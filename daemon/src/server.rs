@@ -130,6 +130,11 @@ pub struct Daemon {
     /// tests that don't want live background threads) starts with an empty
     /// cache rather than a real sweep thread.
     health_sweep: crate::health_sweep::HealthSweepState,
+    /// WS-G.1/G.2: store-lock liveness, surfaced by `GET /api/daemon`. The
+    /// checking thread is spawned in `serve()` rather than here, matching
+    /// `health_sweep`'s precedent, so a plain `Daemon::new` (unit tests) gets
+    /// the state without a live background thread.
+    watchdog: Arc<crate::watchdog::WatchdogState>,
 }
 
 /// How to run a unit of background follow-up work spawned from a request
@@ -237,6 +242,7 @@ impl Daemon {
             generation_jobs: crate::generation::GenerationJobs::new(),
             background: BackgroundWork::Immediate,
             health_sweep: crate::health_sweep::HealthSweepState::new(),
+            watchdog: crate::watchdog::WatchdogState::new(),
         }
     }
 
@@ -405,6 +411,22 @@ impl Daemon {
         self.health_sweep.clone()
     }
 
+    /// A cloned handle to the WS-G watchdog state, for the checking thread
+    /// spawned in `serve()` and for the health route to read.
+    #[must_use]
+    pub fn watchdog_handle(&self) -> Arc<crate::watchdog::WatchdogState> {
+        Arc::clone(&self.watchdog)
+    }
+
+    /// `#[track_caller]` so the lock-wait breadcrumb and the WS-B.3 guard
+    /// watchdog name the handler that took the lock, not this wrapper.
+    ///
+    /// Without it every acquisition made through `Daemon` reports as this one
+    /// line, which is precisely how the performance baseline ended up
+    /// attributing 540 acquisitions and a 4.2-second wait to
+    /// "the generic StoreHandle::lock wrapper" -- a location that tells nobody
+    /// anything about which handler is holding the daemon up.
+    #[track_caller]
     pub(crate) fn lock(&self) -> StoreGuard<'_> {
         self.store.lock()
     }
@@ -848,6 +870,28 @@ struct DaemonHealth<'a> {
     /// measured separately from handler execution time so lock contention is
     /// visible without conflating it with query cost.
     lock_wait: crate::store_lock::LockWaitSnapshot,
+    /// How long the store lock has been *held*, at worst, and how often a hold
+    /// crossed the watchdog threshold. Distinct from `lock_wait`, which is time
+    /// spent waiting to get it: a long hold is the cause, a long wait is the
+    /// symptom every other thread experiences.
+    guard_hold: crate::store_lock::GuardHoldSnapshot,
+    /// WS-G.1/G.4: whether the store lock is currently reachable, and the
+    /// history of it not being. `stalled: true` here is the signal that the
+    /// daemon is wedged -- the condition that previously went entirely
+    /// unreported. See `crate::watchdog`.
+    watchdog: crate::watchdog::WatchdogSnapshot,
+    /// WS-G.3: `file:line` of whoever last acquired the store lock, and how
+    /// long ago, so a wedged daemon names its own culprit instead of leaving it
+    /// to be inferred after the fact.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    store_lock_holder: Option<StoreLockHolder>,
+}
+
+/// See [`DaemonHealth::store_lock_holder`].
+#[derive(Serialize)]
+struct StoreLockHolder {
+    site: String,
+    held_ms: i64,
 }
 
 #[derive(Serialize)]
@@ -2144,6 +2188,10 @@ fn health(daemon: &Daemon) -> Reply {
             db,
             warnings,
             lock_wait: crate::store_lock::store_lock_wait_snapshot(),
+            guard_hold: crate::store_lock::guard_hold_snapshot(),
+            watchdog: daemon.watchdog.snapshot(),
+            store_lock_holder: crate::store_lock::store_lock_holder()
+                .map(|(site, held_ms)| StoreLockHolder { site, held_ms }),
         },
     )
 }
@@ -3905,15 +3953,22 @@ fn force_drain_triage_pool(daemon: &Daemon, body: &str) -> Reply {
             vec![],
         );
     };
-    let store = daemon.lock();
-    let project = crate::triage::resolve_pool_key_input(&store, &req.project);
+    // Scoped so the store guard is released before the drain/create path:
+    // `create_review_from_triage_pool`'s `orderer` callback performs a
+    // blocking Arbiter round-trip that must never run with the daemon's
+    // global store lock held.
+    let project = {
+        let store = daemon.lock();
+        crate::triage::resolve_pool_key_input(&store, &req.project)
+    };
+    let store_handle = daemon.store_handle();
     match crate::reviews::create_review_from_triage_pool(
-        &store,
+        &store_handle,
         &project,
         &req.triage_type,
         |cands| {
             crate::arbiter::order_pooled_candidates(
-                &store,
+                &store_handle,
                 &crate::arbiter::Arbiter::current(),
                 cands,
             )
@@ -4033,9 +4088,12 @@ fn list_triage_candidates(daemon: &Daemon) -> Reply {
 /// returns the wire shape directly.
 fn list_projects(daemon: &Daemon) -> Reply {
     let mut timer = perf_timing::PhaseTimer::start();
-    let store = daemon.lock();
+    // WS-E.2: pooled. The `PHASE_LOCK_WAIT` phase is still recorded so the
+    // timing breakdown keeps the same shape, and it should now read ~0 --
+    // acquiring a pooled connection is not waiting on the writer.
+    let projects = daemon.with_read_snapshot(Store::list_projects_conn);
     timer.phase(perf_timing::PHASE_LOCK_WAIT);
-    match store.list_projects() {
+    match projects {
         Ok(projects) => {
             let mut reply = json(200, &ProjectsResponse { projects });
             timer.phase(perf_timing::PHASE_SERIALIZE);
@@ -4073,15 +4131,33 @@ fn agent_profiles_health(daemon: &Daemon, query: &str) -> Reply {
 /// (see [`crate::project_forks::check_fork_health`]'s doc comment);
 /// submission's own pre-flight remains authoritative.
 fn project_forks_health(daemon: &Daemon) -> Reply {
-    let store = daemon.lock();
-    let forks = match store.list_project_forks() {
-        Ok(forks) => forks,
-        Err(e) => return store_error(&e),
+    // Fork records are collected under the lock, which is then released
+    // before the health probes run: each probe is a `git config` subprocess
+    // plus two forge REST lookups, and this is the daemon's one global store
+    // lock -- holding it across that I/O would stall every other request, on
+    // every endpoint, for as long as the probes take.
+    let forks = {
+        let store = daemon.lock();
+        match store.list_project_forks() {
+            Ok(forks) => forks,
+            Err(e) => return store_error(&e),
+        }
     };
-    let checks: Vec<crate::project_forks::ForkHealthCheck> = forks
-        .iter()
-        .flat_map(|fork| crate::project_forks::check_fork_health(&store, fork))
-        .collect();
+    let store = daemon.store_handle();
+    let mut checks: Vec<crate::project_forks::ForkHealthCheck> = Vec::new();
+    for fork in &forks {
+        let (mut fork_checks, project_path) = {
+            let guard = store.lock();
+            crate::project_forks::fork_health_store_inputs(&guard, fork)
+        };
+        if let Some(project_path) = project_path {
+            fork_checks.extend(crate::project_forks::check_fork_network_health(
+                &project_path,
+                fork,
+            ));
+        }
+        checks.extend(fork_checks);
+    }
     json(200, &serde_json::json!({ "checks": checks }))
 }
 
@@ -4517,7 +4593,8 @@ fn list_hidden(daemon: &Daemon, user_header: Option<&str>) -> Reply {
         Ok(name) => name,
         Err(reply) => return reply,
     };
-    match daemon.lock().list_hidden(&user_name) {
+    // WS-E.2: pooled -- read by the board to apply its hidden-item filters.
+    match daemon.with_read_snapshot(|c| Store::list_hidden_conn(c, &user_name)) {
         Ok(hidden) => json(200, &HiddenResponse { hidden }),
         Err(e) => store_error(&e),
     }
@@ -4946,7 +5023,8 @@ fn list_watches_endpoint(daemon: &Daemon, query: &str, user_header: Option<&str>
         Ok(u) => u,
         Err(r) => return r,
     };
-    match daemon.lock().list_watches(&user) {
+    // WS-E.2: pooled -- the Tasks tab polls this on every refresh.
+    match daemon.with_read_snapshot(|c| Store::list_watches_conn(c, &user)) {
         Ok(watches) => json(200, &WatchesResponse { watches }),
         Err(e) => store_error(&e),
     }
@@ -5571,7 +5649,13 @@ fn fetch_fork_credential(daemon: &Daemon, query: &str) -> Reply {
 /// anything (RAL-101). Used by the Projects tab to flag rows whose git
 /// repository has since moved, been deleted, or stopped being a repo.
 fn validate_project(daemon: &Daemon, name: &str) -> Reply {
-    match daemon.lock().get_project(name) {
+    // Bound before the `match`: as a scrutinee the guard would stay alive for
+    // the whole match body, and `validate_project_location` shells out to
+    // `git rev-parse` -- a subprocess that must not run with the daemon's one
+    // global store lock held. WS-E.2: and the lookup itself is pooled, so this
+    // handler never touches the writer lock at all.
+    let project = daemon.with_read_snapshot(|c| Store::get_project_conn(c, name));
+    match project {
         Ok(Some(p)) => match validate_project_location(&p.path, &p.vcs) {
             Ok(()) => json(
                 200,
@@ -5615,7 +5699,11 @@ struct ProjectBranchesResponse {
 }
 
 fn project_branches(daemon: &Daemon, name: &str) -> Reply {
-    match daemon.lock().get_project(name) {
+    // Bound before the `match`: both `list_base_branches` calls below spawn a
+    // `git for-each-ref`, and this endpoint is polled by the board -- two
+    // subprocesses per poll under the global store lock. WS-E.2: pooled too.
+    let project = daemon.with_read_snapshot(|c| Store::get_project_conn(c, name));
+    match project {
         Ok(Some(p)) if p.vcs == "git" => {
             let mut branches = crate::guardian_merge::list_base_branches(&p.path, "main");
             for b in crate::guardian_merge::list_base_branches(&p.path, "origin/HEAD") {
@@ -5653,7 +5741,11 @@ struct ProjectAutofixDefaultBranchResponse {
 /// projects actually use, and a one-click action needs one unambiguous
 /// remote to act on rather than guessing among several.
 fn project_autofix_default_branch(daemon: &Daemon, name: &str) -> Reply {
-    match daemon.lock().get_project(name) {
+    // Bound before the `match`: the `git remote set-head origin --auto` below
+    // contacts the remote, so as a scrutinee this would hold the global store
+    // lock across a network round-trip bounded only by `GIT_TIMEOUT` (60 s).
+    let project = daemon.lock().get_project(name);
+    match project {
         Ok(Some(p)) if p.vcs == "git" => {
             let root = std::path::Path::new(&p.path);
             if let Err(e) =
@@ -6099,14 +6191,27 @@ fn run_submit_followup(
         crate::worktrees::execute_local_worktree_jobs(&jobs)
     };
 
-    let guard = store_handle.lock();
-    if let Err(e) = crate::reviews::derive_reviews_with_full_prefetch(
-        &guard,
+    // WS-D.8: called with the handle, not a held guard. This was the single
+    // worst lock holder in the daemon -- measured at 45.9 seconds, twice, on
+    // this exact line -- because the guard spanned the placeholder resolution
+    // inside, which runs real `git worktree add`/`fetch`/rebase per cell and a
+    // whole provisioning round-trip for a remote one. The two prefetch passes
+    // above were added to shrink that window; anything they miss (a remote
+    // cell, a `<<...>>` upstream sentinel, an unregistered project) still fell
+    // through to live git under the lock. The function now locks internally,
+    // once, for the database half only.
+    //
+    // The failure path below takes its own guard: there is nothing to keep
+    // atomic between the derivation and reporting that it failed.
+    let derived = crate::reviews::derive_reviews_with_full_prefetch(
+        store_handle,
         &squad_id,
         &file,
         &prefetched_upstreams,
         &prefetched_worktrees,
-    ) {
+    );
+    if let Err(e) = derived {
+        let guard = store_handle.lock();
         let _ = guard.set_squad_error(&squad_id, Some(&e.message));
         let _ = guard.set_squad_state(&squad_id, SquadState::Failed);
         crate::rlog!(
@@ -6153,7 +6258,6 @@ fn run_submit_followup(
         }
         return;
     }
-    drop(guard);
 
     // RAL-318: Triage pooling -- and the worktree placeholder resolution
     // `derive_triage_pools` does to get there -- runs only now that review
@@ -11506,7 +11610,18 @@ struct CancelResponse {
 /// critical path. `BackgroundWork::Immediate` (every `Daemon::new()`-built
 /// test daemon) keeps this synchronous for tests that assert on it.
 fn cancel(daemon: &Daemon, id: &str) -> Reply {
-    match daemon.lock().cancel_squad(id, false) {
+    // Bound before the `match`: as a scrutinee the guard stays alive for the
+    // whole match body, which includes the `background().spawn` below -- and
+    // under `BackgroundWork::Immediate` that closure runs *inline*, shelling
+    // out to tmux per session with the daemon's one global store lock held.
+    // The WS-B.3 guard watchdog catches this at 129 ms on a single-squad
+    // cancel; a cascade spanning several squads is far worse.
+    //
+    // The WS-B.2 source lint cannot see it, because it discards work inside a
+    // `spawn`ed closure as by-definition off-thread. That is true of the
+    // deferred `BackgroundWork`, and false of `Immediate`.
+    let cancelled = daemon.lock().cancel_squad(id, false);
+    match cancelled {
         Ok(impact) => {
             let squad_ids: Vec<String> = impact.squads.into_iter().map(|r| r.id).collect();
             // Trip each worker's cooperative cancel token now -- cheap,
@@ -12057,19 +12172,29 @@ fn stop_targets_for_status_change(
 /// of the time there's no live agent to capture (the common case is
 /// overriding an already-finished node), and even a tmux resolution failure
 /// shouldn't stop a user from being able to force a status.
-fn capture_and_stop_nodes(store: &Store, squad_id: &str, reqs: &[SetStatusBody]) {
+/// Takes the [`StoreHandle`] rather than a live guard: the loop below runs
+/// `tmux has-session`, `tmux capture-pane` and `git rev-parse` per target, and
+/// the caller (`set_status`) used to hold the daemon's one global store lock
+/// across all of it. Targets are resolved under a single brief lock, then every
+/// store touch inside the loop takes its own short-lived one, so no subprocess
+/// ever runs with the lock held.
+fn capture_and_stop_nodes(store: &StoreHandle, squad_id: &str, reqs: &[SetStatusBody]) {
     let Ok(tmux) = crate::tmux::Tmux::resolve() else {
         return;
     };
-    let mut seen = HashSet::new();
-    let mut targets = Vec::new();
-    for req in reqs {
-        for target in stop_targets_for_status_change_full(store, squad_id, req) {
-            if seen.insert(target.clone()) {
-                targets.push(target);
+    let targets = {
+        let guard = store.lock();
+        let mut seen = HashSet::new();
+        let mut targets = Vec::new();
+        for req in reqs {
+            for target in stop_targets_for_status_change_full(&guard, squad_id, req) {
+                if seen.insert(target.clone()) {
+                    targets.push(target);
+                }
             }
         }
-    }
+        targets
+    };
     for target in targets {
         if !tmux.has_session(&target.pane_name) {
             continue;
@@ -12084,11 +12209,15 @@ fn capture_and_stop_nodes(store: &Store, squad_id: &str, reqs: &[SetStatusBody])
                 let uri =
                     crate::ghost::cell_uri(squad_id, target.ghost_task_idx, target.ghost_cell_idx);
                 let cwd = store
+                    .lock()
                     .get_cell_agent_resume(squad_id, target.ghost_task_idx, target.ghost_cell_idx)
                     .map(|(cwd, _, _)| cwd)
                     .unwrap_or_default();
+                // `current_revision` shells out to git, so it sits between the
+                // two locked sections rather than inside either.
                 let revision = crate::ghost::current_revision(&cwd);
-                if store
+                let guard = store.lock();
+                if guard
                     .upsert_ghost(
                         &uri,
                         crate::ghost::KIND_CELL,
@@ -12103,7 +12232,7 @@ fn capture_and_stop_nodes(store: &Store, squad_id: &str, reqs: &[SetStatusBody])
                         .squad(squad_id)
                         .scope("cascade-stop")
                         .emit(
-                            store,
+                            &guard,
                             "captured in-progress agent output before manual status change",
                             serde_json::json!({
                                 "pane": target.pane_name,
@@ -12112,13 +12241,14 @@ fn capture_and_stop_nodes(store: &Store, squad_id: &str, reqs: &[SetStatusBody])
                             }),
                         );
                 }
+                drop(guard);
             }
         }
         let _ = tmux.kill_session(&target.pane_name);
     }
 }
 
-fn capture_and_stop_node(store: &Store, squad_id: &str, req: &SetStatusBody) {
+fn capture_and_stop_node(store: &StoreHandle, squad_id: &str, req: &SetStatusBody) {
     capture_and_stop_nodes(store, squad_id, std::slice::from_ref(req));
 }
 
@@ -12179,7 +12309,7 @@ fn set_status(daemon: &Daemon, id: &str, body: &str) -> Reply {
     let Ok(req) = serde_json::from_str::<SetStatusBody>(body) else {
         return error(400, "bad_request", "invalid set-status body", vec![]);
     };
-    let store = daemon.lock();
+    let mut store = daemon.lock();
     let accepted_failed_proof = if req.kind == "proof" && req.state == "done" {
         store
             .proof_state(
@@ -12221,14 +12351,25 @@ fn set_status(daemon: &Daemon, id: &str, body: &str) -> Reply {
     // kill happens before the state change itself is applied below. For a
     // cascading RAL-181 stop, stop every impacted pane in that branch; for any
     // other manual status change, keep the old single-node behavior.
+    // The guard is released for the capture pass and re-taken after it. Every
+    // target costs a `tmux has-session`, a `tmux capture-pane` and a
+    // `git rev-parse`, and this used to run with the guard live from the top of
+    // the handler -- one manual cancel of a multi-cell branch stalled every
+    // other request the daemon served for as long as tmux took to answer.
+    // Re-reading state afterwards is correct: the code below looks up whatever
+    // it needs itself, and this handler already drops and re-acquires the lock
+    // further down for `fire_ready_triage_thresholds` for the same reason.
     if matches!(req.kind.as_str(), "task" | "cell" | "proof") {
         if let Some(state) = NodeState::parse(&req.state) {
             if state != NodeState::Pending {
+                drop(store);
+                let store_handle = daemon.store_handle();
                 if let Some(plan) = &stop_plan {
-                    capture_and_stop_nodes(&store, id, &plan.stop_requests());
+                    capture_and_stop_nodes(&store_handle, id, &plan.stop_requests());
                 } else {
-                    capture_and_stop_node(&store, id, &req);
+                    capture_and_stop_node(&store_handle, id, &req);
                 }
+                store = daemon.lock();
             }
         }
     }
@@ -12381,8 +12522,10 @@ fn set_status(daemon: &Daemon, id: &str, body: &str) -> Reply {
         drop(store);
         let store_handle = daemon.store_handle();
         {
-            let guard = store_handle.lock();
-            if let Err(e) = crate::reviews::fire_ready_triage_thresholds(&guard, id) {
+            // No guard held across this: its pool-firing path invokes the
+            // `orderer` callback, whose Arbiter round-trip is a blocking
+            // network call that must never run with the global store lock held.
+            if let Err(e) = crate::reviews::fire_ready_triage_thresholds(&store_handle, id) {
                 crate::rlog!(
                     ERROR,
                     "ralphus [triage] failed to re-check thresholds after manual completion in {id}: {}",
@@ -12434,7 +12577,11 @@ struct QueueSetPositionBody {
 
 /// The classified, ordered list of runnable work across all schedulable squads.
 fn queue(daemon: &Daemon) -> Reply {
-    match daemon.lock().queue() {
+    // WS-D.6: read-only, and polled by the board -- served from a pooled
+    // read-only connection instead of the writer lock. The read transaction
+    // inside `with_read_snapshot` is what keeps the multi-statement view
+    // internally consistent; excluding the writer was never what did that.
+    match daemon.with_read_snapshot(Store::queue_conn) {
         Ok(items) => json(200, &QueueResponse { items }),
         Err(e) => store_error(&e),
     }
@@ -13770,7 +13917,9 @@ fn pr_get(daemon: &Daemon, pr_id: &str) -> Reply {
 /// including each open PR's last-polled `ci_status`), which needs every
 /// open PR's source task in one request rather than one lookup per row.
 fn pr_index_list(daemon: &Daemon) -> Reply {
-    match daemon.lock().list_pull_requests_index() {
+    // WS-E.2: read-only and polled by the board on every Tasks-tab refresh, so
+    // it runs on a pooled connection rather than the writer lock.
+    match daemon.with_read_snapshot(Store::list_pull_requests_index_conn) {
         Ok(rows) => json(200, &rows),
         Err(e) => store_error(&e),
     }
@@ -14034,14 +14183,23 @@ fn pr_pull_from_pr(daemon: &Daemon, pr_id: &str) -> Reply {
 /// `GET /api/pull-requests/index` poll. Identical for GitHub/GitLab -- both
 /// go through the same `ForgeClient::check_pr_ci_status`.
 fn pr_refresh_ci(daemon: &Daemon, pr_id: &str) -> Reply {
-    let store = daemon.lock();
-    let pr = match store.get_pull_request(pr_id) {
-        Ok(pr) => pr,
-        Err(e) => return store_error(&e),
-    };
-    let guardian = match store.get_guardian(&pr.guardian_id) {
-        Ok(g) => g,
-        Err(e) => return store_error(&e),
+    // Scoped so the store guard is released before anything below reaches for
+    // the forge -- same reasoning as `pr_comments` above: the guard must not
+    // live across `resolve_remote`'s git/token subprocesses or the
+    // `check_pr_ci_status` forge REST round-trip, and
+    // `forge::ForgeClient`'s own resolution path takes the store lock itself
+    // on some routes, so holding it here can also self-deadlock.
+    let (pr, guardian) = {
+        let store = daemon.lock();
+        let pr = match store.get_pull_request(pr_id) {
+            Ok(pr) => pr,
+            Err(e) => return store_error(&e),
+        };
+        let guardian = match store.get_guardian(&pr.guardian_id) {
+            Ok(g) => g,
+            Err(e) => return store_error(&e),
+        };
+        (pr, guardian)
     };
     let Some(pr_number) = pr.pr_number else {
         return error(409, "no_pr_number", "PR has no recorded number yet", vec![]);
@@ -14060,6 +14218,7 @@ fn pr_refresh_ci(daemon: &Daemon, pr_id: &str) -> Reply {
         crate::forge::PrCiState::Failing(f) => f.job_url.clone(),
         _ => None,
     };
+    let store = daemon.lock();
     if let Err(e) = store.set_pr_ci_status(pr_id, state.as_str(), job_url.as_deref()) {
         return store_error(&e);
     }
@@ -14305,7 +14464,12 @@ fn guardian_arrange(daemon: &Daemon, id: &str, body: &str) -> Reply {
 
 fn guardian_approve(daemon: &Daemon, id: &str) -> Reply {
     let snapshot = daemon.lock().get_guardian(id).ok();
-    match daemon.lock().approve_guardian(id) {
+    // Bind before the `match`: the scrutinee temporary would otherwise hold
+    // the store guard across the whole match body, and the success arm's
+    // `retire_dual_root_branch_for_guardian` re-locks the store
+    // (pr.rs) -- a non-reentrant self-park. See `daemon/tests/store_lock_reentrancy.rs`.
+    let approved = daemon.lock().approve_guardian(id);
+    match approved {
         Ok(status) => {
             if let Some(g) = snapshot {
                 crate::pr::retire_dual_root_branch_for_guardian(
@@ -14332,7 +14496,11 @@ fn guardian_cancel(daemon: &Daemon, id: &str) -> Reply {
     // review, and an acknowledgement must not wait behind slow cleanup.
     crate::guardian_merge::stop_merge_worker_for_cancel(&daemon.cancellations, id);
     let snapshot = daemon.lock().get_guardian(id).ok();
-    match daemon.lock().cancel_guardian(id) {
+    // Bind before the `match`: same re-entrant re-lock hazard as
+    // `guardian_approve` above -- the success arm's
+    // `retire_dual_root_branch_for_guardian` takes the store lock itself.
+    let cancelled = daemon.lock().cancel_guardian(id);
+    match cancelled {
         Ok(status) => {
             if let Some(g) = snapshot {
                 crate::pr::retire_dual_root_branch_for_guardian(
@@ -15442,12 +15610,6 @@ pub fn serve<A: ToSocketAddrs>(
     // Arbiter reviews before review recovery starts scheduling work.
     crate::reviews::repair_arbiter_review_project_roots(&store);
     crate::reviews::repair_review_project_identities(&store);
-    // RAL-318 bug 3: repair any Triage pool/threshold/schedule row still
-    // keyed by its pre-fix raw worktree path instead of the resolved
-    // project name, and fire any pool that's now correctly counted and
-    // already past its threshold. Naturally idempotent (see the function's
-    // own doc comment), so unconditional on every restart is safe.
-    crate::reviews::repair_triage_pool_keys(&store);
     // Zombie tmux.exe reaping: on the Windows tmux-alternative (psmux) this
     // project targets, `kill-session` frees a cell's *name* but never
     // actually terminates the backing OS process (see
@@ -15537,6 +15699,15 @@ pub fn serve<A: ToSocketAddrs>(
             .with_token(token)
             .with_background_work(BackgroundWork::Threaded),
     );
+    // RAL-318 bug 3: repair any Triage pool/threshold/schedule row still
+    // keyed by its pre-fix raw worktree path instead of the resolved
+    // project name, and fire any pool that's now correctly counted and
+    // already past its threshold. Naturally idempotent (see the function's
+    // own doc comment), so unconditional on every restart is safe. Runs after
+    // the daemon (and its store handle) exists -- its pool-firing path can
+    // invoke the Arbiter -- but before any background worker or the scheduler
+    // thread below starts scheduling work.
+    crate::reviews::repair_triage_pool_keys(&daemon.store_handle());
 
     // The remote Open Agent terminal relay (RAL-355 Phase 10) listens one
     // port above the main API, on the same host it bound to -- so a remote
@@ -15608,6 +15779,10 @@ pub fn serve<A: ToSocketAddrs>(
     // health check -- see `crate::health_sweep`'s module doc comment for
     // why it's scoped to a subset of the catalog.
     crate::health_sweep::spawn_health_sweep(daemon.health_sweep_handle(), daemon.store_handle());
+    // WS-G.1/G.2: nothing watched the daemon itself until now -- see
+    // `crate::watchdog`'s module doc comment for what the unwatched failure
+    // looked like.
+    crate::watchdog::spawn(daemon.store_handle(), daemon.watchdog_handle());
     std::thread::spawn(move || {
         crate::scheduler::run_loop(
             handle,
@@ -15741,10 +15916,52 @@ fn cors_header(name: &'static [u8], value: &str) -> tiny_http::Header {
 /// `Access-Control-Allow-Origin` (echoing the exact allowed origin, never a
 /// wildcard, per RAL-220) plus `Vary: Origin` so a shared cache never serves
 /// one origin's CORS-tagged response to another.
+/// WS-D.5: an entity tag for a response body, so the board's poll can be
+/// answered `304 Not Modified` when nothing it asked about changed.
+///
+/// The tag is derived from the body that was *just* computed, not from a
+/// version stamp tracked alongside the data. That makes it unconditionally
+/// correct -- there is no way for it to claim "unchanged" about a body it did
+/// not hash -- at the cost of not saving the query itself. What it does save is
+/// everything after the query: the response bytes, and the client's JSON parse
+/// and re-render, which is what the board actually spends its time on when it
+/// re-hydrates every 150 ms and nothing has changed.
+///
+/// `DefaultHasher` rather than a cryptographic digest: an ETag is not a
+/// security boundary, and no new dependency is worth one here. The length is
+/// folded into the tag alongside the hash, so a false "unchanged" would need a
+/// collision at the same body length.
+fn body_etag(body: &str) -> String {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    body.hash(&mut hasher);
+    format!("\"{:x}-{:x}\"", body.len(), hasher.finish())
+}
+
+/// Whether an `If-None-Match` value matches `etag`.
+///
+/// A client may send several tags, comma-separated, and a proxy may weaken a
+/// tag by prefixing `W/`. Both are handled rather than assuming the board is
+/// the only caller.
+fn etag_matches(if_none_match: &str, etag: &str) -> bool {
+    if if_none_match.trim() == "*" {
+        return true;
+    }
+    if_none_match
+        .split(',')
+        .map(|candidate| candidate.trim().trim_start_matches("W/"))
+        .any(|candidate| candidate == etag)
+}
+
 fn cors_response_headers(origin: &str) -> Vec<tiny_http::Header> {
     vec![
         cors_header(b"Access-Control-Allow-Origin", origin),
         cors_header(b"Vary", "Origin"),
+        // WS-D.5: a cross-origin caller cannot read `ETag` unless it is
+        // explicitly exposed, and a caller that cannot read the tag can never
+        // send `If-None-Match` -- the conditional GET would silently never
+        // engage for the board, which is served from a different port.
+        cors_header(b"Access-Control-Expose-Headers", "ETag, Server-Timing"),
     ]
 }
 
@@ -15759,7 +15976,7 @@ fn cors_preflight_headers(origin: &str) -> Vec<tiny_http::Header> {
     ));
     headers.push(cors_header(
         b"Access-Control-Allow-Headers",
-        "Content-Type, traceparent, X-Ralphus-User",
+        "Content-Type, traceparent, X-Ralphus-User, If-None-Match",
     ));
     headers
 }
@@ -15827,6 +16044,9 @@ struct PendingRequest {
     traceparent: Option<String>,
     auth_header: Option<String>,
     user_header: Option<String>,
+    /// WS-D.5: the board's conditional-GET validator, if it sent one — see
+    /// [`body_etag`].
+    if_none_match: Option<String>,
     cors: ralphus_core::cors::CorsDecision,
     /// When the accept loop finished reading this request, so the time it
     /// then spent waiting for a worker is reportable separately from the
@@ -15905,6 +16125,7 @@ fn answer_request(daemon: &Daemon, pending: PendingRequest) {
         traceparent,
         auth_header,
         user_header,
+        if_none_match,
         cors,
         accepted_at,
     } = pending;
@@ -15938,13 +16159,27 @@ fn answer_request(daemon: &Daemon, pending: PendingRequest) {
     };
     let handler_ms = handler_started.elapsed().as_millis();
     let lock_wait_ms = crate::store_lock::take_request_lock_wait_ms();
-    let status = reply.status;
+    let mut status = reply.status;
     let server_timing = reply.server_timing;
+    // WS-D.5: conditional GET. Only for a successful read -- a mutation's
+    // response is not cacheable, and a non-200 body carries an error the client
+    // must see every time.
+    let etag = (method == "GET" && status == 200).then(|| body_etag(&reply.body));
+    let mut body_out = reply.body;
+    if let (Some(etag), Some(sent)) = (etag.as_deref(), if_none_match.as_deref()) {
+        if etag_matches(sent, etag) {
+            status = 304;
+            body_out = String::new();
+        }
+    }
     let header = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
         .expect("valid header");
-    let mut response = tiny_http::Response::from_string(reply.body)
+    let mut response = tiny_http::Response::from_string(body_out)
         .with_status_code(status)
         .with_header(header);
+    if let Some(etag) = &etag {
+        response = response.with_header(cors_header(b"ETag", etag.as_str()));
+    }
     // RAL-414: only present when `RALPHUS_BOARD_TIMING` is enabled and the
     // handler recorded at least one phase (see `crate::perf_timing`) --
     // absent otherwise, so this adds no header on the default hot path.
@@ -16091,6 +16326,7 @@ fn run_http_loop(server: tiny_http::Server, daemon: &Arc<Daemon>) -> HttpLoopEnd
         let traceparent = header_value(&request, "traceparent");
         let auth_header = header_value(&request, "Authorization");
         let user_header = header_value(&request, "X-Ralphus-User");
+        let if_none_match = header_value(&request, "If-None-Match");
 
         let mut body = String::new();
         let _ = request.as_reader().read_to_string(&mut body);
@@ -16103,6 +16339,7 @@ fn run_http_loop(server: tiny_http::Server, daemon: &Arc<Daemon>) -> HttpLoopEnd
             traceparent,
             auth_header,
             user_header,
+            if_none_match,
             cors,
             accepted_at: Instant::now(),
         };
@@ -16222,6 +16459,25 @@ mod tests {
     #![allow(clippy::print_stdout)]
 
     use super::*;
+
+    /// WS-D.5: the ETag helpers, which decide whether a board poll can be
+    /// answered `304 Not Modified`.
+    #[test]
+    fn body_etag_distinguishes_bodies_and_matches_only_itself() {
+        let a = body_etag(r#"{"squads":[]}"#);
+        let b = body_etag(r#"{"squads":[{"id":"squad-000000000001"}]}"#);
+        assert_ne!(a, b, "different bodies produced the same tag");
+        assert_eq!(a, body_etag(r#"{"squads":[]}"#), "the tag is not stable");
+        assert!(a.starts_with('"') && a.ends_with('"'), "not quoted: {a}");
+
+        assert!(etag_matches(&a, &a));
+        assert!(!etag_matches(&b, &a));
+        // A proxy may weaken the tag, and a client may send several at once.
+        assert!(etag_matches(&format!("W/{a}"), &a));
+        assert!(etag_matches(&format!("{b}, {a}"), &a));
+        assert!(etag_matches("*", &a));
+        assert!(!etag_matches("", &a));
+    }
 
     const GOOD: &str = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
 
@@ -16738,7 +16994,25 @@ mod tests {
         let traced = route_with_trace(&d, "GET", "/api/daemon", "", None);
         let plain = route(&d, "GET", "/api/daemon", "");
         assert_eq!(traced.status, plain.status);
-        assert_eq!(traced.body, plain.body);
+
+        // Compared field by field with the inherently time-dependent ones
+        // dropped. `/api/daemon` reports live instrumentation -- how long the
+        // lock has been held, how long ago the watchdog last succeeded -- and
+        // those legitimately differ between two calls a millisecond apart. What
+        // this test is about is that adding a trace context does not change the
+        // *reply*, so it compares everything except the clock.
+        let strip = |body: &str| -> serde_json::Value {
+            let mut v: serde_json::Value =
+                serde_json::from_str(body).expect("health response is JSON");
+            if let Some(obj) = v.as_object_mut() {
+                obj.remove("store_lock_holder");
+                obj.remove("watchdog");
+                obj.remove("lock_wait");
+                obj.remove("guard_hold");
+            }
+            v
+        };
+        assert_eq!(strip(&traced.body), strip(&plain.body));
     }
 
     #[test]

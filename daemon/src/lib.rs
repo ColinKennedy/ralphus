@@ -59,6 +59,7 @@ pub(crate) mod short_paths;
 pub(crate) mod stash;
 pub mod store;
 pub mod store_lock;
+pub mod store_memory;
 pub mod store_pool;
 pub mod summary_worker;
 pub mod terminal_log;
@@ -70,6 +71,7 @@ pub mod triage;
 pub mod user_forge_tokens;
 pub mod users;
 pub mod vcs;
+pub mod watchdog;
 pub mod watches;
 pub mod workspace;
 pub(crate) mod worktree_claims;
@@ -174,6 +176,11 @@ pub enum Command {
         /// worktree) must each be given a distinct `--db` to get real
         /// isolation; nothing here auto-picks a path.
         db: Option<PathBuf>,
+        /// Explicit log file path overriding `[daemon].log_path` for this
+        /// invocation. Stderr stays wired as before; a daemon started without
+        /// a log_path (config or this flag) loses its stderr when detached,
+        /// which is how a hang can go completely undiagnosed.
+        log_path: Option<PathBuf>,
     },
     /// Validate a task TOML file offline (no server, no database).
     Validate(String),
@@ -214,7 +221,8 @@ pub fn parse_args(args: &[String]) -> Command {
             let tail = &args[1..];
             let port = parse_port_flag(tail).unwrap_or(DEFAULT_PORT);
             let db = parse_db_flag(tail);
-            Command::Serve { port, db }
+            let log_path = parse_log_path_flag(tail);
+            Command::Serve { port, db, log_path }
         }
         Some(HelpCommand::Validate) => Command::Validate(args.get(1).cloned().unwrap_or_default()),
         Some(HelpCommand::Mux) => Command::Mux(args[1..].to_vec()),
@@ -281,6 +289,17 @@ fn parse_db_flag(tail: &[String]) -> Option<PathBuf> {
     let mut it = tail.iter();
     while let Some(arg) = it.next() {
         if arg == "--db" {
+            return it.next().map(PathBuf::from);
+        }
+    }
+    None
+}
+
+/// Extract `--log-path <path>` from the argument tail, if present.
+fn parse_log_path_flag(tail: &[String]) -> Option<PathBuf> {
+    let mut it = tail.iter();
+    while let Some(arg) = it.next() {
+        if arg == "--log-path" {
             return it.next().map(PathBuf::from);
         }
     }
@@ -401,7 +420,8 @@ mod tests {
             parse_args(&args(&["serve"])),
             Command::Serve {
                 port: DEFAULT_PORT,
-                db: None
+                db: None,
+                log_path: None
             }
         );
     }
@@ -412,7 +432,8 @@ mod tests {
             parse_args(&args(&["serve", "--port", "9000"])),
             Command::Serve {
                 port: 9000,
-                db: None
+                db: None,
+                log_path: None
             }
         );
     }
@@ -423,7 +444,8 @@ mod tests {
             parse_args(&args(&["serve", "--port", "notaport"])),
             Command::Serve {
                 port: DEFAULT_PORT,
-                db: None
+                db: None,
+                log_path: None
             }
         );
     }
@@ -434,7 +456,20 @@ mod tests {
             parse_args(&args(&["serve", "--db", "C:/tmp/tasks-9000.db"])),
             Command::Serve {
                 port: DEFAULT_PORT,
-                db: Some(PathBuf::from("C:/tmp/tasks-9000.db"))
+                db: Some(PathBuf::from("C:/tmp/tasks-9000.db")),
+                log_path: None
+            }
+        );
+    }
+
+    #[test]
+    fn serve_honors_log_path_flag() {
+        assert_eq!(
+            parse_args(&args(&["serve", "--log-path", "C:/tmp/daemon.log"])),
+            Command::Serve {
+                port: DEFAULT_PORT,
+                db: None,
+                log_path: Some(PathBuf::from("C:/tmp/daemon.log"))
             }
         );
     }
@@ -451,7 +486,8 @@ mod tests {
             ])),
             Command::Serve {
                 port: 9000,
-                db: Some(PathBuf::from("C:/tmp/tasks-9000.db"))
+                db: Some(PathBuf::from("C:/tmp/tasks-9000.db")),
+                log_path: None
             }
         );
     }

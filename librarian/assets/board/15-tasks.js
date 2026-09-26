@@ -37,19 +37,29 @@
        * @returns {Promise<void>}
        */
       async function pollTasksTab() {
+        // WS-D.5: both reads are conditional. This tab polls continuously and
+        // is also refreshed on every SSE event, so most rounds ask about data
+        // that has not moved; a `304` on both lets the whole re-render be
+        // skipped rather than rebuilding an identical table.
+        let anythingChanged = false;
         try {
-          const [indexRes, prRes] = await Promise.all([
-            fetch("/api/task-index"),
-            fetch("/api/pull-requests/index"),
+          const [index, prIndex] = await Promise.all([
+            conditionalGet("/api/task-index"),
+            conditionalGet("/api/pull-requests/index"),
           ]);
-          if (indexRes.ok) {
-            const d = await indexRes.json();
-            /** @type {any} */ (window)._daemonStatus = d.daemon;
-            squads = d.squads || [];
-            byId("running").textContent = formatConcurrencyStatus(d.daemon.running ?? 0, d.daemon.max_concurrent ?? 0);
+          if (index.changed) {
+            anythingChanged = true;
+            if (index.data) {
+              /** @type {any} */ (window)._daemonStatus = index.data.daemon;
+              squads = index.data.squads || [];
+              byId("running").textContent = formatConcurrencyStatus(index.data.daemon.running ?? 0, index.data.daemon.max_concurrent ?? 0);
+            }
           }
-          if (prRes.ok) taskTabPrIndex = await prRes.json();
-        } catch (e) { /* transient -- the next poll retries */ }
+          if (prIndex.changed) {
+            anythingChanged = true;
+            if (prIndex.data) taskTabPrIndex = prIndex.data;
+          }
+        } catch (e) { /* transient -- the next poll retries */ anythingChanged = true; }
         markUpdated();
         if (pendingHash && pendingHash.tab === "tasks") {
           const want = pendingHash;
@@ -62,7 +72,11 @@
           ttScrollSelectionIntoView();
           return;
         }
-        renderTasksTab();
+        // A pending selection change still renders above, because that is a
+        // local state change the server knows nothing about. Here there is no
+        // such change: if neither endpoint moved, the table would be rebuilt
+        // byte-for-byte identical.
+        if (anythingChanged) renderTasksTab();
       }
       // RALPHUS-POLL-TASKS-TAB:END
       /**
@@ -151,8 +165,11 @@
         byId("tt-summary").textContent = `${filtered.length} task${filtered.length === 1 ? "" : "s"} across ${squadCount} squad${squadCount === 1 ? "" : "s"} · ${running} running · ${needsMeKeys.size} waiting on you`;
         byId("tt-needs-me-count").textContent = needsMeKeys.size ? String(needsMeKeys.size) : "";
       }
+      // RALPHUS-TT-COLUMN-TIPS:BEGIN
       /**
        * Per-column header tooltip text (RAL-40: why / who-when / caveat), keyed by `TaskTabColumn.key`.
+       * Every `TASK_TAB_COLUMNS` entry must have one -- a column whose header
+       * hovers to nothing is the bug this map's test guards against.
        * @type {{[key: string]: string}}
        */
       const TT_COLUMN_TIPS = {
@@ -162,11 +179,13 @@
         cells: "Proportional breakdown of this task's cells by state, plus done/total count.",
         review: "Right-aligned Review/PR lane: the most-attention-needing review this task participates in (with a +N suffix for extra reviews), then its earliest-submitted PR, always last.\nA dashed placeholder means a review merged/merging with no PR submitted yet.",
         time: "Duration (live while running) or start time, per this menu's mode toggle. A dash means the task hasn't started.",
+        turns: "Agent turns (RAL-352): completed user/assistant message exchanges, summed over this task's cells, cell proof steps, and task-scope proof steps.\nEach response event counts as both sides of one exchange, so this is the back-and-forth message count, not a count of API calls. It updates live while a cell is running.\nA dash means nothing here carries a conversational count at all -- command-mode work has none, which is not the same as zero.",
         tokens: "Input / output token totals, summed over this task's cells, cell proof steps, and task-scope proof steps.",
         cache: "Prompt-cache write / read token totals -- both are input-side figures, unlike Tokens' in/out split.",
         cost: "Total cost in USD, aggregated the same way as Tokens.\nA dash means no backend reported a cost for this task; a \"~\" prefix means at least one contributing figure is a mid-run estimate, not final accounting.",
         meatball: "Column options: sort, group-by (Squad column), duration/start-time (Time column), and show/hide any column.",
       };
+      // RALPHUS-TT-COLUMN-TIPS:END
       /**
        * Renders one header cell -- label (click sorts), sort caret, meatball menu trigger, resize handle.
        * @param {TaskTabColumn} c
@@ -532,6 +551,21 @@
         return `<span class="tt-time ${running ? "running" : ""}" ${running ? `data-running="1" data-started="${startedAtMs}"` : ""} data-tip="${esc(tip)}">${fmtDuration(durMs)}</span>`;
       }
       /**
+       * Renders the Turns column: the summed agent-turn count, with a tooltip
+       * naming how many cells/proof steps actually contributed one. A dash
+       * means no constituent carries a turn count at all (RAL-352) -- command
+       * mode has no conversational count, which is not a count of zero.
+       * @param {TtUsage} usage
+       * @param {TtUsageItem[]} items
+       * @returns {string}
+       */
+      function ttTurnsCellHtml(usage, items) {
+        if (!usage.anyTurns) return `<span data-tip="No cell or proof step here carries a conversational turn count — command-mode work has none at all, which is not a count of zero.">–</span>`;
+        const contributing = items.filter((it) => it.turns !== undefined && it.turns !== null).length;
+        const tip = `${usage.turns} agent turn${usage.turns === 1 ? "" : "s"} summed over ${contributing} contributing cell/proof step(s).\nA turn is one completed user/assistant exchange, not an API call; it updates live while a cell runs.`;
+        return `<span data-tip="${esc(tip)}">${ttFmtTurns(usage)}</span>`;
+      }
+      /**
        * Renders the Cost column with a per-contributor tooltip breakdown.
        * @param {TtUsage} usage
        * @param {TtUsageItem[]} items
@@ -578,6 +612,7 @@
           + ttColCell("cells", ttCellsBarHtml(row.cells))
           + ttColCell("review", ttReviewPrBadgesHtml(row.reviewBadge, row.prPick))
           + ttColCell("time", ttTimeCellHtml(row.startedAtMs, row.finishedAtMs, row.state))
+          + ttColCell("turns", ttTurnsCellHtml(row.usage, ttTaskUsageItems(row.task)))
           + ttColCell("tokens", ttFmtTokens(row.usage))
           + ttColCell("cache", ttFmtCache(row.usage))
           + ttColCell("cost", ttCostCellHtml(row.usage, ttTaskUsageItems(row.task)))
@@ -608,6 +643,7 @@
           + ttColCell("cells", proofPips)
           + ttColCell("review", `<span data-tip="Review branch(es) this cell submitted under.">${branch}</span>`)
           + ttColCell("time", ttTimeCellHtml(cell.started_at_ms ?? null, cell.finished_at_ms ?? null, cell.state))
+          + ttColCell("turns", ttTurnsCellHtml(cu, ttCellUsageItems(cell)))
           + ttColCell("tokens", ttFmtTokens(cu))
           + ttColCell("cache", ttFmtCache(cu))
           + ttColCell("cost", ttCostCellHtml(cu, ttCellUsageItems(cell)))
@@ -615,7 +651,7 @@
           + `</div>`;
       }
       /**
-       * Renders one virtualized group-by-squad header, absolutely positioned at `top` -- its Tokens/Cache/Cost cells aggregate only the rows visible in this group (post-filter), with the unfiltered total noted in the tooltip when a filter is active.
+       * Renders one virtualized group-by-squad header, absolutely positioned at `top` -- its Turns/Tokens/Cache/Cost cells aggregate only the rows visible in this group (post-filter), with the unfiltered total noted in the tooltip when a filter is active.
        * @param {string} squadId
        * @param {TtRow[]} groupRows
        * @param {number} top
@@ -642,6 +678,7 @@
           + ttColCell("cells", "")
           + ttColCell("review", "")
           + ttColCell("time", "")
+          + ttColCell("turns", `<span data-tip="${esc(tip(agg.anyTurns ? `${agg.turns} agent turn${agg.turns === 1 ? "" : "s"}` : "No agent-turn count"))}">${ttFmtTurns(agg)}</span>`)
           + ttColCell("tokens", `<span data-tip="${esc(tip(ttFmtTokens(agg)))}">${ttFmtTokens(agg)}</span>`)
           + ttColCell("cache", `<span data-tip="${esc(tip(ttFmtCache(agg)))}">${ttFmtCache(agg)}</span>`)
           + ttColCell("cost", `<span data-tip="${esc(tip(ttFmtCost(agg)))}">${agg.anyCost ? (agg.estimated ? "~" : "") + "$" + agg.cost.toFixed(2) : "–"}</span>`)
@@ -1322,6 +1359,10 @@
       let sel = { kind: null, taskIdx: 0, cellIdx: 0, proofIdx: -1 };
       let editing = false;
       let filters = defaultTaskFilters();
+      // RAL-486 follow-up: once true, filters.agents is a user/URL-chosen
+      // selection and is no longer auto-synced to newly-discovered agents
+      // (see renderSquadAgentFilter; mirrors taskTabAgentDefaulted).
+      let squadAgentDefaulted = false;
       let reviewFilters = defaultReviewFilters();
       // Once true, reviewFilters.resolver is a user/URL-chosen selection and is no longer
       // auto-synced to newly-discovered resolvers (see renderReviewResolverFilters).

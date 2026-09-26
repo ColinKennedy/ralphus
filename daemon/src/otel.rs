@@ -198,7 +198,10 @@ impl SpanExporter for UreqOtlpJsonExporter {
                 }],
             }],
         });
-        ureq::post(&self.traces_url)
+        // Bounded timeouts via the shared daemon agent: the OTLP endpoint
+        // must never hang the export thread indefinitely on a stalled socket.
+        crate::forge::http_agent()
+            .post(&self.traces_url)
             .set("Content-Type", "application/json")
             .send_string(&body.to_string())
             .map(|_| ())

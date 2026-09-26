@@ -93,6 +93,11 @@ echo "   librarian -> http://127.0.0.1:${librarian_port}"
 echo "   board dev mode -> reading librarian/assets from disk (RALPHUS_BOARD_ASSETS_DIR); edits are live on browser refresh"
 daemon_args=(serve --port "$daemon_port")
 [ -n "$db_path" ] && daemon_args+=(--db "$db_path")
+# Always keep the daemon's logs on disk: without a log_path a detached
+# daemon's stderr is discarded, so a hang leaves nothing to diagnose
+# (the `no log_path configured` health warning flags this too).
+log_home="${USERPROFILE:-${HOME:-.}}"
+daemon_args+=(--log-path "${log_home}/.ralphus/daemon-${daemon_port}.log")
 "$root/target/debug/ralphus-daemon${ext}" "${daemon_args[@]}" &
 daemon_pid=$!
 trap 'kill "$daemon_pid" 2>/dev/null || true' EXIT

@@ -66,6 +66,10 @@ pub struct Reply {
     /// browser refresh always re-fetches the current bytes); `None` for API
     /// replies.
     pub cache_control: Option<&'static str>,
+    /// WS-D.5: the daemon's `ETag` for a proxied `/api/*` read, passed through
+    /// so the board can echo it back as `If-None-Match` and be answered `304`.
+    /// `None` for static assets and for any reply the daemon did not tag.
+    pub etag: Option<String>,
     /// Response body.
     pub body: String,
 }
@@ -76,6 +80,7 @@ impl Reply {
             status,
             content_type: "application/json",
             cache_control: None,
+            etag: None,
             body: body.into(),
         }
     }
@@ -85,6 +90,7 @@ impl Reply {
             status: 404,
             content_type: "text/plain; charset=utf-8",
             cache_control: None,
+            etag: None,
             body: "not found".into(),
         }
     }
@@ -126,6 +132,21 @@ pub fn handle_with_trace(
     body: &str,
     traceparent: Option<&str>,
 ) -> Reply {
+    handle_with_trace_conditional(daemon_url, method, path, body, traceparent, None)
+}
+
+/// [`handle_with_trace`] plus the caller's `If-None-Match` (WS-D.5), so a
+/// proxied read can come back `304 Not Modified`. The existing entry points
+/// stay validator-free, which keeps their tests unchanged.
+#[must_use]
+pub fn handle_with_trace_conditional(
+    daemon_url: &str,
+    method: &str,
+    path: &str,
+    body: &str,
+    traceparent: Option<&str>,
+    if_none_match: Option<&str>,
+) -> Reply {
     let path_only = path.split('?').next().unwrap_or(path);
     let cx = crate::otel::context_from_traceparent(traceparent);
     let span = crate::otel::start_span("librarian.request", &cx, SpanKind::Server);
@@ -133,13 +154,14 @@ pub fn handle_with_trace(
     span.set_attribute("http.target", path.to_string());
 
     let reply = match (method, path_only) {
-        (_, p) if p.starts_with("/api/") => proxy(
+        (_, p) if p.starts_with("/api/") => proxy_conditional(
             daemon_url,
             method,
             path,
             body,
             Some(&span.cx),
             daemon_token().as_deref(),
+            if_none_match,
         ),
         ("GET", _) => serve_static(path_only),
         _ => Reply::not_found(),
@@ -171,6 +193,7 @@ fn serve_static(path_only: &str) -> Reply {
             status: 200,
             content_type: content_type_for(name),
             cache_control: Some("no-store"),
+            etag: None,
             body,
         },
         None => Reply::not_found(),
@@ -218,11 +241,33 @@ fn proxy(
     parent: Option<&Context>,
     token: Option<&str>,
 ) -> Reply {
+    proxy_conditional(daemon_url, method, path, body, parent, token, None)
+}
+
+/// [`proxy`] plus WS-D.5's conditional GET: `if_none_match` is forwarded to the
+/// daemon, and the daemon's `ETag` comes back on the [`Reply`].
+///
+/// Without the passthrough the board could never be answered `304`: it fetches
+/// same-origin `/api/*`, so every validator it sends and every tag it would
+/// need to send one arrive and leave through here.
+fn proxy_conditional(
+    daemon_url: &str,
+    method: &str,
+    path: &str,
+    body: &str,
+    parent: Option<&Context>,
+    token: Option<&str>,
+    if_none_match: Option<&str>,
+) -> Reply {
     let url = format!("{}{}", daemon_url.trim_end_matches('/'), path);
     let traceparent = parent.and_then(crate::otel::traceparent_from_context);
     let with_trace = |req: ureq::Request| {
         let req = match &traceparent {
             Some(tp) => req.set("traceparent", tp),
+            None => req,
+        };
+        let req = match if_none_match {
+            Some(tag) => req.set("If-None-Match", tag),
             None => req,
         };
         match token {
@@ -249,7 +294,18 @@ fn proxy(
     match result {
         Ok(resp) => {
             let status = resp.status();
-            Reply::json(status, resp.into_string().unwrap_or_default())
+            let etag = resp.header("ETag").map(str::to_string);
+            // A 304 carries no body by definition; `into_string` would give an
+            // empty one anyway, but reading it explicitly keeps the intent
+            // clear and avoids sending "" as if it were data.
+            let body = if status == 304 {
+                String::new()
+            } else {
+                resp.into_string().unwrap_or_default()
+            };
+            let mut reply = Reply::json(status, body);
+            reply.etag = etag;
+            reply
         }
         Err(ureq::Error::Status(code, resp)) => {
             Reply::json(code, resp.into_string().unwrap_or_default())
@@ -451,15 +507,37 @@ fn handle_request(mut request: tiny_http::Request, daemon_url: &str) {
     }
 
     let traceparent = header_value(&request, "traceparent");
+    let if_none_match = header_value(&request, "If-None-Match");
 
     let mut body = String::new();
     let _ = request.as_reader().read_to_string(&mut body);
 
-    let reply = handle_with_trace(daemon_url, &method, &url, &body, traceparent.as_deref());
+    let reply = handle_with_trace_conditional(
+        daemon_url,
+        &method,
+        &url,
+        &body,
+        traceparent.as_deref(),
+        if_none_match.as_deref(),
+    );
     let mut headers = vec![
         tiny_http::Header::from_bytes(&b"Content-Type"[..], reply.content_type.as_bytes())
             .expect("valid header"),
     ];
+    if let Some(etag) = &reply.etag {
+        headers.push(
+            tiny_http::Header::from_bytes(&b"ETag"[..], etag.as_bytes()).expect("valid header"),
+        );
+        // `no-cache` means "you may store this, but revalidate every time" --
+        // which is what makes the validator useful rather than letting the
+        // browser serve a stale body from its heuristic cache. The board sends
+        // `If-None-Match` itself, so this is belt-and-braces for any other
+        // client.
+        headers.push(
+            tiny_http::Header::from_bytes(&b"Cache-Control"[..], &b"no-cache"[..])
+                .expect("valid header"),
+        );
+    }
     if let Some(cache_control) = reply.cache_control {
         headers.push(
             tiny_http::Header::from_bytes(&b"Cache-Control"[..], cache_control.as_bytes())

@@ -40,6 +40,37 @@ use std::time::{Duration, Instant};
 
 use crate::config::ForgeConfig;
 
+/// Build a ureq agent with bounded connect/read/write timeouts. ureq 2.x
+/// defaults the read timeout to *infinite*, so a stalled remote socket would
+/// otherwise hang the calling thread forever -- and if that thread holds the
+/// store lock, the whole daemon with it. Every daemon-initiated HTTP call
+/// routes through an agent built here (see also [`http_agent`]).
+///
+/// Idle connection pooling is disabled: the daemon's HTTP servers (tiny_http,
+/// like every test's fake forge) serve connections strictly sequentially, so
+/// a keep-alive connection held open in the pool while a second connection
+/// waits in the accept queue deadlocks the server -- and this daemon's own
+/// API is among the things a daemon-side client can point at. Forge calls
+/// are far too infrequent for connection reuse to buy back that risk.
+#[must_use]
+pub(crate) fn bounded_http_agent(read_timeout: Duration) -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(15))
+        .timeout_read(read_timeout)
+        .timeout_write(Duration::from_secs(30))
+        .max_idle_connections_per_host(0)
+        .build()
+}
+
+/// The shared agent for forge API calls. Memoized so every request reuses
+/// one connection pool rather than building a new agent (and pool) per call.
+#[must_use]
+pub(crate) fn http_agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::LazyLock<ureq::Agent> =
+        std::sync::LazyLock::new(|| bounded_http_agent(Duration::from_secs(60)));
+    &AGENT
+}
+
 /// Which forge a repository is hosted on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ForgeKind {
@@ -594,7 +625,8 @@ impl ForgeClient {
                     "draft": draft,
                 });
                 let resp = self.send(
-                    ureq::post(&url)
+                    http_agent()
+                        .post(&url)
                         .set("Authorization", &format!("Bearer {token}"))
                         .set("Accept", "application/vnd.github+json"),
                     &payload,
@@ -634,7 +666,10 @@ impl ForgeClient {
                 if let Some(id) = target_project_id {
                     payload["target_project_id"] = serde_json::json!(id);
                 }
-                let resp = self.send(ureq::post(&url).set("PRIVATE-TOKEN", token), &payload)?;
+                let resp = self.send(
+                    http_agent().post(&url).set("PRIVATE-TOKEN", token),
+                    &payload,
+                )?;
                 let number = resp["iid"]
                     .as_i64()
                     .ok_or_else(|| format!("unexpected GitLab MR response shape: {resp}"))?;
@@ -705,7 +740,8 @@ impl ForgeClient {
             ForgeKind::GitHub => {
                 let url = format!("{}/repos/{}/pulls", self.api_base, self.repo_path);
                 let resp = self.get(
-                    ureq::get(&url)
+                    http_agent()
+                        .get(&url)
                         .query("head", head)
                         .query("state", "open")
                         .set("Authorization", &format!("Bearer {token}"))
@@ -742,7 +778,8 @@ impl ForgeClient {
                     self.api_base, self.repo_path
                 );
                 let resp = self.get(
-                    ureq::get(&url)
+                    http_agent()
+                        .get(&url)
                         .query("source_branch", head)
                         .query("state", "opened")
                         .set("PRIVATE-TOKEN", token),
@@ -795,7 +832,7 @@ impl ForgeClient {
         }
         let token = self.require_token()?;
         let url = format!("{}/projects/{}", self.api_base, self.repo_path);
-        let resp = self.get(ureq::get(&url).set("PRIVATE-TOKEN", token))?;
+        let resp = self.get(http_agent().get(&url).set("PRIVATE-TOKEN", token))?;
         resp["id"]
             .as_i64()
             .ok_or_else(|| format!("unexpected GitLab project response shape: {resp}"))
@@ -844,7 +881,8 @@ impl ForgeClient {
             ForgeKind::GitHub => {
                 let url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
                 let resp = self.get(
-                    ureq::get(&url)
+                    http_agent()
+                        .get(&url)
                         .set("Authorization", &format!("Bearer {token}"))
                         .set("Accept", "application/vnd.github+json"),
                 )?;
@@ -858,7 +896,7 @@ impl ForgeClient {
                     "{}/projects/{}/merge_requests/{number}",
                     self.api_base, self.repo_path
                 );
-                let resp = self.get(ureq::get(&url).set("PRIVATE-TOKEN", token))?;
+                let resp = self.get(http_agent().get(&url).set("PRIVATE-TOKEN", token))?;
                 Ok(match resp["state"].as_str().unwrap_or("opened") {
                     "opened" => "open".to_string(),
                     other => other.to_string(),
@@ -923,7 +961,8 @@ impl ForgeClient {
             ForgeKind::GitHub => {
                 let url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
                 let resp = self.get(
-                    ureq::get(&url)
+                    http_agent()
+                        .get(&url)
                         .set("Authorization", &format!("Bearer {token}"))
                         .set("Accept", "application/vnd.github+json"),
                 )?;
@@ -942,7 +981,7 @@ impl ForgeClient {
                     "{}/projects/{}/merge_requests/{number}",
                     self.api_base, self.repo_path
                 );
-                let resp = self.get(ureq::get(&url).set("PRIVATE-TOKEN", token))?;
+                let resp = self.get(http_agent().get(&url).set("PRIVATE-TOKEN", token))?;
                 let base = resp["target_branch"]
                     .as_str()
                     .map(str::to_string)
@@ -1004,7 +1043,8 @@ impl ForgeClient {
             ForgeKind::GitHub => {
                 let url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
                 self.get(
-                    ureq::get(&url)
+                    http_agent()
+                        .get(&url)
                         .set("Authorization", &format!("Bearer {token}"))
                         .set("Accept", "application/vnd.github+json"),
                 )?
@@ -1014,7 +1054,7 @@ impl ForgeClient {
                     "{}/projects/{}/merge_requests/{number}",
                     self.api_base, self.repo_path
                 );
-                self.get(ureq::get(&url).set("PRIVATE-TOKEN", token))?
+                self.get(http_agent().get(&url).set("PRIVATE-TOKEN", token))?
             }
         };
         Ok(PrCiProbe {
@@ -1054,7 +1094,8 @@ impl ForgeClient {
         let token = self.require_token()?;
         let pr_url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
         let pr = self.get(
-            ureq::get(&pr_url)
+            http_agent()
+                .get(&pr_url)
                 .set("Authorization", &format!("Bearer {token}"))
                 .set("Accept", "application/vnd.github+json"),
         )?;
@@ -1093,7 +1134,8 @@ impl ForgeClient {
             self.api_base, self.repo_path
         );
         let checks = self.get(
-            ureq::get(&checks_url)
+            http_agent()
+                .get(&checks_url)
                 .set("Authorization", &format!("Bearer {token}"))
                 .set("Accept", "application/vnd.github+json"),
         )?;
@@ -1134,7 +1176,8 @@ impl ForgeClient {
             self.api_base, self.repo_path
         );
         let status = self.get(
-            ureq::get(&status_url)
+            http_agent()
+                .get(&status_url)
                 .set("Authorization", &format!("Bearer {token}"))
                 .set("Accept", "application/vnd.github+json"),
         )?;
@@ -1211,7 +1254,7 @@ impl ForgeClient {
             "{}/projects/{}/merge_requests/{number}",
             self.api_base, self.repo_path
         );
-        let mr = self.get(ureq::get(&mr_url).set("PRIVATE-TOKEN", token))?;
+        let mr = self.get(http_agent().get(&mr_url).set("PRIVATE-TOKEN", token))?;
         if mr["merge_status"].as_str() == Some("cannot_be_merged") {
             return Ok(PrCiState::Failing(PrFailure {
                 reason: "merge conflicts with the target branch".to_string(),
@@ -1249,7 +1292,7 @@ impl ForgeClient {
                     self.api_base, self.repo_path
                 );
                 let jobs = self
-                    .get(ureq::get(&jobs_url).set("PRIVATE-TOKEN", token))
+                    .get(http_agent().get(&jobs_url).set("PRIVATE-TOKEN", token))
                     .ok()
                     .and_then(|v| v.as_array().cloned())
                     .unwrap_or_default();
@@ -1333,7 +1376,8 @@ impl ForgeClient {
         );
         let job = self
             .get(
-                ureq::get(&url)
+                http_agent()
+                    .get(&url)
                     .set("Authorization", &format!("Bearer {token}"))
                     .set("Accept", "application/vnd.github+json"),
             )
@@ -1359,7 +1403,8 @@ impl ForgeClient {
             "{}/projects/{}/jobs/{job_id}/trace",
             self.api_base, self.repo_path
         );
-        ureq::get(&url)
+        http_agent()
+            .get(&url)
             .set("PRIVATE-TOKEN", token)
             .call()
             .map_err(|e| self.describe_evicting(e))?
@@ -1577,7 +1622,8 @@ impl ForgeClient {
                 let url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
                 let payload = serde_json::json!({ "base": new_base });
                 self.send(
-                    ureq::patch(&url)
+                    http_agent()
+                        .patch(&url)
                         .set("Authorization", &format!("Bearer {token}"))
                         .set("Accept", "application/vnd.github+json"),
                     &payload,
@@ -1590,7 +1636,7 @@ impl ForgeClient {
                     self.api_base, self.repo_path
                 );
                 let payload = serde_json::json!({ "target_branch": new_base });
-                self.send(ureq::put(&url).set("PRIVATE-TOKEN", token), &payload)?;
+                self.send(http_agent().put(&url).set("PRIVATE-TOKEN", token), &payload)?;
                 Ok(())
             }
         }
@@ -1639,7 +1685,8 @@ impl ForgeClient {
                 let url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
                 let payload = serde_json::json!({ "draft": draft });
                 self.send(
-                    ureq::patch(&url)
+                    http_agent()
+                        .patch(&url)
                         .set("Authorization", &format!("Bearer {token}"))
                         .set("Accept", "application/vnd.github+json"),
                     &payload,
@@ -1654,7 +1701,7 @@ impl ForgeClient {
                 let payload = serde_json::json!({
                     "wip_event": if draft { "wip" } else { "unwip" },
                 });
-                self.send(ureq::put(&url).set("PRIVATE-TOKEN", token), &payload)?;
+                self.send(http_agent().put(&url).set("PRIVATE-TOKEN", token), &payload)?;
                 Ok(())
             }
         }
@@ -1700,7 +1747,8 @@ impl ForgeClient {
                 let url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
                 let payload = serde_json::json!({ "state": "closed" });
                 self.send(
-                    ureq::patch(&url)
+                    http_agent()
+                        .patch(&url)
                         .set("Authorization", &format!("Bearer {token}"))
                         .set("Accept", "application/vnd.github+json"),
                     &payload,
@@ -1713,7 +1761,7 @@ impl ForgeClient {
                     self.api_base, self.repo_path
                 );
                 let payload = serde_json::json!({ "state_event": "close" });
-                self.send(ureq::put(&url).set("PRIVATE-TOKEN", token), &payload)?;
+                self.send(http_agent().put(&url).set("PRIVATE-TOKEN", token), &payload)?;
                 Ok(())
             }
         }
@@ -1761,7 +1809,8 @@ impl ForgeClient {
                 );
                 let payload = serde_json::json!({ "body": body });
                 self.send(
-                    ureq::post(&url)
+                    http_agent()
+                        .post(&url)
                         .set("Authorization", &format!("Bearer {token}"))
                         .set("Accept", "application/vnd.github+json"),
                     &payload,
@@ -1774,7 +1823,10 @@ impl ForgeClient {
                     self.api_base, self.repo_path
                 );
                 let payload = serde_json::json!({ "body": body });
-                self.send(ureq::post(&url).set("PRIVATE-TOKEN", token), &payload)?;
+                self.send(
+                    http_agent().post(&url).set("PRIVATE-TOKEN", token),
+                    &payload,
+                )?;
                 Ok(())
             }
         }
@@ -1828,7 +1880,8 @@ impl ForgeClient {
         let url = format!("{}/repos/{}/stacks", self.api_base, self.repo_path);
         let payload = serde_json::json!({ "pull_requests": pr_numbers });
         let resp = self.send(
-            ureq::post(&url)
+            http_agent()
+                .post(&url)
                 .set("Authorization", &format!("Bearer {token}"))
                 .set("Accept", "application/vnd.github+json"),
             &payload,
@@ -1885,7 +1938,8 @@ impl ForgeClient {
         );
         let payload = serde_json::json!({ "pull_requests": pr_numbers });
         self.send(
-            ureq::post(&url)
+            http_agent()
+                .post(&url)
                 .set("Authorization", &format!("Bearer {token}"))
                 .set("Accept", "application/vnd.github+json"),
             &payload,
@@ -1914,7 +1968,8 @@ impl ForgeClient {
             "{}/repos/{}/stacks/{stack_number}",
             self.api_base, self.repo_path
         );
-        let result = match ureq::get(&url)
+        let result = match http_agent()
+            .get(&url)
             .set("Authorization", &format!("Bearer {token}"))
             .set("Accept", "application/vnd.github+json")
             .call()
@@ -1961,7 +2016,8 @@ impl ForgeClient {
             "{}/repos/{}/stacks/{stack_number}",
             self.api_base, self.repo_path
         );
-        let result = match ureq::get(&url)
+        let result = match http_agent()
+            .get(&url)
             .set("Authorization", &format!("Bearer {token}"))
             .set("Accept", "application/vnd.github+json")
             .call()
@@ -2062,7 +2118,8 @@ impl ForgeClient {
             "{}/repos/{}/stacks/{stack_number}/unstack",
             self.api_base, self.repo_path
         );
-        ureq::post(&url)
+        http_agent()
+            .post(&url)
             .set("Authorization", &format!("Bearer {token}"))
             .set("Accept", "application/vnd.github+json")
             .set("Content-Type", "application/json")
@@ -2129,7 +2186,8 @@ impl ForgeClient {
                         self.api_base, self.repo_path
                     );
                     let resp = self.get(
-                        ureq::get(&url)
+                        http_agent()
+                            .get(&url)
                             .set("Authorization", &format!("Bearer {token}"))
                             .set("Accept", "application/vnd.github+json"),
                     )?;
@@ -2149,7 +2207,7 @@ impl ForgeClient {
                     "{}/projects/{}/merge_requests/{number}/notes?per_page={PER_PAGE}",
                     self.api_base, self.repo_path
                 );
-                let resp = self.get(ureq::get(&url).set("PRIVATE-TOKEN", token))?;
+                let resp = self.get(http_agent().get(&url).set("PRIVATE-TOKEN", token))?;
                 let items = resp
                     .as_array()
                     .ok_or_else(|| format!("unexpected GitLab notes response shape: {resp}"))?;
@@ -2179,7 +2237,8 @@ impl ForgeClient {
                     "{}/repos/{}/issues/{number}/comments?per_page={PER_PAGE}",
                     self.api_base, self.repo_path
                 );
-                ureq::get(&url)
+                http_agent()
+                    .get(&url)
                     .set("Authorization", &format!("Bearer {token}"))
                     .set("Accept", "application/vnd.github+json")
             }
@@ -2188,7 +2247,8 @@ impl ForgeClient {
                     "{}/repos/{}/pulls/{number}/comments?per_page={PER_PAGE}",
                     self.api_base, self.repo_path
                 );
-                ureq::get(&url)
+                http_agent()
+                    .get(&url)
                     .set("Authorization", &format!("Bearer {token}"))
                     .set("Accept", "application/vnd.github+json")
             }
@@ -2197,7 +2257,7 @@ impl ForgeClient {
                     "{}/projects/{}/merge_requests/{number}/notes?per_page={PER_PAGE}",
                     self.api_base, self.repo_path
                 );
-                ureq::get(&url).set("PRIVATE-TOKEN", token)
+                http_agent().get(&url).set("PRIVATE-TOKEN", token)
             }
         };
         match self.get_conditional(req, etag)? {
@@ -2274,7 +2334,9 @@ impl ForgeClient {
 
     fn github_contents(&self, path: &str, token: Option<&str>) -> Option<String> {
         let url = format!("{}/repos/{}/contents/{path}", self.api_base, self.repo_path);
-        let mut req = ureq::get(&url).set("Accept", "application/vnd.github+json");
+        let mut req = http_agent()
+            .get(&url)
+            .set("Accept", "application/vnd.github+json");
         if let Some(t) = token {
             req = req.set("Authorization", &format!("Bearer {t}"));
         }
@@ -2285,7 +2347,7 @@ impl ForgeClient {
 
     fn gitlab_default_branch(&self, token: Option<&str>) -> Option<String> {
         let url = format!("{}/projects/{}", self.api_base, self.repo_path);
-        let mut req = ureq::get(&url);
+        let mut req = http_agent().get(&url);
         if let Some(t) = token {
             req = req.set("PRIVATE-TOKEN", t);
         }
@@ -2299,7 +2361,7 @@ impl ForgeClient {
             "{}/projects/{}/repository/files/{encoded_path}/raw?ref={ref_}",
             self.api_base, self.repo_path
         );
-        let mut req = ureq::get(&url);
+        let mut req = http_agent().get(&url);
         if let Some(t) = token {
             req = req.set("PRIVATE-TOKEN", t);
         }
@@ -2543,8 +2605,10 @@ pub enum TokenVerifyOutcome {
 pub fn verify_forge_token(kind: ForgeKind, api_base: &str, token: &str) -> TokenVerifyOutcome {
     let url = format!("{api_base}/user");
     let req = match kind {
-        ForgeKind::GitHub => ureq::get(&url).set("Authorization", &format!("Bearer {token}")),
-        ForgeKind::GitLab => ureq::get(&url).set("PRIVATE-TOKEN", token),
+        ForgeKind::GitHub => http_agent()
+            .get(&url)
+            .set("Authorization", &format!("Bearer {token}")),
+        ForgeKind::GitLab => http_agent().get(&url).set("PRIVATE-TOKEN", token),
     };
     match req.timeout(Duration::from_secs(10)).call() {
         Ok(_) => TokenVerifyOutcome::Valid,
@@ -3034,7 +3098,8 @@ impl ForgeClient {
         };
         let url = format!("{}/repos/{}", self.api_base, self.repo_path);
         let Ok(resp) = self.get(
-            ureq::get(&url)
+            http_agent()
+                .get(&url)
                 .set("Authorization", &format!("Bearer {token}"))
                 .set("Accept", "application/vnd.github+json"),
         ) else {
@@ -3101,7 +3166,8 @@ impl ForgeClient {
 
     fn get_gitlab_project(&self, token: &str, path_or_id: &str) -> Option<serde_json::Value> {
         let url = format!("{}/projects/{path_or_id}", self.api_base);
-        self.get(ureq::get(&url).set("PRIVATE-TOKEN", token)).ok()
+        self.get(http_agent().get(&url).set("PRIVATE-TOKEN", token))
+            .ok()
     }
 }
 
@@ -6078,7 +6144,7 @@ mod tests {
             "acme/widget".to_string(),
             Some("tok".to_string()),
         );
-        let req = ureq::get(&format!("http://{addr}/x"));
+        let req = http_agent().get(&format!("http://{addr}/x"));
         let result = client.get_conditional(req, Some("\"v1\"")).unwrap();
         assert!(matches!(result, ConditionalGet::NotModified));
         handle.join().unwrap();

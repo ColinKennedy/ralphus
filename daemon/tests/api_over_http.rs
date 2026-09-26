@@ -52,6 +52,85 @@ fn request_as_user(base: &str, method: &str, path: &str, user: &str, body: &str)
 }
 
 const GOOD: &str = "[[task]]\nname=\"build\"\n[[task.cell]]\ncwd=\"/repo\"\nprompt=\"go\"\n";
+const STALE_ETAG: &str = "\"deadbeef-0\"";
+
+/// WS-D.5: a repeated board poll carrying the previous `ETag` is answered
+/// `304` with no body, and starts returning `200` again the moment the data
+/// changes.
+///
+/// Over real HTTP rather than through `route()`, because the tag and the
+/// conditional check both live at the HTTP boundary -- `route()` never sees
+/// either.
+#[test]
+fn a_repeat_read_with_the_previous_etag_is_answered_304() {
+    let base = spawn_server();
+    let user_body = serde_json::json!({ "name": "test-user" }).to_string();
+    let (status, _) = post(&base, "/api/users", &user_body);
+    assert_eq!(status, 200);
+
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(30))
+        .build();
+    let fetch = |tag: Option<&str>| -> (u16, Option<String>, String) {
+        let mut req = agent.get(&format!("{base}/api/tasks"));
+        if let Some(tag) = tag {
+            req = req.set("If-None-Match", tag);
+        }
+        match req.call() {
+            Ok(r) => {
+                let status = r.status();
+                let etag = r.header("ETag").map(str::to_string);
+                (status, etag, r.into_string().unwrap_or_default())
+            }
+            Err(ureq::Error::Status(code, r)) => {
+                let etag = r.header("ETag").map(str::to_string);
+                (code, etag, r.into_string().unwrap_or_default())
+            }
+            Err(e) => panic!("request error: {e}"),
+        }
+    };
+
+    let (status, etag, body) = fetch(None);
+    assert_eq!(status, 200);
+    let etag = etag.expect("a GET 200 must carry an ETag");
+    assert!(!body.is_empty());
+
+    // Nothing changed: the same tag comes back as an empty 304.
+    let (status, echoed, body) = fetch(Some(&etag));
+    assert_eq!(status, 304, "an unchanged read was not answered 304");
+    assert!(body.is_empty(), "a 304 must carry no body, got: {body}");
+    assert_eq!(
+        echoed.as_deref(),
+        Some(etag.as_str()),
+        "the 304 must still carry the tag it validated"
+    );
+
+    // A stale tag is not a match, so the full body comes back.
+    let (status, _, body) = fetch(Some(STALE_ETAG));
+    assert_eq!(status, 200, "an unknown tag must not be treated as a match");
+    assert!(!body.is_empty());
+
+    // Now change the data. The old tag must stop matching, or the board would
+    // never see the new squad.
+    let submit_body = serde_json::json!({ "toml": GOOD, "label": "etag test" }).to_string();
+    let (status, resp) = request_as_user(&base, "POST", "/api/squads", "test-user", &submit_body);
+    assert_eq!(status, 201, "submit body: {resp}");
+
+    let (status, new_etag, body) = fetch(Some(&etag));
+    assert_eq!(
+        status, 200,
+        "a changed read was still answered 304 -- stale"
+    );
+    assert!(
+        body.contains("etag test"),
+        "body missing the new squad: {body}"
+    );
+    assert_ne!(
+        new_etag.expect("tag on the fresh 200"),
+        etag,
+        "the tag did not change even though the body did"
+    );
+}
 
 #[test]
 fn full_submit_and_read_cycle_over_http() {

@@ -409,10 +409,7 @@ fn full_monorepo_flow_with_subproject_cells() {
 
     // 3) Derive the review: both worktrees are one project (same git root) →
     //    one guardian with two branches.
-    let ids = {
-        let g = store.lock();
-        derive_reviews(&g, &squad_id, &file).expect("derive ok")
-    };
+    let ids = { derive_reviews(&store, &squad_id, &file).expect("derive ok") };
     assert_eq!(ids.len(), 1, "one git root → one review");
     let gid = ids[0].clone();
     assert_eq!(

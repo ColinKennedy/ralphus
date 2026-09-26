@@ -78,9 +78,7 @@ pub struct SecretEnvNameView {
 
 impl Store {
     fn invalidate_secret_env_names_cache(&self) {
-        if let Ok(mut guard) = self.secret_env_names_cache.write() {
-            *guard = None;
-        }
+        self.memory().invalidate_secret_env_names();
     }
 
     /// Register a new secret env-var name. Unlike `create_user`/
@@ -237,12 +235,7 @@ impl Store {
     /// # Errors
     /// Propagates any SQLite failure from the (cache-miss-only) reload.
     pub fn secret_env_names_cached(&self) -> StoreResult<BTreeSet<String>> {
-        if let Some(set) = self
-            .secret_env_names_cache
-            .read()
-            .ok()
-            .and_then(|g| g.clone())
-        {
+        if let Some(set) = self.memory().secret_env_names_cached() {
             return Ok(set);
         }
         let set: BTreeSet<String> = self
@@ -250,9 +243,7 @@ impl Store {
             .into_iter()
             .map(|v| v.name)
             .collect();
-        if let Ok(mut guard) = self.secret_env_names_cache.write() {
-            *guard = Some(set.clone());
-        }
+        self.memory().cache_secret_env_names(set.clone());
         Ok(set)
     }
 }

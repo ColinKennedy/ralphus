@@ -13,6 +13,20 @@
 
 use serde_json::json;
 
+/// Shared agent for LLM HTTP calls: the same bounded-connect/write
+/// discipline as the forge agent ([`crate::forge::bounded_http_agent`]), but
+/// a much longer read timeout -- a non-streaming completion sends no bytes
+/// until the whole response is ready, which for a long generation can take
+/// minutes. ureq 2.x's infinite default read timeout would instead hang the
+/// calling thread forever on a stalled socket (and if that thread holds the
+/// store lock, the whole daemon with it).
+fn llm_agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::LazyLock<ureq::Agent> = std::sync::LazyLock::new(|| {
+        crate::forge::bounded_http_agent(std::time::Duration::from_secs(300))
+    });
+    &AGENT
+}
+
 /// One turn in a conversation, using Claude/OpenAI API role names.
 pub struct ChatMessage {
     /// `"user"` for reviewer turns, `"assistant"` for guardian turns.
@@ -148,7 +162,8 @@ fn call_claude(
     })
     .to_string();
 
-    let response = ureq::post("https://api.anthropic.com/v1/messages")
+    let response = llm_agent()
+        .post("https://api.anthropic.com/v1/messages")
         .set("x-api-key", &api_key)
         .set("anthropic-version", "2023-06-01")
         .set("content-type", "application/json")
@@ -211,7 +226,8 @@ fn call_ollama(
     .to_string();
 
     let url = format!("{base_url}/chat/completions");
-    let response = ureq::post(&url)
+    let response = llm_agent()
+        .post(&url)
         .set("content-type", "application/json")
         .send_string(&payload)
         .map_err(|e| match e {

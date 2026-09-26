@@ -527,6 +527,7 @@
       // still "pending" (filters, menus, and the API all use the real state).
       const WAITING_TIP = "Waiting for the configured scheduler down-time window to end before this squad can be picked up.\nShown instead of \"pending\" when the daemon is currently inside a down-time window (see [daemon] in .ralphus.toml).\nIn-progress squads are never paused — this only affects new automatic pickups.";
       const SQUAD_TURNS_TIP = "RAL-352: completed user/assistant message exchanges across this whole squad — every cell, every cell-scope proof step, and every task-scope proof step, each response event counting as both sides of one exchange.\nA dash means no constituent has a conversational count (a command-only squad, or one whose cells haven't re-run since RAL-352). Task-scope proofs are included.\nWhile a cell runs, this updates live as each turn completes.";
+      const TASK_TURNS_TIP = "RAL-352: completed user/assistant message exchanges across this whole task — every cell, every cell-scope proof step, and the task's own task-scope proof steps, each response event counting as both sides of one exchange.\nA dash means no constituent has a conversational count (a command-only task, or one whose cells haven't re-run since RAL-352).\nWhile a cell runs, this updates live as each turn completes.";
       const TURNS_TIP = "RAL-352: completed user/assistant message exchanges (each response event counts as both sides of one exchange, so this is the back-and-forth message count, not API calls).\nOmitted entirely for command-mode cells/proof steps — they have no conversational count at all, not a count of zero.\nWhile this runs, it updates live as each turn completes.";
       const DEFAULT_AGENT = "claude";
       // RAL-160: token/cost figures shown in the cell detail pane reflect
@@ -706,6 +707,63 @@
        * @returns {{traceparent: string}}
        */
       const traceHeaders = () => ({ traceparent: newTraceparent() });
+      // RALPHUS-CONDITIONAL-GET:BEGIN
+      /**
+       * Per-path entity tags from the last successful conditional GET, so the
+       * next poll can ask "has this changed?" instead of re-downloading and
+       * re-parsing an identical body.
+       * @type {Record<string, string>}
+       */
+      const etagByPath = {};
+      /**
+       * GETs a board endpoint conditionally (WS-D.5).
+       *
+       * Returns `{ changed: false }` when the daemon answers `304 Not
+       * Modified`, which is the point: the board polls every 150 ms and a
+       * Cartographer write triggers a refresh, so most polls ask about data
+       * that has not moved. Skipping the JSON parse and the re-render on those
+       * is what the tag buys -- the query still ran server-side.
+       *
+       * `cache: "no-store"` is deliberate. With the browser's own cache in
+       * play, `fetch` transparently turns a `304` back into a `200` carrying
+       * the cached body, so the caller could never tell that nothing changed
+       * and would re-render anyway. Owning the validator here is the only way
+       * to see the `304`.
+       *
+       * A non-OK response other than `304` returns `{ changed: true, data:
+       * null }` so callers keep their existing "transient, the next poll
+       * retries" behavior rather than having to learn a new failure shape.
+       * @param {string} path
+       * @returns {Promise<{changed: boolean, data: any}>}
+       */
+      const conditionalGet = async (path) => {
+        /** @type {Record<string, string>} */
+        const headers = traceHeaders();
+        const known = etagByPath[path];
+        if (known) headers["If-None-Match"] = known;
+        const res = await fetch(path, { headers, cache: "no-store" });
+        if (res.status === 304) return { changed: false, data: null };
+        if (!res.ok) return { changed: true, data: null };
+        const tag = res.headers.get("ETag");
+        if (tag) etagByPath[path] = tag;
+        else delete etagByPath[path];
+        return { changed: true, data: await res.json() };
+      };
+      /**
+       * Forgets a path's cached tag, so the next `conditionalGet` is
+       * unconditional. Needed after a mutation whose effect the caller must
+       * see rendered even if it happens to leave the body byte-identical.
+       * @param {string} [path] - every path when omitted.
+       * @returns {void}
+       */
+      const forgetEtag = (path) => {
+        if (path === undefined) {
+          for (const key of Object.keys(etagByPath)) delete etagByPath[key];
+          return;
+        }
+        delete etagByPath[path];
+      };
+      // RALPHUS-CONDITIONAL-GET:END
       // RALPHUS-POST-DEL:BEGIN
       /**
        * POSTs JSON to the daemon API with a fresh trace header. A squad-scoped
@@ -729,6 +787,10 @@
        */
       const post = (path, body, notifyOpts) => {
         if (path.startsWith("/api/squads/")) invalidateTasksFetch();
+        // WS-D.5: drop every cached validator too. A mutation whose effect is
+        // not visible in a polled body would otherwise be answered `304` and
+        // never rendered.
+        forgetEtag();
         const resp = fetch(path, { method: "POST", headers: traceHeaders(), body: body ? JSON.stringify(body) : undefined });
         return notifyOpts ? withActionNotify(resp, notifyOpts) : resp;
       };
@@ -742,6 +804,7 @@
        */
       const del = (path, notifyOpts) => {
         if (path.startsWith("/api/squads/")) invalidateTasksFetch();
+        forgetEtag();
         const resp = fetch(path, { method: "DELETE", headers: traceHeaders() });
         return notifyOpts ? withActionNotify(resp, notifyOpts) : resp;
       };

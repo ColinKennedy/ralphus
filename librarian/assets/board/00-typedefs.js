@@ -887,6 +887,44 @@
        * @typedef {StatusPickerItem & { key: string, kind: "task"|"cell"|"proof" }} GraphNodeSelectionItem
        */
       /**
+       * `GET /api/daemon` response shape, as far as the Health tab's store-lock
+       * panel reads it (WS-G.4). The endpoint also returns name/version/status/
+       * db/warnings, which other call sites use.
+       * @typedef {object} DaemonHealthView
+       * @property {StoreLockWaitView} [lock_wait] - store-lock acquisition wait over the daemon's lifetime (RAL-393).
+       * @property {StoreGuardHoldView} [guard_hold] - how long the lock has been *held* at worst (WS-D.8/M5). Distinct from `lock_wait`: a long hold is the cause, a long wait is what every other thread feels.
+       * @property {StoreWatchdogView} [watchdog] - store-lock liveness (WS-G.1/G.2, `daemon/src/watchdog.rs`).
+       * @property {{site: string, held_ms: number}|null} [store_lock_holder] - `file:line` that last acquired the store lock, and how long ago. Absent if the lock has never been taken.
+       */
+      /**
+       * Worst store-lock hold over the daemon's lifetime, and how many holds
+       * crossed the watchdog's warn threshold.
+       * @typedef {object} StoreGuardHoldView
+       * @property {number} max_ms
+       * @property {number} over_threshold
+       * @property {number} warn_threshold_ms
+       */
+      /**
+       * Store-lock wait distribution. Wait time only -- query time is not
+       * folded in, so a high value is contention rather than slow SQL.
+       * @typedef {object} StoreLockWaitView
+       * @property {number} samples
+       * @property {number} p50_ms
+       * @property {number} p95_ms
+       * @property {number} max_ms
+       */
+      /**
+       * The store-lock liveness watchdog's verdict. `stalled` is the one that
+       * matters: it means a check could not acquire the lock within its
+       * timeout, i.e. the daemon is wedged rather than merely busy.
+       * @typedef {object} StoreWatchdogView
+       * @property {number|null} last_ok_age_ms - ms since the lock was last reachable; null before the first check.
+       * @property {boolean} stalled
+       * @property {number} consecutive_stalls
+       * @property {number} total_stalls - lifetime count, kept after recovery so a resolved incident stays visible.
+       * @property {number} worst_wait_ms
+       */
+      /**
        * One `ralphus_core::health_catalog` entry (RAL-416) -- catalog
        * metadata only, no live result. `GET /api/health/catalog`.
        * @typedef {object} HealthCatalogEntry
