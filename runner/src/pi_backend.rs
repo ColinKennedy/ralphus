@@ -335,6 +335,7 @@ impl ModelBackend for PiBackend {
             thrash_thresholds,
             tool_arg_truncate_chars,
             options.retry_attempt,
+            options.retry_after_unknown_default_seconds,
         )?;
 
         if !self.keep_temporary_files {
@@ -809,6 +810,7 @@ fn drive_json_events(
     thrash_thresholds: crate::thrash::ThrashThresholds,
     tool_arg_truncate_chars: usize,
     retry_attempt: u32,
+    retry_after_unknown_default_seconds: u64,
 ) -> Result<BackendOutcome, BackendError> {
     let stderr = child.stderr.take();
     let stderr_thread = stderr.map(|s| {
@@ -930,6 +932,58 @@ fn drive_json_events(
             ));
             let message = format!(
                 "pi: retrying transient provider error (attempt {retry_attempt}, delay {}s): {}",
+                delay.as_secs(),
+                display_terminal_error(&error)
+            );
+            eprintln!("{message}");
+            crate::cartographer::emit(
+                "pi",
+                &message,
+                "warning",
+                crate::cartographer::EventContext::default(),
+                serde_json::json!({
+                    "retry_attempt": retry_attempt,
+                    "retry_after_secs": delay.as_secs(),
+                    "error": tail(&error, SUMMARY_TAIL_CHARS),
+                }),
+            );
+            return Ok(BackendOutcome {
+                summary: tail(&state.latest_assistant_message, SUMMARY_TAIL_CHARS),
+                turns: state.turns,
+                tokens_in: state.tokens_in,
+                tokens_out: state.tokens_out,
+                cache_creation_tokens: state.cache_creation_tokens,
+                cache_read_tokens: state.cache_read_tokens,
+                cost_usd: state.cost_usd,
+                agent_session_id: state.agent_session_id,
+                abandoned_background_job: None,
+                compaction_thrash: None,
+                rate_limit_retry_after: Some(delay),
+                compaction_input_tokens: 0,
+                compaction_count: 0,
+            });
+        }
+
+        // RAL-517: a provider error can invite a retry ("please try again")
+        // without naming any concrete delay, and without matching either of
+        // the two vocabularies above -- e.g. InferenceNet's
+        // "Inference request failed, please try again." wording, which has
+        // neither a parseable delay (RAL-435) nor any of
+        // `RETRYABLE_PROVIDER_ERROR_SUBSTRINGS`'s phrasings (RAL-497). Before
+        // this tier existed, that error fell straight through to the hard
+        // failure below -- it never reached the `terminal_error_partial_output`
+        // guard, since that guard only gates an *already-classified*
+        // retryable error; an unrecognized one was simply never retried.
+        // Gated by the same partial-output check as the RAL-497 tier, for the
+        // same reason: a turn that already streamed output may have caused
+        // non-idempotent side effects.
+        if !state.terminal_error_partial_output && is_unknown_delay_retryable_provider_error(&error)
+        {
+            let delay = Duration::from_secs(ralphus_core::rate_limit::clamp_retry_after_secs(
+                retry_after_unknown_default_seconds,
+            ));
+            let message = format!(
+                "pi: retrying provider error with no stated retry delay (attempt {retry_attempt}, delay {}s): {}",
                 delay.as_secs(),
                 display_terminal_error(&error)
             );
@@ -1719,6 +1773,40 @@ fn is_broadened_retryable_provider_error(error: &str) -> bool {
     RETRYABLE_HTTP_STATUS_TOKENS
         .iter()
         .any(|token| mentions_numeric_token(error, token))
+}
+
+/// RAL-517: a narrow, generic "the provider is inviting a retry, but named no
+/// delay of its own" vocabulary -- distinct from
+/// [`RETRYABLE_PROVIDER_ERROR_SUBSTRINGS`], which is specific wording for
+/// known transient-error *shapes* (rate limits, 5xx, network failures, ...).
+/// This list instead catches a bare retry invitation with no shape of its
+/// own to key off, e.g. InferenceNet's
+/// "Inference request failed, please try again." Deliberately kept short:
+/// "please try again"/"try again" is generic enough to also appear in some
+/// permanent errors, so [`NON_RETRYABLE_PROVIDER_LIMIT_SUBSTRINGS`] must
+/// (and, via [`is_unknown_delay_retryable_provider_error`], does) win first.
+const GENERIC_RETRY_INVITATION_SUBSTRINGS: &[&str] = &["please try again"];
+
+/// RAL-517: classifies a Pi terminal `errorMessage` as retryable when it
+/// invites a retry (see [`GENERIC_RETRY_INVITATION_SUBSTRINGS`]) but names no
+/// concrete delay -- the tier below [`is_broadened_retryable_provider_error`]
+/// in `drive_json_events`, using
+/// `RunOptions::retry_after_unknown_default_seconds` as the wait instead of
+/// [`broadened_retry_delay_ms`]'s exponential backoff. Checks
+/// [`NON_RETRYABLE_PROVIDER_LIMIT_SUBSTRINGS`] first, same as
+/// [`is_broadened_retryable_provider_error`], so quota/billing wording still
+/// wins even if it happens to also contain a retry invitation.
+fn is_unknown_delay_retryable_provider_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    if NON_RETRYABLE_PROVIDER_LIMIT_SUBSTRINGS
+        .iter()
+        .any(|pat| lower.contains(pat))
+    {
+        return false;
+    }
+    GENERIC_RETRY_INVITATION_SUBSTRINGS
+        .iter()
+        .any(|pat| lower.contains(pat))
 }
 
 /// Whether `error` names `token` (e.g. "500") as a standalone alphanumeric
@@ -2748,6 +2836,7 @@ mod tests {
             default_thrash_thresholds(),
             DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
             0,
+            30,
         )
         .expect("a clean pre-first-token transient error must be retried, not fail the cell");
 
@@ -2785,6 +2874,7 @@ mod tests {
             default_thrash_thresholds(),
             DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
             0,
+            30,
         )
         .expect_err("quota/billing exhaustion must not be retried");
         assert!(err.0.contains("insufficient_quota"), "{}", err.0);
@@ -2824,9 +2914,158 @@ mod tests {
             default_thrash_thresholds(),
             DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
             0,
+            30,
         )
         .expect_err("a transient error after partial output must not be retried");
         assert!(err.0.contains("socket hang up"), "{}", err.0);
+
+        std::fs::remove_dir_all(&events_dir).ok();
+        std::fs::remove_dir_all(&workspace_dir).ok();
+    }
+
+    #[test]
+    fn is_unknown_delay_retryable_provider_error_matches_a_generic_retry_invitation() {
+        assert!(is_unknown_delay_retryable_provider_error(
+            "Upstream error from InferenceNet: Inference request failed, please try again. \
+             You will not be charged for this request. (generation ID = gv2_abc123)"
+        ));
+    }
+
+    #[test]
+    fn is_unknown_delay_retryable_provider_error_lets_quota_billing_win_first() {
+        // Same generic retry invitation as above, but paired with quota
+        // wording -- AC3's over-matching risk: the non-retryable check must
+        // still win even though "please try again" is also present.
+        assert!(!is_unknown_delay_retryable_provider_error(
+            "insufficient_quota: you have no available balance, please try again next month"
+        ));
+    }
+
+    #[test]
+    fn is_unknown_delay_retryable_provider_error_rejects_an_unrelated_error() {
+        assert!(!is_unknown_delay_retryable_provider_error(
+            "the model refused the request: content policy violation"
+        ));
+    }
+
+    /// AC1/AC2 regression test using the verbatim wording from the ticket.
+    ///
+    /// AC1 finding, recorded here since no human reads the ticket tracker:
+    /// before this tier existed, this exact message took neither of the two
+    /// existing branches -- `parse_retryable_rate_limit` found no delay to
+    /// parse, and `is_broadened_retryable_provider_error` did not match (it
+    /// has "try your request again"/"please retry your request", but not
+    /// this wording's "please try again"/"request failed"). It fell straight
+    /// through to the final `Err`, and never touched the
+    /// `terminal_error_partial_output` guard at all -- that guard only gates
+    /// an error tier that already matched, and this one matched nothing.
+    #[test]
+    fn drive_json_events_retries_the_inferencenet_unstated_delay_wording_verbatim() {
+        let (mut child, events_dir) = spawn_child_emitting_json_lines(
+            "unknown-delay",
+            &[serde_json::json!({
+                "type":"message_end",
+                "message":{
+                    "role":"assistant",
+                    "content":[],
+                    "stopReason":"error",
+                    "errorMessage":"Upstream error from InferenceNet: Inference request failed, \
+                                     please try again. You will not be charged for this request. \
+                                     (generation ID = gv2_abc123)"
+                }
+            })],
+        );
+        let (workspace, workspace_dir) = temp_workspace("unknown-delay");
+
+        let outcome = drive_json_events(
+            &mut child,
+            &workspace,
+            default_thrash_thresholds(),
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+            0,
+            45,
+        )
+        .expect("an unstated-delay retry invitation must be retried, not fail the cell");
+
+        assert_eq!(
+            outcome.rate_limit_retry_after,
+            Some(Duration::from_secs(45)),
+            "expected the unknown-delay tier to use retry_after_unknown_default_seconds verbatim"
+        );
+
+        std::fs::remove_dir_all(&events_dir).ok();
+        std::fs::remove_dir_all(&workspace_dir).ok();
+    }
+
+    /// AC11: `0` means an immediate retry, not "disable retrying".
+    #[test]
+    fn drive_json_events_unknown_delay_tier_accepts_a_zero_second_wait() {
+        let (mut child, events_dir) = spawn_child_emitting_json_lines(
+            "unknown-delay-zero",
+            &[serde_json::json!({
+                "type":"message_end",
+                "message":{
+                    "role":"assistant",
+                    "content":[],
+                    "stopReason":"error",
+                    "errorMessage":"Inference request failed, please try again."
+                }
+            })],
+        );
+        let (workspace, workspace_dir) = temp_workspace("unknown-delay-zero");
+
+        let outcome = drive_json_events(
+            &mut child,
+            &workspace,
+            default_thrash_thresholds(),
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+            0,
+            0,
+        )
+        .expect("a zero-second unknown-delay wait must still retry immediately");
+
+        assert_eq!(outcome.rate_limit_retry_after, Some(Duration::from_secs(0)));
+
+        std::fs::remove_dir_all(&events_dir).ok();
+        std::fs::remove_dir_all(&workspace_dir).ok();
+    }
+
+    /// AC11: the unknown-delay tier's wait is clamped to the same 600s
+    /// ceiling as every other retry-after value in the codebase
+    /// (`ralphus_core::rate_limit::MAX_RATE_LIMIT_RETRY_SECS`).
+    #[test]
+    fn drive_json_events_unknown_delay_tier_clamps_to_the_600s_ceiling() {
+        let (mut child, events_dir) = spawn_child_emitting_json_lines(
+            "unknown-delay-clamp",
+            &[serde_json::json!({
+                "type":"message_end",
+                "message":{
+                    "role":"assistant",
+                    "content":[],
+                    "stopReason":"error",
+                    "errorMessage":"Inference request failed, please try again."
+                }
+            })],
+        );
+        let (workspace, workspace_dir) = temp_workspace("unknown-delay-clamp");
+
+        let outcome = drive_json_events(
+            &mut child,
+            &workspace,
+            default_thrash_thresholds(),
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+            0,
+            10_000,
+        )
+        .expect("an over-ceiling unknown-delay wait must still retry, only clamped");
+
+        assert_eq!(
+            outcome.rate_limit_retry_after,
+            Some(Duration::from_secs(
+                ralphus_core::rate_limit::MAX_RATE_LIMIT_RETRY_SECS
+            )),
+            "expected the wait clamped to the 600s ceiling, not the raw 10_000s"
+        );
 
         std::fs::remove_dir_all(&events_dir).ok();
         std::fs::remove_dir_all(&workspace_dir).ok();

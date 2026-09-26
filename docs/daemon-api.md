@@ -1849,6 +1849,28 @@ starts a fresh campaign. It can also be set as a `[review]
 base_shift_maximum_rebuilds` project default in `.ralphus.toml`; a value of 0
 is rejected as "must be at least 1".
 
+`retry_after_unknown_default_seconds` (RAL-517, optional non-negative integer,
+default 30) is the wait, in whole seconds, the `pi` agent backend uses when it
+recognizes a provider error as retryable but the message names no concrete
+delay of its own -- e.g. InferenceNet's "Inference request failed, please try
+again." wording, which invites a retry without stating when. It is set as a
+`[review] retry_after_unknown_default_seconds` project default in
+`.ralphus.toml`, resolved the same global-then-per-project-wins way as
+`provider_timeout_max_retries`, and the retry it governs is still bounded by
+that same `provider_timeout_max_retries` budget -- exhausting it fails the
+cell with the original upstream error text intact. Unlike
+`base_shift_maximum_rebuilds`, `0` is accepted rather than rejected: it means
+an immediate retry (no wait), not "disable retrying" -- this setting is a
+single flat wait applied once per retry rather than the base of a doubling
+backoff, so "immediate" is a coherent, if aggressive, choice an operator can
+make on purpose. Any configured value is clamped to the same 600-second
+ceiling (`ralphus_core::rate_limit::MAX_RATE_LIMIT_RETRY_SECS`) applied to
+every other provider retry-after value in the codebase. This setting is
+additive, not a consolidation: the RAL-497 exponential backoff
+(`broadened_retry_delay_ms`), the scheduler's rate-limit retry fallback, and
+`pr.rs`'s PR-agent rate-limit backoff each stay separately controlled by
+their own constants.
+
 `separate_pr_branch` (RAL-378, optional boolean) controls whether this
 review's pull request gets a remote branch of its own. `false` -- the default
 -- means the review branch *is* the PR branch: every branch registered since

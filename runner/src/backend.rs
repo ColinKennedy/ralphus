@@ -170,6 +170,16 @@ pub struct RunOptions<'a> {
     /// same "hand-rolled backends accept and ignore it" precedent as
     /// `assigned_agent_session_id`.
     pub retry_attempt: u32,
+    /// RAL-517: the daemon's resolved `[review] retry_after_unknown_default_seconds`,
+    /// forwarded from `CellSpec::retry_after_unknown_default_seconds`. Only
+    /// the pi backend reads this, as the wait for a provider error it
+    /// recognizes as retryable but that names no concrete delay of its own --
+    /// distinct from `retry_attempt`'s exponential `broadened_retry_delay_ms`
+    /// backoff and from RAL-435's parsed 429 delay, both of which stay
+    /// separately controllable. `0` via `RunOptions`'s `Default` derive means
+    /// an immediate retry, same convention as everywhere else this ticket's
+    /// setting is threaded (see `daemon::config::ReviewConfig`'s field doc).
+    pub retry_after_unknown_default_seconds: u64,
 }
 
 /// RAL-292: the sole turn content sent by [`ModelBackend::nudge`]'s default
