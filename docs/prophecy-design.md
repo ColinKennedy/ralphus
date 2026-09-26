@@ -82,3 +82,61 @@ Two consequences worth stating:
   derived** from the most recent N for that cell. The agent stops having to
   remember a separate end-of-reply marker, and the two systems stop competing
   for the same discipline. See phase 5.
+
+## 4. Transport
+
+| Transport | Covers | Captures | Verdict |
+|---|---|---|---|
+| `RALPHUS_PROPHECY:` marker | Every backend — ollama, native, tmux, remote | The moment; stderr is read line by line, not at exit | **Primary.** No credential, no endpoint. Attribution is unforgeable. |
+| `RunnerResult` field | Every backend, local and remote — it's in the `exec` reply | Everything the cell collected, at exit | **Primary backstop.** A typed contract rather than best-effort stderr. Exactly how `ghost` already crosses the provider boundary. |
+| Daemon-side writes | Rebase, merge, auto-fix | Decisions ralphus itself made | **Free.** No agent cooperation needed. |
+| MCP tool | claude-code, codex, pi — and only where the daemon is reachable | The moment, with a delivery acknowledgment | Later. Better ergonomics, but the agent must hold a token. |
+| CLI write command | Anything that can run a shell command | The moment | Later, with the above — it's what the MCP tool routes through. |
+
+### 4.1 Why the marker wins
+
+I initially had this backwards, and the correction matters: I dismissed the
+marker as "an end-of-reply summary, can't record a path." That is true of
+`RALPHUS_GHOST:`. It is **not** true of `RALPHUS_EVENT:`, which the daemon
+reads **line by line, not just at exit**. So the marker gets mid-work
+timestamped capture too, and the MCP tool's only remaining edge is a delivery
+acknowledgment plus structured arguments — not worth a credential for
+append-only advisory notes.
+
+### 4.2 The MCP finding — banked, not spent
+
+Worth recording because it changes the cost of the *later* phase, not this one:
+
+- `mcp/src/tools.rs:1` builds the tool registry from
+  `help_map::registered_leaves()`.
+- `mcp/tests/parity.rs` asserts **in both directions** that every
+  non-excluded CLI leaf has a tool and every tool has a leaf, with a
+  substantive reason required for any exclusion.
+
+So `ralphus prophecy record` would yield the MCP tool, the HTTP endpoint, and a
+shell-callable path from one implementation, permanently enforced. **The "tiny
+MCP server" idea is not a new server — it is one CLI subcommand.** But every
+one of those routes is an authenticated HTTP call, so it waits on §5.
+
+Read-side `ralphus prophecy list | show` is fine to ship early (phase 1) — it
+grants an agent read access to prophecies via parity, which is harmless.
+
+### 4.3 The marker's one real weakness
+
+Documented already in `docs/special-syntax.md`: an agent whose *work* prints
+one of these markers trips the parser reading its own output. Not hypothetical
+here — ralphus agents develop ralphus and read that file.
+
+Mitigation is in-tree precedent: match a **standalone line of exact form**, not
+a substring scan. That is exactly what `RALPHUS_TMUX_DONE` does, after the
+substring version false-positived. Cheaper to adopt that convention than to
+hand out a credential.
+
+### 4.4 Daemon-side writers — start here
+
+`guardian_merge.rs` already writes Cartographer rows at every
+conflict-resolution step. Rather than teaching the merge agent a new marker,
+have that path write a prophecy directly for decisions it already makes:
+conflict resolved, hunk dropped, ours taken. Daemon-side code, needs nobody to
+remember anything — and "we had to leave one thing behind in the rebase" is the
+single highest-value note on the whole list.
