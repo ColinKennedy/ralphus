@@ -152,7 +152,16 @@ impl Store {
 
     /// List all items hidden by one user, newest first.
     pub fn list_hidden(&self, user_name: &str) -> StoreResult<Vec<HiddenItem>> {
-        let mut stmt = self.conn.prepare(
+        Self::list_hidden_conn(&self.conn, user_name)
+    }
+
+    /// [`Self::list_hidden`] against an explicit connection (WS-E.2) -- the
+    /// board reads this to apply its hidden-item filters.
+    pub(crate) fn list_hidden_conn(
+        conn: &rusqlite::Connection,
+        user_name: &str,
+    ) -> StoreResult<Vec<HiddenItem>> {
+        let mut stmt = conn.prepare(
             "SELECT kind, squad_id, guardian_id, task_idx, hidden_at_ms
              FROM hidden_items WHERE user_name=?
              ORDER BY hidden_at_ms DESC, kind, COALESCE(squad_id, guardian_id), task_idx",

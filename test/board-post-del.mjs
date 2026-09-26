@@ -32,7 +32,7 @@ const REGION = ["// RALPHUS-POST-DEL:BEGIN", "// RALPHUS-POST-DEL:END"];
  * wasn't) called for a given path.
  */
 export function makePostDel() {
-  const calls = { invalidateTasksFetch: 0, fetches: [] };
+  const calls = { invalidateTasksFetch: 0, forgetEtag: 0, fetches: [] };
   const fetchImpl = (path, init) => {
     calls.fetches.push({ path, init });
     return Promise.resolve({ ok: true, json: async () => ({}) });
@@ -40,12 +40,15 @@ export function makePostDel() {
   const deps = {
     traceHeaders: () => ({ traceparent: "stub" }),
     invalidateTasksFetch: () => { calls.invalidateTasksFetch++; },
+    // WS-D.5: `post`/`del` drop every cached conditional-GET validator, so a
+    // mutation can never be followed by a `304` that hides its effect.
+    forgetEtag: () => { calls.forgetEtag++; },
   };
   // eslint-disable-next-line no-new-func -- evaluating the real shipped source is the point; see the header.
   const factory = new Function(
     "deps",
     "fetchImpl",
-    `const { traceHeaders, invalidateTasksFetch } = deps;
+    `const { traceHeaders, invalidateTasksFetch, forgetEtag } = deps;
      const fetch = fetchImpl;
      ${sliceRegion(REGION)}
      return { post, del };`,

@@ -55,6 +55,26 @@ jobs:
             cargo nextest run --package ralphus-daemon --test http_concurrency
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
+      # WS-G.5: the store under sustained concurrent load, for longer than the
+      # per-PR gate runs it. The captured deadlock took 108 seconds to appear
+      # from a clean start, so a 4-second window is not where it would show up.
+      #
+      # RALPHUS_REPLAY_SECONDS lengthens `workload_replay`'s window (see that
+      # file's module doc comment). A green run here is weak evidence -- runs
+      # preceding the captured deadlock did not hang either -- so read a failure
+      # as informative and a pass as "no regression observed", never as proof of
+      # deadlock freedom.
+      - name: Soak the store under the recorded workload
+        env:
+          RALPHUS_REPLAY_SECONDS: "120"
+        run: cargo nextest run --package ralphus-daemon --test workload_replay --run-ignored only --test-threads 1
+      - name: Repeat the board contention gate
+        shell: pwsh
+        run: |
+          1..5 | ForEach-Object {
+            cargo nextest run --package ralphus-daemon --test board_contention --run-ignored only --test-threads 1
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
       - name: Stop isolated psmux server
         if: always()
         continue-on-error: true

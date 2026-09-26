@@ -34,6 +34,66 @@ use rusqlite::{Connection, OpenFlags};
 /// `SQLITE_BUSY` during, e.g., a WAL checkpoint.
 pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Page cache per connection, as the negative-kibibyte form SQLite reads as
+/// "this many KiB" rather than "this many pages" (which varies with page
+/// size). 64 MiB comfortably holds the whole of a 40 MB database plus its
+/// indexes, against a SQLite default of 2 MB -- on a database that size the
+/// default guarantees the hot read paths keep going back to the OS for pages
+/// they just read.
+///
+/// Costed per connection, so the real figure is this times 1 writer + 4
+/// pooled readers. That is the intended trade: 320 MiB of virtual cache
+/// against a daemon whose read amplification (RC-4: the board re-hydrates
+/// everything on every SSE event) is the thing being paid for.
+const CACHE_SIZE_KIB: i64 = -65_536;
+
+/// Memory-mapped I/O window, in bytes. Reads inside the window are served
+/// straight out of the page cache with no `read()` syscall and no copy into
+/// SQLite's own cache; 256 MiB covers the whole database with room to grow.
+/// SQLite silently caps this at whatever it can actually map and treats it as
+/// advisory, so an over-generous value is safe.
+const MMAP_SIZE_BYTES: i64 = 268_435_456;
+
+/// PRAGMAs every connection to a `Store`'s database wants -- the writer and
+/// each pooled reader alike.
+///
+/// Kept in one function so the writer and the pool cannot drift apart: a
+/// reader with a 2 MB cache reading the same 40 MB database the writer reads
+/// with 64 MB is a silent asymmetry that only shows up as unexplained read
+/// latency on the pooled paths.
+///
+/// `execute_batch` rather than `pragma_update`: several of these return their
+/// new value as a result row, which the `execute` path underneath
+/// `pragma_update` rejects.
+pub(crate) fn apply_shared_pragmas(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(&format!(
+        "PRAGMA cache_size = {CACHE_SIZE_KIB};
+         PRAGMA mmap_size = {MMAP_SIZE_BYTES};
+         -- Sorting and `DISTINCT` build temporary b-trees. On disk they are
+         -- another source of write I/O on the database's own filesystem,
+         -- competing with the WAL; `board`-shaped queries (`ORDER BY` over
+         -- squads, `DISTINCT` over branches) hit this routinely.
+         PRAGMA temp_store = MEMORY;"
+    ))
+}
+
+/// PRAGMAs that only make sense on the one connection that commits.
+///
+/// `synchronous = NORMAL` is the change: SQLite defaults to `FULL`, which
+/// fsyncs the WAL on every single commit, and that fsync is the entire cost of
+/// a small write -- measured at 404 writes/sec in
+/// `daemon/tests/store_write_throughput.rs` against a store that does nothing
+/// else. Under `NORMAL` in WAL mode the WAL is still fsynced at each
+/// checkpoint, so the database **cannot** be corrupted by an OS crash or power
+/// loss; what can be lost is the most recent transactions. For a daemon whose
+/// state is regenerable agent task bookkeeping -- squads, cells, proof results
+/// and a log -- losing the last few hundred milliseconds of a crash is a much
+/// smaller cost than an fsync on every row, and the plan records it as a
+/// deliberate trade (§8).
+pub(crate) fn apply_writer_pragmas(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch("PRAGMA synchronous = NORMAL;")
+}
+
 /// How many pooled read-only connections to open per `Store`. Small and
 /// fixed -- this is meant to absorb HTTP `GET` read bursts, not to be a
 /// general-purpose connection pool sized to core count.
@@ -73,6 +133,7 @@ fn open_reader(location: &DbLocation) -> rusqlite::Result<Connection> {
         }
     };
     conn.busy_timeout(BUSY_TIMEOUT)?;
+    apply_shared_pragmas(&conn)?;
     Ok(conn)
 }
 

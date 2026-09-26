@@ -472,7 +472,7 @@ impl Runner for AutoFixRunner {
     }
 }
 
-fn setup_review_with_pending_last_branch(store: &mut Store) -> (PathBuf, String) {
+fn setup_review_with_pending_last_branch(store: &Arc<StoreMutex>) -> (PathBuf, String) {
     let root = temp_repo();
     init_repo(&root);
     write(&root, "base.txt", "base\n");
@@ -508,18 +508,25 @@ fn setup_review_with_pending_last_branch(store: &mut Store) -> (PathBuf, String)
          [[review]]\nid=\"rev\"\nskip_auto_build=true\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
-    let run_id = store.insert_squad(&file, None, false).unwrap();
+    let run_id = store.lock().insert_squad(&file, None, false).unwrap();
     let gid = derive_reviews(store, &run_id, &file).unwrap()[0].clone();
     store
+        .lock()
         .set_cell_state(&run_id, 0, 0, NodeState::Done)
         .unwrap();
     // RAL-442: task "a" must also reach `done` -- mirroring
     // `run_task_finalizer` clearing task-level proofs -- before its branch
     // may promote.
-    store.set_task_state(&run_id, 0, NodeState::Done).unwrap();
-    store.mark_ready_branches_with_done_cells(&gid).unwrap();
+    store
+        .lock()
+        .set_task_state(&run_id, 0, NodeState::Done)
+        .unwrap();
+    store
+        .lock()
+        .mark_ready_branches_with_done_cells(&gid)
+        .unwrap();
 
-    let guardian = store.get_guardian(&gid).unwrap();
+    let guardian = store.lock().get_guardian(&gid).unwrap();
     assert_eq!(guardian.status, "collecting");
     assert_eq!(guardian.branches[0].merge_status, "ready");
     assert_eq!(guardian.branches[1].merge_status, "pending");
@@ -573,10 +580,7 @@ fn builds_review_branch_from_two_features() {
 #[test]
 fn start_merge_defers_while_an_enabled_branch_is_still_pending() {
     let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
-    let (root, gid) = {
-        let mut guard = store.lock();
-        setup_review_with_pending_last_branch(&mut guard)
-    };
+    let (root, gid) = setup_review_with_pending_last_branch(&store);
 
     let reply = start_merge(
         Arc::clone(&store),
@@ -655,10 +659,7 @@ fn reopen_cancelled_guardian_merge_stages_the_ready_prefix_while_a_branch_is_pen
 #[test]
 fn reopen_guardian_merge_rejects_a_guardian_that_is_neither_cancelled_nor_merged() {
     let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
-    let (root, gid) = {
-        let mut guard = store.lock();
-        setup_review_with_pending_last_branch(&mut guard)
-    };
+    let (root, gid) = setup_review_with_pending_last_branch(&store);
 
     // Still `collecting`, never cancelled or merged: reopen must be
     // rejected and the guardian state left untouched.
@@ -739,10 +740,7 @@ fn reopen_waits_for_cancelled_merge_worker_before_reusing_its_worktrees() {
 fn change_base_route_records_base_but_defers_merge_while_last_branch_is_pending() {
     let daemon = Daemon::new(Store::open_in_memory().unwrap(), 4);
     let store = daemon.store_handle();
-    let (root, gid) = {
-        let mut guard = store.lock();
-        setup_review_with_pending_last_branch(&mut guard)
-    };
+    let (root, gid) = setup_review_with_pending_last_branch(&store);
 
     let reply = route(
         &daemon,

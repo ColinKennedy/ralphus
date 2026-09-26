@@ -486,9 +486,9 @@
         jumpToTask(hit.squadId, hit.taskIdx, -1, "task");
       }
       /**
-       * @returns {{q: string, sort: string, dir: number, status: Set<string>, showHidden: boolean, projects: Set<string>}}
+       * @returns {{q: string, sort: string, dir: number, status: Set<string>, showHidden: boolean, projects: Set<string>, agents: Set<string>}}
        */
-      function defaultTaskFilters() { return { q: "", sort: "date", dir: -1, status: new Set(SQUAD_STATES), showHidden: false, projects: new Set() }; }
+      function defaultTaskFilters() { return { q: "", sort: "date", dir: -1, status: new Set(SQUAD_STATES), showHidden: false, projects: new Set(), agents: new Set() }; }
       /**
        * @typedef {object} TaskTabFilters
        * @property {string} q

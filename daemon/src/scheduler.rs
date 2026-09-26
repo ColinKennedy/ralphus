@@ -992,9 +992,14 @@ fn execute_squad_inner(
     // project/worktree can no longer be resolved (e.g. deregistered after
     // submit) fails the whole squad cleanly rather than panicking mid-dispatch.
     {
-        let guard = store.lock();
+        // WS-D.8: no guard held. This pass runs real git per unresolved
+        // placeholder -- `git worktree add`, `git fetch`, a rebase, and for a
+        // remote cell a whole provisioning round-trip -- and it used to do all
+        // of it with the daemon's one global store lock held, serializing every
+        // other request behind the slowest worktree in the squad. It now takes
+        // the handle and locks per store touch instead.
         let result = crate::worktrees::resolve_placeholders_with_full_prefetch(
-            &guard,
+            store,
             squad_id,
             &mut cells,
             &tasks,
@@ -1002,7 +1007,6 @@ fn execute_squad_inner(
             &prefetched_worktrees,
             &_squad_span.cx,
         );
-        drop(guard);
         if let Err(e) = result {
             _squad_span.set_status(opentelemetry::trace::Status::error(e.clone()));
             finalize_all_failed(store, squad_id, &tasks, &e);
@@ -2412,18 +2416,23 @@ fn run_cell_worker(
     }
     spec.trace_context = cell_trace_context.clone();
     spec.env_overrides = {
-        let guard = store.lock();
-        if let Some(snapshot) = guard
+        // WS-D.8: each store touch takes its own guard, and none is held across
+        // `materialize_env_overrides` -- an unresolved placeholder in an
+        // `environment` value falls through to a live git fetch, which must not
+        // run under the daemon's one global lock.
+        let cached = store
+            .lock()
             .get_cell_materialized_env_overrides(squad_id, row.task_idx, row.idx)
-            .unwrap_or_default()
-        {
+            .unwrap_or_default();
+        if let Some(snapshot) = cached {
             snapshot
         } else {
-            let merged = guard
+            let merged = store
+                .lock()
                 .resolve_cell_env_overrides(squad_id, row.task_idx, row.idx)
                 .unwrap_or_default();
             let materialized = crate::worktrees::materialize_env_overrides(
-                &guard,
+                store,
                 crate::worktrees::PlaceholderContext {
                     squad_id,
                     task_idx: row.task_idx,
@@ -2462,7 +2471,7 @@ fn run_cell_worker(
                 &merged,
             )
             .unwrap_or(merged);
-            let _ = guard.set_cell_materialized_env_overrides(
+            let _ = store.lock().set_cell_materialized_env_overrides(
                 squad_id,
                 row.task_idx,
                 row.idx,
@@ -2697,17 +2706,17 @@ fn run_cell_worker(
             executable: spec.executable.as_deref(),
             model: row.model.as_deref(),
         };
-        {
-            let guard = store.lock();
-            crate::remediation::run_repair_pass(
-                &guard,
-                runner,
-                cancel,
-                &spec,
-                remediation_attempt,
-                &repair_agent,
-            );
-        }
+        // The store lock must not be held across this call -- the repair pass
+        // runs an agent through the tmux runner, which takes the same
+        // (non-reentrant) lock itself.
+        crate::remediation::run_repair_pass(
+            store,
+            runner,
+            cancel,
+            &spec,
+            remediation_attempt,
+            &repair_agent,
+        );
         remediation_attempt += 1;
     };
     _permit = resumed_permit;
@@ -3417,8 +3426,10 @@ fn run_task_finalizer(
     // the lock.
     if did_write && state == NodeState::Done {
         {
-            let guard = store.lock();
-            if let Err(e) = crate::reviews::fire_ready_triage_thresholds(&guard, squad_id) {
+            // No guard held across this: its pool-firing path invokes the
+            // `orderer` callback, whose Arbiter round-trip is a blocking
+            // network call that must never run with the global store lock held.
+            if let Err(e) = crate::reviews::fire_ready_triage_thresholds(store, squad_id) {
                 crate::rlog!(
                     ERROR,
                     "ralphus [triage] failed to re-check thresholds after task {task_idx} in {squad_id} completed: {}",
@@ -4193,21 +4204,29 @@ fn run_proofs(
         // carries its own narrowest env layer on top of the scope's, so two
         // steps under the same task can set the same key to different values.
         let env_overrides = {
-            let guard = store.lock();
-            if let Some(snapshot) = guard
+            // WS-D.8: see the sibling cell call site -- no guard is held across
+            // `materialize_env_overrides`, whose placeholder expansion can run
+            // git.
+            let cached = store
+                .lock()
                 .get_proof_materialized_env_overrides(squad_id, task_idx, scope, cell_idx, idx)
-                .unwrap_or_default()
-            {
+                .unwrap_or_default();
+            if let Some(snapshot) = cached {
                 snapshot
             } else {
-                let merged = if scope == "task" {
-                    guard.resolve_task_proof_step_env_overrides(squad_id, task_idx, idx)
-                } else {
-                    guard.resolve_cell_proof_step_env_overrides(squad_id, task_idx, cell_idx, idx)
+                let merged = {
+                    let guard = store.lock();
+                    if scope == "task" {
+                        guard.resolve_task_proof_step_env_overrides(squad_id, task_idx, idx)
+                    } else {
+                        guard.resolve_cell_proof_step_env_overrides(
+                            squad_id, task_idx, cell_idx, idx,
+                        )
+                    }
                 }
                 .unwrap_or_default();
                 let materialized = crate::worktrees::materialize_env_overrides(
-                    &guard,
+                    store,
                     crate::worktrees::PlaceholderContext {
                         squad_id,
                         task_idx,
@@ -4245,7 +4264,7 @@ fn run_proofs(
                     &merged,
                 )
                 .unwrap_or(merged);
-                let _ = guard.set_proof_materialized_env_overrides(
+                let _ = store.lock().set_proof_materialized_env_overrides(
                     squad_id,
                     task_idx,
                     scope,
@@ -4338,9 +4357,11 @@ fn run_proofs(
                     executable: selection.executable.as_deref(),
                     model: repair_model,
                 };
-                let guard = store.lock();
+                // The store lock must not be held across this call -- it runs
+                // the command through the tmux runner, which takes the same
+                // (non-reentrant) lock itself.
                 let result: RunnerResult = crate::remediation::run_command_with_remediation(
-                    &guard,
+                    store,
                     runner,
                     cancel,
                     &runner_spec,

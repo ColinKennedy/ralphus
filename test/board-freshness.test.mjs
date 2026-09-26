@@ -19,7 +19,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { boardSource, makeUpdateCounter, makePollTasksTab, resolveJson, rejectFetch } from "./board-freshness.mjs";
+import { boardSource, makeUpdateCounter, makePollTasksTab, resolveJson, rejectFetch, awaitFetches } from "./board-freshness.mjs";
 
 // ---------- updateCounter: no longer swallows a failed fetch ----------
 
@@ -77,6 +77,102 @@ test("pollTasksTab: a failed /api/pull-requests/index fetch still stamps #update
   rejectFetch(pt.pendingFetches[1]);
   await promise;
   assert.match(pt.els.updated.textContent, /^updated /);
+});
+
+// ---------- pollTasksTab: WS-D.5 conditional GET ----------
+
+test("pollTasksTab: sends no If-None-Match on the first poll, then echoes the tag the daemon gave it", async () => {
+  const pt = makePollTasksTab();
+  const first = pt.pollTasksTab();
+  await awaitFetches(pt, 2);
+  assert.equal(pt.pendingFetches[0].init.headers["If-None-Match"], undefined, "the first poll has no tag to send yet");
+  resolveJson(pt.pendingFetches[0], { daemon: { running: 1, max_concurrent: 2 }, squads: [] }, { etag: '"abc-1"' });
+  resolveJson(pt.pendingFetches[1], {}, { etag: '"def-2"' });
+  await first;
+
+  const second = pt.pollTasksTab();
+  await awaitFetches(pt, 4);
+  assert.equal(pt.pendingFetches[2].init.headers["If-None-Match"], '"abc-1"');
+  assert.equal(pt.pendingFetches[3].init.headers["If-None-Match"], '"def-2"');
+  resolveJson(pt.pendingFetches[2], null, { status: 304 });
+  resolveJson(pt.pendingFetches[3], null, { status: 304 });
+  await second;
+});
+
+test("pollTasksTab: a 304 on both reads skips the re-render but still stamps #updated", async () => {
+  const pt = makePollTasksTab();
+  const first = pt.pollTasksTab();
+  resolveJson(pt.pendingFetches[0], { daemon: { running: 1, max_concurrent: 2 }, squads: [{ id: "squad-1" }] }, { etag: '"abc-1"' });
+  resolveJson(pt.pendingFetches[1], {}, { etag: '"def-2"' });
+  await first;
+  assert.equal(pt.calls.renderTasksTab, 1, "the first poll must render");
+
+  const second = pt.pollTasksTab();
+  resolveJson(pt.pendingFetches[2], null, { status: 304 });
+  resolveJson(pt.pendingFetches[3], null, { status: 304 });
+  await second;
+  assert.equal(pt.calls.renderTasksTab, 1, "an all-304 poll rebuilt a table that could not have changed");
+  // The stamp is still refreshed: the board did successfully hear from the
+  // daemon, which is what "updated" reports. Suppressing it would make a
+  // healthy idle daemon look unreachable.
+  assert.match(pt.els.updated.textContent, /^updated /);
+  // And the previously-loaded data survives rather than being blanked by the
+  // empty 304 body.
+  assert.equal(pt.state().squads.length, 1, "a 304 discarded already-loaded squads");
+});
+
+test("pollTasksTab: a 304 on one read and fresh data on the other still renders", async () => {
+  const pt = makePollTasksTab();
+  const first = pt.pollTasksTab();
+  resolveJson(pt.pendingFetches[0], { daemon: { running: 0, max_concurrent: 2 }, squads: [] }, { etag: '"abc-1"' });
+  resolveJson(pt.pendingFetches[1], {}, { etag: '"def-2"' });
+  await first;
+
+  const second = pt.pollTasksTab();
+  resolveJson(pt.pendingFetches[2], null, { status: 304 });
+  resolveJson(pt.pendingFetches[3], { changed: true }, { etag: '"def-3"' });
+  await second;
+  assert.equal(pt.calls.renderTasksTab, 2, "a changed PR index must still reach the table");
+});
+
+test("pollTasksTab: forgetEtag makes the next poll unconditional", async () => {
+  const pt = makePollTasksTab();
+  const first = pt.pollTasksTab();
+  resolveJson(pt.pendingFetches[0], { daemon: { running: 0, max_concurrent: 2 }, squads: [] }, { etag: '"abc-1"' });
+  resolveJson(pt.pendingFetches[1], {}, { etag: '"def-2"' });
+  await first;
+
+  pt.forgetEtag();
+  const second = pt.pollTasksTab();
+  await awaitFetches(pt, 4);
+  assert.equal(pt.pendingFetches[2].init.headers["If-None-Match"], undefined, "a forgotten tag was still sent");
+  assert.equal(pt.pendingFetches[3].init.headers["If-None-Match"], undefined);
+  resolveJson(pt.pendingFetches[2], { daemon: { running: 0, max_concurrent: 2 }, squads: [] });
+  resolveJson(pt.pendingFetches[3], {});
+  await second;
+});
+
+test("pollTasksTab: a read the daemon left untagged goes back to unconditional rather than reusing a stale tag", async () => {
+  const pt = makePollTasksTab();
+  const first = pt.pollTasksTab();
+  resolveJson(pt.pendingFetches[0], { daemon: { running: 0, max_concurrent: 2 }, squads: [] }, { etag: '"abc-1"' });
+  resolveJson(pt.pendingFetches[1], {}, { etag: '"def-2"' });
+  await first;
+
+  // A 200 with no ETag (an older daemon, or a proxy that stripped it) must
+  // clear the remembered tag -- echoing it afterwards could earn a 304 about
+  // a body the board never received.
+  const second = pt.pollTasksTab();
+  resolveJson(pt.pendingFetches[2], { daemon: { running: 0, max_concurrent: 2 }, squads: [] }, { etag: null });
+  resolveJson(pt.pendingFetches[3], {}, { etag: null });
+  await second;
+
+  const third = pt.pollTasksTab();
+  await awaitFetches(pt, 6);
+  assert.equal(pt.pendingFetches[4].init.headers["If-None-Match"], undefined);
+  resolveJson(pt.pendingFetches[4], { daemon: { running: 0, max_concurrent: 2 }, squads: [] });
+  resolveJson(pt.pendingFetches[5], {});
+  await third;
 });
 
 // ---------- showTab: clears the stamp so it can't be misread across tabs ----------

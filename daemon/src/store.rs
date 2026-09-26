@@ -16,6 +16,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::runner::{effective_cell_system_prompt, effective_proof_system_prompt};
 
+/// Ceiling, in bytes, that a checkpoint truncates the `-wal` sidecar back
+/// down to (`PRAGMA journal_size_limit`, applied in [`Store::open`]).
+///
+/// Comfortably above the working set a normal checkpoint interval leaves
+/// behind, so steady-state operation never pays for a truncate, while still
+/// bounding what a write-heavy burst can strand on disk. A much smaller
+/// limit would churn the file size on routine load for no benefit.
+const WAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
+
 /// Errors the store can produce.
 #[derive(Debug)]
 pub enum StoreError {
@@ -899,83 +908,16 @@ pub struct Store {
     /// In-process SSE broadcast registry (RAL-167), fed by
     /// [`Store::cartographer_log`]. See `crate::events`.
     event_bus: crate::events::EventBus,
-    /// Liveness signal (RAL-170): last time fresh pane output was observed
-    /// for a running tmux-wrapped session, keyed by `crate::tmux::session_name`
-    /// (the same deterministic key used for task cells, proof steps, and
-    /// Guardian resolver/manual-check sessions alike — see
-    /// [`Self::note_live_activity`]'s doc comment for why this is in-memory
-    /// only, not a DB column). Entries are removed once the owning
-    /// `run_via_tmux` call returns, so this stays bounded by the number of
-    /// *currently running* tmux-wrapped sessions, not lifetime history.
-    live_activity: HashMap<String, i64>,
-    /// RAL-208: per-guardian debounce bookkeeping for the LLM-authored final
-    /// change summary, keyed by guardian id. In-memory only, like
-    /// `live_activity` above — losing this across a daemon restart just means
-    /// the next enabled-branch-set change regenerates the summary once more
-    /// than strictly necessary, not a correctness issue. See
-    /// `guardian_merge::queue_final_summary_regen`/`sweep_pending_summaries`.
-    guardian_summary_debounce: HashMap<String, GuardianSummaryDebounce>,
-    /// Exclusive ownership of one review branch's mutable worktree, keyed by
-    /// `(guardian_id, branch_id)` and valued by an owner tag (e.g.
-    /// `feedback:{branch_id}`) — see the `worktree lease` glossary entry.
-    /// `run_feedback` holds one for the duration of its resolver call so a
-    /// concurrent restack can never rebase a branch out from under a
-    /// still-running feedback pass. In-memory only: a daemon restart mid-lease
-    /// simply drops it, which is safe since the worktree itself is re-checked
-    /// for dirt on the next pass through `drive_rebase`.
-    guardian_worktree_leases: HashMap<(String, String), String>,
-    /// A pending restack request per guardian, coalesced to the lowest
-    /// requested `from_position` — a later request for a *later* position
-    /// while an earlier one is still queued would otherwise lose ground
-    /// already claimed. Cleared by [`Store::try_claim_guardian_restack`].
-    guardian_restack_requests: HashMap<String, i64>,
-    /// Guardians with a restack currently claimed (running). A restack may
-    /// only be claimed when no branch of the guardian holds a worktree lease,
-    /// and no new worktree lease may be acquired while the guardian's id is
-    /// in this set — see [`Store::try_claim_guardian_restack`] and
-    /// [`Store::try_acquire_guardian_worktree_lease`].
-    guardian_restack_running: std::collections::HashSet<String>,
-    /// RAL-241: which `crate::tmux::session_name` keys have already had a
-    /// stall escalation enqueued for their *current* stall onset, and when
-    /// that onset's last-known-good activity timestamp was — so a still-
-    /// ongoing stall doesn't re-enqueue a mailbox message on every poll.
-    /// In-memory only, like `live_activity` above: cleared alongside it (see
-    /// `Store::clear_live_activity`) once the owning `run_via_tmux` call has
-    /// a terminal result, so a *new* attempt/cell can be escalated again.
-    stall_escalated: HashMap<String, i64>,
-    /// RAL-281: process-lifetime cache of `secret_env_names`, `None` when
-    /// invalidated by a mutation. See `crate::secret_env_names`'s module doc
-    /// comment for why this exists (the scheduler's per-cell/per-proof-step
-    /// env-merge choke point reads it on every dispatch, so it must not cost
-    /// a DB query per call). Scoped to this `Store` instance (not a global
-    /// static) so it can't leak between the daemon's one real DB and the many
-    /// independent in-memory stores each test opens.
-    pub(crate) secret_env_names_cache:
-        std::sync::RwLock<Option<std::collections::BTreeSet<String>>>,
-    /// RAL-393 Stage 3: a small pool of read-only connections to this same
-    /// database, so read-classified methods can run without waiting on
-    /// [`crate::store_lock::StoreMutex`]. See `crate::store_pool`'s module
-    /// doc comment for why this is a connection pool rather than
-    /// `RwLock<Store>`.
+    /// WS-E.1: every piece of this store's state that is not in SQLite --
+    /// worktree leases, restack bookkeeping, tmux liveness, stall debounce and
+    /// the secret-name cache -- behind its own small locks rather than this
+    /// one. See `crate::store_memory` for why they are grouped the way they
+    /// are, and why having them here was blocking the read-path migration.
+    ///
+    /// An `Arc` so a caller can hold a handle to it without holding the store:
+    /// see [`Store::memory`].
+    memory: std::sync::Arc<crate::store_memory::StoreMemory>,
     read_pool: std::sync::Arc<crate::store_pool::ReadConnPool>,
-}
-
-/// RAL-208: see [`Store::guardian_summary_debounce`].
-#[derive(Debug, Default, Clone)]
-struct GuardianSummaryDebounce {
-    /// The enabled-branch signature the current LLM-authored `change_summary`
-    /// was generated from. `None` until the first final summary is produced.
-    generated_signature: Option<String>,
-    /// A signature awaiting generation, and when it was last (re)requested.
-    /// Each new request overwrites both fields — that's what implements the
-    /// trailing debounce: the "quiet period" clock restarts on every
-    /// enable/disable toggle instead of accumulating separate pending jobs.
-    pending_signature: Option<String>,
-    pending_requested_at_ms: Option<i64>,
-    /// RAL-303: whether this daemon process has already tried to repair a
-    /// guardian left with no LLM-authored summary. See
-    /// [`Self::claim_final_summary_repair`].
-    repair_attempted: bool,
 }
 
 pub(crate) fn now_ms() -> i64 {
@@ -1049,20 +991,13 @@ impl Store {
     /// while another owner already holds this branch's lease. See the
     /// `worktree lease` glossary entry.
     pub(crate) fn try_acquire_guardian_worktree_lease(
-        &mut self,
+        &self,
         guardian_id: &str,
         branch_id: &str,
         owner: &str,
     ) -> bool {
-        if self.guardian_restack_running.contains(guardian_id) {
-            return false;
-        }
-        let key = (guardian_id.to_string(), branch_id.to_string());
-        if self.guardian_worktree_leases.contains_key(&key) {
-            return false;
-        }
-        self.guardian_worktree_leases.insert(key, owner.to_string());
-        true
+        self.memory
+            .try_acquire_worktree_lease(guardian_id, branch_id, owner)
     }
 
     /// Release `branch_id`'s worktree lease, but only if `owner` is the
@@ -1070,17 +1005,13 @@ impl Store {
     /// release a lease it no longer owns. Returns whether it actually
     /// released one.
     pub(crate) fn release_guardian_worktree_lease(
-        &mut self,
+        &self,
         guardian_id: &str,
         branch_id: &str,
         owner: &str,
     ) -> bool {
-        let key = (guardian_id.to_string(), branch_id.to_string());
-        if self.guardian_worktree_leases.get(&key).map(String::as_str) != Some(owner) {
-            return false;
-        }
-        self.guardian_worktree_leases.remove(&key);
-        true
+        self.memory
+            .release_worktree_lease(guardian_id, branch_id, owner)
     }
 
     /// The current lease owner for `branch_id`'s worktree, if any — used by
@@ -1091,20 +1022,15 @@ impl Store {
         guardian_id: &str,
         branch_id: &str,
     ) -> Option<String> {
-        self.guardian_worktree_leases
-            .get(&(guardian_id.to_string(), branch_id.to_string()))
-            .cloned()
+        self.memory.worktree_lease_owner(guardian_id, branch_id)
     }
 
     /// Queue a restack starting at `from_position` for `guardian_id`,
     /// coalescing with any already-queued request by keeping the lower
     /// position — a restack from a later position can never safely replace
     /// one already promised to reach further back into the stack.
-    pub(crate) fn request_guardian_restack(&mut self, guardian_id: &str, from_position: i64) {
-        self.guardian_restack_requests
-            .entry(guardian_id.to_string())
-            .and_modify(|p| *p = (*p).min(from_position))
-            .or_insert(from_position);
+    pub(crate) fn request_guardian_restack(&self, guardian_id: &str, from_position: i64) {
+        self.memory.request_restack(guardian_id, from_position);
     }
 
     /// Claim the queued restack request for `guardian_id`, if one exists and
@@ -1114,37 +1040,38 @@ impl Store {
     /// guardian is marked running until [`Store::finish_guardian_restack`]
     /// is called, and the coalesced position is returned and removed from
     /// the queue.
-    pub(crate) fn try_claim_guardian_restack(&mut self, guardian_id: &str) -> Option<i64> {
-        if self.guardian_restack_running.contains(guardian_id)
-            || self
-                .guardian_worktree_leases
-                .keys()
-                .any(|(gid, _)| gid == guardian_id)
-        {
-            return None;
-        }
-        let position = self.guardian_restack_requests.remove(guardian_id)?;
-        self.guardian_restack_running
-            .insert(guardian_id.to_string());
-        Some(position)
+    pub(crate) fn try_claim_guardian_restack(&self, guardian_id: &str) -> Option<i64> {
+        self.memory.try_claim_restack(guardian_id)
     }
 
     /// Mark `guardian_id`'s claimed restack finished, allowing a new restack
     /// claim or worktree lease acquisition.
-    pub(crate) fn finish_guardian_restack(&mut self, guardian_id: &str) {
-        self.guardian_restack_running.remove(guardian_id);
+    pub(crate) fn finish_guardian_restack(&self, guardian_id: &str) {
+        self.memory.finish_restack(guardian_id);
     }
 
     /// Open (creating if needed) a store at `path`, in WAL mode.
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        // Cap the `-wal` sidecar. SQLite's autocheckpoint keeps spilling the
+        // WAL back into the database, but at the default `journal_size_limit`
+        // of -1 a checkpoint only *resets* the file for reuse -- it never
+        // shrinks it -- so the WAL stays at its all-time high-water mark for
+        // the life of the database. One period of heavy write load (or one
+        // stalled writer holding checkpoints off) is enough to strand
+        // hundreds of megabytes there permanently, which a later restart then
+        // has to read back through. With a limit set, each checkpoint
+        // truncates the WAL down to it instead.
+        conn.pragma_update(None, "journal_size_limit", WAL_SIZE_LIMIT_BYTES)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         // RAL-393 Stage 3: bound how long any connection (this writer, or a
         // pooled reader opened below) waits on SQLite's busy handler before
         // surfacing `SQLITE_BUSY`, instead of leaving it at the default of 0
         // (fail immediately on any lock contention).
         conn.busy_timeout(crate::store_pool::BUSY_TIMEOUT)?;
+        crate::store_pool::apply_shared_pragmas(&conn)?;
+        crate::store_pool::apply_writer_pragmas(&conn)?;
         // Built from the writer connection's own path so pooled reads see
         // the same on-disk (WAL-mode) database -- see `crate::store_pool`.
         let read_pool = crate::store_pool::ReadConnPool::open(
@@ -1153,13 +1080,7 @@ impl Store {
         let store = Self {
             conn,
             event_bus: crate::events::EventBus::new(),
-            live_activity: HashMap::new(),
-            guardian_summary_debounce: HashMap::new(),
-            guardian_worktree_leases: HashMap::new(),
-            guardian_restack_requests: HashMap::new(),
-            guardian_restack_running: std::collections::HashSet::new(),
-            stall_escalated: HashMap::new(),
-            secret_env_names_cache: std::sync::RwLock::new(None),
+            memory: crate::store_memory::StoreMemory::new(),
             read_pool,
         };
         store.init_schema()?;
@@ -1185,17 +1106,13 @@ impl Store {
                 | OpenFlags::SQLITE_OPEN_URI,
         )?;
         conn.busy_timeout(crate::store_pool::BUSY_TIMEOUT)?;
+        crate::store_pool::apply_shared_pragmas(&conn)?;
+        crate::store_pool::apply_writer_pragmas(&conn)?;
         let read_pool = crate::store_pool::ReadConnPool::open(&location);
         let store = Self {
             conn,
             event_bus: crate::events::EventBus::new(),
-            live_activity: HashMap::new(),
-            guardian_summary_debounce: HashMap::new(),
-            guardian_worktree_leases: HashMap::new(),
-            guardian_restack_requests: HashMap::new(),
-            guardian_restack_running: std::collections::HashSet::new(),
-            stall_escalated: HashMap::new(),
-            secret_env_names_cache: std::sync::RwLock::new(None),
+            memory: crate::store_memory::StoreMemory::new(),
             read_pool,
         };
         store.init_schema()?;
@@ -1211,11 +1128,41 @@ impl Store {
         std::sync::Arc::clone(&self.read_pool)
     }
 
+    /// This store's non-database state (WS-E.1). Cloning the `Arc` is cheap and
+    /// takes no lock, so a caller can hold it independently of the store --
+    /// which is the point: worktree leases, tmux liveness and the rest no
+    /// longer require the global `StoreMutex` to reach.
+    #[must_use]
+    pub fn memory(&self) -> std::sync::Arc<crate::store_memory::StoreMemory> {
+        std::sync::Arc::clone(&self.memory)
+    }
+
     /// The SSE broadcast registry (RAL-167) — subscribe from the `/api/events`
     /// HTTP handler, published to automatically by [`Store::cartographer_log`].
     #[must_use]
     pub fn event_bus(&self) -> &crate::events::EventBus {
         &self.event_bus
+    }
+
+    /// Run `f` inside one explicit write transaction, committing if it returns
+    /// `Ok` and rolling back otherwise.
+    ///
+    /// Every `Store` method writes through `self.conn`, so anything `f` calls
+    /// joins this transaction rather than committing on its own. That is the
+    /// point: SQLite's per-commit cost is dominated by the journal flush, so a
+    /// batch of N writes under one commit costs roughly one commit rather than
+    /// N (measured in `daemon/tests/store_write_throughput.rs`).
+    ///
+    /// Two constraints on `f`. It must not take the `StoreMutex` — the caller
+    /// already holds it, and re-entering is a permanent self-park (see
+    /// `crate::store_lock`). And it must not block on I/O: an open write
+    /// transaction holds the WAL writer, so every other writer waits on
+    /// whatever `f` is waiting on.
+    pub fn transaction<T>(&self, f: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
+        let tx = self.conn.unchecked_transaction()?;
+        let out = f(self)?;
+        tx.commit()?;
+        Ok(out)
     }
 
     fn init_schema(&self) -> Result<()> {
@@ -1544,10 +1491,17 @@ impl Store {
                 payload     TEXT NOT NULL DEFAULT '{}'
             );
             CREATE INDEX IF NOT EXISTS idx_carto_at ON cartographer_events(at_ms);
-            CREATE INDEX IF NOT EXISTS idx_carto_squad ON cartographer_events(squad_id);
             CREATE INDEX IF NOT EXISTS idx_carto_guardian ON cartographer_events(guardian_id);
-            CREATE INDEX IF NOT EXISTS idx_carto_cell ON cartographer_events(cell_id);
             CREATE INDEX IF NOT EXISTS idx_carto_source ON cartographer_events(source);
+            -- WS-D.2: partial rather than full. `squad_id`/`cell_id`/`task`
+            -- are NULL on ~99% of rows, and Cartographer inserts are the
+            -- daemon's highest-volume write; see the WS-D.2 migration block
+            -- further down `init_schema` for the measurements and for why an
+            -- equality lookup still uses a partial index.
+            CREATE INDEX IF NOT EXISTS idx_carto_squad_partial
+                ON cartographer_events(squad_id) WHERE squad_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_carto_cell_partial
+                ON cartographer_events(cell_id) WHERE cell_id IS NOT NULL;
             CREATE TABLE IF NOT EXISTS projects (
                 name          TEXT PRIMARY KEY,
                 description   TEXT NOT NULL DEFAULT '',
@@ -3072,6 +3026,60 @@ impl Store {
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_guardian_branches_branch_id ON guardian_branches(id)",
             [],
         );
+        // WS-D.2: `guardian_branches`' primary key is (`guardian_id`,
+        // `position`), so every lookup *by branch name* -- the branch-name arm
+        // of `reviews_for_squad`, and the same join in the review-derivation
+        // paths -- had no index to seek on and scanned. This is the index that
+        // makes WS-D.1's `UNION` rewrite actually index-driven rather than
+        // merely better-shaped.
+        let _ = self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_guardian_branches_branch ON guardian_branches(branch)",
+            [],
+        );
+        // WS-D.2: the board's review lists filter guardians by status
+        // ("collecting", "merged", ...) and order them by creation time. The
+        // `(created_at_ms, id)` pair matches `reviews_for_squad`'s and the
+        // guardian index's `ORDER BY` exactly, so the sort can be satisfied by
+        // walking the index instead of building a temporary b-tree.
+        let _ = self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_guardians_status ON guardians(status)",
+            [],
+        );
+        let _ = self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_guardians_created ON guardians(created_at_ms, id)",
+            [],
+        );
+        // WS-D.2: three of `cartographer_events`' six indexes cover columns
+        // that are almost always NULL -- measured against the captured
+        // production database: `squad_id` 98.6% NULL, `cell_id` 99.0%,
+        // `task` 98.8%. SQLite indexes NULLs like any other value, so each of
+        // those three b-trees was being maintained on every single insert to
+        // serve roughly one row in a hundred. Cartographer writes are the
+        // daemon's highest-volume write by a wide margin, and index
+        // maintenance is what dominates their cost (2,308/sec against six
+        // indexes versus 12,466/sec with none).
+        //
+        // A partial index skips the NULL rows entirely. Nothing is lost:
+        // every query these serve is an equality match (`WHERE squad_id = ?`),
+        // which cannot match NULL, so SQLite still uses the partial index for
+        // exactly the lookups the full index served.
+        //
+        // Dropped and recreated rather than created `IF NOT EXISTS`: a
+        // database from before this change already has the full index under
+        // the old name, and `IF NOT EXISTS` would leave it in place.
+        for stmt in [
+            "DROP INDEX IF EXISTS idx_carto_squad",
+            "DROP INDEX IF EXISTS idx_carto_cell",
+            "DROP INDEX IF EXISTS idx_carto_task",
+            "CREATE INDEX IF NOT EXISTS idx_carto_squad_partial
+                 ON cartographer_events(squad_id) WHERE squad_id IS NOT NULL",
+            "CREATE INDEX IF NOT EXISTS idx_carto_cell_partial
+                 ON cartographer_events(cell_id) WHERE cell_id IS NOT NULL",
+            "CREATE INDEX IF NOT EXISTS idx_carto_task_partial
+                 ON cartographer_events(task) WHERE task IS NOT NULL",
+        ] {
+            let _ = self.conn.execute(stmt, []);
+        }
         // RAL-110: one-time backfill of the old `skip_checks` column (present on
         // any database created before this change) into both new columns --
         // preserving prior behavior exactly (skip_checks used to gate both the
@@ -3838,34 +3846,52 @@ impl Store {
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
+        let satisfied = Self::dependency_satisfying_squads(&self.conn)?;
         let mut ready = Vec::new();
         for (id, deps_json) in pending {
-            let deps = from_json(&deps_json);
-            if self.deps_satisfied(&deps)? {
+            let deps: Vec<String> = from_json(&deps_json);
+            if Self::deps_satisfied_in(&satisfied, &deps) {
                 ready.push(id);
             }
         }
         Ok(ready)
     }
 
-    /// Whether every cross-squad dependency reference points at a Done squad.
-    fn deps_satisfied(&self, deps: &[String]) -> Result<bool> {
-        for dep in deps {
-            let dep_squad = dep.split('/').next().unwrap_or(dep);
-            let state: Option<String> = self
-                .conn
-                .query_row(
-                    "SELECT state FROM squads WHERE id=?",
-                    params![dep_squad],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            match state.as_deref().and_then(SquadState::parse) {
-                Some(s) if s.satisfies_dependents() => {}
-                _ => return Ok(false),
+    /// Every squad id currently in a state that satisfies its dependents, in
+    /// one query.
+    ///
+    /// WS-D.7: the per-dependency `SELECT` this replaces was nested two loops
+    /// deep -- once per dependency, inside once per squad, inside `queue`
+    /// (polled by the board) and `list_ready` (polled by the scheduler). The
+    /// state of every squad fits comfortably in memory; re-querying it per
+    /// dependency reference did not.
+    ///
+    /// Filtering happens in Rust rather than as a SQL `IN (...)` so
+    /// [`SquadState::satisfies_dependents`] stays the single definition of
+    /// which states count.
+    fn dependency_satisfying_squads(conn: &Connection) -> Result<HashSet<String>> {
+        let mut stmt = conn.prepare("SELECT id, state FROM squads")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out = HashSet::new();
+        for row in rows {
+            let (id, state) = row?;
+            if SquadState::parse(&state).is_some_and(SquadState::satisfies_dependents) {
+                out.insert(id);
             }
         }
-        Ok(true)
+        Ok(out)
+    }
+
+    /// Whether every cross-squad dependency reference points at a squad whose
+    /// state satisfies dependents, given the set from
+    /// [`Self::dependency_satisfying_squads`].
+    ///
+    /// A reference is `squad-id` or `squad-id/task/cell`; only the squad part
+    /// gates today (path-precise gating is a later refinement). An unknown
+    /// squad id is unsatisfied, which is also what a missing row meant before.
+    fn deps_satisfied_in(satisfied: &HashSet<String>, deps: &[String]) -> bool {
+        deps.iter()
+            .all(|dep| satisfied.contains(dep.split('/').next().unwrap_or(dep)))
     }
 
     /// Count of currently running squads.
@@ -4436,12 +4462,39 @@ impl Store {
     /// of these reads must wrap them in a read transaction -- see
     /// [`Self::board_snapshot_conn`].
     pub(crate) fn list_squads_conn(conn: &Connection) -> Result<Vec<SquadView>> {
+        Self::list_squads_conn_limited(conn, None)
+    }
+
+    /// [`Self::list_squads_conn`] with an optional cap on how many squads are
+    /// hydrated (WS-D.3).
+    ///
+    /// The cost of this view is `1 + 8S` statements for `S` squads -- each one
+    /// pays `build_squad_view` for its tasks, cells and proofs -- so it grows
+    /// without bound as a project accumulates history, and the board was
+    /// re-fetching all of it. `None` preserves exactly the previous behavior,
+    /// which is what keeps this change internal: capping what the board
+    /// *displays* is a product decision (it currently shows all history
+    /// implicitly), so this adds the capability and leaves that call open.
+    ///
+    /// The cap is applied in SQL, not by truncating afterwards, so the
+    /// per-squad hydration is skipped rather than done and discarded.
+    pub(crate) fn list_squads_conn_limited(
+        conn: &Connection,
+        limit: Option<i64>,
+    ) -> Result<Vec<SquadView>> {
         // Tie-break on id so squads created within the same millisecond still order
         // deterministically. Squad ids are monotonic, zero-padded, fixed-width, so
         // lexicographic `id DESC` == newest-first.
-        let mut stmt = conn.prepare(
+        let sql = String::from(
             "SELECT id, label, state, created_at_ms, started_at_ms, finished_at_ms, env_overrides, error, submitter FROM squads ORDER BY created_at_ms DESC, id DESC",
-        )?;
+        );
+        // A non-positive limit would mean "no rows", which no caller wants and a
+        // typo could easily produce; treat it as unlimited.
+        let sql = match limit.filter(|n| *n > 0) {
+            Some(n) => format!("{sql} LIMIT {n}"),
+            None => sql,
+        };
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
             .query_map([], |r| {
                 Ok((
@@ -4670,20 +4723,34 @@ impl Store {
     /// review list has always included terminal (merged/deployed/cancelled)
     /// reviews too.
     fn reviews_for_squad(conn: &Connection, squad_id: &str) -> Result<Vec<SquadReviewRef>> {
+        // WS-D.1: the two ways a cell reaches a guardian are collected as a
+        // `UNION` of two separately index-driven subqueries, not as an `OR`
+        // inside one join condition.
+        //
+        // An `OR` spanning two different tables leaves SQLite no single index
+        // to drive the join from, so it fell back to pairing every guardian
+        // with every one of the squad's cells and evaluating the `EXISTS`
+        // per pair -- O(cells x guardians), which is why this was the
+        // costliest query on the board and why it got worse as a project
+        // accumulated reviews rather than staying flat.
+        //
+        // Each arm below seeks: the direct arm on `cells`' primary key
+        // (`squad_id`, ...) and then `idx_cells_review_guardian_id`, the
+        // branch-name arm on the same primary key and then
+        // `idx_guardian_branches_branch`. `UNION` also supplies the
+        // de-duplication the outer `DISTINCT` used to do.
         let mut stmt = conn.prepare(
-            "SELECT DISTINCT g.id, g.name, g.status, g.origin FROM guardians g
-             JOIN cells s ON (
-                 s.review_guardian_id = g.id
-                 OR (
-                     s.review_guardian_id IS NULL
-                     AND s.review_branch IS NOT NULL
-                     AND EXISTS (
-                         SELECT 1 FROM guardian_branches gb
-                         WHERE gb.guardian_id = g.id AND gb.branch = s.review_branch
-                     )
-                 )
+            "SELECT g.id, g.name, g.status, g.origin FROM guardians g
+             WHERE g.id IN (
+                 SELECT s.review_guardian_id FROM cells s
+                 WHERE s.squad_id = ?1 AND s.review_guardian_id IS NOT NULL
+                 UNION
+                 SELECT gb.guardian_id FROM cells s
+                 JOIN guardian_branches gb ON gb.branch = s.review_branch
+                 WHERE s.squad_id = ?1
+                   AND s.review_guardian_id IS NULL
+                   AND s.review_branch IS NOT NULL
              )
-             WHERE s.squad_id = ?
              ORDER BY g.created_at_ms, g.id",
         )?;
         let rows = stmt
@@ -5548,7 +5615,12 @@ impl Store {
 
     /// A project by its exact registered name, or `None` when absent.
     pub fn get_project(&self, name: &str) -> Result<Option<ProjectView>> {
-        self.conn
+        Self::get_project_conn(&self.conn, name)
+    }
+
+    /// [`Self::get_project`] against an explicit connection (WS-E.2).
+    pub(crate) fn get_project_conn(conn: &Connection, name: &str) -> Result<Option<ProjectView>> {
+        conn
             .query_row(
                 "SELECT name, description, path, clone_url, vcs, created_at_ms FROM projects WHERE name=?",
                 params![name],
@@ -5569,7 +5641,13 @@ impl Store {
 
     /// All registered projects, newest first.
     pub fn list_projects(&self) -> Result<Vec<ProjectView>> {
-        let mut stmt = self.conn.prepare(
+        Self::list_projects_conn(&self.conn)
+    }
+
+    /// [`Self::list_projects`] against an explicit connection, so the Projects
+    /// tab's poll runs on the read pool (WS-E.2).
+    pub(crate) fn list_projects_conn(conn: &Connection) -> Result<Vec<ProjectView>> {
+        let mut stmt = conn.prepare(
             "SELECT name, description, path, clone_url, vcs, created_at_ms FROM projects ORDER BY created_at_ms DESC, name",
         )?;
         let rows = stmt
@@ -6684,8 +6762,13 @@ impl Store {
 
     /// The cross-squad dependency references declared in the squad's `[[default]]`.
     pub fn squad_depends_on(&self, squad_id: &str) -> Result<Vec<String>> {
-        let s: Option<String> = self
-            .conn
+        Self::squad_depends_on_conn(&self.conn, squad_id)
+    }
+
+    /// [`Self::squad_depends_on`]'s query against an explicit connection, so
+    /// the pooled read path can reach it — see [`Self::queue_conn`].
+    pub(crate) fn squad_depends_on_conn(conn: &Connection, squad_id: &str) -> Result<Vec<String>> {
+        let s: Option<String> = conn
             .query_row(
                 "SELECT depends_on FROM squads WHERE id=?",
                 params![squad_id],
@@ -9490,8 +9573,8 @@ impl Store {
     /// as the owning `run_via_tmux` call returns, so memory stays bounded by
     /// *currently running* cells rather than growing across the daemon's
     /// lifetime.
-    pub fn note_live_activity(&mut self, session_name: &str, at_ms: i64) {
-        self.live_activity.insert(session_name.to_string(), at_ms);
+    pub fn note_live_activity(&self, session_name: &str, at_ms: i64) {
+        self.memory.note_live_activity(session_name, at_ms);
     }
 
     /// The last time [`Self::note_live_activity`] was called for
@@ -9499,7 +9582,7 @@ impl Store {
     /// has never produced pane growth (fresh cell, no output yet) or has
     /// already ended (see [`Self::clear_live_activity`]).
     pub fn live_activity_ms(&self, session_name: &str) -> Option<i64> {
-        self.live_activity.get(session_name).copied()
+        self.memory.live_activity_ms(session_name)
     }
 
     /// Drop the liveness entry for `session_name` once its owning
@@ -9507,8 +9590,8 @@ impl Store {
     /// reattach kill — see the call site's doc comment). Best-effort: a
     /// missing entry (cell never produced output, or was already
     /// cleared) is not an error.
-    pub fn clear_live_activity(&mut self, session_name: &str) {
-        self.live_activity.remove(session_name);
+    pub fn clear_live_activity(&self, session_name: &str) {
+        self.memory.clear_live_activity(session_name);
     }
 
     /// RAL-241: has a stall escalation already been enqueued for
@@ -9520,23 +9603,24 @@ impl Store {
     /// again, without needing an explicit "clear" between the two stalls.
     #[must_use]
     pub fn is_stall_escalated(&self, session_name: &str, last_activity_ms: i64) -> bool {
-        self.stall_escalated.get(session_name) == Some(&last_activity_ms)
+        self.memory
+            .is_stall_escalated(session_name, last_activity_ms)
     }
 
     /// Record that a stall escalation was just enqueued for `session_name`'s
     /// current stall onset (`last_activity_ms`), so
     /// [`Self::is_stall_escalated`] suppresses a repeat enqueue for the same
     /// ongoing stall.
-    pub fn note_stall_escalated(&mut self, session_name: &str, last_activity_ms: i64) {
-        self.stall_escalated
-            .insert(session_name.to_string(), last_activity_ms);
+    pub fn note_stall_escalated(&self, session_name: &str, last_activity_ms: i64) {
+        self.memory
+            .note_stall_escalated(session_name, last_activity_ms);
     }
 
     /// Drop the RAL-241 stall-escalation bookkeeping for `session_name`,
     /// mirroring [`Self::clear_live_activity`] — called from the same site,
     /// once the owning `run_via_tmux` call has a terminal result for good.
-    pub fn clear_stall_escalated(&mut self, session_name: &str) {
-        self.stall_escalated.remove(session_name);
+    pub fn clear_stall_escalated(&self, session_name: &str) {
+        self.memory.clear_stall_escalated(session_name);
     }
 
     /// RAL-208: request that guardian `id`'s LLM-authored final change
@@ -9554,16 +9638,9 @@ impl Store {
     /// git-log preliminary — there the branch set is unchanged but the summary
     /// has never been through the LLM at all, so the caller passes `force` to
     /// get the handoff it would otherwise be denied.
-    pub fn request_final_summary(&mut self, id: &str, signature: &str, now_ms: i64, force: bool) {
-        let d = self
-            .guardian_summary_debounce
-            .entry(id.to_string())
-            .or_default();
-        if !force && d.generated_signature.as_deref() == Some(signature) {
-            return;
-        }
-        d.pending_signature = Some(signature.to_string());
-        d.pending_requested_at_ms = Some(now_ms);
+    pub fn request_final_summary(&self, id: &str, signature: &str, now_ms: i64, force: bool) {
+        self.memory
+            .request_final_summary(id, signature, now_ms, force);
     }
 
     /// RAL-208: atomically claim every guardian whose pending
@@ -9573,23 +9650,12 @@ impl Store {
     /// claim. Returns `(guardian_id, signature)` pairs for the caller to
     /// actually generate (a background call, well outside this lock).
     pub fn take_due_final_summary_requests(
-        &mut self,
+        &self,
         now_ms: i64,
         debounce_ms: i64,
     ) -> Vec<(String, String)> {
-        let mut due = Vec::new();
-        for (id, d) in &mut self.guardian_summary_debounce {
-            let Some(requested_at) = d.pending_requested_at_ms else {
-                continue;
-            };
-            if now_ms.saturating_sub(requested_at) >= debounce_ms {
-                if let Some(sig) = d.pending_signature.take() {
-                    due.push((id.clone(), sig));
-                }
-                d.pending_requested_at_ms = None;
-            }
-        }
-        due
+        self.memory
+            .take_due_final_summary_requests(now_ms, debounce_ms)
     }
 
     /// Queue a guardian's PR stack for asynchronous submission, restarting
@@ -9630,12 +9696,8 @@ impl Store {
     /// RAL-208: record that guardian `id`'s change summary now reflects
     /// `signature`, so a later request for the same signature is recognized
     /// as already-satisfied (see [`Self::request_final_summary`]).
-    pub fn mark_final_summary_generated(&mut self, id: &str, signature: &str) {
-        let d = self
-            .guardian_summary_debounce
-            .entry(id.to_string())
-            .or_default();
-        d.generated_signature = Some(signature.to_string());
+    pub fn mark_final_summary_generated(&self, id: &str, signature: &str) {
+        self.memory.mark_final_summary_generated(id, signature);
     }
 
     /// RAL-303: claim the one repair attempt this daemon process gets at a
@@ -9649,16 +9711,8 @@ impl Store {
     /// summary it had at restart forever. This lets the review-maintenance
     /// sweep re-request exactly once rather than re-firing the LLM on every
     /// tick when generation is failing for some other reason.
-    pub fn claim_final_summary_repair(&mut self, id: &str) -> bool {
-        let d = self
-            .guardian_summary_debounce
-            .entry(id.to_string())
-            .or_default();
-        if d.repair_attempted || d.generated_signature.is_some() {
-            return false;
-        }
-        d.repair_attempted = true;
-        true
+    pub fn claim_final_summary_repair(&self, id: &str) -> bool {
+        self.memory.claim_final_summary_repair(id)
     }
 
     /// Fetch a task's first (lowest-`idx`) cell's cwd — the cwd a
@@ -9916,8 +9970,21 @@ impl Store {
     /// `pending`/`running` state. Ordered canonically by
     /// `(queue_rank NULLS LAST, squad created_at, task_idx, cells-before-proofs, idx)`.
     pub fn queue(&self) -> Result<Vec<QueueItem>> {
+        Self::queue_conn(&self.conn)
+    }
+
+    /// [`Self::queue`] against an explicit connection (WS-D.6).
+    ///
+    /// `GET /api/queue` is polled by the board and reads only — it has no
+    /// business waiting on the writer lock behind the scheduler and the
+    /// guardian-merge workers. Routed through
+    /// [`crate::server::Daemon::with_read_snapshot`], whose read transaction
+    /// supplies the atomicity the writer lock used to provide implicitly: this
+    /// view is built from several statements and a torn read across them would
+    /// show a cell as both blocked and ready.
+    pub(crate) fn queue_conn(conn: &Connection) -> Result<Vec<QueueItem>> {
         let squads: Vec<(String, Option<String>, String, i64)> = {
-            let mut stmt = self.conn.prepare(
+            let mut stmt = conn.prepare(
                 "SELECT id, label, state, created_at_ms FROM squads
                  WHERE state IN ('pending','running','queued') ORDER BY created_at_ms, id",
             )?;
@@ -9932,13 +9999,18 @@ impl Store {
             .collect::<std::result::Result<Vec<_>, _>>()?
         };
 
+        // Built once for the whole queue view rather than per squad's
+        // per-dependency lookup -- see `dependency_satisfying_squads`.
+        let satisfied = Self::dependency_satisfying_squads(conn)?;
         let mut out: Vec<QueueItem> = Vec::new();
         for (squad_id, squad_label, squad_state, squad_created) in squads {
-            self.queue_items_for_squad(
+            Self::queue_items_for_squad(
+                conn,
                 &squad_id,
                 squad_label.as_deref(),
                 &squad_state,
                 squad_created,
+                &satisfied,
                 &mut out,
             )?;
         }
@@ -9953,20 +10025,22 @@ impl Store {
     }
 
     fn queue_items_for_squad(
-        &self,
+        conn: &Connection,
         squad_id: &str,
         squad_label: Option<&str>,
         squad_state: &str,
         squad_created: i64,
+        satisfied: &HashSet<String>,
         out: &mut Vec<QueueItem>,
     ) -> Result<()> {
-        let cells = self.cells_of(squad_id)?;
-        let tasks = self.tasks_of(squad_id)?;
+        let cells = Self::cells_of_conn(conn, squad_id)?;
+        let tasks = Self::tasks_of_conn(conn, squad_id)?;
         let plan = match crate::plan::plan(&cells, &tasks) {
             Ok(p) => p,
             Err(_) => return Ok(()), // a cyclic squad cannot be queued
         };
-        let squad_deps_ok = self.deps_satisfied(&self.squad_depends_on(squad_id)?)?;
+        let squad_deps_ok =
+            Self::deps_satisfied_in(satisfied, &Self::squad_depends_on_conn(conn, squad_id)?);
 
         // Each task's declared `depends_on` (task names), for the header display.
         let task_deps: HashMap<i64, Vec<String>> = tasks
@@ -9987,7 +10061,7 @@ impl Store {
             rank: Option<f64>,
         }
         let smeta: HashMap<(i64, i64), SMeta> = {
-            let mut stmt = self.conn.prepare(
+            let mut stmt = conn.prepare(
                 "SELECT task_idx, idx, sid, name, state, queue_rank FROM cells WHERE squad_id=?",
             )?;
             stmt.query_map(params![squad_id], |r| {
@@ -10082,7 +10156,7 @@ impl Store {
 
         // ── proofs (cell-scope and task-scope) ──
         let proof_rows: Vec<ProofQueueRow> = {
-            let mut stmt = self.conn.prepare(
+            let mut stmt = conn.prepare(
                 "SELECT task_idx, scope, cell_idx, idx, vid, kind, state, queue_rank
                  FROM proofs WHERE squad_id=? ORDER BY task_idx, scope, cell_idx, idx",
             )?;
@@ -10632,6 +10706,264 @@ fn move_block(
 mod tests {
     use super::*;
 
+    /// WS-D.3: `list_squads` can be capped, and the cap keeps newest-first
+    /// order rather than returning an arbitrary slice.
+    ///
+    /// The uncapped call must stay uncapped: the board currently shows all
+    /// history implicitly, so changing that default is a product decision this
+    /// change deliberately does not make.
+    #[test]
+    fn list_squads_honours_an_optional_limit_and_stays_newest_first() {
+        let mut store = Store::open_in_memory().unwrap();
+        let file = parse(SAMPLE);
+        let mut ids = Vec::new();
+        for _ in 0..5 {
+            ids.push(store.insert_squad(&file, None, false).unwrap());
+        }
+
+        let all = Store::list_squads_conn(&store.conn).unwrap();
+        assert_eq!(all.len(), 5, "the default must not be capped");
+        // Newest first: ids are monotonic, so the last inserted leads.
+        assert_eq!(all[0].id, *ids.last().unwrap());
+
+        let capped = Store::list_squads_conn_limited(&store.conn, Some(2)).unwrap();
+        assert_eq!(capped.len(), 2);
+        assert_eq!(
+            capped.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
+            all.iter().take(2).map(|s| s.id.clone()).collect::<Vec<_>>(),
+            "the cap must take the newest squads, not an arbitrary two"
+        );
+
+        // A limit at or above the row count is the same as no limit.
+        assert_eq!(
+            Store::list_squads_conn_limited(&store.conn, Some(99))
+                .unwrap()
+                .len(),
+            5
+        );
+        // A nonsensical limit means unlimited, not zero rows -- a `0` reaching
+        // here from a typo should not silently blank the board.
+        assert_eq!(
+            Store::list_squads_conn_limited(&store.conn, Some(0))
+                .unwrap()
+                .len(),
+            5
+        );
+        assert_eq!(
+            Store::list_squads_conn_limited(&store.conn, Some(-1))
+                .unwrap()
+                .len(),
+            5
+        );
+    }
+
+    /// WS-D.1/M13: `reviews_for_squad` must reach its guardians by index seek,
+    /// never by scanning the `guardians` table.
+    ///
+    /// The shape this guards against is the one it replaced: an `OR` spanning
+    /// `cells.review_guardian_id` and a `guardian_branches` subquery gave
+    /// SQLite no index to drive the join from, so it scanned every guardian and
+    /// evaluated a correlated subquery per (guardian, cell) pair. That is
+    /// O(cells x guardians), and it degrades as a project accumulates reviews
+    /// rather than staying flat -- the "it has always been getting slower"
+    /// mechanism. A plan assertion catches a regression here that a timing
+    /// assertion on a small test database never would.
+    #[test]
+    fn reviews_for_squad_reaches_guardians_by_index_seek() {
+        let store = Store::open_in_memory().unwrap();
+        let plan: Vec<String> = {
+            let mut stmt = store
+                .conn
+                .prepare(
+                    "EXPLAIN QUERY PLAN
+                     SELECT g.id, g.name, g.status, g.origin FROM guardians g
+                     WHERE g.id IN (
+                         SELECT s.review_guardian_id FROM cells s
+                         WHERE s.squad_id = ?1 AND s.review_guardian_id IS NOT NULL
+                         UNION
+                         SELECT gb.guardian_id FROM cells s
+                         JOIN guardian_branches gb ON gb.branch = s.review_branch
+                         WHERE s.squad_id = ?1
+                           AND s.review_guardian_id IS NULL
+                           AND s.review_branch IS NOT NULL
+                     )
+                     ORDER BY g.created_at_ms, g.id",
+                )
+                .expect("prepare plan query");
+            stmt.query_map(params!["squad-000000000001"], |r| r.get::<_, String>(3))
+                .expect("run plan query")
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .expect("collect plan")
+        };
+        let plan_text = plan.join(
+            "
+",
+        );
+
+        assert!(
+            !plan_text.contains("SCAN g"),
+            "the guardians table is being scanned:
+{plan_text}"
+        );
+        assert!(
+            plan_text.contains("SEARCH g USING"),
+            "guardians are not reached by index seek:
+{plan_text}"
+        );
+        // Both arms of the `UNION` must seek too, or the rewrite only moved
+        // the scan somewhere less visible.
+        assert!(
+            plan_text.contains("SEARCH gb USING INDEX idx_guardian_branches_branch"),
+            "the branch-name arm is not using idx_guardian_branches_branch --              without it this query has no index on `guardian_branches.branch`              to seek, since the table's primary key starts with guardian_id:
+{plan_text}"
+        );
+        assert!(
+            !plan_text.contains("SCAN s"),
+            "a cells scan is present; the squad_id seek was lost:
+{plan_text}"
+        );
+    }
+
+    /// WS-D.2: the Cartographer indexes on the near-always-NULL columns are
+    /// partial, and an equality lookup still uses them.
+    ///
+    /// The second half is the part worth asserting: a partial index is only a
+    /// free win if the planner still picks it. `WHERE squad_id = ?` cannot
+    /// match NULL, so it is covered by `WHERE squad_id IS NOT NULL` -- but
+    /// that is a property of SQLite's planner, not something the schema
+    /// states, so it is checked rather than assumed.
+    #[test]
+    fn cartographer_null_heavy_indexes_are_partial_and_still_used() {
+        let store = Store::open_in_memory().unwrap();
+
+        let partial_sql: Vec<String> = {
+            let mut stmt = store
+                .conn
+                .prepare(
+                    "SELECT sql FROM sqlite_master
+                     WHERE type='index' AND tbl_name='cartographer_events'
+                       AND name LIKE '%_partial'",
+                )
+                .expect("prepare index query");
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .expect("run index query")
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .expect("collect index sql")
+        };
+        assert_eq!(
+            partial_sql.len(),
+            3,
+            "expected partial indexes on squad_id, cell_id and task: {partial_sql:?}"
+        );
+        for sql in &partial_sql {
+            assert!(
+                sql.contains("IS NOT NULL"),
+                "index is not actually partial: {sql}"
+            );
+        }
+        // The full-index names must be gone, or an upgraded database keeps
+        // paying for both.
+        for stale in ["idx_carto_squad", "idx_carto_cell", "idx_carto_task"] {
+            let count: i64 = store
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?",
+                    params![stale],
+                    |r| r.get(0),
+                )
+                .expect("count stale index");
+            assert_eq!(count, 0, "the full index {stale} still exists");
+        }
+
+        let plan: String = store
+            .conn
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT id FROM cartographer_events WHERE squad_id = ?",
+                params!["squad-000000000001"],
+                |r| r.get(3),
+            )
+            .expect("plan the squad_id lookup");
+        assert!(
+            plan.contains("idx_carto_squad_partial"),
+            "an equality lookup on squad_id no longer uses the partial index: {plan}"
+        );
+    }
+
+    /// WS-C: the writer's performance PRAGMAs are actually set. Each of these
+    /// is per-connection, not stored in the database file, so a connection
+    /// opened without them looks identical on disk and only shows up as
+    /// unexplained latency -- worth asserting rather than trusting.
+    #[test]
+    fn writer_connection_applies_the_performance_pragmas() {
+        let dir = std::env::temp_dir().join(format!(
+            "ralphus-pragma-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let store = Store::open(&dir.join("tasks.db")).expect("open store");
+
+        let int_pragma = |name: &str| -> i64 {
+            store
+                .conn
+                .query_row(&format!("PRAGMA {name}"), [], |r| r.get(0))
+                .unwrap_or_else(|e| panic!("read PRAGMA {name}: {e}"))
+        };
+        // 1 == NORMAL. `FULL` (2, the SQLite default) fsyncs every commit and
+        // costs ~6x the write throughput -- see `apply_writer_pragmas`.
+        assert_eq!(int_pragma("synchronous"), 1, "synchronous is not NORMAL");
+        // 2 == MEMORY.
+        assert_eq!(int_pragma("temp_store"), 2, "temp_store is not MEMORY");
+        assert_eq!(
+            int_pragma("cache_size"),
+            -65_536,
+            "cache_size is not the 64 MiB negative-KiB form"
+        );
+        assert!(
+            int_pragma("mmap_size") > 0,
+            "mmap_size is off; reads pay a syscall and a copy per page"
+        );
+        let journal: String = store
+            .conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .expect("read journal_mode");
+        assert_eq!(
+            journal, "wal",
+            "WAL is what makes synchronous=NORMAL non-corrupting and pooled              reads concurrent"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same PRAGMAs on a pooled reader. A reader left at the 2 MB default
+    /// cache while the writer has 64 MB is a silent asymmetry that only
+    /// surfaces as slow pooled reads.
+    #[test]
+    fn pooled_readers_apply_the_shared_pragmas() {
+        let dir = std::env::temp_dir().join(format!(
+            "ralphus-pragma-pool-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let store = Store::open(&dir.join("tasks.db")).expect("open store");
+        let pool = store.read_pool();
+        let conn = pool.acquire().expect("pooled connection");
+        let cache: i64 = conn
+            .query_row("PRAGMA cache_size", [], |r| r.get(0))
+            .expect("read cache_size");
+        assert_eq!(cache, -65_536, "pooled reader cache_size was not applied");
+        let temp: i64 = conn
+            .query_row("PRAGMA temp_store", [], |r| r.get(0))
+            .expect("read temp_store");
+        assert_eq!(temp, 2, "pooled reader temp_store was not applied");
+        drop(conn);
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     const SAMPLE: &str = r#"
 [[task]]
 name = "build"
@@ -10813,13 +11145,7 @@ prompt = "legacy cell, no review_guardian_id"
         let store = Store {
             conn,
             event_bus: crate::events::EventBus::new(),
-            live_activity: HashMap::new(),
-            guardian_summary_debounce: HashMap::new(),
-            guardian_worktree_leases: HashMap::new(),
-            guardian_restack_requests: HashMap::new(),
-            guardian_restack_running: std::collections::HashSet::new(),
-            stall_escalated: HashMap::new(),
-            secret_env_names_cache: std::sync::RwLock::new(None),
+            memory: crate::store_memory::StoreMemory::new(),
             // These legacy-migration tests exercise `store.conn` directly
             // against a private (non-shared-cache) in-memory connection and
             // never touch the read pool, so an unrelated, freshly-named
@@ -10937,13 +11263,7 @@ prompt = "legacy cell, no review_guardian_id"
         let store = Store {
             conn,
             event_bus: crate::events::EventBus::new(),
-            live_activity: HashMap::new(),
-            guardian_summary_debounce: HashMap::new(),
-            guardian_worktree_leases: HashMap::new(),
-            guardian_restack_requests: HashMap::new(),
-            guardian_restack_running: std::collections::HashSet::new(),
-            stall_escalated: HashMap::new(),
-            secret_env_names_cache: std::sync::RwLock::new(None),
+            memory: crate::store_memory::StoreMemory::new(),
             // These legacy-migration tests exercise `store.conn` directly
             // against a private (non-shared-cache) in-memory connection and
             // never touch the read pool, so an unrelated, freshly-named
@@ -11034,13 +11354,7 @@ prompt = "legacy cell, no review_guardian_id"
         let store = Store {
             conn,
             event_bus: crate::events::EventBus::new(),
-            live_activity: HashMap::new(),
-            guardian_summary_debounce: HashMap::new(),
-            guardian_worktree_leases: HashMap::new(),
-            guardian_restack_requests: HashMap::new(),
-            guardian_restack_running: std::collections::HashSet::new(),
-            stall_escalated: HashMap::new(),
-            secret_env_names_cache: std::sync::RwLock::new(None),
+            memory: crate::store_memory::StoreMemory::new(),
             // These legacy-migration tests exercise `store.conn` directly
             // against a private (non-shared-cache) in-memory connection and
             // never touch the read pool, so an unrelated, freshly-named
@@ -11083,13 +11397,7 @@ prompt = "legacy cell, no review_guardian_id"
         let store = Store {
             conn,
             event_bus: crate::events::EventBus::new(),
-            live_activity: HashMap::new(),
-            guardian_summary_debounce: HashMap::new(),
-            guardian_worktree_leases: HashMap::new(),
-            guardian_restack_requests: HashMap::new(),
-            guardian_restack_running: std::collections::HashSet::new(),
-            stall_escalated: HashMap::new(),
-            secret_env_names_cache: std::sync::RwLock::new(None),
+            memory: crate::store_memory::StoreMemory::new(),
             // These legacy-migration tests exercise `store.conn` directly
             // against a private (non-shared-cache) in-memory connection and
             // never touch the read pool, so an unrelated, freshly-named
@@ -11160,13 +11468,7 @@ prompt = "legacy cell, no review_guardian_id"
         let store = Store {
             conn,
             event_bus: crate::events::EventBus::new(),
-            live_activity: HashMap::new(),
-            guardian_summary_debounce: HashMap::new(),
-            guardian_worktree_leases: HashMap::new(),
-            guardian_restack_requests: HashMap::new(),
-            guardian_restack_running: std::collections::HashSet::new(),
-            stall_escalated: HashMap::new(),
-            secret_env_names_cache: std::sync::RwLock::new(None),
+            memory: crate::store_memory::StoreMemory::new(),
             read_pool: crate::store_pool::ReadConnPool::open(&crate::store_pool::memory_location()),
         };
         store
@@ -15548,7 +15850,7 @@ command = "e"
 
     #[test]
     fn claim_final_summary_repair_fires_once_per_guardian() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         assert!(store.claim_final_summary_repair("g1"));
         assert!(!store.claim_final_summary_repair("g1"));
         // Independent per guardian.
@@ -15557,14 +15859,14 @@ command = "e"
 
     #[test]
     fn claim_final_summary_repair_declines_a_guardian_already_summarized() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         store.mark_final_summary_generated("g1", "sig-a");
         assert!(!store.claim_final_summary_repair("g1"));
     }
 
     #[test]
     fn request_final_summary_is_noop_when_signature_already_generated() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         store.mark_final_summary_generated("g1", "sig-a");
         // A rebuild that didn't change the enabled-branch set (a feedback
         // restack, a manual-push rebase, a base-branch shift) requests the
@@ -15583,7 +15885,7 @@ command = "e"
     /// deny it and the review would keep showing raw commit subjects forever.
     #[test]
     fn request_final_summary_forced_queues_even_for_an_already_generated_signature() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         store.mark_final_summary_generated("g1", "sig-a");
         store.request_final_summary("g1", "sig-a", 1_000, true);
         let due = store.take_due_final_summary_requests(1_000 + 60_000, 0);
@@ -15592,7 +15894,7 @@ command = "e"
 
     #[test]
     fn request_final_summary_queues_when_signature_differs_from_generated() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         store.mark_final_summary_generated("g1", "sig-a");
         store.request_final_summary("g1", "sig-b", 1_000, false);
         let due = store.take_due_final_summary_requests(1_000 + 5_000, 5_000);
@@ -15601,7 +15903,7 @@ command = "e"
 
     #[test]
     fn take_due_final_summary_requests_respects_debounce_window() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         store.request_final_summary("g1", "sig-a", 1_000, false);
         // Not due yet -- the quiet period hasn't elapsed.
         assert!(
@@ -15616,7 +15918,7 @@ command = "e"
 
     #[test]
     fn repeated_requests_restart_the_debounce_clock_and_only_the_latest_signature_survives() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         // Simulates rapid enable/disable toggling: each toggle rebuilds and
         // requests a different enabled-branch signature before the previous
         // request's debounce window has elapsed.
@@ -15639,7 +15941,7 @@ command = "e"
 
     #[test]
     fn take_due_final_summary_requests_clears_pending_so_it_is_claimed_once() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         store.request_final_summary("g1", "sig-a", 0, false);
         let first = store.take_due_final_summary_requests(10_000, 5_000);
         assert_eq!(first, vec![("g1".to_string(), "sig-a".to_string())]);
@@ -15654,6 +15956,32 @@ command = "e"
 
     fn any_guardian(store: &Store) -> String {
         store.create_guardian("r", "main", "/repo").unwrap()
+    }
+
+    #[test]
+    fn opening_a_file_store_caps_the_wal_size() {
+        // Must be an on-disk store: an in-memory database has no `-wal`
+        // sidecar for `journal_size_limit` to bound, so `open_in_memory` would
+        // prove nothing here.
+        let dir = std::env::temp_dir().join(format!("ralphus-wal-limit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let store = Store::open(&dir.join("tasks.db")).expect("open store");
+
+        let limit: i64 = store
+            .conn
+            .query_row("PRAGMA journal_size_limit", [], |row| row.get(0))
+            .expect("read journal_size_limit");
+
+        assert_eq!(
+            limit, WAL_SIZE_LIMIT_BYTES,
+            "a checkpoint must be able to truncate the WAL back down -- at the \
+             default of -1 it only resets the file for reuse, so the sidecar \
+             keeps its all-time high-water mark forever"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The board read no longer holds the writer lock, so a write *can* now
@@ -15779,7 +16107,7 @@ command = "e"
 
     #[test]
     fn guardian_restack_waits_for_all_parallel_branch_leases_and_coalesces() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         assert!(store.try_acquire_guardian_worktree_lease("g", "a", "feedback:a"));
         assert!(store.try_acquire_guardian_worktree_lease("g", "b", "feedback:b"));
         store.request_guardian_restack("g", 4);
@@ -15798,7 +16126,7 @@ command = "e"
 
     #[test]
     fn guardian_distinct_branch_feedback_leases_are_concurrent() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         assert!(store.try_acquire_guardian_worktree_lease("g", "a", "feedback:a"));
         assert!(store.try_acquire_guardian_worktree_lease("g", "b", "feedback:b"));
         assert!(!store.try_acquire_guardian_worktree_lease("g", "a", "feedback:a2"));
