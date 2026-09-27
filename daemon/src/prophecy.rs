@@ -290,6 +290,62 @@ impl Store {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows.into_iter().map(ProphecyView::from).collect())
     }
+
+    /// Every not-yet-published prophecy that belongs to `guardian_id`'s
+    /// review, oldest first -- backs phase 4's PR-body fold-in (§8.1 of
+    /// docs/prophecy-design.md). "Belongs to" is the union of two sources,
+    /// matching §3's "whole review stack" reach:
+    ///
+    /// - Daemon-side writes stamped directly with this guardian id (e.g.
+    ///   `guardian_merge.rs`'s conflict-resolution decisions).
+    /// - Cell-authored prophecies, resolved via `cells.review_guardian_id`
+    ///   (RAL-314: recorded at submit time) -- the same join `crate::store`
+    ///   already uses to resolve which cells belong to which review.
+    ///
+    /// Filtered to `published_at_ms IS NULL` so a resubmit's PR body doesn't
+    /// repeat a prophecy already folded into an earlier open PR.
+    pub fn list_unpublished_prophecies_for_guardian(
+        &self,
+        guardian_id: &str,
+    ) -> Result<Vec<ProphecyView>> {
+        let mut direct = self.list_prophecies(&ProphecyFilter {
+            guardian_id: Some(guardian_id.to_string()),
+            limit: 10000,
+            ..ProphecyFilter::default()
+        })?;
+        let mut cell_uri_stmt = self
+            .conn
+            .prepare("SELECT squad_id, task_idx, idx FROM cells WHERE review_guardian_id=?")?;
+        let cell_uris: Vec<String> = cell_uri_stmt
+            .query_map(params![guardian_id], |r| {
+                let squad_id: String = r.get(0)?;
+                let task_idx: i64 = r.get(1)?;
+                let idx: i64 = r.get(2)?;
+                Ok(crate::ghost::cell_uri(&squad_id, task_idx, idx))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for uri in cell_uris {
+            direct.extend(self.list_prophecies_for_entity(&uri)?);
+        }
+        direct.retain(|p| p.published_at_ms.is_none());
+        direct.sort_by_key(|p| p.created_at_ms);
+        Ok(direct)
+    }
+
+    /// Stamp every prophecy in `ids` as published into `pr_id`, so a later
+    /// resubmit's [`Self::list_unpublished_prophecies_for_guardian`] call
+    /// does not repeat them (§8.1). Best-effort per row -- a single bad id
+    /// (there should never be one) does not abort the rest.
+    pub fn mark_prophecies_published(&self, ids: &[i64], pr_id: &str) -> Result<()> {
+        let now = now_ms();
+        for id in ids {
+            self.conn.execute(
+                "UPDATE prophecies SET published_at_ms=?, pr_id=? WHERE id=?",
+                params![now, pr_id, id],
+            )?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -442,6 +498,105 @@ mod tests {
             .unwrap();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].body, "took ours");
+    }
+
+    #[test]
+    fn list_unpublished_prophecies_for_guardian_unions_direct_and_cell_authored() {
+        let s = store();
+        seed_squad(&s, "squad-1");
+        seed_guardian(&s, "guardian-1");
+        // Daemon-side write, stamped directly with the guardian id.
+        s.add_prophecy(
+            "guardian:guardian-1",
+            0,
+            ProphecyKind::Decision,
+            "took ours",
+            None,
+            None,
+            Some("guardian-1"),
+        )
+        .unwrap();
+        // Cell-authored write: the cell's review membership (RAL-314)
+        // resolves to this guardian.
+        s.add_prophecy(
+            "cell:squad-1:0:0",
+            0,
+            ProphecyKind::Hazard,
+            "left something behind",
+            None,
+            Some("squad-1"),
+            None,
+        )
+        .unwrap();
+        s.conn
+            .execute(
+                "INSERT INTO cells(squad_id, task_idx, idx, sid, agent, state, review_guardian_id)
+                 VALUES (?,?,?,?,?,?,?)",
+                params![
+                    "squad-1",
+                    0i64,
+                    0i64,
+                    "sid-1",
+                    "claude",
+                    "done",
+                    "guardian-1"
+                ],
+            )
+            .unwrap();
+
+        let unioned = s
+            .list_unpublished_prophecies_for_guardian("guardian-1")
+            .unwrap();
+        assert_eq!(unioned.len(), 2);
+        let bodies: Vec<&str> = unioned.iter().map(|p| p.body.as_str()).collect();
+        assert!(bodies.contains(&"took ours"));
+        assert!(bodies.contains(&"left something behind"));
+    }
+
+    #[test]
+    fn list_unpublished_prophecies_for_guardian_excludes_already_published() {
+        let s = store();
+        seed_guardian(&s, "guardian-1");
+        let p = s
+            .add_prophecy(
+                "guardian:guardian-1",
+                0,
+                ProphecyKind::Decision,
+                "took ours",
+                None,
+                None,
+                Some("guardian-1"),
+            )
+            .unwrap();
+        s.mark_prophecies_published(&[p.id], "pr-1").unwrap();
+        let unioned = s
+            .list_unpublished_prophecies_for_guardian("guardian-1")
+            .unwrap();
+        assert!(
+            unioned.is_empty(),
+            "a resubmit must not repeat an already-published prophecy"
+        );
+    }
+
+    #[test]
+    fn mark_prophecies_published_stamps_pr_id_and_timestamp() {
+        let s = store();
+        seed_guardian(&s, "guardian-1");
+        let p = s
+            .add_prophecy(
+                "guardian:guardian-1",
+                0,
+                ProphecyKind::Decision,
+                "took ours",
+                None,
+                None,
+                Some("guardian-1"),
+            )
+            .unwrap();
+        s.mark_prophecies_published(&[p.id], "pr-42").unwrap();
+        let fetched = s.get_prophecy(p.id).unwrap().unwrap();
+        assert_eq!(fetched.pr_id.as_deref(), Some("pr-42"));
+        assert!(fetched.published_at_ms.is_some());
     }
 
     #[test]

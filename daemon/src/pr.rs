@@ -1968,6 +1968,25 @@ fn resolve_title_description(
     )
 }
 
+/// Renders prophecies as a deterministic details block for the end of a PR
+/// description. It is appended after any synthesized description so agent
+/// notes reach reviewers without another model rewriting them.
+fn format_prophecy_details_block(prophecies: &[crate::prophecy::ProphecyView]) -> Option<String> {
+    if prophecies.is_empty() {
+        return None;
+    }
+    let count = prophecies.len();
+    let items = prophecies
+        .iter()
+        .map(|prophecy| format!("- **{}** — {}", prophecy.kind, prophecy.body))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let noun = if count == 1 { "insight" } else { "insights" };
+    Some(format!(
+        "<details>\n<summary>Prophecies ({count} {noun} recorded while this was built)</summary>\n\n{items}\n\n</details>"
+    ))
+}
+
 /// Currently open PR alias for each stacked branch that has one, keyed by
 /// branch id -- when a branch has more than one historical PR row (e.g. a
 /// resubmission), the most recently created still-open one wins. A small
@@ -6015,6 +6034,10 @@ fn submit_stacked_branch_pr(
     // filter (see `find_open_pull_request`'s doc for why this is a
     // structured query, never a parse of the creation error's free-text
     // message) and adopt what's already there instead of failing.
+    let unpublished_prophecies = store
+        .lock()
+        .list_unpublished_prophecies_for_guardian(id)
+        .unwrap_or_default();
     let (created_pr, base, title, description, adopted) =
         match route.find_existing_pull_request()? {
             Some(existing) => {
@@ -6065,6 +6088,10 @@ fn submit_stacked_branch_pr(
                     &route.client,
                     trace_context,
                 );
+                let description = match format_prophecy_details_block(&unpublished_prophecies) {
+                    Some(block) => format!("{description}\n\n{block}"),
+                    None => description,
+                };
                 let created = route.create_pull_request(&title, &description, draft)?;
                 (created, base, title, description, false)
             }
@@ -6087,6 +6114,13 @@ fn submit_stacked_branch_pr(
             "parent",
         )
         .map_err(|e| e.to_string())?;
+    if !unpublished_prophecies.is_empty() {
+        let ids = unpublished_prophecies
+            .iter()
+            .map(|prophecy| prophecy.id)
+            .collect::<Vec<_>>();
+        let _ = store.lock().mark_prophecies_published(&ids, &row_id);
+    }
     if let Some(sha) = &pushed_sha {
         let _ = store.lock().update_pull_request_ex(
             &row_id,

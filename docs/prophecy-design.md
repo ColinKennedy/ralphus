@@ -398,10 +398,23 @@ model against real traffic before any prompt work exists.
 
 ### Phase 4 — fold into the PR
 
-- [ ] Deterministic `<details>` block after the synthesized description (§8.1)
-- [ ] `published_at_ms` / `pr_id` so a resubmit does not duplicate
-- [ ] `Ralphus-Cell:` trailer on the existing RAL-445 hook (§8.2) — **blocked
-      on the two gaps in §13**
+- [x] Deterministic `<details>` block after the synthesized description
+      (§8.1) — `pr.rs::format_prophecy_details_block`, appended in
+      `submit_stacked_branch_pr` after `resolve_title_description` returns,
+      never passed back through the synthesis LLM call
+- [x] `published_at_ms` / `pr_id` so a resubmit does not duplicate —
+      `Store::list_unpublished_prophecies_for_guardian` (union of
+      guardian-stamped + cell-authored, via `cells.review_guardian_id`,
+      RAL-314) feeds the block, `Store::mark_prophecies_published` stamps
+      the ones actually folded in right after the PR row is created
+- [ ] `Ralphus-Cell:` trailer on the existing RAL-445 hook (§8.2) — **still
+      blocked**, but not on "the two gaps in §13" as originally framed: §13's
+      re-investigation found RAL-445's hook infrastructure
+      (`git_hooks.rs`/`sync_coauthor_hook`/`prepare-commit-msg`) does not
+      exist in this codebase at all. There is no existing hook to add a
+      second `--trailer` flag to. Building one from scratch is a
+      differently-shaped, RAL-445-sized task of its own, out of scope here —
+      not attempted under this phase's much narrower framing.
 
 ### Phase 5 — derive the ghost (optional)
 
