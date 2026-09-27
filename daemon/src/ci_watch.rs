@@ -625,14 +625,46 @@ pub fn poll_open_pr_ci_status(
         }
         last.insert(guardian_id.to_string(), now);
     }
-    let Ok(guardian) = store.lock().get_guardian(guardian_id) else {
-        return;
+    // A store read failing here silently skips this review's whole CI/auto-fix
+    // pass, and the throttle above has already consumed this interval's slot --
+    // so nothing retries for another STANDING_POLL_INTERVAL. Say so rather than
+    // letting "auto-fix never ran" look like "CI never failed".
+    // Both results are bound before their `match` -- a `MutexGuard` temporary in
+    // a scrutinee lives for the whole `match`, arms included, and the error arms
+    // below log through `store.lock()`. Same hazard `ensure_review_upstream_branch`
+    // documents in `pr.rs`.
+    let loaded = store.lock().get_guardian(guardian_id);
+    let guardian = match loaded {
+        Ok(guardian) => guardian,
+        Err(error) => {
+            // ralphus[ignore-rlog-pair]: the store read that would carry the row is the one that just failed.
+            crate::rlog!(
+                WARNING,
+                "ralphus [ci-watch] review {guardian_id} standing poll skipped: could not load the review: {error}"
+            );
+            return;
+        }
     };
     if crate::guardian::GuardianStatus::is_terminal_status(&guardian.status) {
         return;
     }
-    let Ok(prs) = store.lock().list_pull_requests_for_guardian(guardian_id) else {
-        return;
+    let listed = store.lock().list_pull_requests_for_guardian(guardian_id);
+    let prs = match listed {
+        Ok(prs) => prs,
+        Err(error) => {
+            log_ci_watch(
+                store,
+                guardian_id,
+                "",
+                LogLevel::WARNING,
+                format!(
+                    "ralphus [ci-watch] review {guardian_id} standing poll skipped: could not list \
+                     this review's pull requests: {error}"
+                ),
+                serde_json::json!({"outcome": "skipped_pr_list_failed", "error": error.to_string()}),
+            );
+            return;
+        }
     };
     let open: Vec<PullRequestView> = prs
         .into_iter()
@@ -727,6 +759,31 @@ pub fn poll_open_pr_ci_status(
                 &decision.pr.repo,
                 guardian.owner.as_deref(),
             ) else {
+                // Every other outcome in this loop records why it did not fix
+                // the PR. This one abandoned a dispatch the planner had already
+                // decided to make, so it is the one most worth saying out loud:
+                // the review looks like auto-fix is on and simply never ran.
+                log_ci_watch(
+                    store,
+                    guardian_id,
+                    decision.pr.branch_id.as_deref().unwrap_or(""),
+                    LogLevel::WARNING,
+                    format!(
+                        "ralphus [ci-watch] review {guardian_id} pr #{} auto-fix skipped: no forge \
+                         client could be resolved for repo {} -- check this project's clone_url and \
+                         fork routing",
+                        decision.pr.pr_number.unwrap_or_default(),
+                        decision.pr.repo
+                    ),
+                    serde_json::json!({
+                        "pr_number": decision.pr.pr_number,
+                        "repo": decision.pr.repo,
+                        "outcome": "skipped_no_forge_client",
+                    }),
+                );
+                let _ = store
+                    .lock()
+                    .set_pr_auto_fix_outcome(&decision.pr.id, "skipped_no_forge_client");
                 continue;
             };
             dispatch_pr_auto_fix(

@@ -3958,6 +3958,49 @@ pub(crate) fn kickoff_merge(
     Ok(StartMergeOutcome::Merging)
 }
 
+/// Report a review/branch state write that the store refused.
+///
+/// Merge-path state writes are `let _ = ...` throughout, on the reasoning that
+/// a bookkeeping hiccup must not abort a rebase. The cost is that a *failed*
+/// write leaves the board rendering the previous state with nothing saying the
+/// daemon tried and could not change it -- indistinguishable from the daemon
+/// never having tried. This makes that difference visible.
+///
+/// The Cartographer row is itself a store write and may well fail for the same
+/// reason the caller's did; the stderr line is the one that always lands.
+fn report_state_write_failure(
+    store: &crate::store_lock::StoreHandle,
+    id: &str,
+    what: &str,
+    error: &str,
+) {
+    // ralphus[ignore-rlog-pair]: paired with the cartographer_log below.
+    crate::rlog!(
+        WARNING,
+        "ralphus [guardian] review {id} could not record {what}: {error}"
+    );
+    let guard = store.lock();
+    let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+        level: crate::logging::LogLevel::WARNING,
+        source: "guardian",
+        message: "state write failed",
+        scope: Some("guardian"),
+        squad_id: None,
+        guardian_id: Some(id),
+        cell_id: None,
+        task: None,
+        log_path: None,
+        payload: serde_json::json!({
+            "what": what,
+            "error": error,
+            "remediation": "the board is showing the previous state for this field because the \
+                            write was rejected; re-run the action, and check the daemon log for a \
+                            SQLite error behind it",
+        }),
+        admin_only: false,
+    });
+}
+
 /// How long a merge worker may wait for a slot on the global concurrency
 /// semaphore before the wait itself is reported.
 ///
@@ -4690,7 +4733,16 @@ pub fn run_merge_staged(
     let _git_operation =
         git_review_operation_guard(Path::new(&guardian.git_root), guardian.machine.as_deref());
     let set_status = |s: GuardianStatus, detail: Option<&str>| {
-        let _ = store.lock().set_guardian_status(id, s, detail);
+        // Bound before the `if` so the guard is gone before the reporter relocks.
+        let written = store.lock().set_guardian_status(id, s, detail);
+        if let Err(error) = written {
+            report_state_write_failure(
+                store,
+                id,
+                &format!("review status → {}", s.as_str()),
+                &error.to_string(),
+            );
+        }
     };
     let resolved = match resolve_resolver_agent(
         guardian.resolver_agent.as_deref(),
@@ -4894,7 +4946,16 @@ fn staged_merge_pass(
     }
 
     let set_status = |s: GuardianStatus, d: Option<&str>| {
-        let _ = store.lock().set_guardian_status(id, s, d);
+        // Bound before the `if` so the guard is gone before the reporter relocks.
+        let written = store.lock().set_guardian_status(id, s, d);
+        if let Err(error) = written {
+            report_state_write_failure(
+                store,
+                id,
+                &format!("review status → {}", s.as_str()),
+                &error.to_string(),
+            );
+        }
     };
 
     // Resolve every project's base commit up front; if any base is unresolvable
@@ -5415,7 +5476,16 @@ pub fn run_merge_cancellable(
     }
 
     let set_status = |s: GuardianStatus, detail: Option<&str>| {
-        let _ = store.lock().set_guardian_status(id, s, detail);
+        // Bound before the `if` so the guard is gone before the reporter relocks.
+        let written = store.lock().set_guardian_status(id, s, detail);
+        if let Err(error) = written {
+            report_state_write_failure(
+                store,
+                id,
+                &format!("review status → {}", s.as_str()),
+                &error.to_string(),
+            );
+        }
     };
     let resolved = match resolve_resolver_agent(
         guardian.resolver_agent.as_deref(),
@@ -6547,7 +6617,16 @@ pub fn run_feedback(
     }
 
     let set_status = |s: GuardianStatus, detail: Option<&str>| {
-        let _ = store.lock().set_guardian_status(id, s, detail);
+        // Bound before the `if` so the guard is gone before the reporter relocks.
+        let written = store.lock().set_guardian_status(id, s, detail);
+        if let Err(error) = written {
+            report_state_write_failure(
+                store,
+                id,
+                &format!("review status → {}", s.as_str()),
+                &error.to_string(),
+            );
+        }
     };
 
     // Resolve this branch's effective project root (RAL-29: may differ from primary).
@@ -7400,7 +7479,16 @@ pub fn pull_pr_commits(
     }
 
     let set_status = |s: GuardianStatus, detail: Option<&str>| {
-        let _ = store.lock().set_guardian_status(id, s, detail);
+        // Bound before the `if` so the guard is gone before the reporter relocks.
+        let written = store.lock().set_guardian_status(id, s, detail);
+        if let Err(error) = written {
+            report_state_write_failure(
+                store,
+                id,
+                &format!("review status → {}", s.as_str()),
+                &error.to_string(),
+            );
+        }
     };
     let final_branch_id: Option<String> = guardian
         .branches
@@ -7919,7 +8007,16 @@ pub(crate) fn restack_stack_from(
     let git_root = Workspace::for_guardian(store, id, PathBuf::from(&guardian.git_root));
     let wt_base = git_root.at(worktree_dir(&guardian.git_root, id));
     let set_status = |s: GuardianStatus, d: Option<&str>| {
-        let _ = store.lock().set_guardian_status(id, s, d);
+        // Bound before the `if` so the guard is gone before the reporter relocks.
+        let written = store.lock().set_guardian_status(id, s, d);
+        if let Err(error) = written {
+            report_state_write_failure(
+                store,
+                id,
+                &format!("review status → {}", s.as_str()),
+                &error.to_string(),
+            );
+        }
     };
     restack_from_position(
         store,
@@ -8541,7 +8638,16 @@ fn stack_pick(
     cancel: &CancelToken,
 ) -> std::result::Result<(), ()> {
     let set_status = |s: GuardianStatus, d: Option<&str>| {
-        let _ = store.lock().set_guardian_status(id, s, d);
+        // Bound before the `if` so the guard is gone before the reporter relocks.
+        let written = store.lock().set_guardian_status(id, s, d);
+        if let Err(error) = written {
+            report_state_write_failure(
+                store,
+                id,
+                &format!("review status → {}", s.as_str()),
+                &error.to_string(),
+            );
+        }
     };
     match drive_rebase(
         store,
@@ -10141,9 +10247,19 @@ fn fail_branch<F: Fn(GuardianStatus, Option<&str>)>(
     err: &str,
     set_status: &F,
 ) {
-    let _ = store
+    let written = store
         .lock()
         .set_branch_status(id, branch_id, MergeStatus::Failed, Some(err));
+    if let Err(error) = written {
+        // Without this the branch keeps its previous status while the review
+        // goes MergeFailed -- a mismatch on the board with no explanation.
+        report_state_write_failure(
+            store,
+            id,
+            &format!("branch {branch} → failed"),
+            &error.to_string(),
+        );
+    }
     set_status(
         GuardianStatus::MergeFailed,
         Some(&format!("branch {branch}: {err}")),
