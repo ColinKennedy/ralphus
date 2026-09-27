@@ -932,6 +932,23 @@ pub struct RunnerResult {
     /// `ralphus_core::thrash`.
     #[serde(default)]
     pub retry_after_secs: Option<u64>,
+    /// Every `RALPHUS_PROPHECY:` marker the runner found in the agent's
+    /// final reply (`docs/prophecy-design.md` phase 2) -- the at-exit
+    /// backstop transport, mirroring how `ghost` already crosses the
+    /// provider boundary inside this same `exec` reply. Empty for command
+    /// cells, proof steps, or when the agent reported no prophecies.
+    #[serde(default)]
+    pub prophecies: Vec<RunnerProphecyMarker>,
+}
+
+/// Wire shape of one prophecy marker in a [`RunnerResult`], mirroring
+/// `ralphus-runner`'s own `prophecy::ProphecyMarker` -- duplicated rather
+/// than shared as a type since the daemon has no compile-time dependency on
+/// the runner crate (it's a separate subprocess, JSON-only contract).
+#[derive(Debug, Clone, Deserialize)]
+pub struct RunnerProphecyMarker {
+    pub kind: String,
+    pub body: String,
 }
 
 impl RunnerResult {
@@ -955,6 +972,7 @@ impl RunnerResult {
             turns: None,
             ghost: None,
             retry_after_secs: None,
+            prophecies: Vec::new(),
         }
     }
 
@@ -994,6 +1012,7 @@ impl RunnerResult {
             turns: Some(usage.turns),
             ghost: None,
             retry_after_secs: None,
+            prophecies: Vec::new(),
         }
     }
 
@@ -1026,6 +1045,7 @@ impl RunnerResult {
             turns: Some(usage.turns),
             ghost: None,
             retry_after_secs: None,
+            prophecies: Vec::new(),
         }
     }
 
@@ -1057,6 +1077,7 @@ impl RunnerResult {
             turns: Some(usage.turns),
             ghost: None,
             retry_after_secs: None,
+            prophecies: Vec::new(),
         }
     }
 
@@ -1109,6 +1130,7 @@ impl RunnerResult {
             retry_after_secs: Some(ralphus_core::rate_limit::clamp_retry_after_secs(
                 retry_after_secs,
             )),
+            prophecies: Vec::new(),
         }
     }
 
@@ -3787,6 +3809,7 @@ mod tests {
             ghost: None,
             turns: None,
             retry_after_secs: None,
+            prophecies: Vec::new(),
         };
         assert!(r.proof_passed());
 

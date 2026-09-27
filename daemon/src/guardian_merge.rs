@@ -351,6 +351,7 @@ fn run_agent_with_rate_limit_retry(
                 turns: total_turns,
                 ghost: None,
                 retry_after_secs: None,
+                prophecies: Vec::new(),
             };
         }
         retries += 1;
@@ -12584,6 +12585,7 @@ mod tests {
             agent_session_id: None,
             ghost: None,
             turns: None,
+            prophecies: Vec::new(),
         }
     }
 
@@ -12761,6 +12763,7 @@ mod tests {
                 agent_session_id: None,
                 turns: None,
                 ghost: None,
+                prophecies: Vec::new(),
             }
         }
     }
@@ -15949,6 +15952,7 @@ mod tests {
                 agent_session_id: None,
                 ghost: None,
                 turns: None,
+                prophecies: Vec::new(),
             }
         }
     }
@@ -16344,6 +16348,35 @@ mod tests {
     /// auto_build` default when both are configured. The project default is
     /// set to a command that would fail, so if it ran instead of the
     /// review-declared one, this test would fail.
+    /// A resolver-agent stand-in that returns a fixed manual-commands/
+    /// build-command JSON response instead of actually calling an LLM.
+    struct FixedManualCommandsRunner(String);
+    impl Runner for FixedManualCommandsRunner {
+        fn run(&self, _spec: &RunnerSpec) -> RunnerResult {
+            RunnerResult {
+                status: "done".to_string(),
+                tokens_in: 0,
+                tokens_out: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+                cost_usd: 0.0,
+                cost_is_estimated: false,
+                summary: self.0.clone(),
+                error: None,
+                proofed: None,
+                agent_session_id: None,
+                ghost: None,
+                prophecies: Vec::new(),
+            }
+        }
+    }
+
+    /// RAL-313: `generate_manual_commands`'s AI-inferred build command runs
+    /// against the combined worktree under this review's own `build_env`,
+    /// same as `final_checks`'s check gates/project `auto_build`
+    /// (`final_checks_runs_check_gates_under_this_reviews_build_env_override`
+    /// above) -- the inferred build command below fails unless the
+    /// overridden variable is actually present in its process environment.
     #[test]
     fn final_checks_prefers_review_declared_auto_build_over_project_default() {
         let (base, repo, _fwt) = make_repo("finalchecks-review-autobuild-precedence");

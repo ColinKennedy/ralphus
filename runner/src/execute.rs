@@ -491,6 +491,7 @@ fn run_with_backend(
                     ghost: None,
                     turns: total_turns,
                     retry_after_secs: None,
+                    prophecies: Vec::new(),
                 };
             }
             bg_nudge_attempt += 1;
@@ -552,6 +553,7 @@ fn run_with_backend(
                         ghost: None,
                         turns: total_turns,
                         retry_after_secs: None,
+                        prophecies: Vec::new(),
                     };
                 }
                 Err(e) => return CellResult::failed(e.to_string(), ""),
@@ -636,6 +638,7 @@ fn run_with_backend(
                     ghost: None,
                     turns: total_turns,
                     retry_after_secs: None,
+                    prophecies: Vec::new(),
                 };
             }
             return CellResult {
@@ -657,6 +660,7 @@ fn run_with_backend(
                 ghost: None,
                 turns: total_turns,
                 retry_after_secs: None,
+                prophecies: Vec::new(),
             };
         }
 
@@ -691,6 +695,7 @@ fn run_with_backend(
                 ghost: None,
                 turns: total_turns,
                 retry_after_secs: None,
+                prophecies: Vec::new(),
             };
         }
 
@@ -716,6 +721,7 @@ fn run_with_backend(
                 ghost: None,
                 turns: total_turns,
                 retry_after_secs: None,
+                prophecies: Vec::new(),
             };
         }
 
@@ -754,6 +760,7 @@ fn run_with_backend(
             ghost,
             turns: total_turns,
             retry_after_secs: None,
+            prophecies: crate::prophecy::parse_prophecies(&outcome.summary),
         };
     }
 
@@ -810,6 +817,7 @@ fn thrash_cell_result(
         turns: Some(turns),
         ghost: None,
         retry_after_secs: None,
+        prophecies: Vec::new(),
     }
 }
 

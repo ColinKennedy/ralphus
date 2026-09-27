@@ -359,13 +359,30 @@ model against real traffic before any prompt work exists.
 
 ### Phase 2 — transport
 
-- [ ] Scan the agent's streaming output for a standalone `RALPHUS_PROPHECY:`
+- [x] Scan the agent's final reply for every standalone `RALPHUS_PROPHECY:`
       line; match exact-form lines only, per the `RALPHUS_TMUX_DONE` precedent
-      (§4.3)
-- [ ] Forward it as a runner event; let `forward_runner_event` attribute it
-- [ ] Add a `prophecies` field to `RunnerResult` so the at-exit set crosses the
-      provider boundary as a typed contract, mirroring `ghost` (§6.1)
-- [ ] `docs/special-syntax.md` entry for the marker
+      (§4.3) — `runner/src/prophecy.rs::parse_prophecies`
+- [~] Forward it as a runner event; let `forward_runner_event` attribute it —
+      **not implemented**. The genuinely "mid-work" per-turn variant of this
+      (scanning each streaming assistant turn and emitting `RALPHUS_EVENT:`
+      immediately, the way live-usage snapshots already do per backend) would
+      need its own hook duplicated across `claude_code_backend.rs`/
+      `codex_backend.rs`/`pi_backend.rs`/`harness_backend.rs`'s own streaming
+      loops — out of scope for this pass. What *is* implemented (the next
+      item) is explicitly sanctioned by §4 as a standalone primary transport,
+      not merely a fallback, so this is a real gap to revisit, not a
+      correctness hole.
+- [x] Add a `prophecies` field to `RunnerResult` so the at-exit set crosses the
+      provider boundary as a typed contract, mirroring `ghost` (§6.1) — wired
+      end-to-end: `runner/src/spec.rs::CellResult.prophecies` →
+      `daemon/src/runner.rs::RunnerResult.prophecies` →
+      `scheduler.rs::run_cell_worker` calls `Store::add_prophecy` per marker
+      (attempt is hardcoded `0` for every write here — there is no per-cell
+      restart counter in the schema yet, a follow-on improvement, not
+      blocking)
+- [x] `docs/special-syntax.md` entry for the marker — the file did not exist
+      at all before this phase; created with the full existing marker
+      inventory, not just the new one
 
 *No credential, no endpoint, no new env. Works remotely unchanged.*
 
