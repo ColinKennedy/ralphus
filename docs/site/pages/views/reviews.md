@@ -50,3 +50,10 @@ result of your feedback without triggering anything yourself.
 That feedback routing (what the word does in reviewer mode — and what it
 doesn't — plus the per-branch selector and restack effects) is documented in
 the repo's [special syntax & markers](../special-syntax.md) guide.
+
+A [waypoint](waypoints.md) (RAL-400) rostering this review delivers its
+guidance through this exact same path: the bearing is posted as synthetic
+feedback into the review's topmost ready branch, so it amends and pushes —
+and restacks anything downstream — exactly as a human's feedback would. The
+roster entry is recorded `delivered` once that post succeeds; it never needs
+its own separate injection mechanism.

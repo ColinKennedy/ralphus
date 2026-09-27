@@ -20,6 +20,7 @@ on GitHub, or open the file locally). This page is the quick table.
 | `<<ralphus:new-worktree/<branch>?upstream=<upstream>>>` | cell `cwd` | materializes (or reuses) a worktree for `<branch>` under the task's `project`; the stored `cwd` is rewritten to the real path |
 | `<<default>>` / `<<current_branch>>` | the placeholder's `?upstream=` value | the branch the new worktree tracks: the repo's default branch (recommended), or whatever the project has checked out (changes between runs) |
 | `<<review:<id>>>` / `<<ralphus:new-review/<key>>>` | `[[task.cell]].review` | attaches the cell to an existing review, or mints a fresh review per submission (`<key>` groups cells into one) |
+| `<<review:<id>>>` / `<<squad:<id>>>` / `<<ralphus:new-squad>>` | `[[waypoint]].roster` | rosters an existing review or squad, or the squad this submission itself creates (no `<key>` — one file makes exactly one squad) |
 | `task/cell/proof?on=pass\|fail\|both` | proof step `restart_on` | when the named proof step fires with that verdict, this cell's proof cursor re-runs from the start |
 | `ralphus:/SQUAD[…]…` | CLI selectors, board, API | addresses any squad/task/cell/proof/review entity; `?id=` disambiguates, `~` marks a positional index |
 | `<guardian-id>#<branch>` | per-branch review commands | legacy review selector: head is the review (id or `@name`), after `#`/`~` is the branch |
@@ -33,6 +34,14 @@ on GitHub, or open the file locally). This page is the quick table.
 any unrecognized one is rejected at validation time. `depends_on` is
 deliberately not a sentinel. Unknown `restart_on` entries are validation
 errors.
+
+Every `prompt` cell/proof step also gets an unconditional `## Cross-Squad
+Waypoints` system-prompt section (RAL-400), and a rostered cell additionally
+gets a **bearing block** prepended to its own prompt — coordination context
+an agent must reconcile against what it can actually observe, never a
+substitute for inspecting the working tree itself. The exact injected text
+and block format are in the repository's `docs/special-syntax.md`, under
+"Cross-squad waypoint bearing injection (RAL-400)".
 
 ## Agent-facing conventions (not parsed)
 
