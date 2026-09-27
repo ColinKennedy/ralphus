@@ -421,7 +421,14 @@ model against real traffic before any prompt work exists.
 - [ ] Build the ghost from recent prophecies instead of a separate marker, so
       there is one discipline to teach rather than two (§3)
 
-*Only once the rest is proven.*
+*Only once the rest is proven.* **Deliberately not started**: phases 1-4
+landed together in one pass with automated test coverage but zero real
+agent usage yet — there is no field evidence the marker discipline actually
+works in practice (the same gate ghost itself needed before anyone trusted
+it, per this phase's own note "ghost is the evidence it works"). Collapsing
+ghost into prophecy now would bet the *proven* system on the *unproven*
+one's ergonomics sight unseen. Revisit once prophecies have actually
+accumulated from real cells.
 
 ### Phase 6 — the CLI write path (only if the marker disappoints)
 
@@ -429,7 +436,10 @@ model against real traffic before any prompt work exists.
 - [ ] Export `RALPHUS_ENTITY_URI` / `RALPHUS_ATTEMPT`
 
 *Blocked on the credential question, which is RAL-252 / RAL-225 territory, not
-this subsystem's. Do not start here.*
+this subsystem's. Do not start here.* **Not started, per the instruction
+above** — the marker (phases 1-4) has not even shipped long enough to have
+"disappointed" yet, and the credential/env-export question this phase rides
+on is explicitly out of scope for the prophecy subsystem to decide.
 
 ---
 
