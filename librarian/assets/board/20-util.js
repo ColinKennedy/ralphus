@@ -808,6 +808,20 @@
         const resp = fetch(path, { method: "DELETE", headers: traceHeaders() });
         return notifyOpts ? withActionNotify(resp, notifyOpts) : resp;
       };
+      /**
+       * PATCHes JSON to the daemon API with a fresh trace header. Same
+       * squad-mutation invalidation as `post` above (RAL-406). See `post`'s
+       * doc comment above for `notifyOpts`.
+       * @param {string} path
+       * @param {*} [body]
+       * @param {NotifyOpts} [notifyOpts]
+       * @returns {Promise<Response>}
+       */
+      const patchJson = (path, body, notifyOpts) => {
+        if (path.startsWith("/api/squads/")) invalidateTasksFetch();
+        const resp = fetch(path, { method: "PATCH", headers: traceHeaders(), body: body ? JSON.stringify(body) : undefined });
+        return notifyOpts ? withActionNotify(resp, notifyOpts) : resp;
+      };
       // RALPHUS-POST-DEL:END
       // copy-to-clipboard: a small button carrying its payload in data-copy.
       /**

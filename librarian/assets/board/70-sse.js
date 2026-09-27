@@ -551,6 +551,7 @@
         else if (tab === "health") tabPoll = pollHealth();
         else if (tab === "prefs") tabPoll = pollPrefs();
         else if (tab === "tasks") tabPoll = refreshRegisteredProjectNames().then(() => pollTasksTab());
+        else if (tab === "waypoints") tabPoll = pollWaypoints();
         else tabPoll = refreshRegisteredProjectNames().then(() => pollTasks());
         await Promise.all([globalPolls, tabPoll]);
         await refreshBanner();

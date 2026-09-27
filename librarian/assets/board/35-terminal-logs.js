@@ -1062,6 +1062,13 @@
         if (graphActionShown("unsolo", items)) {
           rows.push(`<div onclick="squadGraphMenuAction(event,'unsolo')" data-tip="Un-solo every selected task that is currently soloed.\nOther paused tasks in the same squad can dispatch again afterward.">☆ Un-solo task</div>`);
         }
+        if (items.length === 1) {
+          const squadId = items[0].squadId;
+          rows.push(`<div onclick="openAddToWaypointMenu(event,'squad','${esc(squadId)}')" data-tip="Add this node's squad to a cross-squad waypoint's roster, or create a new waypoint from it.">📍 Add to waypoint…</div>`);
+          if (kind === "cell") {
+            rows.push(`<div onclick="openSetWaypointFromCell(event,'${esc(squadId)}')" data-tip="Add this cell's owning squad to a cross-squad waypoint's roster.\nCell-level roster tracking isn't supported yet, so the whole squad is added instead.">🧭 Set waypoint from this cell</div>`);
+          }
+        }
         return rows;
       }
 

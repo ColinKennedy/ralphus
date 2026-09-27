@@ -17,6 +17,7 @@
           <button id="tab-tasks" class="tab" onclick="showTab('tasks', true)" data-tip="Tasks — a flat list of every task across every squad, with cost, review/PR state, and watch status.">📋 Tasks</button>
           <button id="tab-queue" class="tab" onclick="showTab('queue', true)" data-tip="Queue — reorder pending work by priority.\nDrag ready-to-run cells and proof steps into the order you want them picked up; set a status of 'ignored' to unblock downstream work.\nOrder is a best-effort hint honored when a compute slot frees.">🚦 Queue</button>
           <button id="tab-reviews" class="tab" onclick="showTab('reviews', true)" data-tip="Reviews — manage Guardian merge reviews: branch stacking, automated rebase, conflict resolution, and CI check gates.">👀 Reviews</button>
+          <button id="tab-waypoints" class="tab" onclick="showTab('waypoints', true)" data-tip="Waypoints (RAL-400) — cross-squad coordination join points.\nA waypoint blocks or advises a roster of squads/reviews until the work it's watching for actually lands, then delivers feedback and records bearings (completed-work chronicle entries).">🧭 Waypoints</button>
           <button id="tab-resources" class="tab" onclick="showTab('resources', true)" data-tip="Resources — live CPU, RAM, and GPU usage per running cell. Useful for spotting runaway processes.">📊 Resources</button>
           <button id="tab-cartographer" class="tab" onclick="showTab('cartographer', true)" data-tip="Logs — the unified, chronological, structured event log across the whole system.\nFilter by source, scope, level, squad/cell/guardian id, or time range; click a squad/review id to jump straight to it.">📜 Logs</button>
           <!-- RAL-332: admin-only tabs start hidden and are revealed by applyAdminTabVisibility() once GET /api/whoami confirms is_admin -- avoids a flash of admin-only chrome for a non-admin caller before that first resolves. -->
@@ -129,6 +130,25 @@
       </div>
       <div class="splitter" data-var="--reviews-sidebar-w" data-tip="Drag to resize the reviews sidebar. Your preference is saved between sessions."></div>
       <div class="col center"><div id="review-detail"><div class="empty">Select a review.</div></div></div>
+    </main>
+
+    <main id="waypoints-page" style="display:none">
+      <div class="col sidebar">
+        <div class="side-head">
+          <div class="row" style="justify-content:space-between">
+            <b>Waypoints</b>
+            <span class="row" style="gap:4px">
+              <button class="newtask" onclick="openCreateWaypoint()" data-tip="Create a new waypoint — a cross-squad coordination join point (RAL-400).\nWho/when: use this when several squads/reviews need to block or advise on the same upcoming piece of work before they proceed.">＋ Create</button>
+            </span>
+          </div>
+          <input type="text" id="waypoint-filter" placeholder="filter by waypoint id / label…" oninput="onWaypointFilter(this.value)" data-tip="Filter waypoints by id or label. Only matching waypoints appear in the list." />
+          <div class="status-filters row" id="waypoint-status-filters"></div>
+          <div class="row" id="waypoint-project-filter"></div>
+        </div>
+        <div id="waypoints"></div>
+      </div>
+      <div class="splitter" data-var="--waypoints-sidebar-w" data-tip="Drag to resize the waypoints sidebar. Your preference is saved between sessions."></div>
+      <div class="col center"><div id="waypoint-detail"><div class="empty">Select a waypoint.</div></div></div>
     </main>
 
     <main id="resources-page" style="display:none">
@@ -360,6 +380,7 @@
     <script src="/board/79-health.js"></script>
     <script src="/board/79-worktree-retirement.js"></script>
     <script src="/board/80-queue.js"></script>
+    <script src="/board/82-waypoints.js"></script>
     <script src="/board/85-perf-timing.js"></script>
   </body>
 </html>

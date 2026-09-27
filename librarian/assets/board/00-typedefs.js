@@ -999,3 +999,105 @@
        * @property {string} machine
        * @property {TargetHealthCheck[]} checks
        */
+      /**
+       * "review" | "squad" -- what a cross-squad waypoint's roster entry
+       * points at (RAL-400). `GET`/`POST /api/waypoints/{id}/roster`.
+       * @typedef {"review"|"squad"} RosterEntryKind
+       */
+      /**
+       * "block" (can halt an entry's in-flight cells, mandatory mailbox
+       * notification) | "advisory" (informational only, never halts
+       * anything) -- see `docs/colors.md`'s Waypoint roster mode section for
+       * the badge color rule (RAL-400).
+       * @typedef {"block"|"advisory"} RosterMode
+       */
+      /**
+       * A roster entry's delivery state for its waypoint's coordination
+       * prompt (RAL-400 Phase 4/5). Note this is the JSON wire form
+       * (`#[serde(rename_all = "snake_case")]`, underscore) -- distinct from
+       * `DeliveryStatus::as_str()`'s hyphenated `via-restack` used only in
+       * Rust-internal (non-JSON) contexts.
+       * @typedef {"undelivered"|"delivered"|"via_restack"|"failed"} DeliveryStatus
+       */
+      /**
+       * One roster entry of a cross-squad waypoint (RAL-400). Part of
+       * `WaypointDetail.roster`.
+       * @typedef {object} RosterEntryView
+       * @property {string} waypoint_id
+       * @property {RosterEntryKind} kind
+       * @property {string} entry_id - a squad id or review (guardian) id, depending on `kind`.
+       * @property {RosterMode} mode
+       * @property {string|null} survey_verdict - the relevance-assessment verdict, if surveyed.
+       * @property {string|null} survey_rationale - the relevance-assessment rationale, if surveyed.
+       * @property {DeliveryStatus} delivery_status
+       * @property {number|null} stand_down_at_ms - set once this entry's advisory stand-down notice has been sent.
+       * @property {number} created_at_ms
+       * @property {number} updated_at_ms
+       */
+      /**
+       * One append-only bearing (a chronicle of actual completed work) on a
+       * cross-squad waypoint (RAL-400). `commit_id`/`commit_summary` are a
+       * narrowing aid for finding the referenced work, not an assertion that
+       * the base currently being viewed already contains it.
+       * @typedef {object} BearingView
+       * @property {number} id
+       * @property {string} waypoint_id
+       * @property {RosterEntryKind} producer_kind
+       * @property {string} producer_id
+       * @property {string} summary
+       * @property {string|null} entity_uri
+       * @property {string|null} commit_id
+       * @property {string|null} commit_summary
+       * @property {number} created_at_ms
+       */
+      /**
+       * Roster-entry counts by `DeliveryStatus`, e.g. "3/5 delivered", shown
+       * without hydrating the full roster (RAL-400).
+       * @typedef {object} DeliverySummary
+       * @property {number} undelivered
+       * @property {number} delivered
+       * @property {number} via_restack
+       * @property {number} failed
+       */
+      /**
+       * Lean per-waypoint projection for `GET /api/waypoints`'s list view
+       * (RAL-400) -- everything the Waypoints tab's sidebar needs without
+       * hydrating the full roster or prompt.
+       * @typedef {object} WaypointListEntry
+       * @property {string} id
+       * @property {string|null} label
+       * @property {string} state - "open" | "closed"
+       * @property {boolean} allow_advisory
+       * @property {string[]} projects - server-resolved project names (RAL-396); render as-is.
+       * @property {number} roster_count
+       * @property {number} created_at_ms
+       * @property {number} updated_at_ms
+       * @property {number|null} closed_at_ms
+       */
+      /**
+       * Full `GET /api/waypoints/{id}` response: settings, roster, and a
+       * delivery summary (RAL-400). `prompt` is already redacted server-side.
+       * @typedef {object} WaypointDetail
+       * @property {string} id
+       * @property {string|null} label
+       * @property {string} prompt
+       * @property {string|null} agent
+       * @property {string|null} model
+       * @property {boolean} allow_advisory
+       * @property {string} state - "open" | "closed"
+       * @property {number} created_at_ms
+       * @property {number} updated_at_ms
+       * @property {number|null} closed_at_ms
+       * @property {string[]} projects - server-resolved project names (RAL-396); render as-is.
+       * @property {RosterEntryView[]} roster
+       * @property {DeliverySummary} delivery_summary
+       */
+      /**
+       * One Cartographer-backed delivery/lifecycle event for a waypoint's
+       * feed (RAL-400). `GET /api/waypoints/{id}/deliveries`.
+       * @typedef {object} WaypointEventEntry
+       * @property {number} at_ms
+       * @property {string} level
+       * @property {string} message
+       * @property {object} payload
+       */

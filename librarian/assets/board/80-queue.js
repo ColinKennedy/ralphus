@@ -850,6 +850,11 @@
             renderReviewOriginFilters();
             renderReviewPrStatusFilter();
             showTab("reviews");
+          } else if (h.tab === "waypoints") {
+            if (h.waypointId) selectedWaypointId = h.waypointId;
+            renderWaypointStatusFilters();
+            renderWaypointProjectFilterChips();
+            showTab("waypoints");
           } else if (h.tab === "resources") {
             showTab("resources");
           } else if (h.tab === "queue") {
@@ -885,6 +890,7 @@
       renderStatusFilters(); renderSortChips(); renderTtStatusFilters(); renderTtAgentFilter(); renderReviewStatusFilters(); renderReviewResolverFilters(); renderReviewOriginFilters(); renderReviewPrStatusFilter();
       if (pendingHash && pendingHash.tab === "reviews") { showTab("reviews"); }  // keep pendingHash for pollReviews to apply guardianId
       else if (pendingHash && pendingHash.tab === "tasks") { showTab("tasks"); }  // keep pendingHash for pollTasksTab to apply the selection
+      else if (pendingHash && pendingHash.tab === "waypoints") { renderWaypointStatusFilters(); renderWaypointProjectFilterChips(); showTab("waypoints"); }  // keep pendingHash for pollWaypoints to apply waypointId
       else if (pendingHash && pendingHash.tab === "resources") { pendingHash = null; showTab("resources"); }
       else if (pendingHash && pendingHash.tab === "queue") { pendingHash = null; showTab("queue"); }
       else if (pendingHash && pendingHash.tab === "cartographer") { applyCartoQuery(pendingHash.cartoQuery || {}); pendingHash = null; showTab("cartographer"); }

@@ -518,7 +518,7 @@ test("a multi-selection disables the squad menu's popup-bearing items (Rename, W
     clickedId: "s1",
   });
   const html = menu.innerHTML;
-  assert.equal((html.match(/ctx-disabled/g) || []).length, 3);
+  assert.equal((html.match(/ctx-disabled/g) || []).length, 4);
   assert.ok(html.includes("✎ Rename"));
   assert.ok(html.includes("◎ Watch"));
   assert.ok(html.includes("📄 Logs"));
@@ -551,7 +551,7 @@ test("a multi-selection disables the review menu's popup-bearing items (Edit Det
     clickedId: "g1",
   });
   const html = menu.innerHTML;
-  assert.equal((html.match(/ctx-disabled/g) || []).length, 2);
+  assert.equal((html.match(/ctx-disabled/g) || []).length, 3);
   assert.ok(html.includes("✎ Edit Details"));
   assert.ok(html.includes("◎ Watch"));
   assert.ok(!html.includes('data-click="openEditReviewDetailsFromMenu"'));
