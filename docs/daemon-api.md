@@ -217,6 +217,21 @@ produced no pane output.
 | POST | `/api/pull-requests/{pr_id}/pull-from-pr` | [Pull PR-branch commits](#post-apipull-requestspr_idpull-from-pr) into the review worktree (RAL-190) |
 | POST | `/api/pull-requests/{pr_id}/refresh-ci` | [Live-poll and persist CI status](#post-apipull-requestspr_idrefresh-ci) for one PR on demand (RAL-402) |
 
+**Waypoints (RAL-400)**
+| Method | Path | What |
+|---|---|---|
+| POST | `/api/waypoints` | [Create a waypoint](#waypoints-ral-400) with its initial roster (≥1 entry required) |
+| GET | `/api/waypoints` | List every waypoint (bare array); `?state=open\|closed` and `?project=` filter |
+| GET | `/api/waypoints/{id}` | [One waypoint's full detail](#waypoints-ral-400): settings, roster, bearings |
+| POST | `/api/waypoints/{id}/roster` | Add a squad or review roster entry |
+| DELETE | `/api/waypoints/{id}/roster/{entry_id}` | Remove a roster entry |
+| PATCH | `/api/waypoints/{id}/roster/{entry_id}` | Field-selective update of a roster entry (currently `mode`) |
+| POST | `/api/waypoints/{id}/close` | Manually close a waypoint |
+| POST | `/api/waypoints/{id}/reopen` | Reopen a closed waypoint |
+| POST | `/api/waypoints/{id}/bearings` | [Append a bearing](#waypoints-ral-400) (append-only, no edit/delete) |
+| GET | `/api/waypoints/{id}/bearings` | List every bearing for a waypoint, oldest first (bare array) |
+| GET | `/api/waypoints/{id}/deliveries` | [Cartographer-backed delivery/event feed](#waypoints-ral-400) — doubles as the waypoint's timeline; there is no separate `/timeline` route |
+
 **Fork registration (RAL-338)**
 | Method | Path | What |
 |---|---|---|
@@ -3693,13 +3708,19 @@ task:<squad_id>:<task_idx>
 cell:<squad_id>:<task_idx>:<cell_idx>
 proof:<squad_id>:<task_idx>:<proof_scope>:<cell_idx>:<proof_idx>
 guardian:<guardian_id>
+waypoint:<waypoint_id>
 ```
 
 `task_idx`/`cell_idx`/`proof_idx` are the same 0-based indices the HTTP
 routes already use (`/api/squads/{id}/cells/{ti}/{si}/...`). `proof_scope`
 is `"task"` or `"cell"`; `cell_idx` is `-1` for a task-scope proof.
 Examples: `task:squad-000000000001:0`, `cell:squad-000000000001:0:1`,
-`proof:squad-000000000001:0:cell:1:0`, `guardian:guardian-000000000001`.
+`proof:squad-000000000001:0:cell:1:0`, `guardian:guardian-000000000001`,
+`waypoint:waypoint-000000000001`. `Waypoint` (like `Guardian`) is a leaf —
+it has no owning squad and covers only itself, not the squads/reviews on its
+roster; the board's `gotoEntityUri()` recognizes the `waypoint:` prefix
+alongside `squad:`/`guardian:` to jump straight to a waypoint's detail pane
+(see [Waypoints (RAL-400)](#waypoints-ral-400) below).
 
 ### `GET /api/squads/{id}/timeline`
 Generates and returns the merged, chronological "uber-log-viewer" for a
@@ -4223,6 +4244,213 @@ event. No `?category` filter here (RAL-375) — a watched entity's messages
 (e.g. a `review`-category PR/CI-watch notice, see the Mailbox row above)
 always surface through a personal watch regardless of category, so a client
 polling this endpoint sees them no matter which mode it's operating in.
+
+## Waypoints (RAL-400)
+
+A **waypoint** is a cross-squad coordination join point: a named `prompt`
+plus a **roster** of squads and/or reviews that must (`block` mode) or may
+(`advisory` mode) check in before the waypoint is considered settled. A
+waypoint's tracked **projects** are inferred entirely from its roster (by
+resolving each roster entry's own squad/review scope), so creation requires
+at least one roster entry.
+
+#### `POST /api/waypoints`
+```json
+{
+  "prompt": "Renaming the shared auth token field -- squads touching login must adjust.",
+  "label": "auth-token-rename",
+  "agent": null,
+  "model": null,
+  "allow_advisory": true,
+  "roster": [
+    { "kind": "squad", "entry_id": "squad-000000000042", "mode": "block" },
+    { "kind": "review", "entry_id": "guardian-000000000007" }
+  ]
+}
+```
+`prompt` and a non-empty `roster` (≥1 entry) are required; `label`, `agent`,
+`model` are optional; `allow_advisory` defaults to `false`. Each roster
+entry's `kind` must be `"review"` or `"squad"`, `entry_id` must be
+non-empty, and `mode` (optional, defaults to `"block"`) must be `"block"` or
+`"advisory"` — any violation is `400 bad_request`. On success: `201
+{"id": "waypoint-..."}`, and every roster entry's own watchers (the squad's
+`squad:{id}` watchers or the review's `guardian:{id}` watchers) get an
+ordinary `Normal`-priority mailbox notice that a waypoint now tracks them
+(not a failure/remediation notice — see `notify_watchers_with_context` vs.
+`notify_watchers_with_remediation` in `.agent/agent-conduct.md`).
+
+#### `GET /api/waypoints`
+Bare array of `WaypointListEntry`, sorted by id. `?state=open|closed` and
+`?project=<name>` (must appear in the waypoint's inferred project set) both
+filter; an invalid `state` value is `400 bad_request`.
+```json
+[
+  {
+    "id": "waypoint-000000000003",
+    "label": "auth-token-rename",
+    "state": "open",
+    "allow_advisory": true,
+    "projects": ["ralphus"],
+    "roster_count": 2,
+    "created_at_ms": 1732999999000,
+    "updated_at_ms": 1733000500000,
+    "closed_at_ms": null
+  }
+]
+```
+
+#### `GET /api/waypoints/{id}`
+The full `WaypointDetail`: settings, roster, inferred projects, and a
+delivery-status rollup. `prompt` is passed through
+`ralphus_core::redact::redact_secrets` before it leaves the daemon, the same
+as every other user-authored content field. `404 not_found` for an unknown
+id.
+```json
+{
+  "id": "waypoint-000000000003",
+  "label": "auth-token-rename",
+  "prompt": "Renaming the shared auth token field...",
+  "agent": null,
+  "model": null,
+  "allow_advisory": true,
+  "state": "open",
+  "created_at_ms": 1732999999000,
+  "updated_at_ms": 1733000500000,
+  "closed_at_ms": null,
+  "projects": ["ralphus"],
+  "roster": [
+    {
+      "waypoint_id": "waypoint-000000000003",
+      "kind": "squad",
+      "entry_id": "squad-000000000042",
+      "mode": "block",
+      "survey_verdict": null,
+      "survey_rationale": null,
+      "delivery_status": "undelivered",
+      "stand_down_at_ms": null,
+      "created_at_ms": 1732999999000,
+      "updated_at_ms": 1732999999000
+    }
+  ],
+  "delivery_summary": { "undelivered": 1, "delivered": 0, "via_restack": 0, "failed": 0 }
+}
+```
+`roster[].kind`/`mode`/`delivery_status` all serialize with
+`#[serde(rename_all = "snake_case")]`. This matters for `delivery_status`
+specifically: its Rust `as_str()` (used for CLI/display text) renders the
+"delivered as part of an unrelated rebase, not a dedicated injection" state
+as the hyphenated `"via-restack"`, but its actual **JSON** value here (and
+everywhere else on the wire) is the underscored `"via_restack"` — match on
+the underscored form when consuming this API. Every other endpoint below
+that returns a waypoint (`roster` add/remove/patch, `close`, `reopen`)
+returns this same `WaypointDetail` shape, so a caller always sees the
+post-mutation state without a second `GET`.
+
+#### `POST /api/waypoints/{id}/roster`
+Add a roster entry, or update an existing one's `mode` (same underlying
+upsert as `PATCH .../roster/{entry_id}`).
+```json
+{ "kind": "squad", "entry_id": "squad-000000000099", "mode": "advisory" }
+```
+`kind`/`entry_id`/`mode` validate exactly like `POST /api/waypoints`'s
+roster entries (`mode` optional, defaults to `"block"`). Returns the
+waypoint's `WaypointDetail`; a nonexistent `id` surfaces as `404 not_found`
+from the `get_waypoint` lookup used to build that response.
+
+#### `DELETE /api/waypoints/{id}/roster/{entry_id}`
+Remove one roster entry (`kind` is inferred from `entry_id`'s prefix —
+`squad-...` vs. `guardian-...` — so no `kind` query parameter is needed).
+`404 not_found` if `entry_id` isn't on this waypoint's roster. Returns the
+updated `WaypointDetail`.
+
+#### `PATCH /api/waypoints/{id}/roster/{entry_id}`
+A human override of a roster entry's block/advisory mode (e.g. overruling
+the survey's own verdict) — never touches that entry's `survey_verdict`/
+`survey_rationale`.
+```json
+{ "mode": "advisory" }
+```
+`mode` must be `"block"` or `"advisory"`; `404 not_found` if `entry_id`
+isn't on this waypoint's roster. Returns the updated `WaypointDetail`.
+
+#### `POST /api/waypoints/{id}/close` / `POST /api/waypoints/{id}/reopen`
+Manual lifecycle overrides — no request body. `close` works regardless of
+whether every roster entry has reached a terminal delivery state yet (a
+waypoint also closes itself automatically once every `block`-mode entry has
+delivered). Both return the updated `WaypointDetail`.
+
+#### `POST /api/waypoints/{id}/bearings`
+Append a bearing: a durable, auditable record of guidance or completed work
+reported against this waypoint. There is deliberately no edit/delete
+endpoint (v1) — the bearing feed only ever grows.
+```json
+{
+  "producer_kind": "squad",
+  "producer_id": "squad-000000000042",
+  "summary": "Renamed auth_token -> session_token across the login module.",
+  "entity_uri": "squad:squad-000000000042",
+  "commit_id": "a1b2c3d",
+  "commit_summary": "rename auth_token to session_token"
+}
+```
+`producer_kind` must be `"review"` or `"squad"`; `summary` must be
+non-empty; `entity_uri`/`commit_id`/`commit_summary` are optional. On
+success: `201` with the created `BearingView` (`summary` and
+`commit_summary` redacted the same way `prompt` is), and a Cartographer row
+(`source: "waypoints"`, `scope: "waypoint"`) is emitted recording the
+bearing's arrival.
+
+#### `GET /api/waypoints/{id}/bearings`
+Bare array of every `BearingView` for this waypoint, oldest first (`id` is
+an autoincrement rowid, so it doubles as arrival order), each redacted the
+same way the `POST` response is.
+```json
+[
+  {
+    "id": 1,
+    "waypoint_id": "waypoint-000000000003",
+    "producer_kind": "squad",
+    "producer_id": "squad-000000000042",
+    "summary": "Renamed auth_token -> session_token across the login module.",
+    "entity_uri": "squad:squad-000000000042",
+    "commit_id": "a1b2c3d",
+    "commit_summary": "rename auth_token to session_token",
+    "created_at_ms": 1733000500000
+  }
+]
+```
+
+#### `GET /api/waypoints/{id}/deliveries`
+The waypoint's Cartographer-backed event/delivery history, oldest first —
+creation, roster changes, survey verdicts, deliveries, bearings,
+closes/reopens. This doubles as the waypoint's full timeline, matching the
+squad-timeline response family (`GET /api/squads/{id}/timeline`); there is
+no separate `.../timeline` route. `404 not_found` for an unknown waypoint
+id, rather than an empty array.
+```json
+[
+  {
+    "at_ms": 1732999999000,
+    "level": "INFO",
+    "message": "waypoint waypoint-000000000003 received a bearing from squad squad-000000000042",
+    "payload": { "waypoint_id": "waypoint-000000000003", "bearing_id": 1, "producer_kind": "squad", "producer_id": "squad-000000000042" }
+  }
+]
+```
+
+**Injection into cell/proof prompts.** A rostered squad's cells and proof
+steps receive their waypoint's current bearings as coordination context
+(rendered by `crate::waypoints::render_bearing_block`, prepended to the
+cell's prompt the same way RAL-136 ghost context is), alongside a static,
+always-present system-prompt section explaining what a bearing is and is
+not. See "Cross-squad waypoint bearings" in
+[`docs/special-syntax.md`](special-syntax.md) for the exact injected text
+and format. This same gating also drives squad scheduling: a rostered squad
+whose waypoint is still open halts each affected cell at `status:
+"waypoint_halted"` rather than running it past an unresolved coordination
+point, auto-resuming once the waypoint closes — see
+[Squad lifecycle](#squad-lifecycle) above and
+[`.agent/waypoints-phase0-decisions.md`](../.agent/waypoints-phase0-decisions.md).
 
 ## Notes on future evolution
 

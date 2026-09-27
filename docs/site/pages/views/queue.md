@@ -23,7 +23,11 @@ the right is its **readiness**:
   cancelled, so this item can't ever become ready without intervention.
 - **running** — already in flight. Running work is pinned to the top of the
   list and can't be reordered — nothing can be scheduled ahead of work
-  that's already started.
+  that's already started. A cell rostered on an open, blocking
+  [waypoint](waypoints.md) also shows **running** rather than a distinct
+  gated state — it's dependency-ready and picked up, just paused pending the
+  waypoint's survey or a bearing, so don't read "running" here as proof a
+  cell is actively making progress.
 
 ## Dragging, and the lazy-anchoring rule
 
