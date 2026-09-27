@@ -463,3 +463,38 @@ trailer work is blocked on them, but they are worth fixing either way.
    squashed commit.
 
 Optional third, smaller: `ghost::current_revision` is local-only (§6.3).
+
+---
+
+## Appendix A — source references
+
+Everything asserted above, in one table, for a cold pickup.
+
+| Claim | Source |
+|---|---|
+| Ghost store, merge-on-write, 4000-char cap | `daemon/src/ghost.rs` |
+| `RALPHUS_GHOST:` parsing | `runner/src/execute.rs:884` |
+| Ghost injected as "Prior context" | `daemon/src/ghost.rs:257` (`format_context_block`); used at `daemon/src/scheduler.rs:2351` |
+| Ghost revision capture is local-only | `daemon/src/ghost.rs:202` |
+| Cartographer row shape + retention | `daemon/src/cartographer.rs` |
+| `RALPHUS_EVENT:` marker constant | `daemon/src/runner.rs:27` |
+| Daemon-side attribution from `RunnerSpec` | `daemon/src/runner.rs:2789` |
+| `RunnerResult.ghost` crosses the provider boundary | `daemon/src/runner.rs:925` |
+| Remote event forwarding | `daemon/src/remote_runner.rs:468` |
+| Remote transcript written locally | `daemon/src/remote_runner.rs` (`poll_to_completion` → `write_pane_snapshot`) |
+| Entity URI grammar | `daemon/src/entity_uri.rs` |
+| Squad timeline | `daemon/src/timeline.rs` |
+| `guardians.squad_id` nullable | `daemon/src/store.rs:1360` |
+| MCP tools derived from `help_map` | `mcp/src/tools.rs:1` |
+| Bidirectional CLI↔tool parity test | `mcp/tests/parity.rs` |
+| Hardcoded default daemon URL | `cli/src/client.rs:12` |
+| Token file fallback | `cli/src/client.rs:159`; `daemon/src/token.rs` |
+| "no verified-login distinction yet (RAL-252)" | `daemon/src/server.rs:4181` |
+| Admin gate trusts `X-Ralphus-User` | `daemon/src/server.rs:4296` |
+| RAL-445 co-author hook | `daemon/src/git_hooks.rs` |
+| Hook synced on local worktree plan only | `daemon/src/worktrees.rs:1204` |
+| Squash bypasses the hook | `daemon/src/guardian_merge.rs:10402` |
+| Machine-aware workspace | `daemon/src/workspace.rs` |
+| Provider contract + verbs, `env_overrides` in `exec` | `docs/machine-providers.md` |
+| PR body synthesis | `daemon/src/pr.rs` (`resolve_title_description`, `synthesize_pr_text`, `fallback_pr_description`) |
+| Marker self-trip hazard | `docs/special-syntax.md` |
