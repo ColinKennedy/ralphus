@@ -400,6 +400,21 @@ const GHOST_SYSTEM_PROMPT: &str = "Operational logging note, not a request to ch
      but did not fix, and open questions. This is not a changelog. If there \
      is truly nothing worth flagging, write 'RALPHUS_GHOST: (nothing to \
      report)'.";
+const PROPHECY_SYSTEM_PROMPT: &str = "Operational logging note, not a request to change your behavior: this \
+     ralphus task run also keeps a separate, durable record read later by a \
+     human in the eventual pull request -- not by the next agent, and not \
+     merged into anything. Whenever you learn something the code diff itself \
+     cannot show -- why you chose one approach over another, a risk or \
+     hazard you noticed but are leaving behind, something you are \
+     deliberately deferring, or any other discovery worth a human knowing -- \
+     write one standalone line of the exact form \
+     'RALPHUS_PROPHECY: <kind>: <note>', where <kind> is exactly one of \
+     discovery, decision, hazard, or deferred. Write as many of these as are \
+     genuinely useful, anywhere in your reply, not only at the end -- unlike \
+     the handoff note above, this is not a single end-of-reply section. This \
+     is not a changelog and not a summary of what you did: only write one \
+     when there is a real insight a human reading the diff would not \
+     otherwise get. If there is nothing like that, write none at all.";
 const ASYNC_SYSTEM_PROMPT: &str = "## Conclusion\nThis is a single, non-interactive invocation — no \
      human will check back on you or answer follow-up questions, though \
      Ralphus may re-invoke you synchronously to continue. Never use an \
@@ -502,6 +517,7 @@ pub(crate) fn effective_cell_system_prompt(
         Some(TOOLS_SYSTEM_PROMPT),
         Some(ASYNC_SYSTEM_PROMPT),
         Some(GHOST_SYSTEM_PROMPT),
+        Some(PROPHECY_SYSTEM_PROMPT),
     ])
     .expect("cell prompts always include ralphus system instructions")
 }
@@ -777,6 +793,7 @@ impl RunnerSpec {
                 Some(TOOLS_SYSTEM_PROMPT),
                 Some(ASYNC_SYSTEM_PROMPT),
                 Some(GHOST_SYSTEM_PROMPT),
+                Some(PROPHECY_SYSTEM_PROMPT),
             ])
             .expect("prompt cells always include ralphus system instructions")
         })

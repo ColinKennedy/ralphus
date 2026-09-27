@@ -388,8 +388,11 @@ model against real traffic before any prompt work exists.
 
 ### Phase 3 — teach the agents
 
-- [ ] System-prompt fragment alongside the existing ghost fragment in
-      `runner/src/execute.rs`
+- [x] System-prompt fragment alongside the existing ghost fragment in
+      `runner/src/execute.rs` — `PROPHECY_SYSTEM_PROMPT`, mirrored
+      byte-identically into `daemon/src/runner.rs` per that pair's existing
+      sync convention, appended for normal prompt cells only (never proof
+      steps, matching ghost's own scope)
 
 *This is where the discipline is won or lost. Ghost is the evidence it works.*
 
