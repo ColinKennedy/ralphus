@@ -262,6 +262,21 @@
       CLICK_HANDLERS.deleteAgentProfile = (e, ds) => deleteAgentProfile(ds.name || "");
       CLICK_HANDLERS.forceDeleteAgentProfile = (e, ds) => forceDeleteAgentProfile(ds.name || "");
       CLICK_HANDLERS.removeAgentProfileEnvRow = (e, ds) => removeAgentProfileEnvRow(Number(ds.i));
+      CLICK_HANDLERS.selectWaypoint = (e, ds) => selectWaypoint(ds.waypointId || "");
+      CLICK_HANDLERS.openWaypointMenu = (e, ds) => openWaypointMenu(e, ds.waypointId || "");
+      CTX_HANDLERS.openWaypointMenu = (e, ds) => openWaypointMenu(e, ds.waypointId || "");
+      CLICK_HANDLERS.gotoEntityUri = (e, ds) => { e.preventDefault(); gotoEntityUri(ds.entityUri || ""); };
+      CLICK_HANDLERS.removeRosterEntry = (e, ds) => removeRosterEntry(ds.waypointId || "", ds.entryId || "");
+      CLICK_HANDLERS.toggleRosterEntryMode = (e, ds) => toggleRosterEntryMode(ds.waypointId || "", ds.entryId || "", ds.mode || "block");
+      CLICK_HANDLERS.closeWaypoint = (e, ds) => closeWaypoint(ds.waypointId || "");
+      CLICK_HANDLERS.reopenWaypoint = (e, ds) => reopenWaypoint(ds.waypointId || "");
+      CLICK_HANDLERS.openAddRosterEntry = (e, ds) => openAddRosterEntry(ds.waypointId || "");
+      CLICK_HANDLERS.submitAddRosterEntry = (e, ds) => submitAddRosterEntry(ds.waypointId || "");
+      CLICK_HANDLERS.openAppendBearing = (e, ds) => openAppendBearing(ds.waypointId || "");
+      CLICK_HANDLERS.submitAppendBearing = (e, ds) => submitAppendBearing(ds.waypointId || "");
+      CLICK_HANDLERS.submitCreateWaypoint = (e, ds) => submitCreateWaypoint(ds.seedKind || "", ds.seedEntryId || "");
+      CLICK_HANDLERS.addEntryToWaypointFromMenu = (e, ds) => addEntryToWaypointFromMenu(ds.kind || "", ds.entryId || "", ds.waypointId || "");
+      CLICK_HANDLERS.openCreateWaypointFromMenu = (e, ds) => openCreateWaypointFromMenu(ds.kind || "", ds.entryId || "");
       document.addEventListener("click", (/** @type {MouseEvent} */ e) => {
         const el = /** @type {HTMLElement|null} */ (/** @type {HTMLElement} */ (e.target).closest("[data-click]"));
         if (!el || !el.dataset.click) return;

@@ -51,6 +51,7 @@ role in the table below, then use it.
 | `--delayed` | `#79c0ff` | *(shared)* | semantic (a cell waiting out a recognized, retryable provider rate limit before automatically resuming, RAL-435) |
 | `--arbiter` | `#7c3aed` | *(shared)* | semantic (a review automatically created by the Arbiter/Triage subsystem rather than an authored `[[review]]`, RAL-318) |
 | `--terminal-bg` | `#000000` | *(shared)* | surface (the remote terminal relay's xterm.js panel background, RAL-355 Phase 10) |
+| `--roster-block` | `#e8590c` | *(shared)* | semantic (a cross-squad waypoint roster entry in `block` mode — can halt in-flight cells, RAL-400) |
 
 "*(shared)*" = not overridden in the light theme; the same hue is used in both.
 
@@ -337,6 +338,37 @@ text in italics (`font-style: italic`) with the normal primary text color
 the UI Tooltip Rule in `CLAUDE.md`). Do **not** recolor inherited values to
 `--muted`, `--ignored`, or any status hue — inheritance is provenance, not a
 disabled state, warning, or status.
+
+### Waypoint roster mode — `--roster-block` for block, no color for advisory (RAL-400)
+A cross-squad waypoint's roster entries carry a `mode`: `block` (can halt an
+entry's in-flight cells and requires a mandatory mailbox notification) or
+`advisory` (informational only — never halts anything). The `block` badge
+uses the dedicated `--roster-block` (burnt orange) — distinct from
+`--danger`/`--failed` (reserved for destructive actions/genuine failure) and
+from `--ignored` (reserved for the real `ignored` status) — because no
+existing role fits "this entry can stop other work." The `advisory` badge
+deliberately introduces **no** new color and reuses `--muted` instead,
+mirroring the "PR draft state — no color (RAL-353)" precedent above:
+advisory is the softer, non-blocking default relative to block, not a status
+of its own that needs a hue.
+
+### Waypoint state and delivery status — reuse of existing roles (RAL-400)
+The Waypoints board tab (`librarian/assets/board/82-waypoints.js`) introduces
+two more badge concepts and deliberately adds no new variables for either:
+
+- A waypoint's own `open`/`closed` state (`.p-open`/`.p-closed`) reuses
+  `--running` (open — still coordinating, the same "in progress" idea as an
+  entity's `running` state) and `--done` (closed — coordination finished, the
+  same idea as an entity's `done` state), matching the "Branch already merged
+  upstream — `--done` (RAL-480)" precedent of reusing a role rather than
+  minting a color for a concept that already has one.
+- A roster entry's `delivery_status` reuses `--muted` for `undelivered` (nothing
+  has happened yet — a neutral, not a warning), `--done` for `delivered`
+  (succeeded), `--teal` for `via_restack` (delivered indirectly, through the
+  review's own restack — a side effect of another action, the same "moved
+  automatically" idea `--teal` already carries for dependency-pulled
+  movement), and `--failed` for `failed` (a genuine failure, reusing the
+  standard failure hue).
 
 ### Terminal surface — `--terminal-bg` only (RAL-355 Phase 10)
 The remote Open Agent terminal relay's xterm.js panel always renders on a

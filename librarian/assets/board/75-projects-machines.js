@@ -898,7 +898,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
        */
       function triageOpenProjectFilterMenu(e) {
         e.preventDefault(); e.stopPropagation();
-        closeProjectFilterMenu(); ttCloseProjectFilterMenu();
+        closeProjectFilterMenu(); ttCloseProjectFilterMenu(); closeWaypointProjectFilterMenu();
         const existing = document.getElementById("triage-project-filter-menu");
         if (existing) { existing.remove(); return; }
         const menu = document.createElement("div");
@@ -925,10 +925,11 @@ Work submitted against it will fail — fix the machine or deregister the provid
        */
       function closeProjectFilterMenusOnOutsideClick(e) {
         const target = /** @type {Element|null} */ (e.target);
-        if (target instanceof Element && target.closest("#project-filter-menu, #tt-project-filter-menu, #triage-project-filter-menu")) return;
+        if (target instanceof Element && target.closest("#project-filter-menu, #tt-project-filter-menu, #triage-project-filter-menu, #waypoint-project-filter-menu")) return;
         closeProjectFilterMenu();
         ttCloseProjectFilterMenu();
         triageCloseProjectFilterMenu();
+        closeWaypointProjectFilterMenu();
       }
       document.addEventListener("click", closeProjectFilterMenusOnOutsideClick);
 
