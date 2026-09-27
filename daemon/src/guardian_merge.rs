@@ -10541,7 +10541,31 @@ fn squash_review_commits(
         .map(|l| format!("- {l}"))
         .collect::<Vec<_>>()
         .join("\n");
-    let msg = format!("{feature} (squashed {count} commits)\n\n{body}");
+    // §13 of docs/prophecy-design.md: this commits with `--no-verify` and
+    // rebuilds the message from subjects only, so any trailer on any
+    // squashed commit (a `Co-authored-by:`, or in the future a
+    // `Ralphus-Cell:`) was previously discarded outright. Collect the
+    // union of every squashed commit's trailers (deduped, first-seen order)
+    // and re-append them to the squash commit's own message instead.
+    let trailers_raw = wt
+        .git(&["log", "--reverse", "--format=%(trailers:unfold)", &range])
+        .unwrap_or_default();
+    let mut seen_trailers = std::collections::HashSet::new();
+    let mut trailer_lines = Vec::new();
+    for line in trailers_raw.lines() {
+        let line = line.trim();
+        if !line.is_empty() && seen_trailers.insert(line.to_string()) {
+            trailer_lines.push(line.to_string());
+        }
+    }
+    let msg = if trailer_lines.is_empty() {
+        format!("{feature} (squashed {count} commits)\n\n{body}")
+    } else {
+        format!(
+            "{feature} (squashed {count} commits)\n\n{body}\n\n{}",
+            trailer_lines.join("\n")
+        )
+    };
     wt.git(&["reset", "--soft", newbase])?;
     if let Err(e) = wt.git(&["commit", "--no-verify", "--message", &msg]) {
         // Restore the pre-squash tip so the stack is not left in a dirty state.
@@ -12354,6 +12378,95 @@ mod tests {
         };
         assert!(err.contains("pi-openrouter-deepseek"));
         let _ = std::fs::remove_dir_all(&dir);
+    // §13 of docs/prophecy-design.md: squash must preserve trailers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn squash_review_commits_preserves_deduped_trailers_from_every_squashed_commit() {
+        let root = tmp_dir("squash-trailers");
+        g(&root, &["init", "--quiet", "--initial-branch", "main"]);
+        g(&root, &["config", "user.email", "t@t.com"]);
+        g(&root, &["config", "user.name", "t"]);
+        write_file(&root, "base.txt", "base\n");
+        g(&root, &["add", "-A"]);
+        g(&root, &["commit", "-m", "base"]);
+        let base = rev_parse(&root, "HEAD");
+
+        write_file(&root, "a.txt", "a\n");
+        g(&root, &["add", "-A"]);
+        g(
+            &root,
+            &[
+                "commit",
+                "-m",
+                "add a",
+                "--trailer",
+                "Co-authored-by: Alice <alice@example.com>",
+            ],
+        );
+
+        write_file(&root, "b.txt", "b\n");
+        g(&root, &["add", "-A"]);
+        g(
+            &root,
+            &[
+                "commit",
+                "-m",
+                "add b",
+                "--trailer",
+                "Co-authored-by: Alice <alice@example.com>",
+                "--trailer",
+                "Ralphus-Cell: cell:squad-1:0:0",
+            ],
+        );
+
+        let wt = Workspace::local(&root);
+        squash_review_commits(&wt, &base, "feature").expect("squash");
+
+        let message = wt.git(&["log", "-1", "--format=%B"]).expect("git log");
+        assert!(message.contains("feature (squashed 2 commits)"));
+        assert!(message.contains("- add a"));
+        assert!(message.contains("- add b"));
+        assert_eq!(
+            message
+                .matches("Co-authored-by: Alice <alice@example.com>")
+                .count(),
+            1,
+            "must dedupe the trailer repeated on both commits: {message}"
+        );
+        assert!(
+            message.contains("Ralphus-Cell: cell:squad-1:0:0"),
+            "must preserve a trailer carried by only one of the squashed commits: {message}"
+        );
+    }
+
+    #[test]
+    fn squash_review_commits_with_no_trailers_appends_none() {
+        let root = tmp_dir("squash-no-trailers");
+        g(&root, &["init", "--quiet", "--initial-branch", "main"]);
+        g(&root, &["config", "user.email", "t@t.com"]);
+        g(&root, &["config", "user.name", "t"]);
+        write_file(&root, "base.txt", "base\n");
+        g(&root, &["add", "-A"]);
+        g(&root, &["commit", "-m", "base"]);
+        let base = rev_parse(&root, "HEAD");
+
+        write_file(&root, "a.txt", "a\n");
+        g(&root, &["add", "-A"]);
+        g(&root, &["commit", "-m", "add a"]);
+
+        write_file(&root, "b.txt", "b\n");
+        g(&root, &["add", "-A"]);
+        g(&root, &["commit", "-m", "add b"]);
+
+        let wt = Workspace::local(&root);
+        squash_review_commits(&wt, &base, "feature").expect("squash");
+
+        let message = wt.git(&["log", "-1", "--format=%B"]).expect("git log");
+        assert_eq!(
+            message.trim(),
+            "feature (squashed 2 commits)\n\n- add a\n- add b"
+        );
     }
 
     // -----------------------------------------------------------------------

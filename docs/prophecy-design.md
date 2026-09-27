@@ -484,18 +484,32 @@ but better as a written decision than an unexamined default. Note
 
 ## 13. Tickets to file regardless of this subsystem
 
-Both are pre-existing RAL-445 bugs surfaced while designing §8.2. Phase 4's
-trailer work is blocked on them, but they are worth fixing either way.
+Both were meant to be pre-existing RAL-445 bugs surfaced while designing
+§8.2. **Reality check, on picking this back up in a fresh working tree**:
+`daemon/src/git_hooks.rs`, `sync_coauthor_hook`, and `prepare-commit-msg`
+do not exist anywhere in this codebase — a repo-wide search turns up zero
+hits outside this design doc itself. RAL-445's commit-trailer hook
+infrastructure this section (and §6.3, §8.2) describes was evidently never
+merged to this branch, or lived only on the branch this doc's header says it
+was written against (`worktree-daemon-perf-plan-main`, 2026-09-25). Do not
+trust §6.3/§8.2's file-level claims about it without re-verifying first.
 
-1. **RAL-445 does not reach remote worktrees.** `sync_coauthor_hook` is only
-   called from the local `git worktree add` path, so every commit made on a
-   remote machine is silently missing its `Co-authored-by:` attribution. Fix:
-   port `git_hooks.rs` from `&Path` to `&Workspace` (§6.3).
-2. **RAL-445 loses trailers on squash.** `squash_review_commits`
-   (`daemon/src/guardian_merge.rs:10402`) commits with `--no-verify` — skipping
-   the hook — and rebuilds its message from `git log --format=%s`, subjects
-   only. Squashing a review branch therefore discards every trailer on every
-   squashed commit.
+1. **RAL-445 does not reach remote worktrees.** Not fixable as described —
+   there is no `git_hooks.rs`/`sync_coauthor_hook` to port from `&Path` to
+   `&Workspace`. If/when RAL-445's hook infrastructure actually lands, this
+   ticket should be re-filed against it then; inventing a whole
+   hook-installation subsystem here, under an "port &Path to &Workspace"
+   framing that presumes it already exists, would be a much bigger and
+   differently-shaped change than this ticket describes.
+2. **RAL-445 loses trailers on squash.** **Fixed independently of the above**
+   — `squash_review_commits` (`daemon/src/guardian_merge.rs`) genuinely does
+   exist and genuinely did discard every trailer on every squashed commit
+   (`--no-verify` + a subject-only rebuilt message via `git log --format=%s`),
+   which is a real bug regardless of whether any hook is installed today: a
+   trailer can already reach a commit by other means (manual authorship, a
+   future feature). Now collects the deduped union of every squashed
+   commit's trailers (`git log --format=%(trailers:unfold)`) and re-appends
+   them to the squash commit's own message.
 
 Optional third, smaller: `ghost::current_revision` is local-only (§6.3).
 
