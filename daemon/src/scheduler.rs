@@ -2891,28 +2891,30 @@ fn run_cell_worker(
     // (`daemon/src/runner.rs::forward_prophecy_line`), but a cell that was
     // killed, timed out, or otherwise never had its stderr scanned to
     // completion may only have this set.
-    for text in result
-        .prophecies
-        .iter()
-        .map(|p| p.trim())
-        .filter(|p| !p.is_empty())
-    {
+    if !result.prophecies.is_empty() {
         let guard = store.lock();
-        // TODO(prophecy-store): persist `text` into the prophecy table once
-        // it lands (a sibling task in this batch owns the table); for now
-        // this only reaches Cartographer, which is pruned at
-        // `[cartographer] retention_days`/`max_rows` and so cannot be this
-        // subsystem's durable home.
-        crate::cartographer::Note::new("prophecy")
-            .squad(squad_id)
-            .cell(&row.cell_id)
-            .task(&row.task_name)
-            .scope("cell")
-            .emit(
-                &guard,
-                "prophecy recorded",
-                serde_json::json!({"len": text.len()}),
-            );
+        for text in result
+            .prophecies
+            .iter()
+            .map(|p| p.trim())
+            .filter(|p| !p.is_empty())
+        {
+            // TODO(prophecy-store): persist `text` into the prophecy table once
+            // it lands (a sibling task in this batch owns the table); for now
+            // this only reaches Cartographer, which is pruned at
+            // `[cartographer] retention_days`/`max_rows` and so cannot be this
+            // subsystem's durable home.
+            crate::cartographer::Note::new("prophecy")
+                .squad(squad_id)
+                .cell(&row.cell_id)
+                .task(&row.task_name)
+                .scope("cell")
+                .emit(
+                    &guard,
+                    "prophecy recorded",
+                    serde_json::json!({"len": text.len()}),
+                );
+        }
     }
 
     if !result.is_done() {
