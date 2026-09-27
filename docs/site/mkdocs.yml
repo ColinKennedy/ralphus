@@ -12,6 +12,7 @@ nav:
       - Tasks: views/tasks.md
       - Queue: views/queue.md
       - Reviews: views/reviews.md
+      - Waypoints: views/waypoints.md
       - Resources: views/resources.md
       - Logs: views/cartographer.md
       - Projects: views/projects.md

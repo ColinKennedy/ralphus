@@ -85,6 +85,13 @@ as if the setting were unset, and ralphus logs (stderr plus a Cartographer
 row) that `dual_root_pr` was requested but skipped because no fork is in use,
 so the effective behavior stays visible when debugging.
 
+Every restack triggered by feedback on a branch — whether a human posts it or
+a cross-squad waypoint (RAL-400, see [`daemon-api.md`](daemon-api.md#waypoints-ral-400))
+delivers a bearing to a rostered review — amends and pushes through this same
+fork-aware routing. Neither path needs its own fork handling: a waypoint's
+guidance reaches a fork-enabled review's topmost ready branch exactly as any
+other feedback would.
+
 ### Alias uniqueness
 
 A PR branch alias is scoped to whichever repository it's physically pushed
