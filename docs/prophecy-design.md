@@ -179,3 +179,65 @@ are *information*, not capability — they grant no access, and they would make
 any CLI command usable in-cell without the agent guessing ids. Worth doing
 eventually, but not needed for a prophecy, and the credential question rides
 along with them. Own ticket. `RALPHUS_DAEMON_URL` is cut outright.
+
+---
+
+## 6. Topology — daemon, cell, and review on different machines
+
+Ralphus supports this properly, so it cannot be assumed away.
+
+**The model.** A `machine` value resolves to a provider *executable the daemon
+runs locally*; the remote host is reached only through that process's
+stdin/stdout and **never initiates a connection back**. There is no reverse
+channel, by design. Reviews are machine-aware too: `daemon/src/workspace.rs`
+(RAL-185 Phase 3c) carries "a directory *plus the machine it lives on*", and
+`guardian_merge` routes git through `ws.git()`, which dispatches to the
+provider's `run` verb when remote. So daemon here / cell on a build farm /
+review on a third box is a supported topology.
+
+### 6.1 What holds
+
+1. **The marker route is topology-independent.** `remote_runner.rs:468`
+   already forwards `RALPHUS_EVENT:` lines off the provider's stderr.
+2. **`log_path` and timeline inlining still work.** A remote cell's transcript
+   is materialized *locally* on the daemon host from pumped `stream` output
+   (`write_pane_snapshot` in `poll_to_completion`). Checked specifically
+   because I expected this to break; it does not.
+3. **There is a second remote-safe channel, and we should use it.**
+   `RunnerResult.ghost` (`daemon/src/runner.rs:925`) already crosses the
+   provider boundary inside the `exec` reply. Ghost therefore has *two*
+   remote-safe transports today. Mirror both: marker for mid-work streaming,
+   plus a `prophecies` field on `RunnerResult` as the at-exit backstop. The
+   result field is a typed contract; stderr forwarding is explicitly
+   best-effort ("streaming is a convenience, not the result").
+
+### 6.2 Remote makes the credential idea worse, not safer
+
+`env_overrides` is part of the `RunnerSpec` that crosses to the provider on
+`exec` (documented in the `exec` verb row of `docs/machine-providers.md`).
+Exporting a daemon token or URL would therefore **copy the daemon's bearer
+token onto every remote machine** — a credential that currently never leaves
+its host — where it would also be useless, since the daemon binds loopback.
+Exfiltration with no upside.
+
+**Constraint worth writing down while it is still true:** no ralphus credential
+crosses the provider boundary today. Remote auth is the provider's own business
+(SSH keys for `ralphus-ssh-provider`). Preserve that.
+
+### 6.3 What genuinely breaks — the commit trailer
+
+`git_hooks::sync_coauthor_hook` uses `std::fs::write` and the **local**
+`guardian_merge::git` free function, and is only called from
+`execute_worktree_plan` (`daemon/src/worktrees.rs:1204`) — the local
+`git worktree add` path. `provision_remote_with_targets` never calls it.
+
+- **A remote worktree receives no `prepare-commit-msg` hook at all.**
+- So RAL-445's `Co-authored-by:` is **already silently absent from every remote
+  commit today**, and a `Ralphus-Cell:` trailer would inherit that hole.
+- Mechanical fix: port the module from `&Path` to `&Workspace` and use the
+  existing `ws.write_file()` / `ws.git()`.
+- File as a RAL-445 bug independent of this subsystem (§13).
+
+Same shape, smaller: `ghost::current_revision` (`daemon/src/ghost.rs:202`)
+calls the local `git`, so on a remote `cwd` it returns `None` and the revision
+marker silently vanishes. Needs `ws.git()` too.
