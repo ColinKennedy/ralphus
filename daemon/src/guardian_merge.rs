@@ -564,6 +564,118 @@ fn guard_against_clobber(
     ))
 }
 
+/// Whether `e` is [`guard_against_clobber`]'s own refusal message -- the one
+/// case [`push_feedback_branch_reconciling`] knows how to recover from
+/// automatically, as opposed to any other reason the push itself failed
+/// (auth, network, a genuinely missing remote, ...), which it must not touch.
+/// Kept in sync with that function's wording by construction: this is the
+/// only other place that string appears.
+fn is_remote_clobber_error(e: &str) -> bool {
+    e.contains("has commits not present in the review")
+}
+
+/// Fetch `remote_branch` from `remote` and merge its tip into the worktree's
+/// current `HEAD` (RAL-<new>). Exists to recover automatically from exactly
+/// the case [`guard_against_clobber`] refuses to force-push over: a reviewer
+/// pushed a fix directly to the review/PR branch while an auto-fix round was
+/// mid-flight, so the branch this worktree is about to push carries a real
+/// commit force-pushing away would silently discard.
+///
+/// Deliberately narrow -- this is *not* [`pull_pr_commits`]'s rebase-with-
+/// agent-conflict-resolution machinery. That function is designed to run as
+/// its own top-level operation (it claims the guardian's status, drives a
+/// full rebase, and restacks downstream itself); calling it from inside an
+/// in-flight [`run_feedback`] round, which already holds this branch's
+/// worktree lease and queues its own downstream restack once it finishes,
+/// would double up both. A plain merge composes safely instead: on a clean
+/// merge, the reviewer's commit becomes an ancestor of the branch's new tip,
+/// the caller's ordinary re-push goes through un-forced, and `run_feedback`'s
+/// existing downstream restack (already unconditional on any change to this
+/// branch's tip) picks up the merged result exactly as it would any other
+/// feedback commit.
+///
+/// A merge that conflicts is aborted and reported rather than guessed at --
+/// resolving a real conflict here needs judgment (most plausibly a future
+/// pass through the same resolver-agent flow rebase conflicts already use),
+/// which is deliberately not attempted yet. Either outcome is logged (RAL-502:
+/// this is exactly the kind of automatic-recovery decision a reviewer
+/// wouldn't otherwise see any trace of).
+fn reconcile_remote_feedback_commits(
+    store: &crate::store_lock::StoreHandle,
+    id: &str,
+    branch_id: &str,
+    wt: &Workspace,
+    remote: &str,
+    remote_branch: &str,
+) -> std::result::Result<(), String> {
+    wt.git(&["fetch", remote, remote_branch])
+        .map_err(|e| format!("fetch {remote}/{remote_branch} failed: {e}"))?;
+    let remote_sha = wt
+        .git(&["rev-parse", "FETCH_HEAD"])
+        .map_err(|e| format!("rev-parse FETCH_HEAD failed: {e}"))?
+        .trim()
+        .to_string();
+    let merge_message =
+        format!("Merge remote-pushed review changes from {remote_branch} (auto-reconciled)");
+    match wt.git(&["merge", "--no-edit", "-m", &merge_message, &remote_sha]) {
+        Ok(_) => {
+            let merged_sha = wt
+                .git(&["rev-parse", "HEAD"])
+                .ok()
+                .map(|s| s.trim().to_string());
+            crate::rlog!(
+                INFO,
+                "ralphus [guardian] review {id} branch={branch_id} auto-reconciled a \
+                 reviewer's direct push on {remote_branch} (remote_sha={remote_sha}) before \
+                 the feedback push -- merge_sha={merged_sha:?}"
+            );
+            let guard = store.lock();
+            crate::cartographer::Note::new("guardian")
+                .guardian(id)
+                .scope("branch")
+                .level(crate::logging::LogLevel::INFO)
+                .emit(
+                    &guard,
+                    "auto-reconciled a reviewer's direct push before the feedback push",
+                    serde_json::json!({
+                        "branch_id": branch_id,
+                        "remote_branch": remote_branch,
+                        "remote_sha": remote_sha,
+                        "merge_sha": merged_sha,
+                    }),
+                );
+            Ok(())
+        }
+        Err(merge_err) => {
+            let _ = wt.git(&["merge", "--abort"]);
+            crate::rlog!(
+                WARNING,
+                "ralphus [guardian] review {id} branch={branch_id} could not auto-reconcile a \
+                 reviewer's direct push on {remote_branch} (remote_sha={remote_sha}): \
+                 {merge_err}"
+            );
+            let guard = store.lock();
+            crate::cartographer::Note::new("guardian")
+                .guardian(id)
+                .scope("branch")
+                .level(crate::logging::LogLevel::WARNING)
+                .emit(
+                    &guard,
+                    "could not auto-reconcile a reviewer's direct push -- merge conflicted",
+                    serde_json::json!({
+                        "branch_id": branch_id,
+                        "remote_branch": remote_branch,
+                        "remote_sha": remote_sha,
+                        "error": merge_err,
+                    }),
+                );
+            Err(format!(
+                "automatic merge of the reviewer's commits conflicted and was aborted: {merge_err}"
+            ))
+        }
+    }
+}
+
 /// The `.git/worktrees/<name>` admin-entry name for `wt`, resolved rather than
 /// assumed from its directory's basename (RAL-211).
 ///
@@ -6650,7 +6762,44 @@ pub fn run_feedback(
                     None,
                 ))
             });
-            match push_feedback_branch(&wt, &review_branch, !squash, push_remote.as_deref()) {
+            let push_result =
+                match push_feedback_branch(&wt, &review_branch, !squash, push_remote.as_deref()) {
+                    Ok(sha) => Ok(sha),
+                    // RAL-<new>: the only case `push_feedback_branch` refuses on is a
+                    // reviewer's direct push to this exact remote branch -- try to
+                    // absorb it automatically instead of stopping here and leaving a
+                    // human to `review pr pull-feedback` by hand. `push_remote` is
+                    // always `Some` on this path (see the RAL-510 comment above), and
+                    // for the `explicit_remote` branch `push_feedback_branch` takes,
+                    // the remote branch name is `review_branch` itself.
+                    Err(e) if is_remote_clobber_error(&e) => match push_remote.as_deref() {
+                        Some(remote) => match reconcile_remote_feedback_commits(
+                            store,
+                            id,
+                            branch_id,
+                            &wt,
+                            remote,
+                            &review_branch,
+                        ) {
+                            Ok(()) => push_feedback_branch(
+                                &wt,
+                                &review_branch,
+                                false,
+                                push_remote.as_deref(),
+                            )
+                            .map_err(|push_e| {
+                                format!(
+                                    "{e}; automatic merge of the reviewer's commits succeeded but \
+                                     the re-push still failed: {push_e}"
+                                )
+                            }),
+                            Err(merge_err) => Err(format!("{e}; {merge_err}")),
+                        },
+                        None => Err(e),
+                    },
+                    Err(e) => Err(e),
+                };
+            match push_result {
                 Ok(sha) => {
                     pushed = true;
                     pushed_sha = Some(sha.clone());
