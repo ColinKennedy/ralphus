@@ -337,3 +337,63 @@ stalls.
 | `pr_id` | text? | Which PR it landed in. |
 
 Deliberately **not** in v1: a confidence score (§12).
+
+---
+
+## 10. Build phases
+
+Each phase is independently shippable and useful alone — stop after two and
+something was still gained.
+
+### Phase 1 — store, plus the writers that need no agent
+
+- [ ] Append-only table keyed by `entity_uri` + `attempt`
+- [ ] Cartographer row emitted on every write (logging policy)
+- [ ] Read-side `ralphus prophecy list | show`
+- [ ] Populate from the rebase/conflict decisions `guardian_merge.rs` already
+      makes (§4.4)
+- [ ] Glossary entry for **prophecy** in `docs/glossary.md`
+
+*Why first:* zero agent involvement, immediate value, and it proves the storage
+model against real traffic before any prompt work exists.
+
+### Phase 2 — transport
+
+- [ ] Scan the agent's streaming output for a standalone `RALPHUS_PROPHECY:`
+      line; match exact-form lines only, per the `RALPHUS_TMUX_DONE` precedent
+      (§4.3)
+- [ ] Forward it as a runner event; let `forward_runner_event` attribute it
+- [ ] Add a `prophecies` field to `RunnerResult` so the at-exit set crosses the
+      provider boundary as a typed contract, mirroring `ghost` (§6.1)
+- [ ] `docs/special-syntax.md` entry for the marker
+
+*No credential, no endpoint, no new env. Works remotely unchanged.*
+
+### Phase 3 — teach the agents
+
+- [ ] System-prompt fragment alongside the existing ghost fragment in
+      `runner/src/execute.rs`
+
+*This is where the discipline is won or lost. Ghost is the evidence it works.*
+
+### Phase 4 — fold into the PR
+
+- [ ] Deterministic `<details>` block after the synthesized description (§8.1)
+- [ ] `published_at_ms` / `pr_id` so a resubmit does not duplicate
+- [ ] `Ralphus-Cell:` trailer on the existing RAL-445 hook (§8.2) — **blocked
+      on the two gaps in §13**
+
+### Phase 5 — derive the ghost (optional)
+
+- [ ] Build the ghost from recent prophecies instead of a separate marker, so
+      there is one discipline to teach rather than two (§3)
+
+*Only once the rest is proven.*
+
+### Phase 6 — the CLI write path (only if the marker disappoints)
+
+- [ ] `ralphus prophecy record`; inherit the MCP tool via parity (§4.2)
+- [ ] Export `RALPHUS_ENTITY_URI` / `RALPHUS_ATTEMPT`
+
+*Blocked on the credential question, which is RAL-252 / RAL-225 territory, not
+this subsystem's. Do not start here.*
