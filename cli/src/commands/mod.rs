@@ -22,6 +22,7 @@ pub mod mcp;
 pub mod misc;
 pub mod project;
 pub mod proof;
+pub mod prophecy;
 pub mod queue;
 pub mod quick_start;
 pub mod review;
@@ -185,6 +186,7 @@ pub enum Command {
     TutorShow,
     Cell(cell::CellCommand),
     Proof(proof::ProofCommand),
+    Prophecy(prophecy::ProphecyCommand),
     Review(review::ReviewCommand),
     Queue(queue::QueueCommand),
     Mcp(mcp::McpCommand),
@@ -294,6 +296,7 @@ pub fn parse_args(args: &[String]) -> Command {
         Some("task") => Command::Task(task::parse(&scanner.remaining())),
         Some("cell") => Command::Cell(cell::parse(&scanner.remaining())),
         Some("proof") => Command::Proof(proof::parse(&scanner.remaining())),
+        Some("prophecy") => Command::Prophecy(prophecy::parse(&scanner.remaining())),
         Some("review") => Command::Review(review::parse(&scanner.remaining())),
         Some("queue") => Command::Queue(queue::parse(&scanner.remaining())),
         Some("project") => Command::Project(project::parse(&scanner.remaining())),
@@ -369,6 +372,7 @@ pub fn dispatch(cmd: Command, opts: &GlobalOpts) -> i32 {
         Command::Task(c) => task::dispatch(c, opts),
         Command::Cell(c) => cell::dispatch(c, opts),
         Command::Proof(c) => proof::dispatch(c, opts),
+        Command::Prophecy(c) => prophecy::dispatch(c, opts),
         Command::Review(c) => review::dispatch(c, opts),
         Command::Queue(c) => queue::dispatch(c, opts),
         Command::Mcp(c) => mcp::dispatch(c),

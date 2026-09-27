@@ -347,12 +347,12 @@ something was still gained.
 
 ### Phase 1 — store, plus the writers that need no agent
 
-- [ ] Append-only table keyed by `entity_uri` + `attempt`
-- [ ] Cartographer row emitted on every write (logging policy)
-- [ ] Read-side `ralphus prophecy list | show`
-- [ ] Populate from the rebase/conflict decisions `guardian_merge.rs` already
-      makes (§4.4)
-- [ ] Glossary entry for **prophecy** in `docs/glossary.md`
+- [x] Append-only table keyed by `entity_uri` + `attempt` (`daemon/src/prophecy.rs`, `prophecies` table in `store.rs`)
+- [x] Cartographer row emitted on every write (logging policy) — done inside `Store::add_prophecy` itself, not left to callers
+- [x] Read-side `ralphus prophecy list | show`
+- [x] Populate from the rebase/conflict decisions `guardian_merge.rs` already
+      makes (§4.4) — `finish_branch_resolved` (decision) and `give_up_on_stuck_commit` (hazard)
+- [x] Glossary entry for **prophecy** in `docs/glossary.md`
 
 *Why first:* zero agent involvement, immediate value, and it proves the storage
 model against real traffic before any prompt work exists.
@@ -410,11 +410,26 @@ because open strings become forty synonyms for "note" within a month and
 nothing is filterable. But a closed set rejects a kind wanted later. Real
 trade; needs a decision before phase 1's schema.
 
+**Resolved (phase 1): closed enum.** Implemented as `ProphecyKind`
+(`daemon/src/prophecy.rs`) — `Discovery | Decision | Hazard | Deferred`, not
+a raw string column — so an invalid kind is a compile-time error at every
+current (internal, daemon-side) call site rather than a runtime validation
+question. Revisit if phase 2's marker parser needs to accept a kind from
+agent-supplied text: an unrecognized string there should be dropped/logged as
+malformed, the same way `forward_runner_event` already treats an
+unparseable `RALPHUS_EVENT:` payload, rather than silently widening the enum.
+
 ### 11.2 Does a prophecy survive its squad's deletion?
 
 Ghosts cascade-delete. If a prophecy does too, deleting a squad silently strips
 the reasoning out of an already-open PR. Leaning **survives**, which means a
 nullable squad reference and an orphan-retention policy.
+
+**Resolved (phase 1): survives.** `squad_id`/`guardian_id` carry no `ON
+DELETE CASCADE` (deliberately no `REFERENCES` constraint at all, so the
+column can't accidentally regain one) — `Store::delete_squad`/
+`delete_guardian`/`clear_all` `UPDATE ... SET squad_id=NULL` (orphan) instead
+of deleting the row.
 
 ### 11.3 Does a prophecy feed forward into prompts, or only outward to humans?
 

@@ -2055,6 +2055,22 @@ fn finish_branch_resolved(
             payload: serde_json::json!({"branch": branch, "committed": committed}),
             admin_only: false,
         });
+        // Prophecy (§4.4 of docs/prophecy-design.md): a daemon-side writer
+        // needing no agent cooperation, for a decision ralphus itself made
+        // during the rebase. Best-effort -- a failed write here must never
+        // fail the merge itself.
+        let _ = guard.add_prophecy(
+            &format!("guardian:{id}"),
+            0,
+            crate::prophecy::ProphecyKind::Decision,
+            &format!(
+                "Rebase conflicts on branch '{branch}' were resolved by the conflict-resolver \
+                 agent and {committed} commit(s) were committed onto the review stack."
+            ),
+            None,
+            None,
+            Some(id),
+        );
     }
     // RAL-168: gated by Proof scope -- a branch that just had real conflicts
     // resolved is never "auto-clean", so only `scope` (not `skip_auto_clean`)
@@ -2162,6 +2178,27 @@ fn give_up_on_stuck_commit(
                 "rebase_commands_total": command_progress.map(|(_, total)| total),
             }),
         });
+        // Prophecy (§4.4): "we had to leave one thing behind in the rebase"
+        // is called out in the design doc as the single highest-value note
+        // on the whole list -- this is exactly that moment. Best-effort, as
+        // above: must never fail the abort this function's caller is about
+        // to run.
+        let _ = guard.add_prophecy(
+            &format!("guardian:{id}"),
+            0,
+            crate::prophecy::ProphecyKind::Hazard,
+            &format!(
+                "The conflict-resolver agent could not resolve branch '{branch}' within its \
+                 {attempts}/{MAX_ATTEMPTS_PER_COMMIT}-attempt budget (found={found} \
+                 committed={committed} remaining_files={final_files:?} \
+                 remaining_markers={final_remaining}). The rebase was aborted, which leaves the \
+                 worktree looking clean even though this conflict was never actually resolved -- \
+                 a human should investigate before trusting this branch's review stack."
+            ),
+            None,
+            None,
+            Some(id),
+        );
     }
     "conflict resolver exhausted its attempt budget on this commit".to_string()
 }
