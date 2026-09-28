@@ -5187,7 +5187,7 @@ fn prepare_fork_worktree(
         },
     );
     crate::worktrees::apply_worktree_credential_helper_best_effort(
-        &store.lock(),
+        store,
         root,
         user,
         &fork.fork_url,
@@ -6526,6 +6526,7 @@ fn refresh_open_prs<'a>(
     store: &crate::store_lock::StoreHandle,
     id: &str,
     client: &crate::forge::ForgeClient,
+    fork_routing: Option<&ForkRouting>,
     open_by_branch: HashMap<&'a str, &'a PullRequestView>,
 ) -> HashMap<&'a str, &'a PullRequestView> {
     open_by_branch
@@ -6534,7 +6535,36 @@ fn refresh_open_prs<'a>(
             let Some(number) = pr.pr_number else {
                 return true;
             };
-            match client.get_pull_request_state(number) {
+            // A GitLab MR IID is scoped to its project. In fork mode, the
+            // parent-project root MR and fork-internal stack MRs can have
+            // the same IID, so every row must be queried through the client
+            // for its recorded repository.
+            let state_client = match fork_routing {
+                Some(routing) => crate::forge::client_for_repo(
+                    &pr.repo,
+                    &[&routing.parent_client, &routing.fork_client],
+                ),
+                None => Some(client),
+            };
+            let Some(state_client) = state_client else {
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [pr] pr {} state check skipped: no forge client matches recorded repo {}",
+                    pr.id,
+                    pr.repo
+                );
+                crate::cartographer::Note::new("pr")
+                    .level(crate::logging::LogLevel::WARNING)
+                    .scope("guardian")
+                    .guardian(id)
+                    .emit(
+                        &store.lock(),
+                        "pr state check skipped: no forge client matches recorded repo",
+                        serde_json::json!({"pr_id": pr.id, "repo": pr.repo}),
+                    );
+                return true;
+            };
+            match state_client.get_pull_request_state(number) {
                 Ok(state) if state != "open" => {
                     // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
                     crate::rlog!(
@@ -6643,7 +6673,7 @@ fn submit_stack_for_guardian(
 ) -> std::result::Result<StackSubmitOutcome, String> {
     let mut open_by_branch = open_prs_by_branch(existing_prs);
     retain_prs_reachable_via_current_routing(&mut open_by_branch, client, fork_routing);
-    let already_open = refresh_open_prs(store, id, client, open_by_branch);
+    let already_open = refresh_open_prs(store, id, client, fork_routing, open_by_branch);
     // RAL-<new>: `ordered_enabled` was assembled by the caller *before* this
     // call's own `refresh_open_prs` ran -- so a branch whose linked PR
     // `refresh_open_prs` just this instant discovered closed-without-merging
@@ -6769,7 +6799,7 @@ fn reconcile_native_pr_stack(
         .map_err(|e| e.to_string())?;
     let mut open_by_branch = open_prs_by_branch(&existing_prs);
     retain_prs_reachable_via_current_routing(&mut open_by_branch, client, fork_routing);
-    let already_open = refresh_open_prs(store, id, client, open_by_branch);
+    let already_open = refresh_open_prs(store, id, client, fork_routing, open_by_branch);
 
     // Re-target any PR that already existed for this guardian but whose base
     // no longer matches the current stack order/chain (RAL-190) -- without
@@ -12533,7 +12563,7 @@ mod tests {
             "sanity: recorded as open before the refresh"
         );
 
-        let refreshed = refresh_open_prs(&store, &gid, &client, by_branch);
+        let refreshed = refresh_open_prs(&store, &gid, &client, None, by_branch);
         assert!(
             refreshed.is_empty(),
             "a PR closed on the forge must not count as still open"
@@ -12544,6 +12574,85 @@ mod tests {
             updated.state, "closed",
             "the local row must be corrected to match forge reality"
         );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn refresh_open_prs_uses_the_parent_client_for_a_fork_mode_root_gitlab_mr() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(
+                req.url(),
+                "/projects/parent%2Fwidget/merge_requests/10",
+                "the parent MR IID must not be looked up in the fork project"
+            );
+            req.respond(
+                tiny_http::Response::from_string(r#"{"state":"opened"}"#).with_status_code(200),
+            )
+            .unwrap();
+        });
+
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let gid = store
+            .lock()
+            .create_guardian("demo", "main", "/repo")
+            .unwrap();
+        let pr_id = store
+            .lock()
+            .create_pull_request(
+                &gid,
+                Some("branch-000000000001"),
+                "gitlab",
+                "parent%2Fwidget",
+                "review/root",
+                "main",
+                "Root",
+                "Root MR",
+                Some(10),
+                None,
+            )
+            .unwrap();
+        let parent_client = crate::forge::ForgeClient::new(
+            crate::forge::ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "parent%2Fwidget".to_string(),
+            Some("tok".to_string()),
+        );
+        let fork_client = crate::forge::ForgeClient::new(
+            crate::forge::ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "fork%2Fwidget".to_string(),
+            Some("tok".to_string()),
+        );
+        let routing = ForkRouting {
+            fork: crate::project_forks::ForkRecord {
+                project: "demo".to_string(),
+                user: "alice".to_string(),
+                fork_url: "https://gitlab.com/fork/widget.git".to_string(),
+                remote_name: "fork-alice".to_string(),
+                fork_owner: String::new(),
+                git_user_name: None,
+                git_user_email: None,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+            parent_client: parent_client.clone(),
+            fork_client,
+            parent_project_id: Some(1),
+        };
+        let prs = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
+        let refreshed = refresh_open_prs(
+            &store,
+            &gid,
+            &routing.fork_client,
+            Some(&routing),
+            open_prs_by_branch(&prs),
+        );
+
+        assert_eq!(refreshed.len(), 1, "the open parent MR remains live");
+        assert_eq!(store.lock().get_pull_request(&pr_id).unwrap().state, "open");
         handle.join().unwrap();
     }
 

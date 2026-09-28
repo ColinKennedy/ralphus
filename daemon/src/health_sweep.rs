@@ -339,6 +339,8 @@ fn check_backend_command(
 /// would.
 #[must_use]
 pub fn run_sweep(store: &StoreHandle) -> SweepReport {
+    // allow-lock-io: see the doc comment above -- one short DB read, released
+    // before any of the slower external probing below.
     let overrides = AgentCommandOverrides::load(&store.lock());
     let checks = vec![
         check_git(),

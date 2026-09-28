@@ -629,8 +629,16 @@ fn note_and_return(
 /// # Errors
 /// Returns a human-readable failure reason: the cap already being reached,
 /// an unsupported backend, a provider error, or an empty reply.
-pub fn health_check(store: &Store, arbiter: &Arbiter) -> Result<String, String> {
-    if over_budget(store, arbiter) {
+pub fn health_check(
+    store: &crate::store_lock::StoreHandle,
+    arbiter: &Arbiter,
+) -> Result<String, String> {
+    // Bound to its own `let` (rather than passed as `&store.lock()` inline)
+    // so the guard visibly drops here, well before the network call below.
+    let budget_guard = store.lock();
+    let over_cap = over_budget(&budget_guard, arbiter);
+    drop(budget_guard);
+    if over_cap {
         return Err(format!(
             "Arbiter maximum_budget_usd cap (${:.4}) already reached",
             arbiter.maximum_budget_usd.unwrap_or_default()
@@ -641,6 +649,13 @@ pub fn health_check(store: &Store, arbiter: &Arbiter) -> Result<String, String> 
         content: "Reply with exactly one word: pong".to_string(),
         image: None,
     }];
+    // The provider round-trip below is real network I/O with no bound this
+    // crate controls -- it must run with the store lock released, not held.
+    // The `over_budget` guard above is already dropped by the time we get
+    // here (a bare `store.lock()` temporary lives only for that one `if`
+    // scrutinee); the guard below is acquired fresh, after the call
+    // returns, only for the DB write and Cartographer note that follow. See
+    // `health_check_never_holds_the_store_lock_across_the_provider_call`.
     let (reply, usage) = chat_client::call_direct_with_usage(
         &arbiter.agent,
         arbiter.model.as_deref(),
@@ -652,7 +667,8 @@ pub fn health_check(store: &Store, arbiter: &Arbiter) -> Result<String, String> 
         arbiter.model.as_deref().unwrap_or_default(),
         usage,
     );
-    let _ = store.record_arbiter_cost(
+    let guard = store.lock();
+    let _ = guard.record_arbiter_cost(
         "health_check",
         usage.tokens_in as i64,
         usage.tokens_out as i64,
@@ -662,7 +678,7 @@ pub fn health_check(store: &Store, arbiter: &Arbiter) -> Result<String, String> 
         return Err("Arbiter agent returned an empty reply".to_string());
     }
     crate::cartographer::Note::new("arbiter").emit(
-        store,
+        &guard,
         format!(
             "Arbiter health check round-trip succeeded via {}",
             arbiter.agent
@@ -1162,20 +1178,22 @@ mod tests {
 
     #[test]
     fn health_check_reports_cap_reached_without_making_a_call() {
-        let s = store();
+        let s = Arc::new(crate::store_lock::StoreMutex::new(store()));
         let arbiter = Arbiter {
             agent: "ollama".to_string(),
             model: None,
             maximum_budget_usd: Some(0.0),
         };
-        s.record_arbiter_cost("health_check", 1, 1, 0.0001).unwrap();
+        s.lock()
+            .record_arbiter_cost("health_check", 1, 1, 0.0001)
+            .unwrap();
         let err = health_check(&s, &arbiter).unwrap_err();
         assert!(err.contains("maximum_budget_usd"), "{err}");
     }
 
     #[test]
     fn health_check_fails_clearly_for_unsupported_backend() {
-        let s = store();
+        let s = Arc::new(crate::store_lock::StoreMutex::new(store()));
         let arbiter = Arbiter {
             agent: "codex".to_string(),
             model: None,

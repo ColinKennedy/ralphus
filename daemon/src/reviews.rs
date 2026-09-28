@@ -823,6 +823,7 @@ pub fn derive_reviews_with_full_prefetch(
     // worktree creation to discover. See its own doc comment for why this only
     // covers link-key reviews and is advisory (the real check below still runs
     // regardless, so an imprecise answer here only costs time, never correctness).
+    // allow-lock-io: local config/DB reads only, no subprocess or network.
     require_auto_build_declaration_early(&store.lock(), file, &tasks, &cells, &cell_info)?;
 
     // A review-opted-in cell's `cwd` may still be an unmaterialized
