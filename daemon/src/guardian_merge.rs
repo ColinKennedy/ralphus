@@ -564,6 +564,118 @@ fn guard_against_clobber(
     ))
 }
 
+/// Whether `e` is [`guard_against_clobber`]'s own refusal message -- the one
+/// case [`push_feedback_branch_reconciling`] knows how to recover from
+/// automatically, as opposed to any other reason the push itself failed
+/// (auth, network, a genuinely missing remote, ...), which it must not touch.
+/// Kept in sync with that function's wording by construction: this is the
+/// only other place that string appears.
+fn is_remote_clobber_error(e: &str) -> bool {
+    e.contains("has commits not present in the review")
+}
+
+/// Fetch `remote_branch` from `remote` and merge its tip into the worktree's
+/// current `HEAD` (RAL-<new>). Exists to recover automatically from exactly
+/// the case [`guard_against_clobber`] refuses to force-push over: a reviewer
+/// pushed a fix directly to the review/PR branch while an auto-fix round was
+/// mid-flight, so the branch this worktree is about to push carries a real
+/// commit force-pushing away would silently discard.
+///
+/// Deliberately narrow -- this is *not* [`pull_pr_commits`]'s rebase-with-
+/// agent-conflict-resolution machinery. That function is designed to run as
+/// its own top-level operation (it claims the guardian's status, drives a
+/// full rebase, and restacks downstream itself); calling it from inside an
+/// in-flight [`run_feedback`] round, which already holds this branch's
+/// worktree lease and queues its own downstream restack once it finishes,
+/// would double up both. A plain merge composes safely instead: on a clean
+/// merge, the reviewer's commit becomes an ancestor of the branch's new tip,
+/// the caller's ordinary re-push goes through un-forced, and `run_feedback`'s
+/// existing downstream restack (already unconditional on any change to this
+/// branch's tip) picks up the merged result exactly as it would any other
+/// feedback commit.
+///
+/// A merge that conflicts is aborted and reported rather than guessed at --
+/// resolving a real conflict here needs judgment (most plausibly a future
+/// pass through the same resolver-agent flow rebase conflicts already use),
+/// which is deliberately not attempted yet. Either outcome is logged (RAL-502:
+/// this is exactly the kind of automatic-recovery decision a reviewer
+/// wouldn't otherwise see any trace of).
+fn reconcile_remote_feedback_commits(
+    store: &crate::store_lock::StoreHandle,
+    id: &str,
+    branch_id: &str,
+    wt: &Workspace,
+    remote: &str,
+    remote_branch: &str,
+) -> std::result::Result<(), String> {
+    wt.git(&["fetch", remote, remote_branch])
+        .map_err(|e| format!("fetch {remote}/{remote_branch} failed: {e}"))?;
+    let remote_sha = wt
+        .git(&["rev-parse", "FETCH_HEAD"])
+        .map_err(|e| format!("rev-parse FETCH_HEAD failed: {e}"))?
+        .trim()
+        .to_string();
+    let merge_message =
+        format!("Merge remote-pushed review changes from {remote_branch} (auto-reconciled)");
+    match wt.git(&["merge", "--no-edit", "-m", &merge_message, &remote_sha]) {
+        Ok(_) => {
+            let merged_sha = wt
+                .git(&["rev-parse", "HEAD"])
+                .ok()
+                .map(|s| s.trim().to_string());
+            crate::rlog!(
+                INFO,
+                "ralphus [guardian] review {id} branch={branch_id} auto-reconciled a \
+                 reviewer's direct push on {remote_branch} (remote_sha={remote_sha}) before \
+                 the feedback push -- merge_sha={merged_sha:?}"
+            );
+            let guard = store.lock();
+            crate::cartographer::Note::new("guardian")
+                .guardian(id)
+                .scope("branch")
+                .level(crate::logging::LogLevel::INFO)
+                .emit(
+                    &guard,
+                    "auto-reconciled a reviewer's direct push before the feedback push",
+                    serde_json::json!({
+                        "branch_id": branch_id,
+                        "remote_branch": remote_branch,
+                        "remote_sha": remote_sha,
+                        "merge_sha": merged_sha,
+                    }),
+                );
+            Ok(())
+        }
+        Err(merge_err) => {
+            let _ = wt.git(&["merge", "--abort"]);
+            crate::rlog!(
+                WARNING,
+                "ralphus [guardian] review {id} branch={branch_id} could not auto-reconcile a \
+                 reviewer's direct push on {remote_branch} (remote_sha={remote_sha}): \
+                 {merge_err}"
+            );
+            let guard = store.lock();
+            crate::cartographer::Note::new("guardian")
+                .guardian(id)
+                .scope("branch")
+                .level(crate::logging::LogLevel::WARNING)
+                .emit(
+                    &guard,
+                    "could not auto-reconcile a reviewer's direct push -- merge conflicted",
+                    serde_json::json!({
+                        "branch_id": branch_id,
+                        "remote_branch": remote_branch,
+                        "remote_sha": remote_sha,
+                        "error": merge_err,
+                    }),
+                );
+            Err(format!(
+                "automatic merge of the reviewer's commits conflicted and was aborted: {merge_err}"
+            ))
+        }
+    }
+}
+
 /// The `.git/worktrees/<name>` admin-entry name for `wt`, resolved rather than
 /// assumed from its directory's basename (RAL-211).
 ///
@@ -6650,7 +6762,44 @@ pub fn run_feedback(
                     None,
                 ))
             });
-            match push_feedback_branch(&wt, &review_branch, !squash, push_remote.as_deref()) {
+            let push_result =
+                match push_feedback_branch(&wt, &review_branch, !squash, push_remote.as_deref()) {
+                    Ok(sha) => Ok(sha),
+                    // RAL-<new>: the only case `push_feedback_branch` refuses on is a
+                    // reviewer's direct push to this exact remote branch -- try to
+                    // absorb it automatically instead of stopping here and leaving a
+                    // human to `review pr pull-feedback` by hand. `push_remote` is
+                    // always `Some` on this path (see the RAL-510 comment above), and
+                    // for the `explicit_remote` branch `push_feedback_branch` takes,
+                    // the remote branch name is `review_branch` itself.
+                    Err(e) if is_remote_clobber_error(&e) => match push_remote.as_deref() {
+                        Some(remote) => match reconcile_remote_feedback_commits(
+                            store,
+                            id,
+                            branch_id,
+                            &wt,
+                            remote,
+                            &review_branch,
+                        ) {
+                            Ok(()) => push_feedback_branch(
+                                &wt,
+                                &review_branch,
+                                false,
+                                push_remote.as_deref(),
+                            )
+                            .map_err(|push_e| {
+                                format!(
+                                    "{e}; automatic merge of the reviewer's commits succeeded but \
+                                     the re-push still failed: {push_e}"
+                                )
+                            }),
+                            Err(merge_err) => Err(format!("{e}; {merge_err}")),
+                        },
+                        None => Err(e),
+                    },
+                    Err(e) => Err(e),
+                };
+            match push_result {
                 Ok(sha) => {
                     pushed = true;
                     pushed_sha = Some(sha.clone());
@@ -7287,34 +7436,68 @@ static CI_POLLING: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::ne
 static IDLE_MAINT_LAST: LazyLock<Mutex<HashMap<String, std::time::Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Last time `review_maintenance`'s `stack_partially_merged` branch deferred
+/// a guardian. Deliberately its own map, separate from [`IDLE_MAINT_LAST`]:
+/// that one's throttle is keyed to the `merge_failed`/`merge_stopped`
+/// *status* tier and must reset the instant a guardian's status leaves that
+/// tier (see `a_guardian_leaving_the_idle_tier_is_maintained_immediately`),
+/// whereas a `stack_partially_merged` guardian's status never changes while
+/// deferred -- it stays `in_review` the whole time -- so nothing would ever
+/// reset a shared entry via a status transition, and reusing `IDLE_MAINT_LAST`
+/// for both would make a stale merge_failed-era entry wrongly throttle a
+/// guardian that just left that tier. Same throttle duration
+/// ([`crate::scheduler::REVIEW_IDLE_MAINT_INTERVAL`]), tracked independently
+/// so the two mechanisms cannot interfere with each other. Pruned on every
+/// [`filter_by_idle_cadence`] call the same way.
+static STACK_MERGE_DEFERRED_LAST: LazyLock<Mutex<HashMap<String, std::time::Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 /// Applies the per-status maintenance cadence to a candidate `(id, status)`
 /// list: `in_review`/`merging` guardians pass through on every call, while
 /// `merge_failed`/`merge_stopped` guardians are throttled to at most once per
 /// [`crate::scheduler::REVIEW_IDLE_MAINT_INTERVAL`]. Also prunes
 /// [`IDLE_MAINT_LAST`] to the ids present in `candidates`, so it cannot grow
 /// unbounded as guardians leave the maintained-status set entirely.
+///
+/// Independently of that status-tier throttle, an id recently recorded in
+/// [`STACK_MERGE_DEFERRED_LAST`] is throttled too, regardless of its current
+/// status. Without this, a guardian `review_maintenance` just deferred
+/// because its PR stack is part-merged (see the `stack_partially_merged`
+/// branch there) re-qualifies for the full maintenance pass -- a real `git
+/// fetch` via `sync_remote_pr_commits`, a CI poll, and a store-lock read,
+/// among other work -- on every `REVIEW_MAINT_INTERVAL` (5s) tick forever,
+/// contending the global store lock for as long as whatever it's actually
+/// waiting on (the rest of the stack to merge) stays unresolved. See
+/// `filter_by_idle_cadence_backs_off_an_in_review_guardian_already_marked_idle`.
 fn filter_by_idle_cadence(candidates: &[(String, String)]) -> Vec<String> {
     let now = std::time::Instant::now();
     let mut last = IDLE_MAINT_LAST.lock().expect("poisoned");
+    let mut deferred = STACK_MERGE_DEFERRED_LAST.lock().expect("poisoned");
     let live: HashSet<&str> = candidates.iter().map(|(id, _)| id.as_str()).collect();
     last.retain(|id, _| live.contains(id.as_str()));
+    deferred.retain(|id, _| live.contains(id.as_str()));
     candidates
         .iter()
         .filter(|(id, status)| {
-            if !matches!(status.as_str(), "merge_failed" | "merge_stopped") {
-                return true;
-            }
-            match last.get(id) {
-                Some(prev)
-                    if now.duration_since(*prev) < crate::scheduler::REVIEW_IDLE_MAINT_INTERVAL =>
-                {
-                    false
+            if matches!(status.as_str(), "merge_failed" | "merge_stopped") {
+                match last.get(id.as_str()) {
+                    Some(prev)
+                        if now.duration_since(*prev)
+                            < crate::scheduler::REVIEW_IDLE_MAINT_INTERVAL =>
+                    {
+                        return false;
+                    }
+                    _ => {
+                        last.insert(id.clone(), now);
+                    }
                 }
-                _ => {
-                    last.insert(id.clone(), now);
-                    true
+            }
+            if let Some(prev) = deferred.get(id.as_str()) {
+                if now.duration_since(*prev) < crate::scheduler::REVIEW_IDLE_MAINT_INTERVAL {
+                    return false;
                 }
             }
+            true
         })
         .map(|(id, _)| id.clone())
         .collect()
@@ -7539,6 +7722,16 @@ pub fn review_maintenance(
                 merged > 0 && open > 0
             };
             if stack_partially_merged {
+                // Mark idle so `filter_by_idle_cadence` backs this guardian
+                // off to `REVIEW_IDLE_MAINT_INTERVAL` on the next call,
+                // instead of re-entering this same full maintenance pass (and
+                // the real `git fetch` `sync_remote_pr_commits` already did
+                // above, every call) on every 5s tick until the rest of the
+                // stack merges -- which may be a long, human-paced wait.
+                STACK_MERGE_DEFERRED_LAST
+                    .lock()
+                    .expect("poisoned")
+                    .insert(id.clone(), std::time::Instant::now());
                 crate::cartographer::Note::new("pr")
                     .level(crate::logging::LogLevel::INFO)
                     .scope("guardian")
@@ -11321,6 +11514,8 @@ fn phase_note(
         .level(level)
         .scope("guardian")
         .guardian(id)
+        // allow-lock-io: Note::emit is a synchronous Cartographer DB insert,
+        // no network/subprocess work of its own.
         .emit(&store.lock(), message, payload);
 }
 
@@ -12060,6 +12255,130 @@ mod tests {
                 "merging-1".to_string(),
                 "merge-stopped-1".to_string(),
             ]
+        );
+    }
+
+    /// Clears both [`IDLE_MAINT_LAST`] and [`STACK_MERGE_DEFERRED_LAST`]
+    /// before a `filter_by_idle_cadence` test runs, so an id reused across
+    /// test bodies (or a stray entry left by a previous run in the same
+    /// process) cannot leak in and change the outcome. `nextest` gives each
+    /// `#[test]` its own process, so this is belt-and-suspenders rather than
+    /// load-bearing -- but cheap enough that there is no reason to rely on
+    /// that alone for a pair of global statics.
+    fn reset_idle_cadence_state() {
+        IDLE_MAINT_LAST.lock().expect("poisoned").clear();
+        STACK_MERGE_DEFERRED_LAST.lock().expect("poisoned").clear();
+    }
+
+    #[test]
+    fn filter_by_idle_cadence_lets_a_fresh_guardian_of_any_status_through() {
+        reset_idle_cadence_state();
+        let pairs = vec![
+            ("in-review-1".to_string(), "in_review".to_string()),
+            ("merging-1".to_string(), "merging".to_string()),
+            ("merge-failed-1".to_string(), "merge_failed".to_string()),
+            ("merge-stopped-1".to_string(), "merge_stopped".to_string()),
+        ];
+        let mut ids = filter_by_idle_cadence(&pairs);
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![
+                "in-review-1".to_string(),
+                "merge-failed-1".to_string(),
+                "merge-stopped-1".to_string(),
+                "merging-1".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn filter_by_idle_cadence_throttles_merge_failed_on_the_very_next_call() {
+        reset_idle_cadence_state();
+        let pairs = vec![("merge-failed-1".to_string(), "merge_failed".to_string())];
+        assert_eq!(filter_by_idle_cadence(&pairs), vec!["merge-failed-1"]);
+        // Second call within `REVIEW_IDLE_MAINT_INTERVAL` (5 minutes): the
+        // first call just recorded `merge-failed-1` into `IDLE_MAINT_LAST`.
+        assert!(
+            filter_by_idle_cadence(&pairs).is_empty(),
+            "a merge_failed guardian must not pass through twice inside the idle interval"
+        );
+    }
+
+    #[test]
+    fn filter_by_idle_cadence_backs_off_an_in_review_guardian_already_marked_idle() {
+        // Regression test: `review_maintenance`'s `stack_partially_merged`
+        // deferral marks a guardian idle in `STACK_MERGE_DEFERRED_LAST` even
+        // though its status stays `in_review` (there is no other status to
+        // transition it to). Before this fix, `filter_by_idle_cadence` had
+        // no way to throttle a non-idle-tier status at all, so an `in_review`
+        // guardian this deferral just fired for was let straight back through
+        // on the very next call -- re-entering the full maintenance pass (a
+        // real `git fetch` via `sync_remote_pr_commits`, among other work) on
+        // every `REVIEW_MAINT_INTERVAL` (5s) tick forever, instead of the
+        // intended once per `REVIEW_IDLE_MAINT_INTERVAL`.
+        reset_idle_cadence_state();
+        let id = "stuck-in-review-1".to_string();
+        STACK_MERGE_DEFERRED_LAST
+            .lock()
+            .expect("poisoned")
+            .insert(id.clone(), std::time::Instant::now());
+        let pairs = vec![(id, "in_review".to_string())];
+        assert!(
+            filter_by_idle_cadence(&pairs).is_empty(),
+            "an in_review guardian already marked idle this cycle must be throttled, \
+             the same as a merge_failed/merge_stopped one"
+        );
+    }
+
+    #[test]
+    fn filter_by_idle_cadence_stack_merge_deferral_does_not_disturb_the_status_tier_reset() {
+        // The two throttle maps must stay independent: a guardian carrying a
+        // stale `IDLE_MAINT_LAST` entry from an earlier `merge_failed` spell
+        // still gets maintained immediately the instant its status leaves
+        // that tier (see `a_guardian_leaving_the_idle_tier_is_maintained_immediately`),
+        // even with an unrelated `STACK_MERGE_DEFERRED_LAST` entry for some
+        // *other* guardian sitting in the same process-global map.
+        reset_idle_cadence_state();
+        let id = "g-tier-transition-2".to_string();
+        IDLE_MAINT_LAST
+            .lock()
+            .expect("poisoned")
+            .insert(id.clone(), std::time::Instant::now());
+        STACK_MERGE_DEFERRED_LAST
+            .lock()
+            .expect("poisoned")
+            .insert("some-other-guardian".to_string(), std::time::Instant::now());
+
+        let active = vec![(id.clone(), "merging".to_string())];
+        assert_eq!(
+            filter_by_idle_cadence(&active),
+            vec![id],
+            "an unrelated STACK_MERGE_DEFERRED_LAST entry must not throttle a different id, \
+             and a stale IDLE_MAINT_LAST entry must not survive a status-tier exit"
+        );
+    }
+
+    #[test]
+    fn filter_by_idle_cadence_prunes_stack_merge_deferred_ids_no_longer_in_candidates() {
+        reset_idle_cadence_state();
+        let stale = "left-review-1".to_string();
+        STACK_MERGE_DEFERRED_LAST
+            .lock()
+            .expect("poisoned")
+            .insert(stale.clone(), std::time::Instant::now());
+        // `stale` is not among today's candidates (it merged, was deleted,
+        // etc.) -- it must be pruned from `STACK_MERGE_DEFERRED_LAST`, not
+        // linger forever as dead weight in a process-lifetime map.
+        let pairs = vec![("other-1".to_string(), "in_review".to_string())];
+        let _ = filter_by_idle_cadence(&pairs);
+        assert!(
+            !STACK_MERGE_DEFERRED_LAST
+                .lock()
+                .expect("poisoned")
+                .contains_key(&stale),
+            "an id absent from the current candidate list must be pruned from \
+             STACK_MERGE_DEFERRED_LAST"
         );
     }
 
