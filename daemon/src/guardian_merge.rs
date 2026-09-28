@@ -472,12 +472,30 @@ pub(crate) fn git(root: &Path, args: &[&str]) -> std::result::Result<String, Str
 /// force-pushed to a divergent tip. Guarded by [`guard_against_clobber`]
 /// before any force-push, so a reviewer's own direct push to the same remote
 /// branch is never silently discarded.
+#[derive(Debug)]
+pub(crate) enum FeedbackPushError {
+    RemoteDiverged,
+    Other(String),
+}
+
+impl std::fmt::Display for FeedbackPushError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RemoteDiverged => write!(
+                f,
+                "remote branch has commits not present in the review worktree"
+            ),
+            Self::Other(error) => f.write_str(error),
+        }
+    }
+}
+
 pub(crate) fn push_feedback_branch(
     wt: &Workspace,
     local_branch: &str,
     force: bool,
     explicit_remote: Option<&str>,
-) -> std::result::Result<String, String> {
+) -> std::result::Result<String, FeedbackPushError> {
     let (remote, remote_branch) = if let Some(explicit_remote) = explicit_remote {
         (explicit_remote.to_string(), local_branch.to_string())
     } else {
@@ -501,21 +519,31 @@ pub(crate) fn push_feedback_branch(
         }
     };
 
-    if force {
-        guard_against_clobber(wt, &remote, &remote_branch, local_branch)?;
-    }
+    // Inspect every push. A normal push is safe from overwriting remote work,
+    // but detecting divergence here lets squash feedback use the same
+    // reconciliation path as a forced feedback push.
+    let expected_remote_tip = guard_against_clobber(wt, &remote, &remote_branch, local_branch)?;
 
     let refspec = format!("{local_branch}:refs/heads/{remote_branch}");
+    let lease;
     let mut args = vec!["push"];
     if force {
-        args.push("--force");
+        // The preflight is not atomic with this request. The lease makes the
+        // forge reject the rewrite if the remote moved after it was inspected.
+        lease = format!(
+            "--force-with-lease=refs/heads/{remote_branch}:{}",
+            expected_remote_tip.as_deref().unwrap_or("")
+        );
+        args.push(&lease);
     }
     args.push("--set-upstream");
     args.push(&remote);
     args.push(&refspec);
-    wt.git(&args)?;
+    wt.git(&args).map_err(FeedbackPushError::Other)?;
 
-    wt.git(&["rev-parse", "HEAD"]).map(|s| s.trim().to_string())
+    wt.git(&["rev-parse", "HEAD"])
+        .map(|s| s.trim().to_string())
+        .map_err(FeedbackPushError::Other)
 }
 
 /// Workspace-routed counterpart of `pr::guard_against_clobber` — refuse to
@@ -523,9 +551,8 @@ pub(crate) fn push_feedback_branch(
 /// `local_branch` does not (e.g. a reviewer pushed a fix directly to the
 /// branch). A remote branch that doesn't exist yet, or one whose tip is
 /// already an ancestor of `local_branch` (so the force-push is a strict
-/// superset), is safe and returns `Ok(())`. Only needed ahead of a
-/// force-push — a plain push is already safely rejected by git itself on
-/// divergence.
+/// superset), is safe. Every feedback push calls this so both forced and
+/// squash feedback can take the same reconciliation path.
 ///
 /// A restack rewrites every SHA it replays, so a remote holding nothing but
 /// the pre-restack spelling of `local_branch`'s own commits is un-ancestored
@@ -535,78 +562,72 @@ fn guard_against_clobber(
     remote: &str,
     remote_branch: &str,
     local_branch: &str,
-) -> std::result::Result<(), String> {
-    if wt.git(&["fetch", remote, remote_branch]).is_err() {
-        return Ok(());
+) -> std::result::Result<Option<String>, FeedbackPushError> {
+    // A fetch error is not proof that the branch is absent: a later push can
+    // still reach the forge. Confirm absence with `ls-remote`; otherwise fail
+    // before any force operation.
+    let remote_ref = format!("refs/heads/{remote_branch}");
+    let advertised = wt
+        .git(&["ls-remote", "--heads", remote, &remote_ref])
+        .map_err(|e| {
+            FeedbackPushError::Other(format!(
+                "could not inspect {remote}/{remote_branch} before push: {e}"
+            ))
+        })?;
+    if advertised.trim().is_empty() {
+        return Ok(None);
     }
-    let Ok(remote_sha) = wt.git(&["rev-parse", "FETCH_HEAD"]) else {
-        return Ok(());
-    };
-    let remote_sha = remote_sha.trim();
+    wt.git(&["fetch", remote, remote_branch]).map_err(|e| {
+        FeedbackPushError::Other(format!(
+            "could not fetch {remote}/{remote_branch} before push: {e}"
+        ))
+    })?;
+    let remote_sha = wt
+        .git(&["rev-parse", "FETCH_HEAD"])
+        .map_err(|e| {
+            FeedbackPushError::Other(format!(
+                "could not resolve fetched {remote}/{remote_branch}: {e}"
+            ))
+        })?
+        .trim()
+        .to_string();
     if wt
-        .git(&["merge-base", "--is-ancestor", remote_sha, local_branch])
+        .git(&["merge-base", "--is-ancestor", &remote_sha, local_branch])
         .is_ok()
     {
-        return Ok(());
+        return Ok(Some(remote_sha));
     }
     // `+`-prefixed lines are remote commits with no patch-equivalent in
     // `local_branch`; none means the remote is a replayed ancestor in all but
     // SHA. See `pr::guard_against_clobber` for the same check.
-    if let Ok(cherry) = wt.git(&["cherry", local_branch, remote_sha]) {
+    if let Ok(cherry) = wt.git(&["cherry", local_branch, &remote_sha]) {
         if !cherry.lines().any(|l| l.starts_with('+')) {
-            return Ok(());
+            return Ok(Some(remote_sha));
         }
     }
-    Err(format!(
-        "remote branch '{remote_branch}' has commits not present in the review \
-         worktree (a reviewer likely pushed directly to it) -- pull those commits \
-         into the worktree first instead of overwriting them"
-    ))
+    Err(FeedbackPushError::RemoteDiverged)
 }
 
-/// Whether `e` is [`guard_against_clobber`]'s own refusal message -- the one
-/// case [`push_feedback_branch_reconciling`] knows how to recover from
-/// automatically, as opposed to any other reason the push itself failed
-/// (auth, network, a genuinely missing remote, ...), which it must not touch.
-/// Kept in sync with that function's wording by construction: this is the
-/// only other place that string appears.
-fn is_remote_clobber_error(e: &str) -> bool {
-    e.contains("has commits not present in the review")
-}
-
-/// Fetch `remote_branch` from `remote` and merge its tip into the worktree's
-/// current `HEAD` (RAL-<new>). Exists to recover automatically from exactly
-/// the case [`guard_against_clobber`] refuses to force-push over: a reviewer
-/// pushed a fix directly to the review/PR branch while an auto-fix round was
-/// mid-flight, so the branch this worktree is about to push carries a real
-/// commit force-pushing away would silently discard.
+/// Replay this feedback pass on top of a reviewer's direct remote push.
 ///
-/// Deliberately narrow -- this is *not* [`pull_pr_commits`]'s rebase-with-
-/// agent-conflict-resolution machinery. That function is designed to run as
-/// its own top-level operation (it claims the guardian's status, drives a
-/// full rebase, and restacks downstream itself); calling it from inside an
-/// in-flight [`run_feedback`] round, which already holds this branch's
-/// worktree lease and queues its own downstream restack once it finishes,
-/// would double up both. A plain merge composes safely instead: on a clean
-/// merge, the reviewer's commit becomes an ancestor of the branch's new tip,
-/// the caller's ordinary re-push goes through un-forced, and `run_feedback`'s
-/// existing downstream restack (already unconditional on any change to this
-/// branch's tip) picks up the merged result exactly as it would any other
-/// feedback commit.
-///
-/// A merge that conflicts is aborted and reported rather than guessed at --
-/// resolving a real conflict here needs judgment (most plausibly a future
-/// pass through the same resolver-agent flow rebase conflicts already use),
-/// which is deliberately not attempted yet. Either outcome is logged (RAL-502:
-/// this is exactly the kind of automatic-recovery decision a reviewer
-/// wouldn't otherwise see any trace of).
+/// This deliberately uses the review's existing conflict resolver rather
+/// than a merge. `run_feedback` already owns the branch worktree lease and
+/// queues the downstream restack, so invoking the top-level PR-pull operation
+/// would deadlock on that lease and duplicate the restack. The smaller rebase
+/// below retains its conflict-resolution and proof machinery without taking a
+/// second lease.
+#[allow(clippy::too_many_arguments)]
 fn reconcile_remote_feedback_commits(
     store: &crate::store_lock::StoreHandle,
     id: &str,
     branch_id: &str,
+    runner: &dyn Runner,
     wt: &Workspace,
     remote: &str,
     remote_branch: &str,
+    feature: &str,
+    is_final_branch: bool,
+    cancel: &CancelToken,
 ) -> std::result::Result<(), String> {
     wt.git(&["fetch", remote, remote_branch])
         .map_err(|e| format!("fetch {remote}/{remote_branch} failed: {e}"))?;
@@ -615,19 +636,49 @@ fn reconcile_remote_feedback_commits(
         .map_err(|e| format!("rev-parse FETCH_HEAD failed: {e}"))?
         .trim()
         .to_string();
-    let merge_message =
-        format!("Merge remote-pushed review changes from {remote_branch} (auto-reconciled)");
-    match wt.git(&["merge", "--no-edit", "-m", &merge_message, &remote_sha]) {
-        Ok(_) => {
-            let merged_sha = wt
+    let base_sha = wt
+        .git(&["merge-base", "HEAD", &remote_sha])
+        .map_err(|e| format!("could not find common history with {remote_branch}: {e}"))?
+        .trim()
+        .to_string();
+    let rebase_args = [
+        "rebase",
+        "--onto",
+        &remote_sha,
+        "--empty=drop",
+        "--no-fork-point",
+        &base_sha,
+        remote_branch,
+    ];
+    let gate = ProofGate::resolve(store, id, is_final_branch);
+    let reconciled = match wt.git(&rebase_args) {
+        Ok(_) => Ok(()),
+        Err(_rebase_err) if !conflicted_files(wt).is_empty() || rebase_in_progress(wt) => {
+            let resolved = resolver_backend(store, id)?;
+            resolve_conflicts_with_agent(
+                store, id, branch_id, runner, wt, feature, &resolved, &gate, cancel,
+            )
+            .map(|_| ())
+        }
+        Err(rebase_err) => {
+            let _ = wt.git(&["rebase", "--abort"]);
+            Err(format!(
+                "could not rebase feedback onto the reviewer's remote commits: {rebase_err}"
+            ))
+        }
+    };
+    match reconciled {
+        Ok(()) => {
+            run_commit_checks(store, id, branch_id, wt, feature, cancel)?;
+            let rebased_sha = wt
                 .git(&["rev-parse", "HEAD"])
                 .ok()
                 .map(|s| s.trim().to_string());
             crate::rlog!(
                 INFO,
-                "ralphus [guardian] review {id} branch={branch_id} auto-reconciled a \
-                 reviewer's direct push on {remote_branch} (remote_sha={remote_sha}) before \
-                 the feedback push -- merge_sha={merged_sha:?}"
+                "ralphus [guardian] review {id} branch={branch_id} rebased feedback onto \
+                a reviewer's direct push on {remote_branch} (remote_sha={remote_sha}) -- \
+                rebased_sha={rebased_sha:?}"
             );
             let guard = store.lock();
             crate::cartographer::Note::new("guardian")
@@ -636,23 +687,23 @@ fn reconcile_remote_feedback_commits(
                 .level(crate::logging::LogLevel::INFO)
                 .emit(
                     &guard,
-                    "auto-reconciled a reviewer's direct push before the feedback push",
+                    "rebased feedback onto a reviewer's direct push before the feedback push",
                     serde_json::json!({
                         "branch_id": branch_id,
                         "remote_branch": remote_branch,
                         "remote_sha": remote_sha,
-                        "merge_sha": merged_sha,
+                        "rebased_sha": rebased_sha,
                     }),
                 );
             Ok(())
         }
-        Err(merge_err) => {
-            let _ = wt.git(&["merge", "--abort"]);
+        Err(reconcile_err) => {
+            let _ = wt.git(&["rebase", "--abort"]);
             crate::rlog!(
                 WARNING,
-                "ralphus [guardian] review {id} branch={branch_id} could not auto-reconcile a \
-                 reviewer's direct push on {remote_branch} (remote_sha={remote_sha}): \
-                 {merge_err}"
+                "ralphus [guardian] review {id} branch={branch_id} could not rebase feedback \
+                 onto a reviewer's direct push on {remote_branch} (remote_sha={remote_sha}): \
+                 {reconcile_err}"
             );
             let guard = store.lock();
             crate::cartographer::Note::new("guardian")
@@ -661,16 +712,16 @@ fn reconcile_remote_feedback_commits(
                 .level(crate::logging::LogLevel::WARNING)
                 .emit(
                     &guard,
-                    "could not auto-reconcile a reviewer's direct push -- merge conflicted",
+                    "could not rebase feedback onto a reviewer's direct push",
                     serde_json::json!({
                         "branch_id": branch_id,
                         "remote_branch": remote_branch,
                         "remote_sha": remote_sha,
-                        "error": merge_err,
+                        "error": reconcile_err,
                     }),
                 );
             Err(format!(
-                "automatic merge of the reviewer's commits conflicted and was aborted: {merge_err}"
+                "automatic rebase onto the reviewer's commits failed: {reconcile_err}"
             ))
         }
     }
@@ -6765,21 +6816,18 @@ pub fn run_feedback(
             let push_result =
                 match push_feedback_branch(&wt, &review_branch, !squash, push_remote.as_deref()) {
                     Ok(sha) => Ok(sha),
-                    // RAL-<new>: the only case `push_feedback_branch` refuses on is a
-                    // reviewer's direct push to this exact remote branch -- try to
-                    // absorb it automatically instead of stopping here and leaving a
-                    // human to `review pr pull-feedback` by hand. `push_remote` is
-                    // always `Some` on this path (see the RAL-510 comment above), and
-                    // for the `explicit_remote` branch `push_feedback_branch` takes,
-                    // the remote branch name is `review_branch` itself.
-                    Err(e) if is_remote_clobber_error(&e) => match push_remote.as_deref() {
+                    Err(FeedbackPushError::RemoteDiverged) => match push_remote.as_deref() {
                         Some(remote) => match reconcile_remote_feedback_commits(
                             store,
                             id,
                             branch_id,
+                            runner,
                             &wt,
                             remote,
                             &review_branch,
+                            &feature,
+                            is_final_branch,
+                            cancel,
                         ) {
                             Ok(()) => push_feedback_branch(
                                 &wt,
@@ -6789,15 +6837,15 @@ pub fn run_feedback(
                             )
                             .map_err(|push_e| {
                                 format!(
-                                    "{e}; automatic merge of the reviewer's commits succeeded but \
+                                    "rebasing feedback onto the reviewer's commits succeeded but \
                                      the re-push still failed: {push_e}"
                                 )
                             }),
-                            Err(merge_err) => Err(format!("{e}; {merge_err}")),
+                            Err(reconcile_err) => Err(reconcile_err),
                         },
-                        None => Err(e),
+                        None => Err(FeedbackPushError::RemoteDiverged.to_string()),
                     },
-                    Err(e) => Err(e),
+                    Err(e) => Err(e.to_string()),
                 };
             match push_result {
                 Ok(sha) => {
