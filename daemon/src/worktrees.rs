@@ -417,15 +417,11 @@ fn resolve_squad_branch(
     squad_id: &str,
     on_disk: &HashMap<String, String>,
 ) -> Result<String, String> {
-    // The git probe runs with no guard held; the claim decision below takes one.
-    if names_remote_tracking_branch(Path::new(&project.path), base_branch) {
-        return Ok(base_branch.to_string());
-    }
     let guard = store.lock();
     resolve_squad_branch_claim(&guard, project, base_branch, squad_id, on_disk)
 }
 
-/// [`resolve_squad_branch`]'s claim decision, with the git probe already done.
+/// [`resolve_squad_branch`]'s claim decision.
 ///
 /// Takes a live `&Store` rather than the handle **on purpose**: this reads every
 /// existing claim, picks a candidate no claim and no on-disk worktree occupies,
@@ -434,6 +430,13 @@ fn resolve_squad_branch(
 /// statement instead would let two concurrent submissions both observe the same
 /// branch as free and both claim it, handing two squads the same worktree --
 /// which is exactly the failure RAL-337 introduced this allocation to prevent.
+///
+/// Also the sole gate for the remote-tracking exemption documented on
+/// [`resolve_squad_branch`] -- this function has a second, direct caller
+/// ([`plan_local_worktree_jobs`]) that already holds the store guard it would
+/// otherwise need to take itself, so the exemption lives here rather than in
+/// [`resolve_squad_branch`] alone, where that second caller would silently
+/// miss it.
 fn resolve_squad_branch_claim(
     store: &Store,
     project: &ProjectView,
@@ -441,6 +444,9 @@ fn resolve_squad_branch_claim(
     squad_id: &str,
     on_disk: &HashMap<String, String>,
 ) -> Result<String, String> {
+    if names_remote_tracking_branch(Path::new(&project.path), base_branch) {
+        return Ok(base_branch.to_string());
+    }
     if let Some(existing) = store
         .task_worktree_claim_for_squad(&project.name, base_branch, squad_id)
         .map_err(|e| e.to_string())?
