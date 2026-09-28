@@ -6315,8 +6315,13 @@ enum StackAction {
         stack_number: i64,
         all_ordered: Vec<i64>,
     },
-    /// Nothing to do this call.
-    Skip { reason: &'static str },
+    /// Nothing to do this call. `retry` marks the skip as *transient* -- the
+    /// inputs are expected to settle by themselves, so the caller owes this
+    /// guardian another reconcile pass rather than leaving the native stack
+    /// unregistered until some unrelated event happens to schedule one. A
+    /// `retry: false` skip is a settled answer (nothing to stack, or the
+    /// registered stack is already right) and needs no follow-up.
+    Skip { reason: &'static str, retry: bool },
 }
 
 /// Decide the [`StackAction`] for one submission. `all_branches_with_prs` is
@@ -6335,10 +6340,16 @@ enum StackAction {
 /// review fully unstacked on the forge until a later pass happens to retry
 /// (RAL-401 follow-up: this is what actually happened, confirmed against
 /// both the daemon log and GitHub's own "added to stack / removed from
-/// stack" PR timeline). Skipping here instead costs nothing: the review
-/// keeps whatever stack registration it already has (however stale) and the
-/// next reconcile pass -- run again on every terminal branch transition --
-/// retries once the chain is actually consistent.
+/// stack" PR timeline). Skipping here instead lets the review keep whatever
+/// stack registration it already has (however stale) until the chain is
+/// actually consistent.
+///
+/// Both chain-not-valid skips are marked `retry: true`, because nothing else
+/// is guaranteed to bring this guardian back: reconciliation runs as a side
+/// effect of submission, and submission is driven by branch transitions, so a
+/// chain that only becomes consistent *after* the last branch reached a
+/// terminal state has no further event to ride in on. See
+/// [`schedule_stack_chain_retry`], which the caller uses to give it one.
 ///
 /// `Rebuild` is likewise withheld whenever `all_branches_with_prs` merely
 /// describes *fewer* PRs than the registered stack in an otherwise identical
@@ -6355,8 +6366,12 @@ fn decide_stack_action(
     all_ordered.sort_by_key(|(pos, _)| *pos);
     let all_ordered: Vec<i64> = all_ordered.into_iter().map(|(_, num)| num).collect();
     if all_ordered.len() < 2 {
+        // Not transient in the sense `retry` means: a review grows PRs only as
+        // its branches reach a terminal state, and each of those transitions
+        // queues a pass of its own already.
         return StackAction::Skip {
             reason: "fewer than 2 PRs in the stack",
+            retry: false,
         };
     }
     match recorded_stack {
@@ -6364,6 +6379,7 @@ fn decide_stack_action(
             if !chain_is_valid {
                 return StackAction::Skip {
                     reason: "base-ref chain isn't fully resynced yet; postponing native stack registration until it is",
+                    retry: true,
                 };
             }
             StackAction::Create { all_ordered }
@@ -6372,11 +6388,13 @@ fn decide_stack_action(
             if members == all_ordered {
                 return StackAction::Skip {
                     reason: "native stack already matches the review PR order",
+                    retry: false,
                 };
             }
             if !chain_is_valid {
                 return StackAction::Skip {
                     reason: "base-ref chain isn't fully resynced yet; leaving the existing native stack alone until it is",
+                    retry: true,
                 };
             }
             if all_ordered.starts_with(&members) {
@@ -6389,6 +6407,7 @@ fn decide_stack_action(
             if is_ordered_subset(&all_ordered, &members) {
                 return StackAction::Skip {
                     reason: "the registered native stack already contains every expected PR in this order",
+                    retry: false,
                 };
             }
             StackAction::Rebuild {
@@ -6827,7 +6846,14 @@ fn reconcile_native_pr_stack(
         },
         None => None,
     };
-    match decide_stack_action(&all_with_prs, recorded, chain_is_valid) {
+    let action = decide_stack_action(&all_with_prs, recorded, chain_is_valid);
+    // Any settled answer ends whatever retry streak this guardian was on, so a
+    // later inconsistency gets the full budget again rather than inheriting a
+    // spent one.
+    if !matches!(action, StackAction::Skip { retry: true, .. }) {
+        clear_stack_chain_retries(id);
+    }
+    match action {
         StackAction::Create { all_ordered } => {
             match create_and_record_native_stack(store, id, client, &all_ordered) {
                 Ok(Some(stack_number)) => {
@@ -6935,12 +6961,15 @@ fn reconcile_native_pr_stack(
                 );
             }
         },
-        StackAction::Skip { reason } => {
+        StackAction::Skip { reason, retry } => {
             // ralphus[ignore-rlog-pair]: the surrounding stack-submission handler records the durable workflow outcome after this best-effort native-stack action
             crate::rlog!(
                 DEBUG,
                 "ralphus [pr] review {id} skipping stack registration: {reason}"
             );
+            if retry {
+                schedule_stack_chain_retry(store, id);
+            }
         }
     }
 
@@ -7267,6 +7296,96 @@ fn record_auto_submit_failure(
 /// RAL-389: trailing-debounce window that coalesces branches completing in
 /// the same restack pass before PR submission begins off-thread.
 const AUTO_SUBMIT_DEBOUNCE_MS: i64 = 400;
+
+/// RAL-<new>: how long a reconcile that skipped native-stack registration
+/// purely because the base-ref chain had not finished resyncing waits before
+/// running again.
+///
+/// Repointing each downstream base is its own forge round trip, so a chain
+/// mid-resync is usually settled well inside this window; making it any
+/// tighter mostly buys repeated per-PR forge reads (`refresh_open_prs` costs
+/// one live state lookup per open PR) for a chain that was always going to
+/// need a moment.
+const STACK_CHAIN_RETRY_DELAY_MS: i64 = 30_000;
+
+/// Most consecutive chain-not-yet-valid retries one guardian gets from this
+/// daemon process. Reaching it means the chain stayed inconsistent across
+/// [`STACK_CHAIN_RETRY_LIMIT`] x [`STACK_CHAIN_RETRY_DELAY_MS`], which is a
+/// standing inconsistency no further polling is going to resolve -- native
+/// stack registration then waits for the next real submission or branch
+/// transition instead of re-queueing forever.
+const STACK_CHAIN_RETRY_LIMIT: u32 = 10;
+
+/// Consecutive transient [`StackAction::Skip`]s per guardian, so a review
+/// whose base-ref chain never becomes consistent stops re-queueing itself.
+/// In-process rather than durable for the same reason
+/// [`AUTO_SUBMIT_IN_FLIGHT`] is: it only has to bound one daemon's own retry
+/// loop, and a restart legitimately re-earns the attempts.
+static STACK_CHAIN_RETRIES: LazyLock<Mutex<HashMap<String, u32>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Forget `id`'s transient-skip streak, so a later inconsistency starts from
+/// a full [`STACK_CHAIN_RETRY_LIMIT`] budget.
+fn clear_stack_chain_retries(id: &str) {
+    STACK_CHAIN_RETRIES.lock().expect("poisoned").remove(id);
+}
+
+/// Queue another reconcile pass for a guardian whose native-stack
+/// registration was skipped only because its base-ref chain had not finished
+/// resyncing (RAL-<new>).
+///
+/// [`reconcile_native_pr_stack`] runs as a side effect of submission, and
+/// submission is driven by branch transitions -- so once every branch is
+/// terminal and holds a PR, a chain that becomes consistent a moment later
+/// has no remaining event to ride in on. The review is then left with
+/// correctly chained PRs that GitHub was never told to group, and nothing
+/// short of a manual `review pr submit` ever revisits that.
+///
+/// Re-queueing through the same durable auto-submit request the
+/// terminal-branch trigger already uses keeps the retry on one path:
+/// [`sweep_pending_pr_auto_submits_once`] picks it up, takes the usual
+/// in-flight claim, and runs a full pass. The request is stamped
+/// [`STACK_CHAIN_RETRY_DELAY_MS`] into the future so the debounce window
+/// holds it back rather than firing it on the very next tick.
+///
+/// Returns whether a retry was queued.
+fn schedule_stack_chain_retry(store: &crate::store_lock::StoreHandle, id: &str) -> bool {
+    let attempt = {
+        let mut retries = STACK_CHAIN_RETRIES.lock().expect("poisoned");
+        let slot = retries.entry(id.to_string()).or_insert(0);
+        *slot += 1;
+        *slot
+    };
+    if attempt > STACK_CHAIN_RETRY_LIMIT {
+        // ralphus[ignore-rlog-pair]: the surrounding stack-submission handler records the durable workflow outcome after this best-effort native-stack action
+        crate::rlog!(
+            WARNING,
+            "ralphus [pr] review {id} base-ref chain still inconsistent after \
+             {STACK_CHAIN_RETRY_LIMIT} native-stack retries; leaving registration to the next \
+             submission"
+        );
+        return false;
+    }
+    let requested_at_ms = now_ms() + STACK_CHAIN_RETRY_DELAY_MS;
+    match store.lock().request_auto_submit_branch(id, requested_at_ms) {
+        Ok(()) => {
+            // ralphus[ignore-rlog-pair]: the surrounding stack-submission handler records the durable workflow outcome after this best-effort native-stack action
+            crate::rlog!(
+                DEBUG,
+                "ralphus [pr] review {id} queued native-stack retry {attempt}/{STACK_CHAIN_RETRY_LIMIT}"
+            );
+            true
+        }
+        Err(e) => {
+            // ralphus[ignore-rlog-pair]: the surrounding stack-submission handler records the durable workflow outcome after this best-effort native-stack action
+            crate::rlog!(
+                WARNING,
+                "ralphus [pr] review {id} could not queue native-stack retry: {e}"
+            );
+            false
+        }
+    }
+}
 
 /// Queue a guardian for asynchronous PR-stack submission. The durable row is
 /// guardian-scoped; the worker reads the terminal branches fresh when it runs.
@@ -9570,7 +9689,8 @@ mod tests {
         assert_eq!(
             decide_stack_action(&prs, None, true),
             StackAction::Skip {
-                reason: "fewer than 2 PRs in the stack"
+                reason: "fewer than 2 PRs in the stack",
+                retry: false
             }
         );
     }
@@ -9614,7 +9734,8 @@ mod tests {
         assert_eq!(
             decide_stack_action(&prs, Some((42, vec![3, 6])), true),
             StackAction::Skip {
-                reason: "native stack already matches the review PR order"
+                reason: "native stack already matches the review PR order",
+                retry: false
             }
         );
     }
@@ -9641,7 +9762,8 @@ mod tests {
         assert_eq!(
             decide_stack_action(&prs, None, false),
             StackAction::Skip {
-                reason: "base-ref chain isn't fully resynced yet; postponing native stack registration until it is"
+                reason: "base-ref chain isn't fully resynced yet; postponing native stack registration until it is",
+                retry: true
             }
         );
     }
@@ -9663,9 +9785,117 @@ mod tests {
         assert_eq!(
             decide_stack_action(&prs, Some((42, vec![3, 9])), false),
             StackAction::Skip {
-                reason: "base-ref chain isn't fully resynced yet; leaving the existing native stack alone until it is"
+                reason: "base-ref chain isn't fully resynced yet; leaving the existing native stack alone until it is",
+                retry: true
             }
         );
+    }
+
+    /// RAL-<new>: only the chain-not-yet-valid skips are transient. A skip
+    /// that is a settled answer must not keep a guardian re-queueing itself
+    /// for a reconcile that would decide exactly the same thing again.
+    #[test]
+    fn only_a_not_yet_valid_chain_marks_a_stack_skip_retryable() {
+        let one = vec![("b-a".to_string(), 0, 3)];
+        let two = vec![("b-a".to_string(), 0, 3), ("b-b".to_string(), 1, 6)];
+        let settled = [
+            decide_stack_action(&one, None, true),
+            decide_stack_action(&two, Some((42, vec![3, 6])), true),
+        ];
+        for action in settled {
+            assert!(
+                matches!(action, StackAction::Skip { retry: false, .. }),
+                "a settled outcome must not ask for a retry: {action:?}"
+            );
+        }
+        for action in [
+            decide_stack_action(&two, None, false),
+            decide_stack_action(&two, Some((42, vec![6, 3])), false),
+        ] {
+            assert!(
+                matches!(action, StackAction::Skip { retry: true, .. }),
+                "an unresynced chain must ask for a retry: {action:?}"
+            );
+        }
+    }
+
+    /// RAL-<new>: the regression this retry exists for. Reconciliation runs
+    /// only as a side effect of submission, and submission is driven by
+    /// branch transitions -- so a base-ref chain that finishes resyncing
+    /// *after* the last branch reached a terminal state has no remaining
+    /// event to bring the reconciler back. The review is then left holding
+    /// correctly chained PRs that GitHub was never told to group as a stack,
+    /// with nothing short of a manual `review pr submit` revisiting it. A
+    /// transient skip therefore has to queue its own next pass.
+    #[test]
+    fn a_transient_stack_skip_queues_its_own_delayed_retry() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let gid = store
+            .lock()
+            .create_guardian("transient-skip", "main", "/repo")
+            .unwrap();
+
+        assert!(
+            schedule_stack_chain_retry(&store, &gid),
+            "a transient skip must queue a retry"
+        );
+
+        // Queued for the future, so the very next sweep tick doesn't burn the
+        // retry re-reading a chain that has had no time to change.
+        let now = now_ms();
+        assert!(
+            store
+                .lock()
+                .take_due_auto_submits(now, AUTO_SUBMIT_DEBOUNCE_MS)
+                .unwrap()
+                .is_empty(),
+            "a retry stamped into the future must not be due immediately"
+        );
+        assert_eq!(
+            store
+                .lock()
+                .take_due_auto_submits(
+                    now + STACK_CHAIN_RETRY_DELAY_MS + AUTO_SUBMIT_DEBOUNCE_MS,
+                    AUTO_SUBMIT_DEBOUNCE_MS
+                )
+                .unwrap(),
+            vec![gid.clone()],
+            "the retry must come due once its delay has elapsed"
+        );
+
+        clear_stack_chain_retries(&gid);
+    }
+
+    /// A chain that never becomes consistent must not poll the forge forever:
+    /// every retry pass costs a live state read per open PR.
+    #[test]
+    fn stack_chain_retries_are_bounded_and_reset_on_a_settled_outcome() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let gid = store
+            .lock()
+            .create_guardian("bounded-retry", "main", "/repo")
+            .unwrap();
+
+        for attempt in 1..=STACK_CHAIN_RETRY_LIMIT {
+            assert!(
+                schedule_stack_chain_retry(&store, &gid),
+                "attempt {attempt} is within budget and must queue"
+            );
+        }
+        assert!(
+            !schedule_stack_chain_retry(&store, &gid),
+            "the budget must stop the retry loop rather than re-queueing forever"
+        );
+
+        // A settled reconcile outcome ends the streak, so a *later*
+        // inconsistency is not punished for an older one.
+        clear_stack_chain_retries(&gid);
+        assert!(
+            schedule_stack_chain_retry(&store, &gid),
+            "a cleared streak must restore the full retry budget"
+        );
+
+        clear_stack_chain_retries(&gid);
     }
 
     /// The bug this whole guard exists for: a restack resets every enabled
@@ -9826,6 +10056,7 @@ mod tests {
                 decide_stack_action(&prs, Some((42, full.clone())), true),
                 StackAction::Skip {
                     reason: "the registered native stack already contains every expected PR in this order",
+                    retry: false,
                 },
                 "a {}-PR view of a {}-PR stack must not dissolve it",
                 partial.len(),
@@ -9848,6 +10079,7 @@ mod tests {
             decide_stack_action(&prs, Some((42, vec![3, 6, 9, 12])), true),
             StackAction::Skip {
                 reason: "the registered native stack already contains every expected PR in this order",
+                retry: false,
             }
         );
     }
