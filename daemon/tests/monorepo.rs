@@ -151,6 +151,7 @@ impl Runner for CapturingRunner {
             agent_session_id: None,
             ghost: None,
             turns: None,
+            prophecies: Vec::new(),
         }
     }
 }

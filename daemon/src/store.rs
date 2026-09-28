@@ -1869,6 +1869,32 @@ impl Store {
             );
             CREATE INDEX IF NOT EXISTS idx_ghosts_squad ON ghosts(squad_id);
             CREATE INDEX IF NOT EXISTS idx_ghosts_guardian ON ghosts(guardian_id);
+            -- Prophecy subsystem (docs/prophecy-design.md): a durable,
+            -- append-only record of what an agent learned while it worked.
+            -- Unlike ghosts, this is NOT one row per owner -- every write is
+            -- its own row (`crate::prophecy::Store::add_prophecy`), and a
+            -- squad/guardian deletion orphans (nulls out) squad_id/
+            -- guardian_id rather than cascading, since a prophecy must
+            -- outlive both -- the PR is its terminal home (§11.2). No FK
+            -- constraint on either column for that reason (a hard
+            -- `REFERENCES ... ON DELETE CASCADE` would fight the orphan
+            -- policy the moment `PRAGMA foreign_keys` is on).
+            CREATE TABLE IF NOT EXISTS prophecies (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_uri      TEXT NOT NULL,
+                attempt         INTEGER NOT NULL DEFAULT 0,
+                kind            TEXT NOT NULL,
+                body            TEXT NOT NULL,
+                revision        TEXT,
+                squad_id        TEXT,
+                guardian_id     TEXT,
+                created_at_ms   INTEGER NOT NULL,
+                published_at_ms INTEGER,
+                pr_id           TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_prophecies_entity ON prophecies(entity_uri);
+            CREATE INDEX IF NOT EXISTS idx_prophecies_squad ON prophecies(squad_id);
+            CREATE INDEX IF NOT EXISTS idx_prophecies_guardian ON prophecies(guardian_id);
             -- RAL-241: the escalation mailbox. `mailbox_clients` is who can
             -- drain (registered via `POST /api/mailbox/register`);
             -- `mailbox_messages` is what got enqueued (a failed cell, a
@@ -8895,6 +8921,14 @@ impl Store {
         tx.execute("DELETE FROM cells WHERE squad_id=?", params![squad_id])?;
         tx.execute("DELETE FROM tasks WHERE squad_id=?", params![squad_id])?;
         tx.execute("DELETE FROM ghosts WHERE squad_id=?", params![squad_id])?;
+        // Prophecies survive their owning squad's deletion (§11.2 of
+        // docs/prophecy-design.md) -- orphan the reference rather than
+        // deleting the row, since a squad delete must never silently strip
+        // reasoning out of an already-open PR.
+        tx.execute(
+            "UPDATE prophecies SET squad_id=NULL WHERE squad_id=?",
+            params![squad_id],
+        )?;
         tx.execute(
             "DELETE FROM hidden_items WHERE squad_id=?",
             params![squad_id],
@@ -8957,6 +8991,9 @@ impl Store {
             tx.execute("DELETE FROM cells", [])?;
             tx.execute("DELETE FROM tasks", [])?;
             tx.execute("DELETE FROM ghosts", [])?;
+            // Prophecies survive a full clear too (§11.2) -- orphan every
+            // squad reference rather than wiping the rows.
+            tx.execute("UPDATE prophecies SET squad_id=NULL", [])?;
             tx.execute("DELETE FROM hidden_items", [])?;
             tx.execute("DELETE FROM mailbox_messages", [])?;
             let squads_deleted = tx.execute("DELETE FROM squads", [])?;
@@ -8964,6 +9001,8 @@ impl Store {
             tx.execute("DELETE FROM guardian_messages", [])?;
             tx.execute("DELETE FROM guardian_input_resolutions", [])?;
             tx.execute("DELETE FROM guardian_costs", [])?;
+            // Same orphan-not-delete treatment for the guardian side (§11.2).
+            tx.execute("UPDATE prophecies SET guardian_id=NULL", [])?;
             let guardians_deleted = tx.execute("DELETE FROM guardians", [])?;
             // Reset id sequences so the next squad/guardian id restarts at 1.
             tx.execute(
@@ -8998,6 +9037,10 @@ impl Store {
             tx.execute("DELETE FROM cells WHERE squad_id=?", params![id])?;
             tx.execute("DELETE FROM tasks WHERE squad_id=?", params![id])?;
             tx.execute("DELETE FROM ghosts WHERE squad_id=?", params![id])?;
+            tx.execute(
+                "UPDATE prophecies SET squad_id=NULL WHERE squad_id=?",
+                params![id],
+            )?;
             tx.execute("DELETE FROM hidden_items WHERE squad_id=?", params![id])?;
             tx.execute("DELETE FROM mailbox_messages WHERE squad_id=?", params![id])?;
             tx.execute("DELETE FROM squads WHERE id=?", params![id])?;
