@@ -681,6 +681,34 @@ fn current_checked_out_branch(root: &Path) -> Result<String, String> {
     Ok(branch.to_string())
 }
 
+/// Resolve `upstream` to a fully-qualified ref before handing it to git as a
+/// revision (a `worktree add` start-point, or `ls-tree`'s preflight
+/// measurement). A bare short name like `alt/staging` is ambiguous whenever
+/// the repo has BOTH a local branch literally named `alt/staging`
+/// (`refs/heads/alt/staging`) and a remote-tracking ref for remote `alt`'s
+/// `staging` branch (`refs/remotes/alt/staging`) -- exactly the situation
+/// [`resolve_registered_remote_upstream`] creates when it rewrites a bare
+/// `?upstream=staging` to `<remote>/staging` for a registered project whose
+/// remote happens to also have a same-named local branch. Mirrors
+/// [`set_explicit_upstream`]'s preference order: a remote-tracking match wins
+/// over a same-named local branch, since `?upstream=`'s whole purpose is
+/// naming what to track. Falls back to the input unchanged when neither
+/// namespace has a match (a SHA, a tag, or an already-unambiguous ref) -- git
+/// resolves those exactly as before.
+fn qualify_upstream_ref(root: &Path, upstream: &str) -> String {
+    if upstream.contains('/') {
+        let remote_ref = format!("refs/remotes/{upstream}");
+        if git(root, &["rev-parse", "--verify", &remote_ref]).is_ok() {
+            return remote_ref;
+        }
+    }
+    let local_ref = format!("refs/heads/{upstream}");
+    if git(root, &["rev-parse", "--verify", &local_ref]).is_ok() {
+        return local_ref;
+    }
+    upstream.to_string()
+}
+
 fn branch_materialization(root: &Path, branch: &str) -> Result<BranchMaterialization, String> {
     validate_branch_name(root, branch)?;
     let branch_ref = format!("refs/heads/{branch}");
@@ -1265,7 +1293,16 @@ fn execute_worktree_plan(
             // implicit `HEAD` -- so this new branch's content always reflects
             // what the submitter named, not whatever the shared `root`
             // checkout happens to have checked out right now.
-            preflight_worktree_budget(root, &plan.wt, upstream, path_budget_limit())?;
+            //
+            // `upstream` may be a bare short name that's ambiguous in this
+            // repo (e.g. `resolve_registered_remote_upstream` rewriting
+            // `staging` to `alt/staging` when both a local branch and a
+            // remote-tracking ref share that name) -- qualify it first so
+            // git resolves an exact ref instead of guessing across
+            // namespaces and failing with "ambiguous" (see
+            // `qualify_upstream_ref`).
+            let qualified_upstream = qualify_upstream_ref(root, upstream);
+            preflight_worktree_budget(root, &plan.wt, &qualified_upstream, path_budget_limit())?;
             // `--no-track`: see the `NewFromRemote` arm above -- `upstream`
             // being a plain local branch still triggers git's own implicit,
             // unlocked auto-tracking setup by default (`branch.autoSetupMerge`),
@@ -1279,7 +1316,7 @@ fn execute_worktree_plan(
                     "-b",
                     branch,
                     &wt_str,
-                    upstream,
+                    &qualified_upstream,
                 ],
             )?;
         }
@@ -4189,6 +4226,92 @@ mod tests {
         assert!(
             !log.contains("local unrelated work"),
             "new branch must not inherit the shared checkout's unrelated local branch: {log}"
+        );
+    }
+
+    #[test]
+    fn resolve_placeholders_disambiguates_a_registered_remote_upstream_from_a_same_named_local_branch()
+     {
+        // RAL-<pending>: `resolve_registered_remote_upstream` rewrites a bare
+        // `?upstream=staging` to `<remote>/staging` (here, `origin/staging`)
+        // for a registered project. If this repo ALSO happens to have a
+        // local branch literally named `origin/staging`
+        // (`refs/heads/origin/staging`), that short name is ambiguous to
+        // git -- it matches both the local branch and the remote-tracking
+        // ref `refs/remotes/origin/staging`. Materialization must still
+        // succeed, and must prefer the remote-tracking ref (the whole point
+        // of `?upstream=`), not fail with git's "ambiguous" error.
+        let base = tmp_dir("registered-remote-upstream-ambiguous");
+        let remote = base.join("remote.git");
+        let mut bare_opts = git2::RepositoryInitOptions::new();
+        bare_opts.bare(true).initial_head("main");
+        git2::Repository::init_opts(&remote, &bare_opts).unwrap();
+
+        let seed = base.join("seed");
+        let mut seed_opts = git2::RepositoryInitOptions::new();
+        seed_opts.initial_head("main");
+        let seed_repo = git2::Repository::init_opts(&seed, &seed_opts).unwrap();
+        let sig = git2::Signature::now("t", "t@t").unwrap();
+        std::fs::write(seed.join("base.txt"), "base\n").unwrap();
+        let base_oid = git2_commit_all(&seed_repo, &sig, "base", &[]);
+        let base_commit = seed_repo.find_commit(base_oid).unwrap();
+        let mut origin = seed_repo
+            .remote("origin", remote.to_str().unwrap())
+            .unwrap();
+        origin
+            .push(&["refs/heads/main:refs/heads/main"], None)
+            .unwrap();
+
+        seed_repo.branch("staging", &base_commit, false).unwrap();
+        git2_checkout(&seed_repo, "staging");
+        std::fs::write(seed.join("staging-only.txt"), "staging content\n").unwrap();
+        git2_commit_all(&seed_repo, &sig, "staging work", &[&base_commit]);
+        origin
+            .push(&["refs/heads/staging:refs/heads/staging"], None)
+            .unwrap();
+
+        let clone_path = base.join("clone");
+        let clone_repo = git2::Repository::clone(remote.to_str().unwrap(), &clone_path).unwrap();
+        let mut clone_config = clone_repo.config().unwrap();
+        clone_config.set_str("user.name", "t").unwrap();
+        clone_config.set_str("user.email", "t@t").unwrap();
+        drop(clone_repo);
+
+        // A local branch literally named `origin/staging` -- unrelated to
+        // the remote-tracking ref of the same short name, and pointing at
+        // different content (whatever `main` has, not the remote's
+        // "staging work" commit).
+        g(&clone_path, &["branch", "origin/staging"]);
+
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        store
+            .lock()
+            .register_project_with_clone_url_ex(
+                "proj",
+                "",
+                &clone_path.to_string_lossy(),
+                "git",
+                Some(remote.to_str().unwrap()),
+                None,
+            )
+            .unwrap();
+        let mut cells = vec![cell_row(
+            0,
+            0,
+            "s0",
+            Some("ralphus:new-worktree/feature-ambiguous?upstream=staging"),
+        )];
+        let tasks = vec![task_row(0, Some("proj"))];
+        resolve_placeholders(&store, "squad-1", &mut cells, &tasks, &Context::new())
+            .expect("materialize despite the ambiguous \"origin/staging\" short name");
+        let resolved = cells[0].cwd.clone().expect("resolved cwd");
+        let log = git(Path::new(&resolved), &["log", "--format=%s"]).unwrap();
+        assert!(
+            log.contains("staging work"),
+            "new branch must be based on the remote-tracking ref, not the same-named local \
+             branch: {log}"
         );
     }
 
