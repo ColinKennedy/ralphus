@@ -5187,7 +5187,7 @@ fn prepare_fork_worktree(
         },
     );
     crate::worktrees::apply_worktree_credential_helper_best_effort(
-        &store.lock(),
+        store,
         root,
         user,
         &fork.fork_url,

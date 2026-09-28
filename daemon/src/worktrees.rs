@@ -1097,7 +1097,7 @@ fn credential_helper_command() -> String {
 /// push` simply falls back to whatever ambient auth the host already has,
 /// exactly like before this existed).
 pub(crate) fn apply_worktree_credential_helper_best_effort(
-    store: &Store,
+    store: &crate::store_lock::StoreHandle,
     worktree_dir: &Path,
     submitter: &str,
     fork_url: &str,
@@ -1111,7 +1111,16 @@ pub(crate) fn apply_worktree_credential_helper_best_effort(
     };
     let result = (|| -> Result<(), String> {
         let worktree_id = crate::token::generate();
+        // The DB write is the only step here that needs the store -- scoped
+        // to its own statement so the guard is dropped before the `git`
+        // subprocess chain below, which must never run with the daemon's one
+        // global store lock held (RAL-<pending>: a prior version passed
+        // `&store.lock()` straight into this whole function as a call
+        // argument, keeping the guard live across every one of these calls;
+        // caught by the WS-B.3 runtime watchdog panicking with the guard
+        // held 3+ seconds).
         let grant = store
+            .lock()
             .mint_worktree_credential_grant(&worktree_id, submitter, &host)
             .map_err(|e| e.to_string())?;
         ensure_worktree_config_extension(worktree_dir)?;
@@ -1932,6 +1941,7 @@ fn provision_remote_with_targets(
     squad_id: &str,
     targets: &std::collections::BTreeMap<String, crate::machine_targets::MachineTarget>,
 ) -> Result<String, String> {
+    // allow-lock-io: registry lookups only, no network/subprocess work here.
     let provider = crate::remote_runner::provider_from_store(&store.lock(), machine)
         .map_err(|e| format!("cell '{}': {e}", cell.cell_id))?
         .ok_or_else(|| {
@@ -2099,21 +2109,41 @@ fn route_worktree_to_submitter_fork(
             email: fork.git_user_email.clone(),
         },
     );
-    apply_worktree_credential_helper_best_effort(
-        &store.lock(),
-        worktree,
-        &submitter,
-        &fork.fork_url,
-    );
+    apply_worktree_credential_helper_best_effort(store, worktree, &submitter, &fork.fork_url);
     let branch = git(worktree, &["symbolic-ref", "--quiet", "--short", "HEAD"])
         .map_err(|e| format!("could not determine fork-routed worktree branch: {e}"))?;
     let branch = branch.trim();
+    // RAL-<pending>: the one real network call in this whole function -- a
+    // `git push` to the submitter's fork -- timed and emitted on its own,
+    // separately from the aggregate per-cell note the caller
+    // (`resolve_placeholders_inner`) emits, so a slow materialization can be
+    // attributed specifically to this push (as opposed to the upstream
+    // fetch/worktree-add that precedes it) without guessing.
+    let push_started = std::time::Instant::now();
     git(worktree, &["push", "--set-upstream", &fork.remote_name, branch]).map_err(|e| {
         format!(
             "could not publish worktree branch {branch:?} to fork {:?} for submitter {submitter:?}: {e}",
             fork.remote_name
         )
     })?;
+    let elapsed_ms = push_started.elapsed().as_millis();
+    crate::cartographer::Note::new("worktrees")
+        .level(crate::logging::LogLevel::INFO)
+        .scope("materialize")
+        .squad(squad_id)
+        .emit(
+            &store.lock(),
+            format!(
+                "worktree branch {branch:?} pushed to fork remote {:?} ({elapsed_ms}ms)",
+                fork.remote_name
+            ),
+            serde_json::json!({
+                "branch": branch,
+                "fork_remote": fork.remote_name,
+                "submitter": submitter,
+                "elapsed_ms": elapsed_ms as u64,
+            }),
+        );
     Ok(())
 }
 
@@ -2559,6 +2589,17 @@ fn resolve_placeholders_inner(
             continue;
         };
         let cache_before = cache.len();
+        // RAL-<pending>: this whole per-cell resolution -- the upstream
+        // fetch/worktree-add inside `resolve_placeholder_text_for_project`
+        // plus `route_worktree_to_submitter_fork`'s git-identity/credential/
+        // push work below -- is real, sequential network + subprocess time
+        // with no Cartographer visibility at all until it either finishes or
+        // fails: a squad stuck in the "Authenticating remote machines"
+        // materialization phase previously looked like total silence for as
+        // long as this took (minutes, in the incident that prompted this).
+        // Timed and emitted below so a slow submit shows *which* cell and
+        // *how long*, not just that materialization hasn't finished yet.
+        let resolve_started = std::time::Instant::now();
         let resolved = resolve_placeholder_text_for_project(
             store,
             project_name,
@@ -2587,11 +2628,30 @@ fn resolve_placeholders_inner(
             .set_cell_cwd(squad_id, cell.task_idx, cell.idx, &resolved)
             .map_err(|e| e.to_string())?;
         route_worktree_to_submitter_fork(store, squad_id, project_name, Path::new(&resolved))?;
-        crate::rlog!(
-            INFO,
-            "ralphus [scheduler] cell {squad_id}/{} cwd placeholder \"{cwd}\" resolved to {resolved}",
-            cell.cell_id
-        );
+        let elapsed_ms = resolve_started.elapsed().as_millis();
+        // `Note::emit` writes the `ralphus [scheduler] ...` stderr line itself
+        // (same sink `rlog!` uses), so this single call replaces what used to
+        // be a bare `rlog!` here -- see the module-level logging policy on
+        // Cartographer superseding rlog!-only call sites.
+        crate::cartographer::Note::new("scheduler")
+            .level(crate::logging::LogLevel::INFO)
+            .scope("materialize")
+            .squad(squad_id)
+            .task(&cell.task_name)
+            .cell(&cell.cell_id)
+            .emit(
+                &store.lock(),
+                format!(
+                    "cell {squad_id}/{} cwd placeholder \"{cwd}\" resolved to {resolved} \
+                     ({elapsed_ms}ms)",
+                    cell.cell_id
+                ),
+                serde_json::json!({
+                    "placeholder": cwd,
+                    "resolved_to": resolved,
+                    "elapsed_ms": elapsed_ms as u64,
+                }),
+            );
         cell.cwd = Some(resolved);
     }
     Ok(materialized)
