@@ -173,12 +173,19 @@ pub(crate) fn rebase_onto(cwd: &Path, target_branch: &str) -> std::result::Resul
 /// about this worktree changed. Freezing the resolved commit here is what
 /// makes the marker a comparison point fixed at the moment this call ran,
 /// rather than a live pointer re-read at guard-check time.
+///
+/// `baseline` is qualified via [`crate::guardian_merge::qualify_ambiguous_ref`]
+/// before resolution: a caller-supplied `@{upstream}` name (e.g. from
+/// `--abbrev-ref`) is exactly the kind of bare short name that can collide
+/// with a same-named local branch, which would otherwise silently freeze the
+/// baseline to the wrong commit.
 pub(crate) fn set_worktree_commit_baseline(
     cwd: &Path,
     baseline: &str,
 ) -> std::result::Result<(), String> {
     let branch = worktree_branch(cwd)?;
-    let resolved = git(cwd, &["rev-parse", "--verify", baseline])?;
+    let qualified = crate::guardian_merge::qualify_ambiguous_ref(cwd, baseline);
+    let resolved = git(cwd, &["rev-parse", "--verify", &qualified])?;
     git(
         cwd,
         &[
