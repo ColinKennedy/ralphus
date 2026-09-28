@@ -12378,6 +12378,8 @@ mod tests {
         };
         assert!(err.contains("pi-openrouter-deepseek"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // §13 of docs/prophecy-design.md: squash must preserve trailers
     // -----------------------------------------------------------------------
 
