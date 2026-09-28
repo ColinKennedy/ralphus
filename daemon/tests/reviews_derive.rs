@@ -41,6 +41,7 @@ impl Runner for OkRunner {
             agent_session_id: None,
             ghost: None,
             turns: None,
+            prophecies: Vec::new(),
         }
     }
 }
@@ -104,6 +105,7 @@ impl Runner for ConflictResolvingRunner {
             agent_session_id: None,
             ghost: None,
             turns: None,
+            prophecies: Vec::new(),
         }
     }
 }
@@ -1228,6 +1230,7 @@ fn ok_result() -> RunnerResult {
         agent_session_id: None,
         ghost: None,
         turns: None,
+        prophecies: Vec::new(),
     }
 }
 
@@ -1270,6 +1273,7 @@ impl Runner for GatableRunner {
                 agent_session_id: None,
                 ghost: None,
                 turns: None,
+                prophecies: Vec::new(),
             };
         }
         ok_result()

@@ -351,6 +351,7 @@ fn run_agent_with_rate_limit_retry(
                 turns: total_turns,
                 ghost: None,
                 retry_after_secs: None,
+                prophecies: Vec::new(),
             };
         }
         retries += 1;
@@ -2055,6 +2056,22 @@ fn finish_branch_resolved(
             payload: serde_json::json!({"branch": branch, "committed": committed}),
             admin_only: false,
         });
+        // Prophecy (§4.4 of docs/prophecy-design.md): a daemon-side writer
+        // needing no agent cooperation, for a decision ralphus itself made
+        // during the rebase. Best-effort -- a failed write here must never
+        // fail the merge itself.
+        let _ = guard.add_prophecy(
+            &format!("guardian:{id}"),
+            0,
+            crate::prophecy::ProphecyKind::Decision,
+            &format!(
+                "Rebase conflicts on branch '{branch}' were resolved by the conflict-resolver \
+                 agent and {committed} commit(s) were committed onto the review stack."
+            ),
+            None,
+            None,
+            Some(id),
+        );
     }
     // RAL-168: gated by Proof scope -- a branch that just had real conflicts
     // resolved is never "auto-clean", so only `scope` (not `skip_auto_clean`)
@@ -2162,6 +2179,27 @@ fn give_up_on_stuck_commit(
                 "rebase_commands_total": command_progress.map(|(_, total)| total),
             }),
         });
+        // Prophecy (§4.4): "we had to leave one thing behind in the rebase"
+        // is called out in the design doc as the single highest-value note
+        // on the whole list -- this is exactly that moment. Best-effort, as
+        // above: must never fail the abort this function's caller is about
+        // to run.
+        let _ = guard.add_prophecy(
+            &format!("guardian:{id}"),
+            0,
+            crate::prophecy::ProphecyKind::Hazard,
+            &format!(
+                "The conflict-resolver agent could not resolve branch '{branch}' within its \
+                 {attempts}/{MAX_ATTEMPTS_PER_COMMIT}-attempt budget (found={found} \
+                 committed={committed} remaining_files={final_files:?} \
+                 remaining_markers={final_remaining}). The rebase was aborted, which leaves the \
+                 worktree looking clean even though this conflict was never actually resolved -- \
+                 a human should investigate before trusting this branch's review stack."
+            ),
+            None,
+            None,
+            Some(id),
+        );
     }
     "conflict resolver exhausted its attempt budget on this commit".to_string()
 }
@@ -10503,7 +10541,31 @@ fn squash_review_commits(
         .map(|l| format!("- {l}"))
         .collect::<Vec<_>>()
         .join("\n");
-    let msg = format!("{feature} (squashed {count} commits)\n\n{body}");
+    // §13 of docs/prophecy-design.md: this commits with `--no-verify` and
+    // rebuilds the message from subjects only, so any trailer on any
+    // squashed commit (a `Co-authored-by:`, or in the future a
+    // `Ralphus-Cell:`) was previously discarded outright. Collect the
+    // union of every squashed commit's trailers (deduped, first-seen order)
+    // and re-append them to the squash commit's own message instead.
+    let trailers_raw = wt
+        .git(&["log", "--reverse", "--format=%(trailers:unfold)", &range])
+        .unwrap_or_default();
+    let mut seen_trailers = std::collections::HashSet::new();
+    let mut trailer_lines = Vec::new();
+    for line in trailers_raw.lines() {
+        let line = line.trim();
+        if !line.is_empty() && seen_trailers.insert(line.to_string()) {
+            trailer_lines.push(line.to_string());
+        }
+    }
+    let msg = if trailer_lines.is_empty() {
+        format!("{feature} (squashed {count} commits)\n\n{body}")
+    } else {
+        format!(
+            "{feature} (squashed {count} commits)\n\n{body}\n\n{}",
+            trailer_lines.join("\n")
+        )
+    };
     wt.git(&["reset", "--soft", newbase])?;
     if let Err(e) = wt.git(&["commit", "--no-verify", "--message", &msg]) {
         // Restore the pre-squash tip so the stack is not left in a dirty state.
@@ -12318,6 +12380,97 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // §13 of docs/prophecy-design.md: squash must preserve trailers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn squash_review_commits_preserves_deduped_trailers_from_every_squashed_commit() {
+        let root = tmp_dir("squash-trailers");
+        g(&root, &["init", "--quiet", "--initial-branch", "main"]);
+        g(&root, &["config", "user.email", "t@t.com"]);
+        g(&root, &["config", "user.name", "t"]);
+        write_file(&root, "base.txt", "base\n");
+        g(&root, &["add", "-A"]);
+        g(&root, &["commit", "-m", "base"]);
+        let base = rev_parse(&root, "HEAD");
+
+        write_file(&root, "a.txt", "a\n");
+        g(&root, &["add", "-A"]);
+        g(
+            &root,
+            &[
+                "commit",
+                "-m",
+                "add a",
+                "--trailer",
+                "Co-authored-by: Alice <alice@example.com>",
+            ],
+        );
+
+        write_file(&root, "b.txt", "b\n");
+        g(&root, &["add", "-A"]);
+        g(
+            &root,
+            &[
+                "commit",
+                "-m",
+                "add b",
+                "--trailer",
+                "Co-authored-by: Alice <alice@example.com>",
+                "--trailer",
+                "Ralphus-Cell: cell:squad-1:0:0",
+            ],
+        );
+
+        let wt = Workspace::local(&root);
+        squash_review_commits(&wt, &base, "feature").expect("squash");
+
+        let message = wt.git(&["log", "-1", "--format=%B"]).expect("git log");
+        assert!(message.contains("feature (squashed 2 commits)"));
+        assert!(message.contains("- add a"));
+        assert!(message.contains("- add b"));
+        assert_eq!(
+            message
+                .matches("Co-authored-by: Alice <alice@example.com>")
+                .count(),
+            1,
+            "must dedupe the trailer repeated on both commits: {message}"
+        );
+        assert!(
+            message.contains("Ralphus-Cell: cell:squad-1:0:0"),
+            "must preserve a trailer carried by only one of the squashed commits: {message}"
+        );
+    }
+
+    #[test]
+    fn squash_review_commits_with_no_trailers_appends_none() {
+        let root = tmp_dir("squash-no-trailers");
+        g(&root, &["init", "--quiet", "--initial-branch", "main"]);
+        g(&root, &["config", "user.email", "t@t.com"]);
+        g(&root, &["config", "user.name", "t"]);
+        write_file(&root, "base.txt", "base\n");
+        g(&root, &["add", "-A"]);
+        g(&root, &["commit", "-m", "base"]);
+        let base = rev_parse(&root, "HEAD");
+
+        write_file(&root, "a.txt", "a\n");
+        g(&root, &["add", "-A"]);
+        g(&root, &["commit", "-m", "add a"]);
+
+        write_file(&root, "b.txt", "b\n");
+        g(&root, &["add", "-A"]);
+        g(&root, &["commit", "-m", "add b"]);
+
+        let wt = Workspace::local(&root);
+        squash_review_commits(&wt, &base, "feature").expect("squash");
+
+        let message = wt.git(&["log", "-1", "--format=%B"]).expect("git log");
+        assert_eq!(
+            message.trim(),
+            "feature (squashed 2 commits)\n\n- add a\n- add b"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // RAL-330: rerere fast-path content-preservation guard
     //
@@ -12547,6 +12700,7 @@ mod tests {
             agent_session_id: None,
             ghost: None,
             turns: None,
+            prophecies: Vec::new(),
         }
     }
 
@@ -12724,6 +12878,7 @@ mod tests {
                 agent_session_id: None,
                 turns: None,
                 ghost: None,
+                prophecies: Vec::new(),
             }
         }
     }
@@ -12960,6 +13115,7 @@ mod tests {
                 agent_session_id: None,
                 turns: None,
                 ghost: None,
+                prophecies: Vec::new(),
             }
         }
     }
@@ -15912,6 +16068,7 @@ mod tests {
                 agent_session_id: None,
                 ghost: None,
                 turns: None,
+                prophecies: Vec::new(),
             }
         }
     }
@@ -16307,6 +16464,12 @@ mod tests {
     /// auto_build` default when both are configured. The project default is
     /// set to a command that would fail, so if it ran instead of the
     /// review-declared one, this test would fail.
+    /// RAL-313: `generate_manual_commands`'s AI-inferred build command runs
+    /// against the combined worktree under this review's own `build_env`,
+    /// same as `final_checks`'s check gates/project `auto_build`
+    /// (`final_checks_runs_check_gates_under_this_reviews_build_env_override`
+    /// above) -- the inferred build command below fails unless the
+    /// overridden variable is actually present in its process environment.
     #[test]
     fn final_checks_prefers_review_declared_auto_build_over_project_default() {
         let (base, repo, _fwt) = make_repo("finalchecks-review-autobuild-precedence");
@@ -16383,6 +16546,7 @@ mod tests {
                 agent_session_id: None,
                 ghost: None,
                 turns: None,
+                prophecies: Vec::new(),
             }
         }
     }

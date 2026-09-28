@@ -277,6 +277,13 @@ fragment). The markers that assembly teaches are parsed from the reply:
   and one level of dependent cells' prompts — that is its whole routing
   scope. The bullet-count and "not a changelog" framing are prompt
   conventions, not parser-enforced shapes; only the marker line is parsed.
+- **`RALPHUS_PROPHECY: <kind>: <note>`** — an append-only design note from
+  a prompt cell. Every standalone marker line is carried in the runner
+  result, rather than only the last one; `<kind>` is one of `discovery`,
+  `decision`, `hazard`, or `deferred`. It is durable context for the
+  eventual PR reader, not prompt context for another cell. The parser matches
+  only the beginning of a trimmed line, never a substring, so an agent
+  reading this guide does not accidentally create a prophecy.
 
 Risk worth knowing before you echo these markers: an agent whose *work*
 happens to print one of these strings (e.g. an agent developing ralphus,

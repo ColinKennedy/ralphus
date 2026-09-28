@@ -1744,6 +1744,33 @@ const PROOF_CHILDREN: &[HelpNode] = &[
     ),
 ];
 
+const PROPHECY_CHILDREN: &[HelpNode] = &[
+    node(
+        "list",
+        &[],
+        &[
+            "--entity [str]",
+            "--guardian [str]",
+            "--limit [integer]",
+            "--offset [integer]",
+            "--squad [str]",
+        ],
+        "List recorded prophecies, filtered/paginated (docs/prophecy-design.md).",
+        false,
+        true, // ("prophecy", "list")
+        &[],
+    ),
+    node(
+        "show",
+        &["entity_uri [str]"],
+        &[],
+        "Show every prophecy recorded for one owner URI, oldest first.",
+        false,
+        true, // ("prophecy", "show")
+        &[],
+    ),
+];
+
 const QUICK_START_BACKENDS: &[HelpNode] = &[
     // ralphus[ignore-endpoint-cli]: interactive end-to-end launch (runtime boot + submit + board watch), not a daemon endpoint client -- MCP excludes the same leaves (mcp/src/exclusions.rs)
     node(
@@ -2186,6 +2213,16 @@ Python's `task show-tutor` to this top-level command.)",
             false,
             false,
             PROOF_CHILDREN,
+        ),
+        node(
+            "prophecy",
+            &[],
+            &[],
+            "Inspect the prophecy subsystem: a durable, append-only record of what an agent \
+learned while it worked (docs/prophecy-design.md). Read-only in this phase.",
+            false,
+            false,
+            PROPHECY_CHILDREN,
         ),
     ],
 );

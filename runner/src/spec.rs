@@ -303,6 +303,13 @@ pub struct CellResult {
     /// rather than treating the cell as done or failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_after_secs: Option<u64>,
+    /// Every `RALPHUS_PROPHECY:` marker found in the agent's final reply
+    /// (`docs/prophecy-design.md` phase 2) -- the at-exit backstop transport,
+    /// crossing the provider boundary the same way `ghost` already does.
+    /// Unlike `ghost`, this can hold more than one entry: a prophecy is
+    /// append-only, so the agent may report several insights in one reply.
+    #[serde(default)]
+    pub prophecies: Vec<crate::prophecy::ProphecyMarker>,
 }
 
 impl CellResult {
@@ -325,6 +332,7 @@ impl CellResult {
             turns: None,
             ghost: None,
             retry_after_secs: None,
+            prophecies: Vec::new(),
         }
     }
 
@@ -347,6 +355,7 @@ impl CellResult {
             turns: None,
             ghost: None,
             retry_after_secs: None,
+            prophecies: Vec::new(),
         }
     }
 
@@ -391,6 +400,7 @@ impl CellResult {
             agent_session_id,
             ghost: None,
             retry_after_secs: Some(retry_after_secs),
+            prophecies: Vec::new(),
         }
     }
 
@@ -433,6 +443,7 @@ impl CellResult {
             agent_session_id,
             ghost: None,
             retry_after_secs: None,
+            prophecies: Vec::new(),
         }
     }
 

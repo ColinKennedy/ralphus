@@ -2168,6 +2168,12 @@ impl Store {
         )?;
         self.conn
             .execute("DELETE FROM ghosts WHERE guardian_id=?", params![id])?;
+        // Prophecies survive their owning guardian's deletion (§11.2 of
+        // docs/prophecy-design.md) -- orphan rather than delete.
+        self.conn.execute(
+            "UPDATE prophecies SET guardian_id=NULL WHERE guardian_id=?",
+            params![id],
+        )?;
         self.conn
             .execute("DELETE FROM hidden_items WHERE guardian_id=?", params![id])?;
         self.conn.execute(
