@@ -2111,6 +2111,7 @@ fn run_cell_with_rate_limit_retries<'a>(
                 turns: total_turns,
                 ghost: None,
                 retry_after_secs: None,
+                prophecies: Vec::new(),
             };
             return Some((failed, permit));
         }
@@ -2881,6 +2882,38 @@ fn run_cell_worker(
                         serde_json::json!({"len": ghost_text.len()}),
                     );
             }
+        }
+    }
+
+    // Prophecy transport phase 2 (docs/prophecy-design.md §6.1): the at-exit
+    // backstop -- every `RALPHUS_PROPHECY:` marker the runner found crosses
+    // the provider boundary inside this same `exec` reply, mirroring the
+    // ghost handling just above. `attempt` is `0` for every write here: there
+    // is no per-cell restart counter in the schema today (a real
+    // improvement, out of scope for this phase), so a restarted cell's
+    // prophecies are not yet distinguished by attempt number the way the
+    // design intends -- they still each get their own row (append-only),
+    // just without a meaningfully distinct `attempt` value yet.
+    if !result.prophecies.is_empty() {
+        let uri = crate::ghost::cell_uri(squad_id, row.task_idx, row.idx);
+        let revision = crate::ghost::current_revision(row.cwd.as_deref().unwrap_or_default());
+        let guard = store.lock();
+        for marker in &result.prophecies {
+            let Ok(kind) = marker.kind.parse::<crate::prophecy::ProphecyKind>() else {
+                continue;
+            };
+            // `add_prophecy` already emits its own Cartographer row (and the
+            // log line that rides along with it) on success -- nothing
+            // further to log here.
+            let _ = guard.add_prophecy(
+                &uri,
+                0,
+                kind,
+                &marker.body,
+                revision.as_deref(),
+                Some(squad_id),
+                None,
+            );
         }
     }
 
@@ -4756,9 +4789,77 @@ mod tests {
                     agent_session_id: None,
                     ghost: None,
                     turns: None,
+                    prophecies: Vec::new(),
                 }
             }
         }
+    }
+
+    /// docs/prophecy-design.md phase 2: returns a `RunnerResult` carrying a
+    /// canned set of prophecy markers, so a test can assert the scheduler's
+    /// at-exit backstop handling (`run_cell_worker`'s `result.prophecies`
+    /// block) actually persists them.
+    struct ProphecyRunner {
+        markers: Vec<crate::runner::RunnerProphecyMarker>,
+    }
+
+    impl Runner for ProphecyRunner {
+        fn run(&self, _spec: &RunnerSpec) -> RunnerResult {
+            RunnerResult {
+                status: "done".to_string(),
+                tokens_in: 1,
+                tokens_out: 2,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+                compaction_input_tokens: 0,
+                compaction_count: 0,
+                cost_usd: 0.5,
+                cost_is_estimated: false,
+                summary: "ok".to_string(),
+                error: None,
+                proofed: None,
+                agent_session_id: None,
+                turns: None,
+                ghost: None,
+                retry_after_secs: None,
+                prophecies: self
+                    .markers
+                    .iter()
+                    .map(|m| crate::runner::RunnerProphecyMarker {
+                        kind: m.kind.clone(),
+                        body: m.body.clone(),
+                    })
+                    .collect(),
+            }
+        }
+    }
+
+    #[test]
+    fn runner_result_prophecies_are_persisted_as_the_at_exit_backstop() {
+        let (store, id) = store_with(ONE_CELL);
+        let runner = ProphecyRunner {
+            markers: vec![
+                crate::runner::RunnerProphecyMarker {
+                    kind: "hazard".to_string(),
+                    body: "left a race condition unresolved".to_string(),
+                },
+                crate::runner::RunnerProphecyMarker {
+                    kind: "bogus-kind".to_string(),
+                    body: "must be dropped, not a real kind".to_string(),
+                },
+            ],
+        };
+        execute_squad(&store, &runner, &id);
+        let uri = crate::ghost::cell_uri(&id, 0, 0);
+        let recorded = store.lock().list_prophecies_for_entity(&uri).unwrap();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "the unrecognized kind must be dropped, not the whole batch"
+        );
+        assert_eq!(recorded[0].kind, "hazard");
+        assert_eq!(recorded[0].body, "left a race condition unresolved");
+        assert_eq!(recorded[0].squad_id.as_deref(), Some(id.as_str()));
     }
 
     /// RAL-288 Stage 6: records whatever `resume_agent_session_id` (and, for
@@ -4795,6 +4896,7 @@ mod tests {
                 agent_session_id: spec.resume_agent_session_id.clone(),
                 ghost: None,
                 turns: None,
+                prophecies: Vec::new(),
             }
         }
     }
@@ -5055,6 +5157,7 @@ mod tests {
                         agent_session_id: None,
                         ghost: None,
                         turns: None,
+                        prophecies: Vec::new(),
                     }
                 }
                 Some("y") => {
@@ -5086,6 +5189,7 @@ mod tests {
                         agent_session_id: None,
                         ghost: None,
                         turns: None,
+                        prophecies: Vec::new(),
                     }
                 }
                 other => panic!("unexpected command {other:?}"),
@@ -5244,6 +5348,7 @@ mod tests {
                 agent_session_id: Some("sess-rl-1".to_string()),
                 ghost: None,
                 turns: Some(1),
+                prophecies: Vec::new(),
             }
         }
     }
@@ -5466,6 +5571,7 @@ mod tests {
                 agent_session_id: None,
                 ghost: None,
                 turns: None,
+                prophecies: Vec::new(),
             }
         }
     }
@@ -5609,6 +5715,7 @@ mod tests {
                 agent_session_id: None,
                 ghost: None,
                 turns: None,
+                prophecies: Vec::new(),
             }
         }
     }
@@ -6223,6 +6330,7 @@ mod tests {
                             agent_session_id: None,
                             ghost: None,
                             turns: None,
+                            prophecies: Vec::new(),
                         }
                     }
                 } else {
@@ -6245,6 +6353,7 @@ mod tests {
                         agent_session_id: None,
                         ghost: None,
                         turns: None,
+                        prophecies: Vec::new(),
                     }
                 }
             }
@@ -6371,6 +6480,7 @@ mod tests {
                     agent_session_id: None,
                     ghost: None,
                     turns: None,
+                    prophecies: Vec::new(),
                 };
             }
             if spec.cell_id.starts_with("proof-") {
@@ -6395,6 +6505,7 @@ mod tests {
                     agent_session_id: None,
                     ghost: None,
                     turns: None,
+                    prophecies: Vec::new(),
                 };
             }
             if spec.cell_id == "finalize" {
@@ -6417,6 +6528,7 @@ mod tests {
                 agent_session_id: None,
                 ghost: None,
                 turns: None,
+                prophecies: Vec::new(),
             }
         }
     }
@@ -6555,6 +6667,7 @@ mod tests {
                     agent_session_id: None,
                     ghost: None,
                     turns: None,
+                    prophecies: Vec::new(),
                 };
             }
             if spec.cell_id == "finalize" {
@@ -6580,6 +6693,7 @@ mod tests {
                 agent_session_id: None,
                 ghost: None,
                 turns: None,
+                prophecies: Vec::new(),
             }
         }
     }
@@ -6708,6 +6822,7 @@ mod tests {
                     agent_session_id: None,
                     ghost: None,
                     turns: None,
+                    prophecies: Vec::new(),
                 }
             }
         }
@@ -6948,6 +7063,7 @@ mod tests {
                     agent_session_id: None,
                     ghost: None,
                     turns: None,
+                    prophecies: Vec::new(),
                 }
             }
         }
@@ -7294,6 +7410,7 @@ mod tests {
                 agent_session_id: None,
                 turns: None,
                 ghost: None,
+                prophecies: Vec::new(),
             }
         }
     }
@@ -7362,6 +7479,7 @@ mod tests {
                 agent_session_id: None,
                 turns: None,
                 ghost: None,
+                prophecies: Vec::new(),
             }
         }
     }
@@ -7568,7 +7686,7 @@ mod tests {
             if spec.proof {
                 self.seen
                     .lock()
-                    .unwrap()
+                    .expect("seen mutex poisoned")
                     .push((spec.agent.clone(), spec.model.clone()));
             }
             RunnerResult {
@@ -7588,6 +7706,7 @@ mod tests {
                 agent_session_id: None,
                 ghost: None,
                 turns: None,
+                prophecies: Vec::new(),
             }
         }
     }
@@ -7660,6 +7779,7 @@ mod tests {
                 agent_session_id: None,
                 ghost: None,
                 turns: None,
+                prophecies: Vec::new(),
             }
         }
     }
@@ -7859,6 +7979,7 @@ mod tests {
                     agent_session_id: None,
                     ghost: None,
                     turns: None,
+                    prophecies: Vec::new(),
                 }
             }
         }
@@ -7983,6 +8104,7 @@ mod tests {
                 agent_session_id: None,
                 ghost: None,
                 turns: None,
+                prophecies: Vec::new(),
             }
         }
     }
@@ -8485,6 +8607,7 @@ mod tests {
                 agent_session_id: None,
                 ghost: None,
                 turns: None,
+                prophecies: Vec::new(),
             }
         }
     }
@@ -8747,6 +8870,7 @@ mod tests {
                 agent_session_id: None,
                 ghost: None,
                 turns: None,
+                prophecies: Vec::new(),
             }
         }
     }
@@ -8890,6 +9014,7 @@ mod tests {
                 agent_session_id: None,
                 ghost: None,
                 turns: None,
+                prophecies: Vec::new(),
             }
         }
     }
@@ -9260,6 +9385,7 @@ mod tests {
                 },
                 ghost: None,
                 turns: None,
+                prophecies: Vec::new(),
             }
         }
     }
@@ -9432,6 +9558,7 @@ mod tests {
                 },
                 ghost: None,
                 turns: None,
+                prophecies: Vec::new(),
             }
         }
     }

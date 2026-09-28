@@ -1533,6 +1533,8 @@ fn route_for_user(
         ("POST", ["api", "ghosts", "copy"]) => ghost_copy(daemon, body),
         // ralphus[ignore-endpoint-cli]: board ghost link resolution inside the board (RAL-155)
         ("GET", ["api", "ghosts", owner_uri]) => ghost_get(daemon, owner_uri),
+        ("GET", ["api", "prophecies"]) => prophecies_query(daemon, query),
+        ("GET", ["api", "prophecies", entity_uri]) => prophecies_show(daemon, entity_uri),
         ("POST", ["api", "mailbox", "register"]) => mailbox_register(daemon),
         // Monitor watches + the per-user mailbox view they filter.
         // These literal "personal"/"watches" segments must stay ahead of the
@@ -7124,6 +7126,37 @@ fn ghost_get(daemon: &Daemon, owner_uri: &str) -> Reply {
     match daemon.lock().get_ghost(owner_uri) {
         Ok(Some(g)) => json(200, &g),
         Ok(None) => error(404, "not_found", "no such ghost", vec![]),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// Filtered, paginated query over the prophecy subsystem
+/// (`docs/prophecy-design.md`) -- backs `ralphus prophecy list`.
+fn prophecies_query(daemon: &Daemon, query: &str) -> Reply {
+    let limit = query_param(query, "limit")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(100);
+    let offset = query_param(query, "offset")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0);
+    let filter = crate::prophecy::ProphecyFilter {
+        entity_uri: query_filter(query, "entity_uri"),
+        squad_id: query_filter(query, "squad_id"),
+        guardian_id: query_filter(query, "guardian_id"),
+        limit,
+        offset,
+    };
+    match daemon.lock().list_prophecies(&filter) {
+        Ok(rows) => json(200, &rows),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// Every prophecy recorded for one owner URI, oldest first -- backs
+/// `ralphus prophecy show <entity-uri>`.
+fn prophecies_show(daemon: &Daemon, entity_uri: &str) -> Reply {
+    match daemon.lock().list_prophecies_for_entity(entity_uri) {
+        Ok(rows) => json(200, &rows),
         Err(e) => store_error(&e),
     }
 }
@@ -20775,6 +20808,86 @@ remediation_attempts=1
         );
     }
 
+    // ── Prophecy (docs/prophecy-design.md) ───────────────────────────────────
+
+    #[test]
+    fn prophecies_show_returns_every_row_for_an_entity_oldest_first() {
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        let uri = crate::ghost::cell_uri("squad-000000000001", 0, 0);
+        d.lock()
+            .add_prophecy(
+                &uri,
+                0,
+                crate::prophecy::ProphecyKind::Discovery,
+                "first insight",
+                None,
+                Some("squad-000000000001"),
+                None,
+            )
+            .unwrap();
+        d.lock()
+            .add_prophecy(
+                &uri,
+                1,
+                crate::prophecy::ProphecyKind::Hazard,
+                "second insight",
+                None,
+                Some("squad-000000000001"),
+                None,
+            )
+            .unwrap();
+
+        let r = route(&d, "GET", &format!("/api/prophecies/{uri}"), "");
+        assert_eq!(r.status, 200, "body={}", r.body);
+        let rows: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        let rows = rows.as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["body"], "first insight");
+        assert_eq!(rows[1]["body"], "second insight");
+
+        let empty = route(&d, "GET", "/api/prophecies/cell:nope:0:0", "");
+        assert_eq!(empty.status, 200);
+        assert_eq!(empty.body, "[]");
+    }
+
+    #[test]
+    fn prophecies_query_filters_by_guardian_id() {
+        let d = daemon();
+        d.lock()
+            .add_prophecy(
+                "guardian:guardian-000000000001",
+                0,
+                crate::prophecy::ProphecyKind::Decision,
+                "took ours",
+                None,
+                None,
+                Some("guardian-000000000001"),
+            )
+            .unwrap();
+        d.lock()
+            .add_prophecy(
+                "guardian:guardian-000000000002",
+                0,
+                crate::prophecy::ProphecyKind::Decision,
+                "took theirs",
+                None,
+                None,
+                Some("guardian-000000000002"),
+            )
+            .unwrap();
+
+        let r = route(
+            &d,
+            "GET",
+            "/api/prophecies?guardian_id=guardian-000000000001",
+            "",
+        );
+        assert_eq!(r.status, 200, "body={}", r.body);
+        assert!(r.body.contains("took ours"));
+        assert!(!r.body.contains("took theirs"));
+    }
+
     #[test]
     fn mailbox_register_returns_a_client_id() {
         let d = daemon();
@@ -23415,6 +23528,7 @@ remediation_attempts = 1
                     agent_session_id: None,
                     turns: None,
                     ghost: None,
+                    prophecies: Vec::new(),
                 }
             }
         }
@@ -23568,6 +23682,7 @@ remediation_attempts = 1
                     agent_session_id: None,
                     turns: None,
                     ghost: None,
+                    prophecies: Vec::new(),
                 }
             }
         }

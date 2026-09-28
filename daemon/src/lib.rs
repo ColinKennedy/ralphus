@@ -44,6 +44,7 @@ pub mod pr;
 pub mod procreg;
 pub mod project_forks;
 pub mod proof;
+pub mod prophecy;
 pub mod redact;
 pub mod remediation;
 pub mod remote_failure;

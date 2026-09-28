@@ -107,6 +107,7 @@ fn maybe_run_commit_step(spec: &RunnerSpec) -> Option<RunnerResult> {
         agent_session_id: None,
         turns: None,
         ghost: None,
+        prophecies: Vec::new(),
     })
 }
 
@@ -176,6 +177,7 @@ impl Runner for StageDoneRunner {
             agent_session_id: None,
             ghost: None,
             turns: None,
+            prophecies: Vec::new(),
         }
     }
 }
@@ -238,6 +240,7 @@ impl Runner for LossyRunner {
             agent_session_id: None,
             ghost: None,
             turns: None,
+            prophecies: Vec::new(),
         }
     }
 }
@@ -287,6 +290,7 @@ impl Runner for MarkerStrippingRunner {
             agent_session_id: None,
             ghost: None,
             turns: None,
+            prophecies: Vec::new(),
         }
     }
 }
@@ -316,6 +320,7 @@ impl Runner for FeedbackRunner {
             agent_session_id: None,
             ghost: None,
             turns: None,
+            prophecies: Vec::new(),
         }
     }
 }
@@ -357,6 +362,7 @@ impl Runner for RaceInjectingRunner {
             agent_session_id: None,
             ghost: None,
             turns: None,
+            prophecies: Vec::new(),
         }
     }
 }
@@ -385,6 +391,7 @@ impl Runner for SilentNoOpFeedbackRunner {
             agent_session_id: None,
             ghost: None,
             turns: None,
+            prophecies: Vec::new(),
         }
     }
 }
@@ -414,6 +421,7 @@ impl Runner for NamedFeedbackRunner {
             agent_session_id: None,
             ghost: None,
             turns: None,
+            prophecies: Vec::new(),
         }
     }
 }
@@ -469,6 +477,7 @@ impl Runner for AutoFixRunner {
             agent_session_id: None,
             turns: None,
             ghost: None,
+            prophecies: Vec::new(),
         }
     }
 }
@@ -3009,6 +3018,7 @@ impl Runner for FailingAutoBuildRunner {
                 agent_session_id: None,
                 ghost: None,
                 turns: None,
+                prophecies: Vec::new(),
             };
         }
         RunnerResult::failure("only auto_build is faked in this test")
@@ -3152,6 +3162,7 @@ fn proof_scope_nothing_suppresses_final_verify() {
                 agent_session_id: None,
                 ghost: None,
                 turns: None,
+                prophecies: Vec::new(),
             }
         }
     }
@@ -5166,6 +5177,7 @@ command = "cargo test --workspace"
                     agent_session_id: None,
                     ghost: None,
                     turns: None,
+                    prophecies: Vec::new(),
                 };
             }
 
@@ -5214,6 +5226,7 @@ command = "cargo test --workspace"
                 agent_session_id: None,
                 ghost: None,
                 turns: None,
+                prophecies: Vec::new(),
             }
         }
     }
@@ -5364,6 +5377,7 @@ impl Runner for SelfCommittingFeedbackRunner {
             agent_session_id: None,
             turns: None,
             ghost: None,
+            prophecies: Vec::new(),
         }
     }
 }
@@ -5811,6 +5825,7 @@ fn stage_done_marker_present_in_resolver_system_prompt() {
                 agent_session_id: None,
                 ghost: None,
                 turns: None,
+                prophecies: Vec::new(),
             }
         }
     }
@@ -5936,6 +5951,7 @@ fn resolver_system_prompt_is_scope_agnostic_and_honest() {
                     agent_session_id: None,
                     ghost: None,
                     turns: None,
+                    prophecies: Vec::new(),
                 }
             }
         }
@@ -6093,6 +6109,7 @@ fn conflict_resolver_does_not_sweep_untouched_build_artifact_into_commit() {
                 agent_session_id: None,
                 ghost: None,
                 turns: None,
+                prophecies: Vec::new(),
             }
         }
     }
@@ -6280,6 +6297,7 @@ impl Runner for PartialResolutionRunner {
             agent_session_id: None,
             ghost: None,
             turns: None,
+            prophecies: Vec::new(),
         }
     }
 }
@@ -6415,6 +6433,7 @@ impl Runner for NeverResolvesRunner {
             agent_session_id,
             ghost: None,
             turns: None,
+            prophecies: Vec::new(),
         }
     }
 }
@@ -7627,6 +7646,7 @@ fn settings_change_restarts_a_stuck_merge_and_new_setting_takes_effect() {
                 agent_session_id: None,
                 ghost: None,
                 turns: None,
+                prophecies: Vec::new(),
             }
         }
     }

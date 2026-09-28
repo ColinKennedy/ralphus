@@ -19,6 +19,7 @@ pub mod llm_client;
 pub mod mcp_init;
 pub mod otel;
 pub mod pi_backend;
+pub mod prophecy;
 pub mod providers;
 pub mod shellcmd;
 pub mod spec;

@@ -926,6 +926,25 @@ impl DaemonClient {
         self.get(&format!("/api/cartographer{qs}"))
     }
 
+    /// `docs/daemon-api.md`'s `GET /api/prophecies` -- filtered/paginated
+    /// list of the prophecy subsystem (`docs/prophecy-design.md`, phase 1).
+    pub fn list_prophecies(&self, filters: ProphecyFilters<'_>) -> Result<Value, DaemonError> {
+        let qs = query_string(&[
+            ("entity_uri", filters.entity_uri.map(str::to_string)),
+            ("squad_id", filters.squad_id.map(str::to_string)),
+            ("guardian_id", filters.guardian_id.map(str::to_string)),
+            ("limit", Some(filters.limit.to_string())),
+            ("offset", Some(filters.offset.to_string())),
+        ]);
+        self.get(&format!("/api/prophecies{qs}"))
+    }
+
+    /// `GET /api/prophecies/{entity_uri}` -- every prophecy recorded for one
+    /// owner, oldest first.
+    pub fn show_prophecy(&self, entity_uri: &str) -> Result<Value, DaemonError> {
+        self.get(&format!("/api/prophecies/{entity_uri}"))
+    }
+
     // ---- mailbox (RAL-241) ---------------------------------------------
 
     /// `POST /api/mailbox/register` -- returns `{"client_id": "..."}`.
@@ -1910,6 +1929,28 @@ impl Default for CartographerFilters<'_> {
             limit: 100,
             offset: 0,
             ascending: false,
+        }
+    }
+}
+
+/// Bundled optional filters for [`DaemonClient::list_prophecies`].
+#[derive(Debug, Clone)]
+pub struct ProphecyFilters<'a> {
+    pub entity_uri: Option<&'a str>,
+    pub squad_id: Option<&'a str>,
+    pub guardian_id: Option<&'a str>,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+impl Default for ProphecyFilters<'_> {
+    fn default() -> Self {
+        Self {
+            entity_uri: None,
+            squad_id: None,
+            guardian_id: None,
+            limit: 100,
+            offset: 0,
         }
     }
 }

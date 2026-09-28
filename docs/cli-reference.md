@@ -727,6 +727,9 @@ use; see `READ_ONLY_NOTE`.
         - restart selector [uri]  {Restart this proof step (and any later ones in its scope).}
         - set-status selector [uri] state [str]  {Manually override a proof step's status.}
         - (read-only-safe) show selector [uri]  {Show a single proof step's detail.}
+    - prophecy  {Inspect the prophecy subsystem: a durable, append-only record of what an agent learned while it worked (docs/prophecy-design.md). Read-only in this phase.}
+        - (read-only-safe) list --entity [uri] --guardian [id] --limit [integer] --offset [integer] --squad [id]  {List recorded prophecies, filtered/paginated (docs/prophecy-design.md).}
+        - (read-only-safe) show entity_uri [uri]  {Show every prophecy recorded for one owner URI, oldest first.}
     - queue  {Inspect and reorder the squad queue by priority.}
         - (read-only-safe) list --all  {List queued work items (ready-to-run by default).}
         - reorder paths [str...]  {Set the queue order to the given item paths (dependency-repaired).}
