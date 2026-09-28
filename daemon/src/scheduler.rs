@@ -4811,13 +4811,17 @@ mod tests {
                 tokens_out: 2,
                 cache_creation_tokens: 0,
                 cache_read_tokens: 0,
+                compaction_input_tokens: 0,
+                compaction_count: 0,
                 cost_usd: 0.5,
                 cost_is_estimated: false,
                 summary: "ok".to_string(),
                 error: None,
                 proofed: None,
                 agent_session_id: None,
+                turns: None,
                 ghost: None,
+                retry_after_secs: None,
                 prophecies: self
                     .markers
                     .iter()
@@ -4847,11 +4851,7 @@ mod tests {
         };
         execute_squad(&store, &runner, &id);
         let uri = crate::ghost::cell_uri(&id, 0, 0);
-        let recorded = store
-            .lock()
-            .unwrap()
-            .list_prophecies_for_entity(&uri)
-            .unwrap();
+        let recorded = store.lock().list_prophecies_for_entity(&uri).unwrap();
         assert_eq!(
             recorded.len(),
             1,
@@ -5348,6 +5348,7 @@ mod tests {
                 agent_session_id: Some("sess-rl-1".to_string()),
                 ghost: None,
                 turns: Some(1),
+                prophecies: Vec::new(),
             }
         }
     }
@@ -5570,6 +5571,7 @@ mod tests {
                 agent_session_id: None,
                 ghost: None,
                 turns: None,
+                prophecies: Vec::new(),
             }
         }
     }
@@ -7061,6 +7063,7 @@ mod tests {
                     agent_session_id: None,
                     ghost: None,
                     turns: None,
+                    prophecies: Vec::new(),
                 }
             }
         }
@@ -7407,6 +7410,7 @@ mod tests {
                 agent_session_id: None,
                 turns: None,
                 ghost: None,
+                prophecies: Vec::new(),
             }
         }
     }
@@ -7475,6 +7479,7 @@ mod tests {
                 agent_session_id: None,
                 turns: None,
                 ghost: None,
+                prophecies: Vec::new(),
             }
         }
     }
@@ -7681,7 +7686,7 @@ mod tests {
             if spec.proof {
                 self.seen
                     .lock()
-                    .unwrap()
+                    .expect("seen mutex poisoned")
                     .push((spec.agent.clone(), spec.model.clone()));
             }
             RunnerResult {

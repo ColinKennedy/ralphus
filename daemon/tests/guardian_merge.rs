@@ -107,6 +107,7 @@ fn maybe_run_commit_step(spec: &RunnerSpec) -> Option<RunnerResult> {
         agent_session_id: None,
         turns: None,
         ghost: None,
+        prophecies: Vec::new(),
     })
 }
 
@@ -476,6 +477,7 @@ impl Runner for AutoFixRunner {
             agent_session_id: None,
             turns: None,
             ghost: None,
+            prophecies: Vec::new(),
         }
     }
 }
@@ -5375,6 +5377,7 @@ impl Runner for SelfCommittingFeedbackRunner {
             agent_session_id: None,
             turns: None,
             ghost: None,
+            prophecies: Vec::new(),
         }
     }
 }
@@ -5948,6 +5951,7 @@ fn resolver_system_prompt_is_scope_agnostic_and_honest() {
                     agent_session_id: None,
                     ghost: None,
                     turns: None,
+                    prophecies: Vec::new(),
                 }
             }
         }
@@ -6105,6 +6109,7 @@ fn conflict_resolver_does_not_sweep_untouched_build_artifact_into_commit() {
                 agent_session_id: None,
                 ghost: None,
                 turns: None,
+                prophecies: Vec::new(),
             }
         }
     }
