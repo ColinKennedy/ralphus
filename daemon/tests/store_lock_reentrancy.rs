@@ -952,3 +952,139 @@ fn callee_detector_flags_a_relock_one_call_away() {
         "a callee that takes the handle must be flagged one call level away"
     );
 }
+
+// ── No lock temporary passed as a call argument ──────────────────────────
+//
+// A `&receiver.lock()` temporary written directly into an enclosing call's
+// argument list -- `helper(&store.lock(), worktree, user, url)` -- lives for
+// the whole enclosing call, same as a scrutinee does for a `match`. Two real
+// incidents were exactly this shape (`worktrees::apply_worktree_credential_
+// helper_best_effort` and `arbiter::health_check`, both called with `&store
+// .lock()`/`&daemon.lock()` in argument position), each caught only after
+// the fact by the WS-B.3 runtime watchdog panicking with the guard held
+// several seconds into a git subprocess chain or a provider network call.
+// None of this file's other detectors see this shape: it is not a `match`/
+// `if let` scrutinee, the blocking work has no IO_TOKEN on the call-site
+// line itself (it is several frames down, inside the callee), and there is
+// no live `let`-bound guard for `guard_io_sites` to track.
+//
+// Deliberately narrow to avoid flagging the common, safe
+// `store.lock().accessor(...)` chain (the guard there is a plain statement
+// temporary, dropped at the end of that one statement, and never reaches an
+// *enclosing* call): only `&<receiver>.lock()` sitting immediately after a
+// `(` or `,` -- i.e. actually occupying an argument slot -- counts.
+
+/// 1-based lines where a `&<receiver>.lock()` temporary occupies an argument
+/// slot of an enclosing call.
+fn lock_temporary_passed_as_argument(src: &str) -> Vec<usize> {
+    let lines: Vec<&str> = src.lines().collect();
+    let test_ranges = cfg_test_ranges(&lines);
+    let mut found = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if in_ranges(i + 1, &test_ranges) {
+            continue;
+        }
+        let code = code_of(line);
+        let bytes = code.as_bytes();
+        let mut search_from = 0usize;
+        while let Some(rel) = code[search_from..].find(".lock()") {
+            let lock_start = search_from + rel;
+            // Walk left over the receiver expression (word chars and `.`,
+            // so a chain like `crate::store_lock::StoreMutex` behind a
+            // module path is also covered) to find where it begins.
+            let mut k = lock_start;
+            while k > 0 {
+                let c = bytes[k - 1];
+                if c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c == b':' {
+                    k -= 1;
+                } else {
+                    break;
+                }
+            }
+            if k > 0 && bytes[k - 1] == b'&' {
+                let before_amp = code[..k - 1].trim_end();
+                if before_amp.ends_with('(') || before_amp.ends_with(',') {
+                    // The `allow-lock-io:` marker (on this line or either of
+                    // the two preceding it) exempts it -- same escape hatch
+                    // `guard_io_sites`/`scrutinee_io_sites` already use, for
+                    // a call verified to do no blocking work of its own.
+                    let allowed =
+                        (i.saturating_sub(2)..=i).any(|k| lines[k].contains(ALLOW_MARKER));
+                    if !allowed {
+                        found.push(i + 1);
+                    }
+                }
+            }
+            search_from = lock_start + ".lock()".len();
+        }
+    }
+    found
+}
+
+#[test]
+fn no_lock_temporary_is_passed_as_a_call_argument() {
+    let sources = daemon_sources();
+    let mut offenders = Vec::new();
+    for (name, src) in &sources {
+        for line in lock_temporary_passed_as_argument(src) {
+            offenders.push(format!("  daemon/src/{name}:{line}"));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "a `&receiver.lock()` temporary is passed directly as a call argument, which keeps \
+         the store lock held for the whole enclosing call -- including whatever blocking \
+         work that call does several frames down, which this static analysis cannot see. \
+         Bind it to its own `let` first (dropping it before any blocking work) and pass \
+         `&guard` instead, or change the callee to take `&StoreHandle`/`&StoreMutex` and \
+         lock internally only for as long as it actually needs to:\n{}",
+        offenders.join("\n")
+    );
+}
+
+#[test]
+fn lock_argument_detector_flags_the_shape_this_test_exists_to_catch() {
+    let bad = r"
+    fn caller(store: &crate::store_lock::StoreHandle) {
+        helper(&store.lock(), worktree, user, url);
+    }
+";
+    assert_eq!(
+        lock_temporary_passed_as_argument(bad).len(),
+        1,
+        "a lock temporary in argument position must be flagged"
+    );
+
+    let bad_second_arg = r"
+    fn caller(daemon: &Daemon) {
+        crate::arbiter::health_check(&daemon.lock(), &arbiter)
+    }
+";
+    assert_eq!(
+        lock_temporary_passed_as_argument(bad_second_arg).len(),
+        1,
+        "a lock temporary must be flagged in any argument position, not only the first"
+    );
+
+    let good_bound_first = r"
+    fn caller(store: &crate::store_lock::StoreHandle) {
+        let guard = store.lock();
+        helper(&guard, worktree, user, url);
+    }
+";
+    assert!(
+        lock_temporary_passed_as_argument(good_bound_first).is_empty(),
+        "a guard bound to its own `let` first must not be flagged"
+    );
+
+    let good_accessor_chain = r"
+    fn caller(store: &crate::store_lock::StoreHandle) {
+        let name = store.lock().get_guardian(id).unwrap().name;
+    }
+";
+    assert!(
+        lock_temporary_passed_as_argument(good_accessor_chain).is_empty(),
+        "a plain `store.lock().accessor(...)` chain (guard dropped at the end of that one \
+         statement, never reaching an enclosing call) must not be flagged"
+    );
+}

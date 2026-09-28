@@ -480,6 +480,7 @@ impl Daemon {
     pub(crate) fn read_board_snapshot(&self) -> crate::store::Result<crate::store::BoardSnapshot> {
         match self.read_pool.acquire() {
             Some(conn) => Store::board_snapshot_conn(&conn),
+            // allow-lock-io: fallback only when the read pool has no free connection.
             None => Store::board_snapshot_conn(&self.lock().conn),
         }
     }
@@ -3821,7 +3822,7 @@ fn list_agent_profiles_for_backend(daemon: &Daemon, backend: &str) -> Reply {
 /// cap like any other Arbiter call.
 fn health_arbiter(daemon: &Daemon) -> Reply {
     let arbiter = crate::arbiter::Arbiter::current();
-    match crate::arbiter::health_check(&daemon.lock(), &arbiter) {
+    match crate::arbiter::health_check(&daemon.store_handle(), &arbiter) {
         Ok(reply) => json(
             200,
             &serde_json::json!({"status": "pass", "agent": arbiter.agent, "model": arbiter.model, "reply": reply}),
@@ -5904,6 +5905,7 @@ fn submit(daemon: &Daemon, body: &str, query: &str, user_header: Option<&str>) -
         Ok(resolved) => file.submitter = resolved,
         Err(reply) => return reply,
     }
+    // allow-lock-io: preflight validators below are local DB/registry lookups only.
     let profile_errors =
         crate::agent_profiles::validate_task_file_profiles(&daemon.lock(), &req.toml, &file);
     if !profile_errors.is_empty() {
@@ -5933,11 +5935,13 @@ fn submit(daemon: &Daemon, body: &str, query: &str, user_header: Option<&str>) -
             candidate_list_errors,
         );
     }
+    // allow-lock-io: local DB/registry lookup only.
     crate::agent_profiles::apply_profile_model_defaults(&daemon.lock(), &mut file);
 
     // RAL-318: an inline `triage_type` must name a registered Triage type --
     // `core::validate` only checked its structure (non-empty, requires
     // `triage = true`), since `core` has no store access.
+    // allow-lock-io: local DB/registry lookup only.
     let triage_type_errors =
         crate::triage::validate_task_file_triage_types(&daemon.lock(), &req.toml, &file);
     if !triage_type_errors.is_empty() {
@@ -5953,6 +5957,7 @@ fn submit(daemon: &Daemon, body: &str, query: &str, user_header: Option<&str>) -
     // project in its `project` field; `validate_toml` above already required
     // that field to be set (core has no DB access), so this preflight only
     // needs the registry lookup itself (RAL-100).
+    // allow-lock-io: local DB/registry lookup only.
     if let Err(msg) = validate_projects_registered(&daemon.lock(), &file) {
         return error(400, "project_validation_failed", &msg, vec![]);
     }
@@ -5971,6 +5976,7 @@ fn submit(daemon: &Daemon, body: &str, query: &str, user_header: Option<&str>) -
     // Every `machine` value must name a registered provider at a supported
     // contract version (RAL-185). Core validated the syntax offline; only the
     // daemon can see the registry.
+    // allow-lock-io: local DB/registry lookup only.
     if let Err(msg) = validate_machines_registered(&daemon.lock(), &file) {
         return error(400, "machine_validation_failed", &msg, vec![]);
     }
@@ -5979,6 +5985,7 @@ fn submit(daemon: &Daemon, body: &str, query: &str, user_header: Option<&str>) -
         return error(400, "machine_validation_failed", &msg, vec![]);
     }
     // Phase 3b: a remote-fed review must declare what cannot be discovered.
+    // allow-lock-io: local DB/registry lookup only.
     if let Err(msg) = validate_remote_reviews_are_declarative(&daemon.lock(), &file) {
         return error(400, "machine_validation_failed", &msg, vec![]);
     }
@@ -7086,6 +7093,8 @@ fn apply_entity_filter(
 /// — so the board's "generate to file, then display" button and this JSON
 /// response come from the exact same generation, not two separate code paths.
 fn squad_timeline(daemon: &Daemon, id: &str) -> Reply {
+    // allow-lock-io: merges already-fetched Cartographer/terminal-log rows
+    // in-process, no subprocess/network work.
     match crate::timeline::build_squad_timeline(&daemon.lock(), id) {
         Ok(timeline) => json(200, &timeline),
         Err(e) => store_error(&e),
@@ -9370,6 +9379,7 @@ struct AgentCatalogResponse {
 }
 
 fn agent_catalog_reply(daemon: &Daemon) -> Reply {
+    // allow-lock-io: local DB/registry lookup only.
     let agents = crate::agent_catalog::agent_catalog(&daemon.lock());
     json(
         200,
@@ -10197,6 +10207,8 @@ fn cell_pane_transcript(daemon: &Daemon, id: &str, ti: &str, si: &str, query: &s
 /// `crate::timeline::entity_debug_timeline`'s doc comment for the merge and
 /// current-attempt-trim rules.
 fn debug_events_reply(daemon: &Daemon, squad_id: &str, task: &str, cell_id: &str) -> Reply {
+    // allow-lock-io: merges already-fetched Cartographer rows in-process, no
+    // subprocess/network work.
     match crate::timeline::entity_debug_timeline(&daemon.lock(), squad_id, task, cell_id) {
         Ok(entries) => json(200, &entries),
         Err(e) => store_error(&e),

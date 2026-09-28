@@ -1135,6 +1135,132 @@ fn feedback_edits_review_worktree_and_restacks_downstream() {
     let _ = std::fs::remove_dir_all(&remote_dir);
 }
 
+/// RAL-<new>: a reviewer pushing a fix directly to the review branch while an
+/// auto-fix/feedback round is mid-flight used to be an automatic dead end --
+/// `push_feedback_branch`'s clobber guard refused the force-push and nothing
+/// downstream of that ever did anything about it, leaving a human to pull the
+/// reviewer's commit and re-push by hand. This proves the automatic recovery:
+/// `run_feedback` fetches and merges the reviewer's commit into the worktree
+/// before re-pushing, so the round still reports success and the branch ends
+/// up carrying both changes, with a Cartographer entry recording that the
+/// reconciliation happened automatically.
+#[test]
+fn feedback_push_auto_reconciles_a_reviewers_direct_push() {
+    let root = temp_repo();
+    init_repo(&root);
+    let remote_dir = temp_repo();
+    git(&remote_dir, &["init", "--bare"]);
+    git(
+        &root,
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+    );
+    write(&root, "base.txt", "base\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+
+    git(&root, &["checkout", "-b", "feature/a"]);
+    write(&root, "a.txt", "from a\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "add a"]);
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock();
+        let id = g
+            .create_guardian("r", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/a").unwrap();
+        id
+    };
+    run_merge(&store, &NoopRunner, &id);
+
+    let bid0 = store.lock().get_guardian(&id).unwrap().branches[0]
+        .id
+        .clone();
+    let review0 = store.lock().get_guardian(&id).unwrap().branches[0]
+        .review_branch
+        .clone()
+        .expect("review branch built");
+
+    // Seed `origin` with the review branch at its pre-feedback tip, exactly
+    // as an earlier feedback round's own push would have left it.
+    git(
+        &root,
+        &["push", "origin", &format!("{review0}:refs/heads/{review0}")],
+    );
+
+    // A reviewer clones that same branch and pushes a fix directly to it,
+    // bypassing ralphus entirely -- the exact scenario `guard_against_clobber`
+    // exists to detect.
+    let reviewer_clone = temp_repo();
+    let _ = std::fs::remove_dir_all(&reviewer_clone);
+    git(
+        reviewer_clone.parent().unwrap(),
+        &[
+            "clone",
+            remote_dir.to_str().unwrap(),
+            reviewer_clone.file_name().unwrap().to_str().unwrap(),
+        ],
+    );
+    git(&reviewer_clone, &["checkout", &review0]);
+    write(&reviewer_clone, "reviewer.txt", "fixed by reviewer\n");
+    git(&reviewer_clone, &["add", "."]);
+    git(&reviewer_clone, &["commit", "-m", "reviewer fix"]);
+    git(&reviewer_clone, &["push", "origin", &review0]);
+
+    // The auto-fix round commits its own, unrelated change and pushes.
+    run_feedback(
+        &store,
+        &FeedbackRunner,
+        &id,
+        &bid0,
+        "add a note file",
+        None,
+        false,
+        &CancelToken::never(),
+    );
+
+    let view = store.lock().get_guardian(&id).unwrap();
+    assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
+    let detail0 = view.branches[0].detail.as_deref().unwrap_or("");
+    assert!(
+        detail0.starts_with("feedback applied"),
+        "feedback should succeed via automatic reconciliation, got: {detail0:?}"
+    );
+    assert!(
+        !detail0.contains("push failed"),
+        "feedback must not report a push failure once reconciled, got: {detail0:?}"
+    );
+
+    // The review branch now carries both the reviewer's direct fix and the
+    // auto-fix's own commit -- neither was discarded.
+    let files = git(&root, &["ls-tree", "-r", "--name-only", &review0]);
+    assert!(
+        files.contains("reviewer.txt") && files.contains("note.txt") && files.contains("a.txt"),
+        "review branch should carry both the reviewer's fix and the auto-fix commit: {files}"
+    );
+
+    // The reconciliation must have been logged, not silently applied.
+    let page = store
+        .lock()
+        .cartographer_query(&CartographerFilter {
+            guardian_id: Some(id.clone()),
+            ..CartographerFilter::recent(30)
+        })
+        .unwrap();
+    assert!(
+        page.rows.iter().any(|r| r
+            .message
+            .contains("auto-reconciled a reviewer's direct push")),
+        "expected a Cartographer entry recording the automatic reconciliation"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&remote_dir);
+    let _ = std::fs::remove_dir_all(&reviewer_clone);
+}
+
 /// Regression for a real-world failure: a guardian whose base branch lives on
 /// a remote that isn't named `origin` (e.g. `alt/staging`) -- and which has
 /// no registered fork (RAL-338) -- previously had every feedback push
