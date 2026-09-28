@@ -2096,6 +2096,84 @@ fn worktree_sharing_gates_branch_ready_until_all_sessions_done() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// RAL-519: if a session sharing the worktree fails (or is cancelled) instead
+/// of finishing, the branch must never be falsely promoted to `ready` -- it
+/// stays `pending` even after the successful sibling and both owning tasks
+/// have otherwise reached a terminal state, since `mark_ready_branches_with_done_cells`
+/// requires every worktree-sharing session to be `done`, not merely finished.
+#[test]
+fn worktree_sibling_failure_never_falsely_reports_ready() {
+    let base = temp_base("worktree-gate-fail");
+    let cwd = repo_with_worktree(&base, "feature/gate-fail");
+    let sub = format!("{cwd}/sub");
+    std::fs::create_dir_all(sub.replace('/', std::path::MAIN_SEPARATOR_STR)).unwrap();
+
+    let toml = format!(
+        "[[task]]\nname=\"a\"\n[[task.cell]]\ncwd=\"{cwd}\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n\
+         [[task]]\nname=\"b\"\n[[task.cell]]\ncwd=\"{sub}\"\nprompt=\"p\"\n\
+         [[review]]\nid=\"r\"\nskip_auto_build=true\n"
+    );
+    let file: TaskFile = toml::from_str(&toml).unwrap();
+
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    let run_id = store.lock().insert_squad(&file, None, false).unwrap();
+    let ids = derive_reviews(&store, &run_id, &file).expect("derive ok");
+    let gid = ids[0].clone();
+
+    // Task A (explicit) finishes successfully.
+    store
+        .lock()
+        .set_cell_state(&run_id, 0, 0, NodeState::Done)
+        .unwrap();
+    store
+        .lock()
+        .set_task_state(&run_id, 0, NodeState::Done)
+        .unwrap();
+
+    // Task B (the implicit worktree sibling) fails instead of finishing.
+    store
+        .lock()
+        .set_cell_state(&run_id, 1, 0, NodeState::Failed)
+        .unwrap();
+    store
+        .lock()
+        .set_task_state(&run_id, 1, NodeState::Failed)
+        .unwrap();
+
+    let n = store
+        .lock()
+        .mark_ready_branches_with_done_cells(&gid)
+        .unwrap();
+    assert_eq!(n, 0, "a failed sibling must never promote the branch");
+    assert_eq!(
+        store.lock().get_guardian(&gid).unwrap().branches[0].merge_status,
+        "pending",
+        "the branch must stay pending, not falsely report ready"
+    );
+
+    // Cancelling the sibling instead of failing it must behave the same way.
+    store
+        .lock()
+        .set_cell_state(&run_id, 1, 0, NodeState::Cancelled)
+        .unwrap();
+    store
+        .lock()
+        .set_task_state(&run_id, 1, NodeState::Cancelled)
+        .unwrap();
+    let n = store
+        .lock()
+        .mark_ready_branches_with_done_cells(&gid)
+        .unwrap();
+    assert_eq!(n, 0, "a cancelled sibling must never promote the branch");
+    assert_eq!(
+        store.lock().get_guardian(&gid).unwrap().branches[0].merge_status,
+        "pending",
+        "the branch must stay pending, not falsely report ready"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// Two sessions sharing a worktree finishing at (near-)simultaneously must
 /// transition the branch to `ready` exactly once -- no double-trigger, no
 /// missed trigger (RAL-159 interview Q4). Phase 1 races both sessions' `done`
