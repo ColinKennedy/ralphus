@@ -10415,15 +10415,56 @@ pub fn poll_base_branch_freshness_once(store: &crate::store_lock::StoreHandle) {
     }
 }
 
+/// Resolve a bare short ref name to the fully-qualified ref git should treat
+/// it as, when that short name is ambiguous between a local branch and a
+/// remote-tracking ref of the same spelling (e.g. `alt/staging` matching both
+/// `refs/heads/alt/staging` and `refs/remotes/alt/staging`). Git's own
+/// unqualified resolution prefers `refs/heads/*` in that case and only warns
+/// on stderr -- callers that hand a bare name straight to `rev-parse`/
+/// `worktree add` silently get whichever the local branch happens to be,
+/// even when that branch is stale or unrelated (a literal local branch
+/// someone created that happens to share a remote's `<remote>/<branch>`
+/// spelling shadows the real remote-tracking ref forever, since nothing
+/// updates a plain local branch on fetch).
+///
+/// The single, consolidated implementation of that preference order --
+/// **a remote-tracking match wins over a same-named local branch** -- used by
+/// every place in the daemon that resolves a possibly-ambiguous branch name
+/// to a ref or commit: [`resolve_base`] (a guardian's `base_branch`),
+/// `crate::worktrees`'s worktree materialization
+/// (`qualify_upstream_ref`'s prior home) and explicit-upstream config, and
+/// `crate::reviews::set_worktree_commit_baseline`'s baseline marker. Falls
+/// back to `name` unchanged when neither namespace has a match (a SHA, a
+/// tag, or an already-unambiguous ref) -- git resolves those exactly as
+/// before.
+pub(crate) fn qualify_ambiguous_ref(root: &Path, name: &str) -> String {
+    if name.contains('/') {
+        let remote_ref = format!("refs/remotes/{name}");
+        if git(root, &["rev-parse", "--verify", &remote_ref]).is_ok() {
+            return remote_ref;
+        }
+    }
+    let local_ref = format!("refs/heads/{name}");
+    if git(root, &["rev-parse", "--verify", &local_ref]).is_ok() {
+        return local_ref;
+    }
+    name.to_string()
+}
+
 /// Resolve `base_branch` (a branch name — mutable, may be local or a remote
 /// tracking ref) to the immutable commit it currently points at, so a single
 /// build snapshots one base and a later shift is detectable. Returns the short-ish
 /// full SHA, or an error if the ref does not resolve.
+///
+/// Qualifies `base_branch` via [`qualify_ambiguous_ref`] first so a
+/// same-named local branch can never shadow the real remote-tracking ref --
+/// see that function's doc for why an unqualified `rev-parse` is unsafe here.
 pub(crate) fn resolve_base(
     root: &Workspace,
     base_branch: &str,
 ) -> std::result::Result<String, String> {
-    let spec = format!("{base_branch}^{{commit}}");
+    let qualified = qualify_ambiguous_ref(root.root(), base_branch);
+    let spec = format!("{qualified}^{{commit}}");
     Ok(root
         .git(&["rev-parse", "--verify", &spec])?
         .trim()
@@ -12506,6 +12547,59 @@ mod tests {
         .expect("utf8")
         .trim()
         .to_string()
+    }
+
+    // -----------------------------------------------------------------------
+    // `qualify_ambiguous_ref` / `resolve_base`: a stale local branch must
+    // never shadow a same-named remote-tracking ref.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_base_prefers_a_remote_tracking_ref_over_a_same_named_local_branch() {
+        // Reproduces the guardian bug this guards against: a local branch
+        // literally named "alt/staging" (created once, then never updated)
+        // shadowed the real, moving `refs/remotes/alt/staging` for every
+        // unqualified `rev-parse "alt/staging"`, freezing a guardian's
+        // `base_commit` to a stale, off-lineage snapshot instead of the real
+        // base branch.
+        let dir = tmp_dir("resolve-base-ambiguous");
+        g(&dir, &["init", "-q", "-b", "main"]);
+        write_file(&dir, "base.txt", "base\n");
+        g(&dir, &["add", "."]);
+        g(&dir, &["commit", "-q", "-m", "base"]);
+
+        write_file(&dir, "stale.txt", "stale local branch content\n");
+        g(&dir, &["add", "."]);
+        g(&dir, &["commit", "-q", "-m", "stale local alt/staging"]);
+        // A local branch literally named "alt/staging" -- unrelated to any
+        // remote, pointing at content that must never be mistaken for the
+        // real base.
+        g(&dir, &["branch", "alt/staging"]);
+        let stale_sha = rev_parse(&dir, "alt/staging");
+
+        g(&dir, &["checkout", "-q", "main"]);
+        write_file(&dir, "real.txt", "real remote staging content\n");
+        g(&dir, &["add", "."]);
+        g(
+            &dir,
+            &["commit", "-q", "-m", "real remote-tracking staging"],
+        );
+        let real_sha = rev_parse(&dir, "HEAD");
+        // A remote-tracking ref of the identical short name, pointing at
+        // different content -- no actual git remote needed for this shape to
+        // reproduce, since the ambiguity is purely a `refs/heads/` vs.
+        // `refs/remotes/` namespace collision.
+        g(&dir, &["update-ref", "refs/remotes/alt/staging", &real_sha]);
+
+        let workspace = Workspace::local(&dir);
+        let resolved = resolve_base(&workspace, "alt/staging").expect("resolve_base resolves");
+        assert_eq!(
+            resolved, real_sha,
+            "resolve_base must prefer the remote-tracking ref over the stale same-named local \
+             branch (got {resolved}, stale local branch is {stale_sha})"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -----------------------------------------------------------------------

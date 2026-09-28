@@ -35,7 +35,7 @@ use std::sync::LazyLock;
 use opentelemetry::Context;
 use opentelemetry::trace::{SpanKind, Status};
 
-use crate::guardian_merge::git;
+use crate::guardian_merge::{git, qualify_ambiguous_ref};
 use crate::otel;
 use crate::store::{CellRow, ProjectView, Store, TaskRow};
 use crate::store_lock::StoreHandle;
@@ -681,34 +681,6 @@ fn current_checked_out_branch(root: &Path) -> Result<String, String> {
     Ok(branch.to_string())
 }
 
-/// Resolve `upstream` to a fully-qualified ref before handing it to git as a
-/// revision (a `worktree add` start-point, or `ls-tree`'s preflight
-/// measurement). A bare short name like `alt/staging` is ambiguous whenever
-/// the repo has BOTH a local branch literally named `alt/staging`
-/// (`refs/heads/alt/staging`) and a remote-tracking ref for remote `alt`'s
-/// `staging` branch (`refs/remotes/alt/staging`) -- exactly the situation
-/// [`resolve_registered_remote_upstream`] creates when it rewrites a bare
-/// `?upstream=staging` to `<remote>/staging` for a registered project whose
-/// remote happens to also have a same-named local branch. Mirrors
-/// [`set_explicit_upstream`]'s preference order: a remote-tracking match wins
-/// over a same-named local branch, since `?upstream=`'s whole purpose is
-/// naming what to track. Falls back to the input unchanged when neither
-/// namespace has a match (a SHA, a tag, or an already-unambiguous ref) -- git
-/// resolves those exactly as before.
-fn qualify_upstream_ref(root: &Path, upstream: &str) -> String {
-    if upstream.contains('/') {
-        let remote_ref = format!("refs/remotes/{upstream}");
-        if git(root, &["rev-parse", "--verify", &remote_ref]).is_ok() {
-            return remote_ref;
-        }
-    }
-    let local_ref = format!("refs/heads/{upstream}");
-    if git(root, &["rev-parse", "--verify", &local_ref]).is_ok() {
-        return local_ref;
-    }
-    upstream.to_string()
-}
-
 fn branch_materialization(root: &Path, branch: &str) -> Result<BranchMaterialization, String> {
     validate_branch_name(root, branch)?;
     let branch_ref = format!("refs/heads/{branch}");
@@ -749,11 +721,12 @@ fn branch_materialization(root: &Path, branch: &str) -> Result<BranchMaterializa
 /// what happens for e.g. `?upstream=origin/foo` on a branch [`ensure_worktree`]
 /// itself may have just created *literally named* `origin/foo` while tracking
 /// remote-tracking ref `refs/remotes/origin/foo` (the `NewFromRemote` case
-/// above). Resolving `upstream` ourselves first -- an unambiguous, fully
-/// qualified `rev-parse --verify` against each candidate namespace -- and then
-/// writing `branch.<branch>.remote`/`.merge` directly sidesteps that ambiguity
-/// entirely. A remote-tracking match is preferred over a same-named local
-/// branch, since tracking a remote is `?upstream=`'s primary purpose.
+/// above). Resolving `upstream` ourselves first via [`qualify_ambiguous_ref`]
+/// -- an unambiguous, fully qualified `rev-parse --verify` against each
+/// candidate namespace -- and then writing `branch.<branch>.remote`/`.merge`
+/// directly sidesteps that ambiguity entirely. A remote-tracking match is
+/// preferred over a same-named local branch, since tracking a remote is
+/// `?upstream=`'s primary purpose.
 ///
 /// Does *not* itself record the no-new-commits guard's durable baseline
 /// marker (`ralphus.<branch>.baseline`) -- that used to happen here, mirroring
@@ -816,28 +789,28 @@ fn set_explicit_upstream(wt: &Path, branch: &str, upstream: &str) -> Result<(), 
             wt.display()
         )
     };
-    if let Some((remote, remote_branch)) = upstream.split_once('/') {
-        let remote_ref = format!("refs/remotes/{upstream}");
-        if git(wt, &["rev-parse", "--verify", &remote_ref]).is_ok() {
-            git(wt, &["config", &format!("branch.{branch}.remote"), remote]).map_err(fail)?;
-            git(
-                wt,
-                &[
-                    "config",
-                    &format!("branch.{branch}.merge"),
-                    &format!("refs/heads/{remote_branch}"),
-                ],
-            )
-            .map_err(fail)?;
-            return Ok(());
-        }
+    let qualified = qualify_ambiguous_ref(wt, upstream);
+    if let Some(remote_ref) = qualified.strip_prefix("refs/remotes/") {
+        let (remote, remote_branch) = remote_ref
+            .split_once('/')
+            .ok_or_else(|| fail(format!("malformed remote-tracking ref \"{remote_ref}\"")))?;
+        git(wt, &["config", &format!("branch.{branch}.remote"), remote]).map_err(fail)?;
+        git(
+            wt,
+            &[
+                "config",
+                &format!("branch.{branch}.merge"),
+                &format!("refs/heads/{remote_branch}"),
+            ],
+        )
+        .map_err(fail)?;
+        return Ok(());
     }
-    let local_ref = format!("refs/heads/{upstream}");
-    if git(wt, &["rev-parse", "--verify", &local_ref]).is_ok() {
+    if qualified.starts_with("refs/heads/") {
         git(wt, &["config", &format!("branch.{branch}.remote"), "."]).map_err(fail)?;
         git(
             wt,
-            &["config", &format!("branch.{branch}.merge"), &local_ref],
+            &["config", &format!("branch.{branch}.merge"), &qualified],
         )
         .map_err(fail)?;
         return Ok(());
@@ -1300,8 +1273,8 @@ fn execute_worktree_plan(
             // remote-tracking ref share that name) -- qualify it first so
             // git resolves an exact ref instead of guessing across
             // namespaces and failing with "ambiguous" (see
-            // `qualify_upstream_ref`).
-            let qualified_upstream = qualify_upstream_ref(root, upstream);
+            // `qualify_ambiguous_ref`).
+            let qualified_upstream = qualify_ambiguous_ref(root, upstream);
             preflight_worktree_budget(root, &plan.wt, &qualified_upstream, path_budget_limit())?;
             // `--no-track`: see the `NewFromRemote` arm above -- `upstream`
             // being a plain local branch still triggers git's own implicit,
