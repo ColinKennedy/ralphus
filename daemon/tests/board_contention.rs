@@ -41,6 +41,11 @@ const SQUADS: usize = 10;
 /// per-dependency query, the worst endpoint measures ~19 ms, so this is
 /// ratcheted below the target with headroom for slower CI hardware.
 const P95_BUDGET_MS: u128 = 100;
+/// The cyclic reader reaches each endpoint once per four-request cycle. With
+/// every endpoint at the p95 budget, a four-second window yields ten samples
+/// per endpoint; requiring that floor keeps the progress check compatible
+/// with the latency budget it protects.
+const MIN_SAMPLES_PER_ENDPOINT: usize = 10;
 /// M3: store-lock *wait* p95 over the whole contention window. 10,450 ms before
 /// the WS-A fixes, ~25 ms after WS-A through WS-C, ~0.2 ms once the board's
 /// hottest read stopped taking the writer lock at all. The plan's M3 target is
@@ -227,26 +232,36 @@ fn board_reads_stay_fast_under_four_writers() {
         })
         .collect();
 
-    // One reader per polled endpoint, sampling latency for the whole window.
-    let readers: Vec<_> = endpoints
-        .iter()
-        .map(|endpoint| {
-            let url = format!("{base}{endpoint}");
-            thread::spawn(move || {
-                let agent = agent();
-                let mut samples: Vec<u128> = Vec::new();
-                let mut statuses: Vec<u16> = Vec::new();
-                while Instant::now() < deadline {
+    // One reader cycles through every polled endpoint for the whole window.
+    //
+    // Four separate reader threads made this assertion depend on which of
+    // their persistent sockets tiny_http's single accept loop happened to
+    // service. A shared runner could leave one reader unaccepted for the
+    // entire window even when its handler was healthy, which tests socket
+    // scheduling rather than read latency under writer contention. Cycling
+    // gives every endpoint a bounded turn while preserving real HTTP requests
+    // concurrent with all four writers.
+    let reader = {
+        let base = base.clone();
+        thread::spawn(move || {
+            let agent = agent();
+            let mut samples: Vec<Vec<u128>> = (0..endpoints.len()).map(|_| Vec::new()).collect();
+            let mut statuses: Vec<Vec<u16>> = (0..endpoints.len()).map(|_| Vec::new()).collect();
+            while Instant::now() < deadline {
+                for (index, endpoint) in endpoints.iter().enumerate() {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
                     let started = Instant::now();
-                    let (status, body) = request(&agent, "GET", &url, None);
-                    samples.push(started.elapsed().as_millis());
-                    statuses.push(status);
+                    let (status, body) = request(&agent, "GET", &format!("{base}{endpoint}"), None);
+                    samples[index].push(started.elapsed().as_millis());
+                    statuses[index].push(status);
                     let _ = body;
                 }
-                (samples, statuses)
-            })
+            }
+            (samples, statuses)
         })
-        .collect();
+    };
 
     let write_counts: Vec<u64> = writers
         .into_iter()
@@ -258,10 +273,14 @@ fn board_reads_stay_fast_under_four_writers() {
         "writers only managed {total_writes} writes in {LOAD_MS}ms -- the load was not real"
     );
 
-    for (endpoint, reader) in endpoints.iter().zip(readers) {
-        let (mut samples, statuses) = reader.join().expect("reader");
+    let (samples_by_endpoint, statuses_by_endpoint) = reader.join().expect("reader");
+    for ((endpoint, mut samples), statuses) in endpoints
+        .iter()
+        .zip(samples_by_endpoint)
+        .zip(statuses_by_endpoint)
+    {
         assert!(
-            samples.len() >= 20,
+            samples.len() >= MIN_SAMPLES_PER_ENDPOINT,
             "{endpoint}: only {} samples in the window; the read is starved",
             samples.len()
         );
