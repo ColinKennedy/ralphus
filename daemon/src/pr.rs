@@ -6553,6 +6553,15 @@ fn refresh_open_prs<'a>(
                     pr.id,
                     pr.repo
                 );
+                crate::cartographer::Note::new("pr")
+                    .level(crate::logging::LogLevel::WARNING)
+                    .scope("guardian")
+                    .guardian(id)
+                    .emit(
+                        &store.lock(),
+                        "pr state check skipped: no forge client matches recorded repo",
+                        serde_json::json!({"pr_id": pr.id, "repo": pr.repo}),
+                    );
                 return true;
             };
             match state_client.get_pull_request_state(number) {
