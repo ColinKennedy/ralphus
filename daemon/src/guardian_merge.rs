@@ -16464,33 +16464,6 @@ mod tests {
     /// auto_build` default when both are configured. The project default is
     /// set to a command that would fail, so if it ran instead of the
     /// review-declared one, this test would fail.
-    /// A resolver-agent stand-in that returns a fixed manual-commands/
-    /// build-command JSON response instead of actually calling an LLM.
-    struct FixedManualCommandsRunner(String);
-    impl Runner for FixedManualCommandsRunner {
-        fn run(&self, _spec: &RunnerSpec) -> RunnerResult {
-            RunnerResult {
-                status: "done".to_string(),
-                tokens_in: 0,
-                tokens_out: 0,
-                cache_creation_tokens: 0,
-                cache_read_tokens: 0,
-                compaction_input_tokens: 0,
-                compaction_count: 0,
-                cost_usd: 0.0,
-                cost_is_estimated: false,
-                summary: self.0.clone(),
-                error: None,
-                proofed: None,
-                agent_session_id: None,
-                turns: None,
-                ghost: None,
-                prophecies: Vec::new(),
-                retry_after_secs: None,
-            }
-        }
-    }
-
     /// RAL-313: `generate_manual_commands`'s AI-inferred build command runs
     /// against the combined worktree under this review's own `build_env`,
     /// same as `final_checks`'s check gates/project `auto_build`
