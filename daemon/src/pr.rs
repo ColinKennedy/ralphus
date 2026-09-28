@@ -1983,7 +1983,7 @@ fn format_prophecy_details_block(prophecies: &[crate::prophecy::ProphecyView]) -
         .join("\n");
     let noun = if count == 1 { "insight" } else { "insights" };
     Some(format!(
-        "<details>\n<summary>Prophecies ({count} {noun} recorded while this was built)</summary>\n\n{items}\n\n</details>"
+        "<details>\n<summary>Insights ({count} {noun} recorded while this was built)</summary>\n\n{items}\n\n</details>"
     ))
 }
 
