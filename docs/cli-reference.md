@@ -709,8 +709,10 @@ use; see `READ_ONLY_NOTE`.
     - mcp  {Configure agent hosts to use the ralphus MCP server.}
         - initialize host [claude|codex|pi] --dry-run --profile-file [path] --yes  {Preview and apply the local MCP setup required by an agent host.}
     - project  {Register and inspect projects known to the daemon.}
+        - (read-only-safe) check-destination name [str]  {Run a manual reachability check for a project's destination repository -- its registered clone URL, else the checkout's forge remote -- against the forge REST API. SSH-style clone URLs resolve through their host/path pair (no SSH connection is opened); a URL no REST identity can be resolved from is reported as a failed check with an actionable diagnostic.}
         - fork  {Manage per-project, per-user fork registrations for fork-based stacked PR routing.}
             - add project [str] --owner [owner] --remote-name [name] --url [url] --user [name]  {Register a fork for a project, optionally scoped to one user (defaults to the project-wide fallback row when --user is omitted).}
+            - (read-only-safe) check project [str] --url [url] --user [name]  {Run a manual reachability check for one fork URL against the forge REST API -- a URL about to be registered, or one already registered on a row. --user names whose stored forge token should authenticate the check (private forks); without it the daemon's own credential chain is used, and a public fork is checked unauthenticated.}
             - (read-only-safe) list project [str, optional] --short --user [name]  {List registered forks, optionally scoped to one project and/or filtered to one user.}
             - remove project [str] --user [name]  {Remove a fork registration (defaults to the project-wide fallback row when --user is omitted).}
             - set project [str] --owner [owner] --remote-name [name] --url [url] --user [name]  {Update fields on an existing fork registration (defaults to the project-wide fallback row when --user is omitted).}
@@ -825,6 +827,7 @@ use; see `READ_ONLY_NOTE`.
             - register name [str] --description [text] --label [text]  {Register (or update) a Triage type -- the categories the Arbiter classifies a Triage-opted-in cell into (RAL-318).}
     - (read-only-safe) tutor  {Print the Task TOML schema reference and worked examples. (Rust port hoists Python's `task show-tutor` to this top-level command.)}
     - user  {Manage a ralphus user's own forge personal access tokens (RAL-338 follow-up).}
+        - (read-only-safe) check-forge-token user [str] host [str]  {Run a manual connectivity check of a ralphus user's stored personal access token for one forge host: the daemon authenticates against the forge with it and reports whether the token works (and as whom) and whether the forge is reachable. Never returns the token.}
         - delete-forge-token user [str] host [str]  {Remove a ralphus user's personal access token for one forge host.}
         - (read-only-safe) list-forge-tokens user [str]  {List which forge hosts a ralphus user has a token configured for. Never returns the token value itself.}
         - set-forge-token user [str] --host [host] --token [token]  {Set or replace a ralphus user's personal access token for one forge host (e.g. gitlab.com), so their fork-routed worktrees can push over HTTPS without any SSH key setup.}

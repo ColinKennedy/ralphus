@@ -994,6 +994,17 @@
        * @property {number} updated_at_ms
        */
       /**
+       * A manual forge connectivity-check outcome (RAL-523) -- the wire shape
+       * of the `POST .../check` endpoints' responses. `detail` is safe to
+       * display and copy: the daemon never puts the token value in it.
+       * @typedef {object} ForgeCheckOutcome
+       * @property {boolean} ok - Whether the check got the answer it wanted.
+       * @property {string} status - "ok" | "unauthorized" | "forbidden" |
+       *   "not_found" | "no_token" | "unreachable" | "unresolvable" | "error".
+       * @property {string} detail - Human-readable explanation.
+       * @property {string=} identity - Who/what authenticated, when known.
+       */
+      /**
        * @typedef {object} TargetHealthReport
        * @property {string} target
        * @property {string} machine

@@ -8,7 +8,7 @@ use serde_json::Value;
 use crate::args::GlobalOpts;
 use crate::flags::Scanner;
 
-use super::{emit, run_and_report};
+use super::{emit, render_forge_check_outcome, run_and_report};
 
 #[derive(Debug)]
 pub enum UserCommand {
@@ -25,6 +25,10 @@ pub enum UserCommand {
         user: String,
         host: String,
     },
+    CheckForgeToken {
+        user: String,
+        host: String,
+    },
     UsageError(String),
 }
 
@@ -35,6 +39,7 @@ pub fn parse(args: &[String]) -> UserCommand {
         Some("set-forge-token") => parse_set_forge_token(&tail[1..]),
         Some("list-forge-tokens") => parse_list_forge_tokens(&tail[1..]),
         Some("delete-forge-token") => parse_delete_forge_token(&tail[1..]),
+        Some("check-forge-token") => parse_check_forge_token(&tail[1..]),
         Some(other) => UserCommand::UsageError(format!("unknown user subcommand: {other}")),
         None => UserCommand::Help,
     }
@@ -85,6 +90,18 @@ fn parse_delete_forge_token(args: &[String]) -> UserCommand {
     UserCommand::DeleteForgeToken { user, host }
 }
 
+fn parse_check_forge_token(args: &[String]) -> UserCommand {
+    let scanner = Scanner::new(args);
+    let rest = scanner.remaining();
+    let mut it = rest.into_iter();
+    let (Some(user), Some(host)) = (it.next(), it.next()) else {
+        return UserCommand::UsageError(
+            "user check-forge-token requires <user> and <host> arguments".to_string(),
+        );
+    };
+    UserCommand::CheckForgeToken { user, host }
+}
+
 pub fn dispatch(cmd: UserCommand, opts: &GlobalOpts) -> i32 {
     match cmd {
         UserCommand::Help => {
@@ -117,6 +134,17 @@ pub fn dispatch(cmd: UserCommand, opts: &GlobalOpts) -> i32 {
             client.delete_user_forge_token(&user, &host)?;
             emit(opts, &serde_json::json!({"removed": true}), |_| {
                 println!("removed forge token for user {user:?} host {host:?}");
+            });
+            Ok(())
+        }),
+        UserCommand::CheckForgeToken { user, host } => run_and_report(opts, None, || {
+            let client = opts.client();
+            let payload = client.check_user_forge_token(&user, &host)?;
+            emit(opts, &payload, |outcome| {
+                render_forge_check_outcome(
+                    outcome,
+                    &format!("forge token for user {user:?} host {host:?}"),
+                );
             });
             Ok(())
         }),
@@ -183,6 +211,17 @@ mod tests {
     fn parses_list_forge_tokens() {
         match parse(&v(&["list-forge-tokens", "alice"])) {
             UserCommand::ListForgeTokens { user } => assert_eq!(user, "alice"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_check_forge_token() {
+        match parse(&v(&["check-forge-token", "alice", "gitlab.com"])) {
+            UserCommand::CheckForgeToken { user, host } => {
+                assert_eq!(user, "alice");
+                assert_eq!(host, "gitlab.com");
+            }
             other => panic!("unexpected: {other:?}"),
         }
     }

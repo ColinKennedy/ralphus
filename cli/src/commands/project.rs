@@ -14,7 +14,7 @@
 use serde_json::Value;
 
 use crate::args::GlobalOpts;
-use crate::commands::CommandError;
+use crate::commands::{CommandError, emit, render_forge_check_outcome, run_and_report};
 use crate::flags::{Scanner, UsageError};
 
 const SHORT_DESCRIPTION_MAX: usize = 80;
@@ -47,6 +47,11 @@ pub enum ProjectCommand {
     },
     Fork(ProjectForkCommand),
     ReviewSettings(ProjectReviewSettingsCommand),
+    /// RAL-523: manual reachability check of the project's destination
+    /// repository.
+    CheckDestination {
+        name: String,
+    },
     UsageError(String),
 }
 
@@ -118,6 +123,11 @@ pub enum ProjectForkCommand {
         project: String,
         user: Option<String>,
     },
+    Check {
+        project: String,
+        url: String,
+        user: Option<String>,
+    },
     UsageError(String),
 }
 
@@ -143,6 +153,12 @@ pub fn parse(args: &[String]) -> ProjectCommand {
             None => ProjectCommand::UsageError("remove requires a <name> argument".to_string()),
         },
         Some("fork") => ProjectCommand::Fork(parse_fork(&scanner.remaining())),
+        Some("check-destination") => match scanner.remaining().into_iter().next() {
+            Some(name) => ProjectCommand::CheckDestination { name },
+            None => ProjectCommand::UsageError(
+                "check-destination requires a <name> argument".to_string(),
+            ),
+        },
         Some("review-settings") => {
             ProjectCommand::ReviewSettings(parse_review_settings(&scanner.remaining()))
         }
@@ -171,6 +187,10 @@ fn parse_fork(args: &[String]) -> ProjectForkCommand {
             Err(e) => ProjectForkCommand::UsageError(e.0),
         },
         Some("remove") => match parse_fork_remove(&mut scanner) {
+            Ok(cmd) => cmd,
+            Err(e) => ProjectForkCommand::UsageError(e.0),
+        },
+        Some("check") => match parse_fork_check(&mut scanner) {
             Ok(cmd) => cmd,
             Err(e) => ProjectForkCommand::UsageError(e.0),
         },
@@ -240,6 +260,22 @@ fn parse_fork_remove(scanner: &mut Scanner) -> Result<ProjectForkCommand, UsageE
         ));
     };
     Ok(ProjectForkCommand::Remove { project, user })
+}
+
+fn parse_fork_check(scanner: &mut Scanner) -> Result<ProjectForkCommand, UsageError> {
+    let url = scanner.take_value("--url")?;
+    let user = non_empty(scanner.take_value("--user")?);
+    let Some(project) = scanner.clone().remaining().into_iter().next() else {
+        return Err(UsageError(
+            "project fork check requires a <project> argument".to_string(),
+        ));
+    };
+    let Some(url) = url else {
+        return Err(UsageError(
+            "project fork check requires --url (the fork clone URL to check)".to_string(),
+        ));
+    };
+    Ok(ProjectForkCommand::Check { project, url, user })
 }
 
 fn parse_git(scanner: &mut Scanner) -> Result<ProjectCommand, UsageError> {
@@ -468,6 +504,14 @@ pub fn dispatch(cmd: ProjectCommand, opts: &GlobalOpts) -> i32 {
         },
         ProjectCommand::Fork(cmd) => dispatch_fork(cmd, opts),
         ProjectCommand::ReviewSettings(cmd) => dispatch_review_settings(cmd, opts),
+        ProjectCommand::CheckDestination { name } => run_and_report(opts, None, || {
+            let client = opts.client();
+            let payload = client.check_project_destination(&name)?;
+            emit(opts, &payload, |outcome| {
+                render_forge_check_outcome(outcome, &format!("destination of project {name:?}"));
+            });
+            Ok(())
+        }),
     }
 }
 
@@ -729,6 +773,22 @@ fn dispatch_fork(cmd: ProjectForkCommand, opts: &GlobalOpts) -> i32 {
                 }
             }
         }
+        ProjectForkCommand::Check { project, url, user } => run_and_report(opts, None, || {
+            let client = opts.client();
+            let payload = client.check_project_fork_url(&project, &url, user.as_deref())?;
+            emit(opts, &payload, |outcome| {
+                render_forge_check_outcome(
+                    outcome,
+                    &format!(
+                        "fork {url} of project \"{project}\"{}",
+                        user.as_deref()
+                            .map(|u| format!(" as user {u:?}"))
+                            .unwrap_or_default()
+                    ),
+                );
+            });
+            Ok(())
+        }),
     }
 }
 
@@ -1107,6 +1167,58 @@ mod tests {
         assert!(matches!(
             parse(&v(&["fork", "add", "proj"])),
             ProjectCommand::Fork(ProjectForkCommand::UsageError(_))
+        ));
+    }
+
+    #[test]
+    fn parses_fork_check_with_url_and_optional_user() {
+        match parse(&v(&[
+            "fork",
+            "check",
+            "proj",
+            "--url",
+            "git@x:alice/proj.git",
+            "--user",
+            "alice",
+        ])) {
+            ProjectCommand::Fork(ProjectForkCommand::Check { project, url, user }) => {
+                assert_eq!(project, "proj");
+                assert_eq!(url, "git@x:alice/proj.git");
+                assert_eq!(user.as_deref(), Some("alice"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        match parse(&v(&["fork", "check", "proj", "--url", "https://x/a/b.git"])) {
+            ProjectCommand::Fork(ProjectForkCommand::Check { project, url, user }) => {
+                assert_eq!(project, "proj");
+                assert_eq!(url, "https://x/a/b.git");
+                assert_eq!(user, None);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fork_check_requires_project_and_url() {
+        assert!(matches!(
+            parse(&v(&["fork", "check", "--url", "url"])),
+            ProjectCommand::Fork(ProjectForkCommand::UsageError(_))
+        ));
+        assert!(matches!(
+            parse(&v(&["fork", "check", "proj"])),
+            ProjectCommand::Fork(ProjectForkCommand::UsageError(_))
+        ));
+    }
+
+    #[test]
+    fn parses_check_destination() {
+        match parse(&v(&["check-destination", "proj"])) {
+            ProjectCommand::CheckDestination { name } => assert_eq!(name, "proj"),
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(matches!(
+            parse(&v(&["check-destination"])),
+            ProjectCommand::UsageError(_)
         ));
     }
 

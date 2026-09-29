@@ -1522,10 +1522,10 @@ Work submitted against it will fail — fix the machine or deregister the provid
        * @returns {void}
        */
       function renderPreferenceForks() {
-        const rows = preferenceForks.slice().sort((a, b) => a.project.localeCompare(b.project)).map((f) => `<tr><td>${esc(f.project)}</td><td class="mono">${esc(f.fork_url)}</td><td class="mono">${esc(f.remote_name)}</td><td><button class="btn" data-click="removePreferenceFork" data-project="${esc(f.project)}" data-tip="Remove this user's fork mapping for ${esc(f.project)}. This cannot be undone.">Remove</button></td></tr>`).join("");
+        const rows = preferenceForks.slice().sort((a, b) => a.project.localeCompare(b.project)).map((f) => `<tr><td>${esc(f.project)}</td><td class="mono">${esc(f.fork_url)}</td><td class="mono">${esc(f.remote_name)}</td><td style="text-align:right"><div class="row" style="gap:6px;flex-wrap:nowrap;justify-content:flex-end;align-items:center"><button class="btn" data-click="checkPreferenceFork" data-project="${esc(f.project)}" style="padding:2px 8px;font-size:12px" data-tip="Run a manual reachability check for this fork URL (RAL-523), authenticated with your own stored forge token for its host when one is configured.\nWho/when: after registering the mapping, or whenever a fork-routed push or PR has failed and you suspect the fork URL.\nRead-only: changes nothing; the result shows in this cell.">Check</button>${forgeCheckStatusHtml(`preffork|${esc(f.project)}|${prefsUserName() || ""}`)}</div></td><td><button class="btn" data-click="removePreferenceFork" data-project="${esc(f.project)}" data-tip="Remove this user's fork mapping for ${esc(f.project)}. This cannot be undone.">Remove</button></td></tr>`).join("");
         const d = preferenceForkDraft;
         const choices = projects.map((p) => `<option value="${esc(p.name)}" ${d.project === p.name ? "selected" : ""}>${esc(p.name)}</option>`).join("");
-        byId("preference-forks").innerHTML = `${preferenceForksError ? `<div class="verr">${esc(preferenceForksError)}</div>` : ""}<table class="proj-table"><thead><tr><th>Project</th><th>Fork URL</th><th>Remote</th><th></th></tr></thead><tbody>${rows || `<tr><td colspan="4" class="empty">No personal fork mappings. Projects without one use origin.</td></tr>`}</tbody></table><div class="row" style="gap:8px;flex-wrap:wrap;margin-top:10px;align-items:flex-start"><select onchange="preferenceForkDraft.project=this.value" data-tip="Registered project this fork applies to. Choosing a mapped project replaces its URL."><option value="">Choose project…</option>${choices}</select><div><input type="text" value="${esc(d.fork_url)}" oninput="onForkUrlInput(this, preferenceForkDraft, 'pref-fork-url-err')" placeholder="fork clone URL" data-tip="The clone URL for this user's fork of the selected project. Must use HTTPS -- SSH and other transports are not accepted."/><div class="verr" id="pref-fork-url-err">${esc(forkUrlValidationError(d.fork_url))}</div></div><input type="text" value="${esc(d.remote_name)}" oninput="preferenceForkDraft.remote_name=this.value" placeholder="remote name (optional)" data-tip="Optional local git remote name. Ralphus derives one when blank."/><button class="btn primary" onclick="addPreferenceFork()" data-tip="Save this user's fork mapping for the selected project, replacing an existing mapping for that project.">Add / replace</button></div>`;
+        byId("preference-forks").innerHTML = `${preferenceForksError ? `<div class="verr">${esc(preferenceForksError)}</div>` : ""}<table class="proj-table"><thead><tr><th>Project</th><th>Fork URL</th><th>Remote</th><th style="text-align:right" data-tip="Manual reachability check (RAL-523): one live request to the forge REST API for this fork URL, run daemon-side.">Check</th><th></th></tr></thead><tbody>${rows || `<tr><td colspan="5" class="empty">No personal fork mappings. Projects without one use origin.</td></tr>`}</tbody></table><div class="row" style="gap:8px;flex-wrap:wrap;margin-top:10px;align-items:flex-start"><select onchange="preferenceForkDraft.project=this.value" data-tip="Registered project this fork applies to. Choosing a mapped project replaces its URL."><option value="">Choose project…</option>${choices}</select><div><input type="text" value="${esc(d.fork_url)}" oninput="onForkUrlInput(this, preferenceForkDraft, 'pref-fork-url-err')" placeholder="fork clone URL" data-tip="The clone URL for this user's fork of the selected project. Must use HTTPS -- SSH and other transports are not accepted."/><div class="verr" id="pref-fork-url-err">${esc(forkUrlValidationError(d.fork_url))}</div></div><input type="text" value="${esc(d.remote_name)}" oninput="preferenceForkDraft.remote_name=this.value" placeholder="remote name (optional)" data-tip="Optional local git remote name. Ralphus derives one when blank."/><button class="btn primary" onclick="addPreferenceFork()" data-tip="Save this user's fork mapping for the selected project, replacing an existing mapping for that project.">Add / replace</button></div>`;
       }
       /**
        * Sensible default host to prefill when the forge-token kind dropdown
@@ -1656,6 +1656,223 @@ Work submitted against it will fail — fix the machine or deregister the provid
           default: return "";
         }
       }
+
+      // RALPHUS-FORGE-CHECK:BEGIN
+      // ---- Manual forge connectivity checks (RAL-523) ----
+      /**
+       * Runs one manual forge connectivity check (RAL-523) and records the
+       * outcome under `key` for `forgeCheckStatusHtml` to render. The POST
+       * endpoints answer 200 with a `ForgeCheckOutcome` even when the check
+       * itself failed (bad token, unreachable forge, unresolvable URL), so a
+       * non-OK HTTP response here is only a daemon/API-level problem.
+       * @param {string} key
+       * @param {string} path - daemon API path to POST
+       * @param {object|null} body - JSON request body, or null for none
+       * @param {() => void} rerender - re-render of the surface the checked row lives on
+       * @returns {Promise<void>}
+       */
+      async function runForgeCheck(key, path, body, rerender) {
+        forgeCheckState.set(key, { loading: true, outcome: null });
+        rerender();
+        try {
+          const r = await fetch(path, {
+            method: "POST",
+            headers: body ? { "Content-Type": "application/json" } : {},
+            body: body ? JSON.stringify(body) : undefined,
+          });
+          const outcome = r.ok
+            ? /** @type {ForgeCheckOutcome} */ (await r.json())
+            : { ok: false, status: "error", detail: await responseError(r, "check failed") };
+          forgeCheckState.set(key, { loading: false, outcome });
+        } catch (_) {
+          forgeCheckState.set(key, { loading: false, outcome: { ok: false, status: "error", detail: "daemon unreachable" } });
+        }
+        rerender();
+      }
+      /**
+       * Renders the right-aligned status half of a manual connectivity-check
+       * cell (RAL-523): a transient "checking" badge while in flight, a
+       * green ok badge (with the authenticated identity when one came back),
+       * or — for a failed check — red right-aligned status text naming the
+       * verdict and the reason, truncated with an ellipsis when long and
+       * click-to-open the full message in `openForgeCheckDetail`'s popup.
+       * @param {string} key
+       * @returns {string}
+       */
+      function forgeCheckStatusHtml(key) {
+        const st = forgeCheckState.get(key);
+        if (!st) return "";
+        if (st.loading) {
+          return `<span style="color:var(--pending)" data-tip="Pinging the forge from the daemon — this is a live network round-trip and can take a few seconds.\nCaveats: none — this is a transient state.">⏳ Checking…</span>`;
+        }
+        const o = st.outcome;
+        if (!o) return "";
+        if (o.ok) {
+          const tip = `${esc(o.detail)}${o.identity ? `\nAuthenticated as: ${esc(o.identity)}` : ""}\nCaveats: a token can be revoked or a repo made private later — re-run the check to re-confirm.`;
+          return `<span style="color:var(--done)" data-tip="${tip}">✓ ok${o.identity ? ` as ${esc(o.identity)}` : ""}</span>`;
+        }
+        const truncated = o.detail.length > FORGE_CHECK_INLINE_MAX;
+        const shown = truncated ? `${o.detail.slice(0, FORGE_CHECK_INLINE_MAX)}…` : o.detail;
+        // A truncated failure keeps its full message out of the tooltip -- the
+        // popup is what carries the complete text, so the cell stays bounded.
+        const tip = truncated
+          ? `${esc(o.status)}: the forge-check failed; click the message to open the complete text with a copy control.`
+          : `${esc(o.detail)}\nCaveats: re-run the check after fixing the cause.`;
+        return `<span style="color:var(--failed);${truncated ? "cursor:pointer;text-decoration:underline dotted" : ""}" ${truncated ? `data-click="openForgeCheckDetail" data-key="${esc(key)}"` : ""} data-tip="${tip}">✗ ${esc(o.status)}: ${esc(shown)}</span>`;
+      }
+      /**
+       * Opens the full-message popup for one truncated connectivity-check
+       * failure (RAL-523): the complete, untruncated detail plus the board's
+       * standard copy-to-clipboard control. A floating near-click panel
+       * (same pattern as the status picker) rather than a `#modal-root`
+       * modal, so it can open on top of the fork-registrations popup without
+       * clobbering it.
+       * @param {MouseEvent} e
+       * @param {string} key
+       * @returns {void}
+       */
+      function openForgeCheckDetail(e, key) {
+        e.stopPropagation();
+        const st = forgeCheckState.get(key);
+        const o = st && st.outcome;
+        if (!o) return;
+        closeForgeCheckDetail();
+        const pop = document.createElement("div");
+        pop.id = "forge-check-detail";
+        pop.style.cssText = "position:fixed;z-index:1000;max-width:540px;padding:10px;background:var(--bg,#111);border:1px solid var(--border,#444);border-radius:6px;box-shadow:0 4px 16px rgba(0,0,0,.5)";
+        pop.innerHTML = `
+          <div style="font-weight:600;margin-bottom:6px">✗ check failed — full message</div>
+          <div style="white-space:pre-wrap;max-height:40vh;overflow:auto;font-size:12px">${esc(o.detail)}</div>
+          <div class="row" style="gap:6px;margin-top:8px;align-items:center">
+            ${copyBtn(o.detail)}
+            <button class="btn" onclick="closeForgeCheckDetail()" data-tip="Close this popup.">Close</button>
+          </div>`;
+        document.body.appendChild(pop);
+        const rect = pop.getBoundingClientRect();
+        pop.style.left = `${Math.max(8, Math.min(e.clientX, window.innerWidth - rect.width - 8))}px`;
+        pop.style.top = `${Math.max(8, Math.min(e.clientY + 12, window.innerHeight - rect.height - 8))}px`;
+        setTimeout(() => document.addEventListener("click", forgeCheckDetailOutside, true), 0);
+      }
+      /**
+       * Outside-click dismissal for `openForgeCheckDetail`'s popup: a click
+       * anywhere outside it (including the truncated message that opened it)
+       * closes it; a click inside — e.g. on the copy button — leaves it open.
+       * @param {MouseEvent} e
+       * @returns {void}
+       */
+      function forgeCheckDetailOutside(e) {
+        const pop = document.getElementById("forge-check-detail");
+        if (!pop) {
+          document.removeEventListener("click", forgeCheckDetailOutside, true);
+          return;
+        }
+        if (pop.contains(/** @type {Node} */ (e.target))) return;
+        pop.remove();
+        document.removeEventListener("click", forgeCheckDetailOutside, true);
+      }
+      /**
+       * Closes `openForgeCheckDetail`'s full-message popup.
+       * @returns {void}
+       */
+      function closeForgeCheckDetail() {
+        const pop = document.getElementById("forge-check-detail");
+        if (pop) pop.remove();
+      }
+      /**
+       * Runs the manual connectivity check for one stored forge-token row on
+       * the Preferences page (RAL-523) -- the daemon authenticates against
+       * the forge with the stored token and reports whether it works (and as
+       * whom) and whether the forge is reachable.
+       * @param {string} host
+       * @returns {Promise<void>}
+       */
+      async function checkPreferenceForgeToken(host) {
+        const user = prefsUserName();
+        if (!user || !host) return;
+        await runForgeCheck(
+          `token|${user}|${host}`,
+          `/api/users/${encodeURIComponent(user)}/forge-tokens/${encodeURIComponent(host)}/check`,
+          null,
+          renderPrefs,
+        );
+      }
+      /**
+       * Runs the manual reachability check for one personal fork-mapping row
+       * on the Preferences page (RAL-523), authenticated with this user's
+       * own stored forge token for the fork's host when one is configured.
+       * @param {string} project
+       * @returns {Promise<void>}
+       */
+      async function checkPreferenceFork(project) {
+        const user = prefsUserName();
+        if (!user || !project) return;
+        const row = preferenceForks.find((/** @type {ForkRecord} */ f) => f.project === project);
+        if (!row) return;
+        await runForgeCheck(
+          `preffork|${project}|${user}`,
+          `/api/projects/${encodeURIComponent(project)}/forks/check`,
+          { url: row.fork_url, user },
+          renderPrefs,
+        );
+      }
+      /**
+       * Runs the manual reachability check for one registered fork row in
+       * the open Projects-tab fork-registrations popup (RAL-523).
+       * @param {string} user - "" for the project-wide default row.
+       * @returns {Promise<void>}
+       */
+      async function checkProjectFork(user) {
+        const projectName = projectForksModalProject;
+        if (!projectName) return;
+        const row = projectForks.find((/** @type {ForkRecord} */ f) => f.project === projectName && f.user === user);
+        if (!row) return;
+        await runForgeCheck(
+          `fork|${projectName}|${user}`,
+          `/api/projects/${encodeURIComponent(projectName)}/forks/check`,
+          { url: row.fork_url, user },
+          renderProjectForksModal,
+        );
+      }
+      /**
+       * Runs the manual reachability check for the open fork-registrations
+       * popup's add-form URL (RAL-523) -- lets you confirm a fork URL is
+       * reachable before saving it. Uses the draft's `user` field so a
+       * user-scoped fork is checked with that user's stored forge token.
+       * @returns {Promise<void>}
+       */
+      async function checkProjectForkDraft() {
+        const projectName = projectForksModalProject;
+        const url = (projectForksAddDraft.fork_url || "").trim();
+        if (!projectName || !url) {
+          projectForksModalError = "Enter a fork clone URL to check.";
+          renderProjectForksModal();
+          return;
+        }
+        await runForgeCheck(
+          `fork-add|${projectName}`,
+          `/api/projects/${encodeURIComponent(projectName)}/forks/check`,
+          { url, user: projectForksAddDraft.user || "" },
+          renderProjectForksModal,
+        );
+      }
+      /**
+       * Runs the manual reachability check for a project's destination
+       * repository (RAL-523) -- its registered clone URL, else the checkout's
+       * forge remote.
+       * @param {string} name
+       * @returns {Promise<void>}
+       */
+      async function checkProjectDestination(name) {
+        if (!name) return;
+        closeSquadMenu();
+        await runForgeCheck(
+          `dest|${name}`,
+          `/api/projects/${encodeURIComponent(name)}/check-destination`,
+          null,
+          renderProjects,
+        );
+      }
+      // RALPHUS-FORGE-CHECK:END
       /**
        * Renders the Preferences tab's forge personal-access-token section
        * (RAL-490): existing host rows (never token values) plus the
@@ -1664,11 +1881,11 @@ Work submitted against it will fail — fix the machine or deregister the provid
        */
       function renderPreferenceForgeTokens() {
         const rows = preferenceForgeTokens.slice().sort((a, b) => a.host.localeCompare(b.host))
-          .map((t) => `<tr><td class="mono">${esc(t.host)}</td><td>${new Date(t.updated_at_ms).toLocaleString()}</td><td><button class="btn" data-click="removePreferenceForgeToken" data-host="${esc(t.host)}" data-tip="Remove the forge token configured for ${esc(t.host)}. This cannot be undone.">Remove</button></td></tr>`)
+          .map((t) => `<tr><td class="mono">${esc(t.host)}</td><td>${new Date(t.updated_at_ms).toLocaleString()}</td><td style="text-align:right"><div class="row" style="gap:6px;flex-wrap:nowrap;justify-content:flex-end;align-items:center"><button class="btn" data-click="checkPreferenceForgeToken" data-host="${esc(t.host)}" style="padding:2px 8px;font-size:12px" data-tip="Run a manual connectivity check for this stored token (RAL-523): the daemon authenticates against ${esc(t.host)} with it and reports whether the token works (and as whom) and whether the forge is reachable.\nWho/when: any time — the check reads the already-saved token, so you never re-paste it.\nRead-only: changes nothing; the result shows in this cell.">Check</button>${forgeCheckStatusHtml(`token|${prefsUserName() || ""}|${t.host}`)}</div></td><td><button class="btn" data-click="removePreferenceForgeToken" data-host="${esc(t.host)}" data-tip="Remove the forge token configured for ${esc(t.host)}. This cannot be undone.">Remove</button></td></tr>`)
           .join("");
         const d = preferenceForgeTokenDraft;
         const kindChoices = (forgeKinds.length ? forgeKinds : [d.kind]).map((k) => `<option value="${esc(k)}" ${d.kind === k ? "selected" : ""}>${esc(k)}</option>`).join("");
-        byId("preference-forge-tokens").innerHTML = `${preferenceForgeTokensError ? `<div class="verr">${esc(preferenceForgeTokensError)}</div>` : ""}<table class="proj-table"><thead><tr><th>Host</th><th>Last updated</th><th></th></tr></thead><tbody>${rows || `<tr><td colspan="3" class="empty">No forge tokens configured yet.</td></tr>`}</tbody></table><div class="row" style="gap:8px;flex-wrap:wrap;margin-top:10px;align-items:center"><select onchange="preferenceForgeTokenDraft.kind=this.value; preferenceForgeTokenDraft.host=defaultForgeHost(this.value); preferenceForgeTokenVerify='idle'; renderPrefs()" data-tip="Which forge this token is for -- populated from the daemon's supported adapters (GET /api/forge/kinds), never a fixed list.">${kindChoices}</select><input type="text" value="${esc(d.host)}" oninput="preferenceForgeTokenDraft.host=this.value; preferenceForgeTokenVerify='idle'" placeholder="host, e.g. github.com" data-tip="The forge host this token authenticates against. Defaults to github.com/gitlab.com; change it for a self-hosted GitHub Enterprise or GitLab instance."/><input type="password" value="${esc(d.token)}" oninput="preferenceForgeTokenDraft.token=this.value; preferenceForgeTokenVerify='idle'" placeholder="personal access token" autocomplete="off" data-tip="The token's characters are masked as you type, the same as a password field. Why: this token grants PR/MR access on your behalf.\nWho/when: paste a freshly generated forge PAT here.\nCaveats: it is stored server-side and never redisplayed -- re-paste it here if you ever need to change it."/><button class="btn primary" onclick="applyPreferenceForgeToken()" data-tip="Save this token for the selected host, then immediately make a live authenticated request to the forge to confirm it works.\nWho/when: use after pasting a new or rotated token.\nCaveats: overwrites any existing token already saved for this host.">Apply</button>${forgeTokenVerifyBadge()}</div>`;
+        byId("preference-forge-tokens").innerHTML = `${preferenceForgeTokensError ? `<div class="verr">${esc(preferenceForgeTokensError)}</div>` : ""}<table class="proj-table"><thead><tr><th>Host</th><th>Last updated</th><th style="text-align:right" data-tip="Manual connectivity check (RAL-523): one live authenticated request to this forge, run daemon-side with the stored token, reporting whether the token authenticates (and as whom) and whether the forge is reachable.">Check</th><th></th></tr></thead><tbody>${rows || `<tr><td colspan="4" class="empty">No forge tokens configured yet.</td></tr>`}</tbody></table><div class="row" style="gap:8px;flex-wrap:wrap;margin-top:10px;align-items:center"><select onchange="preferenceForgeTokenDraft.kind=this.value; preferenceForgeTokenDraft.host=defaultForgeHost(this.value); preferenceForgeTokenVerify='idle'; renderPrefs()" data-tip="Which forge this token is for -- populated from the daemon's supported adapters (GET /api/forge/kinds), never a fixed list.">${kindChoices}</select><input type="text" value="${esc(d.host)}" oninput="preferenceForgeTokenDraft.host=this.value; preferenceForgeTokenVerify='idle'" placeholder="host, e.g. github.com" data-tip="The forge host this token authenticates against. Defaults to github.com/gitlab.com; change it for a self-hosted GitHub Enterprise or GitLab instance."/><input type="password" value="${esc(d.token)}" oninput="preferenceForgeTokenDraft.token=this.value; preferenceForgeTokenVerify='idle'" placeholder="personal access token" autocomplete="off" data-tip="The token's characters are masked as you type, the same as a password field. Why: this token grants PR/MR access on your behalf.\nWho/when: paste a freshly generated forge PAT here.\nCaveats: it is stored server-side and never redisplayed -- re-paste it here if you ever need to change it."/><button class="btn primary" onclick="applyPreferenceForgeToken()" data-tip="Save this token for the selected host, then immediately make a live authenticated request to the forge to confirm it works.\nWho/when: use after pasting a new or rotated token.\nCaveats: overwrites any existing token already saved for this host.">Apply</button>${forgeTokenVerifyBadge()}</div>`;
       }
       /**
        * Updates the Preferences tab's free-text hidden-item filter and re-renders.
@@ -1960,6 +2177,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
                     <option value="git" ${d.vcs === "git" ? "selected" : ""}>git</option>
                   </select></td>
               <td style="color:var(--muted)">${fmtProjCreated(p.created_at_ms)}</td>
+              <td></td>
               <td>
                 <div class="row" style="gap:6px;flex-wrap:nowrap">
                   <button class="btn primary" data-click="saveProjectEdit" data-name="${esc(p.name)}" data-tip="Save these changes.\nIf the path does not exist or is not a git repository, the save is rejected and the reason is shown here.">Save</button>
@@ -1976,6 +2194,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
             <td><span class="proj-field mono" data-name="${esc(p.name)}" ondblclick="startProjectEdit(this.dataset.name)" data-tip="Double-click to edit. Clone URL a machine provider uses to provision this project on another machine (RAL-355).\nBlank means remote work on this project will fail until one is set.">${p.clone_url ? esc(p.clone_url) : `<span style="color:var(--muted)">(none)</span>`}</span></td>
             <td><span class="proj-field" data-name="${esc(p.name)}" ondblclick="startProjectEdit(this.dataset.name)" data-tip="Double-click to edit. Only \"git\" is implemented today.">${esc(p.vcs)}</span></td>
             <td style="color:var(--muted)">${fmtProjCreated(p.created_at_ms)}</td>
+            <td style="text-align:right"><div class="row" style="gap:6px;flex-wrap:nowrap;justify-content:flex-end;align-items:center"><button class="btn" data-click="checkProjectDestination" data-name="${esc(p.name)}" style="padding:2px 8px;font-size:12px" data-tip="Run a manual reachability check for this project's destination repository (RAL-523) — its registered clone URL, else this checkout's forge remote — against the forge REST API.\nSSH-style clone URLs are resolved through their host/path pair; no SSH connection is opened.\nRead-only: changes nothing; the result shows in this cell.">Check</button>${forgeCheckStatusHtml(`dest|${esc(p.name)}`)}</div></td>
             <td><button class="btn" data-click="openProjectMenu" data-name="${esc(p.name)}" style="padding:2px 8px;font-size:12px" data-tip="Project actions: auto-review (Triage) thresholds, and this project's DEFAULT review settings.">⋯</button></td>
           </tr>`;
       }
@@ -2025,6 +2244,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
           + `<th data-tip="Clone URL a machine provider uses to provision this project on another machine (RAL-355). Blank means remote work on this project will fail until one is set.">Clone URL</th>`
           + `<th data-tip="Version control kind. Only \"git\" is implemented today.">VCS</th>`
           + `<th data-tip="When this project was registered.">Registered</th>`
+          + `<th style="text-align:right" data-tip="Manual reachability check (RAL-523): one live request to the forge REST API for this project's destination repository (its registered clone URL, else the checkout's forge remote), run daemon-side.">Check</th>`
           + `<th></th>`;
         const rows = projects.map((p) => projectRowHtml(p)).join("");
         el.innerHTML = `${warningBanner}${removeErrorBanner}<table class="proj-table"><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table>`;
@@ -2591,6 +2811,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
               <td><input type="text" value="${esc(d.fork_url || "")}" oninput="onForkUrlInput(this, projectForksEditDraft, 'edit-fork-url-err')" data-tip="The fork's own clone URL. Must use HTTPS -- SSH and other transports are not accepted." /><div class="verr" id="edit-fork-url-err">${esc(forkUrlValidationError(d.fork_url || ""))}</div></td>
               <td><input type="text" value="${esc(d.remote_name || "")}" oninput="projectForksEditDraft.remote_name=this.value" data-tip="Local git remote name ralphus creates/updates automatically before the first fork-mode push." /></td>
               <td><input type="text" value="${esc(d.fork_owner || "")}" oninput="projectForksEditDraft.fork_owner=this.value" data-tip="GitHub owner/org login the fork lives under (needed to build the cross-repository PR's \"owner:branch\" head). Leave blank for GitLab, which addresses cross-project MRs by numeric project id instead." /></td>
+              <td></td>
               <td>
                 <div class="row" style="gap:6px;flex-wrap:nowrap">
                   <button class="btn primary" data-click="saveProjectForkEdit" data-user="${esc(f.user)}" data-tip="Save these changes.">Save</button>
@@ -2604,6 +2825,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
             <td class="mono">${esc(f.fork_url)}</td>
             <td class="mono">${esc(f.remote_name)}</td>
             <td class="mono">${f.fork_owner ? esc(f.fork_owner) : `<span style="color:var(--muted)">(none)</span>`}</td>
+            <td style="text-align:right"><div class="row" style="gap:6px;flex-wrap:nowrap;justify-content:flex-end;align-items:center"><button class="btn" data-click="checkProjectFork" data-user="${esc(f.user)}" style="padding:2px 8px;font-size:12px" data-tip="Run a manual reachability check for this fork's URL against the forge REST API (RAL-523).\nA row scoped to a user is checked with that user's stored forge token for the fork's host when one is configured; the project-wide default row uses the daemon's own credential chain.\nWho/when: after registering the fork, or whenever a fork-routed push or PR has failed.\nRead-only: changes nothing; the result shows in this cell.">Check</button>${forgeCheckStatusHtml(`fork|${esc(projectForksModalProject || "")}|${esc(f.user)}`)}</div></td>
             <td>
               <div class="row" style="gap:6px;flex-wrap:nowrap">
                 <button class="btn" data-click="startProjectForkEdit" data-user="${esc(f.user)}" style="padding:2px 8px;font-size:12px" data-tip="Edit this fork registration.">Edit</button>
@@ -2628,7 +2850,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
           .sort((a, b) => (a.user === "" ? -1 : b.user === "" ? 1 : a.user.localeCompare(b.user)));
         const rowsHtml = rows.length
           ? rows.map((f) => projectForkRowHtml(f)).join("")
-          : `<tr><td colspan="5" class="empty">No forks registered for this project yet.</td></tr>`;
+          : `<tr><td colspan="6" class="empty">No forks registered for this project yet.</td></tr>`;
         const d = projectForksAddDraft;
         const err = projectForksModalError ? `<div class="verr" style="margin-top:8px">${esc(projectForksModalError)}</div>` : "";
         byId("modal-root").innerHTML = `
@@ -2640,6 +2862,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
               <th data-tip="The fork's own clone URL.">Fork URL</th>
               <th data-tip="Local git remote name ralphus creates/updates automatically before the first fork-mode push.">Remote name</th>
               <th data-tip="GitHub owner/org login the fork lives under. Blank for GitLab.">Owner</th>
+              <th style="text-align:right" data-tip="Manual reachability check (RAL-523): one live request to the forge REST API for this fork's URL, run daemon-side.">Check</th>
               <th></th>
             </tr></thead><tbody>${rowsHtml}</tbody></table>
             <div class="row" style="gap:8px;flex-wrap:wrap;margin-top:12px;align-items:flex-start">
@@ -2648,6 +2871,8 @@ Work submitted against it will fail — fix the machine or deregister the provid
               <input type="text" placeholder="remote name (optional)" value="${esc(d.remote_name || "")}" oninput="projectForksAddDraft.remote_name=this.value" style="width:150px" data-tip="Defaults to \"fork\" for the default row, else \"fork-<user>\"." />
               <input type="text" placeholder="owner (optional)" value="${esc(d.fork_owner || "")}" oninput="projectForksAddDraft.fork_owner=this.value" style="width:120px" data-tip="GitHub owner/org login. Auto-derived from the URL when it looks like a GitHub host; leave blank for GitLab." />
               <button class="btn primary" onclick="addProjectFork()" data-tip="Register this fork. Replaces any existing row for the same user (or the default row, if user is blank).">Add / Replace</button>
+              <button class="btn" onclick="checkProjectForkDraft()" data-tip="Run a manual reachability check for the fork URL typed above, before saving it (RAL-523).\nChecked with the draft user's stored forge token when one is configured; the result shows right here once it lands.">Check URL</button>
+              <span style="text-align:right">${forgeCheckStatusHtml(`fork-add|${esc(projectName || "")}`)}</span>
             </div>
             ${err}
             <div class="btn-row">
