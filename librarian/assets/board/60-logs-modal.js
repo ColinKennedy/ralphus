@@ -849,7 +849,7 @@
       function resolverPeekBox(g, b) {
         if (!b.worktree) return "";
         const key = `guardian|${g.id}|${b.id}`;
-        return `${peekBox(key, b.started_at_ms ?? null, null, b.finished_at_ms ?? null)}${historyBox(key)}`;
+        return `${peekBox(key, b.started_at_ms ?? null, null, b.finished_at_ms ?? null, g.resolver_thinking_capable)}${historyBox(key)}`;
       }
 
       // Render manual-checks-generation terminal buttons for a review (RAL-88
@@ -897,6 +897,6 @@
         const state = g.checks_state || (cmds.length ? "ready" : "waiting");
         if (state === "waiting") return "";
         const key = `guardian-manual|${g.id}`;
-        return `${peekBox(key, g.manual_checks_started_at_ms ?? null, null, g.manual_checks_finished_at_ms ?? null)}${historyBox(key)}`;
+        return `${peekBox(key, g.manual_checks_started_at_ms ?? null, null, g.manual_checks_finished_at_ms ?? null, g.manual_commands_thinking_capable)}${historyBox(key)}`;
       }
 

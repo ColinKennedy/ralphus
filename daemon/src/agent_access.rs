@@ -210,7 +210,14 @@ mod tests {
         let cwd = tempdir("db-profile");
         let store = Store::open_in_memory().expect("open store");
         store
-            .upsert_agent_profile("openrouter-deepseek", "claude-code", None, None, Vec::new())
+            .upsert_agent_profile(
+                "openrouter-deepseek",
+                "claude-code",
+                None,
+                None,
+                Vec::new(),
+                None,
+            )
             .expect("save db profile");
         let agents = DefaultAgentAccess
             .available_agents(&UserContext::default(), &cwd, &store)
@@ -233,7 +240,7 @@ mod tests {
         .expect("write project config");
         let store = Store::open_in_memory().expect("open store");
         store
-            .upsert_agent_profile("shared-name", "claude-code", None, None, Vec::new())
+            .upsert_agent_profile("shared-name", "claude-code", None, None, Vec::new(), None)
             .expect("save db profile");
         let agents = DefaultAgentAccess
             .available_agents(&UserContext::default(), &cwd, &store)

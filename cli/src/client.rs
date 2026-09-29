@@ -705,6 +705,9 @@ impl DaemonClient {
 
     /// `POST /api/agent-profiles`: create a new DB-backed agent profile.
     /// `env` is `(key, kind, value)` triples, `kind` one of `"set"`/`"link"`.
+    /// `thinking_capable` is RAL-516's tri-state override of whether this
+    /// profile's agent can emit thinking output: `None` inherits the
+    /// backend's own default, `Some(_)` is explicit.
     pub fn create_agent_profile(
         &self,
         name: &str,
@@ -712,6 +715,7 @@ impl DaemonClient {
         executable: Option<&str>,
         model: Option<&str>,
         env: &[(String, String, String)],
+        thinking_capable: Option<bool>,
     ) -> Result<Value, DaemonError> {
         self.post(
             "/api/agent-profiles",
@@ -721,11 +725,14 @@ impl DaemonClient {
                 "executable": executable,
                 "model": model,
                 "env": agent_env_json(env),
+                "thinking_capable": thinking_capable,
             })),
         )
     }
 
     /// `PATCH /api/agent-profiles/{name}`: update an existing profile.
+    /// `thinking_capable` is RAL-516's tri-state override, see
+    /// [`Self::create_agent_profile`].
     pub fn update_agent_profile(
         &self,
         name: &str,
@@ -733,6 +740,7 @@ impl DaemonClient {
         executable: Option<&str>,
         model: Option<&str>,
         env: &[(String, String, String)],
+        thinking_capable: Option<bool>,
     ) -> Result<Value, DaemonError> {
         self.patch(
             &format!("/api/agent-profiles/{name}"),
@@ -741,6 +749,7 @@ impl DaemonClient {
                 "executable": executable,
                 "model": model,
                 "env": agent_env_json(env),
+                "thinking_capable": thinking_capable,
             })),
         )
     }

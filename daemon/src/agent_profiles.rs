@@ -37,6 +37,11 @@ pub struct AgentProfile {
     /// terminal (e.g. `$env:ANTHROPIC_AUTH_TOKEN = 'sk-or-v1-...'`). Literal
     /// values are excluded — they are already plaintext in the config file.
     pub secret_values: BTreeSet<String>,
+    /// RAL-516: override of whether this profile's agent can emit
+    /// thinking/reasoning output the Live View's "Show Thinking" control can
+    /// fold. `None` inherits `ralphus_core::schema::agent_supports_thinking`
+    /// for [`Self::backend`]; `Some(_)` is an explicit override.
+    pub thinking_capable: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +55,11 @@ pub struct ResolvedAgentSelection {
     /// selection (empty for a built-in backend, which has no `env`).
     /// Propagated from [`AgentProfile::secret_values`]; see its doc comment.
     pub secret_values: BTreeSet<String>,
+    /// RAL-516: the resolved answer to "can a Live View pane running this
+    /// agent show a Show Thinking control" -- a profile override if one was
+    /// set, else the backend's own declared default
+    /// (`ralphus_core::schema::agent_supports_thinking`).
+    pub thinking_capable: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -73,6 +83,8 @@ struct RawAgentProfile {
     model: Option<String>,
     #[serde(default)]
     env: BTreeMap<String, RawEnvValue>,
+    #[serde(default)]
+    thinking_capable: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -148,6 +160,7 @@ fn parse_profile_file(path: &Path) -> Result<BTreeMap<String, AgentProfile>, Str
                 model: profile.model,
                 env,
                 secret_values,
+                thinking_capable: profile.thinking_capable,
             },
         );
     }
@@ -238,6 +251,39 @@ pub fn normalize_builtin_agent(agent: &str) -> Option<&'static str> {
         "pi" => Some("pi"),
         _ => None,
     }
+}
+
+/// Cheap, IO-free classification of whether `agent` can emit thinking output,
+/// for board-view rows (`CellView`/`ProofView`/`GuardianView`) that only have
+/// the resolved-at-submit-time agent identifier string and a batch of
+/// already-fetched RAL-473 database profiles on hand (`db_profiles`, from
+/// `crate::agent_profile_store::list_agent_profiles_conn`, prefetched once
+/// per view build). Unlike [`resolve_agent_for_path`]/[`resolve_agent_for_path_db`],
+/// this never touches the filesystem, since it runs once per row on every
+/// board poll.
+///
+/// A bare built-in backend name (`"pi"`, `"claude-code"`, ...) or a
+/// database-backed custom profile resolve exactly like cell dispatch does. A
+/// legacy TOML-only profile (not in `db_profiles` -- e.g. one only defined
+/// via `.ralphus.toml` and never migrated to the database) can't be resolved
+/// without the file IO this path deliberately avoids; this mirrors
+/// `server.rs`'s `reject_unsupported_maximum_context`/
+/// `reject_unsupported_maximum_tool_output_tokens` precedent of deferring
+/// classification for an agent name outside [`ralphus_core::schema::RESERVED_AGENT_NAMES`],
+/// and defaults to `true` (assume capable, i.e. keep showing the control) so
+/// an unresolvable custom profile never loses a feature it may already use.
+#[must_use]
+pub fn thinking_capable_for_agent(
+    agent: &str,
+    db_profiles: &std::collections::HashMap<String, crate::agent_profile_store::AgentProfileView>,
+) -> bool {
+    if let Some(backend) = normalize_builtin_agent(agent) {
+        return ralphus_core::schema::agent_supports_thinking(backend);
+    }
+    if let Some(profile) = db_profiles.get(agent) {
+        return profile.effective_thinking_capable();
+    }
+    true
 }
 
 /// A DB-side snapshot of everything [`resolve_agent_for_path_with`] needs to
@@ -366,6 +412,7 @@ fn resolve_agent_for_path_with(
             env: resolved_env,
             custom_profile: true,
             secret_values,
+            thinking_capable: db_profile.effective_thinking_capable(),
         });
     }
     let profiles = load_profiles_for_path_with(cwd, configuration_path_env)?;
@@ -393,6 +440,9 @@ fn resolve_agent_for_path_with(
             env: profile.env.clone(),
             custom_profile: true,
             secret_values: profile.secret_values.clone(),
+            thinking_capable: profile
+                .thinking_capable
+                .unwrap_or_else(|| ralphus_core::schema::agent_supports_thinking(&profile.backend)),
         });
     }
     if let Some(backend) = normalize_builtin_agent(agent) {
@@ -406,6 +456,7 @@ fn resolve_agent_for_path_with(
             env: BTreeMap::new(),
             custom_profile: false,
             secret_values: BTreeSet::new(),
+            thinking_capable: ralphus_core::schema::agent_supports_thinking(backend),
         });
     }
     Err(format!(
@@ -1069,6 +1120,66 @@ mod tests {
         assert_eq!(normalize_builtin_agent("unknown"), None);
     }
 
+    fn db_profile(backend: &str, thinking_capable: Option<bool>) -> AgentProfileView {
+        AgentProfileView {
+            name: "irrelevant-in-this-test".to_string(),
+            backend: backend.to_string(),
+            executable: None,
+            model: None,
+            env: Vec::new(),
+            thinking_capable,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        }
+    }
+
+    // RAL-516: `thinking_capable_for_agent` is the "Show Thinking" checkbox's
+    // visibility gate for board-view rows — these four tests pin its
+    // precedence: bare builtin backend name (layer 1) > DB profile explicit
+    // override (layer 2 override) > DB profile inherit (layer 2 fallback to
+    // layer 1) > unresolvable name (defaults to capable). See that
+    // function's doc comment for the full rationale, and
+    // `peekShowsThinking`/`toggleShowThinking` in
+    // `librarian/assets/board/30-live-view.js` (tested in
+    // `test/board-thinking-precedence.test.mjs`) for the
+    // downstream layers (`live_view.hide_thinking` default, per-pane
+    // override) this checkbox's *checked state* -- as opposed to its
+    // visibility -- goes through once it is shown at all.
+    #[test]
+    fn thinking_capable_for_agent_uses_the_builtin_backend_default_when_bare() {
+        let db_profiles = std::collections::HashMap::new();
+        assert!(thinking_capable_for_agent("pi", &db_profiles));
+        assert!(!thinking_capable_for_agent("claude-code", &db_profiles));
+        assert!(!thinking_capable_for_agent("codex", &db_profiles));
+    }
+
+    #[test]
+    fn thinking_capable_for_agent_honors_an_explicit_db_profile_override() {
+        let mut db_profiles = std::collections::HashMap::new();
+        db_profiles.insert("my-pi".to_string(), db_profile("pi", Some(false)));
+        db_profiles.insert("my-codex".to_string(), db_profile("codex", Some(true)));
+        assert!(!thinking_capable_for_agent("my-pi", &db_profiles));
+        assert!(thinking_capable_for_agent("my-codex", &db_profiles));
+    }
+
+    #[test]
+    fn thinking_capable_for_agent_falls_back_to_backend_default_when_profile_does_not_override() {
+        let mut db_profiles = std::collections::HashMap::new();
+        db_profiles.insert("my-pi".to_string(), db_profile("pi", None));
+        db_profiles.insert("my-codex".to_string(), db_profile("codex", None));
+        assert!(thinking_capable_for_agent("my-pi", &db_profiles));
+        assert!(!thinking_capable_for_agent("my-codex", &db_profiles));
+    }
+
+    #[test]
+    fn thinking_capable_for_agent_defaults_to_capable_for_an_unresolvable_name() {
+        let db_profiles = std::collections::HashMap::new();
+        assert!(thinking_capable_for_agent(
+            "some-legacy-toml-only-profile",
+            &db_profiles
+        ));
+    }
+
     #[test]
     fn parse_profile_file_resolves_from_env_indirection() {
         let project_root = tempdir("project-root");
@@ -1227,6 +1338,7 @@ backend = "claude-code"
                 model: None,
                 env: BTreeMap::from([("GLOBAL_ONLY".to_string(), "1".to_string())]),
                 secret_values: BTreeSet::new(),
+                thinking_capable: None,
             },
         );
         let mut project = BTreeMap::new();
@@ -1238,6 +1350,7 @@ backend = "claude-code"
                 model: None,
                 env: BTreeMap::from([("PROJECT_ONLY".to_string(), "1".to_string())]),
                 secret_values: BTreeSet::new(),
+                thinking_capable: None,
             },
         );
 

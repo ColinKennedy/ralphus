@@ -265,6 +265,21 @@ pub trait ModelBackend {
     fn supports_maximum_tool_output_tokens(&self) -> bool {
         false
     }
+
+    /// RAL-516: whether this backend emits its model's thinking/reasoning as
+    /// a distinct, taggable stream the Live View's "Show Thinking" control
+    /// (RAL-434) can fold/unfold -- see `PiBackend`'s own override, the only
+    /// one today (`THINKING_MARKER`/`print_thinking_line`). Defaults to
+    /// `false`, same shape as
+    /// [`supports_maximum_context`](Self::supports_maximum_context).
+    /// `ralphus_core::schema::agent_supports_thinking` is the daemon-side
+    /// mirror used to answer the board's "does this pane's agent have
+    /// anything to fold" question before any output arrives; the two checks
+    /// are independent (`core` cannot see `runner`'s trait impls) and must
+    /// be kept in sync by hand.
+    fn supports_thinking(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
