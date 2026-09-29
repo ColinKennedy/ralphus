@@ -21,6 +21,7 @@ pub mod otel;
 pub mod pi_backend;
 pub mod prophecy;
 pub mod providers;
+pub mod ripgrep;
 pub mod shellcmd;
 pub mod spec;
 pub mod thrash;

@@ -203,6 +203,33 @@ output) is treated as "no token from this source," not an error.
 reports `pass` either way, explaining this fallback role in the detail text
 — a missing `gh`/`glab` never fails `check health`.
 
+### ripgrep (rg) — optional, best-effort only
+
+Agents are prompted (`daemon/src/runner.rs`'s tools system prompt) to prefer
+`rg` for shell searches and to reach for `grep` only when it's unavailable,
+so a missing ripgrep degrades search speed on large repositories without
+breaking anything. Nothing in the compiled binaries invokes `rg` itself.
+
+`ralphus check health`'s Harness section (`cli/src/health.rs`'s
+`check_ripgrep`, RAL-522) and the daemon's hourly Free-tier health sweep
+(`daemon/src/health_sweep.rs`, which backs the board's Health tab) both run
+the same shared probe (`runner/src/ripgrep.rs`), as two separate
+diagnostics: PATH resolution (catalog id `ripgrep-path`) and actually
+invoking `rg --version` on the resolved executable (catalog id `ripgrep-version`).
+Both findings are `warn`s, never `fail`s, and each
+failure shape (not on PATH; resolved but not executable; ran but reported
+no ripgrep version) carries its own actionable detail.
+
+Check your version:
+
+```bash
+rg --version
+```
+
+Install via your package manager (e.g. `winget install BurntSushi.ripgrep.MSVC`,
+`brew install ripgrep`, `apt install ripgrep`) — see
+<https://github.com/BurntSushi/ripgrep#installation>.
+
 ### OS-integration binaries — best-effort, platform-gated
 
 A long tail of small, platform-specific subprocess calls, each with a
