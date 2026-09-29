@@ -697,10 +697,11 @@ pub struct GuardianView {
     /// unset. The merge engine gates manual-checks regeneration on this
     /// plus [`Self::manual_checks_cached`].
     pub effective_cache_manual_checks: bool,
-    /// RAL-521: `true` once manual-checks generation has produced commands
-    /// for this review. Under an enabled [`Self::effective_cache_manual_checks`]
-    /// the merge engine treats the stored `manual_commands` as current and
-    /// skips regeneration on every merge/rebase/fix after the first.
+    /// RAL-521: `true` once manual-checks generation has completed for this
+    /// review, including an intentionally empty command result. Under an
+    /// enabled [`Self::effective_cache_manual_checks`] the merge engine treats
+    /// the stored `manual_commands` as current and skips regeneration on every
+    /// merge/rebase/fix after the first.
     pub manual_checks_cached: bool,
     /// The review source type. `git` (the default and only fully-implemented
     /// type) drives the branch-stacking flow; other values are placeholders for
@@ -3125,12 +3126,12 @@ impl Store {
         }
     }
 
-    /// RAL-521: record that manual-checks generation has produced commands
-    /// for this review. The marker is what lets a later merge/rebase/fix
-    /// (under an enabled `cache_manual_checks`) recognize the already
-    /// computed result and skip regeneration. The merge engine never resets
-    /// it back to `false` -- a review keeps its first generation for its
-    /// whole life.
+    /// RAL-521: record that manual-checks generation has completed for this
+    /// review. The marker is what lets a later merge/rebase/fix (under an
+    /// enabled `cache_manual_checks`) recognize the already computed result
+    /// and skip regeneration, including when that result is empty. The merge
+    /// engine never resets it back to `false` -- a review keeps its first
+    /// generation for its whole life.
     ///
     /// # Errors
     /// [`StoreError::NotFound`] when no such guardian exists.

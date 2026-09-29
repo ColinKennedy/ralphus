@@ -8904,10 +8904,7 @@ fn post_merge_jobs_inner(
     // tip changed. An explicit opt-out continues to use the pre-cache basis
     // check and regenerates whenever the result is absent or stale.
     let cached = stored.as_ref().is_some_and(|g| {
-        g.effective_cache_manual_checks
-            && g.manual_checks_cached
-            && commands_present
-            && g.manual_checks_basis.is_some()
+        g.effective_cache_manual_checks && g.manual_checks_cached && g.manual_checks_basis.is_some()
     });
     let generate_manual = jobs.manual_checks && !cached && (!commands_present || basis_changed);
 
@@ -12189,24 +12186,24 @@ fn generate_manual_commands(
             Some(agent.as_str()),
             model.as_deref(),
         );
-        // RAL-520: record the diff basis these commands were generated
-        // against, so a later post-merge run regenerates only when the
-        // settled stack's changes actually changed.
-        let tip_tree = worktree
-            .unwrap_or(root)
-            .git(&["rev-parse", &format!("{tip_ref}^{{tree}}")])
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|_| tip_ref.to_string());
-        let basis = serde_json::json!({ "base_sha": base_sha, "tip_tree": tip_tree }).to_string();
-        let _ = store
-            .lock()
-            .set_guardian_manual_checks_basis(id, Some(&basis));
-        // RAL-521: mark the review's manual checks as computed. Under an
-        // enabled `cache_manual_checks` this marker is what every later
-        // merge/rebase/fix consults to skip regeneration and keep these
-        // commands; under `false` the marker is simply ignored.
-        let _ = store.lock().set_guardian_manual_checks_cached(id, true);
     }
+    // RAL-520: record the diff basis the manual checks were generated against,
+    // including an intentionally empty command list, so a later post-merge
+    // run regenerates only when the settled stack's changes actually changed.
+    let tip_tree = worktree
+        .unwrap_or(root)
+        .git(&["rev-parse", &format!("{tip_ref}^{{tree}}")])
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| tip_ref.to_string());
+    let basis = serde_json::json!({ "base_sha": base_sha, "tip_tree": tip_tree }).to_string();
+    let _ = store
+        .lock()
+        .set_guardian_manual_checks_basis(id, Some(&basis));
+    // RAL-521: mark the review's manual checks as computed. Under an enabled
+    // `cache_manual_checks` this marker is what every later merge/rebase/fix
+    // consults to skip regeneration, even when the computed result is empty;
+    // under `false` the marker is simply ignored.
+    let _ = store.lock().set_guardian_manual_checks_cached(id, true);
     phase_note(
         store,
         id,
