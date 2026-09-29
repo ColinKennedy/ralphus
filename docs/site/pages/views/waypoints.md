@@ -8,6 +8,8 @@ squad's tasks, a waypoint tracks impact *across* squads and reviews that
 otherwise have no dependency edge between them — the roster is exactly the
 set of other things a piece of work needs to keep in sync with.
 
+![Waypoints tab showing an open release-coordination waypoint with a partially delivered squad/review roster, delivery feed, and completed-work bearing](../screenshots/waypoints-overview.png)
+
 ## Sidebar: filtering by state and project
 
 The sidebar lists every waypoint, newest first, with **Status** (open/closed)
