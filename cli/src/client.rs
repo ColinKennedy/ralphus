@@ -599,6 +599,39 @@ impl DaemonClient {
         self.delete(&format!("/api/users/{user}/forge-tokens/{host}"))
     }
 
+    /// `POST /api/users/{user}/forge-tokens/{host}/check` (RAL-523): manual
+    /// connectivity check of the token *stored* for `(user, host)` -- the
+    /// daemon authenticates against the forge with it and reports whether
+    /// the token works and the forge is reachable. Never returns the token.
+    pub fn check_user_forge_token(&self, user: &str, host: &str) -> Result<Value, DaemonError> {
+        self.post(
+            &format!("/api/users/{user}/forge-tokens/{host}/check"),
+            None,
+        )
+    }
+
+    /// `POST /api/projects/{name}/forks/check` (RAL-523): manual
+    /// reachability check for one fork URL; `user` (when given) names whose
+    /// stored forge token should authenticate the check.
+    pub fn check_project_fork_url(
+        &self,
+        project: &str,
+        url: &str,
+        user: Option<&str>,
+    ) -> Result<Value, DaemonError> {
+        self.post(
+            &format!("/api/projects/{project}/forks/check"),
+            Some(json!({"url": url, "user": user.unwrap_or("")})),
+        )
+    }
+
+    /// `POST /api/projects/{name}/check-destination` (RAL-523): manual
+    /// reachability check for the project's destination repository (its
+    /// registered clone URL, else the checkout's forge remote).
+    pub fn check_project_destination(&self, project: &str) -> Result<Value, DaemonError> {
+        self.post(&format!("/api/projects/{project}/check-destination"), None)
+    }
+
     /// `GET /api/internal/fork-credential` (RAL-338 follow-up): the
     /// git-credential helper's fetch path -- `worktree_id`+`grant` is the
     /// entire authorization for *which* credential comes back, no user

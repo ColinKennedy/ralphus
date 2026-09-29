@@ -1078,6 +1078,18 @@ fallback row when --user is omitted).",
         false,
         &[],
     ),
+    node(
+        "check",
+        &["project [str]"],
+        &["--url [url]", "--user [name]"],
+        "Run a manual reachability check for one fork URL against the forge REST API -- a URL \
+about to be registered, or one already registered on a row. --user names whose stored forge \
+token should authenticate the check (private forks); without it the daemon's own credential \
+chain is used, and a public fork is checked unauthenticated.",
+        false,
+        true, // ("project", "fork", "check")
+        &[],
+    ),
 ];
 
 // RAL-408: a project's database-backed review-setting DEFAULTS -- see
@@ -1159,6 +1171,17 @@ token value itself.",
         false,
         &[],
     ),
+    node(
+        "check-forge-token",
+        &["user [str]", "host [str]"],
+        &[],
+        "Run a manual connectivity check of a ralphus user's stored personal access token for \
+one forge host: the daemon authenticates against the forge with it and reports whether the \
+token works (and as whom) and whether the forge is reachable. Never returns the token.",
+        false,
+        true, // ("user", "check-forge-token")
+        &[],
+    ),
 ];
 
 // RAL-338 follow-up: machine-invoked interfaces with no interactive/task-file
@@ -1184,6 +1207,19 @@ const PROJECT_CHILDREN: &[HelpNode] = &[
         false,
         false,
         PROJECT_FORK_CHILDREN,
+    ),
+    node(
+        "check-destination",
+        &["name [str]"],
+        &[],
+        "Run a manual reachability check for a project's destination repository -- its \
+registered clone URL, else the checkout's forge remote -- against the forge REST API. \
+SSH-style clone URLs resolve through their host/path pair (no SSH connection is opened); \
+a URL no REST identity can be resolved from is reported as a failed check with an \
+actionable diagnostic.",
+        false,
+        true, // ("project", "check-destination")
+        &[],
     ),
     node(
         "get",

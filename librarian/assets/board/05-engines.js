@@ -233,6 +233,11 @@
       CLICK_HANDLERS.removeProjectFork = (e, ds) => removeProjectFork(ds.user || "");
       CLICK_HANDLERS.removePreferenceFork = (e, ds) => removePreferenceFork(ds.project || "");
       CLICK_HANDLERS.removePreferenceForgeToken = (e, ds) => removePreferenceForgeToken(ds.host || "");
+      CLICK_HANDLERS.checkPreferenceForgeToken = (e, ds) => checkPreferenceForgeToken(ds.host || "");
+      CLICK_HANDLERS.checkPreferenceFork = (e, ds) => checkPreferenceFork(ds.project || "");
+      CLICK_HANDLERS.checkProjectFork = (e, ds) => checkProjectFork(ds.user || "");
+      CLICK_HANDLERS.checkProjectDestination = (e, ds) => checkProjectDestination(ds.name || "");
+      CLICK_HANDLERS.openForgeCheckDetail = (e, ds) => openForgeCheckDetail(e, ds.key || "");
       CLICK_HANDLERS.previewProjectTriageThreshold = (e, ds) => previewProjectTriageThreshold(e, ds.triageType || "");
       CLICK_HANDLERS.confirmProjectTriageThreshold = (e, ds) => confirmProjectTriageThreshold(ds.triageType || "");
       CLICK_HANDLERS.cancelProjectTriageThresholdPreview = (e, ds) => cancelProjectTriageThresholdPreview(ds.triageType || "");
