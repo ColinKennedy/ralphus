@@ -63,6 +63,8 @@
        * @property {boolean} originalDiscourageTests
        * @property {boolean} autoCancelOutdatedPrPipelines
        * @property {boolean} originalAutoCancelOutdatedPrPipelines
+       * @property {boolean} cacheManualChecks
+       * @property {boolean} originalCacheManualChecks
        */
 
       /** @type {ProjectReviewSettingsDraft|null} */
@@ -115,6 +117,7 @@
         const autoFixPromptTemplate = str(s.auto_fix_prompt_template);
         const discourageTests = boolOr(s.discourage_tests_during_auto_pull_request_fixes, effective.discourage_tests_during_auto_pull_request_fixes);
         const autoCancelOutdatedPrPipelines = boolOr(s.auto_cancel_outdated_pr_pipelines, effective.auto_cancel_outdated_pr_pipelines);
+        const cacheManualChecks = boolOr(s.cache_manual_checks, effective.cache_manual_checks);
         return {
           project,
           cwd: proj ? proj.path : "",
@@ -137,6 +140,7 @@
           autoFixPromptTemplate, originalAutoFixPromptTemplate: autoFixPromptTemplate,
           discourageTests, originalDiscourageTests: discourageTests,
           autoCancelOutdatedPrPipelines, originalAutoCancelOutdatedPrPipelines: autoCancelOutdatedPrPipelines,
+          cacheManualChecks, originalCacheManualChecks: cacheManualChecks,
         };
       }
 
@@ -309,6 +313,12 @@
        * @returns {void}
        */
       function onProjectEditAutoCancelOutdatedPrPipelines(checked) { if (projectReviewSettingsDraft) projectReviewSettingsDraft.autoCancelOutdatedPrPipelines = checked; }
+      /**
+       * Stages the cache-manual-checks default (RAL-521).
+       * @param {boolean} checked
+       * @returns {void}
+       */
+      function onProjectEditCacheManualChecks(checked) { if (projectReviewSettingsDraft) projectReviewSettingsDraft.cacheManualChecks = checked; }
 
       const PROJECT_REVIEW_SETTINGS_BASE_SHIFT_CAP_TIP = "Maximum unattended rebuild attempts per base-shift retry campaign (a persistent conflict, failed proof, or outage stops automatic rebasing once spent, and the mailbox says so). Blank inherits the file-config/global value shown below; manual Merge/rebase resets the budget.";
       const PROJECT_REVIEW_SETTINGS_BUDGET_TIP = "USD spend cap applied to a future review's own resolver/prover cost when neither its [[review]] block nor the Arbiter sets one. Blank means unbounded (inherits the file-config/global value shown below).";
@@ -349,6 +359,8 @@
             ${autoFixSection}
             <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Cancel a PR/MR's still-running CI pipelines whenever a newer commit is force-pushed onto the same branch, for a future review that declares no explicit auto_cancel_outdated_pr_pipelines setting of its own. Reduces CI runner exhaustion when multiple reviews stack on a busy upstream.">
               <input type="checkbox" ${draft.autoCancelOutdatedPrPipelines ? "checked" : ""} onchange="onProjectEditAutoCancelOutdatedPrPipelines(this.checked)">auto-cancel outdated CI pipelines</label>
+            <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Compute a future review's manual checks once, when its review branches are first created, and reuse that result through later merges, rebases, and automated fix iterations, for a future review that declares no explicit cache_manual_checks setting of its own. Manual checks describe review work that does not change across ordinary rebases, so caching avoids re-running the manual-checks agent for nothing.">
+              <input type="checkbox" ${draft.cacheManualChecks ? "checked" : ""} onchange="onProjectEditCacheManualChecks(this.checked)">cache manual checks across rebases</label>
             ${err}
             <div class="btn-row" style="margin-top:12px"><button class="btn" onclick="closeProjectReviewSettingsModal()">Cancel</button><button class="btn primary" onclick="saveProjectReviewSettings()" data-tip="Apply every change made in this modal in a single request. Only fields you actually touched are sent -- an untouched field keeps inheriting from the file-config/global default.">Save</button></div>
           </div></div>`;
@@ -397,6 +409,7 @@
         if (draft.autoFixPromptTemplate !== draft.originalAutoFixPromptTemplate) body.auto_fix_prompt_template = draft.autoFixPromptTemplate;
         if (draft.discourageTests !== draft.originalDiscourageTests) body.discourage_tests_during_auto_pull_request_fixes = draft.discourageTests;
         if (draft.autoCancelOutdatedPrPipelines !== draft.originalAutoCancelOutdatedPrPipelines) body.auto_cancel_outdated_pr_pipelines = draft.autoCancelOutdatedPrPipelines;
+        if (draft.cacheManualChecks !== draft.originalCacheManualChecks) body.cache_manual_checks = draft.cacheManualChecks;
         if (Object.keys(body).length === 0) { closeProjectReviewSettingsModal(); return; }
         try {
           const r = await fetch(`/api/projects/${encodeURIComponent(draft.project)}/review-settings`, {

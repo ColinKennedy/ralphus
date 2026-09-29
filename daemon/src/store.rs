@@ -796,6 +796,12 @@ pub struct ProjectReviewSettings {
     /// onto the same branch. Defaults to `true` (on by default) when unset.
     #[serde(default)]
     pub auto_cancel_outdated_pr_pipelines: Option<bool>,
+    /// RAL-521: project-level default for whether a review's manual checks
+    /// are computed once, when its review branches are first created, and
+    /// then reused through later merges, rebases, and automated fix
+    /// iterations. Defaults to `true` (on by default) when unset.
+    #[serde(default)]
+    pub cache_manual_checks: Option<bool>,
     /// RAL-507: the project's default cap on unattended base-shift rebuild
     /// attempts per retry campaign, for a future review whose `[[review]]`
     /// block (and whose own per-review override) leaves the cap unset.
@@ -848,6 +854,7 @@ impl ProjectReviewSettings {
             discourage_tests_during_auto_pull_request_fixes: self
                 .discourage_tests_during_auto_pull_request_fixes,
             auto_cancel_outdated_pr_pipelines: self.auto_cancel_outdated_pr_pipelines,
+            cache_manual_checks: self.cache_manual_checks,
             auto_fix_max_attempts: None,
             auto_fix_retry_base_seconds: None,
             // Database-backed project settings don't cover this setting --
@@ -3096,6 +3103,17 @@ impl Store {
             // project/global default, which resolves to `true` (on by
             // default -- unlike most opt-in review settings).
             "ALTER TABLE guardians ADD COLUMN auto_cancel_outdated_pr_pipelines INTEGER",
+            // RAL-521: per-review override for whether this review's manual
+            // checks are computed once, when its review branches are first
+            // created, and then reused through later merges, rebases, and
+            // automated fix iterations. `None` inherits the project/global
+            // default, which resolves to `true` (on by default). The second
+            // column is the durable one-time-computed marker: set the first
+            // time manual-checks generation produces commands for this
+            // review, read by the merge engine to decide whether a later
+            // merge/rebase/fix may regenerate.
+            "ALTER TABLE guardians ADD COLUMN cache_manual_checks INTEGER",
+            "ALTER TABLE guardians ADD COLUMN manual_checks_cached INTEGER NOT NULL DEFAULT 0",
             // RAL-<pending>: coarse-grained progress reporting for a squad
             // sitting in `materializing` (`run_submit_followup`'s named
             // phases -- fetching upstream refs, creating worktrees,
@@ -15927,6 +15945,7 @@ command = "e"
             auto_fix_prompt_template: Some("fix it <<prompt>>".to_string()),
             discourage_tests_during_auto_pull_request_fixes: Some(true),
             auto_cancel_outdated_pr_pipelines: Some(false),
+            cache_manual_checks: Some(false),
             base_shift_maximum_rebuilds: Some(5),
             default_pr_user: Some("alice".to_string()),
             forks_only: Some(true),

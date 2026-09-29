@@ -128,6 +128,11 @@ pub enum ReviewCommand {
         /// force-pushed onto the same branch. Defaults to `true` (on by
         /// default) when unset.
         auto_cancel_outdated_pr_pipelines: Option<bool>,
+        /// RAL-521: this review's own override for whether its manual checks
+        /// are computed once, when its review branches are first created,
+        /// and then reused through later merges, rebases, and automated fix
+        /// iterations. Defaults to `true` (on by default) when unset.
+        cache_manual_checks: Option<bool>,
     },
     BuildEnv(GuardianEnvArgs),
     ManualChecksEnv(GuardianEnvArgs),
@@ -417,6 +422,7 @@ pub fn parse(args: &[String]) -> ReviewCommand {
                 take_tri_bool(&mut scanner, "--discourage-tests-during-auto-pr-fixes");
             let auto_cancel_outdated_pr_pipelines =
                 take_tri_bool(&mut scanner, "--auto-cancel-outdated-pr-pipelines");
+            let cache_manual_checks = take_tri_bool(&mut scanner, "--cache-manual-checks");
             with_selector(scanner, |selector| ReviewCommand::Settings {
                 selector,
                 skip_auto_build,
@@ -436,6 +442,7 @@ pub fn parse(args: &[String]) -> ReviewCommand {
                 auto_fix_prompt_template,
                 discourage_tests_during_auto_pull_request_fixes,
                 auto_cancel_outdated_pr_pipelines,
+                cache_manual_checks,
             })
         }
         Some("env") => {
@@ -1338,6 +1345,7 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
             auto_fix_prompt_template,
             discourage_tests_during_auto_pull_request_fixes,
             auto_cancel_outdated_pr_pipelines,
+            cache_manual_checks,
         } => run_and_report(opts, None, || {
             let resolved = resolve_guardian_selector(&client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
             let settings = GuardianSettings {
@@ -1358,6 +1366,7 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
                 auto_fix_prompt_template: auto_fix_prompt_template.as_deref(),
                 discourage_tests_during_auto_pull_request_fixes,
                 auto_cancel_outdated_pr_pipelines,
+                cache_manual_checks,
             };
             let result = client.guardian_settings(&resolved.guardian_id, &settings)?;
             emit(opts, &result, |_| println!("{selector} settings updated"));
@@ -2975,6 +2984,31 @@ mod tests {
                 auto_cancel_outdated_pr_pipelines,
                 ..
             } => assert_eq!(auto_cancel_outdated_pr_pipelines, None),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_settings_cache_manual_checks_tri_state() {
+        match parse(&v(&["settings", "g1", "--cache-manual-checks"])) {
+            ReviewCommand::Settings {
+                cache_manual_checks,
+                ..
+            } => assert_eq!(cache_manual_checks, Some(true)),
+            other => panic!("unexpected: {other:?}"),
+        }
+        match parse(&v(&["settings", "g1", "--no-cache-manual-checks"])) {
+            ReviewCommand::Settings {
+                cache_manual_checks,
+                ..
+            } => assert_eq!(cache_manual_checks, Some(false)),
+            other => panic!("unexpected: {other:?}"),
+        }
+        match parse(&v(&["settings", "g1"])) {
+            ReviewCommand::Settings {
+                cache_manual_checks,
+                ..
+            } => assert_eq!(cache_manual_checks, None),
             other => panic!("unexpected: {other:?}"),
         }
     }

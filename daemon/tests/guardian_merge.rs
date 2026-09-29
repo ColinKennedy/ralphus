@@ -6,7 +6,7 @@ mod common;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -7392,6 +7392,423 @@ fn manual_push_clears_stale_manual_commands() {
         after.manual_commands
     );
     assert_eq!(after.checks_state, "waiting");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// RAL-521: a runner that answers ONLY the manual-checks generation spec
+// (with one parseable command) and counts those invocations -- everything
+// else fails like `NoopRunner`, since a no-conflict merge invokes the runner
+// for nothing else.
+struct ManualCommandsCountingRunner {
+    calls: AtomicUsize,
+}
+impl ManualCommandsCountingRunner {
+    fn new() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+        }
+    }
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+impl Runner for ManualCommandsCountingRunner {
+    fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+        if spec.task == "manual_commands" {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            return RunnerResult {
+                retry_after_secs: None,
+                status: "done".into(),
+                tokens_in: 0,
+                tokens_out: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+                compaction_input_tokens: 0,
+                compaction_count: 0,
+                cost_usd: 0.0,
+                cost_is_estimated: false,
+                summary: "[\"echo cached-check\"]".into(),
+                error: None,
+                proofed: None,
+                agent_session_id: None,
+                ghost: None,
+                turns: None,
+                prophecies: Vec::new(),
+            };
+        }
+        RunnerResult::failure("unexpected runner call")
+    }
+}
+
+// RAL-521: with `cache_manual_checks` at its enabled-by-default value, the
+// manual checks are computed exactly once -- when the review's branches are
+// first created -- and a later rebase (a reviewer's manual push restack) and
+// a later full merge both reuse the cached result instead of re-running the
+// manual-checks agent.
+#[test]
+fn cached_manual_checks_survive_later_merges_and_rebases() {
+    let (root, store, id) = single_feature_repo();
+    let runner = ManualCommandsCountingRunner::new();
+    run_merge(&store, &runner, &id);
+    assert_eq!(store.lock().get_guardian(&id).unwrap().status, "in_review");
+    assert_eq!(runner.calls(), 1, "the initial merge generates the checks");
+    let first = store.lock().get_guardian(&id).unwrap();
+    assert!(!first.manual_commands.is_empty());
+    assert!(first.manual_checks_cached, "one-time marker recorded");
+    let cached = first.manual_commands.clone();
+
+    // A reviewer's manual push restack must not regenerate.
+    let wt0 = PathBuf::from(first.branches[0].worktree.as_deref().expect("worktree"));
+    write(&wt0, "manual.txt", "reviewer fix\n");
+    git(&wt0, &["add", "-A"]);
+    git(&wt0, &["commit", "-m", "manual reviewer fix"]);
+    let sem = Semaphore::new(4);
+    assert!(rebase_on_manual_push(&store, &runner, &id, &sem));
+    assert_eq!(runner.calls(), 1, "a rebase reuses the cached checks");
+
+    // A later full merge (the manual "Merge / rebase" trigger) must not
+    // regenerate either.
+    run_merge(&store, &runner, &id);
+    assert_eq!(runner.calls(), 1, "a later merge reuses the cached checks");
+    let after = store.lock().get_guardian(&id).unwrap();
+    assert_eq!(
+        serde_json::to_string(&after.manual_commands).unwrap(),
+        serde_json::to_string(&cached).unwrap(),
+        "cached commands retained"
+    );
+    assert!(after.manual_checks_cached);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// RAL-521: with `cache_manual_checks` explicitly `false`, the pre-existing
+// behavior is preserved -- every later merge and rebase recomputes the
+// manual checks from the freshly stacked diff.
+#[test]
+fn cache_manual_checks_false_recomputes_on_merges_and_rebases() {
+    let (root, store, id) = single_feature_repo();
+    store
+        .lock()
+        .set_guardian_cache_manual_checks(&id, Some(false))
+        .unwrap();
+    let runner = ManualCommandsCountingRunner::new();
+    run_merge(&store, &runner, &id);
+    assert_eq!(store.lock().get_guardian(&id).unwrap().status, "in_review");
+    assert_eq!(runner.calls(), 1);
+    assert!(
+        !store
+            .lock()
+            .get_guardian(&id)
+            .unwrap()
+            .manual_commands
+            .is_empty()
+    );
+
+    // A reviewer's manual push restack recomputes.
+    let first = store.lock().get_guardian(&id).unwrap();
+    let wt0 = PathBuf::from(first.branches[0].worktree.as_deref().expect("worktree"));
+    write(&wt0, "manual.txt", "reviewer fix\n");
+    git(&wt0, &["add", "-A"]);
+    git(&wt0, &["commit", "-m", "manual reviewer fix"]);
+    let sem = Semaphore::new(4);
+    assert!(rebase_on_manual_push(&store, &runner, &id, &sem));
+    assert_eq!(runner.calls(), 2, "a rebase recomputes with caching off");
+
+    // A later full merge recomputes too.
+    run_merge(&store, &runner, &id);
+    assert_eq!(
+        runner.calls(),
+        3,
+        "a later merge recomputes with caching off"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// RAL-521: same as `FeedbackRunner` -- answers the feedback/auto-fix agent
+// call with a `note.txt` edit -- but counts `manual_commands` invocations like
+// [`ManualCommandsCountingRunner`], so a feedback pass's manual-checks
+// regeneration (or its caching skip) is observable.
+struct FeedbackManualCommandsCountingRunner {
+    calls: AtomicUsize,
+}
+impl FeedbackManualCommandsCountingRunner {
+    fn new() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+        }
+    }
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+impl Runner for FeedbackManualCommandsCountingRunner {
+    fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+        if let Some(r) = maybe_run_commit_step(spec) {
+            return r;
+        }
+        if spec.task == "manual_commands" {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            return RunnerResult {
+                retry_after_secs: None,
+                status: "done".into(),
+                tokens_in: 0,
+                tokens_out: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+                compaction_input_tokens: 0,
+                compaction_count: 0,
+                cost_usd: 0.0,
+                cost_is_estimated: false,
+                summary: "[\"echo cached-check\"]".into(),
+                error: None,
+                proofed: None,
+                agent_session_id: None,
+                ghost: None,
+                turns: None,
+                prophecies: Vec::new(),
+            };
+        }
+        let _ = std::fs::write(PathBuf::from(&spec.cwd).join("note.txt"), "reviewed\n");
+        RunnerResult {
+            retry_after_secs: None,
+            status: "done".into(),
+            tokens_in: 0,
+            tokens_out: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            compaction_input_tokens: 0,
+            compaction_count: 0,
+            cost_usd: 0.0,
+            cost_is_estimated: false,
+            summary: "edited".into(),
+            error: None,
+            proofed: None,
+            agent_session_id: None,
+            ghost: None,
+            turns: None,
+            prophecies: Vec::new(),
+        }
+    }
+}
+
+// RAL-521: with `cache_manual_checks` explicitly `false`, an automated
+// fix/reviewer-feedback pass (the `run_feedback` path the auto-fix dispatcher
+// uses) also recomputes the manual checks, same as merges and rebases.
+#[test]
+fn cache_manual_checks_false_recomputes_after_feedback() {
+    let (root, store, id) = single_feature_repo();
+    store
+        .lock()
+        .set_guardian_cache_manual_checks(&id, Some(false))
+        .unwrap();
+    let runner = FeedbackManualCommandsCountingRunner::new();
+    run_merge(&store, &runner, &id);
+    assert_eq!(store.lock().get_guardian(&id).unwrap().status, "in_review");
+    assert_eq!(runner.calls(), 1);
+
+    // An automated fix / reviewer feedback pass recomputes.
+    let bid = store.lock().get_guardian(&id).unwrap().branches[0]
+        .id
+        .clone();
+    run_feedback(
+        &store,
+        &runner,
+        &id,
+        &bid,
+        "add a note file",
+        None,
+        false,
+        &CancelToken::never(),
+    );
+    assert_eq!(
+        store.lock().get_guardian(&id).unwrap().status,
+        "in_review",
+        "detail: {:?}",
+        store.lock().get_guardian(&id).unwrap().detail
+    );
+    assert_eq!(
+        runner.calls(),
+        2,
+        "a feedback/auto-fix pass recomputes with caching off"
+    );
+
+    // A later full merge recomputes too.
+    run_merge(&store, &runner, &id);
+    assert_eq!(runner.calls(), 3, "a later merge recomputes with caching off");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// RAL-521: with `cache_manual_checks` at its enabled-by-default value, a
+// feedback/auto-fix pass reuses the cached checks instead of regenerating,
+// same as merges and rebases.
+#[test]
+fn cached_manual_checks_survive_a_feedback_restack() {
+    let (root, store, id) = single_feature_repo();
+    let runner = FeedbackManualCommandsCountingRunner::new();
+    run_merge(&store, &runner, &id);
+    assert_eq!(store.lock().get_guardian(&id).unwrap().status, "in_review");
+    assert_eq!(runner.calls(), 1, "the initial merge generates the checks");
+    let cached = store.lock().get_guardian(&id).unwrap().manual_commands.clone();
+
+    let bid = store.lock().get_guardian(&id).unwrap().branches[0]
+        .id
+        .clone();
+    run_feedback(
+        &store,
+        &runner,
+        &id,
+        &bid,
+        "add a note file",
+        None,
+        false,
+        &CancelToken::never(),
+    );
+    let after = store.lock().get_guardian(&id).unwrap();
+    assert_eq!(after.status, "in_review", "detail: {:?}", after.detail);
+    assert_eq!(
+        runner.calls(),
+        1,
+        "a feedback/auto-fix pass reuses the cached checks"
+    );
+    assert_eq!(
+        serde_json::to_string(&after.manual_commands).unwrap(),
+        serde_json::to_string(&cached).unwrap(),
+        "cached commands retained through the feedback restack"
+    );
+    assert!(after.manual_checks_cached);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// RAL-521: the one-time cached marker is per-review -- one review's cached
+// checks neither suppress nor are reused by another review in the same store,
+// and moving a branch between reviews (a membership change) regenerates
+// neither side's cache.
+#[test]
+fn manual_checks_cache_is_scoped_per_review_across_membership_changes() {
+    let root = temp_repo();
+    init_repo(&root);
+    write(&root, "base.txt", "base\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+    git(&root, &["checkout", "-b", "feature/a"]);
+    write(&root, "a.txt", "from a\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "add a"]);
+    git(&root, &["checkout", "main"]);
+    git(&root, &["checkout", "-b", "feature/b"]);
+    write(&root, "b.txt", "from b\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "add b"]);
+    git(&root, &["checkout", "main"]);
+    git(&root, &["checkout", "-b", "feature/c"]);
+    write(&root, "c.txt", "from c\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "add c"]);
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    let (r1, r2) = {
+        let g = store.lock();
+        let r1 = g
+            .create_guardian("r1", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&r1, "feature/a").unwrap();
+        g.add_guardian_branch(&r1, "feature/b").unwrap();
+        let r2 = g
+            .create_guardian("r2", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&r2, "feature/c").unwrap();
+        (r1, r2)
+    };
+
+    let runner = ManualCommandsCountingRunner::new();
+    run_merge(&store, &runner, &r1);
+    run_merge(&store, &runner, &r2);
+    assert_eq!(runner.calls(), 2, "each review generates its own checks");
+    let cached_r1 = store.lock().get_guardian(&r1).unwrap();
+    let cached_r2 = store.lock().get_guardian(&r2).unwrap();
+    assert!(cached_r1.manual_checks_cached && cached_r2.manual_checks_cached);
+    let commands_r1 = serde_json::to_string(&cached_r1.manual_commands).unwrap();
+    let commands_r2 = serde_json::to_string(&cached_r2.manual_commands).unwrap();
+
+    // Membership change: move feature/a from r1 into r2, then rebuild both
+    // exactly as the HTTP handler does (see
+    // `move_branch_rebuilds_correctly_in_both_source_and_destination`).
+    let bid_a = store.lock().get_guardian(&r1).unwrap().branches[0]
+        .id
+        .clone();
+    store
+        .lock()
+        .move_guardian_branch(&r1, &bid_a, &r2)
+        .unwrap();
+    purge_worktrees(&store, root.to_str().unwrap(), &r1);
+    run_merge(&store, &runner, &r1);
+    run_merge(&store, &runner, &r2);
+    assert_eq!(
+        runner.calls(),
+        2,
+        "a membership change must not regenerate either review's cache"
+    );
+    let after_r1 = store.lock().get_guardian(&r1).unwrap();
+    let after_r2 = store.lock().get_guardian(&r2).unwrap();
+    assert_eq!(after_r1.status, "in_review", "detail: {:?}", after_r1.detail);
+    assert_eq!(after_r2.status, "in_review", "detail: {:?}", after_r2.detail);
+    assert!(after_r1.manual_checks_cached && after_r2.manual_checks_cached);
+    assert_eq!(
+        serde_json::to_string(&after_r1.manual_commands).unwrap(),
+        commands_r1,
+        "r1 keeps its own cached commands"
+    );
+    assert_eq!(
+        serde_json::to_string(&after_r2.manual_commands).unwrap(),
+        commands_r2,
+        "r2 keeps its own cached commands, never r1's"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// RAL-521: a deliberate opt-out -- turning `cache_manual_checks` off on an
+// already-cached review makes the next pass regenerate despite the marker,
+// and turning it back on resumes caching from the regenerated result (the
+// regeneration re-stamped the one-time marker).
+#[test]
+fn turning_caching_off_regenerates_cached_manual_checks() {
+    let (root, store, id) = single_feature_repo();
+    let runner = ManualCommandsCountingRunner::new();
+    run_merge(&store, &runner, &id);
+    assert_eq!(runner.calls(), 1);
+    assert!(store.lock().get_guardian(&id).unwrap().manual_checks_cached);
+
+    // Deliberate opt-out: the next merge regenerates even though the marker
+    // is still set.
+    store
+        .lock()
+        .set_guardian_cache_manual_checks(&id, Some(false))
+        .unwrap();
+    run_merge(&store, &runner, &id);
+    assert_eq!(
+        runner.calls(),
+        2,
+        "an explicit opt-out regenerates on the next pass"
+    );
+
+    // Turning caching back on resumes from the regenerated result.
+    store
+        .lock()
+        .set_guardian_cache_manual_checks(&id, Some(true))
+        .unwrap();
+    run_merge(&store, &runner, &id);
+    assert_eq!(
+        runner.calls(),
+        2,
+        "caching resumes after the deliberate regeneration"
+    );
+    assert!(store.lock().get_guardian(&id).unwrap().manual_checks_cached);
 
     let _ = std::fs::remove_dir_all(&root);
 }

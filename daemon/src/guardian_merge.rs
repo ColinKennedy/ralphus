@@ -3392,12 +3392,20 @@ pub(crate) fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
     // while the top-level status stays stuck on the stale failure until
     // `finalize_review` finally overwrites it at the very end.
     set_status(GuardianStatus::Merging, None);
+    // RAL-521: decide once whether this re-stack regenerates the manual
+    // checks. With caching enabled and the one-time marker set, the cached
+    // commands are kept -- both the clear below and the generation at the
+    // end of the re-stack are skipped, so the reviewer keeps seeing the
+    // cached checks while the stack rebuilds.
+    let generate_manual_checks = manual_checks_should_generate_for(store, id);
     // RAL-103: this is a forced regeneration (feedback routing or a detected
     // manual push) -- clear the stale manual-checks commands up front so
     // `checks_state` drops out of "ready" for the whole restack, instead of
     // showing the previous build's commands as current until
     // `generate_manual_commands` overwrites them at the end.
-    let _ = store.lock().clear_guardian_manual_commands(id);
+    if generate_manual_checks {
+        let _ = store.lock().clear_guardian_manual_commands(id);
+    }
     // RAL-193: this restack is its own re-merge attempt -- a distinct
     // resolver/prover cost bucket from whatever attempt preceded it,
     // whether triggered by routed reviewer feedback or a detected manual
@@ -4734,8 +4742,13 @@ pub fn run_merge_staged(
         // conflict bookkeeping up front so the board never shows a stale
         // "checks ready" state or leftover conflict progress while the staged
         // build is in flight. (Manual commands are only regenerated on final
-        // InReview, not on a partial pass.)
-        let _ = guard.clear_guardian_manual_commands(id);
+        // InReview, not on a partial pass.) Under an enabled
+        // `cache_manual_checks` with the one-time marker set (RAL-521) the
+        // cached commands are neither cleared nor regenerated, so they stay
+        // visible and current across the rebuild.
+        if manual_checks_should_generate(&guardian) {
+            let _ = guard.clear_guardian_manual_commands(id);
+        }
         let _ = guard.set_guardian_conflicts(id, None, None, None);
         let _ = guard.clear_all_branch_conflicts(id);
     }
@@ -5219,6 +5232,10 @@ fn finish_staged_merge<F: Fn(GuardianStatus, Option<&str>)>(
         );
         return;
     }
+    // RAL-521: decide once whether this finalize regenerates the manual
+    // checks -- with caching enabled and the one-time marker set, the cached
+    // commands survive this staged merge untouched.
+    let generate_manual_checks = manual_checks_should_generate(&guardian);
 
     for proj in &project_order {
         if cancel.is_cancelled() {
@@ -5373,6 +5390,11 @@ pub fn run_merge_cancellable(
         set_status(GuardianStatus::MergeFailed, Some(&error));
         return;
     }
+    // RAL-521: decide once, up front, whether this merge regenerates the
+    // manual checks. With caching enabled and the one-time marker set, the
+    // cached commands are kept (the clear below is skipped too) and the
+    // per-project generation sites below are all skipped.
+    let generate_manual_checks = manual_checks_should_generate(&guardian);
     set_status(GuardianStatus::Merging, None);
     {
         let guard = store.lock();
@@ -5381,7 +5403,9 @@ pub fn run_merge_cancellable(
         // a debounced `generate_final_summary` (RAL-208) eventually overwrites
         // it, instead of showing a misleading empty/"generating" gap for the
         // whole rebuild.
-        let _ = guard.clear_guardian_manual_commands(id);
+        if generate_manual_checks {
+            let _ = guard.clear_guardian_manual_commands(id);
+        }
         let _ = guard.set_guardian_conflicts(id, None, None, None);
         let _ = guard.clear_all_branch_conflicts(id);
     }
@@ -5563,6 +5587,7 @@ pub fn run_merge_cancellable(
                 squash,
                 &set_status,
                 final_branch_id.as_deref(),
+                generate_manual_checks,
                 cancel,
             );
             // On failure, set_status was already called inside run_merge_shared.
@@ -5733,6 +5758,10 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
     squash: bool,
     set_status: &F,
     final_branch_id: Option<&str>,
+    // RAL-521: computed once by [`run_merge_cancellable`] for the whole
+    // merge -- `false` skips this path's manual-checks generation so a
+    // cached result survives the rebuild.
+    generate_manual_checks: bool,
     cancel: &CancelToken,
 ) {
     let combined_branch = match claim_combined_review_ref_by_id(store, root, id) {
@@ -6930,8 +6959,13 @@ pub fn run_feedback(
     // stale manual-checks commands now so `checks_state` drops out of "ready"
     // for the downstream restack below, instead of showing the previous
     // build's commands as current until `generate_manual_commands` overwrites
-    // them at the end.
-    let _ = store.lock().clear_guardian_manual_commands(id);
+    // them at the end. Under an enabled `cache_manual_checks` with the
+    // one-time marker set (RAL-521) the cached commands are neither cleared
+    // nor regenerated below.
+    let generate_manual_checks = manual_checks_should_generate_for(store, id);
+    if generate_manual_checks {
+        let _ = store.lock().clear_guardian_manual_commands(id);
+    }
 
     // Re-stack only the downstream branches in the SAME project (cross-project
     // rebasing is impossible). Snapshot the base commit once for consistency.
@@ -11860,6 +11894,26 @@ fn elapsed_ms(started: std::time::Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+/// RAL-521: whether this merge/rebase/fix pass should run manual-checks
+/// generation. With `cache_manual_checks` enabled (the default) the checks
+/// are computed once, when the review's branches are first created, and
+/// every later pass reuses that result; a review whose cached marker is not
+/// set yet, or whose effective setting resolves to `false`, regenerates on
+/// every pass.
+fn manual_checks_should_generate(guardian: &crate::guardian::GuardianView) -> bool {
+    !(guardian.effective_cache_manual_checks && guardian.manual_checks_cached)
+}
+
+/// [`manual_checks_should_generate`] against a freshly loaded guardian -- for
+/// call sites that do not already have the full view in hand.
+fn manual_checks_should_generate_for(store: &crate::store_lock::StoreHandle, id: &str) -> bool {
+    store
+        .lock()
+        .get_guardian(id)
+        .map(|g| manual_checks_should_generate(&g))
+        .unwrap_or(true)
+}
+
 /// Generate LLM-suggested shell commands for manually testing or verifying
 /// the changes in the review branch (RAL-27).
 ///
@@ -12151,6 +12205,11 @@ fn generate_manual_commands(
         let _ = store
             .lock()
             .set_guardian_manual_checks_basis(id, Some(&basis));
+        // RAL-521: mark the review's manual checks as computed. Under an
+        // enabled `cache_manual_checks` this marker is what every later
+        // merge/rebase/fix consults to skip regeneration and keep these
+        // commands; under `false` the marker is simply ignored.
+        let _ = store.lock().set_guardian_manual_checks_cached(id, true);
     }
     phase_note(
         store,

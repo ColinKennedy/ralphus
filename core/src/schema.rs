@@ -1361,6 +1361,17 @@ pub struct ReviewDef {
     /// `[[review]]` block to read it from.
     #[serde(default)]
     pub auto_cancel_outdated_pr_pipelines: Option<bool>,
+    /// RAL-521: whether this review's manual checks are computed once, when
+    /// its review branches are first created, and then reused through later
+    /// merges, rebases, and automated fix iterations. Unset inherits the
+    /// project-level `.ralphus.toml [review] cache_manual_checks` default,
+    /// then `true` (on by default). Set it to `false` to have every later
+    /// merge or rebase regenerate the manual checks from the freshly stacked
+    /// diff. Auto-created reviews (Arbiter/Triage) always use the project
+    /// default and never set this directly, since they have no `[[review]]`
+    /// block to read it from.
+    #[serde(default)]
+    pub cache_manual_checks: Option<bool>,
     /// RAL-395: this review's own override of the prompt template handed to
     /// the resolver agent when `auto_fix_pr_errors` fires. Must contain the
     /// literal `<<prompt>>` placeholder, which is replaced with the

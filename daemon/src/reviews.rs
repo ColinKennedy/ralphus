@@ -413,6 +413,11 @@ struct Membership {
     /// PR/MR's still-running CI pipelines whenever a newer commit is
     /// force-pushed onto the same branch.
     auto_cancel_outdated_pr_pipelines: Option<bool>,
+    /// RAL-521: optional override declared on the review (`[[review]]
+    /// cache_manual_checks`) for whether this review's manual checks are
+    /// computed once, when its review branches are first created, and then
+    /// reused through later merges, rebases, and automated fix iterations.
+    cache_manual_checks: Option<bool>,
 }
 
 /// Build the planner's cell/task rows straight from the task file (same order
@@ -1048,6 +1053,7 @@ pub fn derive_reviews_with_full_prefetch(
             discourage_tests_during_auto_pull_request_fixes: rv
                 .and_then(|r| r.discourage_tests_during_auto_pull_request_fixes),
             auto_cancel_outdated_pr_pipelines: rv.and_then(|r| r.auto_cancel_outdated_pr_pipelines),
+            cache_manual_checks: rv.and_then(|r| r.cache_manual_checks),
         });
     }
 
@@ -1509,6 +1515,13 @@ fn apply_resolver(
     {
         store
             .set_guardian_auto_cancel_outdated_pr_pipelines(gid, Some(enabled))
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+    }
+    // RAL-521: this review's own manual-check caching override, authored via
+    // `[[review]] cache_manual_checks`.
+    if let Some(enabled) = members.iter().find_map(|m| m.cache_manual_checks) {
+        store
+            .set_guardian_cache_manual_checks(gid, Some(enabled))
             .map_err(|e| ReviewError::new(e.to_string()))?;
     }
     Ok(())
@@ -3176,6 +3189,7 @@ mod tests {
             auto_fix_prompt_template: None,
             discourage_tests_during_auto_pull_request_fixes: None,
             auto_cancel_outdated_pr_pipelines: None,
+            cache_manual_checks: None,
         }
     }
 
@@ -3267,6 +3281,7 @@ mod tests {
             skip_auto_clean: Some(true),
             match_pr_branch_name: Some(true),
             separate_pr_branch: Some(true),
+            cache_manual_checks: Some(false),
             ..membership(None)
         };
         apply_resolver(&store, &gid, &[&m]).unwrap();
@@ -3277,6 +3292,7 @@ mod tests {
         assert_eq!(guardian.proof_skip_auto_clean, Some(true));
         assert_eq!(guardian.match_pr_branch_name, Some(true));
         assert_eq!(guardian.separate_pr_branch, Some(true));
+        assert_eq!(guardian.cache_manual_checks, Some(false));
     }
 
     // ── [[review]] auto_build wiring / required-declaration (RAL-342) ────
