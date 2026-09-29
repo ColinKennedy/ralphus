@@ -1140,8 +1140,8 @@ fn feedback_edits_review_worktree_and_restacks_downstream() {
 /// `push_feedback_branch`'s clobber guard refused the force-push and nothing
 /// downstream of that ever did anything about it, leaving a human to pull the
 /// reviewer's commit and re-push by hand. This proves the automatic recovery:
-/// `run_feedback` fetches and merges the reviewer's commit into the worktree
-/// before re-pushing, so the round still reports success and the branch ends
+/// `run_feedback` fetches and rebases the feedback commit onto the reviewer's
+/// tip before re-pushing, so the round still reports success and the branch ends
 /// up carrying both changes, with a Cartographer entry recording that the
 /// reconciliation happened automatically.
 #[test]
@@ -1240,6 +1240,12 @@ fn feedback_push_auto_reconciles_a_reviewers_direct_push() {
         files.contains("reviewer.txt") && files.contains("note.txt") && files.contains("a.txt"),
         "review branch should carry both the reviewer's fix and the auto-fix commit: {files}"
     );
+    assert!(
+        git(&root, &["rev-list", "--merges", &review0])
+            .trim()
+            .is_empty(),
+        "reconciliation must replay feedback instead of adding a merge commit"
+    );
 
     // The reconciliation must have been logged, not silently applied.
     let page = store
@@ -1252,7 +1258,7 @@ fn feedback_push_auto_reconciles_a_reviewers_direct_push() {
     assert!(
         page.rows.iter().any(|r| r
             .message
-            .contains("auto-reconciled a reviewer's direct push")),
+            .contains("rebased feedback onto a reviewer's direct push")),
         "expected a Cartographer entry recording the automatic reconciliation"
     );
 
