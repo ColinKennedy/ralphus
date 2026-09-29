@@ -817,7 +817,7 @@ impl ProjectReviewSettings {
             auto_build: self.auto_build,
             summary_format: None,
             default_proof_scope: self.default_proof_scope,
-            verify_skip_auto_clean: self.verify_skip_auto_clean,
+            proof_skip_auto_clean: self.verify_skip_auto_clean,
             default_resolver_agent: self.default_resolver_agent,
             default_resolver_model: self.default_resolver_model,
             default_machine: self.default_machine,

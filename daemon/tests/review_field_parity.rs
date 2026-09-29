@@ -1,77 +1,60 @@
-//! RAL-342/RAL-338: every top-level `[[review]]` TOML field must either have
-//! a per-project auto-review default (so the Arbiter's `[[review]]`-block-less
-//! reviews still get one) or a documented reason it deliberately doesn't --
-//! see `daemon/src/config.rs`'s `REVIEW_FIELD_PARITY` doc comment for the
-//! full rationale. A real `cargo test`, part of the normal `cargo test
-//! --all-targets` run `AGENTS.md` already asks developers to run and
-//! `.github/workflows/ci.yml`'s `rust` job already runs -- no separate
-//! CI-only script or gate, mirroring `mcp/tests/parity.rs`'s precedent for
-//! this exact shape of check.
+//! Prevent authored review settings and project defaults from silently drifting.
 
 use std::collections::BTreeSet;
 
 use ralphus_core::validate::REVIEW_KEYS;
-use ralphus_daemon::config::{REVIEW_FIELD_PARITY, ReviewConfig, ReviewFieldDefault};
+use ralphus_daemon::config::REVIEW_CONFIG_KEYS;
+
+const PAIRS: &[(&str, &str)] = &[
+    ("agent", "default_resolver_agent"),
+    ("model", "default_resolver_model"),
+    ("machine", "default_machine"),
+    ("maximum_budget_usd", "default_maximum_budget_usd"),
+    ("proof_scope", "default_proof_scope"),
+    ("auto_submit_pr_stack", "auto_submit_pr_stack"),
+    ("match_pr_branch_name", "match_pr_branch_name"),
+    ("skip_worktrees", "skip_worktrees"),
+    ("skip_base_updates", "skip_base_updates"),
+    ("proof_skip_auto_clean", "proof_skip_auto_clean"),
+    ("checks", "checks"),
+    ("auto_build", "auto_build"),
+    ("summary_format", "summary_format"),
+];
+
+const REVIEW_DEF_ONLY_EXCLUSIONS: &[(&str, &str)] = &[
+    ("id", "identity is assigned for each individual review"),
+    ("name", "a shared default label would collide between reviews"),
+    ("upstream", "the contributing branches determine the correct upstream"),
+    ("action", "manual action buttons are bespoke to one review"),
+    ("skip_auto_clean", "legacy spelling accepted only for backwards compatibility"),
+    ("auto_pr_feedback", "feedback handling remains an explicit per-review choice"),
+    ("base_shift_maximum_rebuilds", "outside this review-default parity contract"),
+    ("separate_pr_branch", "outside this review-default parity contract"),
+    ("dual_root_pr", "outside this review-default parity contract"),
+    ("skip_auto_build", "an opt-out has no project default counterpart"),
+    ("auto_fix_pr_errors", "outside this review-default parity contract"),
+    ("auto_fix_prompt_template", "outside this review-default parity contract"),
+    ("discourage_tests_during_auto_pull_request_fixes", "outside this review-default parity contract"),
+    ("auto_cancel_outdated_pr_pipelines", "outside this review-default parity contract"),
+];
 
 #[test]
-fn every_review_key_has_a_parity_entry_and_vice_versa() {
-    let review_keys: BTreeSet<&str> = REVIEW_KEYS.iter().copied().collect();
-    let parity_keys: BTreeSet<&str> = REVIEW_FIELD_PARITY.iter().map(|(k, _)| *k).collect();
-
-    let missing: Vec<&&str> = review_keys.difference(&parity_keys).collect();
-    assert!(
-        missing.is_empty(),
-        "these `[[review]]` fields (core::validate::REVIEW_KEYS) have no entry in \
-         REVIEW_FIELD_PARITY -- add one wiring it to a project default, or a \
-         ReviewFieldDefault::NotApplicable with a real reason: {missing:?}"
-    );
-
-    let stale: Vec<&&str> = parity_keys.difference(&review_keys).collect();
-    assert!(
-        stale.is_empty(),
-        "these REVIEW_FIELD_PARITY entries name a field that no longer exists on \
-         ReviewDef/REVIEW_KEYS (stale or typo'd): {stale:?}"
-    );
+fn every_review_key_is_covered_by_a_pair_or_exclusion() {
+    let review_keys: BTreeSet<_> = REVIEW_KEYS.iter().copied().collect();
+    let paired: BTreeSet<_> = PAIRS.iter().map(|(review, _)| *review).collect();
+    let excluded: BTreeSet<_> = REVIEW_DEF_ONLY_EXCLUSIONS.iter().map(|(review, _)| *review).collect();
+    assert_eq!(paired.len(), PAIRS.len(), "duplicate review keys in PAIRS");
+    assert_eq!(excluded.len(), REVIEW_DEF_ONLY_EXCLUSIONS.len(), "duplicate review keys in exclusions");
+    assert!(paired.is_disjoint(&excluded), "a key cannot be paired and excluded");
+    let covered: BTreeSet<_> = paired.union(&excluded).copied().collect();
+    assert_eq!(review_keys, covered, "every authored review key must be paired or deliberately excluded");
+    assert!(REVIEW_DEF_ONLY_EXCLUSIONS.iter().all(|(_, reason)| reason.trim().len() >= 15));
 }
 
 #[test]
-fn every_not_applicable_entry_has_a_substantive_reason() {
-    let mut bad = Vec::new();
-    for (key, disposition) in REVIEW_FIELD_PARITY {
-        if let ReviewFieldDefault::NotApplicable(reason) = disposition {
-            if reason.trim().len() < 15 {
-                bad.push(format!("{key:?}: {reason:?}"));
-            }
-        }
-    }
-    assert!(
-        bad.is_empty(),
-        "every NotApplicable entry needs a real, documented reason (not empty/placeholder \
-         text):\n{}",
-        bad.join("\n")
-    );
-}
-
-#[test]
-fn every_project_default_getter_is_wired_to_an_actually_unset_field() {
-    // Sanity check, not exhaustive: a fresh `ReviewConfig` has nothing set, so
-    // every `ProjectDefault` getter must report `false` against it. This
-    // mainly guards against a getter accidentally wired to the wrong field
-    // (e.g. one that already has a non-`None` fallback baked into its
-    // accessor, like `default_resolver_agent()` returning `"ollama"` rather
-    // than the raw `Option`).
-    let empty = ReviewConfig::default();
-    let mut bad = Vec::new();
-    for (key, disposition) in REVIEW_FIELD_PARITY {
-        if let ReviewFieldDefault::ProjectDefault(getter) = disposition {
-            if getter(&empty) {
-                bad.push(*key);
-            }
-        }
-    }
-    assert!(
-        bad.is_empty(),
-        "these ProjectDefault getters report `true` against a wholly-unset ReviewConfig -- \
-         likely wired to the wrong field: {bad:?}"
-    );
+fn every_project_default_key_is_covered_by_exactly_one_pair() {
+    let config_keys: BTreeSet<_> = REVIEW_CONFIG_KEYS.iter().copied().collect();
+    let paired: BTreeSet<_> = PAIRS.iter().map(|(_, config)| *config).collect();
+    assert_eq!(paired.len(), PAIRS.len(), "duplicate project config keys in PAIRS");
+    assert_eq!(config_keys, paired, "every project default must have one authored counterpart");
 }

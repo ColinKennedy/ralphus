@@ -385,7 +385,7 @@ struct Membership {
     /// RAL-507: optional base-shift rebuild retry cap declared on the review
     /// (`[[review]] base_shift_maximum_rebuilds`).
     base_shift_maximum_rebuilds: Option<u32>,
-    skip_auto_clean: Option<bool>,
+    proof_skip_auto_clean: Option<bool>,
     match_pr_branch_name: Option<bool>,
     separate_pr_branch: Option<bool>,
     /// Declared `[[review.auto_build]]` steps (RAL-342): zero or more build
@@ -1036,7 +1036,7 @@ pub fn derive_reviews_with_full_prefetch(
             auto_pr_feedback: rv.and_then(|r| r.auto_pr_feedback),
             skip_base_updates: rv.and_then(|r| r.skip_base_updates),
             base_shift_maximum_rebuilds: rv.and_then(|r| r.base_shift_maximum_rebuilds),
-            skip_auto_clean: rv.and_then(|r| r.skip_auto_clean),
+            proof_skip_auto_clean: rv.and_then(|r| r.proof_skip_auto_clean),
             match_pr_branch_name: rv.and_then(|r| r.match_pr_branch_name),
             separate_pr_branch: rv.and_then(|r| r.separate_pr_branch),
             auto_build: rv.map(|r| r.auto_build.clone()).unwrap_or_default(),
@@ -1457,7 +1457,7 @@ fn apply_resolver(
             .set_guardian_base_shift_maximum_rebuilds(gid, Some(cap))
             .map_err(|e| ReviewError::new(e.to_string()))?;
     }
-    if let Some(skip) = members.iter().find_map(|m| m.skip_auto_clean) {
+    if let Some(skip) = members.iter().find_map(|m| m.proof_skip_auto_clean) {
         store
             .set_guardian_proof_skip_auto_clean(gid, Some(skip))
             .map_err(|e| ReviewError::new(e.to_string()))?;
