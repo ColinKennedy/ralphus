@@ -92,6 +92,7 @@
        * @property {boolean} soloed
        * @property {number|null} [started_at_ms]
        * @property {number|null} [finished_at_ms]
+       * @property {number} duration_ms - Sum of all descendant active durations.
        * @property {boolean} [env_out_of_date] - RAL-271: cosmetic "out of date" badge — true once this task's own `env_overrides` has been edited since the task last ran/retried or had its status explicitly set. No behavioral effect.
        */
       /**
