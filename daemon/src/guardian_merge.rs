@@ -11598,11 +11598,7 @@ fn generate_final_summary(
     };
     let (agent, model) = (resolved.backend.clone(), resolved.model.clone());
 
-    let prompt = if store
-        .lock()
-        .resolve_review_config(ws_root.root())
-        .bullet_summary()
-    {
+    let prompt = if guardian.effective_summary_format != "prose" {
         format!(
             "You are summarising a stacked code review made up of the branches \
              [{branch_labels}]. The following are commit subject lines for each \
