@@ -17198,8 +17198,8 @@ mod tests {
             result
                 .unwrap()
                 .unwrap()
-                .contains("auto-built via project default"),
-            "expected the project-auto_build note"
+                .contains("auto-built via review auto_build"),
+            "expected the stamped review auto_build note"
         );
 
         let _ = std::fs::remove_dir_all(&base);
