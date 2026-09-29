@@ -8903,9 +8903,12 @@ fn post_merge_jobs_inner(
     // rebases and restacks must not invalidate it merely because the stacked
     // tip changed. An explicit opt-out continues to use the pre-cache basis
     // check and regenerates whenever the result is absent or stale.
-    let cached = stored
-        .as_ref()
-        .is_some_and(|g| g.effective_cache_manual_checks && g.manual_checks_cached);
+    let cached = stored.as_ref().is_some_and(|g| {
+        g.effective_cache_manual_checks
+            && g.manual_checks_cached
+            && commands_present
+            && g.manual_checks_basis.is_some()
+    });
     let generate_manual = jobs.manual_checks && !cached && (!commands_present || basis_changed);
 
     // Both jobs read the scratch worktree and neither reads the other's
