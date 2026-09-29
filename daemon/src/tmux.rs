@@ -1463,6 +1463,40 @@ pub enum ProcessExit {
     Unknown(String),
 }
 
+/// Interpret the output of the short-lived process-exit helper.
+///
+/// A successful helper invocation normally writes the process exit code to
+/// stdout. Some Windows/.NET process observations can nevertheless complete
+/// without writing anything. Keep that case distinct from a known code, and
+/// prefer stderr as context only when stdout did not provide a diagnostic.
+fn process_exit_from_helper_output(
+    stdout: &str,
+    stderr: &str,
+    helper_succeeded: bool,
+    helper_status: &str,
+) -> ProcessExit {
+    let stdout = stdout.trim();
+    if let Ok(code) = stdout.parse::<i64>() {
+        return ProcessExit::Exited(code);
+    }
+
+    let reason = stdout.strip_prefix("GONE:").unwrap_or(stdout).trim();
+    if !reason.is_empty() {
+        return ProcessExit::Unknown(reason.to_string());
+    }
+
+    let stderr = stderr.trim();
+    if !stderr.is_empty() {
+        return ProcessExit::Unknown(stderr.to_string());
+    }
+
+    if helper_succeeded {
+        ProcessExit::Unknown("process exited but did not report an exit code".to_string())
+    } else {
+        ProcessExit::Unknown(format!("powershell exited {helper_status}"))
+    }
+}
+
 /// Best-effort lookup of the OS process id backing session `name`'s live
 /// tmux server, by matching a `tmux.exe server -s <name> ...` command line.
 /// Returns `None` on any failure or on non-Windows platforms (this whole
@@ -1605,24 +1639,12 @@ pub fn watch_for_exit(pid: u32) -> std::sync::mpsc::Receiver<ProcessExit> {
             .stdin(Stdio::null())
             .output();
         let observation = match result {
-            Ok(out) if out.status.success() => {
-                let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                text.parse::<i64>().map_or_else(
-                    |_| {
-                        let reason = text
-                            .strip_prefix("GONE:")
-                            .map(str::to_string)
-                            .unwrap_or(text);
-                        ProcessExit::Unknown(reason)
-                    },
-                    ProcessExit::Exited,
-                )
-            }
-            Ok(out) => ProcessExit::Unknown(format!(
-                "powershell exited {}: {}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr).trim()
-            )),
+            Ok(out) => process_exit_from_helper_output(
+                &String::from_utf8_lossy(&out.stdout),
+                &String::from_utf8_lossy(&out.stderr),
+                out.status.success(),
+                &out.status.to_string(),
+            ),
             Err(e) => ProcessExit::Unknown(format!("could not spawn powershell: {e}")),
         };
         // The receiver may already be dropped (caller gave up waiting) --
@@ -1693,6 +1715,38 @@ mod tests {
     #![allow(clippy::print_stdout)]
 
     use super::*;
+
+    #[test]
+    fn process_exit_helper_preserves_numeric_stdout_over_stderr() {
+        assert_eq!(
+            process_exit_from_helper_output(" 3221225477\n", "diagnostic", true, "exit code: 0"),
+            ProcessExit::Exited(3_221_225_477),
+        );
+    }
+
+    #[test]
+    fn process_exit_helper_uses_stderr_when_stdout_is_blank() {
+        assert_eq!(
+            process_exit_from_helper_output("\n", "access is denied", false, "exit code: 1"),
+            ProcessExit::Unknown("access is denied".to_string()),
+        );
+    }
+
+    #[test]
+    fn process_exit_helper_describes_blank_stdout_and_stderr() {
+        assert_eq!(
+            process_exit_from_helper_output("", "", true, "exit code: 0"),
+            ProcessExit::Unknown("process exited but did not report an exit code".to_string()),
+        );
+    }
+
+    #[test]
+    fn process_exit_helper_describes_failed_helper_without_diagnostics() {
+        assert_eq!(
+            process_exit_from_helper_output("", " ", false, "exit code: 1"),
+            ProcessExit::Unknown("powershell exited exit code: 1".to_string()),
+        );
+    }
 
     #[test]
     fn tmux_history_limit_stays_at_or_above_the_live_snapshot_capture_window() {
