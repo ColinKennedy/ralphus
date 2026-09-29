@@ -260,6 +260,18 @@ def _prefs_overview(page: Page) -> None:
         _shoot(page, "prefs-overview")
 
 
+def _waypoints_overview(page: Page) -> None:
+    with (
+        fixture_server(fixtures.WAYPOINTS_ROUTES) as daemon_url,
+        librarian_server(daemon_url) as base_url,
+    ):
+        _goto(page, base_url, "#/tasks")
+        page.evaluate("showTab('waypoints', true)")
+        page.wait_for_selector("#waypoints .squad-item.selected")
+        page.wait_for_selector("#waypoint-detail .kv-row")
+        _shoot(page, "waypoints-overview")
+
+
 SCENARIOS = (
     _squads_overview,
     _squads_session_detail,
@@ -276,6 +288,7 @@ SCENARIOS = (
     _worktree_retirement_overview,
     _health_overview,
     _prefs_overview,
+    _waypoints_overview,
 )
 
 

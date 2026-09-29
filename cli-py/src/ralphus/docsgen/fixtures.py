@@ -54,6 +54,7 @@ __all__ = [
     "TRIAGE_TYPES",
     "USERS_ROUTES",
     "USERS_ROWS",
+    "WAYPOINTS_ROUTES",
     "WORKTREE_RETIREMENT_ROUTES",
     "WORKTREE_RETIREMENT_ROWS",
     "Json",
@@ -759,6 +760,79 @@ TASKS_ROUTES: Routes = {
     "/api/guardian-index": [],
     "/api/resources": {"resources": []},
     "/api/queue": {"items": []},
+}
+
+# ---------------------------------------------------------------------------
+# Waypoints scenario (RAL-400) — one open waypoint with a partially delivered
+# squad roster, a delivery event, and a completed-work bearing.
+# ---------------------------------------------------------------------------
+
+_WAYPOINT_ID = "waypoint-000000000001"
+
+WAYPOINTS_ROUTES: Routes = {
+    "/api/waypoints": [
+        {
+            "id": _WAYPOINT_ID,
+            "label": "release coordination",
+            "state": "open",
+            "created_at_ms": 1_783_100_000_000,
+            "roster_count": 2,
+            "projects": ["ralphus"],
+        }
+    ],
+    f"/api/waypoints/{_WAYPOINT_ID}": {
+        "id": _WAYPOINT_ID,
+        "label": "release coordination",
+        "prompt": "Coordinate the release migration with the implementation squad.",
+        "agent": "ollama",
+        "model": "qwen3:8b",
+        "allow_advisory": True,
+        "state": "open",
+        "projects": ["ralphus"],
+        "delivery_summary": {
+            "delivered": 1,
+            "via_restack": 0,
+            "failed": 0,
+            "undelivered": 1,
+        },
+        "roster": [
+            {
+                "waypoint_id": _WAYPOINT_ID,
+                "kind": "squad",
+                "entry_id": "squad-000000000004",
+                "mode": "block",
+                "delivery_status": "delivered",
+                "survey_verdict": "impacted",
+                "survey_rationale": "The implementation changes the shared release path.",
+            },
+            {
+                "waypoint_id": _WAYPOINT_ID,
+                "kind": "review",
+                "entry_id": "guardian-000000000001",
+                "mode": "advisory",
+                "delivery_status": "undelivered",
+                "survey_verdict": None,
+                "survey_rationale": None,
+            },
+        ],
+    },
+    f"/api/waypoints/{_WAYPOINT_ID}/bearings": [
+        {
+            "id": 1,
+            "created_at_ms": 1_783_100_001_000,
+            "summary": "Migration implementation is ready for review.",
+            "entity_uri": "squad:squad-000000000004",
+            "commit_id": "abc123def456789",
+            "commit_summary": "feat: prepare release migration",
+        }
+    ],
+    f"/api/waypoints/{_WAYPOINT_ID}/deliveries": [
+        {
+            "at_ms": 1_783_100_002_000,
+            "level": "info",
+            "message": "squad-000000000004 delivered to the waypoint",
+        }
+    ],
 }
 
 # ---------------------------------------------------------------------------
