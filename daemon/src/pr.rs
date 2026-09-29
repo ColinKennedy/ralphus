@@ -1818,7 +1818,17 @@ fn synthesize_pr_text(
         .find(|b| b.position == position)
         .map(|b| b.branch.clone())
         .unwrap_or_else(|| guardian.name.clone());
-    let base_sha = match git(&root, &["rev-parse", &guardian.base_branch]) {
+    // RAL-<new>: an unqualified rev-parse of `base_branch` silently prefers a
+    // same-named local branch over the real remote-tracking ref whenever
+    // both exist (exactly what happened for guardian-000000000161's PR
+    // description: a stale local `alt/staging` shadowed the real, moving
+    // `refs/remotes/alt/staging`, so this call resolved to an ancient
+    // snapshot and every commit landed on real staging since then read as
+    // "unique to this branch"). `qualify_ambiguous_ref` is the same
+    // consolidated fix `guardian_merge::resolve_base` already uses for this
+    // ambiguity class.
+    let qualified_base = guardian_merge::qualify_ambiguous_ref(&root, &guardian.base_branch);
+    let base_sha = match git(&root, &["rev-parse", &qualified_base]) {
         Ok(s) => s.trim().to_string(),
         Err(_) => return (fallback_title, template.unwrap_or_default().to_string()),
     };
@@ -17135,6 +17145,74 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         assert!(!prompt.contains("add predecessor behavior"), "{prompt}");
         assert!(!prompt.contains("add downstream behavior"), "{prompt}");
         assert!(prompt.contains("<!-- fill this in -->"), "{prompt}");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pr_text_prefers_the_remote_tracking_base_over_a_same_named_stale_local_branch() {
+        // Regression test for guardian-000000000161's PR description pulling
+        // in dozens of already-merged commits: `synthesize_pr_text` rev-parsed
+        // the guardian's bare `base_branch` ("alt/staging") directly, which is
+        // ambiguous whenever a local branch happens to share that exact
+        // dotted name -- git's ref-lookup precedence silently prefers
+        // `refs/heads/*` over the real, moving `refs/remotes/*`, freezing the
+        // "unique commit range" at a stale, ancient snapshot.
+        let root = tmp_dir("pr-text-ambiguous-base");
+        g(&root, &["init", "--initial-branch", "main"]);
+        gwrite(&root, "base.txt", "base\n");
+        g(&root, &["add", "."]);
+        g(&root, &["commit", "--message", "base"]);
+
+        // A stale local branch literally named "alt/staging", frozen at the
+        // repo's very first commit -- the same shape as the stray branch
+        // that shadowed the real ref in the incident this test guards.
+        g(&root, &["branch", "alt/staging"]);
+
+        // The real, moving base: commits that have already landed upstream,
+        // represented here as a remote-tracking ref (as they would be after
+        // a real `git fetch`).
+        for (file, subject) in [
+            ("a.txt", "already merged commit A"),
+            ("b.txt", "already merged commit B"),
+        ] {
+            gwrite(&root, file, &format!("{subject}\n"));
+            g(&root, &["add", "."]);
+            g(&root, &["commit", "--message", subject]);
+        }
+        let real_base_sha = g(&root, &["rev-parse", "HEAD"]).trim().to_string();
+        g(
+            &root,
+            &["update-ref", "refs/remotes/alt/staging", &real_base_sha],
+        );
+
+        // This branch's own review work: one new commit on top of the real base.
+        g(&root, &["checkout", "-b", "review/x"]);
+        gwrite(&root, "x.txt", "add x\n");
+        g(&root, &["add", "."]);
+        g(&root, &["commit", "--message", "add x"]);
+        g(&root, &["checkout", "main"]);
+
+        let store = store();
+        let gid = store
+            .create_guardian("demo", "alt/staging", root.to_str().unwrap())
+            .unwrap();
+        store.add_guardian_branch(&gid, "x").unwrap();
+        let branch_id = store.get_guardian(&gid).unwrap().branches[0].id.clone();
+        store
+            .set_branch_review(&gid, &branch_id, "review/x", "worktree-x")
+            .unwrap();
+        let guardian = store.get_guardian(&gid).unwrap();
+        let runner = CapturingFailureRunner(Mutex::new(None));
+
+        let (_, description) = synthesize_pr_text(&runner, &guardian, 0, None, None);
+
+        assert!(description.contains("add x"), "{description}");
+        assert!(
+            !description.contains("already merged"),
+            "the stale local `alt/staging` branch shadowed the real remote-tracking \
+             ref, pulling already-merged commits into the description: {description}"
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
