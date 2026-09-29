@@ -58,6 +58,18 @@ Codex, Pi, and native-agent backend implementations and the shared
 `ModelBackend` interface over daemon-side tables or duplicated backend-specific
 conditionals.
 
+Backend capabilities are part of that rule. A caller must obtain an answer
+such as whether a backend supports thinking, streaming, a model option, or a
+launch feature from the backend abstraction, not from a raw backend-name
+comparison, a `match`/lookup table keyed by strings, or a second
+backend-specific helper elsewhere in the codebase. Add the capability to the
+shared abstraction when multiple callers need it, and let each concrete
+backend provide its answer. If a layer cannot access the abstraction because
+of a dependency boundary, move the query to a layer that can or expose the
+answer through its API; do not recreate a name-based mirror. This keeps a new
+backend's capability behavior correct in every caller when its implementation
+is added or changed.
+
 The daemon orchestrates agent work; it must not become a second source of
 truth for how a backend selects or invokes its program. If a capability needs
 to be shared across backends, add it to the shared backend abstraction and let
