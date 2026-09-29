@@ -10912,14 +10912,30 @@ impl Store {
         };
         let squad_deps_ok =
             Self::deps_satisfied_in(satisfied, &Self::squad_depends_on_conn(conn, squad_id)?);
-        let blocking_waypoint = self.squad_block_gating_waypoint(squad_id)?;
+        let blocking_waypoint: Option<String> = conn
+            .query_row(
+                "SELECT wr.waypoint_id FROM waypoint_roster wr
+                 JOIN waypoints w ON w.id = wr.waypoint_id
+                 WHERE wr.kind = 'squad' AND wr.entry_id = ? AND wr.mode = 'block'
+                   AND (wr.survey_verdict IS NULL OR wr.survey_verdict = 'impacted')
+                   AND w.state = 'open'
+                 ORDER BY wr.created_at_ms ASC
+                 LIMIT 1",
+                params![squad_id],
+                |r| r.get(0),
+            )
+            .optional()?;
         // Resolved once (not per cell/proof row below) since it's the same
         // label for every queue item this squad produces.
         let blocking_waypoint_label = blocking_waypoint.as_deref().map(|wp| {
-            self.get_waypoint(wp)
-                .ok()
-                .and_then(|w| w.label)
-                .unwrap_or_else(|| wp.to_string())
+            conn.query_row("SELECT label FROM waypoints WHERE id=?", params![wp], |r| {
+                r.get::<_, Option<String>>(0)
+            })
+            .optional()
+            .ok()
+            .flatten()
+            .flatten()
+            .unwrap_or_else(|| wp.to_string())
         });
 
         // Each task's declared `depends_on` (task names), for the header display.
