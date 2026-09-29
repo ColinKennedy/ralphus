@@ -1308,7 +1308,7 @@ impl Store {
         self.conn.execute(
             "UPDATE guardians SET \
              resolver_agent=?, resolver_model=?, machine=?, maximum_budget_usd=?, \
-             proof_scope=?, proof_skip_auto_clean=?, skip_worktrees=?, skip_base_updates=?, \
+             proof_skip_auto_clean=?, skip_worktrees=?, skip_base_updates=?, \
              auto_submit_pr_stack=?, match_pr_branch_name=?, checks=?, \
              summary_format=? WHERE id=?",
             params![
@@ -1316,7 +1316,6 @@ impl Store {
                 defaults.default_resolver_model(),
                 defaults.default_machine(),
                 defaults.default_maximum_budget_usd(),
-                defaults.default_proof_scope(),
                 i64::from(defaults.proof_skip_auto_clean()),
                 i64::from(defaults.skip_worktrees()),
                 i64::from(defaults.skip_base_updates()),
