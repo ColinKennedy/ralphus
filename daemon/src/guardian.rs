@@ -1261,6 +1261,15 @@ impl Store {
             .or(auto_submit_pr_stack_stamp)
             .or(live_global.auto_submit_pr_stack)
             .unwrap_or(false);
+        // RAL-250: freeze the effective base-update setting onto the new
+        // review, with the project's registration-time stamp taking
+        // precedence over the live global value.
+        let skip_base_updates = db_settings
+            .skip_base_updates
+            .or(explicit_project.skip_base_updates)
+            .or(self.project_skip_base_updates_stamp(git_root))
+            .or(live_global.skip_base_updates)
+            .unwrap_or(false);
         // RAL-378: same stamping shape again. `readable_review_branch` is set
         // unconditionally here -- every review created from now on names its
         // combined branch readably; only reviews that predate the column keep
@@ -1318,7 +1327,7 @@ impl Store {
                 defaults.default_maximum_budget_usd(),
                 i64::from(defaults.proof_skip_auto_clean()),
                 i64::from(defaults.skip_worktrees()),
-                i64::from(defaults.skip_base_updates()),
+                i64::from(skip_base_updates),
                 i64::from(auto_submit_pr_stack),
                 i64::from(match_pr_branch_name),
                 crate::store::to_json(&defaults.checks),
