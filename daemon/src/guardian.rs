@@ -7849,6 +7849,29 @@ mod tests {
     }
 
     #[test]
+    fn list_guardians_keeps_review_branch_name_aligned_with_later_columns() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store
+            .set_guardian_review_branch_name(&id, "r-review")
+            .unwrap();
+        store
+            .set_guardian_auto_fix_pr_errors(&id, Some(true))
+            .unwrap();
+        store
+            .set_guardian_auto_fix_prompt_template(&id, Some("fix: <<prompt>>"))
+            .unwrap();
+
+        let guardian = store.list_guardians().unwrap().pop().unwrap();
+        assert_eq!(guardian.review_branch_name.as_deref(), Some("r-review"));
+        assert_eq!(guardian.auto_fix_pr_errors, Some(true));
+        assert_eq!(
+            guardian.auto_fix_prompt_template.as_deref(),
+            Some("fix: <<prompt>>")
+        );
+    }
+
+    #[test]
     fn a_claimed_review_branch_name_survives_a_branch_reset() {
         // The whole point of the separate column: the reset paths clear
         // `review_branch`, but re-resolving the *name* on every rebuild would
