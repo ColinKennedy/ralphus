@@ -2043,6 +2043,10 @@ fn route_for_user(
             ],
         ) => guardian_manual_checks_terminal_log_attempt(daemon, id, attempt),
         ("POST", ["api", "guardians", id, "merge"]) => guardian_merge(daemon, id),
+        // ralphus[ignore-endpoint-cli]: board manual-checks regenerate control (RAL-520); CLI has `review checks regen`
+        ("POST", ["api", "guardians", id, "manual-checks", "regenerate"]) => {
+            guardian_regenerate_manual_checks(daemon, id, body)
+        }
         // ralphus[ignore-endpoint-cli]: board multi-select Merge/Rebase context-menu action (RAL-514); the CLI already has per-review `review merge`
         ("POST", ["api", "guardians", "merge-batch"]) => guardian_merge_batch(daemon, body),
         ("POST", ["api", "guardians", id, "stop"]) => guardian_stop(daemon, id),
@@ -15360,6 +15364,83 @@ fn guardian_merge(daemon: &Daemon, id: &str) -> Reply {
     )
 }
 
+/// RAL-520: the board's manual-checks regenerate control.
+///
+/// Schedules a manual-checks-only post-merge worker run: clears the stored
+/// generation basis so the worker regenerates unconditionally, stores the
+/// reviewer's steering text (folded into the generation agent's prompt), and
+/// spawns the worker. The check gates are NOT re-run -- their outcome is
+/// advisory and already reported; the reviewer is re-running generation
+/// deliberately.
+///
+/// Advisory like every post-merge job: 409s when the review isn't settled
+/// (only `in_review` reviews have a finished stack to regenerate from) or
+/// when a post-merge phase is already running (one generation at a time --
+/// never a gate on merging, which is unaffected by any of this).
+fn guardian_regenerate_manual_checks(daemon: &Daemon, id: &str, body: &str) -> Reply {
+    #[derive(serde::Deserialize)]
+    struct ManualChecksRegenBody {
+        #[serde(default)]
+        focus: Option<String>,
+    }
+    let req = if body.trim().is_empty() {
+        ManualChecksRegenBody { focus: None }
+    } else {
+        match serde_json::from_str::<ManualChecksRegenBody>(body) {
+            Ok(req) => req,
+            Err(_) => return error(400, "bad_request", "body must be {focus?}", vec![]),
+        }
+    };
+    let store = daemon.lock();
+    let guardian = match store.get_guardian(id) {
+        Ok(g) => g,
+        Err(e) => return store_error(&e),
+    };
+    if guardian.status.as_str() != crate::guardian::GuardianStatus::InReview.as_str()
+        || guardian.combined_worktree.is_none()
+    {
+        return error(
+            409,
+            "invalid_transition",
+            "manual checks can only be regenerated for an in-review review with a built stack",
+            vec![],
+        );
+    }
+    // One post-merge job at a time: a generation that is genuinely still
+    // running would have its session killed and its outcome overwritten by a
+    // second one. This never gates merging -- a merge supersedes any running
+    // post-merge job by design (RAL-520).
+    if guardian.post_merge_status.as_deref() == Some("running")
+        && guardian.post_merge_started_at_ms.is_some_and(|started| {
+            crate::store::now_ms().saturating_sub(started)
+                < crate::guardian_merge::POST_MERGE_STALE_AFTER_MS
+        })
+    {
+        return error(
+            409,
+            "invalid_transition",
+            "a post-merge job is already running; try again when it finishes",
+            vec![],
+        );
+    }
+    if let Err(e) = store.set_guardian_manual_checks_basis(id, None) {
+        return store_error(&e);
+    }
+    if let Err(e) = store.set_guardian_manual_checks_focus(id, req.focus.as_deref()) {
+        return store_error(&e);
+    }
+    drop(store);
+    crate::guardian_merge::spawn_guardian_post_merge(
+        &daemon.store_handle(),
+        id,
+        crate::guardian_merge::PostMergeJobs::MANUAL_CHECKS_ONLY,
+    );
+    match daemon.lock().get_guardian(id) {
+        Ok(g) => json(202, &g),
+        Err(e) => store_error(&e),
+    }
+}
+
 /// Batch form of [`guardian_merge`] (RAL-514) -- the board's multi-select
 /// Merge/Rebase context-menu action applies to every selected review in one
 /// request. Runs the same per-id reset-then-kickoff sequence as the single
@@ -15621,6 +15702,10 @@ pub fn serve<A: ToSocketAddrs>(
     // see the `startup` note emitted just before `run_http_loop` below, which
     // reports how much of this was schema-open vs. recovery+reap.
     let startup_started = Instant::now();
+    // RAL-520: production daemons hand post-merge work (check gates,
+    // manual-checks generation) to the independent worker; in-process tests
+    // keep synchronous merges so their assertions stay hermetic.
+    crate::guardian_merge::enable_post_merge_spawning();
     let store = Store::open(db_path).map_err(|e| std::io::Error::other(e.to_string()))?;
     let schema_open_ms = startup_started.elapsed().as_millis();
     // RAL-332: apply `[daemon].default_user_is_admin` before serving any

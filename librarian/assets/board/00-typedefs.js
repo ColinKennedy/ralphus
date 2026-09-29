@@ -367,6 +367,7 @@
        * @property {string|null} [post_merge_detail] - the post-merge phase's note: what failed when `post_merge_status` is "failed", otherwise the gate's own summary (e.g. which build command ran). Null when there is nothing to report.
        * @property {number|null} [post_merge_started_at_ms] - epoch-ms when the post-merge phase most recently started, or null if it has never run.
        * @property {number|null} [post_merge_finished_at_ms] - epoch-ms when the post-merge phase most recently finished, or null while it is still running.
+       * @property {string|null} [manual_checks_focus] - RAL-520: the reviewer's steering text for manual-checks regeneration, set via the board's regenerate control and folded into the generation agent's prompt. Null when no steering text is set.
        * @property {number} [attempt_tokens_in] - RAL-193: input tokens spent on this review's own resolver/proof calls during the current merge attempt only.
        * @property {number} [attempt_tokens_out] - RAL-193: output tokens, current merge attempt only.
        * @property {number} [attempt_cost_usd] - RAL-193: USD cost, current merge attempt only.

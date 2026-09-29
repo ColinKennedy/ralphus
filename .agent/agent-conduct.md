@@ -64,6 +64,20 @@ to be shared across backends, add it to the shared backend abstraction and let
 each concrete backend implement it. This keeps backend-specific configuration,
 defaults, and launch semantics in the one place that executes them.
 
+## Post-merge work never gates merge/rebase completion (RAL-520)
+
+A review's merge/rebase succeeds the moment its stack is rebuilt — the check
+gates, manual-checks generation, and any other settled-state follow-up run in
+the independent post-merge worker (`guardian_merge::run_guardian_post_merge`)
+against a scratch checkout, and are **advisory**. Never reintroduce code that
+makes post-merge work hold the review in `merging`, reject a new merge while a
+post-merge job is running, disable/relabel the board's Merge / rebase control,
+or fold a post-merge outcome into the review's own status. Post-merge failures
+are recorded on the post-merge phase and surfaced separately; the review stays
+`in_review`, approvable, and mergeable throughout. New settled-state work
+(manual checks, change summary, check gates, auto-build) belongs in that
+worker, not in the merge lifecycle.
+
 ## Comments and docstrings describe the code as it is now
 
 No "used to", no "originally", no "ported from Python", no narrating a `TODO`

@@ -1139,6 +1139,15 @@ fn no_checks_configured_runs_project_auto_build_default() {
     );
 
     run_merge(&store, &OkRunner, &gid);
+    // Auto-build is post-merge work (RAL-520): the merge leaves the review
+    // `in_review` immediately; the worker runs the gate against a scratch
+    // checkout, so its byproducts never dirty the combined worktree.
+    ralphus_daemon::guardian_merge::run_guardian_post_merge(
+        &store,
+        &OkRunner,
+        &gid,
+        ralphus_daemon::guardian_merge::PostMergeJobs::ALL,
+    );
 
     let view = store.lock().get_guardian(&gid).unwrap();
     assert_eq!(
@@ -1151,13 +1160,14 @@ fn no_checks_configured_runs_project_auto_build_default() {
         .clone()
         .expect("combined worktree must exist");
     assert!(
-        Path::new(&combined).join("autobuild_ran.txt").exists(),
-        "the project's auto_build default must actually have run in the combined worktree"
+        !Path::new(&combined).join("autobuild_ran.txt").exists(),
+        "the auto-build must run in the post-merge scratch checkout, not the combined worktree"
     );
+    assert_eq!(view.post_merge_status.as_deref(), Some("ok"));
     assert_eq!(
-        view.detail.as_deref(),
+        view.post_merge_detail.as_deref(),
         Some("auto-built via project default: echo built > autobuild_ran.txt"),
-        "the guardian detail must record that the project auto-build ran, for the Reviews UI"
+        "the post-merge phase must record that the project auto-build ran, for the Reviews UI"
     );
 
     let _ = std::fs::remove_dir_all(&base);
@@ -1193,6 +1203,12 @@ fn checks_configured_does_not_also_run_auto_build() {
         .unwrap();
 
     run_merge(&store, &OkRunner, &gid);
+    ralphus_daemon::guardian_merge::run_guardian_post_merge(
+        &store,
+        &OkRunner,
+        &gid,
+        ralphus_daemon::guardian_merge::PostMergeJobs::ALL,
+    );
 
     let view = store.lock().get_guardian(&gid).unwrap();
     assert_eq!(
@@ -1201,8 +1217,9 @@ fn checks_configured_does_not_also_run_auto_build() {
          (that would have failed the merge): detail={:?}",
         view.detail
     );
+    assert_eq!(view.post_merge_status.as_deref(), Some("ok"));
     assert_ne!(
-        view.detail.as_deref(),
+        view.post_merge_detail.as_deref(),
         Some("auto-built via project default: exit 1"),
         "auto-build must not be recorded as having run when explicit checks are configured"
     );

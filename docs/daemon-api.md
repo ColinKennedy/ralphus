@@ -145,6 +145,7 @@ where one exists.
 | POST | `/api/guardians/{id}/manual-checks/open-terminal` | Spawn a manual-checks-generation terminal **on the daemon host** (`?mode=open\|agent`) |
 | GET | `/api/guardians/{id}/manual-checks/debug-events` | Same, for the manual-checks generation pass |
 | POST | `/api/guardians/{id}/merge` | Start/continue the stacked rebase |
+| POST | `/api/guardians/{id}/manual-checks/regenerate` | [Regenerate the review's manual checks on demand, with optional steering text](#post-apiguardiansidmanual-checksregenerate-ral-520) (RAL-520) |
 | POST | `/api/guardians/merge-batch` | [Start/continue the stacked rebase for many reviews in one request](#post-apiguardiansmerge-batch-ral-514) (RAL-514) |
 | POST | `/api/guardians/{id}/cancel_and_merge` | Cancel an in-progress rebase, start fresh |
 | POST | `/api/guardians/{id}/stop` | [Stop a mid-rebase at the next checkpoint](#post-apiguardiansidstop) (RAL-249), leaving it resumable |
@@ -1997,6 +1998,55 @@ HTTP status for the whole request:
 `/api/hidden/*/batch` endpoints, an unknown id is still reported per-review
 (`failed`, not a top-level `404`) since the batch as a whole always returns
 `200`.
+
+### `POST /api/guardians/{id}/manual-checks/regenerate` (RAL-520)
+Regenerate a review's manual checks on demand — the board's "↻ Regenerate"
+control in the manual-checks section. Body is optional:
+```json
+{ "focus": "focus on the CLI flags" }
+```
+An empty body (or no `focus`) regenerates with the same coverage as before.
+Non-empty `focus` is stored as the review's `manual_checks_focus` steering
+text and folded into the generation agent's prompt; it stays on the review
+until the next regeneration replaces or clears it.
+
+Schedules a manual-checks-only post-merge worker run: it clears the stored
+generation basis, then runs the generation agent in the background against a
+scratch checkout of the combined review branch's tip. Returns `202` with the
+updated `GuardianView` once the run is scheduled — the generation itself is
+asynchronous, so the caller watches `post_merge_status`/the timeline for
+completion.
+
+Advisory by construction, like every post-merge job: it never gates
+`POST .../merge`, approval, or PR submission.
+
+- `409 invalid_transition` — the review is not `in_review` with a built
+  stack (only a settled review has a finished stack to regenerate from), or
+  a post-merge job is already running (one generation at a time; retry when
+  it finishes).
+- `400 bad_request` — the body doesn't parse.
+
+#### The post-merge phase (RAL-520)
+Once a merge/rebase settles a stack, the review moves to `in_review`
+immediately and the remaining jobs — the check gates and manual-checks
+generation — run in an **independent post-merge worker**, against a scratch
+worktree of the finished stack, never inside the combined worktree itself.
+Consequences:
+
+- Post-merge state (`post_merge_status`, `post_merge_detail`) is advisory
+  and separately reported; it never disables, relabels, or blocks the
+  `Merge / rebase` control.
+- Manual checks are **not** regenerated on every merge. They are generated
+  when there is nothing to regenerate, or when the settled stack's diff
+  basis (base commit + tip tree, surfaced as `manual_checks_basis`
+  internally) changed since the last generation — i.e. at the review-branch
+  rebuild boundary, and on explicit regeneration.
+- A post-merge run interrupted by a daemon restart is marked `failed`
+  ("interrupted") by the maintenance sweep, and is rerunnable via this
+  endpoint.
+- The reviewer's steering text rides on `GuardianView` as
+  `manual_checks_focus`; it is folded into the generation agent's prompt and
+  replaced on each regeneration.
 
 ### `POST /api/guardians/{id}/branches/reorder`
 Persist a new branch order for a review (RAL-6/RAL-14). Body is the full ordered

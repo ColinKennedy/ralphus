@@ -3499,28 +3499,22 @@ pub(crate) fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
         }
         prev_ref = rev;
     }
-    match finalize_review(store, runner, root, wt_base, id, &prev_ref, cancel) {
-        Ok(note) => {
+    match finalize_review(store, root, wt_base, id, &prev_ref) {
+        Ok(()) => {
             // RAL-208: request a change-summary regen -- a no-op unless the
             // enabled-branch set actually changed since the last one (a plain
             // re-stack never does), and debounced when it did.
             queue_final_summary_regen(store, id);
-            // RAL-27: regenerate manual review commands after re-stacking.
-            generate_manual_commands(
-                store,
-                runner,
-                id,
-                root,
-                &base_sha,
-                &prev_ref,
-                Some(&wt_base.join("review")),
-                cancel,
-            );
             // RAL-92: re-baseline every branch's review-branch tip now that the
             // stack has settled, so the restacked downstream branches are not
             // mistaken for a manual push on the next maintenance sweep.
             snapshot_review_heads(store, id);
-            set_status(GuardianStatus::InReview, note.as_deref());
+            set_status(GuardianStatus::InReview, None);
+            // The check gates and manual-checks generation are post-merge work
+            // against the settled stack: hand them to the independent worker
+            // instead of holding this restack (and the review's `merging`
+            // state) while they run (RAL-520).
+            maybe_spawn_post_merge(store, id);
         }
         Err(e) => set_status(GuardianStatus::MergeFailed, Some(&e)),
     }
@@ -4072,33 +4066,15 @@ pub(crate) fn kickoff_merge(
         return Ok(StartMergeOutcome::Deferred);
     }
 
-    // A review reaches `in_review` as soon as its branches are rebased, while
-    // its post-merge jobs (check gates, manual-checks generation) are still
-    // working inside the combined worktree. `in_review` is a claimable state,
-    // so without this a merge started in that window would run a second worker
-    // through the same worktree as the first one's jobs.
+    // A review reaches `in_review` as soon as its branches are rebased, and
+    // its post-merge jobs (check gates, manual-checks generation) run in their
+    // own worker against a scratch checkout of the finished stack -- never
+    // inside this merge worker. Post-merge state therefore never gates a new
+    // merge claim here (RAL-520): `claim_guardian_merge` below is the only
+    // concurrency gate, and the review is claimable the moment the rebase is
+    // done, even while post-merge work is still running or has reported an
+    // advisory failure.
     //
-    // Reported as already-in-progress because that is what it is, and the
-    // board already renders that 409 as a real error rather than a silent
-    // no-op.
-    //
-    // Time-bounded on purpose. Nothing clears `running` if the daemon is
-    // restarted mid-phase, or if the phase panics before it can record an
-    // outcome -- an unbounded check would make a review permanently
-    // un-mergeable with no way back. Past the bound the flag is assumed
-    // abandoned and the merge proceeds.
-    const POST_MERGE_STALE_AFTER_MS: i64 = 60 * 60 * 1000;
-    let post_merge_running = matches!(
-        lock_timed(&store, id, "post-merge").get_guardian(id),
-        Ok(g) if g.post_merge_status.as_deref() == Some("running")
-            && g.post_merge_started_at_ms.is_some_and(|started| {
-                crate::store::now_ms().saturating_sub(started) < POST_MERGE_STALE_AFTER_MS
-            })
-    );
-    if post_merge_running {
-        return Ok(StartMergeOutcome::AlreadyInProgress);
-    }
-
     // Atomically transition collecting, merge_failed, or in_review → merging
     // (RAL-108: in_review is included so "Merge / rebase" forces a fresh rebase
     // even on an already-done review). Two concurrent requests can both pass
@@ -4802,7 +4778,7 @@ pub fn run_merge_staged(
                     if built_any_total {
                         let _ = store.lock().bump_guardian_merge_attempt(id);
                     }
-                    finish_staged_merge(store, runner, id, cancel, &set_status);
+                    finish_staged_merge(store, id, cancel, &set_status);
                     return;
                 }
                 if !built_any || !next_not_built_is_ready(store, id) {
@@ -5185,13 +5161,11 @@ fn staged_resume_point(
 }
 
 /// Finalize a fully-rebased staged merge: build each project's combined
-/// worktree, regenerate manual commands, run the final check gates, snapshot
-/// review heads for manual-push detection, and move to `InReview`. Mirrors the
-/// tail of [`run_merge_cancellable`].
-#[allow(clippy::too_many_arguments)]
+/// worktree, baseline the review heads, and move to `InReview`, handing the
+/// post-merge jobs to the independent worker. Mirrors the tail of
+/// [`run_merge_cancellable`].
 fn finish_staged_merge<F: Fn(GuardianStatus, Option<&str>)>(
     store: &crate::store_lock::StoreHandle,
-    runner: &dyn Runner,
     id: &str,
     cancel: &CancelToken,
     set_status: &F,
@@ -5246,8 +5220,6 @@ fn finish_staged_merge<F: Fn(GuardianStatus, Option<&str>)>(
         return;
     }
 
-    let mut last_combined: Option<String> = None;
-    let mut last_root: Option<Workspace> = None;
     for proj in &project_order {
         if cancel.is_cancelled() {
             log_merge_cancelled(store, id);
@@ -5290,25 +5262,9 @@ fn finish_staged_merge<F: Fn(GuardianStatus, Option<&str>)>(
             .last()
             .map(|b| review_ref_of(id, b))
             .unwrap_or_else(|| base_sha.clone());
-        match rebuild_combined(store, &root, &wt_base, id, &prev_ref) {
-            Ok(combined_str) => {
-                last_combined = Some(combined_str);
-                last_root = Some(root.clone());
-                generate_manual_commands(
-                    store,
-                    runner,
-                    id,
-                    &root,
-                    &base_sha,
-                    &prev_ref,
-                    Some(&wt_base.join("review")),
-                    cancel,
-                );
-            }
-            Err(e) => {
-                set_status(GuardianStatus::MergeFailed, Some(&e));
-                return;
-            }
+        if let Err(e) = rebuild_combined(store, &root, &wt_base, id, &prev_ref) {
+            set_status(GuardianStatus::MergeFailed, Some(&e));
+            return;
         }
     }
     if cancel.is_cancelled() {
@@ -5316,42 +5272,17 @@ fn finish_staged_merge<F: Fn(GuardianStatus, Option<&str>)>(
         return;
     }
     // Every project's branches are rebased by this point, so the merge itself
-    // is done. The check gates below run against a finished stack, and their
-    // result is advisory: it is recorded on the post-merge phase and surfaced
-    // on the board, but it never turns a correct rebase back into a failure.
-    // Matches `run_merge_shared`; see `run_commit_checks` for why gates run
-    // *during* the merge still fail it.
-    //
-    // Known difference from `run_merge_shared`: that path moves the review to
-    // `in_review` before running these, so the board stops saying "merging"
-    // the moment the branches are done. This multi-project path still holds
-    // `merging` until the gates finish. Behaviour is safe either way -- both
-    // states block a competing merge claim -- but the status shown here is
-    // more pessimistic than it needs to be.
-    let _ = store.lock().start_guardian_post_merge(id);
-    let outcome = if let (Some(combined_str), Some(root)) = (&last_combined, &last_root) {
-        final_checks(store, runner, id, root, combined_str, cancel)
-    } else {
-        Ok(None)
-    };
-    let note = outcome.as_ref().ok().and_then(Clone::clone);
-    {
-        let failure = outcome.as_ref().err().map(String::as_str);
-        let detail = match &outcome {
-            Ok(n) => n.as_deref(),
-            Err(e) => Some(e.as_str()),
-        };
-        let _ = store
-            .lock()
-            .finish_guardian_post_merge(id, failure.is_none(), detail);
-    }
-    // RAL-92: baseline the freshly-built review-branch tips so this build is
-    // never read as a reviewer's manual push on the next maintenance sweep.
+    // is done: baseline the tips, queue the change-summary regen, move to
+    // `in_review`, and hand the post-merge jobs (check gates, manual-checks
+    // generation) to the independent worker instead of holding this merge
+    // worker -- or the review's `merging` state -- while they run (RAL-520).
+    // Their result is advisory and never turns a correct rebase back into a
+    // failure; see `run_commit_checks` for why gates run *during* the merge
+    // still fail it.
     snapshot_review_heads(store, id);
-    // RAL-208: debounced LLM change summary for the whole guardian, now that
-    // every branch has finished rebuilding.
     queue_final_summary_regen(store, id);
-    set_status(GuardianStatus::InReview, note.as_deref());
+    set_status(GuardianStatus::InReview, None);
+    maybe_spawn_post_merge(store, id);
 }
 
 /// Build the review stack for a guardian (synchronous; called on a worker thread
@@ -5578,11 +5509,6 @@ pub fn run_merge_cancellable(
         cleanup_review_worktrees(&root, &wt_base, id, &num, &claimed);
     }
 
-    // Track the last combined worktree (and its project root, for RAL-101
-    // auto-build config resolution) across all projects, used for final checks.
-    let mut last_combined: Option<String> = None;
-    let mut last_root: Option<Workspace> = None;
-
     for (proj, proj_branches) in &project_branches {
         if cancel.is_cancelled() {
             log_merge_cancelled(store, id);
@@ -5648,14 +5574,6 @@ pub fn run_merge_cancellable(
             if cur_status == GuardianStatus::MergeFailed.as_str() {
                 return;
             }
-            let combined_str = store
-                .lock()
-                .get_guardian(id)
-                .ok()
-                .and_then(|g| g.combined_worktree)
-                .unwrap_or_default();
-            last_combined = Some(combined_str);
-            last_root = Some(root.clone());
             continue;
         }
 
@@ -5774,28 +5692,9 @@ pub fn run_merge_cancellable(
         }
 
         // Build per-project combined worktree at the top of this project's stack.
-        match rebuild_combined(store, &root, &wt_base, id, &prev_ref) {
-            Ok(combined_str) => {
-                let combined_wt = std::path::PathBuf::from(&combined_str);
-                last_combined = Some(combined_str);
-                last_root = Some(root.clone());
-                // RAL-27: regenerate manual review commands once the stack is
-                // ready for this project.
-                generate_manual_commands(
-                    store,
-                    runner,
-                    id,
-                    &root,
-                    &base_sha,
-                    &prev_ref,
-                    Some(&root.at(&combined_wt)),
-                    cancel,
-                );
-            }
-            Err(e) => {
-                set_status(GuardianStatus::MergeFailed, Some(&e));
-                return;
-            }
+        if let Err(e) = rebuild_combined(store, &root, &wt_base, id, &prev_ref) {
+            set_status(GuardianStatus::MergeFailed, Some(&e));
+            return;
         }
     }
 
@@ -5803,40 +5702,18 @@ pub fn run_merge_cancellable(
         log_merge_cancelled(store, id);
         return;
     }
-    // Run final check gates against the last combined worktree (all-projects pass).
     // Every project's branches are rebased by this point, so the merge itself
-    // is done. The check gates below run against a finished stack, and their
-    // result is advisory: it is recorded on the post-merge phase and surfaced
-    // on the board, but it never turns a correct rebase back into a failure.
-    // Matches `run_merge_shared`; see `run_commit_checks` for why gates run
-    // *during* the merge still fail it.
-    let _ = store.lock().start_guardian_post_merge(id);
-    let outcome = if let (Some(combined_str), Some(root)) = (&last_combined, &last_root) {
-        final_checks(store, runner, id, root, combined_str, cancel)
-    } else {
-        Ok(None)
-    };
-    let note = outcome.as_ref().ok().and_then(Clone::clone);
-    {
-        let failure = outcome.as_ref().err().map(String::as_str);
-        let detail = match &outcome {
-            Ok(n) => n.as_deref(),
-            Err(e) => Some(e.as_str()),
-        };
-        let _ = store
-            .lock()
-            .finish_guardian_post_merge(id, failure.is_none(), detail);
-    }
-    // RAL-92: record the freshly-built review-branch tip of every branch as the
-    // baseline for manual-push detection, so this build (or a base-shift rebuild)
-    // is never itself detected as a reviewer's manual push.
+    // is done: baseline the tips, queue the change-summary regen, move to
+    // `in_review`, and hand the post-merge jobs (check gates, manual-checks
+    // generation) to the independent worker instead of holding this merge
+    // worker -- or the review's `merging` state -- while they run (RAL-520).
+    // Their result is advisory and never turns a correct rebase back into a
+    // failure; see `run_commit_checks` for why gates run *during* the merge
+    // still fail it.
     snapshot_review_heads(store, id);
-    // RAL-208: every enabled branch across every project has now finished
-    // rebuilding -- request a (debounced, dedup'd-by-signature) LLM change
-    // summary covering the whole guardian, once, instead of the old
-    // per-project unconditional call this replaced.
     queue_final_summary_regen(store, id);
-    set_status(GuardianStatus::InReview, note.as_deref());
+    set_status(GuardianStatus::InReview, None);
+    maybe_spawn_post_merge(store, id);
 }
 
 /// CCTL-156 skip-worktrees path: rebase every branch, in order, onto a single
@@ -5994,21 +5871,16 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
         let _ = guard.set_guardian_review_branch(id, &combined_branch);
         let _ = guard.set_guardian_combined_worktree(id, &wt_str);
     }
-    // Every branch is rebased; what follows runs for minutes without changing
-    // any branch's status, so this is the last point the board hears anything
-    // unless each remaining phase announces itself. Bracket them individually
-    // from here down.
+    // Every branch is rebased; what follows runs without changing any
+    // branch's status, so announce the merge's completion here.
     phase_note(
         store,
         id,
         crate::logging::LogLevel::INFO,
-        format!(
-            "review {id} branches merged ({} of them); starting post-merge phases",
-            branches.len()
-        ),
+        format!("review {id} branches merged ({} of them)", branches.len()),
         serde_json::json!({
-            "phase": "post_merge",
-            "state": "started",
+            "phase": "merge",
+            "state": "branches_merged",
             "branch_count": branches.len(),
             "combined_branch": combined_branch,
         }),
@@ -6032,99 +5904,17 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
     );
 
     // The merge is finished here: every branch has been rebased onto the one
-    // before it and the combined branch is built. Everything below is
-    // *post-merge* work against a stack that is already done, so the review
-    // moves to `in_review` now rather than sitting in `merging` for the several
-    // minutes those jobs take.
+    // before it and the combined branch is built. The post-merge jobs (check
+    // gates, manual-checks generation) are handled by the independent worker
+    // ([`run_guardian_post_merge`]) against a scratch checkout of the finished
+    // stack, so they neither hold this merge worker nor block the next merge
+    // (RAL-520); the caller that owns this worker thread spawns it once the
+    // review is settled.
     //
     // RAL-92: baseline the shared review branch's tip (all branches share it
     // here) so the daemon's own build is not read as a manual push.
     snapshot_review_heads(store, id);
     set_status(GuardianStatus::InReview, None);
-    phase_note(
-        store,
-        id,
-        crate::logging::LogLevel::INFO,
-        format!(
-            "review {id} merge complete ({} branches); post-merge checks starting",
-            branches.len()
-        ),
-        serde_json::json!({
-            "phase": "post_merge",
-            "state": "started",
-            "branch_count": branches.len(),
-        }),
-    );
-    let _ = store.lock().start_guardian_post_merge(id);
-
-    // Two independent post-merge jobs: the check gates run the project's own
-    // build/test command, and manual-commands generation asks an agent to write
-    // verification steps from the same diff. Neither reads the other's output
-    // and both take minutes, so they run concurrently rather than end to end.
-    //
-    // Both are joined before returning -- not to gate the merge, which already
-    // completed above, but because the combined worktree they are both reading
-    // is reused by the next merge of this review and must not have work still
-    // running inside it.
-    let post_merge_started = std::time::Instant::now();
-    let checks_outcome = std::thread::scope(|scope| {
-        let manual = scope.spawn(|| {
-            generate_manual_commands(
-                store,
-                runner,
-                id,
-                root,
-                base_sha,
-                &combined_branch,
-                Some(&wt),
-                cancel,
-            );
-        });
-        let outcome = final_checks(store, runner, id, root, &wt_str, cancel);
-        let _ = manual.join();
-        outcome
-    });
-
-    // A failed gate is advisory: it is recorded and surfaced, but the review
-    // stays `in_review` and remains approvable. The merge it would once have
-    // failed has already succeeded, and re-running a gate is not a reason to
-    // throw away a correctly rebased stack.
-    // On success `detail` carries the gate's own note (e.g. which project
-    // default build command ran), which the old code passed to `set_status`.
-    let failure = checks_outcome.as_ref().err().map(String::as_str);
-    let detail = match &checks_outcome {
-        Ok(note) => note.as_deref(),
-        Err(e) => Some(e.as_str()),
-    };
-    let _ = store
-        .lock()
-        .finish_guardian_post_merge(id, failure.is_none(), detail);
-    phase_note(
-        store,
-        id,
-        if failure.is_none() {
-            crate::logging::LogLevel::INFO
-        } else {
-            crate::logging::LogLevel::WARNING
-        },
-        match failure {
-            None => format!(
-                "review {id} post-merge checks passed in {}ms",
-                elapsed_ms(post_merge_started)
-            ),
-            Some(e) => format!(
-                "review {id} post-merge checks reported a failure after {}ms: {e}",
-                elapsed_ms(post_merge_started)
-            ),
-        },
-        serde_json::json!({
-            "phase": "post_merge",
-            "state": if failure.is_none() { "ok" } else { "failed" },
-            "elapsed_ms": elapsed_ms(post_merge_started),
-            "error": failure,
-            "advisory": true,
-        }),
-    );
     // RAL-208: the LLM change summary is no longer regenerated here on every
     // stack rebuild -- `run_merge` requests a (debounced) regen once, after
     // every project in this merge has finished, so it is never re-triggered by
@@ -7270,28 +7060,22 @@ pub fn run_feedback(
         return outcome;
     }
 
-    match finalize_review(store, runner, &root, &wt_base, id, &prev_ref, cancel) {
-        Ok(note) => {
+    match finalize_review(store, &root, &wt_base, id, &prev_ref) {
+        Ok(()) => {
             // RAL-208: request a change-summary regen -- a no-op unless the
             // enabled-branch set actually changed since the last one (a
             // feedback restack never does), and debounced when it did.
             queue_final_summary_regen(store, id);
-            // RAL-27: regenerate manual review commands after the re-stack.
-            generate_manual_commands(
-                store,
-                runner,
-                id,
-                &root,
-                &base_sha,
-                &prev_ref,
-                Some(&wt_base.join("review")),
-                cancel,
-            );
             // RAL-92: re-baseline after applying feedback so the new tips (the
             // edited branch and its restacked downstream) are the reference for
             // future manual-push detection.
             snapshot_review_heads(store, id);
-            set_status(GuardianStatus::InReview, note.as_deref());
+            set_status(GuardianStatus::InReview, None);
+            // The check gates and manual-checks generation are post-merge work
+            // against the settled stack: hand them to the independent worker
+            // instead of holding this feedback run (and the review's `merging`
+            // state) while they run (RAL-520).
+            maybe_spawn_post_merge(store, id);
         }
         Err(e) => set_status(GuardianStatus::MergeFailed, Some(&e)),
     }
@@ -7647,6 +7431,25 @@ pub fn review_maintenance(
     sem: &Arc<Semaphore>,
     cancellations: &Cancellations,
 ) {
+    // RAL-520: a post-merge phase only stays `running` past its natural end
+    // when the daemon died mid-run (the worker records its own outcome), so
+    // mark such leftovers failed -- advisory only -- and let the board's
+    // manual-checks regenerate control rerun them.
+    match store
+        .lock()
+        .interrupt_stale_post_merge_runs(POST_MERGE_STALE_AFTER_MS)
+    {
+        Ok(ids) if !ids.is_empty() => {
+            crate::rlog!(
+                WARNING,
+                "ralphus [guardian] {} interrupted post-merge run(s) marked failed: {}",
+                ids.len(),
+                ids.join(", ")
+            );
+        }
+        _ => {}
+    }
+
     let straggler_ids: Vec<String> = {
         let guard = store.lock();
         guard.guardians_with_ready_stragglers().unwrap_or_default()
@@ -8689,26 +8492,425 @@ fn stack_pick(
     }
 }
 
-/// Rebuild the combined review worktree at `prev_ref` and run the *deterministic*
-/// check gates (see [`final_checks`] for the full RAL-342 precedence).
+/// Build the review's combined worktree/branch for a settled stack.
 ///
-/// Returns an optional informational note for the `InReview` status: `Some(...)`
-/// when the check gates were opted out (CCTL-130), a review-declared auto_build
-/// (RAL-342) ran, or a config auto-build ran in place of explicit checks
-/// (RAL-101), so the UI can distinguish those from a plain "checks passed";
-/// `None` when explicit checks ran and passed, or nothing ran at all (no checks,
-/// no review/project auto_build configured).
+/// The merge itself is done once this returns: the combined worktree and
+/// branch are in place and the caller baselines the tips and moves the review
+/// to `in_review`. Everything that merely *reads* that settled state -- the
+/// check gates, the manual-checks generation -- belongs to the independent
+/// post-merge worker ([`run_guardian_post_merge`]), never to the caller's
+/// lifecycle: post-merge work must not keep a review looking busy or delay
+/// the next merge/rebase (RAL-520).
 fn finalize_review(
     store: &crate::store_lock::StoreHandle,
-    runner: &dyn Runner,
     root: &Workspace,
     wt_base: &Workspace,
     id: &str,
     prev_ref: &str,
+) -> std::result::Result<(), String> {
+    rebuild_combined(store, root, wt_base, id, prev_ref).map(|_| ())
+}
+
+/// Whether a completed merge hands its post-merge work (check gates +
+/// manual-checks generation) to the independent worker
+/// ([`run_guardian_post_merge`]) instead of running it inline.
+///
+/// Production daemons enable this in `serve()`; tests leave it off so a direct
+/// `run_merge` call stays synchronous and hermetic, asserting only on the
+/// state the merge itself produced. Tests that exercise the worker call
+/// [`run_guardian_post_merge`] directly with their own runner.
+static POST_MERGE_SPAWNING: AtomicBool = AtomicBool::new(false);
+
+/// Enable the post-merge hand-off (see [`POST_MERGE_SPAWNING`]). Called once
+/// by the real daemon entry point (`server::serve`); never in-process tests.
+pub fn enable_post_merge_spawning() {
+    POST_MERGE_SPAWNING.store(true, Ordering::Relaxed);
+}
+
+/// How long a post-merge phase may sit in `running` before it is treated as
+/// abandoned (the daemon died mid-run): stale sweeps mark it failed, the
+/// manual-checks regenerate endpoint refuses to queue a second job behind a
+/// phase this fresh, and a worker that finds one already running defers.
+pub(crate) const POST_MERGE_STALE_AFTER_MS: i64 = 60 * 60 * 1000;
+
+/// Directory name of the post-merge worker's scratch checkout, a sibling of
+/// the combined worktree (e.g. `.../g/<short>/review-postmerge`).
+const POST_MERGE_WORKTREE_DIR: &str = "review-postmerge";
+
+/// Which post-merge jobs a worker run should perform.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PostMergeJobs {
+    /// Run the review's check gates ([`final_checks`]).
+    pub checks: bool,
+    /// Regenerate the manual review commands when their basis changed.
+    pub manual_checks: bool,
+}
+
+impl PostMergeJobs {
+    /// Both jobs -- what a completed merge hands off.
+    pub const ALL: Self = Self {
+        checks: true,
+        manual_checks: true,
+    };
+    /// Manual-checks generation only -- what the board's regenerate control
+    /// runs (the check gates' outcome is advisory and already reported; the
+    /// reviewer is re-running generation deliberately, e.g. with new focus).
+    pub const MANUAL_CHECKS_ONLY: Self = Self {
+        checks: false,
+        manual_checks: true,
+    };
+}
+
+/// Spawn the independent post-merge worker for a settled review (RAL-520).
+///
+/// No-op unless spawning is enabled (production `serve()`) or the review is
+/// not `in_review` with a combined worktree -- i.e. only reviews whose
+/// merge/rebase actually settled get a worker. The worker runs on its own
+/// thread with its own `SubprocessRunner`, so the merge worker that finished
+/// the rebase is free immediately and the review never looks busy behind
+/// post-merge work.
+pub(crate) fn maybe_spawn_post_merge(store: &crate::store_lock::StoreHandle, id: &str) {
+    spawn_guardian_post_merge(store, id, PostMergeJobs::ALL);
+}
+
+/// Spawn the post-merge worker unconditionally (caller checked preconditions).
+///
+/// No-op when spawning is disabled (in-process tests): tests that exercise
+/// the worker call [`run_guardian_post_merge`] directly with their own
+/// runner instead, keeping them hermetic.
+pub(crate) fn spawn_guardian_post_merge(
+    store: &crate::store_lock::StoreHandle,
+    id: &str,
+    jobs: PostMergeJobs,
+) {
+    if !POST_MERGE_SPAWNING.load(Ordering::Relaxed) {
+        return;
+    }
+    let guardian = match store.lock().get_guardian(id) {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    if guardian.status.as_str() != GuardianStatus::InReview.as_str()
+        || guardian.combined_worktree.is_none()
+    {
+        return;
+    }
+    let store = store.clone();
+    let id = id.to_string();
+    std::thread::Builder::new()
+        .name(format!("postmerge-{id}"))
+        .spawn(move || {
+            let runner: std::sync::Arc<dyn Runner> = std::sync::Arc::new(
+                crate::runner::SubprocessRunner::from_env().with_cartographer(store.clone()),
+            );
+            run_guardian_post_merge(&store, runner.as_ref(), &id, jobs);
+        })
+        .ok();
+}
+
+/// The independent post-merge worker (RAL-520).
+///
+/// Runs a settled review's post-merge jobs -- the check gates and manual-checks
+/// generation -- against a dedicated scratch worktree checked out from the
+/// combined review branch's tip, never inside the combined worktree itself
+/// (which the next merge of this review may reuse at any moment, since a
+/// review is approvable the instant it is `in_review`).
+///
+/// Deliberately separate from the merge lifecycle: a merge/rebase succeeds the
+/// moment the stack is rebuilt, and everything here is advisory follow-up
+/// work that must never delay, disable, or re-open a merge. A failed job is
+/// recorded on the post-merge phase and surfaced on the board, and a
+/// daemon-restart-interrupted run is marked failed by the stale sweep
+/// ([`Store::interrupt_stale_post_merge_runs`]) so the board's manual-checks
+/// regenerate control can rerun it.
+///
+/// A run is cancelled (best-effort, via the cancel token the long-running
+/// jobs poll) when the review leaves `in_review`, or when a newer post-merge
+/// run starts for the same review -- the newer run owns the outcome slot.
+/// Only the run whose `started_at` stamp still matches records an outcome.
+pub fn run_guardian_post_merge(
+    store: &crate::store_lock::StoreHandle,
+    runner: &dyn Runner,
+    id: &str,
+    jobs: PostMergeJobs,
+) {
+    let guardian = match store.lock().get_guardian(id) {
+        Ok(g) => g,
+        Err(e) => {
+            phase_note(
+                store,
+                id,
+                crate::logging::LogLevel::WARNING,
+                format!("review {id} post-merge worker could not load the review: {e}"),
+                serde_json::json!({ "phase": "post_merge", "state": "aborted" }),
+            );
+            return;
+        }
+    };
+    if guardian.status.as_str() != GuardianStatus::InReview.as_str() {
+        // Nothing settled to work from -- e.g. a merge is already underway
+        // again. Post-merge work never gates a merge, so it simply stands down.
+        return;
+    }
+    let Some(combined_str) = guardian.combined_worktree.clone() else {
+        return;
+    };
+
+    let _review_op =
+        git_review_operation_guard(Path::new(&guardian.git_root), guardian.machine.as_deref());
+    let started_at = match store.lock().start_guardian_post_merge(id) {
+        Ok(stamp) => stamp,
+        Err(_) => crate::store::now_ms(),
+    };
+    let run_started = std::time::Instant::now();
+    phase_note(
+        store,
+        id,
+        crate::logging::LogLevel::INFO,
+        format!(
+            "review {id} post-merge jobs started (background): {}",
+            if jobs.checks && jobs.manual_checks {
+                "check gates + manual checks"
+            } else {
+                "manual checks"
+            }
+        ),
+        serde_json::json!({ "phase": "post_merge", "state": "started" }),
+    );
+
+    // Supersede watcher: a post-merge run is only meaningful while the review
+    // it was built for is still the settled one. If the review leaves
+    // `in_review` (a new merge/rebase claimed it) or a newer post-merge run
+    // starts, cancel this run's jobs; only the run whose started_at stamp
+    // still matches records an outcome.
+    let cancel = CancelToken::new();
+    let superseded = Arc::new(AtomicBool::new(false));
+    let watch_cancel = cancel.clone();
+    let watch_superseded = Arc::clone(&superseded);
+    let watch_store = store.clone();
+    let watch_id = id.to_string();
+    let watcher = std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            if watch_cancel.is_cancelled() {
+                return;
+            }
+            let Ok(g) = watch_store.lock().get_guardian(&watch_id) else {
+                watch_superseded.store(true, Ordering::Relaxed);
+                watch_cancel.cancel();
+                return;
+            };
+            let stale = g.status.as_str() != GuardianStatus::InReview.as_str()
+                || g.post_merge_started_at_ms != Some(started_at);
+            if stale {
+                watch_superseded.store(true, Ordering::Relaxed);
+                watch_cancel.cancel();
+                return;
+            }
+        }
+    });
+
+    let outcome = post_merge_jobs_inner(store, runner, id, &guardian, &combined_str, jobs, &cancel);
+
+    // Stop the supersede watcher: the run is over, one way or the other. The
+    // superseded flag was sampled by the watcher before this cancel.
+    let was_superseded = superseded.load(Ordering::Relaxed);
+    cancel.cancel();
+
+    // Record the outcome. A failure is advisory by construction: the review
+    // stays `in_review`, stays approvable, and stays mergeable. On success
+    // `detail` carries the gate's own note (e.g. which project default build
+    // command ran).
+    let (ok, detail) = match &outcome {
+        Ok(note) => (true, note.as_deref()),
+        Err(e) => (false, Some(e.as_str())),
+    };
+    let recorded = if was_superseded {
+        // Superseded: record the interruption only when this run still owns
+        // the outcome slot (a newer run's stamp replaces ours, and its
+        // `finish` would then be the one that lands).
+        store.lock().finish_guardian_post_merge(
+            id,
+            started_at,
+            false,
+            Some("post-merge job interrupted (the review changed or a newer run started)"),
+        )
+    } else {
+        store
+            .lock()
+            .finish_guardian_post_merge(id, started_at, ok, detail)
+    };
+    phase_note(
+        store,
+        id,
+        if ok {
+            crate::logging::LogLevel::INFO
+        } else {
+            crate::logging::LogLevel::WARNING
+        },
+        match (&outcome, was_superseded) {
+            (Ok(_), _) => format!(
+                "review {id} post-merge jobs finished in {}ms",
+                elapsed_ms(run_started)
+            ),
+            (Err(e), false) => format!(
+                "review {id} post-merge jobs reported a failure after {}ms: {e}",
+                elapsed_ms(run_started)
+            ),
+            (Err(e), true) => format!(
+                "review {id} post-merge jobs interrupted after {}ms: {e}",
+                elapsed_ms(run_started)
+            ),
+        },
+        serde_json::json!({
+            "phase": "post_merge",
+            "state": if ok { "ok" } else { "failed" },
+            "elapsed_ms": elapsed_ms(run_started),
+            "error": detail,
+            "recorded": recorded.unwrap_or(false),
+            "advisory": true,
+        }),
+    );
+    let _ = watcher.join();
+}
+
+/// The worker's body: check out a scratch worktree at the combined review
+/// branch's tip and run the requested jobs there concurrently.
+fn post_merge_jobs_inner(
+    store: &crate::store_lock::StoreHandle,
+    runner: &dyn Runner,
+    id: &str,
+    guardian: &crate::guardian::GuardianView,
+    combined_str: &str,
+    jobs: PostMergeJobs,
     cancel: &CancelToken,
 ) -> std::result::Result<Option<String>, String> {
-    let combined_str = rebuild_combined(store, root, wt_base, id, prev_ref)?;
-    final_checks(store, runner, id, root, &combined_str, cancel)
+    let combined_path = PathBuf::from(combined_str);
+    // Project root of the combined worktree: `<proj>/.git/.ralphus/g/<short>/review`.
+    let proj = combined_path
+        .ancestors()
+        .nth(5)
+        .map(|p| p.to_path_buf())
+        .filter(|p| {
+            // Sanity: must be a project this review actually covers (or its
+            // git root) -- otherwise the path layout assumption broke.
+            let candidates = guardian
+                .branches
+                .iter()
+                .map(|b| {
+                    b.project
+                        .clone()
+                        .unwrap_or_else(|| guardian.git_root.clone())
+                })
+                .chain(std::iter::once(guardian.git_root.clone()))
+                .collect::<Vec<_>>();
+            candidates.iter().any(|c| Path::new(c) == p)
+        })
+        .ok_or_else(|| {
+            format!("could not derive the project root from combined worktree path {combined_str}")
+        })?;
+    let ws_root = Workspace::for_guardian(store, id, &proj);
+    let combined_ws = ws_root.at(&combined_path);
+
+    let combined_ref = combined_review_ref_of(guardian);
+    let tip = combined_ws
+        .git(&["rev-parse", "--verify", &combined_ref])
+        .map(|s| s.trim().to_string())
+        .map_err(|e| format!("combined review branch '{combined_ref}' no longer resolves: {e}"))?;
+    let tip_tree = combined_ws
+        .git(&["rev-parse", &format!("{tip}^{{tree}}")])
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| tip.clone());
+
+    // Scratch checkout of the tip. Sibling of the combined worktree, with its
+    // own branch, so the jobs' byproducts land here instead of dirtying the
+    // combined worktree a future merge reuses -- and so a failed deletion can
+    // never wedge the combined worktree itself.
+    let pm_dir = combined_path
+        .parent()
+        .map(|p| p.join(POST_MERGE_WORKTREE_DIR))
+        .ok_or_else(|| "combined worktree path has no parent".to_string())?;
+    let pm_ws = ws_root.at(&pm_dir);
+    let pm_str = pm_dir.to_string_lossy().to_string();
+    // Scratch checkout of the tip: a detached `git worktree add` at the tip --
+    // deliberately not a named branch and not the lease/recovery machinery the
+    // review worktrees use, since this checkout is disposable by construction
+    // (the jobs read it; nothing commits to it) and must never fight the next
+    // merge over a branch name. Reuse the previous scratch in place when a
+    // Windows file lock keeps `worktree remove` from deleting it.
+    if pm_ws.root().exists() {
+        let _ = combined_ws.git(&["worktree", "remove", "--force", &pm_str]);
+    }
+    if !pm_ws.root().exists() {
+        combined_ws
+            .git(&["worktree", "add", "--detach", &pm_str, &tip])
+            .map_err(|e| format!("post-merge scratch checkout failed: {e}"))?;
+    } else {
+        pm_ws
+            .git(&["checkout", "-f", "--detach", &tip])
+            .map_err(|e| format!("post-merge scratch reset failed: {e}"))?;
+        let _ = pm_ws.git(&["clean", "-fdx"]);
+    }
+
+    // The project base commit this generation diffs against.
+    let proj_str = proj.to_string_lossy().to_string();
+    let base_sha = guardian
+        .base_commits
+        .get(&proj_str)
+        .cloned()
+        .unwrap_or_else(|| {
+            resolve_base(&combined_ws, &guardian.base_branch).unwrap_or_else(|_| tip.clone())
+        });
+
+    // Manual checks: regenerate only when there is nothing to regenerate, or
+    // the settled stack's diff basis changed since the last generation
+    // (RAL-520: never on every merge).
+    let stored = store.lock().get_guardian(id).ok();
+    let commands_present = stored
+        .as_ref()
+        .is_some_and(|g| !g.manual_commands.is_empty());
+    let expected_basis =
+        serde_json::json!({ "base_sha": base_sha, "tip_tree": tip_tree }).to_string();
+    let basis_changed = stored
+        .as_ref()
+        .and_then(|g| g.manual_checks_basis.as_deref())
+        != Some(expected_basis.as_str());
+    let generate_manual = jobs.manual_checks && (!commands_present || basis_changed);
+
+    // Both jobs read the scratch worktree and neither reads the other's
+    // output, so they run concurrently.
+    let outcome = std::thread::scope(|scope| {
+        let manual = generate_manual.then(|| {
+            scope.spawn(|| {
+                generate_manual_commands(
+                    store,
+                    runner,
+                    id,
+                    &ws_root.at(&proj),
+                    &base_sha,
+                    &tip,
+                    Some(&pm_ws),
+                    cancel,
+                );
+            })
+        });
+        let checks = if jobs.checks {
+            final_checks(store, runner, id, &ws_root.at(&proj), &pm_str, cancel)
+        } else {
+            Ok(None)
+        };
+        if let Some(handle) = manual {
+            let _ = handle.join();
+        }
+        checks
+    });
+
+    // Remove the scratch worktree best-effort; a leftover directory is swept
+    // by the next `worktree_add_or_reset` on this path, and a failed deletion
+    // must never fail the (already recorded) post-merge outcome.
+    let _ = combined_ws.git(&["worktree", "remove", "--force", &pm_str]);
+    let _ = combined_ws.git(&["worktree", "prune"]);
+    outcome
 }
 
 /// Run the review's check gates against the finished combined worktree.
@@ -11596,7 +11798,7 @@ fn parse_manual_commands_response(text: &str) -> Vec<GuardianCheck> {
 }
 
 /// Shared prompt body for [`generate_manual_commands`].
-fn manual_commands_prompt(tail: &str) -> String {
+pub fn manual_commands_prompt(tail: &str, steering: Option<&str>) -> String {
     let focus = "You are preparing a code review. Based on the changed files and commit \
          messages below, produce 1-5 shell command strings that a human reviewer should \
          run to manually verify these changes. Focus on hands-on, observable steps: \
@@ -11616,7 +11818,10 @@ fn manual_commands_prompt(tail: &str) -> String {
     let format = " Return ONLY a valid JSON array where each element is either a plain string or \
           the object shape described above — no markdown fences, no explanation, no \
           other text.";
-    format!("{focus}{format}\n\n{tail}")
+    let steer = steering
+        .map(|s| format!(" The reviewer asked to focus these checks on: {s}"))
+        .unwrap_or_default();
+    format!("{focus}{steer}{format}\n\n{tail}")
 }
 
 /// Emit one merge-pipeline phase record: stderr and Cartographer together via
@@ -11681,6 +11886,14 @@ fn generate_manual_commands(
     worktree: Option<&Workspace>,
     cancel: &CancelToken,
 ) {
+    // RAL-520: the reviewer's steering text from the board's regenerate
+    // control, folded into the generation prompt so a regen can steer what
+    // the checks cover.
+    let steering = store
+        .lock()
+        .get_guardian(id)
+        .ok()
+        .and_then(|g| g.manual_checks_focus);
     let (cwd, machine, prompt) = if let Some(wt) = worktree {
         // Worktree path: embed only the --stat output (always compact — one line
         // per changed file). Never embed the full diff; it can be arbitrarily
@@ -11709,7 +11922,7 @@ fn generate_manual_commands(
         (
             wt.root().to_string_lossy().into_owned(),
             wt.machine().map(str::to_string),
-            manual_commands_prompt(&tail),
+            manual_commands_prompt(&tail, steering.as_deref()),
         )
     } else {
         // Fallback: list changed file names from the repository root. The file
@@ -11738,7 +11951,7 @@ fn generate_manual_commands(
         (
             root.root().to_string_lossy().into_owned(),
             root.machine().map(str::to_string),
-            manual_commands_prompt(&tail),
+            manual_commands_prompt(&tail, steering.as_deref()),
         )
     };
 
@@ -11909,6 +12122,19 @@ fn generate_manual_commands(
 
     let commands = parse_manual_commands_response(result.summary.trim());
 
+    if cancel.is_cancelled() {
+        // Superseded mid-generation (a newer merge or regen owns the outcome
+        // slot): drop the result rather than write over the newer run's data.
+        phase_note(
+            store,
+            id,
+            crate::logging::LogLevel::INFO,
+            format!("review {id} manual-commands generation superseded; result dropped"),
+            serde_json::json!({ "phase": "manual_commands", "state": "superseded" }),
+        );
+        return;
+    }
+
     if !commands.is_empty() {
         // RAL-88: record which resolved agent/model produced these commands.
         let _ = store.lock().set_guardian_manual_commands(
@@ -11917,6 +12143,18 @@ fn generate_manual_commands(
             Some(agent.as_str()),
             model.as_deref(),
         );
+        // RAL-520: record the diff basis these commands were generated
+        // against, so a later post-merge run regenerates only when the
+        // settled stack's changes actually changed.
+        let tip_tree = worktree
+            .unwrap_or(root)
+            .git(&["rev-parse", &format!("{tip_ref}^{{tree}}")])
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| tip_ref.to_string());
+        let basis = serde_json::json!({ "base_sha": base_sha, "tip_tree": tip_tree }).to_string();
+        let _ = store
+            .lock()
+            .set_guardian_manual_checks_basis(id, Some(&basis));
     }
     phase_note(
         store,
