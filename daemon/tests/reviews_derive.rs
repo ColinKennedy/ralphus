@@ -405,6 +405,71 @@ fn declared_review_settings_override_project_defaults() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+// RAL-521: manual-check caching precedence -- the review's own
+// `[[review]] cache_manual_checks` wins over the project's
+// `.ralphus.toml [review] cache_manual_checks` default, which wins over
+// the built-in default of `true` (caching on).
+#[test]
+fn cache_manual_checks_precedence_review_over_project_over_default() {
+    // Review override wins over the project file default.
+    let base = temp_base("cache-manual-precedence-override");
+    let cwd = repo_with_worktree(&base, "feature/cache-override");
+    std::fs::write(
+        base.join("repo").join(".ralphus.toml"),
+        "[review]\ncache_manual_checks = true\n",
+    )
+    .unwrap();
+    let toml = session_toml(
+        &cwd,
+        "override",
+        "skip_auto_build=true\ncache_manual_checks=false",
+    );
+    let file: TaskFile = toml::from_str(&toml).unwrap();
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    let squad_id = store.lock().insert_squad(&file, None, false).unwrap();
+    let guardian_id = derive_reviews(&store, &squad_id, &file).unwrap().remove(0);
+    let guardian = store.lock().get_guardian(&guardian_id).unwrap();
+    assert_eq!(guardian.cache_manual_checks, Some(false));
+    assert!(!guardian.effective_cache_manual_checks);
+    let _ = std::fs::remove_dir_all(&base);
+
+    // Project file default applies when the review leaves it unset.
+    let base = temp_base("cache-manual-precedence-project");
+    let cwd = repo_with_worktree(&base, "feature/cache-project");
+    // The review's git_root is the base repo checkout, not the linked
+    // worktree -- the project file lives there.
+    std::fs::write(
+        base.join("repo").join(".ralphus.toml"),
+        "[review]\ncache_manual_checks = false\n",
+    )
+    .unwrap();
+    let toml = session_toml(&cwd, "project", "skip_auto_build=true");
+    let file: TaskFile = toml::from_str(&toml).unwrap();
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    let squad_id = store.lock().insert_squad(&file, None, false).unwrap();
+    let guardian_id = derive_reviews(&store, &squad_id, &file).unwrap().remove(0);
+    let guardian = store.lock().get_guardian(&guardian_id).unwrap();
+    assert_eq!(guardian.cache_manual_checks, None);
+    assert!(
+        !guardian.effective_cache_manual_checks,
+        "project default should apply"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+
+    // Everything unset resolves to the built-in default: caching on.
+    let base = temp_base("cache-manual-precedence-default");
+    let cwd = repo_with_worktree(&base, "feature/cache-default");
+    let toml = session_toml(&cwd, "default", "skip_auto_build=true");
+    let file: TaskFile = toml::from_str(&toml).unwrap();
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    let squad_id = store.lock().insert_squad(&file, None, false).unwrap();
+    let guardian_id = derive_reviews(&store, &squad_id, &file).unwrap().remove(0);
+    let guardian = store.lock().get_guardian(&guardian_id).unwrap();
+    assert_eq!(guardian.cache_manual_checks, None);
+    assert!(guardian.effective_cache_manual_checks);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 #[test]
 fn two_projects_make_two_disambiguated_reviews() {
     let base_a = temp_base("projA");

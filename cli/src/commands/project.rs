@@ -89,6 +89,7 @@ pub enum ProjectReviewSettingsCommand {
         auto_fix_prompt_template: Option<String>,
         discourage_tests_during_auto_pull_request_fixes: Option<bool>,
         auto_cancel_outdated_pr_pipelines: Option<bool>,
+        cache_manual_checks: Option<bool>,
     },
     UsageError(String),
 }
@@ -357,6 +358,8 @@ fn parse_review_settings_set(
         crate::commands::review::take_tri_bool(scanner, "--discourage-tests-during-auto-pr-fixes");
     let auto_cancel_outdated_pr_pipelines =
         crate::commands::review::take_tri_bool(scanner, "--auto-cancel-outdated-pr-pipelines");
+    let cache_manual_checks =
+        crate::commands::review::take_tri_bool(scanner, "--cache-manual-checks");
     if clear_maximum_budget_usd && maximum_budget_usd_raw.is_some() {
         return Err(UsageError(
             "review-settings set: --clear-maximum-budget-usd cannot be combined with \
@@ -415,6 +418,7 @@ fn parse_review_settings_set(
         auto_fix_prompt_template,
         discourage_tests_during_auto_pull_request_fixes,
         auto_cancel_outdated_pr_pipelines,
+        cache_manual_checks,
     })
 }
 
@@ -565,6 +569,7 @@ fn dispatch_review_settings(cmd: ProjectReviewSettingsCommand, opts: &GlobalOpts
             auto_fix_prompt_template,
             discourage_tests_during_auto_pull_request_fixes,
             auto_cancel_outdated_pr_pipelines,
+            cache_manual_checks,
         } => {
             let patch = crate::client::ProjectReviewSettingsPatch {
                 default_resolver_agent: resolver_agent.as_deref(),
@@ -587,6 +592,7 @@ fn dispatch_review_settings(cmd: ProjectReviewSettingsCommand, opts: &GlobalOpts
                 auto_fix_prompt_template: auto_fix_prompt_template.as_deref(),
                 discourage_tests_during_auto_pull_request_fixes,
                 auto_cancel_outdated_pr_pipelines,
+                cache_manual_checks,
             };
             match client.set_project_review_settings(&name, &patch) {
                 Ok(payload) => {
@@ -671,6 +677,7 @@ fn render_review_settings(payload: &Value) {
         "auto cancel outdated pr pipelines:",
         "auto_cancel_outdated_pr_pipelines",
     );
+    row_bool("cache manual checks:", "cache_manual_checks");
 }
 
 #[must_use]

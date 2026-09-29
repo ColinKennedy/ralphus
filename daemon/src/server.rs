@@ -2860,6 +2860,9 @@ struct EffectiveReviewDefaults {
     auto_fix_prompt_template: Option<String>,
     discourage_tests_during_auto_pull_request_fixes: bool,
     auto_cancel_outdated_pr_pipelines: bool,
+    /// RAL-521: the resolved manual-check caching default (per-review
+    /// override > database default > `.ralphus.toml`/global > `true`).
+    cache_manual_checks: bool,
 }
 
 impl EffectiveReviewDefaults {
@@ -2884,6 +2887,7 @@ impl EffectiveReviewDefaults {
             discourage_tests_during_auto_pull_request_fixes: cfg
                 .discourage_tests_during_auto_pull_request_fixes(),
             auto_cancel_outdated_pr_pipelines: cfg.auto_cancel_outdated_pr_pipelines(),
+            cache_manual_checks: cfg.cache_manual_checks(),
         }
     }
 }
@@ -2985,6 +2989,13 @@ struct ProjectReviewSettingsBody {
     /// Defaults to `true` when unset.
     #[serde(default)]
     auto_cancel_outdated_pr_pipelines: Option<bool>,
+    /// RAL-521: project-level default for whether a review's manual checks
+    /// are computed once, when its review branches are first created, and
+    /// then reused through later merges, rebases, and automated fix
+    /// iterations -- see [`crate::store::ProjectReviewSettings`]. Defaults
+    /// to `true` when unset.
+    #[serde(default)]
+    cache_manual_checks: Option<bool>,
     /// RAL-507: the project's default cap on unattended base-shift rebuild
     /// attempts per retry campaign. Zero is itself invalid (the cap must be
     /// at least 1), so clearing uses an explicit flag -- same convention as
@@ -3173,6 +3184,9 @@ fn set_project_review_settings(daemon: &Daemon, name: &str, body: &str) -> Reply
     }
     if let Some(v) = req.auto_cancel_outdated_pr_pipelines {
         settings.auto_cancel_outdated_pr_pipelines = Some(v);
+    }
+    if let Some(v) = req.cache_manual_checks {
+        settings.cache_manual_checks = Some(v);
     }
     if let Some(v) = req.default_pr_user {
         settings.default_pr_user = clear_if_empty(v);
@@ -13195,6 +13209,13 @@ struct GuardianSettingsBody {
     /// by default -- unlike most of the overrides above).
     #[serde(default)]
     auto_cancel_outdated_pr_pipelines: Option<bool>,
+    /// RAL-521: this review's own override for whether its manual checks are
+    /// computed once, when its review branches are first created, and then
+    /// reused through later merges, rebases, and automated fix iterations.
+    /// `None` (or the field being absent) means "inherit the project/global
+    /// default", which resolves to `true` (caching on by default).
+    #[serde(default)]
+    cache_manual_checks: Option<bool>,
 }
 
 /// Body for `POST /api/guardians/{id}/details` -- the board's single
@@ -13247,6 +13268,9 @@ struct GuardianDetailsBody {
     /// RAL-510: see [`GuardianSettingsBody::auto_cancel_outdated_pr_pipelines`].
     #[serde(default)]
     auto_cancel_outdated_pr_pipelines: Option<bool>,
+    /// RAL-521: see [`GuardianSettingsBody::cache_manual_checks`].
+    #[serde(default)]
+    cache_manual_checks: Option<bool>,
     /// Full desired squash membership: every project in this list gets
     /// squash turned ON, every other project in the review's
     /// [`crate::guardian::GuardianView::projects`] gets it turned OFF.
@@ -13674,6 +13698,11 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
             return store_error(&e);
         }
     }
+    if let Some(enabled) = req.cache_manual_checks {
+        if let Err(e) = store.set_guardian_cache_manual_checks(id, Some(enabled)) {
+            return store_error(&e);
+        }
+    }
     // RAL-213: every setting above is a plain DB column write that a running
     // merge never re-reads mid-flight -- restart it now so the new setting
     // actually takes effect on this build instead of only the next one.
@@ -13981,6 +14010,11 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
     }
     if let Some(enabled) = req.auto_cancel_outdated_pr_pipelines {
         if let Err(e) = store.set_guardian_auto_cancel_outdated_pr_pipelines(id, Some(enabled)) {
+            return store_error(&e);
+        }
+    }
+    if let Some(enabled) = req.cache_manual_checks {
+        if let Err(e) = store.set_guardian_cache_manual_checks(id, Some(enabled)) {
             return store_error(&e);
         }
     }
@@ -27329,6 +27363,29 @@ remediation_attempts=1
         assert_eq!(r.status, 200);
         assert!(r.body.contains("\"match_pr_branch_name\":false"));
         assert!(r.body.contains("\"effective_match_pr_branch_name\":false"));
+    }
+
+    // RAL-521: the review settings endpoint accepts `cache_manual_checks`
+    // (default on) and the view reports both the raw override and the
+    // effective resolved value.
+    #[test]
+    fn guardian_settings_sets_and_resets_cache_manual_checks() {
+        let d = daemon();
+        let gid = make_guardian(&d);
+        // Unset inherits the enabled-by-default value.
+        let r = route(&d, "GET", &format!("/api/guardians/{gid}"), "");
+        assert!(r.body.contains("\"cache_manual_checks\":null"));
+        assert!(r.body.contains("\"effective_cache_manual_checks\":true"));
+        let body = serde_json::json!({"cache_manual_checks": false}).to_string();
+        let r = route(&d, "POST", &format!("/api/guardians/{gid}/settings"), &body);
+        assert_eq!(r.status, 200);
+        assert!(r.body.contains("\"cache_manual_checks\":false"));
+        assert!(r.body.contains("\"effective_cache_manual_checks\":false"));
+        let body = serde_json::json!({"cache_manual_checks": true}).to_string();
+        let r = route(&d, "POST", &format!("/api/guardians/{gid}/settings"), &body);
+        assert_eq!(r.status, 200);
+        assert!(r.body.contains("\"cache_manual_checks\":true"));
+        assert!(r.body.contains("\"effective_cache_manual_checks\":true"));
     }
 
     #[test]

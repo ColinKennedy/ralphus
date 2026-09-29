@@ -684,6 +684,24 @@ pub struct GuardianView {
     /// [`Self::auto_fix_pr_errors`]), else resolves to `true` at dispatch
     /// time (on by default -- unlike most opt-in review settings).
     pub auto_cancel_outdated_pr_pipelines: Option<bool>,
+    /// RAL-521: this review's own override for whether its manual checks are
+    /// computed once, when its review branches are first created, and then
+    /// reused through later merges, rebases, and automated fix iterations.
+    /// `None` means "inherit the project/global default" (resolved into
+    /// [`Self::effective_cache_manual_checks`] at hydration time).
+    pub cache_manual_checks: Option<bool>,
+    /// RAL-521: [`Self::cache_manual_checks`] resolved against the
+    /// database-backed project setting, the project-level `.ralphus.toml
+    /// [review] cache_manual_checks` default, and the live global config --
+    /// always a plain `bool`, `true` (caching on) when every layer is
+    /// unset. The merge engine gates manual-checks regeneration on this
+    /// plus [`Self::manual_checks_cached`].
+    pub effective_cache_manual_checks: bool,
+    /// RAL-521: `true` once manual-checks generation has produced commands
+    /// for this review. Under an enabled [`Self::effective_cache_manual_checks`]
+    /// the merge engine treats the stored `manual_commands` as current and
+    /// skips regeneration on every merge/rebase/fix after the first.
+    pub manual_checks_cached: bool,
     /// The review source type. `git` (the default and only fully-implemented
     /// type) drives the branch-stacking flow; other values are placeholders for
     /// future non-git review kinds (see CCTL-112). Existing/derived reviews are
@@ -3089,6 +3107,45 @@ impl Store {
         }
     }
 
+    /// RAL-521: set this review's own manual-check caching override
+    /// (`[[review]] cache_manual_checks`, or the board/CLI settings
+    /// endpoint). `None` inherits the project/global default.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] when no such guardian exists.
+    pub fn set_guardian_cache_manual_checks(&self, id: &str, enabled: Option<bool>) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE guardians SET cache_manual_checks=?, updated_at_ms=? WHERE id=?",
+            params![enabled.map(i64::from), crate::store::now_ms(), id],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// RAL-521: record that manual-checks generation has produced commands
+    /// for this review. The marker is what lets a later merge/rebase/fix
+    /// (under an enabled `cache_manual_checks`) recognize the already
+    /// computed result and skip regeneration. The merge engine never resets
+    /// it back to `false` -- a review keeps its first generation for its
+    /// whole life.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] when no such guardian exists.
+    pub fn set_guardian_manual_checks_cached(&self, id: &str, cached: bool) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE guardians SET manual_checks_cached=?, updated_at_ms=? WHERE id=?",
+            params![i64::from(cached), crate::store::now_ms(), id],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Set this review's own override of the auto-fix prompt template
     /// (RAL-395). `None` inherits the project/global default. Callers must
     /// validate the `<<prompt>>` placeholder is present before calling this
@@ -4658,7 +4715,7 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, manual_checks_basis, manual_checks_focus
+                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus
                  , summary_format FROM guardians WHERE id=?", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
                 params![id],
                 Self::map_guardian_row,
@@ -4774,7 +4831,7 @@ impl Store {
     /// (`crate::store_pool`) can serve it without the writer lock.
     pub(crate) fn list_guardians_conn(conn: &Connection) -> Result<Vec<GuardianView>> {
         let mut stmt = conn.prepare(
-            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, manual_checks_basis, manual_checks_focus
+            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus
              , summary_format FROM guardians ORDER BY created_at_ms DESC", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
         )?;
         let rows = stmt
@@ -4908,9 +4965,11 @@ impl Store {
             base_shift_rebuild_targets: r.get(65)?,
             base_shift_exhausted_notified_at_ms: r.get(66)?,
             auto_cancel_outdated_pr_pipelines: r.get::<_, Option<i64>>(67)?.map(|v| v != 0),
-            manual_checks_basis: r.get(68)?,
-            manual_checks_focus: r.get(69)?,
-            summary_format: r.get(70)?,
+            cache_manual_checks: r.get::<_, Option<i64>>(68)?.map(|v| v != 0),
+            manual_checks_cached: r.get::<_, i64>(69)?,
+            manual_checks_basis: r.get(70)?,
+            manual_checks_focus: r.get(71)?,
+            summary_format: r.get(72)?,
         })
     }
 
@@ -5297,6 +5356,20 @@ impl Store {
             .or(live_global.dual_root_pr)
             .unwrap_or(false);
 
+        // RAL-521: manual-check caching, layered per-review override >
+        // database-backed project default > explicit `.ralphus.toml [review]`
+        // value > the live global config > `true` (caching on). Unlike the
+        // boolean settings above there is no creation-time stamp for this
+        // option, so the chain is shorter by design; and unlike most of them
+        // the built-in default is `true` -- reusing the first manual-checks
+        // result is the intended behavior, with `false` as the opt-out.
+        let effective_cache_manual_checks = row
+            .cache_manual_checks
+            .or(db_settings.cache_manual_checks)
+            .or(explicit_project.cache_manual_checks)
+            .or(live_global.cache_manual_checks)
+            .unwrap_or(true);
+
         // RAL-193: this review's own agent cost -- conflict resolution and
         // prover calls made by the guardian merge machinery -- scoped to
         // the current merge attempt and cumulatively across every
@@ -5396,6 +5469,9 @@ impl Store {
             base_shift_rebuild_targets,
             base_shift_exhausted_notified_at_ms: row.base_shift_exhausted_notified_at_ms,
             auto_cancel_outdated_pr_pipelines: row.auto_cancel_outdated_pr_pipelines,
+            cache_manual_checks: row.cache_manual_checks,
+            effective_cache_manual_checks,
+            manual_checks_cached: row.manual_checks_cached != 0,
             match_pr_branch_name: row.match_pr_branch_name,
             effective_match_pr_branch_name,
             separate_pr_branch: row.separate_pr_branch,
@@ -5888,6 +5964,15 @@ struct GuardianRow {
     /// force-pushed onto the same branch. `None` inherits the
     /// project/global default.
     auto_cancel_outdated_pr_pipelines: Option<bool>,
+    /// RAL-521: per-review override for whether this review's manual checks
+    /// are computed once, when its review branches are first created, and
+    /// then reused through later merges, rebases, and automated fix
+    /// iterations. `None` inherits the project/global default.
+    cache_manual_checks: Option<bool>,
+    /// RAL-521: whether manual-checks generation has already produced
+    /// commands for this review (the one-time-computed marker the merge
+    /// engine consults when `effective_cache_manual_checks` is on).
+    manual_checks_cached: i64,
 }
 
 #[cfg(test)]
@@ -7410,6 +7495,42 @@ mod tests {
         assert!(
             store
                 .set_guardian_proof_skip_auto_clean("nope", Some(true))
+                .is_err()
+        );
+    }
+
+    // RAL-521: `cache_manual_checks` defaults to ON (caching enabled) and
+    // the per-review override flips it off/on, with the effective value
+    // resolving through the hydration chain.
+    #[test]
+    fn cache_manual_checks_defaults_on_and_toggles_independently() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.cache_manual_checks, None);
+        assert!(g.effective_cache_manual_checks, "defaults to caching on");
+
+        store
+            .set_guardian_cache_manual_checks(&id, Some(false))
+            .unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.cache_manual_checks, Some(false));
+        assert!(!g.effective_cache_manual_checks);
+
+        store
+            .set_guardian_cache_manual_checks(&id, Some(true))
+            .unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert!(g.effective_cache_manual_checks);
+
+        // Resetting back to None restores the built-in default.
+        store.set_guardian_cache_manual_checks(&id, None).unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert!(g.effective_cache_manual_checks);
+
+        assert!(
+            store
+                .set_guardian_cache_manual_checks("nope", Some(false))
                 .is_err()
         );
     }

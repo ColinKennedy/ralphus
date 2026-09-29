@@ -250,6 +250,16 @@ pub struct ReviewConfig {
     /// over this.
     #[serde(default)]
     pub auto_cancel_outdated_pr_pipelines: Option<bool>,
+    /// RAL-521: whether a review's manual checks are computed once, when its
+    /// review branches are first created, and then reused through later
+    /// merges, rebases, and automated fix iterations. `None` means unset,
+    /// which resolves to `true` (see [`Self::cache_manual_checks`], on by
+    /// default -- caching avoids re-running the manual-checks agent for work
+    /// that a rebase or autofix did not change); per-project scalars win
+    /// over the global layer, same as `skip_worktrees`. A per-review override
+    /// (see `Guardian::cache_manual_checks` in `guardian.rs`) wins over this.
+    #[serde(default)]
+    pub cache_manual_checks: Option<bool>,
     /// RAL-395: the prompt template handed to the resolver agent when
     /// `auto_fix_pr_errors` fires, with `<<prompt>>` replaced by the
     /// concatenated prompts of the failing branch's attached Cells. `None`
@@ -524,6 +534,14 @@ impl ReviewConfig {
         self.auto_cancel_outdated_pr_pipelines.unwrap_or(true)
     }
 
+    /// Whether a review's manual checks are computed once at initial branch
+    /// creation and reused through later merges/rebases/fixes (unset
+    /// resolves to `true` -- caching on by default). RAL-521.
+    #[must_use]
+    pub fn cache_manual_checks(&self) -> bool {
+        self.cache_manual_checks.unwrap_or(true)
+    }
+
     /// The configured default auto-fix prompt template, unset resolves to
     /// `None` -- callers fall back to [`DEFAULT_AUTO_FIX_PROMPT_TEMPLATE`].
     /// RAL-395.
@@ -657,6 +675,7 @@ impl ReviewConfig {
             auto_cancel_outdated_pr_pipelines: over
                 .auto_cancel_outdated_pr_pipelines
                 .or(self.auto_cancel_outdated_pr_pipelines),
+            cache_manual_checks: over.cache_manual_checks.or(self.cache_manual_checks),
             auto_fix_prompt_template: over
                 .auto_fix_prompt_template
                 .or(self.auto_fix_prompt_template),
@@ -820,6 +839,10 @@ pub const REVIEW_FIELD_PARITY: &[(&str, ReviewFieldDefault)] = &[
     (
         "auto_cancel_outdated_pr_pipelines",
         ReviewFieldDefault::ProjectDefault(|c| c.auto_cancel_outdated_pr_pipelines.is_some()),
+    ),
+    (
+        "cache_manual_checks",
+        ReviewFieldDefault::ProjectDefault(|c| c.cache_manual_checks.is_some()),
     ),
     (
         "auto_fix_prompt_template",
@@ -4443,6 +4466,39 @@ mod tests {
         assert!(!global.clone().merge(project).match_pr_branch_name());
         // Project unset falls back to the global value.
         assert!(global.merge(ReviewConfig::default()).match_pr_branch_name());
+    }
+
+    // ── cache_manual_checks (RAL-521) ──────────────────────────────────────
+
+    #[test]
+    fn cache_manual_checks_defaults_to_true_when_unset() {
+        assert!(ReviewConfig::default().cache_manual_checks());
+        assert!(from_toml_str("[review]\nskip_worktrees = true\n").cache_manual_checks());
+    }
+
+    #[test]
+    fn cache_manual_checks_parses_explicit_values() {
+        let c = from_toml_str("[review]\ncache_manual_checks = false\n");
+        assert_eq!(c.cache_manual_checks, Some(false));
+        assert!(!c.cache_manual_checks());
+        let c = from_toml_str("[review]\ncache_manual_checks = true\n");
+        assert_eq!(c.cache_manual_checks, Some(true));
+        assert!(c.cache_manual_checks());
+    }
+
+    #[test]
+    fn merge_cache_manual_checks_project_wins() {
+        let global = ReviewConfig {
+            cache_manual_checks: Some(true),
+            ..ReviewConfig::default()
+        };
+        let project = ReviewConfig {
+            cache_manual_checks: Some(false),
+            ..ReviewConfig::default()
+        };
+        assert!(!global.clone().merge(project).cache_manual_checks());
+        // Project unset falls back to the global value.
+        assert!(global.merge(ReviewConfig::default()).cache_manual_checks());
     }
 
     // ── auto_submit_pr_stack (RAL-317) ──────────────────────────────────────
