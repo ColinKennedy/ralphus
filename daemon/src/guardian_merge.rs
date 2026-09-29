@@ -11377,6 +11377,20 @@ fn generate_final_summary(
                 WARNING,
                 "ralphus [guardian] review {id} summary generation: unresolvable resolver agent: {message}"
             );
+            let guard = store.lock();
+            let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::WARNING,
+                source: "guardian",
+                message: "summary generation skipped: unresolvable resolver agent",
+                scope: Some("guardian"),
+                squad_id: None,
+                guardian_id: Some(id),
+                cell_id: None,
+                task: None,
+                log_path: None,
+                payload: serde_json::json!({"error": message}),
+                admin_only: false,
+            });
             return;
         }
     };
