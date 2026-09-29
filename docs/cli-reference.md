@@ -829,5 +829,19 @@ use; see `READ_ONLY_NOTE`.
         - (read-only-safe) list-forge-tokens user [str]  {List which forge hosts a ralphus user has a token configured for. Never returns the token value itself.}
         - set-forge-token user [str] --host [host] --token [token]  {Set or replace a ralphus user's personal access token for one forge host (e.g. gitlab.com), so their fork-routed worktrees can push over HTTPS without any SSH key setup.}
     - (read-only-safe) validate file [path...]  {Validate one or more task TOML files.}
+    - waypoint  {Coordinate cross-squad work: create waypoints, manage rosters, and track bearings/deliveries (RAL-400).}
+        - bearing  {Append a completed-work bearing to a waypoint's delivery feed.}
+            - add waypoint_id [id] producer_kind [review|squad] producer_id [str] --commit-id [str] --commit-summary [text] --entity-uri [uri] --summary [text]  {Append a completed-work bearing to a waypoint's durable delivery feed.}
+        - (read-only-safe) bearings waypoint_id [id]  {List a waypoint's bearing feed.}
+        - close waypoint_id [id]  {Manually close an open waypoint.}
+        - create --agent [name] --allow-advisory --label [text] --model [name] --prompt [text] --roster [kind:entry_id[:mode]...]  {Create a cross-squad waypoint coordinating the given roster of reviews/squads (RAL-400).}
+        - (read-only-safe) deliveries waypoint_id [id]  {Show a waypoint's delivery/event history.}
+        - (read-only-safe) get waypoint_id [id]  {Show one waypoint's settings, roster, tracked projects, and delivery summary.}
+        - (read-only-safe) list --project [name] --state [open|closed]  {List waypoints.}
+        - reopen waypoint_id [id]  {Reopen a closed waypoint.}
+        - roster  {Add/remove/change the mode of a waypoint's roster entries.}
+            - add waypoint_id [id] kind [review|squad] entry_id [id] --mode [block|advisory]  {Add (or upsert the mode of) one roster entry on a waypoint.}
+            - mode waypoint_id [id] entry_id [id] mode [block|advisory]  {Override the block/advisory mode of one existing roster entry.}
+            - remove waypoint_id [id] entry_id [id]  {Remove one roster entry from a waypoint.}
 ```
 <!-- END GENERATED HELP-MAP (RAL-110) -->
