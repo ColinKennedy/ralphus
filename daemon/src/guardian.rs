@@ -1297,6 +1297,50 @@ impl Store {
              VALUES(?,?,?,?,?,NULL,?,NULL,?,?,?,?,?,?,?,?,1,?,?)",
             params![id, name, base_branch, git_root, project, GuardianStatus::Collecting.as_str(), squad_id, review_key, now, now, now, i64::from(match_pr_branch_name), i64::from(auto_submit_pr_stack), i64::from(separate_pr_branch), owner, i64::from(dual_root_pr)],
         )?;
+        let defaults = self.resolve_review_config(Path::new(git_root));
+        let auto_build_json = defaults
+            .auto_build
+            .as_deref()
+            .map(|command| {
+                serde_json::to_string(&GuardianAutoBuild {
+                    command: Some(command.to_string()),
+                    prompt: None,
+                    system_prompt: None,
+                    system_prompt_position: None,
+                    agent: None,
+                    model: None,
+                })
+            })
+            .transpose()
+            .map_err(|err| {
+                StoreError::InvalidTransition(format!("serialize review auto-build: {err}"))
+            })?;
+        // These are creation-time stamps, not user edits. Writing them directly
+        // preserves the initial snapshot without announcing spurious settings
+        // changes to review watchers.
+        self.conn.execute(
+            "UPDATE guardians SET \
+             resolver_agent=?, resolver_model=?, machine=?, maximum_budget_usd=?, \
+             proof_scope=?, proof_skip_auto_clean=?, skip_worktrees=?, skip_base_updates=?, \
+             auto_submit_pr_stack=?, match_pr_branch_name=?, checks=?, auto_build_json=?, \
+             summary_format=? WHERE id=?",
+            params![
+                defaults.default_resolver_agent(),
+                defaults.default_resolver_model(),
+                defaults.default_machine(),
+                defaults.default_maximum_budget_usd(),
+                defaults.default_proof_scope(),
+                i64::from(defaults.proof_skip_auto_clean()),
+                i64::from(defaults.skip_worktrees()),
+                i64::from(defaults.skip_base_updates()),
+                i64::from(auto_submit_pr_stack),
+                i64::from(match_pr_branch_name),
+                crate::store::to_json(&defaults.checks),
+                auto_build_json,
+                defaults.summary_format,
+                id,
+            ],
+        )?;
         // RAL-<new>: a new review coming into existence is the single most
         // consequential event in this file, and every route into it
         // (`create_guardian_for_squad`/`_for_project`/`_keyed` directly) went
@@ -6675,11 +6719,11 @@ mod tests {
     }
 
     #[test]
-    fn resolver_defaults_none_and_sets() {
+    fn resolver_defaults_are_stamped_and_can_be_changed() {
         let store = Store::open_in_memory().unwrap();
         let id = store.create_guardian("r", "main", "/repo").unwrap();
         let g = store.get_guardian(&id).unwrap();
-        assert_eq!(g.resolver_agent, None);
+        assert_eq!(g.resolver_agent.as_deref(), Some("ollama"));
         assert_eq!(g.resolver_model, None);
         store
             .set_guardian_resolver(&id, Some(Some("claude")), Some(Some("claude-opus-4-8")))
@@ -7278,7 +7322,7 @@ mod tests {
         store
             .conn
             .execute(
-                "UPDATE guardians SET skip_worktree_checks=1 WHERE id=?",
+                "UPDATE guardians SET skip_worktree_checks=1, proof_scope=NULL WHERE id=?",
                 params![id],
             )
             .unwrap();
@@ -7302,7 +7346,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let id = store.create_guardian("r", "main", "/repo").unwrap();
         let g = store.get_guardian(&id).unwrap();
-        assert_eq!(g.proof_scope, None);
+        assert_eq!(g.proof_scope.as_deref(), Some("each_branch"));
         assert_eq!(g.effective_proof_scope, "each_branch");
         assert!(!g.effective_proof_skip_auto_clean);
 
@@ -7345,7 +7389,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let id = store.create_guardian("r", "main", "/repo").unwrap();
         let g = store.get_guardian(&id).unwrap();
-        assert_eq!(g.skip_base_updates, None);
+        assert_eq!(g.skip_base_updates, Some(false));
         assert!(
             !g.effective_skip_base_updates,
             "defaults to auto-update on (no skip)"
