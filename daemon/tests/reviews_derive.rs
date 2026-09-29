@@ -2051,12 +2051,21 @@ fn worktree_sharing_gates_branch_ready_until_all_sessions_done() {
     let ids = derive_reviews(&store, &run_id, &file).expect("derive ok");
     let gid = ids[0].clone();
 
-    // Task A (explicit) finishes -- branch must stay `pending`: task B (the
-    // implicit worktree sibling) hasn't finished yet.
+    // Task A (explicit) reaches successful terminal completion -- branch
+    // must still stay `pending`: task B (the implicit worktree sibling)
+    // hasn't reached a terminal state yet.
     store
         .lock()
         .set_cell_state(&run_id, 0, 0, NodeState::Done)
         .unwrap();
+    store
+        .lock()
+        .set_task_state(&run_id, 0, NodeState::Done)
+        .unwrap();
+    let squad = store.lock().get_squad(&run_id).unwrap();
+    assert_eq!(squad.tasks[0].state, "done");
+    assert_eq!(squad.tasks[1].state, "pending");
+    assert_eq!(squad.tasks[1].cells[0].state, "pending");
     let n = store
         .lock()
         .mark_ready_branches_with_done_cells(&gid)
@@ -2067,17 +2076,13 @@ fn worktree_sharing_gates_branch_ready_until_all_sessions_done() {
         "pending"
     );
 
-    // Task B finishes too -- now every worktree-sharing session is done.
-    // Both owning tasks (RAL-442) also need to reach `done` -- mirroring
+    // Task B finishes too -- now every worktree-sharing cell is done. Its
+    // owning task (RAL-442) also needs to reach `done` -- mirroring
     // `run_task_finalizer` clearing task-level proofs -- before the branch
     // may promote.
     store
         .lock()
         .set_cell_state(&run_id, 1, 0, NodeState::Done)
-        .unwrap();
-    store
-        .lock()
-        .set_task_state(&run_id, 0, NodeState::Done)
         .unwrap();
     store
         .lock()
