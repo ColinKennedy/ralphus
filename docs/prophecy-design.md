@@ -224,19 +224,13 @@ Exfiltration with no upside.
 crosses the provider boundary today. Remote auth is the provider's own business
 (SSH keys for `ralphus-ssh-provider`). Preserve that.
 
-### 6.3 What genuinely breaks — the commit trailer
+### 6.3 Commit trailer installation
 
-`git_hooks::sync_coauthor_hook` uses `std::fs::write` and the **local**
-`guardian_merge::git` free function, and is only called from
-`execute_worktree_plan` (`daemon/src/worktrees.rs:1204`) — the local
-`git worktree add` path. `provision_remote_with_targets` never calls it.
-
-- **A remote worktree receives no `prepare-commit-msg` hook at all.**
-- So RAL-445's `Co-authored-by:` is **already silently absent from every remote
-  commit today**, and a `Ralphus-Cell:` trailer would inherit that hole.
-- Mechanical fix: port the module from `&Path` to `&Workspace` and use the
-  existing `ws.write_file()` / `ws.git()`.
-- File as a RAL-445 bug independent of this subsystem (§13).
+`git_hooks::sync_commit_metadata_hook` operates on `Workspace`, resolving the
+hooks path through `Workspace::git` and writing the executable hook through
+the workspace's provider-aware file API. It runs for local worktree
+materialization, remote provisioning, and project registration. Remote
+worktrees therefore receive the same `prepare-commit-msg` hook as local ones.
 
 Same shape, smaller: `ghost::current_revision` (`daemon/src/ghost.rs:202`)
 calls the local `git`, so on a remote `cwd` it returns `None` and the revision
@@ -307,16 +301,16 @@ Ralphus-Cell: cell:squad-000000000012:0:1
 3. **Keep the attempt number out**, so the same cell across attempts 1 and 3
    yields one trailer rather than two (`--if-exists addIfDifferent` keys on the
    exact key+value pair).
-4. **The hook already exists.** RAL-445's `daemon/src/git_hooks.rs` installs a
+4. **The hook is managed for every workspace.** RAL-445's
+   `daemon/src/git_hooks.rs` installs a
    `prepare-commit-msg` hook running
    `git interpret-trailers --in-place --if-exists addIfDifferent --trailer "Co-authored-by: …"`,
    synced on every squad worktree materialization and at project registration.
    Hooks are repo-common, so one install covers every worktree; a `MARKER`
    guard keeps it from clobbering a hand-authored hook; `[commits]
-   add_coauthor` opts a project out. Adding `Ralphus-Cell:` is a second
-   `--trailer` flag — and since the hook inherits the cell's environment, it
-   reads `$RALPHUS_ENTITY_URI` for free once that is exported.
-5. **Two pre-existing RAL-445 gaps block the trailer half** — see §13.
+   add_coauthor` opts a project out of only the co-author trailer. The hook
+   adds `Ralphus-Cell:` from `$RALPHUS_ENTITY_URI`, which the scheduler exports
+   for each cell.
 
 ---
 
@@ -407,14 +401,10 @@ model against real traffic before any prompt work exists.
       guardian-stamped + cell-authored, via `cells.review_guardian_id`,
       RAL-314) feeds the block, `Store::mark_prophecies_published` stamps
       the ones actually folded in right after the PR row is created
-- [ ] `Ralphus-Cell:` trailer on the existing RAL-445 hook (§8.2) — **still
-      blocked**, but not on "the two gaps in §13" as originally framed: §13's
-      re-investigation found RAL-445's hook infrastructure
-      (`git_hooks.rs`/`sync_coauthor_hook`/`prepare-commit-msg`) does not
-      exist in this codebase at all. There is no existing hook to add a
-      second `--trailer` flag to. Building one from scratch is a
-      differently-shaped, RAL-445-sized task of its own, out of scope here —
-      not attempted under this phase's much narrower framing.
+- [x] `Ralphus-Cell:` trailer on the managed hook (§8.2), including remote
+      worktrees. The scheduler exports the cell URI, the hook uses Git's
+      deduplicating trailer parser, and review squashes preserve the union of
+      source trailers.
 
 ### Phase 5 — derive the ghost (optional)
 
@@ -505,36 +495,15 @@ but better as a written decision than an unexamined default. Note
 
 ---
 
-## 13. Tickets to file regardless of this subsystem
+## 13. Commit-trailer safeguards
 
-Both were meant to be pre-existing RAL-445 bugs surfaced while designing
-§8.2. **Reality check, on picking this back up in a fresh working tree**:
-`daemon/src/git_hooks.rs`, `sync_coauthor_hook`, and `prepare-commit-msg`
-do not exist anywhere in this codebase — a repo-wide search turns up zero
-hits outside this design doc itself. RAL-445's commit-trailer hook
-infrastructure this section (and §6.3, §8.2) describes was evidently never
-merged to this branch, or lived only on the branch this doc's header says it
-was written against (`worktree-daemon-perf-plan-main`, 2026-09-25). Do not
-trust §6.3/§8.2's file-level claims about it without re-verifying first.
+`squash_review_commits` collects the deduplicated union of source trailers
+with `git log --format=%(trailers:unfold)` and appends it to the squash
+message. This preserves `Ralphus-Cell:` associations alongside existing
+trailers such as `Co-authored-by:` when Guardian creates a review squash.
 
-1. **RAL-445 does not reach remote worktrees.** Not fixable as described —
-   there is no `git_hooks.rs`/`sync_coauthor_hook` to port from `&Path` to
-   `&Workspace`. If/when RAL-445's hook infrastructure actually lands, this
-   ticket should be re-filed against it then; inventing a whole
-   hook-installation subsystem here, under an "port &Path to &Workspace"
-   framing that presumes it already exists, would be a much bigger and
-   differently-shaped change than this ticket describes.
-2. **RAL-445 loses trailers on squash.** **Fixed independently of the above**
-   — `squash_review_commits` (`daemon/src/guardian_merge.rs`) genuinely does
-   exist and genuinely did discard every trailer on every squashed commit
-   (`--no-verify` + a subject-only rebuilt message via `git log --format=%s`),
-   which is a real bug regardless of whether any hook is installed today: a
-   trailer can already reach a commit by other means (manual authorship, a
-   future feature). Now collects the deduped union of every squashed
-   commit's trailers (`git log --format=%(trailers:unfold)`) and re-appends
-   them to the squash commit's own message.
-
-Optional third, smaller: `ghost::current_revision` is local-only (§6.3).
+`ghost::current_revision` remains local-only; a remote cell can still record a
+prophecy without its optional revision marker.
 
 ---
 

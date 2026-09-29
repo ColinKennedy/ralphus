@@ -2752,17 +2752,17 @@ fn register_project(daemon: &Daemon, body: &str) -> Reply {
                     return store_error(&e);
                 }
             }
-            // RAL-445: `validate_project_location` above already confirmed
+            // RAL-445/RAL-531: `validate_project_location` above already confirmed
             // `req.path` is a real, local git repository, so this is safe to
             // do inline -- a worktree cell run will re-sync it anyway
-            // (`worktrees::sync_coauthor_hook_best_effort`), but doing it at
+            // (`worktrees::sync_commit_metadata_hook_best_effort`), but doing it at
             // registration too covers a cell whose `cwd` is the project root
             // itself rather than a `ralphus:new-worktree/...` placeholder.
             if req.vcs == "git" {
                 let enabled =
                     crate::config::load_commit_config(Path::new(&req.path)).add_coauthor();
-                if let Err(e) = crate::git_hooks::sync_coauthor_hook(Path::new(&req.path), enabled)
-                {
+                let workspace = crate::workspace::Workspace::local(&req.path);
+                if let Err(e) = crate::git_hooks::sync_commit_metadata_hook(&workspace, enabled) {
                     crate::rlog!(
                         WARNING,
                         "ralphus [server] could not sync co-author hook for project {:?}: {e}",
@@ -17498,10 +17498,10 @@ mod tests {
         assert!(contents.contains("ralphus:coauthor-hook"));
     }
 
-    /// RAL-445: `[commits] add_coauthor = false` in the registered project's
-    /// `.ralphus.toml` means no hook is installed at registration time.
+    /// RAL-531: `[commits] add_coauthor = false` retains cell associations
+    /// while omitting Ralphus's optional co-author attribution.
     #[test]
-    fn register_project_route_skips_hook_when_project_disables_it() {
+    fn register_project_route_keeps_cell_hook_when_project_disables_coauthor() {
         let d = daemon();
         let repo = tmp_git_repo("register-hook-disabled");
         std::fs::write(
@@ -17518,7 +17518,9 @@ mod tests {
         assert_eq!(r.status, 201, "{}", r.body);
 
         let hook_path = repo.join(".git").join("hooks").join("prepare-commit-msg");
-        assert!(!hook_path.exists());
+        let contents = std::fs::read_to_string(&hook_path).unwrap();
+        assert!(contents.contains("Ralphus-Cell"));
+        assert!(!contents.contains("Co-authored-by: ralphus-bot"));
     }
 
     #[test]

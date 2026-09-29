@@ -613,20 +613,23 @@ at); `404` if no project is registered under that exact name.
 
 ### Commit co-author attribution
 
-Ralphus adds a `Co-authored-by: ralphus-bot
-<ralphus-bot@users.noreply.github.com>` trailer to commits made in a managed
-git project by installing a managed `prepare-commit-msg` hook. Attribution is
-enabled by default. Disable it in the project's `.ralphus.toml` (or the
-global config layered below it):
+Ralphus installs a managed `prepare-commit-msg` hook in every local or remote
+managed Git workspace. For a cell-authored commit, it adds a stable, readable
+association trailer such as `Ralphus-Cell: cell:squad-000000000012:0:1`.
+That lets the commit retain its associated prophecy insights even when forge
+metadata is unavailable. The hook also adds a `Co-authored-by: ralphus-bot
+<ralphus-bot@users.noreply.github.com>` trailer by default. Disable only that
+optional attribution in the project's `.ralphus.toml` (or the global config
+layered below it):
 
 ```toml
 [commits]
 add_coauthor = false
 ```
 
-The per-project value wins over the global value. Ralphus creates, updates, or
-removes its managed hook the next time the project is registered or a
-worktree is materialized; it never overwrites a hook it did not install.
+The per-project value wins over the global value. Ralphus creates or updates
+its managed hook the next time the project is registered or a worktree is
+materialized; it never overwrites a hook it did not install.
 
 ### `GET /api/agents`
 List the agents selectable for a project -- built-in backends plus every

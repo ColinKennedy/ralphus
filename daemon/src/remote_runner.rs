@@ -157,6 +157,12 @@ pub struct FileRequest {
     /// single file.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub recursive: bool,
+    /// `write-file` only: whether the created file must be executable.
+    ///
+    /// Git hooks are scripts, so a remote workspace needs this rather than
+    /// relying on the provider's default file mode.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub executable: bool,
 }
 
 /// The payload sent to a provider's `run` verb.
@@ -1225,6 +1231,7 @@ impl ProviderRunner {
             path: path.to_string(),
             content: None,
             recursive: false,
+            executable: false,
         };
         let payload = serde_json::to_string(&req)
             .map_err(|e| format!("could not serialize read-file request: {e}"))?;
@@ -1238,10 +1245,34 @@ impl ProviderRunner {
     /// # Errors
     /// Any provider-side failure.
     pub fn write_file(&self, path: &str, content: &str, spec: &RunnerSpec) -> Result<(), String> {
+        self.write_file_with_mode(path, content, false, spec)
+    }
+
+    /// Write an executable file into a workspace on this machine.
+    ///
+    /// # Errors
+    /// Any provider-side failure.
+    pub fn write_executable_file(
+        &self,
+        path: &str,
+        content: &str,
+        spec: &RunnerSpec,
+    ) -> Result<(), String> {
+        self.write_file_with_mode(path, content, true, spec)
+    }
+
+    fn write_file_with_mode(
+        &self,
+        path: &str,
+        content: &str,
+        executable: bool,
+        spec: &RunnerSpec,
+    ) -> Result<(), String> {
         let req = FileRequest {
             path: path.to_string(),
             content: Some(content.to_string()),
             recursive: false,
+            executable,
         };
         let payload = serde_json::to_string(&req)
             .map_err(|e| format!("could not serialize write-file request: {e}"))?;
@@ -1263,6 +1294,7 @@ impl ProviderRunner {
             path: path.to_string(),
             content: None,
             recursive,
+            executable: false,
         };
         let payload = serde_json::to_string(&req)
             .map_err(|e| format!("could not serialize remove-path request: {e}"))?;

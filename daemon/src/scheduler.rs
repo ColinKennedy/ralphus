@@ -2483,6 +2483,13 @@ fn run_cell_worker(
     };
     let mut merged_profile_env = selection.env;
     merged_profile_env.extend(spec.env_overrides.clone());
+    // The hook consumes the stable cell URI at commit time. Insert it after
+    // user/profile environment values so a cell cannot accidentally associate
+    // its commits with another cell.
+    merged_profile_env.insert(
+        crate::git_hooks::ENTITY_URI_ENV.to_string(),
+        crate::ghost::cell_uri(squad_id, row.task_idx, row.idx),
+    );
     spec.env_overrides = merged_profile_env;
     register_secret_named_env_values(store, &spec.env_overrides);
 
@@ -9018,6 +9025,31 @@ mod tests {
             list.matches("worktree ").count(),
             2,
             "shared cwd/env placeholder should materialize exactly one extra worktree: {list}"
+        );
+    }
+
+    #[test]
+    fn execute_squad_exports_only_the_owning_cell_uri_for_commit_metadata() {
+        let toml = "[[task]]\nname=\"t\"\nno_commit_required=true\n[[task.cell]]\ncwd=\".\"\ncommand=\"do-thing\"\nenvironment={RALPHUS_ENTITY_URI=\"cell:squad-unrelated:7:9\"}\n";
+        let mut store = Store::open_in_memory().unwrap();
+        let file = toml::from_str(toml).unwrap();
+        let id = store.insert_squad(&file, None, false).unwrap();
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+
+        execute_squad(
+            &store,
+            &EnvCapturingRunner {
+                seen: Arc::clone(&seen),
+            },
+            &id,
+        );
+
+        let expected = crate::ghost::cell_uri(&id, 0, 0);
+        assert_eq!(
+            seen.lock().unwrap()[0].get(crate::git_hooks::ENTITY_URI_ENV),
+            Some(&expected),
+            "the commit hook must receive this cell's URI, never a user-supplied or unrelated one"
         );
     }
 

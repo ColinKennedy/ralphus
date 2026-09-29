@@ -971,20 +971,23 @@ pub fn ensure_worktree(root: &Path, branch: &str, upstream: &str) -> Result<Path
     )
 }
 
-/// Install or remove the RAL-445 co-author `prepare-commit-msg` hook for
-/// `root`'s project, per its resolved `.ralphus.toml` `[commits]
-/// add_coauthor` (`crate::config::load_commit_config`). Failure (e.g. a
-/// read-only hooks directory) is logged and swallowed rather than
+/// Install the RAL-445/RAL-531 `prepare-commit-msg` hook for a project
+/// workspace, per its resolved `.ralphus.toml` `[commits] add_coauthor`
+/// (`crate::config::load_commit_config`). Failure (e.g. a read-only hooks
+/// directory) is logged and swallowed rather than
 /// propagated -- a hook sync must never block a squad's actual work, and
 /// re-running this on the project's next materialization retries it anyway.
-fn sync_coauthor_hook_best_effort(root: &Path) {
-    let enabled = crate::config::load_commit_config(root).add_coauthor();
-    if let Err(e) = crate::git_hooks::sync_coauthor_hook(root, enabled) {
+fn sync_commit_metadata_hook_best_effort(
+    workspace: &crate::workspace::Workspace,
+    config_root: &Path,
+) {
+    let add_coauthor = crate::config::load_commit_config(config_root).add_coauthor();
+    if let Err(e) = crate::git_hooks::sync_commit_metadata_hook(workspace, add_coauthor) {
         // ralphus[ignore-rlog-pair]: worktree setup helper without access to Store for Cartographer logging
         crate::rlog!(
             WARNING,
-            "ralphus [worktrees] could not sync co-author hook for {}: {e}",
-            root.display()
+            "ralphus [worktrees] could not sync commit metadata hook for {}: {e}",
+            workspace.root().display()
         );
     }
 }
@@ -1005,7 +1008,7 @@ fn sync_coauthor_hook_best_effort(root: &Path) {
 /// [`set_explicit_upstream`] already relies on.
 ///
 /// Best-effort: failure is logged and swallowed, exactly like
-/// [`sync_coauthor_hook_best_effort`] -- a failed identity write must never
+/// [`sync_commit_metadata_hook_best_effort`] -- a failed identity write must never
 /// block a squad's actual work.
 pub(crate) fn apply_worktree_git_identity_best_effort(
     worktree_dir: &Path,
@@ -1223,7 +1226,7 @@ fn execute_worktree_plan(
     upstream: &str,
     plan: &WorktreePlan,
 ) -> Result<PathBuf, String> {
-    sync_coauthor_hook_best_effort(root);
+    sync_commit_metadata_hook_best_effort(&crate::workspace::Workspace::local(root), root);
     if plan.already_exists {
         set_explicit_upstream(&plan.wt, branch, upstream)?;
         resync_remote_tracking_branch(&plan.wt)?;
@@ -2048,6 +2051,11 @@ fn provision_remote_with_targets(
                 "error": result.as_ref().err(),
             }),
         );
+    if let Ok(workspace_root) = &result {
+        let workspace = crate::workspace::Workspace::on(workspace_root.as_str(), Some(machine))
+            .with_store(std::sync::Arc::clone(store));
+        sync_commit_metadata_hook_best_effort(&workspace, Path::new(&project.path));
+    }
     result
 }
 
