@@ -2292,6 +2292,7 @@ impl Store {
             // RAL-168: per-review override of the "each_branch" auto-clean-skip
             // sub-option. NULL means "inherit the project-level default".
             "ALTER TABLE guardians ADD COLUMN proof_skip_auto_clean INTEGER",
+            "ALTER TABLE guardians ADD COLUMN summary_format TEXT",
             // RAL-185: the machine this review's worktrees and merge run on.
             // NULL means the daemon's own host, which is every pre-RAL-185 row.
             "ALTER TABLE guardians ADD COLUMN machine TEXT",

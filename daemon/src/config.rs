@@ -3236,9 +3236,9 @@ mod tests {
 
     #[test]
     fn verify_skip_auto_clean_defaults_to_false() {
-        assert!(!ReviewConfig::default().verify_skip_auto_clean());
+        assert!(!ReviewConfig::default().proof_skip_auto_clean());
         let c = from_toml_str("[review]\nverify_skip_auto_clean = true\n");
-        assert!(c.verify_skip_auto_clean());
+        assert!(c.proof_skip_auto_clean());
     }
 
     #[test]
