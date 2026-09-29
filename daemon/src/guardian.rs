@@ -1335,6 +1335,27 @@ impl Store {
                 id,
             ],
         )?;
+        let auto_build_json = defaults
+            .auto_build
+            .as_deref()
+            .map(|command| {
+                serde_json::to_string(&GuardianAutoBuild {
+                    command: Some(command.to_string()),
+                    prompt: None,
+                    system_prompt: None,
+                    system_prompt_position: None,
+                    agent: None,
+                    model: None,
+                })
+            })
+            .transpose()
+            .map_err(|err| {
+                StoreError::InvalidTransition(format!("serialize review auto-build: {err}"))
+            })?;
+        self.conn.execute(
+            "UPDATE guardians SET auto_build_json=? WHERE id=?",
+            params![auto_build_json, id],
+        )?;
         // RAL-<new>: a new review coming into existence is the single most
         // consequential event in this file, and every route into it
         // (`create_guardian_for_squad`/`_for_project`/`_keyed` directly) went
