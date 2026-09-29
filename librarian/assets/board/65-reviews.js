@@ -1494,13 +1494,31 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
                 : "Manual checks aren't generated yet — they're only produced after every enabled branch in this review has finished rebasing with no pending conflicts.\nStill collecting or rebasing branches.";
             const label = isReady ? "▶ Run all" : (state === "generating" ? "▶ Generating…" : "▶ Waiting on branches…");
             const runAllBtn = `<button class="btn primary" ${isReady ? "" : "disabled"} data-click="runAllManualChecks" data-guardian-id="${esc(g.id)}" style="${cmds.length > 1 && isReady ? 'border-radius:6px 0 0 6px' : ''}"${isReady ? ` data-tip="${gateTip}"` : ""}>${label}</button>`;
-            return `<h3 class="section" data-tip="Shell commands suggested by the resolver agent to manually verify these changes.\nRegenerated every time the review branch is rebuilt.">manual checks${agentInspectBtn(g.id, "manual", "manual checks", g.manual_commands_agent || g.resolver_agent, g.manual_commands_model || g.resolver_model)}</h3>
+            return `<h3 class="section" data-tip="Shell commands suggested by the resolver agent to manually verify these changes.\nGenerated once when the review branch is rebuilt (or when the rebuilt stack's changes change), and re-generated on demand via Regenerate below.">manual checks${agentInspectBtn(g.id, "manual", "manual checks", g.manual_commands_agent || g.resolver_agent, g.manual_commands_model || g.resolver_model)}</h3>
               <div class="btn-row" style="position:relative;gap:0">
                 ${isReady ? runAllBtn : `<span data-tip="${gateTip}">${runAllBtn}</span>`}
                 ${isReady && cmds.length > 1 ? `<button class="btn" data-click="toggleManualMenu" data-guardian-id="${esc(g.id)}" style="border-left:none;border-radius:0 6px 6px 0;padding:4px 8px" data-tip="Show individual commands — run one at a time.">▾</button>
                 ${menuOpen ? `<div style="position:absolute;top:100%;left:0;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;min-width:200px;z-index:50;box-shadow:0 4px 12px rgba(0,0,0,.4);padding:4px 0;margin-top:2px">${menuItems}</div>` : ""}` : ""}
               </div>
               <div class="btn-row" style="margin-top:4px;position:relative;gap:0">${manualChecksTerminalBtns(g)}</div>
+              ${(() => {
+                // RAL-520: on-demand regeneration with optional reviewer
+                // steering. Advisory like every post-merge job -- it can be
+                // disabled while a post-merge job is running, but it never
+                // gates or blocks Merge / rebase.
+                const regenPending = pendingMergeActions.has(`${g.id}:regen`);
+                const regenBusy = regenPending || g.post_merge_status === "running";
+                const regenTip = regenPending
+                  ? "The regenerate request has been sent — waiting for the daemon to confirm."
+                  : g.post_merge_status === "running"
+                    ? "A post-merge job (check gates or manual-checks generation) is already running — wait for it to finish, then regenerate.\nThis never blocks Merge / rebase, which is unaffected by post-merge state."
+                    : "Ask the resolver agent to write the manual checks again, against the review branch's current changes.\nThe optional text field steers what the regenerated checks cover (e.g. \"focus on the CLI flags\"); leave it empty to keep the same coverage.\nRuns in the background and is advisory: it never blocks Approve, PR submission, or Merge / rebase.";
+                const regenBtn = regenBusy
+                  ? `<button class="btn" disabled>${regenPending ? "Regenerating…" : "↻ Regenerate"}</button>`
+                  : `<button class="btn" data-click="regenManualChecks" data-guardian-id="${esc(g.id)}" data-tip="${regenTip}">↻ Regenerate</button>`;
+                const focusInput = `<input id="manual-focus-${esc(g.id)}" type="text" style="flex:1;min-width:0;font-size:12px;padding:4px 6px" placeholder="optional focus — what should the regenerated checks cover?" value="${esc(g.manual_checks_focus || "")}" data-tip="Steering text for the next manual-checks regeneration, folded into the generation agent's prompt.\nOptional — leave empty to regenerate with the same coverage.\nRemembered on the review until the next regeneration.">`;
+                return `<div class="btn-row" style="margin-top:4px;gap:4px">${regenBusy ? `<span data-tip="${regenTip}">${regenBtn}</span>` : regenBtn}${focusInput}</div>`;
+              })()}
               ${manualChecksPeekBox(g)}`;
           })()}`;
         attachPeekResizeHandlers();
@@ -2592,6 +2610,27 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        */
       async function runAllManualChecks(id) {
         await guardianAction(`/api/guardians/${id}/run-manual-commands`, {});
+      }
+      // RAL-520: regenerate the manual checks on demand, with optional focus.
+      /**
+       * Asks the daemon to regenerate this review's manual checks, passing the
+       * reviewer's steering text from the section's focus field (empty = none).
+       *
+       * The pending key is `${id}:regen` so it never collides with the merge
+       * button's pending entry for the same review; the two are independent
+       * actions and one must never block the other.
+       * @param {string} id
+       * @returns {Promise<void>}
+       */
+      async function regenManualChecks(id) {
+        pendingMergeActions.add(`${id}:regen`);
+        renderReviewDetail();
+        const el = /** @type {HTMLInputElement|null} */ (document.getElementById(`manual-focus-${id}`));
+        const focus = el && typeof el.value === "string" ? el.value.trim() : "";
+        const resp = await guardianAction(`/api/guardians/${id}/manual-checks/regenerate`, focus ? { focus } : {});
+        if (resp && resp.ok) notify("info", "Manual-checks regeneration requested — it runs in the background.");
+        pendingMergeActions.delete(`${id}:regen`);
+        tick();
       }
       /**
        * Runs a single suggested manual-check command by index.

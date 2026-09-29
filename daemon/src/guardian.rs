@@ -991,6 +991,15 @@ pub struct GuardianView {
     /// When the post-merge phase most recently finished (epoch ms). `None`
     /// while it is still running.
     pub post_merge_finished_at_ms: Option<i64>,
+    /// RAL-520: the reviewer's steering text for manual-checks generation,
+    /// set via the board's regenerate control and folded into the generation
+    /// agent's prompt. `None` when no steering text is set.
+    pub manual_checks_focus: Option<String>,
+    /// RAL-520: what the last successful manual-checks generation ran
+    /// against -- a JSON `{"base_sha":…,"tip_tree":…}` basis. `None` when no
+    /// generation has succeeded yet, which forces the next post-merge run to
+    /// regenerate.
+    pub manual_checks_basis: Option<String>,
     /// RAL-193: input tokens spent on this review's own conflict-resolution
     /// and prover agent calls during the current merge attempt only --
     /// excludes the tasks/cells that fed into the review.
@@ -4026,23 +4035,34 @@ impl Store {
     }
 
     /// Mark this review's post-merge phase (check gates + manual-checks
-    /// generation) as started, clearing any previous run's result.
+    /// generation) as started, clearing any previous run's result, and return
+    /// the epoch-ms start stamp it recorded -- the worker that called this
+    /// compares that stamp against its own finish write so a superseded run
+    /// can never overwrite a newer one's state.
     ///
-    /// Called once the merge itself is complete -- every branch rebased and the
-    /// review already moved to `in_review`. The two jobs it covers run
-    /// concurrently against the finished stack; see [`GuardianView::post_merge_status`].
-    pub fn start_guardian_post_merge(&self, id: &str) -> Result<()> {
+    /// Called by the independent post-merge worker once the merge itself is
+    /// complete -- every branch rebased and the review already moved to
+    /// `in_review`. The two jobs it covers run concurrently against a scratch
+    /// checkout of the finished stack; see [`GuardianView::post_merge_status`].
+    pub fn start_guardian_post_merge(&self, id: &str) -> Result<i64> {
+        let started = crate::store::now_ms();
         self.conn.execute(
             "UPDATE guardians SET post_merge_status='running', post_merge_detail=NULL, \
              post_merge_started_at_ms=?, post_merge_finished_at_ms=NULL WHERE id=?",
-            params![crate::store::now_ms(), id],
+            params![started, id],
         )?;
-        Ok(())
+        Ok(started)
     }
 
-    /// Record the post-merge phase's outcome. `detail` is what failed when
-    /// `ok` is false, and the gate's own summary note (e.g. which build command
-    /// ran) when it is true.
+    /// Record the post-merge phase's outcome, but only when this run is still
+    /// the current one: the write matches on the `started_at` stamp the
+    /// run's own [`Self::start_guardian_post_merge`] returned, so a worker
+    /// that was superseded (a new merge claimed the review and its own worker
+    /// already re-started the phase) drops its stale result instead of
+    /// overwriting the newer run's state.
+    ///
+    /// `detail` is what failed when `ok` is false, and the gate's own summary
+    /// note (e.g. which build command ran) when it is true.
     ///
     /// Deliberately written here rather than onto the guardian's `status`/
     /// `detail`: the review's status belongs to the merge, which already
@@ -4050,28 +4070,28 @@ impl Store {
     /// still running. Writing status from here would clobber that.
     ///
     /// A `false` is advisory only -- it never changes the review's status and
-    /// never blocks approval or PR submission.
+    /// never blocks approval, PR submission, or another merge/rebase.
     pub fn finish_guardian_post_merge(
         &self,
         id: &str,
+        started_at: i64,
         ok: bool,
         detail: Option<&str>,
-    ) -> Result<()> {
-        self.conn.execute(
+    ) -> Result<bool> {
+        let changed = self.conn.execute(
             "UPDATE guardians SET post_merge_status=?, post_merge_detail=?, \
-             post_merge_finished_at_ms=? WHERE id=?",
+             post_merge_finished_at_ms=? WHERE id=? AND post_merge_started_at_ms=?",
             params![
                 if ok { "ok" } else { "failed" },
                 detail,
                 crate::store::now_ms(),
-                id
+                id,
+                started_at
             ],
         )?;
-        // RAL-<new>: the post-merge build/gate outcome -- including a real
-        // failure -- was previously recorded with zero logging anywhere in
-        // this call chain (most callers just `let _ =` it). A failing
-        // post-merge gate is exactly the "the system stopped and nothing
-        // says why" case this audit targets.
+        // The post-merge build/gate outcome -- including a real failure -- is
+        // recorded here as well as in the row, so a failing post-merge gate is
+        // never the "the system stopped and nothing says why" case.
         crate::cartographer::Note::new("guardian")
             .level(if ok {
                 crate::logging::LogLevel::INFO
@@ -4086,9 +4106,71 @@ impl Store {
                     if ok { "passed" } else { "failed" },
                     detail.map_or_else(String::new, |d| format!(": {d}"))
                 ),
-                serde_json::json!({"ok": ok, "detail": detail}),
+                serde_json::json!({"ok": ok, "detail": detail, "recorded": changed > 0}),
             );
+        Ok(changed > 0)
+    }
+
+    /// Record which review-branch state the last successful manual-checks
+    /// generation ran against: a JSON `{"base_sha":…,"tip_tree":…}` basis.
+    /// `None` clears it, forcing the next post-merge run to regenerate.
+    pub fn set_guardian_manual_checks_basis(&self, id: &str, basis: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE guardians SET manual_checks_basis=?, updated_at_ms=? WHERE id=?",
+            params![basis, crate::store::now_ms(), id],
+        )?;
         Ok(())
+    }
+
+    /// Store the reviewer's steering text for manual-checks generation
+    /// (RAL-520), folded into the generation agent's prompt. `None` clears it.
+    pub fn set_guardian_manual_checks_focus(&self, id: &str, focus: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE guardians SET manual_checks_focus=?, updated_at_ms=? WHERE id=?",
+            params![
+                focus.map(str::trim).filter(|f| !f.is_empty()),
+                crate::store::now_ms(),
+                id
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Mark every post-merge phase that has been `running` for longer than
+    /// `max_age_ms` as failed with an advisory "interrupted" detail, and
+    /// return the affected guardian ids.
+    ///
+    /// A post-merge job only ever stays `running` past its natural end when
+    /// the daemon died mid-run (the worker always records an outcome itself),
+    /// so an unbounded `running` is a stale leftover, not live work. It stays
+    /// advisory: the review's own status is untouched, and the rerun is the
+    /// board's manual-checks regenerate control (or the next merge's own
+    /// post-merge run).
+    pub fn interrupt_stale_post_merge_runs(&self, max_age_ms: i64) -> Result<Vec<String>> {
+        let cutoff = crate::store::now_ms().saturating_sub(max_age_ms);
+        let ids: Vec<String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id FROM guardians WHERE post_merge_status='running' \
+                 AND post_merge_started_at_ms IS NOT NULL AND post_merge_started_at_ms < ?",
+            )?;
+            let rows = stmt.query_map(params![cutoff], |r| r.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for id in &ids {
+            self.conn.execute(
+                "UPDATE guardians SET post_merge_status='failed', \
+                 post_merge_detail=?, post_merge_finished_at_ms=? WHERE id=? \
+                 AND post_merge_status='running' AND post_merge_started_at_ms < ?",
+                params![
+                    "post-merge job interrupted (daemon restart or crash); rerun it from the \
+                     review's manual-checks regenerate control",
+                    crate::store::now_ms(),
+                    id,
+                    cutoff
+                ],
+            )?;
+        }
+        Ok(ids)
     }
 
     /// Reorder a guardian's branches to match `order` (a permutation of the
@@ -4504,7 +4586,7 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines
+                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, manual_checks_basis, manual_checks_focus
                  FROM guardians WHERE id=?", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
                 params![id],
                 Self::map_guardian_row,
@@ -4620,7 +4702,7 @@ impl Store {
     /// (`crate::store_pool`) can serve it without the writer lock.
     pub(crate) fn list_guardians_conn(conn: &Connection) -> Result<Vec<GuardianView>> {
         let mut stmt = conn.prepare(
-            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines
+            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, manual_checks_basis, manual_checks_focus
              FROM guardians ORDER BY created_at_ms DESC", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
         )?;
         let rows = stmt
@@ -4754,6 +4836,8 @@ impl Store {
             base_shift_rebuild_targets: r.get(65)?,
             base_shift_exhausted_notified_at_ms: r.get(66)?,
             auto_cancel_outdated_pr_pipelines: r.get::<_, Option<i64>>(67)?.map(|v| v != 0),
+            manual_checks_basis: r.get(68)?,
+            manual_checks_focus: r.get(69)?,
         })
     }
 
@@ -5267,6 +5351,8 @@ impl Store {
             post_merge_detail: row.post_merge_detail,
             post_merge_started_at_ms: row.post_merge_started_at_ms,
             post_merge_finished_at_ms: row.post_merge_finished_at_ms,
+            manual_checks_focus: row.manual_checks_focus,
+            manual_checks_basis: row.manual_checks_basis,
             notice_kind: row.notice_kind,
             notice_message: row.notice_message,
             notice_at_ms: row.notice_at_ms,
@@ -5662,6 +5748,12 @@ struct GuardianRow {
     post_merge_detail: Option<String>,
     post_merge_started_at_ms: Option<i64>,
     post_merge_finished_at_ms: Option<i64>,
+    /// RAL-520: what the last successful manual-checks generation ran
+    /// against -- a JSON `{"base_sha":…,"tip_tree":…}` basis. `None` forces
+    /// the next post-merge run to regenerate.
+    manual_checks_basis: Option<String>,
+    /// RAL-520: the reviewer's steering text for manual-checks generation.
+    manual_checks_focus: Option<String>,
     /// RAL-476: the registered user this review is submitted/routed as --
     /// see [`GuardianView::owner`].
     owner: Option<String>,

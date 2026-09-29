@@ -2934,6 +2934,20 @@ impl Store {
             "ALTER TABLE guardians ADD COLUMN post_merge_detail TEXT",
             "ALTER TABLE guardians ADD COLUMN post_merge_started_at_ms INTEGER",
             "ALTER TABLE guardians ADD COLUMN post_merge_finished_at_ms INTEGER",
+            // What the last successful manual-checks generation ran against: a
+            // JSON `{"base_sha":…,"tip_tree":…}` basis recorded by the
+            // post-merge worker. A later post-merge run whose review branch
+            // still matches this basis (same base commit, same combined-tip
+            // *tree*) skips regeneration -- the recorded commands already
+            // describe exactly that content. Cleared to force a regeneration
+            // (the board's manual-checks regenerate control does exactly
+            // that).
+            "ALTER TABLE guardians ADD COLUMN manual_checks_basis TEXT",
+            // The reviewer's steering text for manual-checks generation, set
+            // via the regenerate control (RAL-520). Folded into the
+            // generation agent's prompt and persisted so later automatic
+            // regenerations after a rebuild honor the same focus.
+            "ALTER TABLE guardians ADD COLUMN manual_checks_focus TEXT",
             // RAL-435: when this cell is waiting out a Pi rate limit's
             // suggested retry delay (Unix epoch milliseconds it will resume
             // at). `NULL` while not delayed. `state` stays `"running"`

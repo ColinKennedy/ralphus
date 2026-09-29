@@ -18,11 +18,11 @@ use ralphus_daemon::guardian::{
     FeedbackActionStatus, GuardianAutoBuild, GuardianCheck, GuardianStatus, MergeStatus,
 };
 use ralphus_daemon::guardian_merge::{
-    poll_base_branch_freshness_once, pull_pr_commits, purge_worktrees, rebase_command_progress,
-    rebase_on_manual_push, rebuild_on_base_shift, rebuild_on_base_shift_with_debounce,
-    reopen_guardian_merge, reopen_straggler, restart_guardian_merge, run_feedback, run_merge,
-    run_merge_staged, start_feedback, start_merge, stop_guardian_merge,
-    stop_merge_worker_for_cancel,
+    PostMergeJobs, poll_base_branch_freshness_once, pull_pr_commits, purge_worktrees,
+    rebase_command_progress, rebase_on_manual_push, rebuild_on_base_shift,
+    rebuild_on_base_shift_with_debounce, reopen_guardian_merge, reopen_straggler,
+    restart_guardian_merge, run_feedback, run_guardian_post_merge, run_merge, run_merge_staged,
+    start_feedback, start_merge, stop_guardian_merge, stop_merge_worker_for_cancel,
 };
 use ralphus_daemon::pr::sync_remote_pr_commits;
 use ralphus_daemon::reviews::derive_reviews;
@@ -3000,6 +3000,10 @@ fn auto_build_runs_when_no_checks_configured() {
         "[review]\nauto_build = \"test -f a.txt\"\n",
     );
     run_merge(&store, &NoopRunner, &id);
+    // The auto-build is post-merge work: the merge leaves the review
+    // `in_review` immediately, and the worker runs the gate afterwards
+    // (RAL-520) -- tests drive the worker directly to stay hermetic.
+    run_guardian_post_merge(&store, &NoopRunner, &id, PostMergeJobs::ALL);
     let view = store.lock().get_guardian(&id).unwrap();
     assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
     // The auto-build runs after the merge is already complete, so its note
@@ -3016,6 +3020,409 @@ fn auto_build_runs_when_no_checks_configured() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+// RAL-520: the merge itself finishes before any post-merge job runs -- a
+// direct run_merge leaves the review `in_review` with no post-merge phase at
+// all (only a production daemon spawns the worker; tests drive
+// `run_guardian_post_merge` directly to stay hermetic).
+#[test]
+fn merge_completes_without_running_post_merge_inline() {
+    let (root, store, id) = single_feature_repo();
+    run_merge(&store, &NoopRunner, &id);
+    let view = store.lock().get_guardian(&id).unwrap();
+    assert_eq!(view.status, "in_review");
+    assert_eq!(
+        view.post_merge_status.as_deref(),
+        None,
+        "post-merge work must not run inside the merge lifecycle"
+    );
+    assert_eq!(view.post_merge_detail, None);
+    assert_eq!(view.post_merge_started_at_ms, None);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// RAL-520: a post-merge job that is still running must never block a new
+// merge/rebase claim -- the merge wins, the stale job gets superseded.
+#[test]
+fn running_post_merge_does_not_block_a_new_merge() {
+    let (root, store, id) = single_feature_repo();
+    run_merge(&store, &NoopRunner, &id);
+    assert_eq!(store.lock().get_guardian(&id).unwrap().status, "in_review");
+
+    // Simulate a post-merge job that is still running.
+    store.lock().start_guardian_post_merge(&id).unwrap();
+    assert_eq!(
+        store
+            .lock()
+            .get_guardian(&id)
+            .unwrap()
+            .post_merge_status
+            .as_deref(),
+        Some("running")
+    );
+
+    let reply = start_merge(
+        Arc::clone(&store),
+        Arc::new(NoopRunner),
+        &id,
+        Arc::new(Semaphore::new(4)),
+        Cancellations::new(),
+    );
+    assert_eq!(reply.status, 202, "body={}", reply.body);
+    assert!(
+        reply.body.contains("\"status\":\"merging\""),
+        "a running post-merge job must not block the merge: body={}",
+        reply.body
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// A runner whose only job is the manual-commands generation task, answering
+// with one plain manual-check command.
+struct ManualCommandsRunner;
+impl Runner for ManualCommandsRunner {
+    fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+        assert_eq!(
+            spec.task, "manual_commands",
+            "unexpected task: {}",
+            spec.task
+        );
+        RunnerResult {
+            status: "done".to_string(),
+            tokens_in: 0,
+            tokens_out: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            compaction_input_tokens: 0,
+            compaction_count: 0,
+            cost_usd: 0.0,
+            cost_is_estimated: false,
+            summary: "[\"echo manual-check\"]".to_string(),
+            error: None,
+            proofed: None,
+            agent_session_id: None,
+            turns: None,
+            ghost: None,
+            retry_after_secs: None,
+            prophecies: Vec::new(),
+        }
+    }
+}
+
+// RAL-520: the post-merge worker records what generation ran against (the
+// basis), and a later run on the same settled stack skips regeneration; a
+// cleared basis (the board's regenerate control) forces it again.
+#[test]
+fn post_merge_worker_regenerates_manual_checks_only_when_the_basis_changes() {
+    let (root, store, id) = single_feature_repo();
+    run_merge(&store, &NoopRunner, &id);
+
+    run_guardian_post_merge(
+        &store,
+        &ManualCommandsRunner,
+        &id,
+        PostMergeJobs::MANUAL_CHECKS_ONLY,
+    );
+    let first = store.lock().get_guardian(&id).unwrap();
+    assert_eq!(first.status, "in_review");
+    assert_eq!(first.post_merge_status.as_deref(), Some("ok"));
+    assert!(
+        !first.manual_commands.is_empty(),
+        "generation must produce commands"
+    );
+    let basis1 = first
+        .manual_checks_basis
+        .clone()
+        .expect("generation must record its basis");
+
+    // Second run: the settled stack is unchanged, so its basis matches and
+    // generation is skipped entirely (no new agent run stamped).
+    run_guardian_post_merge(
+        &store,
+        &ManualCommandsRunner,
+        &id,
+        PostMergeJobs::MANUAL_CHECKS_ONLY,
+    );
+    let second = store.lock().get_guardian(&id).unwrap();
+    assert_eq!(second.manual_checks_basis.as_deref(), Some(basis1.as_str()));
+    assert_eq!(
+        second.manual_checks_started_at_ms, first.manual_checks_started_at_ms,
+        "an unchanged basis must not rerun the generation agent"
+    );
+
+    // Clearing the basis (what the regenerate endpoint does) forces the next
+    // worker run to regenerate.
+    store
+        .lock()
+        .set_guardian_manual_checks_basis(&id, None)
+        .unwrap();
+    run_guardian_post_merge(
+        &store,
+        &ManualCommandsRunner,
+        &id,
+        PostMergeJobs::MANUAL_CHECKS_ONLY,
+    );
+    let third = store.lock().get_guardian(&id).unwrap();
+    assert_ne!(
+        third.manual_checks_started_at_ms, first.manual_checks_started_at_ms,
+        "a cleared basis must force regeneration"
+    );
+    assert!(
+        !third.manual_commands.is_empty(),
+        "regeneration must produce commands again"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// RAL-520: a post-merge worker run on a review that is no longer `in_review`
+// (a new merge claimed it) stands down without touching anything.
+#[test]
+fn post_merge_worker_stands_down_when_the_review_is_not_in_review() {
+    let (root, store, id) = single_feature_repo();
+    run_merge(&store, &NoopRunner, &id);
+    // Force a fresh merge claim (status no longer in_review).
+    store
+        .lock()
+        .set_guardian_status(&id, GuardianStatus::Merging, None)
+        .unwrap();
+    run_guardian_post_merge(&store, &ManualCommandsRunner, &id, PostMergeJobs::ALL);
+    let view = store.lock().get_guardian(&id).unwrap();
+    assert_eq!(view.status, "merging");
+    assert_eq!(
+        view.post_merge_status.as_deref(),
+        None,
+        "the worker must not touch a review that is not in_review"
+    );
+    assert!(view.manual_commands.is_empty());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// RAL-520: the post-merge outcome slot is guarded by its started_at stamp --
+// only the run whose stamp still matches records an outcome, so a superseded
+// run can never overwrite the newer run's result.
+#[test]
+fn finish_guardian_post_merge_only_writes_when_the_stamp_still_matches() {
+    let (root, store, id) = single_feature_repo();
+    run_merge(&store, &NoopRunner, &id);
+    let stamp = store.lock().start_guardian_post_merge(&id).unwrap();
+
+    // A newer run took over the slot; the older run's finish must not land.
+    // (Distinct started_at stamps need at least one ms between the starts.)
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let _newer = store.lock().start_guardian_post_merge(&id).unwrap();
+    let recorded = store
+        .lock()
+        .finish_guardian_post_merge(&id, stamp, true, None)
+        .unwrap();
+    assert!(!recorded, "a superseded run's outcome must be dropped");
+    assert_eq!(
+        store
+            .lock()
+            .get_guardian(&id)
+            .unwrap()
+            .post_merge_status
+            .as_deref(),
+        Some("running")
+    );
+
+    // The current run's stamp matches, so its outcome lands.
+    let current = store
+        .lock()
+        .get_guardian(&id)
+        .unwrap()
+        .post_merge_started_at_ms;
+    let recorded = store
+        .lock()
+        .finish_guardian_post_merge(&id, current.unwrap(), false, Some("boom"))
+        .unwrap();
+    assert!(recorded);
+    let view = store.lock().get_guardian(&id).unwrap();
+    assert_eq!(view.post_merge_status.as_deref(), Some("failed"));
+    assert_eq!(view.post_merge_detail.as_deref(), Some("boom"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// RAL-520: the stale sweep marks a post-merge phase that has been `running`
+// past the bound as failed (advisory only) and leaves fresh ones alone.
+#[test]
+fn stale_post_merge_runs_are_marked_interrupted_by_the_sweep() {
+    let (root, store, id) = single_feature_repo();
+    run_merge(&store, &NoopRunner, &id);
+    let _ = store.lock().start_guardian_post_merge(&id).unwrap();
+
+    // A just-started run is untouched by a generous bound.
+    let swept = store
+        .lock()
+        .interrupt_stale_post_merge_runs(60 * 60 * 1000)
+        .unwrap();
+    assert!(swept.is_empty());
+    assert_eq!(
+        store
+            .lock()
+            .get_guardian(&id)
+            .unwrap()
+            .post_merge_status
+            .as_deref(),
+        Some("running")
+    );
+
+    // Past the bound (here: any run older than 1ms, after a beat so the
+    // started stamp is genuinely in the past): swept to an advisory failure
+    // with remediation guidance.
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let swept = store.lock().interrupt_stale_post_merge_runs(1).unwrap();
+    assert_eq!(swept, vec![id.clone()]);
+    let view = store.lock().get_guardian(&id).unwrap();
+    assert_eq!(view.status, "in_review", "the sweep is advisory only");
+    assert_eq!(view.post_merge_status.as_deref(), Some("failed"));
+    assert!(
+        view.post_merge_detail
+            .unwrap_or_default()
+            .contains("interrupted"),
+        "the detail must carry remediation guidance"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// RAL-520: regenerate focus text is stored on the review and folded into the
+// generation agent's prompt.
+#[test]
+fn manual_checks_focus_is_stored_and_folded_into_the_prompt() {
+    let (root, store, id) = single_feature_repo();
+    run_merge(&store, &NoopRunner, &id);
+    store
+        .lock()
+        .set_guardian_manual_checks_focus(&id, Some("  focus on the CLI flags  "))
+        .unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
+    assert_eq!(
+        view.manual_checks_focus.as_deref(),
+        Some("focus on the CLI flags"),
+        "focus must be trimmed when stored"
+    );
+    let prompt = ralphus_daemon::guardian_merge::manual_commands_prompt(
+        "CHANGED FILES",
+        Some("focus on the CLI flags"),
+    );
+    assert!(
+        prompt.contains("The reviewer asked to focus these checks on: focus on the CLI flags"),
+        "the steering text must be folded into the generation prompt"
+    );
+    let plain = ralphus_daemon::guardian_merge::manual_commands_prompt("CHANGED FILES", None);
+    assert!(!plain.contains("focus these checks on"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// RAL-520: a worker run on a review whose manual commands already exist and
+// whose basis is unchanged still runs the check gates when asked to.
+#[test]
+fn post_merge_worker_runs_checks_even_when_generation_is_skipped() {
+    let (root, store, id) = single_feature_repo();
+    write(
+        &root,
+        ".ralphus.toml",
+        "[review]\nauto_build = \"test -f a.txt\"\n",
+    );
+    run_merge(&store, &NoopRunner, &id);
+    // First run generates (records the basis) and runs checks.
+    run_guardian_post_merge(&store, &ManualCommandsRunner, &id, PostMergeJobs::ALL);
+    let first = store.lock().get_guardian(&id).unwrap();
+    assert_eq!(first.post_merge_status.as_deref(), Some("ok"));
+    let started1 = first.post_merge_started_at_ms;
+
+    // Second full run: generation is skipped (basis unchanged) but the check
+    // gates rerun, so the post-merge phase gets a fresh outcome.
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    run_guardian_post_merge(&store, &ManualCommandsRunner, &id, PostMergeJobs::ALL);
+    let second = store.lock().get_guardian(&id).unwrap();
+    assert_eq!(second.post_merge_status.as_deref(), Some("ok"));
+    assert_ne!(
+        second.post_merge_started_at_ms, started1,
+        "the check gates must have rerun"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// RAL-520: the board's manual-checks regenerate endpoint -- 202 with the
+// basis cleared and the focus text stored when the review is settled; 409
+// when it isn't, or when a post-merge job is already running; 400 on a bad
+// body. (The worker itself stays unspawned under `Daemon::new` -- tests
+// drive `run_guardian_post_merge` directly.)
+#[test]
+fn manual_checks_regenerate_endpoint_gates_and_records() {
+    let root = temp_repo();
+    init_repo(&root);
+    write(&root, "base.txt", "base\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+    git(&root, &["checkout", "-b", "feature/a"]);
+    write(&root, "a.txt", "from a\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "add a"]);
+    git(&root, &["checkout", "main"]);
+
+    let daemon = Daemon::new(Store::open(&root.join("daemon.db")).unwrap(), 4);
+    let store = daemon.store_handle();
+    let id = {
+        let g = store.lock();
+        let id = g
+            .create_guardian("r", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/a").unwrap();
+        id
+    };
+
+    // Not settled yet (still collecting): 409.
+    let reply = route(
+        &daemon,
+        "POST",
+        &format!("/api/guardians/{id}/manual-checks/regenerate"),
+        "",
+    );
+    assert_eq!(reply.status, 409, "body={}", reply.body);
+
+    run_merge(&store, &NoopRunner, &id);
+    assert_eq!(store.lock().get_guardian(&id).unwrap().status, "in_review");
+    // Seed a basis so the endpoint's clear is observable.
+    store
+        .lock()
+        .set_guardian_manual_checks_basis(&id, Some("{\"base_sha\":\"x\"}"))
+        .unwrap();
+
+    // Bad body: 400.
+    let reply = route(
+        &daemon,
+        "POST",
+        &format!("/api/guardians/{id}/manual-checks/regenerate"),
+        "not json",
+    );
+    assert_eq!(reply.status, 400, "body={}", reply.body);
+
+    // Settled: 202, basis cleared, focus stored (trimmed).
+    let reply = route(
+        &daemon,
+        "POST",
+        &format!("/api/guardians/{id}/manual-checks/regenerate"),
+        "{\"focus\":\"  the CLI flags  \"}",
+    );
+    assert_eq!(reply.status, 202, "body={}", reply.body);
+    let view = store.lock().get_guardian(&id).unwrap();
+    assert_eq!(view.manual_checks_basis, None, "basis must be cleared");
+    assert_eq!(view.manual_checks_focus.as_deref(), Some("the CLI flags"));
+
+    // A post-merge job already running: 409 (one generation at a time).
+    store.lock().start_guardian_post_merge(&id).unwrap();
+    let reply = route(
+        &daemon,
+        "POST",
+        &format!("/api/guardians/{id}/manual-checks/regenerate"),
+        "",
+    );
+    assert_eq!(reply.status, 409, "body={}", reply.body);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 // A failing auto-build is advisory: the branches were rebased correctly, so the
 // merge succeeded and the review stays approvable. The failure is reported on
 // the post-merge phase instead of being allowed to discard a good rebase.
@@ -3028,6 +3435,7 @@ fn failing_auto_build_is_advisory_and_does_not_fail_the_merge() {
         "[review]\nauto_build = \"test -f does_not_exist.txt\"\n",
     );
     run_merge(&store, &NoopRunner, &id);
+    run_guardian_post_merge(&store, &NoopRunner, &id, PostMergeJobs::ALL);
     let view = store.lock().get_guardian(&id).unwrap();
     assert_eq!(
         view.status, "in_review",
@@ -3058,10 +3466,15 @@ fn configured_checks_are_not_double_built_by_auto_build() {
         .set_guardian_checks(&id, &["test -f a.txt".to_string()])
         .unwrap();
     run_merge(&store, &NoopRunner, &id);
+    run_guardian_post_merge(&store, &NoopRunner, &id, PostMergeJobs::ALL);
     let view = store.lock().get_guardian(&id).unwrap();
     assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
+    assert_eq!(view.post_merge_status.as_deref(), Some("ok"));
     assert!(
-        !view.detail.unwrap_or_default().contains("auto-built"),
+        !view
+            .post_merge_detail
+            .unwrap_or_default()
+            .contains("auto-built"),
         "the configured check gate should take priority over the auto-build default"
     );
     let _ = std::fs::remove_dir_all(&root);
@@ -3115,10 +3528,12 @@ fn review_declared_auto_build_command_wins_over_project_default() {
         )
         .unwrap();
     run_merge(&store, &NoopRunner, &id);
+    run_guardian_post_merge(&store, &NoopRunner, &id, PostMergeJobs::ALL);
     let view = store.lock().get_guardian(&id).unwrap();
     assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
+    assert_eq!(view.post_merge_status.as_deref(), Some("ok"));
     assert!(
-        view.detail
+        view.post_merge_detail
             .unwrap_or_default()
             .contains("auto-built via review auto_build"),
         "expected the review-declared auto_build note, not the project default"
@@ -3179,6 +3594,9 @@ fn review_declared_auto_build_agent_failure_is_advisory_not_fatal() {
         )
         .unwrap();
     run_merge(&store, &FailingAutoBuildRunner, &id);
+    // The review-declared auto_build agent call is post-merge work (RAL-520):
+    // drive the worker the way a production daemon would.
+    run_guardian_post_merge(&store, &FailingAutoBuildRunner, &id, PostMergeJobs::ALL);
     let view = store.lock().get_guardian(&id).unwrap();
     assert_eq!(
         view.status, "in_review",

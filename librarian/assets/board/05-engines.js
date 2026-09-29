@@ -195,6 +195,7 @@
       CLICK_HANDLERS.approveReview = (e, ds) => approveReview(ds.guardianId || "");
       CLICK_HANDLERS.syncPrReview = (e, ds) => syncPrReview(ds.guardianId || "");
       CLICK_HANDLERS.runAllManualChecks = (e, ds) => runAllManualChecks(ds.guardianId || "");
+      CLICK_HANDLERS.regenManualChecks = (e, ds) => regenManualChecks(ds.guardianId || "");
       CLICK_HANDLERS.toggleManualMenu = (e, ds) => toggleManualMenu(ds.guardianId || "");
       CLICK_HANDLERS.copyChatAs = (e, ds) => copyChatAs(ds.guardianId || "", ds.branchId || "", ds.format || "");
       CLICK_HANDLERS.doForceStart = (e, ds) => doForceStart(ds.guardianId || "");
