@@ -8899,7 +8899,14 @@ fn post_merge_jobs_inner(
         .as_ref()
         .and_then(|g| g.manual_checks_basis.as_deref())
         != Some(expected_basis.as_str());
-    let generate_manual = jobs.manual_checks && (!commands_present || basis_changed);
+    // RAL-521: once the review's cached result has been recorded, ordinary
+    // rebases and restacks must not invalidate it merely because the stacked
+    // tip changed. An explicit opt-out continues to use the pre-cache basis
+    // check and regenerates whenever the result is absent or stale.
+    let cached = stored
+        .as_ref()
+        .is_some_and(|g| g.effective_cache_manual_checks && g.manual_checks_cached);
+    let generate_manual = jobs.manual_checks && !cached && (!commands_present || basis_changed);
 
     // Both jobs read the scratch worktree and neither reads the other's
     // output, so they run concurrently.

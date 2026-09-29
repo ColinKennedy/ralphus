@@ -12078,14 +12078,20 @@ fn shutdown(daemon: &Daemon, body: &str) -> Reply {
     daemon.cancellations.cancel_all();
 
     let squads = daemon.lock().list_squads().unwrap_or_default();
-    let guardians = daemon.lock().list_guardians().unwrap_or_default();
+    // Shutdown only needs guardian ids here. The full view hydrates project
+    // configuration and walks each git root; an unavailable/stale root must
+    // not prevent an otherwise valid auto-cancel from reaching that review.
+    let guardians = daemon
+        .lock()
+        .list_guardian_status_pairs()
+        .unwrap_or_default();
     let tmux_killed: usize = squads
         .iter()
         .map(|r| kill_squad_tmux_sessions(&r.id))
         .sum::<usize>()
         + guardians
             .iter()
-            .map(|g| kill_guardian_tmux_sessions(&g.id))
+            .map(|(id, _status)| kill_guardian_tmux_sessions(id))
             .sum::<usize>();
 
     let mut cancelled_squads = Vec::new();
@@ -12105,9 +12111,9 @@ fn shutdown(daemon: &Daemon, body: &str) -> Reply {
             }
         }
 
-        for g in guardians {
-            if daemon.lock().cancel_guardian(&g.id).is_ok() {
-                cancelled_guardians.push(g.id);
+        for (id, _status) in guardians {
+            if daemon.lock().cancel_guardian(&id).is_ok() {
+                cancelled_guardians.push(id);
             }
         }
     }
