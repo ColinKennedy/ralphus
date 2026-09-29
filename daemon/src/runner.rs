@@ -2511,6 +2511,12 @@ impl SubprocessRunner {
                         format!("tmux server process exit code: {code}")
                     }
                     crate::tmux::ProcessExit::Unknown(reason) => {
+                        let reason = reason.trim();
+                        let reason = if reason.is_empty() {
+                            "process exited but did not report an exit code"
+                        } else {
+                            reason
+                        };
                         format!("tmux server process exit code: unknown ({reason})")
                     }
                 };
