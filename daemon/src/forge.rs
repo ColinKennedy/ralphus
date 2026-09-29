@@ -7107,10 +7107,12 @@ mod tests {
 
     #[test]
     fn resolve_repository_identity_honors_config_overrides_and_fails_actionably() {
-        let mut cfg = ForgeConfig::default();
         // A self-hosted instance pins both its kind and its API base.
-        cfg.kind = Some("github".to_string());
-        cfg.api_base = Some("https://ghe.example.com/api".to_string());
+        let mut cfg = ForgeConfig {
+            kind: Some("github".to_string()),
+            api_base: Some("https://ghe.example.com/api".to_string()),
+            ..ForgeConfig::default()
+        };
         let (kind, _, api_base, _) =
             resolve_repository_identity("https://ghe.example.com/acme/widget", &cfg).unwrap();
         assert_eq!(
@@ -7159,8 +7161,10 @@ mod tests {
             )
             .unwrap();
         });
-        let mut cfg = ForgeConfig::default();
-        cfg.api_base = Some(format!("http://{addr}"));
+        let cfg = ForgeConfig {
+            api_base: Some(format!("http://{addr}")),
+            ..ForgeConfig::default()
+        };
         let outcome =
             check_repository_url("https://github.com/acme/widget", &cfg, Some("user-token"))
                 .unwrap();
