@@ -231,6 +231,8 @@ pub struct ProofView {
     pub kind: String,
     /// Current state string.
     pub state: String,
+    /// Completed active time plus the current active interval, if any.
+    pub duration_ms: i64,
     /// Unix epoch milliseconds when this proof will retry after a provider
     /// rate limit, or `None` while it is executing normally.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -348,6 +350,8 @@ pub struct CellView {
     pub system_prompt: Option<String>,
     /// Current state string.
     pub state: String,
+    /// Completed active time plus the current active interval, if any.
+    pub duration_ms: i64,
     /// Input tokens recorded so far.
     pub tokens_in: i64,
     /// Output tokens recorded so far.
@@ -516,6 +520,8 @@ pub struct TaskView {
     pub model: Option<String>,
     /// Current state string.
     pub state: String,
+    /// Sum of this task's cells and proof steps' active durations.
+    pub duration_ms: i64,
     /// Failure detail, for a task that failed for a task-level reason with
     /// no underlying cell/proof error to point to (RAL-291) -- e.g. the
     /// RAL-156 no-commits-since-baseline guard. Mirrors [`CellView::error`]'s
@@ -617,6 +623,8 @@ pub struct SquadView {
     /// When this squad last reached a terminal state (Unix epoch
     /// milliseconds). `None` while queued/pending/running.
     pub finished_at_ms: Option<i64>,
+    /// Sum of all cell and proof active durations in this squad.
+    pub duration_ms: i64,
     /// The tasks in the squad.
     pub tasks: Vec<TaskView>,
     /// Every distinct [`TaskView::project`] among this squad's tasks, in
@@ -1378,6 +1386,8 @@ impl Store {
                 materialized_env_overrides TEXT,
                 started_at_ms  INTEGER,
                 finished_at_ms INTEGER,
+                completed_active_duration_ms INTEGER NOT NULL DEFAULT 0,
+                active_started_at_ms INTEGER,
                 PRIMARY KEY (squad_id, task_idx, idx)
             );
             CREATE TABLE IF NOT EXISTS proofs (
@@ -1404,6 +1414,8 @@ impl Store {
                 materialized_env_overrides TEXT,
                 started_at_ms  INTEGER,
                 finished_at_ms INTEGER,
+                completed_active_duration_ms INTEGER NOT NULL DEFAULT 0,
+                active_started_at_ms INTEGER,
                 PRIMARY KEY (squad_id, task_idx, scope, cell_idx, idx)
             );
             CREATE TABLE IF NOT EXISTS guardians (
@@ -3098,6 +3110,12 @@ impl Store {
             // row, which is exactly "keep inheriting the backend default"
             // and preserves current behavior unchanged.
             "ALTER TABLE agent_profiles ADD COLUMN thinking_capable INTEGER",
+            // RAL-530: completed active intervals are durable; an open
+            // interval is only included while its runner is actually active.
+            "ALTER TABLE cells ADD COLUMN completed_active_duration_ms INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE cells ADD COLUMN active_started_at_ms INTEGER",
+            "ALTER TABLE proofs ADD COLUMN completed_active_duration_ms INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE proofs ADD COLUMN active_started_at_ms INTEGER",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
@@ -3949,10 +3967,19 @@ impl Store {
             )?;
         }
         self.conn.execute(
-            &format!(
-                "UPDATE proofs SET state='cancelled' WHERE squad_id=? AND state IN {UNFINISHED}"
-            ),
-            params![squad_id],
+            "UPDATE cells SET completed_active_duration_ms = completed_active_duration_ms +
+                    CASE WHEN active_started_at_ms IS NULL THEN 0 ELSE MAX(0, ? - active_started_at_ms) END,
+                 active_started_at_ms = NULL
+             WHERE squad_id=? AND active_started_at_ms IS NOT NULL",
+            params![now, squad_id],
+        )?;
+        self.conn.execute(
+            "UPDATE proofs SET state='cancelled',
+                 completed_active_duration_ms = completed_active_duration_ms +
+                    CASE WHEN active_started_at_ms IS NULL THEN 0 ELSE MAX(0, ? - active_started_at_ms) END,
+                 active_started_at_ms = NULL
+             WHERE squad_id=? AND state IN ('pending','running','failed')",
+            params![now, squad_id],
         )?;
         Ok(())
     }
@@ -4093,13 +4120,20 @@ impl Store {
         self.conn.execute(
             "UPDATE cells SET state=?, env_out_of_date=0,
                  started_at_ms = CASE WHEN ?=1 THEN COALESCE(started_at_ms, ?) ELSE started_at_ms END,
-                 finished_at_ms = CASE WHEN ?=1 THEN ? ELSE finished_at_ms END
+                 finished_at_ms = CASE WHEN ?=1 THEN ? ELSE finished_at_ms END,
+                 completed_active_duration_ms = completed_active_duration_ms +
+                    CASE WHEN active_started_at_ms IS NULL OR ?=1 THEN 0 ELSE MAX(0, ? - active_started_at_ms) END,
+                 active_started_at_ms = CASE WHEN ?=1 THEN COALESCE(active_started_at_ms, ?) ELSE NULL END
              WHERE squad_id=? AND task_idx=? AND idx=?",
             params![
                 state.as_str(),
                 entering_running,
                 now,
                 entering_terminal,
+                now,
+                entering_running,
+                now,
+                entering_running,
                 now,
                 squad_id,
                 task_idx,
@@ -4838,12 +4872,15 @@ impl Store {
                 .get(&(t_idx, "task".to_string(), -1))
                 .cloned()
                 .unwrap_or_default();
+            let duration_ms = cells.iter().map(|cell| cell.duration_ms).sum::<i64>()
+                + proof.iter().map(|step| step.duration_ms).sum::<i64>();
             tasks.push(TaskView {
                 name,
                 project,
                 agent,
                 model,
                 state: tstate,
+                duration_ms,
                 error: t_error,
                 cells,
                 proof,
@@ -4865,6 +4902,7 @@ impl Store {
                 projects.push(t.project.clone());
             }
         }
+        let duration_ms = tasks.iter().map(|task| task.duration_ms).sum();
         Ok(SquadView {
             id,
             label,
@@ -4872,6 +4910,7 @@ impl Store {
             created_at_ms,
             started_at_ms,
             finished_at_ms,
+            duration_ms,
             tasks,
             projects,
             reviews,
@@ -4964,7 +5003,7 @@ impl Store {
         db_profiles: &HashMap<String, crate::agent_profile_store::AgentProfileView>,
     ) -> Result<HashMap<i64, Vec<CellView>>> {
         let mut stmt = conn.prepare(
-            "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date, machine, detached_at_ms, maximum_context, auto_compact_threshold, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, delayed_until_ms
+            "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date, machine, detached_at_ms, maximum_context, auto_compact_threshold, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, delayed_until_ms, completed_active_duration_ms, active_started_at_ms
              FROM cells WHERE squad_id=? ORDER BY task_idx, idx",
         )?;
         let rows = stmt
@@ -4997,6 +5036,9 @@ impl Store {
                         thinking_capable,
                         model: r.get::<_, Option<String>>(6)?,
                         state: r.get::<_, String>(7)?,
+                        duration_ms: r.get::<_, i64>(35)?
+                            + r.get::<_, Option<i64>>(36)?
+                                .map_or(0, |start| (now_ms() - start).max(0)),
                         tokens_in: r.get::<_, i64>(8)?,
                         tokens_out: r.get::<_, i64>(9)?,
                         cost_usd: r.get::<_, f64>(10)?,
@@ -5172,7 +5214,7 @@ impl Store {
         db_profiles: &HashMap<String, crate::agent_profile_store::AgentProfileView>,
     ) -> Result<HashMap<(i64, String, i64), Vec<ProofView>>> {
         let mut stmt = conn.prepare(
-            "SELECT task_idx, scope, cell_idx, vid, kind, state, delayed_until_ms, delayed_reason, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count FROM proofs
+            "SELECT task_idx, scope, cell_idx, vid, kind, state, delayed_until_ms, delayed_reason, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, completed_active_duration_ms, active_started_at_ms FROM proofs
              WHERE squad_id=? ORDER BY task_idx, scope, cell_idx, idx",
         )?;
         let rows = stmt
@@ -5188,6 +5230,9 @@ impl Store {
                         id: r.get::<_, Option<String>>(3)?,
                         kind: r.get::<_, String>(4)?,
                         state: r.get::<_, String>(5)?,
+                        duration_ms: r.get::<_, i64>(25)?
+                            + r.get::<_, Option<i64>>(26)?
+                                .map_or(0, |start| (now_ms() - start).max(0)),
                         delayed_until_ms: r.get::<_, Option<i64>>(6)?,
                         delayed_reason: r.get::<_, Option<String>>(7)?,
                         output: r.get::<_, Option<String>>(8)?,
@@ -5235,7 +5280,7 @@ impl Store {
                 .map(|p| (p.name.clone(), p))
                 .collect();
         let mut stmt = self.conn.prepare(
-            "SELECT vid, kind, state, delayed_until_ms, delayed_reason, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count FROM proofs
+            "SELECT vid, kind, state, delayed_until_ms, delayed_reason, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, completed_active_duration_ms, active_started_at_ms FROM proofs
              WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? ORDER BY idx",
         )?;
         let rows = stmt
@@ -5247,6 +5292,9 @@ impl Store {
                     id: r.get::<_, Option<String>>(0)?,
                     kind: r.get::<_, String>(1)?,
                     state: r.get::<_, String>(2)?,
+                    duration_ms: r.get::<_, i64>(22)?
+                        + r.get::<_, Option<i64>>(23)?
+                            .map_or(0, |start| (now_ms() - start).max(0)),
                     delayed_until_ms: r.get::<_, Option<i64>>(3)?,
                     delayed_reason: r.get::<_, Option<String>>(4)?,
                     output: r.get::<_, Option<String>>(5)?,
@@ -6856,17 +6904,14 @@ impl Store {
         Ok(rows)
     }
 
-    /// Cumulative wall-clock milliseconds already consumed by every cell and
+    /// Cumulative active milliseconds already consumed by every cell and
     /// proof step under one task (RAL-308), for enforcing a task-level
     /// `maximum_timeout_seconds` cap that's cumulative across the whole
     /// task's descendants (both cell-scope and task-scope proofs). A row
-    /// that has started contributes `min(now_ms, finished_at_ms) -
-    /// started_at_ms` (a still-running row's `finished_at_ms` is still
-    /// `NULL`, so it contributes its own live elapsed time); a row that
-    /// never started (still pending, or `ignored`/`cancelled` before it
-    /// ran) contributes nothing. Reading live from these columns rather than
-    /// tracking a separate running counter means this stays correct even
-    /// when sibling cells run concurrently under the same task.
+    /// completed interval contributes its durable aggregate, and an active
+    /// row additionally contributes `now_ms - active_started_at_ms`. This
+    /// excludes daemon downtime after recovery while retaining concurrent
+    /// sibling work as separate consumed runtime.
     pub fn task_cumulative_runtime_ms(
         &self,
         squad_id: &str,
@@ -6874,21 +6919,23 @@ impl Store {
         now_ms: i64,
     ) -> Result<i64> {
         let cells_ms: i64 = self.conn.query_row(
-            "SELECT COALESCE(SUM(COALESCE(finished_at_ms, ?1) - started_at_ms), 0)
-             FROM cells WHERE squad_id=?2 AND task_idx=?3 AND started_at_ms IS NOT NULL",
+            "SELECT COALESCE(SUM(completed_active_duration_ms +
+                CASE WHEN active_started_at_ms IS NULL THEN 0 ELSE MAX(0, ?1 - active_started_at_ms) END), 0)
+             FROM cells WHERE squad_id=?2 AND task_idx=?3",
             params![now_ms, squad_id, task_idx],
             |r| r.get(0),
         )?;
         let proofs_ms: i64 = self.conn.query_row(
-            "SELECT COALESCE(SUM(COALESCE(finished_at_ms, ?1) - started_at_ms), 0)
-             FROM proofs WHERE squad_id=?2 AND task_idx=?3 AND started_at_ms IS NOT NULL",
+            "SELECT COALESCE(SUM(completed_active_duration_ms +
+                CASE WHEN active_started_at_ms IS NULL THEN 0 ELSE MAX(0, ?1 - active_started_at_ms) END), 0)
+             FROM proofs WHERE squad_id=?2 AND task_idx=?3",
             params![now_ms, squad_id, task_idx],
             |r| r.get(0),
         )?;
         Ok(cells_ms + proofs_ms)
     }
 
-    /// Cumulative wall-clock milliseconds already consumed by one cell and
+    /// Cumulative active milliseconds already consumed by one cell and
     /// its own cell-scope proof steps (RAL-308) -- the same shape as
     /// [`Self::task_cumulative_runtime_ms`], scoped one level narrower for a
     /// cell-level `maximum_timeout_seconds` cap.
@@ -6902,16 +6949,18 @@ impl Store {
         let cell_ms: i64 = self
             .conn
             .query_row(
-                "SELECT COALESCE(finished_at_ms, ?1) - started_at_ms
-                 FROM cells WHERE squad_id=?2 AND task_idx=?3 AND idx=?4 AND started_at_ms IS NOT NULL",
+                "SELECT completed_active_duration_ms +
+                    CASE WHEN active_started_at_ms IS NULL THEN 0 ELSE MAX(0, ?1 - active_started_at_ms) END
+                 FROM cells WHERE squad_id=?2 AND task_idx=?3 AND idx=?4",
                 params![now_ms, squad_id, task_idx, cell_idx],
                 |r| r.get(0),
             )
             .optional()?
             .unwrap_or(0);
         let proofs_ms: i64 = self.conn.query_row(
-            "SELECT COALESCE(SUM(COALESCE(finished_at_ms, ?1) - started_at_ms), 0)
-             FROM proofs WHERE squad_id=?2 AND task_idx=?3 AND scope='cell' AND cell_idx=?4 AND started_at_ms IS NOT NULL",
+            "SELECT COALESCE(SUM(completed_active_duration_ms +
+                CASE WHEN active_started_at_ms IS NULL THEN 0 ELSE MAX(0, ?1 - active_started_at_ms) END), 0)
+             FROM proofs WHERE squad_id=?2 AND task_idx=?3 AND scope='cell' AND cell_idx=?4",
             params![now_ms, squad_id, task_idx, cell_idx],
             |r| r.get(0),
         )?;
@@ -7164,13 +7213,20 @@ impl Store {
         self.conn.execute(
             "UPDATE proofs SET state=?, env_out_of_date=0,
                  started_at_ms = CASE WHEN ?=1 THEN COALESCE(started_at_ms, ?) ELSE started_at_ms END,
-                 finished_at_ms = CASE WHEN ?=1 THEN ? ELSE finished_at_ms END
+                 finished_at_ms = CASE WHEN ?=1 THEN ? ELSE finished_at_ms END,
+                 completed_active_duration_ms = completed_active_duration_ms +
+                    CASE WHEN active_started_at_ms IS NULL OR ?=1 THEN 0 ELSE MAX(0, ? - active_started_at_ms) END,
+                 active_started_at_ms = CASE WHEN ?=1 THEN COALESCE(active_started_at_ms, ?) ELSE NULL END
              WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=?",
             params![
                 state.as_str(),
                 entering_running,
                 now,
                 entering_terminal,
+                now,
+                entering_running,
+                now,
+                entering_running,
                 now,
                 squad_id,
                 task_idx,
@@ -8165,11 +8221,11 @@ impl Store {
             params![squad_id],
         )?;
         self.conn.execute(
-            "UPDATE cells SET state='pending', error=NULL, started_at_ms=NULL, finished_at_ms=NULL, env_out_of_date=0 WHERE squad_id=?",
+            "UPDATE cells SET state='pending', error=NULL, started_at_ms=NULL, finished_at_ms=NULL, completed_active_duration_ms=0, active_started_at_ms=NULL, env_out_of_date=0 WHERE squad_id=?",
             params![squad_id],
         )?;
         self.conn.execute(
-            "UPDATE proofs SET state='pending', env_out_of_date=0 WHERE squad_id=?",
+            "UPDATE proofs SET state='pending', completed_active_duration_ms=0, active_started_at_ms=NULL, env_out_of_date=0 WHERE squad_id=?",
             params![squad_id],
         )?;
         Ok(())
@@ -8210,12 +8266,20 @@ impl Store {
                 admin_only: false,
             });
             self.conn.execute(
-                "UPDATE cells SET state='pending', error=NULL WHERE squad_id=? AND state='running'",
-                params![id],
+                "UPDATE cells SET state='pending', error=NULL,
+                    completed_active_duration_ms = completed_active_duration_ms +
+                        CASE WHEN active_started_at_ms IS NULL THEN 0 ELSE MAX(0, ? - active_started_at_ms) END,
+                    active_started_at_ms=NULL
+                 WHERE squad_id=? AND state='running'",
+                params![now_ms(), id],
             )?;
             self.conn.execute(
-                "UPDATE proofs SET state='pending' WHERE squad_id=? AND state='running'",
-                params![id],
+                "UPDATE proofs SET state='pending',
+                    completed_active_duration_ms = completed_active_duration_ms +
+                        CASE WHEN active_started_at_ms IS NULL THEN 0 ELSE MAX(0, ? - active_started_at_ms) END,
+                    active_started_at_ms=NULL
+                 WHERE squad_id=? AND state='running'",
+                params![now_ms(), id],
             )?;
             self.conn.execute(
                 "UPDATE tasks SET state='pending' WHERE squad_id=? AND state='running'",
@@ -8672,11 +8736,11 @@ impl Store {
 
         for s in &impact.cells {
             self.conn.execute(
-                "UPDATE cells SET state='pending', error=NULL, started_at_ms=NULL, finished_at_ms=NULL, env_out_of_date=0 WHERE squad_id=? AND task_idx=? AND idx=?",
+                "UPDATE cells SET state='pending', error=NULL, started_at_ms=NULL, finished_at_ms=NULL, completed_active_duration_ms=0, active_started_at_ms=NULL, env_out_of_date=0 WHERE squad_id=? AND task_idx=? AND idx=?",
                 params![squad_id, s.task_idx, s.idx],
             )?;
             self.conn.execute(
-                "UPDATE proofs SET state='pending', env_out_of_date=0 WHERE squad_id=? AND task_idx=? AND scope='cell' AND cell_idx=?",
+                "UPDATE proofs SET state='pending', completed_active_duration_ms=0, active_started_at_ms=NULL, env_out_of_date=0 WHERE squad_id=? AND task_idx=? AND scope='cell' AND cell_idx=?",
                 params![squad_id, s.task_idx, s.idx],
             )?;
         }
@@ -8686,7 +8750,7 @@ impl Store {
                 params![squad_id, t.idx],
             )?;
             self.conn.execute(
-                "UPDATE proofs SET state='pending', env_out_of_date=0 WHERE squad_id=? AND task_idx=? AND scope='task'",
+                "UPDATE proofs SET state='pending', completed_active_duration_ms=0, active_started_at_ms=NULL, env_out_of_date=0 WHERE squad_id=? AND task_idx=? AND scope='task'",
                 params![squad_id, t.idx],
             )?;
         }
@@ -13656,13 +13720,12 @@ command = "cargo test"
             )
             .unwrap();
         let now = now_ms();
-        // Cell 0: still running, started 10s ago -- contributes its own live
-        // elapsed time (finished_at_ms is NULL).
+        // Cell 0: still active, with an open interval 10s old.
         store
             .conn
             .execute(
-                "INSERT INTO cells(squad_id, task_idx, idx, sid, agent, state, started_at_ms, finished_at_ms)
-                 VALUES('squad-1', 0, 0, 'cell-a', 'claude', 'running', ?1, NULL)",
+                "INSERT INTO cells(squad_id, task_idx, idx, sid, agent, state, active_started_at_ms)
+                 VALUES('squad-1', 0, 0, 'cell-a', 'claude', 'running', ?1)",
                 params![now - 10_000],
             )
             .unwrap();
@@ -13670,9 +13733,9 @@ command = "cargo test"
         store
             .conn
             .execute(
-                "INSERT INTO proofs(squad_id, task_idx, scope, cell_idx, idx, kind, spec, agent, state, started_at_ms, finished_at_ms)
-                 VALUES('squad-1', 0, 'cell', 0, 0, 'command', 'true', 'claude', 'done', ?1, ?2)",
-                params![now - 20_000, now - 16_000],
+                "INSERT INTO proofs(squad_id, task_idx, scope, cell_idx, idx, kind, spec, agent, state, completed_active_duration_ms)
+                 VALUES('squad-1', 0, 'cell', 0, 0, 'command', 'true', 'claude', 'done', 4000)",
+                [],
             )
             .unwrap();
         // A different cell (idx 1) under the same task, already finished,
@@ -13680,9 +13743,9 @@ command = "cargo test"
         store
             .conn
             .execute(
-                "INSERT INTO cells(squad_id, task_idx, idx, sid, agent, state, started_at_ms, finished_at_ms)
-                 VALUES('squad-1', 0, 1, 'cell-b', 'claude', 'done', ?1, ?2)",
-                params![now - 9_000, now - 6_000],
+                "INSERT INTO cells(squad_id, task_idx, idx, sid, agent, state, completed_active_duration_ms)
+                 VALUES('squad-1', 0, 1, 'cell-b', 'claude', 'done', 3000)",
+                [],
             )
             .unwrap();
         // A pending cell that never started contributes nothing.
