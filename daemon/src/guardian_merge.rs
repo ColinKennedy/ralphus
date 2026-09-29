@@ -5232,6 +5232,11 @@ fn finish_staged_merge<F: Fn(GuardianStatus, Option<&str>)>(
         );
         return;
     }
+    // RAL-521: decide once whether this finalize regenerates the manual
+    // checks -- with caching enabled and the one-time marker set, the cached
+    // commands survive this staged merge untouched.
+    let generate_manual_checks = manual_checks_should_generate(&guardian);
+
     for proj in &project_order {
         if cancel.is_cancelled() {
             log_merge_cancelled(store, id);
@@ -5582,6 +5587,7 @@ pub fn run_merge_cancellable(
                 squash,
                 &set_status,
                 final_branch_id.as_deref(),
+                generate_manual_checks,
                 cancel,
             );
             // On failure, set_status was already called inside run_merge_shared.
@@ -5752,6 +5758,10 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
     squash: bool,
     set_status: &F,
     final_branch_id: Option<&str>,
+    // RAL-521: computed once by [`run_merge_cancellable`] for the whole
+    // merge -- `false` skips this path's manual-checks generation so a
+    // cached result survives the rebuild.
+    generate_manual_checks: bool,
     cancel: &CancelToken,
 ) {
     let combined_branch = match claim_combined_review_ref_by_id(store, root, id) {
