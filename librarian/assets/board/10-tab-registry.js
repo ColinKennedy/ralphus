@@ -738,6 +738,7 @@
        * @property {TtUsage} usage
        * @property {number|null} startedAtMs
        * @property {number|null} finishedAtMs
+       * @property {number} durationMs
        * @property {number|null} sortTimeMs
        * @property {{watched: boolean, inherited: boolean}} watch
        * @property {boolean} needsMe

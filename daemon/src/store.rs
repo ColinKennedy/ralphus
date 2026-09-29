@@ -233,6 +233,8 @@ pub struct ProofView {
     pub state: String,
     /// Completed active time plus the current active interval, if any.
     pub duration_ms: i64,
+    /// Number of active intervals contributing to [`Self::duration_ms`].
+    pub active_duration_intervals: i64,
     /// Unix epoch milliseconds when this proof will retry after a provider
     /// rate limit, or `None` while it is executing normally.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -352,6 +354,8 @@ pub struct CellView {
     pub state: String,
     /// Completed active time plus the current active interval, if any.
     pub duration_ms: i64,
+    /// Number of active intervals contributing to [`Self::duration_ms`].
+    pub active_duration_intervals: i64,
     /// Input tokens recorded so far.
     pub tokens_in: i64,
     /// Output tokens recorded so far.
@@ -522,6 +526,8 @@ pub struct TaskView {
     pub state: String,
     /// Sum of this task's cells and proof steps' active durations.
     pub duration_ms: i64,
+    /// Number of descendant active intervals contributing to [`Self::duration_ms`].
+    pub active_duration_intervals: i64,
     /// Failure detail, for a task that failed for a task-level reason with
     /// no underlying cell/proof error to point to (RAL-291) -- e.g. the
     /// RAL-156 no-commits-since-baseline guard. Mirrors [`CellView::error`]'s
@@ -625,6 +631,8 @@ pub struct SquadView {
     pub finished_at_ms: Option<i64>,
     /// Sum of all cell and proof active durations in this squad.
     pub duration_ms: i64,
+    /// Number of descendant active intervals contributing to [`Self::duration_ms`].
+    pub active_duration_intervals: i64,
     /// The tasks in the squad.
     pub tasks: Vec<TaskView>,
     /// Every distinct [`TaskView::project`] among this squad's tasks, in
@@ -4162,6 +4170,36 @@ impl Store {
         Ok(())
     }
 
+    /// Closes a cell's current active interval while retaining its `running`
+    /// state, for a scheduler wait that does not execute agent or command work.
+    pub fn stop_cell_active_interval(&self, squad_id: &str, task_idx: i64, idx: i64) -> Result<()> {
+        let now = now_ms();
+        self.conn.execute(
+            "UPDATE cells SET completed_active_duration_ms = completed_active_duration_ms +
+                    CASE WHEN active_started_at_ms IS NULL THEN 0 ELSE MAX(0, ? - active_started_at_ms) END,
+                 active_started_at_ms=NULL
+             WHERE squad_id=? AND task_idx=? AND idx=?",
+            params![now, squad_id, task_idx, idx],
+        )?;
+        Ok(())
+    }
+
+    /// Opens a cell active interval without changing state, immediately before
+    /// the scheduler resumes agent or command execution.
+    pub fn start_cell_active_interval(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        idx: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE cells SET active_started_at_ms=COALESCE(active_started_at_ms, ?)
+             WHERE squad_id=? AND task_idx=? AND idx=?",
+            params![now_ms(), squad_id, task_idx, idx],
+        )?;
+        Ok(())
+    }
+
     /// Force a cell to `done` via a manual `set-status` override (RAL-74),
     /// including any of its own cell-level proof steps still sitting in a
     /// non-terminal state.
@@ -4874,6 +4912,14 @@ impl Store {
                 .unwrap_or_default();
             let duration_ms = cells.iter().map(|cell| cell.duration_ms).sum::<i64>()
                 + proof.iter().map(|step| step.duration_ms).sum::<i64>();
+            let active_duration_intervals = cells
+                .iter()
+                .map(|cell| cell.active_duration_intervals)
+                .sum::<i64>()
+                + proof
+                    .iter()
+                    .map(|step| step.active_duration_intervals)
+                    .sum::<i64>();
             tasks.push(TaskView {
                 name,
                 project,
@@ -4881,6 +4927,7 @@ impl Store {
                 model,
                 state: tstate,
                 duration_ms,
+                active_duration_intervals,
                 error: t_error,
                 cells,
                 proof,
@@ -4903,6 +4950,10 @@ impl Store {
             }
         }
         let duration_ms = tasks.iter().map(|task| task.duration_ms).sum();
+        let active_duration_intervals = tasks
+            .iter()
+            .map(|task| task.active_duration_intervals)
+            .sum();
         Ok(SquadView {
             id,
             label,
@@ -4911,6 +4962,7 @@ impl Store {
             started_at_ms,
             finished_at_ms,
             duration_ms,
+            active_duration_intervals,
             tasks,
             projects,
             reviews,
@@ -5039,6 +5091,9 @@ impl Store {
                         duration_ms: r.get::<_, i64>(35)?
                             + r.get::<_, Option<i64>>(36)?
                                 .map_or(0, |start| (now_ms() - start).max(0)),
+                        active_duration_intervals: i64::from(
+                            r.get::<_, Option<i64>>(36)?.is_some(),
+                        ),
                         tokens_in: r.get::<_, i64>(8)?,
                         tokens_out: r.get::<_, i64>(9)?,
                         cost_usd: r.get::<_, f64>(10)?,
@@ -5233,6 +5288,9 @@ impl Store {
                         duration_ms: r.get::<_, i64>(25)?
                             + r.get::<_, Option<i64>>(26)?
                                 .map_or(0, |start| (now_ms() - start).max(0)),
+                        active_duration_intervals: i64::from(
+                            r.get::<_, Option<i64>>(26)?.is_some(),
+                        ),
                         delayed_until_ms: r.get::<_, Option<i64>>(6)?,
                         delayed_reason: r.get::<_, Option<String>>(7)?,
                         output: r.get::<_, Option<String>>(8)?,
@@ -5295,6 +5353,7 @@ impl Store {
                     duration_ms: r.get::<_, i64>(22)?
                         + r.get::<_, Option<i64>>(23)?
                             .map_or(0, |start| (now_ms() - start).max(0)),
+                    active_duration_intervals: i64::from(r.get::<_, Option<i64>>(23)?.is_some()),
                     delayed_until_ms: r.get::<_, Option<i64>>(3)?,
                     delayed_reason: r.get::<_, Option<String>>(4)?,
                     output: r.get::<_, Option<String>>(5)?,
@@ -7178,6 +7237,45 @@ impl Store {
             .optional()?)
     }
 
+    /// Closes a proof's current active interval while retaining its `running`
+    /// state, for a scheduler wait that does not execute agent work.
+    pub fn stop_proof_active_interval(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        scope: &str,
+        cell_idx: i64,
+        idx: i64,
+    ) -> Result<()> {
+        let now = now_ms();
+        self.conn.execute(
+            "UPDATE proofs SET completed_active_duration_ms = completed_active_duration_ms +
+                    CASE WHEN active_started_at_ms IS NULL THEN 0 ELSE MAX(0, ? - active_started_at_ms) END,
+                 active_started_at_ms=NULL
+             WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=?",
+            params![now, squad_id, task_idx, scope, cell_idx, idx],
+        )?;
+        Ok(())
+    }
+
+    /// Opens a proof active interval without changing state, immediately before
+    /// the scheduler resumes agent execution.
+    pub fn start_proof_active_interval(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        scope: &str,
+        cell_idx: i64,
+        idx: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE proofs SET active_started_at_ms=COALESCE(active_started_at_ms, ?)
+             WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=?",
+            params![now_ms(), squad_id, task_idx, scope, cell_idx, idx],
+        )?;
+        Ok(())
+    }
+
     /// Set a proof step's state. Also stamps `started_at_ms` (once, the
     /// first time the step enters `running`) and `finished_at_ms` (every
     /// time it enters a terminal state, so a restart-triggered re-run
@@ -8266,20 +8364,14 @@ impl Store {
                 admin_only: false,
             });
             self.conn.execute(
-                "UPDATE cells SET state='pending', error=NULL,
-                    completed_active_duration_ms = completed_active_duration_ms +
-                        CASE WHEN active_started_at_ms IS NULL THEN 0 ELSE MAX(0, ? - active_started_at_ms) END,
-                    active_started_at_ms=NULL
+                "UPDATE cells SET state='pending', error=NULL, active_started_at_ms=NULL
                  WHERE squad_id=? AND state='running'",
-                params![now_ms(), id],
+                params![id],
             )?;
             self.conn.execute(
-                "UPDATE proofs SET state='pending',
-                    completed_active_duration_ms = completed_active_duration_ms +
-                        CASE WHEN active_started_at_ms IS NULL THEN 0 ELSE MAX(0, ? - active_started_at_ms) END,
-                    active_started_at_ms=NULL
+                "UPDATE proofs SET state='pending', active_started_at_ms=NULL
                  WHERE squad_id=? AND state='running'",
-                params![now_ms(), id],
+                params![id],
             )?;
             self.conn.execute(
                 "UPDATE tasks SET state='pending' WHERE squad_id=? AND state='running'",
@@ -12508,6 +12600,14 @@ command = "y"
         store.set_task_state(&id, 0, NodeState::Running).unwrap();
         store.set_cell_state(&id, 0, 0, NodeState::Done).unwrap();
         store.set_cell_state(&id, 0, 1, NodeState::Running).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE cells SET completed_active_duration_ms=123, active_started_at_ms=?
+                 WHERE squad_id=? AND task_idx=0 AND idx=1",
+                params![now_ms() - 60_000, id],
+            )
+            .unwrap();
         assert_eq!(store.running_cell_count().unwrap(), 1);
 
         let recovered = store.recover_orphaned_squads().unwrap();
@@ -12519,6 +12619,10 @@ command = "y"
         // Finished work is preserved (skipped on resume); orphaned work resets.
         assert_eq!(squad.tasks[0].cells[0].state, "done");
         assert_eq!(squad.tasks[0].cells[1].state, "pending");
+        assert_eq!(
+            squad.tasks[0].cells[1].duration_ms, 123,
+            "recovery must discard an interval left open by the prior daemon rather than count downtime"
+        );
         assert_eq!(store.running_cell_count().unwrap(), 0);
     }
 

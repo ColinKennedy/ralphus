@@ -2134,6 +2134,7 @@ fn run_cell_with_rate_limit_retries<'a>(
         );
         {
             let guard = store.lock();
+            let _ = guard.stop_cell_active_interval(squad_id, row.task_idx, row.idx);
             let _ = guard.mark_cell_delayed(squad_id, row.task_idx, row.idx, wake_at_ms);
             let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
                 level: crate::logging::LogLevel::INFO,
@@ -2165,6 +2166,9 @@ fn run_cell_with_rate_limit_retries<'a>(
             return None;
         }
         permit = sem.acquire_ranked(dispatch_priority);
+        let _ = store
+            .lock()
+            .start_cell_active_interval(squad_id, row.task_idx, row.idx);
         spec.resume_agent_session_id = agent_session_id;
         spec.retry_attempt = spec.retry_attempt.saturating_add(1);
     }
@@ -4099,6 +4103,7 @@ fn run_proof_with_rate_limit_retries(
         );
         {
             let guard = store.lock();
+            let _ = guard.stop_proof_active_interval(squad_id, task_idx, scope, cell_idx, idx);
             let _ = guard.mark_proof_delayed(
                 squad_id, task_idx, scope, cell_idx, idx, wake_at_ms, &reason,
             );
@@ -4132,6 +4137,9 @@ fn run_proof_with_rate_limit_retries(
         let _ = store
             .lock()
             .clear_proof_delayed(squad_id, task_idx, scope, cell_idx, idx);
+        let _ = store
+            .lock()
+            .start_proof_active_interval(squad_id, task_idx, scope, cell_idx, idx);
         spec.resume_agent_session_id = result.agent_session_id;
         spec.retry_attempt = retries;
     }

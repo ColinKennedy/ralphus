@@ -288,10 +288,10 @@
        * @param {number|null|undefined} startedAtMs
        * @param {number|null|undefined} finishedAtMs
        * @param {number} durationMs
-       * @param {boolean} active
+       * @param {number} activeDurationIntervals
        * @returns {string}
        */
-      function timingRows(startedAtMs, finishedAtMs, durationMs, active) {
+      function timingRows(startedAtMs, finishedAtMs, durationMs, activeDurationIntervals) {
         const startedTip = "When this first started executing, in UTC — not when it was submitted or queued, if those differ."
           + "\nUseful for confirming exactly when execution began without doing timezone math from a local timestamp.";
         const runningTip = "How long this has been executing."
@@ -301,7 +301,9 @@
           return `<div class="kv-row"><span class="k">started at</span><span class="v" data-tip="${startedTip}">—</span></div>
             <div class="kv-row"><span class="k">time running</span><span class="v" data-tip="${runningTip}">—</span></div>`;
         }
-        const runningAttrs = active ? ` data-running="1" data-started="${Date.now() - durationMs}"` : "";
+        const runningAttrs = activeDurationIntervals > 0
+          ? ` data-running="1" data-started="${Date.now() - durationMs / activeDurationIntervals}" data-duration-rate="${activeDurationIntervals}"`
+          : "";
         return `<div class="kv-row"><span class="k">started at</span><span class="v mono" data-tip="${startedTip}">${fmtUtc(startedAtMs)}</span></div>
           <div class="kv-row"><span class="k">active duration</span><span class="v"${runningAttrs} data-tip="${runningTip}">${fmtDuration(durationMs)}</span></div>`;
       }
@@ -364,7 +366,7 @@
           <div class="kv-row"><span class="k">id</span><span class="v mono">${esc(r.id)}${copyBtn(r.id)}</span></div>
           <div class="kv-row"><span class="k">label</span><span class="v">${esc(r.label || "—")}</span></div>
           <div class="kv-row"><span class="k">state</span><span class="v"${isDowntimeWaiting(r) ? ` data-tip="${WAITING_TIP}"` : ""}>${pill(squadDisplayState(r))}${["pending","queued"].includes(r.state) ? "" : squadLogsBtn(r.id) + squadTimelineBtn(r.id)}</span></div>
-          ${timingRows(r.started_at_ms, r.finished_at_ms, r.duration_ms ?? 0, r.state === "running")}
+          ${timingRows(r.started_at_ms, r.finished_at_ms, r.duration_ms ?? 0, r.active_duration_intervals ?? 0)}
           <div class="kv-row" data-tip="${SQUAD_TURNS_TIP}"><span class="k">turns</span><span class="v">${totalTurns === null ? "–" : String(totalTurns)}</span></div>
           <div class="kv-row"><span class="k">watchers</span><span class="v">${watchersHtml(`squad:${r.id}`)}</span></div>
           ${tasks}
@@ -790,7 +792,7 @@
           <div class="kv-row"><span class="k">name</span><span class="v">${esc(t.name)}</span></div>
           <div class="kv-row"><span class="k">project</span><span class="v">${esc(t.project)}</span></div>
           <div class="kv-row"><span class="k">state</span><span class="v">${pill(t.state)}${outOfDateBadge(t.env_out_of_date)}${["pending","queued"].includes(t.state) ? "" : squadLogsBtn(r.id)}${t.error ? failLogBtn(t.error) : ""}</span></div>
-          ${timingRows(t.started_at_ms, t.finished_at_ms, t.duration_ms ?? 0, t.state === "running")}
+          ${timingRows(t.started_at_ms, t.finished_at_ms, t.duration_ms ?? 0, t.active_duration_intervals ?? 0)}
           <div class="kv-row" data-tip="${TASK_TURNS_TIP}"><span class="k">turns</span><span class="v">${totalTurns === null ? "–" : String(totalTurns)}</span></div>
           ${cells}
           ${proof}
@@ -1077,7 +1079,7 @@
           <div class="kv-row"><span class="k">id</span><span class="v mono">${esc(s.id)}${copyBtn(s.id)}</span></div>
           <div class="kv-row"><span class="k">task</span><span class="v">${esc(t.name)}</span></div>
           <div class="kv-row"><span class="k">state</span><span class="v">${pill(s.state)}${detachedBadge(s.detached_at_ms)}${delayedBadge(s.delayed_until_ms)}${outOfDateBadge(s.env_out_of_date)}${subprojectBadge(s)}${["pending","queued"].includes(s.state) ? "" : squadLogsBtn(r.id)}${s.error ? failLogBtn(s.error) : ""}</span></div>
-          ${timingRows(s.started_at_ms, s.finished_at_ms, s.duration_ms ?? 0, s.state === "running")}
+          ${timingRows(s.started_at_ms, s.finished_at_ms, s.duration_ms ?? 0, s.active_duration_intervals ?? 0)}
           <div class="kv-row"><span class="k">agent</span>${detailValueHtml(s.agent, agentTip)}</div>
           <div class="kv-row"><span class="k">model</span>${detailValueHtml(s.model || "—", modelTip)}</div>
           <div class="kv-row"><span class="k">project</span><span class="v mono">${esc(project)}${paths && paths.project ? copyBtn(paths.project) : ""}</span></div>
