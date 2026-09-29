@@ -139,7 +139,11 @@ pub struct ReviewConfig {
     /// "auto-clean" branch) -- the old, lighter-weight default behavior.
     /// `None` means unset, which resolves to `false`; per-project scalars win
     /// over the global layer, same as `skip_worktrees`.
-    #[serde(rename = "proof_skip_auto_clean", alias = "verify_skip_auto_clean", default)]
+    #[serde(
+        rename = "proof_skip_auto_clean",
+        alias = "verify_skip_auto_clean",
+        default
+    )]
     pub proof_skip_auto_clean: Option<bool>,
     /// The conflict-resolver agent used when a review doesn't set its own
     /// `[[review]].agent` and `RALPHUS_RESOLVER_AGENT` isn't set -- a builtin

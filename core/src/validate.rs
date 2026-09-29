@@ -1922,7 +1922,14 @@ fn validate_review_blocks(value: Option<&toml::Value>, ctx: &mut Ctx) {
             header,
         );
         check_positive_number(ctx, table, "base_shift_maximum_rebuilds", &rpath, header);
-        check_type(ctx, table, "proof_skip_auto_clean", Ty::Bool, &rpath, header);
+        check_type(
+            ctx,
+            table,
+            "proof_skip_auto_clean",
+            Ty::Bool,
+            &rpath,
+            header,
+        );
         check_type(ctx, table, "skip_auto_clean", Ty::Bool, &rpath, header);
         check_type(ctx, table, "match_pr_branch_name", Ty::Bool, &rpath, header);
         check_type(ctx, table, "separate_pr_branch", Ty::Bool, &rpath, header);

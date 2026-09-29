@@ -5333,6 +5333,12 @@ impl Store {
             review_branch_name: row.review_branch_name,
             auto_submit_pr_stack: row.auto_submit_pr_stack,
             effective_auto_submit_pr_stack,
+            summary_format: row.summary_format.clone(),
+            effective_summary_format: row.summary_format.unwrap_or_else(|| {
+                project_review_config
+                    .summary_format
+                    .unwrap_or_else(|| "bullet".to_string())
+            }),
             origin: row.origin,
             ready,
             merge_progress,
