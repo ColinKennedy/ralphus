@@ -3482,6 +3482,23 @@ fn run_task_finalizer(
     }
 }
 
+/// Whether startup feedback recovery must leave this review's durably-pending
+/// feedback queued rather than reapplying it (RAL-524).
+///
+/// A `merge_stopped` review is an explicit user stop (RAL-249): reapplying its
+/// queued feedback would restart exactly the agent work the stop halted. A
+/// terminal review (`merged`/`cancelled`/`deployed`) cannot be revived by
+/// background work at all. In both cases the feedback text stays durably
+/// stored (see `Store::set_branch_pending_feedback`), so it is still queued
+/// once a deliberate user action resumes the review and a later daemon
+/// restart runs recovery again.
+fn pending_feedback_blocked_by_status(status: &str) -> bool {
+    matches!(
+        status,
+        "merge_stopped" | "merged" | "cancelled" | "deployed"
+    )
+}
+
 /// RAL-375: recovery run once at scheduler startup so review work an unclean
 /// daemon shutdown interrupted resumes automatically, mirroring how
 /// [`crate::store::Store::recover_orphaned_squads`] already resumes squads
@@ -3500,10 +3517,12 @@ fn run_task_finalizer(
 /// Separately, any branch with feedback still durably marked pending (RAL-375
 /// -- an unclean shutdown mid-`guardian_merge::run_feedback`, whose feedback
 /// text was previously held only as that function's own in-memory argument
-/// and so silently lost) has that feedback reapplied directly. This must run
-/// before the guardian-level reclaim above finishes rebuilding the stack, or
-/// an ordinary rebuild would finalize the review having silently dropped the
-/// never-applied feedback.
+/// and so silently lost) has that feedback reapplied directly -- unless its
+/// review is stopped or terminal (see [`pending_feedback_blocked_by_status`],
+/// RAL-524), in which case the stop stays authoritative and the feedback
+/// stays queued. This must run before the guardian-level reclaim above
+/// finishes rebuilding the stack, or an ordinary rebuild would finalize the
+/// review having silently dropped the never-applied feedback.
 ///
 /// MUST run before `server::serve`'s startup spawns any competing recovery
 /// that could flip a `merging` guardian to a terminal status first (see
@@ -3525,6 +3544,35 @@ pub fn recover_interrupted_reviews(
         (interrupted, pending_feedback)
     };
     for (gid, branch_id, feedback) in pending_feedback {
+        // RAL-524: a review the user explicitly stopped (or one already
+        // terminal) keeps its queued feedback untouched -- resuming it here
+        // would override the stop. Log the skip so the decision is visible,
+        // and leave the durable pending-feedback record in place.
+        let status = store.lock().guardian_status_str(&gid).unwrap_or_default();
+        if pending_feedback_blocked_by_status(&status) {
+            crate::rlog!(
+                WARNING,
+                "ralphus [recovery] review {gid} branch {branch_id}: pending feedback left \
+                 queued -- review is {status}; it will be applied when the review is \
+                 deliberately resumed and recovery runs again"
+            );
+            let _ = store
+                .lock()
+                .cartographer_log(crate::cartographer::CartographerEntry {
+                    level: crate::logging::LogLevel::WARNING,
+                    source: "recovery",
+                    message: "pending feedback left queued: review is stopped or terminal",
+                    scope: Some("branch"),
+                    squad_id: None,
+                    guardian_id: Some(&gid),
+                    cell_id: None,
+                    task: None,
+                    log_path: None,
+                    payload: serde_json::json!({"branch_id": branch_id, "status": status}),
+                    admin_only: false,
+                });
+            continue;
+        }
         crate::rlog!(
             WARNING,
             "ralphus [recovery] review {gid} branch {branch_id}: reapplying feedback interrupted by daemon restart"
@@ -4687,6 +4735,24 @@ mod tests {
     use super::*;
     use crate::runner::{RunnerResult, RunnerSpec};
     use std::collections::BTreeMap;
+
+    /// RAL-524: startup feedback recovery defers to an explicit user stop.
+    /// A `merge_stopped` review's queued feedback stays queued (applied once
+    /// the review is deliberately resumed and recovery runs again), and no
+    /// terminal status is ever revived by a feedback reapply.
+    #[test]
+    fn pending_feedback_is_blocked_for_stopped_and_terminal_reviews() {
+        assert!(pending_feedback_blocked_by_status("merge_stopped"));
+        assert!(pending_feedback_blocked_by_status("cancelled"));
+        assert!(pending_feedback_blocked_by_status("merged"));
+        assert!(pending_feedback_blocked_by_status("deployed"));
+        for live in ["collecting", "merging", "in_review", "merge_failed"] {
+            assert!(
+                !pending_feedback_blocked_by_status(live),
+                "a live review's interrupted feedback must still be resumed ({live})"
+            );
+        }
+    }
 
     /// Runs `f` on its own thread and requires it to finish within `timeout`.
     ///

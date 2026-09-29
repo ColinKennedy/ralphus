@@ -2484,6 +2484,27 @@ guarded on the review actually being `merging`, a merge that had already
 completed before the worker was stopped is left in `in_review` (the endpoint
 reports a `store_error`), rather than being mis-labelled as stopped.
 
+The stop stays authoritative until a deliberate user action resumes or reruns
+the review (RAL-524):
+
+- A background worker that outlives the stop (a feedback pass in flight, or a
+  merge worker the bounded wait gave up on) can still finish its branch-level
+  work, but its status writes cannot move the review out of `merge_stopped` —
+  the generic status setter refuses to revive a stopped review, the same way
+  it already refuses to revive a `cancelled` one. Resuming is the explicit
+  `POST /api/guardians/{id}/merge` above (or `POST /api/guardians/{id}/cancel`
+  to abandon it); both remain available.
+- A review stopped while feedback was still pending (an interrupted feedback
+  pass leaves its text durably queued) does **not** have that feedback
+  reapplied by the daemon's startup recovery. The feedback stays queued and
+  is applied by a later recovery pass once the review has been deliberately
+  resumed and the daemon restarts again.
+- The standing CI poll still records PR CI statuses for the board while a
+  review is stopped, but it does **not** dispatch automatic CI-failure fixes
+  into it; each failing PR's auto-fix outcome is recorded as
+  `skipped_stopped` until the review is resumed. Manual PR feedback/fix
+  actions are unaffected — a person acting is the deliberate user action.
+
 ### `POST /api/guardians/{id}/reopen`
 
 Reopen a `cancelled` review: flips `cancelled → collecting` and immediately

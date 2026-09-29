@@ -2353,6 +2353,13 @@ impl Store {
     }
 
     /// Set a guardian's status (and optional detail).
+    ///
+    /// Atomically refuses to move a review out of `cancelled` (terminal) or
+    /// `merge_stopped` (an explicit user stop, RAL-249): a background worker
+    /// writing its final status after a slow operation cannot revive a review
+    /// the user halted. Deliberate transitions out of those two states go
+    /// through their own dedicated paths instead (`claim_guardian_merge`,
+    /// `reopen_guardian`, `cancel_guardian`).
     pub fn set_guardian_status(
         &self,
         id: &str,
@@ -2372,7 +2379,8 @@ impl Store {
             .unwrap_or_else(|| "unknown".to_string());
         let n = self.conn.execute(
             "UPDATE guardians SET status=?, detail=?, updated_at_ms=? WHERE id=? \
-             AND (status != 'cancelled' OR ?='cancelled')",
+             AND (status NOT IN ('cancelled','merge_stopped') \
+                  OR ? IN ('cancelled','merge_stopped'))",
             params![
                 status.as_str(),
                 detail,
@@ -2382,12 +2390,24 @@ impl Store {
             ],
         )?;
         if n == 0 {
-            // A cancelled review is terminal. Merge workers can observe their
-            // cancellation after a slow operation completes, so their final
-            // status write must not revive a review the user has cancelled.
-            // Explicit reopening uses `reopen_guardian`, whose transition is
-            // deliberately separate from this generic setter.
-            if old == "cancelled" && status != GuardianStatus::Cancelled {
+            // A cancelled review is terminal and a `merge_stopped` review is
+            // an explicit user stop (RAL-249). Merge workers can observe their
+            // cancellation/stop after a slow operation completes, so their
+            // final status write must not revive a review the user halted --
+            // an explicit stop stays authoritative until a deliberate user
+            // action resumes the review. Explicit transitions out use
+            // dedicated paths instead: `claim_guardian_merge` (the board's
+            // "Merge / rebase" on a `merge_stopped` review) and
+            // `reopen_guardian` for terminal statuses. `cancelled` remains
+            // writable from `merge_stopped` so a stopped review can still be
+            // cancelled outright.
+            if (old == "cancelled" && status != GuardianStatus::Cancelled)
+                || (old == "merge_stopped"
+                    && !matches!(
+                        status,
+                        GuardianStatus::MergeStopped | GuardianStatus::Cancelled
+                    ))
+            {
                 return Ok(());
             }
             Err(StoreError::NotFound)
@@ -6969,6 +6989,56 @@ mod tests {
 
         // A terminal/cancelled review can't be stopped.
         assert!(store.stop_guardian_merge(&id).is_err());
+    }
+
+    /// RAL-524: an explicit stop stays authoritative. The generic status
+    /// setter must not move a review out of `merge_stopped` -- a background
+    /// worker (a feedback pass or a merge worker that outlived the stop)
+    /// writing its final status would otherwise silently restart the review
+    /// the user stopped. Cancelling a stopped review stays allowed.
+    #[test]
+    fn set_guardian_status_cannot_revive_a_merge_stopped_review() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "feat").unwrap();
+        store.claim_guardian_merge(&id).unwrap();
+        store.stop_guardian_merge(&id).unwrap();
+        assert_eq!(store.get_guardian(&id).unwrap().status, "merge_stopped");
+
+        // Every worker-style status write is a silent no-op: the review was
+        // stopped, and it stays stopped.
+        for revived in [
+            GuardianStatus::Merging,
+            GuardianStatus::InReview,
+            GuardianStatus::MergeFailed,
+            GuardianStatus::Collecting,
+            GuardianStatus::Merged,
+        ] {
+            store.set_guardian_status(&id, revived, None).unwrap();
+            assert_eq!(
+                store.get_guardian(&id).unwrap().status,
+                "merge_stopped",
+                "a {revived:?} write must not revive a merge_stopped review"
+            );
+        }
+
+        // Cancelling a stopped review is still a legitimate user action.
+        assert_eq!(
+            store.cancel_guardian(&id).unwrap(),
+            GuardianStatus::Cancelled
+        );
+
+        // Normal (non-stopped) reviews keep transitioning through the generic
+        // setter -- the guard must only bite from `merge_stopped`/`cancelled`.
+        let id2 = store.create_guardian("r2", "main", "/repo").unwrap();
+        store
+            .set_guardian_status(&id2, GuardianStatus::Merging, None)
+            .unwrap();
+        assert_eq!(store.get_guardian(&id2).unwrap().status, "merging");
+        store
+            .set_guardian_status(&id2, GuardianStatus::InReview, None)
+            .unwrap();
+        assert_eq!(store.get_guardian(&id2).unwrap().status, "in_review");
     }
 
     #[test]
