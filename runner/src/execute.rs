@@ -335,17 +335,19 @@ fn check_context_limit_support(spec: &CellSpec, backend: &dyn ModelBackend) -> R
     Ok(())
 }
 
-/// The backend-agnostic half of [`run_prompt_inner`], split out so the
-/// still-working retry loop and the RAL-292 background-job nudge loop can be
-/// exercised in tests against a stub [`ModelBackend`] instead of a real CLI
-/// subprocess.
-fn run_with_backend(
-    spec: &CellSpec,
-    original_prompt: &str,
-    workspace: &Workspace,
-    backend: &dyn ModelBackend,
-) -> CellResult {
-    let system_prompt = if spec.proof {
+/// The full system prompt a prompt-kind spec delivers to its backend: the
+/// caller-authored fragment first (cells) or last (proofs), with ralphus's
+/// own fragments around it in the documented `## Background` →
+/// `## Regarding Tools` → `## Conclusion` order. Split out from
+/// [`run_with_backend`] so the daemon's own re-derivation of these prompts
+/// (`daemon/src/runner.rs`'s `effective_cell_system_prompt`/
+/// `effective_proof_system_prompt`, whose fragment constants must stay
+/// byte-identical to the ones above) can be tested against the assembly the
+/// runner actually performs -- including for the review-merge agent paths
+/// (conflict resolver, final proof, feedback/auto-fix actioning) that reuse
+/// the same composition.
+pub fn assembled_system_prompt(spec: &CellSpec) -> Option<String> {
+    if spec.proof {
         combine_system_prompts(&[
             Some(NON_INTERACTIVE_SYSTEM_PROMPT),
             Some(TOOLS_SYSTEM_PROMPT),
@@ -365,7 +367,20 @@ fn run_with_backend(
             Some(GHOST_SYSTEM_PROMPT),
             Some(PROPHECY_SYSTEM_PROMPT),
         ])
-    };
+    }
+}
+
+/// The backend-agnostic half of [`run_prompt_inner`], split out so the
+/// still-working retry loop and the RAL-292 background-job nudge loop can be
+/// exercised in tests against a stub [`ModelBackend`] instead of a real CLI
+/// subprocess.
+fn run_with_backend(
+    spec: &CellSpec,
+    original_prompt: &str,
+    workspace: &Workspace,
+    backend: &dyn ModelBackend,
+) -> CellResult {
+    let system_prompt = assembled_system_prompt(spec);
     if let Some(sp) = &system_prompt {
         crate::cartographer::emit(
             "runner",

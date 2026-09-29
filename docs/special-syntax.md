@@ -248,8 +248,12 @@ The CLI also accepts **legacy selectors** where a URI is overkill:
 Every `prompt` cell and `prompt` proof step gets ralphus's system
 instructions appended to the agent's instructions, assembled in this order:
 `## Background` (non-interactive framing) → `## Regarding Tools` (prefer
-`rg`) → `## Conclusion` (async framing, then either the proof or the ghost
-fragment). The markers that assembly teaches are parsed from the reply:
+`rg` over `grep`, with `grep` as the fallback when `rg` is unavailable) →
+`## Conclusion` (async framing, then either the proof or the ghost
+fragment). The review's own agent passes — conflict resolution during a
+rebase, the dedicated final-proof pass, and the feedback/auto-fix
+actioning pass — run through the same assembly, so they teach the same
+tool guidance. The markers that assembly teaches are parsed from the reply:
 
 - **`RALPHUS_PROOF: PASS` / `RALPHUS_PROOF: FAIL`** — the verdict contract of
   a `prompt` proof step. Applies to prompt proof steps only: normal cells

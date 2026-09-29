@@ -465,11 +465,19 @@ const NON_INTERACTIVE_SYSTEM_PROMPT: &str = "## Background\nYou are running unat
      Never ask a clarifying question, never stop to present a plan for \
      confirmation, and never pause waiting for input. Make the most \
      reasonable judgment call yourself and continue until the task is \
-     complete. Your working directory for this cell is fixed for the entire \
-     session — never `cd` to, read, or write any path outside it, even one \
-     that looks related or more familiar (such as this repository's main \
-     checkout); every file edit and git operation must happen inside the \
-     working directory you were given.\n\nYou are working in a dedicated git \
+     complete. Your working directory is this cell's assigned worktree for \
+     this project. For this project only, treat that inherited working \
+     directory as the sole authority for which checkout to use: never select, \
+     read, or write this project's main checkout or another linked worktree. \
+     Do not choose a different checkout of this project because a tool \
+     suggests one, Git discovers one, a repository name is familiar, or an \
+     absolute path looks plausible. For this project, use relative paths and \
+     ordinary Git commands in the assigned worktree; never use `git -C`, \
+     `--git-dir`, `--work-tree`, `GIT_DIR`, or `GIT_WORK_TREE` to select a \
+     different checkout of this project. You may access files, network paths, \
+     or unrelated repositories outside this project when the task requires \
+     them; do not treat any of them as a substitute for this project's \
+     assigned worktree.\n\nYou are working in a dedicated git \
      worktree of this project's repository, not its main checkout. Implement \
      the work exactly as described and keep every change -- file edits, \
      `git add`, commits, anything -- confined to this worktree; never touch \
@@ -3271,6 +3279,97 @@ mod tests {
         assert!(sp.contains("RALPHUS_PROOF: PASS"), "{sp}");
         assert!(sp.contains("RALPHUS_PROOF: FAIL"), "{sp}");
         assert!(!sp.contains("RALPHUS_GHOST:"), "{sp}");
+    }
+
+    #[test]
+    fn rebaser_prompts_carry_tool_guidance() {
+        // RAL-526: the review merge's conflict-resolution pass (the rebaser)
+        // reuses the shared cell composition, so its effective prompt carries
+        // the same `rg`-over-`grep` guidance ordinary cells get.
+        let sp = effective_cell_system_prompt(
+            Some(crate::guardian_merge::CONFLICT_RESOLVER_SYSTEM_PROMPT),
+            &[],
+        );
+        assert_assembled_prompt_sections(&sp, "You are a git merge-conflict resolver");
+        assert!(sp.contains("git merge-conflict resolver"), "{sp}");
+
+        // The dedicated final-proof pass of the same rebase cycle is a proof
+        // spec, so it goes through the proof composition instead -- same
+        // tool guidance, proof framing.
+        let sp =
+            effective_proof_system_prompt(Some(crate::guardian_merge::FINAL_PROOF_SYSTEM_PROMPT));
+        assert_assembled_prompt_sections(&sp, "## Background");
+        assert!(sp.contains("dedicated final-proof pass"), "{sp}");
+        assert!(sp.contains("RALPHUS_PROOF: PASS"), "{sp}");
+    }
+
+    #[test]
+    fn auto_fix_feedback_prompt_carries_tool_guidance() {
+        // RAL-526: the feedback-actioning pass that both human feedback and
+        // the PR auto-fix dispatcher funnel through (`run_feedback`) builds
+        // its `RunnerSpec` with no authored system prompt, so its effective
+        // prompt is ralphus's defaults alone -- which must still include the
+        // `rg`-over-`grep` guidance. The RAL-395 `require_proof` variant
+        // flips the same pass to a proof spec; assert both shapes.
+        let sp = effective_cell_system_prompt(None, &[]);
+        assert_assembled_prompt_sections(&sp, "## Background");
+
+        let sp = effective_proof_system_prompt(None);
+        assert_assembled_prompt_sections(&sp, "## Background");
+        assert!(sp.contains("RALPHUS_PROOF: PASS"), "{sp}");
+    }
+
+    #[test]
+    fn daemon_re_derivation_matches_the_runner_assembly_for_review_paths() {
+        // The daemon-side `effective_*` composition and the runner's own
+        // assembly must agree byte-for-byte -- the constants are duplicated
+        // across the two crates by design, and drift would silently diverge
+        // what the board/`system-prompt` endpoints show from what the agent
+        // actually receives. Round-trip the exact wire format (`RunnerSpec`
+        // JSON -> `CellSpec`) for the two review-merge shapes: the
+        // feedback/auto-fix actioning pass (no authored system prompt) and
+        // the final-proof pass (authored system prompt, `proof: true`).
+        let mut feedback_spec = RunnerSpec::for_proof(
+            "guardian-x",
+            "feedback",
+            "feedback-branch",
+            "/repo",
+            "fix the PR errors",
+            "claude-code",
+            None,
+            None,
+            None,
+            None,
+        );
+        // `for_proof` is the proof shape; the plain actioning pass is a cell
+        // spec, so clear the flag.
+        feedback_spec.proof = false;
+        let cell_sp = ralphus_runner::execute::assembled_system_prompt(
+            &ralphus_runner::spec::CellSpec::from_json(
+                &serde_json::to_string(&feedback_spec).unwrap(),
+            )
+            .unwrap(),
+        )
+        .expect("feedback actioning is a prompt spec");
+        assert_eq!(cell_sp, effective_cell_system_prompt(None, &[]));
+
+        // The RAL-395 require_proof variant keeps the feedback prompt but
+        // carries the final-proof pass's authored system prompt.
+        let mut proof_spec = feedback_spec.clone();
+        proof_spec.proof = true;
+        proof_spec.system_prompt =
+            Some(crate::guardian_merge::FINAL_PROOF_SYSTEM_PROMPT.to_string());
+        let proof_sp = ralphus_runner::execute::assembled_system_prompt(
+            &ralphus_runner::spec::CellSpec::from_json(
+                &serde_json::to_string(&proof_spec).unwrap(),
+            )
+            .unwrap(),
+        )
+        .expect("require_proof feedback is a prompt proof");
+        assert_eq!(
+            proof_sp,
+            effective_proof_system_prompt(Some(crate::guardian_merge::FINAL_PROOF_SYSTEM_PROMPT))
+        );
     }
 
     #[test]
