@@ -4759,7 +4759,7 @@ impl Store {
     /// (`crate::store_pool`) can serve it without the writer lock.
     pub(crate) fn list_guardians_conn(conn: &Connection) -> Result<Vec<GuardianView>> {
         let mut stmt = conn.prepare(
-            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus
+            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus
              FROM guardians ORDER BY created_at_ms DESC", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
         )?;
         let rows = stmt
@@ -7765,6 +7765,29 @@ mod tests {
         assert_eq!(g.branches[0].review_branch_name, None);
         assert!(g.readable_review_branch);
         assert_eq!(g.review_branch_name, None);
+    }
+
+    #[test]
+    fn list_guardians_keeps_review_branch_name_aligned_with_later_columns() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store
+            .set_guardian_review_branch_name(&id, "r-review")
+            .unwrap();
+        store
+            .set_guardian_auto_fix_pr_errors(&id, Some(true))
+            .unwrap();
+        store
+            .set_guardian_auto_fix_prompt_template(&id, Some("fix: <<prompt>>"))
+            .unwrap();
+
+        let guardian = store.list_guardians().unwrap().pop().unwrap();
+        assert_eq!(guardian.review_branch_name.as_deref(), Some("r-review"));
+        assert_eq!(guardian.auto_fix_pr_errors, Some(true));
+        assert_eq!(
+            guardian.auto_fix_prompt_template.as_deref(),
+            Some("fix: <<prompt>>")
+        );
     }
 
     #[test]
