@@ -5246,6 +5246,11 @@ fn finish_staged_merge<F: Fn(GuardianStatus, Option<&str>)>(
         );
         return;
     }
+    // RAL-521: decide once whether this finalize regenerates the manual
+    // checks -- with caching enabled and the one-time marker set, the cached
+    // commands survive this staged merge untouched.
+    let generate_manual_checks = manual_checks_should_generate(&guardian);
+
     for proj in &project_order {
         if cancel.is_cancelled() {
             log_merge_cancelled(store, id);
