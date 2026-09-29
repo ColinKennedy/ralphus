@@ -1302,23 +1302,6 @@ impl Store {
             params![id, name, base_branch, git_root, project, GuardianStatus::Collecting.as_str(), squad_id, review_key, now, now, now, i64::from(match_pr_branch_name), i64::from(auto_submit_pr_stack), i64::from(separate_pr_branch), owner, i64::from(dual_root_pr)],
         )?;
         let defaults = self.resolve_review_config(Path::new(git_root));
-        let auto_build_json = defaults
-            .auto_build
-            .as_deref()
-            .map(|command| {
-                serde_json::to_string(&GuardianAutoBuild {
-                    command: Some(command.to_string()),
-                    prompt: None,
-                    system_prompt: None,
-                    system_prompt_position: None,
-                    agent: None,
-                    model: None,
-                })
-            })
-            .transpose()
-            .map_err(|err| {
-                StoreError::InvalidTransition(format!("serialize review auto-build: {err}"))
-            })?;
         // These are creation-time stamps, not user edits. Writing them directly
         // preserves the initial snapshot without announcing spurious settings
         // changes to review watchers.
@@ -1326,7 +1309,7 @@ impl Store {
             "UPDATE guardians SET \
              resolver_agent=?, resolver_model=?, machine=?, maximum_budget_usd=?, \
              proof_scope=?, proof_skip_auto_clean=?, skip_worktrees=?, skip_base_updates=?, \
-             auto_submit_pr_stack=?, match_pr_branch_name=?, checks=?, auto_build_json=?, \
+             auto_submit_pr_stack=?, match_pr_branch_name=?, checks=?, \
              summary_format=? WHERE id=?",
             params![
                 defaults.default_resolver_agent(),
@@ -1340,7 +1323,6 @@ impl Store {
                 i64::from(auto_submit_pr_stack),
                 i64::from(match_pr_branch_name),
                 crate::store::to_json(&defaults.checks),
-                auto_build_json,
                 defaults.summary_format,
                 id,
             ],
