@@ -53,7 +53,7 @@ const MIN_SAMPLES_PER_ENDPOINT: usize = 10;
 const LOCK_WAIT_P95_BUDGET_MS: f64 = 50.0;
 /// M4: store-lock wait max. 45,890 ms at baseline; now well under a
 /// millisecond. The plan's target is 500 ms.
-const LOCK_WAIT_MAX_BUDGET_MS: f64 = 100.0;
+const LOCK_WAIT_MAX_BUDGET_MS: f64 = 500.0;
 
 fn submit_body(tag: usize) -> String {
     serde_json::json!({

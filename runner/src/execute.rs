@@ -407,6 +407,7 @@ fn run_with_backend(
             allow_personal_settings: spec.allow_personal_settings,
             allow_personal_memory: spec.allow_personal_memory,
             retry_attempt: spec.retry_attempt,
+            retry_after_unknown_default_seconds: spec.retry_after_unknown_default_seconds,
         };
         let mut outcome: BackendOutcome = match backend.run(&prompt, workspace, &options) {
             Ok(o) => o,
@@ -538,6 +539,7 @@ fn run_with_backend(
                 allow_personal_settings: spec.allow_personal_settings,
                 allow_personal_memory: spec.allow_personal_memory,
                 retry_attempt: spec.retry_attempt,
+                retry_after_unknown_default_seconds: spec.retry_after_unknown_default_seconds,
             };
             outcome = match backend.nudge(workspace, &nudge_options) {
                 Ok(Some(o)) => o,
@@ -1279,6 +1281,7 @@ mod tests {
             allow_personal_settings: false,
             allow_personal_memory: false,
             retry_attempt: 0,
+            retry_after_unknown_default_seconds: 30,
         }
     }
 
@@ -1547,6 +1550,7 @@ mod tests {
             allow_personal_settings: false,
             allow_personal_memory: false,
             retry_attempt: 0,
+            retry_after_unknown_default_seconds: 30,
         };
         let result = run_cell(&spec, false);
         assert!(!result.ok());
