@@ -718,6 +718,31 @@ pub fn poll_open_pr_ci_status(
     // pass is known -- see `plan_auto_fix_dispatch` for why stack order
     // matters here.
     for decision in plan_auto_fix_dispatch(&guardian, &polled) {
+        if decision.stopped {
+            // RAL-524: the review was explicitly stopped -- record why no fix
+            // ran so the board's per-PR outcome reflects the stop rather than
+            // a silent no-op.
+            log_ci_watch(
+                store,
+                guardian_id,
+                decision.pr.branch_id.as_deref().unwrap_or(""),
+                LogLevel::INFO,
+                format!(
+                    "ralphus [ci-watch] review {guardian_id} pr #{} auto-fix skipped: the review \
+                     is stopped (merge_stopped); resume it (Merge / rebase) to re-enable \
+                     automatic fixes",
+                    decision.pr.pr_number.unwrap_or_default()
+                ),
+                serde_json::json!({
+                    "pr_number": decision.pr.pr_number,
+                    "outcome": "skipped_stopped",
+                }),
+            );
+            let _ = store
+                .lock()
+                .set_pr_auto_fix_outcome(&decision.pr.id, "skipped_stopped");
+            continue;
+        }
         if decision.dispatch {
             let Some(client) = crate::pr::forge_client_for_pr(
                 store,
@@ -782,6 +807,13 @@ pub fn poll_open_pr_ci_status(
 
 /// One failing PR's auto-fix eligibility for this poll pass, from
 /// [`plan_auto_fix_dispatch`].
+///
+/// RAL-524: when the review itself is `merge_stopped` -- an explicit user stop
+/// (RAL-249) -- every decision carries `stopped: true` and no automatic fix
+/// may be dispatched into it until a person deliberately resumes the review
+/// (the board's "Merge / rebase"), regardless of branch readiness. The manual
+/// "fix" action is unaffected: a person clicking it *is* the deliberate user
+/// action.
 struct AutoFixDecision<'a> {
     pr: &'a PullRequestView,
     failure: &'a PrFailure,
@@ -795,6 +827,8 @@ struct AutoFixDecision<'a> {
     /// which is also `true` for a perfectly ready branch that's merely
     /// blocked behind a failing upstream sibling.
     not_ready: bool,
+    /// RAL-524: the review itself is `merge_stopped` (see the struct doc).
+    stopped: bool,
 }
 
 /// This guardian's `[BranchView::position]` for the branch a PR was opened
@@ -856,6 +890,29 @@ fn plan_auto_fix_dispatch<'a>(
     guardian: &GuardianView,
     polled: &'a [(PullRequestView, PrCiState)],
 ) -> Vec<AutoFixDecision<'a>> {
+    // RAL-524: an explicitly stopped review must not be auto-fixed back into
+    // motion. `merge_stopped` (RAL-249) is a deliberate user halt -- the
+    // standing poll still records CI statuses for the board, but every
+    // failing PR here is reported as skipped rather than dispatched, and the
+    // skip persists as the PR's auto-fix outcome so the board shows why
+    // nothing ran. Resuming the review ("Merge / rebase") re-enables normal
+    // dispatch on a later pass.
+    if guardian.status.as_str() == "merge_stopped" {
+        return polled
+            .iter()
+            .filter_map(|(pr, state)| match state {
+                PrCiState::Failing(failure) => Some((pr, failure)),
+                _ => None,
+            })
+            .map(|(pr, failure)| AutoFixDecision {
+                pr,
+                failure,
+                dispatch: false,
+                not_ready: false,
+                stopped: true,
+            })
+            .collect();
+    }
     let mut ordered: Vec<(i64, &PullRequestView, &PrFailure, bool)> = polled
         .iter()
         .filter_map(|(pr, state)| match state {
@@ -878,6 +935,7 @@ fn plan_auto_fix_dispatch<'a>(
                 failure,
                 dispatch: ready && !upstream_failing,
                 not_ready: !ready,
+                stopped: false,
             };
             if ready {
                 upstream_failing = true;
@@ -1726,6 +1784,41 @@ mod tests {
             "a failing downstream PR must dispatch once its upstream is no longer failing"
         );
         assert_eq!(decisions[0].pr.id, pr1.id);
+    }
+
+    /// RAL-524: an explicitly stopped review (`merge_stopped`, RAL-249) is
+    /// never auto-fixed back into motion. Every failing PR reports as
+    /// `stopped` (recorded as the PR's `skipped_stopped` outcome by the
+    /// caller) instead of dispatching, until a person resumes the review.
+    #[test]
+    fn plan_auto_fix_dispatch_never_dispatches_into_a_stopped_review() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let (guardian, pr0, pr1) = two_branch_stack_with_open_prs(&store);
+        store
+            .lock()
+            .set_guardian_status(
+                &guardian.id,
+                crate::guardian::GuardianStatus::MergeStopped,
+                None,
+            )
+            .unwrap();
+        let guardian = store.lock().get_guardian(&guardian.id).unwrap();
+        let polled = vec![(pr0.clone(), failing("a")), (pr1.clone(), failing("b"))];
+        let decisions = plan_auto_fix_dispatch(&guardian, &polled);
+        assert_eq!(decisions.len(), 2, "both failing PRs still get a decision");
+        for decision in &decisions {
+            assert!(decision.stopped, "the review is stopped");
+            assert!(
+                !decision.dispatch,
+                "nothing may auto-dispatch into a stopped review"
+            );
+            assert!(
+                !decision.not_ready,
+                "stopped is not the same as branch-not-ready"
+            );
+        }
     }
 
     /// Like [`two_branch_stack_with_open_prs`], but lets each test control
