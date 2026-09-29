@@ -27,7 +27,7 @@ use ralphus_daemon::guardian_merge::{
 use ralphus_daemon::pr::sync_remote_pr_commits;
 use ralphus_daemon::reviews::derive_reviews;
 use ralphus_daemon::runner::{Runner, RunnerResult, RunnerSpec};
-use ralphus_daemon::scheduler::Semaphore;
+use ralphus_daemon::scheduler::{Semaphore, recover_interrupted_reviews};
 use ralphus_daemon::server::{Daemon, route};
 use ralphus_daemon::store::{NodeState, Store};
 use ralphus_daemon::store_lock::StoreMutex;
@@ -2393,6 +2393,216 @@ fn interrupted_feedback_is_reapplied_on_simulated_restart_recovery() {
             .unwrap()
             .is_empty(),
         "resumed feedback must clear its own pending record on completion"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&remote_dir);
+}
+
+/// RAL-524: a review the user explicitly stopped (`merge_stopped`, RAL-249)
+/// must not have its durably-pending feedback reapplied by startup recovery --
+/// the stop stays authoritative until a deliberate user action resumes the
+/// review. Same crash simulation as
+/// [`interrupted_feedback_is_reapplied_on_simulated_restart_recovery`], but
+/// the review is stopped before the restart, so recovery must leave the
+/// pending record queued and apply nothing. Runs the real
+/// `scheduler::recover_interrupted_reviews` (a stopped guardian's feedback is
+/// skipped before any worker thread is spawned, so this stays synchronous and
+/// deterministic).
+#[test]
+fn stopped_review_s_pending_feedback_is_left_queued_by_restart_recovery() {
+    let root = temp_repo();
+    init_repo(&root);
+    write(&root, "base.txt", "base\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+    git(&root, &["checkout", "-b", "feature/a"]);
+    write(&root, "a.txt", "from a\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "add a"]);
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock();
+        let id = g
+            .create_guardian("r", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/a").unwrap();
+        id
+    };
+    run_merge(&store, &NoopRunner, &id);
+    let bid0 = store.lock().get_guardian(&id).unwrap().branches[0]
+        .id
+        .clone();
+
+    // Simulate: feedback was durably recorded, then the user stopped the
+    // review (or the stop landed mid-feedback-pass and the daemon was
+    // restarted before the pass could finish) -- the exact DB state a restart
+    // after a stop-with-pending-feedback leaves behind.
+    store
+        .lock()
+        .set_branch_pending_feedback(&id, &bid0, "add a note file")
+        .unwrap();
+    store
+        .lock()
+        .set_guardian_status(&id, GuardianStatus::MergeStopped, None)
+        .unwrap();
+
+    recover_interrupted_reviews(&store, &Arc::new(Semaphore::new(2)), &Cancellations::new());
+
+    // The stop is untouched and the feedback is still durably queued --
+    // recovery neither applied it nor dropped it.
+    assert_eq!(
+        store.lock().get_guardian(&id).unwrap().status,
+        "merge_stopped",
+        "recovery must not revive a stopped review"
+    );
+    assert_eq!(
+        store.lock().branches_with_pending_feedback().unwrap(),
+        vec![(id.clone(), bid0.clone(), "add a note file".to_string())],
+        "a stopped review's pending feedback stays queued for a deliberate resume"
+    );
+    let view = store.lock().get_guardian(&id).unwrap();
+    let rev0 = view.branches[0].review_branch.clone().unwrap();
+    let files0 = git(&root, &["ls-tree", "-r", "--name-only", &rev0]);
+    assert!(
+        !files0.contains("note.txt"),
+        "recovery must not apply a stopped review's pending feedback"
+    );
+
+    // The skip is notified, not silent: recovery records a warning-level
+    // Cartographer row naming the review and branch so the board (and the
+    // daemon log) shows why the queued feedback did not run.
+    let page = store
+        .lock()
+        .cartographer_query(&CartographerFilter {
+            guardian_id: Some(id.clone()),
+            ..CartographerFilter::recent(30)
+        })
+        .unwrap();
+    let skip_row = page
+        .rows
+        .iter()
+        .find(|r| r.source == "recovery" && r.level == "warning")
+        .unwrap_or_else(|| panic!(
+            "expected a warning Cartographer row from recovery for the skipped feedback, got: {:?}",
+            page.rows.iter().map(|r| (r.source.as_str(), r.level.as_str(), r.message.as_str())).collect::<Vec<_>>()
+        ));
+    assert!(
+        skip_row.message.contains("pending feedback"),
+        "the skip row should describe the deferred feedback"
+    );
+    assert_eq!(
+        skip_row.payload.get("branch_id").and_then(|v| v.as_str()),
+        Some(bid0.as_str()),
+        "the skip row should name the branch whose feedback was deferred"
+    );
+
+    // And once the user deliberately resumes the review, the same recovery
+    // pass would apply it -- the feedback was deferred, never discarded.
+    store.lock().claim_guardian_merge(&id).unwrap();
+    assert_ne!(
+        store.lock().get_guardian(&id).unwrap().status,
+        "merge_stopped",
+        "the explicit resume claim must still work from merge_stopped"
+    );
+    assert_eq!(
+        store.lock().branches_with_pending_feedback().unwrap().len(),
+        1,
+        "resuming the review does not discard its queued feedback"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// RAL-524: a feedback pass that was already in flight when the user stopped
+/// the review (the pass itself is not cancellable, so it runs to completion)
+/// still lands its edits on the branch, but must not move the review out of
+/// `merge_stopped` -- resuming the merge is the separate, explicit
+/// "Merge / rebase" action, and no background status write may revive the
+/// review the user stopped.
+#[test]
+fn feedback_pass_on_a_stopped_review_does_not_revive_it() {
+    let root = temp_repo();
+    init_repo(&root);
+    let remote_dir = temp_repo();
+    git(&remote_dir, &["init", "--bare"]);
+    git(
+        &root,
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+    );
+    write(&root, "base.txt", "base\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+    git(&root, &["checkout", "-b", "feature/a"]);
+    write(&root, "a.txt", "from a\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "add a"]);
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock();
+        let id = g
+            .create_guardian("r", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/a").unwrap();
+        id
+    };
+    run_merge(&store, &NoopRunner, &id);
+    let bid0 = store.lock().get_guardian(&id).unwrap().branches[0]
+        .id
+        .clone();
+
+    // The user stops the review while a feedback pass is about to run.
+    store
+        .lock()
+        .set_guardian_status(&id, GuardianStatus::MergeStopped, None)
+        .unwrap();
+    run_feedback(
+        &store,
+        &FeedbackRunner,
+        &id,
+        &bid0,
+        "add a note file",
+        None,
+        false,
+        &CancelToken::never(),
+    );
+
+    // The pass completed its branch-level work...
+    let view = store.lock().get_guardian(&id).unwrap();
+    assert_eq!(
+        view.branches[0].merge_status,
+        MergeStatus::Done.as_str(),
+        "the feedback pass itself still completes"
+    );
+    assert!(
+        view.branches[0]
+            .detail
+            .as_deref()
+            .unwrap_or("")
+            .starts_with("feedback applied"),
+        "expected the feedback outcome detail, got: {:?}",
+        view.branches[0].detail
+    );
+    let rev0 = view.branches[0].review_branch.clone().unwrap();
+    let files0 = git(&root, &["ls-tree", "-r", "--name-only", &rev0]);
+    assert!(files0.contains("note.txt"), "the edits land on the branch");
+
+    // ...but the review the user stopped stays stopped.
+    assert_eq!(
+        view.status, "merge_stopped",
+        "a feedback pass must not revive a stopped review"
+    );
+    assert!(
+        store
+            .lock()
+            .branches_with_pending_feedback()
+            .unwrap()
+            .is_empty(),
+        "the completed pass still clears its own pending record"
     );
 
     let _ = std::fs::remove_dir_all(&root);
