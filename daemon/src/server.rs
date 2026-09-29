@@ -6372,6 +6372,7 @@ fn run_submit_followup(
     // submitter asked for, so silently dropping it would be worse than
     // surfacing the error the same way a review-derivation failure does.
     if !file.waypoint.is_empty() {
+        let guard = store_handle.lock();
         if let Err(e) = guard.create_submission_waypoints(&squad_id, &file.waypoint) {
             let message = e.to_string();
             let _ = guard.set_squad_error(&squad_id, Some(&message));
@@ -6415,7 +6416,6 @@ fn run_submit_followup(
             return;
         }
     }
-    drop(guard);
 
     report_phase("Finishing up");
 
