@@ -12141,10 +12141,10 @@ fn generate_manual_commands(
             .set_guardian_manual_commands_session_id(id, sid);
     }
 
-    if !result.is_done() || result.summary.trim().is_empty() {
+    if !result.is_done() {
         // WARNING, not INFO: the merge still reaches `in_review`, but the
         // review lands without the manual checks it was supposed to carry, and
-        // nothing else reports that.
+        // a failed generation remains eligible for a later retry.
         phase_note(
             store,
             id,
@@ -12165,6 +12165,27 @@ fn generate_manual_commands(
 
     let commands = parse_manual_commands_response(result.summary.trim());
 
+    if commands.is_empty() {
+        // An empty, completed result is still a result. Cache it so the
+        // default one-time behavior does not keep rerunning a check that
+        // intentionally found no manual commands.
+        phase_note(
+            store,
+            id,
+            crate::logging::LogLevel::WARNING,
+            format!(
+                "review {id} manual-commands generation produced no commands after {}ms",
+                elapsed_ms(started)
+            ),
+            serde_json::json!({
+                "phase": "manual_commands",
+                "state": "empty",
+                "elapsed_ms": elapsed_ms(started),
+                "cancelled": cancel.is_cancelled(),
+            }),
+        );
+    }
+
     if cancel.is_cancelled() {
         // Superseded mid-generation (a newer merge or regen owns the outcome
         // slot): drop the result rather than write over the newer run's data.
@@ -12178,15 +12199,15 @@ fn generate_manual_commands(
         return;
     }
 
-    if !commands.is_empty() {
-        // RAL-88: record which resolved agent/model produced these commands.
-        let _ = store.lock().set_guardian_manual_commands(
-            id,
-            &commands,
-            Some(agent.as_str()),
-            model.as_deref(),
-        );
-    }
+    // RAL-88: record which resolved agent/model produced these commands. This
+    // also clears a previous result when a later opt-out regeneration is
+    // successfully empty.
+    let _ = store.lock().set_guardian_manual_commands(
+        id,
+        &commands,
+        Some(agent.as_str()),
+        model.as_deref(),
+    );
     // RAL-520: record the diff basis the manual checks were generated against,
     // including an intentionally empty command list, so a later post-merge
     // run regenerates only when the settled stack's changes actually changed.
