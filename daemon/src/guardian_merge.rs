@@ -5596,6 +5596,7 @@ pub fn run_merge_cancellable(
                 squash,
                 &set_status,
                 final_branch_id.as_deref(),
+                generate_manual_checks,
                 cancel,
             );
             // On failure, set_status was already called inside run_merge_shared.
@@ -5766,6 +5767,10 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
     squash: bool,
     set_status: &F,
     final_branch_id: Option<&str>,
+    // RAL-521: computed once by [`run_merge_cancellable`] for the whole
+    // merge -- `false` skips this path's manual-checks generation so a
+    // cached result survives the rebuild.
+    generate_manual_checks: bool,
     cancel: &CancelToken,
 ) {
     let combined_branch = match claim_combined_review_ref_by_id(store, root, id) {
@@ -12227,6 +12232,11 @@ fn generate_manual_commands(
                 "cancelled": cancel.is_cancelled(),
             }),
         );
+        // RAL-521: mark the review's manual checks as computed. Under an
+        // enabled `cache_manual_checks` this marker is what every later
+        // merge/rebase/fix consults to skip regeneration and keep these
+        // commands; under `false` the marker is simply ignored.
+        let _ = store.lock().set_guardian_manual_checks_cached(id, true);
     }
 
     if cancel.is_cancelled() {
