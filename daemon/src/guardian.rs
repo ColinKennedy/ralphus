@@ -7346,7 +7346,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let id = store.create_guardian("r", "main", "/repo").unwrap();
         let g = store.get_guardian(&id).unwrap();
-        assert_eq!(g.proof_scope.as_deref(), Some("each_branch"));
+        assert_eq!(g.proof_scope, None);
         assert_eq!(g.effective_proof_scope, "each_branch");
         assert!(!g.effective_proof_skip_auto_clean);
 
