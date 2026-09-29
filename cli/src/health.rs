@@ -8,9 +8,10 @@
 //!   conventions, templates, agent profiles/resolver).
 //! - [`HARNESS`]: everything the actual execution harness needs to run a
 //!   cell -- `git` (only when a registered project actually uses it),
-//!   `tmux`/psmux (live session panes), the runner binary, agent backend
-//!   commands (`claude`/`codex`/`pi`/`ollama`), and the optional `gh`/`glab`
-//!   forge-auth fallbacks.
+//!   `tmux`/psmux (live session panes), the runner binary, ripgrep (`rg`,
+//!   optional -- agents fall back to `grep` when it's unavailable), agent
+//!   backend commands (`claude`/`codex`/`pi`/`ollama`), and the optional
+//!   `gh`/`glab` forge-auth fallbacks.
 //! - [`MACHINE`]: host-level resource/build capabilities that degrade
 //!   gracefully rather than blocking task execution -- `nvidia-smi` (GPU
 //!   sampling), the opt-in developer toolchain (`cargo`), and opt-in
@@ -646,6 +647,74 @@ fn check_glab_for(found: Option<String>) -> CheckResult {
 
 fn check_glab() -> CheckResult {
     check_glab_for(which("glab"))
+}
+
+/// RAL-522: ripgrep (`rg`) availability, both halves (PATH resolution and an
+/// actual `rg --version` invocation) via the same shared probe the daemon's
+/// Health-tab sweep runs (`ralphus_runner::ripgrep`), so this report and the
+/// board can never disagree about whether ripgrep is usable. Neither half is
+/// ever a hard `fail`: agents are prompted to prefer `rg` and fall back to
+/// `grep` when it's unavailable, so a missing/broken ripgrep degrades search
+/// speed, not correctness.
+fn check_ripgrep() -> Vec<CheckResult> {
+    ripgrep_check_results(
+        &ralphus_runner::ripgrep::probe_path(),
+        &ralphus_runner::ripgrep::probe_version(),
+    )
+}
+
+/// Assembles the two ripgrep [`CheckResult`]s from already-run probes --
+/// split out so tests can exercise every failure shape without mutating the
+/// real PATH environment.
+fn ripgrep_check_results(
+    path_probe: &ralphus_runner::ripgrep::RipgrepPathProbe,
+    version_probe: &ralphus_runner::ripgrep::RipgrepVersionProbe,
+) -> Vec<CheckResult> {
+    const PATH_IMPACT: &str = "Agents are prompted to prefer ripgrep for repository search; without it they fall back to grep, which is slower on large repositories.";
+    const VERSION_IMPACT: &str = "A resolved rg that cannot execute (or does not report a ripgrep version) means repository search silently falls back to grep despite ripgrep appearing installed.";
+    let path_result = if path_probe.status() == PASS {
+        CheckResult::harness(
+            "ripgrep-path",
+            PASS,
+            path_probe.detail(),
+            PATH_IMPACT,
+            "No action needed.",
+        )
+    } else {
+        CheckResult::harness(
+            "ripgrep-path",
+            WARN,
+            path_probe.detail(),
+            PATH_IMPACT,
+            "Optional: install ripgrep (https://github.com/BurntSushi/ripgrep#installation) and ensure rg resolves on PATH.",
+        )
+    }
+    .with_id(ralphus_core::health_catalog::ID_RG_PATH);
+    let version_result = if version_probe.status() == PASS {
+        CheckResult::harness(
+            "ripgrep-version",
+            PASS,
+            version_probe.detail(),
+            VERSION_IMPACT,
+            "No action needed.",
+        )
+    } else {
+        CheckResult::harness(
+            "ripgrep-version",
+            WARN,
+            version_probe.detail(),
+            VERSION_IMPACT,
+            "Reinstall ripgrep so `rg --version` works, or remove the broken rg from PATH.",
+        )
+    }
+    .with_id(ralphus_core::health_catalog::ID_RG_VERSION);
+    // The resolved executable is the one contributing source the version
+    // probe has worth naming.
+    let version_result = match version_probe.resolved_path() {
+        Some(path) => version_result.with_provenance(path),
+        None => version_result,
+    };
+    vec![path_result, version_result]
 }
 
 /// Resolves tmux/psmux exactly the way the daemon does
@@ -1566,6 +1635,7 @@ pub fn run_checks(
     results.push(check_tmux().with_id(ID_TMUX));
     results.push(check_gh().with_id(ID_GH));
     results.push(check_glab().with_id(ID_GLAB));
+    results.extend(check_ripgrep());
     results.push(
         check_agent_command_via_daemon(daemon_url, ID_CLAUDE_COMMAND, "claude-command")
             .with_id(ID_CLAUDE_COMMAND),
@@ -2084,6 +2154,83 @@ mod tests {
         let result = check_glab_for(Some("/usr/bin/glab".to_string()));
         assert_ne!(result.status, FAIL);
         assert!(result.detail.contains("/usr/bin/glab"));
+    }
+
+    // ── ripgrep (RAL-522) ────────────────────────────────────────────────
+
+    #[test]
+    fn check_ripgrep_warns_neither_fails_when_missing() {
+        let results = ripgrep_check_results(
+            &ralphus_runner::ripgrep::RipgrepPathProbe::NotFound,
+            &ralphus_runner::ripgrep::RipgrepVersionProbe::NotFound,
+        );
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].id, ralphus_core::health_catalog::ID_RG_PATH);
+        assert_eq!(results[1].id, ralphus_core::health_catalog::ID_RG_VERSION);
+        for r in &results {
+            assert_eq!(r.status, WARN, "{r:?}");
+            assert_eq!(r.section, HARNESS);
+            assert!(r.remediation.to_lowercase().contains("ripgrep"), "{r:?}");
+        }
+        assert!(results[0].detail.contains("not found on PATH"));
+        let version = &results[1];
+        assert!(version.detail.contains("not probed"), "{version:?}");
+    }
+
+    #[test]
+    fn check_ripgrep_passes_when_found_and_versioned() {
+        let results = ripgrep_check_results(
+            &ralphus_runner::ripgrep::RipgrepPathProbe::Found("/usr/bin/rg".to_string()),
+            &ralphus_runner::ripgrep::RipgrepVersionProbe::Ok {
+                path: "/usr/bin/rg".to_string(),
+                version: "14.1.1".to_string(),
+            },
+        );
+        for r in &results {
+            assert_eq!(r.status, PASS, "{r:?}");
+            assert_eq!(r.remediation, "No action needed.");
+        }
+        assert_eq!(results[0].detail, "/usr/bin/rg");
+        let version = &results[1];
+        assert!(version.detail.contains("14.1.1"), "{version:?}");
+        assert_eq!(results[1].provenance.as_deref(), Some("/usr/bin/rg"));
+    }
+
+    #[test]
+    fn check_ripgrep_version_warns_on_a_resolved_but_broken_rg() {
+        let results = ripgrep_check_results(
+            &ralphus_runner::ripgrep::RipgrepPathProbe::Found("/usr/bin/rg".to_string()),
+            &ralphus_runner::ripgrep::RipgrepVersionProbe::BadOutput {
+                path: "/usr/bin/rg".to_string(),
+                detail: "/usr/bin/rg --version did not report a ripgrep version: hi".to_string(),
+            },
+        );
+        // A PATH hit that can't run is exactly the split the two diagnostics
+        // exist to distinguish: the path half still passes, the version half
+        // warns.
+        assert_eq!(results[0].status, PASS);
+        assert_eq!(results[1].status, WARN);
+        let version = &results[1];
+        assert!(version.detail.contains("/usr/bin/rg"), "{version:?}");
+        assert!(version.remediation.contains("Reinstall"), "{version:?}");
+    }
+
+    #[test]
+    fn check_ripgrep_live_probe_never_fails() {
+        // Whatever this machine's actual ripgrep state is, neither half may
+        // ever report a hard failure -- and the two halves must agree on the
+        // resolved path when there is one.
+        let results = check_ripgrep();
+        assert_eq!(results.len(), 2);
+        for r in &results {
+            assert_ne!(r.status, FAIL, "{r:?}");
+        }
+        let found = ralphus_runner::ripgrep::probe_path();
+        if found.status() == PASS {
+            let path_detail = results[0].detail.clone();
+            let version = &results[1];
+            assert!(version.detail.contains(&path_detail), "{version:?}");
+        }
     }
 
     // ── tmux resolution (RAL-415) ───────────────────────────────────────

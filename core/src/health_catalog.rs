@@ -167,6 +167,8 @@ catalog_ids! {
     ID_OLLAMA => "ollama",
     ID_GH => "gh",
     ID_GLAB => "glab",
+    ID_RG_PATH => "ripgrep-path",
+    ID_RG_VERSION => "ripgrep-version",
     ID_TMUX => "tmux",
     ID_CLAUDE_COMMAND => "claude-command",
     ID_CODEX_COMMAND => "codex-command",
@@ -320,6 +322,28 @@ pub const CATALOG: &[CatalogEntry] = &[
         probe: Probe::Local,
         impact: "Optional fallback token source for GitLab auth, used only when RALPHUS_GITLAB_TOKEN/[forge].token_env is unset.",
         remediation: "Optional: install the GitLab CLI (https://gitlab.com/gitlab-org/cli) and run `glab auth login`, or set RALPHUS_GITLAB_TOKEN directly.",
+    },
+    CatalogEntry {
+        id: ID_RG_PATH,
+        label: "ripgrep (rg) on PATH",
+        section: section::HARNESS,
+        applicability: Applicability::DaemonLocal,
+        cost_tier: CostTier::Free,
+        requirement: RequirementLevel::Optional,
+        probe: Probe::Local,
+        impact: "Agents are prompted to prefer ripgrep for repository search; without it they fall back to grep, which is slower on large repositories.",
+        remediation: "Optional: install ripgrep (https://github.com/BurntSushi/ripgrep#installation) and ensure rg resolves on PATH.",
+    },
+    CatalogEntry {
+        id: ID_RG_VERSION,
+        label: "ripgrep --version",
+        section: section::HARNESS,
+        applicability: Applicability::DaemonLocal,
+        cost_tier: CostTier::Free,
+        requirement: RequirementLevel::Optional,
+        probe: Probe::Local,
+        impact: "A resolved rg that cannot execute (or does not report a ripgrep version) means repository search silently falls back to grep despite ripgrep appearing installed.",
+        remediation: "Reinstall ripgrep so `rg --version` works, or remove the broken rg from PATH.",
     },
     CatalogEntry {
         id: ID_TMUX,
@@ -638,8 +662,15 @@ pub fn free_daemon_local_entries() -> impl Iterator<Item = &'static CatalogEntry
 /// of these ids is cross-referenced by its exact catalog id, so the two
 /// documents can never silently disagree about which check backs which
 /// dependency section.
-pub const DOCUMENTED_IN_DEPENDENCIES_MD: &[&str] =
-    &[ID_GIT, ID_TMUX, ID_GH, ID_GLAB, ID_NVIDIA_SMI];
+pub const DOCUMENTED_IN_DEPENDENCIES_MD: &[&str] = &[
+    ID_GIT,
+    ID_TMUX,
+    ID_GH,
+    ID_GLAB,
+    ID_RG_PATH,
+    ID_RG_VERSION,
+    ID_NVIDIA_SMI,
+];
 
 #[cfg(test)]
 mod tests {

@@ -5,7 +5,7 @@
 //!
 //! Deliberately scoped to checks whose probe is self-contained inside the
 //! daemon process: binary-on-`PATH`/reachability checks (`git`, `tmux`/
-//! psmux, the runner binary, `gh`/`glab`, `nvidia-smi`, Ollama). The CLI's
+//! psmux, the runner binary, `gh`/`glab`, ripgrep, `nvidia-smi`, Ollama). The CLI's
 //! own `.ralphus.toml`-shape checks (`config`, `templates`, `thrash-*`,
 //! `pull-request-branch-convention`, ...) need the CLI process's own
 //! config-loading context (`ralphus_cli::config::load_config`, keyed off
@@ -29,7 +29,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ralphus_core::health_catalog::{
     ID_CLAUDE_COMMAND, ID_CODEX_COMMAND, ID_GH, ID_GIT, ID_GLAB, ID_NVIDIA_SMI, ID_OLLAMA,
-    ID_PI_COMMAND, ID_RUNNER, ID_TMUX,
+    ID_PI_COMMAND, ID_RG_PATH, ID_RG_VERSION, ID_RUNNER, ID_TMUX,
 };
 use ralphus_core::process::which;
 use ralphus_runner::cli_agent_common::{self, BackendCommandHealth};
@@ -51,6 +51,8 @@ const SWEEP_CATALOG_IDS: &[&str] = &[
     ID_RUNNER,
     ID_GH,
     ID_GLAB,
+    ID_RG_PATH,
+    ID_RG_VERSION,
     ID_NVIDIA_SMI,
     ID_OLLAMA,
     ID_CLAUDE_COMMAND,
@@ -203,6 +205,30 @@ fn check_glab() -> SweepCheck {
     }
 }
 
+/// RAL-522: ripgrep PATH resolution, via the same shared probe the CLI's
+/// `check health` runs (`ralphus_runner::ripgrep`) so the two surfaces can
+/// never disagree. A `warn`, never a `fail`: agents fall back to `grep`.
+fn check_rg_path() -> SweepCheck {
+    let probe = ralphus_runner::ripgrep::probe_path();
+    SweepCheck {
+        id: ID_RG_PATH,
+        status: probe.status(),
+        detail: probe.detail(),
+    }
+}
+
+/// RAL-522: ripgrep version invocation (`rg --version` on the resolved
+/// executable), the second half of the same shared probe. A `warn`, never a
+/// `fail`, with a distinct detail per failure shape.
+fn check_rg_version() -> SweepCheck {
+    let probe = ralphus_runner::ripgrep::probe_version();
+    SweepCheck {
+        id: ID_RG_VERSION,
+        status: probe.status(),
+        detail: probe.detail(),
+    }
+}
+
 fn check_nvidia_smi() -> SweepCheck {
     match which("nvidia-smi") {
         Some(path) => SweepCheck {
@@ -348,6 +374,8 @@ pub fn run_sweep(store: &StoreHandle) -> SweepReport {
         check_runner(),
         check_gh(),
         check_glab(),
+        check_rg_path(),
+        check_rg_version(),
         check_nvidia_smi(),
         check_ollama(),
         check_backend_command(
@@ -518,6 +546,28 @@ mod tests {
         let health = diagnose_backend_command("pi", "definitely-not-a-real-pi-ral485");
         assert_eq!(health.status, "fail");
         assert_eq!(health.effective_command, "definitely-not-a-real-pi-ral485");
+    }
+
+    #[test]
+    fn ripgrep_checks_are_warns_at_worst_and_agree_on_the_resolved_path() {
+        // RAL-522: neither ripgrep half is ever a hard fail (agents fall
+        // back to grep), and when PATH resolution finds an rg, the version
+        // probe must have invoked that same resolved executable -- its
+        // detail names the path whatever the invocation outcome was.
+        let path_check = check_rg_path();
+        let version_check = check_rg_version();
+        assert_ne!(path_check.status, FAIL, "{path_check:?}");
+        assert_ne!(version_check.status, FAIL, "{version_check:?}");
+        if path_check.status == PASS {
+            assert!(
+                version_check.detail.contains(&path_check.detail),
+                "version detail {:?} should name the resolved path {:?}",
+                version_check.detail,
+                path_check.detail
+            );
+        } else {
+            assert_eq!(version_check.status, WARN, "{version_check:?}");
+        }
     }
 
     #[test]
