@@ -539,19 +539,20 @@
       /**
        * Renders the Time column per the current duration/start-time mode; the tooltip always shows both.
        * @param {number|null} startedAtMs
-       * @param {number|null} finishedAtMs
+       * @param {number} durationMs
+       * @param {number} activeDurationIntervals
        * @param {string} state
        * @returns {string}
        */
-      function ttTimeCellHtml(startedAtMs, durationMs, state) {
+      function ttTimeCellHtml(startedAtMs, durationMs, activeDurationIntervals, state) {
         if (state === "queued" || state === "ignored") return `<span data-tip="Not started yet.">–</span>`;
         if (!startedAtMs) return `<span data-tip="Not started yet.">–</span>`;
         const durMs = durationMs;
         const tip = `Started ${fmtActivityTime(startedAtMs)} (local).\nDuration: ${fmtDuration(durMs)}.`;
         if (taskTabTimeMode === "start") return `<span data-tip="${esc(tip)}">${fmtRelativeAge(Date.now() - startedAtMs)} ago</span>`;
-        const running = state === "running";
-        const liveStart = Date.now() - durMs;
-        return `<span class="tt-time ${running ? "running" : ""}" ${running ? `data-running="1" data-started="${liveStart}"` : ""} data-tip="${esc(tip)}">${fmtDuration(durMs)}</span>`;
+        const running = activeDurationIntervals > 0;
+        const liveStart = Date.now() - durMs / activeDurationIntervals;
+        return `<span class="tt-time ${running ? "running" : ""}" ${running ? `data-running="1" data-started="${liveStart}" data-duration-rate="${activeDurationIntervals}"` : ""} data-tip="${esc(tip)}">${fmtDuration(durMs)}</span>`;
       }
       /**
        * Renders the Turns column: the summed agent-turn count, with a tooltip
@@ -614,7 +615,7 @@
           + ttColCell("squad", ttSquadChipHtml(row))
           + ttColCell("cells", ttCellsBarHtml(row.cells))
           + ttColCell("review", ttReviewPrBadgesHtml(row.reviewBadge, row.prPick))
-          + ttColCell("time", ttTimeCellHtml(row.startedAtMs, row.durationMs, row.state))
+          + ttColCell("time", ttTimeCellHtml(row.startedAtMs, row.durationMs, row.task.active_duration_intervals ?? 0, row.state))
           + ttColCell("turns", ttTurnsCellHtml(row.usage, ttTaskUsageItems(row.task)))
           + ttColCell("tokens", ttFmtTokens(row.usage))
           + ttColCell("cache", ttFmtCache(row.usage))
@@ -645,7 +646,7 @@
           + ttColCell("squad", cell.model ? `<span data-tip="Agent / model for this cell.">${esc(cell.agent)} / ${esc(cell.model)}</span>` : `<span data-tip="Agent for this cell.">${esc(cell.agent)}</span>`)
           + ttColCell("cells", proofPips)
           + ttColCell("review", `<span data-tip="Review branch(es) this cell submitted under.">${branch}</span>`)
-          + ttColCell("time", ttTimeCellHtml(cell.started_at_ms ?? null, cell.duration_ms ?? 0, cell.state))
+          + ttColCell("time", ttTimeCellHtml(cell.started_at_ms ?? null, cell.duration_ms ?? 0, cell.active_duration_intervals ?? 0, cell.state))
           + ttColCell("turns", ttTurnsCellHtml(cu, ttCellUsageItems(cell)))
           + ttColCell("tokens", ttFmtTokens(cu))
           + ttColCell("cache", ttFmtCache(cu))
@@ -1278,7 +1279,7 @@
         html += `<div class="kv-row"><span class="k">state</span><span class="v">${pill(row.state)}</span></div>`;
         html += `<div class="kv-row"><span class="k">agent</span><span class="v">${esc(row.task.agent || "–")}</span></div>`;
         html += `<div class="kv-row"><span class="k">model</span><span class="v">${esc(row.task.model || "–")}</span></div>`;
-        html += timingRows(row.startedAtMs, row.finishedAtMs, row.durationMs, row.state === "running");
+        html += timingRows(row.startedAtMs, row.finishedAtMs, row.durationMs, row.task.active_duration_intervals ?? 0);
         html += `<div class="kv-row"><span class="k">tokens</span><span class="v">${ttFmtTokens(row.usage)}</span></div>`;
         html += `<div class="kv-row"><span class="k">cache</span><span class="v">${ttFmtCache(row.usage)}</span></div>`;
         html += `<div class="kv-row"><span class="k">cost</span><span class="v">${ttCostCellHtml(row.usage, ttTaskUsageItems(row.task))}</span></div>`;
@@ -1310,7 +1311,7 @@
         if (cell) {
           html += `<h4 style="margin:14px 0 6px">${esc(cell.name || cell.id)}</h4>`;
           html += `<div class="kv-row"><span class="k">agent</span><span class="v">${esc(cell.agent)}${cell.model ? " / " + esc(cell.model) : ""}</span></div>`;
-          html += timingRows(cell.started_at_ms ?? null, cell.finished_at_ms ?? null, cell.duration_ms ?? 0, cell.state === "running");
+          html += timingRows(cell.started_at_ms ?? null, cell.finished_at_ms ?? null, cell.duration_ms ?? 0, cell.active_duration_intervals ?? 0);
           const cu = ttCellUsage(cell);
           html += `<div class="kv-row"><span class="k">tokens</span><span class="v">${ttFmtTokens(cu)}</span></div>`;
           html += `<div class="kv-row"><span class="k">cost</span><span class="v">${ttCostCellHtml(cu, ttCellUsageItems(cell))}</span></div>`;
@@ -1346,7 +1347,8 @@
           // Tasks-tab Time column only ticks in duration mode; start mode shows static "ago" text.
           if (el.classList.contains("tt-time") && tab === "tasks" && taskTabTimeMode !== "duration") return;
           const started = Number(/** @type {HTMLElement} */ (el).dataset.started);
-          if (started) el.textContent = fmtDuration(Date.now() - started);
+          const rate = Number(/** @type {HTMLElement} */ (el).dataset.durationRate);
+          if (started && rate) el.textContent = fmtDuration((Date.now() - started) * rate);
         });
       }
       setInterval(ttTickRunningTimes, 1000);
