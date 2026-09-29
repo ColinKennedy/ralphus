@@ -7636,7 +7636,11 @@ fn cache_manual_checks_false_recomputes_after_feedback() {
 
     // A later full merge recomputes too.
     run_merge(&store, &runner, &id);
-    assert_eq!(runner.calls(), 3, "a later merge recomputes with caching off");
+    assert_eq!(
+        runner.calls(),
+        3,
+        "a later merge recomputes with caching off"
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -7651,7 +7655,12 @@ fn cached_manual_checks_survive_a_feedback_restack() {
     run_merge(&store, &runner, &id);
     assert_eq!(store.lock().get_guardian(&id).unwrap().status, "in_review");
     assert_eq!(runner.calls(), 1, "the initial merge generates the checks");
-    let cached = store.lock().get_guardian(&id).unwrap().manual_commands.clone();
+    let cached = store
+        .lock()
+        .get_guardian(&id)
+        .unwrap()
+        .manual_commands
+        .clone();
 
     let bid = store.lock().get_guardian(&id).unwrap().branches[0]
         .id
@@ -7741,10 +7750,7 @@ fn manual_checks_cache_is_scoped_per_review_across_membership_changes() {
     let bid_a = store.lock().get_guardian(&r1).unwrap().branches[0]
         .id
         .clone();
-    store
-        .lock()
-        .move_guardian_branch(&r1, &bid_a, &r2)
-        .unwrap();
+    store.lock().move_guardian_branch(&r1, &bid_a, &r2).unwrap();
     purge_worktrees(&store, root.to_str().unwrap(), &r1);
     run_merge(&store, &runner, &r1);
     run_merge(&store, &runner, &r2);
@@ -7755,8 +7761,16 @@ fn manual_checks_cache_is_scoped_per_review_across_membership_changes() {
     );
     let after_r1 = store.lock().get_guardian(&r1).unwrap();
     let after_r2 = store.lock().get_guardian(&r2).unwrap();
-    assert_eq!(after_r1.status, "in_review", "detail: {:?}", after_r1.detail);
-    assert_eq!(after_r2.status, "in_review", "detail: {:?}", after_r2.detail);
+    assert_eq!(
+        after_r1.status, "in_review",
+        "detail: {:?}",
+        after_r1.detail
+    );
+    assert_eq!(
+        after_r2.status, "in_review",
+        "detail: {:?}",
+        after_r2.detail
+    );
     assert!(after_r1.manual_checks_cached && after_r2.manual_checks_cached);
     assert_eq!(
         serde_json::to_string(&after_r1.manual_commands).unwrap(),
