@@ -3644,14 +3644,13 @@ mod tests {
         ));
         insert_squad_for_stall_test(&store.lock(), "squad-cap-1");
         // A cell-scope proof under cell 0 that already burned 10s.
-        let now = crate::store::now_ms();
         store
             .lock()
             .conn
             .execute(
-                "INSERT INTO proofs(squad_id, task_idx, scope, cell_idx, idx, kind, spec, agent, state, started_at_ms, finished_at_ms)
-                 VALUES('squad-cap-1', 0, 'cell', 0, 0, 'command', 'true', 'claude', 'done', ?1, ?2)",
-                rusqlite::params![now - 10_000, now],
+                "INSERT INTO proofs(squad_id, task_idx, scope, cell_idx, idx, kind, spec, agent, state, completed_active_duration_ms)
+                 VALUES('squad-cap-1', 0, 'cell', 0, 0, 'command', 'true', 'claude', 'done', ?1)",
+                rusqlite::params![10_000],
             )
             .unwrap();
         let runner = SubprocessRunner::new("unused").with_cartographer(Arc::clone(&store));

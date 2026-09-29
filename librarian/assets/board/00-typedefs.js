@@ -6,6 +6,7 @@
        * @property {string|null} id
        * @property {string} kind - "command" | "prompt" | "brain" | "approval"
        * @property {string} state - "pending" | "running" | "done" | "failed" | "cancelled"
+       * @property {number} duration_ms - Completed active duration plus any active interval at response time.
        * @property {number|null} [delayed_until_ms] - Epoch-ms when an agent-backed proof step will automatically retry after a provider rate limit; absent otherwise.
        * @property {string|null} [delayed_reason] - Safe provider-delay summary shown while `delayed_until_ms` is set.
        * @property {string|null} output
@@ -37,6 +38,7 @@
        * @property {boolean} [thinking_capable] - RAL-516: whether `agent` can emit thinking output at all (backend capability folded with any per-profile override, computed server-side). The Live View hides its "Show Thinking" checkbox entirely when this is `false`.
        * @property {string|null} model
        * @property {string} state
+       * @property {number} duration_ms - Completed active duration plus any active interval at response time.
        * @property {number} [tokens_in]
        * @property {number} [tokens_out]
        * @property {number} [cost_usd]
@@ -77,6 +79,7 @@
        * @property {string|null} agent - Raw task-level `agent` from the submitted TOML, or null when unset.
        * @property {string|null} model - Raw task-level `model` from the submitted TOML, or null when unset.
        * @property {string} state
+       * @property {number} duration_ms - Sum of its cells' and proof steps' active durations.
        * @property {string|null} [error] - RAL-291: failure detail for a task-level failure with no underlying cell/proof error to point to (e.g. the RAL-156 no-commits-since-baseline guard). Absent/null when the task hasn't failed this way, including when a child cell/proof failure caused the task to fail instead.
        * @property {CellView[]} cells
        * @property {ProofView[]} [proof]
@@ -86,6 +89,7 @@
        * @property {boolean} soloed
        * @property {number|null} [started_at_ms]
        * @property {number|null} [finished_at_ms]
+       * @property {number} duration_ms - Sum of all descendant active durations.
        * @property {boolean} [env_out_of_date] - RAL-271: cosmetic "out of date" badge — true once this task's own `env_overrides` has been edited since the task last ran/retried or had its status explicitly set. No behavioral effect.
        */
       /**
