@@ -1038,7 +1038,7 @@ pub fn load_monorepo_config(start: &Path) -> MonorepoConfig {
 /// Ralphus-managed project's commits automatically receive the
 /// `Co-authored-by: ralphus-bot <ralphus-bot@users.noreply.github.com>`
 /// trailer, injected by
-/// the `prepare-commit-msg` hook `crate::git_hooks::sync_coauthor_hook`
+/// the `prepare-commit-msg` hook `crate::git_hooks::sync_commit_metadata_hook`
 /// installs. `None` means unset (so a lower layer can supply it); resolved
 /// callers use [`add_coauthor`](Self::add_coauthor), which falls back to
 /// `true` -- attribution is on by default, and a project opts out

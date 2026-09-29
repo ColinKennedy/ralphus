@@ -11050,12 +11050,8 @@ fn squash_review_commits(
         .map(|l| format!("- {l}"))
         .collect::<Vec<_>>()
         .join("\n");
-    // §13 of docs/prophecy-design.md: this commits with `--no-verify` and
-    // rebuilds the message from subjects only, so any trailer on any
-    // squashed commit (a `Co-authored-by:`, or in the future a
-    // `Ralphus-Cell:`) was previously discarded outright. Collect the
-    // union of every squashed commit's trailers (deduped, first-seen order)
-    // and re-append them to the squash commit's own message instead.
+    // Preserve the deduplicated, first-seen union of every squashed commit's
+    // trailers, including cell associations and existing co-author metadata.
     let trailers_raw = wt
         .git(&["log", "--reverse", "--format=%(trailers:unfold)", &range])
         .unwrap_or_default();
@@ -13154,6 +13150,8 @@ mod tests {
                 "add a",
                 "--trailer",
                 "Co-authored-by: Alice <alice@example.com>",
+                "--trailer",
+                "Ralphus-Cell: cell:squad-1:0:1",
             ],
         );
 
@@ -13189,6 +13187,10 @@ mod tests {
         assert!(
             message.contains("Ralphus-Cell: cell:squad-1:0:0"),
             "must preserve a trailer carried by only one of the squashed commits: {message}"
+        );
+        assert!(
+            message.contains("Ralphus-Cell: cell:squad-1:0:1"),
+            "must retain each cell association when the review is squashed: {message}"
         );
     }
 

@@ -276,6 +276,31 @@ impl Workspace {
         }
     }
 
+    /// Write an executable file at `path`, creating parent directories as
+    /// needed. This is used for Git hooks, which Git ignores on Unix unless
+    /// their executable bit is set.
+    pub fn write_executable_file(
+        &self,
+        path: impl AsRef<Path>,
+        content: &str,
+    ) -> Result<(), String> {
+        let full = self.resolve(path);
+        match &self.machine {
+            None => {
+                if let Some(parent) = full.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
+                }
+                std::fs::write(&full, content)
+                    .map_err(|e| format!("could not write {}: {e}", full.display()))?;
+                set_executable(&full)
+            }
+            Some(_) => self.with_provider(|p, spec| {
+                p.write_executable_file(&full.to_string_lossy(), content, spec)
+            }),
+        }
+    }
+
     /// Delete a file, or a directory tree when `recursive`.
     ///
     /// Best-effort by design: a path that does not exist is success, because
@@ -414,6 +439,27 @@ impl Workspace {
         };
         self.with_provider(|p, spec| p.run_vcs(&req, spec))
     }
+}
+
+#[cfg(unix)]
+fn set_executable(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = std::fs::metadata(path)
+        .map_err(|e| format!("could not read permissions for {}: {e}", path.display()))?
+        .permissions();
+    permissions.set_mode(permissions.mode() | 0o111);
+    std::fs::set_permissions(path, permissions).map_err(|e| {
+        format!(
+            "could not set executable permissions on {}: {e}",
+            path.display()
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn set_executable(_path: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 #[cfg(test)]

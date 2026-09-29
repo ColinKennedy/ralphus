@@ -28,6 +28,8 @@ struct FileRequest {
     content: Option<String>,
     #[serde(default)]
     recursive: bool,
+    #[serde(default)]
+    executable: bool,
 }
 
 /// The `run` verb's payload (`RunRequest` in `daemon/src/remote_runner.rs`).
@@ -123,7 +125,11 @@ pub fn write_file(uri: &str, payload_json: &str, config: &EffectiveConfig) -> Re
             "set -eu; umask 077; tmp={quoted_path}.tmp; cat > \"$tmp\"; mv \"$tmp\" {quoted_path}"
         )
     };
-    ssh_command(&target, &script, config, Some(content.as_bytes())).map(|_| ())
+    ssh_command(&target, &script, config, Some(content.as_bytes()))?;
+    if req.executable {
+        ssh_command(&target, &format!("chmod 700 {quoted_path}"), config, None)?;
+    }
+    Ok(())
 }
 
 /// Delete a file, or a directory tree when `recursive`. A path that does not
