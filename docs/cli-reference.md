@@ -841,6 +841,7 @@ use; see `READ_ONLY_NOTE`.
         - (read-only-safe) deliveries waypoint_id [id]  {Show a waypoint's delivery/event history.}
         - (read-only-safe) get waypoint_id [id]  {Show one waypoint's settings, roster, tracked projects, and delivery summary.}
         - (read-only-safe) list --project [name] --state [open|closed]  {List waypoints.}
+        - redo waypoint_id [id] entry_id [id]  {Re-run a squad whose finished work a closed waypoint flagged as stale, carrying its prior findings and the waypoint's bearings into the new run.}
         - reopen waypoint_id [id]  {Reopen a closed waypoint.}
         - roster  {Add/remove/change the mode of a waypoint's roster entries.}
             - add waypoint_id [id] kind [review|squad] entry_id [id] --mode [block|advisory]  {Add (or upsert the mode of) one roster entry on a waypoint.}

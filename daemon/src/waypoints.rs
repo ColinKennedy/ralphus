@@ -226,6 +226,12 @@ pub struct RosterEntryView {
     /// Phase 6) has been sent -- `None` while still pending. See
     /// [`run_pending_stand_down_notices`].
     pub stand_down_at_ms: Option<i64>,
+    /// Set once this entry's already-finished work was flagged as possibly
+    /// needing a redo -- its waypoint closed while the survey had judged it
+    /// `impacted`, so the work landed without the waypoint's own changes.
+    /// `None` means not flagged. Purely advisory: nothing is re-run until
+    /// someone calls [`redo_roster_entry`]. See [`run_pending_stale_notices`].
+    pub stale_at_ms: Option<i64>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
 }
@@ -864,7 +870,7 @@ impl Store {
     /// Propagates any SQLite failure.
     pub fn list_roster_entries(&self, waypoint_id: &str) -> StoreResult<Vec<RosterEntryView>> {
         let mut stmt = self.conn.prepare(
-            "SELECT waypoint_id, kind, entry_id, mode, survey_verdict, survey_rationale, delivery_status, stand_down_at_ms, created_at_ms, updated_at_ms
+            "SELECT waypoint_id, kind, entry_id, mode, survey_verdict, survey_rationale, delivery_status, stand_down_at_ms, created_at_ms, updated_at_ms, stale_at_ms
              FROM waypoint_roster WHERE waypoint_id=? ORDER BY created_at_ms, entry_id",
         )?;
         let rows = stmt
@@ -889,6 +895,7 @@ impl Store {
             stand_down_at_ms: r.get(7)?,
             created_at_ms: r.get(8)?,
             updated_at_ms: r.get(9)?,
+            stale_at_ms: r.get(10)?,
         })
     }
 
@@ -929,6 +936,135 @@ impl Store {
             params![now_ms(), now_ms(), waypoint_id, kind.as_str(), entry_id],
         )?;
         Ok(())
+    }
+
+    /// Queue one newly-appended bearing for delivery to every **advisory**
+    /// squad roster entry on this waypoint, one injection per not-yet-finished
+    /// cell. Returns how many injections were queued.
+    ///
+    /// This is the advisory counterpart to the blocking path's ghost-fold. A
+    /// `block`-mode entry gets its bearings when its cell is halted and
+    /// re-dispatched; an `advisory` entry is deliberately never halted, so
+    /// nothing was reaching it at all -- `pending_injections` existed and was
+    /// unit-tested but had no production writer. This is that writer; the
+    /// scheduler's cell-dispatch drain is the reader.
+    ///
+    /// All injections from one bearing share a `batch_id` (the bearing's own
+    /// rowid), so a superseded bearing can be withdrawn wholesale via
+    /// [`Self::cancel_injection_batch`] without tracking individual rows.
+    ///
+    /// Scope note: a cell that is *already running* only sees this on its next
+    /// dispatch -- there is no mid-turn injection into a live agent process,
+    /// which needs per-backend session semantics and stays out. In practice
+    /// that means the squad's later cells receive it, and a running cell
+    /// receives it if it is restarted or resumed.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn queue_advisory_bearing_injections(
+        &self,
+        waypoint_id: &str,
+        bearing: &BearingView,
+    ) -> StoreResult<usize> {
+        let payload = render_bearing_block(waypoint_id, std::slice::from_ref(bearing))
+            .unwrap_or_else(|| bearing.summary.clone());
+        let batch_id = format!("bearing-{}", bearing.id);
+        let mut queued = 0usize;
+        for entry in self.list_roster_entries(waypoint_id)? {
+            if entry.mode != RosterMode::Advisory || entry.kind != RosterEntryKind::Squad {
+                continue;
+            }
+            let mut stmt = self.conn.prepare(
+                "SELECT task_idx, idx FROM cells
+                 WHERE squad_id=? AND state NOT IN ('done','failed','cancelled','ignored')
+                 ORDER BY task_idx, idx",
+            )?;
+            let targets: Vec<(i64, i64)> = stmt
+                .query_map(params![entry.entry_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            drop(stmt);
+            for (task_idx, idx) in targets {
+                self.enqueue_injection(&entry.entry_id, task_idx, idx, &payload, Some(&batch_id))?;
+                queued += 1;
+            }
+        }
+        Ok(queued)
+    }
+
+    /// Flag a roster entry's already-finished work as possibly needing a
+    /// redo. Idempotent, and set-once like
+    /// [`Self::mark_roster_entry_stood_down`] -- a reopen+reclose cycle never
+    /// re-flags an entry whose flag a redo already cleared, so the notice
+    /// isn't re-sent for work someone has already dealt with.
+    ///
+    /// Returns `true` if this call is what set the flag.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn mark_roster_entry_stale(
+        &self,
+        waypoint_id: &str,
+        kind: RosterEntryKind,
+        entry_id: &str,
+    ) -> StoreResult<bool> {
+        let now = now_ms();
+        let n = self.conn.execute(
+            "UPDATE waypoint_roster SET stale_at_ms=?, updated_at_ms=?
+             WHERE waypoint_id=? AND kind=? AND entry_id=? AND stale_at_ms IS NULL",
+            params![now, now, waypoint_id, kind.as_str(), entry_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Clear a roster entry's stale flag, once its redo has been kicked off
+    /// (or the flag dismissed). Returns `true` if a flag was actually
+    /// cleared.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn clear_roster_entry_stale(
+        &self,
+        waypoint_id: &str,
+        kind: RosterEntryKind,
+        entry_id: &str,
+    ) -> StoreResult<bool> {
+        let n = self.conn.execute(
+            "UPDATE waypoint_roster SET stale_at_ms=NULL, updated_at_ms=?
+             WHERE waypoint_id=? AND kind=? AND entry_id=? AND stale_at_ms IS NOT NULL",
+            params![now_ms(), waypoint_id, kind.as_str(), entry_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Whether this roster entry's work has reached a terminal state -- the
+    /// same per-kind terminality [`Self::all_roster_entries_terminal`] uses,
+    /// for one entry instead of the whole roster.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn roster_entry_work_is_terminal(
+        &self,
+        kind: RosterEntryKind,
+        entry_id: &str,
+    ) -> StoreResult<bool> {
+        match kind {
+            RosterEntryKind::Squad => match self.squad_state(entry_id) {
+                Ok(state) => Ok(state.is_terminal_for_waypoint()),
+                Err(StoreError::NotFound) => Ok(false),
+                Err(e) => Err(e),
+            },
+            RosterEntryKind::Review => {
+                let status: Option<String> = self
+                    .conn
+                    .query_row(
+                        "SELECT status FROM guardians WHERE id=?",
+                        params![entry_id],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                Ok(status.is_some_and(|s| GuardianStatus::is_terminal_status(&s)))
+            }
+        }
     }
 
     /// Record one candidate's survey outcome (Phase 2): sets `mode` and the
@@ -2351,6 +2487,313 @@ fn stand_down_squad(
             "squad_id": squad_id,
         }),
     );
+}
+
+/// Render a cell's prior [`crate::prophecy::ProphecyView`]s into a block for
+/// the redo ghost-fold, or `None` when the cell recorded none.
+///
+/// Prophecies are ordinarily a *human*-facing channel: the agent-facing
+/// contract in `runner.rs` says a prophecy is "for the human in the eventual
+/// pull request -- not by the next agent", and the general dispatch path
+/// deliberately never injects them. A redo is the one place that framing does
+/// not fit: the operator is explicitly asking for this work to be regenerated
+/// *because* something it depended on changed, and the whole point of redoing
+/// rather than resubmitting is to keep what the last run learned. Discarding
+/// the previous agent's own recorded discoveries, decisions, hazards and
+/// deferrals there would throw away the most valuable thing the run produced.
+///
+/// So this is scoped to redo only -- it does not change what any ordinary
+/// dispatch injects, and prophecies remain human/PR-facing everywhere else.
+#[must_use]
+pub fn render_prophecy_block(prophecies: &[crate::prophecy::ProphecyView]) -> Option<String> {
+    if prophecies.is_empty() {
+        return None;
+    }
+    let mut out = String::from("--- Findings from the previous run of this cell ---\n");
+    out.push_str(
+        "You have run this work before. These are the insights that run recorded. Treat them as \
+         leads, not as established fact about the current tree -- the code may have moved since, \
+         and this redo exists because something it depended on changed.\n",
+    );
+    for prophecy in prophecies {
+        out.push_str(&format!("- [{}] {}\n", prophecy.kind, prophecy.body.trim()));
+    }
+    out.push_str("--- End findings from the previous run ---\n");
+    Some(out)
+}
+
+/// Render drained [`PendingInjectionView`] payloads into one prompt-prefix
+/// block. Each payload is already a rendered bearing block (see
+/// [`Store::queue_advisory_bearing_injections`]), so this only frames and
+/// concatenates them in arrival order.
+///
+/// Mirrors [`render_bearing_block`]'s framing so an agent sees the same shape
+/// whether guidance arrived via a blocking halt's ghost-fold or an advisory
+/// injection, and matches `WAYPOINT_SYSTEM_PROMPT`'s contract that injected
+/// waypoint information is expected rather than anomalous.
+#[must_use]
+pub fn render_injection_block(injections: &[PendingInjectionView]) -> String {
+    let mut out = String::from("--- Advisory waypoint guidance ---\n");
+    out.push_str(
+        "The following guidance was published while this work was in flight. It is advisory: \
+         it does not block this cell. Inspect the current state of the code rather than \
+         assuming the described changes are already present locally, and respond as \
+         applicable to your own task.\n\n",
+    );
+    for injection in injections {
+        out.push_str(injection.payload.trim());
+        out.push('\n');
+    }
+    out.push_str("--- End advisory waypoint guidance ---\n\n");
+    out
+}
+
+/// The message body for a stale-work notice. Names the waypoint whose closure
+/// triggered it, so a reader can tell *which* coordination point their
+/// finished work predates.
+fn stale_notice_text(waypoint: &WaypointView, kind: RosterEntryKind, entry_id: &str) -> String {
+    let which = match &waypoint.label {
+        Some(label) => format!("waypoint \"{label}\""),
+        None => format!("waypoint {}", waypoint.id),
+    };
+    format!(
+        "This {} ({entry_id}) finished while {} was still open and had judged it impacted -- so \
+         the work landed without that waypoint's own changes and may now be stale. Nothing has \
+         been re-run.",
+        kind.as_str(),
+        which
+    )
+}
+
+/// Scheduler-owned periodic sweep: flag any roster entry whose work finished
+/// **while its waypoint was still open** and whose survey had judged it
+/// `impacted`, so a human can decide whether to redo it.
+///
+/// This is the "work was already done when the waypoint's own changes landed"
+/// case. Keying on the waypoint still being *open* is what makes the rule
+/// correct: work that finished before the waypoint closed cannot have
+/// incorporated its guidance, whereas work that only became claimable *after*
+/// the close already ran against the landed changes and is not stale. Sweeping
+/// closed waypoints instead would flag exactly that second, healthy group --
+/// every squad the gate correctly held until the waypoint closed.
+///
+/// In practice the entries this catches are the ones that were allowed to keep
+/// running: `advisory`-mode work (never halted, by definition), and work
+/// de-escalated from `block` to `advisory` mid-flight. `block`-mode work
+/// cannot finish while its waypoint is open, so it is never flagged -- which
+/// is the correct outcome, not a gap.
+///
+/// Deliberately advisory: it never re-runs anything on its own. A waypoint in
+/// a single-project repo has `Scope::RepoWide`, so it can legitimately cover
+/// every squad in the project -- auto-redoing on that basis would re-run an
+/// unbounded amount of finished work and spend real money with no one asking.
+/// Acting on a flag is [`redo_roster_entry`], via `ralphus waypoint redo`.
+///
+/// Costs no LLM calls: it only reads verdicts the survey already recorded.
+/// That is also its one limitation -- work that was *already terminal before
+/// the waypoint existed* was never a survey candidate (terminal work is
+/// excluded from [`Store::waypoint_survey_candidates`] by construction), so it
+/// has no verdict to key off and is not flagged. Catching that would mean
+/// surveying the full history of terminal squads against every open waypoint,
+/// which is unbounded; it is left out on purpose.
+///
+/// Idempotent per entry via `stale_at_ms`
+/// ([`Store::mark_roster_entry_stale`]), which a redo clears, so an entry
+/// already dealt with is never re-flagged.
+pub fn run_pending_stale_notices(store: &crate::store_lock::StoreHandle) {
+    let waypoint_ids = {
+        let guard = store.lock();
+        guard.list_open_waypoint_ids().unwrap_or_default()
+    };
+    for waypoint_id in waypoint_ids {
+        let (waypoint, entries) = {
+            let guard = store.lock();
+            let Ok(waypoint) = guard.get_waypoint(&waypoint_id) else {
+                continue;
+            };
+            let entries = guard.list_roster_entries(&waypoint_id).unwrap_or_default();
+            (waypoint, entries)
+        };
+        for entry in entries {
+            if entry.survey_verdict.as_deref() != Some("impacted") || entry.stale_at_ms.is_some() {
+                continue;
+            }
+            let guard = store.lock();
+            if !guard
+                .roster_entry_work_is_terminal(entry.kind, &entry.entry_id)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            if !guard
+                .mark_roster_entry_stale(&waypoint_id, entry.kind, &entry.entry_id)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            // A squad can be redone directly; a review cannot (it has no
+            // cells of its own), so point that case at the squad that
+            // produced it.
+            //
+            // This goes out via `notify_watchers_with_context`, not
+            // `notify_watchers_with_remediation`: a stale flag is an ordinary
+            // status change, not a failure or blocked state (nothing is stuck
+            // and nothing has failed), and the remediation-carrying variant
+            // asserts it is only used for the failure/blocked event kinds. The
+            // next-step command is therefore part of the message body, the
+            // same way the new-waypoint roster notice states its own.
+            let next_step = match entry.kind {
+                RosterEntryKind::Squad => format!(
+                    " To re-run it with its prior findings and this waypoint's bearings \
+                     carried into the new run: `ralphus waypoint redo {waypoint_id} {}`.",
+                    entry.entry_id
+                ),
+                RosterEntryKind::Review => format!(
+                    " A review has no cells of its own to re-run -- inspect this waypoint's \
+                     bearings with `ralphus waypoint get {waypoint_id}`, then redo the squad \
+                     behind this review if its work needs regenerating."
+                ),
+            };
+            let entity_uri = match entry.kind {
+                RosterEntryKind::Squad => format!("squad:{}", entry.entry_id),
+                RosterEntryKind::Review => format!("guardian:{}", entry.entry_id),
+            };
+            let squad_scope = match entry.kind {
+                RosterEntryKind::Squad => Some(entry.entry_id.as_str()),
+                RosterEntryKind::Review => None,
+            };
+            let body = format!(
+                "{}{next_step}",
+                stale_notice_text(&waypoint, entry.kind, &entry.entry_id)
+            );
+            let _ = guard.notify_watchers_with_context(
+                crate::monitor::NotifiableEventKind::SquadAttributesChanged,
+                &entity_uri,
+                crate::mailbox::MailboxPriority::Normal,
+                &body,
+                squad_scope,
+                None,
+                None,
+            );
+            let note = crate::cartographer::Note::new("waypoints").scope("waypoint");
+            let note = match entry.kind {
+                RosterEntryKind::Squad => note.squad(&entry.entry_id),
+                RosterEntryKind::Review => note.guardian(&entry.entry_id),
+            };
+            note.emit(
+                &guard,
+                format!(
+                    "waypoint {waypoint_id} flagged finished {} {} as possibly stale",
+                    entry.kind.as_str(),
+                    entry.entry_id
+                ),
+                serde_json::json!({
+                    "waypoint_id": waypoint_id,
+                    "entry_kind": entry.kind.as_str(),
+                    "entry_id": entry.entry_id,
+                }),
+            );
+        }
+    }
+}
+
+/// Redo one stale-flagged squad roster entry: fold the waypoint's bearings
+/// into every cell's ghost note, reset the squad to `pending`, and clear the
+/// flag. Returns the squads this dirtied downstream (same as
+/// [`Store::restart_squad`]).
+///
+/// This is the "keep the insights, forward them to a new generation" path.
+/// Two existing mechanisms do the actual carrying, so nothing new is invented
+/// here:
+///
+/// - [`Store::restart_squad`] resets cells to `pending` without touching the
+///   `ghosts` table, and a ghost is keyed by `(squad, task, cell)` -- so the
+///   previous run's own self-summarized findings survive the reset and the
+///   scheduler's existing ghost-context prepend feeds them to the new run.
+/// - [`render_bearing_block`] + [`Store::upsert_ghost`] add the waypoint's
+///   bearings on top, exactly as the Phase 5 halt path already does, and
+///   `upsert_ghost` *merges* rather than overwrites, so the bearings augment
+///   the prior findings instead of clobbering them.
+///
+/// Rejects a `Review`-kind entry: a review has no cells of its own to re-run,
+/// and redoing the squad behind it is the meaningful action.
+///
+/// # Errors
+/// [`StoreError::NotFound`] if the waypoint or roster entry doesn't exist;
+/// [`StoreError::InvalidTransition`] for a review-kind entry; otherwise
+/// propagates any SQLite failure.
+pub fn redo_roster_entry(
+    store: &Store,
+    waypoint_id: &str,
+    entry_id: &str,
+) -> StoreResult<Vec<String>> {
+    let _ = store.get_waypoint(waypoint_id)?;
+    let entry = store
+        .list_roster_entries(waypoint_id)?
+        .into_iter()
+        .find(|e| e.entry_id == entry_id)
+        .ok_or(StoreError::NotFound)?;
+    if entry.kind != RosterEntryKind::Squad {
+        return Err(StoreError::InvalidTransition(format!(
+            "roster entry {entry_id} on waypoint {waypoint_id} is a review, which has no cells \
+             of its own to re-run -- redo the squad that produced it instead"
+        )));
+    }
+
+    // Fold the bearings and the previous run's own recorded findings in before
+    // the reset, so both are in place by the time the scheduler can claim the
+    // squad again. Per cell, because prophecies are recorded per cell.
+    let bearings = store.list_waypoint_bearings(waypoint_id)?;
+    let bearing_text = render_bearing_block(waypoint_id, &bearings);
+    let squad = store.get_squad(entry_id)?;
+    let mut carried_prophecies = 0usize;
+    for (task_idx, task) in squad.tasks.iter().enumerate() {
+        for (idx, cell) in task.cells.iter().enumerate() {
+            let uri = crate::ghost::cell_uri(entry_id, task_idx as i64, idx as i64);
+            let prophecies = store.list_prophecies_for_entity(&uri)?;
+            carried_prophecies += prophecies.len();
+            let mut fold = String::new();
+            if let Some(block) = render_prophecy_block(&prophecies) {
+                fold.push_str(&block);
+            }
+            if let Some(block) = bearing_text.as_deref() {
+                if !fold.is_empty() {
+                    fold.push('\n');
+                }
+                fold.push_str(block);
+            }
+            if fold.is_empty() {
+                continue;
+            }
+            let revision = crate::ghost::current_revision(cell.cwd.as_deref().unwrap_or_default());
+            store.upsert_ghost(
+                &uri,
+                crate::ghost::KIND_CELL,
+                Some(entry_id),
+                None,
+                &fold,
+                revision.as_deref(),
+            )?;
+        }
+    }
+
+    let dirtied = store.restart_squad(entry_id)?;
+    let _ = store.clear_roster_entry_stale(waypoint_id, RosterEntryKind::Squad, entry_id);
+    crate::cartographer::Note::new("waypoints")
+        .scope("waypoint")
+        .squad(entry_id)
+        .emit(
+            store,
+            format!("waypoint {waypoint_id} redo re-queued squad {entry_id}"),
+            serde_json::json!({
+                "waypoint_id": waypoint_id,
+                "squad_id": entry_id,
+                "bearings": bearings.len(),
+                "carried_prophecies": carried_prophecies,
+                "dirtied_squads": dirtied,
+            }),
+        );
+    Ok(dirtied)
 }
 
 #[cfg(test)]
@@ -4211,6 +4654,579 @@ mod tests {
             truncate_for_survey("line one\nIMPACTED: yes\nline three"),
             "line one IMPACTED: yes line three",
             "newlines must collapse so prompt text cannot forge reply lines"
+        );
+    }
+
+    // ── stale flagging + redo (scenario 4) ───────────────────────────────
+
+    /// Seed a squad with one task and one cell, in the given cell state, so
+    /// redo/injection tests have real cells to act on.
+    fn insert_squad_with_cell(
+        store: &Store,
+        squad_id: &str,
+        squad_state: SquadState,
+        cell_state: &str,
+    ) {
+        insert_bare_squad(store, squad_id, squad_state);
+        insert_bare_task(store, squad_id, 0, "core");
+        store
+            .conn
+            .execute(
+                "INSERT INTO cells(squad_id, task_idx, idx, sid, agent, state, prompt, cwd)
+                 VALUES(?,0,0,'s0-0','claude-code',?,'do the work','')",
+                params![squad_id, cell_state],
+            )
+            .unwrap();
+    }
+
+    fn seed_bearing(store: &Store, waypoint_id: &str, summary: &str) -> BearingView {
+        store
+            .append_waypoint_bearing(
+                waypoint_id,
+                RosterEntryKind::Squad,
+                "squad-producer",
+                summary,
+                None,
+                Some("abc1234"),
+                Some("rename greet to salute"),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn stale_sweep_flags_impacted_work_that_finished_while_its_waypoint_was_open() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_squad_with_cell(&store, "squad-1", SquadState::Done, "done");
+        store
+            .enroll_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-1",
+                RosterMode::Block,
+            )
+            .unwrap();
+        store
+            .set_roster_survey_result(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-1",
+                &SurveyVerdict {
+                    impacted: true,
+                    mode: RosterMode::Block,
+                    rationale: "touches the renamed function".to_string(),
+                },
+            )
+            .unwrap();
+        // The waypoint stays OPEN: this squad finished without its guidance.
+
+        let handle = handle(store);
+        run_pending_stale_notices(&handle);
+
+        let store = handle.lock();
+        let entries = store.list_roster_entries("waypoint-1").unwrap();
+        assert!(
+            entries[0].stale_at_ms.is_some(),
+            "finished impacted work must be flagged stale once the waypoint closes"
+        );
+        let broadcast = store
+            .mailbox_messages_for_client("client", false, None)
+            .unwrap();
+        assert_eq!(broadcast.len(), 1, "exactly one stale notice");
+        assert!(
+            broadcast[0].message.contains("ralphus waypoint redo"),
+            "the stale notice must state the next step: {}",
+            broadcast[0].message
+        );
+    }
+
+    #[test]
+    fn stale_sweep_skips_not_impacted_and_still_running_entries() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        // Finished, but the survey cleared it -> nothing to redo.
+        insert_squad_with_cell(&store, "squad-clear", SquadState::Done, "done");
+        store
+            .enroll_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-clear",
+                RosterMode::Block,
+            )
+            .unwrap();
+        store
+            .set_roster_survey_result(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-clear",
+                &SurveyVerdict {
+                    impacted: false,
+                    mode: RosterMode::Block,
+                    rationale: "unrelated".to_string(),
+                },
+            )
+            .unwrap();
+        // Impacted, but still running -> not finished, so not stale.
+        insert_squad_with_cell(&store, "squad-live", SquadState::Running, "running");
+        store
+            .enroll_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-live",
+                RosterMode::Block,
+            )
+            .unwrap();
+        store
+            .set_roster_survey_result(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-live",
+                &SurveyVerdict {
+                    impacted: true,
+                    mode: RosterMode::Block,
+                    rationale: "touches it".to_string(),
+                },
+            )
+            .unwrap();
+
+        let handle = handle(store);
+        run_pending_stale_notices(&handle);
+
+        let store = handle.lock();
+        for entry in store.list_roster_entries("waypoint-1").unwrap() {
+            assert!(
+                entry.stale_at_ms.is_none(),
+                "{} must not be flagged stale",
+                entry.entry_id
+            );
+        }
+    }
+
+    #[test]
+    fn stale_sweep_does_not_flag_work_that_only_ran_after_its_waypoint_closed() {
+        // The gate's healthy case, and the reason this sweep keys on the
+        // waypoint still being *open*: a squad the gate correctly held until
+        // the waypoint closed then ran against the landed changes, so it is
+        // not stale. Sweeping closed waypoints instead would flag every
+        // correctly-gated squad in the project.
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_squad_with_cell(&store, "squad-gated", SquadState::Done, "done");
+        store
+            .enroll_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-gated",
+                RosterMode::Block,
+            )
+            .unwrap();
+        store
+            .set_roster_survey_result(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-gated",
+                &SurveyVerdict {
+                    impacted: true,
+                    mode: RosterMode::Block,
+                    rationale: "touches it".to_string(),
+                },
+            )
+            .unwrap();
+        assert!(store.close_waypoint("waypoint-1").unwrap());
+
+        let handle = handle(store);
+        run_pending_stale_notices(&handle);
+
+        let store = handle.lock();
+        assert!(
+            store.list_roster_entries("waypoint-1").unwrap()[0]
+                .stale_at_ms
+                .is_none(),
+            "work that ran after the waypoint closed already has its changes"
+        );
+        assert!(
+            store
+                .mailbox_messages_for_client("client", false, None)
+                .unwrap()
+                .is_empty(),
+            "no stale notice for correctly-gated work"
+        );
+    }
+
+    #[test]
+    fn a_redo_clears_the_stale_flag_so_a_later_sweep_does_not_re_flag_it() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_squad_with_cell(&store, "squad-1", SquadState::Done, "done");
+        store
+            .enroll_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-1",
+                RosterMode::Block,
+            )
+            .unwrap();
+        store
+            .set_roster_survey_result(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-1",
+                &SurveyVerdict {
+                    impacted: true,
+                    mode: RosterMode::Block,
+                    rationale: "touches it".to_string(),
+                },
+            )
+            .unwrap();
+
+        let handle = handle(store);
+        run_pending_stale_notices(&handle);
+        {
+            let store = handle.lock();
+            redo_roster_entry(&store, "waypoint-1", "squad-1").unwrap();
+            assert!(
+                store.list_roster_entries("waypoint-1").unwrap()[0]
+                    .stale_at_ms
+                    .is_none(),
+                "a redo must clear the stale flag"
+            );
+        }
+        // The squad is back to pending, so it is no longer terminal and the
+        // sweep has nothing to re-flag. Re-running must stay quiet.
+        run_pending_stale_notices(&handle);
+        let store = handle.lock();
+        assert!(
+            store.list_roster_entries("waypoint-1").unwrap()[0]
+                .stale_at_ms
+                .is_none(),
+            "a re-queued squad must not be re-flagged as stale"
+        );
+        let broadcast = store
+            .mailbox_messages_for_client("client", false, None)
+            .unwrap();
+        assert_eq!(broadcast.len(), 1, "the stale notice must not be re-sent");
+    }
+
+    #[test]
+    fn a_redo_requeues_the_squad_and_folds_bearings_in_without_losing_prior_findings() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_squad_with_cell(&store, "squad-1", SquadState::Done, "done");
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-1",
+                RosterMode::Block,
+            )
+            .unwrap();
+        seed_bearing(&store, "waypoint-1", "salute() now lives in src/greet.py");
+
+        // The previous run's own findings, which the redo must carry forward
+        // rather than replace -- that is the whole point of redoing rather
+        // than resubmitting from scratch.
+        let uri = crate::ghost::cell_uri("squad-1", 0, 0);
+        store
+            .upsert_ghost(
+                &uri,
+                crate::ghost::KIND_CELL,
+                Some("squad-1"),
+                None,
+                "prior finding: the caller list lives in src/app.py",
+                None,
+            )
+            .unwrap();
+
+        redo_roster_entry(&store, "waypoint-1", "squad-1").unwrap();
+
+        assert_eq!(
+            store.squad_state("squad-1").unwrap(),
+            SquadState::Pending,
+            "a redo must reset the squad to pending"
+        );
+        let ghost = store.get_ghost(&uri).unwrap().expect("ghost present");
+        assert!(
+            ghost.content.contains("prior finding"),
+            "the previous run's findings must survive the redo: {}",
+            ghost.content
+        );
+        assert!(
+            ghost.content.contains("salute() now lives in src/greet.py"),
+            "the waypoint's bearings must be folded in: {}",
+            ghost.content
+        );
+    }
+
+    #[test]
+    fn a_redo_carries_the_previous_runs_own_prophecies_into_the_new_iteration() {
+        // The point of redoing rather than resubmitting is to keep what the
+        // last run learned. Prophecies are where an agent records exactly
+        // that, so a redo that dropped them would throw away the run's most
+        // valuable output and the new agent would start cold.
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_squad_with_cell(&store, "squad-1", SquadState::Done, "done");
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-1",
+                RosterMode::Block,
+            )
+            .unwrap();
+        seed_bearing(&store, "waypoint-1", "salute() now lives in src/greet.py");
+
+        let uri = crate::ghost::cell_uri("squad-1", 0, 0);
+        store
+            .add_prophecy(
+                &uri,
+                0,
+                crate::prophecy::ProphecyKind::Discovery,
+                "the caller list lives only in src/app.py",
+                None,
+                Some("squad-1"),
+                None,
+            )
+            .unwrap();
+        store
+            .add_prophecy(
+                &uri,
+                0,
+                crate::prophecy::ProphecyKind::Hazard,
+                "the import in src/app.py is not re-exported anywhere",
+                None,
+                Some("squad-1"),
+                None,
+            )
+            .unwrap();
+
+        redo_roster_entry(&store, "waypoint-1", "squad-1").unwrap();
+
+        let ghost = store.get_ghost(&uri).unwrap().expect("ghost present");
+        assert!(
+            ghost
+                .content
+                .contains("the caller list lives only in src/app.py"),
+            "the previous run's discovery must be carried forward: {}",
+            ghost.content
+        );
+        assert!(
+            ghost
+                .content
+                .contains("the import in src/app.py is not re-exported anywhere"),
+            "every prophecy must be carried, not just the first: {}",
+            ghost.content
+        );
+        assert!(
+            ghost.content.contains("[hazard]"),
+            "a prophecy's kind must survive, so the agent can weigh it: {}",
+            ghost.content
+        );
+        assert!(
+            ghost.content.contains("salute() now lives in src/greet.py"),
+            "the waypoint's bearings must still be folded in alongside: {}",
+            ghost.content
+        );
+    }
+
+    #[test]
+    fn a_redo_with_no_prophecies_still_folds_bearings_and_adds_no_empty_section() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_squad_with_cell(&store, "squad-1", SquadState::Done, "done");
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-1",
+                RosterMode::Block,
+            )
+            .unwrap();
+        seed_bearing(&store, "waypoint-1", "salute() now lives in src/greet.py");
+
+        redo_roster_entry(&store, "waypoint-1", "squad-1").unwrap();
+
+        let ghost = store
+            .get_ghost(&crate::ghost::cell_uri("squad-1", 0, 0))
+            .unwrap()
+            .expect("ghost present");
+        assert!(ghost.content.contains("salute() now lives in src/greet.py"));
+        assert!(
+            !ghost.content.contains("previous run"),
+            "no empty findings section when the cell recorded no prophecies: {}",
+            ghost.content
+        );
+    }
+
+    #[test]
+    fn a_redo_of_a_review_entry_is_rejected_with_a_pointer_to_its_squad() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_bare_guardian(&store, "guardian-1");
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Review,
+                "guardian-1",
+                RosterMode::Block,
+            )
+            .unwrap();
+        let err = redo_roster_entry(&store, "waypoint-1", "guardian-1").unwrap_err();
+        assert!(
+            matches!(err, StoreError::InvalidTransition(ref m) if m.contains("redo the squad")),
+            "a review-kind redo must be refused and point at its squad, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_redo_of_an_unknown_entry_is_not_found() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        assert!(matches!(
+            redo_roster_entry(&store, "waypoint-1", "squad-nope").unwrap_err(),
+            StoreError::NotFound
+        ));
+    }
+
+    // ── advisory bearing injection (advisory in-flight delivery) ─────────
+
+    #[test]
+    fn an_advisory_bearing_queues_one_injection_per_unfinished_cell() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_squad_with_cell(&store, "squad-1", SquadState::Running, "running");
+        // A second, still-pending cell in the same squad: the realistic way an
+        // advisory note reaches work that hasn't started its turn yet.
+        store
+            .conn
+            .execute(
+                "INSERT INTO cells(squad_id, task_idx, idx, sid, agent, state, prompt, cwd)
+                 VALUES('squad-1',0,1,'s0-1','claude-code','pending','later work','')",
+                [],
+            )
+            .unwrap();
+        // ...and a finished one, which must be skipped.
+        store
+            .conn
+            .execute(
+                "INSERT INTO cells(squad_id, task_idx, idx, sid, agent, state, prompt, cwd)
+                 VALUES('squad-1',0,2,'s0-2','claude-code','done','old work','')",
+                [],
+            )
+            .unwrap();
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-1",
+                RosterMode::Advisory,
+            )
+            .unwrap();
+
+        let bearing = seed_bearing(&store, "waypoint-1", "salute() replaces greet()");
+        let queued = store
+            .queue_advisory_bearing_injections("waypoint-1", &bearing)
+            .unwrap();
+        assert_eq!(queued, 2, "only the two unfinished cells get an injection");
+
+        let drained = store.drain_injections("squad-1", 0, 0).unwrap();
+        assert_eq!(drained.len(), 1);
+        assert!(
+            drained[0].payload.contains("salute() replaces greet()"),
+            "payload must carry the bearing text: {}",
+            drained[0].payload
+        );
+        assert!(
+            drained[0].payload.contains("abc1234"),
+            "payload must keep the bearing's commit reference as an investigation lead: {}",
+            drained[0].payload
+        );
+        assert!(
+            store.drain_injections("squad-1", 0, 0).unwrap().is_empty(),
+            "delivery must be exactly-once"
+        );
+        assert!(
+            store.drain_injections("squad-1", 0, 2).unwrap().is_empty(),
+            "a finished cell must never have been queued"
+        );
+    }
+
+    #[test]
+    fn a_block_mode_entry_gets_no_advisory_injection() {
+        // Blocking entries receive bearings through the halt path's ghost-fold
+        // instead; queueing for them too would double-deliver.
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_squad_with_cell(&store, "squad-1", SquadState::Running, "running");
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-1",
+                RosterMode::Block,
+            )
+            .unwrap();
+        let bearing = seed_bearing(&store, "waypoint-1", "guidance");
+        assert_eq!(
+            store
+                .queue_advisory_bearing_injections("waypoint-1", &bearing)
+                .unwrap(),
+            0
+        );
+        assert!(store.drain_injections("squad-1", 0, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_superseded_bearing_batch_can_be_withdrawn_before_delivery() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_squad_with_cell(&store, "squad-1", SquadState::Running, "running");
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-1",
+                RosterMode::Advisory,
+            )
+            .unwrap();
+        let bearing = seed_bearing(&store, "waypoint-1", "guidance");
+        store
+            .queue_advisory_bearing_injections("waypoint-1", &bearing)
+            .unwrap();
+        assert_eq!(
+            store
+                .cancel_injection_batch(&format!("bearing-{}", bearing.id))
+                .unwrap(),
+            1,
+            "one bearing's injections share a batch id, so they cancel together"
+        );
+        assert!(store.drain_injections("squad-1", 0, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_rendered_injection_block_frames_guidance_as_advisory() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_squad_with_cell(&store, "squad-1", SquadState::Running, "running");
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-1",
+                RosterMode::Advisory,
+            )
+            .unwrap();
+        let bearing = seed_bearing(&store, "waypoint-1", "salute() replaces greet()");
+        store
+            .queue_advisory_bearing_injections("waypoint-1", &bearing)
+            .unwrap();
+        let drained = store.drain_injections("squad-1", 0, 0).unwrap();
+        let block = render_injection_block(&drained);
+        assert!(block.contains("does not block this cell"));
+        assert!(block.contains("salute() replaces greet()"));
+        assert!(
+            block.contains("Inspect the current state of the code"),
+            "must keep WAYPOINT_SYSTEM_PROMPT's don't-assume-it's-local contract: {block}"
         );
     }
 

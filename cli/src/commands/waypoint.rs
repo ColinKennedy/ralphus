@@ -35,6 +35,10 @@ pub enum WaypointCommand {
     Reopen {
         waypoint_id: String,
     },
+    Redo {
+        waypoint_id: String,
+        entry_id: String,
+    },
     Roster(WaypointRosterCommand),
     Bearing(WaypointBearingCommand),
     Bearings {
@@ -123,6 +127,18 @@ pub fn parse(args: &[String]) -> WaypointCommand {
         Some("reopen") => with_waypoint_id(scanner, |waypoint_id| WaypointCommand::Reopen {
             waypoint_id,
         }),
+        Some("redo") => {
+            let rest = scanner.remaining();
+            match (rest.first(), rest.get(1)) {
+                (Some(waypoint_id), Some(entry_id)) => WaypointCommand::Redo {
+                    waypoint_id: waypoint_id.clone(),
+                    entry_id: entry_id.clone(),
+                },
+                _ => WaypointCommand::UsageError(
+                    "redo requires <waypoint_id> <entry_id>".to_string(),
+                ),
+            }
+        }
         Some("roster") => WaypointCommand::Roster(parse_roster(&scanner.remaining())),
         Some("bearing") => WaypointCommand::Bearing(parse_bearing(&scanner.remaining())),
         Some("bearings") => with_waypoint_id(scanner, |waypoint_id| WaypointCommand::Bearings {
@@ -311,6 +327,14 @@ pub fn dispatch(cmd: WaypointCommand, opts: &GlobalOpts) -> i32 {
         }),
         WaypointCommand::Close { waypoint_id } => run_and_report(opts, None, || {
             let result = client.waypoint_close(&waypoint_id)?;
+            emit(opts, &result, render_waypoint_detail);
+            Ok(())
+        }),
+        WaypointCommand::Redo {
+            waypoint_id,
+            entry_id,
+        } => run_and_report(opts, None, || {
+            let result = client.waypoint_redo_roster_entry(&waypoint_id, &entry_id)?;
             emit(opts, &result, render_waypoint_detail);
             Ok(())
         }),

@@ -2193,6 +2193,9 @@ fn route_for_user(
         ("PATCH", ["api", "waypoints", id, "roster", entry_id]) => {
             waypoint_patch_roster_entry(daemon, id, entry_id, body)
         }
+        ("POST", ["api", "waypoints", id, "roster", entry_id, "redo"]) => {
+            waypoint_redo_roster_entry(daemon, id, entry_id)
+        }
         ("POST", ["api", "waypoints", id, "close"]) => waypoint_close(daemon, id),
         ("POST", ["api", "waypoints", id, "reopen"]) => waypoint_reopen(daemon, id),
         ("POST", ["api", "waypoints", id, "bearings"]) => waypoint_append_bearing(daemon, id, body),
@@ -15331,6 +15334,24 @@ fn waypoint_patch_roster_entry(daemon: &Daemon, id: &str, entry_id: &str, body: 
     }
 }
 
+/// `POST /api/waypoints/{id}/roster/{entry_id}/redo` -- re-run one
+/// stale-flagged squad roster entry, carrying its prior findings and the
+/// waypoint's bearings into the new run
+/// (`crate::waypoints::redo_roster_entry`).
+///
+/// Replies with the refreshed waypoint detail, like every other roster
+/// mutation, so a caller sees the flag cleared in the same round trip.
+fn waypoint_redo_roster_entry(daemon: &Daemon, id: &str, entry_id: &str) -> Reply {
+    let store = daemon.lock();
+    if let Err(e) = crate::waypoints::redo_roster_entry(&store, id, entry_id) {
+        return store_error(&e);
+    }
+    match waypoint_detail(&store, id) {
+        Ok(detail) => json(200, &detail),
+        Err(e) => store_error(&e),
+    }
+}
+
 /// `POST /api/waypoints/{id}/close` -- manual lifecycle control: close a
 /// waypoint regardless of whether every roster entry has reached a terminal
 /// state yet.
@@ -15399,6 +15420,15 @@ fn waypoint_append_bearing(daemon: &Daemon, id: &str, body: &str) -> Reply {
         Ok(bearing) => bearing,
         Err(e) => return store_error(&e),
     };
+    // RAL-400: queue this bearing for every advisory squad entry's
+    // not-yet-finished cells. Advisory entries are never halted, so the
+    // blocking path's ghost-fold never fires for them -- this is the only
+    // thing that delivers guidance to them. Best-effort: a queueing failure
+    // must not fail the bearing append, since the bearing itself is already
+    // durably recorded and is the source of truth.
+    let queued = store
+        .queue_advisory_bearing_injections(id, &bearing)
+        .unwrap_or(0);
     crate::cartographer::Note::new("waypoints")
         .scope("waypoint")
         .emit(
@@ -15413,6 +15443,7 @@ fn waypoint_append_bearing(daemon: &Daemon, id: &str, body: &str) -> Reply {
                 "bearing_id": bearing.id,
                 "producer_kind": producer_kind.as_str(),
                 "producer_id": req.producer_id,
+                "advisory_injections_queued": queued,
             }),
         );
     json(
