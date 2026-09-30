@@ -309,6 +309,13 @@ pub struct ProofView {
     /// sizes unreported by this backend/version", not "no compaction
     /// happened".
     pub compaction_count: i64,
+    /// RAL-352: completed user/assistant message exchanges (each response
+    /// event represents both sides of the exchange). Omitted (no attribute
+    /// at all) for a command-mode step -- there is no conversational count
+    /// to report, not a count of zero -- and for any pre-RAL-352 step that
+    /// has not re-run yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turns: Option<i64>,
     /// Cost of this step's most recent run, USD.
     pub cost_usd: f64,
     /// RAL-326: `true` when `cost_usd` and the token counts are the last
@@ -393,6 +400,13 @@ pub struct CellView {
     /// sizes unreported by this backend/version", not "no compaction
     /// happened".
     pub compaction_count: i64,
+    /// RAL-352: completed user/assistant message exchanges (each response
+    /// event represents both sides of the exchange). Omitted (no attribute
+    /// at all) for a command-mode cell -- there is no conversational count
+    /// to report, not a count of zero -- and for any pre-RAL-352 cell that
+    /// has not re-run yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turns: Option<i64>,
     /// Cost recorded so far, USD.
     pub cost_usd: f64,
     /// RAL-326: `true` when `cost_usd` and the token counts are the last
@@ -1483,6 +1497,7 @@ impl Store {
                 cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
                 compaction_input_tokens INTEGER NOT NULL DEFAULT 0,
                 compaction_count        INTEGER NOT NULL DEFAULT 0,
+                turns      INTEGER,
                 cost_usd   REAL NOT NULL DEFAULT 0,
                 cost_is_estimated INTEGER NOT NULL DEFAULT 0,
                 error      TEXT,
@@ -1524,6 +1539,7 @@ impl Store {
                 maximum_timeout_sec INTEGER,
                 budget_tokens INTEGER,
                 maximum_tool_output_tokens INTEGER,
+                turns         INTEGER,
                 queue_rank    REAL,
                 env_overrides TEXT NOT NULL DEFAULT '{}',
                 materialized_env_overrides TEXT,
@@ -3243,6 +3259,15 @@ impl Store {
             "ALTER TABLE cells ADD COLUMN active_started_at_ms INTEGER",
             "ALTER TABLE proofs ADD COLUMN completed_active_duration_ms INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE proofs ADD COLUMN active_started_at_ms INTEGER",
+            // RAL-352: per-cell/per-proof agent-turn counts -- the number of
+            // completed user/assistant message exchanges (each response event
+            // is both sides of the exchange). NULL means command-mode (no
+            // conversational count applies); a fresh row's next run or live
+            // snapshot fills the integer for agent-mode rows. Existing rows
+            // stay NULL until their next result arrives, exactly like every
+            // other usage migration here.
+            "ALTER TABLE cells ADD COLUMN turns INTEGER",
+            "ALTER TABLE proofs ADD COLUMN turns INTEGER",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
@@ -3751,8 +3776,8 @@ impl Store {
                     (None, None)
                 };
                 tx.execute(
-                    "INSERT INTO cells(squad_id, task_idx, idx, sid, name, cwd, subprojects, prompt, command, agent, model, system_prompt, system_prompt_position, effective_system_prompt, state, depends_on, timeout_sec, budget_tokens, maximum_budget_usd, maximum_context, auto_compact_threshold, maximum_tool_output_tokens, upstream, queue_rank, env_overrides, machine, share_session, maximum_timeout_sec, mode, remediation_attempts)
-                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO cells(squad_id, task_idx, idx, sid, name, cwd, subprojects, prompt, command, agent, model, system_prompt, system_prompt_position, effective_system_prompt, state, depends_on, timeout_sec, budget_tokens, maximum_budget_usd, maximum_context, auto_compact_threshold, maximum_tool_output_tokens, turns, upstream, queue_rank, env_overrides, machine, share_session, maximum_timeout_sec, mode, remediation_attempts)
+                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     params![
                         squad_id,
                         t_idx_i,
@@ -3776,6 +3801,11 @@ impl Store {
                         maximum_context,
                         auto_compact_threshold,
                         maximum_tool_output_tokens,
+                        // RAL-352: an agent cell starts at 0 completed
+                        // exchanges; a command cell stays NULL (no applicable
+                        // conversational count). Either way the first run's
+                        // result overwrites it.
+                        cell.prompt.as_ref().map(|_| 0i64),
                         cell.upstream,
                         // Seed the queue rank from the cell's own priority, or
                         // the owning task's priority as a fallback, so a task-level
@@ -5174,7 +5204,7 @@ impl Store {
         db_profiles: &HashMap<String, crate::agent_profile_store::AgentProfileView>,
     ) -> Result<HashMap<i64, Vec<CellView>>> {
         let mut stmt = conn.prepare(
-            "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date, machine, detached_at_ms, maximum_context, auto_compact_threshold, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, delayed_until_ms, completed_active_duration_ms, active_started_at_ms
+            "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date, machine, detached_at_ms, maximum_context, auto_compact_threshold, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, delayed_until_ms, completed_active_duration_ms, active_started_at_ms, turns
              FROM cells WHERE squad_id=? ORDER BY task_idx, idx",
         )?;
         let rows = stmt
@@ -5244,6 +5274,7 @@ impl Store {
                         compaction_input_tokens: r.get::<_, i64>(32)?,
                         compaction_count: r.get::<_, i64>(33)?,
                         delayed_until_ms: r.get::<_, Option<i64>>(34)?,
+                        turns: r.get::<_, Option<i64>>(37)?,
                     },
                 ))
             })?
@@ -5388,7 +5419,7 @@ impl Store {
         db_profiles: &HashMap<String, crate::agent_profile_store::AgentProfileView>,
     ) -> Result<HashMap<(i64, String, i64), Vec<ProofView>>> {
         let mut stmt = conn.prepare(
-            "SELECT task_idx, scope, cell_idx, vid, kind, state, delayed_until_ms, delayed_reason, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, completed_active_duration_ms, active_started_at_ms FROM proofs
+            "SELECT task_idx, scope, cell_idx, vid, kind, state, delayed_until_ms, delayed_reason, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, completed_active_duration_ms, active_started_at_ms, turns FROM proofs
              WHERE squad_id=? ORDER BY task_idx, scope, cell_idx, idx",
         )?;
         let rows = stmt
@@ -5430,6 +5461,7 @@ impl Store {
                         maximum_tool_output_tokens: r.get::<_, Option<i64>>(22)?,
                         compaction_input_tokens: r.get::<_, i64>(23)?,
                         compaction_count: r.get::<_, i64>(24)?,
+                        turns: r.get::<_, Option<i64>>(27)?,
                     },
                 ))
             })?
@@ -5457,7 +5489,7 @@ impl Store {
                 .map(|p| (p.name.clone(), p))
                 .collect();
         let mut stmt = self.conn.prepare(
-            "SELECT vid, kind, state, delayed_until_ms, delayed_reason, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, completed_active_duration_ms, active_started_at_ms FROM proofs
+            "SELECT vid, kind, state, delayed_until_ms, delayed_reason, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, completed_active_duration_ms, active_started_at_ms, turns FROM proofs
              WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? ORDER BY idx",
         )?;
         let rows = stmt
@@ -5493,6 +5525,7 @@ impl Store {
                     maximum_tool_output_tokens: r.get::<_, Option<i64>>(19)?,
                     compaction_input_tokens: r.get::<_, i64>(20)?,
                     compaction_count: r.get::<_, i64>(21)?,
+                    turns: r.get::<_, Option<i64>>(24)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -6710,8 +6743,8 @@ fn insert_proof(
         (None, None)
     };
     tx.execute(
-        "INSERT INTO proofs(squad_id, task_idx, scope, cell_idx, idx, vid, kind, spec, effective_system_prompt, model, agent, state, timeout_sec, maximum_timeout_sec, budget_tokens, maximum_tool_output_tokens, env_overrides, mode, remediation_attempts)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO proofs(squad_id, task_idx, scope, cell_idx, idx, vid, kind, spec, effective_system_prompt, model, agent, state, timeout_sec, maximum_timeout_sec, budget_tokens, maximum_tool_output_tokens, turns, env_overrides, mode, remediation_attempts)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         params![
             squad_id,
             task_idx,
@@ -6729,6 +6762,9 @@ fn insert_proof(
             maximum_timeout_sec,
             budget_tokens,
             maximum_tool_output_tokens,
+            // RAL-352: same rule as cells -- a `prompt`-kind step starts at
+            // 0 completed exchanges; every other kind stays NULL.
+            (kind == "prompt").then_some(0i64),
             // RAL-191: the step's TOML-declared `environment` seeds the same
             // column `POST .../proof/{vi}/env` writes to, so a declared value
             // and one set later are indistinguishable from here on.
@@ -7515,7 +7551,7 @@ impl Store {
             .flatten()
             .unwrap_or_else(|| ("unknown".to_string(), None));
         self.conn.execute(
-            "UPDATE proofs SET state=?, output=?, agent_session_id=?, tokens_in=?, tokens_out=?, cache_creation_tokens=?, cache_read_tokens=?, compaction_input_tokens=?, compaction_count=?, cost_usd=?, cost_is_estimated=?
+            "UPDATE proofs SET state=?, output=?, agent_session_id=?, tokens_in=?, tokens_out=?, cache_creation_tokens=?, cache_read_tokens=?, compaction_input_tokens=?, compaction_count=?, turns=?, cost_usd=?, cost_is_estimated=?
              WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=? AND state IN ('pending', 'running', ?)",
             params![
                 state.as_str(),
@@ -7527,6 +7563,7 @@ impl Store {
                 usage.cache_read_tokens,
                 usage.compaction_input_tokens,
                 usage.compaction_count,
+                usage.turns,
                 usage.cost_usd,
                 usage.cost_is_estimated,
                 squad_id,
@@ -9480,7 +9517,7 @@ impl Store {
     ) -> Result<()> {
         let entering_terminal = i64::from(outcome.state.is_terminal());
         self.conn.execute(
-            "UPDATE cells SET state=?, tokens_in=?, tokens_out=?, cache_creation_tokens=?, cache_read_tokens=?, compaction_input_tokens=?, compaction_count=?, cost_usd=?, cost_is_estimated=?, error=?, agent_session_id=COALESCE(?, agent_session_id),
+            "UPDATE cells SET state=?, tokens_in=?, tokens_out=?, cache_creation_tokens=?, cache_read_tokens=?, compaction_input_tokens=?, compaction_count=?, turns=?, cost_usd=?, cost_is_estimated=?, error=?, agent_session_id=COALESCE(?, agent_session_id),
                  finished_at_ms = CASE WHEN ?=1 THEN ? ELSE finished_at_ms END
              WHERE squad_id=? AND task_idx=? AND idx=? AND state IN ('pending', 'running', ?)",
             params![
@@ -9491,6 +9528,7 @@ impl Store {
                 outcome.usage.cache_read_tokens,
                 outcome.usage.compaction_input_tokens,
                 outcome.usage.compaction_count,
+                outcome.usage.turns,
                 outcome.usage.cost_usd,
                 outcome.usage.cost_is_estimated,
                 outcome.error.as_deref(),
@@ -10031,7 +10069,7 @@ impl Store {
         usage: crate::runner::LiveUsage,
     ) -> Result<()> {
         self.conn.execute(
-            "UPDATE cells SET tokens_in=?, tokens_out=?, cache_creation_tokens=?, cache_read_tokens=?, cost_usd=?
+            "UPDATE cells SET tokens_in=?, tokens_out=?, cache_creation_tokens=?, cache_read_tokens=?, cost_usd=?, turns=?
              WHERE squad_id=? AND sid=? AND task_idx=(SELECT idx FROM tasks WHERE squad_id=? AND name=?)",
             params![
                 usage.tokens_in,
@@ -10039,6 +10077,7 @@ impl Store {
                 usage.cache_creation_tokens,
                 usage.cache_read_tokens,
                 usage.cost_usd,
+                usage.turns,
                 squad_id,
                 cell_sid,
                 squad_id,
@@ -10895,6 +10934,12 @@ pub struct RecordedUsage {
     /// sizes unreported by this backend/version", not "no compaction
     /// happened".
     pub compaction_count: i64,
+    /// RAL-352: completed user/assistant message exchanges (each response
+    /// event represents both sides of the exchange). `None` for a
+    /// command-only run -- there is no applicable conversational count, and
+    /// the column stays NULL so the serialized view deliberately omits the
+    /// attribute (see `CellView::turns`/`ProofView::turns`).
+    pub turns: Option<i64>,
     /// Cost in USD.
     pub cost_usd: f64,
     /// `true` when the figures above are the last live mid-run snapshot
@@ -10914,6 +10959,7 @@ impl From<&crate::runner::RunnerResult> for RecordedUsage {
             cache_read_tokens: r.cache_read_tokens,
             compaction_input_tokens: r.compaction_input_tokens,
             compaction_count: r.compaction_count,
+            turns: r.turns,
             cost_usd: r.cost_usd,
             cost_is_estimated: r.cost_is_estimated,
         }
@@ -14332,6 +14378,7 @@ command = "cargo test"
                 cache_read_tokens: 7_204_990,
                 compaction_input_tokens: 115_000,
                 compaction_count: 1,
+                turns: Some(2),
                 cost_usd: 0.6807,
                 cost_is_estimated: true,
             },
@@ -14349,6 +14396,8 @@ command = "cargo test"
         // RAL-373: the same round trip, for the columns this ticket adds.
         assert_eq!(cell.compaction_input_tokens, 115_000);
         assert_eq!(cell.compaction_count, 1);
+        // RAL-352: the exchanged-message count survives the same write path.
+        assert_eq!(cell.turns, Some(2));
         assert!(
             cell.cost_is_estimated,
             "a snapshot-derived figure must not read as a settled bill"
@@ -14383,6 +14432,7 @@ command = "cargo test"
                     cache_read_tokens: 44,
                     compaction_input_tokens: 55,
                     compaction_count: 2,
+                    turns: Some(6),
                     cost_usd: 0.5,
                     cost_is_estimated: true,
                 },
@@ -14398,6 +14448,8 @@ command = "cargo test"
         // RAL-373: the same round trip, for the columns this ticket adds.
         assert_eq!(step.compaction_input_tokens, 55);
         assert_eq!(step.compaction_count, 2);
+        // RAL-352: the RAL-352 proof-step column, in the same round trip.
+        assert_eq!(step.turns, Some(6));
         assert!(step.cost_is_estimated);
     }
 
