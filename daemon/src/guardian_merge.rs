@@ -8088,10 +8088,7 @@ fn guardian_base_already_has_every_branch(
 /// identically. Only valid from `in_review` (mirrors `approve_guardian`'s one
 /// legal transition); returns whether it did.
 fn approve_base_already_landed(store: &crate::store_lock::StoreHandle, id: &str) -> bool {
-    let merged = store
-        .lock()
-        .set_guardian_status(id, GuardianStatus::Merged, None)
-        .is_ok();
+    let merged = store.lock().approve_guardian(id).is_ok();
     if merged {
         // A `MutexGuard` temporary produced in an `if let` scrutinee lives
         // for the whole `if let` (it desugars to `match`), so binding the
