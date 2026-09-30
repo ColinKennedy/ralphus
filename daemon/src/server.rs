@@ -15962,6 +15962,7 @@ fn guardian_feedback(
     crate::guardian_merge::start_feedback(
         daemon.store_handle(),
         runner,
+        daemon.cancellations_handle(),
         id,
         branch_id,
         req.feedback,
