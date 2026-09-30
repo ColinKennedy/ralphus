@@ -674,9 +674,10 @@ fn reconcile_remote_feedback_commits(
                 .git(&["rev-parse", "HEAD"])
                 .ok()
                 .map(|s| s.trim().to_string());
+            let branch_label = crate::guardian::branch_log_label_for(store, id, branch_id);
             crate::rlog!(
                 INFO,
-                "ralphus [guardian] review {id} branch={branch_id} rebased feedback onto \
+                "ralphus [guardian] review {id} branch={branch_label} rebased feedback onto \
                 a reviewer's direct push on {remote_branch} (remote_sha={remote_sha}) -- \
                 rebased_sha={rebased_sha:?}"
             );
@@ -690,6 +691,7 @@ fn reconcile_remote_feedback_commits(
                     "rebased feedback onto a reviewer's direct push before the feedback push",
                     serde_json::json!({
                         "branch_id": branch_id,
+                        "branch_label": branch_label,
                         "remote_branch": remote_branch,
                         "remote_sha": remote_sha,
                         "rebased_sha": rebased_sha,
@@ -699,9 +701,10 @@ fn reconcile_remote_feedback_commits(
         }
         Err(reconcile_err) => {
             let _ = wt.git(&["rebase", "--abort"]);
+            let branch_label = crate::guardian::branch_log_label_for(store, id, branch_id);
             crate::rlog!(
                 WARNING,
-                "ralphus [guardian] review {id} branch={branch_id} could not rebase feedback \
+                "ralphus [guardian] review {id} branch={branch_label} could not rebase feedback \
                  onto a reviewer's direct push on {remote_branch} (remote_sha={remote_sha}): \
                  {reconcile_err}"
             );
@@ -715,6 +718,7 @@ fn reconcile_remote_feedback_commits(
                     "could not rebase feedback onto a reviewer's direct push",
                     serde_json::json!({
                         "branch_id": branch_id,
+                        "branch_label": branch_label,
                         "remote_branch": remote_branch,
                         "remote_sha": remote_sha,
                         "error": reconcile_err,
@@ -6279,13 +6283,18 @@ pub fn run_feedback(
                 .try_acquire_guardian_worktree_lease(id, branch_id, &lease_owner);
         if acquired {
             let guard = store.lock();
+            let branch_label = crate::guardian::branch_log_label(&guardian, branch_id);
             crate::cartographer::Note::new("guardian")
                 .guardian(id)
                 .scope("branch")
                 .emit(
                     &guard,
                     "worktree lease acquired",
-                    serde_json::json!({"branch_id": branch_id, "owner": lease_owner}),
+                    serde_json::json!({
+                        "branch_id": branch_id,
+                        "branch_label": branch_label,
+                        "owner": lease_owner,
+                    }),
                 );
             break;
         }
@@ -6742,6 +6751,7 @@ pub fn run_feedback(
                 "ralphus [guardian] review {id} feedback: stash restore failed: {e}"
             );
             let guard = store.lock();
+            let branch_label = crate::guardian::branch_log_label(&guardian, branch_id);
             crate::cartographer::Note::new("guardian")
                 .guardian(id)
                 .scope("branch")
@@ -6749,7 +6759,12 @@ pub fn run_feedback(
                 .emit(
                     &guard,
                     "feedback stash restore failed",
-                    serde_json::json!({"branch_id": branch_id, "stash_name": name, "error": e}),
+                    serde_json::json!({
+                        "branch_id": branch_id,
+                        "branch_label": branch_label,
+                        "stash_name": name,
+                        "error": e,
+                    }),
                 );
         }
     }
@@ -6906,13 +6921,18 @@ pub fn run_feedback(
             .release_guardian_worktree_lease(id, branch_id, &lease_owner);
         if released {
             let guard = store.lock();
+            let branch_label = crate::guardian::branch_log_label(&guardian, branch_id);
             crate::cartographer::Note::new("guardian")
                 .guardian(id)
                 .scope("branch")
                 .emit(
                     &guard,
                     "worktree lease released",
-                    serde_json::json!({"branch_id": branch_id, "owner": lease_owner}),
+                    serde_json::json!({
+                        "branch_id": branch_id,
+                        "branch_label": branch_label,
+                        "owner": lease_owner,
+                    }),
                 );
         }
     }
@@ -10862,6 +10882,7 @@ fn drive_rebase(
         if let Some(owner) = owner {
             lease_polls += 1;
             if lease_wait_log.due() {
+                let branch_label = crate::guardian::branch_log_label_for(store, id, branch_id);
                 let guard = store.lock();
                 crate::cartographer::Note::new("guardian")
                     .guardian(id)
@@ -10871,6 +10892,7 @@ fn drive_rebase(
                         "restack deferred: branch worktree leased",
                         serde_json::json!({
                             "branch_id": branch_id,
+                            "branch_label": branch_label,
                             "owner": owner,
                             "waited_ms": lease_wait_started.elapsed().as_millis() as u64,
                             "polls": lease_polls,
@@ -10893,6 +10915,7 @@ fn drive_rebase(
         // lease contention episode is bracketed in the log rather than
         // trailing off.
         if lease_polls > 0 {
+            let branch_label = crate::guardian::branch_log_label_for(store, id, branch_id);
             let guard = store.lock();
             crate::cartographer::Note::new("guardian")
                 .guardian(id)
@@ -10902,6 +10925,7 @@ fn drive_rebase(
                     "restack proceeding: branch worktree lease free",
                     serde_json::json!({
                         "branch_id": branch_id,
+                        "branch_label": branch_label,
                         "waited_ms": lease_wait_started.elapsed().as_millis() as u64,
                         "polls": lease_polls,
                     }),

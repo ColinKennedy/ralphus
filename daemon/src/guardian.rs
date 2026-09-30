@@ -551,6 +551,43 @@ pub struct BranchView {
     pub auto_submit_error: Option<String>,
 }
 
+/// Human-readable label for a branch in Cartographer log text: its readable
+/// review-branch name (RAL-378, e.g. `ral-521-cache-review-manual-checks`,
+/// the same label shown in the board's review view) when one has been
+/// claimed, falling back to the feature/task branch name, then -- if the
+/// branch has since left the guardian's list entirely -- the raw internal
+/// `branch_id` (e.g. `branch-000000000524`), which on its own tells a human
+/// reader nothing about which review or branch is meant.
+#[must_use]
+pub fn branch_log_label(guardian: &GuardianView, branch_id: &str) -> String {
+    guardian
+        .branches
+        .iter()
+        .find(|b| b.id == branch_id)
+        .map(|b| {
+            b.review_branch_name
+                .clone()
+                .unwrap_or_else(|| b.branch.clone())
+        })
+        .unwrap_or_else(|| branch_id.to_string())
+}
+
+/// [`branch_log_label`] for a call site that hasn't already loaded this
+/// guardian -- looks it up first. Falls back to the raw `branch_id` if the
+/// guardian itself can't be found (e.g. it was deleted between the event and
+/// this log call).
+#[must_use]
+pub fn branch_log_label_for(
+    store: &crate::store_lock::StoreHandle,
+    guardian_id: &str,
+    branch_id: &str,
+) -> String {
+    match store.lock().get_guardian(guardian_id) {
+        Ok(guardian) => branch_log_label(&guardian, branch_id),
+        Err(_) => branch_id.to_string(),
+    }
+}
+
 /// One message in a guardian's feedback thread (RAL-22, scoped per-branch by RAL-272).
 #[derive(Debug, Clone, Serialize)]
 pub struct MessageView {

@@ -3032,11 +3032,11 @@ fn maybe_promote_fork_root(
                         .unwrap_or("(see this branch's parent PR)")
                 );
                 if let Err(e) = routing.fork_client.close_pull_request(number) {
+                    let pr_label = pr_log_label(store, &guardian.git_root, old_stack_pr);
                     crate::rlog!(
                         WARNING,
-                        "ralphus [pr] review {id} could not close stack pr={} whose branch's \
-                         parent pr just merged: {e}",
-                        old_stack_pr.id
+                        "ralphus [pr] review {id} could not close stack pr {pr_label} whose \
+                         branch's parent pr just merged: {e}"
                     );
                     crate::cartographer::Note::new("pr")
                         .level(crate::logging::LogLevel::WARNING)
@@ -3045,15 +3045,19 @@ fn maybe_promote_fork_root(
                         .emit(
                             &store.lock(),
                             "could not close stack pr whose branch's parent pr just merged",
-                            serde_json::json!({"pr_id": old_stack_pr.id, "error": e.to_string()}),
+                            serde_json::json!({
+                                "pr_id": old_stack_pr.id,
+                                "pr_label": pr_label,
+                                "error": e.to_string(),
+                            }),
                         );
                 }
                 if let Err(e) = routing.fork_client.post_pr_comment(number, &pointer) {
+                    let pr_label = pr_log_label(store, &guardian.git_root, old_stack_pr);
                     crate::rlog!(
                         WARNING,
                         "ralphus [pr] review {id} could not post the pointer comment on stack \
-                         pr={}: {e}",
-                        old_stack_pr.id
+                         pr {pr_label}: {e}"
                     );
                     crate::cartographer::Note::new("pr")
                         .level(crate::logging::LogLevel::WARNING)
@@ -3062,7 +3066,11 @@ fn maybe_promote_fork_root(
                         .emit(
                             &store.lock(),
                             "could not post the pointer comment on stack pr",
-                            serde_json::json!({"pr_id": old_stack_pr.id, "error": e.to_string()}),
+                            serde_json::json!({
+                                "pr_id": old_stack_pr.id,
+                                "pr_label": pr_label,
+                                "error": e.to_string(),
+                            }),
                         );
                 }
             }
@@ -4929,6 +4937,7 @@ fn refresh_pr_forge_cache_for_guardian(store: &crate::store_lock::StoreHandle, i
             } else {
                 crate::logging::LogLevel::WARNING
             };
+            let pr_label = pr_log_label(store, &guardian.git_root, pr);
             crate::cartographer::Note::new("pr")
                 .level(level)
                 .scope("guardian")
@@ -4936,11 +4945,11 @@ fn refresh_pr_forge_cache_for_guardian(store: &crate::store_lock::StoreHandle, i
                 .emit(
                     &store.lock(),
                     format!(
-                        "ralphus [pr] review {id} pr={} forge cache poll: now {new_status}",
-                        pr.id
+                        "ralphus [pr] review {id} pr {pr_label} forge cache poll: now {new_status}"
                     ),
                     serde_json::json!({
                         "pr_id": pr.id,
+                        "pr_label": pr_label,
                         "status": new_status,
                         "error": comment_error,
                     }),
@@ -6562,10 +6571,16 @@ fn refresh_open_prs<'a>(
                 None => Some(client),
             };
             let Some(state_client) = state_client else {
+                let git_root = store
+                    .lock()
+                    .get_guardian(id)
+                    .map(|g| g.git_root)
+                    .unwrap_or_default();
+                let pr_label = pr_log_label(store, &git_root, pr);
                 crate::rlog!(
                     WARNING,
-                    "ralphus [pr] pr {} state check skipped: no forge client matches recorded repo {}",
-                    pr.id,
+                    "ralphus [pr] pr {pr_label} state check skipped: no forge client matches \
+                     recorded repo {}",
                     pr.repo
                 );
                 crate::cartographer::Note::new("pr")
@@ -6575,7 +6590,7 @@ fn refresh_open_prs<'a>(
                     .emit(
                         &store.lock(),
                         "pr state check skipped: no forge client matches recorded repo",
-                        serde_json::json!({"pr_id": pr.id, "repo": pr.repo}),
+                        serde_json::json!({"pr_id": pr.id, "pr_label": pr_label, "repo": pr.repo}),
                     );
                 return true;
             };
@@ -7314,25 +7329,27 @@ pub fn run_auto_submit_pass(store: &crate::store_lock::StoreHandle, runner: &dyn
 /// mirror of [`record_auto_submit_failure`], so both outcomes of a pass are
 /// recorded the same way for every branch it covered.
 fn record_auto_submit_success(store: &crate::store_lock::StoreHandle, id: &str, branch_id: &str) {
+    let branch_label = crate::guardian::branch_log_label_for(store, id, branch_id);
     crate::rlog!(
         INFO,
-        "ralphus [pr] review {id} branch {branch_id} auto-submit-pr-stack completed"
+        "ralphus [pr] review {id} branch {branch_label} auto-submit-pr-stack completed"
     );
     let _ = store
         .lock()
         .set_branch_auto_submit_error(id, branch_id, None);
     let guard = store.lock();
+    let message = format!("auto-submit completed for branch {branch_label}");
     let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
         level: crate::logging::LogLevel::INFO,
         source: "pr",
-        message: "auto-submit completed",
+        message: &message,
         scope: Some("branch"),
         squad_id: None,
         guardian_id: Some(id),
         cell_id: None,
         task: None,
         log_path: None,
-        payload: serde_json::json!({"branch_id": branch_id}),
+        payload: serde_json::json!({"branch_id": branch_id, "branch_label": branch_label}),
         admin_only: false,
     });
 }
@@ -7349,25 +7366,27 @@ fn record_auto_submit_failure(
     branch_id: &str,
     error: &str,
 ) {
+    let branch_label = crate::guardian::branch_log_label_for(store, id, branch_id);
     crate::rlog!(
         WARNING,
-        "ralphus [pr] review {id} branch {branch_id} auto-submit-pr-stack failed: {error}"
+        "ralphus [pr] review {id} branch {branch_label} auto-submit-pr-stack failed: {error}"
     );
     let _ = store
         .lock()
         .set_branch_auto_submit_error(id, branch_id, Some(error));
     let guard = store.lock();
+    let message = format!("auto-submit failed for branch {branch_label}");
     let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
         level: crate::logging::LogLevel::WARNING,
         source: "pr",
-        message: "auto-submit failed",
+        message: &message,
         scope: Some("branch"),
         squad_id: None,
         guardian_id: Some(id),
         cell_id: None,
         task: None,
         log_path: None,
-        payload: serde_json::json!({"branch_id": branch_id, "error": error}),
+        payload: serde_json::json!({"branch_id": branch_id, "branch_label": branch_label, "error": error}),
         admin_only: false,
     });
 }
@@ -7951,6 +7970,28 @@ fn local_ref_for_pr(guardian: &GuardianView, pr: &PullRequestView) -> Option<Str
     }
 }
 
+/// Human-readable PR label for Cartographer log text: `<project>#<number>`
+/// once both are known (RAL-396: the registered project name, never the raw
+/// `git_root` path), falling back to `<repo>#<number>` when this git root
+/// isn't a registered project, and to the internal row id (e.g.
+/// `pr-000000000097`) when the forge hasn't assigned this PR a number yet.
+/// The internal id is worthless on its own in a log line -- it identifies the
+/// row to the daemon, not the PR to a human reading the log.
+fn pr_log_label(
+    store: &crate::store_lock::StoreHandle,
+    git_root: &str,
+    pr: &PullRequestView,
+) -> String {
+    let scope = store
+        .lock()
+        .project_name_for_path(git_root)
+        .unwrap_or_else(|| pr.repo.clone());
+    match pr.pr_number {
+        Some(n) => format!("{scope}#{n}"),
+        None => format!("{scope} ({})", pr.id),
+    }
+}
+
 /// Classify drift between a PR's remote branch tip and its review worktree
 /// tip into `(pr_ahead, worktree_ahead, in_sync)` (RAL-190) -- the
 /// comparison [`compute_sync_status`] and the RAL-366 cache poller's batched
@@ -8201,6 +8242,7 @@ fn compute_sync_status_inner(
     // response and is exactly what makes the board look frozen.
     let elapsed = started.elapsed();
     if elapsed >= SYNC_STATUS_SLOW_THRESHOLD {
+        let pr_label = pr_log_label(store, &guardian.git_root, &pr);
         crate::cartographer::Note::new("pr")
             .level(crate::logging::LogLevel::WARNING)
             .scope("guardian")
@@ -8208,13 +8250,14 @@ fn compute_sync_status_inner(
             .emit(
                 &store.lock(),
                 format!(
-                    "review {} pr={pr_id} sync-status took {}ms -- likely contention on \
+                    "review {} pr {pr_label} sync-status took {}ms -- likely contention on \
                      this PR's fetch lock",
                     pr.guardian_id,
                     elapsed.as_millis()
                 ),
                 serde_json::json!({
                     "pr_id": pr_id,
+                    "pr_label": pr_label,
                     "elapsed_ms": u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
                 }),
             );
