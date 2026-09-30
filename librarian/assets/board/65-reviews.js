@@ -1395,8 +1395,19 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         const model = g.resolver_model ? ` · ${esc(g.resolver_model)}` : "";
         // Gates is the one setting that can leave a review provably unverified,
         // so it is the one that earns the warning register.
+        //
+        // With no gates and auto-build allowed, the chip must report what has
+        // actually happened rather than what is intended: the daemon only
+        // infers and runs a build once the stack finishes merging. Saying
+        // "auto" before then reads as "already verified" and contradicts the
+        // check-gates section right below, which is still warning that nothing
+        // has verified this review yet. Same `auto-built via ` prefix the
+        // daemon writes into `detail` that the section keys off.
+        const autoBuilt = (g.detail || "").startsWith("auto-built via ");
         const unverified = gates === 0 && !!g.skip_auto_build;
-        const gatesText = gates ? `${gates}` : (g.skip_auto_build ? "none" : "auto");
+        const gatesText = gates
+          ? `${gates}`
+          : (g.skip_auto_build ? "none" : (autoBuilt ? "auto-built" : "inferred"));
         return `<div class="setup-strip">`
           + `<div class="setup-chips">`
           + setupChip(g.id, "onto", esc(g.base_branch || "—"),
@@ -1412,7 +1423,9 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
               ? "No check gates, and skip auto-build is on — nothing verifies this review. It can reach 'in review', and be approved, without a single build or test having run.\nAdd a gate, or set [review] auto_build in the project's .ralphus.toml."
               : gates
                 ? `${gates} check gate(s) must pass before this review can be approved.`
-                : "No gates configured, so the daemon infers a build command from the diff once the stack merges.",
+                : autoBuilt
+                  ? "No gates configured, so the daemon inferred a build command and ran it once the stack merged. See the check gates section for which command."
+                  : "No gates configured. The daemon will infer a build command from the diff once the stack finishes merging — until then nothing has verified this review.",
             unverified)
           + setupChip(g.id, "worktrees", g.skip_worktrees ? "shared" : "per-branch",
             g.skip_worktrees
