@@ -12244,6 +12244,11 @@ fn generate_manual_commands(
                 "cancelled": cancel.is_cancelled(),
             }),
         );
+        // RAL-521: mark the review's manual checks as computed. Under an
+        // enabled `cache_manual_checks` this marker is what every later
+        // merge/rebase/fix consults to skip regeneration and keep these
+        // commands; under `false` the marker is simply ignored.
+        let _ = store.lock().set_guardian_manual_checks_cached(id, true);
     }
 
     if cancel.is_cancelled() {

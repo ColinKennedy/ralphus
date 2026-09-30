@@ -2477,6 +2477,13 @@ impl Store {
     }
 
     /// Set a guardian's status (and optional detail).
+    ///
+    /// Atomically refuses to move a review out of `cancelled` (terminal) or
+    /// `merge_stopped` (an explicit user stop, RAL-249): a background worker
+    /// writing its final status after a slow operation cannot revive a review
+    /// the user halted. Deliberate transitions out of those two states go
+    /// through their own dedicated paths instead (`claim_guardian_merge`,
+    /// `reopen_guardian`, `cancel_guardian`).
     pub fn set_guardian_status(
         &self,
         id: &str,
@@ -2496,22 +2503,36 @@ impl Store {
             .unwrap_or_else(|| "unknown".to_string());
         let n = self.conn.execute(
             "UPDATE guardians SET status=?, detail=?, updated_at_ms=? WHERE id=? \
-             AND (status != 'cancelled' OR ?='cancelled')",
+             AND (status != 'cancelled' OR ?='cancelled') \
+             AND (status != 'merge_stopped' OR ? IN ('cancelled','merge_stopped'))",
             params![
                 status.as_str(),
                 detail,
                 crate::store::now_ms(),
                 id,
-                status.as_str()
+                status.as_str(),
+                status.as_str(),
             ],
         )?;
         if n == 0 {
-            // A cancelled review is terminal. Merge workers can observe their
-            // cancellation after a slow operation completes, so their final
-            // status write must not revive a review the user has cancelled.
-            // Explicit reopening uses `reopen_guardian`, whose transition is
-            // deliberately separate from this generic setter.
-            if old == "cancelled" && status != GuardianStatus::Cancelled {
+            // A cancelled review is terminal and a `merge_stopped` review is
+            // an explicit user stop (RAL-249). Merge workers can observe their
+            // cancellation/stop after a slow operation completes, so their
+            // final status write must not revive a review the user halted --
+            // an explicit stop stays authoritative until a deliberate user
+            // action resumes the review. Explicit transitions out use
+            // dedicated paths instead: `claim_guardian_merge` (the board's
+            // "Merge / rebase" on a `merge_stopped` review) and
+            // `reopen_guardian` for terminal statuses. `cancelled` remains
+            // writable from `merge_stopped` so a stopped review can still be
+            // cancelled outright.
+            if (old == "cancelled" && status != GuardianStatus::Cancelled)
+                || (old == "merge_stopped"
+                    && !matches!(
+                        status,
+                        GuardianStatus::MergeStopped | GuardianStatus::Cancelled
+                    ))
+            {
                 return Ok(());
             }
             Err(StoreError::NotFound)
@@ -4753,8 +4774,17 @@ impl Store {
         let row = self
             .conn
             .query_row(
+                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus, summary_format
+                  FROM guardians WHERE id=?", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
+                /*
                 "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus
                  , summary_format FROM guardians WHERE id=?", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
+                */
+                /*
+                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached
+                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus
+                 FROM guardians WHERE id=?", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
+                */
                 params![id],
                 Self::map_guardian_row,
             )
@@ -4869,8 +4899,8 @@ impl Store {
     /// (`crate::store_pool`) can serve it without the writer lock.
     pub(crate) fn list_guardians_conn(conn: &Connection) -> Result<Vec<GuardianView>> {
         let mut stmt = conn.prepare(
-            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus
-             , summary_format FROM guardians ORDER BY created_at_ms DESC", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
+            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus, summary_format
+              FROM guardians ORDER BY created_at_ms DESC", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
         )?;
         let rows = stmt
             .query_map([], Self::map_guardian_row)?
@@ -7264,6 +7294,60 @@ mod tests {
 
         // A terminal/cancelled review can't be stopped.
         assert!(store.stop_guardian_merge(&id).is_err());
+    }
+
+    /// RAL-524: an explicit stop stays authoritative. The generic status
+    /// setter must not move a review out of `merge_stopped` -- a background
+    /// worker (a feedback pass or a merge worker that outlived the stop)
+    /// writing its final status would otherwise silently restart the review
+    /// the user stopped. Cancelling a stopped review stays allowed.
+    #[test]
+    fn set_guardian_status_cannot_revive_a_merge_stopped_review() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "feat").unwrap();
+        store.claim_guardian_merge(&id).unwrap();
+        store.stop_guardian_merge(&id).unwrap();
+        assert_eq!(store.get_guardian(&id).unwrap().status, "merge_stopped");
+
+        // Every worker-style status write is a silent no-op: the review was
+        // stopped, and it stays stopped.
+        for revived in [
+            GuardianStatus::Merging,
+            GuardianStatus::InReview,
+            GuardianStatus::MergeFailed,
+            GuardianStatus::Collecting,
+            GuardianStatus::Merged,
+        ] {
+            store.set_guardian_status(&id, revived, None).unwrap();
+            assert_eq!(
+                store.get_guardian(&id).unwrap().status,
+                "merge_stopped",
+                "a {revived:?} write must not revive a merge_stopped review"
+            );
+        }
+
+        // Cancelling a stopped review is still a legitimate user action.
+        assert_eq!(
+            store.cancel_guardian(&id).unwrap(),
+            GuardianStatus::Cancelled
+        );
+        store
+            .set_guardian_status(&id, GuardianStatus::MergeStopped, None)
+            .unwrap();
+        assert_eq!(store.get_guardian(&id).unwrap().status, "cancelled");
+
+        // Normal (non-stopped) reviews keep transitioning through the generic
+        // setter -- the guard must only bite from `merge_stopped`/`cancelled`.
+        let id2 = store.create_guardian("r2", "main", "/repo").unwrap();
+        store
+            .set_guardian_status(&id2, GuardianStatus::Merging, None)
+            .unwrap();
+        assert_eq!(store.get_guardian(&id2).unwrap().status, "merging");
+        store
+            .set_guardian_status(&id2, GuardianStatus::InReview, None)
+            .unwrap();
+        assert_eq!(store.get_guardian(&id2).unwrap().status, "in_review");
     }
 
     #[test]
