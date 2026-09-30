@@ -1775,12 +1775,19 @@ struct SuggestedPr {
     title: String,
     #[serde(default)]
     description: String,
+    /// RAL-<new>: ids (from the numbered list the prompt gave the model) of
+    /// the prophecies the model judged reviewer-relevant. Absent/empty
+    /// whenever the branch had no unpublished prophecies to judge, or an
+    /// older-shaped response omitted the field entirely.
+    #[serde(default)]
+    relevant_prophecy_ids: Vec<i64>,
 }
 
-/// Parse the resolver agent's `{"title": ..., "description": ...}` response,
-/// tolerating a chatty model that wraps the object in prose (same `{...}`-
-/// substring fallback used by `guardian_merge::parse_manual_commands_response`).
-fn parse_suggested_pr(text: &str) -> Option<(String, String)> {
+/// Parse the resolver agent's `{"title": ..., "description": ..., \
+/// "relevant_prophecy_ids": [...]}` response, tolerating a chatty model that
+/// wraps the object in prose (same `{...}`-substring fallback used by
+/// `guardian_merge::parse_manual_commands_response`).
+fn parse_suggested_pr(text: &str) -> Option<(String, String, Vec<i64>)> {
     serde_json::from_str::<SuggestedPr>(text)
         .ok()
         .or_else(|| {
@@ -1790,7 +1797,7 @@ fn parse_suggested_pr(text: &str) -> Option<(String, String)> {
                 .then(|| serde_json::from_str::<SuggestedPr>(&text[start..=end]).ok())
                 .flatten()
         })
-        .map(|s| (s.title, s.description))
+        .map(|s| (s.title, s.description, s.relevant_prophecy_ids))
 }
 
 /// Synthesize a suggested PR title + description from one branch's unique
@@ -1804,13 +1811,24 @@ fn parse_suggested_pr(text: &str) -> Option<(String, String)> {
 /// (the owning `pr.submit_pull_requests`/`pr.action_feedback` span, if any) is
 /// forwarded onto the `RunnerSpec` so `runner.subprocess`'s span (RAL-96)
 /// becomes a child of it instead of starting a disconnected trace.
+///
+/// RAL-<new>: also judges which of `prophecies` (this branch's unpublished
+/// insights) are reviewer-relevant, in the *same* model turn that writes the
+/// description -- the model already has the description and the diff in
+/// front of it, so asking it a second time in a separate call would just be
+/// a second chance to disagree with itself. Every early return below (no
+/// base sha, no commits, no resolvable resolver agent, agent call failed,
+/// response unparseable) has no model turn to ask, so it falls back to
+/// [`deterministic_relevant_prophecies`] rather than silently keeping
+/// nothing or everything.
 fn synthesize_pr_text(
     runner: &dyn Runner,
     guardian: &GuardianView,
     position: i64,
     template: Option<&str>,
     trace_context: Option<&str>,
-) -> (String, String) {
+    prophecies: &[crate::prophecy::ProphecyView],
+) -> (String, String, Vec<crate::prophecy::ProphecyView>) {
     let root = PathBuf::from(&guardian.git_root);
     let fallback_title = guardian
         .branches
@@ -1830,7 +1848,13 @@ fn synthesize_pr_text(
     let qualified_base = guardian_merge::qualify_ambiguous_ref(&root, &guardian.base_branch);
     let base_sha = match git(&root, &["rev-parse", &qualified_base]) {
         Ok(s) => s.trim().to_string(),
-        Err(_) => return (fallback_title, template.unwrap_or_default().to_string()),
+        Err(_) => {
+            return (
+                fallback_title,
+                template.unwrap_or_default().to_string(),
+                deterministic_relevant_prophecies(prophecies),
+            );
+        }
     };
     let Some((commits, diff_stat, patch)) =
         branch_change_context(&root, &base_sha, guardian, position)
@@ -1840,7 +1864,11 @@ fn synthesize_pr_text(
             DEBUG,
             "ralphus [pr] synthesize pr text position={position:?} skipped: empty commit log"
         );
-        return (fallback_title, template.unwrap_or_default().to_string());
+        return (
+            fallback_title,
+            template.unwrap_or_default().to_string(),
+            deterministic_relevant_prophecies(prophecies),
+        );
     };
     let fallback_description = fallback_pr_description(&commits, template);
 
@@ -1859,7 +1887,11 @@ fn synthesize_pr_text(
                 WARNING,
                 "ralphus [pr] synthesize pr text position={position:?} skipped: {e}"
             );
-            return (fallback_title, fallback_description);
+            return (
+                fallback_title,
+                fallback_description,
+                deterministic_relevant_prophecies(prophecies),
+            );
         }
     };
     let template_note = template.map_or_else(String::new, |t| {
@@ -1868,6 +1900,32 @@ fn synthesize_pr_text(
              follow -- fill it in, keeping its section headers intact:\n\n{t}"
         )
     });
+    // RAL-<new>: ask the same call that writes the description to also judge
+    // which of this branch's unpublished prophecies are worth a reviewer's
+    // time -- see the function doc for why this rides the existing call
+    // instead of a second one.
+    let (prophecy_note, prophecy_schema_note) = if prophecies.is_empty() {
+        (String::new(), String::new())
+    } else {
+        let numbered = prophecies
+            .iter()
+            .map(|p| format!("[{}] ({}) {}", p.id, p.kind, p.body))
+            .collect::<Vec<_>>()
+            .join("\n");
+        (
+            format!(
+                "\n\nWhile this branch was built, the agent(s) working on it recorded the \
+                 following notes (\"insights\"), numbered by id:\n\n{numbered}\n\n\
+                 Decide which of these would be genuinely useful to a human reviewer \
+                 evaluating this PR's code -- a code/design decision, a hazard, or a \
+                 discovery the diff alone would not tell them. Exclude any that only \
+                 describe internal daemon/tooling mechanics (e.g. which git remote or \
+                 branch a push landed on, routine rebase bookkeeping): those duplicate \
+                 what the diff already shows and give the reviewer nothing to act on."
+            ),
+            ", \"relevant_prophecy_ids\": [...]".to_string(),
+        )
+    };
     let prompt = format!(
         "Suggest a pull request title and description for one branch in a \
          stacked review. Use ONLY the commits and diff in the unique range \
@@ -1877,10 +1935,10 @@ fn synthesize_pr_text(
          UNIQUE DIFF STAT:\n\n{diff_stat}\n\n\
          UNIQUE DIFF:\n\n{patch}\n\n\
          Respond with ONLY a JSON object of the form \
-         {{\"title\": \"...\", \"description\": \"...\"}}. The title must be a \
-         single concise line under 72 characters. The description should be a \
+         {{\"title\": \"...\", \"description\": \"...\"{prophecy_schema_note}}}. The title \
+         must be a single concise line under 72 characters. The description should be a \
          few sentences of markdown explaining what changed and why, focused on \
-         developer intent rather than file-level detail.{template_note}"
+         developer intent rather than file-level detail.{template_note}{prophecy_note}"
     );
     let pr_cwd = guardian
         .branches
@@ -1937,14 +1995,22 @@ fn synthesize_pr_text(
     );
     let result = runner.run(&spec);
     if result.is_done() {
-        if let Some((title, description)) = parse_suggested_pr(&result.summary) {
+        if let Some((title, description, relevant_ids)) = parse_suggested_pr(&result.summary) {
             if !title.trim().is_empty() {
                 // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
                 crate::rlog!(
                     DEBUG,
-                    "ralphus [pr] synthesize pr text position={position:?} done: used llm suggestion"
+                    "ralphus [pr] synthesize pr text position={position:?} done: used llm suggestion \
+                     ({} of {} prophecies judged reviewer-relevant)",
+                    relevant_ids.len(),
+                    prophecies.len()
                 );
-                return (title, description);
+                let relevant = prophecies
+                    .iter()
+                    .filter(|p| relevant_ids.contains(&p.id))
+                    .cloned()
+                    .collect();
+                return (title, description, relevant);
             }
         }
     }
@@ -1955,7 +2021,11 @@ fn synthesize_pr_text(
          (agent result status={:?})",
         result.status
     );
-    (fallback_title, fallback_description)
+    (
+        fallback_title,
+        fallback_description,
+        deterministic_relevant_prophecies(prophecies),
+    )
 }
 
 fn resolve_title_description(
@@ -1965,31 +2035,47 @@ fn resolve_title_description(
     position: i64,
     client: &crate::forge::ForgeClient,
     trace_context: Option<&str>,
-) -> (String, String) {
+    prophecies: &[crate::prophecy::ProphecyView],
+) -> (String, String, Vec<crate::prophecy::ProphecyView>) {
     if let (Some(t), Some(d)) = (&req.title, &req.description) {
-        return (t.clone(), d.clone());
+        // Both title and description were given explicitly, so the
+        // synthesis call never runs -- there is no model turn to ask about
+        // relevance, so this falls back to the deterministic mechanics
+        // filter (see `prophecy_is_reviewer_relevant`).
+        return (
+            t.clone(),
+            d.clone(),
+            deterministic_relevant_prophecies(prophecies),
+        );
     }
     let template = client.fetch_pr_template();
-    let (synth_title, synth_description) = synthesize_pr_text(
+    let (synth_title, synth_description, relevant_prophecies) = synthesize_pr_text(
         runner,
         guardian,
         position,
         template.as_deref(),
         trace_context,
+        prophecies,
     );
     (
         req.title.clone().unwrap_or(synth_title),
         req.description.clone().unwrap_or(synth_description),
+        relevant_prophecies,
     )
 }
 
-/// RAL-534: a prophecy is reviewer-relevant unless its prose is recognizably
-/// daemon/push mechanics -- internal bookkeeping a reviewer evaluating the
-/// *code* has no use for. This is a deterministic string match, not a model
-/// call: it must never be surprised by phrasing it hasn't seen, and it must
-/// never silently drop something that turns out to matter, so it only
-/// excludes the two known-noisy shapes call out in the ticket rather than
-/// guessing at intent.
+/// RAL-534's original relevance check, now demoted from the primary path to
+/// the deterministic fallback [`deterministic_relevant_prophecies`] falls
+/// back to whenever `synthesize_pr_text` has no model turn to ask (see that
+/// function's doc): a prophecy is reviewer-relevant unless its prose is
+/// recognizably daemon/push mechanics -- internal bookkeeping a reviewer
+/// evaluating the *code* has no use for. Deliberately still a plain string
+/// match rather than a second, independent model call of its own: a
+/// fallback that runs *because* the model couldn't be reached needs an
+/// answer that doesn't itself depend on reaching a model, and it must never
+/// be surprised by phrasing it hasn't seen, so it only excludes the two
+/// known-noisy shapes called out in RAL-534's ticket rather than guessing at
+/// intent.
 ///
 /// - Routine rebase/merge bookkeeping with no reviewer-relevant outcome: the
 ///   single daemon-authored template `finish_branch_resolved` emits
@@ -2020,11 +2106,124 @@ fn prophecy_is_reviewer_relevant(prophecy: &crate::prophecy::ProphecyView) -> bo
     !MECHANICS_MARKERS.iter().any(|marker| body.contains(marker))
 }
 
+/// The deterministic fallback list, wherever `synthesize_pr_text` has no
+/// model turn available to ask (see its doc and
+/// [`prophecy_is_reviewer_relevant`]).
+fn deterministic_relevant_prophecies(
+    prophecies: &[crate::prophecy::ProphecyView],
+) -> Vec<crate::prophecy::ProphecyView> {
+    prophecies
+        .iter()
+        .filter(|p| prophecy_is_reviewer_relevant(p))
+        .cloned()
+        .collect()
+}
+
+/// Plain-text rendering of `prophecies` for a commit message body -- unlike
+/// [`format_prophecy_details_block`]'s `<details>` block, a commit message
+/// has no use for HTML, so this is a plain bullet list instead.
+fn insights_commit_block(prophecies: &[crate::prophecy::ProphecyView]) -> Option<String> {
+    if prophecies.is_empty() {
+        return None;
+    }
+    let items = prophecies
+        .iter()
+        .map(|p| format!("- {}: {}", p.kind, p.body))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(format!("Insights recorded while this was built:\n{items}"))
+}
+
+/// RAL-<new>: folds the same reviewer-relevant prophecy list that goes into
+/// the PR description into the review branch's own tip commit too, so an
+/// org that squash-merges its PRs keeps the insights in git history even
+/// after the PR itself is closed/deleted -- the PR body alone doesn't
+/// survive that. Targets the tip commit specifically because
+/// `guardian_merge::squash_review_commits` has usually already collapsed
+/// the branch down to exactly one commit by the time a PR is submitted, so
+/// the tip is normally the *only* commit a squash-merge has to work with;
+/// when it isn't (squashing skipped or disabled), the tip is still the
+/// closest analogue to "the commit that answers for the whole branch",
+/// mirroring why the `Ralphus-Cell:` join-key trailer (`docs/prophecy-design.md`
+/// §8.2) rides every commit rather than picking one -- except here the
+/// content is only known once, at submission time, so there is exactly one
+/// commit left to carry it: whichever one is on top right now.
+///
+/// Rewrites via plumbing (`commit-tree` + `update-ref`) rather than `git
+/// commit --amend`, because `root` need not have `review_ref` checked out as
+/// `HEAD` -- [`push_ref`] already treats it as a plain ref, not a
+/// working-tree state, and this function keeps that assumption. Force-pushes
+/// the result immediately after, same as the initial push above (`push_ref`
+/// always forces) -- restacking already force-pushes this branch on every
+/// merge cycle, so this is not a new class of risk for it.
+///
+/// Returns `Ok(None)` (no rewrite, no push) when there is nothing to add.
+fn append_insights_to_review_commit(
+    root: &Path,
+    review_ref: &str,
+    remote_name: &str,
+    alias: &str,
+    prophecies: &[crate::prophecy::ProphecyView],
+) -> std::result::Result<Option<String>, String> {
+    let Some(block) = insights_commit_block(prophecies) else {
+        return Ok(None);
+    };
+    // `update-ref` (unlike `rev-parse`) does not DWIM-resolve a short branch
+    // name -- it needs the fully-qualified ref it will actually write.
+    let full_ref = git(root, &["rev-parse", "--symbolic-full-name", review_ref])?
+        .trim()
+        .to_string();
+    let old_sha = git(root, &["rev-parse", review_ref])?.trim().to_string();
+    let original_message = git(root, &["log", "-1", "--format=%B", &old_sha])?;
+    let new_message = format!("{}\n\n{block}", original_message.trim_end());
+    let tree = git(root, &["rev-parse", &format!("{old_sha}^{{tree}}")])?
+        .trim()
+        .to_string();
+    // A merge commit has more than one parent; preserve every one of them
+    // rather than assuming the linear-stack common case.
+    let parents_raw = git(root, &["log", "-1", "--format=%P", &old_sha])?;
+    // `commit-tree` falls back to `user.name`/`user.email` (or
+    // `GIT_AUTHOR_*`/`GIT_COMMITTER_*`) for the identity on the commit it
+    // creates. A machine that already has a global git identity configured
+    // never notices, but a bare CI runner has none, and this plumbing runs
+    // unconditionally as part of every PR submission -- not something to
+    // leave dependent on ambient config. Pin both author and committer to
+    // the commit's own existing author (the same identity `commit --amend
+    // --no-edit` would keep) so this never depends on the environment's git
+    // config at all.
+    let author_name = git(root, &["log", "-1", "--format=%an", &old_sha])?
+        .trim()
+        .to_string();
+    let author_email = git(root, &["log", "-1", "--format=%ae", &old_sha])?
+        .trim()
+        .to_string();
+    let mut commit_tree_args: Vec<String> = vec![
+        "-c".to_string(),
+        format!("user.name={author_name}"),
+        "-c".to_string(),
+        format!("user.email={author_email}"),
+        "commit-tree".to_string(),
+        tree,
+    ];
+    for parent in parents_raw.split_whitespace() {
+        commit_tree_args.push("-p".to_string());
+        commit_tree_args.push(parent.to_string());
+    }
+    commit_tree_args.push("-m".to_string());
+    commit_tree_args.push(new_message);
+    let commit_tree_args: Vec<&str> = commit_tree_args.iter().map(String::as_str).collect();
+    let new_sha = git(root, &commit_tree_args)?.trim().to_string();
+    git(root, &["update-ref", &full_ref, &new_sha, &old_sha])?;
+    push_ref(root, remote_name, review_ref, alias)?;
+    Ok(Some(new_sha))
+}
+
 /// Renders prophecies as a deterministic details block for the end of a PR
 /// description. It is appended after any synthesized description so agent
-/// notes reach reviewers without another model rewriting them. Callers pass
-/// only reviewer-relevant prophecies (see [`prophecy_is_reviewer_relevant`])
-/// -- this function renders whatever it is given verbatim.
+/// notes reach reviewers verbatim -- something may judge *which* prophecies
+/// get here (`synthesize_pr_text`'s relevance check, or its
+/// [`prophecy_is_reviewer_relevant`] fallback), but nothing rewrites their
+/// wording; this function renders whatever it is given as-is.
 fn format_prophecy_details_block(prophecies: &[crate::prophecy::ProphecyView]) -> Option<String> {
     if prophecies.is_empty() {
         return None;
@@ -6094,7 +6293,11 @@ fn submit_stacked_branch_pr(
         guard_against_clobber(root, remote_name, &alias, &review_ref, None)?;
     }
     push_ref(root, remote_name, &review_ref, &alias)?;
-    let pushed_sha = git(root, &["rev-parse", &review_ref])
+    // RAL-<new>: re-pushed below (mutated, not re-declared) if the `None`
+    // arm folds the reviewer-relevant insight list into the tip commit --
+    // that rewrites the commit this sha names, so `pushed_sha`/CI
+    // cancellation must track whichever push actually happened last.
+    let mut pushed_sha = git(root, &["rev-parse", &review_ref])
         .map(|s| s.trim().to_string())
         .ok();
     if let Some(sha) = pushed_sha.as_deref() {
@@ -6178,24 +6381,50 @@ fn submit_stacked_branch_pr(
             )
         }
         None => {
-            let (title, description) = resolve_title_description(
+            let (title, description, reviewer_relevant_prophecies) = resolve_title_description(
                 runner,
                 guardian,
                 req,
                 position,
                 &route.client,
                 trace_context,
+                &unpublished_prophecies,
             );
-            let reviewer_relevant_prophecies: Vec<crate::prophecy::ProphecyView> =
-                unpublished_prophecies
-                    .iter()
-                    .filter(|p| prophecy_is_reviewer_relevant(p))
-                    .cloned()
-                    .collect();
             let description = match format_prophecy_details_block(&reviewer_relevant_prophecies) {
                 Some(block) => format!("{description}\n\n{block}"),
                 None => description,
             };
+            // RAL-<new>: fold the same reviewer-relevant list into the
+            // review branch's own tip commit, not just the PR body, so it
+            // survives an eventual squash-merge after the PR itself is
+            // gone. Best-effort -- a failure here must never block PR
+            // creation, since the insights already reached the reviewer via
+            // the description above.
+            match append_insights_to_review_commit(
+                root,
+                &review_ref,
+                remote_name,
+                &alias,
+                &reviewer_relevant_prophecies,
+            ) {
+                Ok(Some(new_sha)) => {
+                    pushed_sha = Some(new_sha.clone());
+                    cancel_superseded_ci_after_push(
+                        store,
+                        id,
+                        guardian.auto_cancel_outdated_pr_pipelines.unwrap_or(true),
+                        Some(client),
+                        &alias,
+                        &new_sha,
+                    );
+                }
+                Ok(None) => {}
+                Err(e) => crate::rlog!(
+                    WARNING,
+                    "ralphus [pr] review {id} branch {branch_id} could not fold insights into \
+                     the review commit history: {e}"
+                ),
+            }
             let created = route.create_pull_request(&title, &description, draft)?;
             (created, base, title, description, false)
         }
@@ -9148,8 +9377,16 @@ mod tests {
     }
 
     fn prophecy(kind: crate::prophecy::ProphecyKind, body: &str) -> crate::prophecy::ProphecyView {
+        prophecy_with_id(1, kind, body)
+    }
+
+    fn prophecy_with_id(
+        id: i64,
+        kind: crate::prophecy::ProphecyKind,
+        body: &str,
+    ) -> crate::prophecy::ProphecyView {
         crate::prophecy::ProphecyView {
-            id: 1,
+            id,
             entity_uri: "guardian:g1".to_string(),
             attempt: 0,
             kind: kind.as_str().to_string(),
@@ -9218,6 +9455,156 @@ mod tests {
              tighter loop was pushing CPU usage up noticeably on the branch's own benchmark.",
         );
         assert!(prophecy_is_reviewer_relevant(&p));
+    }
+
+    /// RAL-<new>: `synthesize_pr_text`'s success path trusts the model's
+    /// judgment over the deterministic marker list -- a prophecy the
+    /// deterministic matcher would keep (no mechanics marker in its body)
+    /// can still be dropped if the model says so, and one it would exclude
+    /// can still survive. Also confirms a hallucinated id (7, which no
+    /// prophecy in the input has) is silently ignored rather than panicking
+    /// or producing a phantom entry.
+    struct ScriptedRunner(String);
+
+    impl Runner for ScriptedRunner {
+        fn run(&self, _spec: &RunnerSpec) -> crate::runner::RunnerResult {
+            crate::runner::RunnerResult {
+                retry_after_secs: None,
+                status: "done".to_string(),
+                tokens_in: 0,
+                tokens_out: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+                compaction_input_tokens: 0,
+                compaction_count: 0,
+                cost_usd: 0.0,
+                cost_is_estimated: false,
+                summary: self.0.clone(),
+                error: None,
+                proofed: None,
+                agent_session_id: None,
+                ghost: None,
+                turns: None,
+                prophecies: Vec::new(),
+                thinking_stall_last_line: None,
+            }
+        }
+    }
+
+    #[test]
+    fn synthesize_pr_text_uses_the_models_relevance_judgment_over_the_deterministic_marker_list() {
+        let root = tmp_dir("pr-text-ai-relevance");
+        g(&root, &["init", "--initial-branch", "main"]);
+        gwrite(&root, "base.txt", "base\n");
+        g(&root, &["add", "."]);
+        g(&root, &["commit", "--message", "base"]);
+        g(&root, &["checkout", "-b", "review/x"]);
+        gwrite(&root, "x.txt", "add x\n");
+        g(&root, &["add", "."]);
+        g(&root, &["commit", "--message", "add x"]);
+        g(&root, &["checkout", "main"]);
+
+        let store = store();
+        let gid = store
+            .create_guardian("demo", "main", root.to_str().unwrap())
+            .unwrap();
+        store.add_guardian_branch(&gid, "x").unwrap();
+        let branch_id = store.get_guardian(&gid).unwrap().branches[0].id.clone();
+        store
+            .set_branch_review(&gid, &branch_id, "review/x", "worktree-x")
+            .unwrap();
+        let guardian = store.get_guardian(&gid).unwrap();
+
+        // id 1 has no mechanics marker (the deterministic filter would keep
+        // it), but the model drops it anyway; id 2 has one (the
+        // deterministic filter would drop it), but the model keeps it; id 3
+        // is dropped by both; id 7 doesn't exist in the input at all.
+        let prophecies = vec![
+            prophecy_with_id(1, crate::prophecy::ProphecyKind::Decision, "a clean note"),
+            prophecy_with_id(
+                2,
+                crate::prophecy::ProphecyKind::Decision,
+                "pushed explicitly to a branch",
+            ),
+            prophecy_with_id(
+                3,
+                crate::prophecy::ProphecyKind::Decision,
+                "dropped by both",
+            ),
+        ];
+        let runner = ScriptedRunner(
+            "{\"title\": \"Add x\", \"description\": \"Adds x.\", \
+             \"relevant_prophecy_ids\": [2, 7]}"
+                .to_string(),
+        );
+
+        let (title, description, relevant) =
+            synthesize_pr_text(&runner, &guardian, 0, None, None, &prophecies);
+
+        assert_eq!(title, "Add x");
+        assert_eq!(description, "Adds x.");
+        assert_eq!(relevant.len(), 1, "{relevant:?}");
+        assert_eq!(relevant[0].id, 2);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn append_insights_to_review_commit_rewrites_the_tip_and_pushes_it() {
+        let root = tmp_dir("insights-commit-root");
+        g(&root, &["init", "--initial-branch", "main"]);
+        gwrite(&root, "base.txt", "base\n");
+        g(&root, &["add", "."]);
+        g(
+            &root,
+            &[
+                "commit",
+                "--message",
+                "add feature\n\nRalphus-Cell: cell:squad-1:0:0",
+            ],
+        );
+
+        let remote_dir = tmp_dir("insights-commit-remote");
+        g(&remote_dir, &["init", "--bare"]);
+        let remote = remote_dir.to_str().unwrap();
+        g(&root, &["push", remote, "main:refs/heads/pr-x"]);
+        let old_sha = g(&root, &["rev-parse", "main"]).trim().to_string();
+
+        let prophecies = vec![prophecy_with_id(
+            1,
+            crate::prophecy::ProphecyKind::Decision,
+            "kept this one",
+        )];
+        let new_sha = append_insights_to_review_commit(&root, "main", remote, "pr-x", &prophecies)
+            .unwrap()
+            .expect("a rewrite happened");
+        assert_ne!(new_sha, old_sha);
+
+        // The local ref and the remote alias both landed on the rewritten commit.
+        assert_eq!(g(&root, &["rev-parse", "main"]).trim(), new_sha);
+        assert_eq!(g(&remote_dir, &["rev-parse", "pr-x"]).trim(), new_sha);
+
+        let message = g(&root, &["log", "-1", "--format=%B", &new_sha]);
+        assert!(message.contains("add feature"), "{message}");
+        assert!(
+            message.contains("Ralphus-Cell: cell:squad-1:0:0"),
+            "the original trailer must survive: {message}"
+        );
+        assert!(
+            message.contains("Insights recorded while this was built:\n- decision: kept this one"),
+            "{message}"
+        );
+
+        // No prophecies -> no rewrite, no push, ref untouched.
+        assert!(
+            append_insights_to_review_commit(&root, "main", remote, "pr-x", &[])
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(g(&root, &["rev-parse", "main"]).trim(), new_sha);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote_dir);
     }
 
     /// Every push site now runs `cancel_superseded_ci_after_push` right after
@@ -17388,12 +17775,26 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
 
     #[test]
     fn parse_suggested_pr_handles_wrapped_json() {
-        let (t, d) = parse_suggested_pr(
+        let (t, d, ids) = parse_suggested_pr(
             "Sure! {\"title\": \"Fix bug\", \"description\": \"Fixes it.\"} done.",
         )
         .unwrap();
         assert_eq!(t, "Fix bug");
         assert_eq!(d, "Fixes it.");
+        assert!(
+            ids.is_empty(),
+            "no relevant_prophecy_ids given must default empty"
+        );
+    }
+
+    #[test]
+    fn parse_suggested_pr_extracts_relevant_prophecy_ids() {
+        let (_, _, ids) = parse_suggested_pr(
+            "{\"title\": \"Fix bug\", \"description\": \"Fixes it.\", \
+             \"relevant_prophecy_ids\": [2, 5]}",
+        )
+        .unwrap();
+        assert_eq!(ids, vec![2, 5]);
     }
 
     #[test]
@@ -17464,13 +17865,15 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         let guardian = store.get_guardian(&gid).unwrap();
         let runner = CapturingFailureRunner(Mutex::new(None));
 
-        let (title, description) = synthesize_pr_text(
+        let (title, description, relevant) = synthesize_pr_text(
             &runner,
             &guardian,
             1,
             Some("## Summary\n\n<!-- fill this in -->"),
             None,
+            &[],
         );
+        assert!(relevant.is_empty(), "no prophecies were given to judge");
 
         assert_eq!(title, "b");
         assert!(description.starts_with("## Summary"), "{description}");
@@ -17556,7 +17959,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         let guardian = store.get_guardian(&gid).unwrap();
         let runner = CapturingFailureRunner(Mutex::new(None));
 
-        let (_, description) = synthesize_pr_text(&runner, &guardian, 0, None, None);
+        let (_, description, _) = synthesize_pr_text(&runner, &guardian, 0, None, None, &[]);
 
         assert!(description.contains("add x"), "{description}");
         assert!(
