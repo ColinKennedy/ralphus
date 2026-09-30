@@ -123,7 +123,7 @@
 
       // ---------- reviews (list + detail, read-only for now) ----------
       /** @type {{[key: string]: string}} */
-      const G_COLORS = { collecting:"--muted", merging:"--running", merge_failed:"--failed", merge_stopped:"--pending", in_review:"--accent", merged:"--done", cancelled:"--cancelled", deployed:"--done", pending:"--pending", ready:"--teal", in_progress:"--running", actioning:"--running", done:"--done", proof_pending:"--running", conflict_resolved:"--queued", failed:"--failed", closed:"--cancelled" };
+      const G_COLORS = { collecting:"--muted", merging:"--running", merge_failed:"--failed", merge_stopped:"--pending", in_review:"--accent", merged:"--done", approved:"--done", cancelled:"--cancelled", deployed:"--done", pending:"--pending", ready:"--teal", in_progress:"--running", actioning:"--running", done:"--done", proof_pending:"--running", conflict_resolved:"--queued", failed:"--failed", closed:"--cancelled" };
       // States in which a review may be cancelled — mirrors the backend's
       // cancel_guardian() (daemon/src/guardian.rs). Both the left-hand review
       // list menu and the detail pane's upper-right ⋯ menu use this one set so
@@ -1148,15 +1148,15 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
       // RALPHUS-MERGE-BUTTON:END
 
       /** Review statuses whose primary action button is "Reopen" instead of "Merge / rebase" -- mirrors the backend's `Store::reopen_guardian` (daemon/src/guardian.rs). */
-      const REOPEN_ELIGIBLE = ["cancelled", "merged"];
+      const REOPEN_ELIGIBLE = ["cancelled", "merged", "approved"];
 
       /**
        * How the "Reopen" button should read, for a review that occupies the
-       * "Merge / rebase" button's slot once it is cancelled or merged --
-       * both are otherwise dead ends for that button (see
+       * "Merge / rebase" button's slot once it is cancelled, merged, or
+       * approved -- all three are otherwise dead ends for that button (see
        * `MERGE_DISABLED_REASON`), so reopening back into `collecting` is the
        * only way to continue one instead of starting over from scratch.
-       * @param {string} status the review's current status ("cancelled" or "merged")
+       * @param {string} status the review's current status ("cancelled", "merged", or "approved")
        * @param {boolean} pending whether a reopen kickoff is already in flight
        * @returns {{label: string, enabled: boolean, tip: string}}
        */
@@ -1168,12 +1168,18 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
             tip: "The request has been sent — waiting for the daemon to confirm the review reopened.\nReopening also immediately stages whatever branches are already ready.\nDisabled so the same reopen cannot be submitted twice.",
           };
         }
+        let tip;
+        if (status === "merged") {
+          tip = "Reopen this merged review back into collecting and immediately stage in whatever branches are already ready, without waiting for the rest.\nUse this to make further changes to an already-merged review instead of starting a new one from scratch.";
+        } else if (status === "approved") {
+          tip = "Reopen this approved review back into collecting and immediately stage in whatever branches are already ready, without waiting for the rest.\nUse this to make further changes to an already-approved review instead of starting a new one from scratch.";
+        } else {
+          tip = "Reopen this cancelled review and immediately stage in whatever branches are already ready, without waiting for the rest.\nUse this when a review was cancelled by mistake, or you want to retry it without recreating it from scratch.";
+        }
         return {
           label: "↺ Reopen review",
           enabled: true,
-          tip: status === "merged"
-            ? "Reopen this merged review back into collecting and immediately stage in whatever branches are already ready, without waiting for the rest.\nUse this to make further changes to an already-merged review instead of starting a new one from scratch."
-            : "Reopen this cancelled review and immediately stage in whatever branches are already ready, without waiting for the rest.\nUse this when a review was cancelled by mistake, or you want to retry it without recreating it from scratch.",
+          tip,
         };
       }
 
@@ -1210,8 +1216,8 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         }
         reviewDetailLoading = null;
         // RAL-14: reorder is allowed while the review is still open — not once it
-        // is merged/deployed (those branches are considered merged/shipped).
-        const canReorder = !["merged", "cancelled", "deployed"].includes(g.status);
+        // is merged/approved/deployed (those branches are considered merged/shipped).
+        const canReorder = !["merged", "approved", "cancelled", "deployed"].includes(g.status);
         const drag = canReorder ? `draggable="true" ondragstart="brDragStart(event)" ondragover="brDragOver(event)" ondragleave="brDragLeave(event)" ondrop="brDrop(event,this.dataset.guardianId)" ondragend="brDragEnd(event)"` : "";
         // Staged reorder + enable state (RAL-6, RAL-43): pendingReorder holds both
         // the branch order and per-branch enabled flags, committed only on Save.
@@ -1423,13 +1429,17 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
             })()}
             ${(() => {
               const isPending = pendingGuardianActions.has(g.id);
-              const alreadyMerged = g.status === "merged";
-              const disabled = isPending || alreadyMerged;
+              // RAL-535: a review can also already be `approved` (a prior
+              // explicit approval, possibly from `merge_stopped`) -- both it
+              // and `merged` (the forge detecting an actual PR/MR merge) are
+              // terminal outcomes this button can no longer act on.
+              const alreadyDecided = g.status === "merged" || g.status === "approved";
+              const disabled = isPending || alreadyDecided;
               const approveTip = isPending
                 ? "Approval is in flight — waiting for the daemon to confirm."
-                : alreadyMerged
-                  ? "This review is already merged.\nPress Reopen review above to make further changes, then approve again."
-                  : "Approve this review for deployment — marks it as merged once all merges and check gates have passed.\nCan be pressed at any time; the daemon rejects it if the review isn't in a state that can be approved yet.";
+                : alreadyDecided
+                  ? `This review is already ${g.status}.\nPress Reopen review above to make further changes, then approve again.`
+                  : "Approve this review — marks it as approved, whether or not its PR/MR has merged.\nCan be pressed from in_review or merge_stopped; the daemon rejects it if the review isn't in a state that can be approved yet.";
               const approveBtn = `<button class="btn" data-click="approveReview" data-guardian-id="${esc(g.id)}" ${disabled ? "disabled" : ""} data-tip="${approveTip}">${isPending ? "Approving…" : "Approve"}</button>`;
               return disabled ? `<span data-tip="${approveTip}">${approveBtn}</span>` : approveBtn;
             })()}
@@ -2446,11 +2456,12 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         tick();
       }
       /**
-       * Approves an in-review review for deployment. Marks the button
-       * pending/disabled immediately (RAL-234) -- the daemon write itself is
-       * a single status-string match, but the follow-up `tick()` reload
-       * still takes a network round-trip or two, and without this the button
-       * looked unresponsive for that whole window.
+       * Approves a review that is `in_review` or `merge_stopped` (RAL-535).
+       * Marks the button pending/disabled immediately (RAL-234) -- the
+       * daemon write itself is a single status-string match, but the
+       * follow-up `tick()` reload still takes a network round-trip or two,
+       * and without this the button looked unresponsive for that whole
+       * window.
        * @param {string} id
        * @returns {Promise<void>}
        */
@@ -2566,7 +2577,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         e.preventDefault(); e.stopPropagation(); closeSquadMenu();
         // Exclude the current review and reviews that can no longer accept new
         // work (mirrors the canReorder gate used for the move button itself).
-        const targets = guardians.filter((x) => x.id !== gid && !["merged", "cancelled", "deployed"].includes(x.status));
+        const targets = guardians.filter((x) => x.id !== gid && !["merged", "approved", "cancelled", "deployed"].includes(x.status));
         const menu = document.createElement("div");
         menu.className = "ctx-menu"; menu.id = "squad-menu";
         menu.innerHTML = targets.length

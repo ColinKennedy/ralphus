@@ -142,7 +142,7 @@
           originalName: g.name,
           baseBranch: g.base_branch || "",
           originalBaseBranch: g.base_branch || "",
-          resolverFrozen: ["merged", "deployed"].includes(g.status),
+          resolverFrozen: ["merged", "approved", "deployed"].includes(g.status),
           resolverAgent: g.resolver_agent || "",
           originalResolverAgent: g.resolver_agent || "",
           resolverModel: g.resolver_model || "",
