@@ -4140,7 +4140,9 @@ impl Store {
         let mut ready = Vec::new();
         for (id, deps_json) in pending {
             let deps = from_json(&deps_json);
-            if self.deps_satisfied(&deps)? && self.squad_block_gating_waypoint(&id)?.is_none() {
+            if Self::deps_satisfied_in(&satisfied, &deps)
+                && self.squad_block_gating_waypoint(&id)?.is_none()
+            {
                 ready.push(id);
             }
         }
@@ -10619,12 +10621,13 @@ impl Store {
             Ok(p) => p,
             Err(_) => return Ok(()), // a cyclic squad cannot be queued
         };
-        let squad_deps_ok = self.deps_satisfied(&self.squad_depends_on(squad_id)?)?;
-        let blocking_waypoint = self.squad_block_gating_waypoint(squad_id)?;
+        let deps = Self::squad_depends_on_conn(conn, squad_id)?;
+        let squad_deps_ok = Self::deps_satisfied_in(satisfied, &deps);
+        let blocking_waypoint = Self::squad_block_gating_waypoint_conn(conn, squad_id)?;
         // Resolved once (not per cell/proof row below) since it's the same
         // label for every queue item this squad produces.
         let blocking_waypoint_label = blocking_waypoint.as_deref().map(|wp| {
-            self.get_waypoint(wp)
+            Self::get_waypoint_conn(conn, wp)
                 .ok()
                 .and_then(|w| w.label)
                 .unwrap_or_else(|| wp.to_string())

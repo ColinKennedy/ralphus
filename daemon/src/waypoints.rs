@@ -54,7 +54,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
 use crate::chat_client::{self, ChatMessage};
@@ -425,28 +425,32 @@ impl Store {
     /// Returns [`StoreError::NotFound`] if no such waypoint exists, or
     /// propagates any other SQLite failure.
     pub fn get_waypoint(&self, id: &str) -> StoreResult<WaypointView> {
-        self.conn
-            .query_row(
-                "SELECT id, label, prompt, agent, model, allow_advisory, state, created_at_ms, updated_at_ms, closed_at_ms
-                 FROM waypoints WHERE id=?",
-                params![id],
-                |r| {
-                    Ok(WaypointView {
-                        id: r.get(0)?,
-                        label: r.get(1)?,
-                        prompt: r.get(2)?,
-                        agent: r.get(3)?,
-                        model: r.get(4)?,
-                        allow_advisory: r.get(5)?,
-                        state: r.get(6)?,
-                        created_at_ms: r.get(7)?,
-                        updated_at_ms: r.get(8)?,
-                        closed_at_ms: r.get(9)?,
-                    })
-                },
-            )
-            .optional()?
-            .ok_or(StoreError::NotFound)
+        Self::get_waypoint_conn(&self.conn, id)
+    }
+
+    /// [`Self::get_waypoint`]'s query against an explicit connection (WS-D.6).
+    pub(crate) fn get_waypoint_conn(conn: &Connection, id: &str) -> StoreResult<WaypointView> {
+        conn.query_row(
+            "SELECT id, label, prompt, agent, model, allow_advisory, state, created_at_ms, updated_at_ms, closed_at_ms
+             FROM waypoints WHERE id=?",
+            params![id],
+            |r| {
+                Ok(WaypointView {
+                    id: r.get(0)?,
+                    label: r.get(1)?,
+                    prompt: r.get(2)?,
+                    agent: r.get(3)?,
+                    model: r.get(4)?,
+                    allow_advisory: r.get(5)?,
+                    state: r.get(6)?,
+                    created_at_ms: r.get(7)?,
+                    updated_at_ms: r.get(8)?,
+                    closed_at_ms: r.get(9)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or(StoreError::NotFound)
     }
 
     /// A squad's aggregate [`Scope`], per project. Groups every cell in the
@@ -1046,20 +1050,27 @@ impl Store {
     /// # Errors
     /// Propagates any SQLite failure.
     pub fn squad_block_gating_waypoint(&self, squad_id: &str) -> StoreResult<Option<String>> {
-        self.conn
-            .query_row(
-                "SELECT wr.waypoint_id FROM waypoint_roster wr
-                 JOIN waypoints w ON w.id = wr.waypoint_id
-                 WHERE wr.kind = 'squad' AND wr.entry_id = ? AND wr.mode = 'block'
-                   AND (wr.survey_verdict IS NULL OR wr.survey_verdict = 'impacted')
-                   AND w.state = 'open'
-                 ORDER BY wr.created_at_ms ASC
-                 LIMIT 1",
-                params![squad_id],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(StoreError::from)
+        Self::squad_block_gating_waypoint_conn(&self.conn, squad_id)
+    }
+
+    /// [`Self::squad_block_gating_waypoint`]'s query against an explicit connection (WS-D.6).
+    pub(crate) fn squad_block_gating_waypoint_conn(
+        conn: &Connection,
+        squad_id: &str,
+    ) -> StoreResult<Option<String>> {
+        conn.query_row(
+            "SELECT wr.waypoint_id FROM waypoint_roster wr
+             JOIN waypoints w ON w.id = wr.waypoint_id
+             WHERE wr.kind = 'squad' AND wr.entry_id = ? AND wr.mode = 'block'
+               AND (wr.survey_verdict IS NULL OR wr.survey_verdict = 'impacted')
+               AND w.state = 'open'
+             ORDER BY wr.created_at_ms ASC
+             LIMIT 1",
+            params![squad_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(StoreError::from)
     }
 
     /// Every cell currently halted because its squad-kind roster entry

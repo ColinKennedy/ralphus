@@ -6365,6 +6365,8 @@ fn run_submit_followup(
         return;
     }
 
+    let guard = store_handle.lock();
+
     // RAL-400 Phase 8: create every `[[waypoint]]` this submission declared,
     // now that review derivation above has run and every same-file
     // `[[review]]` block's guardian id is known. Failing this fails the

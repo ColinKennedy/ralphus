@@ -1194,6 +1194,7 @@ impl RunnerResult {
             turns: Some(usage.turns),
             ghost: None,
             retry_after_secs: None,
+            prophecies: Vec::new(),
         }
     }
 
