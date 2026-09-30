@@ -4442,9 +4442,11 @@ pub fn start_resolve_input(
 /// (the caller may name one; the HTTP layer defaults it to `submitted_by`
 /// when absent). `submitted_by` is the resolved authenticated/default
 /// requester and is never taken from request data.
+#[allow(clippy::too_many_arguments)]
 pub fn start_feedback(
     store: crate::store_lock::StoreHandle,
     runner: Arc<dyn Runner>,
+    cancellations: Cancellations,
     id: &str,
     branch_id: &str,
     feedback: String,
@@ -4514,24 +4516,32 @@ pub fn start_feedback(
     };
     let sid = id.to_string();
     let bid = branch_id.to_string();
+    // Register before spawning so cancellation between this acknowledgement
+    // and the background thread starting still reaches the feedback agent.
+    // Review merges, feedback, and their downstream work share this key.
+    let cancellation_key = format!("guardian:{sid}");
+    let cancel = cancellations.register(&cancellation_key);
     std::thread::spawn(move || {
-        record_feedback_reply(&store, &sid, &bid, &feature, &feedback);
-        let outcome = run_feedback(
-            &store,
-            runner.as_ref(),
-            &sid,
-            &bid,
-            &feedback,
-            Some(message_seq),
-            false,
-            &CancelToken::never(),
-        );
-        crate::rlog!(
-            INFO,
-            "ralphus [guardian] review {sid} feedback outcome committed={} pushed={}",
-            outcome.committed,
-            outcome.pushed
-        );
+        if !cancel.is_cancelled() {
+            record_feedback_reply(&store, &sid, &bid, &feature, &feedback);
+            let outcome = run_feedback(
+                &store,
+                runner.as_ref(),
+                &sid,
+                &bid,
+                &feedback,
+                Some(message_seq),
+                false,
+                &cancel,
+            );
+            crate::rlog!(
+                INFO,
+                "ralphus [guardian] review {sid} feedback outcome committed={} pushed={}",
+                outcome.committed,
+                outcome.pushed
+            );
+        }
+        cancellations.remove(&cancellation_key);
     });
     reply(202, "{\"status\":\"applying_feedback\"}")
 }
@@ -6503,6 +6513,15 @@ pub fn run_feedback(
     let result =
         run_agent_with_rate_limit_retry(&mut spec, runner, cancel, Some((store, id, branch_id)));
     let _ = record_guardian_call_cost(store, id, Some(branch_id), "feedback", &result);
+    if cancel.is_cancelled() {
+        log_merge_cancelled(store, id);
+        let _ = store
+            .lock()
+            .release_guardian_worktree_lease(id, branch_id, &lease_owner);
+        let _ = store.lock().clear_branch_pending_feedback(id, branch_id);
+        fail_message();
+        return FeedbackOutcome::default();
+    }
     // RAL-395: the resolver's own verdict, before we know whether anything it
     // did actually ended up committed -- combined with `committed` below into
     // the outcome's real `proof_passed` once that's known, so a "PASS" from

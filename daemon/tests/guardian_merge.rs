@@ -325,6 +325,37 @@ impl Runner for FeedbackRunner {
     }
 }
 
+/// A feedback resolver that remains active until review cancellation reaches
+/// its runner token.
+struct CancellationAwareFeedbackRunner {
+    started: AtomicBool,
+    stopped: AtomicBool,
+}
+
+impl CancellationAwareFeedbackRunner {
+    fn new() -> Self {
+        Self {
+            started: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
+        }
+    }
+}
+
+impl Runner for CancellationAwareFeedbackRunner {
+    fn run(&self, _spec: &RunnerSpec) -> RunnerResult {
+        RunnerResult::failure("expected cancellable runner")
+    }
+
+    fn run_cancellable(&self, _spec: &RunnerSpec, cancel: &CancelToken) -> RunnerResult {
+        self.started.store(true, Ordering::SeqCst);
+        while !cancel.is_cancelled() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        self.stopped.store(true, Ordering::SeqCst);
+        RunnerResult::failure("cancelled")
+    }
+}
+
 /// Same as `FeedbackRunner`, but also simulates a concurrent failure landing
 /// on the guardian mid-flight -- e.g. a racing "Merge / rebase" click hitting
 /// a transient worktree error -- by stamping `MergeFailed` on the guardian
@@ -2860,6 +2891,7 @@ fn start_feedback_persists_reviewer_message_scoped_to_its_branch() {
     let reply = start_feedback(
         store.clone(),
         Arc::new(FeedbackRunner),
+        Cancellations::new(),
         &id,
         &bid0,
         "please add a note file".to_string(),
@@ -2887,6 +2919,70 @@ fn start_feedback_persists_reviewer_message_scoped_to_its_branch() {
     // Let the background apply + best-effort reply generation finish before
     // the repo is removed out from under it.
     std::thread::sleep(Duration::from_millis(500));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn cancelling_a_review_stops_an_in_flight_feedback_agent() {
+    let (root, store, id) = single_feature_repo();
+    // Keep the conversational acknowledgment local and deterministic so this
+    // test exercises only the resolver agent that applies feedback.
+    store
+        .lock()
+        .set_guardian_resolver(&id, Some(Some("claude-code")), None)
+        .unwrap();
+    run_merge(&store, &NoopRunner, &id);
+    let branch_id = store.lock().get_guardian(&id).unwrap().branches[0]
+        .id
+        .clone();
+    let cancellations = Cancellations::new();
+    let runner = Arc::new(CancellationAwareFeedbackRunner::new());
+
+    let reply = start_feedback(
+        Arc::clone(&store),
+        runner.clone(),
+        cancellations.clone(),
+        &id,
+        &branch_id,
+        "keep working until cancelled".to_string(),
+        None,
+        None,
+    );
+    assert_eq!(reply.status, 202);
+
+    for _ in 0..200 {
+        if runner.started.load(Ordering::SeqCst) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        runner.started.load(Ordering::SeqCst),
+        "feedback agent never started"
+    );
+
+    // This is the same cancellation signal the HTTP review-cancel handler
+    // sends before it changes the review's durable state.
+    stop_merge_worker_for_cancel(&cancellations, &id);
+    store.lock().cancel_guardian(&id).unwrap();
+
+    let key = format!("guardian:{id}");
+    for _ in 0..200 {
+        if runner.stopped.load(Ordering::SeqCst) && !cancellations.is_active(&key) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        runner.stopped.load(Ordering::SeqCst),
+        "feedback agent ignored cancellation"
+    );
+    assert!(
+        !cancellations.is_active(&key),
+        "feedback worker remained registered after cancellation"
+    );
+    assert_eq!(store.lock().get_guardian(&id).unwrap().status, "cancelled");
+
     let _ = std::fs::remove_dir_all(&root);
 }
 
