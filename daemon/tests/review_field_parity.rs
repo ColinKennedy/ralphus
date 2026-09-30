@@ -78,16 +78,30 @@ const REVIEW_DEF_ONLY_EXCLUSIONS: &[(&str, &str)] = &[
 #[test]
 fn every_review_key_is_covered_by_a_pair_or_exclusion() {
     let review_keys: BTreeSet<_> = REVIEW_KEYS.iter().copied().collect();
-    let paired: BTreeSet<_> = PAIRS.iter().map(|(review, _)| *review).collect();
-    let excluded: BTreeSet<_> = REVIEW_DEF_ONLY_EXCLUSIONS
-        .iter()
-        .map(|(review, _)| *review)
-        .collect();
-    assert_eq!(paired.len(), PAIRS.len(), "duplicate review keys in PAIRS");
-    assert_eq!(
-        excluded.len(),
-        REVIEW_DEF_ONLY_EXCLUSIONS.len(),
-        "duplicate review keys in exclusions"
+    let mut paired = BTreeSet::new();
+    let mut duplicate_pairs = Vec::new();
+    for (review_key, _) in PAIRS {
+        if !paired.insert(*review_key) {
+            duplicate_pairs.push(*review_key);
+        }
+    }
+    assert!(
+        duplicate_pairs.is_empty(),
+        "these REVIEW_KEYS names appear more than once as a PAIRS left-hand side: \\
+         {duplicate_pairs:?}"
+    );
+
+    let mut excluded = BTreeSet::new();
+    let mut duplicate_exclusions = Vec::new();
+    for (review_key, _) in REVIEW_DEF_ONLY_EXCLUSIONS {
+        if !excluded.insert(*review_key) {
+            duplicate_exclusions.push(*review_key);
+        }
+    }
+    assert!(
+        duplicate_exclusions.is_empty(),
+        "these REVIEW_KEYS names appear more than once in REVIEW_DEF_ONLY_EXCLUSIONS: \\
+         {duplicate_exclusions:?}"
     );
     assert!(
         paired.is_disjoint(&excluded),
@@ -108,11 +122,17 @@ fn every_review_key_is_covered_by_a_pair_or_exclusion() {
 #[test]
 fn every_project_default_key_is_covered_by_exactly_one_pair() {
     let config_keys: BTreeSet<_> = REVIEW_CONFIG_KEYS.iter().copied().collect();
-    let paired: BTreeSet<_> = PAIRS.iter().map(|(_, config)| *config).collect();
-    assert_eq!(
-        paired.len(),
-        PAIRS.len(),
-        "duplicate project config keys in PAIRS"
+    let mut paired = BTreeSet::new();
+    let mut duplicate_pairs = Vec::new();
+    for (_, config_key) in PAIRS {
+        if !paired.insert(*config_key) {
+            duplicate_pairs.push(*config_key);
+        }
+    }
+    assert!(
+        duplicate_pairs.is_empty(),
+        "these REVIEW_CONFIG_KEYS names appear more than once as a PAIRS right-hand side: \\
+         {duplicate_pairs:?}"
     );
     assert_eq!(
         config_keys, paired,
