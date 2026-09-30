@@ -3431,15 +3431,29 @@ fn apply_pr_merge_state(
 }
 
 /// Marks the branch whose "parent"-kind PR was just observed closed on the
-/// forge *without* merging as [`MergeStatus::Closed`] -- shared by
-/// [`apply_pr_merge_state`] (the periodic `check_pr_merges` poll) and
-/// [`refresh_open_prs`] (the live-state check every submission attempt runs
-/// before deciding what still needs a PR) so whichever of the two discovers
-/// the closure first transitions the branch identically. This is what
-/// keeps a human's deliberate close of a PR/MR respected: once a branch is
-/// `Closed`, `auto_submit_terminal_branches`'s `done`/`conflict_resolved`
-/// filter excludes it from every future auto-submit sweep, and the same-call
-/// re-check in [`submit_stack_for_guardian`] excludes it from a whole-stack
+/// forge *without* merging -- shared by [`apply_pr_merge_state`] (the
+/// periodic `check_pr_merges` poll) and [`refresh_open_prs`] (the live-state
+/// check every submission attempt runs before deciding what still needs a
+/// PR) so whichever of the two discovers the closure first transitions the
+/// branch identically.
+///
+/// A forge close is not always a human's rejection: GitHub/GitLab also close
+/// a PR whose diff went empty because its commits landed on the base via a
+/// different route (e.g. another already-merged PR absorbed the same
+/// content, or a squash elsewhere). That is the exact "already merged
+/// upstream" case RAL-480 already detects for ralphus's own rebase path
+/// (`clean_rebase_status`) and grants `MergeStatus::Merged` -- reusing
+/// [`crate::guardian_merge::branch_diff_is_empty`] here (the same check,
+/// discovered through the forge instead of through ralphus's own rebase)
+/// tells the two apart, so a superseded branch gets `Merged` instead of
+/// `Closed`. A genuinely abandoned branch (real, unlanded work) still gets
+/// `Closed`, as before; so does one whose diff can't be answered -- an
+/// unanswerable comparison must not silently pick a side.
+///
+/// Both outcomes keep a branch out of every future auto-submit sweep --
+/// `auto_submit_terminal_branches`'s `done`/`conflict_resolved` filter
+/// excludes `Merged` and `Closed` alike, and the same-call re-check in
+/// [`submit_stack_for_guardian`] excludes both from a whole-stack
 /// resubmission too -- only an explicit per-branch resubmit request bypasses
 /// both and opens a fresh PR.
 ///
@@ -3469,12 +3483,29 @@ fn mark_branch_pr_closed_externally(
     if matches!(branch.merge_status.as_str(), "merged" | "closed") {
         return;
     }
-    let _ = store.lock().set_branch_status(
-        id,
-        branch_id,
-        crate::guardian::MergeStatus::Closed,
-        Some("linked pr closed without merging"),
+    let root = branch
+        .project
+        .clone()
+        .unwrap_or_else(|| guardian.git_root.clone());
+    let already_landed = crate::guardian_merge::branch_diff_is_empty(
+        store,
+        std::path::Path::new(&root),
+        &pr.base_ref,
+        &pr.branch_alias,
     );
+    let (status, detail) = match already_landed {
+        Ok(true) => (
+            crate::guardian::MergeStatus::Merged,
+            "linked pr closed without merging, but its content is already on the base branch",
+        ),
+        Ok(false) | Err(_) => (
+            crate::guardian::MergeStatus::Closed,
+            "linked pr closed without merging",
+        ),
+    };
+    let _ = store
+        .lock()
+        .set_branch_status(id, branch_id, status, Some(detail));
 }
 
 fn log_pr_merge_check_failure(
@@ -12839,6 +12870,156 @@ mod tests {
         handle.join().unwrap();
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&remote_dir);
+    }
+
+    #[test]
+    fn mark_branch_pr_closed_externally_promotes_to_merged_when_content_already_landed() {
+        // Regression test (guardian-000000000162 / RAL-523): a PR closed on
+        // the forge without merging isn't always a human's rejection.
+        // GitHub/GitLab also close a PR once its branch's content has
+        // already landed on the base via a different route -- e.g. another
+        // already-merged PR absorbed the same commits, exactly what happened
+        // when `alt/staging` absorbed RAL-523's commits through a sibling PR
+        // instead of this one. Before this fix, this function always wrote
+        // `MergeStatus::Closed` here, indistinguishable from a human's
+        // deliberate abandonment -- the branch then kept being reset to
+        // `pending` and re-rebased against a moving base on every merge
+        // cycle instead of sitting inert like RAL-480's own "already merged
+        // upstream" branches do.
+        let root = tmp_dir("closed-but-landed-root");
+        let mut init_opts = git2::RepositoryInitOptions::new();
+        init_opts.initial_head("main");
+        let repo = git2::Repository::init_opts(&root, &init_opts).unwrap();
+        let sig = git2::Signature::now("t", "t@t").unwrap();
+        gwrite(&root, "base.txt", "base\n");
+        let base_oid = git2_commit_all(&repo, &sig, "base", &[]);
+        let base_commit = repo.find_commit(base_oid).unwrap();
+        repo.branch("feature-a", &base_commit, false).unwrap();
+        git2_checkout(&repo, "feature-a");
+        gwrite(&root, "a.txt", "a\n");
+        git2_commit_all(&repo, &sig, "add a", &[&base_commit]);
+
+        // Simulate the content landing on `main` via a different route (a
+        // sibling PR, a squash elsewhere): merge feature-a's commit into
+        // main directly, so main now already contains it.
+        git2_checkout(&repo, "main");
+        g(&root, &["merge", "--no-edit", "feature-a"]);
+
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let gid = store
+            .lock()
+            .create_guardian("demo", "main", root.to_str().unwrap())
+            .unwrap();
+        store.lock().add_guardian_branch(&gid, "feature-a").unwrap();
+        let branch_id = store.lock().get_guardian(&gid).unwrap().branches[0]
+            .id
+            .clone();
+        store
+            .lock()
+            .set_branch_review(&gid, &branch_id, "feature-a", root.to_str().unwrap())
+            .unwrap();
+        store
+            .lock()
+            .set_branch_status(&gid, &branch_id, MergeStatus::Done, None)
+            .unwrap();
+        store
+            .lock()
+            .create_pull_request(
+                &gid,
+                Some(branch_id.as_str()),
+                "github",
+                "acme/w",
+                "feature-a",
+                "main",
+                "Add a",
+                "Adds a.",
+                Some(99),
+                Some("http://x/99"),
+            )
+            .unwrap();
+        let pr = store.lock().list_pull_requests_for_guardian(&gid).unwrap()[0].clone();
+
+        mark_branch_pr_closed_externally(&store, &gid, &pr);
+
+        let branch = store.lock().get_guardian(&gid).unwrap().branches[0].clone();
+        assert_eq!(
+            branch.merge_status,
+            MergeStatus::Merged.as_str(),
+            "content already on the base must promote to Merged, not Closed"
+        );
+        assert!(
+            branch.enabled,
+            "a merged branch must stay enabled and in the stack (RAL-480)"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mark_branch_pr_closed_externally_stays_closed_when_content_never_landed() {
+        // Sibling of the above: a PR closed with real, unlanded work must
+        // still respect the human's close -- the new diff check must never
+        // regress into resurrecting a genuinely abandoned branch.
+        let root = tmp_dir("closed-and-abandoned-root");
+        let mut init_opts = git2::RepositoryInitOptions::new();
+        init_opts.initial_head("main");
+        let repo = git2::Repository::init_opts(&root, &init_opts).unwrap();
+        let sig = git2::Signature::now("t", "t@t").unwrap();
+        gwrite(&root, "base.txt", "base\n");
+        let base_oid = git2_commit_all(&repo, &sig, "base", &[]);
+        let base_commit = repo.find_commit(base_oid).unwrap();
+        repo.branch("feature-b", &base_commit, false).unwrap();
+        git2_checkout(&repo, "feature-b");
+        gwrite(&root, "b.txt", "b\n");
+        git2_commit_all(&repo, &sig, "add b", &[&base_commit]);
+        git2_checkout(&repo, "main");
+        // `main` never absorbs feature-b's commit -- it is genuinely
+        // abandoned, unlanded work.
+
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let gid = store
+            .lock()
+            .create_guardian("demo", "main", root.to_str().unwrap())
+            .unwrap();
+        store.lock().add_guardian_branch(&gid, "feature-b").unwrap();
+        let branch_id = store.lock().get_guardian(&gid).unwrap().branches[0]
+            .id
+            .clone();
+        store
+            .lock()
+            .set_branch_review(&gid, &branch_id, "feature-b", root.to_str().unwrap())
+            .unwrap();
+        store
+            .lock()
+            .set_branch_status(&gid, &branch_id, MergeStatus::Done, None)
+            .unwrap();
+        store
+            .lock()
+            .create_pull_request(
+                &gid,
+                Some(branch_id.as_str()),
+                "github",
+                "acme/w",
+                "feature-b",
+                "main",
+                "Add b",
+                "Adds b.",
+                Some(100),
+                Some("http://x/100"),
+            )
+            .unwrap();
+        let pr = store.lock().list_pull_requests_for_guardian(&gid).unwrap()[0].clone();
+
+        mark_branch_pr_closed_externally(&store, &gid, &pr);
+
+        let branch = store.lock().get_guardian(&gid).unwrap().branches[0].clone();
+        assert_eq!(
+            branch.merge_status,
+            MergeStatus::Closed.as_str(),
+            "real, unlanded work must still respect the human's close"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

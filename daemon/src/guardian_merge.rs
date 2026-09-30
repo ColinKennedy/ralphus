@@ -9400,6 +9400,33 @@ const EMPTY_BRANCH_DETAIL: &str = "branch is empty: it adds no changes over the 
 /// `git diff --quiet` exits 0 when there is no difference, 1 when there is;
 /// any other outcome (a bad ref, git missing) leaves the flag alone and
 /// reports `false` rather than guessing a review into failure.
+/// The raw git-level check backing [`note_if_branch_is_empty`] (RAL-480): is
+/// `head`'s content already fully present on `upstream` (`Ok(true)`, no
+/// diff), still different (`Ok(false)`), or unanswerable (`Err`)? Also used
+/// by `pr::mark_branch_pr_closed_externally` to recognize a branch that was
+/// closed on the forge *because* its content landed upstream via a different
+/// route (still effectively merged) apart from one a human genuinely
+/// abandoned -- the same "already merged upstream" fact RAL-480 already
+/// detects for ralphus's own rebase path, just discovered through the forge
+/// instead.
+///
+/// Never a raw git call: a project may be registered as something other than
+/// git, so this goes through the VCS adapter (see `crate::vcs`). Callers must
+/// treat `Err` as "couldn't tell", never coerce it to either boolean -- an
+/// unanswerable comparison must not silently pick a side.
+pub(crate) fn branch_diff_is_empty(
+    store: &crate::store_lock::StoreHandle,
+    root: &Path,
+    upstream: &str,
+    head: &str,
+) -> Result<bool, String> {
+    let vcs = {
+        let guard = store.lock();
+        crate::vcs::for_project_root(&guard, root)?
+    };
+    vcs.differs(root, upstream, head).map(|differs| !differs)
+}
+
 fn note_if_branch_is_empty(
     store: &crate::store_lock::StoreHandle,
     guardian_id: &str,
@@ -9408,27 +9435,17 @@ fn note_if_branch_is_empty(
     root: &Workspace,
     upstream: &str,
 ) -> bool {
-    // Through the VCS adapter, never a raw git call: a project may be
-    // registered as something other than git, and this check runs on every
-    // review (see `crate::vcs`).
-    let vcs = {
-        let guard = store.lock();
-        match crate::vcs::for_project_root(&guard, root.root()) {
-            Ok(v) => v,
-            Err(e) => {
-                crate::rlog!(
-                    WARNING,
-                    "ralphus [guardian] review {guardian_id} cannot check whether branch {branch} is empty: {e}"
-                );
-                return false;
-            }
-        }
-    };
     // An unanswerable comparison must never fail a review on a guess, so it
     // reports "not empty" and leaves the stored flag untouched.
-    let is_empty = match vcs.differs(root.root(), upstream, branch) {
-        Ok(differs) => !differs,
-        Err(_) => return false,
+    let is_empty = match branch_diff_is_empty(store, root.root(), upstream, branch) {
+        Ok(is_empty) => is_empty,
+        Err(e) => {
+            crate::rlog!(
+                WARNING,
+                "ralphus [guardian] review {guardian_id} cannot check whether branch {branch} is empty: {e}"
+            );
+            return false;
+        }
     };
     {
         let guard = store.lock();
