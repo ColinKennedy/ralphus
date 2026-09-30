@@ -2511,7 +2511,6 @@ impl Store {
                 crate::store::now_ms(),
                 id,
                 status.as_str(),
-                status.as_str(),
             ],
         )?;
         if n == 0 {
