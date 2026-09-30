@@ -476,6 +476,53 @@
         box-shadow: 0 4px 16px rgba(0,0,0,.5); opacity: 0; transition: opacity .1s;
       }
       #board-tip.show { opacity: 1; }
+
+      /* ---- Entity hovercards ---- */
+      /* Anchored, interactive sibling to the tooltip above: a tooltip says what
+         a control does, a hovercard says what a value *is*. Anchored rather than
+         cursor-following, and pointer-events enabled, so the action row at the
+         bottom can actually be clicked. See board/22-hovercards.js. */
+      #board-card {
+        position: fixed; z-index: 210; width: 330px;
+        background: var(--panel); color: var(--text); border: 1px solid var(--border);
+        border-radius: 8px; overflow: hidden; font-size: 12px; font-weight: normal;
+        box-shadow: 0 10px 34px rgba(0,0,0,.55);
+        opacity: 0; visibility: hidden; transition: opacity .1s;
+      }
+      #board-card.show { opacity: 1; visibility: visible; }
+      .hc-head {
+        display: flex; align-items: center; gap: 7px; padding: 8px 11px;
+        background: var(--panel-2); border-bottom: 1px solid var(--border);
+      }
+      .hc-title {
+        font-size: 9.5px; text-transform: uppercase; letter-spacing: .7px;
+        color: var(--muted); font-weight: 700;
+      }
+      .hc-sp { flex: 1; }
+      .hc-body { padding: 10px 11px; }
+      .hc-kv {
+        display: grid; grid-template-columns: 78px 1fr; gap: 4px 10px;
+        align-items: baseline; margin: 0; font-size: 11.5px;
+      }
+      .hc-kv dt { color: var(--cancelled); }
+      .hc-kv dd { margin: 0; overflow-wrap: anywhere; }
+      .hc-note { margin: 8px 0 0; font-size: 10.5px; color: var(--cancelled); line-height: 1.5; }
+      .hc-path {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10.5px;
+        color: var(--muted); word-break: break-all; background: var(--bg);
+        border: 1px solid var(--border); border-radius: 6px; padding: 6px 7px; margin-bottom: 9px;
+      }
+      .hc-foot {
+        display: flex; gap: 5px; padding: 8px 11px;
+        border-top: 1px solid var(--border); background: var(--panel-2);
+      }
+      .hc-foot .btn { padding: 2px 8px; font-size: 11.5px; }
+      /* Marks a value as carrying a hovercard: a dotted underline is the
+         conventional "there is more here" cue, and distinguishes an
+         inspectable value from ordinary monospace text around it. */
+      .hc-anchor { border-bottom: 1px dotted var(--cancelled); cursor: help; }
+      .hc-anchor:hover { border-bottom-color: var(--accent); color: var(--accent); }
+
       /* ---- Queue tab (RAL Queue) ---- */
       #queue-page { padding: 16px; overflow: auto; }
       .queue-wrap { max-width: 80%; margin: 0 auto; padding-bottom: 80px; }

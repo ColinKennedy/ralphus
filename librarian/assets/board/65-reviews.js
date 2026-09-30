@@ -1196,6 +1196,158 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         const inner = document.getElementById("review-detail");
         return /** @type {HTMLElement|null} */ (inner ? inner.parentElement : null);
       }
+      // ---- Entity hovercards for the Reviews tab ----
+      //
+      // A review's most-inspected values -- the worktree paths, the branch
+      // names, the review id -- were plain text. Knowing what a worktree
+      // actually *was* (which branch, whether it is clean, what overrides it
+      // carries, when it retires) meant reading the change notes or the CLI.
+      // These put that where the value already is. See board/22-hovercards.js
+      // for the engine; the renderers live here because only this chunk knows
+      // what a guardian branch is.
+
+      /**
+       * Resolves a hovercard anchor's `data-guardian-id` to the loaded review,
+       * or null when that review's full detail is not in `guardians` yet.
+       * @param {DOMStringMap} ds - The anchor's dataset.
+       * @returns {GuardianView|null}
+       */
+      function hcGuardian(ds) {
+        const g = guardians.find((x) => x.id === (ds.guardianId || ""));
+        return g && g.branches ? g : null;
+      }
+      /**
+       * Resolves a hovercard anchor's `data-guardian-id`/`data-branch-id` pair
+       * to one branch of a loaded review.
+       * @param {DOMStringMap} ds - The anchor's dataset.
+       * @returns {{g: GuardianView, b: GuardianBranch}|null}
+       */
+      function hcBranch(ds) {
+        const g = hcGuardian(ds);
+        if (!g) return null;
+        const b = (g.branches || []).find((x) => x.id === (ds.branchId || ""));
+        return b ? { g: g, b: b } : null;
+      }
+      /**
+       * Counts a branch's own env-override layer, split into values it sets and
+       * keys it tombstones (a `null` value removes an inherited variable).
+       * @param {GuardianBranch} b - The branch.
+       * @returns {{set: number, unset: number}}
+       */
+      function hcEnvCounts(b) {
+        const own = b.env_overrides || {};
+        let set = 0, unset = 0;
+        Object.keys(own).forEach((k) => { if (own[k] === null) unset++; else set++; });
+        return { set: set, unset: unset };
+      }
+      /**
+       * The branch a given stack position rebases onto: the one beneath it, or
+       * the review's upstream for the first branch.
+       * @param {GuardianView} g - The review.
+       * @param {GuardianBranch} b - The branch.
+       * @returns {string}
+       */
+      function hcRebasesOnto(g, b) {
+        const ordered = (g.branches || []).filter((x) => x.enabled !== false);
+        const i = ordered.findIndex((x) => x.id === b.id);
+        if (i > 0) return ordered[i - 1].branch;
+        return g.base_branch || "—";
+      }
+
+      registerHoverCard("gBranchWorktree", (ds) => {
+        const hit = hcBranch(ds);
+        if (!hit) return null;
+        const b = hit.b;
+        if (!b.worktree) {
+          return {
+            title: "Branch worktree",
+            body: hcNote("Not built yet. A per-branch worktree is created when this branch starts rebasing. "
+              + "With <b>skip per-branch worktrees</b> on, the whole stack builds in one shared worktree instead."),
+          };
+        }
+        const env = hcEnvCounts(b);
+        const envText = env.set || env.unset
+          ? `${env.set} set${env.unset ? `, ${env.unset} removed` : ""}`
+          : "inherited";
+        const conflicts = (b.conflicts_found || 0) > 0
+          ? `${b.conflicts_fixed || 0} fixed of ${b.conflicts_found} found`
+          : "none";
+        return {
+          title: "Branch worktree",
+          badge: pill(b.merge_status || "pending"),
+          body: `<div class="hc-path">${esc(b.worktree)}</div>`
+            + hcKv(
+              hcRow("branch", esc(b.branch), "mono")
+              + hcRow("rebases onto", esc(hcRebasesOnto(hit.g, b)), "mono")
+              + hcRow("conflicts", esc(conflicts))
+              + hcRow("env", esc(envText))
+              + hcRow("status", esc(b.detail || "—")),
+            )
+            + hcNote("Retired with the review once it is approved — see the Worktree Retirement tab for when."),
+          foot: `<button class="btn" data-tip="Copy this worktree's absolute path." data-copy="${esc(b.worktree)}" onclick="copyText(event)">Copy path</button>`,
+        };
+      });
+
+      registerHoverCard("gCombinedWorktree", (ds) => {
+        const g = hcGuardian(ds);
+        if (!g || !g.combined_worktree) return null;
+        return {
+          title: "Combined worktree",
+          badge: pill(g.status),
+          body: `<div class="hc-path">${esc(g.combined_worktree)}</div>`
+            + hcKv(
+              hcRow("review branch", esc(g.review_branch || "—"), "mono")
+              + hcRow("upstream", esc(g.base_branch || "—"), "mono")
+              + hcRow("branches", `${(g.branches || []).filter((b) => b.enabled !== false).length} enabled of ${(g.branches || []).length}`),
+            )
+            + hcNote("The whole stack rebased into one tree — what the check gates actually run against."),
+          foot: `<button class="btn" data-tip="Copy this worktree's absolute path." data-copy="${esc(g.combined_worktree)}" onclick="copyText(event)">Copy path</button>`,
+        };
+      });
+
+      registerHoverCard("gBranch", (ds) => {
+        const hit = hcBranch(ds);
+        if (!hit) return null;
+        const g = hit.g, b = hit.b;
+        const src = b.source_squad_id
+          ? `${esc(b.source_squad_id)}${b.source_cell_idx === undefined ? "" : ` · cell ${b.source_cell_idx}`}`
+          : "—";
+        return {
+          title: "Branch",
+          badge: pill(b.merge_status || "pending"),
+          body: hcKv(
+            hcRow("position", `${b.position} of ${(g.branches || []).length} in the stack`)
+            + hcRow("rebases onto", esc(hcRebasesOnto(g, b)), "mono")
+            + hcRow("in stack", b.enabled === false ? "disabled" : "enabled")
+            + hcRow("source", src, "mono")
+            + hcRow("status", esc(b.detail || "—")),
+          )
+            + (b.is_empty
+              ? hcNote("<b>Adds no diff</b> over the branch beneath it, which fails the review.")
+              : ""),
+          foot: `<button class="btn" data-tip="Copy this branch's name." data-copy="${esc(b.branch)}" onclick="copyText(event)">Copy name</button>`,
+        };
+      });
+
+      registerHoverCard("gReviewId", (ds) => {
+        const g = hcGuardian(ds);
+        if (!g) return null;
+        return {
+          title: "Review id",
+          badge: pill(g.status),
+          body: `<div class="hc-path">${esc(g.id)}</div>`
+            + hcKv(
+              hcRow("from squad", esc(g.squad_id || "—"), "mono")
+              + hcRow("type", esc(g.review_type || "git"))
+              + hcRow("upstream", esc(g.base_branch || "—"), "mono"),
+            )
+            + hcNote("Use this id with <span class=\"mono\">ralphus review show</span>, in daemon logs, "
+              + "or to find the review worktree on disk."),
+          foot: `<button class="btn" data-tip="Copy the full review id." data-copy="${esc(g.id)}" onclick="copyText(event)">Copy id</button>`
+            + `<button class="btn" data-tip="View the audit log for this review." data-click="openReviewLogs" data-guardian-id="${esc(g.id)}">Logs</button>`,
+        };
+      });
+
       /**
        * Renders the full review detail pane (branch stack, checks, manual commands, chat, etc).
        * @returns {void}
@@ -1254,7 +1406,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
             : `<span class="br-toggle placeholder">▸</span>`;
           const detail = hasDetail ? `<div class="branch-detail ${open ? "" : "hidden"}">
               ${b.detail ? `<div class="kv-row" style="margin:0 0 4px"><span class="k" style="text-transform:none;letter-spacing:0">status</span><span class="v" style="font-size:12px">${detailSummary(b.detail, "Branch detail")}</span></div>` : ""}
-              ${b.worktree ? `<div class="kv-row" style="margin:0"><span class="k" style="text-transform:none;letter-spacing:0">review worktree</span><span class="v mono" style="font-size:11px">${esc(b.worktree)}</span>${b.merge_status === "merged" ? ` ${mergedBranchBadge()}` : ""}</div>` : ""}
+              ${b.worktree ? `<div class="kv-row" style="margin:0"><span class="k" style="text-transform:none;letter-spacing:0">review worktree</span><span class="v mono hc-anchor" style="font-size:11px" data-card="gBranchWorktree" data-guardian-id="${esc(g.id)}" data-branch-id="${esc(b.id)}">${esc(b.worktree)}</span>${b.merge_status === "merged" ? ` ${mergedBranchBadge()}` : ""}</div>` : ""}
               ${(b.worktree || b.source_squad_id != null) ? `<div class="row" style="margin:2px 0 4px">${worktreeCellBtn(b, `${g.id}:${b.id}`)}</div>` : ""}
               <div class="btn-row" style="margin-top:4px;position:relative;gap:0">${resolverTerminalBtns(g, b)}</div>
               ${resolverPeekBox(g, b)}
@@ -1287,7 +1439,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
               ${canReorder ? '<span class="grip" data-tip="Drag to reorder branches — the merge order determines the rebase stack.">⋮⋮</span>' : ""}
               ${toggle}
               <span>${gdot(b.merge_status || "")}</span>
-              <span class="mono" style="flex:1${isEnabled ? "" : ";color:var(--muted)"}">${esc(b.branch)}</span>
+              <span class="mono hc-anchor" style="flex:1${isEnabled ? "" : ";color:var(--muted)"}" data-card="gBranch" data-guardian-id="${esc(g.id)}" data-branch-id="${esc(b.id)}">${esc(b.branch)}</span>
               ${isEnabled ? `${branchBadge(b)} ${pill(b.merge_status || "")} ${branchPrLink(g, b)}` : '<span class="badge" style="color:var(--muted);border-color:var(--border);font-size:11px">disabled</span>'}
               ${enableToggle}${reEnableIcon}${moveBtn}
             </div>
@@ -1351,7 +1503,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           ${conflictProgress(g)}
           ${postMergeBadge(g) ? `<div class="kv-row"><span class="k">post-merge</span><span class="v">${postMergeBadge(g)}</span></div>` : ""}
           ${reviewCostSummary(g)}
-          <div class="kv-row"><span class="k">review id</span><span class="mono" style="cursor:pointer" data-tip="The unique identifier for this Guardian review.\nUse this ID in API calls, daemon logs, or to find the review worktree on disk.\nClick to copy the full ID." data-copy="${esc(g.id)}" onclick="copyText(event)">${esc(g.id)}</span></div>
+          <div class="kv-row"><span class="k">review id</span><span class="mono hc-anchor" style="cursor:pointer" data-card="gReviewId" data-guardian-id="${esc(g.id)}" data-copy="${esc(g.id)}" onclick="copyText(event)">${esc(g.id)}</span></div>
           ${g.squad_id ? `<div class="kv-row"><span class="k">from squad</span><span class="v"><a href="#" data-click="gotoSquad" data-squad-id="${esc(g.squad_id)}" style="color:var(--accent)" data-tip="Switch to the Squads tab and open this squad.">${esc(g.squad_id)}</a></span></div>` : ""}
           ${g.status === "collecting" && g.squad_id ? `<div class="kv-row"><span class="k" style="text-transform:none;letter-spacing:0">gate</span><span class="v">${g.branches.some((b) => b.merge_status === "ready") ? "tasks complete — rebase will start automatically" : "starts automatically when its squad finishes — or start it now below"}</span></div>` : ""}
           <div class="kv-row"><span class="k">type</span><span class="v">${esc(g.review_type || "git")}</span></div>
@@ -1364,7 +1516,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
               ? `<div class="kv-row"><span class="k">project</span><span class="v" data-tip="This review was created through the registered-project route. Its concrete git path may be machine-specific, so the project name is the stable identity shown here.">${esc(g.project)}</span></div>`
               : `<div class="kv-row"><span class="k">git root</span><span class="mono">${esc(g.git_root)}</span></div>`}
           <div class="kv-row"><span class="k">review branch</span><span class="mono">${esc(g.review_branch||"—")}</span></div>
-          ${g.combined_worktree ? `<div class="kv-row"><span class="k">combined worktree</span><span class="v mono" style="font-size:11px">${esc(g.combined_worktree)}</span></div>` : ""}
+          ${g.combined_worktree ? `<div class="kv-row"><span class="k">combined worktree</span><span class="v mono hc-anchor" style="font-size:11px" data-card="gCombinedWorktree" data-guardian-id="${esc(g.id)}">${esc(g.combined_worktree)}</span></div>` : ""}
           ${renderChangeSummary(g)}
           ${combinedPrSection(g)}
           <h3 class="section">check gates</h3>${checks}${skipInfo}
