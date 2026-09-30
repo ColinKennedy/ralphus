@@ -8085,10 +8085,24 @@ fn guardian_base_already_has_every_branch(
 /// equivalent per-project check inline in [`rebuild_on_base_shift`]) found
 /// every enabled branch already landed on its base (RAL-300) -- shared so the
 /// periodic sweep and a manual "Merge / rebase" trigger log/mark-merged
-/// identically. Only valid from `in_review` (mirrors `approve_guardian`'s one
-/// legal transition); returns whether it did.
+/// identically. Only valid from `in_review` (forge-driven transition to merged,
+/// distinct from the human-driven `approve_guardian` transition to approved);
+/// returns whether it did.
 fn approve_base_already_landed(store: &crate::store_lock::StoreHandle, id: &str) -> bool {
-    let merged = store.lock().approve_guardian(id).is_ok();
+    let merged = {
+        let guard = store.lock();
+        if let Ok(status_str) = guard.guardian_status_str(id) {
+            if status_str == "in_review" {
+                guard
+                    .set_guardian_status(id, crate::guardian::GuardianStatus::Merged, None)
+                    .is_ok()
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    };
     if merged {
         // A `MutexGuard` temporary produced in an `if let` scrutinee lives
         // for the whole `if let` (it desugars to `match`), so binding the
