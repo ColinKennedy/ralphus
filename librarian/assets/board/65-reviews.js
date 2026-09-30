@@ -1241,17 +1241,23 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         return { set: set, unset: unset };
       }
       /**
-       * The branch a given stack position rebases onto: the one beneath it, or
-       * the review's upstream for the first branch.
+       * A branch's 1-based place in the enabled rebase stack, and what it
+       * rebases onto (the branch beneath it, or the review's upstream when it
+       * is first). Derived from the ordered list rather than read off
+       * `GuardianBranch.position`, which is a 0-based internal ordinal -- using
+       * it directly rendered the first branch as "0 of 3".
        * @param {GuardianView} g - The review.
        * @param {GuardianBranch} b - The branch.
-       * @returns {string}
+       * @returns {{place: number, total: number, onto: string}}
        */
-      function hcRebasesOnto(g, b) {
+      function hcStackPlace(g, b) {
         const ordered = (g.branches || []).filter((x) => x.enabled !== false);
         const i = ordered.findIndex((x) => x.id === b.id);
-        if (i > 0) return ordered[i - 1].branch;
-        return g.base_branch || "—";
+        return {
+          place: i < 0 ? 0 : i + 1,
+          total: ordered.length,
+          onto: i > 0 ? ordered[i - 1].branch : (g.base_branch || "—"),
+        };
       }
 
       registerHoverCard("gBranchWorktree", (ds) => {
@@ -1278,7 +1284,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           body: `<div class="hc-path">${esc(b.worktree)}</div>`
             + hcKv(
               hcRow("branch", esc(b.branch), "mono")
-              + hcRow("rebases onto", esc(hcRebasesOnto(hit.g, b)), "mono")
+              + hcRow("rebases onto", esc(hcStackPlace(hit.g, b).onto), "mono")
               + hcRow("conflicts", esc(conflicts))
               + hcRow("env", esc(envText))
               + hcRow("status", esc(b.detail || "—")),
@@ -1312,12 +1318,15 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         const src = b.source_squad_id
           ? `${esc(b.source_squad_id)}${b.source_cell_idx === undefined ? "" : ` · cell ${b.source_cell_idx}`}`
           : "—";
+        const place = hcStackPlace(g, b);
         return {
           title: "Branch",
           badge: pill(b.merge_status || "pending"),
           body: hcKv(
-            hcRow("position", `${b.position} of ${(g.branches || []).length} in the stack`)
-            + hcRow("rebases onto", esc(hcRebasesOnto(g, b)), "mono")
+            hcRow("position", b.enabled === false
+              ? "not in the stack"
+              : `${place.place} of ${place.total} in the stack`)
+            + hcRow("rebases onto", esc(place.onto), "mono")
             + hcRow("in stack", b.enabled === false ? "disabled" : "enabled")
             + hcRow("source", src, "mono")
             + hcRow("status", esc(b.detail || "—")),

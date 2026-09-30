@@ -154,6 +154,12 @@
           if (!render) return;
           const view = render(el.dataset);
           if (!view) return;
+          // The card supersedes any tooltip. A `data-card` value often sits
+          // inside a row that carries its own `data-tip` (a branch name inside
+          // a selectable branch row, say), so both engines legitimately match
+          // different elements and would otherwise paint at once.
+          const tip = document.getElementById("board-tip");
+          if (tip) tip.classList.remove("show");
           card.innerHTML =
             `<div class="hc-head"><span class="hc-title">${esc(view.title)}</span>` +
             `<span class="hc-sp"></span>${view.badge ?? ""}</div>` +
