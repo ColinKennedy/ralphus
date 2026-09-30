@@ -2857,7 +2857,7 @@ impl EffectiveReviewDefaults {
             machine: cfg.default_machine().map(str::to_string),
             maximum_budget_usd: cfg.default_maximum_budget_usd(),
             proof_scope: cfg.default_proof_scope().to_string(),
-            skip_auto_clean: cfg.verify_skip_auto_clean(),
+            skip_auto_clean: cfg.proof_skip_auto_clean(),
             skip_worktrees: cfg.skip_worktrees(),
             skip_base_updates: cfg.skip_base_updates(),
             base_shift_maximum_rebuilds: cfg.base_shift_maximum_rebuilds(),

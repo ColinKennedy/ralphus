@@ -853,7 +853,7 @@ impl ProjectReviewSettings {
             auto_build: self.auto_build,
             summary_format: None,
             default_proof_scope: self.default_proof_scope,
-            verify_skip_auto_clean: self.verify_skip_auto_clean,
+            proof_skip_auto_clean: self.verify_skip_auto_clean,
             default_resolver_agent: self.default_resolver_agent,
             default_resolver_model: self.default_resolver_model,
             default_machine: self.default_machine,
@@ -2425,6 +2425,7 @@ impl Store {
             // RAL-168: per-review override of the "each_branch" auto-clean-skip
             // sub-option. NULL means "inherit the project-level default".
             "ALTER TABLE guardians ADD COLUMN proof_skip_auto_clean INTEGER",
+            "ALTER TABLE guardians ADD COLUMN summary_format TEXT",
             // RAL-185: the machine this review's worktrees and merge run on.
             // NULL means the daemon's own host, which is every pre-RAL-185 row.
             "ALTER TABLE guardians ADD COLUMN machine TEXT",

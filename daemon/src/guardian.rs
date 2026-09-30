@@ -1043,6 +1043,10 @@ pub struct GuardianView {
     /// before that migration shipped simply has no auto_build tier at
     /// finalize time (see `guardian_merge::final_checks`).
     pub auto_build: Option<GuardianAutoBuild>,
+    /// The summary format stamped when this review was created.
+    pub summary_format: Option<String>,
+    /// The summary format used by the merge engine.
+    pub effective_summary_format: String,
 }
 
 /// Aggregated merge progress across a guardian's branches, ported from
@@ -1257,6 +1261,15 @@ impl Store {
             .or(auto_submit_pr_stack_stamp)
             .or(live_global.auto_submit_pr_stack)
             .unwrap_or(false);
+        // RAL-250: freeze the effective base-update setting onto the new
+        // review, with the project's registration-time stamp taking
+        // precedence over the live global value.
+        let skip_base_updates = db_settings
+            .skip_base_updates
+            .or(explicit_project.skip_base_updates)
+            .or(self.project_skip_base_updates_stamp(git_root))
+            .or(live_global.skip_base_updates)
+            .unwrap_or(false);
         // RAL-378: same stamping shape again. `readable_review_branch` is set
         // unconditionally here -- every review created from now on names its
         // combined branch readably; only reviews that predate the column keep
@@ -1296,6 +1309,52 @@ impl Store {
             "INSERT INTO guardians(id, name, base_branch, git_root, project, review_branch, status, detail, squad_id, review_key, created_at_ms, updated_at_ms, base_changed_at_ms, match_pr_branch_name, auto_submit_pr_stack, separate_pr_branch, readable_review_branch, owner, dual_root_pr)
              VALUES(?,?,?,?,?,NULL,?,NULL,?,?,?,?,?,?,?,?,1,?,?)",
             params![id, name, base_branch, git_root, project, GuardianStatus::Collecting.as_str(), squad_id, review_key, now, now, now, i64::from(match_pr_branch_name), i64::from(auto_submit_pr_stack), i64::from(separate_pr_branch), owner, i64::from(dual_root_pr)],
+        )?;
+        let defaults = self.resolve_review_config(Path::new(git_root));
+        // These are creation-time stamps, not user edits. Writing them directly
+        // preserves the initial snapshot without announcing spurious settings
+        // changes to review watchers.
+        self.conn.execute(
+            "UPDATE guardians SET \
+             resolver_agent=?, resolver_model=?, machine=?, maximum_budget_usd=?, \
+             proof_skip_auto_clean=?, skip_worktrees=?, skip_base_updates=?, \
+             auto_submit_pr_stack=?, match_pr_branch_name=?, checks=?, \
+             summary_format=? WHERE id=?",
+            params![
+                defaults.default_resolver_agent(),
+                defaults.default_resolver_model(),
+                defaults.default_machine(),
+                defaults.default_maximum_budget_usd(),
+                i64::from(defaults.proof_skip_auto_clean()),
+                i64::from(defaults.skip_worktrees()),
+                i64::from(skip_base_updates),
+                i64::from(auto_submit_pr_stack),
+                i64::from(match_pr_branch_name),
+                crate::store::to_json(&defaults.checks),
+                defaults.summary_format,
+                id,
+            ],
+        )?;
+        let auto_build_json = defaults
+            .auto_build
+            .as_deref()
+            .map(|command| {
+                serde_json::to_string(&GuardianAutoBuild {
+                    command: Some(command.to_string()),
+                    prompt: None,
+                    system_prompt: None,
+                    system_prompt_position: None,
+                    agent: None,
+                    model: None,
+                })
+            })
+            .transpose()
+            .map_err(|err| {
+                StoreError::InvalidTransition(format!("serialize review auto-build: {err}"))
+            })?;
+        self.conn.execute(
+            "UPDATE guardians SET auto_build_json=? WHERE id=?",
+            params![auto_build_json, id],
         )?;
         // RAL-<new>: a new review coming into existence is the single most
         // consequential event in this file, and every route into it
@@ -2883,6 +2942,19 @@ impl Store {
             .optional()?
             .ok_or(StoreError::NotFound)?;
         Ok(json.as_deref().and_then(|s| serde_json::from_str(s).ok()))
+    }
+
+    /// Set the summary rendering format stored for this review.
+    pub fn set_guardian_summary_format(&self, id: &str, format: Option<&str>) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE guardians SET summary_format=?, updated_at_ms=? WHERE id=?",
+            params![format, crate::store::now_ms(), id],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
     }
 
     /// RAL-378: set this review's own override for whether its pull request
@@ -4617,7 +4689,7 @@ impl Store {
             .conn
             .query_row(
                 "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, manual_checks_basis, manual_checks_focus
-                 FROM guardians WHERE id=?", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
+                 , summary_format FROM guardians WHERE id=?", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
                 params![id],
                 Self::map_guardian_row,
             )
@@ -4733,7 +4805,7 @@ impl Store {
     pub(crate) fn list_guardians_conn(conn: &Connection) -> Result<Vec<GuardianView>> {
         let mut stmt = conn.prepare(
             "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, manual_checks_basis, manual_checks_focus
-             FROM guardians ORDER BY created_at_ms DESC", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
+             , summary_format FROM guardians ORDER BY created_at_ms DESC", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
         )?;
         let rows = stmt
             .query_map([], Self::map_guardian_row)?
@@ -4868,6 +4940,7 @@ impl Store {
             auto_cancel_outdated_pr_pipelines: r.get::<_, Option<i64>>(67)?.map(|v| v != 0),
             manual_checks_basis: r.get(68)?,
             manual_checks_focus: r.get(69)?,
+            summary_format: r.get(70)?,
         })
     }
 
@@ -5156,7 +5229,7 @@ impl Store {
         };
         let effective_proof_skip_auto_clean = row
             .proof_skip_auto_clean
-            .unwrap_or_else(|| project_review_config.verify_skip_auto_clean());
+            .unwrap_or_else(|| project_review_config.proof_skip_auto_clean());
 
         // RAL-250: effective base-branch auto-update opt-out, layered
         // per-review override > explicit `.ralphus.toml [review]` value > this
@@ -5363,6 +5436,12 @@ impl Store {
             review_branch_name: row.review_branch_name,
             auto_submit_pr_stack: row.auto_submit_pr_stack,
             effective_auto_submit_pr_stack,
+            summary_format: row.summary_format.clone(),
+            effective_summary_format: row.summary_format.unwrap_or_else(|| {
+                project_review_config
+                    .summary_format
+                    .unwrap_or_else(|| "bullet".to_string())
+            }),
             origin: row.origin,
             ready,
             merge_progress,
@@ -5784,6 +5863,7 @@ struct GuardianRow {
     manual_checks_basis: Option<String>,
     /// RAL-520: the reviewer's steering text for manual-checks generation.
     manual_checks_focus: Option<String>,
+    summary_format: Option<String>,
     /// RAL-476: the registered user this review is submitted/routed as --
     /// see [`GuardianView::owner`].
     owner: Option<String>,
@@ -6699,11 +6779,11 @@ mod tests {
     }
 
     #[test]
-    fn resolver_defaults_none_and_sets() {
+    fn resolver_defaults_are_stamped_and_can_be_changed() {
         let store = Store::open_in_memory().unwrap();
         let id = store.create_guardian("r", "main", "/repo").unwrap();
         let g = store.get_guardian(&id).unwrap();
-        assert_eq!(g.resolver_agent, None);
+        assert_eq!(g.resolver_agent.as_deref(), Some("ollama"));
         assert_eq!(g.resolver_model, None);
         store
             .set_guardian_resolver(&id, Some(Some("claude")), Some(Some("claude-opus-4-8")))
@@ -7302,7 +7382,7 @@ mod tests {
         store
             .conn
             .execute(
-                "UPDATE guardians SET skip_worktree_checks=1 WHERE id=?",
+                "UPDATE guardians SET skip_worktree_checks=1, proof_scope=NULL WHERE id=?",
                 params![id],
             )
             .unwrap();
@@ -7369,7 +7449,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let id = store.create_guardian("r", "main", "/repo").unwrap();
         let g = store.get_guardian(&id).unwrap();
-        assert_eq!(g.skip_base_updates, None);
+        assert_eq!(g.skip_base_updates, Some(false));
         assert!(
             !g.effective_skip_base_updates,
             "defaults to auto-update on (no skip)"

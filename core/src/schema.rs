@@ -954,6 +954,9 @@ pub const PROOF_SCOPE_VALUES: &[&str] = &[
     PROOF_SCOPE_NOTHING,
 ];
 
+/// Every accepted `summary_format` literal for a review change summary.
+pub const SUMMARY_FORMAT_VALUES: &[&str] = &["bullet", "prose"];
+
 /// Valid values for `[[task.cell]] mode` / `[[task.proof]]` (and
 /// `[[task.cell.proof]]`) `mode`: how a `command` cell/proof step behaves on
 /// failure. See [`CellDef::mode`]/[`ProofStep::mode`].
@@ -1357,11 +1360,18 @@ pub struct ReviewDef {
     /// Whether each-branch proof runs skip auto-clean branches. This requires
     /// `proof_scope = "each_branch"`.
     #[serde(default)]
-    pub skip_auto_clean: Option<bool>,
+    #[serde(alias = "skip_auto_clean")]
+    pub proof_skip_auto_clean: Option<bool>,
     /// Whether submitted PRs use the exact worktree branch name rather than
     /// the convention-derived alias.
     #[serde(default)]
     pub match_pr_branch_name: Option<bool>,
+    /// Commands that gate this review before it becomes ready.
+    #[serde(default)]
+    pub checks: Vec<String>,
+    /// Rendering format for the generated change summary.
+    #[serde(default)]
+    pub summary_format: Option<String>,
     /// Whether this review pushes its PR to a branch separate from its review
     /// branch.
     #[serde(default)]

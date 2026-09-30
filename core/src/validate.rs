@@ -284,6 +284,7 @@ pub const REVIEW_KEYS: &[&str] = &[
     "auto_pr_feedback",
     "skip_base_updates",
     "base_shift_maximum_rebuilds",
+    "proof_skip_auto_clean",
     "skip_auto_clean",
     "match_pr_branch_name",
     "separate_pr_branch",
@@ -294,6 +295,8 @@ pub const REVIEW_KEYS: &[&str] = &[
     "auto_fix_prompt_template",
     "discourage_tests_during_auto_pull_request_fixes",
     "auto_cancel_outdated_pr_pipelines",
+    "checks",
+    "summary_format",
 ];
 /// The full set of top-level `[[waypoint]]` keys (RAL-400).
 pub const WAYPOINT_KEYS: &[&str] = &[
@@ -1934,11 +1937,19 @@ fn validate_review_blocks(value: Option<&toml::Value>, ctx: &mut Ctx) {
             header,
         );
         check_positive_number(ctx, table, "base_shift_maximum_rebuilds", &rpath, header);
+        check_type(
+            ctx,
+            table,
+            "proof_skip_auto_clean",
+            Ty::Bool,
+            &rpath,
+            header,
+        );
         check_type(ctx, table, "skip_auto_clean", Ty::Bool, &rpath, header);
         check_type(ctx, table, "match_pr_branch_name", Ty::Bool, &rpath, header);
         check_type(ctx, table, "separate_pr_branch", Ty::Bool, &rpath, header);
         check_type(ctx, table, "dual_root_pr", Ty::Bool, &rpath, header);
-        if table.contains_key("skip_auto_clean")
+        if (table.contains_key("proof_skip_auto_clean") || table.contains_key("skip_auto_clean"))
             && table.get("proof_scope").and_then(toml::Value::as_str)
                 != Some(crate::schema::PROOF_SCOPE_EACH_BRANCH)
         {
@@ -1948,6 +1959,25 @@ fn validate_review_blocks(value: Option<&toml::Value>, ctx: &mut Ctx) {
                 "'skip_auto_clean' requires 'proof_scope = \"each_branch\"' because auto-clean skipping only applies to each-branch proof runs",
                 ctx.key_line(header, "skip_auto_clean"),
             );
+        }
+        check_type(ctx, table, "checks", Ty::StrArray, &rpath, header);
+        check_type(ctx, table, "summary_format", Ty::Str, &rpath, header);
+        if let Some(format) = table.get("summary_format").and_then(toml::Value::as_str) {
+            if !crate::schema::SUMMARY_FORMAT_VALUES.contains(&format) {
+                ctx.error(
+                    &format!("{rpath}.summary_format"),
+                    ErrorKind::InvalidValue,
+                    format!(
+                        "'summary_format' must be one of {} -- got \"{format}\"",
+                        crate::schema::SUMMARY_FORMAT_VALUES
+                            .iter()
+                            .map(|value| format!("\"{value}\""))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    ctx.key_line(header, "summary_format"),
+                );
+            }
         }
         check_type(ctx, table, "skip_auto_build", Ty::Bool, &rpath, header);
         validate_auto_build_table(table, &rpath, ctx, header);

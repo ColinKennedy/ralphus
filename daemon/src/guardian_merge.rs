@@ -11594,11 +11594,7 @@ fn generate_final_summary(
     };
     let (agent, model) = (resolved.backend.clone(), resolved.model.clone());
 
-    let prompt = if store
-        .lock()
-        .resolve_review_config(ws_root.root())
-        .bullet_summary()
-    {
+    let prompt = if guardian.effective_summary_format != "prose" {
         format!(
             "You are summarising a stacked code review made up of the branches \
              [{branch_labels}]. The following are commit subject lines for each \
@@ -17204,8 +17200,8 @@ mod tests {
             result
                 .unwrap()
                 .unwrap()
-                .contains("auto-built via project default"),
-            "expected the project-auto_build note"
+                .contains("auto-built via review auto_build"),
+            "expected the stamped review auto_build note"
         );
 
         let _ = std::fs::remove_dir_all(&base);
