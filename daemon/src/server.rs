@@ -672,6 +672,16 @@ struct VerifyUserForgeTokenResponse {
     outcome: &'static str,
 }
 
+/// `POST /api/projects/{name}/forks/check` (RAL-523) body: the fork URL to
+/// check, plus the optional user whose stored forge token should authenticate
+/// the check (blank = the daemon's own credential chain).
+#[derive(Deserialize)]
+struct CheckProjectForkUrlBody {
+    url: String,
+    #[serde(default)]
+    user: String,
+}
+
 #[derive(Serialize)]
 struct AgentProfilesHealthResponse {
     profiles: Vec<crate::agent_profiles::ProfileHealthResult>,
@@ -1160,6 +1170,14 @@ fn route_for_user(
                 project_autofix_default_branch(daemon, name)
             })
         }
+        // RAL-523: manual reachability check for this project's destination
+        // repository (its registered clone URL, else the checkout's forge
+        // remote). A read in effect -- it changes nothing and reports only
+        // reachability -- so open to every caller like the fork reads above,
+        // same as the fork-network health check it mirrors.
+        ("POST", ["api", "projects", name, "check-destination"]) => {
+            check_project_destination(daemon, &url_decode(name))
+        }
         // RAL-338: fork registration. Reads open to every caller (matches the
         // `projects` pattern above). `GET /api/project-forks` is the
         // unscoped list across every project. A trailing user segment
@@ -1228,6 +1246,19 @@ fn route_for_user(
                 verify_user_forge_token(body)
             })
         }
+        // RAL-523: manual connectivity check of a *stored* token -- the same
+        // authenticated probe `verify` above runs, but against the token
+        // already saved for `host` (never re-supplied by the caller, so the
+        // response can also report who the token authenticates as), and
+        // confirming the forge's API is reachable from the daemon's own
+        // network position. Self-or-admin gated like every other route that
+        // touches a user's stored credential.
+        ("POST", ["api", "users", user, "forge-tokens", host, "check"]) => {
+            let target_user = url_decode(user);
+            self_or_admin_gated(daemon, user_header, &target_user, || {
+                check_user_forge_token(daemon, &target_user, &url_decode(host))
+            })
+        }
         // RAL-338 follow-up: fetch path for a worktree's git-credential
         // helper. Deliberately NOT self-or-admin gated -- the caller makes
         // no identity claim at all, `worktree_id`+`grant` (query params) is
@@ -1247,6 +1278,20 @@ fn route_for_user(
                 .unwrap_or_default();
             self_or_admin_gated(daemon, user_header, &target_user, || {
                 create_project_fork(daemon, &url_decode(name), body)
+            })
+        }
+        // RAL-523: manual reachability check for one fork URL -- a URL the
+        // add/edit form is about to save, or one already registered on a
+        // row. Gated like the write above: a check of a `user`-scoped fork
+        // can exercise that user's stored forge token, so it is
+        // self-or-admin gated on the same name; the project-wide default
+        // (`user:""`) check uses only the daemon's own credential chain.
+        ("POST", ["api", "projects", name, "forks", "check"]) => {
+            let target_user = serde_json::from_str::<CheckProjectForkUrlBody>(body)
+                .map(|req| req.user)
+                .unwrap_or_default();
+            self_or_admin_gated(daemon, user_header, &target_user, || {
+                check_project_fork_url(daemon, &url_decode(name), body)
             })
         }
         ("PATCH", ["api", "projects", name, "forks"]) => admin_gated(daemon, user_header, || {
@@ -2815,6 +2860,9 @@ struct EffectiveReviewDefaults {
     auto_fix_prompt_template: Option<String>,
     discourage_tests_during_auto_pull_request_fixes: bool,
     auto_cancel_outdated_pr_pipelines: bool,
+    /// RAL-521: the resolved manual-check caching default (per-review
+    /// override > database default > `.ralphus.toml`/global > `true`).
+    cache_manual_checks: bool,
 }
 
 impl EffectiveReviewDefaults {
@@ -2839,6 +2887,7 @@ impl EffectiveReviewDefaults {
             discourage_tests_during_auto_pull_request_fixes: cfg
                 .discourage_tests_during_auto_pull_request_fixes(),
             auto_cancel_outdated_pr_pipelines: cfg.auto_cancel_outdated_pr_pipelines(),
+            cache_manual_checks: cfg.cache_manual_checks(),
         }
     }
 }
@@ -2940,6 +2989,13 @@ struct ProjectReviewSettingsBody {
     /// Defaults to `true` when unset.
     #[serde(default)]
     auto_cancel_outdated_pr_pipelines: Option<bool>,
+    /// RAL-521: project-level default for whether a review's manual checks
+    /// are computed once, when its review branches are first created, and
+    /// then reused through later merges, rebases, and automated fix
+    /// iterations -- see [`crate::store::ProjectReviewSettings`]. Defaults
+    /// to `true` when unset.
+    #[serde(default)]
+    cache_manual_checks: Option<bool>,
     /// RAL-507: the project's default cap on unattended base-shift rebuild
     /// attempts per retry campaign. Zero is itself invalid (the cap must be
     /// at least 1), so clearing uses an explicit flag -- same convention as
@@ -3128,6 +3184,9 @@ fn set_project_review_settings(daemon: &Daemon, name: &str, body: &str) -> Reply
     }
     if let Some(v) = req.auto_cancel_outdated_pr_pipelines {
         settings.auto_cancel_outdated_pr_pipelines = Some(v);
+    }
+    if let Some(v) = req.cache_manual_checks {
+        settings.cache_manual_checks = Some(v);
     }
     if let Some(v) = req.default_pr_user {
         settings.default_pr_user = clear_if_empty(v);
@@ -5627,6 +5686,205 @@ fn verify_user_forge_token(body: &str) -> Reply {
             },
         },
     )
+}
+
+/// Structured record for one completed manual connectivity check (RAL-523):
+/// stderr via `rlog!` plus a Cartographer row, per the logging policy. The
+/// payload carries only the check's kind, subject, and verdict -- never the
+/// token (which never appears in an outcome's `detail` either, by
+/// [`crate::forge::ForgeCheckOutcome`]'s contract).
+fn record_forge_check(
+    daemon: &Daemon,
+    what: &str,
+    subject: &str,
+    outcome: &crate::forge::ForgeCheckOutcome,
+) {
+    let message = format!(
+        "connectivity check for {what} {subject}: {} -- {}",
+        outcome.status, outcome.detail
+    );
+    let _ = daemon
+        .lock()
+        .cartographer_log(crate::cartographer::CartographerEntry {
+            level: if outcome.ok {
+                crate::logging::LogLevel::INFO
+            } else {
+                crate::logging::LogLevel::WARNING
+            },
+            source: "server",
+            message: &message,
+            scope: Some("forge-check"),
+            squad_id: None,
+            guardian_id: None,
+            cell_id: None,
+            task: None,
+            log_path: None,
+            payload: serde_json::json!({
+                "what": what,
+                "subject": subject,
+                "status": outcome.status,
+                "ok": outcome.ok,
+            }),
+            admin_only: false,
+        });
+    if outcome.ok {
+        crate::rlog!(INFO, "ralphus [server] {message}");
+    } else {
+        crate::rlog!(WARNING, "ralphus [server] {message}");
+    }
+}
+
+/// `POST /api/users/{user}/forge-tokens/{host}/check` (RAL-523): manual
+/// connectivity check of the token *stored* for `(user, host)` -- one
+/// authenticated GET of the forge's "who am I" endpoint run daemon-side,
+/// reporting both that the token can authenticate and that its forge is
+/// reachable from the daemon's own network position. Distinct from
+/// [`verify_user_forge_token`], which probes a token the caller just typed
+/// and cannot answer "who does this stored token authenticate as?" without
+/// the caller re-supplying it. The response body is the check's
+/// [`crate::forge::ForgeCheckOutcome`] verbatim (no token value, ever).
+fn check_user_forge_token(daemon: &Daemon, user: &str, host: &str) -> Reply {
+    let host = host.trim();
+    if host.is_empty() {
+        return error(400, "invalid_value", "'host' must not be empty", vec![]);
+    }
+    let Some(kind) = crate::forge::ForgeKind::from_host(host) else {
+        return error(
+            400,
+            "invalid_value",
+            &format!(
+                "could not determine the forge kind for host {host:?} -- connectivity checks \
+                 support GitHub and GitLab hosts"
+            ),
+            vec![],
+        );
+    };
+    let token = match daemon.lock().get_user_forge_token(user, host) {
+        Ok(Some(token)) => token,
+        Ok(None) => {
+            return error(
+                404,
+                "not_found",
+                &format!("no forge token configured for user {user:?} host {host:?}"),
+                vec![],
+            );
+        }
+        Err(e) => return store_error(&e),
+    };
+    // The network probe runs with the store lock released -- a slow forge
+    // must not stall every other API request behind it.
+    let client = crate::forge::ForgeClient::new(
+        kind,
+        kind.default_api_base(host),
+        String::new(),
+        Some(token),
+    );
+    let outcome = client.check_token();
+    record_forge_check(
+        daemon,
+        "forge token",
+        &format!("{user:?} @{host}"),
+        &outcome,
+    );
+    json(200, &outcome)
+}
+
+/// `POST /api/projects/{name}/forks/check` (RAL-523) body: `{"url": ...}`
+/// plus an optional `"user"` whose stored forge token should authenticate
+/// the check. Covers both the add/edit-form case (a URL not saved yet) and
+/// the registered-row case (the UI passes the row's own `fork_url`), so one
+/// endpoint serves every fork-reachability control. A URL no REST identity
+/// can be resolved from is reported as a failed `unresolvable` check with an
+/// actionable diagnostic, not a 4xx, so every caller renders it the same way.
+fn check_project_fork_url(daemon: &Daemon, project: &str, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<CheckProjectForkUrlBody>(body) else {
+        return error(
+            400,
+            "bad_request",
+            "body must include a non-empty \"url\" string",
+            vec![],
+        );
+    };
+    let url = req.url.trim().to_string();
+    if url.is_empty() {
+        return error(400, "invalid_value", "'url' must not be empty", vec![]);
+    }
+    let user = req.user.trim().to_string();
+    // Gather everything the check needs from the store first, then release
+    // the lock before any network I/O (the same rule the scheduler's
+    // subprocess waits follow).
+    let (token_override, cfg) = {
+        let store = daemon.lock();
+        let token_override = if user.is_empty() {
+            None
+        } else {
+            crate::forge::parse_remote_url(&url)
+                .and_then(|(host, _)| store.get_user_forge_token(&user, &host).ok().flatten())
+        };
+        let cfg = store
+            .get_project(project)
+            .ok()
+            .flatten()
+            .map(|p| crate::config::resolve_forge(std::path::Path::new(&p.path)))
+            .unwrap_or_default();
+        (token_override, cfg)
+    };
+    let outcome = crate::forge::check_repository_url(&url, &cfg, token_override.as_deref())
+        .unwrap_or_else(crate::forge::ForgeCheckOutcome::unresolvable);
+    let subject = if user.is_empty() {
+        format!("{project:?} fork {url}")
+    } else {
+        format!("{project:?} fork {url} (as user {user:?})")
+    };
+    record_forge_check(daemon, "fork", &subject, &outcome);
+    json(200, &outcome)
+}
+
+/// `POST /api/projects/{name}/check-destination` (RAL-523): manual
+/// reachability check for the project's destination repository -- its
+/// registered clone URL, else the checkout's own forge remote (the same
+/// precedence [`crate::project_forks::resolve_project_forge_host`] uses for
+/// the host). The check goes through the forge REST API, so an SSH-style
+/// clone URL resolves through its host/path pair rather than ever opening an
+/// SSH connection; a URL no REST identity can be resolved from is reported
+/// as a failed `unresolvable` check with an actionable diagnostic, not a 4xx.
+fn check_project_destination(daemon: &Daemon, project: &str) -> Reply {
+    let (project_url, cfg) = {
+        let store = daemon.lock();
+        let project = match store.get_project(project) {
+            Ok(Some(project)) => project,
+            Ok(None) => {
+                return error(
+                    404,
+                    "not_found",
+                    &format!("no project registered under {project:?}"),
+                    vec![],
+                );
+            }
+            Err(e) => return store_error(&e),
+        };
+        let cfg = crate::config::resolve_forge(std::path::Path::new(&project.path));
+        (crate::project_forks::project_destination_url(&project), cfg)
+    };
+    let Some(url) = project_url else {
+        let outcome = crate::forge::ForgeCheckOutcome::unresolvable(
+            "this project has no clone URL registered and its checkout has no forge remote \
+             configured -- set a clone URL (project row, clone URL column) or add a git remote, \
+             then re-check"
+                .to_string(),
+        );
+        record_forge_check(daemon, "project destination", project, &outcome);
+        return json(200, &outcome);
+    };
+    let outcome = crate::forge::check_repository_url(&url, &cfg, None)
+        .unwrap_or_else(crate::forge::ForgeCheckOutcome::unresolvable);
+    record_forge_check(
+        daemon,
+        "project destination",
+        &format!("{project:?} {url}"),
+        &outcome,
+    );
+    json(200, &outcome)
 }
 
 /// `GET /api/internal/fork-credential?worktree_id=...&grant=...` (RAL-338
@@ -11820,14 +12078,20 @@ fn shutdown(daemon: &Daemon, body: &str) -> Reply {
     daemon.cancellations.cancel_all();
 
     let squads = daemon.lock().list_squads().unwrap_or_default();
-    let guardians = daemon.lock().list_guardians().unwrap_or_default();
+    // Shutdown only needs guardian ids here. The full view hydrates project
+    // configuration and walks each git root; an unavailable/stale root must
+    // not prevent an otherwise valid auto-cancel from reaching that review.
+    let guardians = daemon
+        .lock()
+        .list_guardian_status_pairs()
+        .unwrap_or_default();
     let tmux_killed: usize = squads
         .iter()
         .map(|r| kill_squad_tmux_sessions(&r.id))
         .sum::<usize>()
         + guardians
             .iter()
-            .map(|g| kill_guardian_tmux_sessions(&g.id))
+            .map(|(id, _status)| kill_guardian_tmux_sessions(id))
             .sum::<usize>();
 
     let mut cancelled_squads = Vec::new();
@@ -11847,9 +12111,9 @@ fn shutdown(daemon: &Daemon, body: &str) -> Reply {
             }
         }
 
-        for g in guardians {
-            if daemon.lock().cancel_guardian(&g.id).is_ok() {
-                cancelled_guardians.push(g.id);
+        for (id, _status) in guardians {
+            if daemon.lock().cancel_guardian(&id).is_ok() {
+                cancelled_guardians.push(id);
             }
         }
     }
@@ -12311,7 +12575,22 @@ fn capture_and_stop_nodes(store: &StoreHandle, squad_id: &str, reqs: &[SetStatus
         if !tmux.has_session(&target.pane_name) {
             continue;
         }
-        if let Ok(content) = tmux.capture_pane(&target.pane_name, 2000) {
+        // psmux can briefly reject `capture-pane` immediately after its
+        // session server becomes visible. Retrying that transport race before
+        // the terminal kill preserves the checkpoint without delaying a pane
+        // that was genuinely empty.
+        let mut capture = None;
+        for attempt in 0..3 {
+            match tmux.capture_pane(&target.pane_name, 2000) {
+                Ok(content) => {
+                    capture = Some(content);
+                    break;
+                }
+                Err(_) if attempt < 2 => std::thread::sleep(std::time::Duration::from_millis(100)),
+                Err(_) => break,
+            }
+        }
+        if let Some(content) = capture {
             // RAL-247: scrub credential env-var values before folding the pane
             // capture into the cell's ghost (which is later served back and
             // prepended to the next attempt's prompt).
@@ -12951,6 +13230,13 @@ struct GuardianSettingsBody {
     /// by default -- unlike most of the overrides above).
     #[serde(default)]
     auto_cancel_outdated_pr_pipelines: Option<bool>,
+    /// RAL-521: this review's own override for whether its manual checks are
+    /// computed once, when its review branches are first created, and then
+    /// reused through later merges, rebases, and automated fix iterations.
+    /// `None` (or the field being absent) means "inherit the project/global
+    /// default", which resolves to `true` (caching on by default).
+    #[serde(default)]
+    cache_manual_checks: Option<bool>,
 }
 
 /// Body for `POST /api/guardians/{id}/details` -- the board's single
@@ -13003,6 +13289,9 @@ struct GuardianDetailsBody {
     /// RAL-510: see [`GuardianSettingsBody::auto_cancel_outdated_pr_pipelines`].
     #[serde(default)]
     auto_cancel_outdated_pr_pipelines: Option<bool>,
+    /// RAL-521: see [`GuardianSettingsBody::cache_manual_checks`].
+    #[serde(default)]
+    cache_manual_checks: Option<bool>,
     /// Full desired squash membership: every project in this list gets
     /// squash turned ON, every other project in the review's
     /// [`crate::guardian::GuardianView::projects`] gets it turned OFF.
@@ -13430,6 +13719,11 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
             return store_error(&e);
         }
     }
+    if let Some(enabled) = req.cache_manual_checks {
+        if let Err(e) = store.set_guardian_cache_manual_checks(id, Some(enabled)) {
+            return store_error(&e);
+        }
+    }
     // RAL-213: every setting above is a plain DB column write that a running
     // merge never re-reads mid-flight -- restart it now so the new setting
     // actually takes effect on this build instead of only the next one.
@@ -13737,6 +14031,11 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
     }
     if let Some(enabled) = req.auto_cancel_outdated_pr_pipelines {
         if let Err(e) = store.set_guardian_auto_cancel_outdated_pr_pipelines(id, Some(enabled)) {
+            return store_error(&e);
+        }
+    }
+    if let Some(enabled) = req.cache_manual_checks {
+        if let Err(e) = store.set_guardian_cache_manual_checks(id, Some(enabled)) {
             return store_error(&e);
         }
     }
@@ -15663,6 +15962,7 @@ fn guardian_feedback(
     crate::guardian_merge::start_feedback(
         daemon.store_handle(),
         runner,
+        daemon.cancellations_handle(),
         id,
         branch_id,
         req.feedback,
@@ -17899,6 +18199,153 @@ mod tests {
         );
         assert_eq!(r.status, 200, "{}", r.body);
         assert!(r.body.contains("unreachable"), "{}", r.body);
+    }
+
+    // ---------------------------------------------------------------------
+    // Manual forge connectivity checks (RAL-523)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn check_user_forge_token_route_rejects_an_unknown_host_and_a_missing_token() {
+        let d = daemon();
+        d.lock().create_user("alice").unwrap();
+
+        let unknown_host = route_for_user(
+            &d,
+            "POST",
+            "/api/users/alice/forge-tokens/forge.internal/check",
+            "",
+            Some("alice"),
+        );
+        assert_eq!(unknown_host.status, 400, "{}", unknown_host.body);
+
+        let no_token = route_for_user(
+            &d,
+            "POST",
+            "/api/users/alice/forge-tokens/github.com/check",
+            "",
+            Some("alice"),
+        );
+        assert_eq!(no_token.status, 404, "{}", no_token.body);
+        assert!(
+            no_token.body.contains("no forge token configured"),
+            "{}",
+            no_token.body
+        );
+    }
+
+    #[test]
+    fn check_user_forge_token_route_is_self_or_admin_gated() {
+        let d = daemon();
+        d.lock().create_user("alice").unwrap();
+        d.lock().create_user("bob").unwrap();
+        d.lock()
+            .set_user_forge_token("alice", "github.com", "ghp-secret")
+            .unwrap();
+        d.lock().create_user("some-admin").unwrap();
+        d.lock().set_user_admin("some-admin", true).unwrap();
+
+        let r = route_for_user(
+            &d,
+            "POST",
+            "/api/users/alice/forge-tokens/github.com/check",
+            "",
+            Some("bob"),
+        );
+        assert_eq!(r.status, 403, "{}", r.body);
+    }
+
+    #[test]
+    fn check_project_fork_url_route_rejects_bad_bodies() {
+        let d = daemon();
+
+        let empty_body = route(&d, "POST", "/api/projects/proj/forks/check", "");
+        assert_eq!(empty_body.status, 400, "{}", empty_body.body);
+
+        let missing_url = route(
+            &d,
+            "POST",
+            "/api/projects/proj/forks/check",
+            &serde_json::json!({"user": "alice"}).to_string(),
+        );
+        assert_eq!(missing_url.status, 400, "{}", missing_url.body);
+
+        let blank_url = route(
+            &d,
+            "POST",
+            "/api/projects/proj/forks/check",
+            &serde_json::json!({"url": "   "}).to_string(),
+        );
+        assert_eq!(blank_url.status, 400, "{}", blank_url.body);
+    }
+
+    #[test]
+    fn check_project_fork_url_route_reports_an_unresolvable_url_as_a_failed_check() {
+        let d = daemon();
+        // The project need not exist: the fork check is about the URL, and an
+        // unknown project just means the daemon-default forge config applies.
+        let r = route(
+            &d,
+            "POST",
+            "/api/projects/proj/forks/check",
+            &serde_json::json!({"url": "git@forge.internal:acme/widget.git"}).to_string(),
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let body: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(body["status"], "unresolvable");
+        assert_eq!(body["ok"], false);
+        assert!(
+            body["detail"].as_str().unwrap().contains("forge.internal"),
+            "{}",
+            r.body
+        );
+    }
+
+    #[test]
+    fn check_project_fork_url_route_is_gated_on_the_body_user() {
+        let d = daemon();
+        d.lock().create_user("alice").unwrap();
+        d.lock().create_user("bob").unwrap();
+        d.lock().create_user("some-admin").unwrap();
+        d.lock().set_user_admin("some-admin", true).unwrap();
+
+        let r = route_for_user(
+            &d,
+            "POST",
+            "/api/projects/proj/forks/check",
+            &serde_json::json!({"url": "https://github.com/acme/widget", "user": "alice"})
+                .to_string(),
+            Some("bob"),
+        );
+        assert_eq!(r.status, 403, "{}", r.body);
+    }
+
+    #[test]
+    fn check_project_destination_route_404s_an_unknown_project_and_reports_a_missing_url() {
+        let d = daemon();
+
+        let unknown = route(&d, "POST", "/api/projects/nope/check-destination", "");
+        assert_eq!(unknown.status, 404, "{}", unknown.body);
+
+        // A registered project with neither a clone URL nor a forge remote
+        // answers with a failed, actionable `unresolvable` check, not a 4xx,
+        // so every caller renders it exactly like a network failure.
+        let repo = tmp_git_repo("check-destination-no-url");
+        let body =
+            serde_json::json!({ "name": "proj", "path": repo.to_string_lossy(), "vcs": "git" })
+                .to_string();
+        let registered = route(&d, "POST", "/api/projects", &body);
+        assert_eq!(registered.status, 201, "{}", registered.body);
+
+        let r = route(&d, "POST", "/api/projects/proj/check-destination", "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        let parsed: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(parsed["status"], "unresolvable");
+        assert!(
+            parsed["detail"].as_str().unwrap().contains("clone URL"),
+            "{}",
+            r.body
+        );
     }
 
     #[test]
@@ -22952,25 +23399,42 @@ remediation_attempts = 1
         // actually still be alive for the whole test, not just have
         // recently printed something -- sleeping well past any test's own
         // runtime removes the race outright instead of narrowing it.
+        let (program, args) = if cfg!(windows) {
+            (
+                "powershell",
+                vec![
+                    "-NoProfile".to_string(),
+                    "-Command".to_string(),
+                    format!("Write-Output {marker}; Start-Sleep -Seconds 60"),
+                ],
+            )
+        } else {
+            (
+                "sh",
+                vec!["-c".to_string(), format!("echo {marker}; sleep 60")],
+            )
+        };
         tmux.new_detached_session_with_command(
             name,
             &cwd,
             &std::collections::BTreeMap::new(),
-            "sh",
-            &["-c".to_string(), format!("echo {marker}; sleep 60")],
+            program,
+            &args,
             None,
         )
         .unwrap();
+        let mut captured = String::new();
         for _ in 0..50 {
             std::thread::sleep(std::time::Duration::from_millis(200));
-            if tmux
-                .capture_pane(name, 50)
-                .unwrap_or_default()
-                .contains(marker)
-            {
+            captured = tmux.capture_pane(name, 50).unwrap_or_default();
+            if captured.contains(marker) {
                 break;
             }
         }
+        assert!(
+            captured.contains(marker),
+            "marker process did not become visible in the live tmux pane: {captured}"
+        );
         tmux
     }
 
@@ -23003,6 +23467,7 @@ remediation_attempts = 1
         let name = crate::tmux::session_name(&squad_id, &task, &sid);
         let marker = "ral-163-in-progress-marker";
         spawn_marker_session(&name, marker);
+        let _cleanup = crate::tmux::KillSessionOnDrop(name.clone());
 
         let body = serde_json::json!({
             "kind": "cell", "task_idx": 0, "cell_idx": 0, "state": "done"
@@ -23121,6 +23586,7 @@ remediation_attempts = 1
         let name = crate::tmux::session_name(&squad_id, &task, &sid);
         let marker = "ral-163-ignored-marker";
         spawn_marker_session(&name, marker);
+        let _cleanup = crate::tmux::KillSessionOnDrop(name.clone());
 
         let body = serde_json::json!({
             "kind": "cell", "task_idx": 0, "cell_idx": 0, "state": "ignored"
@@ -26938,6 +27404,29 @@ remediation_attempts=1
         assert_eq!(r.status, 200);
         assert!(r.body.contains("\"match_pr_branch_name\":false"));
         assert!(r.body.contains("\"effective_match_pr_branch_name\":false"));
+    }
+
+    // RAL-521: the review settings endpoint accepts `cache_manual_checks`
+    // (default on) and the view reports both the raw override and the
+    // effective resolved value.
+    #[test]
+    fn guardian_settings_sets_and_resets_cache_manual_checks() {
+        let d = daemon();
+        let gid = make_guardian(&d);
+        // Unset inherits the enabled-by-default value.
+        let r = route(&d, "GET", &format!("/api/guardians/{gid}"), "");
+        assert!(r.body.contains("\"cache_manual_checks\":null"));
+        assert!(r.body.contains("\"effective_cache_manual_checks\":true"));
+        let body = serde_json::json!({"cache_manual_checks": false}).to_string();
+        let r = route(&d, "POST", &format!("/api/guardians/{gid}/settings"), &body);
+        assert_eq!(r.status, 200);
+        assert!(r.body.contains("\"cache_manual_checks\":false"));
+        assert!(r.body.contains("\"effective_cache_manual_checks\":false"));
+        let body = serde_json::json!({"cache_manual_checks": true}).to_string();
+        let r = route(&d, "POST", &format!("/api/guardians/{gid}/settings"), &body);
+        assert_eq!(r.status, 200);
+        assert!(r.body.contains("\"cache_manual_checks\":true"));
+        assert!(r.body.contains("\"effective_cache_manual_checks\":true"));
     }
 
     #[test]

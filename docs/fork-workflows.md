@@ -208,6 +208,48 @@ missing relationships, and cross-instance impossibility. A `fail` here is
 informational only — it does not block anything by itself; submission's own
 pre-flight is what's authoritative.
 
+### Manual connectivity checks (RAL-523)
+
+Separate from that advisory pass, three *manual*, one-shot probes answer
+"is this specific credential or repository usable right now?" — run only
+when you ask (a Check button on the board, or a CLI command), never polled:
+
+- `ralphus user check-forge-token <user> <host>` re-checks a user's *stored*
+  forge token: one authenticated "who am I" request that reports whether the
+  token still authenticates (and as whom) and whether the forge is reachable
+  from the daemon's network position. Use it when a fork-routed push or PR
+  submission has started failing with auth errors and you suspect a revoked
+  or expired token.
+- `ralphus project fork check <project> --url <fork-url> [--user <user>]`
+  probes a fork URL's reachability before or instead of saving it — one GET
+  of the repository through the forge REST API. With `--user`, the check
+  authenticates with that user's own stored forge token for the URL's host
+  when one is configured, so it exercises the credentials that user's
+  fork-routed work would actually use. The URL may be any clone-URL shape git
+  accepts (`https://`, `ssh://`, `git@host:path`); SSH-style URLs resolve
+  through their host/path pair — the SSH transport itself is never contacted.
+- `ralphus project check-destination <project>` probes the project's
+  destination repository — its registered clone URL, else the checkout's own
+  forge remote — so you can confirm a target exists and the daemon's
+  credentials can see it before anything tries to push or open a PR/MR
+  against it.
+
+Every check goes over HTTPS to the forge's REST API — the same path every
+push and PR/MR submission takes — never through the `gh`/`glab` CLIs. The
+answer is a small verdict (`ok` / `unauthorized` / `forbidden` / `not_found`
+/ `no_token` / `unreachable` / `error` / `unresolvable`) plus a human-readable
+explanation; a failed check is still a successful *check*, reported the same
+way as a passing one, never as an API error. A URL that cannot be resolved
+to a forge REST identity at all (an unparseable URL, or a host that is
+neither GitHub nor GitLab and has no `[forge].kind` pinned in the project's
+`.ralphus.toml`) is reported as `unresolvable` with the fix in the message
+rather than failing the request.
+
+These are point-in-time probes, like `POST /api/machines/{scheme}/check` is
+for machine providers: the result is shown where you ran the check and is
+not persisted as a health verdict, so re-run after fixing whatever the
+message pointed at.
+
 ## Permissions
 
 Fork registration mutations (`POST`/`PATCH`/`DELETE`) are admin-gated the

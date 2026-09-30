@@ -88,6 +88,11 @@
       let preferenceForgeTokenDraft = { kind: "github", host: "github.com", token: "" };
       /** @type {"idle"|"saving"|"valid"|"invalid"|"unreachable"} outcome of the last "Apply" click's live verification, shown next to the form. Resets to "idle" whenever the draft changes. */
       let preferenceForgeTokenVerify = "idle";
+      // ---- Manual forge connectivity checks (RAL-523) ----
+      /** Longest stretch of a failed check's detail shown inline before it is truncated with an ellipsis and made click-to-open-full-message. */
+      const FORGE_CHECK_INLINE_MAX = 140;
+      /** @type {Map<string, {loading: boolean, outcome: (ForgeCheckOutcome|null)}>} per-row manual connectivity-check state, keyed by `<surface>|<row key>` (see `forgeCheckStatusHtml`). Outcomes never carry a token value. */
+      const forgeCheckState = new Map();
       /** @type {ProjectView[]} */
       let projects = [];
       /** @type {string[]} registered project names (RAL-345) -- the live, non-admin source for the Tasks/Squads project-filter dropdowns, refreshed from `GET /api/projects` on every poll of those tabs (reads are open to every caller, RAL-332; only mutations are admin-gated). Empty until the first such poll lands -- never a stale snapshot. */

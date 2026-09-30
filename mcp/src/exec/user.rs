@@ -15,5 +15,8 @@ pub fn execute(cmd: UserCommand, client: &DaemonClient) -> ExecResult {
         UserCommand::DeleteForgeToken { user, host } => {
             Ok(client.delete_user_forge_token(&user, &host)?)
         }
+        UserCommand::CheckForgeToken { user, host } => {
+            Ok(client.check_user_forge_token(&user, &host)?)
+        }
     }
 }

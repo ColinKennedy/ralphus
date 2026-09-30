@@ -3392,12 +3392,20 @@ pub(crate) fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
     // while the top-level status stays stuck on the stale failure until
     // `finalize_review` finally overwrites it at the very end.
     set_status(GuardianStatus::Merging, None);
+    // RAL-521: decide once whether this re-stack regenerates the manual
+    // checks. With caching enabled and the one-time marker set, the cached
+    // commands are kept -- both the clear below and the generation at the
+    // end of the re-stack are skipped, so the reviewer keeps seeing the
+    // cached checks while the stack rebuilds.
+    let generate_manual_checks = manual_checks_should_generate_for(store, id);
     // RAL-103: this is a forced regeneration (feedback routing or a detected
     // manual push) -- clear the stale manual-checks commands up front so
     // `checks_state` drops out of "ready" for the whole restack, instead of
     // showing the previous build's commands as current until
     // `generate_manual_commands` overwrites them at the end.
-    let _ = store.lock().clear_guardian_manual_commands(id);
+    if generate_manual_checks {
+        let _ = store.lock().clear_guardian_manual_commands(id);
+    }
     // RAL-193: this restack is its own re-merge attempt -- a distinct
     // resolver/prover cost bucket from whatever attempt preceded it,
     // whether triggered by routed reviewer feedback or a detected manual
@@ -4434,9 +4442,11 @@ pub fn start_resolve_input(
 /// (the caller may name one; the HTTP layer defaults it to `submitted_by`
 /// when absent). `submitted_by` is the resolved authenticated/default
 /// requester and is never taken from request data.
+#[allow(clippy::too_many_arguments)]
 pub fn start_feedback(
     store: crate::store_lock::StoreHandle,
     runner: Arc<dyn Runner>,
+    cancellations: Cancellations,
     id: &str,
     branch_id: &str,
     feedback: String,
@@ -4506,24 +4516,32 @@ pub fn start_feedback(
     };
     let sid = id.to_string();
     let bid = branch_id.to_string();
+    // Register before spawning so cancellation between this acknowledgement
+    // and the background thread starting still reaches the feedback agent.
+    // Review merges, feedback, and their downstream work share this key.
+    let cancellation_key = format!("guardian:{sid}");
+    let cancel = cancellations.register(&cancellation_key);
     std::thread::spawn(move || {
-        record_feedback_reply(&store, &sid, &bid, &feature, &feedback);
-        let outcome = run_feedback(
-            &store,
-            runner.as_ref(),
-            &sid,
-            &bid,
-            &feedback,
-            Some(message_seq),
-            false,
-            &CancelToken::never(),
-        );
-        crate::rlog!(
-            INFO,
-            "ralphus [guardian] review {sid} feedback outcome committed={} pushed={}",
-            outcome.committed,
-            outcome.pushed
-        );
+        if !cancel.is_cancelled() {
+            record_feedback_reply(&store, &sid, &bid, &feature, &feedback);
+            let outcome = run_feedback(
+                &store,
+                runner.as_ref(),
+                &sid,
+                &bid,
+                &feedback,
+                Some(message_seq),
+                false,
+                &cancel,
+            );
+            crate::rlog!(
+                INFO,
+                "ralphus [guardian] review {sid} feedback outcome committed={} pushed={}",
+                outcome.committed,
+                outcome.pushed
+            );
+        }
+        cancellations.remove(&cancellation_key);
     });
     reply(202, "{\"status\":\"applying_feedback\"}")
 }
@@ -4734,8 +4752,13 @@ pub fn run_merge_staged(
         // conflict bookkeeping up front so the board never shows a stale
         // "checks ready" state or leftover conflict progress while the staged
         // build is in flight. (Manual commands are only regenerated on final
-        // InReview, not on a partial pass.)
-        let _ = guard.clear_guardian_manual_commands(id);
+        // InReview, not on a partial pass.) Under an enabled
+        // `cache_manual_checks` with the one-time marker set (RAL-521) the
+        // cached commands are neither cleared nor regenerated, so they stay
+        // visible and current across the rebuild.
+        if manual_checks_should_generate(&guardian) {
+            let _ = guard.clear_guardian_manual_commands(id);
+        }
         let _ = guard.set_guardian_conflicts(id, None, None, None);
         let _ = guard.clear_all_branch_conflicts(id);
     }
@@ -5219,7 +5242,6 @@ fn finish_staged_merge<F: Fn(GuardianStatus, Option<&str>)>(
         );
         return;
     }
-
     for proj in &project_order {
         if cancel.is_cancelled() {
             log_merge_cancelled(store, id);
@@ -5373,6 +5395,11 @@ pub fn run_merge_cancellable(
         set_status(GuardianStatus::MergeFailed, Some(&error));
         return;
     }
+    // RAL-521: decide once, up front, whether this merge regenerates the
+    // manual checks. With caching enabled and the one-time marker set, the
+    // cached commands are kept (the clear below is skipped too) and the
+    // per-project generation sites below are all skipped.
+    let generate_manual_checks = manual_checks_should_generate(&guardian);
     set_status(GuardianStatus::Merging, None);
     {
         let guard = store.lock();
@@ -5381,7 +5408,9 @@ pub fn run_merge_cancellable(
         // a debounced `generate_final_summary` (RAL-208) eventually overwrites
         // it, instead of showing a misleading empty/"generating" gap for the
         // whole rebuild.
-        let _ = guard.clear_guardian_manual_commands(id);
+        if generate_manual_checks {
+            let _ = guard.clear_guardian_manual_commands(id);
+        }
         let _ = guard.set_guardian_conflicts(id, None, None, None);
         let _ = guard.clear_all_branch_conflicts(id);
     }
@@ -6484,6 +6513,15 @@ pub fn run_feedback(
     let result =
         run_agent_with_rate_limit_retry(&mut spec, runner, cancel, Some((store, id, branch_id)));
     let _ = record_guardian_call_cost(store, id, Some(branch_id), "feedback", &result);
+    if cancel.is_cancelled() {
+        log_merge_cancelled(store, id);
+        let _ = store
+            .lock()
+            .release_guardian_worktree_lease(id, branch_id, &lease_owner);
+        let _ = store.lock().clear_branch_pending_feedback(id, branch_id);
+        fail_message();
+        return FeedbackOutcome::default();
+    }
     // RAL-395: the resolver's own verdict, before we know whether anything it
     // did actually ended up committed -- combined with `committed` below into
     // the outcome's real `proof_passed` once that's known, so a "PASS" from
@@ -6930,8 +6968,13 @@ pub fn run_feedback(
     // stale manual-checks commands now so `checks_state` drops out of "ready"
     // for the downstream restack below, instead of showing the previous
     // build's commands as current until `generate_manual_commands` overwrites
-    // them at the end.
-    let _ = store.lock().clear_guardian_manual_commands(id);
+    // them at the end. Under an enabled `cache_manual_checks` with the
+    // one-time marker set (RAL-521) the cached commands are neither cleared
+    // nor regenerated below.
+    let generate_manual_checks = manual_checks_should_generate_for(store, id);
+    if generate_manual_checks {
+        let _ = store.lock().clear_guardian_manual_commands(id);
+    }
 
     // Re-stack only the downstream branches in the SAME project (cross-project
     // rebasing is impossible). Snapshot the base commit once for consistency.
@@ -8875,7 +8918,14 @@ fn post_merge_jobs_inner(
         .as_ref()
         .and_then(|g| g.manual_checks_basis.as_deref())
         != Some(expected_basis.as_str());
-    let generate_manual = jobs.manual_checks && (!commands_present || basis_changed);
+    // RAL-521: once the review's cached result has been recorded, ordinary
+    // rebases and restacks must not invalidate it merely because the stacked
+    // tip changed. An explicit opt-out continues to use the pre-cache basis
+    // check and regenerates whenever the result is absent or stale.
+    let cached = stored.as_ref().is_some_and(|g| {
+        g.effective_cache_manual_checks && g.manual_checks_cached && g.manual_checks_basis.is_some()
+    });
+    let generate_manual = jobs.manual_checks && !cached && (!commands_present || basis_changed);
 
     // Both jobs read the scratch worktree and neither reads the other's
     // output, so they run concurrently.
@@ -11856,6 +11906,26 @@ fn elapsed_ms(started: std::time::Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+/// RAL-521: whether this merge/rebase/fix pass should run manual-checks
+/// generation. With `cache_manual_checks` enabled (the default) the checks
+/// are computed once, when the review's branches are first created, and
+/// every later pass reuses that result; a review whose cached marker is not
+/// set yet, or whose effective setting resolves to `false`, regenerates on
+/// every pass.
+fn manual_checks_should_generate(guardian: &crate::guardian::GuardianView) -> bool {
+    !(guardian.effective_cache_manual_checks && guardian.manual_checks_cached)
+}
+
+/// [`manual_checks_should_generate`] against a freshly loaded guardian -- for
+/// call sites that do not already have the full view in hand.
+fn manual_checks_should_generate_for(store: &crate::store_lock::StoreHandle, id: &str) -> bool {
+    store
+        .lock()
+        .get_guardian(id)
+        .map(|g| manual_checks_should_generate(&g))
+        .unwrap_or(true)
+}
+
 /// Generate LLM-suggested shell commands for manually testing or verifying
 /// the changes in the review branch (RAL-27).
 ///
@@ -12090,10 +12160,10 @@ fn generate_manual_commands(
             .set_guardian_manual_commands_session_id(id, sid);
     }
 
-    if !result.is_done() || result.summary.trim().is_empty() {
+    if !result.is_done() {
         // WARNING, not INFO: the merge still reaches `in_review`, but the
         // review lands without the manual checks it was supposed to carry, and
-        // nothing else reports that.
+        // a failed generation remains eligible for a later retry.
         phase_note(
             store,
             id,
@@ -12114,6 +12184,27 @@ fn generate_manual_commands(
 
     let commands = parse_manual_commands_response(result.summary.trim());
 
+    if commands.is_empty() {
+        // An empty, completed result is still a result. Cache it so the
+        // default one-time behavior does not keep rerunning a check that
+        // intentionally found no manual commands.
+        phase_note(
+            store,
+            id,
+            crate::logging::LogLevel::WARNING,
+            format!(
+                "review {id} manual-commands generation produced no commands after {}ms",
+                elapsed_ms(started)
+            ),
+            serde_json::json!({
+                "phase": "manual_commands",
+                "state": "empty",
+                "elapsed_ms": elapsed_ms(started),
+                "cancelled": cancel.is_cancelled(),
+            }),
+        );
+    }
+
     if cancel.is_cancelled() {
         // Superseded mid-generation (a newer merge or regen owns the outcome
         // slot): drop the result rather than write over the newer run's data.
@@ -12127,27 +12218,32 @@ fn generate_manual_commands(
         return;
     }
 
-    if !commands.is_empty() {
-        // RAL-88: record which resolved agent/model produced these commands.
-        let _ = store.lock().set_guardian_manual_commands(
-            id,
-            &commands,
-            Some(agent.as_str()),
-            model.as_deref(),
-        );
-        // RAL-520: record the diff basis these commands were generated
-        // against, so a later post-merge run regenerates only when the
-        // settled stack's changes actually changed.
-        let tip_tree = worktree
-            .unwrap_or(root)
-            .git(&["rev-parse", &format!("{tip_ref}^{{tree}}")])
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|_| tip_ref.to_string());
-        let basis = serde_json::json!({ "base_sha": base_sha, "tip_tree": tip_tree }).to_string();
-        let _ = store
-            .lock()
-            .set_guardian_manual_checks_basis(id, Some(&basis));
-    }
+    // RAL-88: record which resolved agent/model produced these commands. This
+    // also clears a previous result when a later opt-out regeneration is
+    // successfully empty.
+    let _ = store.lock().set_guardian_manual_commands(
+        id,
+        &commands,
+        Some(agent.as_str()),
+        model.as_deref(),
+    );
+    // RAL-520: record the diff basis the manual checks were generated against,
+    // including an intentionally empty command list, so a later post-merge
+    // run regenerates only when the settled stack's changes actually changed.
+    let tip_tree = worktree
+        .unwrap_or(root)
+        .git(&["rev-parse", &format!("{tip_ref}^{{tree}}")])
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| tip_ref.to_string());
+    let basis = serde_json::json!({ "base_sha": base_sha, "tip_tree": tip_tree }).to_string();
+    let _ = store
+        .lock()
+        .set_guardian_manual_checks_basis(id, Some(&basis));
+    // RAL-521: mark the review's manual checks as computed. Under an enabled
+    // `cache_manual_checks` this marker is what every later merge/rebase/fix
+    // consults to skip regeneration, even when the computed result is empty;
+    // under `false` the marker is simply ignored.
+    let _ = store.lock().set_guardian_manual_checks_cached(id, true);
     phase_note(
         store,
         id,

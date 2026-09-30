@@ -713,6 +713,7 @@
        * @property {string|null|undefined} auto_fix_prompt_template
        * @property {boolean|null|undefined} discourage_tests_during_auto_pull_request_fixes
        * @property {boolean|null|undefined} auto_cancel_outdated_pr_pipelines
+       * @property {boolean|null|undefined} cache_manual_checks
        */
       /**
        * RAL-408: the fully resolved effective review-setting defaults (file
@@ -737,6 +738,7 @@
        * @property {string|undefined} auto_fix_prompt_template
        * @property {boolean} discourage_tests_during_auto_pull_request_fixes
        * @property {boolean} auto_cancel_outdated_pr_pipelines
+       * @property {boolean} cache_manual_checks
        */
       /**
        * RAL-408: `GET/POST /api/projects/{name}/review-settings`'s response
@@ -992,6 +994,17 @@
        * @property {string} host
        * @property {number} created_at_ms
        * @property {number} updated_at_ms
+       */
+      /**
+       * A manual forge connectivity-check outcome (RAL-523) -- the wire shape
+       * of the `POST .../check` endpoints' responses. `detail` is safe to
+       * display and copy: the daemon never puts the token value in it.
+       * @typedef {object} ForgeCheckOutcome
+       * @property {boolean} ok - Whether the check got the answer it wanted.
+       * @property {string} status - "ok" | "unauthorized" | "forbidden" |
+       *   "not_found" | "no_token" | "unreachable" | "unresolvable" | "error".
+       * @property {string} detail - Human-readable explanation.
+       * @property {string=} identity - Who/what authenticated, when known.
        */
       /**
        * @typedef {object} TargetHealthReport

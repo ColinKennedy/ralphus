@@ -135,6 +135,25 @@ pub fn emit(opts: &GlobalOpts, data: &Value, human: impl FnOnce(&Value)) {
     crate::output::emit(opts.json, data, human);
 }
 
+/// Human-readable rendering of one forge connectivity-check outcome
+/// (RAL-523), shared by every check command: a check that ran and reported a
+/// verdict is a successful command (exit 0) -- the verdict itself is the
+/// payload, so `--json` consumers and scripts read `ok`/`status`/`detail`
+/// rather than inferring anything from the exit code.
+pub fn render_forge_check_outcome(outcome: &Value, subject: &str) {
+    let ok = outcome["ok"].as_bool().unwrap_or(false);
+    let status = outcome["status"].as_str().unwrap_or("error");
+    let detail = outcome["detail"].as_str().unwrap_or_default();
+    let mark = if ok { "✓" } else { "✗" };
+    println!("{mark} {subject}: {status}");
+    if let Some(identity) = outcome["identity"].as_str() {
+        println!("  authenticated as: {identity}");
+    }
+    if !detail.is_empty() {
+        println!("  {detail}");
+    }
+}
+
 /// The parsed command-line action. Group-only nodes (e.g. bare `ralphus
 /// run`) are represented by that group enum's own `Help` variant so every
 /// node in the tree has well-defined, non-panicking behavior.

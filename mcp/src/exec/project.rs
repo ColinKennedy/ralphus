@@ -36,6 +36,7 @@ pub fn execute(cmd: ProjectCommand, client: &DaemonClient) -> ExecResult {
         ProjectCommand::Get { name } => Ok(client.get_project(&name)?),
         ProjectCommand::Remove { name } => Ok(client.remove_project(&name)?),
         ProjectCommand::Fork(cmd) => exec_fork(cmd, client),
+        ProjectCommand::CheckDestination { name } => Ok(client.check_project_destination(&name)?),
         ProjectCommand::ReviewSettings(cmd) => exec_review_settings(cmd, client),
     }
 }
@@ -70,6 +71,7 @@ fn exec_review_settings(cmd: ProjectReviewSettingsCommand, client: &DaemonClient
             auto_fix_prompt_template,
             discourage_tests_during_auto_pull_request_fixes,
             auto_cancel_outdated_pr_pipelines,
+            cache_manual_checks,
         } => {
             let patch = ProjectReviewSettingsPatch {
                 default_resolver_agent: resolver_agent.as_deref(),
@@ -92,6 +94,7 @@ fn exec_review_settings(cmd: ProjectReviewSettingsCommand, client: &DaemonClient
                 auto_fix_prompt_template: auto_fix_prompt_template.as_deref(),
                 discourage_tests_during_auto_pull_request_fixes,
                 auto_cancel_outdated_pr_pipelines,
+                cache_manual_checks,
             };
             Ok(client.set_project_review_settings(&name, &patch)?)
         }
@@ -133,6 +136,9 @@ fn exec_fork(cmd: ProjectForkCommand, client: &DaemonClient) -> ExecResult {
         )?),
         ProjectForkCommand::Remove { project, user } => {
             Ok(client.remove_project_fork(&project, user.as_deref().unwrap_or(""))?)
+        }
+        ProjectForkCommand::Check { project, url, user } => {
+            Ok(client.check_project_fork_url(&project, &url, user.as_deref())?)
         }
     }
 }

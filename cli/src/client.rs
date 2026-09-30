@@ -496,6 +496,7 @@ impl DaemonClient {
             "auto_cancel_outdated_pr_pipelines",
             patch.auto_cancel_outdated_pr_pipelines,
         );
+        set_if_some(&mut body, "cache_manual_checks", patch.cache_manual_checks);
         self.post(&format!("/api/projects/{name}/review-settings"), Some(body))
     }
 
@@ -597,6 +598,39 @@ impl DaemonClient {
     /// `DELETE /api/users/{user}/forge-tokens/{host}` (RAL-338 follow-up).
     pub fn delete_user_forge_token(&self, user: &str, host: &str) -> Result<Value, DaemonError> {
         self.delete(&format!("/api/users/{user}/forge-tokens/{host}"))
+    }
+
+    /// `POST /api/users/{user}/forge-tokens/{host}/check` (RAL-523): manual
+    /// connectivity check of the token *stored* for `(user, host)` -- the
+    /// daemon authenticates against the forge with it and reports whether
+    /// the token works and the forge is reachable. Never returns the token.
+    pub fn check_user_forge_token(&self, user: &str, host: &str) -> Result<Value, DaemonError> {
+        self.post(
+            &format!("/api/users/{user}/forge-tokens/{host}/check"),
+            None,
+        )
+    }
+
+    /// `POST /api/projects/{name}/forks/check` (RAL-523): manual
+    /// reachability check for one fork URL; `user` (when given) names whose
+    /// stored forge token should authenticate the check.
+    pub fn check_project_fork_url(
+        &self,
+        project: &str,
+        url: &str,
+        user: Option<&str>,
+    ) -> Result<Value, DaemonError> {
+        self.post(
+            &format!("/api/projects/{project}/forks/check"),
+            Some(json!({"url": url, "user": user.unwrap_or("")})),
+        )
+    }
+
+    /// `POST /api/projects/{name}/check-destination` (RAL-523): manual
+    /// reachability check for the project's destination repository (its
+    /// registered clone URL, else the checkout's forge remote).
+    pub fn check_project_destination(&self, project: &str) -> Result<Value, DaemonError> {
+        self.post(&format!("/api/projects/{project}/check-destination"), None)
     }
 
     /// `GET /api/internal/fork-credential` (RAL-338 follow-up): the
@@ -1673,6 +1707,11 @@ impl DaemonClient {
             "auto_cancel_outdated_pr_pipelines",
             settings.auto_cancel_outdated_pr_pipelines,
         );
+        set_if_some(
+            &mut body,
+            "cache_manual_checks",
+            settings.cache_manual_checks,
+        );
         self.post(
             &format!("/api/guardians/{guardian_id}/settings"),
             Some(body),
@@ -2004,6 +2043,11 @@ pub struct GuardianSettings<'a> {
     /// pipelines whenever a newer commit is force-pushed onto the same
     /// branch. Defaults to `true` (on by default) when unset.
     pub auto_cancel_outdated_pr_pipelines: Option<bool>,
+    /// RAL-521: whether this review's manual checks are computed once, when
+    /// its review branches are first created, and then reused through later
+    /// merges, rebases, and automated fix iterations. Defaults to `true`
+    /// (on by default) when unset.
+    pub cache_manual_checks: Option<bool>,
 }
 
 /// RAL-408: bundled optional fields for
@@ -2047,6 +2091,11 @@ pub struct ProjectReviewSettingsPatch<'a> {
     /// still-running CI pipelines whenever a newer commit is force-pushed
     /// onto the same branch. Defaults to `true` (on by default) when unset.
     pub auto_cancel_outdated_pr_pipelines: Option<bool>,
+    /// RAL-521: the project's default for whether a review's manual checks
+    /// are computed once, when its review branches are first created, and
+    /// then reused through later merges, rebases, and automated fix
+    /// iterations. Defaults to `true` (on by default) when unset.
+    pub cache_manual_checks: Option<bool>,
 }
 
 #[cfg(test)]

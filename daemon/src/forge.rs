@@ -2617,6 +2617,315 @@ pub fn verify_forge_token(kind: ForgeKind, api_base: &str, token: &str) -> Token
     }
 }
 
+/// The safe, user-facing result of one manual connectivity check (RAL-523).
+/// `detail` is the human-readable explanation shown verbatim in the board and
+/// the CLI; it is built only from status codes, the forge's own response
+/// body, and this crate's own text -- never from the request that produced
+/// it -- so the API token (which travels only in headers) can never appear in
+/// it. `identity` is who/what the forge says the request authenticated as,
+/// when the check got an authenticated answer (the token's account for token
+/// checks; the repository's canonical path for reachability checks).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ForgeCheckOutcome {
+    /// Whether the check got the answer it wanted (an authenticated yes for
+    /// a token check; a found-repository answer for a reachability check).
+    pub ok: bool,
+    /// Machine-readable verdict: `"ok"`, `"unauthorized"`, `"forbidden"`,
+    /// `"not_found"`, `"no_token"`, `"unreachable"`, `"error"`, or
+    /// `"unresolvable"` (the URL could not be resolved to a REST identity at
+    /// all -- see [`ForgeCheckOutcome::unresolvable`]).
+    pub status: String,
+    /// Human-readable explanation, safe to display and copy (see the struct
+    /// doc for what can never appear in it).
+    pub detail: String,
+    /// Who/what the forge says the request authenticated as, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+}
+
+impl ForgeCheckOutcome {
+    fn failure(status: &str, detail: String) -> Self {
+        Self {
+            ok: false,
+            status: status.to_string(),
+            detail,
+            identity: None,
+        }
+    }
+
+    /// The outcome for a URL no forge REST identity could be resolved from
+    /// at all (RAL-523) -- not a network verdict but a configuration
+    /// diagnostic, carrying the actionable explanation of what the URL would
+    /// have to look like for a check to be possible.
+    #[must_use]
+    pub fn unresolvable(detail: String) -> Self {
+        Self::failure("unresolvable", detail)
+    }
+}
+
+/// Longest forge-response-body snippet folded into a failure `detail`. The
+/// body is the forge's own error text (useful for self-hosted instances
+/// whose messages name the actual problem); capped so one pathological
+/// response can't flood the board's status cell.
+const CHECK_BODY_SNIPPET_MAX: usize = 300;
+
+/// Run one probe request and normalize its every possible outcome into a
+/// [`ForgeCheckOutcome`] (RAL-523). `identity_from_body` extracts the
+/// authenticated identity from a success body. Shared by
+/// [`ForgeClient::check_token`] and [`ForgeClient::check_repo`] so both forges'
+/// probes normalize identically -- the forge-specific part is only which URL
+/// is probed and how the identity is read, which is exactly where
+/// GitHub/GitLab parity must not drift.
+fn run_forge_check(
+    req: ureq::Request,
+    ok_detail: &dyn Fn(&serde_json::Value) -> String,
+    identity_from_body: &dyn Fn(&serde_json::Value) -> Option<String>,
+) -> ForgeCheckOutcome {
+    let req = req.timeout(Duration::from_secs(15));
+    match req.call() {
+        Ok(resp) => match parse_body(resp) {
+            Ok(body) => ForgeCheckOutcome {
+                ok: true,
+                status: "ok".to_string(),
+                detail: ok_detail(&body),
+                identity: identity_from_body(&body),
+            },
+            Err(e) => ForgeCheckOutcome::failure(
+                "error",
+                format!("the forge answered but its response body could not be read: {e}"),
+            ),
+        },
+        Err(ureq::Error::Status(code, resp)) => {
+            // Best-effort body read: the forge's own error message is often
+            // the single most useful thing in a failed check (GitLab in
+            // particular explains scope problems here). Never echoed: the
+            // token only ever travels in a request header, so it cannot be
+            // in this response.
+            let forge_message = resp
+                .into_string()
+                .ok()
+                .map(|b| b.trim().to_string())
+                .filter(|b| !b.is_empty())
+                .map(|b| {
+                    let mut b = b;
+                    if b.len() > CHECK_BODY_SNIPPET_MAX {
+                        b.truncate(CHECK_BODY_SNIPPET_MAX);
+                        b.push_str(" …");
+                    }
+                    format!(": {b}")
+                })
+                .unwrap_or_default();
+            let (status, detail) = match code {
+                401 => (
+                    "unauthorized",
+                    "the forge rejected the request's credentials (401) -- the token is wrong, "
+                        .to_string()
+                        + "expired, or lacks the needed scope",
+                ),
+                403 => (
+                    "forbidden",
+                    "the forge refused the request (403) -- the credentials are accepted but not "
+                        .to_string()
+                        + "allowed to see this resource (or the request was rate-limited)",
+                ),
+                404 => (
+                    "not_found",
+                    "the forge reports no such resource (404) -- it does not exist, or it is "
+                        .to_string()
+                        + "private and this request had no access to it (forges hide private \
+                         repositories behind 404 rather than confirming they exist)",
+                ),
+                _ => ("error", format!("the forge answered with HTTP {code}")),
+            };
+            ForgeCheckOutcome::failure(status, format!("{detail}{forge_message}"))
+        }
+        Err(e) => ForgeCheckOutcome::failure(
+            "unreachable",
+            format!("could not reach the forge to check (network/DNS/timeout): {e}"),
+        ),
+    }
+}
+
+impl ForgeClient {
+    /// Manual token check (RAL-523): one authenticated GET of the forge's
+    /// "who am I" endpoint, reporting whether `self.token` can authenticate
+    /// against its forge at all. Distinct from
+    /// [`verify_forge_token`] (RAL-490), which answers the narrower
+    /// just-typed-a-token question for a token that is not persisted anywhere;
+    /// this one is the *stored*-token re-check -- same probe, but it reports
+    /// who the token authenticates as and never needs the token value to be
+    /// re-supplied by the caller.
+    #[must_use]
+    pub fn check_token(&self) -> ForgeCheckOutcome {
+        let Some(token) = &self.token else {
+            return ForgeCheckOutcome::failure(
+                "no_token",
+                "no forge API token is configured for this check -- set one first".to_string(),
+            );
+        };
+        let req = match self.kind {
+            ForgeKind::GitHub => http_agent()
+                .get(&format!("{}/user", self.api_base))
+                .set("Authorization", &format!("Bearer {token}")),
+            ForgeKind::GitLab => http_agent()
+                .get(&format!("{}/user", self.api_base))
+                .set("PRIVATE-TOKEN", token),
+        };
+        run_forge_check(
+            req,
+            &|_| {
+                format!(
+                    "the forge at {} accepted this token for an authenticated request",
+                    self.api_base
+                )
+            },
+            &|body| {
+                body["login"]
+                    .as_str()
+                    .or_else(|| body["username"].as_str())
+                    .map(str::to_string)
+            },
+        )
+    }
+
+    /// Manual repository-reachability check (RAL-523): one GET of this
+    /// client's own repository (GitHub `GET /repos/{owner}/{repo}`, GitLab
+    /// `GET /projects/{id}`), so a user can confirm a configured destination
+    /// exists and the request's credentials can see it before anything tries
+    /// to push or open a PR/MR against it. Works unauthenticated too -- a
+    /// public repository answers 200 without a token, reported as reachable
+    /// with no identity; a private one reports 404 (forges hide private
+    /// repositories from unauthorized callers), which the outcome's detail
+    /// explains rather than leaving "404" to be guessed at.
+    #[must_use]
+    pub fn check_repo(&self) -> ForgeCheckOutcome {
+        let req = match self.kind {
+            ForgeKind::GitHub => {
+                let mut r =
+                    http_agent().get(&format!("{}/repos/{}", self.api_base, self.repo_path));
+                if let Some(token) = &self.token {
+                    r = r.set("Authorization", &format!("Bearer {token}"));
+                }
+                r
+            }
+            ForgeKind::GitLab => {
+                let mut r =
+                    http_agent().get(&format!("{}/projects/{}", self.api_base, self.repo_path));
+                if let Some(token) = &self.token {
+                    r = r.set("PRIVATE-TOKEN", token);
+                }
+                r
+            }
+        };
+        run_forge_check(
+            req,
+            &|_| {
+                format!(
+                    "the forge at {} answered for repository {}",
+                    self.api_base, self.repo_path
+                )
+            },
+            &|body| {
+                body["full_name"]
+                    .as_str()
+                    .or_else(|| body["path_with_namespace"].as_str())
+                    .map(str::to_string)
+            },
+        )
+    }
+}
+
+/// The daemon's own forge API token for `kind` at `host` (RAL-523
+/// connectivity checks): `[forge].token_env` (or the kind's default env var)
+/// when set in the daemon's environment, else the forge CLI's cached login
+/// via the same best-effort fallback every real forge client build uses -- so
+/// a manual check exercises exactly the credential chain a push or PR/MR
+/// submission would, not some parallel idea of it.
+#[must_use]
+pub fn daemon_forge_token(
+    kind: ForgeKind,
+    host: &str,
+    token_env_override: Option<&str>,
+) -> Option<String> {
+    let env_name = token_env_override
+        .map(str::to_string)
+        .unwrap_or_else(|| kind.default_token_env().to_string());
+    match std::env::var(&env_name) {
+        Ok(t) if !t.trim().is_empty() => Some(t),
+        Ok(_) | Err(_) => resolve_cli_token_cached(kind, host).ok(),
+    }
+}
+
+/// Resolve a repository clone URL (any form git accepts: `https://`,
+/// `ssh://`, `git://`, or scp-style `git@host:path`) into the forge REST API
+/// identity a connectivity check probes (RAL-523): `(kind, host, api_base,
+/// repo_path)` with `repo_path` shaped the way [`ForgeClient`] addresses that
+/// forge (plain `owner/repo` for GitHub, percent-encoded namespace path for
+/// GitLab). This is the defined SSH-clone-URL resolution path: SSH URLs name
+/// the same host/path pair an HTTPS clone would, so they resolve through the
+/// identical parse -- the SSH transport itself is never contacted.
+///
+/// # Errors
+/// A URL that does not parse as a forge repository URL, or whose host cannot
+/// be attributed to a supported forge (and which `cfg` does not pin with
+/// `[forge].kind`), returns an actionable diagnostic explaining exactly that.
+pub fn resolve_repository_identity(
+    url: &str,
+    cfg: &ForgeConfig,
+) -> Result<(ForgeKind, String, String, String), String> {
+    let url = url.trim();
+    let (host, path) = parse_remote_url(url).ok_or_else(|| {
+        format!(
+            "could not parse {url:?} as a forge repository URL -- connectivity checks go \
+             through the forge REST API, which needs an https://host/owner/repo, \
+             ssh://git@host/owner/repo, or git@host:owner/repo style URL"
+        )
+    })?;
+    let kind = cfg
+        .kind
+        .as_deref()
+        .and_then(ForgeKind::parse)
+        .or_else(|| ForgeKind::from_host(&host))
+        .ok_or_else(|| {
+            format!(
+                "could not determine the forge kind for host {host:?} -- connectivity checks \
+                 support GitHub and GitLab hosts; set [forge].kind explicitly for self-hosted \
+                 instances with neither in the hostname"
+            )
+        })?;
+    let api_base = cfg
+        .api_base
+        .clone()
+        .unwrap_or_else(|| kind.default_api_base(&host));
+    let repo_path = match kind {
+        ForgeKind::GitHub => path,
+        ForgeKind::GitLab => path.replace('/', "%2F"),
+    };
+    Ok((kind, host, api_base, repo_path))
+}
+
+/// Manual repository-reachability check for an arbitrary clone URL (RAL-523):
+/// resolve [`resolve_repository_identity`]'s REST identity from `url`, build
+/// a [`ForgeClient`] for it, and run [`ForgeClient::check_repo`] with the
+/// caller's `token_override` when given, else the daemon's own credential
+/// chain ([`daemon_forge_token`]). Unresolvable URLs are the `Err` case --
+/// the caller surfaces that diagnostic as a failed check, not an API error.
+///
+/// # Errors
+/// See [`resolve_repository_identity`].
+pub fn check_repository_url(
+    url: &str,
+    cfg: &ForgeConfig,
+    token_override: Option<&str>,
+) -> Result<ForgeCheckOutcome, String> {
+    let (kind, host, api_base, repo_path) = resolve_repository_identity(url, cfg)?;
+    let token = match token_override {
+        Some(t) => Some(t.to_string()),
+        None => daemon_forge_token(kind, &host, cfg.token_env.as_deref()),
+    };
+    Ok(ForgeClient::new(kind, api_base, repo_path, token).check_repo())
+}
+
 /// Parse a git remote URL into `(host, path)`, where `path` has no leading
 /// slash, trailing slash, or `.git` suffix. Supports the three shapes git
 /// itself accepts: `git@host:owner/repo.git`, `https://host/owner/repo.git`,
@@ -6561,5 +6870,314 @@ mod tests {
         // failure without this test's runtime depending on an actual timeout.
         let outcome = verify_forge_token(ForgeKind::GitHub, "http://127.0.0.1:0", "tok");
         assert_eq!(outcome, TokenVerifyOutcome::Unreachable);
+    }
+
+    // ---- RAL-523: manual forge connectivity checks ----
+
+    fn check_outcome_status(outcome: &ForgeCheckOutcome) -> &str {
+        &outcome.status
+    }
+
+    #[test]
+    fn check_token_github_ok_reports_identity_and_sends_the_bearer_header() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/user");
+            assert_eq!(
+                req_header(&req, "Authorization").as_deref(),
+                Some("Bearer sekrit-523")
+            );
+            req.respond(
+                tiny_http::Response::from_string(r#"{"login":"alice"}"#).with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            String::new(),
+            Some("sekrit-523".to_string()),
+        );
+        let outcome = client.check_token();
+        assert!(outcome.ok);
+        assert_eq!(check_outcome_status(&outcome), "ok");
+        assert_eq!(outcome.identity.as_deref(), Some("alice"));
+        assert!(
+            !outcome.detail.contains("sekrit-523"),
+            "the token must never appear in the detail"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn check_token_gitlab_ok_uses_the_private_token_header_and_username_identity() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/user");
+            assert_eq!(req_header(&req, "PRIVATE-TOKEN").as_deref(), Some("tok"));
+            req.respond(
+                tiny_http::Response::from_string(r#"{"username":"bob"}"#).with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            String::new(),
+            Some("tok".to_string()),
+        );
+        let outcome = client.check_token();
+        assert!(outcome.ok);
+        assert_eq!(outcome.identity.as_deref(), Some("bob"));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn check_token_reports_unauthorized_and_folds_in_the_forges_own_message() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            req.respond(
+                tiny_http::Response::from_string(r#"{"message":"401 Unauthorized"}"#)
+                    .with_status_code(401),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            String::new(),
+            Some("bad".to_string()),
+        );
+        let outcome = client.check_token();
+        assert!(!outcome.ok);
+        assert_eq!(check_outcome_status(&outcome), "unauthorized");
+        assert!(outcome.detail.contains("401"));
+        assert!(
+            outcome.detail.contains("401 Unauthorized"),
+            "the forge's own error text is the most useful part of a failed check"
+        );
+        assert!(
+            !outcome.detail.contains("bad"),
+            "the token must never appear in the detail"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn check_token_without_a_token_reports_no_token_without_contacting_the_forge() {
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            "http://127.0.0.1:0".to_string(),
+            String::new(),
+            None,
+        );
+        let outcome = client.check_token();
+        assert!(!outcome.ok);
+        assert_eq!(check_outcome_status(&outcome), "no_token");
+    }
+
+    #[test]
+    fn check_token_reports_unreachable_when_nothing_is_listening() {
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            "http://127.0.0.1:0".to_string(),
+            String::new(),
+            Some("tok".to_string()),
+        );
+        let outcome = client.check_token();
+        assert!(!outcome.ok);
+        assert_eq!(check_outcome_status(&outcome), "unreachable");
+    }
+
+    #[test]
+    fn check_repo_github_ok_reports_the_full_name() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/repos/acme/widget");
+            req.respond(
+                tiny_http::Response::from_string(r#"{"full_name":"acme/widget"}"#)
+                    .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        let outcome = client.check_repo();
+        assert!(outcome.ok);
+        assert_eq!(outcome.identity.as_deref(), Some("acme/widget"));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn check_repo_gitlab_ok_addresses_the_percent_encoded_project_path() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/projects/acme%2Fwidget%2Fsub");
+            req.respond(
+                tiny_http::Response::from_string(r#"{"path_with_namespace":"acme/widget/sub"}"#)
+                    .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "acme%2Fwidget%2Fsub".to_string(),
+            None,
+        );
+        let outcome = client.check_repo();
+        assert!(
+            outcome.ok,
+            "a public repo must be reachable unauthenticated too"
+        );
+        assert_eq!(outcome.identity.as_deref(), Some("acme/widget/sub"));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn check_repo_reports_not_found_on_404_and_forbidden_on_403() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            req.respond(tiny_http::Response::from_string("{}").with_status_code(404))
+                .unwrap();
+            let req = server.recv().unwrap();
+            req.respond(tiny_http::Response::from_string("{}").with_status_code(403))
+                .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/private".to_string(),
+            Some("tok".to_string()),
+        );
+        let not_found = client.check_repo();
+        assert_eq!(check_outcome_status(&not_found), "not_found");
+        assert!(
+            not_found.detail.contains("private"),
+            "a 404 on a repo check should explain that forges hide private repositories behind 404"
+        );
+        let forbidden = client.check_repo();
+        assert_eq!(check_outcome_status(&forbidden), "forbidden");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn resolve_repository_identity_handles_every_clone_url_shape() {
+        let cfg = ForgeConfig::default();
+        let (kind, host, api_base, repo_path) =
+            resolve_repository_identity("https://github.com/acme/widget.git", &cfg).unwrap();
+        assert_eq!(
+            (kind, host.as_str(), api_base.as_str(), repo_path.as_str()),
+            (
+                ForgeKind::GitHub,
+                "github.com",
+                "https://api.github.com",
+                "acme/widget"
+            )
+        );
+        let (_, host, _, repo_path) =
+            resolve_repository_identity("ssh://git@gitlab.com/acme/widget.git", &cfg).unwrap();
+        assert_eq!(
+            (host.as_str(), repo_path.as_str()),
+            ("gitlab.com", "acme%2Fwidget")
+        );
+        let (_, host, _, repo_path) =
+            resolve_repository_identity("git@github.com:acme/widget.git", &cfg).unwrap();
+        assert_eq!(
+            (host.as_str(), repo_path.as_str()),
+            ("github.com", "acme/widget")
+        );
+    }
+
+    #[test]
+    fn resolve_repository_identity_honors_config_overrides_and_fails_actionably() {
+        // A self-hosted instance pins both its kind and its API base.
+        let mut cfg = ForgeConfig {
+            kind: Some("github".to_string()),
+            api_base: Some("https://ghe.example.com/api".to_string()),
+            ..ForgeConfig::default()
+        };
+        let (kind, _, api_base, _) =
+            resolve_repository_identity("https://ghe.example.com/acme/widget", &cfg).unwrap();
+        assert_eq!(
+            (kind, api_base.as_str()),
+            (ForgeKind::GitHub, "https://ghe.example.com/api")
+        );
+        // `[forge].kind` alone rescues a host with neither "github" nor
+        // "gitlab" in its name.
+        cfg.api_base = None;
+        cfg.kind = Some("gitlab".to_string());
+        let (kind, _, _, repo_path) =
+            resolve_repository_identity("https://forge.internal/acme/widget", &cfg).unwrap();
+        assert_eq!(
+            (kind, repo_path.as_str()),
+            (ForgeKind::GitLab, "acme%2Fwidget")
+        );
+        // Without the pin, the unattributable host is an actionable failure.
+        cfg.kind = None;
+        let err =
+            resolve_repository_identity("https://forge.internal/acme/widget", &cfg).unwrap_err();
+        assert!(
+            err.contains("forge.internal"),
+            "the diagnostic must name the unattributable host"
+        );
+        let err = resolve_repository_identity("not a url at all", &cfg).unwrap_err();
+        assert!(
+            err.contains("https://host/owner/repo"),
+            "the diagnostic must show what a workable URL looks like"
+        );
+    }
+
+    #[test]
+    fn check_repository_url_uses_the_callers_token_override() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/repos/acme/widget");
+            assert_eq!(
+                req_header(&req, "Authorization").as_deref(),
+                Some("Bearer user-token")
+            );
+            req.respond(
+                tiny_http::Response::from_string(r#"{"full_name":"acme/widget"}"#)
+                    .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let cfg = ForgeConfig {
+            api_base: Some(format!("http://{addr}")),
+            ..ForgeConfig::default()
+        };
+        let outcome =
+            check_repository_url("https://github.com/acme/widget", &cfg, Some("user-token"))
+                .unwrap();
+        assert!(outcome.ok);
+        assert_eq!(outcome.identity.as_deref(), Some("acme/widget"));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn check_repository_url_reports_unresolvable_urls_as_an_err_not_a_network_verdict() {
+        let cfg = ForgeConfig::default();
+        let err =
+            check_repository_url("https://forge.internal/acme/widget", &cfg, None).unwrap_err();
+        assert!(err.contains("forge.internal"));
     }
 }

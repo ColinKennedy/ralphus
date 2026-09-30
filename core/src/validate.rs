@@ -291,6 +291,7 @@ pub const REVIEW_KEYS: &[&str] = &[
     "auto_cancel_outdated_pr_pipelines",
     "checks",
     "summary_format",
+    "cache_manual_checks",
 ];
 /// RAL-395: the literal placeholder every `auto_fix_prompt_template` must
 /// contain -- shared between `[[review]]` submission validation
@@ -1975,6 +1976,7 @@ fn validate_review_blocks(value: Option<&toml::Value>, ctx: &mut Ctx) {
             &rpath,
             header,
         );
+        check_type(ctx, table, "cache_manual_checks", Ty::Bool, &rpath, header);
         check_type(
             ctx,
             table,
@@ -3514,6 +3516,32 @@ prompt = "make it build"
         assert!(
             r.errors.iter().any(|e| e.kind == ErrorKind::WrongType
                 && e.message.contains("auto_cancel_outdated_pr_pipelines")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    // ── [[review]] cache_manual_checks (RAL-521) ──
+
+    #[test]
+    fn review_cache_manual_checks_accepted() {
+        for value in ["true", "false"] {
+            let src = format!(
+                "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\ncache_manual_checks={value}\n"
+            );
+            let r = validate_toml(&src);
+            assert!(r.is_ok(), "{value}: {:?}", r.errors);
+        }
+    }
+
+    #[test]
+    fn review_cache_manual_checks_wrong_type_reported() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\ncache_manual_checks=\"yes\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors.iter().any(
+                |e| e.kind == ErrorKind::WrongType && e.message.contains("cache_manual_checks")
+            ),
             "{:?}",
             r.errors
         );

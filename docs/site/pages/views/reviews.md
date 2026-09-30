@@ -31,8 +31,17 @@ once you click **Save**, which re-runs the stacked rebase in the new shape.
 ![The manual-checks dropdown open, showing individual suggested commands](../screenshots/reviews-manual-checks.png)
 
 Alongside the automated check gates, an agent suggests shell commands worth
-running by hand to sanity-check the change (regenerated every time the
-branch is rebuilt). **▶ Run all** launches every suggested command at once in
+running by hand to sanity-check the change. The suggestions are computed once,
+when the review's branches are first created, and then kept through later
+merges, rebases, and automated fix iterations — manual checks describe review
+work that doesn't change across an ordinary rebase, so ralphus doesn't spend
+another agent run re-deriving the same list. If your workflow needs fresh
+suggestions on every rebuild instead, turn the caching off: set
+`[[review]] cache_manual_checks = false` on the review (or a `[review]
+cache_manual_checks = false` project default) and every later merge or rebase
+regenerates the commands from the freshly stacked diff.
+
+**▶ Run all** launches every suggested command at once in
 a new terminal in the repository root; the **▾** next to it opens the
 individual commands so you can run just one.
 

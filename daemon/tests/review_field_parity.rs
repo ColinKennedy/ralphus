@@ -19,6 +19,7 @@ const PAIRS: &[(&str, &str)] = &[
     ("checks", "checks"),
     ("auto_build", "auto_build"),
     ("summary_format", "summary_format"),
+    ("cache_manual_checks", "cache_manual_checks"),
 ];
 
 const REVIEW_DEF_ONLY_EXCLUSIONS: &[(&str, &str)] = &[

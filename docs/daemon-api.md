@@ -228,6 +228,13 @@ produced no pane output.
 | DELETE | `/api/projects/{name}/forks/{user}` | Remove one user's fork row |
 | GET | `/api/health/project-forks` | [Advisory health checks](#fork-registration-ral-338) for every registered fork row |
 
+**Forge connectivity checks (RAL-523, manual-only)**
+| Method | Path | What |
+|---|---|---|
+| POST | `/api/users/{user}/forge-tokens/{host}/check` | [One authenticated "who am I" request](#manual-forge-connectivity-checks-ral-523) with the token stored for `(user, host)` |
+| POST | `/api/projects/{name}/forks/check` | [One reachability request](#manual-forge-connectivity-checks-ral-523) for a fork URL (`{url, user?}`), before or instead of saving it |
+| POST | `/api/projects/{name}/check-destination` | [One reachability request](#manual-forge-connectivity-checks-ral-523) for the project's destination repository (its clone URL, else its checkout's forge remote) |
+
 **Mailbox (RAL-241, poll-only scope)**
 | Method | Path | What |
 |---|---|---|
@@ -1839,6 +1846,28 @@ also declarable at submit time in `[[review]]` as the same names, except
 `[[review]] upstream`: the guardian's base branch is minted from that declared
 or inferred upstream when the review is created.
 
+`cache_manual_checks` (RAL-521, boolean, default `true`) controls whether a
+review's manual checks — the agent-suggested shell commands a human reviewer
+can run by hand — are computed once, when the review's branches are first
+created, and then reused through every later merge, rebase, and automated fix
+iteration. The default keeps that first result: manual checks describe review
+work that does not change across ordinary rebases and autofixes, so
+regenerating them on every rebuild just repeats a multi-minute agent call and
+flips the checks panel through "generating" states for nothing. Setting it to
+`false` (per review, or as a `[review] cache_manual_checks` project default in
+`.ralphus.toml` or the project review-settings database) restores the
+recompute-on-every-build behavior. Precedence is the usual layered one: a
+review's own `[[review]] cache_manual_checks` (or a later `POST
+.../settings` write of it) wins over the project default, which wins over the
+global config's `[review]` value, which wins over the built-in `true`. The
+marker that records "the checks were computed once" lives on the review row
+itself, so caching never leaks a result between reviews — a first generation
+that produced no commands doesn't set it, so the next rebuild tries again and
+only a non-empty result sticks. But note that a review reused across
+submissions via a `ralphus:new-review/<key>` link is one review, so its first
+generation (from whichever submission built its branches first) is what
+sticks.
+
 `base_shift_maximum_rebuilds` (RAL-507, optional positive integer, default 3)
 caps how many times the automatic base-branch-update rebuild may retry one
 unresolved base shift -- a rebuild that keeps failing on the same new base (a
@@ -2520,6 +2549,53 @@ and does not itself block anything — submission's own pre-flight
 
 See [`fork-workflows.md`](fork-workflows.md) for topology, promotion, and
 setup guidance.
+
+### Manual forge connectivity checks (RAL-523)
+
+Three on-demand probes that answer "is this forge credential / repository
+actually usable right now?" — each is one REST API request run daemon-side,
+never polled, and reported as the same `ForgeCheckOutcome` shape:
+
+```json
+{ "ok": false, "status": "unauthorized", "detail": "the forge rejected ...", "identity": null }
+```
+
+`status` is one of `ok`, `unauthorized` (401), `forbidden` (403),
+`not_found` (404), `no_token`, `unreachable` (network/DNS/timeout), `error`
+(any other HTTP answer), or `unresolvable` (the URL could not be resolved to
+a REST identity at all — a configuration diagnostic, not a network verdict).
+A *failed check is still a `200`*: the endpoint did its job, which was to
+find out. `detail` is a human-readable explanation safe to display and copy,
+and never contains any token value (the token travels only in a request
+header, and forge responses never echo it). `identity` names who/what the
+request authenticated as (`login`/`username` for token checks,
+`full_name`/`path_with_namespace` for repository checks) when the forge
+reported one.
+
+- `POST /api/users/{user}/forge-tokens/{host}/check` — probes the token
+  *stored* for `(user, host)` (self-or-admin gated, like the rest of the
+  forge-token surface). `404` when no token is stored; `400` when `host`
+  cannot be attributed to a supported forge. Distinct from
+  `POST /api/users/{user}/forge-tokens/verify` (RAL-490), which probes a
+  token the caller just typed and is not persisted anywhere.
+- `POST /api/projects/{name}/forks/check` — body `{"url": ..., "user?":
+  ...}`, self-or-admin gated on `user`. Covers both the not-yet-saved add/edit
+  form and the registered-row case (callers pass the row's own `fork_url`).
+  When `user` names a user with a stored token for the URL's host, that token
+  authenticates the check; otherwise the daemon's own credential chain is
+  used (and a public repository is reachable unauthenticated).
+- `POST /api/projects/{name}/check-destination` — open (it is read-like: one
+  GET, no stored secrets beyond what the daemon already uses for pushes).
+  `404` for an unknown project; a project with neither a registered
+  `clone_url` nor a forge remote answers `unresolvable` with an actionable
+  diagnostic.
+
+SSH-style clone URLs (`git@host:path`, `ssh://...`) are resolved through
+their host/path pair — the SSH transport is never contacted; the check goes
+over HTTPS to the forge's REST API, exactly like every push and PR/MR
+submission does. GitHub and GitLab are at feature parity: same outcome
+shape, same status vocabulary, same identity extraction, different
+endpoints/headers only.
 
 ### `POST /api/guardians/{id}/stop`
 

@@ -381,6 +381,34 @@ pub(crate) fn resolve_project_forge_host(project: &crate::store::ProjectView) ->
     crate::forge::parse_remote_url(url.trim()).map(|(host, _)| host)
 }
 
+/// The destination URL a project's connectivity check probes (RAL-523): the
+/// same precedence [`resolve_project_forge_host`] uses for the host, but
+/// returning the full URL -- the explicitly registered `clone_url` when set,
+/// else the local git remote picked by [`crate::forge::default_remote_name`].
+/// `None` means neither source is set -- the caller reports that as a failed
+/// check with a "configure one first" diagnostic rather than a 4xx.
+#[must_use]
+pub(crate) fn project_destination_url(project: &crate::store::ProjectView) -> Option<String> {
+    if let Some(clone_url) = project
+        .clone_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(clone_url.to_string());
+    }
+    let root = std::path::Path::new(&project.path);
+    let forge_cfg = crate::config::resolve_forge(root);
+    let remote_name = crate::forge::default_remote_name(&forge_cfg);
+    crate::guardian_merge::git(
+        root,
+        &["config", "--get", &format!("remote.{remote_name}.url")],
+    )
+    .ok()
+    .map(|url| url.trim().to_string())
+    .filter(|url| !url.is_empty())
+}
+
 /// Idempotently add or update a local git remote pointing at `fork_url`
 /// under `remote_name`, in the working tree rooted at `root`. Safe to call
 /// before every fork-mode push -- a no-op when the remote already points at
