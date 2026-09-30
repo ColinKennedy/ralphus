@@ -276,7 +276,7 @@ pub fn dispatch(cmd: WaypointCommand, opts: &GlobalOpts) -> i32 {
             for spec in &roster {
                 entries.push(parse_roster_spec(spec)?);
             }
-            let result = client.waypoint_create(
+            let created = client.waypoint_create(
                 &prompt,
                 label.as_deref(),
                 agent.as_deref(),
@@ -284,6 +284,18 @@ pub fn dispatch(cmd: WaypointCommand, opts: &GlobalOpts) -> i32 {
                 allow_advisory,
                 &entries,
             )?;
+            // `POST /api/waypoints` replies `201 {"id": ...}`, not a waypoint
+            // detail, so rendering the reply directly printed a detail view
+            // with every field blank and "no roster entries". Read the
+            // just-created waypoint back so both the human and `--json`
+            // output match every other `waypoint` subcommand. If that read
+            // fails the create still succeeded, so fall back to the id reply
+            // rather than reporting an error.
+            let result = created
+                .get("id")
+                .and_then(Value::as_str)
+                .and_then(|id| client.waypoint_get(id).ok())
+                .unwrap_or(created);
             emit(opts, &result, render_waypoint_detail);
             Ok(())
         }),

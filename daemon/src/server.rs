@@ -6698,6 +6698,43 @@ fn run_submit_followup(
         }
     }
 
+    // RAL-400: hold the gate closed for any already-open waypoint whose scope
+    // overlaps this squad, before the scheduler can claim it. The survey sweep
+    // that would otherwise discover this squad runs up to
+    // `scheduler::WAYPOINT_SURVEY_INTERVAL` later, and the gate is only read at
+    // claim time -- so without this a squad submitted under an open waypoint
+    // starts unguarded, and a short one finishes and goes terminal (hence
+    // permanently unsurveyable) before the waypoint ever sees it. Enrolling at
+    // `block` with no verdict is fail-closed and needs no LLM call here; the
+    // next sweep confirms or releases it. A failure to enroll must not fail the
+    // submission: the squad is already materialized, and the sweep still picks
+    // it up the old way.
+    {
+        let guard = store_handle.lock();
+        match guard.enroll_new_squad_in_open_waypoints(&squad_id) {
+            Ok(enrolled) if !enrolled.is_empty() => {
+                crate::cartographer::Note::new("submit")
+                    .squad(&squad_id)
+                    .scope("waypoint")
+                    .emit(
+                        &guard,
+                        format!(
+                            "squad enrolled on {} open waypoint(s) pending survey",
+                            enrolled.len()
+                        ),
+                        serde_json::json!({ "waypoint_ids": enrolled }),
+                    );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [submit] waypoint enrollment for squad {squad_id} failed: {e}"
+                );
+            }
+        }
+    }
+
     report_phase("Finishing up");
 
     // RAL-318: Triage pooling -- and the worktree placeholder resolution
@@ -14976,10 +15013,19 @@ fn waypoint_create(daemon: &Daemon, body: &str) -> Reply {
     ) {
         return store_error(&e);
     }
+    let waypoint_halts = daemon.waypoint_halts_handle();
     for (kind, entry_id, mode) in &parsed_roster {
         if let Err(e) = store.add_roster_entry(&id, *kind, entry_id, *mode) {
             return store_error(&e);
         }
+        crate::waypoints::signal_explicit_block_halt(
+            &store,
+            &waypoint_halts,
+            &id,
+            *kind,
+            entry_id,
+            *mode,
+        );
     }
     notify_roster_of_new_waypoint(&store, &id, &req.prompt, &parsed_roster);
     json(201, &IdResponse { id })
@@ -15185,6 +15231,14 @@ fn waypoint_add_roster_entry(daemon: &Daemon, id: &str, body: &str) -> Reply {
     if let Err(e) = store.add_roster_entry(id, kind, &req.entry_id, mode) {
         return store_error(&e);
     }
+    crate::waypoints::signal_explicit_block_halt(
+        &store,
+        &daemon.waypoint_halts_handle(),
+        id,
+        kind,
+        &req.entry_id,
+        mode,
+    );
     match waypoint_detail(&store, id) {
         Ok(detail) => json(200, &detail),
         Err(e) => store_error(&e),
@@ -15263,6 +15317,14 @@ fn waypoint_patch_roster_entry(daemon: &Daemon, id: &str, entry_id: &str, body: 
     if let Err(e) = store.add_roster_entry(id, entry.kind, entry_id, mode) {
         return store_error(&e);
     }
+    crate::waypoints::signal_explicit_block_halt(
+        &store,
+        &daemon.waypoint_halts_handle(),
+        id,
+        entry.kind,
+        entry_id,
+        mode,
+    );
     match waypoint_detail(&store, id) {
         Ok(detail) => json(200, &detail),
         Err(e) => store_error(&e),

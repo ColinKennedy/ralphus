@@ -2322,6 +2322,7 @@ impl Store {
                 survey_rationale TEXT,
                 delivery_status  TEXT NOT NULL DEFAULT 'undelivered',
                 stand_down_at_ms INTEGER,
+                auto_enrolled    INTEGER NOT NULL DEFAULT 0,
                 created_at_ms    INTEGER NOT NULL,
                 updated_at_ms    INTEGER NOT NULL,
                 PRIMARY KEY (waypoint_id, kind, entry_id)
@@ -3386,6 +3387,13 @@ impl Store {
             // waypoint -- see `CellView::waypoint_halted_at_ms`. NULL means
             // not halted.
             "ALTER TABLE cells ADD COLUMN waypoint_halted_at_ms INTEGER",
+            // RAL-400: `1` when this roster entry was auto-enrolled by the
+            // daemon (submit-time scope overlap, or the survey sweep's own
+            // discovery) rather than declared explicitly by a human/agent.
+            // Only auto-enrolled entries are eligible to be surveyed, so an
+            // explicit declaration is never second-guessed by the classifier
+            // -- see `waypoints::Store::waypoint_survey_candidates`.
+            "ALTER TABLE waypoint_roster ADD COLUMN auto_enrolled INTEGER NOT NULL DEFAULT 0",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
