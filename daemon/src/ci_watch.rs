@@ -1067,11 +1067,11 @@ fn describe_failing_check(
     // bundles several shell commands needs the agent to read the log and
     // determine which one actually failed, not have one guessed here.
     let command_note = "Before verifying your fix, determine the exact command this failing \
-         step ran -- including any flags and working directory -- from its job URL/log above, \
-         or the CI pipeline/workflow definition if those don't spell it out. Reproduce the \
-         failure and verify your fix using that same command, not a similar-looking one \
-         reconstructed from memory or project convention. If the step runs more than one shell \
-         command, use the log to find out which one actually failed rather than guessing.\n";
+step ran -- including any flags and working directory -- from its job URL/log above, or the \
+CI pipeline/workflow definition if those don't spell it out. Reproduce the failure and verify \
+your fix using that same command, not a similar-looking one reconstructed from memory or \
+project convention. If the step runs more than one shell command, use the log to find out \
+which one actually failed rather than guessing.\n";
     format!("Reason: {reason_line}\n{step_note}{job_note}{log_note}\n{command_note}")
 }
 
