@@ -4592,6 +4592,14 @@ fn record_feedback_reply(
         // hit the wrong endpoint/key.
         return;
     }
+    if !matches!(
+        resolved.backend.to_lowercase().as_str(),
+        "claude" | "anthropic" | "ollama"
+    ) {
+        // `call_direct` only supports these backends; subprocess runners
+        // (like "claude-code") are not supported for direct chat.
+        return;
+    }
     let system = format!(
         "You are the review Guardian. A reviewer just left feedback on branch \
          '{feature}', which an agent is now applying in its review worktree. \
@@ -8080,7 +8088,10 @@ fn guardian_base_already_has_every_branch(
 /// identically. Only valid from `in_review` (mirrors `approve_guardian`'s one
 /// legal transition); returns whether it did.
 fn approve_base_already_landed(store: &crate::store_lock::StoreHandle, id: &str) -> bool {
-    let merged = store.lock().approve_guardian(id).is_ok();
+    let merged = store
+        .lock()
+        .set_guardian_status(id, GuardianStatus::Merged, None)
+        .is_ok();
     if merged {
         // A `MutexGuard` temporary produced in an `if let` scrutinee lives
         // for the whole `if let` (it desugars to `match`), so binding the
