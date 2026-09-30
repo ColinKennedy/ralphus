@@ -943,6 +943,8 @@ struct TaskIndexSquad {
     id: String,
     label: Option<String>,
     state: String,
+    duration_ms: i64,
+    active_duration_intervals: i64,
     tasks: Vec<TaskIndexTask>,
 }
 
@@ -956,6 +958,8 @@ struct TaskIndexTask {
     error: Option<String>,
     cells: Vec<TaskIndexCell>,
     proof: Vec<TaskIndexProof>,
+    duration_ms: i64,
+    active_duration_intervals: i64,
     started_at_ms: Option<i64>,
     finished_at_ms: Option<i64>,
 }
@@ -973,6 +977,8 @@ struct TaskIndexCell {
     agent: String,
     model: Option<String>,
     state: String,
+    duration_ms: i64,
+    active_duration_intervals: i64,
     tokens_in: i64,
     tokens_out: i64,
     cache_creation_tokens: i64,
@@ -1031,6 +1037,8 @@ impl From<crate::store::CellView> for TaskIndexCell {
             agent: value.agent,
             model: value.model,
             state: value.state,
+            duration_ms: value.duration_ms,
+            active_duration_intervals: value.active_duration_intervals,
             tokens_in: value.tokens_in,
             tokens_out: value.tokens_out,
             cache_creation_tokens: value.cache_creation_tokens,
@@ -1060,6 +1068,8 @@ impl From<crate::store::TaskView> for TaskIndexTask {
             error: value.error,
             cells: value.cells.into_iter().map(Into::into).collect(),
             proof: value.proof.into_iter().map(Into::into).collect(),
+            duration_ms: value.duration_ms,
+            active_duration_intervals: value.active_duration_intervals,
             started_at_ms: value.started_at_ms,
             finished_at_ms: value.finished_at_ms,
         }
@@ -1072,6 +1082,8 @@ impl From<crate::store::SquadView> for TaskIndexSquad {
             id: value.id,
             label: value.label,
             state: value.state,
+            duration_ms: value.duration_ms,
+            active_duration_intervals: value.active_duration_intervals,
             tasks: value.tasks.into_iter().map(Into::into).collect(),
         }
     }
@@ -17717,6 +17729,57 @@ mod tests {
         assert!(!index.body.contains("private prompt"));
         assert!(!index.body.contains("private proof"));
         assert!(!index.body.contains("\"system_prompt\""));
+    }
+
+    /// RAL-538: the Tasks tab's `/api/task-index` response must carry the
+    /// same `duration_ms`/`active_duration_intervals` fields as the full
+    /// board's `store::{SquadView,TaskView,CellView}` -- the compact
+    /// `TaskIndex*` structs previously omitted them entirely, so every cell,
+    /// task, and squad silently serialized as `duration_ms: 0` regardless of
+    /// how long it actually ran.
+    #[test]
+    fn task_index_reports_nonzero_duration_for_a_completed_cell() {
+        let d = daemon();
+        let submitted = route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        assert_eq!(submitted.status, 201, "{}", submitted.body);
+        {
+            let store = d.lock();
+            store
+                .set_cell_state("squad-000000000001", 0, 0, NodeState::Running)
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+            store
+                .set_cell_state("squad-000000000001", 0, 0, NodeState::Done)
+                .unwrap();
+            store
+                .set_task_state("squad-000000000001", 0, NodeState::Done)
+                .unwrap();
+            store
+                .set_squad_state("squad-000000000001", SquadState::Done)
+                .unwrap();
+        }
+
+        let index = route(&d, "GET", "/api/task-index", "");
+        assert_eq!(index.status, 200, "{}", index.body);
+        let v: serde_json::Value = serde_json::from_str(&index.body).unwrap();
+        let squad = &v["squads"][0];
+        assert!(
+            squad["duration_ms"].as_i64().unwrap() > 0,
+            "squad duration_ms should be non-zero: {}",
+            index.body
+        );
+        let task = &squad["tasks"][0];
+        assert!(
+            task["duration_ms"].as_i64().unwrap() > 0,
+            "task duration_ms should be non-zero: {}",
+            index.body
+        );
+        let cell = &task["cells"][0];
+        assert!(
+            cell["duration_ms"].as_i64().unwrap() > 0,
+            "cell duration_ms should be non-zero: {}",
+            index.body
+        );
     }
 
     // ── Project registry (RAL-100) ───────────────────────────────────────────
