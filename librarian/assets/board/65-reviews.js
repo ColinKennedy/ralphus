@@ -1593,7 +1593,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
               ? `<div class="warn" style="margin:8px 0 4px">Some branches are not yet ready (still running or never submitted). Merge / rebase will offer to continue with just the ready branches.</div>`
               : "";
           })()}
-          <div class="btn-row">
+          <div class="btn-row review-actions">
             ${(() => {
               // RAL-40: a disabled <button> gets `pointer-events:none` from the
               // global `.btn[disabled]` rule, so the tooltip engine's
@@ -1660,7 +1660,17 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           ${(() => {
             // RAL-77: user-declared test actions from [[review.action]] in TOML.
             const hints = g.action_hints || [];
-            if (hints.length === 0) return "";
+            // An absent section reads as "not applicable to this review", which
+            // is wrong: every review *could* have test actions, they just have
+            // to be declared in the task file. Saying so -- and saying where --
+            // is the difference between a missing feature and a missing input.
+            if (hints.length === 0) {
+              return `<h3 class="section" data-tip="User-declared test actions from the task TOML [[review.action]] blocks.\nLabelled buttons give reviewers one-click access to targeted manual checks.">test actions <span class="k" style="text-transform:none;letter-spacing:0">— none</span></h3>
+                <div class="absent-note" data-tip="Test actions are authored, not generated: add [[review.action]] blocks to the task file and each becomes a labelled, one-click check here.\nThis is different from Manual checks below, which the resolver agent writes for you.">
+                  No test actions declared. Add <span class="mono">[[review.action]]</span> blocks to the
+                  task file to put one-click checks here.
+                </div>`;
+            }
             const btns = hints.map((h, i) => {
               if (h.command) {
                 return renderCheckControl(g, "action", i, h, h.label || "Run");
