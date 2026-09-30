@@ -985,10 +985,12 @@ fn write_ci_failure_log(path: &Path, log_text: &str) -> Option<PathBuf> {
 
 /// Render one failing check/job as a self-contained paragraph for the
 /// auto-fix prompt (RAL-<new>): its reason, its own job URL (when the forge
-/// gave one), and where its own log ended up (or a note that none was
-/// available) -- everything [`dispatch_pr_auto_fix`] joins one of these per
-/// failing check into the final prompt, so an agent facing several failures
-/// at once gets every one of their URLs up front instead of just the first.
+/// gave one), where its own log ended up (or a note that none was
+/// available), and (RAL-533) an instruction to reproduce/verify against the
+/// exact command that step ran rather than a reconstructed guess --
+/// everything [`dispatch_pr_auto_fix`] joins one of these per failing check
+/// into the final prompt, so an agent facing several failures at once gets
+/// every one of their URLs up front instead of just the first.
 /// `reason_line` is passed in rather than derived from `check.name` here
 /// because the caller already knows whether this is the failure's only check
 /// (in which case `PrFailure::reason` already reads naturally, e.g. "check
@@ -1054,7 +1056,25 @@ fn describe_failing_check(
         }
         (_, None) => "The forge did not provide a CI failure log for this job.".to_string(),
     };
-    format!("Reason: {reason_line}\n{step_note}{job_note}{log_note}")
+    // RAL-533: agents were reconstructing a plausible-looking but wrong
+    // reproduction command (e.g. `cargo test` when this repo's CI actually
+    // runs `cargo nextest run --workspace`) instead of reading the one the
+    // failing step itself invoked. Point at the job URL/log above (or, if
+    // those don't spell it out, the CI pipeline/workflow definition) as the
+    // source of truth, rather than reconstructing an equivalent command from
+    // memory or project convention. Deliberately does not extract or
+    // front-load the command itself (interview decision) -- a step that
+    // bundles several shell commands needs the agent to read the log and
+    // determine which one actually failed, not have one guessed here.
+    let command_note = "Before verifying your fix, determine the exact command this failing \
+step ran -- its subcommand and flags -- from its job URL/log above, or the CI pipeline/workflow \
+definition if those don't spell it out. Reproduce the failure and verify your fix using that \
+same command, not a similar-looking one reconstructed from memory or project convention. The \
+machine running this fix is often not the one that ran CI, so an absolute working directory or \
+path named in the log may not exist here -- adapt it to the equivalent location on this machine \
+rather than following it literally. If the step runs more than one shell command, use the log \
+to find out which one actually failed rather than guessing.\n";
+    format!("Reason: {reason_line}\n{step_note}{job_note}{log_note}\n{command_note}")
 }
 
 /// Attributed `author` (RAL-379 semantics) for the feedback message
@@ -1633,6 +1653,54 @@ mod tests {
                     .starts_with("ralphus-ci-watch-pr-test-1-")
             });
         assert!(!leftover, "temp dir must be cleaned up");
+    }
+
+    /// RAL-533: agents were reconstructing a plausible-looking but wrong
+    /// reproduction command (e.g. `cargo test` instead of the project's
+    /// actual `cargo nextest run --workspace`) instead of reading the one
+    /// the failing CI step itself ran. The rendered paragraph must tell the
+    /// agent to determine and reuse that step's own command rather than
+    /// guessing an equivalent one -- with or without a specifically named
+    /// failing step known.
+    #[test]
+    fn describe_failing_check_tells_the_agent_to_reuse_the_step_s_own_command() {
+        let check = FailedCheck {
+            name: "build".to_string(),
+            job_url: Some("https://ci.example/job/1".to_string()),
+            log_text: None,
+            failing_step: Some("cargo nextest run --workspace".to_string()),
+        };
+        let text = describe_failing_check(None, &check, "check 'build' failed", true);
+        assert!(
+            text.contains("the exact command this failing step ran"),
+            "must instruct the agent to find the step's own command: {text}"
+        );
+        assert!(
+            text.contains(
+                "not a similar-looking one reconstructed from memory or project convention"
+            ),
+            "must warn against guessing an equivalent command: {text}"
+        );
+    }
+
+    /// The instruction to reuse the step's own command must still render
+    /// even when no `failing_step` was resolved (the GitHub-only enrichment
+    /// is best-effort, and GitLab never sets it at all) -- the agent still
+    /// needs to be told to look the command up rather than guess, it just
+    /// won't have the step name spelled out for it.
+    #[test]
+    fn describe_failing_check_reuse_instruction_present_without_a_named_failing_step() {
+        let check = FailedCheck {
+            name: "test".to_string(),
+            job_url: None,
+            log_text: None,
+            failing_step: None,
+        };
+        let text = describe_failing_check(None, &check, "check 'test' failed", true);
+        assert!(
+            text.contains("the exact command this failing step ran"),
+            "instruction must not depend on a resolved failing_step: {text}"
+        );
     }
 
     #[test]

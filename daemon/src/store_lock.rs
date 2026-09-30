@@ -52,13 +52,21 @@ static HOLDER: LazyLock<parking_lot::Mutex<Option<HolderInfo>>> =
 const SLOW_WAIT_LOG_THRESHOLD: Duration = Duration::from_secs(2);
 
 /// A `Store` behind an eventually-fair, timed mutex. See the module doc
-/// comment.
-pub struct StoreMutex(parking_lot::Mutex<Store>);
+/// comment. The `memory` field is stored separately to allow
+/// [`lock_free_memory`] to access it without acquiring the store lock.
+pub struct StoreMutex {
+    store: parking_lot::Mutex<Store>,
+    memory: std::sync::Arc<crate::store_memory::StoreMemory>,
+}
 
 impl StoreMutex {
     #[must_use]
     pub fn new(store: Store) -> Self {
-        Self(parking_lot::Mutex::new(store))
+        let memory = std::sync::Arc::clone(&store.memory());
+        Self {
+            store: parking_lot::Mutex::new(store),
+            memory,
+        }
     }
 
     /// Acquire the store lock, recording how long this call waited into both
@@ -73,7 +81,7 @@ impl StoreMutex {
     #[track_caller]
     pub fn lock(&self) -> StoreGuard<'_> {
         let start = Instant::now();
-        let guard = self.0.lock();
+        let guard = self.store.lock();
         let waited = start.elapsed();
         record_wait(waited);
         let loc = Location::caller();
@@ -124,7 +132,7 @@ impl StoreMutex {
     /// the histogram would report contention that no request experienced.
     #[track_caller]
     pub fn try_lock_for(&self, timeout: Duration) -> Option<StoreGuard<'_>> {
-        let guard = self.0.try_lock_for(timeout)?;
+        let guard = self.store.try_lock_for(timeout)?;
         Some(StoreGuard::new(guard, Location::caller()))
     }
 
@@ -139,13 +147,12 @@ impl StoreMutex {
     /// them queue behind the scheduler and the guardian-merge workers was pure
     /// cost.
     ///
-    /// Briefly takes `self.0` to clone the `Arc` out, so it is not literally
-    /// lock-free at the instant of the call; the name is about what the
-    /// *returned* handle costs to use. Hold the result rather than calling this
-    /// repeatedly in a loop.
+    /// This is truly lock-free: the memory Arc is stored separately and does
+    /// not require acquiring the store lock. Hold the result rather than calling
+    /// this repeatedly in a loop.
     #[must_use]
     pub fn lock_free_memory(&self) -> std::sync::Arc<crate::store_memory::StoreMemory> {
-        self.0.lock().memory()
+        std::sync::Arc::clone(&self.memory)
     }
 }
 
