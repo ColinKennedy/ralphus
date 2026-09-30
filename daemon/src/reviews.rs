@@ -385,7 +385,9 @@ struct Membership {
     /// RAL-507: optional base-shift rebuild retry cap declared on the review
     /// (`[[review]] base_shift_maximum_rebuilds`).
     base_shift_maximum_rebuilds: Option<u32>,
-    skip_auto_clean: Option<bool>,
+    proof_skip_auto_clean: Option<bool>,
+    checks: Vec<String>,
+    summary_format: Option<String>,
     match_pr_branch_name: Option<bool>,
     separate_pr_branch: Option<bool>,
     /// Declared `[[review.auto_build]]` steps (RAL-342): zero or more build
@@ -1041,7 +1043,9 @@ pub fn derive_reviews_with_full_prefetch(
             auto_pr_feedback: rv.and_then(|r| r.auto_pr_feedback),
             skip_base_updates: rv.and_then(|r| r.skip_base_updates),
             base_shift_maximum_rebuilds: rv.and_then(|r| r.base_shift_maximum_rebuilds),
-            skip_auto_clean: rv.and_then(|r| r.skip_auto_clean),
+            proof_skip_auto_clean: rv.and_then(|r| r.proof_skip_auto_clean),
+            checks: rv.map(|r| r.checks.clone()).unwrap_or_default(),
+            summary_format: rv.and_then(|r| r.summary_format.clone()),
             match_pr_branch_name: rv.and_then(|r| r.match_pr_branch_name),
             separate_pr_branch: rv.and_then(|r| r.separate_pr_branch),
             auto_build: rv.map(|r| r.auto_build.clone()).unwrap_or_default(),
@@ -1463,7 +1467,7 @@ fn apply_resolver(
             .set_guardian_base_shift_maximum_rebuilds(gid, Some(cap))
             .map_err(|e| ReviewError::new(e.to_string()))?;
     }
-    if let Some(skip) = members.iter().find_map(|m| m.skip_auto_clean) {
+    if let Some(skip) = members.iter().find_map(|m| m.proof_skip_auto_clean) {
         store
             .set_guardian_proof_skip_auto_clean(gid, Some(skip))
             .map_err(|e| ReviewError::new(e.to_string()))?;
@@ -1473,6 +1477,22 @@ fn apply_resolver(
             .set_guardian_match_pr_branch_name(gid, Some(enabled))
             .map_err(|e| ReviewError::new(e.to_string()))?;
     }
+    if let Some(format) = members.iter().find_map(|m| m.summary_format.clone()) {
+        store
+            .set_guardian_summary_format(gid, Some(&format))
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+    }
+    let mut checks = store
+        .guardian_checks(gid)
+        .map_err(|e| ReviewError::new(e.to_string()))?;
+    for check in members.iter().flat_map(|member| &member.checks) {
+        if !checks.contains(check) {
+            checks.push(check.clone());
+        }
+    }
+    store
+        .set_guardian_checks(gid, &checks)
+        .map_err(|e| ReviewError::new(e.to_string()))?;
     if let Some(enabled) = members.iter().find_map(|m| m.separate_pr_branch) {
         store
             .set_guardian_separate_pr_branch(gid, Some(enabled))
@@ -3180,7 +3200,9 @@ mod tests {
             auto_pr_feedback: None,
             skip_base_updates: None,
             base_shift_maximum_rebuilds: None,
-            skip_auto_clean: None,
+            proof_skip_auto_clean: None,
+            checks: Vec::new(),
+            summary_format: None,
             match_pr_branch_name: None,
             separate_pr_branch: None,
             auto_build: Vec::new(),
@@ -3278,7 +3300,9 @@ mod tests {
             skip_worktrees: Some(true),
             auto_pr_feedback: Some(true),
             skip_base_updates: Some(true),
-            skip_auto_clean: Some(true),
+            proof_skip_auto_clean: Some(true),
+            checks: Vec::new(),
+            summary_format: None,
             match_pr_branch_name: Some(true),
             separate_pr_branch: Some(true),
             cache_manual_checks: Some(false),
