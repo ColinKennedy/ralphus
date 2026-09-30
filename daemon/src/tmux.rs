@@ -324,6 +324,29 @@ pub fn session_name(run_id: &str, task: &str, session_id: &str) -> String {
     }
 }
 
+/// The sanitized prefix shared by every [`session_name`] built for `run_id`,
+/// regardless of `task`/`session_id` — lets a caller reset or find all
+/// tmux-session-keyed state for one run without enumerating every
+/// task/session pair it might have used. RAL-536 uses this to clear every
+/// thinking-stall strike counter under one review/guardian id (`guardian-{id}`)
+/// at once on a manual restart/reopen, since a review's many agent sessions
+/// (auto-build, resolver/fix-pass, proof-synthesis, per-branch feedback, ...)
+/// share that run id but use call-site-specific task/session ids that aren't
+/// practical to enumerate individually.
+#[must_use]
+pub fn session_name_run_prefix(run_id: &str) -> String {
+    let raw = format!("ralphus_{run_id}_");
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// Directory pane snapshots (see [`write_pane_snapshot`]) live under —
 /// `state_dir()` (next to the SQLite DB), not the OS temp dir the
 /// spec/result side-channel files use, since a snapshot is meant to survive

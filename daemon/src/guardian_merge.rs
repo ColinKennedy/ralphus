@@ -352,6 +352,7 @@ fn run_agent_with_rate_limit_retry(
                 ghost: None,
                 retry_after_secs: None,
                 prophecies: Vec::new(),
+                thinking_stall_last_line: None,
             };
         }
         retries += 1;
@@ -406,6 +407,48 @@ fn run_agent_with_rate_limit_retry(
             .agent_session_id
             .clone()
             .or_else(|| spec.resume_agent_session_id.clone());
+    }
+}
+
+/// RAL-536: wraps [`run_agent_with_rate_limit_retry`] with the interview's
+/// three-failure thinking-stall rule
+/// (`crate::scheduler::handle_thinking_stall_attempt`) so it covers review
+/// and guardian-merge agents too -- conflict resolution, feedback actioning,
+/// final proof, proof synthesis, auto-build, manual-command generation, i.e.
+/// every one of `run_agent_with_rate_limit_retry`'s call sites. The wrapped
+/// function itself needs no change: a `RunnerResult` with
+/// `status == "thinking_stalled"` is not `is_rate_limited()`, so it already
+/// passes straight back out to this wrapper on the very first attempt
+/// (RAL-536's `attempt.is_rate_limited() || cancel.is_cancelled()` early
+/// return), just like a genuine success or failure would.
+///
+/// See `crate::scheduler::handle_thinking_stall_attempt`'s doc comment for
+/// the full three-strike definition, what resets the strike counter (a
+/// human resume/restart/retry, never this automatic retry loop) vs. what
+/// resets `ThinkingStallDetector`'s own per-attempt low-diversity streak,
+/// and the terminal mailbox escalation once the interview's
+/// `THINKING_STALL_MAX_STRIKES` limit is reached.
+fn run_agent_with_stall_recovery(
+    store: &crate::store_lock::StoreHandle,
+    spec: &mut RunnerSpec,
+    runner: &dyn Runner,
+    cancel: &CancelToken,
+    delayed_branch: Option<(&crate::store_lock::StoreHandle, &str, &str)>,
+) -> crate::runner::RunnerResult {
+    loop {
+        let attempt = run_agent_with_rate_limit_retry(spec, runner, cancel, delayed_branch);
+        if !attempt.is_thinking_stalled() || cancel.is_cancelled() {
+            return attempt;
+        }
+        match crate::scheduler::handle_thinking_stall_attempt(store, spec, &attempt) {
+            crate::scheduler::ThinkingStallOutcome::Retry => continue,
+            crate::scheduler::ThinkingStallOutcome::Terminate(message) => {
+                let mut terminal = attempt;
+                terminal.status = "failed".to_string();
+                terminal.error = Some(message);
+                return terminal;
+            }
+        }
     }
 }
 
@@ -2116,7 +2159,7 @@ fn synthesize_proof_instructions(
         retry_after_unknown_default_seconds,
         maximum_timeout: None,
     };
-    let result = run_agent_with_rate_limit_retry(&mut spec, runner, cancel, None);
+    let result = run_agent_with_stall_recovery(store, &mut spec, runner, cancel, None);
     // RAL-193: not fatal from this helper (it returns a plain `String`, not a
     // `Result`) -- a budget already exceeded here is caught on the very next
     // call in `resolve_conflicts_with_agent`'s own loop.
@@ -2730,7 +2773,8 @@ fn resolve_conflicts_with_agent(
         // branch's Live-View start time (COALESCE so the fix pass, fired first
         // within this attempt, wins over the final-proof call that may follow).
         let _ = store.lock().stamp_branch_started_at(id, branch_id);
-        let result = run_agent_with_rate_limit_retry(
+        let result = run_agent_with_stall_recovery(
+            store,
             &mut spec,
             runner,
             cancel,
@@ -3088,8 +3132,13 @@ fn run_final_proof(
     // started a fix pass keeps that (earlier) start; one that went straight to
     // proof (clean rebase) gets stamped here.
     let _ = store.lock().stamp_branch_started_at(id, branch_id);
-    let result =
-        run_agent_with_rate_limit_retry(&mut spec, runner, cancel, Some((store, id, branch_id)));
+    let result = run_agent_with_stall_recovery(
+        store,
+        &mut spec,
+        runner,
+        cancel,
+        Some((store, id, branch_id)),
+    );
     // The final-proof call has actually finished running -- overwrites the
     // fix pass's own finish time above, since this call runs later within
     // the same attempt (see `Store::stamp_branch_finished_at`'s doc comment).
@@ -4261,6 +4310,13 @@ pub fn restart_guardian_merge(
     if let Err(e) = store.lock().reset_guardian_to_collecting(id) {
         return reply(500, &error_body("store_error", &e.to_string()));
     }
+    // RAL-536: a human-triggered restart of the whole review always clears
+    // its thinking-stall automatic-restart strike counters, the same way a
+    // human cell/task/squad restart does for its own narrower scope -- see
+    // `StoreMemory::reset_thinking_stall_strikes_for_run`.
+    store
+        .lock_free_memory()
+        .reset_thinking_stall_strikes_for_run(&format!("guardian-{id}"));
     start_merge(store, runner, id, sem, cancellations)
 }
 
@@ -4312,6 +4368,15 @@ pub fn reopen_guardian_merge(
         // the same instant) -- that other caller's pass covers this reopen.
         return reply(202, "{\"status\":\"merging\"}");
     }
+    // RAL-536: reopening a cancelled/merged review is a human "resume" of the
+    // work per the interview's reset rule, and a review is often cancelled
+    // specifically because it was stuck -- so this claim-won reopen clears
+    // the review's thinking-stall strike counters the same way
+    // `restart_guardian_merge` does, rather than carrying a stale count into
+    // the freshly reopened review.
+    store
+        .lock_free_memory()
+        .reset_thinking_stall_strikes_for_run(&format!("guardian-{id}"));
     let sid = id.to_string();
     let token = cancellations.register(&format!("guardian:{sid}"));
     std::thread::spawn(move || {
@@ -6128,8 +6193,13 @@ fn run_commit_step(
             .retry_after_unknown_default_seconds(),
         maximum_timeout: None,
     };
-    let result =
-        run_agent_with_rate_limit_retry(&mut spec, runner, cancel, Some((store, id, branch_id)));
+    let result = run_agent_with_stall_recovery(
+        store,
+        &mut spec,
+        runner,
+        cancel,
+        Some((store, id, branch_id)),
+    );
     let _ = record_guardian_call_cost(store, id, Some(branch_id), "feedback-commit", &result);
     let after_sha = wt
         .git(&["rev-parse", "HEAD"])
@@ -6528,8 +6598,13 @@ pub fn run_feedback(
         .git(&["rev-parse", "HEAD"])
         .ok()
         .map(|s| s.trim().to_string());
-    let result =
-        run_agent_with_rate_limit_retry(&mut spec, runner, cancel, Some((store, id, branch_id)));
+    let result = run_agent_with_stall_recovery(
+        store,
+        &mut spec,
+        runner,
+        cancel,
+        Some((store, id, branch_id)),
+    );
     let _ = record_guardian_call_cost(store, id, Some(branch_id), "feedback", &result);
     if cancel.is_cancelled() {
         log_merge_cancelled(store, id);
@@ -9238,7 +9313,7 @@ fn run_review_auto_build(
         retry_after_unknown_default_seconds,
         maximum_timeout: None,
     };
-    let result = run_agent_with_rate_limit_retry(&mut spec, runner, cancel, None);
+    let result = run_agent_with_stall_recovery(store, &mut spec, runner, cancel, None);
     let _ = record_guardian_call_cost(store, id, None, "auto_build", &result);
     let ok = result.is_done();
     let _ = store
@@ -12207,7 +12282,7 @@ fn generate_manual_commands(
         }),
     );
     let started = std::time::Instant::now();
-    let result = run_agent_with_rate_limit_retry(&mut spec, runner, cancel, None);
+    let result = run_agent_with_stall_recovery(store, &mut spec, runner, cancel, None);
     // Generation has actually finished running -- stamp the guardian-level
     // Live-View end time regardless of outcome, mirroring the started-at stamp
     // above (plain overwrite, so a regeneration always shows the latest run's
@@ -13597,6 +13672,7 @@ mod tests {
 
     fn fake_result(tokens_in: i64, tokens_out: i64, cost_usd: f64) -> RunnerResult {
         RunnerResult {
+            thinking_stall_last_line: None,
             retry_after_secs: None,
             status: "done".into(),
             tokens_in,
@@ -13775,6 +13851,7 @@ mod tests {
     impl Runner for FixedValueRunner {
         fn run(&self, _spec: &RunnerSpec) -> RunnerResult {
             RunnerResult {
+                thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "done".into(),
                 tokens_in: 1,
@@ -14012,6 +14089,7 @@ mod tests {
     impl Runner for NoOpFeedbackRunner {
         fn run(&self, _spec: &RunnerSpec) -> RunnerResult {
             RunnerResult {
+                thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "done".into(),
                 tokens_in: 0,
@@ -16965,6 +17043,7 @@ mod tests {
         fn run(&self, spec: &RunnerSpec) -> RunnerResult {
             *self.last_prompt.lock().unwrap() = spec.prompt.clone();
             RunnerResult {
+                thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "done".to_string(),
                 tokens_in: 0,
@@ -17443,6 +17522,7 @@ mod tests {
     impl Runner for FailingAgentRunner {
         fn run(&self, _spec: &RunnerSpec) -> RunnerResult {
             RunnerResult {
+                thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "failed".to_string(),
                 tokens_in: 10,

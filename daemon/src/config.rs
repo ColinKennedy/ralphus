@@ -1509,6 +1509,138 @@ pub fn load_terminal_log_config() -> TerminalLogConfig {
     }
 }
 
+/// Agent-health stall-detection configuration (`[agent.health]` table,
+/// RAL-536). Governs the thinking-repetition detector that watches a
+/// thinking-capable agent's `RALPHUS_THINKING:`-tagged output (RAL-434) for a
+/// degenerate loop -- the model repeating itself without producing anything
+/// new -- via a rolling window of recent thinking lines and a
+/// distinct/total-word vocabulary-diversity ratio (see
+/// [`crate::thinking_stall`]). Independent of the existing RAL-241
+/// pane-quiet check and RAL-308 CPU-flat check ([`crate::cpu_stall`]), which
+/// key off entirely different signals (pane silence, CPU-time progress) and
+/// are unaffected by this config.
+///
+/// Four independently configurable knobs, all `None` meaning unset (so a
+/// lower layer, or the built-in default, can supply it), following the same
+/// per-project-overrides-global layering as [`TerminalLogConfig`].
+#[derive(Debug, Default, Deserialize, Clone, Copy, PartialEq)]
+pub struct AgentHealthConfig {
+    /// Number of most-recent thinking lines kept in the rolling vocabulary
+    /// window used to compute the diversity ratio. Must be `>= 2` -- a
+    /// window of one line can never show repetition, so a non-positive or
+    /// `1` value is treated as unset.
+    #[serde(default)]
+    pub thinking_stall_window_lines: Option<i64>,
+    /// Below this distinct-word/total-word ratio (after stoplist stripping,
+    /// see [`crate::thinking_stall::is_stoplisted`]), the window's
+    /// vocabulary is considered degenerate for one sample. Must be in `(0.0,
+    /// 1.0]` -- an out-of-range value is treated as unset.
+    #[serde(default)]
+    pub thinking_stall_diversity_threshold: Option<f64>,
+    /// Consecutive low-diversity samples required before escalating. Must be
+    /// `>= 1`.
+    #[serde(default)]
+    pub thinking_stall_min_consecutive_samples: Option<i64>,
+    /// Minimum time span, in milliseconds, the low-diversity streak must
+    /// cover before escalating -- guards against a burst of fast lines
+    /// tripping on coincidence alone, mirroring
+    /// [`crate::cpu_stall::CPU_STALL_MIN_SPAN_MS`]'s role for that detector.
+    /// Must be `>= 0`.
+    #[serde(default)]
+    pub thinking_stall_min_span_ms: Option<i64>,
+}
+
+impl AgentHealthConfig {
+    /// Rolling window size, in lines. Defaults to 12.
+    #[must_use]
+    pub fn thinking_stall_window_lines(&self) -> usize {
+        match self.thinking_stall_window_lines {
+            Some(n) if n >= 2 => n as usize,
+            _ => 12,
+        }
+    }
+
+    /// Vocabulary-diversity trip threshold. Defaults to 0.35.
+    #[must_use]
+    pub fn thinking_stall_diversity_threshold(&self) -> f64 {
+        match self.thinking_stall_diversity_threshold {
+            Some(n) if n > 0.0 && n <= 1.0 => n,
+            _ => 0.35,
+        }
+    }
+
+    /// Consecutive low-diversity samples required before escalating.
+    /// Defaults to 4.
+    #[must_use]
+    pub fn thinking_stall_min_consecutive_samples(&self) -> u32 {
+        match self.thinking_stall_min_consecutive_samples {
+            Some(n) if n >= 1 => n as u32,
+            _ => 4,
+        }
+    }
+
+    /// Minimum streak span, in milliseconds, before escalating. Defaults to
+    /// 20 seconds.
+    #[must_use]
+    pub fn thinking_stall_min_span_ms(&self) -> i64 {
+        match self.thinking_stall_min_span_ms {
+            Some(n) if n >= 0 => n,
+            _ => 20_000,
+        }
+    }
+}
+
+/// The `[agent]` table wrapper -- currently only nests `[agent.health]`.
+#[derive(Debug, Default, Deserialize, Clone, Copy, PartialEq)]
+pub struct AgentTableConfig {
+    #[serde(default)]
+    pub health: Option<AgentHealthConfig>,
+}
+
+/// Parse an `AgentHealthConfig` from the given TOML text; the built-in
+/// defaults when the `[agent.health]` table is absent.
+#[must_use]
+pub fn agent_health_from_toml_str(s: &str) -> AgentHealthConfig {
+    toml::from_str::<ConfigFile>(s)
+        .unwrap_or_default()
+        .agent
+        .unwrap_or_default()
+        .health
+        .unwrap_or_default()
+}
+
+/// Load the effective agent-health config by layering the global config file
+/// under the nearest per-project `.ralphus.toml` (per-project scalars win),
+/// following the same pattern as [`load_terminal_log_config`].
+#[must_use]
+pub fn load_agent_health_config() -> AgentHealthConfig {
+    let global = global_config_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| agent_health_from_toml_str(&s))
+        .unwrap_or_default();
+    let local = std::env::current_dir()
+        .ok()
+        .as_deref()
+        .and_then(find_project_config)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| agent_health_from_toml_str(&s))
+        .unwrap_or_default();
+    AgentHealthConfig {
+        thinking_stall_window_lines: local
+            .thinking_stall_window_lines
+            .or(global.thinking_stall_window_lines),
+        thinking_stall_diversity_threshold: local
+            .thinking_stall_diversity_threshold
+            .or(global.thinking_stall_diversity_threshold),
+        thinking_stall_min_consecutive_samples: local
+            .thinking_stall_min_consecutive_samples
+            .or(global.thinking_stall_min_consecutive_samples),
+        thinking_stall_min_span_ms: local
+            .thinking_stall_min_span_ms
+            .or(global.thinking_stall_min_span_ms),
+    }
+}
+
 /// Live View debug-line-visibility configuration (`[live_view]` table,
 /// RAL-232). Controls the default state of the board's per-pane "Show Debug
 /// Messages" checkbox -- ralphus interleaves its own diagnostic/telemetry
@@ -2252,6 +2384,8 @@ struct ConfigFile {
     cartographer: Option<CartographerConfig>,
     #[serde(default)]
     terminal_logs: Option<TerminalLogConfig>,
+    #[serde(default)]
+    agent: Option<AgentTableConfig>,
     #[serde(default)]
     live_view: Option<LiveViewConfig>,
     #[serde(default)]
@@ -3795,6 +3929,77 @@ mod tests {
     fn terminal_log_max_lines_of_one_is_valid() {
         let c = terminal_log_from_toml_str("[terminal_logs]\nmax_lines_per_attempt = 1\n");
         assert_eq!(c.max_lines_per_attempt(), 1);
+    }
+
+    // ── AgentHealthConfig (RAL-536) ───────────────────────────────────────
+
+    #[test]
+    fn agent_health_defaults_when_absent() {
+        let c = agent_health_from_toml_str("");
+        assert_eq!(c.thinking_stall_window_lines(), 12);
+        assert!((c.thinking_stall_diversity_threshold() - 0.35).abs() < f64::EPSILON);
+        assert_eq!(c.thinking_stall_min_consecutive_samples(), 4);
+        assert_eq!(c.thinking_stall_min_span_ms(), 20_000);
+    }
+
+    #[test]
+    fn agent_health_parses_explicit_values() {
+        let c = agent_health_from_toml_str(
+            "[agent.health]\nthinking_stall_window_lines = 8\nthinking_stall_diversity_threshold = 0.5\nthinking_stall_min_consecutive_samples = 3\nthinking_stall_min_span_ms = 5000\n",
+        );
+        assert_eq!(c.thinking_stall_window_lines(), 8);
+        assert!((c.thinking_stall_diversity_threshold() - 0.5).abs() < f64::EPSILON);
+        assert_eq!(c.thinking_stall_min_consecutive_samples(), 3);
+        assert_eq!(c.thinking_stall_min_span_ms(), 5000);
+    }
+
+    #[test]
+    fn agent_health_out_of_range_values_fall_back_to_default() {
+        let window_too_small =
+            agent_health_from_toml_str("[agent.health]\nthinking_stall_window_lines = 1\n");
+        assert_eq!(window_too_small.thinking_stall_window_lines(), 12);
+
+        let threshold_too_high = agent_health_from_toml_str(
+            "[agent.health]\nthinking_stall_diversity_threshold = 1.5\n",
+        );
+        assert!(
+            (threshold_too_high.thinking_stall_diversity_threshold() - 0.35).abs() < f64::EPSILON
+        );
+
+        let threshold_zero = agent_health_from_toml_str(
+            "[agent.health]\nthinking_stall_diversity_threshold = 0.0\n",
+        );
+        assert!((threshold_zero.thinking_stall_diversity_threshold() - 0.35).abs() < f64::EPSILON);
+
+        let samples_zero = agent_health_from_toml_str(
+            "[agent.health]\nthinking_stall_min_consecutive_samples = 0\n",
+        );
+        assert_eq!(samples_zero.thinking_stall_min_consecutive_samples(), 4);
+    }
+
+    #[test]
+    fn agent_health_malformed_toml_is_default() {
+        let c = agent_health_from_toml_str("not = = valid");
+        assert_eq!(c.thinking_stall_window_lines(), 12);
+    }
+
+    #[test]
+    fn agent_health_per_project_overrides_global_scalar() {
+        // Layering itself is exercised end-to-end by
+        // `load_agent_health_config`'s directory-walk, which isn't
+        // hermetic to unit-test from here (it reads the real cwd and
+        // `$RALPHUS_CONFIG_HOME`) -- mirror `terminal_log`'s precedent of
+        // testing the merge shape directly instead.
+        let global =
+            agent_health_from_toml_str("[agent.health]\nthinking_stall_window_lines = 12\n");
+        let local = agent_health_from_toml_str("[agent.health]\nthinking_stall_window_lines = 8\n");
+        let merged = AgentHealthConfig {
+            thinking_stall_window_lines: local
+                .thinking_stall_window_lines
+                .or(global.thinking_stall_window_lines),
+            ..AgentHealthConfig::default()
+        };
+        assert_eq!(merged.thinking_stall_window_lines(), 8);
     }
 
     // ── LiveViewConfig (RAL-232) ──────────────────────────────────────────

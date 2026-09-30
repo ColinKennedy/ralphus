@@ -25,6 +25,7 @@ struct OkRunner;
 impl Runner for OkRunner {
     fn run(&self, _spec: &RunnerSpec) -> RunnerResult {
         RunnerResult {
+            thinking_stall_last_line: None,
             retry_after_secs: None,
             status: "done".to_string(),
             tokens_in: 0,
@@ -89,6 +90,7 @@ impl Runner for ConflictResolvingRunner {
             }
         }
         RunnerResult {
+            thinking_stall_last_line: None,
             retry_after_secs: None,
             status: "done".to_string(),
             tokens_in: 0,
@@ -1295,6 +1297,7 @@ fn checks_configured_does_not_also_run_auto_build() {
 
 fn ok_result() -> RunnerResult {
     RunnerResult {
+        thinking_stall_last_line: None,
         retry_after_secs: None,
         status: "done".to_string(),
         tokens_in: 0,
@@ -1338,6 +1341,7 @@ impl Runner for GatableRunner {
         }
         if cancel.is_cancelled() {
             return RunnerResult {
+                thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "failed".to_string(),
                 tokens_in: 0,
