@@ -1031,6 +1031,7 @@
        * @property {string|null} survey_rationale - the relevance-assessment rationale, if surveyed.
        * @property {DeliveryStatus} delivery_status
        * @property {number|null} stand_down_at_ms - set once this entry's advisory stand-down notice has been sent.
+       * @property {number|null} stale_at_ms - set when this entry's work finished while the waypoint was still open and had judged it impacted, so it landed without the waypoint's own changes. Advisory: nothing is re-run until `ralphus waypoint redo`.
        * @property {number} created_at_ms
        * @property {number} updated_at_ms
        */

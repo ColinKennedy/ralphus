@@ -305,12 +305,15 @@
         const verdict = entry.survey_verdict
           ? `<details style="margin-top:2px"><summary data-tip="Show the relevance-assessment verdict and rationale the survey pass recorded for this entry.">${esc(entry.survey_verdict)}</summary><div style="color:var(--muted);font-size:12px;padding:2px 0 0 12px">${esc(entry.survey_rationale || "(no rationale recorded)")}</div></details>`
           : "";
+        const staleBadge = entry.stale_at_ms
+          ? ` <span class="badge" style="color:var(--stale);border-color:var(--stale)" data-tip="This work finished while the waypoint was still open and had judged it impacted, so it landed without the waypoint's changes and may be stale.\nNothing has been re-run automatically.\nTo re-run it carrying its prior findings and this waypoint's bearings: ralphus waypoint redo ${esc(entry.waypoint_id)} ${esc(entry.entry_id)}">stale</span>`
+          : "";
         const removeBtn = `<button class="icon-btn" data-click="removeRosterEntry" data-waypoint-id="${esc(entry.waypoint_id)}" data-entry-id="${esc(entry.entry_id)}" data-tip="Remove this entry from the waypoint's roster.\nThis cannot be undone." style="font-size:11px;padding:1px 5px">✕</button>`;
         const toggleModeBtn = `<button class="icon-btn" data-click="toggleRosterEntryMode" data-waypoint-id="${esc(entry.waypoint_id)}" data-entry-id="${esc(entry.entry_id)}" data-mode="${entry.mode === "advisory" ? "block" : "advisory"}" data-tip="Switch this entry to ${entry.mode === "advisory" ? "block" : "advisory"} mode." style="font-size:11px;padding:1px 5px">⇄</button>`;
         return `<div class="kv-row" style="align-items:flex-start">
           <span class="k">${wdot(entry.delivery_status)}</span>
           <span class="v" style="flex:1">
-            <div>${link} ${waypointModeBadge(entry.mode)} <span class="badge" style="color:var(--muted);border-color:var(--border)" data-tip="Delivery status for this roster entry.">${esc(entry.delivery_status)}</span> ${toggleModeBtn}${removeBtn}</div>
+            <div>${link} ${waypointModeBadge(entry.mode)} <span class="badge" style="color:var(--muted);border-color:var(--border)" data-tip="Delivery status for this roster entry.">${esc(entry.delivery_status)}</span>${staleBadge} ${toggleModeBtn}${removeBtn}</div>
             ${verdict}
           </span>
         </div>`;

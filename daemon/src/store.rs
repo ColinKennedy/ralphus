@@ -2200,6 +2200,7 @@ impl Store {
                 delivery_status  TEXT NOT NULL DEFAULT 'undelivered',
                 stand_down_at_ms INTEGER,
                 auto_enrolled    INTEGER NOT NULL DEFAULT 0,
+                stale_at_ms      INTEGER,
                 created_at_ms    INTEGER NOT NULL,
                 updated_at_ms    INTEGER NOT NULL,
                 PRIMARY KEY (waypoint_id, kind, entry_id)
@@ -3250,6 +3251,12 @@ impl Store {
             // explicit declaration is never second-guessed by the classifier
             // -- see `waypoints::Store::waypoint_survey_candidates`.
             "ALTER TABLE waypoint_roster ADD COLUMN auto_enrolled INTEGER NOT NULL DEFAULT 0",
+            // RAL-400: when this entry's already-finished work was flagged as
+            // possibly needing a redo, because its waypoint closed while the
+            // survey had judged it `impacted`. Advisory and non-blocking --
+            // acting on it is `waypoints::redo_roster_entry`, never automatic.
+            // NULL means not flagged. See `run_pending_stale_notices`.
+            "ALTER TABLE waypoint_roster ADD COLUMN stale_at_ms INTEGER",
         ] {
             let _ = self.conn.execute(stmt, []);
         }

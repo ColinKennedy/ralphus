@@ -1268,6 +1268,16 @@ const WAYPOINT_CHILDREN: &[HelpNode] = &[
         &[],
     ),
     node(
+        "redo",
+        &["waypoint_id [str]", "entry_id [str]"],
+        &[],
+        "Re-run a squad whose finished work a closed waypoint flagged as stale, carrying its \
+         prior findings and the waypoint's bearings into the new run.",
+        false,
+        false,
+        &[],
+    ),
+    node(
         "roster",
         &[],
         &[],

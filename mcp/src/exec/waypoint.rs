@@ -38,6 +38,10 @@ pub fn execute(cmd: WaypointCommand, client: &DaemonClient) -> ExecResult {
         WaypointCommand::Get { waypoint_id } => Ok(client.waypoint_get(&waypoint_id)?),
         WaypointCommand::Close { waypoint_id } => Ok(client.waypoint_close(&waypoint_id)?),
         WaypointCommand::Reopen { waypoint_id } => Ok(client.waypoint_reopen(&waypoint_id)?),
+        WaypointCommand::Redo {
+            waypoint_id,
+            entry_id,
+        } => Ok(client.waypoint_redo_roster_entry(&waypoint_id, &entry_id)?),
         WaypointCommand::Roster(c) => exec_roster(c, client),
         WaypointCommand::Bearing(c) => exec_bearing(c, client),
         WaypointCommand::Bearings { waypoint_id } => {

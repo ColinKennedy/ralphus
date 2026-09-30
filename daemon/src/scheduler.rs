@@ -635,6 +635,7 @@ pub fn run_loop(
             crate::waypoints::run_pending_waypoint_resumes(&store, &cancellations);
             crate::waypoints::run_pending_deliveries(&store, &runner);
             crate::waypoints::run_pending_stand_down_notices(&store, &runner);
+            crate::waypoints::run_pending_stale_notices(&store);
             last_waypoint_survey = std::time::Instant::now();
         }
         std::thread::sleep(POLL_INTERVAL);
@@ -2501,6 +2502,38 @@ fn run_cell_worker(
         .map(|p| resolve_handoffs(&p, &plan.deps[i], &summaries));
     if let Some(ctx) = &ghost_context {
         spec.prompt = spec.prompt.map(|p| format!("{ctx}{p}"));
+    }
+    // RAL-400: advisory waypoint guidance queued for this specific cell.
+    // Drained (not merely read) so delivery is exactly-once -- unlike the
+    // ghost-fold path used for a *blocking* halt, which re-renders the whole
+    // bearing list on every halt and relies on `merge_content` to cope.
+    // Advisory guidance never halts a cell, so this dispatch boundary is
+    // where it lands.
+    let injected = {
+        let guard = store.lock();
+        guard
+            .drain_injections(squad_id, row.task_idx, row.idx)
+            .unwrap_or_default()
+    };
+    if !injected.is_empty() {
+        let block = crate::waypoints::render_injection_block(&injected);
+        spec.prompt = spec.prompt.map(|p| format!("{block}{p}"));
+        let guard = store.lock();
+        crate::cartographer::Note::new("scheduler")
+            .scope("waypoint")
+            .squad(squad_id)
+            .emit(
+                &guard,
+                format!(
+                    "delivered {} queued waypoint injection(s) to cell {}",
+                    injected.len(),
+                    row.cell_id
+                ),
+                serde_json::json!({
+                    "count": injected.len(),
+                    "cell_id": row.cell_id,
+                }),
+            );
     }
     spec.trace_context = cell_trace_context.clone();
     spec.env_overrides = {

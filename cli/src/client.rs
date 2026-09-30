@@ -1976,6 +1976,17 @@ impl DaemonClient {
         self.post(&format!("/api/waypoints/{waypoint_id}/reopen"), None)
     }
 
+    pub fn waypoint_redo_roster_entry(
+        &self,
+        waypoint_id: &str,
+        entry_id: &str,
+    ) -> Result<Value, DaemonError> {
+        self.post(
+            &format!("/api/waypoints/{waypoint_id}/roster/{entry_id}/redo"),
+            None,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn waypoint_append_bearing(
         &self,
