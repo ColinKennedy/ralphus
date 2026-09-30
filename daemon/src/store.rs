@@ -1239,6 +1239,7 @@ fn spawn_wal_checkpoint_thread(path: std::path::PathBuf) {
         let conn = match Connection::open(&path) {
             Ok(conn) => conn,
             Err(e) => {
+                // ralphus[ignore-rlog-pair]: this thread has no Store (it opens its own bare rusqlite::Connection) and no caller left to report back to -- it is not spawned from a request/handler that owns one
                 crate::rlog!(
                     ERROR,
                     "ralphus [store] wal checkpoint thread could not open {}: {e}",
@@ -1248,6 +1249,7 @@ fn spawn_wal_checkpoint_thread(path: std::path::PathBuf) {
             }
         };
         if let Err(e) = conn.busy_timeout(crate::store_pool::BUSY_TIMEOUT) {
+            // ralphus[ignore-rlog-pair]: same bare-connection boundary as above -- no Store to emit a structured row through
             crate::rlog!(
                 WARNING,
                 "ralphus [store] wal checkpoint thread: busy_timeout failed: {e}"
@@ -1256,6 +1258,7 @@ fn spawn_wal_checkpoint_thread(path: std::path::PathBuf) {
         loop {
             std::thread::sleep(WAL_CHECKPOINT_INTERVAL);
             if let Err(e) = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(())) {
+                // ralphus[ignore-rlog-pair]: same bare-connection boundary as above -- no Store to emit a structured row through
                 crate::rlog!(
                     WARNING,
                     "ralphus [store] wal checkpoint (truncate) failed: {e}"
