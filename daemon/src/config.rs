@@ -410,6 +410,7 @@ pub const REVIEW_CONFIG_KEYS: &[&str] = &[
     "checks",
     "auto_build",
     "summary_format",
+    "cache_manual_checks",
 ];
 
 impl ReviewConfig {
