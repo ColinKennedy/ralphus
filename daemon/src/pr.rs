@@ -1983,9 +1983,48 @@ fn resolve_title_description(
     )
 }
 
+/// RAL-534: a prophecy is reviewer-relevant unless its prose is recognizably
+/// daemon/push mechanics -- internal bookkeeping a reviewer evaluating the
+/// *code* has no use for. This is a deterministic string match, not a model
+/// call: it must never be surprised by phrasing it hasn't seen, and it must
+/// never silently drop something that turns out to matter, so it only
+/// excludes the two known-noisy shapes call out in the ticket rather than
+/// guessing at intent.
+///
+/// - Routine rebase/merge bookkeeping with no reviewer-relevant outcome: the
+///   single daemon-authored template `finish_branch_resolved` emits
+///   (`guardian_merge.rs`) on every conflict-resolution outcome, win or
+///   lose. It reports how many commits landed, but those commits are already
+///   visible in the branch's own diff -- there is nothing here for a
+///   reviewer to act on. (The sibling `give_up_on_stuck_commit` hazard --
+///   "a human should investigate" -- is intentionally NOT matched here: an
+///   unresolved conflict left behind IS something a reviewer needs to know.)
+/// - Push-destination/remote/branch mechanics: which remote or branch a push
+///   landed on, phrased as a comparison against where it was "supposed" to
+///   go (e.g. "rather than the tracked ... shared base", "pushed explicitly
+///   as ..."). This is free-form agent prose (RAL-534's PR #360 examples),
+///   not a fixed template, so it is matched against a handful of specific
+///   phrases that shape of comparison recurs with, deliberately narrow (not
+///   e.g. any mention of "push" + "branch") so a genuine code decision that
+///   happens to mention pushing to a branch is never caught by accident.
+fn prophecy_is_reviewer_relevant(prophecy: &crate::prophecy::ProphecyView) -> bool {
+    const MECHANICS_MARKERS: &[&str] = &[
+        "committed onto the review stack",
+        "same-named branch",
+        "shared base",
+        "pushed explicitly",
+        "rather than the tracked",
+        "instead of the tracked",
+    ];
+    let body = prophecy.body.to_lowercase();
+    !MECHANICS_MARKERS.iter().any(|marker| body.contains(marker))
+}
+
 /// Renders prophecies as a deterministic details block for the end of a PR
 /// description. It is appended after any synthesized description so agent
-/// notes reach reviewers without another model rewriting them.
+/// notes reach reviewers without another model rewriting them. Callers pass
+/// only reviewer-relevant prophecies (see [`prophecy_is_reviewer_relevant`])
+/// -- this function renders whatever it is given verbatim.
 fn format_prophecy_details_block(prophecies: &[crate::prophecy::ProphecyView]) -> Option<String> {
     if prophecies.is_empty() {
         return None;
@@ -6093,64 +6132,71 @@ fn submit_stacked_branch_pr(
         .lock()
         .list_unpublished_prophecies_for_guardian(id)
         .unwrap_or_default();
-    let (created_pr, base, title, description, adopted) =
-        match route.find_existing_pull_request()? {
-            Some(existing) => {
-                crate::rlog!(
-                    INFO,
-                    "ralphus [pr] review {id} branch {branch_id} alias {alias} adopting \
+    let (created_pr, base, title, description, adopted) = match route
+        .find_existing_pull_request()?
+    {
+        Some(existing) => {
+            crate::rlog!(
+                INFO,
+                "ralphus [pr] review {id} branch {branch_id} alias {alias} adopting \
                      pre-existing open PR/MR #{} (base={}) instead of creating a duplicate",
-                    existing.number,
-                    existing.base
-                );
-                // RAL-196: the adopted PR/MR's draft state must match what
-                // this submission asked for (a whole-stack submission as
-                // drafts must not leave a sibling PR ready-for-review). The
-                // forge toggle is best-effort -- on failure the recorded row
-                // keeps the forge's actual state and the mismatch is logged.
-                let mut adopted_draft = existing.draft;
-                if existing.draft != draft {
-                    match route.update_draft(existing.number, draft) {
-                        Ok(()) => adopted_draft = draft,
-                        Err(e) => crate::rlog!(
-                            WARNING,
-                            "ralphus [pr] review {id} branch {branch_id} adopting PR/MR #{} \
+                existing.number,
+                existing.base
+            );
+            // RAL-196: the adopted PR/MR's draft state must match what
+            // this submission asked for (a whole-stack submission as
+            // drafts must not leave a sibling PR ready-for-review). The
+            // forge toggle is best-effort -- on failure the recorded row
+            // keeps the forge's actual state and the mismatch is logged.
+            let mut adopted_draft = existing.draft;
+            if existing.draft != draft {
+                match route.update_draft(existing.number, draft) {
+                    Ok(()) => adopted_draft = draft,
+                    Err(e) => crate::rlog!(
+                        WARNING,
+                        "ralphus [pr] review {id} branch {branch_id} adopting PR/MR #{} \
                              requested draft={draft} but the forge reports draft={} and the toggle \
                              failed; recording what the forge has: {e}",
-                            existing.number,
-                            existing.draft
-                        ),
-                    }
+                        existing.number,
+                        existing.draft
+                    ),
                 }
-                (
-                    crate::forge::CreatedPr {
-                        number: existing.number,
-                        url: existing.url,
-                        draft: adopted_draft,
-                    },
-                    existing.base,
-                    existing.title,
-                    existing.description,
-                    true,
-                )
             }
-            None => {
-                let (title, description) = resolve_title_description(
-                    runner,
-                    guardian,
-                    req,
-                    position,
-                    &route.client,
-                    trace_context,
-                );
-                let description = match format_prophecy_details_block(&unpublished_prophecies) {
-                    Some(block) => format!("{description}\n\n{block}"),
-                    None => description,
-                };
-                let created = route.create_pull_request(&title, &description, draft)?;
-                (created, base, title, description, false)
-            }
-        };
+            (
+                crate::forge::CreatedPr {
+                    number: existing.number,
+                    url: existing.url,
+                    draft: adopted_draft,
+                },
+                existing.base,
+                existing.title,
+                existing.description,
+                true,
+            )
+        }
+        None => {
+            let (title, description) = resolve_title_description(
+                runner,
+                guardian,
+                req,
+                position,
+                &route.client,
+                trace_context,
+            );
+            let reviewer_relevant_prophecies: Vec<crate::prophecy::ProphecyView> =
+                unpublished_prophecies
+                    .iter()
+                    .filter(|p| prophecy_is_reviewer_relevant(p))
+                    .cloned()
+                    .collect();
+            let description = match format_prophecy_details_block(&reviewer_relevant_prophecies) {
+                Some(block) => format!("{description}\n\n{block}"),
+                None => description,
+            };
+            let created = route.create_pull_request(&title, &description, draft)?;
+            (created, base, title, description, false)
+        }
+    };
     let row_id = store
         .lock()
         .create_pull_request_ex(
@@ -9096,6 +9142,79 @@ mod tests {
 
     fn gwrite(root: &Path, name: &str, content: &str) {
         std::fs::write(root.join(name), content).unwrap();
+    }
+
+    fn prophecy(kind: crate::prophecy::ProphecyKind, body: &str) -> crate::prophecy::ProphecyView {
+        crate::prophecy::ProphecyView {
+            id: 1,
+            entity_uri: "guardian:g1".to_string(),
+            attempt: 0,
+            kind: kind.as_str().to_string(),
+            body: body.to_string(),
+            revision: None,
+            squad_id: None,
+            guardian_id: Some("g1".to_string()),
+            created_at_ms: 0,
+            published_at_ms: None,
+            pr_id: None,
+        }
+    }
+
+    // RAL-534: routine rebase bookkeeping with no reviewer-relevant outcome
+    // (`guardian_merge.rs::finish_branch_resolved`'s own template) is culled,
+    // regardless of how many commits it reports.
+    #[test]
+    fn reviewer_relevant_excludes_rebase_bookkeeping_prophecy() {
+        let p = prophecy(
+            crate::prophecy::ProphecyKind::Decision,
+            "Rebase conflicts on branch 'RAL-527-accurate-active-work-2' were resolved by the \
+             conflict-resolver agent and 0 commit(s) were committed onto the review stack.",
+        );
+        assert!(!prophecy_is_reviewer_relevant(&p));
+    }
+
+    // The sibling hazard from `give_up_on_stuck_commit` -- an unresolved
+    // conflict left behind -- is reviewer-relevant and must survive.
+    #[test]
+    fn reviewer_relevant_keeps_unresolved_conflict_hazard_prophecy() {
+        let p = prophecy(
+            crate::prophecy::ProphecyKind::Hazard,
+            "The conflict-resolver agent could not resolve branch 'x' within its 2/2-attempt \
+             budget. The rebase was aborted, which leaves the worktree looking clean even though \
+             this conflict was never actually resolved -- a human should investigate before \
+             trusting this branch's review stack.",
+        );
+        assert!(prophecy_is_reviewer_relevant(&p));
+    }
+
+    // RAL-534's real PR #360 examples: agent-authored push-destination
+    // mechanics, phrased as a comparison against where the push was
+    // "supposed" to go.
+    #[test]
+    fn reviewer_relevant_excludes_push_destination_mechanics_prophecies() {
+        let a = prophecy(
+            crate::prophecy::ProphecyKind::Discovery,
+            "pushed to a new same-named branch on `alt` (GitHub public) rather than the tracked \
+             `alt/staging` shared base...",
+        );
+        let b = prophecy(
+            crate::prophecy::ProphecyKind::Discovery,
+            "pushed explicitly as `HEAD:ral-523-rest-forge-connectivity-checks` to origin...",
+        );
+        assert!(!prophecy_is_reviewer_relevant(&a));
+        assert!(!prophecy_is_reviewer_relevant(&b));
+    }
+
+    // A genuine code/design decision continues to appear even when it
+    // happens to mention a branch or a push in passing.
+    #[test]
+    fn reviewer_relevant_keeps_code_decision_prophecy() {
+        let p = prophecy(
+            crate::prophecy::ProphecyKind::Decision,
+            "Chose to debounce the stall check by 500ms instead of polling every tick, since the \
+             tighter loop was pushing CPU usage up noticeably on the branch's own benchmark.",
+        );
+        assert!(prophecy_is_reviewer_relevant(&p));
     }
 
     /// Every push site now runs `cancel_superseded_ci_after_push` right after
