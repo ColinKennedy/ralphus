@@ -8899,9 +8899,10 @@ fn post_merge_jobs_inner(
         .as_ref()
         .and_then(|g| g.manual_checks_basis.as_deref())
         != Some(expected_basis.as_str());
-    // Once a cached result has been recorded, later rebases and restacks do
-    // not invalidate it merely because the stacked tip changed. An explicit
-    // opt-out continues to regenerate when the result is absent or stale.
+    // RAL-521: once the review's cached result has been recorded, ordinary
+    // rebases and restacks must not invalidate it merely because the stacked
+    // tip changed. An explicit opt-out continues to use the pre-cache basis
+    // check and regenerates whenever the result is absent or stale.
     let cached = stored.as_ref().is_some_and(|g| {
         g.effective_cache_manual_checks && g.manual_checks_cached && g.manual_checks_basis.is_some()
     });
@@ -12144,10 +12145,10 @@ fn generate_manual_commands(
             .set_guardian_manual_commands_session_id(id, sid);
     }
 
-    if !result.is_done() || result.summary.trim().is_empty() {
+    if !result.is_done() {
         // WARNING, not INFO: the merge still reaches `in_review`, but the
         // review lands without the manual checks it was supposed to carry, and
-        // nothing else reports that.
+        // a failed generation remains eligible for a later retry.
         phase_note(
             store,
             id,
@@ -12168,6 +12169,27 @@ fn generate_manual_commands(
 
     let commands = parse_manual_commands_response(result.summary.trim());
 
+    if commands.is_empty() {
+        // An empty, completed result is still a result. Cache it so the
+        // default one-time behavior does not keep rerunning a check that
+        // intentionally found no manual commands.
+        phase_note(
+            store,
+            id,
+            crate::logging::LogLevel::WARNING,
+            format!(
+                "review {id} manual-commands generation produced no commands after {}ms",
+                elapsed_ms(started)
+            ),
+            serde_json::json!({
+                "phase": "manual_commands",
+                "state": "empty",
+                "elapsed_ms": elapsed_ms(started),
+                "cancelled": cancel.is_cancelled(),
+            }),
+        );
+    }
+
     if cancel.is_cancelled() {
         // Superseded mid-generation (a newer merge or regen owns the outcome
         // slot): drop the result rather than write over the newer run's data.
@@ -12181,32 +12203,32 @@ fn generate_manual_commands(
         return;
     }
 
-    if !commands.is_empty() {
-        // RAL-88: record which resolved agent/model produced these commands.
-        let _ = store.lock().set_guardian_manual_commands(
-            id,
-            &commands,
-            Some(agent.as_str()),
-            model.as_deref(),
-        );
-        // RAL-520: record the diff basis these commands were generated
-        // against, so a later post-merge run regenerates only when the
-        // settled stack's changes actually changed.
-        let tip_tree = worktree
-            .unwrap_or(root)
-            .git(&["rev-parse", &format!("{tip_ref}^{{tree}}")])
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|_| tip_ref.to_string());
-        let basis = serde_json::json!({ "base_sha": base_sha, "tip_tree": tip_tree }).to_string();
-        let _ = store
-            .lock()
-            .set_guardian_manual_checks_basis(id, Some(&basis));
-        // RAL-521: mark the review's manual checks as computed. Under an
-        // enabled `cache_manual_checks` this marker is what every later
-        // merge/rebase/fix consults to skip regeneration and keep these
-        // commands; under `false` the marker is simply ignored.
-        let _ = store.lock().set_guardian_manual_checks_cached(id, true);
-    }
+    // RAL-88: record which resolved agent/model produced these commands. This
+    // also clears a previous result when a later opt-out regeneration is
+    // successfully empty.
+    let _ = store.lock().set_guardian_manual_commands(
+        id,
+        &commands,
+        Some(agent.as_str()),
+        model.as_deref(),
+    );
+    // RAL-520: record the diff basis the manual checks were generated against,
+    // including an intentionally empty command list, so a later post-merge
+    // run regenerates only when the settled stack's changes actually changed.
+    let tip_tree = worktree
+        .unwrap_or(root)
+        .git(&["rev-parse", &format!("{tip_ref}^{{tree}}")])
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| tip_ref.to_string());
+    let basis = serde_json::json!({ "base_sha": base_sha, "tip_tree": tip_tree }).to_string();
+    let _ = store
+        .lock()
+        .set_guardian_manual_checks_basis(id, Some(&basis));
+    // RAL-521: mark the review's manual checks as computed. Under an enabled
+    // `cache_manual_checks` this marker is what every later merge/rebase/fix
+    // consults to skip regeneration, even when the computed result is empty;
+    // under `false` the marker is simply ignored.
+    let _ = store.lock().set_guardian_manual_checks_cached(id, true);
     phase_note(
         store,
         id,

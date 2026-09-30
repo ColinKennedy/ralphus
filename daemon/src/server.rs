@@ -12078,14 +12078,20 @@ fn shutdown(daemon: &Daemon, body: &str) -> Reply {
     daemon.cancellations.cancel_all();
 
     let squads = daemon.lock().list_squads().unwrap_or_default();
-    let guardians = daemon.lock().list_guardians().unwrap_or_default();
+    // Shutdown only needs guardian ids here. The full view hydrates project
+    // configuration and walks each git root; an unavailable/stale root must
+    // not prevent an otherwise valid auto-cancel from reaching that review.
+    let guardians = daemon
+        .lock()
+        .list_guardian_status_pairs()
+        .unwrap_or_default();
     let tmux_killed: usize = squads
         .iter()
         .map(|r| kill_squad_tmux_sessions(&r.id))
         .sum::<usize>()
         + guardians
             .iter()
-            .map(|g| kill_guardian_tmux_sessions(&g.id))
+            .map(|(id, _status)| kill_guardian_tmux_sessions(id))
             .sum::<usize>();
 
     let mut cancelled_squads = Vec::new();
@@ -12105,9 +12111,9 @@ fn shutdown(daemon: &Daemon, body: &str) -> Reply {
             }
         }
 
-        for g in guardians {
-            if daemon.lock().cancel_guardian(&g.id).is_ok() {
-                cancelled_guardians.push(g.id);
+        for (id, _status) in guardians {
+            if daemon.lock().cancel_guardian(&id).is_ok() {
+                cancelled_guardians.push(id);
             }
         }
     }
@@ -12569,7 +12575,22 @@ fn capture_and_stop_nodes(store: &StoreHandle, squad_id: &str, reqs: &[SetStatus
         if !tmux.has_session(&target.pane_name) {
             continue;
         }
-        if let Ok(content) = tmux.capture_pane(&target.pane_name, 2000) {
+        // psmux can briefly reject `capture-pane` immediately after its
+        // session server becomes visible. Retrying that transport race before
+        // the terminal kill preserves the checkpoint without delaying a pane
+        // that was genuinely empty.
+        let mut capture = None;
+        for attempt in 0..3 {
+            match tmux.capture_pane(&target.pane_name, 2000) {
+                Ok(content) => {
+                    capture = Some(content);
+                    break;
+                }
+                Err(_) if attempt < 2 => std::thread::sleep(std::time::Duration::from_millis(100)),
+                Err(_) => break,
+            }
+        }
+        if let Some(content) = capture {
             // RAL-247: scrub credential env-var values before folding the pane
             // capture into the cell's ghost (which is later served back and
             // prepended to the next attempt's prompt).
@@ -23377,25 +23398,42 @@ remediation_attempts = 1
         // actually still be alive for the whole test, not just have
         // recently printed something -- sleeping well past any test's own
         // runtime removes the race outright instead of narrowing it.
+        let (program, args) = if cfg!(windows) {
+            (
+                "powershell",
+                vec![
+                    "-NoProfile".to_string(),
+                    "-Command".to_string(),
+                    format!("Write-Output {marker}; Start-Sleep -Seconds 60"),
+                ],
+            )
+        } else {
+            (
+                "sh",
+                vec!["-c".to_string(), format!("echo {marker}; sleep 60")],
+            )
+        };
         tmux.new_detached_session_with_command(
             name,
             &cwd,
             &std::collections::BTreeMap::new(),
-            "sh",
-            &["-c".to_string(), format!("echo {marker}; sleep 60")],
+            program,
+            &args,
             None,
         )
         .unwrap();
+        let mut captured = String::new();
         for _ in 0..50 {
             std::thread::sleep(std::time::Duration::from_millis(200));
-            if tmux
-                .capture_pane(name, 50)
-                .unwrap_or_default()
-                .contains(marker)
-            {
+            captured = tmux.capture_pane(name, 50).unwrap_or_default();
+            if captured.contains(marker) {
                 break;
             }
         }
+        assert!(
+            captured.contains(marker),
+            "marker process did not become visible in the live tmux pane: {captured}"
+        );
         tmux
     }
 
@@ -23428,6 +23466,7 @@ remediation_attempts = 1
         let name = crate::tmux::session_name(&squad_id, &task, &sid);
         let marker = "ral-163-in-progress-marker";
         spawn_marker_session(&name, marker);
+        let _cleanup = crate::tmux::KillSessionOnDrop(name.clone());
 
         let body = serde_json::json!({
             "kind": "cell", "task_idx": 0, "cell_idx": 0, "state": "done"
@@ -23546,6 +23585,7 @@ remediation_attempts = 1
         let name = crate::tmux::session_name(&squad_id, &task, &sid);
         let marker = "ral-163-ignored-marker";
         spawn_marker_session(&name, marker);
+        let _cleanup = crate::tmux::KillSessionOnDrop(name.clone());
 
         let body = serde_json::json!({
             "kind": "cell", "task_idx": 0, "cell_idx": 0, "state": "ignored"

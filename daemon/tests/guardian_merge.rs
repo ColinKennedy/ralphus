@@ -7747,7 +7747,9 @@ fn manual_checks_cache_is_scoped_per_review_across_membership_changes() {
 
     let runner = ManualCommandsCountingRunner::new();
     run_merge(&store, &runner, &r1);
+    run_guardian_post_merge(&store, &runner, &r1, PostMergeJobs::ALL);
     run_merge(&store, &runner, &r2);
+    run_guardian_post_merge(&store, &runner, &r2, PostMergeJobs::ALL);
     assert_eq!(runner.calls(), 2, "each review generates its own checks");
     let cached_r1 = store.lock().get_guardian(&r1).unwrap();
     let cached_r2 = store.lock().get_guardian(&r2).unwrap();
@@ -7764,7 +7766,9 @@ fn manual_checks_cache_is_scoped_per_review_across_membership_changes() {
     store.lock().move_guardian_branch(&r1, &bid_a, &r2).unwrap();
     purge_worktrees(&store, root.to_str().unwrap(), &r1);
     run_merge(&store, &runner, &r1);
+    run_guardian_post_merge(&store, &runner, &r1, PostMergeJobs::ALL);
     run_merge(&store, &runner, &r2);
+    run_guardian_post_merge(&store, &runner, &r2, PostMergeJobs::ALL);
     assert_eq!(
         runner.calls(),
         2,
@@ -7806,6 +7810,7 @@ fn turning_caching_off_regenerates_cached_manual_checks() {
     let (root, store, id) = single_feature_repo();
     let runner = ManualCommandsCountingRunner::new();
     run_merge(&store, &runner, &id);
+    run_guardian_post_merge(&store, &runner, &id, PostMergeJobs::ALL);
     assert_eq!(runner.calls(), 1);
     assert!(store.lock().get_guardian(&id).unwrap().manual_checks_cached);
 
@@ -7816,6 +7821,7 @@ fn turning_caching_off_regenerates_cached_manual_checks() {
         .set_guardian_cache_manual_checks(&id, Some(false))
         .unwrap();
     run_merge(&store, &runner, &id);
+    run_guardian_post_merge(&store, &runner, &id, PostMergeJobs::ALL);
     assert_eq!(
         runner.calls(),
         2,
@@ -7828,6 +7834,7 @@ fn turning_caching_off_regenerates_cached_manual_checks() {
         .set_guardian_cache_manual_checks(&id, Some(true))
         .unwrap();
     run_merge(&store, &runner, &id);
+    run_guardian_post_merge(&store, &runner, &id, PostMergeJobs::ALL);
     assert_eq!(
         runner.calls(),
         2,

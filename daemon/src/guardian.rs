@@ -697,10 +697,11 @@ pub struct GuardianView {
     /// unset. The merge engine gates manual-checks regeneration on this
     /// plus [`Self::manual_checks_cached`].
     pub effective_cache_manual_checks: bool,
-    /// RAL-521: `true` once manual-checks generation has produced commands
-    /// for this review. Under an enabled [`Self::effective_cache_manual_checks`]
-    /// the merge engine treats the stored `manual_commands` as current and
-    /// skips regeneration on every merge/rebase/fix after the first.
+    /// RAL-521: `true` once manual-checks generation has completed for this
+    /// review, including an intentionally empty command result. Under an
+    /// enabled [`Self::effective_cache_manual_checks`] the merge engine treats
+    /// the stored `manual_commands` as current and skips regeneration on every
+    /// merge/rebase/fix after the first.
     pub manual_checks_cached: bool,
     /// The review source type. `git` (the default and only fully-implemented
     /// type) drives the branch-stacking flow; other values are placeholders for
@@ -3053,12 +3054,12 @@ impl Store {
         }
     }
 
-    /// RAL-521: record that manual-checks generation has produced commands
-    /// for this review. The marker is what lets a later merge/rebase/fix
-    /// (under an enabled `cache_manual_checks`) recognize the already
-    /// computed result and skip regeneration. The merge engine never resets
-    /// it back to `false` -- a review keeps its first generation for its
-    /// whole life.
+    /// RAL-521: record that manual-checks generation has completed for this
+    /// review. The marker is what lets a later merge/rebase/fix (under an
+    /// enabled `cache_manual_checks`) recognize the already computed result
+    /// and skip regeneration, including when that result is empty. The merge
+    /// engine never resets it back to `false` -- a review keeps its first
+    /// generation for its whole life.
     ///
     /// # Errors
     /// [`StoreError::NotFound`] when no such guardian exists.
@@ -4760,7 +4761,7 @@ impl Store {
     pub(crate) fn list_guardians_conn(conn: &Connection) -> Result<Vec<GuardianView>> {
         let mut stmt = conn.prepare(
             "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus
-              FROM guardians ORDER BY created_at_ms DESC", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
+             FROM guardians ORDER BY created_at_ms DESC", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
         )?;
         let rows = stmt
             .query_map([], Self::map_guardian_row)?
