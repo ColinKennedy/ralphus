@@ -2515,7 +2515,7 @@ impl Store {
         let n = self.conn.execute(
             "UPDATE guardians SET status=?, detail=?, updated_at_ms=? WHERE id=? \
              AND (status != 'cancelled' OR ?='cancelled') \
-             AND (status != 'merge_stopped' OR ? IN ('cancelled','merge_stopped'))",
+             AND (status != 'merge_stopped' OR ? IN ('cancelled','merge_stopped','approved'))",
             params![
                 status.as_str(),
                 detail,
@@ -2541,7 +2541,9 @@ impl Store {
                 || (old == "merge_stopped"
                     && !matches!(
                         status,
-                        GuardianStatus::MergeStopped | GuardianStatus::Cancelled
+                        GuardianStatus::MergeStopped
+                            | GuardianStatus::Cancelled
+                            | GuardianStatus::Approved
                     ))
             {
                 return Ok(());
