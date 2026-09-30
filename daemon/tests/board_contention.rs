@@ -199,6 +199,18 @@ fn board_reads_stay_fast_under_four_writers() {
         "/api/guardian-index",
         "/api/daemon",
     ];
+
+    // Let the HTTP accept loop and each read path finish their one-time
+    // initialization before the timed contention window begins.  Otherwise
+    // the first request on a fresh server can include startup work (thread
+    // creation, route/read-pool setup, and allocator/page-cache warming) that
+    // is unrelated to store contention and is especially noisy on a shared
+    // CI runner.  The same endpoints are still measured below, after this
+    // warm-up, while all four writers are active.
+    for endpoint in endpoints {
+        let (status, body) = request(&seed_agent, "GET", &format!("{base}{endpoint}"), None);
+        assert_eq!(status, 200, "warm-up {endpoint}: {body}");
+    }
     let deadline = Instant::now() + Duration::from_millis(LOAD_MS);
 
     // Four writers, rotating env writes across the seeded squads.

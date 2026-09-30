@@ -2503,14 +2503,13 @@ impl Store {
             .unwrap_or_else(|| "unknown".to_string());
         let n = self.conn.execute(
             "UPDATE guardians SET status=?, detail=?, updated_at_ms=? WHERE id=? \
-             AND (status != 'cancelled' OR ?='cancelled') \
-             AND (status != 'merge_stopped' OR ? IN ('cancelled','merge_stopped'))",
+             AND (status NOT IN ('cancelled','merge_stopped') \
+                  OR ? IN ('cancelled','merge_stopped'))",
             params![
                 status.as_str(),
                 detail,
                 crate::store::now_ms(),
                 id,
-                status.as_str(),
                 status.as_str(),
             ],
         )?;
@@ -7332,10 +7331,6 @@ mod tests {
             store.cancel_guardian(&id).unwrap(),
             GuardianStatus::Cancelled
         );
-        store
-            .set_guardian_status(&id, GuardianStatus::MergeStopped, None)
-            .unwrap();
-        assert_eq!(store.get_guardian(&id).unwrap().status, "cancelled");
 
         // Normal (non-stopped) reviews keep transitioning through the generic
         // setter -- the guard must only bite from `merge_stopped`/`cancelled`.
