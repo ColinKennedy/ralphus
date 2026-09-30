@@ -1236,18 +1236,11 @@ impl ForgeClient {
     /// values (`"unchecked"`, `"checking"`) mean GitLab hasn't finished
     /// computing it yet, so they're treated as pending, not failing.
     ///
-    /// RAL-462: unlike GitHub's check-runs/status calls (each scoped to a
-    /// specific commit sha by its own URL), the MR endpoint's `pipeline`
-    /// field is simply "the latest pipeline for this MR" -- if the MR's head
-    /// just moved (rebase, force-push, a new feedback commit) and GitLab
-    /// hasn't registered a pipeline for that new commit yet, this field still
-    /// holds the *previous* commit's pipeline, verdict and all. Reusing that
-    /// verdict verbatim would let a stale "failed" badge survive a rebase
-    /// until GitLab gets around to creating the new pipeline. Comparing the
-    /// pipeline's own `sha` against the MR's current head sha (both in the
-    /// same response, so no extra state to track) tells the two apart: a
-    /// mismatch means the pipeline belongs to a commit that's no longer the
-    /// head, so there's genuinely no verdict yet for the current one.
+    /// A detached MR pipeline runs on the source head, so its SHA must match
+    /// the MR source-head SHA before its verdict can be attributed to the
+    /// current MR. A merged-results pipeline runs on GitLab's synthetic
+    /// `refs/merge-requests/<iid>/merge` commit instead; it is current only
+    /// when its SHA matches the current merge-ref commit.
     fn check_gitlab_pr_ci_status(&self, number: i64) -> Result<PrCiState, String> {
         let token = self.require_token()?;
         let mr_url = format!(
@@ -1268,13 +1261,8 @@ impl ForgeClient {
             // No pipeline has run against this MR yet.
             return Ok(PrCiState::Pending);
         };
-        let head_sha = mr["sha"]
-            .as_str()
-            .or_else(|| mr["diff_refs"]["head_sha"].as_str());
-        if let (Some(head_sha), Some(pipeline_sha)) = (head_sha, mr["pipeline"]["sha"].as_str()) {
-            if head_sha != pipeline_sha {
-                return Ok(PrCiState::Pending);
-            }
+        if !self.gitlab_pipeline_is_current_for_mr(number, &mr, &mr["pipeline"], token) {
+            return Ok(PrCiState::Pending);
         }
         match pipeline_status {
             "success" => Ok(PrCiState::Passing),
@@ -1335,6 +1323,47 @@ impl ForgeClient {
             // "running" | "pending" | "created" | "waiting_for_resource" | "preparing" | ...
             _ => Ok(PrCiState::Pending),
         }
+    }
+
+    /// Checks that the pipeline represents the MR's current source head or
+    /// current merged result. GitLab documents the merge-ref endpoint at
+    /// <https://docs.gitlab.com/api/merge_requests/#merge-to-default-merge-ref-path>.
+    /// A missing or unreadable merge-ref is deliberately not a verdict: the
+    /// caller reports `Pending` until freshness can be established.
+    fn gitlab_pipeline_is_current_for_mr(
+        &self,
+        number: i64,
+        mr: &serde_json::Value,
+        pipeline: &serde_json::Value,
+        token: &str,
+    ) -> bool {
+        let merged_results_ref = format!("refs/merge-requests/{number}/merge");
+        if pipeline["ref"].as_str() == Some(merged_results_ref.as_str()) {
+            let Some(pipeline_sha) = pipeline["sha"].as_str() else {
+                return false;
+            };
+            let merge_ref_url = format!(
+                "{}/projects/{}/merge_requests/{number}/merge_ref",
+                self.api_base, self.repo_path
+            );
+            return self
+                .get(http_agent().get(&merge_ref_url).set("PRIVATE-TOKEN", token))
+                .ok()
+                .and_then(|merge_ref| {
+                    merge_ref["commit_id"]
+                        .as_str()
+                        .map(|merge_sha| merge_sha == pipeline_sha)
+                })
+                .unwrap_or(false);
+        }
+
+        let head_sha = mr["sha"]
+            .as_str()
+            .or_else(|| mr["diff_refs"]["head_sha"].as_str());
+        !matches!(
+            (head_sha, pipeline["sha"].as_str()),
+            (Some(head_sha), Some(pipeline_sha)) if head_sha != pipeline_sha
+        )
     }
 
     /// Best-effort lookup of which step inside a GitHub Actions job actually
@@ -6384,7 +6413,7 @@ mod tests {
             assert_eq!(req.url(), "/projects/group%2Fproj/merge_requests/9");
             req.respond(
                 tiny_http::Response::from_string(
-                    r#"{"merge_status": "can_be_merged", "sha": "newsha", "pipeline": {"id": 55, "sha": "oldsha", "status": "failed", "web_url": "https://gitlab.example/pipelines/55"}}"#,
+                    r#"{"merge_status": "can_be_merged", "sha": "newsha", "pipeline": {"id": 55, "ref": "refs/merge-requests/9/head", "sha": "oldsha", "status": "failed", "web_url": "https://gitlab.example/pipelines/55"}}"#,
                 )
                 .with_status_code(200),
             )
@@ -6419,7 +6448,7 @@ mod tests {
             assert_eq!(req.url(), "/projects/group%2Fproj/merge_requests/9");
             req.respond(
                 tiny_http::Response::from_string(
-                    r#"{"merge_status": "can_be_merged", "sha": "samesha", "pipeline": {"id": 55, "sha": "samesha", "status": "success", "web_url": "https://gitlab.example/pipelines/55"}}"#,
+                    r#"{"merge_status": "can_be_merged", "sha": "samesha", "pipeline": {"id": 55, "ref": "refs/merge-requests/9/head", "sha": "samesha", "status": "success", "web_url": "https://gitlab.example/pipelines/55"}}"#,
                 )
                 .with_status_code(200),
             )
@@ -6436,8 +6465,12 @@ mod tests {
         handle.join().unwrap();
     }
 
+    // These tiny_http responses mock GitLab's documented MR and merge-ref
+    // REST payloads, not a live GitLab server. A passing test proves only
+    // the behavior against this fixture; investigate fixture divergence if
+    // live GitLab differs from https://docs.gitlab.com/api/merge_requests/.
     #[test]
-    fn check_pr_ci_status_reports_a_failing_gitlab_pipeline_job_with_its_trace() {
+    fn check_pr_ci_status_reports_a_current_gitlab_merged_results_pipeline_as_passing() {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let addr = server.server_addr().to_string();
         let handle = std::thread::spawn(move || {
@@ -6445,9 +6478,121 @@ mod tests {
             assert_eq!(req.url(), "/projects/group%2Fproj/merge_requests/9");
             req.respond(
                 tiny_http::Response::from_string(
-                    r#"{"merge_status": "can_be_merged", "pipeline": {"id": 55, "status": "failed", "web_url": "https://gitlab.example/pipelines/55"}}"#,
+                    r#"{"merge_status": "can_be_merged", "sha": "source-sha", "pipeline": {"id": 55, "ref": "refs/merge-requests/9/merge", "sha": "merge-sha", "status": "success", "web_url": "https://gitlab.example/pipelines/55"}}"#,
                 )
                 .with_status_code(200),
+            )
+            .unwrap();
+            let req = server.recv().unwrap();
+            assert_eq!(
+                req.url(),
+                "/projects/group%2Fproj/merge_requests/9/merge_ref"
+            );
+            req.respond(
+                tiny_http::Response::from_string(r#"{"commit_id": "merge-sha"}"#)
+                    .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "group%2Fproj".to_string(),
+            Some("tok".to_string()),
+        );
+        assert_eq!(client.check_pr_ci_status(9).unwrap(), PrCiState::Passing);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn check_pr_ci_status_reports_gitlab_pending_for_a_stale_merged_results_pipeline() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"merge_status": "can_be_merged", "sha": "source-sha", "pipeline": {"id": 55, "ref": "refs/merge-requests/9/merge", "sha": "old-merge-sha", "status": "failed"}}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+            let req = server.recv().unwrap();
+            assert_eq!(
+                req.url(),
+                "/projects/group%2Fproj/merge_requests/9/merge_ref"
+            );
+            req.respond(
+                tiny_http::Response::from_string(r#"{"commit_id": "current-merge-sha"}"#)
+                    .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "group%2Fproj".to_string(),
+            Some("tok".to_string()),
+        );
+        assert_eq!(client.check_pr_ci_status(9).unwrap(), PrCiState::Pending);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn check_pr_ci_status_reports_gitlab_pending_when_the_merge_ref_is_unavailable() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"merge_status": "can_be_merged", "sha": "source-sha", "pipeline": {"id": 55, "ref": "refs/merge-requests/9/merge", "sha": "merge-sha", "status": "success"}}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+            let req = server.recv().unwrap();
+            assert_eq!(
+                req.url(),
+                "/projects/group%2Fproj/merge_requests/9/merge_ref"
+            );
+            req.respond(
+                tiny_http::Response::from_string("merge ref unavailable").with_status_code(503),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "group%2Fproj".to_string(),
+            Some("tok".to_string()),
+        );
+        assert_eq!(client.check_pr_ci_status(9).unwrap(), PrCiState::Pending);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn check_pr_ci_status_reports_failing_gitlab_merged_results_job_trace() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/projects/group%2Fproj/merge_requests/9");
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"merge_status": "can_be_merged", "sha": "source-sha", "pipeline": {"id": 55, "ref": "refs/merge-requests/9/merge", "sha": "merge-sha", "status": "failed", "web_url": "https://gitlab.example/pipelines/55"}}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+            let req = server.recv().unwrap();
+            assert_eq!(
+                req.url(),
+                "/projects/group%2Fproj/merge_requests/9/merge_ref"
+            );
+            req.respond(
+                tiny_http::Response::from_string(r#"{"commit_id": "merge-sha"}"#)
+                    .with_status_code(200),
             )
             .unwrap();
             let req = server.recv().unwrap();
