@@ -4264,17 +4264,17 @@ pub fn restart_guardian_merge(
     start_merge(store, runner, id, sem, cancellations)
 }
 
-/// Reopen a `cancelled` or `merged` review (status → `collecting`) and
-/// immediately try an incremental staged merge (RAL-265, [`run_merge_staged`])
-/// -- the same pass a task completion would have triggered via
-/// `start_reviews` (`daemon/src/scheduler.rs`) had this review not been
-/// cancelled/merged at the time. Deliberately *not* the all-or-nothing
-/// [`start_merge`] that the manual "Merge / rebase" button uses: that path
-/// waits for every enabled branch's cell to finish before rebasing anything,
-/// so a review reopened while one branch is still pending would sit doing
-/// nothing until that last cell completes, even though every earlier
-/// branch's cell finished (and would already have been rebased into the
-/// review) while the review was dormant. Staging the ready prefix now
+/// Reopen a `cancelled`, `merged`, or `approved` review (status →
+/// `collecting`) and immediately try an incremental staged merge (RAL-265,
+/// [`run_merge_staged`]) -- the same pass a task completion would have
+/// triggered via `start_reviews` (`daemon/src/scheduler.rs`) had this review
+/// not been cancelled/merged/approved at the time. Deliberately *not* the
+/// all-or-nothing [`start_merge`] that the manual "Merge / rebase" button
+/// uses: that path waits for every enabled branch's cell to finish before
+/// rebasing anything, so a review reopened while one branch is still pending
+/// would sit doing nothing until that last cell completes, even though every
+/// earlier branch's cell finished (and would already have been rebased into
+/// the review) while the review was dormant. Staging the ready prefix now
 /// catches it up immediately instead of waiting on that last cell or the
 /// periodic maintenance sweep.
 ///
@@ -4282,9 +4282,10 @@ pub fn restart_guardian_merge(
 /// has returned. Wait for that worker here, where a fresh merge could reuse
 /// the same worktrees; if it does not stop within the bounded budget, leave
 /// the review cancelled and ask the caller to retry instead of overlapping two
-/// workers. A merged review never has a worker to wait for -- it only
-/// ever arrives at `merged` from `in_review`, which has none either -- so
-/// this wait resolves immediately for that case.
+/// workers. A merged or approved review never has a worker to wait for --
+/// they only ever arrive there from `in_review`/`merge_stopped` (RAL-535),
+/// none of which have one either -- so this wait resolves immediately for
+/// those cases.
 pub fn reopen_guardian_merge(
     store: crate::store_lock::StoreHandle,
     runner: Arc<dyn Runner>,
@@ -4589,6 +4590,14 @@ fn record_feedback_reply(
         // own environment and has no way to honor a custom profile's env
         // (e.g. an OpenRouter base URL/key), so skip rather than silently
         // hit the wrong endpoint/key.
+        return;
+    }
+    if !matches!(
+        resolved.backend.to_lowercase().as_str(),
+        "claude" | "anthropic" | "ollama"
+    ) {
+        // `call_direct` only supports these backends; subprocess runners
+        // (like "claude-code") are not supported for direct chat.
         return;
     }
     let system = format!(
@@ -8076,10 +8085,24 @@ fn guardian_base_already_has_every_branch(
 /// equivalent per-project check inline in [`rebuild_on_base_shift`]) found
 /// every enabled branch already landed on its base (RAL-300) -- shared so the
 /// periodic sweep and a manual "Merge / rebase" trigger log/mark-merged
-/// identically. Only valid from `in_review` (mirrors `approve_guardian`'s one
-/// legal transition); returns whether it did.
+/// identically. Only valid from `in_review` (forge-driven transition to merged,
+/// distinct from the human-driven `approve_guardian` transition to approved);
+/// returns whether it did.
 fn approve_base_already_landed(store: &crate::store_lock::StoreHandle, id: &str) -> bool {
-    let merged = store.lock().approve_guardian(id).is_ok();
+    let merged = {
+        let guard = store.lock();
+        if let Ok(status_str) = guard.guardian_status_str(id) {
+            if status_str == "in_review" {
+                guard
+                    .set_guardian_status(id, crate::guardian::GuardianStatus::Merged, None)
+                    .is_ok()
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    };
     if merged {
         // A `MutexGuard` temporary produced in an `if let` scrutinee lives
         // for the whole `if let` (it desugars to `match`), so binding the
