@@ -141,7 +141,7 @@ pub const WAYPOINT_SURVEY_INTERVAL: Duration = Duration::from_secs(60);
 /// fetched under a short-lived lock that is dropped *before* resolution runs
 /// (resolution does its own file I/O for legacy TOML profiles, which must
 /// never happen while the store mutex is held).
-fn resolve_agent_selection(
+pub(crate) fn resolve_agent_selection(
     store: &crate::store_lock::StoreHandle,
     agent: &str,
     cwd: &str,
@@ -631,7 +631,7 @@ pub fn run_loop(
             last_cpu_stall_sweep = std::time::Instant::now();
         }
         if last_waypoint_survey.elapsed() >= WAYPOINT_SURVEY_INTERVAL {
-            crate::waypoints::run_pending_surveys(&store, &waypoint_halts);
+            crate::waypoints::run_pending_surveys(&store, &waypoint_halts, &runner);
             crate::waypoints::run_pending_waypoint_resumes(&store, &cancellations);
             crate::waypoints::run_pending_deliveries(&store, &runner);
             crate::waypoints::run_pending_stand_down_notices(&store, &runner);

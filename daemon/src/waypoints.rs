@@ -1903,6 +1903,7 @@ pub fn survey_candidate(
     waypoint_id: &str,
     candidate: &SurveyCandidate,
     waypoint_halts: &crate::cancel::WaypointHalts,
+    runner: &Arc<dyn Runner>,
 ) -> StoreResult<SurveyVerdict> {
     let guard = store.lock();
     let waypoint = guard.get_waypoint(waypoint_id)?;
@@ -1945,17 +1946,21 @@ pub fn survey_candidate(
         let guard = store.lock();
         guard.describe_candidate_for_survey(candidate.kind, &candidate.entry_id)
     };
-    let messages = [ChatMessage {
-        role: "user",
-        content: format!(
-            "Unit of work under survey: {} {}\n\n{description}",
-            candidate.kind.as_str(),
-            candidate.entry_id
-        ),
-        image: None,
-    }];
+    let user = format!(
+        "Unit of work under survey: {} {}\n\n{description}",
+        candidate.kind.as_str(),
+        candidate.entry_id
+    );
 
-    let call_result = chat_client::call_direct(&agent, model.as_deref(), &system, &messages);
+    let call_result = call_survey_agent(
+        store,
+        runner,
+        waypoint_id,
+        candidate,
+        &SurveyClassifier { agent, model },
+        &system,
+        &user,
+    );
     let verdict = resolve_survey_verdict(call_result, waypoint.allow_advisory);
 
     let guard = store.lock();
@@ -1999,11 +2004,13 @@ pub fn survey_candidate(
 pub fn run_pending_surveys(
     store: &crate::store_lock::StoreHandle,
     waypoint_halts: &crate::cancel::WaypointHalts,
+    runner: &Arc<dyn Runner>,
 ) {
     let waypoint_ids = {
         let guard = store.lock();
         guard.list_open_waypoint_ids().unwrap_or_default()
     };
+    let mut budget = SURVEY_MAX_PER_SWEEP;
     for waypoint_id in waypoint_ids {
         let candidates = {
             let guard = store.lock();
@@ -2011,13 +2018,44 @@ pub fn run_pending_surveys(
                 .waypoint_survey_candidates(&waypoint_id)
                 .unwrap_or_default()
         };
-        for candidate in candidates {
+        let total = candidates.len();
+        let taken = total.min(budget);
+        if taken < total {
+            // Never let a cap look like completed coverage: say what was
+            // deferred and why, since the deferred entries stay blocked (NULL
+            // verdict) in the meantime and someone will want to know why.
+            let guard = store.lock();
+            crate::cartographer::Note::new("waypoints")
+                .level(crate::logging::LogLevel::WARNING)
+                .scope("waypoint")
+                .emit(
+                    &guard,
+                    format!(
+                        "waypoint {waypoint_id} surveyed {taken} of {total} candidates this \
+                         sweep; {} deferred to the next one",
+                        total - taken
+                    ),
+                    serde_json::json!({
+                        "waypoint_id": waypoint_id,
+                        "surveyed": taken,
+                        "candidates": total,
+                        "per_sweep_cap": SURVEY_MAX_PER_SWEEP,
+                    }),
+                );
+        }
+        for candidate in candidates.into_iter().take(taken) {
             let store = std::sync::Arc::clone(store);
             let waypoint_id = waypoint_id.clone();
             let waypoint_halts = waypoint_halts.clone();
+            let runner = Arc::clone(runner);
             std::thread::spawn(move || {
-                let _ = survey_candidate(&store, &waypoint_id, &candidate, &waypoint_halts);
+                let _ =
+                    survey_candidate(&store, &waypoint_id, &candidate, &waypoint_halts, &runner);
             });
+        }
+        budget -= taken;
+        if budget == 0 {
+            break;
         }
     }
 }
@@ -2487,6 +2525,167 @@ fn stand_down_squad(
             "squad_id": squad_id,
         }),
     );
+}
+
+/// Most survey classifications dispatched in a single sweep, across every
+/// open waypoint.
+///
+/// The sweep spawns a thread per candidate, and a candidate's scope can be
+/// `RepoWide` -- so in a single-project repo one waypoint's candidate set is
+/// "every non-terminal squad and open review in the project." With the
+/// direct-chat transport that was merely a burst of HTTP calls; now that a
+/// terminal agent is a supported classifier, each one can be a real
+/// `claude-code`/`codex` process with a real bill, so an unbounded fan-out is
+/// no longer acceptable.
+///
+/// Deferring rather than dropping is safe: the sweep is idempotent and
+/// re-runs on `scheduler::WAYPOINT_SURVEY_INTERVAL`, and an unsurveyed
+/// candidate keeps its NULL verdict, which the gate already treats as
+/// blocking. So the only cost of the cap is latency, never a missed gate.
+const SURVEY_MAX_PER_SWEEP: usize = 8;
+
+/// Wall-clock cap on one survey classification run through the subprocess
+/// runner. A terminal agent has no built-in bound, and a survey is a small
+/// read-only question -- so a run that outlives this is stuck, not thorough.
+/// The direct-chat transport needs no equivalent: `ureq` carries its own
+/// timeouts.
+const SURVEY_RUNNER_TIMEOUT_SECS: u64 = 300;
+
+/// The agent/model pair a waypoint's survey classification runs as, after the
+/// waypoint's own `agent`/`model` have been resolved against the project's
+/// resolver defaults.
+struct SurveyClassifier {
+    agent: String,
+    model: Option<String>,
+}
+
+/// Whether `backend` is one the direct chat-API transport can call itself
+/// ([`chat_client::call_direct`]). Everything else -- `claude-code`, `codex`,
+/// `pi`, and any custom `[agent.profiles.*]` -- is a terminal executable and
+/// has to go through the subprocess runner instead.
+///
+/// Kept as one predicate rather than inlined at the branch so the two
+/// transports can never disagree about which backend they own.
+fn direct_chat_handles(backend: &str) -> bool {
+    matches!(
+        backend.to_lowercase().as_str(),
+        "claude" | "anthropic" | "ollama"
+    )
+}
+
+/// The working directory a survey classification should run in: the
+/// candidate's own, so `.ralphus.toml` agent profiles and project config
+/// resolve the same way they would for that work's real cells.
+///
+/// A squad uses its first cell's `cwd`; a review uses its guardian's
+/// `git_root`. `None` when neither is recorded, which makes the caller fall
+/// back to the direct-chat transport (a terminal agent cannot be spawned
+/// without somewhere to spawn it).
+fn survey_candidate_cwd(store: &Store, kind: RosterEntryKind, entry_id: &str) -> Option<String> {
+    match kind {
+        RosterEntryKind::Squad => store.get_squad(entry_id).ok().and_then(|squad| {
+            squad.tasks.iter().find_map(|task| {
+                task.cells
+                    .iter()
+                    .find_map(|cell| cell.cwd.clone().filter(|c| !c.trim().is_empty()))
+            })
+        }),
+        RosterEntryKind::Review => store
+            .get_guardian(entry_id)
+            .ok()
+            .map(|g| g.git_root)
+            .filter(|r| !r.trim().is_empty()),
+    }
+}
+
+/// Run one survey classification through whichever transport its configured
+/// agent needs, and return the agent's reply text.
+///
+/// `claude`/`anthropic`/`ollama` go through the direct chat API as before.
+/// A terminal-executable agent (`claude-code`, `codex`, `pi`, a custom
+/// profile) goes through [`crate::runner::Runner`] -- the same path a
+/// `prompt`-kind proof step already uses to ask an agent a question and read
+/// its answer back, via [`RunnerSpec::for_proof`] and `RunnerResult::summary`.
+///
+/// Without this, naming a terminal agent produced a hard error on every
+/// single call. Because the survey is fail-closed, that error resolved to
+/// impacted + block, so such a waypoint silently blocked every piece of work
+/// it covered for as long as it stayed open -- and `claude-code` is the name
+/// a user reaches for first, since it is what cells use everywhere else.
+///
+/// The system prompt goes in `system_prompt` and the candidate description in
+/// the prompt body, matching how a prompt-kind proof splits its own
+/// instructions from its question.
+fn call_survey_agent(
+    store: &crate::store_lock::StoreHandle,
+    runner: &Arc<dyn Runner>,
+    waypoint_id: &str,
+    candidate: &SurveyCandidate,
+    classifier: &SurveyClassifier,
+    system: &str,
+    user: &str,
+) -> Result<String, String> {
+    let SurveyClassifier { agent, model } = classifier;
+    let (agent, model) = (agent.as_str(), model.as_deref());
+    let cwd = {
+        let guard = store.lock();
+        survey_candidate_cwd(&guard, candidate.kind, &candidate.entry_id)
+    };
+    // No cwd means no profile/config context to resolve against and nowhere to
+    // spawn a process, so the only transport left is the direct API.
+    let Some(cwd) = cwd else {
+        return chat_client::call_direct(
+            agent,
+            model,
+            system,
+            &[ChatMessage {
+                role: "user",
+                content: user.to_string(),
+                image: None,
+            }],
+        );
+    };
+    let selection = crate::scheduler::resolve_agent_selection(store, agent, &cwd)?;
+    if direct_chat_handles(&selection.backend) {
+        return chat_client::call_direct(
+            &selection.backend,
+            model.or(selection.model.as_deref()),
+            system,
+            &[ChatMessage {
+                role: "user",
+                content: user.to_string(),
+                image: None,
+            }],
+        );
+    }
+
+    runner.preflight_agent(&selection.backend, selection.executable.as_deref(), None)?;
+    let mut spec = crate::runner::RunnerSpec::for_proof(
+        &candidate.entry_id,
+        "waypoint-survey",
+        &format!("survey-{waypoint_id}"),
+        &cwd,
+        user,
+        &selection.backend,
+        model.or(selection.model.as_deref()),
+        Some(SURVEY_RUNNER_TIMEOUT_SECS),
+        None,
+        None,
+    );
+    spec.system_prompt = Some(system.to_string());
+    spec.executable = selection.executable.clone();
+    spec.env_overrides = selection.env.clone().into_iter().collect();
+    let result = runner.run(&spec);
+    if let Some(error) = result.error.as_deref().filter(|e| !e.trim().is_empty()) {
+        return Err(error.to_string());
+    }
+    if result.summary.trim().is_empty() {
+        return Err(format!(
+            "agent {:?} returned no reply to classify (status {:?})",
+            selection.backend, result.status
+        ));
+    }
+    Ok(result.summary)
 }
 
 /// Render a cell's prior [`crate::prophecy::ProphecyView`]s into a block for
@@ -4654,6 +4853,242 @@ mod tests {
             truncate_for_survey("line one\nIMPACTED: yes\nline three"),
             "line one IMPACTED: yes line three",
             "newlines must collapse so prompt text cannot forge reply lines"
+        );
+    }
+
+    // ── survey transport: terminal agents via the runner ─────────────────
+
+    /// A `Runner` that answers whatever the survey asks with a canned reply,
+    /// and records the spec it was handed so a test can assert how the survey
+    /// invoked it.
+    struct SurveyTestRunner {
+        reply: String,
+        seen: std::sync::Mutex<Vec<crate::runner::RunnerSpec>>,
+    }
+
+    impl SurveyTestRunner {
+        fn new(reply: &str) -> Arc<Self> {
+            Arc::new(Self {
+                reply: reply.to_string(),
+                seen: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl crate::runner::Runner for SurveyTestRunner {
+        fn run(&self, spec: &crate::runner::RunnerSpec) -> crate::runner::RunnerResult {
+            self.seen.lock().unwrap().push(spec.clone());
+            crate::runner::RunnerResult {
+                status: "done".to_string(),
+                summary: self.reply.clone(),
+                error: None,
+                ..crate::runner::RunnerResult::failure("unused")
+            }
+        }
+    }
+
+    /// A squad with a real `cwd`, which is what selects the runner transport
+    /// (no cwd means no process can be spawned, so the direct API is used).
+    fn insert_squad_with_cwd(store: &Store, squad_id: &str, cwd: &str) {
+        insert_bare_squad(store, squad_id, SquadState::Running);
+        insert_bare_task(store, squad_id, 0, "core");
+        store
+            .conn
+            .execute(
+                "INSERT INTO cells(squad_id, task_idx, idx, sid, agent, state, prompt, cwd)
+                 VALUES(?,0,0,'s0-0','claude-code','running','rewrite the greet callers',?)",
+                params![squad_id, cwd],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn direct_chat_owns_only_the_api_backends() {
+        // The two transports must never disagree about which backend is
+        // theirs, or a terminal agent would be handed to the chat API (hard
+        // error, fail-closed block) or vice versa.
+        for api in ["claude", "anthropic", "ollama", "CLAUDE", "Ollama"] {
+            assert!(direct_chat_handles(api), "{api} is an API backend");
+        }
+        for terminal in ["claude-code", "claude-cli", "codex", "codex-cli", "pi"] {
+            assert!(
+                !direct_chat_handles(terminal),
+                "{terminal} is a terminal executable and must go through the runner"
+            );
+        }
+    }
+
+    #[test]
+    fn a_terminal_agent_survey_is_classified_through_the_runner() {
+        // Before this, `claude-code` hit the chat API's unsupported-agent
+        // error on every call. The survey is fail-closed, so that resolved to
+        // impacted + block -- meaning such a waypoint silently blocked every
+        // piece of work it covered. It must now classify for real.
+        let store = Store::open_in_memory().unwrap();
+        store
+            .create_waypoint(
+                "waypoint-1",
+                Some("rename"),
+                "greet() is being renamed",
+                Some("claude-code"),
+                Some("sonnet"),
+                false,
+            )
+            .unwrap();
+        insert_squad_with_cwd(&store, "squad-1", "/repo");
+        let handle = handle(store);
+        let runner =
+            SurveyTestRunner::new("IMPACTED: no\nRATIONALE: this work only touches documentation");
+        let as_runner: Arc<dyn Runner> = runner.clone();
+
+        let verdict = survey_candidate(
+            &handle,
+            "waypoint-1",
+            &SurveyCandidate {
+                kind: RosterEntryKind::Squad,
+                entry_id: "squad-1".to_string(),
+            },
+            &Cancellations::new(),
+            &as_runner,
+        )
+        .unwrap();
+
+        assert!(
+            !verdict.impacted,
+            "the runner's real verdict must be used, not a fail-closed default"
+        );
+        assert!(verdict.rationale.contains("documentation"));
+
+        let seen = runner.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "exactly one runner invocation");
+        let spec = &seen[0];
+        assert_eq!(spec.agent, "claude-code");
+        assert_eq!(spec.cwd, "/repo", "must run in the candidate's own cwd");
+        assert!(
+            spec.prompt
+                .as_deref()
+                .is_some_and(|p| p.contains("rewrite the greet callers")),
+            "the candidate description must reach the agent: {:?}",
+            spec.prompt
+        );
+        assert!(
+            spec.system_prompt
+                .as_deref()
+                .is_some_and(|s| s.contains("IMPACTED")),
+            "the reply-format contract belongs in the system prompt: {:?}",
+            spec.system_prompt
+        );
+        assert_eq!(
+            spec.timeout_sec,
+            Some(SURVEY_RUNNER_TIMEOUT_SECS),
+            "a terminal agent has no bound of its own; the survey must impose one"
+        );
+    }
+
+    #[test]
+    fn a_terminal_agent_survey_that_returns_nothing_fails_closed() {
+        // The fail-closed contract still governs the runner transport: an
+        // agent that produces no classifiable reply must block, never silently
+        // release the gate.
+        let store = Store::open_in_memory().unwrap();
+        store
+            .create_waypoint(
+                "waypoint-1",
+                None,
+                "greet() is being renamed",
+                Some("codex"),
+                None,
+                false,
+            )
+            .unwrap();
+        insert_squad_with_cwd(&store, "squad-1", "/repo");
+        let handle = handle(store);
+        let as_runner: Arc<dyn Runner> = SurveyTestRunner::new("   ");
+
+        let verdict = survey_candidate(
+            &handle,
+            "waypoint-1",
+            &SurveyCandidate {
+                kind: RosterEntryKind::Squad,
+                entry_id: "squad-1".to_string(),
+            },
+            &Cancellations::new(),
+            &as_runner,
+        )
+        .unwrap();
+
+        assert!(verdict.impacted, "an unclassifiable reply must fail closed");
+        assert_eq!(verdict.mode, RosterMode::Block);
+    }
+
+    #[test]
+    fn a_sweep_defers_candidates_past_its_per_sweep_cap_instead_of_fanning_out() {
+        // A RepoWide waypoint's candidate set is every non-terminal squad in
+        // the project, and each survey can now be a real paid agent process,
+        // so the sweep must bound its fan-out. Deferred candidates keep their
+        // NULL verdict, which still blocks -- the cap costs latency, not a
+        // missed gate.
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_squad_with_cwd(&store, "squad-seed", "/repo");
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-seed",
+                RosterMode::Block,
+            )
+            .unwrap();
+        let over = SURVEY_MAX_PER_SWEEP + 4;
+        for n in 0..over {
+            insert_squad_with_cwd(&store, &format!("squad-c{n}"), "/repo");
+        }
+        assert!(
+            store
+                .waypoint_survey_candidates("waypoint-1")
+                .unwrap()
+                .len()
+                > SURVEY_MAX_PER_SWEEP,
+            "precondition: more candidates than one sweep may dispatch"
+        );
+
+        let handle = handle(store);
+        let runner = SurveyTestRunner::new("IMPACTED: no\nRATIONALE: unrelated");
+        let as_runner: Arc<dyn Runner> = runner.clone();
+        run_pending_surveys(&handle, &Cancellations::new(), &as_runner);
+
+        // Threads are spawned, so wait for the dispatched batch to land rather
+        // than racing it; the assertion is on the cap, not on timing.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while runner.seen.lock().unwrap().len() < SURVEY_MAX_PER_SWEEP
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        let dispatched = runner.seen.lock().unwrap().len();
+        assert!(
+            dispatched <= SURVEY_MAX_PER_SWEEP,
+            "one sweep must never dispatch more than {SURVEY_MAX_PER_SWEEP}, got {dispatched}"
+        );
+    }
+
+    #[test]
+    fn survey_cwd_comes_from_the_candidates_own_work() {
+        let store = Store::open_in_memory().unwrap();
+        insert_squad_with_cwd(&store, "squad-1", "/repo/checkout");
+        assert_eq!(
+            survey_candidate_cwd(&store, RosterEntryKind::Squad, "squad-1").as_deref(),
+            Some("/repo/checkout")
+        );
+        insert_bare_guardian(&store, "guardian-1");
+        assert!(
+            survey_candidate_cwd(&store, RosterEntryKind::Review, "guardian-1").is_some(),
+            "a review resolves to its guardian's git root"
+        );
+        assert_eq!(
+            survey_candidate_cwd(&store, RosterEntryKind::Squad, "squad-missing"),
+            None,
+            "an unknown candidate has no cwd, which falls back to the direct API"
         );
     }
 

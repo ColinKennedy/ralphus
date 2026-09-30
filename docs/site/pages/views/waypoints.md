@@ -27,6 +27,15 @@ Selecting a waypoint shows:
   pair used to run it, whether `allow_advisory` roster entries are permitted,
   the inferred project list, and a rollup of roster delivery status
   (delivered / via restack / failed / undelivered).
+
+  The survey `agent` may be either an API backend (`claude`, `ollama`), which
+  is called directly, or a terminal executable (`claude-code`, `codex`, `pi`,
+  or a custom `[agent.profiles.*]` name), which is run through the same
+  subprocess runner a `prompt`-kind proof step uses. A terminal agent runs in
+  the surveyed work's own working directory, so that project's
+  `.ralphus.toml` agent profiles apply, and is capped at five minutes — a
+  survey is a small read-only question, so a longer run is stuck rather than
+  thorough.
 - **Roster** — one row per tracked review or squad, each showing a
   delivery-status dot, a deep link to the entity itself, its block/advisory
   mode badge (toggleable in place), and — once the survey pass has run — an
