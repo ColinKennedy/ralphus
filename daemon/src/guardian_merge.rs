@@ -5768,9 +5768,11 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
     set_status: &F,
     final_branch_id: Option<&str>,
     // RAL-521: computed once by [`run_merge_cancellable`] for the whole
-    // merge -- `false` skips this path's manual-checks generation so a
-    // cached result survives the rebuild.
-    generate_manual_checks: bool,
+    // merge. This path never generates manual checks itself (that happens in
+    // a later step both the shared and staged paths funnel through), so the
+    // decision has nothing to gate here -- kept as a parameter only so every
+    // call site threads the same one-time-computed value uniformly.
+    _generate_manual_checks: bool,
     cancel: &CancelToken,
 ) {
     let combined_branch = match claim_combined_review_ref_by_id(store, root, id) {
