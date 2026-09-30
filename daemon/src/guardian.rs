@@ -1786,32 +1786,118 @@ impl Store {
     /// before promoting, so a branch whose task hasn't finished validating
     /// yet (or that goes on to fail validation) stays `pending` rather than
     /// being promoted off the strength of cell completion alone.
+    ///
+    /// RAL-519: When multiple cells share the same worktree (RAL-159), a
+    /// branch is only ready when EVERY cell in that worktree (not just linked
+    /// cells) has completed successfully — the readiness gate checks all
+    /// cells, not just those linked to the branch. This prevents falsely
+    /// marking a worktree as ready when sibling cells are still running.
     pub fn mark_ready_branches_with_done_cells(&self, guardian_id: &str) -> Result<usize> {
-        let n = self.conn.execute(
-            "UPDATE guardian_branches
-             SET merge_status='ready'
-             WHERE guardian_id=? AND enabled=1 AND merge_status='pending'
-               AND EXISTS (
-                   SELECT 1 FROM cells s
-                   WHERE s.review_branch = guardian_branches.branch
-                     AND (s.review_guardian_id = guardian_branches.guardian_id OR s.review_guardian_id IS NULL)
-               )
-               AND NOT EXISTS (
-                   SELECT 1 FROM cells s
-                   WHERE s.review_branch = guardian_branches.branch
-                     AND (s.review_guardian_id = guardian_branches.guardian_id OR s.review_guardian_id IS NULL)
-                     AND s.state != 'done'
-               )
-               AND NOT EXISTS (
-                   SELECT 1 FROM cells s
-                   JOIN tasks t ON t.squad_id = s.squad_id AND t.idx = s.task_idx
-                   WHERE s.review_branch = guardian_branches.branch
-                     AND (s.review_guardian_id = guardian_branches.guardian_id OR s.review_guardian_id IS NULL)
-                     AND t.state != 'done'
-               )",
-            params![guardian_id],
+        use std::path::Path;
+
+        let mut stmt = self.conn.prepare(
+            "SELECT id, branch FROM guardian_branches
+             WHERE guardian_id=? AND enabled=1 AND merge_status='pending'",
         )?;
-        Ok(n)
+        let branches_to_check: Vec<(String, String)> = stmt
+            .query_map(params![guardian_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+
+        let mut ready_branch_ids = Vec::new();
+
+        for (branch_id, branch_name) in branches_to_check {
+            let mut stmt = self.conn.prepare(
+                "SELECT squad_id, task_idx, idx, cwd FROM cells
+                 WHERE review_branch=? AND (review_guardian_id=? OR review_guardian_id IS NULL)",
+            )?;
+            let linked_cells: Vec<(String, i64, i64, Option<String>)> = stmt
+                .query_map(params![&branch_name, guardian_id], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })?
+                .collect::<std::result::Result<_, _>>()?;
+
+            if linked_cells.is_empty() {
+                continue;
+            }
+
+            let mut all_ready = true;
+            for (squad_id, _task_idx, _idx, cwd) in linked_cells {
+                let reference_cwd = match &cwd {
+                    Some(c) => c.as_str(),
+                    None => continue,
+                };
+
+                let mut stmt = self
+                    .conn
+                    .prepare("SELECT task_idx, idx, cwd FROM cells WHERE squad_id=?")?;
+                let squad_cells: Vec<(i64, i64, Option<String>)> = stmt
+                    .query_map(params![&squad_id], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })?
+                    .collect::<std::result::Result<_, _>>()?;
+
+                for (other_task_idx, other_idx, other_cwd) in squad_cells {
+                    let other_cwd_str = match &other_cwd {
+                        Some(c) => c.as_str(),
+                        None => continue,
+                    };
+
+                    if crate::reviews::same_git_repo(
+                        Path::new(reference_cwd),
+                        Path::new(other_cwd_str),
+                    ) {
+                        let cell_state: Option<String> = self
+                            .conn
+                            .query_row(
+                                "SELECT state FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
+                                params![&squad_id, other_task_idx, other_idx],
+                                |row| row.get(0),
+                            )
+                            .optional()?;
+
+                        if cell_state.as_deref() != Some("done") {
+                            all_ready = false;
+                            break;
+                        }
+
+                        let task_state: Option<String> = self
+                            .conn
+                            .query_row(
+                                "SELECT state FROM tasks WHERE squad_id=? AND idx=?",
+                                params![&squad_id, other_task_idx],
+                                |row| row.get(0),
+                            )
+                            .optional()?;
+
+                        if task_state.as_deref() != Some("done") {
+                            all_ready = false;
+                            break;
+                        }
+                    }
+                }
+
+                if !all_ready {
+                    break;
+                }
+            }
+
+            if all_ready {
+                ready_branch_ids.push(branch_id);
+            }
+        }
+
+        let mut count = 0;
+        for branch_id in ready_branch_ids {
+            let n = self.conn.execute(
+                "UPDATE guardian_branches
+                 SET merge_status='ready'
+                 WHERE id=?",
+                params![&branch_id],
+            )?;
+            count += n;
+        }
+
+        Ok(count)
     }
 
     /// Link an existing cell/task to a guardian's branch after the fact
