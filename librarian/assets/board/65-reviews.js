@@ -1349,6 +1349,73 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
       });
 
       /**
+       * Builds one chip for the setup strip.
+       * @param {string} gid - The review this chip edits.
+       * @param {string} label - Short uppercase key, e.g. "onto".
+       * @param {string} value - The current value, already escaped.
+       * @param {string} tip - Tooltip explaining what the setting does.
+       * @param {boolean} [warn] - Render in the warning register (a setting that leaves the review unverified).
+       * @returns {string}
+       */
+      function setupChip(gid, label, value, tip, warn) {
+        return `<button class="setup-chip${warn ? " warn" : ""}" data-click="openEditReviewDetails" `
+          + `data-guardian-id="${esc(gid)}" data-tip="${esc(tip)}">`
+          + `<span class="sc-k">${esc(label)}</span><b>${value}</b></button>`;
+      }
+      /**
+       * The review's settings as one strip of chips, replacing the column of
+       * read-only kv-rows RAL-410 left behind when it moved editing into the
+       * Edit Details modal. Those rows cost a screen of vertical space to show
+       * settings you could not act on from there, and pushed the branch stack
+       * -- the thing a reviewer actually came for -- below the fold.
+       *
+       * Every chip opens the same modal, so the strip is both the display and
+       * the edit affordance: there is no separate button to go looking for.
+       * @param {GuardianView} g - The review.
+       * @returns {string}
+       */
+      function reviewSetupStrip(g) {
+        const gates = (g.checks || []).length;
+        const squashOn = g.squash_projects || [];
+        const projects = (g.projects && g.projects.length) ? g.projects : [g.git_root || ""];
+        const squashCount = projects.filter((p) => squashOn.includes(p)).length;
+        const squashText = projects.length > 1
+          ? `${squashCount} of ${projects.length}`
+          : (squashCount ? "on" : "off");
+        const proof = (g.effective_proof_scope || "each_branch").replace(/_/g, " ");
+        const model = g.resolver_model ? ` · ${esc(g.resolver_model)}` : "";
+        // Gates is the one setting that can leave a review provably unverified,
+        // so it is the one that earns the warning register.
+        const unverified = gates === 0 && !!g.skip_auto_build;
+        const gatesText = gates ? `${gates}` : (g.skip_auto_build ? "none" : "auto");
+        return `<div class="setup-strip">`
+          + `<div class="setup-chips">`
+          + setupChip(g.id, "onto", esc(g.base_branch || "—"),
+            `Upstream branch. Every branch in this review rebases onto ${g.base_branch || "it"}, each on top of the one before it.\nChanging it rebuilds the whole stack.`)
+          + setupChip(g.id, "resolver", esc(resolverOf(g)) + model,
+            "The agent that resolves rebase conflicts, writes the change summary, and generates the suggested manual checks.")
+          + setupChip(g.id, "proof", esc(proof),
+            `How often the dedicated LLM proof pass runs${g.proof_scope ? "" : " — currently the project default"}.`)
+          + setupChip(g.id, "squash", esc(squashText),
+            "Whether each task branch collapses to a single commit in the review worktree.\nScope is per git project, so a multi-project review sets it independently.")
+          + setupChip(g.id, "gates", esc(gatesText),
+            unverified
+              ? "No check gates, and skip auto-build is on — nothing verifies this review. It can reach 'in review', and be approved, without a single build or test having run.\nAdd a gate, or set [review] auto_build in the project's .ralphus.toml."
+              : gates
+                ? `${gates} check gate(s) must pass before this review can be approved.`
+                : "No gates configured, so the daemon infers a build command from the diff once the stack merges.",
+            unverified)
+          + setupChip(g.id, "worktrees", g.skip_worktrees ? "shared" : "per-branch",
+            g.skip_worktrees
+              ? "The whole stack builds in one shared worktree instead of one per branch."
+              : "Each branch rebases in its own worktree.")
+          + `</div>`
+          + `<button class="btn setup-edit" data-click="openEditReviewDetails" data-guardian-id="${esc(g.id)}" `
+          + `data-tip="Edit every setting for this review in one place — name, upstream, resolver, proof scope, build and squash options, PR settings and environment overrides.\nEvery chip to the left opens this same editor.\nNothing takes effect until you click Save; Save applies every change in one request and triggers at most one rebase.">`
+          + `✎ Edit setup</button></div>`;
+      }
+
+      /**
        * Renders the full review detail pane (branch stack, checks, manual commands, chat, etc).
        * @returns {void}
        */
@@ -1473,43 +1540,22 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
             : g.skip_auto_build
               ? "—"
               : `<div class="row"><span class="vchip" style="border-color:var(--unverified);color:var(--unverified)" data-tip="No check gates are configured for this review, the project has no auto_build default in .ralphus.toml, and either the resolver agent found no build step to infer or skip auto-build is on.\nWho/when: relevant to anyone relying on 'in review' meaning 'built and tested' — right now this review reached that status with zero build or test verification.\nAdd checks above, or set [review] auto_build in the project's .ralphus.toml, to close this gap.">⚠ no build verification configured</span></div>`;
-        // RAL-410: skip-auto-build/skip-per-branch-worktrees, squash,
-        // resolver agent/model, and proof scope are all now edited via the
-        // "Edit Details" modal (openEditReviewDetails) -- these are
-        // read-only summaries here.
-        const skipInfo = `<div class="kv-row"><span class="k">skip auto-build</span><span class="v">${g.skip_auto_build ? "yes" : "no"}${g.skip_auto_build && gChecks.length ? ' — <span style="color:var(--queued)">gates will be skipped</span>' : ""}</span></div>
-          <div class="kv-row"><span class="k">skip per-branch worktrees</span><span class="v">${g.skip_worktrees ? "yes" : "no"}</span></div>`;
-        // RAL-91: per-(git-project) squash. Scope is each git project in the
-        // review, NOT the whole review — a review spanning N projects honours
-        // each project's setting independently.
-        const squashOn = g.squash_projects || [];
-        const squashProjects = (g.projects && g.projects.length) ? g.projects : [g.git_root || ""];
-        const squashSummary = squashProjects.map((p) => {
-          const on = squashOn.includes(p);
-          const label = (p || "").split(/[\\/]/).filter(Boolean).pop() || p;
-          return `<div class="kv-row"><span class="k">squash${isMultiProject ? ` — <span class="mono" style="font-size:11px">${esc(label)}</span>` : ""}</span><span class="v">${on ? "yes" : "no"}</span></div>`;
-        }).join("");
-        // Conflict-resolver backend for this review.
-        const resolverRow = `<div class="kv-row"><span class="k">resolver agent</span><span class="v mono">${esc(resolverOf(g))}</span></div>
-             <div class="kv-row"><span class="k">resolver model</span><span class="v mono">${esc(g.resolver_model || "agent default")}</span></div>`;
-        // RAL-168: "Proof" scope -- how often the dedicated LLM-based
-        // final-proof pass runs.
-        const effectiveProofScope = g.effective_proof_scope || "each_branch";
-        const proofScopeRow = `<div class="kv-row"><span class="k">proof scope</span><span class="v">${esc(effectiveProofScope.replace(/_/g, " "))}${!g.proof_scope ? " (project default)" : ""}</span></div>
-          ${effectiveProofScope === "each_branch" ? `<div class="kv-row"><span class="k">skip auto-clean branches</span><span class="v">${g.effective_proof_skip_auto_clean ? "yes" : "no"}</span></div>` : ""}`;
+        // RAL-410 moved skip-auto-build/skip-per-branch-worktrees, squash,
+        // resolver agent/model and proof scope into the "Edit Details" modal
+        // but left a column of read-only kv-rows behind for them. Those now
+        // render as the setup strip (reviewSetupStrip) directly under the
+        // banner, where the display is also the edit affordance.
         el.innerHTML = `<div class="squad-banner">${gdot(g.status)}<span class="rid">${esc(g.name)}</span> ${pill(g.status)} ${arbiterBadge(g)}
             <span style="flex:1"></span>${watchersHtml(`guardian:${g.id}`)}<button class="icon-btn" data-click="openEditReviewDetails" data-guardian-id="${esc(g.id)}" data-tip="Edit this review's settings — name, upstream branch, resolver, proof scope, build/squash options, PR settings, and environment overrides — all in one place.\nNothing takes effect until you click Save; Save applies every change in a single request and triggers at most one rebase.">✎ Edit Details</button><button class="icon-btn" data-click="openReviewLogs" data-guardian-id="${esc(g.id)}" data-tip="View the audit log for this review — state changes, branch merge events, and notes.">📄 Logs</button><button class="btn squadbtn" data-click="openReviewTitleMenu" data-guardian-id="${esc(g.id)}" data-tip="Review actions — cancel this review.">⋯</button></div>
           ${mergeProgress(g)}
           ${conflictProgress(g)}
           ${postMergeBadge(g) ? `<div class="kv-row"><span class="k">post-merge</span><span class="v">${postMergeBadge(g)}</span></div>` : ""}
           ${reviewCostSummary(g)}
+          ${reviewSetupStrip(g)}
           <div class="kv-row"><span class="k">review id</span><span class="mono hc-anchor" style="cursor:pointer" data-card="gReviewId" data-guardian-id="${esc(g.id)}" data-copy="${esc(g.id)}" onclick="copyText(event)">${esc(g.id)}</span></div>
           ${g.squad_id ? `<div class="kv-row"><span class="k">from squad</span><span class="v"><a href="#" data-click="gotoSquad" data-squad-id="${esc(g.squad_id)}" style="color:var(--accent)" data-tip="Switch to the Squads tab and open this squad.">${esc(g.squad_id)}</a></span></div>` : ""}
           ${g.status === "collecting" && g.squad_id ? `<div class="kv-row"><span class="k" style="text-transform:none;letter-spacing:0">gate</span><span class="v">${g.branches.some((b) => b.merge_status === "ready") ? "tasks complete — rebase will start automatically" : "starts automatically when its squad finishes — or start it now below"}</span></div>` : ""}
           <div class="kv-row"><span class="k">type</span><span class="v">${esc(g.review_type || "git")}</span></div>
-          <div class="kv-row"><span class="k">upstream</span><span class="mono">${esc(g.base_branch)}</span></div>
-          ${resolverRow}
-          ${proofScopeRow}
           ${isMultiProject
             ? `<div class="kv-row"><span class="k">projects</span><span class="v" style="display:flex;flex-direction:column;gap:2px">${(g.projects||[]).map((p) => `<span class="mono" style="font-size:11px">${esc(p)}</span>`).join("")}</span></div>`
             : g.project
@@ -1519,9 +1565,8 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           ${g.combined_worktree ? `<div class="kv-row"><span class="k">combined worktree</span><span class="v mono hc-anchor" style="font-size:11px" data-card="gCombinedWorktree" data-guardian-id="${esc(g.id)}">${esc(g.combined_worktree)}</span></div>` : ""}
           ${renderChangeSummary(g)}
           ${combinedPrSection(g)}
-          <h3 class="section">check gates</h3>${checks}${skipInfo}
+          <h3 class="section">check gates</h3>${checks}
           <div class="kv-row">${envViewerBtn(`/api/guardians/${g.id}/tests-env`, "this review's check gates (tests)")}</div>
-          <h3 class="section" data-tip="Squash controls how each task branch's commits appear in the review worktree.\nScope is per git project — set it independently for each project in the review.">squash</h3>${squashSummary}
           ${g.detail && !autoBuiltCmd ? `<div class="warn">${detailSummary(g.detail, "Review detail")}</div>` : ""}
           <h3 class="section">branches${canReorder ? ' <span class="k" style="text-transform:none;letter-spacing:0">— drag to reorder · toggle ⊙/⊘ to enable/disable</span>' : ""}${hasPending ? ' <span class="badge warn2" data-tip="Unsaved order or enable/disable changes — click Save to apply, or Discard to revert.">● unsaved changes</span>' : ""}</h3>
           ${allDisabled ? `<div class="warn" style="margin:4px 0 8px">All branches are disabled — saving will make this review a no-op (no rebase runs). Re-enable at least one branch before saving, or click Discard.</div>` : ""}

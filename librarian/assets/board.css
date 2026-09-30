@@ -523,6 +523,41 @@
       .hc-anchor { border-bottom: 1px dotted var(--cancelled); cursor: help; }
       .hc-anchor:hover { border-bottom-color: var(--accent); color: var(--accent); }
 
+      /* ---- Review setup strip ---- */
+      /* The review's settings as one row of chips instead of a column of
+         read-only kv-rows. Every chip opens the Edit Details modal, so the
+         display and the edit affordance are the same object. */
+      .setup-strip {
+        display: flex; align-items: center; gap: 8px;
+        margin: 8px 0 10px; padding: 7px 0;
+        border-top: 1px solid var(--border); border-bottom: 1px solid var(--border);
+      }
+      .setup-chips {
+        display: flex; align-items: center; gap: 6px; flex-wrap: nowrap;
+        overflow-x: auto; flex: 1; min-width: 0; scrollbar-width: none;
+      }
+      .setup-chips::-webkit-scrollbar { height: 0; }
+      .setup-chips > * { flex: none; }
+      .setup-chip {
+        display: inline-flex; align-items: center; gap: 6px;
+        background: var(--bg); border: 1px solid var(--border); color: var(--muted);
+        border-radius: 20px; padding: 3px 10px; font-size: 11.5px; cursor: pointer;
+        white-space: nowrap;
+      }
+      .setup-chip:hover { border-color: var(--accent); color: var(--text); }
+      .setup-chip b {
+        font-weight: 600; color: var(--text);
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px;
+      }
+      .setup-chip .sc-k {
+        color: var(--cancelled); text-transform: uppercase; letter-spacing: .5px;
+        font-size: 9.5px; font-weight: 700;
+      }
+      /* A review that nothing verifies is the one setting worth shouting about. */
+      .setup-chip.warn { border-color: var(--unverified); color: var(--unverified); }
+      .setup-chip.warn b { color: var(--unverified); }
+      .setup-edit { flex: none; padding: 3px 10px; font-size: 11.5px; }
+
       /* ---- Queue tab (RAL Queue) ---- */
       #queue-page { padding: 16px; overflow: auto; }
       .queue-wrap { max-width: 80%; margin: 0 auto; padding-bottom: 80px; }
