@@ -25,6 +25,16 @@ use crate::runner::{effective_cell_system_prompt, effective_proof_system_prompt}
 /// limit would churn the file size on routine load for no benefit.
 const WAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
 
+/// How often the dedicated WAL checkpoint thread (spawned by [`Store::open`])
+/// runs `PRAGMA wal_checkpoint(PASSIVE)`.
+///
+/// Short enough that there is rarely much for a checkpoint to do by the time
+/// it runs -- the point of this thread is to keep the writer's own commits
+/// from ever being the one that pays a checkpoint's I/O (see the thread's
+/// doc comment).
+#[cfg(not(test))]
+const WAL_CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Errors the store can produce.
 #[derive(Debug)]
 pub enum StoreError {
@@ -1144,6 +1154,17 @@ impl Store {
         // has to read back through. With a limit set, each checkpoint
         // truncates the WAL down to it instead.
         conn.pragma_update(None, "journal_size_limit", WAL_SIZE_LIMIT_BYTES)?;
+        // Checkpoints happen on a dedicated background thread/connection
+        // instead (see `spawn_wal_checkpoint_thread`, spawned below): a
+        // checkpoint's own I/O -- copying the WAL's frames back into the
+        // main database file -- is unbounded by the size of whatever query
+        // triggered it, and SQLite's automatic checkpoint runs that I/O
+        // synchronously on whichever connection's commit crossed the
+        // threshold. Every commit on this connection runs under the
+        // daemon's one global store lock, so that I/O was landing on an
+        // otherwise-innocent `store.lock()` call and occasionally taking
+        // long enough to trip the `store_lock` watchdog.
+        conn.pragma_update(None, "wal_autocheckpoint", 0)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         // RAL-393 Stage 3: bound how long any connection (this writer, or a
         // pooled reader opened below) waits on SQLite's busy handler before
@@ -1166,9 +1187,88 @@ impl Store {
         store.init_schema()?;
         #[cfg(unix)]
         tighten_unix_db_permissions(path);
+        // Not spawned for the crate's own unit tests (`cfg(test)`): most of
+        // them use `open_in_memory`, and the handful that open a real file
+        // (e.g. to assert on `-wal`/`-shm` permissions) delete their temp
+        // directory the moment the test ends -- a thread with no shutdown
+        // handle would then spend the rest of that test process's life
+        // retrying a checkpoint against a path that no longer exists.
+        // Integration tests under `daemon/tests/` and the real daemon binary
+        // are unaffected (`cfg(test)` only applies to this crate's own
+        // `#[cfg(test)] mod tests`).
+        #[cfg(not(test))]
+        spawn_wal_checkpoint_thread(path.to_path_buf());
         Ok(store)
     }
+}
 
+/// Periodically runs `PRAGMA wal_checkpoint(TRUNCATE)` against `path` on its
+/// own dedicated connection, entirely outside [`crate::store_lock::StoreMutex`].
+///
+/// SQLite's automatic checkpoint-on-commit is itself effectively `PASSIVE` --
+/// it never blocks on a busy reader -- but the I/O it does when it runs
+/// (copying WAL frames back into the main database file) is not bounded by
+/// the size of whatever statement triggered it, and that I/O runs
+/// synchronously on whichever connection's commit crossed the
+/// `wal_autocheckpoint` threshold. Because the writer connection only ever
+/// runs inside the daemon's one global store lock, an inline checkpoint's
+/// cost was being paid while genuinely holding that lock -- turning an
+/// ordinary, otherwise-fast `store.lock()` call into the multi-second hold
+/// the `store_lock` watchdog panics on. [`Store::open`] disables the
+/// writer's own `wal_autocheckpoint` so this thread is the only place that
+/// cost is ever paid, on a connection nothing else is waiting on.
+///
+/// `TRUNCATE` mode checkpoints exactly like `PASSIVE` first -- it never skips
+/// or delays reclaiming whatever frames are already safe to reclaim -- and
+/// only *additionally* waits (bounded by this connection's own
+/// `busy_timeout`) for old readers to catch up so it can also truncate the
+/// `-wal` file back to empty; a `PASSIVE` checkpoint alone happily
+/// checkpoints every frame but leaves the file sitting at its all-time
+/// high-water mark forever (the very problem `journal_size_limit`, set on
+/// the writer in [`Store::open`], exists to bound -- `TRUNCATE` is what
+/// actually collects on that bound). Run here rather than on the writer
+/// because that potential wait is exactly the kind of thing that must never
+/// happen while holding the store lock; on this dedicated thread it blocks
+/// nothing but itself, and the next tick just tries again. Runs for the life
+/// of the process, matching every other background sweep in this daemon
+/// (`health_sweep::spawn_health_sweep`, `pr::spawn_pr_base_drift_poller`,
+/// ...): none of them have a shutdown handle either.
+#[cfg(not(test))]
+fn spawn_wal_checkpoint_thread(path: std::path::PathBuf) {
+    std::thread::spawn(move || {
+        let conn = match Connection::open(&path) {
+            Ok(conn) => conn,
+            Err(e) => {
+                // ralphus[ignore-rlog-pair]: this thread has no Store (it opens its own bare rusqlite::Connection) and no caller left to report back to -- it is not spawned from a request/handler that owns one
+                crate::rlog!(
+                    ERROR,
+                    "ralphus [store] wal checkpoint thread could not open {}: {e}",
+                    path.display()
+                );
+                return;
+            }
+        };
+        if let Err(e) = conn.busy_timeout(crate::store_pool::BUSY_TIMEOUT) {
+            // ralphus[ignore-rlog-pair]: same bare-connection boundary as above -- no Store to emit a structured row through
+            crate::rlog!(
+                WARNING,
+                "ralphus [store] wal checkpoint thread: busy_timeout failed: {e}"
+            );
+        }
+        loop {
+            std::thread::sleep(WAL_CHECKPOINT_INTERVAL);
+            if let Err(e) = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(())) {
+                // ralphus[ignore-rlog-pair]: same bare-connection boundary as above -- no Store to emit a structured row through
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [store] wal checkpoint (truncate) failed: {e}"
+                );
+            }
+        }
+    });
+}
+
+impl Store {
     /// Open an in-memory store (used by tests). A named, shared-cache
     /// in-memory database rather than a plain private one, so
     /// [`Store::read_pool`]'s pooled connections attach to the same
@@ -16388,6 +16488,100 @@ command = "e"
              keeps its all-time high-water mark forever"
         );
 
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// RAL-<pending>: the writer's own commits must never pay a checkpoint's
+    /// I/O -- that landed on an otherwise-fast `store.lock()` call and
+    /// occasionally took long enough to trip the `store_lock` watchdog (see
+    /// `spawn_wal_checkpoint_thread`'s doc comment). The background thread
+    /// itself is disabled in this crate's own unit tests (`cfg(not(test))`
+    /// in `Store::open`, to avoid leaking a thread that outlives this test's
+    /// temp directory), so this drives the exact pragma it runs -- `PRAGMA
+    /// wal_checkpoint(TRUNCATE)` -- directly, proving the mechanism rather
+    /// than the thread's scheduling.
+    ///
+    /// Touches every pooled read connection before checkpointing: SQLite
+    /// pins a WAL reader's snapshot at whatever it last read *even after
+    /// that read finishes*, so the four connections [`Store::open`] opens
+    /// for [`Store::read_pool`] -- never otherwise touched by this test --
+    /// would each still be parked at the empty database they saw at
+    /// startup, and `TRUNCATE` cannot reclaim a single frame newer than the
+    /// oldest such snapshot. A real daemon's pooled connections are in
+    /// continuous rotation from live GET traffic; this stands in for that.
+    #[test]
+    fn writer_autocheckpoint_is_disabled_and_a_truncate_checkpoint_shrinks_the_wal() {
+        let dir =
+            std::env::temp_dir().join(format!("ralphus-wal-checkpoint-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let db_path = dir.join("tasks.db");
+        let store = Store::open(&db_path).expect("open store");
+
+        let autocheckpoint: i64 = store
+            .conn
+            .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))
+            .expect("read wal_autocheckpoint");
+        assert_eq!(
+            autocheckpoint, 0,
+            "the writer's own commits must never pay a checkpoint's I/O -- \
+             that cost belongs solely to the dedicated background thread"
+        );
+
+        let wal_path = dir.join("tasks.db-wal");
+        for i in 0..2_000 {
+            store
+                .cartographer_log(crate::cartographer::CartographerEntry {
+                    level: crate::logging::LogLevel::INFO,
+                    source: "test",
+                    message: "filler row to grow the wal",
+                    scope: None,
+                    squad_id: None,
+                    guardian_id: None,
+                    cell_id: None,
+                    task: None,
+                    log_path: None,
+                    payload: serde_json::json!({ "i": i }),
+                    admin_only: false,
+                })
+                .unwrap();
+        }
+        let grown = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+        assert!(
+            grown > 0,
+            "with the writer's autocheckpoint disabled, 2,000 inserts must \
+             leave a non-empty wal for a checkpoint to have something to do"
+        );
+
+        // Refresh every pooled reader's snapshot -- see the test's doc comment.
+        let pool = store.read_pool();
+        let refreshed: Vec<_> = std::iter::from_fn(|| pool.acquire())
+            .take(4)
+            .inspect(|c| {
+                let _: i64 = c
+                    .query_row("SELECT count(*) FROM cartographer_events", [], |r| r.get(0))
+                    .unwrap();
+            })
+            .collect();
+        drop(refreshed);
+
+        let checkpointer = Connection::open(&db_path).expect("open checkpoint connection");
+        checkpointer
+            .busy_timeout(crate::store_pool::BUSY_TIMEOUT)
+            .unwrap();
+        checkpointer
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+            .expect("truncate checkpoint");
+        let shrunk = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+        assert!(
+            shrunk < grown,
+            "a truncate checkpoint against the same database must shrink the \
+             wal the writer's disabled autocheckpoint left behind (before: \
+             {grown}, after: {shrunk})"
+        );
+
+        drop(checkpointer);
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }
