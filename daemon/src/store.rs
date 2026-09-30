@@ -8702,6 +8702,80 @@ impl Store {
         })
     }
 
+    /// RAL-536: clear the thinking-stall automatic-restart strike counter
+    /// (`StoreMemory::reset_thinking_stall_strikes`) for each cell's own
+    /// agent session, plus every cell-scope proof step still hanging off it,
+    /// keyed exactly the way `handle_thinking_stall_attempt` and the
+    /// cell-scope proof runner build those keys
+    /// (`crate::tmux::session_name(squad_id, task_name, cell_id)` /
+    /// `crate::tmux::session_name(squad_id, task_name, "proof-cell-{idx}")`).
+    /// Called from every restart path that puts one or more of `cells` back
+    /// to Pending (`restart_cell`, `restart_task`, `restart_squad`) — per the
+    /// RAL-536 interview, a human-initiated restart always resets the limit,
+    /// unlike the automatic restarts that raise it. Resetting a key that was
+    /// never tripped is a harmless no-op.
+    fn reset_thinking_stall_strikes_for_cells(&self, squad_id: &str, cells: &[RestartImpactCell]) {
+        let memory = self.memory();
+        for c in cells {
+            memory.reset_thinking_stall_strikes(&crate::tmux::session_name(
+                squad_id,
+                &c.task_name,
+                &c.cell_id,
+            ));
+            let proof_idxs: Vec<i64> = self
+                .conn
+                .prepare(
+                    "SELECT idx FROM proofs WHERE squad_id=? AND task_idx=? AND scope='cell' AND cell_idx=?",
+                )
+                .and_then(|mut stmt| {
+                    let rows = stmt
+                        .query_map(params![squad_id, c.task_idx, c.idx], |r| r.get::<_, i64>(0))?
+                        .filter_map(std::result::Result::ok)
+                        .collect();
+                    Ok(rows)
+                })
+                .unwrap_or_default();
+            for idx in proof_idxs {
+                memory.reset_thinking_stall_strikes(&crate::tmux::session_name(
+                    squad_id,
+                    &c.task_name,
+                    &format!("proof-cell-{idx}"),
+                ));
+            }
+        }
+    }
+
+    /// RAL-536: the task-scope counterpart of
+    /// [`Store::reset_thinking_stall_strikes_for_cells`] — clears the strike
+    /// counter for every task-scope proof step still hanging off each of
+    /// `tasks`, keyed the way the task-scope proof runner builds it
+    /// (`crate::tmux::session_name(squad_id, task_name, "proof-task-{idx}")`).
+    /// Called from `restart_task` and `restart_squad`, which are the only
+    /// restart paths that put task-scope proofs back to Pending.
+    fn reset_thinking_stall_strikes_for_tasks(&self, squad_id: &str, tasks: &[RestartImpactTask]) {
+        let memory = self.memory();
+        for t in tasks {
+            let proof_idxs: Vec<i64> = self
+                .conn
+                .prepare("SELECT idx FROM proofs WHERE squad_id=? AND task_idx=? AND scope='task'")
+                .and_then(|mut stmt| {
+                    let rows = stmt
+                        .query_map(params![squad_id, t.idx], |r| r.get::<_, i64>(0))?
+                        .filter_map(std::result::Result::ok)
+                        .collect();
+                    Ok(rows)
+                })
+                .unwrap_or_default();
+            for idx in proof_idxs {
+                memory.reset_thinking_stall_strikes(&crate::tmux::session_name(
+                    squad_id,
+                    &t.name,
+                    &format!("proof-task-{idx}"),
+                ));
+            }
+        }
+    }
+
     /// Compute (and, unless `dry_run`, perform) a cascading cancel of
     /// `squad_id`: the squad itself plus every squad transitively dependent on it
     /// (RAL-116). One function drives both the non-mutating dry-run preview
@@ -8742,6 +8816,8 @@ impl Store {
         let impact = self.compute_squad_restart_impact(squad_id)?;
         self.reset_squad_to_pending(squad_id)?;
         let _ = self.log_event(Some(squad_id), None, "squad", None, "restarted");
+        self.reset_thinking_stall_strikes_for_cells(squad_id, &impact.cells);
+        self.reset_thinking_stall_strikes_for_tasks(squad_id, &impact.tasks);
         self.apply_dirty_dependents(&impact.dirtied_squads)?;
         Ok(impact.dirtied_squads.into_iter().map(|r| r.id).collect())
     }
@@ -8876,6 +8952,7 @@ impl Store {
             Some(&format!("{task_idx}/{idx}")),
             "restarted (with downstream)",
         );
+        self.reset_thinking_stall_strikes_for_cells(squad_id, &impact.cells);
         self.apply_dirty_dependents(&impact.dirtied_squads)?;
         Ok(impact.dirtied_squads.into_iter().map(|r| r.id).collect())
     }
@@ -9012,6 +9089,8 @@ impl Store {
             Some(&format!("t{task_idx}")),
             "restarted (with downstream)",
         );
+        self.reset_thinking_stall_strikes_for_cells(squad_id, &impact.cells);
+        self.reset_thinking_stall_strikes_for_tasks(squad_id, &impact.tasks);
         self.apply_dirty_dependents(&impact.dirtied_squads)?;
         Ok(impact.dirtied_squads.into_iter().map(|r| r.id).collect())
     }
@@ -10260,6 +10339,35 @@ impl Store {
             "UPDATE squads SET state='pending', updated_at_ms=? WHERE id=?",
             params![now_ms(), squad_id],
         )?;
+        // RAL-536: a human restart of these proof steps always clears their
+        // thinking-stall automatic-restart strike counter, unlike the
+        // automatic restarts that raise it — see
+        // `Store::reset_thinking_stall_strikes_for_cells`'s doc comment.
+        if let Ok(Some(task_name)) = self.task_name_at(squad_id, task_idx) {
+            let proof_idxs: Vec<i64> = self
+                .conn
+                .prepare(
+                    "SELECT idx FROM proofs WHERE squad_id=? AND task_idx=? AND scope='cell' AND cell_idx=?",
+                )
+                .and_then(|mut stmt| {
+                    let rows = stmt
+                        .query_map(params![squad_id, task_idx, cell_idx], |r| {
+                            r.get::<_, i64>(0)
+                        })?
+                        .filter_map(std::result::Result::ok)
+                        .collect();
+                    Ok(rows)
+                })
+                .unwrap_or_default();
+            let memory = self.memory();
+            for idx in proof_idxs {
+                memory.reset_thinking_stall_strikes(&crate::tmux::session_name(
+                    squad_id,
+                    &task_name,
+                    &format!("proof-cell-{idx}"),
+                ));
+            }
+        }
         let _ = self.log_event(
             Some(squad_id),
             None,
@@ -10325,6 +10433,30 @@ impl Store {
             "UPDATE squads SET state='pending', updated_at_ms=? WHERE id=?",
             params![now_ms(), squad_id],
         )?;
+        // RAL-536: see the matching note in `Store::restart_cell_proof` —
+        // a human restart of these proof steps always clears their
+        // thinking-stall strike counter.
+        if let Ok(Some(task_name)) = self.task_name_at(squad_id, task_idx) {
+            let proof_idxs: Vec<i64> = self
+                .conn
+                .prepare("SELECT idx FROM proofs WHERE squad_id=? AND task_idx=? AND scope='task'")
+                .and_then(|mut stmt| {
+                    let rows = stmt
+                        .query_map(params![squad_id, task_idx], |r| r.get::<_, i64>(0))?
+                        .filter_map(std::result::Result::ok)
+                        .collect();
+                    Ok(rows)
+                })
+                .unwrap_or_default();
+            let memory = self.memory();
+            for idx in proof_idxs {
+                memory.reset_thinking_stall_strikes(&crate::tmux::session_name(
+                    squad_id,
+                    &task_name,
+                    &format!("proof-task-{idx}"),
+                ));
+            }
+        }
         let _ = self.log_event(
             Some(squad_id),
             None,
@@ -14875,6 +15007,71 @@ command = "cargo test"
     }
 
     #[test]
+    fn restart_cell_resets_the_cells_thinking_stall_strikes() {
+        // RAL-536: a human-initiated restart of a cell (and its cell-scope
+        // proofs) must clear the automatic-restart strike counter, unlike
+        // the automatic restarts a thinking-stall trip performs itself.
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+        store.set_cell_state(&id, 0, 0, NodeState::Failed).unwrap();
+
+        let memory = store.memory();
+        let cell_key = crate::tmux::session_name(&id, "build", "worker");
+        let proof_key = crate::tmux::session_name(&id, "build", "proof-cell-0");
+        memory.record_thinking_stall_strike(&cell_key);
+        memory.record_thinking_stall_strike(&cell_key);
+        memory.record_thinking_stall_strike(&proof_key);
+
+        store.restart_cell(&id, 0, 0).unwrap();
+
+        assert_eq!(memory.thinking_stall_strikes(&cell_key), 0);
+        assert_eq!(memory.thinking_stall_strikes(&proof_key), 0);
+    }
+
+    #[test]
+    fn restart_task_resets_cell_and_task_scope_thinking_stall_strikes() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+        store.set_cell_state(&id, 0, 0, NodeState::Failed).unwrap();
+
+        let memory = store.memory();
+        let cell_key = crate::tmux::session_name(&id, "build", "worker");
+        let cell_proof_key = crate::tmux::session_name(&id, "build", "proof-cell-0");
+        let task_proof_key = crate::tmux::session_name(&id, "build", "proof-task-0");
+        memory.record_thinking_stall_strike(&cell_key);
+        memory.record_thinking_stall_strike(&cell_proof_key);
+        memory.record_thinking_stall_strike(&task_proof_key);
+
+        store.restart_task(&id, 0).unwrap();
+
+        assert_eq!(memory.thinking_stall_strikes(&cell_key), 0);
+        assert_eq!(memory.thinking_stall_strikes(&cell_proof_key), 0);
+        assert_eq!(memory.thinking_stall_strikes(&task_proof_key), 0);
+    }
+
+    #[test]
+    fn restart_squad_resets_cell_and_task_scope_thinking_stall_strikes() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+        store.set_cell_state(&id, 0, 0, NodeState::Failed).unwrap();
+        store.set_squad_state(&id, SquadState::Failed).unwrap();
+
+        let memory = store.memory();
+        let cell_key = crate::tmux::session_name(&id, "build", "worker");
+        let cell_proof_key = crate::tmux::session_name(&id, "build", "proof-cell-0");
+        let task_proof_key = crate::tmux::session_name(&id, "build", "proof-task-0");
+        memory.record_thinking_stall_strike(&cell_key);
+        memory.record_thinking_stall_strike(&cell_proof_key);
+        memory.record_thinking_stall_strike(&task_proof_key);
+
+        store.restart_squad(&id).unwrap();
+
+        assert_eq!(memory.thinking_stall_strikes(&cell_key), 0);
+        assert_eq!(memory.thinking_stall_strikes(&cell_proof_key), 0);
+        assert_eq!(memory.thinking_stall_strikes(&task_proof_key), 0);
+    }
+
+    #[test]
     fn restart_cell_proof_keeps_cell_done_but_resets_its_proofs() {
         let mut store = Store::open_in_memory().unwrap();
         let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
@@ -14905,6 +15102,43 @@ command = "cargo test"
             squad.tasks[0].cells[0].proof[0].state, "pending",
             "cell proof must be pending"
         );
+    }
+
+    #[test]
+    fn restart_cell_proof_resets_the_proofs_thinking_stall_strikes() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+        store.set_cell_state(&id, 0, 0, NodeState::Done).unwrap();
+        store
+            .set_proof_state(&id, 0, "cell", 0, 0, NodeState::Failed)
+            .unwrap();
+
+        let memory = store.memory();
+        let proof_key = crate::tmux::session_name(&id, "build", "proof-cell-0");
+        memory.record_thinking_stall_strike(&proof_key);
+        memory.record_thinking_stall_strike(&proof_key);
+
+        store.restart_cell_proof(&id, 0, 0, 0).unwrap();
+
+        assert_eq!(memory.thinking_stall_strikes(&proof_key), 0);
+    }
+
+    #[test]
+    fn restart_task_proof_resets_the_proofs_thinking_stall_strikes() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+        store.set_cell_state(&id, 0, 0, NodeState::Done).unwrap();
+        store
+            .set_proof_state(&id, 0, "task", -1, 0, NodeState::Failed)
+            .unwrap();
+
+        let memory = store.memory();
+        let proof_key = crate::tmux::session_name(&id, "build", "proof-task-0");
+        memory.record_thinking_stall_strike(&proof_key);
+
+        store.restart_task_proof(&id, 0, 0).unwrap();
+
+        assert_eq!(memory.thinking_stall_strikes(&proof_key), 0);
     }
 
     #[test]

@@ -103,6 +103,15 @@ pub struct LiveUsage {
 pub(crate) struct ForwardedEvent {
     pub(crate) agent_session_id: Option<String>,
     pub(crate) live_usage: Option<LiveUsage>,
+    /// RAL-536: `false` only for the periodic `LIVE_USAGE_MESSAGE` heartbeat
+    /// (fires on a fixed cadence regardless of whether the agent did
+    /// anything) and for a malformed/unparseable event. Every other event --
+    /// a tool call, a session-id capture, any other Cartographer-logged
+    /// runner event -- is real forward progress, so the tmux poll loop resets
+    /// [`crate::thinking_stall::ThinkingStallDetector`]'s streak on it. A
+    /// heartbeat must not reset the streak, or a genuine "Hmm." loop would
+    /// never accumulate enough consecutive low-diversity samples to trip.
+    pub(crate) is_activity_signal: bool,
 }
 
 /// The JSON spec sent to the runner on stdin (mirrors the runner's `CellSpec`).
@@ -995,6 +1004,14 @@ pub struct RunnerResult {
     /// cells, proof steps, or when the agent reported no prophecies.
     #[serde(default)]
     pub prophecies: Vec<RunnerProphecyMarker>,
+    /// RAL-536: set only when `status == "thinking_stalled"` -- the last
+    /// `RALPHUS_THINKING:` line [`crate::thinking_stall::ThinkingStallDetector`]
+    /// observed before tripping. Carried through so the retry loop that
+    /// intercepts this status (mirroring how `is_rate_limited()` is
+    /// intercepted before ever reaching [`Self::node_state`]) can quote it
+    /// back to the resumed attempt as recovery context.
+    #[serde(default)]
+    pub thinking_stall_last_line: Option<String>,
 }
 
 /// Wire shape of one prophecy marker in a [`RunnerResult`], mirroring
@@ -1029,6 +1046,7 @@ impl RunnerResult {
             ghost: None,
             retry_after_secs: None,
             prophecies: Vec::new(),
+            thinking_stall_last_line: None,
         }
     }
 
@@ -1069,6 +1087,7 @@ impl RunnerResult {
             ghost: None,
             retry_after_secs: None,
             prophecies: Vec::new(),
+            thinking_stall_last_line: None,
         }
     }
 
@@ -1102,6 +1121,7 @@ impl RunnerResult {
             ghost: None,
             retry_after_secs: None,
             prophecies: Vec::new(),
+            thinking_stall_last_line: None,
         }
     }
 
@@ -1134,6 +1154,7 @@ impl RunnerResult {
             ghost: None,
             retry_after_secs: None,
             prophecies: Vec::new(),
+            thinking_stall_last_line: None,
         }
     }
 
@@ -1187,6 +1208,52 @@ impl RunnerResult {
                 retry_after_secs,
             )),
             prophecies: Vec::new(),
+            thinking_stall_last_line: None,
+        }
+    }
+
+    /// RAL-536: a [`crate::thinking_stall::ThinkingStallDetector`] trip --
+    /// the agent's `RALPHUS_THINKING:` output degenerated into a
+    /// low-vocabulary-diversity loop (see that module's doc comment for the
+    /// detection rule). Neither success nor failure by itself: like
+    /// [`Self::rate_limited`], the scheduler's/guardian-merge's retry loop
+    /// intercepts this status before it would otherwise reach
+    /// [`Self::node_state`] and decides there whether to automatically
+    /// restart the attempt with recovery context or, on the third
+    /// consecutive stall for the same unit of work (cell, proof step, or
+    /// review-merge agent), terminate it and escalate to a human via
+    /// `Store::enqueue_error_mailbox_message`.
+    ///
+    /// Carries the last live usage snapshot for the same "don't regress the
+    /// board's numbers" reason as [`Self::detached`]/[`Self::cost_exceeded`],
+    /// and `last_line` (the final thinking line observed before the trip) so
+    /// the retry loop can quote it back into the resumed attempt's recovery
+    /// context.
+    #[must_use]
+    pub fn thinking_stalled(
+        usage: LiveUsage,
+        agent_session_id: Option<String>,
+        last_line: String,
+    ) -> Self {
+        Self {
+            status: "thinking_stalled".to_string(),
+            tokens_in: usage.tokens_in,
+            tokens_out: usage.tokens_out,
+            cache_creation_tokens: usage.cache_creation_tokens,
+            cache_read_tokens: usage.cache_read_tokens,
+            compaction_input_tokens: 0,
+            compaction_count: 0,
+            cost_usd: usage.cost_usd,
+            cost_is_estimated: true,
+            summary: String::new(),
+            error: Some("thinking-repetition stall detected".to_string()),
+            proofed: None,
+            agent_session_id,
+            turns: Some(usage.turns),
+            ghost: None,
+            retry_after_secs: None,
+            prophecies: Vec::new(),
+            thinking_stall_last_line: Some(last_line),
         }
     }
 
@@ -1215,12 +1282,21 @@ impl RunnerResult {
         self.status == "rate_limited"
     }
 
+    /// RAL-536: a [`Self::thinking_stalled`] trip -- see that constructor's
+    /// doc comment. The retry loop that owns the three-strike rule checks
+    /// this on every attempt and never lets it reach the rest of the normal
+    /// done/failed/detached handling, mirroring [`Self::is_rate_limited`].
+    #[must_use]
+    pub fn is_thinking_stalled(&self) -> bool {
+        self.status == "thinking_stalled"
+    }
+
     /// Map to a node state.
     #[must_use]
     pub fn node_state(&self) -> NodeState {
         if self.is_done() {
             NodeState::Done
-        } else if self.is_detached() || self.is_rate_limited() {
+        } else if self.is_detached() || self.is_rate_limited() || self.is_thinking_stalled() {
             NodeState::Running
         } else {
             NodeState::Failed
@@ -1638,13 +1714,28 @@ fn consume_transcript_lines(
     target: &TranscriptEventTarget<'_>,
     resumable_agent_session_id: &mut Option<String>,
     current_usage: &mut LiveUsage,
-) -> bool {
+    mut stall_detector: Option<&mut crate::thinking_stall::ThinkingStallDetector>,
+) -> (bool, Option<crate::thinking_stall::StallSample>) {
     let mut done = false;
+    let mut stall_sample = None;
     for line in lines {
         if line_is_done_sentinel(line) {
             done = true;
         }
         if target.pane_event_fallback {
+            continue;
+        }
+        // RAL-536: `RALPHUS_THINKING:` lines are a separate stream from
+        // `RALPHUS_EVENT:` tool-call/telemetry lines -- routed to
+        // `observe_thinking_line`, never `reset()`, so a legitimate repeated
+        // tool call can never trip the detector (see that module's doc
+        // comment on the routing contract this relies on).
+        if let Some(text) = line.trim_end().strip_prefix(THINKING_MARKER) {
+            if let Some(detector) = stall_detector.as_deref_mut() {
+                if let Some(sample) = detector.observe_thinking_line(text, crate::store::now_ms()) {
+                    stall_sample.get_or_insert(sample);
+                }
+            }
             continue;
         }
         if let Some(json) = line.trim_end().strip_prefix(EVENT_MARKER) {
@@ -1655,15 +1746,35 @@ fn consume_transcript_lines(
                 target.task,
                 json,
             );
+            // A tool call or any other genuine event resets the streak --
+            // the periodic `LIVE_USAGE_MESSAGE` heartbeat does not
+            // (`is_activity_signal` is `false` for it), since it fires every
+            // poll regardless of real agent progress and would otherwise
+            // erase an in-progress low-diversity streak before it could ever
+            // reach the minimum consecutive-sample count.
+            if forwarded.is_activity_signal {
+                if let Some(detector) = stall_detector.as_deref_mut() {
+                    detector.reset();
+                }
+            }
             if let Some(session_id) = forwarded.agent_session_id {
                 *resumable_agent_session_id = Some(session_id);
             }
             if let Some(usage) = forwarded.live_usage {
                 *current_usage = usage;
             }
+            continue;
+        }
+        // Any other non-empty line is real stdout content from the agent --
+        // "other non-thinking output" per the RAL-536 interview, which also
+        // resets the streak.
+        if let Some(detector) = stall_detector.as_deref_mut() {
+            if !line.trim().is_empty() {
+                detector.reset();
+            }
         }
     }
-    done
+    (done, stall_sample)
 }
 
 /// Drain every byte currently available after the completion sentinel has
@@ -1678,11 +1789,16 @@ fn drain_transcript_to_current_end(
 ) {
     loop {
         let drained = tailer.drain();
+        // No stall detector: this only ever runs after the attempt's
+        // `RunnerResult` is already decided (catching up on trailing events
+        // before the session is torn down), so there is nothing left for a
+        // trip here to affect.
         consume_transcript_lines(
             &drained.lines,
             target,
             resumable_agent_session_id,
             current_usage,
+            None,
         );
         if !drained.saw_new_bytes {
             break;
@@ -1765,6 +1881,25 @@ impl SubprocessRunner {
     /// still fails, it does not retry forever.
     const MAX_REATTACH_ATTEMPTS: u32 = 2;
 
+    /// RAL-536: whether `spec.agent` emits `RALPHUS_THINKING:` output at all
+    /// (RAL-516's `thinking_capable`/`agent_supports_thinking` flag) --
+    /// gates whether [`crate::thinking_stall::ThinkingStallDetector`] is
+    /// constructed for this cell run. `false` with no store attached (e.g.
+    /// direct-runner test harnesses), since there is nowhere to look up a
+    /// custom agent profile from and defaulting to "on" would spend a whole
+    /// cell run tracking a detector that can never observe a thinking line
+    /// anyway for the agents those harnesses actually exercise.
+    fn thinking_capable_for_spec(&self, spec: &RunnerSpec) -> bool {
+        let Some(store) = &self.cartographer else {
+            return false;
+        };
+        let guard = store.lock();
+        let db_profiles = crate::agent_profile_store::list_agent_profiles_conn(&guard.conn)
+            .map(|profiles| profiles.into_iter().map(|p| (p.name.clone(), p)).collect())
+            .unwrap_or_default();
+        crate::agent_profiles::thinking_capable_for_agent(&spec.agent, &db_profiles)
+    }
+
     /// Run `spec` inside a tmux session, transparently retrying via the
     /// backend's own resume mechanism (`claude -p --resume <id>` for
     /// `claude-code`/`claude-cli`, `codex exec resume <id>` for
@@ -1812,6 +1947,11 @@ impl SubprocessRunner {
         // Loaded once per cell run (not per attempt/poll) — RAL-154.
         let terminal_log_max_lines =
             crate::config::load_terminal_log_config().max_lines_per_attempt();
+        // RAL-536: same "once per cell run" reasoning -- `spec.agent` and the
+        // layered `[agent.health]` config are both constant across every
+        // reattach attempt of this same cell.
+        let agent_health_config = crate::config::load_agent_health_config();
+        let thinking_capable = self.thinking_capable_for_spec(spec);
 
         // Shared across every attempt: the overall wall-clock budget must not
         // reset on a reattach, and the agent_session_id captured live on one
@@ -1878,6 +2018,8 @@ impl SubprocessRunner {
                 &mut resumable_agent_session_id,
                 attempt,
                 terminal_log_max_lines,
+                thinking_capable,
+                &agent_health_config,
             );
 
             if !session_died_unexpectedly {
@@ -2008,6 +2150,8 @@ impl SubprocessRunner {
         resumable_agent_session_id: &mut Option<String>,
         attempt: u32,
         terminal_log_max_lines: usize,
+        thinking_capable: bool,
+        agent_health_config: &crate::config::AgentHealthConfig,
     ) -> (RunnerResult, bool) {
         // A stale file from a prior crashed/killed attempt of the same
         // (squad_id, task, cell_id) must never be mistaken for this
@@ -2163,6 +2307,15 @@ impl SubprocessRunner {
         // `TranscriptTailer`'s doc comment on how a reattach re-targets it.
         let mut tailer = TranscriptTailer::new(session_name, attempt, transcript_baseline);
         let mut last_pane: Option<String> = None;
+        // RAL-536: fresh per attempt, not shared across a reattach -- a
+        // reattach is a different, unrelated failure mode (the pane vanished)
+        // and the resumed agent's own thinking output starts a new stream, so
+        // carrying a partially-built window/streak across it would conflate
+        // two attempts' content. `None` when `spec.agent` doesn't emit
+        // `RALPHUS_THINKING:` output at all (RAL-516), so this whole check is
+        // a no-op for Claude Code/Codex.
+        let mut stall_detector = thinking_capable
+            .then(|| crate::thinking_stall::ThinkingStallDetector::new(agent_health_config));
         // RAL-397: `pipe_pane` is best-effort by design (a `pipe-pane` call
         // that returns `Ok` only means tmux accepted the target string — the
         // sink can still fail to exec, die, or never get write access), but
@@ -2322,12 +2475,35 @@ impl SubprocessRunner {
                     cell_id: &attempt_spec.cell_id,
                     task: &attempt_spec.task,
                 };
-                let mut done = consume_transcript_lines(
+                let (mut done, stall_sample) = consume_transcript_lines(
                     &drained.lines,
                     &transcript_target,
                     resumable_agent_session_id,
                     &mut current_usage,
+                    stall_detector.as_mut(),
                 );
+                if let Some(sample) = stall_sample {
+                    let _ = tmux.kill_session(session_name);
+                    crate::rlog!(
+                        WARNING,
+                        "ralphus [runner] thinking-repetition stall detected ({} consecutive low-diversity samples over {}ms), killing squad={} cell={} last_line={:?}",
+                        sample.consecutive_samples,
+                        sample.span_ms,
+                        attempt_spec.squad_id,
+                        attempt_spec.cell_id,
+                        sample.last_line,
+                    );
+                    self.emit_tmux_note(
+                        attempt_spec,
+                        "tmux session killed: thinking-repetition stall detected",
+                        session_name,
+                    );
+                    break RunnerResult::thinking_stalled(
+                        current_usage,
+                        resumable_agent_session_id.clone(),
+                        sample.last_line,
+                    );
+                }
 
                 // A small `capture_pane` (visible window only, not the former
                 // deep 10_000-line scan events used to come from) still runs
@@ -2900,6 +3076,7 @@ pub(crate) fn forward_runner_event(
         }
     };
     redact_event(&mut event);
+    let is_activity_signal = event.message != LIVE_USAGE_MESSAGE;
     let level = event
         .level
         .as_deref()
@@ -3010,6 +3187,7 @@ pub(crate) fn forward_runner_event(
     ForwardedEvent {
         agent_session_id: captured_agent_session_id,
         live_usage,
+        is_activity_signal,
     }
 }
 
@@ -3964,6 +4142,7 @@ mod tests {
             turns: None,
             retry_after_secs: None,
             prophecies: Vec::new(),
+            thinking_stall_last_line: None,
         };
         assert!(r.proof_passed());
 
@@ -4394,7 +4573,7 @@ prompt = "make it build"
     /// not fabricate a session id or a zeroed usage snapshot — a `Some(0.0)`
     /// cost would read as a real reading and reset the cap's running total.
     #[test]
-    fn forward_runner_event_reports_nothing_for_an_ordinary_event() {
+    fn forward_runner_event_reports_nothing_identifiable_for_an_ordinary_event() {
         let (store, squad_id) = store_with_one_cell();
         let json = serde_json::json!({
             "source": "claude-code",
@@ -4406,7 +4585,17 @@ prompt = "make it build"
 
         let fwd = forward_runner_event(Some(&store), &squad_id, "worker", "build", &json);
 
-        assert_eq!(fwd, ForwardedEvent::default());
+        // No agent_session_id/live_usage to capture, but it's still a real
+        // event (not the LIVE_USAGE_MESSAGE heartbeat) -- see
+        // `ForwardedEvent::is_activity_signal`'s doc comment.
+        assert_eq!(
+            fwd,
+            ForwardedEvent {
+                agent_session_id: None,
+                live_usage: None,
+                is_activity_signal: true,
+            }
+        );
     }
 
     #[test]
@@ -5822,7 +6011,7 @@ prompt = "make it build"
             cell_id: "worker",
             task: "build",
         };
-        consume_transcript_lines(&initial.lines, &target, &mut session_id, &mut usage);
+        consume_transcript_lines(&initial.lines, &target, &mut session_id, &mut usage, None);
         drain_transcript_to_current_end(&mut tailer, &target, &mut session_id, &mut usage);
 
         let page = store

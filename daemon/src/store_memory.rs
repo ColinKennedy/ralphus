@@ -112,6 +112,18 @@ pub struct StoreMemory {
     /// the scheduler's per-cell env-merge choke point reads it on every
     /// dispatch and writes only on invalidation.
     secret_env_names: RwLock<Option<BTreeSet<String>>>,
+    /// RAL-536: consecutive automatic restarts a [`crate::thinking_stall`]
+    /// trip has triggered for one unit of work, keyed by
+    /// `crate::tmux::session_name(run_id, task, session_id)` -- the same
+    /// deterministic key [`ActivityState`] already uses, so an automatic
+    /// retry of the same cell/proof/review-agent operation (which reuses
+    /// that triple) keeps accumulating against the same counter, while a
+    /// genuinely different unit of work starts fresh. Independent of every
+    /// other group here: nothing else reads or writes it, and it does not
+    /// share an invariant with the tmux-liveness/stall-escalation state
+    /// despite both being about "is this session stalled" -- this counter
+    /// tracks completed automatic restarts, not liveness.
+    thinking_stall_strikes: Mutex<HashMap<String, u32>>,
 }
 
 impl StoreMemory {
@@ -312,6 +324,68 @@ impl StoreMemory {
     pub fn invalidate_secret_env_names(&self) {
         *self.secret_env_names.write() = None;
     }
+
+    // ---- thinking-stall strike counter (RAL-536) ----
+    //
+    // A [`crate::thinking_stall::ThinkingStallDetector`] trip triggers an
+    // automatic restart of the affected cell/proof/review-agent, injecting
+    // recovery context so the agent takes a different approach. This counter
+    // tracks how many such automatic restarts have happened *in a row* for
+    // one unit of work (keyed by `crate::tmux::session_name(run_id, task,
+    // session_id)`), independent of the low-diversity streak the detector
+    // itself tracks -- that streak lives inside the detector, is scoped to
+    // one running attempt, and is gone once the attempt ends. This counter
+    // is the opposite: it must survive across attempts, since its entire
+    // purpose is noticing a *third* automatic restart of the same work.
+    //
+    // A third strike stops the automatic-restart cycle: instead of
+    // restarting again, the caller terminates the operation and escalates to
+    // a human via `Store::enqueue_error_mailbox_message`. Only a human
+    // action -- resuming, restarting, or retrying the work by hand --
+    // resets the count back to zero; the automatic restarts that raise it do
+    // not reset each other's count, or the streak would never reach three.
+
+    /// Record one automatic restart triggered by a thinking-stall trip for
+    /// `key`, returning the new strike count.
+    pub fn record_thinking_stall_strike(&self, key: &str) -> u32 {
+        let mut strikes = self.thinking_stall_strikes.lock();
+        let count = strikes.entry(key.to_string()).or_insert(0);
+        *count += 1;
+        *count
+    }
+
+    /// The current consecutive-automatic-restart count for `key`, `0` if
+    /// none has ever been recorded (or it was last reset).
+    #[must_use]
+    pub fn thinking_stall_strikes(&self, key: &str) -> u32 {
+        self.thinking_stall_strikes
+            .lock()
+            .get(key)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Reset `key`'s strike count to zero -- called on a human resume,
+    /// restart, or retry of the work, never on an automatic one.
+    pub fn reset_thinking_stall_strikes(&self, key: &str) {
+        self.thinking_stall_strikes.lock().remove(key);
+    }
+
+    /// Reset every strike count whose key belongs to `run_id` -- the
+    /// review/guardian-merge counterpart of [`Self::reset_thinking_stall_strikes`].
+    /// A review's agent sessions (auto-build, resolver/fix-pass,
+    /// proof-synthesis, per-branch feedback, ...) all share `run_id`
+    /// (`guardian-{id}`) but use call-site-specific task/session ids that
+    /// aren't practical to enumerate the way a cell/task/proof restart's
+    /// exact keys are, so a human restart or reopen of the whole review
+    /// clears everything under its prefix (`crate::tmux::session_name_run_prefix`)
+    /// at once rather than key-by-key.
+    pub fn reset_thinking_stall_strikes_for_run(&self, run_id: &str) {
+        let prefix = crate::tmux::session_name_run_prefix(run_id);
+        self.thinking_stall_strikes
+            .lock()
+            .retain(|k, _| !k.starts_with(&prefix));
+    }
 }
 
 #[cfg(test)]
@@ -509,5 +583,51 @@ mod tests {
         );
         mem.invalidate_secret_env_names();
         assert_eq!(mem.secret_env_names_cached(), None);
+    }
+
+    #[test]
+    fn thinking_stall_strikes_accumulate_and_reset_per_key() {
+        let mem = StoreMemory::new();
+        assert_eq!(mem.thinking_stall_strikes("s1"), 0);
+        assert_eq!(mem.record_thinking_stall_strike("s1"), 1);
+        assert_eq!(mem.record_thinking_stall_strike("s1"), 2);
+        assert_eq!(mem.thinking_stall_strikes("s1"), 2);
+
+        // A different session's key is independent.
+        assert_eq!(mem.thinking_stall_strikes("s2"), 0);
+        assert_eq!(mem.record_thinking_stall_strike("s2"), 1);
+        assert_eq!(mem.thinking_stall_strikes("s1"), 2);
+
+        // Only an explicit (human-triggered) reset clears the count -- there is
+        // no automatic decay.
+        mem.reset_thinking_stall_strikes("s1");
+        assert_eq!(mem.thinking_stall_strikes("s1"), 0);
+        assert_eq!(
+            mem.thinking_stall_strikes("s2"),
+            1,
+            "resetting one session's strikes reset an unrelated session too"
+        );
+    }
+
+    #[test]
+    fn reset_thinking_stall_strikes_for_run_clears_only_that_runs_keys() {
+        let mem = StoreMemory::new();
+        let branch_key = crate::tmux::session_name("guardian-g1", "AUTO_BUILD", "branch-a");
+        let resolver_key = crate::tmux::session_name("guardian-g1", "resolver", "conflict-1");
+        let unrelated_key = crate::tmux::session_name("guardian-g2", "AUTO_BUILD", "branch-a");
+        mem.record_thinking_stall_strike(&branch_key);
+        mem.record_thinking_stall_strike(&branch_key);
+        mem.record_thinking_stall_strike(&resolver_key);
+        mem.record_thinking_stall_strike(&unrelated_key);
+
+        mem.reset_thinking_stall_strikes_for_run("guardian-g1");
+
+        assert_eq!(mem.thinking_stall_strikes(&branch_key), 0);
+        assert_eq!(mem.thinking_stall_strikes(&resolver_key), 0);
+        assert_eq!(
+            mem.thinking_stall_strikes(&unrelated_key),
+            1,
+            "resetting one review's strikes reset a different review's key too"
+        );
     }
 }

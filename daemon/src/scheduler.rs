@@ -2042,6 +2042,45 @@ fn run_cell_with_rate_limit_retries<'a>(
             total_turns = Some(total_turns.unwrap_or(0) + t);
         }
 
+        // RAL-536: a thinking-repetition stall is not a rate limit -- its tmux
+        // session is already dead (`run_via_tmux_attempt` killed it the moment
+        // `ThinkingStallDetector` tripped) -- so it's intercepted here, before
+        // the rate-limit check below, and handed to the shared three-failure
+        // rule in `handle_thinking_stall_attempt`. See that function's doc
+        // comment for the full definition/reset/scope/escalation behavior.
+        if attempt.is_thinking_stalled() {
+            match handle_thinking_stall_attempt(store, spec, &attempt) {
+                // No sleep/permit release here, unlike the rate-limit retry
+                // path below -- the stalled attempt already ended (its tmux
+                // session is dead), so there is nothing to wait out; retrying
+                // immediately with the still-held permit is correct.
+                ThinkingStallOutcome::Retry => continue,
+                ThinkingStallOutcome::Terminate(message) => {
+                    let failed = RunnerResult {
+                        status: "failed".to_string(),
+                        tokens_in: total_tokens_in,
+                        tokens_out: total_tokens_out,
+                        cache_creation_tokens: total_cache_creation_tokens,
+                        cache_read_tokens: total_cache_read_tokens,
+                        compaction_input_tokens: total_compaction_input_tokens,
+                        compaction_count: total_compaction_count,
+                        cost_usd: total_cost_usd,
+                        cost_is_estimated: true,
+                        summary: attempt.summary.clone(),
+                        error: Some(message),
+                        proofed: None,
+                        agent_session_id: attempt.agent_session_id.clone(),
+                        turns: total_turns,
+                        ghost: None,
+                        retry_after_secs: None,
+                        prophecies: Vec::new(),
+                        thinking_stall_last_line: None,
+                    };
+                    return Some((failed, permit));
+                }
+            }
+        }
+
         if !attempt.is_rate_limited() {
             let mut merged = attempt;
             merged.tokens_in = total_tokens_in;
@@ -2112,6 +2151,7 @@ fn run_cell_with_rate_limit_retries<'a>(
                 ghost: None,
                 retry_after_secs: None,
                 prophecies: Vec::new(),
+                thinking_stall_last_line: None,
             };
             return Some((failed, permit));
         }
@@ -2207,6 +2247,178 @@ fn rate_limit_thrash_message(detail: &ralphus_core::thrash::OccurrenceDetail) ->
         detail.max_occurrences,
         detail.min_turn_gap,
     )
+}
+
+/// RAL-536 interview: the number of consecutive automatic thinking-stall
+/// restarts a single unit of work (a cell, a proof step, or a
+/// review/guardian-merge agent operation) may take before
+/// [`handle_thinking_stall_attempt`] gives up and terminates it. A human
+/// resume/restart/retry resets the counter this compares against
+/// (`crate::store_memory::StoreMemory::reset_thinking_stall_strikes`) back to
+/// zero; the automatic restarts this constant bounds never reset each other.
+const THINKING_STALL_MAX_STRIKES: u32 = 3;
+
+/// What [`handle_thinking_stall_attempt`] decided to do about one
+/// thinking-stalled attempt.
+pub(crate) enum ThinkingStallOutcome {
+    /// Strikes 1 and 2: `spec` has already been mutated in place (resumed
+    /// agent session + an appended recovery-context prompt) -- the caller's
+    /// retry loop should immediately spin up a fresh attempt with it.
+    Retry,
+    /// Strike 3: the work is terminated. Carries the human-readable message
+    /// the caller should place in its own terminal `RunnerResult.error`.
+    Terminate(String),
+}
+
+/// RAL-536: intercepts a [`RunnerResult`] that tripped the thinking-
+/// repetition stall detector (`attempt.is_thinking_stalled()`) and applies
+/// the interview's three-failure rule. Shared by every retry loop that can
+/// encounter one -- [`run_cell_with_rate_limit_retries`],
+/// [`run_proof_with_rate_limit_retries`], and
+/// `guardian_merge::run_agent_with_stall_recovery` -- so cells, proof steps,
+/// and review/guardian-merge agents (the interview's full scope) all get the
+/// identical rule. By the time this runs, `attempt`'s tmux session has
+/// already been killed by `SubprocessRunner::run_via_tmux_attempt`
+/// (`crate::thinking_stall`'s trip site) -- this function only ever decides
+/// whether to resume or give up, never kills anything itself.
+///
+/// # Definition
+///
+/// "Thinking stall" here means [`crate::thinking_stall::ThinkingStallDetector`]
+/// tripped: the agent's `RALPHUS_THINKING:`-tagged output degenerated into a
+/// content-repetition loop for at least
+/// [`crate::config::AgentHealthConfig::thinking_stall_min_consecutive_samples`]
+/// consecutive rolling-window samples. See that module's doc comment for the
+/// full detection definition and its own (per-attempt, in-memory, *not*
+/// persisted here) reset rules.
+///
+/// # Three-failure rule and what resets what
+///
+/// `work_key` -- `crate::tmux::session_name(&spec.squad_id, &spec.task,
+/// &spec.cell_id)`, the same triple every `RunnerSpec` this can see already
+/// carries, whether it names a real cell, a proof step's synthetic
+/// `proof-<scope>-<idx>` id, or a guardian-merge agent's
+/// `guardian-<id>`/`resolver-<branch>`-style naming -- is the durable key
+/// [`crate::store_memory::StoreMemory::record_thinking_stall_strike`] counts
+/// consecutive automatic restarts against. This counter is distinct from,
+/// and outlives, `ThinkingStallDetector`'s own per-attempt low-diversity
+/// streak: that one resets *within* one running attempt (tool call, other
+/// non-thinking output, or materially changed thinking); this one persists
+/// *across* attempts and is reset to zero only by a human resume, restart,
+/// or retry of the work (`Store::reset_thinking_stall_strikes` call sites in
+/// `server.rs`) -- never by the automatic retries this function performs.
+///
+/// - **Strikes 1 and 2** ([`ThinkingStallOutcome::Retry`]): `spec` is
+///   mutated in place -- `resume_agent_session_id` so the agent resumes its
+///   own conversation rather than starting cold, and `prompt` gets a
+///   recovery-context paragraph appended quoting the last meaningful
+///   pre-stall thinking line (`attempt.thinking_stall_last_line`) and asking
+///   for a materially different approach instead of repeating it.
+/// - **Strike 3** ([`ThinkingStallOutcome::Terminate`]): the work is given
+///   up on. A `high`-priority mailbox message is enqueued via
+///   [`crate::store::Store::enqueue_error_mailbox_message`] with
+///   [`crate::mailbox::Remediation::ManualInterventionRequired`] (wording
+///   mirrors `SubprocessRunner::check_stall_escalation`'s RAL-241 pane-quiet
+///   escalation), and the returned message is what the caller should surface
+///   as its own terminal failure. No cell/proof/review-agent is auto-killed
+///   here -- it already isn't running (its tmux session died with the
+///   `thinking_stalled` result) -- this only stops the automatic retries.
+pub(crate) fn handle_thinking_stall_attempt(
+    store: &crate::store_lock::StoreHandle,
+    spec: &mut RunnerSpec,
+    attempt: &RunnerResult,
+) -> ThinkingStallOutcome {
+    debug_assert!(attempt.is_thinking_stalled());
+    let work_key = crate::tmux::session_name(&spec.squad_id, &spec.task, &spec.cell_id);
+    let strikes = store
+        .lock_free_memory()
+        .record_thinking_stall_strike(&work_key);
+    let last_line = attempt
+        .thinking_stall_last_line
+        .as_deref()
+        .unwrap_or("(no thinking line captured)");
+
+    if strikes < THINKING_STALL_MAX_STRIKES {
+        crate::rlog!(
+            WARNING,
+            "ralphus [scheduler] {}/{} thinking-repetition stall detected (automatic restart {}/{}); resuming with recovery context",
+            spec.squad_id,
+            spec.cell_id,
+            strikes,
+            THINKING_STALL_MAX_STRIKES,
+        );
+        spec.resume_agent_session_id = attempt
+            .agent_session_id
+            .clone()
+            .or_else(|| spec.resume_agent_session_id.clone());
+        let recovery = format!(
+            "\n\n---\nRALPHUS RECOVERY NOTICE: this session was automatically restarted because \
+             your thinking output stopped making progress and started repeating itself instead \
+             of moving forward. The last thing you were thinking before the restart was:\n\n> \
+             {last_line}\n\nDo not repeat that same line of thinking. Take a materially different \
+             approach: re-check the current state of the work, reconsider your plan, and make \
+             forward progress instead of re-deriving the same conclusion again.",
+        );
+        spec.prompt = Some(match spec.prompt.take() {
+            Some(existing) => format!("{existing}{recovery}"),
+            None => recovery.trim_start().to_string(),
+        });
+        return ThinkingStallOutcome::Retry;
+    }
+
+    crate::rlog!(
+        WARNING,
+        "ralphus [scheduler] {}/{} thinking-repetition stall detected for the {strikes} consecutive time; terminating and escalating to a human",
+        spec.squad_id,
+        spec.cell_id,
+    );
+    let guard = store.lock();
+    let text = format!(
+        "'{}' in task '{}' (squad {}) was automatically restarted {THINKING_STALL_MAX_STRIKES} \
+         times after repeatedly detecting a thinking-repetition stall and made no progress; it \
+         has been terminated",
+        spec.cell_id, spec.task, spec.squad_id,
+    );
+    let entity_uri = guard.cell_entity_uri_by_sid(&spec.squad_id, &spec.cell_id);
+    if let Ok(message_id) = guard.enqueue_error_mailbox_message(
+        crate::mailbox::MailboxPriority::High,
+        &text,
+        &crate::mailbox::Remediation::ManualInterventionRequired {
+            guidance: format!(
+                "review the last thinking output before the restart ({last_line:?}) and the \
+                 terminal transcript; a human resume, restart, or retry is required to clear \
+                 this automatic-restart limit before it will run again"
+            ),
+        },
+        Some(&spec.squad_id),
+        Some(&spec.task),
+        Some(&spec.cell_id),
+        entity_uri.as_deref(),
+        None,
+    ) {
+        crate::cartographer::Note::new("scheduler")
+            .level(crate::logging::LogLevel::WARNING)
+            .squad(&spec.squad_id)
+            .cell(&spec.cell_id)
+            .task(&spec.task)
+            .scope("mailbox")
+            .emit(
+                &guard,
+                format!(
+                    "mailbox message enqueued for thinking-stalled work ({})",
+                    spec.cell_id
+                ),
+                serde_json::json!({
+                    "message_id": message_id,
+                    "priority": "high",
+                    "strikes": strikes,
+                }),
+            );
+    }
+    ThinkingStallOutcome::Terminate(format!(
+        "thinking-repetition stall detected {strikes} consecutive times; terminated pending \
+         human intervention (see the mailbox for remediation guidance)",
+    ))
 }
 
 /// Run one cell — and, on success, its cell-level proofs — while
@@ -4073,6 +4285,29 @@ fn run_proof_with_rate_limit_retries(
     let mut retries = 0u32;
     loop {
         let mut result = runner.run_cancellable(spec, cancel);
+
+        // RAL-536: same interception as `run_cell_with_rate_limit_retries` --
+        // a proof step's thinking-repetition stall is not a rate limit and
+        // its tmux session is already dead, so it's handled by the shared
+        // three-failure rule before the rate-limit check below. `spec.cell_id`
+        // is already this proof step's synthetic `proof-<scope>-<idx>` id
+        // (set when this `RunnerSpec` was built), so it keys the strike
+        // counter distinctly per proof step, same as a real cell.
+        if result.is_thinking_stalled() && !cancel.is_cancelled() {
+            match handle_thinking_stall_attempt(store, spec, &result) {
+                ThinkingStallOutcome::Retry => continue,
+                ThinkingStallOutcome::Terminate(message) => {
+                    let _ = store
+                        .lock()
+                        .clear_proof_delayed(squad_id, task_idx, scope, cell_idx, idx);
+                    result.status = "failed".to_string();
+                    result.error = Some(message);
+                    result.retry_after_secs = None;
+                    return result;
+                }
+            }
+        }
+
         if !result.is_rate_limited() || cancel.is_cancelled() {
             let _ = store
                 .lock()
@@ -4788,6 +5023,7 @@ mod tests {
                 RunnerResult::failure("intentional failure")
             } else {
                 RunnerResult {
+                    thinking_stall_last_line: None,
                     retry_after_secs: None,
                     status: "done".to_string(),
                     tokens_in: 1,
@@ -4821,6 +5057,7 @@ mod tests {
     impl Runner for ProphecyRunner {
         fn run(&self, _spec: &RunnerSpec) -> RunnerResult {
             RunnerResult {
+                thinking_stall_last_line: None,
                 status: "done".to_string(),
                 tokens_in: 1,
                 tokens_out: 2,
@@ -4895,6 +5132,7 @@ mod tests {
                 *seen_prompt.lock().unwrap() = spec.prompt.clone();
             }
             RunnerResult {
+                thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "done".to_string(),
                 tokens_in: 1,
@@ -5156,6 +5394,7 @@ mod tests {
                         );
                     }
                     RunnerResult {
+                        thinking_stall_last_line: None,
                         retry_after_secs: None,
                         status: "done".to_string(),
                         tokens_in: 0,
@@ -5188,6 +5427,7 @@ mod tests {
                         released = cv.wait(released).expect("mutex poisoned");
                     }
                     RunnerResult {
+                        thinking_stall_last_line: None,
                         retry_after_secs: None,
                         status: "done".to_string(),
                         tokens_in: 0,
@@ -5347,6 +5587,7 @@ mod tests {
             *self.seen_resume_agent_session_id.lock().unwrap() =
                 Some(spec.resume_agent_session_id.clone());
             RunnerResult {
+                thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "done".to_string(),
                 tokens_in: 3,
@@ -5642,6 +5883,7 @@ mod tests {
                 );
             }
             RunnerResult {
+                thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "done".to_string(),
                 tokens_in: 1,
@@ -5786,6 +6028,7 @@ mod tests {
             self.rendezvous();
             self.current.fetch_sub(1, Ordering::SeqCst);
             RunnerResult {
+                thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "done".to_string(),
                 tokens_in: 0,
@@ -6401,6 +6644,7 @@ mod tests {
                         RunnerResult::failure("first attempt fails")
                     } else {
                         RunnerResult {
+                            thinking_stall_last_line: None,
                             retry_after_secs: None,
                             status: "done".to_string(),
                             tokens_in: 1,
@@ -6424,6 +6668,7 @@ mod tests {
                     self.b_started.store(true, Ordering::SeqCst);
                     std::thread::sleep(Duration::from_millis(400));
                     RunnerResult {
+                        thinking_stall_last_line: None,
                         retry_after_secs: None,
                         status: "done".to_string(),
                         tokens_in: 1,
@@ -6551,6 +6796,7 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(5));
                 }
                 return RunnerResult {
+                    thinking_stall_last_line: None,
                     retry_after_secs: None,
                     status: "done".to_string(),
                     tokens_in: 1,
@@ -6576,6 +6822,7 @@ mod tests {
                     return RunnerResult::failure("first proof attempt fails");
                 }
                 return RunnerResult {
+                    thinking_stall_last_line: None,
                     retry_after_secs: None,
                     status: "done".to_string(),
                     tokens_in: 1,
@@ -6599,6 +6846,7 @@ mod tests {
                 self.finalize_started.store(true, Ordering::SeqCst);
             }
             RunnerResult {
+                thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "done".to_string(),
                 tokens_in: 1,
@@ -6738,6 +6986,7 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(5));
                 }
                 return RunnerResult {
+                    thinking_stall_last_line: None,
                     retry_after_secs: None,
                     status: "done".to_string(),
                     tokens_in: 1,
@@ -6764,6 +7013,7 @@ mod tests {
                 }
             }
             RunnerResult {
+                thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "done".to_string(),
                 tokens_in: 1,
@@ -6893,6 +7143,7 @@ mod tests {
                 RunnerResult::failure("intentional failure")
             } else {
                 RunnerResult {
+                    thinking_stall_last_line: None,
                     retry_after_secs: None,
                     status: "done".to_string(),
                     tokens_in: 0,
@@ -7134,6 +7385,7 @@ mod tests {
                 )
             } else {
                 RunnerResult {
+                    thinking_stall_last_line: None,
                     retry_after_secs: None,
                     status: "done".to_string(),
                     tokens_in: 1,
@@ -7481,6 +7733,7 @@ mod tests {
                 ));
             }
             RunnerResult {
+                thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "done".to_string(),
                 tokens_in: 0,
@@ -7550,6 +7803,7 @@ mod tests {
                 .unwrap()
                 .push((spec.proof, spec.system_prompt.clone()));
             RunnerResult {
+                thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "done".to_string(),
                 tokens_in: 0,
@@ -7777,6 +8031,7 @@ mod tests {
                     .push((spec.agent.clone(), spec.model.clone()));
             }
             RunnerResult {
+                thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "done".to_string(),
                 tokens_in: 0,
@@ -7850,6 +8105,7 @@ mod tests {
                 }
             }
             RunnerResult {
+                thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "done".to_string(),
                 tokens_in: 0,
@@ -8050,6 +8306,7 @@ mod tests {
                 RunnerResult::failure("intentional failure")
             } else {
                 RunnerResult {
+                    thinking_stall_last_line: None,
                     retry_after_secs: None,
                     status: "done".to_string(),
                     tokens_in: 1,
@@ -8175,6 +8432,7 @@ mod tests {
                 return RunnerResult::failure("blocking runner was never cancelled");
             }
             RunnerResult {
+                thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "done".to_string(),
                 tokens_in: 1,
@@ -8678,6 +8936,7 @@ mod tests {
                 .unwrap_or_default();
             self.calls.lock().unwrap().push(label);
             RunnerResult {
+                thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "done".to_string(),
                 tokens_in: 0,
@@ -8941,6 +9200,7 @@ mod tests {
         fn run(&self, spec: &RunnerSpec) -> RunnerResult {
             self.seen.lock().unwrap().push(spec.env_overrides.clone());
             RunnerResult {
+                thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "done".to_string(),
                 tokens_in: 0,
@@ -9110,6 +9370,7 @@ mod tests {
             git(&["add", "."]);
             git(&["commit", "--message", "cell work"]);
             RunnerResult {
+                thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "done".to_string(),
                 tokens_in: 0,
@@ -9477,6 +9738,7 @@ mod tests {
                 .unwrap()
                 .push((spec.cell_id.clone(), spec.resume_agent_session_id.clone()));
             RunnerResult {
+                thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "done".to_string(),
                 tokens_in: 1,
@@ -9650,6 +9912,7 @@ mod tests {
                 .unwrap()
                 .push((spec.cell_id.clone(), spec.assigned_agent_session_id.clone()));
             RunnerResult {
+                thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "done".to_string(),
                 tokens_in: 1,
