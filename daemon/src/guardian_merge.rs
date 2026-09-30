@@ -8899,7 +8899,13 @@ fn post_merge_jobs_inner(
         .as_ref()
         .and_then(|g| g.manual_checks_basis.as_deref())
         != Some(expected_basis.as_str());
-    let generate_manual = jobs.manual_checks && (!commands_present || basis_changed);
+    // Once a cached result has been recorded, later rebases and restacks do
+    // not invalidate it merely because the stacked tip changed. An explicit
+    // opt-out continues to regenerate when the result is absent or stale.
+    let cached = stored.as_ref().is_some_and(|g| {
+        g.effective_cache_manual_checks && g.manual_checks_cached && g.manual_checks_basis.is_some()
+    });
+    let generate_manual = jobs.manual_checks && !cached && (!commands_present || basis_changed);
 
     // Both jobs read the scratch worktree and neither reads the other's
     // output, so they run concurrently.
