@@ -14938,9 +14938,9 @@ fn guardian_cancel(daemon: &Daemon, id: &str) -> Reply {
     }
 }
 
-/// Reopen a `cancelled` or `merged` review (status → `collecting`) and
-/// immediately try a fresh merge pass if the daemon has capacity -- see
-/// [`crate::guardian_merge::reopen_guardian_merge`].
+/// Reopen a `cancelled`, `merged`, or `approved` review (status →
+/// `collecting`) and immediately try a fresh merge pass if the daemon has
+/// capacity -- see [`crate::guardian_merge::reopen_guardian_merge`].
 fn guardian_reopen(daemon: &Daemon, id: &str) -> Reply {
     let runner = guardian_agent_runner(daemon);
     crate::guardian_merge::reopen_guardian_merge(
