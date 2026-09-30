@@ -24145,6 +24145,7 @@ remediation_attempts = 1
                     std::thread::sleep(Duration::from_millis(5));
                 }
                 RunnerResult {
+                    thinking_stall_last_line: None,
                     retry_after_secs: None,
                     status: "done".to_string(),
                     tokens_in: 1,
@@ -24299,6 +24300,7 @@ remediation_attempts = 1
                     std::thread::sleep(Duration::from_millis(5));
                 }
                 RunnerResult {
+                    thinking_stall_last_line: None,
                     retry_after_secs: None,
                     status: "done".to_string(),
                     tokens_in: 1,
