@@ -139,8 +139,12 @@ pub struct ReviewConfig {
     /// "auto-clean" branch) -- the old, lighter-weight default behavior.
     /// `None` means unset, which resolves to `false`; per-project scalars win
     /// over the global layer, same as `skip_worktrees`.
-    #[serde(default)]
-    pub verify_skip_auto_clean: Option<bool>,
+    #[serde(
+        rename = "proof_skip_auto_clean",
+        alias = "verify_skip_auto_clean",
+        default
+    )]
+    pub proof_skip_auto_clean: Option<bool>,
     /// The conflict-resolver agent used when a review doesn't set its own
     /// `[[review]].agent` and `RALPHUS_RESOLVER_AGENT` isn't set -- a builtin
     /// backend name (`"claude"`, `"claude-code"`, `"codex"`, `"ollama"`,
@@ -379,6 +383,25 @@ pub const DEFAULT_BASE_SHIFT_MAXIMUM_REBUILDS: u32 = 3;
 /// unset. RAL-517.
 pub const DEFAULT_RETRY_AFTER_UNKNOWN_DEFAULT_SECONDS: u64 = 30;
 
+/// Canonical project-config keys that correspond to authored `[[review]]`
+/// settings. The parity test compares this list with `core::validate::REVIEW_KEYS`
+/// so schema and project defaults cannot drift independently.
+pub const REVIEW_CONFIG_KEYS: &[&str] = &[
+    "default_resolver_agent",
+    "default_resolver_model",
+    "default_machine",
+    "default_maximum_budget_usd",
+    "default_proof_scope",
+    "auto_submit_pr_stack",
+    "match_pr_branch_name",
+    "skip_worktrees",
+    "skip_base_updates",
+    "proof_skip_auto_clean",
+    "checks",
+    "auto_build",
+    "summary_format",
+];
+
 impl ReviewConfig {
     /// Whether worktrees should be skipped (unset resolves to `false`).
     #[must_use]
@@ -412,8 +435,8 @@ impl ReviewConfig {
     /// Whether `"each_branch"` scope additionally skips auto-clean branches
     /// (unset resolves to `false`).
     #[must_use]
-    pub fn verify_skip_auto_clean(&self) -> bool {
-        self.verify_skip_auto_clean.unwrap_or(false)
+    pub fn proof_skip_auto_clean(&self) -> bool {
+        self.proof_skip_auto_clean.unwrap_or(false)
     }
 
     /// The configured default conflict-resolver agent, unset resolves to
@@ -618,7 +641,7 @@ impl ReviewConfig {
             auto_build: over.auto_build.or(self.auto_build),
             summary_format: over.summary_format.or(self.summary_format),
             default_proof_scope: over.default_proof_scope.or(self.default_proof_scope),
-            verify_skip_auto_clean: over.verify_skip_auto_clean.or(self.verify_skip_auto_clean),
+            proof_skip_auto_clean: over.proof_skip_auto_clean.or(self.proof_skip_auto_clean),
             default_resolver_agent: over.default_resolver_agent.or(self.default_resolver_agent),
             default_resolver_model: over.default_resolver_model.or(self.default_resolver_model),
             default_machine: over.default_machine.or(self.default_machine),
@@ -3217,9 +3240,9 @@ mod tests {
 
     #[test]
     fn verify_skip_auto_clean_defaults_to_false() {
-        assert!(!ReviewConfig::default().verify_skip_auto_clean());
+        assert!(!ReviewConfig::default().proof_skip_auto_clean());
         let c = from_toml_str("[review]\nverify_skip_auto_clean = true\n");
-        assert!(c.verify_skip_auto_clean());
+        assert!(c.proof_skip_auto_clean());
     }
 
     #[test]
