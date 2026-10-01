@@ -57,6 +57,8 @@
        * @property {string} pickerKind - which roster tab is showing.
        * @property {string} pickerQuery - the roster picker's filter text.
        * @property {string} cwd - scopes the agent list, like the review edit modal does.
+       * @property {{prompt: string, agent: string, model: string, allowAdvisory: boolean}} [original] - edit-only: the
+       *   survey-affecting values the form opened with, so saving can tell whether re-judging is even on the table.
        */
       /**
        * @type {WaypointFormDraft|null} The open create/edit dialog's state. Held as a draft rather than read off the
@@ -878,6 +880,15 @@
           pickerKind: "squad",
           pickerQuery: "",
           cwd,
+          // What the form opened with. Saving only offers a re-survey when one
+          // of the survey's own inputs actually moved -- renaming a waypoint
+          // should never put held work back in the classifier's queue.
+          original: {
+            prompt: w.prompt || "",
+            agent: w.agent || "",
+            model: w.model || "",
+            allowAdvisory: !!w.allow_advisory,
+          },
         };
         renderWaypointFormModal();
         const draft = waypointFormDraft;
@@ -1098,13 +1109,96 @@
         const d = waypointFormDraft;
         if (!d) return;
         if (!d.prompt.trim()) { notify("error", "A waypoint needs guidance."); return; }
-        const body = { label: d.label.trim() || null, prompt: d.prompt.trim(), agent: d.agent || null, model: d.model.trim() || null, allow_advisory: d.allowAdvisory };
-        const resp = await patchJson(`/api/waypoints/${d.id}`, body, { success: "Waypoint updated.", errorLabel: "update waypoint" });
+        // Only the survey's own inputs warrant re-judging. A label is not one.
+        const o = d.original || { prompt: "", agent: "", model: "", allowAdvisory: false };
+        const changedSurveyInputs = [
+          o.prompt !== d.prompt.trim() ? "guidance" : "",
+          o.agent !== (d.agent || "") ? "survey agent" : "",
+          o.model !== d.model.trim() ? "model" : "",
+          o.allowAdvisory !== d.allowAdvisory ? "advisory policy" : "",
+        ].filter(Boolean);
+        if (!changedSurveyInputs.length) { await saveWaypointSettings(d, false); return; }
+        const resp = await fetch(`/api/waypoints/${d.id}/resurvey-preview`);
+        if (!resp.ok) { notify("error", "Could not work out what re-running would affect."); return; }
+        /** @type {ResurveyPreview} */
+        const preview = await resp.json();
+        renderResurveyConfirm(preview, changedSurveyInputs);
+      }
+
+      /**
+       * Writes the draft's settings back, optionally re-queueing every daemon-enrolled roster entry for the survey.
+       * @param {WaypointFormDraft} d
+       * @param {boolean} resurvey
+       * @returns {Promise<void>}
+       */
+      async function saveWaypointSettings(d, resurvey) {
+        const body = { label: d.label.trim() || null, prompt: d.prompt.trim(), agent: d.agent || null, model: d.model.trim() || null, allow_advisory: d.allowAdvisory, resurvey };
+        const resp = await patchJson(`/api/waypoints/${d.id}`, body, { success: resurvey ? "Saved; re-running the survey." : "Waypoint updated.", errorLabel: "update waypoint" });
         if (resp.ok) {
           closeModal();
           await refreshWaypointsList();
           void loadWaypointDetail(d.id);
         }
+      }
+
+      /**
+       * Confirms a settings save that changed what the survey judges on, naming every entry it would re-run against.
+       * Saving without re-running is offered too: the new guidance applies to work surveyed from here on, and
+       * already-decided entries keep the verdict they were given.
+       * @param {ResurveyPreview} preview
+       * @param {string[]} changed - Which survey inputs the edit moved, for the explanation line.
+       * @returns {void}
+       */
+      function renderResurveyConfirm(preview, changed) {
+        const targets = preview.targets || [];
+        const explicit = preview.held_explicit || [];
+        const reheld = targets.filter((t) => t.will_be_held_until_judged).length;
+        // `will_be_held_until_judged` only means anything for an entry that is
+        // actually being re-judged. Showing it on the left-alone list would
+        // say the opposite of what that list is for.
+        /**
+         * @param {ResurveyTarget} t
+         * @param {boolean} rerunning - Whether this row is in the re-run list, so the hold badge means something.
+         * @returns {string}
+         */
+        const row = (t, rerunning) => {
+          const name = t.label ? `${esc(t.label)} <span class="wp-rs-id">${esc(t.entry_id)}</span>` : esc(t.entry_id);
+          const verdict = t.current_verdict ? esc(t.current_verdict) : "not yet judged";
+          return `<div class="wp-rs-row">
+            <span class="wp-rs-kind">${esc(t.kind)}</span>
+            <span class="wp-rs-name">${name}</span>
+            <span class="wp-rs-now" data-tip="What the survey decided last time. A re-run replaces it.">${verdict}</span>
+            ${rerunning && t.will_be_held_until_judged ? `<span class="wp-rs-hold" data-tip="This entry blocks while it has no verdict, so it is held again from the moment you save until the survey reaches it.">held until re-judged</span>` : ""}
+          </div>`;
+        };
+        byId("modal-root").innerHTML = `<div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal" style="width:600px;max-width:94vw">
+          <h3>Re-run the survey?</h3>
+          <p class="wp-rs-lead">You changed the ${esc(changed.join(" and "))}, which is what the survey judges on. Its existing verdicts were reached against the old settings.</p>
+          ${targets.length ? `<div class="wp-rs-head">Would re-run against ${targets.length} ${targets.length === 1 ? "entry" : "entries"}</div><div class="wp-rs-list">${targets.map((t) => row(t, true)).join("")}</div>` : `<div class="wp-rs-head">Nothing to re-run — this waypoint has no entries the survey owns.</div>`}
+          ${reheld ? `<p class="wp-rs-warn" data-tip="The gate treats an entry with no verdict as uncleared, so it blocks until the survey reaches it again.">${reheld} of these ${reheld === 1 ? "is" : "are"} held the moment you save, until the survey re-judges ${reheld === 1 ? "it" : "them"} — including any the old settings had released.</p>` : ""}
+          ${explicit.length ? `<div class="wp-rs-head">Left alone — ${explicit.length} declared by hand</div><div class="wp-rs-list muted">${explicit.map((t) => row(t, false)).join("")}</div>` : ""}
+          <div class="btn-row" style="margin-top:14px;justify-content:flex-end">
+            <button class="btn" data-click="closeModal" data-tip="Go back to the form. Nothing is saved.">Cancel</button>
+            <button class="btn" data-click="saveWaypointWithoutResurvey" data-tip="Save the new settings, but leave every existing verdict alone.\nThe new guidance still applies to work the survey judges from here on.">Save without re-running</button>
+            <button class="btn primary" data-click="saveWaypointAndResurvey" data-tip="Save, then put every entry above back in the survey's queue to be judged against the new settings." ${targets.length ? "" : "disabled"}>Save and re-run</button>
+          </div>
+        </div></div>`;
+      }
+
+      /**
+       * Confirm-dialog action: save the edited settings and re-queue the survey.
+       * @returns {Promise<void>}
+       */
+      async function saveWaypointAndResurvey() {
+        if (waypointFormDraft) await saveWaypointSettings(waypointFormDraft, true);
+      }
+
+      /**
+       * Confirm-dialog action: save the edited settings and leave existing verdicts alone.
+       * @returns {Promise<void>}
+       */
+      async function saveWaypointWithoutResurvey() {
+        if (waypointFormDraft) await saveWaypointSettings(waypointFormDraft, false);
       }
 
       /**

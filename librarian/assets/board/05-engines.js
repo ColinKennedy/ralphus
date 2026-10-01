@@ -363,6 +363,8 @@
       CLICK_HANDLERS.submitAppendBearing = (e, ds) => submitAppendBearing(ds.waypointId || "");
       CLICK_HANDLERS.submitCreateWaypoint = () => submitCreateWaypoint();
       CLICK_HANDLERS.submitEditWaypoint = () => submitEditWaypoint();
+      CLICK_HANDLERS.saveWaypointAndResurvey = () => saveWaypointAndResurvey();
+      CLICK_HANDLERS.saveWaypointWithoutResurvey = () => saveWaypointWithoutResurvey();
       CLICK_HANDLERS.openEditWaypoint = (e, ds) => openEditWaypoint(ds.waypointId || "");
       CLICK_HANDLERS.toggleWaypointGuidance = () => toggleWaypointGuidance();
       CLICK_HANDLERS.addEntryToWaypointFromMenu = (e, ds) => addEntryToWaypointFromMenu(ds.kind || "", ds.entryId || "", ds.waypointId || "");

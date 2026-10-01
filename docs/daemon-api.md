@@ -224,6 +224,7 @@ produced no pane output.
 | GET | `/api/waypoints` | List every waypoint (bare array); `?state=open\|closed` and `?project=` filter |
 | GET | `/api/waypoints/{id}` | [One waypoint's full detail](#waypoints-ral-400): settings, roster, bearings |
 | PATCH | `/api/waypoints/{id}` | [Update a waypoint's settings](#waypoints-ral-400): label, guidance prompt, survey agent/model, advisory policy |
+| GET | `/api/waypoints/{id}/resurvey-preview` | [What re-running the survey would act on](#waypoints-ral-400), resolved before anything changes |
 | POST | `/api/waypoints/{id}/roster` | Add a squad or review roster entry |
 | DELETE | `/api/waypoints/{id}/roster/{entry_id}` | Remove a roster entry |
 | PATCH | `/api/waypoints/{id}/roster/{entry_id}` | Field-selective update of a roster entry (currently `mode`) |
@@ -4364,14 +4365,68 @@ Roster membership is deliberately **not** editable here — an entry carries
 its own mode, survey verdict and delivery state, so it has its own
 `roster` endpoints rather than being replaced wholesale by a settings save.
 
-Editing `prompt` likewise does **not** clear existing survey verdicts. An
-entry the survey has already judged keeps that verdict, so rewording
-guidance can never silently release work that was being held on the
-strength of the old text; re-deciding an entry is an explicit
-`PATCH .../roster/{entry_id}` (or a remove-and-re-add).
+Editing `prompt` does **not** clear survey verdicts on its own. An entry the
+survey has already judged keeps that verdict, so rewording guidance can never
+silently re-judge work on the strength of text that entry never saw.
+
+Pass `"resurvey": true` to also clear every **daemon-enrolled**
+(`auto_enrolled = 1`) entry's verdict, putting each back in the classifier's
+queue to be re-judged against the saved settings. Human-declared entries are
+deliberately left alone: the classifier does not second-guess an explicit
+declaration, so clearing their verdict would strand them — never re-judged,
+and now reading as unsurveyed to a gate that fails closed.
+
+Re-surveying is not free of consequence, which is why it is opt-in: the gate
+reads a missing verdict as *uncleared*, so a `block`-mode entry is held again
+from the moment the save lands until the classifier reaches it — including an
+entry the previous settings had released. Call
+`GET /api/waypoints/{id}/resurvey-preview` first to see exactly which entries
+that is.
 
 `400 bad_request` if the body doesn't parse or `prompt` is blank;
 `404 not_found` for an unknown `id`. Returns the updated `WaypointDetail`.
+
+#### `GET /api/waypoints/{id}/resurvey-preview`
+What a `PATCH` with `"resurvey": true` would act on, resolved before anything
+is changed, so accepting one can be an informed choice.
+```json
+{
+  "targets": [
+    {
+      "kind": "squad",
+      "entry_id": "squad-000000000002",
+      "label": null,
+      "mode": "block",
+      "current_verdict": "not_impacted",
+      "delivery_status": "undelivered",
+      "will_be_held_until_judged": true
+    }
+  ],
+  "held_explicit": [
+    {
+      "kind": "review",
+      "entry_id": "guardian-000000000001",
+      "label": "greet rename review",
+      "mode": "block",
+      "current_verdict": null,
+      "delivery_status": "delivered",
+      "will_be_held_until_judged": true
+    }
+  ]
+}
+```
+`targets` are the entries a re-survey re-judges; `held_explicit` are the
+human-declared entries it leaves alone, reported so the answer to "what does
+this touch" is complete. `label` is the squad's label or the review's name,
+`null` when it has none.
+
+`will_be_held_until_judged` is `true` for `block`-mode entries — the ones the
+gate re-holds while they carry no verdict. It is computed for every row, but
+only *means* anything for a `targets` row: nothing in `held_explicit` is being
+re-judged, so nothing there is newly held.
+
+`404 not_found` for an unknown `id` — deliberately, rather than an empty
+preview, which would read as "this would do nothing".
 
 #### `POST /api/waypoints/{id}/roster`
 Add a roster entry, or update an existing one's `mode` (same underlying

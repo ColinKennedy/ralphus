@@ -1357,6 +1357,25 @@
 
       /* The prompt is prose, not a property, so it gets a readable block with
          a quiet rule rather than a key/value row that would clip it. */
+      /* Re-survey confirmation. A list of real work about to be re-judged,
+         so it is set as a table of rows rather than prose -- the reader is
+         scanning for "is mine in here", not reading a sentence. */
+      .wp-rs-lead { margin: 0 0 12px; color: var(--muted); font-size: 12.5px; line-height: 1.5; }
+      .wp-rs-head { font-size: 11px; font-weight: 650; letter-spacing: .4px; text-transform: uppercase;
+        color: var(--muted); margin: 12px 0 5px; }
+      .wp-rs-list { max-height: 34vh; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px; }
+      .wp-rs-list.muted { opacity: .62; }
+      .wp-rs-row { display: flex; align-items: baseline; gap: 8px; padding: 5px 9px; font-size: 12px; }
+      .wp-rs-row + .wp-rs-row { border-top: 1px solid var(--border); }
+      .wp-rs-kind { flex: none; min-width: 44px; color: var(--muted); font-size: 10.5px;
+        text-transform: uppercase; letter-spacing: .3px; }
+      .wp-rs-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .wp-rs-id { color: var(--muted); font-size: 11px; }
+      .wp-rs-now { flex: none; color: var(--muted); font-size: 11px; }
+      .wp-rs-hold { flex: none; color: var(--warn); font-size: 10.5px; border: 1px solid var(--warn);
+        border-radius: 4px; padding: 0 5px; }
+      .wp-rs-warn { margin: 10px 0 0; color: var(--warn); font-size: 12px; line-height: 1.5; }
+
       /* Guidance. Capped to a readable measure -- the detail pane is as wide as
          the window, and prose set to 1700px is a line a reader loses their
          place in -- and clamped to a few lines, because a waypoint's guidance

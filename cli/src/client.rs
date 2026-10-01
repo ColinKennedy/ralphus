@@ -2024,6 +2024,7 @@ impl DaemonClient {
         agent: Option<&str>,
         model: Option<&str>,
         allow_advisory: bool,
+        resurvey: bool,
     ) -> Result<Value, DaemonError> {
         let body = serde_json::json!({
             "label": label,
@@ -2031,8 +2032,13 @@ impl DaemonClient {
             "agent": agent,
             "model": model,
             "allow_advisory": allow_advisory,
+            "resurvey": resurvey,
         });
         self.patch(&format!("/api/waypoints/{waypoint_id}"), Some(body))
+    }
+
+    pub fn waypoint_resurvey_preview(&self, waypoint_id: &str) -> Result<Value, DaemonError> {
+        self.get(&format!("/api/waypoints/{waypoint_id}/resurvey-preview"))
     }
 
     pub fn waypoint_redo_roster_entry(

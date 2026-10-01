@@ -122,7 +122,7 @@ fn scopes_overlap(a: &Scope, b: &Scope) -> bool {
 }
 
 /// Which kind of entity a roster entry or bearing producer refers to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RosterEntryKind {
     Review,
@@ -285,6 +285,34 @@ pub struct WaypointView {
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     pub closed_at_ms: Option<i64>,
+}
+
+/// One entry a re-survey would act on, as shown in the confirmation that
+/// precedes one. Carries enough to name the entry and say what re-judging it
+/// costs, without the caller needing a second lookup per row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ResurveyTarget {
+    pub kind: RosterEntryKind,
+    pub entry_id: String,
+    /// The squad's label or the review's name; `None` when it has none.
+    pub label: Option<String>,
+    pub mode: String,
+    pub current_verdict: Option<String>,
+    pub delivery_status: String,
+    /// Whether clearing this entry's verdict re-holds it until the classifier
+    /// judges it again -- true for `block` mode, since the gate reads a NULL
+    /// verdict as "not cleared".
+    pub will_be_held_until_judged: bool,
+}
+
+/// What [`Store::clear_auto_enrolled_survey_verdicts`] would do, resolved
+/// before it is done. See [`Store::resurvey_preview`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ResurveyPreview {
+    /// Entries a re-survey re-judges.
+    pub targets: Vec<ResurveyTarget>,
+    /// Human-declared entries a re-survey deliberately leaves alone.
+    pub held_explicit: Vec<ResurveyTarget>,
 }
 
 /// A candidate identified by [`Store::waypoint_survey_candidates`]: an open
@@ -1025,11 +1053,12 @@ impl Store {
     /// Update a waypoint's settings in place: label, guidance prompt, survey
     /// agent/model, and whether advisory entries are allowed.
     ///
-    /// Deliberately does **not** clear existing survey verdicts when the
-    /// prompt changes. An entry already judged keeps its verdict, so editing
-    /// guidance never silently releases work that was being held on the
-    /// strength of the old text -- re-deciding is `waypoint roster mode`, or
-    /// removing and re-adding the entry, both of which are explicit.
+    /// Never clears survey verdicts by itself. Editing guidance must not
+    /// silently re-judge work on the strength of text the surveyed entries
+    /// never saw -- re-deciding is a separate, explicit
+    /// [`Self::clear_auto_enrolled_survey_verdicts`] call, which callers are
+    /// expected to precede with [`Self::resurvey_preview`] so whoever asked
+    /// for it can see what it will touch first.
     ///
     /// # Errors
     /// Returns [`StoreError::NotFound`] if no such waypoint exists; otherwise
@@ -1052,6 +1081,155 @@ impl Store {
             return Err(StoreError::NotFound);
         }
         Ok(())
+    }
+
+    /// What a re-survey of this waypoint would act on, so the caller can show
+    /// it before committing to one.
+    ///
+    /// `targets` are the daemon-enrolled entries whose verdicts a re-survey
+    /// clears, putting each back in the classifier's queue. `held_explicit`
+    /// are the human-declared entries, listed only so the answer to "what
+    /// does this touch" is complete -- an explicit declaration is never
+    /// second-guessed by the classifier, so a re-survey leaves them alone.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::NotFound`] if no such waypoint exists; otherwise
+    /// propagates any SQLite failure.
+    pub fn resurvey_preview(&self, waypoint_id: &str) -> StoreResult<ResurveyPreview> {
+        // Proves the waypoint exists, so an unknown id is a 404 rather than
+        // an empty preview that reads as "this would do nothing".
+        let _ = self.get_waypoint(waypoint_id)?;
+        let mut stmt = self.conn.prepare(
+            "SELECT kind, entry_id, mode, survey_verdict, delivery_status, auto_enrolled
+             FROM waypoint_roster WHERE waypoint_id=? ORDER BY created_at_ms ASC, entry_id ASC",
+        )?;
+        let raw: Vec<(String, String, String, Option<String>, String, bool)> = stmt
+            .query_map(params![waypoint_id], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+
+        let rows: Vec<(
+            RosterEntryKind,
+            String,
+            String,
+            Option<String>,
+            String,
+            bool,
+        )> = raw
+            .into_iter()
+            .filter_map(|(kind, entry_id, mode, verdict, delivery, auto)| {
+                RosterEntryKind::parse(&kind)
+                    .map(|kind| (kind, entry_id, mode, verdict, delivery, auto))
+            })
+            .collect();
+
+        let labels = self.roster_entry_labels(
+            &rows
+                .iter()
+                .map(|(kind, entry_id, ..)| (*kind, entry_id.clone()))
+                .collect::<Vec<_>>(),
+        )?;
+        let build = |(kind, entry_id, mode, verdict, delivery, _): &(
+            RosterEntryKind,
+            String,
+            String,
+            Option<String>,
+            String,
+            bool,
+        )| ResurveyTarget {
+            kind: *kind,
+            entry_id: entry_id.clone(),
+            label: labels.get(&(*kind, entry_id.clone())).cloned().flatten(),
+            mode: mode.clone(),
+            current_verdict: verdict.clone(),
+            delivery_status: delivery.clone(),
+            // A block-mode entry whose verdict is cleared is held again until
+            // the classifier re-judges it, because the gate reads a NULL
+            // verdict as "not cleared". Worth saying out loud in a
+            // confirmation: re-surveying a released entry can re-block it.
+            will_be_held_until_judged: mode == "block",
+        };
+        let (auto, explicit): (Vec<_>, Vec<_>) = rows.iter().partition(|(.., auto)| *auto);
+        Ok(ResurveyPreview {
+            targets: auto.into_iter().map(build).collect(),
+            held_explicit: explicit.into_iter().map(build).collect(),
+        })
+    }
+
+    /// Display names for a batch of roster entries, as `(kind, entry_id) ->
+    /// name`. One prepared statement per kind rather than one per entry; an
+    /// entry whose row is gone (or which never had a name) maps to `None`
+    /// rather than dropping out, so a caller can always account for every
+    /// entry it asked about.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    fn roster_entry_labels(
+        &self,
+        entries: &[(RosterEntryKind, String)],
+    ) -> StoreResult<std::collections::HashMap<(RosterEntryKind, String), Option<String>>> {
+        let mut out: std::collections::HashMap<(RosterEntryKind, String), Option<String>> = entries
+            .iter()
+            .map(|(k, id)| ((*k, id.clone()), None))
+            .collect();
+        for (kind, sql) in [
+            (
+                RosterEntryKind::Squad,
+                "SELECT label FROM squads WHERE id = ?",
+            ),
+            (
+                RosterEntryKind::Review,
+                "SELECT name FROM guardians WHERE id = ?",
+            ),
+        ] {
+            let ids: Vec<&String> = entries
+                .iter()
+                .filter(|(k, _)| *k == kind)
+                .map(|(_, id)| id)
+                .collect();
+            if ids.is_empty() {
+                continue;
+            }
+            let mut stmt = self.conn.prepare(sql)?;
+            for id in ids {
+                let name: Option<String> = stmt
+                    .query_row(params![id], |r| r.get::<_, Option<String>>(0))
+                    .optional()?
+                    .flatten();
+                out.insert((kind, id.clone()), name.filter(|n| !n.trim().is_empty()));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Put every daemon-enrolled entry back in the classifier's queue by
+    /// clearing its verdict, so the next sweep re-judges it against the
+    /// waypoint's current guidance. Returns how many rows were cleared.
+    ///
+    /// Human-declared (`auto_enrolled = 0`) entries are left alone: the
+    /// classifier does not second-guess an explicit declaration, so clearing
+    /// their verdict would strand them -- never re-judged, and now reading as
+    /// unsurveyed to the gate, which fails closed.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn clear_auto_enrolled_survey_verdicts(&self, waypoint_id: &str) -> StoreResult<usize> {
+        let n = self.conn.execute(
+            "UPDATE waypoint_roster
+             SET survey_verdict=NULL, survey_rationale=NULL, updated_at_ms=?
+             WHERE waypoint_id=? AND auto_enrolled=1",
+            params![now_ms(), waypoint_id],
+        )?;
+        Ok(n)
     }
 
     /// Delivery-status counts for every waypoint at once, keyed by waypoint id.
@@ -5847,6 +6025,258 @@ mod tests {
                 .any(|e| e.cell_id.as_deref() == Some("cell-0") && e.message.contains("halted")),
             "a halt must be attributable to the cell it stopped: {events:?}"
         );
+    }
+
+    // ---- re-survey after a settings edit ---------------------------------
+
+    /// A re-survey only re-judges what the *daemon* enrolled. A human
+    /// declaration is never second-guessed by the classifier, so clearing an
+    /// explicit entry's verdict would strand it: never re-judged, and now
+    /// reading as unsurveyed to a gate that fails closed.
+    #[test]
+    fn clearing_verdicts_for_a_resurvey_spares_human_declared_entries() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-explicit",
+                RosterMode::Block,
+            )
+            .unwrap();
+        store
+            .enroll_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-auto",
+                RosterMode::Block,
+            )
+            .unwrap();
+        for entry in ["squad-explicit", "squad-auto"] {
+            store
+                .set_roster_survey_result(
+                    "waypoint-1",
+                    RosterEntryKind::Squad,
+                    entry,
+                    &SurveyVerdict {
+                        impacted: false,
+                        mode: RosterMode::Block,
+                        rationale: "unrelated".to_string(),
+                    },
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            store
+                .clear_auto_enrolled_survey_verdicts("waypoint-1")
+                .unwrap(),
+            1,
+            "only the daemon-enrolled entry should be re-queued"
+        );
+
+        let roster = store.list_roster_entries("waypoint-1").unwrap();
+        let verdict = |id: &str| {
+            roster
+                .iter()
+                .find(|e| e.entry_id == id)
+                .expect("entry present")
+                .survey_verdict
+                .clone()
+        };
+        assert_eq!(verdict("squad-auto"), None, "re-queued for the classifier");
+        assert_eq!(
+            verdict("squad-explicit"),
+            Some("not_impacted".to_string()),
+            "a human declaration keeps its verdict"
+        );
+    }
+
+    /// A cleared entry becomes a survey candidate again -- that is the whole
+    /// mechanism by which an edited waypoint gets re-judged, so it is worth
+    /// pinning rather than assuming.
+    #[test]
+    fn a_cleared_entry_is_a_survey_candidate_again() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        // Scope the waypoint repo-wide in project "core" via a seed entry, so
+        // `squad-auto` is inside it and can be a candidate at all.
+        insert_bare_squad(&store, "squad-seed", SquadState::Pending);
+        insert_bare_task(&store, "squad-seed", 0, "core");
+        insert_bare_cell(&store, "squad-seed", 0, 0, None, None);
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-seed",
+                RosterMode::Block,
+            )
+            .unwrap();
+        insert_bare_squad(&store, "squad-auto", SquadState::Pending);
+        insert_bare_task(&store, "squad-auto", 0, "core");
+        insert_bare_cell(&store, "squad-auto", 0, 0, None, None);
+        store
+            .enroll_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-auto",
+                RosterMode::Block,
+            )
+            .unwrap();
+        store
+            .set_roster_survey_result(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-auto",
+                &SurveyVerdict {
+                    impacted: true,
+                    mode: RosterMode::Block,
+                    rationale: "touches it".to_string(),
+                },
+            )
+            .unwrap();
+        let judged = store.waypoint_survey_candidates("waypoint-1").unwrap();
+        assert!(
+            !judged.iter().any(|c| c.entry_id == "squad-auto"),
+            "a judged entry is settled, not a candidate"
+        );
+
+        store
+            .clear_auto_enrolled_survey_verdicts("waypoint-1")
+            .unwrap();
+
+        let requeued = store.waypoint_survey_candidates("waypoint-1").unwrap();
+        assert!(
+            requeued.iter().any(|c| c.entry_id == "squad-auto"),
+            "clearing the verdict must put it back in the classifier's queue"
+        );
+    }
+
+    /// The preview must say the same thing the clear then does -- it is the
+    /// only warning anyone gets before accepting a re-survey.
+    #[test]
+    fn the_resurvey_preview_matches_what_the_clear_actually_touches() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-explicit",
+                RosterMode::Block,
+            )
+            .unwrap();
+        for entry in ["squad-auto-a", "squad-auto-b"] {
+            store
+                .enroll_roster_entry(
+                    "waypoint-1",
+                    RosterEntryKind::Squad,
+                    entry,
+                    RosterMode::Block,
+                )
+                .unwrap();
+        }
+
+        let preview = store.resurvey_preview("waypoint-1").unwrap();
+        let mut previewed: Vec<&str> = preview
+            .targets
+            .iter()
+            .map(|t| t.entry_id.as_str())
+            .collect();
+        previewed.sort_unstable();
+        assert_eq!(previewed, ["squad-auto-a", "squad-auto-b"]);
+        assert_eq!(
+            preview
+                .held_explicit
+                .iter()
+                .map(|t| t.entry_id.as_str())
+                .collect::<Vec<_>>(),
+            ["squad-explicit"],
+            "the explicit entry must still be reported, as left alone"
+        );
+        assert_eq!(
+            preview.targets.len(),
+            store
+                .clear_auto_enrolled_survey_verdicts("waypoint-1")
+                .unwrap(),
+            "the preview promised a count the clear must honour"
+        );
+    }
+
+    /// A block-mode entry with no verdict is held by the gate, so a re-survey
+    /// can re-hold work the old guidance had released. The preview has to say
+    /// so, or accepting it is not an informed choice.
+    #[test]
+    fn the_preview_flags_entries_a_resurvey_would_re_hold() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        store
+            .enroll_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-blocked",
+                RosterMode::Block,
+            )
+            .unwrap();
+        store
+            .enroll_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-advisory",
+                RosterMode::Advisory,
+            )
+            .unwrap();
+        store
+            .set_roster_survey_result(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-blocked",
+                &SurveyVerdict {
+                    impacted: false,
+                    mode: RosterMode::Block,
+                    rationale: "cleared".to_string(),
+                },
+            )
+            .unwrap();
+
+        let preview = store.resurvey_preview("waypoint-1").unwrap();
+        let flag = |id: &str| {
+            preview
+                .targets
+                .iter()
+                .find(|t| t.entry_id == id)
+                .expect("previewed")
+                .will_be_held_until_judged
+        };
+        assert!(flag("squad-blocked"), "a block-mode entry is re-held");
+        assert!(!flag("squad-advisory"), "an advisory entry is never held");
+
+        // And the gate agrees: once cleared, the released entry blocks again.
+        assert_eq!(
+            store.squad_block_gating_waypoint("squad-blocked").unwrap(),
+            None,
+            "a not_impacted verdict clears the gate"
+        );
+        store
+            .clear_auto_enrolled_survey_verdicts("waypoint-1")
+            .unwrap();
+        assert_eq!(
+            store.squad_block_gating_waypoint("squad-blocked").unwrap(),
+            Some("waypoint-1".to_string()),
+            "clearing the verdict re-holds it, exactly as the preview warned"
+        );
+    }
+
+    /// An unknown waypoint is a 404, not an empty preview -- which would read
+    /// as "this would do nothing" and invite a save that then fails.
+    #[test]
+    fn the_resurvey_preview_rejects_an_unknown_waypoint() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(matches!(
+            store.resurvey_preview("waypoint-nope"),
+            Err(StoreError::NotFound)
+        ));
     }
 
     #[test]

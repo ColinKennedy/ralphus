@@ -46,6 +46,10 @@ pub enum WaypointCommand {
         agent: Option<String>,
         model: Option<String>,
         allow_advisory: Option<bool>,
+        resurvey: bool,
+    },
+    ResurveyPreview {
+        waypoint_id: String,
     },
     Roster(WaypointRosterCommand),
     Bearing(WaypointBearingCommand),
@@ -135,11 +139,20 @@ pub fn parse(args: &[String]) -> WaypointCommand {
         Some("reopen") => with_waypoint_id(scanner, |waypoint_id| WaypointCommand::Reopen {
             waypoint_id,
         }),
+        Some("resurvey-preview") => match scanner.remaining().first() {
+            Some(waypoint_id) => WaypointCommand::ResurveyPreview {
+                waypoint_id: waypoint_id.clone(),
+            },
+            None => {
+                WaypointCommand::UsageError("resurvey-preview requires <waypoint_id>".to_string())
+            }
+        },
         Some("edit") => {
             let label = scanner.take_value("--label").ok().flatten();
             let prompt = scanner.take_value("--prompt").ok().flatten();
             let agent = scanner.take_value("--agent").ok().flatten();
             let model = scanner.take_value("--model").ok().flatten();
+            let resurvey = scanner.take_bool("--resurvey");
             let allow_advisory = if scanner.take_bool("--allow-advisory") {
                 Some(true)
             } else if scanner.take_bool("--no-allow-advisory") {
@@ -155,6 +168,7 @@ pub fn parse(args: &[String]) -> WaypointCommand {
                     agent,
                     model,
                     allow_advisory,
+                    resurvey,
                 },
                 None => WaypointCommand::UsageError("edit requires <waypoint_id>".to_string()),
             }
@@ -362,6 +376,11 @@ pub fn dispatch(cmd: WaypointCommand, opts: &GlobalOpts) -> i32 {
             emit(opts, &result, render_waypoint_detail);
             Ok(())
         }),
+        WaypointCommand::ResurveyPreview { waypoint_id } => run_and_report(opts, None, || {
+            let result = client.waypoint_resurvey_preview(&waypoint_id)?;
+            emit(opts, &result, render_resurvey_preview);
+            Ok(())
+        }),
         WaypointCommand::Edit {
             waypoint_id,
             label,
@@ -369,6 +388,7 @@ pub fn dispatch(cmd: WaypointCommand, opts: &GlobalOpts) -> i32 {
             agent,
             model,
             allow_advisory,
+            resurvey,
         } => run_and_report(opts, None, || {
             // Settings are a whole-object PUT-shaped update server-side, so an
             // omitted flag has to mean "keep what is there" rather than
@@ -398,6 +418,7 @@ pub fn dispatch(cmd: WaypointCommand, opts: &GlobalOpts) -> i32 {
                 agent.clone().or_else(|| field("agent")).as_deref(),
                 model.clone().or_else(|| field("model")).as_deref(),
                 merged_allow,
+                resurvey,
             )?;
             emit(opts, &result, render_waypoint_detail);
             Ok(())
@@ -568,6 +589,61 @@ fn render_waypoint_list(waypoints: &Value) {
         })
         .collect();
     crate::output::print_table(&["ID", "LABEL", "STATE", "ROSTER", "PROJECTS"], &rows);
+}
+
+/// Renders a `GET /api/waypoints/{id}/resurvey-preview` body: what a
+/// `--resurvey` edit would re-judge, and what it would leave alone.
+fn render_resurvey_preview(v: &Value) {
+    let rows = |key: &str| -> Vec<&Value> {
+        v.get(key)
+            .and_then(Value::as_array)
+            .map(|a| a.iter().collect())
+            .unwrap_or_default()
+    };
+    let line = |e: &Value| {
+        let kind = e.get("kind").and_then(Value::as_str).unwrap_or("?");
+        let id = e.get("entry_id").and_then(Value::as_str).unwrap_or("?");
+        let label = e
+            .get("label")
+            .and_then(Value::as_str)
+            .map(|l| format!(" \"{l}\""))
+            .unwrap_or_default();
+        let verdict = e
+            .get("current_verdict")
+            .and_then(Value::as_str)
+            .unwrap_or("not yet judged");
+        let held = e
+            .get("will_be_held_until_judged")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        println!(
+            "  {kind} {id}{label} -- now {verdict}{}",
+            if held { "; held until re-judged" } else { "" }
+        );
+    };
+    let targets = rows("targets");
+    if targets.is_empty() {
+        println!("Nothing would be re-judged: this waypoint has no daemon-enrolled entries.");
+    } else {
+        println!(
+            "Would re-judge {} entr{}:",
+            targets.len(),
+            if targets.len() == 1 { "y" } else { "ies" }
+        );
+        for e in &targets {
+            line(e);
+        }
+    }
+    let explicit = rows("held_explicit");
+    if !explicit.is_empty() {
+        println!(
+            "Left alone ({} human-declared, never second-guessed by the survey):",
+            explicit.len()
+        );
+        for e in &explicit {
+            line(e);
+        }
+    }
 }
 
 fn render_waypoint_detail(w: &Value) {

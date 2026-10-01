@@ -1108,6 +1108,25 @@
        * @property {DeliverySummary} delivery_summary
        */
       /**
+       * One roster entry a re-survey would act on (`GET /api/waypoints/{id}/resurvey-preview`).
+       * @typedef {object} ResurveyTarget
+       * @property {string} kind - "squad" or "review".
+       * @property {string} entry_id
+       * @property {string|null} [label] - The squad's label or the review's name, when it has one.
+       * @property {string} mode - "block" or "advisory".
+       * @property {string|null} [current_verdict] - The verdict a re-run would replace; null when never judged.
+       * @property {string} delivery_status
+       * @property {boolean} will_be_held_until_judged - Whether clearing this entry's verdict re-holds it until the survey reaches it (true for block mode, since the gate reads a missing verdict as uncleared).
+       */
+
+      /**
+       * What re-running a waypoint's survey would touch, resolved before anything changes.
+       * @typedef {object} ResurveyPreview
+       * @property {ResurveyTarget[]} targets - Entries the survey owns, which a re-run re-judges.
+       * @property {ResurveyTarget[]} held_explicit - Human-declared entries, which a re-run deliberately leaves alone.
+       */
+
+      /**
        * One Cartographer-backed delivery/lifecycle event for a waypoint's
        * feed (RAL-400). `GET /api/waypoints/{id}/deliveries`.
        * @typedef {object} WaypointEventEntry

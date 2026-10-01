@@ -2194,6 +2194,9 @@ fn route_for_user(
             waypoint_patch_roster_entry(daemon, id, entry_id, body)
         }
         ("PATCH", ["api", "waypoints", id]) => waypoint_update(daemon, id, body),
+        ("GET", ["api", "waypoints", id, "resurvey-preview"]) => {
+            waypoint_resurvey_preview(daemon, id)
+        }
         ("POST", ["api", "waypoints", id, "roster", entry_id, "redo"]) => {
             waypoint_redo_roster_entry(daemon, id, entry_id)
         }
@@ -14920,6 +14923,14 @@ struct UpdateWaypointBody {
     model: Option<String>,
     #[serde(default)]
     allow_advisory: bool,
+    /// Opt-in: also put every daemon-enrolled roster entry back in the
+    /// classifier's queue, so the next sweep re-judges it against the saved
+    /// guidance. Off by default -- re-judging can re-hold work that the old
+    /// guidance had released, so it is something a caller asks for after
+    /// seeing `GET /api/waypoints/{id}/resurvey-preview`, never a side
+    /// effect of saving a label.
+    #[serde(default)]
+    resurvey: bool,
 }
 
 #[derive(Serialize)]
@@ -15434,15 +15445,46 @@ fn waypoint_update(daemon: &Daemon, id: &str, body: &str) -> Reply {
     ) {
         return store_error(&e);
     }
+    let resurveyed = if req.resurvey {
+        match store.clear_auto_enrolled_survey_verdicts(id) {
+            Ok(n) => n,
+            Err(e) => return store_error(&e),
+        }
+    } else {
+        0
+    };
     crate::cartographer::Note::new("server")
         .scope("waypoint")
         .emit(
             &store,
-            format!("waypoint {id} settings updated"),
-            serde_json::json!({ "waypoint_id": id }),
+            if req.resurvey {
+                format!("waypoint {id} settings updated; {resurveyed} entries queued for re-survey")
+            } else {
+                format!("waypoint {id} settings updated")
+            },
+            serde_json::json!({
+                "waypoint_id": id,
+                "resurvey": req.resurvey,
+                "resurveyed_entries": resurveyed,
+            }),
         );
     match waypoint_detail(&store, id) {
         Ok(detail) => json(200, &detail),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `GET /api/waypoints/{id}/resurvey-preview` -- what re-surveying this
+/// waypoint would act on, resolved before anything is changed.
+///
+/// Exists so `PATCH /api/waypoints/{id}` with `resurvey: true` is an informed
+/// choice: re-judging clears verdicts, and a block-mode entry with no verdict
+/// is held again until the classifier reaches it. A caller should be able to
+/// see which entries that is before accepting it.
+fn waypoint_resurvey_preview(daemon: &Daemon, id: &str) -> Reply {
+    let store = daemon.lock();
+    match store.resurvey_preview(id) {
+        Ok(preview) => json(200, &preview),
         Err(e) => store_error(&e),
     }
 }

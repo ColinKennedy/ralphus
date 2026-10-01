@@ -839,11 +839,12 @@ use; see `READ_ONLY_NOTE`.
         - close waypoint_id [id]  {Manually close an open waypoint.}
         - create --agent [name] --allow-advisory --label [text] --model [name] --prompt [text] --roster [kind:entry_id[:mode]...]  {Create a cross-squad waypoint coordinating the given roster of reviews/squads (RAL-400).}
         - (read-only-safe) deliveries waypoint_id [id]  {Show a waypoint's delivery/event history.}
-        - edit waypoint_id [id] --agent [name] --allow-advisory/--no-allow-advisory --label [text] --model [name] --prompt [text]  {Update a waypoint's settings: label, guidance prompt, survey agent/model, and whether advisory roster entries are allowed. Existing survey verdicts are kept.}
+        - edit waypoint_id [id] --agent [name] --allow-advisory/--no-allow-advisory --label [text] --model [name] --prompt [text] --resurvey  {Update a waypoint's settings: label, guidance prompt, survey agent/model, and whether advisory roster entries are allowed. Survey verdicts are kept unless --resurvey re-queues every daemon-enrolled entry for re-judging; preview that first with 'waypoint resurvey-preview'.}
         - (read-only-safe) get waypoint_id [id]  {Show one waypoint's settings, roster, tracked projects, and delivery summary.}
         - (read-only-safe) list --project [name] --state [open|closed]  {List waypoints.}
         - redo waypoint_id [id] entry_id [id]  {Re-run a squad whose finished work a closed waypoint flagged as stale, carrying its prior findings and the waypoint's bearings into the new run.}
         - reopen waypoint_id [id]  {Reopen a closed waypoint.}
+        - resurvey-preview waypoint_id [id] (subagent)  {Show what 'waypoint edit --resurvey' would re-judge: which daemon-enrolled roster entries get their verdict cleared, and which human-declared entries are left alone.}
         - roster  {Add/remove/change the mode of a waypoint's roster entries.}
             - add waypoint_id [id] kind [review|squad] entry_id [id] --mode [block|advisory]  {Add (or upsert the mode of) one roster entry on a waypoint.}
             - mode waypoint_id [id] entry_id [id] mode [block|advisory]  {Override the block/advisory mode of one existing roster entry.}

@@ -45,6 +45,7 @@ pub fn execute(cmd: WaypointCommand, client: &DaemonClient) -> ExecResult {
             agent,
             model,
             allow_advisory,
+            resurvey,
         } => {
             let current = client.waypoint_get(&waypoint_id)?;
             let field = |name: &str| -> Option<String> {
@@ -67,7 +68,11 @@ pub fn execute(cmd: WaypointCommand, client: &DaemonClient) -> ExecResult {
                 agent.or_else(|| field("agent")).as_deref(),
                 model.or_else(|| field("model")).as_deref(),
                 merged_allow,
+                resurvey,
             )?)
+        }
+        WaypointCommand::ResurveyPreview { waypoint_id } => {
+            Ok(client.waypoint_resurvey_preview(&waypoint_id)?)
         }
         WaypointCommand::Redo {
             waypoint_id,

@@ -1301,10 +1301,22 @@ const WAYPOINT_CHILDREN: &[HelpNode] = &[
             "--agent [name]",
             "--model [name]",
             "--allow-advisory/--no-allow-advisory",
+            "--resurvey",
         ],
         "Update a waypoint's settings: label, guidance prompt, survey agent/model, and whether advisory \
-         roster entries are allowed. Existing survey verdicts are kept.",
+         roster entries are allowed. Survey verdicts are kept unless --resurvey re-queues every \
+         daemon-enrolled entry for re-judging; preview that first with 'waypoint resurvey-preview'.",
         false,
+        false,
+        &[],
+    ),
+    node(
+        "resurvey-preview",
+        &["waypoint_id [id]"],
+        &[],
+        "Show what 'waypoint edit --resurvey' would re-judge: which daemon-enrolled roster entries \
+         get their verdict cleared, and which human-declared entries are left alone.",
+        true,
         false,
         &[],
     ),
