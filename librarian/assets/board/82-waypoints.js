@@ -473,7 +473,7 @@
         const staleBadge = entry.stale_at_ms
           ? ` <span class="badge" style="color:var(--stale);border-color:var(--stale)" data-tip="This work finished while the waypoint was still open and had judged it impacted, so it landed without the waypoint's changes and may be stale.\nNothing has been re-run automatically.\nTo re-run it carrying its prior findings and this waypoint's bearings: ralphus waypoint redo ${esc(entry.waypoint_id)} ${esc(entry.entry_id)}">stale</span>`
           : "";
-        const removeBtn = `<button class="icon-btn" data-click="removeAffectedEntry" data-waypoint-id="${esc(entry.waypoint_id)}" data-entry-id="${esc(entry.entry_id)}" data-tip="Remove this entry from the waypoint's affected.\nThis cannot be undone." style="font-size:11px;padding:1px 5px">✕</button>`;
+        const removeBtn = `<button class="icon-btn" data-click="removeAffectedEntry" data-waypoint-id="${esc(entry.waypoint_id)}" data-entry-id="${esc(entry.entry_id)}" data-tip="Remove this entry from the waypoint's affected list.\nThis cannot be undone." style="font-size:11px;padding:1px 5px">✕</button>`;
         const toggleModeBtn = `<button class="icon-btn" data-click="toggleAffectedEntryMode" data-waypoint-id="${esc(entry.waypoint_id)}" data-entry-id="${esc(entry.entry_id)}" data-mode="${entry.mode === "advisory" ? "block" : "advisory"}" data-tip="Switch this entry to ${entry.mode === "advisory" ? "block" : "advisory"} mode.\n${entry.mode === "advisory" ? "Block holds this work until the waypoint closes." : "Advisory releases it while still delivering the guidance."}" style="font-size:11px;padding:1px 5px">⇄</button>`;
         return `<div class="wp-entry">
           <div class="wp-entry-top">
@@ -724,7 +724,7 @@
               <option value="review">review</option>
             </select>
           </span></div>
-          <div class="kv-row"><span class="k">entry id</span><span class="v"><input type="text" id="rw-entry-id" placeholder="squad-... or guardian-..." style="width:100%" data-tip="The exact squad id or review id to add to this waypoint's affected."></span></div>
+          <div class="kv-row"><span class="k">entry id</span><span class="v"><input type="text" id="rw-entry-id" placeholder="squad-... or guardian-..." style="width:100%" data-tip="The exact squad id or review id to add to this waypoint's affected list."></span></div>
           <div class="kv-row"><span class="k">mode</span><span class="v">
             <select id="rw-mode" data-tip="Block mode can halt this entry's in-flight cells; advisory mode is informational only and never halts anything.">
               <option value="block">block</option>
@@ -809,7 +809,7 @@
         const entityUri = `waypoint:${id}`;
         const items = [
           `<div data-click="toggleWatch" data-entity-uri="${esc(entityUri)}" data-tip="${isWatching(entityUri) ? "Stop receiving watcher notifications for this waypoint." : "Watch this waypoint and choose which mailbox priority tiers should notify you."}">${isWatching(entityUri) ? "◉ Unwatch" : "◎ Watch…"}</div>`,
-          `<div data-click="openAddAffectedEntry" data-waypoint-id="${esc(id)}" data-tip="Add a squad or review to this waypoint's affected.">＋ Add affected entry</div>`,
+          `<div data-click="openAddAffectedEntry" data-waypoint-id="${esc(id)}" data-tip="Add a squad or review to this waypoint's affected list.">＋ Add affected entry</div>`,
           w.state === "open"
             ? `<div data-click="closeWaypoint" data-waypoint-id="${esc(id)}" data-tip="Close this waypoint manually.">■ Close</div>`
             : `<div data-click="reopenWaypoint" data-waypoint-id="${esc(id)}" data-tip="Reopen this waypoint.">▶ Reopen</div>`,
@@ -973,6 +973,9 @@
       function onCreateWaypointAgentChange(value) {
         onWaypointFormField("agent", value);
       }
+      // Reached only as a string handed to `renderAgentSelectHtml`, which no
+      // parser can follow -- same reason `onNtAgentChange` carries one.
+      void onCreateWaypointAgentChange;
 
       /**
        * Switches the affected picker between squads and reviews.
@@ -1054,7 +1057,7 @@
         if (!d || !document.getElementById("cw-picker-list")) return;
         const all = createWaypointCandidates();
         byId("cw-picker-tabs").innerHTML = [["squad", "Squads"], ["review", "Reviews"]].map(([kind, label]) =>
-          `<button type="button" class="wp-picker-tab ${d.pickerKind === kind ? "on" : ""}" onclick="setCreateWaypointPickerKind('${kind}')" data-tip="Pick ${label.toLowerCase()} for this waypoint's affected.">${label}<span class="n">${all[kind].length}</span></button>`).join("");
+          `<button type="button" class="wp-picker-tab ${d.pickerKind === kind ? "on" : ""}" onclick="setCreateWaypointPickerKind('${kind}')" data-tip="Pick ${label.toLowerCase()} for this waypoint's affected list.">${label}<span class="n">${all[kind].length}</span></button>`).join("");
 
         const q = d.pickerQuery;
         const rows = (all[d.pickerKind] || [])

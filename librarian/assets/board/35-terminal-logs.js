@@ -1064,9 +1064,9 @@
         }
         if (items.length === 1) {
           const squadId = items[0].squadId;
-          rows.push(`<div onclick="openAddToWaypointMenu(event,'squad','${esc(squadId)}')" data-tip="Add this node's squad to a cross-squad waypoint's affected, or create a new waypoint from it.">📍 Add to waypoint…</div>`);
+          rows.push(`<div onclick="openAddToWaypointMenu(event,'squad','${esc(squadId)}')" data-tip="Add this node's squad to a cross-squad waypoint's affected list, or create a new waypoint from it.">📍 Add to waypoint…</div>`);
           if (kind === "cell") {
-            rows.push(`<div onclick="openSetWaypointFromCell(event,'${esc(squadId)}')" data-tip="Add this cell's owning squad to a cross-squad waypoint's affected.\nCell-level affected tracking isn't supported yet, so the whole squad is added instead.">🧭 Set waypoint from this cell</div>`);
+            rows.push(`<div onclick="openSetWaypointFromCell(event,'${esc(squadId)}')" data-tip="Add this cell's owning squad to a cross-squad waypoint's affected list.\nCell-level affected tracking isn't supported yet, so the whole squad is added instead.">🧭 Set waypoint from this cell</div>`);
           }
         }
         return rows;

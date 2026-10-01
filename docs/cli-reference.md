@@ -832,22 +832,26 @@ use; see `READ_ONLY_NOTE`.
         - (read-only-safe) list-forge-tokens user [str]  {List which forge hosts a ralphus user has a token configured for. Never returns the token value itself.}
         - set-forge-token user [str] --host [host] --token [token]  {Set or replace a ralphus user's personal access token for one forge host (e.g. gitlab.com), so their fork-routed worktrees can push over HTTPS without any SSH key setup.}
     - (read-only-safe) validate file [path...]  {Validate one or more task TOML files.}
-    - waypoint  {Coordinate cross-squad work: create waypoints, manage rosters, and track bearings/deliveries (RAL-400).}
+    - waypoint  {Coordinate cross-squad work: create waypoints, manage their roster and affected entries, and track bearings/deliveries (RAL-400).}
+        - affected  {Add/remove/change the mode of a waypoint's affected entries.}
+            - add waypoint_id [id] kind [review|squad] entry_id [id] --mode [block|advisory]  {Add (or upsert the mode of) one affected entry on a waypoint.}
+            - mode waypoint_id [id] entry_id [id] mode [block|advisory]  {Override the block/advisory mode of one existing affected entry.}
+            - remove waypoint_id [id] entry_id [id]  {Remove one affected entry from a waypoint.}
         - bearing  {Append a completed-work bearing to a waypoint's delivery feed.}
             - add waypoint_id [id] producer_kind [review|squad] producer_id [str] --commit-id [str] --commit-summary [text] --entity-uri [uri] --summary [text]  {Append a completed-work bearing to a waypoint's durable delivery feed.}
         - (read-only-safe) bearings waypoint_id [id]  {List a waypoint's bearing feed.}
         - close waypoint_id [id]  {Manually close an open waypoint.}
-        - create --agent [name] --allow-advisory --label [text] --model [name] --prompt [text] --roster [kind:entry_id[:mode]...]  {Create a cross-squad waypoint coordinating the given roster of reviews/squads (RAL-400).}
+        - create --affected [kind:entry_id[:mode]...] --agent [name] --allow-advisory --label [text] --model [name] --prompt [text]  {Create a cross-squad waypoint over the given affected reviews/squads -- the work it lands on (RAL-400).}
         - (read-only-safe) deliveries waypoint_id [id]  {Show a waypoint's delivery/event history.}
-        - edit waypoint_id [id] --agent [name] --allow-advisory/--no-allow-advisory --label [text] --model [name] --prompt [text] --resurvey  {Update a waypoint's settings: label, guidance prompt, survey agent/model, and whether advisory roster entries are allowed. Survey verdicts are kept unless --resurvey re-queues every daemon-enrolled entry for re-judging; preview that first with 'waypoint resurvey-preview'.}
-        - (read-only-safe) get waypoint_id [id]  {Show one waypoint's settings, roster, tracked projects, and delivery summary.}
+        - edit waypoint_id [id] --agent [name] --allow-advisory/--no-allow-advisory --label [text] --model [name] --prompt [text] --resurvey  {Update a waypoint's settings: label, guidance prompt, survey agent/model, and whether advisory affected entries are allowed. Survey verdicts are kept unless --resurvey re-queues every daemon-enrolled entry for re-judging; preview that first with 'waypoint resurvey-preview'.}
+        - (read-only-safe) get waypoint_id [id]  {Show one waypoint's settings, roster, affected entries, tracked projects, and delivery summary.}
         - (read-only-safe) list --project [name] --state [open|closed]  {List waypoints.}
         - redo waypoint_id [id] entry_id [id]  {Re-run a squad whose finished work a closed waypoint flagged as stale, carrying its prior findings and the waypoint's bearings into the new run.}
         - reopen waypoint_id [id]  {Reopen a closed waypoint.}
-        - resurvey-preview waypoint_id [id] (subagent)  {Show what 'waypoint edit --resurvey' would re-judge: which daemon-enrolled roster entries get their verdict cleared, and which human-declared entries are left alone.}
-        - roster  {Add/remove/change the mode of a waypoint's roster entries.}
-            - add waypoint_id [id] kind [review|squad] entry_id [id] --mode [block|advisory]  {Add (or upsert the mode of) one roster entry on a waypoint.}
-            - mode waypoint_id [id] entry_id [id] mode [block|advisory]  {Override the block/advisory mode of one existing roster entry.}
-            - remove waypoint_id [id] entry_id [id]  {Remove one roster entry from a waypoint.}
+        - resurvey-preview waypoint_id [id] (subagent)  {Show what 'waypoint edit --resurvey' would re-judge: which daemon-enrolled affected entries get their verdict cleared, and which human-declared entries are left alone.}
+        - roster  {Add/remove entries on a waypoint's completion list -- the work whose landing IS this 
+         waypoint being carried out.}
+            - add waypoint_id [id] entry_id [id] --note [text]  {Add a squad or review to a waypoint's completion list -- the work whose landing IS this waypoint being carried out. Distinct from the affected list, which is the work the waypoint lands on; nothing auto-enrolls here.}
+            - remove waypoint_id [id] entry_id [id]  {Drop a squad or review from a waypoint's completion list. Removing the last unfinished goal can complete the waypoint's first phase.}
 ```
 <!-- END GENERATED HELP-MAP (RAL-110) -->
