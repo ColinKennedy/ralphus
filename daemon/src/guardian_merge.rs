@@ -6629,6 +6629,28 @@ pub fn run_feedback(
         fail_message();
         return FeedbackOutcome::default();
     }
+    // RAL-400 phase 2: a waypoint delivers its guidance to a review as
+    // feedback on this branch, authored `Waypoint`, and this resolver is the
+    // agent that read it -- so its reply is the review's answer, the same way
+    // a cell's final reply is a squad's. Recorded here rather than at the
+    // review's merge, because a `block`-mode review is held *at approval*
+    // precisely so it can keep running and answer; waiting for the merge
+    // would be waiting for the thing the answer unblocks.
+    //
+    // Only the resolver on the branch the guidance was delivered to can
+    // answer, which is the topmost enabled branch with a worktree -- the same
+    // one `waypoints::topmost_ready_branch` picks to deliver to.
+    if let Some(report) = result.bearing.as_ref() {
+        if let Some(decision) = crate::waypoints::BearingDecision::parse(&report.decision) {
+            crate::waypoints::record_waypoint_answer(
+                store,
+                crate::waypoints::RosterEntryKind::Review,
+                id,
+                decision,
+                &report.message,
+            );
+        }
+    }
     // RAL-395: the resolver's own verdict, before we know whether anything it
     // did actually ended up committed -- combined with `committed` below into
     // the outcome's real `proof_passed` once that's known, so a "PASS" from

@@ -3420,55 +3420,20 @@ fn run_cell_worker(
     // watching the work stop, so this line is the only thing that closes the
     // loop -- and for a `block`-mode entry, its absence is what keeps the
     // entry held.
+    // RAL-400 phase 2: the cell's answer to whatever waypoints affect its
+    // squad. A waypoint cannot tell whether its guidance was acted on by
+    // watching the work stop, so this line is the only thing that closes the
+    // loop -- and for a `block`-mode entry, its absence is what keeps the
+    // entry held.
     if let Some(report) = result.bearing.as_ref() {
         if let Some(decision) = crate::waypoints::BearingDecision::parse(&report.decision) {
-            let guard = store.lock();
-            let waypoints = guard
-                .open_waypoints_affecting_squad(squad_id)
-                .unwrap_or_default();
-            for waypoint_id in &waypoints {
-                if guard
-                    .set_affected_bearing_decision(
-                        waypoint_id,
-                        crate::waypoints::RosterEntryKind::Squad,
-                        squad_id,
-                        decision,
-                    )
-                    .is_ok()
-                {
-                    let _ = guard.append_waypoint_bearing(
-                        waypoint_id,
-                        crate::waypoints::RosterEntryKind::Squad,
-                        squad_id,
-                        &report.message,
-                        None,
-                        None,
-                        None,
-                    );
-                    crate::cartographer::Note::new("waypoints")
-                        .scope("waypoint")
-                        .squad(squad_id)
-                        .emit(
-                            &guard,
-                            format!(
-                                "waypoint {waypoint_id} answered by squad {squad_id}: {}",
-                                decision.as_str()
-                            ),
-                            serde_json::json!({
-                                "waypoint_id": waypoint_id,
-                                "squad_id": squad_id,
-                                "decision": decision.as_str(),
-                                "message": report.message,
-                            }),
-                        );
-                }
-            }
-            drop(guard);
-            // An answer can be the last thing a waypoint was waiting for.
-            for waypoint_id in &waypoints {
-                let guard = store.lock();
-                let _ = guard.maybe_auto_close_waypoint(waypoint_id);
-            }
+            crate::waypoints::record_waypoint_answer(
+                store,
+                crate::waypoints::RosterEntryKind::Squad,
+                squad_id,
+                decision,
+                &report.message,
+            );
         }
     }
 

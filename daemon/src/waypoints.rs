@@ -1212,6 +1212,24 @@ impl Store {
         Ok(out)
     }
 
+    /// Every open waypoint this review is an affected entry of -- the review
+    /// counterpart of [`Self::open_waypoints_affecting_squad`].
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn open_waypoints_affecting_review(&self, guardian_id: &str) -> StoreResult<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT wa.waypoint_id FROM waypoint_affected wa
+             JOIN waypoints w ON w.id = wa.waypoint_id
+             WHERE wa.kind = 'review' AND wa.entry_id = ? AND w.state = 'open'
+             ORDER BY wa.created_at_ms ASC",
+        )?;
+        let out: Vec<String> = stmt
+            .query_map(params![guardian_id], |r| r.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(out)
+    }
+
     /// The most recent waypoint to have affected this squad, open or closed.
     ///
     /// A cell resuming from a hold has usually outlived the hold: the gate
@@ -3210,6 +3228,70 @@ fn mark_done_but_unreviewed_squad(
             "delivery_status": DeliveryStatus::ViaRestack.as_str(),
         }),
     );
+}
+
+/// Record how one unit of work answered every open waypoint affecting it.
+///
+/// Shared by the squad and review paths so an answer means the same thing
+/// whichever produced it: the decision lands on the affected entry, the
+/// message is appended as a bearing (so it shows up in the waypoint's own
+/// feed and in the bearing block later work reads), and each waypoint is
+/// re-checked for closure, since an answer can be the last thing it was
+/// waiting on.
+///
+/// Returns the waypoints that accepted the answer.
+pub fn record_waypoint_answer(
+    store: &crate::store_lock::StoreHandle,
+    kind: RosterEntryKind,
+    entry_id: &str,
+    decision: BearingDecision,
+    message: &str,
+) -> Vec<String> {
+    let guard = store.lock();
+    let waypoints = match kind {
+        RosterEntryKind::Squad => guard.open_waypoints_affecting_squad(entry_id),
+        RosterEntryKind::Review => guard.open_waypoints_affecting_review(entry_id),
+    }
+    .unwrap_or_default();
+    let mut answered = Vec::new();
+    for waypoint_id in &waypoints {
+        if guard
+            .set_affected_bearing_decision(waypoint_id, kind, entry_id, decision)
+            .is_err()
+        {
+            continue;
+        }
+        let _ =
+            guard.append_waypoint_bearing(waypoint_id, kind, entry_id, message, None, None, None);
+        let note = crate::cartographer::Note::new("waypoints").scope("waypoint");
+        let note = match kind {
+            RosterEntryKind::Squad => note.squad(entry_id),
+            RosterEntryKind::Review => note.guardian(entry_id),
+        };
+        note.emit(
+            &guard,
+            format!(
+                "waypoint {waypoint_id} answered by {} {entry_id}: {}",
+                kind.as_str(),
+                decision.as_str()
+            ),
+            serde_json::json!({
+                "waypoint_id": waypoint_id,
+                "kind": kind.as_str(),
+                "entry_id": entry_id,
+                "decision": decision.as_str(),
+                "message": message,
+            }),
+        );
+        answered.push(waypoint_id.clone());
+    }
+    drop(guard);
+    // An answer can be the last thing a waypoint was waiting for.
+    for waypoint_id in &answered {
+        let guard = store.lock();
+        let _ = guard.maybe_auto_close_waypoint(waypoint_id);
+    }
+    answered
 }
 
 /// The guidance block a cell carries back into its own prompt when it resumes
@@ -6627,6 +6709,86 @@ mod tests {
         );
         assert!(plain.contains("was not rebased"), "{plain}");
         assert!(plain.contains("RALPHUS_BEARING:"), "{plain}");
+    }
+
+    /// A review's approval is held until it answers, so there has to BE a way
+    /// for a review to answer. Until the resolver's reply was read for a
+    /// bearing, there was not: the hold could only be lifted by closing the
+    /// waypoint or demoting the entry to advisory, and the error message told
+    /// the operator to do something impossible.
+    #[test]
+    fn a_review_can_answer_and_release_its_own_approval() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_bare_guardian(&store, "guardian-1");
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Review,
+                "guardian-1",
+                RosterMode::Block,
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.review_block_gating_waypoint("guardian-1").unwrap(),
+            Some("waypoint-1".to_string()),
+            "held until it answers"
+        );
+
+        store
+            .set_affected_bearing_decision(
+                "waypoint-1",
+                RosterEntryKind::Review,
+                "guardian-1",
+                BearingDecision::Accepted,
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.review_block_gating_waypoint("guardian-1").unwrap(),
+            None,
+            "answering releases the approval it was holding"
+        );
+    }
+
+    /// The review lookup must be as scoped as the squad one -- an answer from
+    /// one review must not satisfy a waypoint that never affected it.
+    #[test]
+    fn open_waypoints_affecting_review_is_scoped_to_that_review() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        open_waypoint(&store, "waypoint-2");
+        insert_bare_guardian(&store, "guardian-1");
+        insert_bare_guardian(&store, "guardian-2");
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Review,
+                "guardian-1",
+                RosterMode::Block,
+            )
+            .unwrap();
+        store
+            .add_roster_entry(
+                "waypoint-2",
+                RosterEntryKind::Review,
+                "guardian-2",
+                RosterMode::Block,
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.open_waypoints_affecting_review("guardian-1").unwrap(),
+            vec!["waypoint-1".to_string()]
+        );
+        // A squad id must never match a review entry, and vice versa.
+        assert!(
+            store
+                .open_waypoints_affecting_squad("guardian-1")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     // ---- phase 1 releases, phase 2 closes ---------------------------------
