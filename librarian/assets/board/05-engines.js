@@ -362,6 +362,9 @@
       CLICK_HANDLERS.openAppendBearing = (e, ds) => openAppendBearing(ds.waypointId || "");
       CLICK_HANDLERS.submitAppendBearing = (e, ds) => submitAppendBearing(ds.waypointId || "");
       CLICK_HANDLERS.submitCreateWaypoint = () => submitCreateWaypoint();
+      CLICK_HANDLERS.submitEditWaypoint = () => submitEditWaypoint();
+      CLICK_HANDLERS.openEditWaypoint = (e, ds) => openEditWaypoint(ds.waypointId || "");
+      CLICK_HANDLERS.toggleWaypointGuidance = () => toggleWaypointGuidance();
       CLICK_HANDLERS.addEntryToWaypointFromMenu = (e, ds) => addEntryToWaypointFromMenu(ds.kind || "", ds.entryId || "", ds.waypointId || "");
       CLICK_HANDLERS.openCreateWaypointFromMenu = (e, ds) => openCreateWaypointFromMenu(ds.kind || "", ds.entryId || "");
       document.addEventListener("click", (/** @type {MouseEvent} */ e) => {

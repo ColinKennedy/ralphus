@@ -839,6 +839,7 @@ use; see `READ_ONLY_NOTE`.
         - close waypoint_id [id]  {Manually close an open waypoint.}
         - create --agent [name] --allow-advisory --label [text] --model [name] --prompt [text] --roster [kind:entry_id[:mode]...]  {Create a cross-squad waypoint coordinating the given roster of reviews/squads (RAL-400).}
         - (read-only-safe) deliveries waypoint_id [id]  {Show a waypoint's delivery/event history.}
+        - edit waypoint_id [id] --agent [name] --allow-advisory/--no-allow-advisory --label [text] --model [name] --prompt [text]  {Update a waypoint's settings: label, guidance prompt, survey agent/model, and whether advisory roster entries are allowed. Existing survey verdicts are kept.}
         - (read-only-safe) get waypoint_id [id]  {Show one waypoint's settings, roster, tracked projects, and delivery summary.}
         - (read-only-safe) list --project [name] --state [open|closed]  {List waypoints.}
         - redo waypoint_id [id] entry_id [id]  {Re-run a squad whose finished work a closed waypoint flagged as stale, carrying its prior findings and the waypoint's bearings into the new run.}

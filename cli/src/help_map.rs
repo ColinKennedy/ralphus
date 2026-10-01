@@ -1293,6 +1293,22 @@ const WAYPOINT_CHILDREN: &[HelpNode] = &[
         &[],
     ),
     node(
+        "edit",
+        &["waypoint_id [str]"],
+        &[
+            "--label [text]",
+            "--prompt [text]",
+            "--agent [name]",
+            "--model [name]",
+            "--allow-advisory/--no-allow-advisory",
+        ],
+        "Update a waypoint's settings: label, guidance prompt, survey agent/model, and whether advisory \
+         roster entries are allowed. Existing survey verdicts are kept.",
+        false,
+        false,
+        &[],
+    ),
+    node(
         "redo",
         &["waypoint_id [str]", "entry_id [str]"],
         &[],

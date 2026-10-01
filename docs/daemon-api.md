@@ -223,6 +223,7 @@ produced no pane output.
 | POST | `/api/waypoints` | [Create a waypoint](#waypoints-ral-400) with its initial roster (≥1 entry required) |
 | GET | `/api/waypoints` | List every waypoint (bare array); `?state=open\|closed` and `?project=` filter |
 | GET | `/api/waypoints/{id}` | [One waypoint's full detail](#waypoints-ral-400): settings, roster, bearings |
+| PATCH | `/api/waypoints/{id}` | [Update a waypoint's settings](#waypoints-ral-400): label, guidance prompt, survey agent/model, advisory policy |
 | POST | `/api/waypoints/{id}/roster` | Add a squad or review roster entry |
 | DELETE | `/api/waypoints/{id}/roster/{entry_id}` | Remove a roster entry |
 | PATCH | `/api/waypoints/{id}/roster/{entry_id}` | Field-selective update of a roster entry (currently `mode`) |
@@ -4345,6 +4346,32 @@ the underscored form when consuming this API. Every other endpoint below
 that returns a waypoint (`roster` add/remove/patch, `close`, `reopen`)
 returns this same `WaypointDetail` shape, so a caller always sees the
 post-mutation state without a second `GET`.
+
+#### `PATCH /api/waypoints/{id}`
+Update a waypoint's own settings. `prompt` is required and must be
+non-empty; `label`, `agent` and `model` are nullable, and `allow_advisory`
+defaults to `false` when omitted.
+```json
+{
+  "label": "config schema migration",
+  "prompt": "The [review] block in .ralphus.toml changes shape.",
+  "agent": "claude-code",
+  "model": "claude-sonnet-4-5",
+  "allow_advisory": true
+}
+```
+Roster membership is deliberately **not** editable here — an entry carries
+its own mode, survey verdict and delivery state, so it has its own
+`roster` endpoints rather than being replaced wholesale by a settings save.
+
+Editing `prompt` likewise does **not** clear existing survey verdicts. An
+entry the survey has already judged keeps that verdict, so rewording
+guidance can never silently release work that was being held on the
+strength of the old text; re-deciding an entry is an explicit
+`PATCH .../roster/{entry_id}` (or a remove-and-re-add).
+
+`400 bad_request` if the body doesn't parse or `prompt` is blank;
+`404 not_found` for an unknown `id`. Returns the updated `WaypointDetail`.
 
 #### `POST /api/waypoints/{id}/roster`
 Add a roster entry, or update an existing one's `mode` (same underlying

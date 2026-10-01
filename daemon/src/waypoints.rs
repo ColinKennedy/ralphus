@@ -1022,6 +1022,38 @@ impl Store {
         Ok(())
     }
 
+    /// Update a waypoint's settings in place: label, guidance prompt, survey
+    /// agent/model, and whether advisory entries are allowed.
+    ///
+    /// Deliberately does **not** clear existing survey verdicts when the
+    /// prompt changes. An entry already judged keeps its verdict, so editing
+    /// guidance never silently releases work that was being held on the
+    /// strength of the old text -- re-deciding is `waypoint roster mode`, or
+    /// removing and re-adding the entry, both of which are explicit.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::NotFound`] if no such waypoint exists; otherwise
+    /// propagates any SQLite failure.
+    pub fn update_waypoint_settings(
+        &self,
+        id: &str,
+        label: Option<&str>,
+        prompt: &str,
+        agent: Option<&str>,
+        model: Option<&str>,
+        allow_advisory: bool,
+    ) -> StoreResult<()> {
+        let n = self.conn.execute(
+            "UPDATE waypoints SET label=?, prompt=?, agent=?, model=?, allow_advisory=?, updated_at_ms=?
+             WHERE id=?",
+            params![label, prompt, agent, model, allow_advisory, now_ms(), id],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
     /// Delivery-status counts for every waypoint at once, keyed by waypoint id.
     ///
     /// The list endpoint renders a progress meter per row, which previously

@@ -39,6 +39,14 @@ pub enum WaypointCommand {
         waypoint_id: String,
         entry_id: String,
     },
+    Edit {
+        waypoint_id: String,
+        label: Option<String>,
+        prompt: Option<String>,
+        agent: Option<String>,
+        model: Option<String>,
+        allow_advisory: Option<bool>,
+    },
     Roster(WaypointRosterCommand),
     Bearing(WaypointBearingCommand),
     Bearings {
@@ -127,6 +135,30 @@ pub fn parse(args: &[String]) -> WaypointCommand {
         Some("reopen") => with_waypoint_id(scanner, |waypoint_id| WaypointCommand::Reopen {
             waypoint_id,
         }),
+        Some("edit") => {
+            let label = scanner.take_value("--label").ok().flatten();
+            let prompt = scanner.take_value("--prompt").ok().flatten();
+            let agent = scanner.take_value("--agent").ok().flatten();
+            let model = scanner.take_value("--model").ok().flatten();
+            let allow_advisory = if scanner.take_bool("--allow-advisory") {
+                Some(true)
+            } else if scanner.take_bool("--no-allow-advisory") {
+                Some(false)
+            } else {
+                None
+            };
+            match scanner.remaining().first() {
+                Some(waypoint_id) => WaypointCommand::Edit {
+                    waypoint_id: waypoint_id.clone(),
+                    label,
+                    prompt,
+                    agent,
+                    model,
+                    allow_advisory,
+                },
+                None => WaypointCommand::UsageError("edit requires <waypoint_id>".to_string()),
+            }
+        }
         Some("redo") => {
             let rest = scanner.remaining();
             match (rest.first(), rest.get(1)) {
@@ -327,6 +359,46 @@ pub fn dispatch(cmd: WaypointCommand, opts: &GlobalOpts) -> i32 {
         }),
         WaypointCommand::Close { waypoint_id } => run_and_report(opts, None, || {
             let result = client.waypoint_close(&waypoint_id)?;
+            emit(opts, &result, render_waypoint_detail);
+            Ok(())
+        }),
+        WaypointCommand::Edit {
+            waypoint_id,
+            label,
+            prompt,
+            agent,
+            model,
+            allow_advisory,
+        } => run_and_report(opts, None, || {
+            // Settings are a whole-object PUT-shaped update server-side, so an
+            // omitted flag has to mean "keep what is there" rather than
+            // "clear it" -- read the current values and overlay the flags that
+            // were actually passed.
+            let current = client.waypoint_get(&waypoint_id)?;
+            let field = |name: &str| -> Option<String> {
+                current
+                    .get(name)
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            };
+            let merged_prompt = prompt
+                .clone()
+                .or_else(|| field("prompt"))
+                .unwrap_or_default();
+            let merged_allow = allow_advisory.unwrap_or_else(|| {
+                current
+                    .get("allow_advisory")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            });
+            let result = client.waypoint_update(
+                &waypoint_id,
+                label.clone().or_else(|| field("label")).as_deref(),
+                &merged_prompt,
+                agent.clone().or_else(|| field("agent")).as_deref(),
+                model.clone().or_else(|| field("model")).as_deref(),
+                merged_allow,
+            )?;
             emit(opts, &result, render_waypoint_detail);
             Ok(())
         }),

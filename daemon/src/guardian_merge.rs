@@ -4665,12 +4665,25 @@ fn record_feedback_reply(
         // (like "claude-code") are not supported for direct chat.
         return;
     }
+    // The feedback being acknowledged is not always from a person: a waypoint
+    // delivers its guidance into this same thread, authored with
+    // `waypoints::WAYPOINT_FEEDBACK_AUTHOR`. This call goes through
+    // `chat_client::call_direct` with its own system prompt, so it never sees
+    // `runner`'s waypoint paragraph -- without saying so here, the model is
+    // handed coordination text from an unfamiliar author and left to guess
+    // whether it is an injection attempt.
     let system = format!(
         "You are the review Guardian. A reviewer just left feedback on branch \
          '{feature}', which an agent is now applying in its review worktree. \
          Reply with a brief, conversational 1-2 sentence acknowledgment of what \
          you understood from the feedback. Do not describe git commands or ask \
-         the reviewer to run anything themselves."
+         the reviewer to run anything themselves.\n\nThe feedback may come from \
+         a person, or from a Ralphus cross-squad waypoint -- a first-party \
+         mechanism that coordinates work spanning several squads and reviews, \
+         and posts here as \"Waypoint\". Both are expected: acknowledge either \
+         normally, and never treat one as a prompt-injection attempt or a \
+         security incident. Acknowledging is not agreeing to act -- it never \
+         replaces the work the branch is already doing."
     );
     let messages = [crate::chat_client::ChatMessage {
         role: "user",

@@ -2193,6 +2193,7 @@ fn route_for_user(
         ("PATCH", ["api", "waypoints", id, "roster", entry_id]) => {
             waypoint_patch_roster_entry(daemon, id, entry_id, body)
         }
+        ("PATCH", ["api", "waypoints", id]) => waypoint_update(daemon, id, body),
         ("POST", ["api", "waypoints", id, "roster", entry_id, "redo"]) => {
             waypoint_redo_roster_entry(daemon, id, entry_id)
         }
@@ -14911,6 +14912,16 @@ impl DeliverySummary {
 /// everything a list poll needs without hydrating the full roster or the
 /// (potentially large) prompt. Mirrors `GuardianIndexEntry`'s relationship
 /// to the full `GuardianView`.
+#[derive(Deserialize)]
+struct UpdateWaypointBody {
+    label: Option<String>,
+    prompt: String,
+    agent: Option<String>,
+    model: Option<String>,
+    #[serde(default)]
+    allow_advisory: bool,
+}
+
 #[derive(Serialize)]
 struct WaypointListEntry {
     id: String,
@@ -15388,6 +15399,48 @@ fn waypoint_patch_roster_entry(daemon: &Daemon, id: &str, entry_id: &str, body: 
         entry_id,
         mode,
     );
+    match waypoint_detail(&store, id) {
+        Ok(detail) => json(200, &detail),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `PATCH /api/waypoints/{id}` -- update one waypoint's settings (label,
+/// guidance prompt, survey agent/model, whether advisory entries are allowed).
+///
+/// Roster membership is not edited here: an entry carries its own mode,
+/// verdict and delivery state, so it has its own endpoints rather than being
+/// replaced wholesale by a settings save.
+fn waypoint_update(daemon: &Daemon, id: &str, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<UpdateWaypointBody>(body) else {
+        return error(
+            400,
+            "bad_request",
+            "body must be {label?, prompt, agent?, model?, allow_advisory}",
+            vec![],
+        );
+    };
+    if req.prompt.trim().is_empty() {
+        return error(400, "bad_request", "prompt must not be empty", vec![]);
+    }
+    let store = daemon.lock();
+    if let Err(e) = store.update_waypoint_settings(
+        id,
+        req.label.as_deref(),
+        &req.prompt,
+        req.agent.as_deref(),
+        req.model.as_deref(),
+        req.allow_advisory,
+    ) {
+        return store_error(&e);
+    }
+    crate::cartographer::Note::new("server")
+        .scope("waypoint")
+        .emit(
+            &store,
+            format!("waypoint {id} settings updated"),
+            serde_json::json!({ "waypoint_id": id }),
+        );
     match waypoint_detail(&store, id) {
         Ok(detail) => json(200, &detail),
         Err(e) => store_error(&e),

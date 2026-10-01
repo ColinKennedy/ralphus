@@ -2015,6 +2015,26 @@ impl DaemonClient {
         self.post(&format!("/api/waypoints/{waypoint_id}/reopen"), None)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn waypoint_update(
+        &self,
+        waypoint_id: &str,
+        label: Option<&str>,
+        prompt: &str,
+        agent: Option<&str>,
+        model: Option<&str>,
+        allow_advisory: bool,
+    ) -> Result<Value, DaemonError> {
+        let body = serde_json::json!({
+            "label": label,
+            "prompt": prompt,
+            "agent": agent,
+            "model": model,
+            "allow_advisory": allow_advisory,
+        });
+        self.patch(&format!("/api/waypoints/{waypoint_id}"), Some(body))
+    }
+
     pub fn waypoint_redo_roster_entry(
         &self,
         waypoint_id: &str,

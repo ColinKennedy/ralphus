@@ -1357,11 +1357,23 @@
 
       /* The prompt is prose, not a property, so it gets a readable block with
          a quiet rule rather than a key/value row that would clip it. */
-      /* Capped to a readable measure: the detail pane is as wide as the window,
-         and prose set to 1700px is a line a reader loses their place in. */
+      /* Guidance. Capped to a readable measure -- the detail pane is as wide as
+         the window, and prose set to 1700px is a line a reader loses their
+         place in -- and clamped to a few lines, because a waypoint's guidance
+         can run long and should not push the roster below the fold on open. */
+      .wp-guidance { margin: 0 0 14px; max-width: 92ch; }
+      .wp-guidance-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+      .wp-guidance-label { font-size: 11.5px; font-weight: 650; letter-spacing: .3px;
+        text-transform: uppercase; color: var(--muted); }
       .wp-prompt { border-left: 2px solid var(--border); padding: 2px 0 2px 11px;
-        margin: 0 0 14px; color: var(--text); font-size: 13px; line-height: 1.55;
-        max-width: 92ch; }
+        color: var(--text); font-size: 13px; line-height: 1.55;
+        max-height: 4.65em; overflow: hidden; position: relative; }
+      /* Fades the clamped edge so a cut line reads as "there is more" rather
+         than as the end of the text. */
+      .wp-prompt::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0;
+        height: 1.5em; background: linear-gradient(to bottom, transparent, var(--bg)); }
+      .wp-prompt.is-open { max-height: 50vh; overflow-y: auto; }
+      .wp-prompt.is-open::after { display: none; }
 
       .wp-section { display: flex; align-items: center; gap: 8px; margin: 18px 0 8px; }
       .wp-section h4 { margin: 0; font-size: 12px; font-weight: 650; letter-spacing: .3px;

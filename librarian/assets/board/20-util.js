@@ -819,6 +819,7 @@
        */
       const patchJson = (path, body, notifyOpts) => {
         if (path.startsWith("/api/squads/")) invalidateTasksFetch();
+        forgetEtag();
         const resp = fetch(path, { method: "PATCH", headers: traceHeaders(), body: body ? JSON.stringify(body) : undefined });
         return notifyOpts ? withActionNotify(resp, notifyOpts) : resp;
       };

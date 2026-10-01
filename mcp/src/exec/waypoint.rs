@@ -38,6 +38,37 @@ pub fn execute(cmd: WaypointCommand, client: &DaemonClient) -> ExecResult {
         WaypointCommand::Get { waypoint_id } => Ok(client.waypoint_get(&waypoint_id)?),
         WaypointCommand::Close { waypoint_id } => Ok(client.waypoint_close(&waypoint_id)?),
         WaypointCommand::Reopen { waypoint_id } => Ok(client.waypoint_reopen(&waypoint_id)?),
+        WaypointCommand::Edit {
+            waypoint_id,
+            label,
+            prompt,
+            agent,
+            model,
+            allow_advisory,
+        } => {
+            let current = client.waypoint_get(&waypoint_id)?;
+            let field = |name: &str| -> Option<String> {
+                current
+                    .get(name)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            };
+            let merged_prompt = prompt.or_else(|| field("prompt")).unwrap_or_default();
+            let merged_allow = allow_advisory.unwrap_or_else(|| {
+                current
+                    .get("allow_advisory")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            });
+            Ok(client.waypoint_update(
+                &waypoint_id,
+                label.or_else(|| field("label")).as_deref(),
+                &merged_prompt,
+                agent.or_else(|| field("agent")).as_deref(),
+                model.or_else(|| field("model")).as_deref(),
+                merged_allow,
+            )?)
+        }
         WaypointCommand::Redo {
             waypoint_id,
             entry_id,

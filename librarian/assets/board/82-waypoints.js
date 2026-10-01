@@ -44,18 +44,33 @@
         if (parsed.status) waypointFilters.status = new Set(parsed.status);
         if (parsed.projects) waypointFilters.projects = new Set(parsed.projects);
       }
-      /** @type {Set<string>} `kind:id` keys chosen in the create dialog's roster picker. */
-      let createWaypointPicked = new Set();
-      /** Which tab the create dialog's roster picker is showing: "squad" or "review". */
-      let createWaypointPickerKind = "squad";
-      /** Current free-text filter in the create dialog's roster picker. */
-      let createWaypointPickerQuery = "";
-      /** Survey agent chosen in the create dialog, from the shared agent `<select>`. */
-      let createWaypointAgent = "";
+      /**
+       * @typedef {object} WaypointFormDraft
+       * @property {string} mode - "create" or "edit".
+       * @property {string} id - the waypoint being edited; empty when creating.
+       * @property {string} label
+       * @property {string} prompt
+       * @property {string} agent
+       * @property {string} model
+       * @property {boolean} allowAdvisory
+       * @property {Set<string>} picked - `kind:id` roster keys, create-only.
+       * @property {string} pickerKind - which roster tab is showing.
+       * @property {string} pickerQuery - the roster picker's filter text.
+       * @property {string} cwd - scopes the agent list, like the review edit modal does.
+       */
+      /**
+       * @type {WaypointFormDraft|null} The open create/edit dialog's state. Held as a draft rather than read off the
+       * DOM so the dialog can re-render when the agent and roster lists arrive without discarding what was typed —
+       * the same reason the review edit modal keeps one.
+       */
+      let waypointFormDraft = null;
       /** @type {{id: string, name: string}[]} Squads offered by the create dialog's roster picker, fetched when it opens. */
       let createWaypointSquads = [];
       /** @type {{id: string, name: string}[]} Reviews offered by the create dialog's roster picker, fetched when it opens. */
       let createWaypointReviews = [];
+      /** Whether the detail pane's guidance block is expanded. Collapsed by default: a waypoint's guidance can run
+       * to many lines, and it should not push the roster and activity below the fold on every open. */
+      let waypointGuidanceExpanded = false;
       /** @type {string|null} */
       let selectedWaypointId = null;
       /** @type {WaypointListEntry[]} */
@@ -348,6 +363,15 @@
       }
 
       /**
+       * Expands or collapses the detail pane's guidance block.
+       * @returns {void}
+       */
+      function toggleWaypointGuidance() {
+        waypointGuidanceExpanded = !waypointGuidanceExpanded;
+        renderWaypointDetail();
+      }
+
+      /**
        * Fetches and renders one waypoint's detail pane immediately, for a selection that must not wait for the next
        * poll. Takes a `waypointPollSeq` ticket like `pollWaypoints` does, so whichever request was issued last is the
        * one that renders — a fast click through several waypoints settles on the one actually selected, not on
@@ -555,13 +579,20 @@
             </div>
             <div class="wp-cmd-actions">
               ${waypointStateBadge(w.state)}
+              <button class="btn" data-click="openEditWaypoint" data-waypoint-id="${esc(w.id)}" data-tip="Change this waypoint's label, guidance, survey agent/model, and whether advisory entries are allowed.\nApplies to future surveys and deliveries; entries already decided keep their verdict.">✎ Edit details</button>
               <button class="btn" data-click="toggleWatch" data-entity-uri="${esc(entityUri)}" data-tip="${isWatching(entityUri) ? "Stop receiving watcher notifications for this waypoint." : "Watch this waypoint and choose which mailbox priority tiers should notify you."}">${isWatching(entityUri) ? "◉ Unwatch" : "◎ Watch…"}</button>
               ${closeReopenBtn}
             </div>
           </div>
           ${renderWaypointPipeline(w)}
           ${renderWaypointSetup(w)}
-          <div class="wp-prompt" data-tip="The coordination guidance this waypoint carries.\nIt is sent to the survey to decide which work is impacted, and delivered to the roster entries that are.">${esc(w.prompt)}</div>
+          <div class="wp-guidance">
+            <div class="wp-guidance-head">
+              <span class="wp-guidance-label" data-tip="The coordination guidance this waypoint carries.\nIt is sent to the survey to decide which work is impacted, and delivered to the roster entries that are.">Guidance</span>
+              <button class="btn sm" data-click="toggleWaypointGuidance" data-tip="${waypointGuidanceExpanded ? "Collapse the guidance back to a few lines." : "Show the full guidance. A waypoint's guidance can run long, so it is clamped by default."}">${waypointGuidanceExpanded ? "Collapse" : "Expand"}</button>
+            </div>
+            <div class="wp-prompt ${waypointGuidanceExpanded ? "is-open" : ""}">${esc(w.prompt)}</div>
+          </div>
           <div class="wp-section">
             <h4>Roster</h4>
             <span class="wp-section-rule"></span>
@@ -801,70 +832,135 @@
        * @returns {void}
        */
       function openCreateWaypoint(seedEntry) {
-        createWaypointPicked = new Set();
-        createWaypointPickerKind = "squad";
-        createWaypointPickerQuery = "";
-        createWaypointAgent = "";
-        if (seedEntry) createWaypointPicked.add(`${seedEntry.kind}:${seedEntry.entry_id}`);
-        byId("modal-root").innerHTML = `<div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal" style="width:620px;max-width:94vw">
-          <h3 style="margin-top:0">Create waypoint</h3>
-          <div class="wp-form">
-            <div class="wp-field">
-              <label for="cw-label">Label</label>
-              <input type="text" id="cw-label" placeholder="optional, e.g. rename greet to salute" data-tip="A short human-readable name. Shown wherever this waypoint appears; the id is used when it has none.">
-            </div>
-            <div class="wp-field">
-              <label for="cw-prompt">Guidance</label>
-              <textarea id="cw-prompt" placeholder="What is changing, and which work has to account for it?" data-tip="Required. This is what the survey reads to decide which work is impacted, and what gets delivered to the entries that are.\nWrite it so someone who has not seen the change can tell whether their own work touches it."></textarea>
-              <span class="wp-hint">Read by the survey to decide impact, and delivered to the work it affects.</span>
-            </div>
-            <div class="wp-field-row">
-              <div class="wp-field">
-                <label for="cw-agent">Survey agent</label>
-                ${renderAgentSelectHtml("cw-agent", "", "", "onCreateWaypointAgentChange", "", "The agent that decides which work this waypoint affects.\nAn API backend (claude, ollama) is called directly; a terminal agent (claude-code, codex, pi) runs through the subprocess runner.\nLeave as the default unless you want a specific one.")}
-              </div>
-              <div class="wp-field">
-                <label for="cw-model">Model</label>
-                <input type="text" id="cw-model" placeholder="default" data-tip="Optional model override for the survey agent. Leave empty to use that agent's own default.">
-              </div>
-            </div>
-            <div class="wp-field">
+        waypointFormDraft = {
+          mode: "create",
+          id: "",
+          label: "",
+          prompt: "",
+          agent: "",
+          model: "",
+          allowAdvisory: false,
+          picked: new Set(seedEntry ? [`${seedEntry.kind}:${seedEntry.entry_id}`] : []),
+          pickerKind: "squad",
+          pickerQuery: "",
+          cwd: "",
+        };
+        renderWaypointFormModal();
+        const draft = waypointFormDraft;
+        void loadCreateWaypointCandidates().then(() => {
+          if (waypointFormDraft === draft) renderWaypointFormModal();
+        });
+        preloadAgentSelect("", () => waypointFormDraft === draft, renderWaypointFormModal);
+      }
+
+      /**
+       * Opens the same form against an existing waypoint, for editing its settings.
+       *
+       * Edit and create are one dialog on one draft rather than two that drift: the fields are identical, and the
+       * only differences are the title, which button saves, and that the roster picker is create-only — an existing
+       * waypoint's roster is edited in place on the detail pane, where each entry has its own mode and verdict.
+       * @param {string} waypointId
+       * @returns {void}
+       */
+      function openEditWaypoint(waypointId) {
+        const w = waypointDetail && waypointDetail.id === waypointId ? waypointDetail : null;
+        if (!w) { notify("error", "Open the waypoint first."); return; }
+        const cwd = w.projects && w.projects[0] ? w.projects[0] : "";
+        waypointFormDraft = {
+          mode: "edit",
+          id: w.id,
+          label: w.label || "",
+          prompt: w.prompt || "",
+          agent: w.agent || "",
+          model: w.model || "",
+          allowAdvisory: !!w.allow_advisory,
+          picked: new Set(),
+          pickerKind: "squad",
+          pickerQuery: "",
+          cwd,
+        };
+        renderWaypointFormModal();
+        const draft = waypointFormDraft;
+        preloadAgentSelect(cwd, () => waypointFormDraft === draft, renderWaypointFormModal);
+      }
+
+      /**
+       * Records one form field as it is typed, so a re-render (after the agent list or the roster lists land) keeps
+       * what was already entered. The review edit modal uses the same draft-and-rerender shape for the same reason.
+       * @param {string} field
+       * @param {string|boolean} value
+       * @returns {void}
+       */
+      function onWaypointFormField(field, value) {
+        if (!waypointFormDraft) return;
+        /** @type {{[k: string]: any}} */ (waypointFormDraft)[field] = value;
+      }
+
+      /**
+       * Renders the create/edit waypoint dialog from the current draft.
+       * @returns {void}
+       */
+      function renderWaypointFormModal() {
+        const d = waypointFormDraft;
+        if (!d) return;
+        const editing = d.mode === "edit";
+        const rosterSection = editing
+          ? ""
+          : `<div class="wp-field">
               <label>Roster</label>
               <div class="wp-picked" id="cw-picked" data-tip="The squads and reviews this waypoint tracks. Click one to remove it."></div>
               <div class="wp-picker">
                 <div class="wp-picker-tabs" id="cw-picker-tabs"></div>
                 <div class="wp-picker-search">
-                  <input type="text" id="cw-picker-q" placeholder="filter by name or id…" oninput="onCreateWaypointPickerQuery(this.value)" data-tip="Narrow the list below by name or id.">
+                  <input type="text" id="cw-picker-q" value="${esc(d.pickerQuery)}" placeholder="filter by name or id…" oninput="onCreateWaypointPickerQuery(this.value)" data-tip="Narrow the list below by name or id.">
                 </div>
                 <div class="wp-picker-list" id="cw-picker-list"></div>
               </div>
               <span class="wp-hint">At least one is required. Hidden squads and reviews are not listed.</span>
+            </div>`;
+        byId("modal-root").innerHTML = `<div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal" style="width:620px;max-width:94vw">
+          <h3 style="margin-top:0">${editing ? "Waypoint details" : "Create waypoint"}</h3>
+          <div class="wp-form">
+            <div class="wp-field">
+              <label for="cw-label">Label</label>
+              <input type="text" id="cw-label" value="${esc(d.label)}" oninput="onWaypointFormField('label',this.value)" placeholder="optional, e.g. rename greet to salute" data-tip="A short human-readable name. Shown wherever this waypoint appears; the id is used when it has none.">
             </div>
             <div class="wp-field">
-              <label class="wp-check" data-tip="Lets the survey mark an entry advisory: it receives the guidance but is never held.\nOff means every impacted entry blocks until this waypoint closes."><input type="checkbox" id="cw-allow-advisory"> Allow advisory entries</label>
+              <label for="cw-prompt">Guidance</label>
+              <textarea id="cw-prompt" oninput="onWaypointFormField('prompt',this.value)" placeholder="What is changing, and which work has to account for it?" data-tip="Required. This is what the survey reads to decide which work is impacted, and what gets delivered to the entries that are.\nWrite it so someone who has not seen the change can tell whether their own work touches it.">${esc(d.prompt)}</textarea>
+              <span class="wp-hint">Read by the survey to decide impact, and delivered to the work it affects.</span>
+            </div>
+            <div class="wp-field-row">
+              <div class="wp-field">
+                <label for="cw-agent">Survey agent</label>
+                ${renderAgentSelectHtml("cw-agent", d.cwd, d.agent, "onCreateWaypointAgentChange", "", "The agent that decides which work this waypoint affects.\nAn API backend (claude, ollama) is called directly; a terminal agent (claude-code, codex, pi) runs through the subprocess runner.")}
+              </div>
+              <div class="wp-field">
+                <label for="cw-model">Model</label>
+                <input type="text" id="cw-model" value="${esc(d.model)}" oninput="onWaypointFormField('model',this.value)" placeholder="default" data-tip="Optional model override for the survey agent. Leave empty to use that agent's own default.">
+              </div>
+            </div>
+            ${rosterSection}
+            <div class="wp-field">
+              <label class="wp-check" data-tip="Lets the survey mark an entry advisory: it receives the guidance but is never held.\nOff means every impacted entry blocks until this waypoint closes."><input type="checkbox" id="cw-allow-advisory" ${d.allowAdvisory ? "checked" : ""} onchange="onWaypointFormField('allowAdvisory',this.checked)"> Allow advisory entries</label>
             </div>
           </div>
           <div class="btn-row">
-            <button class="btn" onclick="closeModal()" data-tip="Discard without creating a waypoint.">Cancel</button>
-            <button class="btn primary" data-click="submitCreateWaypoint" data-tip="Create this waypoint. It starts holding its block-mode entries immediately.">Create</button>
+            <button class="btn" onclick="closeModal()" data-tip="Discard without ${editing ? "saving" : "creating a waypoint"}.">Cancel</button>
+            <button class="btn primary" data-click="${editing ? "submitEditWaypoint" : "submitCreateWaypoint"}" data-tip="${editing ? "Save these settings. They apply to future surveys and deliveries; entries already decided keep their verdict." : "Create this waypoint. It starts holding its block-mode entries immediately."}">${editing ? "Save" : "Create"}</button>
           </div>
         </div></div>`;
-        renderCreateWaypointPicker();
-        // Paint the dialog first, fill the picker when its lists land — opening
-        // should never wait on a request.
-        void loadCreateWaypointCandidates().then(() => {
-          if (document.getElementById("cw-picker-list")) renderCreateWaypointPicker();
-        });
+        if (!editing) renderCreateWaypointPicker();
       }
 
       /**
-       * Records the survey agent chosen in the create dialog. The shared agent `<select>` dispatches through a
-       * named global, so this is its handler rather than a value read at submit time.
+       * Records the survey agent chosen in the form. The shared agent `<select>` dispatches through a named global,
+       * so this is its handler rather than a value read at submit time.
        * @param {string} value
        * @returns {void}
        */
       function onCreateWaypointAgentChange(value) {
-        createWaypointAgent = value;
+        onWaypointFormField("agent", value);
       }
 
       /**
@@ -873,7 +969,7 @@
        * @returns {void}
        */
       function setCreateWaypointPickerKind(kind) {
-        createWaypointPickerKind = kind;
+        if (waypointFormDraft) waypointFormDraft.pickerKind = kind;
         renderCreateWaypointPicker();
       }
 
@@ -883,7 +979,7 @@
        * @returns {void}
        */
       function onCreateWaypointPickerQuery(value) {
-        createWaypointPickerQuery = value.toLowerCase();
+        if (waypointFormDraft) waypointFormDraft.pickerQuery = value.toLowerCase();
         renderCreateWaypointPicker();
       }
 
@@ -895,14 +991,14 @@
        * @returns {void}
        */
       function toggleCreateWaypointPick(kind, entryId, on) {
+        if (!waypointFormDraft) return;
         const key = `${kind}:${entryId}`;
-        if (on) createWaypointPicked.add(key); else createWaypointPicked.delete(key);
+        if (on) waypointFormDraft.picked.add(key); else waypointFormDraft.picked.delete(key);
         renderCreateWaypointPicker();
       }
 
       /**
-       * Every squad and review a waypoint may be rostered against, excluding the ones hidden by the user — a hidden
-       * entity is one they have deliberately removed from view, so offering it here would reintroduce it.
+       * Candidates for the roster picker, from the dialog's own fetch.
        * @returns {{[kind: string]: {id: string, name: string}[]}}
        */
       function createWaypointCandidates() {
@@ -943,29 +1039,27 @@
        * @returns {void}
        */
       function renderCreateWaypointPicker() {
+        const d = waypointFormDraft;
+        if (!d || !document.getElementById("cw-picker-list")) return;
         const all = createWaypointCandidates();
-        const tabs = byId("cw-picker-tabs");
-        tabs.innerHTML = [["squad", "Squads"], ["review", "Reviews"]].map(([kind, label]) =>
-          `<button type="button" class="wp-picker-tab ${createWaypointPickerKind === kind ? "on" : ""}" onclick="setCreateWaypointPickerKind('${kind}')" data-tip="Pick ${label.toLowerCase()} for this waypoint's roster.">${label}<span class="n">${all[kind].length}</span></button>`).join("");
+        byId("cw-picker-tabs").innerHTML = [["squad", "Squads"], ["review", "Reviews"]].map(([kind, label]) =>
+          `<button type="button" class="wp-picker-tab ${d.pickerKind === kind ? "on" : ""}" onclick="setCreateWaypointPickerKind('${kind}')" data-tip="Pick ${label.toLowerCase()} for this waypoint's roster.">${label}<span class="n">${all[kind].length}</span></button>`).join("");
 
-        const q = createWaypointPickerQuery;
-        const rows = (all[createWaypointPickerKind] || [])
+        const q = d.pickerQuery;
+        const rows = (all[d.pickerKind] || [])
           .filter((/** @type {{id: string, name: string}} */ c) => !q || c.id.toLowerCase().includes(q) || c.name.toLowerCase().includes(q));
-        const list = byId("cw-picker-list");
-        list.innerHTML = rows.length
+        byId("cw-picker-list").innerHTML = rows.length
           ? rows.map((/** @type {{id: string, name: string}} */ c) => {
-              const key = `${createWaypointPickerKind}:${c.id}`;
-              const on = createWaypointPicked.has(key);
+              const on = d.picked.has(`${d.pickerKind}:${c.id}`);
               return `<label class="wp-pick-row" data-tip="${esc(c.id)}">
-                <input type="checkbox" ${on ? "checked" : ""} onchange="toggleCreateWaypointPick('${esc(createWaypointPickerKind)}','${esc(c.id)}',this.checked)">
+                <input type="checkbox" ${on ? "checked" : ""} onchange="toggleCreateWaypointPick('${esc(d.pickerKind)}','${esc(c.id)}',this.checked)">
                 <span class="wp-pick-name">${esc(c.name)}</span>
                 <span class="wp-pick-id">${esc(c.id)}</span>
               </label>`;
             }).join("")
           : `<div class="empty" style="padding:10px">${q ? "Nothing matches that." : "None available."}</div>`;
-        byId("cw-picker-q").setAttribute("placeholder", rows.length ? "filter by name or id…" : "loading…");
 
-        byId("cw-picked").innerHTML = [...createWaypointPicked].sort().map((key) => {
+        byId("cw-picked").innerHTML = [...d.picked].sort().map((key) => {
           const [kind, ...rest] = key.split(":");
           const id = rest.join(":");
           return `<span class="wp-chip" onclick="toggleCreateWaypointPick('${esc(kind)}','${esc(id)}',false)" data-tip="Remove this entry from the roster."><span class="wp-chip-k">${esc(kind)}</span>${esc(id)} ✕</span>`;
@@ -973,25 +1067,19 @@
       }
 
       /**
-       * Reads the create dialog and submits it, then opens the new waypoint.
-       * @returns {Promise<void>}
-       */
-      /**
-       * Reads the create dialog and submits it, then opens the new waypoint.
+       * Creates a waypoint from the dialog's draft, then opens it.
        * @returns {Promise<void>}
        */
       async function submitCreateWaypoint() {
-        const prompt = /** @type {HTMLTextAreaElement} */ (byId("cw-prompt")).value.trim();
-        if (!prompt) { notify("error", "Enter the guidance this waypoint carries."); return; }
-        const roster = [...createWaypointPicked].map((key) => {
+        const d = waypointFormDraft;
+        if (!d) return;
+        if (!d.prompt.trim()) { notify("error", "Enter the guidance this waypoint carries."); return; }
+        const roster = [...d.picked].map((key) => {
           const [kind, ...rest] = key.split(":");
           return { kind, entry_id: rest.join(":") };
         });
         if (!roster.length) { notify("error", "Pick at least one squad or review for the roster."); return; }
-        const label = /** @type {HTMLInputElement} */ (byId("cw-label")).value.trim();
-        const model = /** @type {HTMLInputElement} */ (byId("cw-model")).value.trim();
-        const allowAdvisory = /** @type {HTMLInputElement} */ (byId("cw-allow-advisory")).checked;
-        const body = { label: label || null, prompt, agent: createWaypointAgent || null, model: model || null, allow_advisory: allowAdvisory, roster };
+        const body = { label: d.label.trim() || null, prompt: d.prompt.trim(), agent: d.agent || null, model: d.model.trim() || null, allow_advisory: d.allowAdvisory, roster };
         const resp = await post("/api/waypoints", body, { success: "Waypoint created.", errorLabel: "create waypoint" });
         if (resp.ok) {
           const created = await resp.json();
@@ -999,6 +1087,23 @@
           await refreshWaypointsList();
           selectWaypoint(created.id);
           showTab("waypoints", true);
+        }
+      }
+
+      /**
+       * Saves edited settings back to an existing waypoint, then refreshes its detail pane.
+       * @returns {Promise<void>}
+       */
+      async function submitEditWaypoint() {
+        const d = waypointFormDraft;
+        if (!d) return;
+        if (!d.prompt.trim()) { notify("error", "A waypoint needs guidance."); return; }
+        const body = { label: d.label.trim() || null, prompt: d.prompt.trim(), agent: d.agent || null, model: d.model.trim() || null, allow_advisory: d.allowAdvisory };
+        const resp = await patchJson(`/api/waypoints/${d.id}`, body, { success: "Waypoint updated.", errorLabel: "update waypoint" });
+        if (resp.ok) {
+          closeModal();
+          await refreshWaypointsList();
+          void loadWaypointDetail(d.id);
         }
       }
 
