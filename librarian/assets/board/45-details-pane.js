@@ -455,7 +455,7 @@
         return `<h3 class="section">environment overrides (${esc(label)})</h3>
           ${banner}
           ${rows}
-          <div class="kv-row">${envViewerBtn(apiPath, `this ${label}`)}<button class="btn" data-click="addEnvOverrideAt" data-api-path="${esc(apiPath)}" data-tip="Set a persistent environment-variable override for this ${esc(label)} (hierarchical env overrides, extending RAL-150).\nUse this to retry with a different model/resolver, feature flag, or credential scoped to just this ${esc(label)}, without editing and resubmitting the TOML.\nOverrides a parent scope's value for the same key; applies the next time this ${esc(label)} executes, and stays set across any number of retries until removed.">+ Add override</button></div>`;
+          <div class="kv-row"><button class="btn" data-click="addEnvOverrideAt" data-api-path="${esc(apiPath)}" data-tip="Set a persistent environment-variable override for this ${esc(label)} (hierarchical env overrides, extending RAL-150).\nUse this to retry with a different model/resolver, feature flag, or credential scoped to just this ${esc(label)}, without editing and resubmitting the TOML.\nOverrides a parent scope's value for the same key; applies the next time this ${esc(label)} executes, and stays set across any number of retries until removed.">+ Add override</button></div>`;
       }
       /**
        * Renders the "environment overrides" section of the squad details pane.

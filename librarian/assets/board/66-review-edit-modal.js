@@ -90,7 +90,6 @@
        * @property {string} title - Human-readable scope label, e.g. "test actions".
        * @property {{[key: string]: string}} inherited
        * @property {EnvScopeDraft} sd
-       * @property {string} resolvedPath - The read-only resolved-environment endpoint describing what the governed section actually runs in. Not always the edited scope's own: check gates resolve from the build step's overrides.
        */
 
       /** @type {ReviewEditDraft|null} */
@@ -479,11 +478,9 @@
        * @param {string} gid
        * @param {string} scope - "build" | "manual_checks" | "branch"
        * @param {string} branchId - Empty unless `scope` is "branch".
-       * @param {string} [resolvedPath] - Override for the read-only resolved-env
-       *   endpoint, for a section whose resolution is not its edited scope's own.
        * @returns {Promise<void>}
        */
-      async function openEnvOverridesEditor(gid, scope, branchId, resolvedPath) {
+      async function openEnvOverridesEditor(gid, scope, branchId) {
         let g = guardians.find((x) => x.id === gid);
         if (!g) return;
         if (!g.branches) {
@@ -500,7 +497,6 @@
             title: `branch ${b.branch}`,
             inherited: b.inherited_env || {},
             sd: envScopeDraftFromOwn(b.env_overrides || {}),
-            resolvedPath: resolvedPath || `/api/guardians/${gid}/branches/${branchId}/env`,
           };
         } else if (scope === "manual_checks") {
           envEditDraft = {
@@ -508,7 +504,6 @@
             title: "manual checks",
             inherited: review.combined_env || {},
             sd: envScopeDraftFromOwn(review.manual_checks_env_overrides || {}),
-            resolvedPath: resolvedPath || `/api/guardians/${gid}/manual-checks-env`,
           };
         } else {
           envEditDraft = {
@@ -516,7 +511,6 @@
             title: "the build step — check gates and test actions",
             inherited: review.combined_env || {},
             sd: envScopeDraftFromOwn(review.build_env_overrides || {}),
-            resolvedPath: resolvedPath || `/api/guardians/${gid}/build-env`,
           };
         }
         renderEnvOverridesEditor();
@@ -537,9 +531,8 @@
         const d = envEditDraft;
         if (!d) return;
         byId("modal-root").innerHTML = `<div class="modal-bg" onclick="if(event.target===this)closeEnvOverridesEditor()"><div class="modal" style="width:620px;max-width:94vw">
-            <h2 data-tip="Environment variables this one surface overrides.\nEverything not listed here is inherited — the 🔎 button shows what each name actually resolves to, layer by layer.\nNothing is sent until Save.">Environment — ${esc(d.title)}</h2>
+            <h2 data-tip="Environment variables this one surface overrides.\nEverything not listed here is inherited — the inherited layer is listed below the overrides.\nNothing is sent until Save.">Environment — ${esc(d.title)}</h2>
             ${renderReviewEditEnvScope(d.scope, d.branchId, d.title, d.inherited, d.sd)}
-            <div class="btn-row" style="margin-top:10px">${envViewerBtn(d.resolvedPath, d.title)}</div>
             <div class="btn-row" style="margin-top:12px;justify-content:flex-end"><button class="btn" onclick="closeEnvOverridesEditor()" data-tip="Close without applying anything typed here.">Cancel</button><button class="btn primary" onclick="saveEnvOverridesEditor()" data-tip="Apply this scope's overrides in one request. Only this scope is touched — no other environment, and no other review setting.">Save</button></div>
           </div></div>`;
       }

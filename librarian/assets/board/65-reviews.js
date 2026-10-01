@@ -451,7 +451,36 @@
       }
       // RALPHUS-REVIEW-HIDE:END
       /**
-       * Opens the review detail pane's title-bar ⋯ context menu.
+       * The review's primary action, as a split button: the thing you came to
+       * press, with everything else behind its ▾.
+       *
+       * The actions used to sit in a row at the foot of the pane, below the
+       * branch stack -- so the one control a reviewer reaches for most was
+       * wherever the stack happened to end, and scrolled off on a long review.
+       * Rebasing is the primary slot rather than Approve: it is what gets
+       * pressed repeatedly while a review is being worked, where Approve is
+       * pressed once at the end and is a decision, not a step.
+       * @param {GuardianView} g - The review.
+       * @returns {string}
+       */
+      function reviewPrimaryAction(g) {
+        // Reopen takes the primary slot once rebasing is a dead end, so the
+        // button is never a permanently greyed-out stub.
+        const view = REOPEN_ELIGIBLE.includes(g.status)
+          ? { ...reopenButtonView(g.status, pendingMergeActions.has(g.id)), action: "reopenReview" }
+          : { ...mergeButtonView(g.status, pendingMergeActions.has(g.id)), action: "mergeReview" };
+        const tip = esc(view.tip);
+        const btn = `<button class="btn primary split-main" data-click="${view.action}" data-guardian-id="${esc(g.id)}" `
+          + `data-status="${esc(g.status)}" ${view.enabled ? "" : "disabled"} data-tip="${tip}">${esc(view.label)}</button>`;
+        // A disabled <button> swallows mouseover, so its tooltip lives on a
+        // wrapper -- the same reason every other gated button here does this.
+        return `<span class="split">${view.enabled ? btn : `<span data-tip="${tip}">${btn}</span>`}`
+          + `<button class="btn primary split-caret" data-click="openReviewTitleMenu" data-guardian-id="${esc(g.id)}" `
+          + `data-tip="Every other action for this review — approving it, its PR stack, and the destructive ones.">▾</button></span>`;
+      }
+      /**
+       * Opens the review's action menu, grouped by what each action acts on:
+       * the review as a whole, or its branch stack.
        * @param {MouseEvent} e
        * @param {string} id
        * @returns {void}
@@ -476,10 +505,36 @@
         const submitItem = g.branches && g.branches.some((b) => b.enabled && b.worktree)
           ? `<div data-click="submitPrStack" data-guardian-id="${esc(id)}" data-tip="Push every enabled branch in this review as its own PR, each based on the branch below it -- never one squashed PR containing everything.\nOn GitHub, also registers/grows a native PR stack so GitHub's own UI shows them as a linked stack.\nSafe to press again after adding a branch on top: only the new branch gets its own PR.\nRuns in the background; each branch's PR chip updates as its forge call completes.${esc(g.effective_auto_submit_pr_stack ? "\nAuto-submit is on for this review, so this normally happens on its own." : "")}">⇧ Submit PR stack</div>`
           : "";
-        menu.innerHTML = submitItem + cancelItem + stacksItem;
+        // Approve moved here from the foot of the pane. It is a decision made
+        // once, not a step repeated while working, so it belongs with the other
+        // one-off actions rather than beside the button you press all day.
+        const approveDecided = g.status === "merged" || g.status === "approved";
+        const approvePending = pendingGuardianActions.has(id);
+        const approveItem = (approveDecided || approvePending)
+          ? `<div class="ctx-disabled" data-tip="${esc(approvePending
+            ? "Approval is in flight — waiting for the daemon to confirm."
+            : `This review is already ${g.status}.\nReopen it to make further changes, then approve again.`)}">✓ ${approvePending ? "Approving…" : "Approve"}</div>`
+          : `<div data-click="approveReview" data-guardian-id="${esc(id)}" data-tip="Approve this review — marks it as approved, whether or not its PR/MR has merged.\nCan be pressed from in_review or merge_stopped; the daemon rejects it if the review isn't in a state that can be approved yet.">✓ Approve</div>`;
+        const stopItem = g.status === "merging"
+          ? `<div data-click="stopMerge" data-guardian-id="${esc(id)}" data-tip="Stop this rebase mid-flight — halts at the next checkpoint and pauses the review.\nThe review and its branches are kept, so you can resume the rebase afterward.\nThis is not a cancel: nothing is discarded.">⏸ Stop rebase</div>`
+          : "";
+        const canSync = ["in_review", "merging"].includes(g.status);
+        const syncItem = canSync
+          ? `<div data-click="syncPrReview" data-guardian-id="${esc(id)}" data-tip="Check GitHub/GitLab for a stack reorder made outside ralphus (e.g. dragging PRs into a new order) and apply it here, retriggering a rebase.\nRuns in the background; watch this review's branch order/status for the result.\nAlso happens automatically every 5 minutes for reviews with an active stack.">⇅ Sync PR order</div>`
+          : `<div class="ctx-disabled" data-tip="Not available — a stack reorder can only be detected once this review has an open PR stack (status in_review or merging).">⇅ Sync PR order</div>`;
+        menu.innerHTML = `<div class="ctx-group">review</div>`
+          + approveItem + submitItem + syncItem + stopItem
+          + `<div class="ctx-sep"></div><div class="ctx-group">stack</div>`
+          + stacksItem + cancelItem;
         document.body.appendChild(menu);
-        menu.style.left = Math.min(e.clientX, window.innerWidth - 180) + "px";
-        menu.style.top = Math.min(e.clientY, window.innerHeight - 90) + "px";
+        // Opened from a button at the pane's top-right, so it is anchored to
+        // that button rather than to the pointer -- a menu that lands under the
+        // cursor would cover the control it belongs to.
+        const btn = /** @type {HTMLElement|null} */ (
+          /** @type {HTMLElement} */ (e.target).closest("[data-click]"));
+        const r = (btn || /** @type {HTMLElement} */ (e.target)).getBoundingClientRect();
+        menu.style.left = Math.max(8, Math.min(r.right - menu.offsetWidth, window.innerWidth - menu.offsetWidth - 8)) + "px";
+        menu.style.top = Math.min(r.bottom + 4, window.innerHeight - menu.offsetHeight - 8) + "px";
       }
       /**
        * Cancels a review's in-progress merge after confirmation. Applies to
@@ -1825,7 +1880,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
                 ${watchersHtml(`guardian:${g.id}`)}
                 <button class="icon-btn" data-click="toggleReviewDock" data-guardian-id="${esc(g.id)}" data-tip="Open the log drawer docked at the bottom of this review.\nIt follows whatever you select — the whole review, one branch, or one command — and stays open while you work instead of covering the page.">☰ Logs</button>
                 <button class="icon-btn" data-click="openEditReviewDetails" data-guardian-id="${esc(g.id)}" data-tip="Edit this review's settings — name, upstream branch, resolver, proof scope, build/squash options, PR settings.\nEnvironment overrides live on each section's ⋯, next to the commands they govern.\nNothing takes effect until you click Save; Save applies every change in a single request and triggers at most one rebase.">✎ Setup</button>
-                <button class="btn squadbtn" data-click="openReviewTitleMenu" data-guardian-id="${esc(g.id)}" data-tip="Every other action for this review.">⋯</button>
+                ${reviewPrimaryAction(g)}
               </div>
             </div>
             ${reviewPipeline(g)}
@@ -1836,7 +1891,6 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           ${reviewIdentityRow(g, isMultiProject)}
           ${renderChangeSummary(g)}
           <h3 class="section">check gates${sectionMenuBtn(g.id, "gates")}</h3>${checks}
-          <div class="kv-row">${envViewerBtn(`/api/guardians/${g.id}/tests-env`, "this review's check gates (tests)")}</div>
           ${g.detail && !autoBuiltCmd ? `<div class="warn">${detailSummary(g.detail, "Review detail")}</div>` : ""}
           <h3 class="section">branches${sectionMenuBtn(g.id, "branches")}${canReorder ? ' <span class="k" style="text-transform:none;letter-spacing:0">— drag to reorder · toggle ⊙/⊘ to enable/disable</span>' : ""}${hasPending ? ' <span class="badge warn2" data-tip="Unsaved order or enable/disable changes — click Save to apply, or Discard to revert.">● unsaved changes</span>' : ""}</h3>
           ${allDisabled ? `<div class="warn" style="margin:4px 0 8px">All branches are disabled — saving will make this review a no-op (no rebase runs). Re-enable at least one branch before saving, or click Discard.</div>` : ""}
@@ -1863,70 +1917,6 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
               ? `<div class="warn" style="margin:8px 0 4px">Some branches are not yet ready (still running or never submitted). Merge / rebase will offer to continue with just the ready branches.</div>`
               : "";
           })()}
-          <div class="btn-row review-actions">
-            ${(() => {
-              // RAL-40: a disabled <button> gets `pointer-events:none` from the
-              // global `.btn[disabled]` rule, so the tooltip engine's
-              // mouseover listener never sees it — data-tip must live on a
-              // wrapping <span> instead whenever the button may be disabled.
-              //
-              // Once a review is cancelled or merged, "Merge / rebase" is a
-              // dead end (see MERGE_DISABLED_REASON) -- this same slot becomes
-              // "Reopen" instead, so there is always a live action here rather
-              // than a permanently greyed-out button.
-              if (REOPEN_ELIGIBLE.includes(g.status)) {
-                const reopen = reopenButtonView(g.status, pendingMergeActions.has(g.id));
-                const reopenTip = esc(reopen.tip);
-                const reopenBtn = `<button class="btn primary" data-click="reopenReview" data-guardian-id="${esc(g.id)}" ${reopen.enabled ? "" : "disabled"} data-tip="${reopenTip}">${esc(reopen.label)}</button>`;
-                return reopen.enabled ? reopenBtn : `<span data-tip="${reopenTip}">${reopenBtn}</span>`;
-              }
-              const merge = mergeButtonView(g.status, pendingMergeActions.has(g.id));
-              const mergeTip = esc(merge.tip);
-              const mergeBtn = `<button class="btn primary" data-click="mergeReview" data-guardian-id="${esc(g.id)}" data-status="${esc(g.status)}" ${merge.enabled ? "" : "disabled"} data-tip="${mergeTip}">${esc(merge.label)}</button>`;
-              // A disabled <button> swallows mouseover, so the tooltip has to
-              // live on a wrapping <span> whenever the button is unavailable.
-              return merge.enabled ? mergeBtn : `<span data-tip="${mergeTip}">${mergeBtn}</span>`;
-            })()}
-            ${(() => {
-              // RAL-249: halt an in-progress rebase at its next checkpoint,
-              // keeping the review resumable — distinct from "Cancel review".
-              const canStop = g.status === "merging";
-              if (!canStop) return "";
-              return `<button class="btn" data-click="stopMerge" data-guardian-id="${esc(g.id)}" data-tip="Stop this rebase mid-flight — halts at the next checkpoint and pauses the review.\nThe review and its branches are kept, so you can resume the rebase afterward.\nThis is not a cancel: nothing is discarded.">⏸ Stop</button>`;
-            })()}
-            ${(() => {
-              const isPending = pendingGuardianActions.has(g.id);
-              // RAL-535: a review can also already be `approved` (a prior
-              // explicit approval, possibly from `merge_stopped`) -- both it
-              // and `merged` (the forge detecting an actual PR/MR merge) are
-              // terminal outcomes this button can no longer act on.
-              const alreadyDecided = g.status === "merged" || g.status === "approved";
-              const disabled = isPending || alreadyDecided;
-              const approveTip = isPending
-                ? "Approval is in flight — waiting for the daemon to confirm."
-                : alreadyDecided
-                  ? `This review is already ${g.status}.\nPress Reopen review above to make further changes, then approve again.`
-                  : "Approve this review — marks it as approved, whether or not its PR/MR has merged.\nCan be pressed from in_review or merge_stopped; the daemon rejects it if the review isn't in a state that can be approved yet.";
-              const approveBtn = `<button class="btn" data-click="approveReview" data-guardian-id="${esc(g.id)}" ${disabled ? "disabled" : ""} data-tip="${approveTip}">${isPending ? "Approving…" : "Approve"}</button>`;
-              return disabled ? `<span data-tip="${approveTip}">${approveBtn}</span>` : approveBtn;
-            })()}
-            ${(() => {
-              const canCancel = G_CANCELLABLE.includes(g.status);
-              if (!canCancel) return "";
-              return `<button class="btn danger" data-click="cancelReview" data-guardian-id="${esc(g.id)}" data-tip="Cancel this review — stops the current merge and discards its result.\nThe review can be restarted afterward.\nThis cannot be undone.">⊘ Cancel review</button>`;
-            })()}
-            ${(() => {
-              // RAL-273: only meaningful once a stack is actually built and
-              // open against the forge -- same scope as the 5-minute
-              // background poll (in_review/merging).
-              const canSync = ["in_review", "merging"].includes(g.status);
-              const syncTip = canSync
-                ? "Check GitHub/GitLab for a stack reorder made outside ralphus (e.g. dragging PRs into a new order) and apply it here, retriggering a rebase.\nRuns in the background; watch this review's branch order/status for the result.\nAlso happens automatically every 5 minutes for reviews with an active stack."
-                : "Not available — a stack reorder can only be detected once this review has an open PR stack (status in_review or merging).";
-              const syncBtn = `<button class="btn" data-click="syncPrReview" data-guardian-id="${esc(g.id)}" ${canSync ? "" : "disabled"}${canSync ? ` data-tip="${syncTip}"` : ""}>Sync PR</button>`;
-              return canSync ? syncBtn : `<span data-tip="${syncTip}">${syncBtn}</span>`;
-            })()}
-          </div>
           ${(() => {
             // RAL-77: user-declared test actions from [[review.action]] in TOML.
             const hints = g.action_hints || [];

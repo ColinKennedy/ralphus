@@ -304,6 +304,19 @@
       .setup-group { border-left: 2px solid transparent; padding-left: 8px; margin-left: -10px; border-radius: 0 4px 4px 0; }
       .setup-group.focused { border-left-color: var(--accent); background: rgba(74,163,255,.09); }
       .setup-group.focused > h3.section { color: var(--accent); }
+      /* The review's primary action and its menu, as one object: the thing you
+         press most, with everything else one click further. */
+      .split { display: inline-flex; flex: none; }
+      .split .split-main { border-radius: 6px 0 0 6px; }
+      .split .split-caret { border-radius: 0 6px 6px 0; border-left: 1px solid rgba(0,0,0,.28); padding: 4px 7px; }
+      .split > span { display: inline-flex; }
+      /* A heading inside the actions menu, naming what its group acts on. */
+      .ctx-menu .ctx-group {
+        padding: 5px 10px 2px; font-size: 9.5px; font-weight: 700; letter-spacing: .7px;
+        text-transform: uppercase; color: var(--faint); cursor: default;
+      }
+      .ctx-menu .ctx-group:hover { background: transparent; }
+
       /* ---- Feedback tab: the branch's change-request thread ----
          A conversation, so it is laid out as one: your request and the
          resolver's reply are different speakers and sit on opposite sides,

@@ -251,8 +251,7 @@
                 own[k] === null
                   ? `<span style="color:var(--failed);text-decoration:line-through" data-tip="Tombstoned — this key is removed from the effective environment even though it would otherwise be inherited.">removed</span>`
                   : esc(own[k] || "")}</dd>`).join("")}</dl>`
-            : `<div class="empty" style="padding:8px 0">Inherits the daemon environment — nothing overridden for this worktree.</div>`}
-          <div class="btn-row" style="margin-top:8px">${envViewerBtn(`/api/guardians/${g.id}/branches/${b.id}/env`, `this branch's worktree`)}</div>`;
+            : `<div class="empty" style="padding:8px 0">Inherits the daemon environment — nothing overridden for this worktree.</div>`}`;
       }
       /**
        * Feedback: the branch's reviewer thread, promoted out of the nested
@@ -1049,32 +1048,26 @@
         manual: { label: "manual checks", note: "Written by the resolver agent against this stack's changes. Advisory — they never block approval." },
       };
       /**
-       * Which env scope each runnable section edits, and which resolved-env
-       * endpoint describes what that section actually ends up running in.
+       * Which env scope each runnable section edits.
        *
-       * `edit` is the writable scope; `resolvedUrl` is the read-only resolution
-       * of it for this section. They differ for check gates: the daemon composes
-       * the gates' environment from the daemon's own plus the build step's
-       * overrides, so the thing you edit is `build` while the thing you read
-       * back is `tests-env`.
-       * @type {{[kind: string]: {edit: string, resolvedUrl: string, label: string, tip: string}}}
+       * `edit` is the writable scope. Check gates and test actions share one:
+       * the daemon composes the gates' environment from the daemon's own plus
+       * the build step's overrides, so both sections edit `build`.
+       * @type {{[kind: string]: {edit: string, label: string, tip: string}}}
        */
       const ENV_SCOPE_FOR_SECTION = {
         gates: {
           edit: "build",
-          resolvedUrl: "tests-env",
           label: "check gates",
           tip: "Edit the environment the check gates run in.\nThe daemon composes it from its own environment plus the build step's overrides, so this edits the build step's — shared with test actions.",
         },
         manual: {
           edit: "manual_checks",
-          resolvedUrl: "manual-checks-env",
           label: "manual checks",
           tip: "Edit the environment overrides applied when the suggested manual checks run.\nThis scope is the manual-checks step's own — nothing else in the review uses it.",
         },
         actions: {
           edit: "build",
-          resolvedUrl: "build-env",
           label: "test actions",
           tip: "Edit the environment overrides for the build step, which is what test actions run against.\nShared with the check gates, which resolve from the same layer.",
         },
@@ -1089,7 +1082,7 @@
         closeSquadMenu();
         const meta = ENV_SCOPE_FOR_SECTION[kind];
         if (!meta) return;
-        void openEnvOverridesEditor(gid, meta.edit, "", `/api/guardians/${gid}/${meta.resolvedUrl}`);
+        void openEnvOverridesEditor(gid, meta.edit, "");
       }
       /**
        * The ⋯ button for one section heading.
