@@ -589,7 +589,9 @@ mod tests {
             .expect("restore succeeds");
 
         assert_eq!(
-            std::fs::read_to_string(dir.join("tracked.txt")).unwrap(),
+            std::fs::read_to_string(dir.join("tracked.txt"))
+                .unwrap()
+                .replace("\r\n", "\n"),
             "attempt edit\n"
         );
         assert_eq!(

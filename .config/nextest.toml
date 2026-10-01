@@ -3,3 +3,7 @@
 [[profile.default.overrides]]
 filter = "test(rapid_upstream_commits_coalesce_into_a_single_debounced_rebuild)"
 threads-required = "num-cpus"
+
+[[profile.default.overrides]]
+filter = "test(cancelling_a_review_stops_an_in_flight_feedback_agent)"
+threads-required = "num-cpus"

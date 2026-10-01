@@ -780,11 +780,13 @@ mod tests {
         let observed = runner.observed_before_edit.lock().unwrap();
         assert_eq!(observed.len(), 2, "two repair passes should have run");
         assert_eq!(
-            observed[0], "original\n",
+            observed[0].replace("\r\n", "\n"),
+            "original\n",
             "first repair pass starts from the pristine snapshot"
         );
         assert_eq!(
-            observed[1], "original\n",
+            observed[1].replace("\r\n", "\n"),
+            "original\n",
             "restore before the second repair pass must have undone the first \
              repair pass's own botched edit, not left it in place"
         );
