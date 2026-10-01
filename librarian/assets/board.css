@@ -69,7 +69,10 @@
         height: calc(100vh - 51px);
       }
       .review-main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
-      .review-main > .col.center { flex: 1; min-height: 0; }
+      /* min-width:0 so the column can actually be narrower than its widest
+         child; without it a single unshrinkable row forces the whole pane to
+         scroll sideways and clips everything past the fold. */
+      .review-main > .col.center { flex: 1; min-height: 0; min-width: 0; overflow-x: hidden; }
       .review-inspector {
         border-left: 1px solid var(--border); background: var(--panel);
         display: flex; flex-direction: column; min-height: 0; overflow: hidden;
@@ -677,23 +680,28 @@
          "where is this review and what do I do about it" is answered without
          scrolling. */
       .review-cmdbar { margin-bottom: 4px; }
-      /* No wrapping: the actions must stay on the title's line, so the one
-         thing you came to do never ends up on a line of its own. The id is the
-         part that gives way when the column is narrow. */
-      .review-cmdbar .cmd-row { display: flex; align-items: center; gap: 8px; flex-wrap: nowrap; }
+      /* The actions travel together: grouped in one flex child pinned right, so
+         when the column is too narrow they wrap as a block rather than leaving
+         a single orphaned ⋯ on its own line — and, critically, rather than
+         overflowing and clipping, which is what `nowrap` with unshrinkable
+         children did. The name and id give way first. */
+      .review-cmdbar .cmd-row {
+        display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0;
+      }
       .review-cmdbar .rid {
         font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 16px;
-        font-weight: 650; white-space: nowrap;
+        font-weight: 650; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
       }
       .review-cmdbar .cmd-id {
-        color: var(--cancelled); font-size: 11px; min-width: 0;
+        color: var(--cancelled); font-size: 11px; min-width: 0; flex-shrink: 1;
         overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
       }
-      .review-cmdbar .cmd-row > .btn,
-      .review-cmdbar .cmd-row > .icon-btn,
-      .review-cmdbar .cmd-row > .cost-chip,
-      .review-cmdbar .cmd-row > .badge,
-      .review-cmdbar .cmd-row > .pill { flex: none; white-space: nowrap; }
+      .review-cmdbar .cmd-actions {
+        display: flex; align-items: center; gap: 6px; margin-left: auto; flex: none;
+      }
+      .review-cmdbar .cost-chip,
+      .review-cmdbar .badge,
+      .review-cmdbar .pill { flex: none; white-space: nowrap; }
       .cost-chip {
         font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px;
         color: var(--unverified); background: rgba(227,179,65,.13);

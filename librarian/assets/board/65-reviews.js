@@ -1729,11 +1729,12 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
               ${gdot(g.status)}<span class="rid">${esc(g.name)}</span> ${pill(g.status)} ${arbiterBadge(g)} ${postMergeBadge(g)}
               <span class="mono hc-anchor cmd-id" style="cursor:pointer" data-card="gReviewId" data-guardian-id="${esc(g.id)}" data-copy="${esc(g.id)}" onclick="copyText(event)">${esc(g.id)}</span>
               ${reviewCostChip(g)}
-              <span style="flex:1"></span>
-              ${watchersHtml(`guardian:${g.id}`)}
-              <button class="icon-btn" data-click="toggleReviewDock" data-guardian-id="${esc(g.id)}" data-tip="Open the log drawer docked at the bottom of this review.\nIt follows whatever you select — the whole review, one branch, or one command — and stays open while you work instead of covering the page.">☰ Logs</button>
-              <button class="icon-btn" data-click="openEditReviewDetails" data-guardian-id="${esc(g.id)}" data-tip="Edit this review's settings — name, upstream branch, resolver, proof scope, build/squash options, PR settings, and environment overrides — all in one place.\nNothing takes effect until you click Save; Save applies every change in a single request and triggers at most one rebase.">✎ Setup</button>
-              <button class="btn squadbtn" data-click="openReviewTitleMenu" data-guardian-id="${esc(g.id)}" data-tip="Every other action for this review.">⋯</button>
+              <div class="cmd-actions">
+                ${watchersHtml(`guardian:${g.id}`)}
+                <button class="icon-btn" data-click="toggleReviewDock" data-guardian-id="${esc(g.id)}" data-tip="Open the log drawer docked at the bottom of this review.\nIt follows whatever you select — the whole review, one branch, or one command — and stays open while you work instead of covering the page.">☰ Logs</button>
+                <button class="icon-btn" data-click="openEditReviewDetails" data-guardian-id="${esc(g.id)}" data-tip="Edit this review's settings — name, upstream branch, resolver, proof scope, build/squash options, PR settings, and environment overrides — all in one place.\nNothing takes effect until you click Save; Save applies every change in a single request and triggers at most one rebase.">✎ Setup</button>
+                <button class="btn squadbtn" data-click="openReviewTitleMenu" data-guardian-id="${esc(g.id)}" data-tip="Every other action for this review.">⋯</button>
+              </div>
             </div>
             ${reviewPipeline(g)}
           </div>
