@@ -43,13 +43,11 @@
        * start and end row.
        * @typedef {object} BranchRun
        * @property {string} id - Stable within one render, for the picker.
-       * @property {string} kind - rebase | proof | feedback | pr | gate.
-       * @property {string} label - Command text, or what the pass was doing.
+       * @property {string} kind - rebase | proof | feedback.
+       * @property {string} label - What the pass was doing.
        * @property {number} atMs - When the run started.
-       * @property {string} outcome - passed / failed / resolved / conflicted / opened …
-       * @property {string} who - The agent or actor that ran it.
-       * @property {string} why - Why there is no transcript, when there is none.
-       * @property {boolean} hasTape - Whether a transcript can be shown for it.
+       * @property {string} outcome - resolved / passed / failed / committed …
+       * @property {string} who - The agent that ran it.
        * @property {number} elapsedMs - Measured duration, or 0 when the emitter reports none. Never estimated.
        */
       /** @type {boolean} True while the log dock is expanded. */
@@ -462,18 +460,21 @@
         }
       }
       /**
-       * Everything that ran for one branch, oldest first.
+       * Every agent session this branch ran, oldest first.
        *
-       * "What was it doing at that time" is not a question about resolver tmux
-       * attempts alone -- a branch rebases, proves, revises against feedback,
-       * submits a PR, and sits under post-merge gates, and any of those is a
-       * point someone wants to walk back to. The daemon records each as a
-       * Cartographer event, so a run is the span between its start and end
-       * rows; this reads the rows the board already has for the review rather
-       * than asking for anything new.
+       * "What was it doing at that time" is not a question about rebase
+       * attempts alone -- a branch rebases, proves, and revises against
+       * feedback, and any of those is a point someone wants to walk back to.
+       * The daemon records each as a Cartographer event, so a run is the span
+       * between its start and end rows; this reads rows the board already has
+       * for the review rather than asking for anything new.
        *
-       * A run with no retained transcript is still listed. Knowing it happened,
-       * and that its text was not kept, beats silently omitting it.
+       * Only passes that ran under a pane are listed. A PR submit goes out over
+       * the forge's REST API and a check gate runs as a plain command, so
+       * neither ever had a transcript -- an entry for one could only ever say
+       * "nothing to show here", which is a walk-back stop that cannot be walked
+       * to. Both stay recorded elsewhere: gates in the check-gates section,
+       * both of them in the logs drawer.
        * @param {GuardianView} g - The review.
        * @param {GuardianBranch} b - The branch.
        * @returns {BranchRun[]}
@@ -518,7 +519,7 @@
               id: `rebase-${r.id}`, kind: "rebase",
               label: `rebase onto ${g.base_branch || "upstream"}${found}`,
               atMs: r.at_ms, outcome: "running", elapsedMs: 0,
-              who: String(p.agent || resolver), why: "", hasTape: true,
+              who: String(p.agent || resolver),
             });
           } else if (msg.startsWith("conflicts resolved")) {
             close("rebase", p.committed ? "resolved" : "resolved, nothing to commit");
@@ -527,58 +528,18 @@
           } else if (msg.startsWith("final proof starting")) {
             runs.push({
               id: `proof-${r.id}`, kind: "proof", label: "final proof",
-              atMs: r.at_ms, outcome: "running", elapsedMs: 0, who: resolver, why: "", hasTape: true,
+              atMs: r.at_ms, outcome: "running", elapsedMs: 0, who: resolver,
             });
           } else if (msg.startsWith("final proof done")) {
             close("proof", p.passed ? "passed" : "failed");
           } else if (msg.startsWith("feedback applying")) {
             runs.push({
               id: `fb-${r.id}`, kind: "feedback", label: "feedback revision",
-              atMs: r.at_ms, outcome: "running", elapsedMs: 0, who: resolver, why: "", hasTape: true,
+              atMs: r.at_ms, outcome: "running", elapsedMs: 0, who: resolver,
             });
           } else if (msg.startsWith("feedback done")) {
             close("feedback", p.committed ? "committed" : "no change committed");
-          } else if (msg.startsWith("auto-submit queued") || msg.startsWith("PR submitted")) {
-            runs.push({
-              id: `pr-${r.id}`, kind: "pr", label: "PR stack submit", atMs: r.at_ms,
-              outcome: "submitted", elapsedMs: 0, who: "daemon", hasTape: false,
-              why: "Submitted through the forge's REST API — no terminal session, so there is no transcript to replay.",
-            });
-          } else if (p.phase === "commit_checks") {
-            // The gates that run inside this branch's own rebase. These are the
-            // one place the daemon records a command, an outcome and a measured
-            // duration together, so they are reported exactly as measured.
-            if (p.state === "started") {
-              runs.push({
-                id: `gate-${r.id}`, kind: "gate",
-                label: `${p.check_count || "?"} check gate${p.check_count === 1 ? "" : "s"}`,
-                atMs: r.at_ms, outcome: "running", elapsedMs: 0, who: "command", why: "", hasTape: false,
-              });
-            } else if (p.state === "passed" || p.state === "failed") {
-              const open = [...runs].reverse().find((x) => x.kind === "gate" && x.outcome === "running");
-              if (open) {
-                open.outcome = p.state;
-                open.elapsedMs = Number(p.elapsed_ms) || 0;
-                if (p.command) open.label = String(p.command);
-                open.why = "A check gate runs as a plain command inside the rebase, not under a tmux pane the board can replay. Its command, result and duration are recorded; its output is not.";
-              }
-            }
           }
-        }
-        // Post-merge gates run once over the merged stack rather than per
-        // branch. They still belong in this walk-back -- they are part of what
-        // happened to this change -- but their result is the stack's, not this
-        // branch's alone, and the entry says so.
-        for (const r of rows) {
-          const msg = r.message || "";
-          if (!msg.startsWith("review auto_build")) continue;
-          const cmd = (r.payload && r.payload.command) || "";
-          runs.push({
-            id: `gate-${r.id}`, kind: "gate", label: String(cmd) || "auto-build",
-            atMs: r.at_ms, outcome: msg.includes("succeeded") ? "passed" : "failed",
-            who: "command", hasTape: false, elapsedMs: 0,
-            why: "The daemon inferred and ran this build once the whole stack had merged — over the merged result, not inside this branch's own session, and with no pane the board can replay. Its command and result are recorded; its output is not.",
-          });
         }
         // One timeline, in the order things actually happened.
         runs.sort((x, y) => x.atMs - y.atMs);
@@ -690,18 +651,13 @@
         // Only the newest pass that used a tmux pane has content the live view
         // still holds: the pane is reused, so an earlier pass's text is no
         // longer in it. "Am I looking at live content" therefore keys on the
-        // newest *taped* run, not the newest run overall -- a gate or a PR
-        // submit happening afterwards does not make the resolver's session
-        // historical, and labelling it so while showing its live output was a
-        // straight contradiction.
-        let newestTape = -1;
-        for (let i = 0; i < runs.length; i++) if (runs[i].hasTape) newestTape = i;
         // Whether the pane still holds this run's text at all, separate from
-        // whether that text is still moving. A finished session's record is
-        // not "historical" in the sense the walk-back note means -- it is this
-        // run's own output, just no longer growing, and the liveness dot and
-        // the pane's own banner already say so.
-        const onNewestTape = !!run && run.hasTape && ri === newestTape;
+        // whether that text is still moving: the pane is reused between passes,
+        // so only the newest one's output is still in it. A finished session's
+        // record is not "historical" in the sense the walk-back note means --
+        // it is this run's own output, just no longer growing, and the liveness
+        // dot and the pane's own banner already say so.
+        const onNewestTape = !!run && ri === runs.length - 1;
         const live = onNewestTape && !ended;
 
         // 1 - who am I looking at, and is it still moving
@@ -718,7 +674,7 @@
             <button class="hnav" data-click="stepBranchRun" data-branch-id="${esc(b.id)}" data-dir="-1" ${ri <= 0 ? "disabled" : ""}
               data-tip="Step back to the previous run on this branch.">&#9664;</button>
             <button class="hpick" data-click="scopeReviewDockToBranch" data-guardian-id="${esc(g.id)}" data-branch-id="${esc(b.id)}"
-              data-tip="Every recorded run on this branch — rebases, final proofs, feedback revisions, PR submits, and the stack's post-merge gates.\nOpens the log drawer, where each run's own rows are listed.">
+              data-tip="Every agent session this branch ran — rebases, final proofs, feedback revisions.\nOpens the log drawer, where each run's own rows are listed, along with the PR submits and check gates that never had a session to replay.">
               <span class="hkind ${esc(run.kind)}">${esc(run.kind)}</span>
               <span class="hlabel mono">${esc(run.label)}</span>
               <span class="hmeta">${esc(runMeta(run))}</span>
@@ -728,10 +684,10 @@
             ${isLatest ? "" : `<button class="btn" style="padding:3px 8px;font-size:11px" data-click="jumpToLatestRun" data-branch-id="${esc(b.id)}"
               data-tip="Jump back to the newest run — the one still streaming.">&#8677; Latest</button>`}
           </div>
-          ${(onNewestTape || !run.hasTape) ? "" : `<div class="histnote">You are walked back to ${esc(run.label)}
+          ${onNewestTape ? "" : `<div class="histnote">You are walked back to ${esc(run.label)}
             from ${esc(runMeta(run))} — an earlier pass than the one the pane below holds.</div>`}`
-          : `<div class="histbar"><span class="hpick" data-tip="Runs appear here as the daemon records them — a rebase pass, a final proof, a feedback revision, a PR submit, a post-merge gate.\nThis branch has not produced one yet.">
-              <span class="hkind">no runs</span><span class="hmeta">nothing recorded for this branch yet</span></span></div>`;
+          : `<div class="histbar"><span class="hpick" data-tip="Sessions appear here as the daemon records them — a rebase pass, a final proof, a feedback revision.\nThis branch has not run one yet.">
+              <span class="hkind">no runs</span><span class="hmeta">no agent session recorded for this branch yet</span></span></div>`;
 
         // 3 - how it is rendered. Terminal-only controls, but they stay put on
         //     the prompt views rather than vanishing: appearing and disappearing
@@ -766,7 +722,7 @@
         const top = identity + histBar + ctl + tabs;
         if (sub === "system") return top + liveSystemPromptView(g, key);
         if (sub === "prompt") return top + livePromptView(g, b, run);
-        return top + liveTerminalView(g, b, key, run, ri === newestTape);
+        return top + liveTerminalView(g, b, key, run, onNewestTape);
       }
       /** @type {{[sub: string]: string}} What each Live sub-view shows. */
       const LIVE_SUB_TIP = {
@@ -793,15 +749,6 @@
               data-tip="Open this branch's log drawer alongside the transcript.">Logs</button>
             <span class="rg-sub">${run ? esc(run.who) : ""}</span>
           </div>`;
-        // A run the daemon recorded but kept no terminal text for still gets a
-        // shape -- "nothing was captured" is a fact about that run, not a
-        // broken pane, and the run's own result is still in the logs.
-        if (run && !run.hasTape) {
-          return `<div class="absent-run"><span class="ai">○</span>
-              <div class="abody"><div class="at">No transcript for this run</div>
-                <div class="as">${esc(run.why)}</div></div>
-            </div>${foot}`;
-        }
         if (!isLatest) {
           return `<div class="absent-run"><span class="ai">○</span>
               <div class="abody"><div class="at">This run's terminal text is no longer reachable</div>
@@ -1430,12 +1377,25 @@
       async function loadReviewDockEvents(gid) {
         try {
           const r = await fetch(`/api/cartographer?guardian_id=${encodeURIComponent(gid)}&limit=200`);
-          if (!r.ok) { reviewDockEvents[gid] = []; renderReviewDock(); return; }
+          if (!r.ok) { reviewDockEvents[gid] = []; afterReviewDockEvents(); return; }
           /** @type {{rows: CartographerRow[], total: number}} */
           const data = await r.json();
           reviewDockEvents[gid] = data.rows || [];
         } catch {
           reviewDockEvents[gid] = [];
         }
+        afterReviewDockEvents();
+      }
+      /**
+       * Repaints everything derived from the review's event rows once they land.
+       *
+       * The dock is no longer their only consumer: the Live tab's walk-back is
+       * derived from the same rows, and it is usually what triggers the fetch.
+       * Repainting only the dock left that tab showing "no runs" until some
+       * unrelated event happened to re-render the inspector.
+       * @returns {void}
+       */
+      function afterReviewDockEvents() {
         renderReviewDock();
+        renderReviewInspector();
       }

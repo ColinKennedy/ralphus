@@ -1526,8 +1526,12 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        * @returns {string}
        */
       function reviewRunGroup(control, note, rows, dim) {
+        // An empty note renders nothing at all rather than an empty span: what
+        // a section *is* belongs in its heading's tooltip, so these notes are
+        // reserved for state that changes (why a run is unavailable right now),
+        // and a standing description no longer takes a line of the pane.
         return `<div class="rungroup"${dim ? ' style="opacity:.5"' : ""}>
-            <div class="rg-head rg-run">${control}<span class="rg-note">${note}</span></div>
+            <div class="rg-head rg-run">${control}${note ? `<span class="rg-note">${note}</span>` : ""}</div>
             ${rows}
           </div>`;
       }
@@ -1700,10 +1704,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
               ${b.detail ? `<div class="kv-row" style="margin:0 0 4px"><span class="k" style="text-transform:none;letter-spacing:0">status</span><span class="v" style="font-size:12px">${detailSummary(b.detail, "Branch detail")}</span></div>` : ""}
               ${b.worktree ? `<div class="kv-row" style="margin:0"><span class="k" style="text-transform:none;letter-spacing:0">review worktree</span><span class="v mono hc-anchor" style="font-size:11px" data-card="gBranchWorktree" data-guardian-id="${esc(g.id)}" data-branch-id="${esc(b.id)}">${esc(b.worktree)}</span>${b.merge_status === "merged" ? ` ${mergedBranchBadge()}` : ""}</div>` : ""}
               ${(b.worktree || b.source_squad_id != null) ? `<div class="row" style="margin:2px 0 4px">${worktreeCellBtn(b, `${g.id}:${b.id}`)}</div>` : ""}
-              <div class="btn-row" style="margin-top:4px;position:relative;gap:0">${resolverTerminalBtns(g, b)}</div>
-              ${resolverPeekBox(g, b)}
               ${branchPrSection(g, b)}
-              ${open ? branchFeedbackSection(g, b) : ""}
             </div>` : "";
           // RAL-43: enable/disable toggle — staged like drag-reorder, takes effect on Save.
           const enableToggle = canReorder
@@ -1972,11 +1973,11 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
                 </div>${commandFullBlock(key, cmdText)}
                 ${needsInput && open ? `<div class="cmd-form">${renderCheckInputForm(g, "action", i, h)}</div>` : ""}`;
             }).join("");
-            return `<h3 class="section" data-tip="User-declared test actions from the task TOML [[review.action]] blocks.\nLabelled buttons give reviewers one-click access to targeted manual checks.">test actions${sectionMenuBtn(g.id, "actions")}</h3>
+            return `<h3 class="section" data-tip="User-declared test actions from the task TOML [[review.action]] blocks.\nAuthored by the task author, not generated — each runs in the built review worktree.\nLabelled buttons give reviewers one-click access to targeted manual checks.">test actions${sectionMenuBtn(g.id, "actions")}</h3>
               ${reviewRunGroup(
                 reviewRunControl(g, "actions", hints.some((h) => h.command && !(h.inputs && h.inputs.length)), "▶ Run all",
                   "Run every command-based test action, each in the built review worktree.\nActions needing input are skipped — run those from their own row."),
-                `Authored by the task author in <span class="mono">[[review.action]]</span>, not generated. Each runs in the built review worktree.`,
+                "",
                 rows)}`;
           })()}
           ${(() => {
@@ -2017,11 +2018,11 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
             const waitingNote = state === "generating"
               ? `Every enabled branch has rebased cleanly, and the resolver agent is writing these now.`
               : `Not generated yet. The resolver agent writes these once every enabled branch has rebased with no pending conflicts — this review is still collecting or rebasing.`;
-            return `<h3 class="section" data-tip="Shell commands suggested by the resolver agent to manually verify these changes.\nGenerated once when the review branch is rebuilt (or when the rebuilt stack's changes change), and re-generated on demand via Regenerate below.">manual checks${agentInspectBtn(g.id, "manual", "manual checks", g.manual_commands_agent || g.resolver_agent, g.manual_commands_model || g.resolver_model)}${sectionMenuBtn(g.id, "manual")}</h3>
+            return `<h3 class="section" data-tip="Shell commands suggested by the resolver agent to manually verify these changes.\nSuggested against this stack's changes and advisory — they never block Approve or Merge / rebase.\nGenerated once when the review branch is rebuilt (or when the rebuilt stack's changes change), and re-generated on demand from this section's ⋯ menu.">manual checks${agentInspectBtn(g.id, "manual", "manual checks", g.manual_commands_agent || g.resolver_agent, g.manual_commands_model || g.resolver_model)}${sectionMenuBtn(g.id, "manual")}</h3>
               ${isReady && cmds.length
                 ? reviewRunGroup(
                   runControl,
-                  `Suggested by the resolver agent against this stack's changes. Advisory — they never block Approve or Merge / rebase.`,
+                  "",
                   cmds.map((cmd, i) => {
                       const cmdText = cmd.command || "";
                       const key = `${g.id}:manual:${i}`;
@@ -2041,26 +2042,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
                         ${needsInput && open ? `<div class="cmd-form">${renderCheckInputForm(g, "manual", i, cmd)}</div>` : ""}`;
                     }).join(""))
                 : reviewRunGroup(runControl, waitingNote, "")}
-              <div class="btn-row" style="margin-top:6px;position:relative;gap:0">${manualChecksTerminalBtns(g)}</div>
-              ${(() => {
-                // RAL-520: on-demand regeneration with optional reviewer
-                // steering. Advisory like every post-merge job -- it can be
-                // disabled while a post-merge job is running, but it never
-                // gates or blocks Merge / rebase.
-                const regenPending = pendingMergeActions.has(`${g.id}:regen`);
-                const regenBusy = regenPending || g.post_merge_status === "running";
-                const regenTip = regenPending
-                  ? "The regenerate request has been sent — waiting for the daemon to confirm."
-                  : g.post_merge_status === "running"
-                    ? "A post-merge job (check gates or manual-checks generation) is already running — wait for it to finish, then regenerate.\nThis never blocks Merge / rebase, which is unaffected by post-merge state."
-                    : "Ask the resolver agent to write the manual checks again, against the review branch's current changes.\nThe optional text field steers what the regenerated checks cover (e.g. \"focus on the CLI flags\"); leave it empty to keep the same coverage.\nRuns in the background and is advisory: it never blocks Approve, PR submission, or Merge / rebase.";
-                const regenBtn = regenBusy
-                  ? `<button class="btn" disabled>${regenPending ? "Regenerating…" : "↻ Regenerate"}</button>`
-                  : `<button class="btn" data-click="regenManualChecks" data-guardian-id="${esc(g.id)}" data-tip="${regenTip}">↻ Regenerate</button>`;
-                const focusInput = `<input id="manual-focus-${esc(g.id)}" type="text" style="flex:1;min-width:0;font-size:12px;padding:4px 6px" placeholder="optional focus — what should the regenerated checks cover?" value="${esc(g.manual_checks_focus || "")}" data-tip="Steering text for the next manual-checks regeneration, folded into the generation agent's prompt.\nOptional — leave empty to regenerate with the same coverage.\nRemembered on the review until the next regeneration.">`;
-                return `<div class="btn-row" style="margin-top:4px;gap:4px">${regenBusy ? `<span data-tip="${regenTip}">${regenBtn}</span>` : regenBtn}${focusInput}</div>`;
-              })()}
-              ${manualChecksPeekBox(g)}`;
+              `;
           })()}`;
         attachPeekResizeHandlers();
         restorePeekScrollPositions(); // RAL-471: the innerHTML rewrite above just destroyed/recreated any peek `<pre>` nodes, dropping their scroll position
@@ -2376,35 +2358,6 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        */
       function stripRoute(t) { return t.replace(/<route\s[^>]*>[\s\S]*?<\/route>/g, '').trim(); }
       /**
-       * The first line of a (possibly multi-line) message body.
-       * @param {string} t
-       * @returns {string}
-       */
-      function firstLine(t) { return t.split("\n")[0]; }
-      /**
-       * Maps a feedback message's `action_status` (RAL-380) to the marker
-       * shown in its chat bubble (RAL-446): an eye once ralphus has seen the
-       * feedback and started acting on it, a checkmark or x-mark once that
-       * action reaches a terminal outcome, and a distinct fourth icon when a
-       * newer message on the same branch superseded it before it finished.
-       * `None`/unrecognized status (e.g. a guardian-role message) renders
-       * nothing.
-       * @param {ChatMessage} m
-       * @returns {string}
-       */
-      function actionStatusMarker(m) {
-        let icon = "";
-        let label = "";
-        switch (m.action_status) {
-          case "received": icon = "\u{1F441}️"; label = "Seen — ralphus has started applying this feedback."; break;
-          case "done": icon = "✅"; label = "Done — this feedback was applied successfully."; break;
-          case "failed": icon = "❌"; label = "Failed — applying this feedback did not succeed."; break;
-          case "superseded": icon = "\u{1F504}"; label = "Superseded — a newer feedback message arrived on this branch before this one finished, so its outcome (if any) is stale."; break;
-          default: return "";
-        }
-        return `<span class="chat-status" data-tip="${esc(label)}">${icon}</span>`;
-      }
-      /**
        * Fetches and caches one review branch's read-only feedback thread (RAL-272), re-rendering unless `opts.silent`.
        * @param {string} gid
        * @param {string} bid
@@ -2446,49 +2399,6 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         // The same bubbles render in the inspector's Feedback tab, which is its
         // own pane -- without this, expanding one there did nothing visible.
         renderReviewInspector();
-      }
-      /**
-       * Renders one review branch's read-only feedback thread (RAL-272):
-       * lazily loads it into `branchMessages` on first render, then shows
-       * either the collapsed message bubbles or a "No feedback yet" placeholder.
-       * @param {GuardianView} g
-       * @param {GuardianBranch} b
-       * @returns {string}
-       */
-      function branchFeedbackSection(g, b) {
-        const key = `${g.id}:${b.id}`;
-        if (branchMessages[key] === undefined) loadBranchMessages(g.id, b.id);
-        const msgs = branchMessages[key] || [];
-        if (msgs.length === 0) {
-          return `<div class="empty" style="margin-top:8px" data-tip="This branch has no feedback yet, so its thread stays hidden until it does.\nGive feedback from the CLI: ralphus review feedback <selector> <text>\nThe reviewer's message and the guardian's short acknowledgment both appear here, read-only, once given.">No feedback yet</div>`;
-        }
-        const thread = msgs.map((m) => {
-          const isUser = m.role === "reviewer";
-          const bubbleKey = `${key}:${m.seq}`;
-          const text = stripRoute(m.text);
-          const expanded = expandedChatBubbles.has(bubbleKey);
-          const shown = expanded ? text : firstLine(text);
-          // RAL-89: datetime the message was sent (reviewer) or received (guardian).
-          const tStr = fmtMsgTime(m.at_ms);
-          const ts = tStr
-            ? `<span class="chat-time" data-tip="When this message was ${isUser ? "sent" : "received"} (${esc(fmtMsgTimeFull(m.at_ms))}, your local time).">${esc(tStr)}</span>`
-            : "";
-          const expandBtn = text.includes("\n")
-            ? `<button class="chat-expand-btn" data-click="toggleChatBubble" data-key="${esc(bubbleKey)}" data-tip="${expanded ? "Collapse this message back to its first line." : "Expand to show the full message."}">${expanded ? "−" : "+"}</button>`
-            : "";
-          // RAL-379: only the attributed author is ever shown here -- the
-          // authenticated submitter (who may differ, e.g. an assistant
-          // posting on someone else's behalf) is audit-only and never
-          // rendered in the UI.
-          const label = isUser ? (m.author || "you") : "guardian";
-          const status = actionStatusMarker(m);
-          return `<div class="chat-msg chat-bubble-wrap ${isUser ? "user" : "guardian"}"><div>
-              <div class="chat-label"${isUser ? ' style="text-align:right"' : ""}>${esc(label)}${ts}${status}</div>
-              <div class="chat-bubble">${esc(shown)}${expandBtn}</div>
-            </div></div>`;
-        }).join("");
-        return `<h3 class="section" style="display:flex;align-items:center;gap:6px;margin-top:8px">branch feedback <button class="copy-btn" data-tip="Copy this branch's feedback thread to clipboard.\nChoose Markdown for readable text or JSON for raw data." data-click="showChatCopyMenu" data-guardian-id="${esc(g.id)}" data-branch-id="${esc(b.id)}">⧉</button></h3>
-          <div style="max-height:260px;overflow-y:auto;border:1px solid var(--border);border-radius:8px;padding:8px;background:var(--bg)">${thread}</div>`;
       }
       /**
        * Opens the "copy chat as" (Markdown/JSON) menu for one branch's feedback thread.
