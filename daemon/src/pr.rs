@@ -12933,6 +12933,46 @@ mod tests {
     }
 
     #[test]
+    fn auto_fix_last_outcome_serializes_to_the_exhausted_sentinel_the_board_checks() {
+        // RAL-537: the board's per-worktree-chip badge checks
+        // `auto_fix_last_outcome === "exhausted"` on an open PR's serialized
+        // JSON -- pin the exact field name and string value here so a
+        // rename/refactor of `set_pr_auto_fix_outcome` breaks a test instead
+        // of silently breaking the badge.
+        let s = store();
+        let gid = s.create_guardian("demo", "main", "/repo").unwrap();
+        s.add_guardian_branch(&gid, "a").unwrap();
+        let branch_id = s.get_guardian(&gid).unwrap().branches[0].id.clone();
+        let pr_id = s
+            .create_pull_request(
+                &gid,
+                Some(&branch_id),
+                "github",
+                "acme/w",
+                "a",
+                "main",
+                "A",
+                "",
+                Some(1),
+                None,
+            )
+            .unwrap();
+
+        let before = s.get_pull_request(&pr_id).unwrap();
+        let before_json = serde_json::to_value(&before).unwrap();
+        assert_eq!(
+            before_json["auto_fix_last_outcome"],
+            serde_json::Value::Null
+        );
+
+        s.set_pr_auto_fix_outcome(&pr_id, "exhausted").unwrap();
+        let after = s.get_pull_request(&pr_id).unwrap();
+        let after_json = serde_json::to_value(&after).unwrap();
+        assert_eq!(after_json["auto_fix_last_outcome"], "exhausted");
+        assert_eq!(after_json["state"], "open");
+    }
+
+    #[test]
     fn guardian_ids_with_open_pull_requests_only_returns_guardians_with_a_numbered_open_pr() {
         let s = store();
         let with_pr = s.create_guardian("has-pr", "main", "/repo").unwrap();
