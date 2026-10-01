@@ -139,11 +139,38 @@
         toggleReviewCommandFull: (e, ds) => toggleReviewCommandFull(ds.key || ""),
         toggleBranch: (e, ds) => toggleBranch(e, ds.guardianId || "", ds.branchId || ""),
       };
-      document.addEventListener("dblclick", (/** @type {MouseEvent} */ e) => {
+      /**
+       * The last row a `data-dblclick` click landed on, and when.
+       * @type {{id: string, at: number}}
+       */
+      let lastDblCandidate = { id: "", at: 0 };
+      /** How long after the first click a second one still counts as a double. */
+      const DBLCLICK_WINDOW_MS = 450;
+      /**
+       * Handles the second click of a double-click on a `data-dblclick` row.
+       *
+       * The browser's own `dblclick` event is unusable here: these rows act on
+       * their *first* click too (select the command, inspect the branch), and
+       * that action re-renders the pane, replacing the row's DOM node. The two
+       * clicks then land on different elements, which is precisely the case a
+       * browser refuses to call a double-click -- so no `dblclick` ever fires.
+       * Pairing the clicks by the row's identity instead of its node survives
+       * the node being swapped underneath.
+       * @param {MouseEvent} e - The click being considered.
+       * @returns {boolean} Whether this click was consumed as a double-click.
+       */
+      function handledAsDoubleClick(e) {
         const el = /** @type {HTMLElement|null} */ (/** @type {HTMLElement} */ (e.target).closest("[data-dblclick]"));
-        if (!el || !el.dataset.dblclick) return;
+        if (!el || !el.dataset.dblclick) { lastDblCandidate = { id: "", at: 0 }; return false; }
+        const id = `${el.dataset.dblclick}|${el.dataset.key || ""}|${el.dataset.branchId || ""}`;
+        const now = Date.now();
+        if (lastDblCandidate.id !== id || now - lastDblCandidate.at > DBLCLICK_WINDOW_MS) {
+          lastDblCandidate = { id, at: now };
+          return false;
+        }
+        lastDblCandidate = { id: "", at: 0 };
         const handler = DBLCLICK_HANDLERS[el.dataset.dblclick];
-        if (!handler) return;
+        if (!handler) return false;
         // A double-click leaves the word under the pointer selected. Left alone
         // that selection is page-wide state: `userIsSelecting()` suppresses
         // every later background re-render while it stands, so a row opened
@@ -152,7 +179,8 @@
         const sel = window.getSelection();
         if (sel) sel.removeAllRanges();
         handler(e, el.dataset);
-      }, true);
+        return true;
+      }
       /** @type {{[action: string]: DelegatedHandler}} */
       const CTX_HANDLERS = {
         openSquadMenu: (e, ds) => openSquadMenu(e, ds.squadId || ""),
@@ -322,6 +350,9 @@
       CLICK_HANDLERS.forceDeleteAgentProfile = (e, ds) => forceDeleteAgentProfile(ds.name || "");
       CLICK_HANDLERS.removeAgentProfileEnvRow = (e, ds) => removeAgentProfileEnvRow(Number(ds.i));
       document.addEventListener("click", (/** @type {MouseEvent} */ e) => {
+        // The second click of a double-click opens the row instead of running
+        // its ordinary action again -- the first click already selected it.
+        if (handledAsDoubleClick(e)) return;
         const el = /** @type {HTMLElement|null} */ (/** @type {HTMLElement} */ (e.target).closest("[data-click]"));
         if (!el || !el.dataset.click) return;
         const handler = CLICK_HANDLERS[el.dataset.click];
