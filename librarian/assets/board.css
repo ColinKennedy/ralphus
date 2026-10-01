@@ -573,6 +573,16 @@
       .rg-note { font-size: 11.5px; color: var(--muted); line-height: 1.5; }
       .rg-head.rg-run { display: flex; align-items: center; gap: 10px; }
       .rg-head.rg-run .rg-note { flex: 1; min-width: 0; }
+      .rg-runbtn { flex: none; padding: 4px 12px; font-size: 12px; font-weight: 600; }
+      /* Check gates have no manual trigger — the daemon runs them after each
+         merge commit — so their slot carries when-it-runs rather than a button
+         that would do nothing. Same position, same rhythm, no false affordance. */
+      .rg-when {
+        flex: none; font-size: 10.5px; text-transform: uppercase; letter-spacing: .5px;
+        font-weight: 700; color: var(--cancelled); background: var(--bg);
+        border: 1px solid var(--border); border-radius: 20px; padding: 3px 10px; cursor: help;
+      }
+      .rg-warn { color: var(--unverified); }
       /* Per-command run control. The commands used to be hidden behind a ▾
          dropdown, so you could run them all or go hunting; they are rows now,
          each with its own run. */

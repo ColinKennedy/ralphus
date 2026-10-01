@@ -1473,6 +1473,47 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         return root.split(/[\\/]/).filter(Boolean).pop() || "—";
       }
       /**
+       * The frame every runnable section wears: a header carrying the section's
+       * run control and what its commands promise, then its rows.
+       *
+       * One frame for all three so a section reads the same whether it is
+       * populated, waiting, or empty. Previously each state produced quite
+       * different furniture -- a row of chips, a lone coloured chip, a bare
+       * disabled button with a stray "Show Live View" beside it -- which is why
+       * a review with nothing generated yet looked like a different, older page.
+       * @param {string} control - The run control: a button, or a badge when the section has nothing to trigger.
+       * @param {string} note - One line on what these commands are and when they run.
+       * @param {string} rows - The section's command rows, or "".
+       * @param {boolean} [dim] - Render muted, for a section whose commands are currently skipped.
+       * @returns {string}
+       */
+      function reviewRunGroup(control, note, rows, dim) {
+        return `<div class="rungroup"${dim ? ' style="opacity:.5"' : ""}>
+            <div class="rg-head rg-run">${control}<span class="rg-note">${note}</span></div>
+            ${rows}
+          </div>`;
+      }
+      /**
+       * The split run control shared by the sections that can actually trigger
+       * their commands. `kind` picks the run-all action; the ▾ half opens the
+       * section's own menu so one command can be run instead of all of them.
+       * @param {GuardianView} g - The review.
+       * @param {string} kind - "manual" or "actions".
+       * @param {boolean} enabled - Whether running is possible right now.
+       * @param {string} label - Button text, which carries the gating reason when disabled.
+       * @param {string} tip - Tooltip explaining what pressing it does, or why it cannot be pressed.
+       * @returns {string}
+       */
+      function reviewRunControl(g, kind, enabled, label, tip) {
+        const action = kind === "manual" ? "runAllManualChecks" : "runAllActionHints";
+        const btn = `<button class="btn primary rg-runbtn" ${enabled ? "" : "disabled"} `
+          + `data-click="${action}" data-guardian-id="${esc(g.id)}"${enabled ? ` data-tip="${esc(tip)}"` : ""}>${esc(label)}</button>`;
+        // A disabled <button> swallows mouseover, so its tooltip has to live on
+        // a wrapper -- same reason the merge/approve buttons do this.
+        return enabled ? btn : `<span data-tip="${esc(tip)}">${btn}</span>`;
+      }
+
+      /**
        * Builds one chip for the setup strip.
        * @param {string} gid - The review this chip edits.
        * @param {string} label - Short uppercase key, e.g. "onto".
@@ -1691,34 +1732,40 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         // then one row per command. Previously a row of wrapping chips for the
         // configured case and a lone coloured chip for every other case, which
         // gave four quite different situations the same undifferentiated shape.
-        const gateHeader = (/** @type {string} */ note) => `<div class="rg-head"><span class="rg-note">${note}</span></div>`;
+        // Check gates wear the same frame as the other runnable sections.
+        // Their run slot is a badge, not a button: gates fire automatically
+        // after each merge commit and the daemon exposes no route to trigger
+        // one by hand, so a button here would be a lie.
+        const gateBadge = (/** @type {string} */ text, /** @type {string} */ tip) =>
+          `<span class="rg-when" data-tip="${esc(tip)}">${esc(text)}</span>`;
+        const gateRow = (/** @type {string} */ cmd, /** @type {number} */ i, /** @type {string} */ icon, /** @type {string} */ iconTip, /** @type {string} */ iconColor) =>
+          `<div class="cmd-row">
+            <span class="cmd-lock"${iconColor ? ` style="color:${iconColor}"` : ""} data-tip="${esc(iconTip)}">${icon}</span>
+            <span class="cmd-text mono" data-tip="${esc(cmd)}">${esc(cmd)}</span>
+            <button class="section-menu" data-click="openReviewCommandMenu" data-guardian-id="${esc(g.id)}" data-kind="gate" data-i="${i}" data-cmd="${esc(cmd)}" data-tip="Actions for this gate — show it in full, copy it, or open the review's log.">⋯</button>
+          </div>`;
         const checks = gChecks.length
-          ? `<div class="rungroup"${g.skip_auto_build ? ' style="opacity:.45"' : ""}>
-              ${gateHeader(`All ${gChecks.length} must pass before this review can be approved. They run after each merge commit and on the combined worktree.${
-                g.skip_auto_build ? " <b>Skip auto-build is on, so these are skipped.</b>" : ""}`)}
-              ${gChecks.map((c, i) => `
-                <div class="cmd-row">
-                  <span class="cmd-lock" data-tip="Check gate — runs after each merge commit and on the combined review worktree.\nAll gates must pass before the review can be approved.">🔒</span>
-                  <span class="cmd-text mono" data-tip="${esc(c)}">${esc(c)}</span>
-                  <button class="section-menu" data-click="openReviewCommandMenu" data-guardian-id="${esc(g.id)}" data-kind="gate" data-i="${i}" data-cmd="${esc(c)}" data-tip="Actions for this gate — show it in full, copy it, or open the review's log.">⋯</button>
-                </div>`).join("")}
-            </div>`
+          ? reviewRunGroup(
+            gateBadge("runs after merge", "Check gates are run by the daemon after each merge commit and on the combined worktree. There is no way to trigger one by hand from here."),
+            `All ${gChecks.length} must pass before this review can be approved.${
+              g.skip_auto_build ? " <b>Skip auto-build is on, so these are skipped.</b>" : ""}`,
+            gChecks.map((c, i) => gateRow(c, i, "🔒", "Check gate — runs after each merge commit and on the combined review worktree.\nAll gates must pass before the review can be approved.", "")).join(""),
+            !!g.skip_auto_build)
           : autoBuiltCmd
-            ? `<div class="rungroup">
-                ${gateHeader(`No gates were configured, so a build was inferred and run once the stack merged — sourced from ${esc(autoBuildMatch ? autoBuildMatch.source : "")}. Nothing to do.`)}
-                <div class="cmd-row">
-                  <span class="cmd-lock" style="color:var(--done)" data-tip="This command was inferred and run automatically, so 'in review' still means the code builds even with no gates configured.">🔧</span>
-                  <span class="cmd-text mono" data-tip="${esc(autoBuiltCmd)}">${esc(autoBuiltCmd)}</span>
-                  <button class="section-menu" data-click="openReviewCommandMenu" data-guardian-id="${esc(g.id)}" data-kind="gate" data-i="0" data-cmd="${esc(autoBuiltCmd)}" data-tip="Actions for this command — show it in full, copy it, or open the review's log.">⋯</button>
-                </div>
-              </div>`
-            : `<div class="absent-note${g.skip_auto_build ? " warn" : ""}" data-tip="${esc(g.skip_auto_build
-                ? "No gates are configured and skip auto-build is on, so nothing verifies this review at all. It can reach 'in review' — and be approved — without a single build or test having run.\nAdd a gate in Setup, or set [review] auto_build in the project's .ralphus.toml."
-                : "No gates are configured, so the daemon infers a build command from the diff once the stack finishes merging. Until that runs, nothing has verified this review.\nAdd explicit gates in Setup to decide what must pass instead.")}">
-                ${g.skip_auto_build
-                  ? `<b>Nothing verifies this review.</b> No check gates, and skip auto-build is on — it can reach <i>in review</i> and be approved without a build or test having run.`
-                  : `No check gates configured. A build is inferred from the diff once the stack finishes merging.`}
-              </div>`;
+            ? reviewRunGroup(
+              gateBadge("auto-built", `No gates were configured, so this build command was inferred and run once the stack merged — sourced from ${autoBuildMatch ? autoBuildMatch.source : ""}.`),
+              `No gates configured, so a build was inferred and run once the stack merged. Nothing to do.`,
+              gateRow(autoBuiltCmd, 0, "🔧", "Inferred and run automatically, so 'in review' still means the code builds even with no gates configured.", "var(--done)"))
+            : reviewRunGroup(
+              gateBadge(g.skip_auto_build ? "nothing runs" : "after merge",
+                g.skip_auto_build
+                  ? "No gates, and skip auto-build is on — nothing verifies this review at any point."
+                  : "The daemon infers a build command from the diff once the stack finishes merging."),
+              g.skip_auto_build
+                ? `<b class="rg-warn">Nothing verifies this review.</b> No check gates, and skip auto-build is on — it can reach <i>in review</i> and be approved without a build or test having run. Add a gate in Setup, or set <span class="mono">[review] auto_build</span> in the project's <span class="mono">.ralphus.toml</span>.`
+                : `No check gates configured. A build is inferred from the diff once the stack finishes merging — until then, nothing has verified this review.`,
+              "")
+;
         // RAL-410 moved skip-auto-build/skip-per-branch-worktrees, squash,
         // resolver agent/model and proof scope into the "Edit Details" modal
         // but left a column of read-only kv-rows behind for them. Those now
@@ -1844,10 +1891,11 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
             // is the difference between a missing feature and a missing input.
             if (hints.length === 0) {
               return `<h3 class="section" data-tip="User-declared test actions from the task TOML [[review.action]] blocks.\nLabelled buttons give reviewers one-click access to targeted manual checks.">test actions <span class="k" style="text-transform:none;letter-spacing:0">— none</span>${sectionMenuBtn(g.id, "actions")}</h3>
-                <div class="absent-note" data-tip="Test actions are authored, not generated: add [[review.action]] blocks to the task file and each becomes a labelled, one-click check here.\nThis is different from Manual checks below, which the resolver agent writes for you.">
-                  No test actions declared. Add <span class="mono">[[review.action]]</span> blocks to the
-                  task file to put one-click checks here.
-                </div>`;
+                ${reviewRunGroup(
+                  reviewRunControl(g, "actions", false, "▶ Run all",
+                    "There are no test actions to run. They are authored, not generated — add [[review.action]] blocks to the task file and each becomes a one-click check here."),
+                  `None declared. Test actions are authored in <span class="mono">[[review.action]]</span> blocks in the task file — unlike manual checks below, which the resolver agent writes for you.`,
+                  "")}`;
             }
             // Same command-list shape as check gates and manual checks. A
             // labelled button alone hid what the action would actually run,
@@ -1879,10 +1927,11 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
                 ${needsInput && open ? `<div class="cmd-form">${renderCheckInputForm(g, "action", i, h)}</div>` : ""}`;
             }).join("");
             return `<h3 class="section" data-tip="User-declared test actions from the task TOML [[review.action]] blocks.\nLabelled buttons give reviewers one-click access to targeted manual checks.">test actions${sectionMenuBtn(g.id, "actions")}</h3>
-              <div class="rungroup">
-                <div class="rg-head"><span class="rg-note">Authored by the task author in <span class="mono">[[review.action]]</span>, not generated. Each runs in the built review worktree.</span></div>
-                ${rows}
-              </div>`;
+              ${reviewRunGroup(
+                reviewRunControl(g, "actions", hints.some((h) => h.command && !(h.inputs && h.inputs.length)), "▶ Run all",
+                  "Run every command-based test action, each in the built review worktree.\nActions needing input are skipped — run those from their own row."),
+                `Authored by the task author in <span class="mono">[[review.action]]</span>, not generated. Each runs in the built review worktree.`,
+                rows)}`;
           })()}
           ${(() => {
             // RAL-103: checks_state is "ready" (commands available), "generating"
@@ -1913,16 +1962,21 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
               : state === "generating"
                 ? "Generating suggested manual check commands now — every enabled branch has finished rebasing cleanly and the resolver agent is producing them.\nThis button enables once they're ready."
                 : "Manual checks aren't generated yet — they're only produced after every enabled branch in this review has finished rebasing with no pending conflicts.\nStill collecting or rebasing branches.";
-            const label = isReady ? "▶ Run all" : (state === "generating" ? "▶ Generating…" : "▶ Waiting on branches…");
-            const runAllBtn = `<button class="btn primary" ${isReady ? "" : "disabled"} data-click="runAllManualChecks" data-guardian-id="${esc(g.id)}" style="${cmds.length > 1 && isReady ? 'border-radius:6px 0 0 6px' : ''}"${isReady ? ` data-tip="${gateTip}"` : ""}>${label}</button>`;
+            const label = isReady ? "▶ Run all" : (state === "generating" ? "▶ Generating…" : "▶ Run all");
+            const runControl = reviewRunControl(g, "manual", isReady && !!cmds.length, label, gateTip);
+            // What the section says about itself while it has nothing to show.
+            // It used to be a lone disabled button labelled "Waiting on
+            // branches…" with a stray Live View button beside it, which read
+            // as a different, older widget than the populated case.
+            const waitingNote = state === "generating"
+              ? `Every enabled branch has rebased cleanly, and the resolver agent is writing these now.`
+              : `Not generated yet. The resolver agent writes these once every enabled branch has rebased with no pending conflicts — this review is still collecting or rebasing.`;
             return `<h3 class="section" data-tip="Shell commands suggested by the resolver agent to manually verify these changes.\nGenerated once when the review branch is rebuilt (or when the rebuilt stack's changes change), and re-generated on demand via Regenerate below.">manual checks${agentInspectBtn(g.id, "manual", "manual checks", g.manual_commands_agent || g.resolver_agent, g.manual_commands_model || g.resolver_model)}${sectionMenuBtn(g.id, "manual")}</h3>
               ${isReady && cmds.length
-                ? `<div class="rungroup">
-                    <div class="rg-head rg-run">
-                      ${runAllBtn}
-                      <span class="rg-note">Suggested by the resolver agent against this stack's changes. Advisory — they never block Approve or Merge / rebase.</span>
-                    </div>
-                    ${cmds.map((cmd, i) => {
+                ? reviewRunGroup(
+                  runControl,
+                  `Suggested by the resolver agent against this stack's changes. Advisory — they never block Approve or Merge / rebase.`,
+                  cmds.map((cmd, i) => {
                       const cmdText = cmd.command || "";
                       const key = `${g.id}:manual:${i}`;
                       const needsInput = !!(cmd.inputs && cmd.inputs.length);
@@ -1937,12 +1991,9 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
                           <button class="section-menu" data-click="openReviewCommandMenu" data-guardian-id="${esc(g.id)}" data-kind="manual" data-i="${i}" data-cmd="${esc(cmdText)}" data-tip="Actions for this check — show it in full, copy it, or open the review's log.">⋯</button>
                         </div>
                         ${needsInput && open ? `<div class="cmd-form">${renderCheckInputForm(g, "manual", i, cmd)}</div>` : ""}`;
-                    }).join("")}
-                  </div>`
-                : `<div class="btn-row" style="position:relative;gap:0">
-                    <span data-tip="${gateTip}">${runAllBtn}</span>
-                  </div>`}
-              <div class="btn-row" style="margin-top:4px;position:relative;gap:0">${manualChecksTerminalBtns(g)}</div>
+                    }).join(""))
+                : reviewRunGroup(runControl, waitingNote, "")}
+              <div class="btn-row" style="margin-top:6px;position:relative;gap:0">${manualChecksTerminalBtns(g)}</div>
               ${(() => {
                 // RAL-520: on-demand regeneration with optional reviewer
                 // steering. Advisory like every post-merge job -- it can be
@@ -3101,6 +3152,30 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        */
       async function runActionHint(id, index) {
         await guardianAction(`/api/guardians/${id}/run-action-hint`, { index });
+      }
+      /**
+       * Runs every command-based test action for a review, in declaration
+       * order. There is no run-all route for action hints the way there is for
+       * manual checks (`/run-manual-commands`), so this fans out over the
+       * per-index one. Prompt-based hints are skipped: they expand through the
+       * resolver LLM before running and that path is not wired up, so firing
+       * them would fail server-side rather than do nothing.
+       * @param {string} id - The review id.
+       * @returns {Promise<void>}
+       */
+      async function runAllActionHints(id) {
+        const g = guardians.find((x) => x.id === id);
+        if (!g) return;
+        const runnable = (g.action_hints || [])
+          .map((h, i) => ({ h: h, i: i }))
+          .filter((x) => !!x.h.command && !(x.h.inputs && x.h.inputs.length));
+        if (!runnable.length) {
+          notify("info", "No test actions can be run without filling in their inputs first.");
+          return;
+        }
+        for (const x of runnable) {
+          await guardianAction(`/api/guardians/${id}/run-action-hint`, { index: x.i });
+        }
       }
 
       // ---------- structured check inputs (RAL-164) ----------
