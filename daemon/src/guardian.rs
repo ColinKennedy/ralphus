@@ -159,6 +159,10 @@ pub struct GuardianArtifact {
     pub readiness_command: Option<String>,
     #[serde(default)]
     pub executable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_os: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_arch: Option<String>,
 }
 
 /// This review's own declared build step (RAL-342), authored via

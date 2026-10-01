@@ -277,7 +277,6 @@ pub const REVIEW_KEYS: &[&str] = &[
     "match_pr_branch_name",
     "separate_pr_branch",
     "dual_root_pr",
-    "auto_build",
     "auto_fix_pr_errors",
     "auto_fix_prompt_template",
     "discourage_tests_during_auto_pull_request_fixes",
@@ -330,6 +329,8 @@ const REVIEW_ARTIFACT_KEYS: &[&str] = &[
     "shared_path",
     "readiness_command",
     "executable",
+    "target_os",
+    "target_arch",
 ];
 const AUTO_BUILD_KEYS: &[&str] = &[
     "command",
@@ -2521,6 +2522,27 @@ fn validate_review_action_array(value: Option<&toml::Value>, path: &str, ctx: &m
 
         validate_preparation_array(table.get("prepare"), &format!("{apath}.prepare"), ctx);
         validate_review_artifact_array(table.get("artifact"), &format!("{apath}.artifact"), ctx);
+        if table.get("run_on").and_then(toml::Value::as_str) == Some("review_machine")
+            && table
+                .get("artifact")
+                .and_then(toml::Value::as_array)
+                .is_some_and(|artifacts| {
+                    artifacts.iter().any(|artifact| {
+                        artifact
+                            .as_table()
+                            .and_then(|value| value.get("placement"))
+                            .and_then(toml::Value::as_str)
+                            == Some("copy")
+                    })
+                })
+        {
+            ctx.error(
+                &format!("{apath}.run_on"),
+                ErrorKind::ConflictingKeys,
+                "an action with copied artifacts runs on the daemon; use retain or shared for review_machine",
+                None,
+            );
+        }
 
         validate_review_action_input_array(table.get("input"), &format!("{apath}.input"), ctx);
     }
@@ -2569,6 +2591,18 @@ fn validate_review_artifact_array(value: Option<&toml::Value>, path: &str, ctx: 
             check_type(ctx, table, key, Ty::Str, &artifact_path, None);
         }
         check_type(ctx, table, "executable", Ty::Bool, &artifact_path, None);
+        check_type(ctx, table, "target_os", Ty::Str, &artifact_path, None);
+        check_type(ctx, table, "target_arch", Ty::Str, &artifact_path, None);
+        if table.get("executable").and_then(toml::Value::as_bool) == Some(true)
+            && (table.get("target_os").is_none() || table.get("target_arch").is_none())
+        {
+            ctx.error(
+                &artifact_path,
+                ErrorKind::MissingRequired,
+                "executable artifacts require 'target_os' and 'target_arch' so readiness cannot cross an incompatible platform",
+                None,
+            );
+        }
         let source = table.get("source").and_then(toml::Value::as_str);
         if source.is_none() {
             ctx.error(
@@ -5489,32 +5523,118 @@ project = "ralphus"
     }
 
     #[test]
-    fn review_auto_build_command_form_is_valid() {
+    fn review_auto_build_command_form_is_now_unknown() {
         let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\n[[review.auto_build]]\ncommand=\"cargo build\"\n";
         assert!(
-            validate_toml(src).is_ok(),
-            "{:?}",
-            validate_toml(src).errors
+            validate_toml(src)
+                .errors
+                .iter()
+                .any(|error| error.kind == ErrorKind::UnknownKey)
         );
     }
 
     #[test]
-    fn review_auto_build_agent_form_is_valid() {
+    fn review_auto_build_agent_form_is_now_unknown() {
         let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\n[[review.auto_build]]\nprompt=\"build it\"\nsystem_prompt=\"be terse\"\nsystem_prompt_position=\"append\"\nagent=\"claude-code\"\nmodel=\"sonnet\"\n";
         assert!(
-            validate_toml(src).is_ok(),
-            "{:?}",
-            validate_toml(src).errors
+            validate_toml(src)
+                .errors
+                .iter()
+                .any(|error| error.kind == ErrorKind::UnknownKey)
         );
     }
 
     #[test]
-    fn review_skip_auto_build_alone_is_valid() {
+    fn review_skip_auto_build_is_now_unknown() {
         let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nskip_auto_build=true\n";
         assert!(
-            validate_toml(src).is_ok(),
-            "{:?}",
-            validate_toml(src).errors
+            validate_toml(src)
+                .errors
+                .iter()
+                .any(|error| error.kind == ErrorKind::UnknownKey)
+        );
+    }
+
+    #[test]
+    fn review_preparation_and_copy_artifact_are_valid() {
+        let src = r#"
+[[task]]
+name = "t"
+[[task.cell]]
+cwd = "/r"
+prompt = "p"
+review = "<<review:r>>"
+[[review]]
+id = "r"
+[[review.prepare]]
+command = "cargo build"
+[[review.action]]
+label = "Run build"
+command = "staged/app"
+description = "Exercise the prepared binary"
+success = "It prints PASS"
+[[review.action.artifact]]
+source = "target/debug/app"
+destination = "staged/app"
+placement = "copy"
+executable = true
+target_os = "windows"
+target_arch = "x86_64"
+"#;
+        let report = validate_toml(src);
+        assert!(report.is_ok(), "{:?}", report.errors);
+    }
+
+    #[test]
+    fn executable_artifact_requires_a_declared_platform() {
+        let src = r#"
+[[task]]
+name = "t"
+[[task.cell]]
+cwd = "/r"
+prompt = "p"
+review = "<<review:r>>"
+[[review]]
+id = "r"
+[[review.action]]
+label = "Run build"
+command = "staged/app"
+[[review.action.artifact]]
+source = "target/debug/app"
+destination = "staged/app"
+placement = "copy"
+executable = true
+"#;
+        assert!(validate_toml(src).errors.iter().any(|error| {
+            error.kind == ErrorKind::MissingRequired && error.message.contains("target_os")
+        }));
+    }
+
+    #[test]
+    fn copied_artifact_cannot_run_on_the_review_machine() {
+        let src = r#"
+[[task]]
+name = "t"
+[[task.cell]]
+cwd = "/r"
+prompt = "p"
+review = "<<review:r>>"
+[[review]]
+id = "r"
+[[review.action]]
+label = "Run build"
+command = "staged/app"
+run_on = "review_machine"
+[[review.action.artifact]]
+source = "target/debug/app"
+destination = "staged/app"
+placement = "copy"
+"#;
+        assert!(
+            validate_toml(src)
+                .errors
+                .iter()
+                .any(|error| error.kind == ErrorKind::ConflictingKeys)
         );
     }
 

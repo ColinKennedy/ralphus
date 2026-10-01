@@ -238,7 +238,7 @@
           label: "",
           prompt: "", fieldValues: {}, agent: "", model: "",
           project: "", upstreamBranch: "", proofs: true, reviewMode: "auto", generateManualChecks: true,
-          skipAutoBuild: true, generateAutoBuild: true,
+          skipAutoBuild: false, generateAutoBuild: true,
           proofItems: [], checkItems: [], buildItems: [], generating: false, confirmStep: false,
           fieldErrors: [], activeGenerationIds: [], generationJobIds: [],
         };
@@ -533,7 +533,7 @@
         const kinds = [];
         if (state.proofs) kinds.push("proof_steps");
         if (state.reviewMode === "explicit" && state.generateManualChecks) kinds.push("manual_checks");
-        if (state.reviewMode === "explicit" && !state.skipAutoBuild && state.generateAutoBuild) kinds.push("auto_build_steps");
+        if (state.reviewMode === "explicit" && state.generateAutoBuild) kinds.push("auto_build_steps");
         return kinds;
       }
       /**
@@ -754,7 +754,7 @@
        * `ralphus task show-tutor`'s recommended per-branch layout. Per
        * `reviewMode`: `"explicit"` sets `review = "<<ralphus:new-review/
        * simple>>"` on the work cell and emits a `[[review]]` block (with
-       * `skip_auto_build`/`[[review.auto_build]]` and manual-check
+       * `[[review.prepare]]` and manual-check
        * `[[review.action]]` entries); `"auto"` sets `triage = true` on the
        * work cell instead, with no `[[review]]` block (the daemon's Arbiter
        * pools and auto-creates the review later); `"none"` sets neither.
@@ -827,15 +827,11 @@
           lines.push("[[review]]");
           lines.push('id = "ralphus:new-review/simple"');
           const buildSteps = ntSimple.buildItems.filter((it) => it.value.trim());
-          if (ntSimple.skipAutoBuild) {
-            lines.push("skip_auto_build = true");
-          } else {
-            buildSteps.forEach((it) => {
-              lines.push("");
-              lines.push("[[review.auto_build]]");
-              lines.push(`command = ${tomlStr(it.value.trim())}`);
-            });
-          }
+          buildSteps.forEach((it) => {
+            lines.push("");
+            lines.push("[[review.prepare]]");
+            lines.push(`command = ${tomlStr(it.value.trim())}`);
+          });
           ntSimple.checkItems.filter((it) => it.value.trim()).forEach((it) => {
             lines.push("");
             lines.push("[[review.action]]");
@@ -1042,7 +1038,7 @@
         if (ntSimple.generating) {
           const parts = [];
           if (ntSimple.proofs) parts.push("proof steps");
-          if (ntSimple.reviewMode === "explicit" && !ntSimple.skipAutoBuild && ntSimple.generateAutoBuild) parts.push("auto-build steps");
+          if (ntSimple.reviewMode === "explicit" && ntSimple.generateAutoBuild) parts.push("preparation steps");
           if (ntSimple.reviewMode === "explicit" && ntSimple.generateManualChecks) parts.push("manual checks");
           return `<p style="color:var(--muted);font-size:13px">Generating ${parts.join(" and ")}… this calls the selected agent, so it may take a little while.</p>`;
         }
@@ -1061,8 +1057,8 @@
                 labelTip: "The manual check's button label.", valueTip: "What a reviewer should check or try.",
               })}`
             : "";
-          const buildsSection = ntSimple.reviewMode === "explicit" && !ntSimple.skipAutoBuild && ntSimple.generateAutoBuild
-            ? `<h4 style="margin:10px 0 4px">Auto-build steps</h4>${ntListWidgetHtml(ntSimple.buildItems, "builds", {
+          const buildsSection = ntSimple.reviewMode === "explicit" && ntSimple.generateAutoBuild
+            ? `<h4 style="margin:10px 0 4px">Preparation steps</h4>${ntListWidgetHtml(ntSimple.buildItems, "builds", {
                 singleField: true, valuePlaceholder: "shell command",
                 addLabel: "Add a build command run when this review's branches merge.",
                 valueTip: "The shell command this build step runs.",
@@ -1128,7 +1124,7 @@
           ${ntSimple.proofItems.length
             ? `<div style="margin-top:6px">${ntListWidgetHtml(ntSimple.proofItems, "proofs", { labelPlaceholder: "id", valuePlaceholder: "shell command", addLabel: "Add a proof step by hand.", labelTip: "A short id for this proof step.", valueTip: "The shell command this proof step runs." })}</div>`
             : `<button class="btn" style="margin-top:6px" onclick="ntListAdd('proofs')" data-tip="Add a proof step by hand, without generating one.">+ Add a proof step by hand</button>`}
-          <label style="display:block;font-size:12px;color:var(--muted);margin-top:10px" data-tip="Whether/how this task gets reviewed.\n&quot;Auto Review&quot; (the default) pools the work cell into Triage — the daemon's Arbiter classifies it and a review is created automatically once its pool threshold or schedule fires, no triage type needed from you.\n&quot;Add a Review&quot; creates an explicit review up front, letting you configure manual checks and auto-build steps now.\n&quot;No Review&quot; skips review entirely.">
+          <label style="display:block;font-size:12px;color:var(--muted);margin-top:10px" data-tip="Whether/how this task gets reviewed.\n&quot;Auto Review&quot; (the default) pools the work cell into Triage — the daemon's Arbiter classifies it and a review is created automatically once its pool threshold or schedule fires, no triage type needed from you.\n&quot;Add a Review&quot; creates an explicit review up front, letting you configure manual checks and preparation steps now.\n&quot;No Review&quot; skips review entirely.">
             Review
             <select style="${NT_INPUT_STYLE}" onchange="ntSimple.reviewMode=this.value;renderNewTaskModal()">
               <option value="auto" ${ntSimple.reviewMode === "auto" ? "selected" : ""}>Auto Review</option>
@@ -1137,17 +1133,12 @@
             </select>
           </label>
           ${ntSimple.reviewMode === "explicit" ? `
-          <label style="display:block;font-size:12px;color:var(--muted);margin-top:10px" data-tip="Every review must say how (or whether) it builds. Checked (the default) means this review deliberately has no build step (skip_auto_build = true). Uncheck to generate or hand-author build command(s) run when this review's branches merge instead.">
-            <input type="checkbox" ${ntSimple.skipAutoBuild ? "checked" : ""} onchange="ntSimple.skipAutoBuild=this.checked;renderNewTaskModal()"> Skip auto-build
-          </label>
-          ${!ntSimple.skipAutoBuild ? `
           <label style="display:block;font-size:12px;color:var(--muted);margin-top:6px" data-tip="When checked, the selected agent/model is asked to propose build/compile command(s) to run automatically when this review's branches merge, shown to you for edit/removal first. You can also add auto-build steps by hand regardless of this checkbox.">
-            <input type="checkbox" ${ntSimple.generateAutoBuild ? "checked" : ""} onchange="ntSimple.generateAutoBuild=this.checked;renderNewTaskModal()"> Generate auto-build steps
+            <input type="checkbox" ${ntSimple.generateAutoBuild ? "checked" : ""} onchange="ntSimple.generateAutoBuild=this.checked;renderNewTaskModal()"> Generate preparation steps
           </label>
           ${ntSimple.buildItems.length
-            ? `<div style="margin-top:6px">${ntListWidgetHtml(ntSimple.buildItems, "builds", { singleField: true, valuePlaceholder: "shell command", addLabel: "Add an auto-build step by hand.", valueTip: "The shell command this build step runs when the review's branches merge." })}</div>`
-            : `<button class="btn" style="margin-top:6px" onclick="ntListAdd('builds')" data-tip="Add an auto-build step by hand, without generating one.">+ Add an auto-build step by hand</button>`}
-          ` : ""}
+            ? `<div style="margin-top:6px">${ntListWidgetHtml(ntSimple.buildItems, "builds", { singleField: true, valuePlaceholder: "shell command", addLabel: "Add a preparation step by hand.", valueTip: "This command runs before manual-check controls become ready." })}</div>`
+            : `<button class="btn" style="margin-top:6px" onclick="ntListAdd('builds')" data-tip="Add a preparation step by hand, without generating one.">+ Add a preparation step by hand</button>`}
           <label style="display:block;font-size:12px;color:var(--muted);margin-top:10px" data-tip="When checked, the selected agent/model is asked to propose manual check button(s) reviewers can run against this project's codebase before you submit, shown to you for edit/removal first. You can also add manual checks by hand regardless of this checkbox.">
             <input type="checkbox" ${ntSimple.generateManualChecks ? "checked" : ""} onchange="ntSimple.generateManualChecks=this.checked;renderNewTaskModal()"> Generate manual checks
           </label>

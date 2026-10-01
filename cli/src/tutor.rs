@@ -560,7 +560,7 @@ Tip: validate before submitting -- `ralphus validate file.toml`
  command string  ONE-OF Verbatim shell command run in a terminal.
  prompt  string  ONE-OF Hint text forwarded to the resolver LLM
                  to expand into a runnable command during preparation.
- run_on  string         "daemon" or "review_machine".
+ run_on  string         "daemon" (default) or "review_machine".
  description string     What the reviewer should inspect.
  success string         What a successful observation looks like.
 
@@ -574,6 +574,8 @@ Tip: validate before submitting -- `ralphus validate file.toml`
  shared_path        network path/URI (required for "shared")
  readiness_command  proves shared output is usable (required for "shared")
  executable         preserve/add executable mode where supported
+ target_os          required for executable artifacts (windows/linux/macos)
+ target_arch        required for executable artifacts (x86_64/aarch64/etc.)
 
  Placement recipes:
 
@@ -601,6 +603,8 @@ Tip: validate before submitting -- `ralphus validate file.toml`
       destination = "staged/demo"
       placement = "copy"
       executable = true
+      target_os = "windows"
+      target_arch = "x86_64"
 
  3. Shared/network placement: preparation publishes to a mounted share or
     artifact store. Ralphus verifies readiness but does not relay the payload.
