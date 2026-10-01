@@ -2531,9 +2531,28 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         const menu = document.getElementById("chat-copy-menu");
         if (menu) menu.remove();
         const msgs = branchMessages[`${gid}:${bid}`] || [];
+        // Both formats carry when each message was posted. A thread pasted into
+        // an issue or handed to another agent is mostly useless without it --
+        // "the resolver replied" and "the resolver replied four hours later"
+        // are different facts, and neither format said which.
         const text = format === "markdown"
-          ? msgs.map((m) => `**${m.role === "reviewer" ? (m.author || "You") : "Guardian"}:** ${m.text}`).join("\n\n")
-          : JSON.stringify(msgs.map((m) => ({ role: m.role, text: m.text, author: m.author })), null, 2);
+          ? msgs.map((m) => {
+            const who = m.role === "reviewer" ? (m.author || "You") : "Resolver";
+            const when = m.at_ms ? ` · ${fmtMsgTimeFull(m.at_ms)}` : "";
+            const status = m.action_status ? ` · ${m.action_status}` : "";
+            return `**${who}**${when}${status}\n\n${m.text}`;
+          }).join("\n\n")
+          : JSON.stringify(msgs.map((m) => ({
+            role: m.role,
+            author: m.author,
+            // Epoch milliseconds for machines, ISO-8601 UTC for a reader --
+            // a bare local string would be ambiguous once it leaves this
+            // browser, which is the whole point of copying it.
+            at_ms: m.at_ms,
+            at: m.at_ms ? new Date(m.at_ms).toISOString() : null,
+            action_status: m.action_status,
+            text: m.text,
+          })), null, 2);
         await navigator.clipboard.writeText(text);
       }
       // RAL-24: base-branch change dropdown — fetch branches on demand and post the change.

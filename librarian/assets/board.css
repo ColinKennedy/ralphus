@@ -308,6 +308,11 @@
          A conversation, so it is laid out as one: your request and the
          resolver's reply are different speakers and sit on opposite sides,
          each labelled with who said it and when. */
+      /* The copy control sits top-right of the tab, where the board's other
+         copy affordances live, rather than as a labelled button competing with
+         Send down in the composer. */
+      .fb-top { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 10px; }
+      .fb-top .copy-btn { flex: none; margin-left: auto; }
       .fb-thread { display: flex; flex-direction: column; gap: 10px; margin-bottom: 12px; }
       .fb-msg { max-width: 86%; border-radius: 10px; padding: 8px 11px; position: relative; }
       .fb-msg.you { align-self: flex-end; background: var(--accent); color: #fff; }

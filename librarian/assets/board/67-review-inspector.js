@@ -266,9 +266,14 @@
       function inspectorFeedbackTab(g, b) {
         const key = `${g.id}:${b.id}`;
         const sending = feedbackSending.has(key);
-        return `<div class="hint" style="margin:0 0 10px">What you write here is routed into
-            <span class="mono">${esc(b.branch)}</span>'s worktree as a change request. The resolver
-            agent amends the branch and replies.</div>
+        return `<div class="fb-top">
+            <div class="hint" style="margin:0">What you write here is routed into
+              <span class="mono">${esc(b.branch)}</span>'s worktree as a change request. The resolver
+              agent amends the branch and replies.</div>
+            <button class="copy-btn" data-click="showChatCopyMenu"
+              data-guardian-id="${esc(g.id)}" data-branch-id="${esc(b.id)}"
+              data-tip="Copy this whole thread — every request and reply.\nChoose Markdown for readable text or JSON for raw data.">⧉</button>
+          </div>
           ${feedbackThread(g, b)}
           <div class="fb-composer">
             <textarea id="fb-input-${esc(b.id)}" rows="3" ${sending ? "disabled" : ""}
@@ -278,8 +283,6 @@
               <button class="btn primary" ${sending ? "disabled" : ""} data-click="sendBranchFeedback"
                 data-guardian-id="${esc(g.id)}" data-branch-id="${esc(b.id)}"
                 data-tip="Send this to the resolver agent.\nIt is recorded on the branch's thread immediately; the agent's reply appears here when it finishes.">${sending ? "Sending…" : "Send"}</button>
-              <button class="btn" data-click="showChatCopyMenu" data-guardian-id="${esc(g.id)}" data-branch-id="${esc(b.id)}"
-                data-tip="Copy this whole thread — every request and reply — as Markdown or as raw JSON.">Copy thread</button>
             </div>
           </div>`;
       }
