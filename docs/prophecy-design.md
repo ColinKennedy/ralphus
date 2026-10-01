@@ -30,6 +30,9 @@ arrives with the code instead of evaporating with the cell.
    bearer token to every remote machine. See §5, §6.
 5. **The prose goes in the PR body; git gets only a join key.** A one-line
    trailer naming the authoring cell, not the prophecy set. See §8.
+   **Superseded in part by RAL-<new>** — see §8's update note: both halves of
+   this decision (never-LLM-filtered PR body, no prophecy content in commits)
+   were deliberately reopened, not forgotten.
 
 ---
 
@@ -264,6 +267,29 @@ real entity, nothing here blocks that.
 ---
 
 ## 8. Where a prophecy lands
+
+> **Update (RAL-<new>).** §8.1's "never LLM-rewritten" and §8.2's "git gets
+> only a join key" were both deliberately reopened, not forgotten:
+>
+> - **Which** prophecies reach the PR body is now judged by the same model
+>   call that already writes the description (`synthesize_pr_text`), not the
+>   RAL-534 string match below — that match is demoted to the fallback for
+>   whenever there is no model turn to ask (no commits resolved, no
+>   resolvable resolver agent, the call failed, or the response didn't
+>   parse). What still never happens is a model *rewriting* a kept
+>   prophecy's wording — §8.1's rendering step stays a verbatim, deterministic
+>   `<details>` block; only the *selection* gained a model in the loop.
+> - The **selected** list is now also folded into the review branch's own
+>   tip commit (`pr::append_insights_to_review_commit`), not only the PR
+>   body, so an org that squash-merges keeps the insights in git history
+>   after the PR itself is gone. This targets the tip commit specifically
+>   because `guardian_merge::squash_review_commits` has usually already
+>   collapsed the branch to one commit by the time a PR is submitted, so the
+>   tip is normally the only commit an eventual squash-merge has to work
+>   with. §8.2's staleness argument (point 2 below) still holds for the
+>   *per-cell* `Ralphus-Cell:` join-key trailer, which is unchanged — this is
+>   a separate, later write, done once at submission time when the relevant
+>   list is already final, not a trailer written early and left to rot.
 
 ### 8.1 The PR body — deterministic, never LLM-rewritten
 
