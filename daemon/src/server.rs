@@ -14843,6 +14843,13 @@ fn pr_refresh_ci(daemon: &Daemon, pr_id: &str) -> Reply {
 // `docs/glossary.md` for the squad/task/cell/proof/waypoint vocabulary.
 
 #[derive(Deserialize)]
+struct CreateWaypointRosterEntryBody {
+    kind: String,
+    entry_id: String,
+    note: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct CreateWaypointAffectedEntryBody {
     kind: String,
     entry_id: String,
@@ -14863,6 +14870,8 @@ struct CreateWaypointBody {
     allow_advisory: bool,
     /// At least one entry is required -- see `waypoint_create`'s doc comment.
     affected: Vec<CreateWaypointAffectedEntryBody>,
+    #[serde(default)]
+    roster: Vec<CreateWaypointRosterEntryBody>,
 }
 
 #[derive(Deserialize)]
@@ -15025,7 +15034,7 @@ fn waypoint_create(daemon: &Daemon, body: &str) -> Reply {
         return error(
             400,
             "bad_request",
-            "body must be {prompt, affected: [{kind, entry_id, mode?}], label?, agent?, model?, allow_advisory?}",
+            "body must be {prompt, affected: [{kind, entry_id, mode?}], roster?: [{kind, entry_id, note?}], label?, agent?, model?, allow_advisory?}",
             vec![],
         );
     };
@@ -15079,6 +15088,31 @@ fn waypoint_create(daemon: &Daemon, body: &str) -> Reply {
         }
         parsed_affected.push((kind, entry.entry_id.clone(), mode));
     }
+    // The completion list is optional -- a waypoint with none is a broadcast,
+    // and there is simply nothing for its affected work to wait on.
+    let mut parsed_roster = Vec::with_capacity(req.roster.len());
+    for entry in &req.roster {
+        let Some(kind) = crate::waypoints::WaypointEntryKind::parse(&entry.kind) else {
+            return error(
+                400,
+                "bad_request",
+                &format!(
+                    "roster entry kind must be \"review\" or \"squad\", got {:?}",
+                    entry.kind
+                ),
+                vec![],
+            );
+        };
+        if entry.entry_id.trim().is_empty() {
+            return error(
+                400,
+                "bad_request",
+                "roster entry_id must not be empty",
+                vec![],
+            );
+        }
+        parsed_roster.push((kind, entry.entry_id.clone(), entry.note.clone()));
+    }
     let store = daemon.lock();
     let id = match store.next_id("waypoint_seq", "waypoint") {
         Ok(id) => id,
@@ -15094,6 +15128,13 @@ fn waypoint_create(daemon: &Daemon, body: &str) -> Reply {
     ) {
         return store_error(&e);
     }
+    for (kind, entry_id, note) in &parsed_roster {
+        if let Err(e) = store.add_roster_entry(&id, *kind, entry_id, note.as_deref()) {
+            return store_error(&e);
+        }
+    }
+    // Only now the affected entries: the halt each one may raise depends on
+    // whether the roster above has landed, so the roster has to exist first.
     let waypoint_halts = daemon.waypoint_halts_handle();
     for (kind, entry_id, mode) in &parsed_affected {
         if let Err(e) = store.add_affected_entry(&id, *kind, entry_id, *mode) {

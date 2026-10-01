@@ -21,6 +21,7 @@ pub enum WaypointCommand {
         model: Option<String>,
         allow_advisory: bool,
         affected: Vec<String>,
+        roster: Vec<String>,
     },
     List {
         project: Option<String>,
@@ -119,6 +120,7 @@ pub fn parse(args: &[String]) -> WaypointCommand {
             let model = scanner.take_value("--model").ok().flatten();
             let allow_advisory = scanner.take_bool("--allow-advisory");
             let affected = scanner.take_repeated("--affected").unwrap_or_default();
+            let roster = scanner.take_repeated("--roster").unwrap_or_default();
             match prompt {
                 Some(prompt) => WaypointCommand::Create {
                     prompt,
@@ -127,6 +129,7 @@ pub fn parse(args: &[String]) -> WaypointCommand {
                     model,
                     allow_advisory,
                     affected,
+                    roster,
                 },
                 None => WaypointCommand::UsageError(
                     "create requires --prompt <text> and at least one --affected kind:entry_id[:mode]"
@@ -337,6 +340,37 @@ fn parse_bearing(args: &[String]) -> WaypointBearingCommand {
     }
 }
 
+/// Parse one `--roster entry_id[:note]` flag value into the JSON body shape
+/// `POST /api/waypoints` expects.
+///
+/// No kind and no mode: the id says which it is, the same way the remove
+/// route infers it, and a roster entry has no mode because it is work the
+/// waypoint consists of rather than work it lands on.
+///
+/// # Errors
+/// Returns a usage error when the id is empty.
+pub fn parse_roster_spec(spec: &str) -> Result<Value, CommandError> {
+    let (entry_id, note) = match spec.split_once(':') {
+        Some((id, note)) => (id.trim(), Some(note.trim())),
+        None => (spec.trim(), None),
+    };
+    if entry_id.is_empty() {
+        return Err(CommandError::Usage(format!(
+            "invalid --roster spec {spec:?}: expected entry_id[:note]"
+        )));
+    }
+    let kind = if entry_id.starts_with("guardian-") {
+        "review"
+    } else {
+        "squad"
+    };
+    Ok(serde_json::json!({
+        "kind": kind,
+        "entry_id": entry_id,
+        "note": note.filter(|n| !n.is_empty()),
+    }))
+}
+
 /// Parse one `--affected kind:entry_id[:mode]` flag value into the JSON body
 /// shape `client.waypoint_create` expects.
 pub fn parse_affected_spec(spec: &str) -> Result<Value, CommandError> {
@@ -379,10 +413,17 @@ pub fn dispatch(cmd: WaypointCommand, opts: &GlobalOpts) -> i32 {
             model,
             allow_advisory,
             affected,
+            roster,
         } => run_and_report(opts, None, || {
             let mut entries = Vec::with_capacity(affected.len());
             for spec in &affected {
                 entries.push(parse_affected_spec(spec)?);
+            }
+            // A roster entry has no mode -- the id says which kind it is, and
+            // an optional note after a second colon says why it is on the list.
+            let mut roster_entries = Vec::with_capacity(roster.len());
+            for spec in &roster {
+                roster_entries.push(parse_roster_spec(spec)?);
             }
             let created = client.waypoint_create(
                 &prompt,
@@ -391,6 +432,7 @@ pub fn dispatch(cmd: WaypointCommand, opts: &GlobalOpts) -> i32 {
                 model.as_deref(),
                 allow_advisory,
                 &entries,
+                &roster_entries,
             )?;
             // `POST /api/waypoints` replies `201 {"id": ...}`, not a waypoint
             // detail, so rendering the reply directly printed a detail view

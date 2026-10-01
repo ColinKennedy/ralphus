@@ -4430,6 +4430,11 @@ re-judged, so nothing there is newly held.
 `404 not_found` for an unknown `id` — deliberately, rather than an empty
 preview, which would read as "this would do nothing".
 
+A waypoint's roster can also be seeded at creation, via an optional `roster`
+array on `POST /api/waypoints` (`[{kind, entry_id, note?}]`). It is written
+before the affected entries, because the hold each affected entry may raise
+depends on whether the roster has landed -- so the roster has to exist first.
+
 #### `POST /api/waypoints/{id}/roster`
 Add a review or squad to the waypoint's **completion list** — the work whose
 landing *is* this waypoint being carried out.

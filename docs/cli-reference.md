@@ -841,7 +841,7 @@ use; see `READ_ONLY_NOTE`.
             - add waypoint_id [id] producer_kind [review|squad] producer_id [str] --commit-id [str] --commit-summary [text] --entity-uri [uri] --summary [text]  {Append a completed-work bearing to a waypoint's durable delivery feed.}
         - (read-only-safe) bearings waypoint_id [id]  {List a waypoint's bearing feed.}
         - close waypoint_id [id]  {Manually close an open waypoint.}
-        - create --affected [kind:entry_id[:mode]...] --agent [name] --allow-advisory --label [text] --model [name] --prompt [text]  {Create a cross-squad waypoint over the given affected reviews/squads -- the work it lands on (RAL-400).}
+        - create --affected [kind:entry_id[:mode]...] --agent [name] --allow-advisory --label [text] --model [name] --prompt [text] --roster [entry_id[:note]...]  {Create a cross-squad waypoint: --affected names the work it lands on, --roster the work whose          landing IS it being carried out. A waypoint with no roster is a broadcast -- nothing has to land,          so its affected work is never held, only asked to answer (RAL-400).}
         - (read-only-safe) deliveries waypoint_id [id]  {Show a waypoint's delivery/event history.}
         - edit waypoint_id [id] --agent [name] --allow-advisory/--no-allow-advisory --label [text] --model [name] --prompt [text] --resurvey  {Update a waypoint's settings: label, guidance prompt, survey agent/model, and whether advisory affected entries are allowed. Survey verdicts are kept unless --resurvey re-queues every daemon-enrolled entry for re-judging; preview that first with 'waypoint resurvey-preview'.}
         - (read-only-safe) get waypoint_id [id]  {Show one waypoint's settings, roster, affected entries, tracked projects, and delivery summary.}

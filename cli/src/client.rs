@@ -1950,9 +1950,14 @@ impl DaemonClient {
         model: Option<&str>,
         allow_advisory: bool,
         affected: &[Value],
+        roster: &[Value],
     ) -> Result<Value, DaemonError> {
-        let mut body =
-            json!({"prompt": prompt, "allow_advisory": allow_advisory, "affected": affected});
+        let mut body = json!({
+            "prompt": prompt,
+            "allow_advisory": allow_advisory,
+            "affected": affected,
+            "roster": roster,
+        });
         set_if_some(&mut body, "label", label.map(str::to_string));
         set_if_some(&mut body, "agent", agent.map(str::to_string));
         set_if_some(&mut body, "model", model.map(str::to_string));

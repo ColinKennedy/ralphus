@@ -18,10 +18,15 @@ pub fn execute(cmd: WaypointCommand, client: &DaemonClient) -> ExecResult {
             model,
             allow_advisory,
             affected,
+            roster,
         } => {
             let mut entries = Vec::with_capacity(affected.len());
             for spec in &affected {
                 entries.push(waypoint::parse_affected_spec(spec)?);
+            }
+            let mut roster_entries = Vec::with_capacity(roster.len());
+            for spec in &roster {
+                roster_entries.push(waypoint::parse_roster_spec(spec)?);
             }
             Ok(client.waypoint_create(
                 &prompt,
@@ -30,6 +35,7 @@ pub fn execute(cmd: WaypointCommand, client: &DaemonClient) -> ExecResult {
                 model.as_deref(),
                 allow_advisory,
                 &entries,
+                &roster_entries,
             )?)
         }
         WaypointCommand::List { project, state } => {
