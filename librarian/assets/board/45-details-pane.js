@@ -659,15 +659,20 @@
         ensureGuardianDetailLoaded(gid);
       }
       /**
-       * Toggles a branch row's selection within a review's branch list.
+       * Toggles a branch row's selection within a review's branch list, and
+       * binds the Reviews tab's inspector (and, unless pinned, its log dock)
+       * to the same branch -- one selection drives every pane.
        * @param {MouseEvent} e
        * @param {string} gid
        * @param {string} branch
+       * @param {string} [branchId] - Stable branch id, for the panes that address a branch by id rather than name.
        * @returns {void}
        */
-      function selectBranchRow(e, gid, branch) {
+      function selectBranchRow(e, gid, branch, branchId) {
         // Toggle: clicking a selected branch deselects it; clicking another selects it.
-        selectedBranch[gid] = selectedBranch[gid] === branch ? null : branch;
+        const deselecting = selectedBranch[gid] === branch;
+        selectedBranch[gid] = deselecting ? null : branch;
+        if (branchId) selectInspectorBranch(deselecting ? "" : branchId);
         // RAL-481: preserve the pane's own scroll across a switch between
         // worktrees/branches in the same review, instead of a bare
         // renderReviewDetail() jumping back to the top. Any open

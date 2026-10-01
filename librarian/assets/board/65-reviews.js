@@ -185,7 +185,34 @@
         const bulkBar = guardianMultiSel.size > 1 ? reviewSelectionBar() : "";
         el.innerHTML = bulkBar + list.map((g) => `<div class="squad-item ${(g.id===selectedGuardian || guardianMultiSel.has(g.id))?"selected":""}" data-click="onReviewClick" data-ctx="openReviewMenu" data-guardian-id="${esc(g.id)}">
           <button class="btn squadbtn" data-click="openReviewMenu" data-guardian-id="${esc(g.id)}" data-tip="Review actions — rename, hide, cancel, or delete this review.">⋯</button>
-          <div class="rid">${hiddenGuardianIds.has(g.id) ? `<span data-tip="You've hidden this review from your own view.\nIt's shown now because \"show hidden\" is on, or you navigated to it directly.\nA personal preference — it does not affect what other users see.">🙈</span> ` : ""}${esc(g.name)} ${arbiterBadge(g)}</div><div class="meta">${gdot(g.status)}<span>${g.status}</span> · ${g.branch_count} branches</div></div>`).join("");
+          <div class="rid">${hiddenGuardianIds.has(g.id) ? `<span data-tip="You've hidden this review from your own view.\nIt's shown now because \"show hidden\" is on, or you navigated to it directly.\nA personal preference — it does not affect what other users see.">🙈</span> ` : ""}${esc(g.name)} ${arbiterBadge(g)}</div>
+          <div class="meta">${pill(g.status)}${reviewSparkbar(g)}</div></div>`).join("");
+      }
+      /**
+       * A review's branch stack as a row of segments, one per branch, coloured
+       * by that branch's merge state -- so the list says how far along each
+       * review is, not just what status it carries. A lean index entry has no
+       * `branches` yet (and must not be made to fetch them just for this), so
+       * it falls back to the plain count it does carry.
+       * @param {GuardianView} g - The review, lean or full.
+       * @returns {string}
+       */
+      function reviewSparkbar(g) {
+        const branches = g.branches || null;
+        const total = branches ? branches.length : (g.branch_count || 0);
+        if (!total) return `<span class="spark-count">no branches</span>`;
+        if (!branches) {
+          return `<span class="spark-count" data-tip="This review's branch detail loads when you open it.">${total} branches</span>`;
+        }
+        const done = branches.filter((b) => b.enabled !== false
+          && ["done", "merged", "conflict_resolved"].includes(b.merge_status || "")).length;
+        const enabled = branches.filter((b) => b.enabled !== false).length;
+        const segs = branches.map((b) => {
+          const cls = b.enabled === false ? "off" : `s-${esc(b.merge_status || "pending")}`;
+          return `<i class="${cls}"></i>`;
+        }).join("");
+        return `<span class="spark" data-tip="${esc(`${done} of ${enabled} enabled branch(es) merged. Each segment is one branch, coloured by its state.`)}">${segs}</span>`
+          + `<span class="spark-count">${done}/${enabled}</span>`;
       }
       /**
        * Handles a click on a review row: plain select, ctrl/cmd toggle, or
@@ -635,21 +662,59 @@
       // rebase/re-merge attempt. Deliberately excludes the cost of the
       // tasks/cells that fed into the review.
       /**
-       * Renders a review's own resolver/proof cost (current attempt + cumulative).
-       * @param {GuardianView} g
+       * The review's spend as one chip for the command bar. Cost is a property
+       * of the review in the same way its id is, and only means anything next
+       * to it -- as two kv-rows further down the pane it was something you had
+       * to go looking for. The full attempt/cumulative breakdown moves into
+       * the chip's tooltip rather than being lost.
+       * @param {GuardianView} g - The review.
        * @returns {string}
        */
-      function reviewCostSummary(g) {
+      function reviewCostChip(g) {
         const hasAttempt = (g.attempt_tokens_in ?? 0) > 0 || (g.attempt_tokens_out ?? 0) > 0 || (g.attempt_cost_usd ?? 0) > 0;
         const hasCumulative = (g.cumulative_tokens_in ?? 0) > 0 || (g.cumulative_tokens_out ?? 0) > 0 || (g.cumulative_cost_usd ?? 0) > 0;
         if (!hasAttempt && !hasCumulative) return "";
         const cap = g.maximum_budget_usd;
-        const capNote = cap ? ` <span style="color:var(--muted)">/ cap $${cap.toFixed(4)}</span>` : "";
         const overCap = cap != null && (g.cumulative_cost_usd ?? 0) > cap;
-        const attemptTip = "This review's own conflict-resolution and proof agent cost for the CURRENT merge attempt only.\nExcludes the cost of the tasks/cells that fed into the review.\nWho/when: check this to see what the most recent rebase/re-merge attempt cost by itself.";
-        const cumulativeTip = "This review's own conflict-resolution and proof agent cost, summed across EVERY rebase/re-merge attempt this review has gone through.\nExcludes the cost of the tasks/cells that fed into the review.\nWho/when: check this to see the full spend on a review that needed several re-merges.\nIf maximum_budget_usd is set, this is the value it's enforced against — once exceeded, the daemon stops making further resolver/proof calls and fails the review.";
-        return `<div class="kv-row" data-tip="${attemptTip}"><span class="k">attempt cost</span><span>input ${g.attempt_tokens_in ?? 0} · output ${g.attempt_tokens_out ?? 0} · ${fmtCostUsd(g.attempt_cost_usd)}</span></div>
-          <div class="kv-row" data-tip="${cumulativeTip}"><span class="k">cumulative cost</span><span>input ${g.cumulative_tokens_in ?? 0} · output ${g.cumulative_tokens_out ?? 0} · ${fmtCostUsd(g.cumulative_cost_usd)}${capNote}${overCap ? ` <span style="color:var(--failed)">⚠ over cap</span>` : ""}</span></div>`;
+        // Several backends (ollama, codex, the native pydantic runner) report
+        // no dollar figure at all. A chip reading "N/A" is worse than no chip:
+        // it looks like a failure rather than a backend that simply does not
+        // price its calls. Fall back to the token count, which every backend
+        // does report, and let the tooltip carry the rest.
+        const priced = (g.cumulative_cost_usd ?? 0) > 0;
+        const tokens = (g.cumulative_tokens_in ?? 0) + (g.cumulative_tokens_out ?? 0);
+        const label = priced
+          ? fmtCostUsd(g.cumulative_cost_usd)
+          : (tokens >= 1000 ? `${Math.round(tokens / 1000)}k tok` : `${tokens} tok`);
+        const tip = "This review's own conflict-resolution and proof agent spend, summed across every rebase attempt."
+          + " It excludes the tasks/cells that fed into the review."
+          + `\nThis attempt: input ${g.attempt_tokens_in ?? 0} · output ${g.attempt_tokens_out ?? 0} · ${fmtCostUsd(g.attempt_cost_usd)}`
+          + `\nAll attempts: input ${g.cumulative_tokens_in ?? 0} · output ${g.cumulative_tokens_out ?? 0} · ${fmtCostUsd(g.cumulative_cost_usd)}`
+          + (cap ? `\nBudget cap: $${cap.toFixed(4)} — once exceeded the daemon stops making resolver/proof calls and fails the review.` : "")
+          + (priced ? "" : "\nThis review's agent backend reports no dollar figure, so this shows tokens instead — it does not mean the work was free.");
+        return `<span class="cost-chip${overCap ? " over" : ""}" data-tip="${esc(tip)}">`
+          + `${esc(label)}${overCap ? " ⚠" : ""}</span>`;
+      }
+      /**
+       * The review's identity -- what it *is*, as opposed to how it is
+       * configured (which the setup strip owns). Kept as kv-rows because these
+       * are read, not acted on.
+       * @param {GuardianView} g - The review.
+       * @param {boolean} isMultiProject - Whether the review spans several git projects.
+       * @returns {string}
+       */
+      function reviewIdentityRow(g, isMultiProject) {
+        const gate = (g.status === "collecting" && g.squad_id)
+          ? `<div class="kv-row"><span class="k" style="text-transform:none;letter-spacing:0">gate</span><span class="v">${
+            g.branches.some((b) => b.merge_status === "ready")
+              ? "tasks complete — rebase will start automatically"
+              : "starts automatically when its squad finishes — or start it now below"}</span></div>`
+          : "";
+        const squad = g.squad_id
+          ? `<div class="kv-row"><span class="k">from squad</span><span class="v"><a href="#" data-click="gotoSquad" data-squad-id="${esc(g.squad_id)}" style="color:var(--accent)" data-tip="Switch to the Squads tab and open this squad.">${esc(g.squad_id)}</a></span></div>`
+          : "";
+        void isMultiProject;
+        return `${squad}${gate}<div class="kv-row"><span class="k">type</span><span class="v">${esc(g.review_type || "git")}</span></div>`;
       }
       /**
        * Renders the RAL-480 "already merged upstream" badge shared by
@@ -853,10 +918,10 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         // still no "generating" gap to report: from the client's view a
         // summary is either present or not yet computed.
         if (g.summary_state === "ready" && g.change_summary) {
-          return `<h3 class="section" data-tip="Computed from git log as each branch becomes ready — a plain commit-subject listing at first, replaced by an agent-written summary once that branch's review worktree is built.\nRecomputed whenever another branch becomes ready or the review is rebuilt.">change summary${agentInspectBtn(g.id, "summary", "change summary", g.summary_agent || g.resolver_agent, g.summary_model || g.resolver_model)}</h3>
+          return `<h3 class="section" data-tip="Computed from git log as each branch becomes ready — a plain commit-subject listing at first, replaced by an agent-written summary once that branch's review worktree is built.\nRecomputed whenever another branch becomes ready or the review is rebuilt.">change summary${agentInspectBtn(g.id, "summary", "change summary", g.summary_agent || g.resolver_agent, g.summary_model || g.resolver_model)}${sectionMenuBtn(g.id, "summary")}</h3>
             <div style="font-size:13px;line-height:1.55;white-space:pre-wrap;border:1px solid var(--border);border-radius:6px;padding:10px 12px;background:var(--bg);color:var(--text)">${esc(g.change_summary)}</div>`;
         }
-        return `<h3 class="section" data-tip="A summary appears here as soon as one branch's source task cell finishes — no need to wait for merging/rebasing.">change summary</h3><div class="empty">waiting for a branch to be ready…</div>`;
+        return `<h3 class="section" data-tip="A summary appears here as soon as one branch's source task cell finishes — no need to wait for merging/rebasing.">change summary${sectionMenuBtn(g.id, "summary")}</h3><div class="empty">waiting for a branch to be ready…</div>`;
       }
       // ---------- PR submission + sync (RAL-117/RAL-190) ----------
       /** RAL-395: PR lifecycle-state color roles, reusing existing status hues (docs/colors.md) rather than inventing new ones -- mirrors the Tasks tab's `TT_PR_COLORS` (10-tab-registry.js) so the two surfaces never drift apart on what a PR state means visually. */
@@ -1357,6 +1422,65 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         };
       });
 
+      // ---- Command bar ----
+      //
+      // The review's lifecycle, rendered as the rail it actually is, plus the
+      // one action its current state calls for. Previously the banner carried
+      // only a name and a status pill, and every action lived in a button row
+      // two thirds down the pane -- so "where is this review, and what do I do
+      // about it" took a scroll and some inference.
+
+      /** The Guardian lifecycle in the order a review passes through it, for the command bar's rail. */
+      const REVIEW_PIPELINE = ["collecting", "merging", "in_review", "approved", "deployed"];
+      /** @type {{[status: string]: string}} Short label for each pipeline stop. */
+      const REVIEW_PIPELINE_LABELS = {
+        collecting: "Collect",
+        merging: "Rebase",
+        in_review: "Review",
+        approved: "Approve",
+        deployed: "Deploy",
+      };
+      /**
+       * Where a review's status sits on {@link REVIEW_PIPELINE}. Statuses that
+       * are not themselves stops on the rail (merge_failed, merge_stopped,
+       * cancelled) resolve to the stage they stalled in, so the rail still
+       * shows how far the review got rather than collapsing to the start.
+       * @param {string} status - The review's status.
+       * @returns {number}
+       */
+      function reviewPipelineIndex(status) {
+        const at = REVIEW_PIPELINE.indexOf(status);
+        if (at >= 0) return at;
+        if (status === "merge_failed" || status === "merge_stopped" || status === "cancelled") {
+          return REVIEW_PIPELINE.indexOf("merging");
+        }
+        return 0;
+      }
+      /**
+       * Renders the lifecycle rail: each stop marked done, current, or not yet
+       * reached.
+       * @param {GuardianView} g - The review.
+       * @returns {string}
+       */
+      function reviewPipeline(g) {
+        const at = reviewPipelineIndex(g.status);
+        const stalled = ["merge_failed", "merge_stopped", "cancelled"].includes(g.status);
+        return `<div class="review-pipe">${REVIEW_PIPELINE.map((stop, i) => {
+          const cls = i < at ? "done" : (i === at ? (stalled ? "stalled" : "now") : "");
+          const mark = i < at ? "✓" : (i === at ? (stalled ? "!" : "●") : "");
+          const tip = i < at
+            ? `${REVIEW_PIPELINE_LABELS[stop]} — complete.`
+            : i === at
+              ? (stalled
+                ? `${REVIEW_PIPELINE_LABELS[stop]} — this review stalled here (${g.status.replace(/_/g, " ")}).`
+                : `${REVIEW_PIPELINE_LABELS[stop]} — this review is here now.`)
+              : `${REVIEW_PIPELINE_LABELS[stop]} — not reached yet.`;
+          return `<span class="pipe-stop ${cls}" data-tip="${esc(tip)}">`
+            + `<span class="pipe-dot">${mark}</span>${REVIEW_PIPELINE_LABELS[stop]}</span>`
+            + (i < REVIEW_PIPELINE.length - 1 ? `<span class="pipe-line ${i < at ? "done" : ""}"></span>` : "");
+        }).join("")}</div>`;
+      }
+
       /**
        * Builds one chip for the setup strip.
        * @param {string} gid - The review this chip edits.
@@ -1524,8 +1648,9 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           const isBranchSel = selectedBranch[g.id] === b.branch;
           return `
           <div class="branch-item"${isEnabled ? "" : ' style="opacity:0.45"'}>
-            <div class="branch-row selectable${isBranchSel ? " sel" : ""}" data-branch="${esc(b.branch)}" ${drag} data-click="selectBranchRow" data-guardian-id="${esc(g.id)}" data-tip="Click to select this branch. Drag to reorder.">
+            <div class="branch-row selectable${isBranchSel ? " sel" : ""}" data-branch="${esc(b.branch)}" data-branch-id="${esc(b.id)}" ${drag} data-click="selectBranchRow" data-guardian-id="${esc(g.id)}" data-tip="Click to inspect this branch in the pane on the right. Drag to reorder.">
               ${canReorder ? '<span class="grip" data-tip="Drag to reorder branches — the merge order determines the rebase stack.">⋮⋮</span>' : ""}
+              <span class="branch-idx" data-tip="This branch's place in the rebase stack.">${i + 1}</span>
               ${toggle}
               <span>${gdot(b.merge_status || "")}</span>
               <span class="mono hc-anchor" style="flex:1${isEnabled ? "" : ";color:var(--muted)"}" data-card="gBranch" data-guardian-id="${esc(g.id)}" data-branch-id="${esc(b.id)}">${esc(b.branch)}</span>
@@ -1567,17 +1692,24 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         // but left a column of read-only kv-rows behind for them. Those now
         // render as the setup strip (reviewSetupStrip) directly under the
         // banner, where the display is also the edit affordance.
-        el.innerHTML = `<div class="squad-banner">${gdot(g.status)}<span class="rid">${esc(g.name)}</span> ${pill(g.status)} ${arbiterBadge(g)}
-            <span style="flex:1"></span>${watchersHtml(`guardian:${g.id}`)}<button class="icon-btn" data-click="openEditReviewDetails" data-guardian-id="${esc(g.id)}" data-tip="Edit this review's settings — name, upstream branch, resolver, proof scope, build/squash options, PR settings, and environment overrides — all in one place.\nNothing takes effect until you click Save; Save applies every change in a single request and triggers at most one rebase.">✎ Edit Details</button><button class="icon-btn" data-click="openReviewLogs" data-guardian-id="${esc(g.id)}" data-tip="View the audit log for this review — state changes, branch merge events, and notes.">📄 Logs</button><button class="btn squadbtn" data-click="openReviewTitleMenu" data-guardian-id="${esc(g.id)}" data-tip="Review actions — cancel this review.">⋯</button></div>
+        el.innerHTML = `<div class="review-cmdbar">
+            <div class="cmd-row">
+              ${gdot(g.status)}<span class="rid">${esc(g.name)}</span> ${pill(g.status)} ${arbiterBadge(g)}
+              <span class="mono hc-anchor cmd-id" style="cursor:pointer" data-card="gReviewId" data-guardian-id="${esc(g.id)}" data-copy="${esc(g.id)}" onclick="copyText(event)">${esc(g.id)}</span>
+              ${reviewCostChip(g)}
+              <span style="flex:1"></span>
+              ${watchersHtml(`guardian:${g.id}`)}
+              <button class="icon-btn" data-click="toggleReviewDock" data-guardian-id="${esc(g.id)}" data-tip="Open the log drawer docked at the bottom of this review.\nIt follows whatever you select — the whole review, one branch, or one command — and stays open while you work instead of covering the page.">☰ Logs</button>
+              <button class="icon-btn" data-click="openEditReviewDetails" data-guardian-id="${esc(g.id)}" data-tip="Edit this review's settings — name, upstream branch, resolver, proof scope, build/squash options, PR settings, and environment overrides — all in one place.\nNothing takes effect until you click Save; Save applies every change in a single request and triggers at most one rebase.">✎ Setup</button>
+              <button class="btn squadbtn" data-click="openReviewTitleMenu" data-guardian-id="${esc(g.id)}" data-tip="Every other action for this review.">⋯</button>
+            </div>
+            ${reviewPipeline(g)}
+          </div>
           ${mergeProgress(g)}
           ${conflictProgress(g)}
           ${postMergeBadge(g) ? `<div class="kv-row"><span class="k">post-merge</span><span class="v">${postMergeBadge(g)}</span></div>` : ""}
-          ${reviewCostSummary(g)}
           ${reviewSetupStrip(g)}
-          <div class="kv-row"><span class="k">review id</span><span class="mono hc-anchor" style="cursor:pointer" data-card="gReviewId" data-guardian-id="${esc(g.id)}" data-copy="${esc(g.id)}" onclick="copyText(event)">${esc(g.id)}</span></div>
-          ${g.squad_id ? `<div class="kv-row"><span class="k">from squad</span><span class="v"><a href="#" data-click="gotoSquad" data-squad-id="${esc(g.squad_id)}" style="color:var(--accent)" data-tip="Switch to the Squads tab and open this squad.">${esc(g.squad_id)}</a></span></div>` : ""}
-          ${g.status === "collecting" && g.squad_id ? `<div class="kv-row"><span class="k" style="text-transform:none;letter-spacing:0">gate</span><span class="v">${g.branches.some((b) => b.merge_status === "ready") ? "tasks complete — rebase will start automatically" : "starts automatically when its squad finishes — or start it now below"}</span></div>` : ""}
-          <div class="kv-row"><span class="k">type</span><span class="v">${esc(g.review_type || "git")}</span></div>
+          ${reviewIdentityRow(g, isMultiProject)}
           ${isMultiProject
             ? `<div class="kv-row"><span class="k">projects</span><span class="v" style="display:flex;flex-direction:column;gap:2px">${(g.projects||[]).map((p) => `<span class="mono" style="font-size:11px">${esc(p)}</span>`).join("")}</span></div>`
             : g.project
@@ -1587,10 +1719,10 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           ${g.combined_worktree ? `<div class="kv-row"><span class="k">combined worktree</span><span class="v mono hc-anchor" style="font-size:11px" data-card="gCombinedWorktree" data-guardian-id="${esc(g.id)}">${esc(g.combined_worktree)}</span></div>` : ""}
           ${renderChangeSummary(g)}
           ${combinedPrSection(g)}
-          <h3 class="section">check gates</h3>${checks}
+          <h3 class="section">check gates${sectionMenuBtn(g.id, "gates")}</h3>${checks}
           <div class="kv-row">${envViewerBtn(`/api/guardians/${g.id}/tests-env`, "this review's check gates (tests)")}</div>
           ${g.detail && !autoBuiltCmd ? `<div class="warn">${detailSummary(g.detail, "Review detail")}</div>` : ""}
-          <h3 class="section">branches${canReorder ? ' <span class="k" style="text-transform:none;letter-spacing:0">— drag to reorder · toggle ⊙/⊘ to enable/disable</span>' : ""}${hasPending ? ' <span class="badge warn2" data-tip="Unsaved order or enable/disable changes — click Save to apply, or Discard to revert.">● unsaved changes</span>' : ""}</h3>
+          <h3 class="section">branches${sectionMenuBtn(g.id, "branches")}${canReorder ? ' <span class="k" style="text-transform:none;letter-spacing:0">— drag to reorder · toggle ⊙/⊘ to enable/disable</span>' : ""}${hasPending ? ' <span class="badge warn2" data-tip="Unsaved order or enable/disable changes — click Save to apply, or Discard to revert.">● unsaved changes</span>' : ""}</h3>
           ${allDisabled ? `<div class="warn" style="margin:4px 0 8px">All branches are disabled — saving will make this review a no-op (no rebase runs). Re-enable at least one branch before saving, or click Discard.</div>` : ""}
           ${isMultiProject ? `<div class="row" style="margin-bottom:8px;gap:4px">${(g.projects||[]).map((p) => {
               const label = p.split(/[\\/]/).filter(Boolean).pop() || p;
@@ -1687,7 +1819,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
             // to be declared in the task file. Saying so -- and saying where --
             // is the difference between a missing feature and a missing input.
             if (hints.length === 0) {
-              return `<h3 class="section" data-tip="User-declared test actions from the task TOML [[review.action]] blocks.\nLabelled buttons give reviewers one-click access to targeted manual checks.">test actions <span class="k" style="text-transform:none;letter-spacing:0">— none</span></h3>
+              return `<h3 class="section" data-tip="User-declared test actions from the task TOML [[review.action]] blocks.\nLabelled buttons give reviewers one-click access to targeted manual checks.">test actions <span class="k" style="text-transform:none;letter-spacing:0">— none</span>${sectionMenuBtn(g.id, "actions")}</h3>
                 <div class="absent-note" data-tip="Test actions are authored, not generated: add [[review.action]] blocks to the task file and each becomes a labelled, one-click check here.\nThis is different from Manual checks below, which the resolver agent writes for you.">
                   No test actions declared. Add <span class="mono">[[review.action]]</span> blocks to the
                   task file to put one-click checks here.
@@ -1699,7 +1831,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
               }
               return `<span data-tip="Prompt: ${esc(h.prompt||'')}\nNot runnable yet — prompt-based test actions expand via the resolver LLM before running, and that expansion isn't wired up.\nOnly command-based [[review.action]] entries are clickable today."><button class="btn" disabled style="opacity:0.6">${esc(h.label)}</button></span>`;
             }).join("");
-            return `<h3 class="section" data-tip="User-declared test actions from the task TOML [[review.action]] blocks.\nLabelled buttons give reviewers one-click access to targeted manual checks.">test actions</h3>
+            return `<h3 class="section" data-tip="User-declared test actions from the task TOML [[review.action]] blocks.\nLabelled buttons give reviewers one-click access to targeted manual checks.">test actions${sectionMenuBtn(g.id, "actions")}</h3>
               <div class="btn-row" style="flex-wrap:wrap">${btns}</div>`;
           })()}
           ${(() => {
@@ -1733,7 +1865,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
                 : "Manual checks aren't generated yet — they're only produced after every enabled branch in this review has finished rebasing with no pending conflicts.\nStill collecting or rebasing branches.";
             const label = isReady ? "▶ Run all" : (state === "generating" ? "▶ Generating…" : "▶ Waiting on branches…");
             const runAllBtn = `<button class="btn primary" ${isReady ? "" : "disabled"} data-click="runAllManualChecks" data-guardian-id="${esc(g.id)}" style="${cmds.length > 1 && isReady ? 'border-radius:6px 0 0 6px' : ''}"${isReady ? ` data-tip="${gateTip}"` : ""}>${label}</button>`;
-            return `<h3 class="section" data-tip="Shell commands suggested by the resolver agent to manually verify these changes.\nGenerated once when the review branch is rebuilt (or when the rebuilt stack's changes change), and re-generated on demand via Regenerate below.">manual checks${agentInspectBtn(g.id, "manual", "manual checks", g.manual_commands_agent || g.resolver_agent, g.manual_commands_model || g.resolver_model)}</h3>
+            return `<h3 class="section" data-tip="Shell commands suggested by the resolver agent to manually verify these changes.\nGenerated once when the review branch is rebuilt (or when the rebuilt stack's changes change), and re-generated on demand via Regenerate below.">manual checks${agentInspectBtn(g.id, "manual", "manual checks", g.manual_commands_agent || g.resolver_agent, g.manual_commands_model || g.resolver_model)}${sectionMenuBtn(g.id, "manual")}</h3>
               <div class="btn-row" style="position:relative;gap:0">
                 ${isReady ? runAllBtn : `<span data-tip="${gateTip}">${runAllBtn}</span>`}
                 ${isReady && cmds.length > 1 ? `<button class="btn" data-click="toggleManualMenu" data-guardian-id="${esc(g.id)}" style="border-left:none;border-radius:0 6px 6px 0;padding:4px 8px" data-tip="Show individual commands — run one at a time.">▾</button>
@@ -1762,6 +1894,12 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           })()}`;
         attachPeekResizeHandlers();
         restorePeekScrollPositions(); // RAL-471: the innerHTML rewrite above just destroyed/recreated any peek `<pre>` nodes, dropping their scroll position
+        // The inspector and the dock are siblings of this pane, not children of
+        // it, so they re-render alongside rather than being rebuilt by the
+        // innerHTML above -- which is what lets the inspector keep its own tab
+        // and scroll while the stack behind it updates.
+        renderReviewInspector();
+        renderReviewDock();
       }
       // CCTL-135: per-branch merge detail is collapsed by default; toggle open.
       /**

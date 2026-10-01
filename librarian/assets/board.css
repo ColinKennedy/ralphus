@@ -60,7 +60,20 @@
       main#tasks-page { display: grid; grid-template-columns: 1fr 3px var(--task-details-w, 340px); height: calc(100vh - 51px); }
       /* RAL-417: the Reviews sidebar is variable-width and draggable like the Squads one --
          the same var-driven track + `.splitter` pattern; the 300px fallback is the old fixed width. */
-      main#reviews-page { display: grid; grid-template-columns: var(--reviews-sidebar-w, 300px) 6px 1fr; height: calc(100vh - 51px); }
+      /* Three panes: the review list, the review itself, and an inspector that
+         binds to the selected branch. The middle column owns the log dock, so
+         the drawer spans the review without covering the inspector. */
+      main#reviews-page {
+        display: grid;
+        grid-template-columns: var(--reviews-sidebar-w, 300px) 6px 1fr 6px var(--review-inspector-w, 360px);
+        height: calc(100vh - 51px);
+      }
+      .review-main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+      .review-main > .col.center { flex: 1; min-height: 0; }
+      .review-inspector {
+        border-left: 1px solid var(--border); background: var(--panel);
+        display: flex; flex-direction: column; min-height: 0; overflow: hidden;
+      }
       main#resources-page { height: calc(100vh - 51px); overflow-y: auto; padding: 18px 20px; }
       .res-table { width: 100%; border-collapse: collapse; font-size: 13px; }
       .res-table th { text-align: right; padding: 6px 12px; color: var(--muted); font-weight: 500; cursor: pointer; white-space: nowrap; user-select: none; }
@@ -522,6 +535,178 @@
          inspectable value from ordinary monospace text around it. */
       .hc-anchor { border-bottom: 1px dotted var(--cancelled); cursor: help; }
       .hc-anchor:hover { border-bottom-color: var(--accent); color: var(--accent); }
+
+      /* ---- Review list sparkbar ---- */
+      /* The branch stack as segments, so the list answers "how far along is
+         this review" at a glance rather than only "what status does it carry". */
+      #reviews .meta { display: flex; align-items: center; gap: 7px; }
+      .spark { display: flex; gap: 2px; flex: 1; min-width: 0; align-items: center; }
+      .spark i { flex: 1; height: 3px; border-radius: 2px; background: var(--border); min-width: 3px; }
+      .spark i.s-done, .spark i.s-merged { background: var(--done); }
+      .spark i.s-conflict_resolved { background: var(--queued); }
+      .spark i.s-failed { background: var(--failed); }
+      .spark i.s-ready, .spark i.s-in_progress { background: var(--accent); }
+      .spark i.s-proof_pending { background: var(--materializing); }
+      .spark i.off { background: var(--border); opacity: .5; }
+      .spark-count { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; flex: none; }
+
+      /* Every review section carries the same ⋯ menu, so "show me this
+         section's log" is one gesture in a consistent place. */
+      .section-menu {
+        background: none; border: 1px solid var(--border); color: var(--cancelled);
+        border-radius: 5px; padding: 0 6px; font-size: 11px; line-height: 1.5;
+        margin-left: 6px; cursor: pointer; vertical-align: middle;
+      }
+      .section-menu:hover { color: var(--text); border-color: var(--muted); background: var(--panel-2); }
+
+      /* ---- Review branch inspector ---- */
+      /* Per-branch detail was a disclosure nested inside a branch row, so
+         reading one branch pushed the rest of the stack off-screen. As its own
+         pane it sits beside the stack instead of inside it. */
+      .insp-head { padding: 10px 12px 0; border-bottom: 1px solid var(--border); flex: none; }
+      .insp-title { display: flex; align-items: center; gap: 7px; margin-bottom: 9px; }
+      .insp-title .t {
+        font-size: 12.5px; font-weight: 650; flex: 1; min-width: 0;
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      }
+      .insp-tabs { display: flex; gap: 1px; }
+      .insp-tab {
+        background: none; border: none; border-bottom: 2px solid transparent;
+        color: var(--muted); font-size: 11.5px; padding: 6px 9px; font-weight: 550;
+        position: relative; cursor: pointer;
+      }
+      .insp-tab:hover { color: var(--text); }
+      .insp-tab.on { color: var(--text); border-bottom-color: var(--accent); }
+      .insp-badge {
+        position: absolute; top: 2px; right: 1px; background: var(--queued); color: var(--bg);
+        font-size: 9px; font-weight: 700; border-radius: 8px; padding: 0 4px; line-height: 12px;
+      }
+      .insp-body { overflow-y: auto; flex: 1; padding: 12px; }
+      .insp-kv {
+        display: grid; grid-template-columns: 96px 1fr; gap: 4px 10px;
+        align-items: baseline; margin: 0; font-size: 12px;
+      }
+      .insp-kv dt { color: var(--cancelled); font-size: 11px; }
+      .insp-kv dd { margin: 0; overflow-wrap: anywhere; }
+      .insp-pr { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; }
+      .insp-pr-head { display: flex; align-items: center; gap: 7px; }
+      .insp-pr-title { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .insp-pr-sub { font-size: 11px; color: var(--muted); margin-top: 4px; }
+      /* The stack's rebase order, shown on the row rather than inferred from
+         position -- the branch list is an ordered stack, not a set. */
+      .branch-idx {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10.5px;
+        color: var(--cancelled); background: var(--bg); border: 1px solid var(--border);
+        border-radius: 4px; padding: 0 5px; line-height: 16px; flex: none;
+      }
+
+      /* ---- Review command bar ---- */
+      /* Identity, state and the review's lifecycle in one block at the top, so
+         "where is this review and what do I do about it" is answered without
+         scrolling. */
+      .review-cmdbar { margin-bottom: 4px; }
+      /* No wrapping: the actions must stay on the title's line, so the one
+         thing you came to do never ends up on a line of its own. The id is the
+         part that gives way when the column is narrow. */
+      .review-cmdbar .cmd-row { display: flex; align-items: center; gap: 8px; flex-wrap: nowrap; }
+      .review-cmdbar .rid {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 16px;
+        font-weight: 650; white-space: nowrap;
+      }
+      .review-cmdbar .cmd-id {
+        color: var(--cancelled); font-size: 11px; min-width: 0;
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      }
+      .review-cmdbar .cmd-row > .btn,
+      .review-cmdbar .cmd-row > .icon-btn,
+      .review-cmdbar .cmd-row > .cost-chip,
+      .review-cmdbar .cmd-row > .pill { flex: none; }
+      .cost-chip {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px;
+        color: var(--unverified); background: rgba(227,179,65,.13);
+        border: 1px solid rgba(227,179,65,.34); border-radius: 20px; padding: 1px 8px; cursor: help;
+      }
+      .cost-chip.over { color: var(--failed); border-color: var(--failed); background: rgba(248,81,73,.13); }
+
+      /* Lifecycle rail: the stages a review passes through, with where it is
+         now. Replaces inferring state from a status pill alone. */
+      .review-pipe { display: flex; align-items: center; margin: 10px 0 2px; }
+      .pipe-stop {
+        display: flex; align-items: center; gap: 6px; font-size: 11.5px;
+        color: var(--cancelled); white-space: nowrap;
+      }
+      .pipe-dot {
+        width: 15px; height: 15px; border-radius: 50%; border: 1.5px solid var(--border);
+        display: grid; place-items: center; font-size: 9px; background: var(--bg); color: var(--cancelled);
+      }
+      .pipe-stop.done { color: var(--muted); }
+      .pipe-stop.done .pipe-dot { border-color: var(--done); background: rgba(63,185,80,.13); color: var(--done); }
+      .pipe-stop.now { color: var(--text); font-weight: 600; }
+      .pipe-stop.now .pipe-dot {
+        border-color: var(--accent); background: rgba(74,163,255,.13); color: var(--accent);
+        box-shadow: 0 0 0 3px rgba(74,163,255,.13);
+      }
+      .pipe-stop.stalled { color: var(--failed); font-weight: 600; }
+      .pipe-stop.stalled .pipe-dot { border-color: var(--failed); background: rgba(248,81,73,.13); color: var(--failed); }
+      .pipe-line { flex: 1; height: 1.5px; background: var(--border); margin: 0 8px; min-width: 12px; border-radius: 2px; }
+      .pipe-line.done { background: rgba(63,185,80,.34); }
+
+      /* ---- Review log dock ---- */
+      /* The audit log as a drawer docked under the review rather than a modal
+         over it, so it can stay open while you work through the stack. */
+      .log-dock {
+        display: flex; flex-direction: column; flex: none;
+        background: var(--panel); border-top: 1px solid var(--border);
+      }
+      .log-dock.closed { height: 30px; }
+      .log-dock.open { height: 300px; }
+      .log-dock .dock-head {
+        display: flex; align-items: center; gap: 8px; padding: 0 14px; height: 30px;
+        flex: none; border-bottom: 1px solid var(--border); cursor: pointer;
+      }
+      .log-dock .dock-head:hover { background: var(--panel-2); }
+      .dock-title {
+        font-size: 11px; font-weight: 650; text-transform: uppercase;
+        letter-spacing: .8px; color: var(--muted);
+      }
+      .dock-hint { font-size: 11px; color: var(--cancelled); }
+      .dock-caret { color: var(--cancelled); font-size: 11px; }
+      .log-dock .dock-body {
+        flex: 1; overflow-y: auto; padding: 6px 0;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px;
+      }
+      .log-dock.closed .dock-body { display: none; }
+      .dock-row { display: grid; grid-template-columns: 74px 84px 1fr; gap: 10px; padding: 2px 14px; align-items: baseline; }
+      .dock-row:hover { background: var(--panel-2); }
+      .dock-row .t { color: var(--cancelled); font-variant-numeric: tabular-nums; font-size: 10.5px; }
+      .dock-row .s { font-size: 10px; text-transform: uppercase; letter-spacing: .4px; overflow: hidden; text-overflow: ellipsis; }
+      .dock-row .m { color: var(--muted); overflow-wrap: anywhere; }
+      .dock-row.info .s { color: var(--accent); }
+      .dock-row.ok .s { color: var(--done); }
+      .dock-row.warn .s { color: var(--unverified); }
+      .dock-row.err .s { color: var(--failed); }
+      .dock-row.err .m { color: var(--text); }
+
+      /* One toggle component for the small on/off controls (sticky, and the
+         Live view's display switches). The box is drawn in CSS rather than a
+         ☐/☑ glyph -- a unicode box renders at whatever weight the font feels
+         like, which reads as a bright blob against this palette. */
+      .tgl {
+        display: inline-flex; align-items: center; gap: 6px; background: var(--bg);
+        border: 1px solid var(--border); color: var(--muted); border-radius: 20px;
+        padding: 2px 9px; font-size: 10.5px; white-space: nowrap; cursor: pointer;
+      }
+      .tgl:hover { color: var(--text); border-color: var(--cancelled); }
+      .tgl .bx {
+        width: 9px; height: 9px; border-radius: 2px; border: 1px solid var(--cancelled);
+        flex: none; background: transparent; position: relative;
+      }
+      .tgl.on { color: var(--accent); border-color: var(--accent); background: rgba(74,163,255,.13); }
+      .tgl.on .bx { background: var(--accent); border-color: var(--accent); }
+      .tgl.on .bx::after {
+        content: ""; position: absolute; left: 2.5px; top: .5px; width: 2.5px; height: 5.5px;
+        border: solid var(--bg); border-width: 0 1.5px 1.5px 0; transform: rotate(42deg);
+      }
 
       /* ---- Review setup strip ---- */
       /* The review's settings as one row of chips instead of a column of

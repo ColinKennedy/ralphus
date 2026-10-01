@@ -55,6 +55,10 @@
         // reviewsSidebarMaxW() so the review detail pane never collapses below
         // MIN_REVIEW_DETAIL_W.
         "--reviews-sidebar-w": { key: "ralphus-reviews-sidebar-w", def: 300, min: 180 },
+        // The Reviews tab's branch inspector. Its own preference key, like the
+        // sidebar's, so resizing one never moves the other. Dragged from the
+        // left edge, hence `data-invert="1"` on its splitter.
+        "--review-inspector-w": { key: "ralphus-review-inspector-w", def: 360, min: 280, max: 720 },
       };
       const MIN_CENTER_W = 240; // guard rail for the middle graph pane, matching --sidebar-w's existing min-width pattern
       // RALPHUS-REVIEWS-SPLIT:BEGIN
