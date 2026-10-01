@@ -54,6 +54,7 @@ __all__ = [
     "TRIAGE_TYPES",
     "USERS_ROUTES",
     "USERS_ROWS",
+    "WAYPOINTS_ROUTES",
     "WORKTREE_RETIREMENT_ROUTES",
     "WORKTREE_RETIREMENT_ROWS",
     "Json",
@@ -762,6 +763,113 @@ TASKS_ROUTES: Routes = {
 }
 
 # ---------------------------------------------------------------------------
+# Waypoints scenario (RAL-400) — one open waypoint showing both of its lists:
+# a roster (what must land for it to be carried out) and the affected work it
+# lands on, one entry of which has answered and one of which has not.
+# ---------------------------------------------------------------------------
+
+_WAYPOINT_ID = "waypoint-000000000001"
+
+WAYPOINTS_ROUTES: Routes = {
+    "/api/waypoints": [
+        {
+            "id": _WAYPOINT_ID,
+            "label": "release coordination",
+            "state": "open",
+            "created_at_ms": 1_783_100_000_000,
+            "affected_count": 2,
+            "projects": ["ralphus"],
+            "allow_advisory": True,
+            "updated_at_ms": 1_783_100_002_000,
+            "closed_at_ms": None,
+            "delivery_summary": {
+                "delivered": 1,
+                "via_restack": 0,
+                "failed": 0,
+                "undelivered": 1,
+            },
+        }
+    ],
+    f"/api/waypoints/{_WAYPOINT_ID}": {
+        "id": _WAYPOINT_ID,
+        "label": "release coordination",
+        "prompt": "Coordinate the release migration with the implementation squad.",
+        "agent": "ollama",
+        "model": "qwen3:8b",
+        "allow_advisory": True,
+        "state": "open",
+        "projects": ["ralphus"],
+        "delivery_summary": {
+            "delivered": 1,
+            "via_restack": 0,
+            "failed": 0,
+            "undelivered": 1,
+        },
+        # What must land for this waypoint to be carried out. Curated by hand;
+        # nothing enrols here from the survey.
+        "roster": [
+            {
+                "waypoint_id": _WAYPOINT_ID,
+                "kind": "squad",
+                "entry_id": "squad-000000000009",
+                "note": "the release migration itself",
+                "terminal": False,
+                "created_at_ms": 1_783_100_000_000,
+            },
+        ],
+        # What it lands on. One entry has answered; the other is still held
+        # because it has not.
+        "affected": [
+            {
+                "waypoint_id": _WAYPOINT_ID,
+                "kind": "squad",
+                "entry_id": "squad-000000000004",
+                "mode": "block",
+                "delivery_status": "delivered",
+                "survey_verdict": "impacted",
+                "survey_rationale": "The implementation changes the shared release path.",
+                "bearing_decision": "accepted",
+                "bearing_decided_at_ms": 1_783_100_002_000,
+                "stale_at_ms": None,
+                "created_at_ms": 1_783_100_000_000,
+                "updated_at_ms": 1_783_100_002_000,
+            },
+            {
+                "waypoint_id": _WAYPOINT_ID,
+                "kind": "review",
+                "entry_id": "guardian-000000000001",
+                "mode": "block",
+                "delivery_status": "undelivered",
+                "survey_verdict": None,
+                "survey_rationale": None,
+                "bearing_decision": None,
+                "bearing_decided_at_ms": None,
+                "stale_at_ms": None,
+                "created_at_ms": 1_783_100_000_000,
+                "updated_at_ms": 1_783_100_000_000,
+            },
+        ],
+    },
+    f"/api/waypoints/{_WAYPOINT_ID}/bearings": [
+        {
+            "id": 1,
+            "created_at_ms": 1_783_100_001_000,
+            "summary": "Migration implementation is ready for review.",
+            "entity_uri": "squad:squad-000000000004",
+            "commit_id": "abc123def456789",
+            "commit_summary": "feat: prepare release migration",
+        }
+    ],
+    f"/api/waypoints/{_WAYPOINT_ID}/deliveries": [
+        {
+            "at_ms": 1_783_100_002_000,
+            "level": "info",
+            "message": "squad-000000000004 delivered to the waypoint",
+        }
+    ],
+}
+
+# ---------------------------------------------------------------------------
 # Queue scenario — "run-migrations" depends on "provision-database". The
 # initial order is already dependency-valid (provision, then migrate, then
 # the unrelated cleanup task). Dragging "provision-database" down past its
@@ -953,7 +1061,12 @@ REVIEWS_MESSAGES: tuple[Json, ...] = (
 
 REVIEWS_ROUTES: Routes = {
     "/api/tasks": _empty_board(),
+    # The sidebar polls the lean `/api/guardian-index`; the detail pane then
+    # fetches the full review by id. Serving only `/api/guardians` left the
+    # tab rendering "No reviews." forever.
+    "/api/guardian-index": [REVIEWS_GUARDIAN],
     "/api/guardians": [REVIEWS_GUARDIAN],
+    f"/api/guardians/{_GUARDIAN_ID}": REVIEWS_GUARDIAN,
     f"/api/guardians/{_GUARDIAN_ID}/branches/{REVIEWS_ROLLOUT_BRANCH_ID}/messages": {
         "messages": list(REVIEWS_MESSAGES)
     },

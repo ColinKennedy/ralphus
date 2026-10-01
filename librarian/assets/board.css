@@ -33,6 +33,8 @@
         --failed-a: rgba(248,81,73,.13); --failed-b: rgba(248,81,73,.34);
         --queued-a: rgba(163,113,247,.13); --queued-b: rgba(163,113,247,.34);
         --amber-a: rgba(227,179,65,.13); --amber-b: rgba(227,179,65,.34);
+        /* A unit of work a cross-squad waypoint affects in block mode (RAL-400). */
+        --roster-block: #e8590c;
       }
       [data-theme="light"] {
         --bg: #ffffff; --panel: #f6f8fa; --panel-2: #eef1f4; --border: #d0d7de;
@@ -100,6 +102,8 @@
         border-left: 1px solid var(--border); background: var(--panel);
         display: flex; flex-direction: column; min-height: 0; overflow: hidden;
       }
+      /* RAL-400: the Waypoints sidebar follows the same var-driven track + `.splitter` pattern as Reviews. */
+      main#waypoints-page { display: grid; grid-template-columns: var(--waypoints-sidebar-w, 300px) 6px 1fr; height: calc(100vh - 51px); }
       main#resources-page { height: calc(100vh - 51px); overflow-y: auto; padding: 18px 20px; }
       .res-table { width: 100%; border-collapse: collapse; font-size: 13px; }
       .res-table th { text-align: right; padding: 6px 12px; color: var(--muted); font-weight: 500; cursor: pointer; white-space: nowrap; user-select: none; }
@@ -198,6 +202,8 @@
       .p-actioning { color: var(--running); border-color: var(--running); }
       .p-ready { color: var(--teal); border-color: var(--teal); }
       .p-merged { color: var(--done); border-color: var(--done); }
+      .p-open { color: var(--running); border-color: var(--running); }
+      .p-closed { color: var(--done); border-color: var(--done); }
       .badge.ready { color: var(--teal); border-color: var(--teal); }
       @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .45; } }
 
@@ -648,6 +654,8 @@
       .badge.live { color: var(--running); border-color: var(--running); }
       .badge.done { color: var(--done); border-color: var(--done); }
       .badge.cancelled { color: var(--cancelled); border-color: var(--cancelled); }
+      .badge.roster-block { color: var(--roster-block); border-color: var(--roster-block); }
+      .badge.roster-advisory { color: var(--muted); border-color: var(--muted); }
       /* RAL-472: a badge carrying a `data-full` payload opens a copyable text popup on click. */
       .badge[data-full] { cursor: pointer; }
       .badge[data-full]:hover { color: var(--accent); border-color: var(--accent); }
@@ -1275,3 +1283,200 @@
         main#reviews-page .splitter { display: none; }
         main#reviews-page .sidebar { max-height: 45vh; }
       }
+
+
+      /* ---------- Waypoints tab (RAL-400) ----------------------------------
+         Every colour here resolves from a `docs/colors.md` token. Tints use
+         `color-mix` against an existing token rather than a new hex, so a
+         waypoint surface can be washed with a status colour without adding a
+         hue to the palette -- change the token and the tint follows it. */
+
+      /* Sidebar card. Replaces the flat `.squad-item` row: a waypoint carries
+         more state than an id and a badge (roster progress, project, how it
+         was closed), and a card gives that room without a second line of
+         chrome. Selection is a tinted ground plus a left stripe, matching how
+         a selected branch reads elsewhere. */
+      .wp-card { position: relative; display: block; width: 100%; text-align: left;
+        background: none; border: 1px solid transparent; border-radius: 10px;
+        padding: 9px 10px 8px; margin-bottom: 3px; overflow: hidden; cursor: pointer; }
+      .wp-card:hover { background: var(--panel-2); }
+      .wp-card.selected { background: color-mix(in srgb, var(--accent) 13%, transparent); }
+      .wp-card.selected::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0;
+        width: 2px; background: var(--accent); }
+      .wp-card-top { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
+      .wp-card-name { flex: 1; min-width: 0; font-size: 13px; font-weight: 600;
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .wp-card-meta { display: flex; align-items: center; gap: 7px; font-size: 11px;
+        color: var(--muted); white-space: nowrap; }
+      .wp-card-meta .wp-proj { overflow: hidden; text-overflow: ellipsis; }
+
+      /* Roster progress as N segments, one per entry, coloured by delivery
+         status. Encodes progress in form so the list reads at a glance rather
+         than forcing a count to be parsed. */
+      .wp-spark { display: flex; gap: 2px; flex: none; width: 54px; height: 3px; align-items: center; }
+      .wp-spark i { flex: 1; height: 3px; border-radius: 2px; background: var(--border); }
+
+      /* Command bar: identity, state and the one action that matters, pinned
+         above the scroll so they survive a long roster. */
+      .wp-cmdbar { display: flex; align-items: flex-start; gap: 10px; padding: 12px 0 11px;
+        border-bottom: 1px solid var(--border); margin-bottom: 11px; }
+      .wp-cmd-id { min-width: 0; }
+      .wp-cmd-name { font-size: 16px; font-weight: 650; letter-spacing: -.2px;
+        overflow-wrap: anywhere; }
+      .wp-cmd-sub { font-size: 12px; color: var(--muted); margin-top: 1px; }
+      .wp-cmd-actions { display: flex; align-items: center; gap: 6px; margin-left: auto; flex: none; }
+
+      /* Lifecycle rail. A waypoint moves open -> surveyed -> delivered ->
+         closed, and which of those is pending is the question a reader
+         actually has. A bare "0/2 delivered" answers a smaller one. */
+      .wp-pipe { display: flex; align-items: center; margin: 0 0 12px; max-width: 560px; }
+      .wp-step { display: flex; align-items: center; gap: 6px; font-size: 11.5px;
+        color: var(--muted); white-space: nowrap; }
+      .wp-step .wp-pdot { width: 15px; height: 15px; border-radius: 50%; flex: none;
+        border: 1.5px solid var(--border); background: var(--bg); color: var(--muted);
+        display: grid; place-items: center; font-size: 9px; line-height: 1; }
+      .wp-step.is-done .wp-pdot { border-color: var(--done);
+        background: color-mix(in srgb, var(--done) 16%, transparent); color: var(--done); }
+      .wp-step.is-now { color: var(--text); font-weight: 600; }
+      .wp-step.is-now .wp-pdot { border-color: var(--accent);
+        background: color-mix(in srgb, var(--accent) 16%, transparent); color: var(--accent);
+        box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 13%, transparent); }
+      .wp-pline { flex: 1; min-width: 12px; height: 1.5px; margin: 0 8px;
+        background: var(--border); border-radius: 2px; }
+      .wp-pline.is-done { background: color-mix(in srgb, var(--done) 40%, transparent); }
+
+      /* Settings as a chip strip rather than a column of read-only key/value
+         rows: these are short scalars, and a row each spends a screen of
+         height to say very little. */
+      .wp-setup { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
+      .wp-chip { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px;
+        background: var(--panel-2); border: 1px solid var(--border); border-radius: 20px;
+        padding: 3px 10px; color: var(--text); }
+      .wp-chip .wp-chip-k { color: var(--muted); }
+      .wp-chip.is-muted { color: var(--muted); }
+
+      /* The prompt is prose, not a property, so it gets a readable block with
+         a quiet rule rather than a key/value row that would clip it. */
+      /* Why a roster entry is on the list, under its id. */
+      .wp-entry-note { padding: 2px 0 0 22px; color: var(--muted); font-size: 11.5px; line-height: 1.45; }
+
+      /* Re-survey confirmation. A list of real work about to be re-judged,
+         so it is set as a table of rows rather than prose -- the reader is
+         scanning for "is mine in here", not reading a sentence. */
+      .wp-rs-lead { margin: 0 0 12px; color: var(--muted); font-size: 12.5px; line-height: 1.5; }
+      .wp-rs-head { font-size: 11px; font-weight: 650; letter-spacing: .4px; text-transform: uppercase;
+        color: var(--muted); margin: 12px 0 5px; }
+      .wp-rs-list { max-height: 34vh; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px; }
+      .wp-rs-list.muted { opacity: .62; }
+      .wp-rs-row { display: flex; align-items: baseline; gap: 8px; padding: 5px 9px; font-size: 12px; }
+      .wp-rs-row + .wp-rs-row { border-top: 1px solid var(--border); }
+      .wp-rs-kind { flex: none; min-width: 44px; color: var(--muted); font-size: 10.5px;
+        text-transform: uppercase; letter-spacing: .3px; }
+      .wp-rs-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .wp-rs-id { color: var(--muted); font-size: 11px; }
+      .wp-rs-now { flex: none; color: var(--muted); font-size: 11px; }
+      .wp-rs-hold { flex: none; color: var(--warn); font-size: 10.5px; border: 1px solid var(--warn);
+        border-radius: 4px; padding: 0 5px; }
+      .wp-rs-warn { margin: 10px 0 0; color: var(--warn); font-size: 12px; line-height: 1.5; }
+
+      /* Guidance. Capped to a readable measure -- the detail pane is as wide as
+         the window, and prose set to 1700px is a line a reader loses their
+         place in -- and clamped to a few lines, because a waypoint's guidance
+         can run long and should not push the roster below the fold on open. */
+      .wp-guidance { margin: 0 0 14px; max-width: 92ch; }
+      .wp-guidance-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+      .wp-guidance-label { font-size: 11.5px; font-weight: 650; letter-spacing: .3px;
+        text-transform: uppercase; color: var(--muted); }
+      .wp-prompt { border-left: 2px solid var(--border); padding: 2px 0 2px 11px;
+        color: var(--text); font-size: 13px; line-height: 1.55;
+        max-height: 4.65em; overflow: hidden; position: relative; }
+      /* Fades the clamped edge so a cut line reads as "there is more" rather
+         than as the end of the text. */
+      .wp-prompt::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0;
+        height: 1.5em; background: linear-gradient(to bottom, transparent, var(--bg)); }
+      .wp-prompt.is-open { max-height: 50vh; overflow-y: auto; }
+      .wp-prompt.is-open::after { display: none; }
+
+      .wp-section { display: flex; align-items: center; gap: 8px; margin: 18px 0 8px; }
+      .wp-section h4 { margin: 0; font-size: 12px; font-weight: 650; letter-spacing: .3px;
+        text-transform: uppercase; color: var(--muted); }
+      .wp-section-rule { flex: 1; height: 1px; background: var(--border); }
+
+      /* One roster entry. The dot/pill vocabulary carries the state so the row
+         itself can stay quiet; actions only surface on hover to keep a long
+         roster from reading as a wall of buttons. */
+      .wp-entry { border: 1px solid var(--border); border-radius: 8px; background: var(--panel);
+        padding: 8px 10px; margin-bottom: 6px; }
+      .wp-entry:hover { border-color: var(--muted); }
+      .wp-entry-top { display: flex; align-items: center; gap: 7px; }
+      .wp-entry-id { font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+        font-size: 12px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .wp-entry-actions { display: flex; align-items: center; gap: 4px; margin-left: auto;
+        flex: none; opacity: 0; transition: opacity .1s; }
+      .wp-entry:hover .wp-entry-actions, .wp-entry:focus-within .wp-entry-actions { opacity: 1; }
+      .wp-entry-why { margin-top: 6px; font-size: 12px; color: var(--muted); }
+      .wp-entry-why summary { cursor: pointer; }
+
+      /* Feed and bearings share a left rail so a reader can see at a glance
+         that both are chronological records rather than settings. */
+      .wp-feed-row { display: flex; gap: 10px; padding: 7px 0 7px 11px;
+        border-left: 2px solid var(--border); }
+      .wp-feed-row:hover { border-left-color: var(--accent); }
+      .wp-feed-when { flex: none; width: 112px; font-size: 11px; color: var(--muted);
+        font-variant-numeric: tabular-nums; }
+      .wp-feed-body { min-width: 0; flex: 1; font-size: 12.5px; }
+      .wp-feed-refs { margin-top: 3px; font-size: 11.5px; color: var(--muted);
+        display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+      .wp-src { font-size: 10.5px; letter-spacing: .04em; text-transform: uppercase;
+        color: var(--muted); border: 1px solid var(--border); border-radius: 4px; padding: 0 5px; }
+
+      .wp-entry-id, .wp-feed-body a, .wp-feed-refs a { color: var(--accent); text-decoration: none; }
+      .wp-entry-id:hover, .wp-feed-body a:hover, .wp-feed-refs a:hover { text-decoration: underline; }
+
+      /* ---------- Waypoint create dialog -----------------------------------
+         The dialog was built from `.kv-row`s, which are a read-only display
+         primitive: a narrow grey key column beside whatever you put in the
+         value cell. Used as a form it gives bare unstyled inputs of differing
+         widths, hard against their labels, with no grouping. These are form
+         styles instead. */
+      .wp-form { display: flex; flex-direction: column; gap: 13px; }
+      .wp-field { display: flex; flex-direction: column; gap: 5px; }
+      .wp-field > label { font-size: 11.5px; font-weight: 600; letter-spacing: .03em;
+        text-transform: uppercase; color: var(--muted); }
+      .wp-field .wp-hint { font-size: 11.5px; color: var(--muted); }
+      .wp-field input[type="text"], .wp-field textarea, .wp-field select {
+        width: 100%; background: var(--bg); border: 1px solid var(--border); color: var(--text);
+        border-radius: 7px; padding: 7px 9px; font: 13px/1.45 inherit; }
+      .wp-field textarea { height: 86px; min-height: 86px; resize: vertical; }
+      .wp-field input[type="text"]:focus, .wp-field textarea:focus, .wp-field select:focus {
+        outline: none; border-color: var(--accent); }
+      .wp-field-row { display: flex; gap: 13px; }
+      .wp-field-row > .wp-field { flex: 1; min-width: 0; }
+      .wp-check { display: flex; align-items: center; gap: 7px; font-size: 13px;
+        color: var(--text); text-transform: none; letter-spacing: 0; font-weight: 400; }
+
+      /* Roster picker: two tabs over one scrolling list, so squads and reviews
+         are chosen the same way without doubling the dialog's height. */
+      .wp-picker { border: 1px solid var(--border); border-radius: 7px; overflow: hidden; }
+      .wp-picker-tabs { display: flex; gap: 2px; padding: 5px 5px 0; background: var(--panel-2); }
+      .wp-picker-tab { background: none; border: none; color: var(--muted); font-size: 12px;
+        font-weight: 550; padding: 5px 11px; border-radius: 6px 6px 0 0; }
+      .wp-picker-tab:hover { color: var(--text); }
+      .wp-picker-tab.on { background: var(--bg); color: var(--text); }
+      .wp-picker-tab .n { color: var(--muted); font-size: 11px; margin-left: 4px; }
+      .wp-picker-search { padding: 6px 7px; background: var(--panel-2);
+        border-bottom: 1px solid var(--border); }
+      .wp-picker-list { max-height: 210px; overflow-y: auto; background: var(--bg); }
+      .wp-pick-row { display: flex; align-items: center; gap: 8px; padding: 5px 9px;
+        font-size: 12.5px; cursor: pointer; }
+      .wp-pick-row:hover { background: var(--panel-2); }
+      .wp-pick-row input { margin: 0; }
+      .wp-pick-id { font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+        font-size: 11.5px; color: var(--muted); }
+      .wp-pick-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+        white-space: nowrap; }
+      .wp-picked { display: flex; flex-wrap: wrap; gap: 5px; }
+      .wp-picked:empty::after { content: "Nothing selected yet — a waypoint needs at least one.";
+        color: var(--muted); font-size: 11.5px; }
+      .wp-picked .wp-chip { cursor: pointer; }
+      .wp-picked .wp-chip:hover { border-color: var(--failed); color: var(--failed); }

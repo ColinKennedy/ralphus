@@ -28,7 +28,11 @@ in a squad, and across squads — and schedules whatever is ready to run, up to
 a configurable concurrency limit. You get a say in *ordering* among
 everything that's currently ready via the [Queue](views/queue.md) tab;
 ralphus never lets you violate a dependency, only reprioritize within what's
-actually runnable.
+actually runnable. A cell rostered on an open, blocking
+[waypoint](views/waypoints.md) is a third kind of gate alongside dependency
+edges and concurrency: it shows as running rather than stuck, and resumes on
+its own once the waypoint's survey clears or the waypoint closes — see
+[Cross-squad waypoints](#cross-squad-waypoints) below.
 
 ## Guardian reviews
 
@@ -38,6 +42,19 @@ branch, resolve merge conflicts with an agent, run your declared check gates,
 and give you a per-branch feedback thread to request changes before anything
 ships. See [Reviews](views/reviews.md) for the full picture, including how
 branch order relates to task dependencies.
+
+## Cross-squad waypoints
+
+Where a Guardian review stacks branches *within* one squad's tasks, a
+**waypoint** (RAL-400) tracks impact *across* squads and reviews that
+otherwise have no dependency edge between them: a named prompt plus a
+**roster** of squads and/or reviews an LLM **survey** pass classifies as
+impacted (or not), each in **block** or **advisory** mode. A rostered squad
+whose survey comes back blocking halts (rather than fails) until it either
+receives a **bearing** — a durable, append-only note of what changed
+elsewhere and why it matters here — or the waypoint closes. See
+[Waypoints](views/waypoints.md) for the full picture, including how a
+waypoint interacts with a review's restack.
 
 ## The board
 
@@ -49,6 +66,7 @@ couple of seconds. It has nine tabs:
 | [Tasks](views/tasks.md) | Every squad, its tasks and cells, and the details of any one you select. |
 | [Queue](views/queue.md) | Reordering priority among everything currently ready to run. |
 | [Reviews](views/reviews.md) | Guardian merge reviews: branch stacking, conflict resolution, check gates, per-branch feedback. |
+| [Waypoints](views/waypoints.md) | Cross-squad coordination join points: roster, survey verdicts, delivery feed, bearings. |
 | [Resources](views/resources.md) | Live CPU/RAM/GPU usage per running cell. |
 | [Logs](views/cartographer.md) | The unified Cartographer event log, filterable and drillable. |
 | [Projects](views/projects.md) | Registered git repositories a task's cell `cwd` can materialize a worktree under. |

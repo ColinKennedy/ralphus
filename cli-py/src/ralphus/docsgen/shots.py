@@ -128,22 +128,32 @@ def _reviews(page: Page) -> None:
         fixture_server(fixtures.REVIEWS_ROUTES) as daemon_url,
         librarian_server(daemon_url) as base_url,
     ):
-        _goto(page, base_url, f"#/reviews/{fixtures.REVIEWS_GUARDIAN['id']}")
+        # The redesigned tab addresses a review by *name* and rewrites the
+        # hash, so a deep link built from its id lands on the unselected list.
+        # Select it the way the page itself does instead.
+        _goto(page, base_url, "#/reviews")
+        page.wait_for_selector("#reviews-page")
+        page.evaluate(f"selectGuardian({fixtures.REVIEWS_GUARDIAN['id']!r})")
         page.wait_for_selector(".branch-row")
         _shoot(page, "reviews-overview")
 
-        # The feedback thread only renders once its branch's merge-detail
-        # panel is expanded (RAL-272) — click that branch's toggle first.
-        page.locator(
-            f'[data-click="toggleBranch"][data-branch-id="{fixtures.REVIEWS_ROLLOUT_BRANCH_ID}"]'
-        ).click()
-        chat = page.locator(".chat-msg").first
+        # The feedback thread moved into the branch inspector's own Feedback
+        # tab, so it is reached by selecting the branch rather than by
+        # expanding a merge-detail panel on the row.
+        page.evaluate(f"inspectBranchFromMenu({fixtures.REVIEWS_ROLLOUT_BRANCH_ID!r}, 'feedback')")
+        chat = page.locator(".fb-msg").first
         chat.wait_for()
         chat.scroll_into_view_if_needed()
         _shoot(page, "reviews-chat")
 
-        page.locator('button[data-click="toggleManualMenu"]').click()
-        page.wait_for_timeout(50)
+        # Manual checks are no longer behind a popup menu -- they render
+        # inline as runnable command rows. Expand the first one so this shot
+        # shows something the overview above does not already show.
+        manual = page.locator('button[data-click="runCheck"][data-kind="manual"]').first
+        manual.wait_for()
+        manual.scroll_into_view_if_needed()
+        page.locator('button[data-click="toggleReviewCommandFull"]').last.click()
+        page.wait_for_timeout(100)
         _shoot(page, "reviews-manual-checks")
 
 
@@ -260,6 +270,22 @@ def _prefs_overview(page: Page) -> None:
         _shoot(page, "prefs-overview")
 
 
+def _waypoints_overview(page: Page) -> None:
+    with (
+        fixture_server(fixtures.WAYPOINTS_ROUTES) as daemon_url,
+        librarian_server(daemon_url) as base_url,
+    ):
+        _goto(page, base_url, "#/tasks")
+        page.evaluate("showTab('waypoints', true)")
+        # The redesigned sidebar renders `.wp-card`s, not the shared
+        # `.squad-item` rows the first version borrowed.
+        page.wait_for_selector("#waypoints .wp-card.selected")
+        # The redesigned pane renders its scalars as `.wp-setup` chips rather
+        # than key/value rows; wait for an entry so both lists are on screen.
+        page.wait_for_selector("#waypoint-detail .wp-entry")
+        _shoot(page, "waypoints-overview")
+
+
 SCENARIOS = (
     _squads_overview,
     _squads_session_detail,
@@ -276,6 +302,7 @@ SCENARIOS = (
     _worktree_retirement_overview,
     _health_overview,
     _prefs_overview,
+    _waypoints_overview,
 )
 
 

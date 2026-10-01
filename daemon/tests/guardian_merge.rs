@@ -87,6 +87,7 @@ fn maybe_run_commit_step(spec: &RunnerSpec) -> Option<RunnerResult> {
         git(&cwd, &["commit", "-m", "test: commit step"]);
     }
     Some(RunnerResult {
+        bearing: None,
         thinking_stall_last_line: None,
         retry_after_secs: None,
         status: "done".into(),
@@ -162,6 +163,7 @@ impl Runner for StageDoneRunner {
             cwd.display()
         );
         RunnerResult {
+            bearing: None,
             thinking_stall_last_line: None,
             retry_after_secs: None,
             status: "done".into(),
@@ -226,6 +228,7 @@ impl Runner for LossyRunner {
             .unwrap_or(false);
         assert!(ok, "LossyRunner: git add -A failed in {}", cwd.display());
         RunnerResult {
+            bearing: None,
             thinking_stall_last_line: None,
             retry_after_secs: None,
             status: "done".into(),
@@ -277,6 +280,7 @@ impl Runner for MarkerStrippingRunner {
             }
         }
         RunnerResult {
+            bearing: None,
             thinking_stall_last_line: None,
             retry_after_secs: None,
             status: "done".into(),
@@ -308,6 +312,7 @@ impl Runner for FeedbackRunner {
         }
         let _ = std::fs::write(PathBuf::from(&spec.cwd).join("note.txt"), "reviewed\n");
         RunnerResult {
+            bearing: None,
             thinking_stall_last_line: None,
             retry_after_secs: None,
             status: "done".into(),
@@ -382,6 +387,7 @@ impl Runner for RaceInjectingRunner {
             Some("simulated concurrent failure"),
         );
         RunnerResult {
+            bearing: None,
             thinking_stall_last_line: None,
             retry_after_secs: None,
             status: "done".into(),
@@ -412,6 +418,7 @@ struct SilentNoOpFeedbackRunner;
 impl Runner for SilentNoOpFeedbackRunner {
     fn run(&self, _spec: &RunnerSpec) -> RunnerResult {
         RunnerResult {
+            bearing: None,
             thinking_stall_last_line: None,
             retry_after_secs: None,
             status: "done".into(),
@@ -443,6 +450,7 @@ impl Runner for NamedFeedbackRunner {
         }
         let _ = std::fs::write(PathBuf::from(&spec.cwd).join(self.0), "reviewed\n");
         RunnerResult {
+            bearing: None,
             thinking_stall_last_line: None,
             retry_after_secs: None,
             status: "done".into(),
@@ -500,6 +508,7 @@ impl Runner for AutoFixRunner {
         self.calls.fetch_add(1, Ordering::Relaxed);
         let _ = std::fs::write(PathBuf::from(&spec.cwd).join("fix.txt"), "fixed\n");
         RunnerResult {
+            bearing: None,
             thinking_stall_last_line: None,
             retry_after_secs: None,
             status: "done".into(),
@@ -3402,6 +3411,7 @@ impl Runner for ManualCommandsRunner {
             spec.task
         );
         RunnerResult {
+            bearing: None,
             thinking_stall_last_line: None,
             status: "done".to_string(),
             tokens_in: 0,
@@ -3865,6 +3875,7 @@ impl Runner for FailingAutoBuildRunner {
     fn run(&self, spec: &RunnerSpec) -> RunnerResult {
         if spec.task == "auto_build" {
             return RunnerResult {
+                bearing: None,
                 thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "failed".to_string(),
@@ -4013,6 +4024,7 @@ fn proof_scope_nothing_suppresses_final_verify() {
                 }
             }
             RunnerResult {
+                bearing: None,
                 thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "done".into(),
@@ -6029,6 +6041,7 @@ command = "cargo test --workspace"
 
             if spec.task == "proof-synthesis" {
                 return RunnerResult {
+                    bearing: None,
                     thinking_stall_last_line: None,
                     retry_after_secs: None,
                     status: "done".into(),
@@ -6074,6 +6087,7 @@ command = "cargo test --workspace"
                 }
             }
             RunnerResult {
+                bearing: None,
                 thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "done".into(),
@@ -6231,6 +6245,7 @@ impl Runner for SelfCommittingFeedbackRunner {
             git(&cwd, &["commit", "-m", "fix: agent self-committed"]);
         }
         RunnerResult {
+            bearing: None,
             thinking_stall_last_line: None,
             retry_after_secs: None,
             status: "done".into(),
@@ -6680,6 +6695,7 @@ fn stage_done_marker_present_in_resolver_system_prompt() {
                 }
             }
             RunnerResult {
+                bearing: None,
                 thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "done".into(),
@@ -6807,6 +6823,7 @@ fn resolver_system_prompt_is_scope_agnostic_and_honest() {
                     }
                 }
                 RunnerResult {
+                    bearing: None,
                     thinking_stall_last_line: None,
                     retry_after_secs: None,
                     status: "done".into(),
@@ -6966,6 +6983,7 @@ fn conflict_resolver_does_not_sweep_untouched_build_artifact_into_commit() {
                 assert!(ok, "selective git add failed for {f} in {}", cwd.display());
             }
             RunnerResult {
+                bearing: None,
                 thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "done".into(),
@@ -7155,6 +7173,7 @@ impl Runner for PartialResolutionRunner {
             }
         }
         RunnerResult {
+            bearing: None,
             thinking_stall_last_line: None,
             retry_after_secs: None,
             status: "done".into(),
@@ -7292,6 +7311,7 @@ impl Runner for NeverResolvesRunner {
             Some("sess-other-task".to_string())
         };
         RunnerResult {
+            bearing: None,
             thinking_stall_last_line: None,
             retry_after_secs: None,
             status: "done".into(),
@@ -7744,6 +7764,7 @@ impl Runner for ManualCommandsCountingRunner {
         if spec.task == "manual_commands" {
             self.calls.fetch_add(1, Ordering::SeqCst);
             return RunnerResult {
+                bearing: None,
                 thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "done".into(),
@@ -7884,6 +7905,7 @@ impl Runner for FeedbackManualCommandsCountingRunner {
         if spec.task == "manual_commands" {
             self.calls.fetch_add(1, Ordering::SeqCst);
             return RunnerResult {
+                bearing: None,
                 thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "done".into(),
@@ -7906,6 +7928,7 @@ impl Runner for FeedbackManualCommandsCountingRunner {
         }
         let _ = std::fs::write(PathBuf::from(&spec.cwd).join("note.txt"), "reviewed\n");
         RunnerResult {
+            bearing: None,
             thinking_stall_last_line: None,
             retry_after_secs: None,
             status: "done".into(),
@@ -8958,6 +8981,7 @@ fn settings_change_restarts_a_stuck_merge_and_new_setting_takes_effect() {
                 }
             }
             RunnerResult {
+                bearing: None,
                 thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "done".into(),

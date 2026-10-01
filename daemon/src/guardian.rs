@@ -1591,6 +1591,25 @@ impl Store {
         Ok(ids)
     }
 
+    /// Resolves a `ralphus:new-review/<key>` affected placeholder (RAL-400) to
+    /// the real guardian id `derive_reviews_with_full_prefetch` created for
+    /// it in this squad's submission, or `None` if no guardian recorded that
+    /// `review_key` for this squad.
+    pub(crate) fn guardian_id_for_review_key(
+        &self,
+        squad_id: &str,
+        review_key: &str,
+    ) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT id FROM guardians WHERE squad_id=? AND review_key=?",
+                params![squad_id, review_key],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
     /// Ids of collecting guardians this squad's cells contribute to.
     ///
     /// Prefers each cell's direct `review_guardian_id` (RAL-314: set at
@@ -2614,6 +2633,17 @@ impl Store {
                     crate::mailbox::MailboxPriority::Normal,
                     &msg,
                     None,
+                );
+            }
+            if GuardianStatus::is_terminal_status(status.as_str()) {
+                // RAL-400 Phase 6: a review reaching `merged`/`cancelled`/
+                // `deployed` may be the last non-terminal affected entry on one
+                // or more open waypoints. `is_terminal_status` already
+                // excludes `merge_failed`, since a failed merge may still be
+                // retried and so is not "finished" for this purpose.
+                let _ = self.maybe_auto_close_waypoints_for_affected_entry(
+                    crate::waypoints::WaypointEntryKind::Review,
+                    id,
                 );
             }
             Ok(())
@@ -5710,7 +5740,20 @@ impl Store {
     /// review after halting its merge, without resuming or completing it).
     /// Distinct from the forge-driven `merged` transition -- see
     /// [`GuardianStatus::Approved`].
+    ///
+    /// Refuses while an open waypoint holds this review in `block` mode:
+    /// RAL-400 defines block mode for a review as holding approval, and
+    /// without this check the hold existed on paper only. A review's hold is
+    /// on approval rather than on its work precisely so it can keep running
+    /// and report the bearing that releases it; de-escalating the entry to
+    /// `advisory` or closing the waypoint release it too.
     pub fn approve_guardian(&self, id: &str) -> Result<GuardianStatus> {
+        if let Some(waypoint_id) = self.review_block_gating_waypoint(id)? {
+            return Err(StoreError::InvalidTransition(format!(
+                "review {id} is held by open waypoint {waypoint_id}; close that waypoint or set \
+                 its affected entry for this review to advisory before approving"
+            )));
+        }
         match GuardianStatus::parse(&self.guardian_status_str(id)?) {
             Some(GuardianStatus::InReview | GuardianStatus::MergeStopped) => {
                 self.set_guardian_status(id, GuardianStatus::Approved, None)?;

@@ -1938,6 +1938,183 @@ impl DaemonClient {
     pub fn pr_pull_from_pr(&self, pr_id: &str) -> Result<Value, DaemonError> {
         self.post(&format!("/api/pull-requests/{pr_id}/pull-from-pr"), None)
     }
+
+    // ---- cross-squad waypoints (RAL-400) ---------------------------------
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn waypoint_create(
+        &self,
+        prompt: &str,
+        label: Option<&str>,
+        agent: Option<&str>,
+        model: Option<&str>,
+        allow_advisory: bool,
+        affected: &[Value],
+        roster: &[Value],
+    ) -> Result<Value, DaemonError> {
+        let mut body = json!({
+            "prompt": prompt,
+            "allow_advisory": allow_advisory,
+            "affected": affected,
+            "roster": roster,
+        });
+        set_if_some(&mut body, "label", label.map(str::to_string));
+        set_if_some(&mut body, "agent", agent.map(str::to_string));
+        set_if_some(&mut body, "model", model.map(str::to_string));
+        self.post("/api/waypoints", Some(body))
+    }
+
+    pub fn waypoint_list(
+        &self,
+        project: Option<&str>,
+        state: Option<&str>,
+    ) -> Result<Value, DaemonError> {
+        let qs = query_string(&[
+            ("project", project.map(str::to_string)),
+            ("state", state.map(str::to_string)),
+        ]);
+        self.get(&format!("/api/waypoints{qs}"))
+    }
+
+    pub fn waypoint_get(&self, waypoint_id: &str) -> Result<Value, DaemonError> {
+        self.get(&format!("/api/waypoints/{waypoint_id}"))
+    }
+
+    pub fn waypoint_add_affected_entry(
+        &self,
+        waypoint_id: &str,
+        kind: &str,
+        entry_id: &str,
+        mode: Option<&str>,
+    ) -> Result<Value, DaemonError> {
+        let mut body = json!({"kind": kind, "entry_id": entry_id});
+        set_if_some(&mut body, "mode", mode.map(str::to_string));
+        self.post(
+            &format!("/api/waypoints/{waypoint_id}/affected"),
+            Some(body),
+        )
+    }
+
+    pub fn waypoint_remove_affected_entry(
+        &self,
+        waypoint_id: &str,
+        entry_id: &str,
+    ) -> Result<Value, DaemonError> {
+        self.delete(&format!("/api/waypoints/{waypoint_id}/affected/{entry_id}"))
+    }
+
+    pub fn waypoint_patch_affected_entry(
+        &self,
+        waypoint_id: &str,
+        entry_id: &str,
+        mode: &str,
+    ) -> Result<Value, DaemonError> {
+        self.patch(
+            &format!("/api/waypoints/{waypoint_id}/affected/{entry_id}"),
+            Some(json!({"mode": mode})),
+        )
+    }
+
+    pub fn waypoint_close(&self, waypoint_id: &str) -> Result<Value, DaemonError> {
+        self.post(&format!("/api/waypoints/{waypoint_id}/close"), None)
+    }
+
+    pub fn waypoint_reopen(&self, waypoint_id: &str) -> Result<Value, DaemonError> {
+        self.post(&format!("/api/waypoints/{waypoint_id}/reopen"), None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn waypoint_update(
+        &self,
+        waypoint_id: &str,
+        label: Option<&str>,
+        prompt: &str,
+        agent: Option<&str>,
+        model: Option<&str>,
+        allow_advisory: bool,
+        resurvey: bool,
+    ) -> Result<Value, DaemonError> {
+        let body = serde_json::json!({
+            "label": label,
+            "prompt": prompt,
+            "agent": agent,
+            "model": model,
+            "allow_advisory": allow_advisory,
+            "resurvey": resurvey,
+        });
+        self.patch(&format!("/api/waypoints/{waypoint_id}"), Some(body))
+    }
+
+    pub fn waypoint_add_roster_entry(
+        &self,
+        waypoint_id: &str,
+        kind: &str,
+        entry_id: &str,
+        note: Option<&str>,
+    ) -> Result<Value, DaemonError> {
+        let body = serde_json::json!({ "kind": kind, "entry_id": entry_id, "note": note });
+        self.post(&format!("/api/waypoints/{waypoint_id}/roster"), Some(body))
+    }
+
+    pub fn waypoint_remove_roster_entry(
+        &self,
+        waypoint_id: &str,
+        entry_id: &str,
+    ) -> Result<Value, DaemonError> {
+        self.delete(&format!("/api/waypoints/{waypoint_id}/roster/{entry_id}"))
+    }
+
+    pub fn waypoint_resurvey_preview(&self, waypoint_id: &str) -> Result<Value, DaemonError> {
+        self.get(&format!("/api/waypoints/{waypoint_id}/resurvey-preview"))
+    }
+
+    pub fn waypoint_redo_affected_entry(
+        &self,
+        waypoint_id: &str,
+        entry_id: &str,
+    ) -> Result<Value, DaemonError> {
+        self.post(
+            &format!("/api/waypoints/{waypoint_id}/affected/{entry_id}/redo"),
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn waypoint_append_bearing(
+        &self,
+        waypoint_id: &str,
+        producer_kind: &str,
+        producer_id: &str,
+        summary: &str,
+        entity_uri: Option<&str>,
+        commit_id: Option<&str>,
+        commit_summary: Option<&str>,
+    ) -> Result<Value, DaemonError> {
+        let mut body = json!({
+            "producer_kind": producer_kind,
+            "producer_id": producer_id,
+            "summary": summary,
+        });
+        set_if_some(&mut body, "entity_uri", entity_uri.map(str::to_string));
+        set_if_some(&mut body, "commit_id", commit_id.map(str::to_string));
+        set_if_some(
+            &mut body,
+            "commit_summary",
+            commit_summary.map(str::to_string),
+        );
+        self.post(
+            &format!("/api/waypoints/{waypoint_id}/bearings"),
+            Some(body),
+        )
+    }
+
+    pub fn waypoint_list_bearings(&self, waypoint_id: &str) -> Result<Value, DaemonError> {
+        self.get(&format!("/api/waypoints/{waypoint_id}/bearings"))
+    }
+
+    pub fn waypoint_deliveries(&self, waypoint_id: &str) -> Result<Value, DaemonError> {
+        self.get(&format!("/api/waypoints/{waypoint_id}/deliveries"))
+    }
 }
 
 /// Optional filters for [`DaemonClient::cartographer`] -- bundled to avoid a

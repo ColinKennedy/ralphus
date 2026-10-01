@@ -282,6 +282,16 @@ fn proxy_conditional(
         "POST" => {
             with_trace(client.post(&url).set("Content-Type", "application/json")).send_string(body)
         }
+        // The daemon has PATCH routes the board reaches (waypoint settings and
+        // roster-entry mode, agent profiles, project forks), so a proxy that
+        // only knew GET/POST/DELETE answered those 405 before the request ever
+        // left this process.
+        "PATCH" => with_trace(
+            client
+                .request("PATCH", &url)
+                .set("Content-Type", "application/json"),
+        )
+        .send_string(body),
         other => {
             return Reply::json(
                 405,
@@ -719,6 +729,47 @@ mod tests {
     }
 
     // ── RAL-219: bearer-token forwarding ────────────────────────────────────
+
+    /// Every HTTP method the daemon actually routes must survive the proxy.
+    /// The board sends PATCH for waypoint settings and roster-entry mode, and
+    /// a method the proxy does not know is rejected here with a 405 that never
+    /// reaches the daemon -- a failure mode indistinguishable, from the page,
+    /// from the route not existing.
+    #[test]
+    fn proxy_forwards_every_method_the_daemon_routes() {
+        for method in ["GET", "POST", "DELETE", "PATCH"] {
+            let server = tiny_http::Server::http("127.0.0.1:0").expect("bind ephemeral port");
+            let port = server.server_addr().to_ip().expect("ip addr").port();
+            let received = std::sync::Arc::new(std::sync::Mutex::new(None::<(String, String)>));
+            let received_clone = std::sync::Arc::clone(&received);
+            let handle_thread = std::thread::spawn(move || {
+                if let Ok(mut req) = server.recv() {
+                    let seen = req.method().as_str().to_string();
+                    let mut body = String::new();
+                    let _ = std::io::Read::read_to_string(req.as_reader(), &mut body);
+                    *received_clone.lock().unwrap() = Some((seen, body));
+                    let _ = req.respond(tiny_http::Response::from_string("{}"));
+                }
+            });
+            let daemon_url = format!("http://127.0.0.1:{port}");
+            let reply = proxy(
+                &daemon_url,
+                method,
+                "/api/waypoints/waypoint-1",
+                r#"{"prompt":"g"}"#,
+                None,
+                None,
+            );
+            handle_thread.join().unwrap();
+            assert_eq!(reply.status, 200, "{method} was not proxied");
+            let (seen, body) = received.lock().unwrap().clone().expect("request reached");
+            assert_eq!(seen, method);
+            // Only the body-carrying methods should forward one.
+            if method == "POST" || method == "PATCH" {
+                assert_eq!(body, r#"{"prompt":"g"}"#, "{method} dropped its body");
+            }
+        }
+    }
 
     /// The proxy must attach `Authorization: Bearer <token>` when one is
     /// available, so the board UI keeps working against a daemon that now

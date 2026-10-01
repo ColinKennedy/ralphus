@@ -197,7 +197,7 @@
       initSplitters();
 
       // ---------- tabs ----------
-      const TABS = ["squads", "tasks", "queue", "reviews", "resources", "cartographer", "projects", "machines", "triage", "users", "secrets", "worktree-retirement", "health", "agents", "prefs"];
+      const TABS = ["squads", "tasks", "queue", "reviews", "waypoints", "resources", "cartographer", "projects", "machines", "triage", "users", "secrets", "worktree-retirement", "health", "agents", "prefs"];
       /**
        * Switches the active top-level tab, updates its URL hash, and re-renders.
        * @param {string} name
@@ -305,6 +305,8 @@
        * @property {string|null} [guardianId]
        * @property {{[key: string]: string}} [cartoQuery]
        * @property {string|null} [squadId]
+       * @property {string|null} [waypointId]
+       * @property {{q: string|null, status: string[]|null, projects: string[]|null}} [waypointHashFilters] raw Waypoints sidebar filters from the hash, applied by the Waypoints chunk (`applyWaypointHashFilters`) rather than here — that chunk loads after the first `parseHash()` call. A `null` field means the parameter was absent.
        * @property {string|null} [sel] legacy `kind:ti:si[:vi]` selector
        * @property {ParsedUri|null} [uri] RAL-188 selection, when the hash carried one
        */
@@ -418,6 +420,14 @@
           const task = squad && taskTabSel.kind ? (squad.tasks || [])[taskTabSel.taskIdx] : null;
           const selUri = squad && task ? taskTabSelectionUri(squad.id, task, taskTabSel) : "";
           url = hashWithSel("#/tasks", p.toString(), selUri);
+        } else if (tab === "waypoints") {
+          const p = new URLSearchParams();
+          if (waypointFilters.q) p.set("q", waypointFilters.q);
+          if (waypointFilters.status.size !== WAYPOINT_STATES.length) p.set("status", [...waypointFilters.status].join(","));
+          if (waypointFilters.projects.size) p.set("project", [...waypointFilters.projects].join(","));
+          const base = selectedWaypointId ? `#/waypoints/${selectedWaypointId}` : "#/waypoints";
+          const qs = p.toString();
+          url = qs ? `${base}?${qs}` : base;
         } else {
           const p = new URLSearchParams();
           if (filters.q) p.set("q", filters.q);
@@ -490,6 +500,30 @@
           const pq = p.get("q"); if (pq !== null) hiddenFilters.q = pq.toLowerCase();
           const ptype = p.get("type"); if (ptype !== null) hiddenFilters.type = new Set(ptype.split(",").filter(Boolean));
           return { tab: "prefs" };
+        }
+        if (raw.startsWith("waypoints")) {
+          const [head] = splitHashSel(raw);
+          const [path, query] = head.split("?");
+          const p = new URLSearchParams(query || "");
+          // Parsed into a plain object rather than assigned straight into the
+          // Waypoints chunk's own `waypointFilters`: the first `parseHash()`
+          // runs while chunk 80 loads, before chunk 82 has defined that state,
+          // so touching it here threw a ReferenceError and took the whole hash
+          // route down with it -- every `#/waypoints` deep link silently fell
+          // back to the default tab. The Waypoints chunk applies this itself
+          // once it is loaded, via `applyWaypointHashFilters`.
+          const pq = p.get("q");
+          const pstatus = p.get("status");
+          const pproject = p.get("project");
+          return {
+            tab: "waypoints",
+            waypointId: path.split("/")[1] || null,
+            waypointHashFilters: {
+              q: pq === null ? null : pq.toLowerCase(),
+              status: pstatus === null ? null : pstatus.split(",").filter(Boolean),
+              projects: pproject === null ? null : pproject.split(",").filter(Boolean),
+            },
+          };
         }
         if (raw.startsWith("squads")) return parseSquadsHashBody(raw);
         if (raw.startsWith("tasks")) {
@@ -798,7 +832,7 @@
        */
       function openProjectFilterMenu(e) {
         e.preventDefault(); e.stopPropagation();
-        ttCloseProjectFilterMenu(); triageCloseProjectFilterMenu();
+        ttCloseProjectFilterMenu(); triageCloseProjectFilterMenu(); closeWaypointProjectFilterMenu();
         const existing = document.getElementById("project-filter-menu");
         if (existing) { existing.remove(); return; }
         const menu = document.createElement("div");
@@ -1228,6 +1262,9 @@
         items.push(menuBatchSize > 1
           ? `<div class="ctx-disabled" data-tip="${singleOnlyTip("Watch")}">${isWatching(squadUri) ? "◉ Unwatch" : "◎ Watch…"}</div>`
           : `<div data-click="toggleWatch" data-entity-uri="${esc(squadUri)}" data-tip="${isWatching(squadUri) ? "Stop receiving watcher notifications for this squad." : "Watch this whole squad and choose which mailbox priority tiers should notify you."}">${isWatching(squadUri) ? "◉ Unwatch" : "◎ Watch…"}</div>`);
+        items.push(menuBatchSize > 1
+          ? `<div class="ctx-disabled" data-tip="${singleOnlyTip("Add to waypoint")}">📍 Add to waypoint…</div>`
+          : `<div onclick="openAddToWaypointMenu(event,'squad','${esc(id)}')" data-tip="Add this squad to a cross-squad waypoint's affected list, or create a new waypoint from it.">📍 Add to waypoint…</div>`);
         if (menuBatchSize > 1) {
           items.push(`<div data-click="hideSquadMenuItem" data-squad-id="${esc(id)}" data-tip="Hide all ${menuBatchSize} selected squads from your own view — they stay fully intact and keep running/counting normally.\nWho/when: use this to declutter your list of squads you don't need to watch right now.\nA personal preference — it never affects what other users see, and can be undone any time via \"show hidden\".">🙈 Hide ${menuBatchSize}</div>`);
           items.push(`<div data-click="unhideSquadMenuItem" data-squad-id="${esc(id)}" data-tip="Show all ${menuBatchSize} selected squads again in your own view, if hidden.\nWho/when: use this to undo an earlier hide across a whole selection.\nA personal preference — it never affects what other users see.">👁 Unhide ${menuBatchSize}</div>`);

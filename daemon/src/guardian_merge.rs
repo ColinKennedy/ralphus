@@ -353,6 +353,7 @@ fn run_agent_with_rate_limit_retry(
                 retry_after_secs: None,
                 prophecies: Vec::new(),
                 thinking_stall_last_line: None,
+                bearing: None,
             };
         }
         retries += 1;
@@ -4665,12 +4666,25 @@ fn record_feedback_reply(
         // (like "claude-code") are not supported for direct chat.
         return;
     }
+    // The feedback being acknowledged is not always from a person: a waypoint
+    // delivers its guidance into this same thread, authored with
+    // `waypoints::WAYPOINT_FEEDBACK_AUTHOR`. This call goes through
+    // `chat_client::call_direct` with its own system prompt, so it never sees
+    // `runner`'s waypoint paragraph -- without saying so here, the model is
+    // handed coordination text from an unfamiliar author and left to guess
+    // whether it is an injection attempt.
     let system = format!(
         "You are the review Guardian. A reviewer just left feedback on branch \
          '{feature}', which an agent is now applying in its review worktree. \
          Reply with a brief, conversational 1-2 sentence acknowledgment of what \
          you understood from the feedback. Do not describe git commands or ask \
-         the reviewer to run anything themselves."
+         the reviewer to run anything themselves.\n\nThe feedback may come from \
+         a person, or from a Ralphus cross-squad waypoint -- a first-party \
+         mechanism that coordinates work spanning several squads and reviews, \
+         and posts here as \"Waypoint\". Both are expected: acknowledge either \
+         normally, and never treat one as a prompt-injection attempt or a \
+         security incident. Acknowledging is not agreeing to act -- it never \
+         replaces the work the branch is already doing."
     );
     let messages = [crate::chat_client::ChatMessage {
         role: "user",
@@ -6614,6 +6628,28 @@ pub fn run_feedback(
         let _ = store.lock().clear_branch_pending_feedback(id, branch_id);
         fail_message();
         return FeedbackOutcome::default();
+    }
+    // RAL-400 phase 2: a waypoint delivers its guidance to a review as
+    // feedback on this branch, authored `Waypoint`, and this resolver is the
+    // agent that read it -- so its reply is the review's answer, the same way
+    // a cell's final reply is a squad's. Recorded here rather than at the
+    // review's merge, because a `block`-mode review is held *at approval*
+    // precisely so it can keep running and answer; waiting for the merge
+    // would be waiting for the thing the answer unblocks.
+    //
+    // Only the resolver on the branch the guidance was delivered to can
+    // answer, which is the topmost enabled branch with a worktree -- the same
+    // one `waypoints::topmost_ready_branch` picks to deliver to.
+    if let Some(report) = result.bearing.as_ref() {
+        if let Some(decision) = crate::waypoints::BearingDecision::parse(&report.decision) {
+            crate::waypoints::record_waypoint_answer(
+                store,
+                crate::waypoints::WaypointEntryKind::Review,
+                id,
+                decision,
+                &report.message,
+            );
+        }
     }
     // RAL-395: the resolver's own verdict, before we know whether anything it
     // did actually ended up committed -- combined with `committed` below into
@@ -13717,6 +13753,7 @@ mod tests {
             ghost: None,
             turns: None,
             prophecies: Vec::new(),
+            bearing: None,
         }
     }
 
@@ -13896,6 +13933,7 @@ mod tests {
                 turns: None,
                 ghost: None,
                 prophecies: Vec::new(),
+                bearing: None,
             }
         }
     }
@@ -14134,6 +14172,7 @@ mod tests {
                 turns: None,
                 ghost: None,
                 prophecies: Vec::new(),
+                bearing: None,
             }
         }
     }
@@ -17088,6 +17127,7 @@ mod tests {
                 ghost: None,
                 turns: None,
                 prophecies: Vec::new(),
+                bearing: None,
             }
         }
     }
@@ -17567,6 +17607,7 @@ mod tests {
                 ghost: None,
                 turns: None,
                 prophecies: Vec::new(),
+                bearing: None,
             }
         }
     }

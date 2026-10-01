@@ -1012,3 +1012,150 @@
        * @property {string} machine
        * @property {TargetHealthCheck[]} checks
        */
+      /**
+       * "review" | "squad" -- what a cross-squad waypoint's affected entry
+       * points at (RAL-400). `GET`/`POST /api/waypoints/{id}/affected`.
+       * @typedef {"review"|"squad"} AffectedEntryKind
+       */
+      /**
+       * "block" (can halt an entry's in-flight cells, mandatory mailbox
+       * notification) | "advisory" (informational only, never halts
+       * anything) -- see `docs/colors.md`'s Waypoint affected mode section for
+       * the badge color rule (RAL-400).
+       * @typedef {"block"|"advisory"} AffectedMode
+       */
+      /**
+       * A affected entry's delivery state for its waypoint's coordination
+       * prompt (RAL-400 Phase 4/5). Note this is the JSON wire form
+       * (`#[serde(rename_all = "snake_case")]`, underscore) -- distinct from
+       * `DeliveryStatus::as_str()`'s hyphenated `via-restack` used only in
+       * Rust-internal (non-JSON) contexts.
+       * @typedef {"undelivered"|"delivered"|"via_restack"|"failed"} DeliveryStatus
+       */
+      /**
+       * One affected entry of a cross-squad waypoint (RAL-400). Part of
+       * `WaypointDetail.affected`.
+       * @typedef {object} AffectedEntryView
+       * @property {string} waypoint_id
+       * @property {AffectedEntryKind} kind
+       * @property {string} entry_id - a squad id or review (guardian) id, depending on `kind`.
+       * @property {AffectedMode} mode
+       * @property {string|null} survey_verdict - the relevance-assessment verdict, if surveyed.
+       * @property {string|null} survey_rationale - the relevance-assessment rationale, if surveyed.
+       * @property {DeliveryStatus} delivery_status
+       * @property {number|null} stand_down_at_ms - set once this entry's advisory stand-down notice has been sent.
+       * @property {number|null} stale_at_ms - set when this entry's work finished while the waypoint was still open and had judged it impacted, so it landed without the waypoint's own changes. Advisory: nothing is re-run until `ralphus waypoint redo`.
+       * @property {string|null} [bearing_decision] - how this entry answered the waypoint: "accepted", "rejected" or "deferred". Null means it has not answered, which for a block-mode entry is what is still holding it.
+       * @property {number|null} [bearing_decided_at_ms]
+       * @property {number} created_at_ms
+       * @property {number} updated_at_ms
+       */
+
+      /**
+       * One row of a waypoint's ROSTER -- its completion list. A review or squad
+       * whose landing IS this waypoint being carried out, as opposed to
+       * `AffectedEntryView`, which is work the waypoint lands on.
+       *
+       * Deliberately thin: no survey verdict, no delivery status, no answer,
+       * because none of those apply to work the waypoint consists of.
+       * @typedef {object} RosterEntryView
+       * @property {string} waypoint_id
+       * @property {AffectedEntryKind} kind
+       * @property {string} entry_id - a squad id or review (guardian) id, depending on `kind`.
+       * @property {string|null} [note] - why this is on the list, in whoever added it's own words.
+       * @property {boolean} terminal - whether it has finished. Derived per read, so it cannot go stale against the squad/review it describes.
+       * @property {number} created_at_ms
+       */
+      /**
+       * One append-only bearing (a chronicle of actual completed work) on a
+       * cross-squad waypoint (RAL-400). `commit_id`/`commit_summary` are a
+       * narrowing aid for finding the referenced work, not an assertion that
+       * the base currently being viewed already contains it.
+       * @typedef {object} BearingView
+       * @property {number} id
+       * @property {string} waypoint_id
+       * @property {AffectedEntryKind} producer_kind
+       * @property {string} producer_id
+       * @property {string} summary
+       * @property {string|null} entity_uri
+       * @property {string|null} commit_id
+       * @property {string|null} commit_summary
+       * @property {number} created_at_ms
+       */
+      /**
+       * Affected-entry counts by `DeliveryStatus`, e.g. "3/5 delivered", shown
+       * without hydrating the full affected (RAL-400).
+       * @typedef {object} DeliverySummary
+       * @property {number} undelivered
+       * @property {number} delivered
+       * @property {number} via_restack
+       * @property {number} failed
+       */
+      /**
+       * Lean per-waypoint projection for `GET /api/waypoints`'s list view
+       * (RAL-400) -- everything the Waypoints tab's sidebar needs without
+       * hydrating the full affected or prompt.
+       * @typedef {object} WaypointListEntry
+       * @property {string} id
+       * @property {string|null} label
+       * @property {string} state - "open" | "closed"
+       * @property {boolean} allow_advisory
+       * @property {string[]} projects - server-resolved project names (RAL-396); render as-is.
+       * @property {number} affected_count
+       * @property {DeliverySummary} delivery_summary - affected-entry counts by delivery status, so the sidebar can show progress without a request per row.
+       * @property {number} created_at_ms
+       * @property {number} updated_at_ms
+       * @property {number|null} closed_at_ms
+       */
+      /**
+       * Full `GET /api/waypoints/{id}` response: settings, affected, and a
+       * delivery summary (RAL-400). `prompt` is already redacted server-side.
+       * @typedef {object} WaypointDetail
+       * @property {string} id
+       * @property {string|null} label
+       * @property {string} prompt
+       * @property {string|null} agent
+       * @property {string|null} model
+       * @property {boolean} allow_advisory
+       * @property {string} state - "open" | "closed"
+       * @property {number} created_at_ms
+       * @property {number} updated_at_ms
+       * @property {number|null} closed_at_ms
+       * @property {string[]} projects - server-resolved project names (RAL-396); render as-is.
+       * @property {RosterEntryView[]} roster - the completion list: what must land for this waypoint to be carried out.
+       * @property {AffectedEntryView[]} affected - the work this waypoint lands on.
+       * @property {DeliverySummary} delivery_summary
+       */
+      /**
+       * One affected entry a re-survey would act on (`GET /api/waypoints/{id}/resurvey-preview`).
+       * @typedef {object} ResurveyTarget
+       * @property {string} kind - "squad" or "review".
+       * @property {string} entry_id
+       * @property {string|null} [label] - The squad's label or the review's name, when it has one.
+       * @property {string} mode - "block" or "advisory".
+       * @property {string|null} [current_verdict] - The verdict a re-run would replace; null when never judged.
+       * @property {string} delivery_status
+       * @property {boolean} will_be_held_until_judged - Whether clearing this entry's verdict re-holds it until the survey reaches it (true for block mode, since the gate reads a missing verdict as uncleared).
+       */
+
+      /**
+       * What re-running a waypoint's survey would touch, resolved before anything changes.
+       * @typedef {object} ResurveyPreview
+       * @property {ResurveyTarget[]} targets - Entries the survey owns, which a re-run re-judges.
+       * @property {ResurveyTarget[]} held_explicit - Human-declared entries, which a re-run deliberately leaves alone.
+       */
+
+      /**
+       * One Cartographer-backed delivery/lifecycle event for a waypoint's
+       * feed (RAL-400). `GET /api/waypoints/{id}/deliveries`.
+       * @typedef {object} WaypointEventEntry
+       * @property {number} at_ms
+       * @property {string} level
+       * @property {string} message
+       * @property {object} payload
+       * @property {string|null} squad_id - the squad this effect landed on, if any.
+       * @property {string|null} guardian_id - the review this effect landed on, if any.
+       * @property {string|null} cell_id - the cell this effect landed on, if any.
+       * @property {string|null} task - the task name owning `cell_id`, if any.
+       * @property {string} source - the subsystem that recorded it (`waypoints`, `scheduler`, `submit`, `server`), which distinguishes a survey decision from an action taken on it.
+       */

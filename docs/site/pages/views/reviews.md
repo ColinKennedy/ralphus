@@ -28,7 +28,7 @@ once you click **Save**, which re-runs the stacked rebase in the new shape.
 
 ## Running manual checks
 
-![The manual-checks dropdown open, showing individual suggested commands](../screenshots/reviews-manual-checks.png)
+![The manual-checks section of a review, listing the agent's suggested commands with one expanded to show its full text](../screenshots/reviews-manual-checks.png)
 
 Alongside the automated check gates, an agent suggests shell commands worth
 running by hand to sanity-check the change. The suggestions are computed once,
@@ -59,3 +59,10 @@ result of your feedback without triggering anything yourself.
 That feedback routing (what the word does in reviewer mode — and what it
 doesn't — plus the per-branch selector and restack effects) is documented in
 the repo's [special syntax & markers](../special-syntax.md) guide.
+
+A [waypoint](waypoints.md) (RAL-400) rostering this review delivers its
+guidance through this exact same path: the bearing is posted as synthetic
+feedback into the review's topmost ready branch, so it amends and pushes —
+and restacks anything downstream — exactly as a human's feedback would. The
+roster entry is recorded `delivered` once that post succeeds; it never needs
+its own separate injection mechanism.

@@ -1186,6 +1186,225 @@ token works (and as whom) and whether the forge is reachable. Never returns the 
     ),
 ];
 
+/// A waypoint's completion list: the reviews and squads whose landing IS
+/// this waypoint being carried out. Distinct from `affected`, which is the
+/// work the waypoint lands on.
+const WAYPOINT_ROSTER_CHILDREN: &[HelpNode] = &[
+    node(
+        "add",
+        &["waypoint_id [id]", "entry_id [id]"],
+        &["--note [text]"],
+        "Add a squad or review to a waypoint's completion list -- the work whose landing IS this \
+         waypoint being carried out. Distinct from the affected list, which is the work the \
+         waypoint lands on; nothing auto-enrolls here.",
+        false,
+        false,
+        &[],
+    ),
+    node(
+        "remove",
+        &["waypoint_id [id]", "entry_id [id]"],
+        &[],
+        "Drop a squad or review from a waypoint's completion list. Removing the last unfinished \
+         goal can complete the waypoint's first phase.",
+        false,
+        false,
+        &[],
+    ),
+];
+
+const WAYPOINT_AFFECTED_CHILDREN: &[HelpNode] = &[
+    node(
+        "add",
+        &["waypoint_id [str]", "kind [review|squad]", "entry_id [str]"],
+        &["--mode [block|advisory]"],
+        "Add (or upsert the mode of) one affected entry on a waypoint.",
+        false,
+        false,
+        &[],
+    ),
+    node(
+        "remove",
+        &["waypoint_id [str]", "entry_id [str]"],
+        &[],
+        "Remove one affected entry from a waypoint.",
+        false,
+        false,
+        &[],
+    ),
+    node(
+        "mode",
+        &[
+            "waypoint_id [str]",
+            "entry_id [str]",
+            "mode [block|advisory]",
+        ],
+        &[],
+        "Override the block/advisory mode of one existing affected entry.",
+        false,
+        false,
+        &[],
+    ),
+];
+
+const WAYPOINT_BEARING_CHILDREN: &[HelpNode] = &[node(
+    "add",
+    &[
+        "waypoint_id [str]",
+        "producer_kind [review|squad]",
+        "producer_id [str]",
+    ],
+    &[
+        "--summary [text]",
+        "--entity-uri [uri]",
+        "--commit-id [str]",
+        "--commit-summary [text]",
+    ],
+    "Append a completed-work bearing to a waypoint's durable delivery feed.",
+    false,
+    false,
+    &[],
+)];
+
+const WAYPOINT_CHILDREN: &[HelpNode] = &[
+    node(
+        "create",
+        &[],
+        &[
+            "--prompt [text]",
+            "--label [text]",
+            "--agent [name]",
+            "--model [name]",
+            "--allow-advisory",
+            "--affected [kind:entry_id[:mode]...]",
+            "--roster [entry_id[:note]...]",
+        ],
+        "Create a cross-squad waypoint: --affected names the work it lands on, --roster the work whose          landing IS it being carried out. A waypoint with no roster is a broadcast -- nothing has to land,          so its affected work is never held, only asked to answer (RAL-400).",
+        false,
+        false,
+        &[],
+    ),
+    node(
+        "list",
+        &[],
+        &["--project [name]", "--state [open|closed]"],
+        "List waypoints.",
+        false,
+        true, // ("waypoint", "list")
+        &[],
+    ),
+    node(
+        "get",
+        &["waypoint_id [str]"],
+        &[],
+        "Show one waypoint's settings, roster, affected entries, tracked projects, and delivery summary.",
+        false,
+        true, // ("waypoint", "get")
+        &[],
+    ),
+    node(
+        "close",
+        &["waypoint_id [str]"],
+        &[],
+        "Manually close an open waypoint.",
+        false,
+        false,
+        &[],
+    ),
+    node(
+        "reopen",
+        &["waypoint_id [str]"],
+        &[],
+        "Reopen a closed waypoint.",
+        false,
+        false,
+        &[],
+    ),
+    node(
+        "edit",
+        &["waypoint_id [str]"],
+        &[
+            "--label [text]",
+            "--prompt [text]",
+            "--agent [name]",
+            "--model [name]",
+            "--allow-advisory/--no-allow-advisory",
+            "--resurvey",
+        ],
+        "Update a waypoint's settings: label, guidance prompt, survey agent/model, and whether advisory \
+         affected entries are allowed. Survey verdicts are kept unless --resurvey re-queues every \
+         daemon-enrolled entry for re-judging; preview that first with 'waypoint resurvey-preview'.",
+        false,
+        false,
+        &[],
+    ),
+    node(
+        "resurvey-preview",
+        &["waypoint_id [id]"],
+        &[],
+        "Show what 'waypoint edit --resurvey' would re-judge: which daemon-enrolled affected entries \
+         get their verdict cleared, and which human-declared entries are left alone.",
+        true,
+        false,
+        &[],
+    ),
+    node(
+        "redo",
+        &["waypoint_id [str]", "entry_id [str]"],
+        &[],
+        "Re-run a squad whose finished work a closed waypoint flagged as stale, carrying its \
+         prior findings and the waypoint's bearings into the new run.",
+        false,
+        false,
+        &[],
+    ),
+    node(
+        "roster",
+        &[],
+        &[],
+        "Add/remove entries on a waypoint's completion list -- the work whose landing IS this \n         waypoint being carried out.",
+        false,
+        false,
+        WAYPOINT_ROSTER_CHILDREN,
+    ),
+    node(
+        "affected",
+        &[],
+        &[],
+        "Add/remove/change the mode of a waypoint's affected entries.",
+        false,
+        false,
+        WAYPOINT_AFFECTED_CHILDREN,
+    ),
+    node(
+        "bearing",
+        &[],
+        &[],
+        "Append a completed-work bearing to a waypoint's delivery feed.",
+        false,
+        false,
+        WAYPOINT_BEARING_CHILDREN,
+    ),
+    node(
+        "bearings",
+        &["waypoint_id [str]"],
+        &[],
+        "List a waypoint's bearing feed.",
+        false,
+        true, // ("waypoint", "bearings")
+        &[],
+    ),
+    node(
+        "deliveries",
+        &["waypoint_id [str]"],
+        &[],
+        "Show a waypoint's delivery/event history.",
+        false,
+        true, // ("waypoint", "deliveries")
+        &[],
+    ),
+];
+
 // RAL-338 follow-up: machine-invoked interfaces with no interactive/task-file
 // use -- see `crate::commands::internal::InternalCommand`.
 const INTERNAL_CHILDREN: &[HelpNode] = &[node(
@@ -2230,6 +2449,15 @@ classification categories (RAL-318).",
             false,
             INTERNAL_CHILDREN,
         ),
+        node(
+            "waypoint",
+            &[],
+            &[],
+            "Coordinate cross-squad work: create waypoints, manage their roster and affected entries, and track bearings/deliveries (RAL-400).",
+            false,
+            false,
+            WAYPOINT_CHILDREN,
+        ),
         // ralphus[ignore-endpoint-cli]: prints the built-in tutorial text bundled in the CLI binary
         node(
             "tutor",
@@ -2423,7 +2651,9 @@ fn display_chip(chip: &str) -> String {
         "selector" | "entity_uri" | "--entity" | "--for" | "cell" | "to_review" => {
             chip.replacen("[str", "[uri", 1)
         }
-        "squad_id" | "pr_id" | "--squad" | "--guardian" => chip.replacen("[str", "[id", 1),
+        "squad_id" | "pr_id" | "--squad" | "--guardian" | "waypoint_id" | "entry_id" => {
+            chip.replacen("[str", "[id", 1)
+        }
         _ => chip.to_string(),
     }
 }

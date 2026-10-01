@@ -28,6 +28,7 @@ TAB_ROUTES = {
     "tasks": "tasks",
     "queue": "queue",
     "reviews": "reviews",
+    "waypoints": "waypoints",
     "resources": "resources",
     "cartographer": "logs",
     "projects": "projects",

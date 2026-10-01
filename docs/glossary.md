@@ -178,6 +178,23 @@ user-facing actions and relations use **watch** / **watcher**.
 | **restart_on** | A proof step's declaration that another step firing should re-run this cell's proof cursor. Grammar: `task/cell/proof?on=pass\|fail\|both`. |
 | **detach** | (RAL-288) Cleanly stopping a still-running cell's live process — without reporting it `Done` or `Failed` — so a real interactive agent session can safely take over the same conversation. The cell stays `Running`, paused, until an explicit **resume automation** call hands it back to unattended execution. |
 
+## Waypoints (RAL-400)
+
+Cross-squad coordination join points. Full design record, including the
+actionable-notification matching model and the EntityUri/sentinel grammar
+decisions, is [`.agent/waypoints-phase0-decisions.md`](../.agent/waypoints-phase0-decisions.md).
+
+| Term | Meaning |
+|---|---|
+| **waypoint** | A named, open/closed join point: a required `prompt`, an `agent`/`model` pair used as the survey classifier, an `allow_advisory` flag (default off), a **roster** (what must land) and an **affected** list (what it lands on). Completion is two-phase: the roster lands, then every blocking affected entry answers. Was called "milestone" in early design. |
+| **roster** | A waypoint's completion list: the reviews and squads whose landing *is* that waypoint being carried out. Curated by hand — nothing enrolls here automatically, because what must be true for a waypoint to be done is a statement of intent, not something a classifier can discover. Distinct from **affected**. |
+| **roster entry** | One item on a roster — a single review or squad reference, plus an optional note saying why it is what "done" means. Carries no mode, verdict or delivery state: it is work the waypoint consists of, so all it has to do is finish. |
+| **affected** | The work a waypoint *lands on*, as opposed to the work it consists of. Populated by the **survey** and by submit-time scope overlap. v1 kinds are **review** and **squad**; cell/task-level entries are deferred to v2. Was called "roster", which now means the completion list. |
+| **affected entry** | One item on the affected list: a review or squad with a **mode** (`block`/`advisory`), the survey's verdict, a delivery status, and the **bearing decision** it answered with. |
+| **bearing decision** | How an affected entry answered a waypoint — `accepted`, `rejected` or `deferred` — reported by its agent as a `RALPHUS_BEARING:` line. Declining is a real answer and is recorded as one; silence is not, and for a `block`-mode entry it is what keeps it held. |
+| **bearing** | A durable, append-only guidance item a waypoint publishes for an impacted affected entry's agent: an optional git commit id + message summary, a concise change description, and an optional entity link. The waypoint's counterpart to a **ghost**, but ongoing rather than one-time. |
+| **survey** | The LLM classification pass that decides whether a review/squad is actually impacted by a waypoint, and at what mode (advisory vs. block). Was called "pulse" / "classification pass". |
+
 ## Components
 
 | Term | Meaning |

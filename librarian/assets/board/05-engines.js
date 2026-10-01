@@ -349,6 +349,29 @@
       CLICK_HANDLERS.deleteAgentProfile = (e, ds) => deleteAgentProfile(ds.name || "");
       CLICK_HANDLERS.forceDeleteAgentProfile = (e, ds) => forceDeleteAgentProfile(ds.name || "");
       CLICK_HANDLERS.removeAgentProfileEnvRow = (e, ds) => removeAgentProfileEnvRow(Number(ds.i));
+      CLICK_HANDLERS.selectWaypoint = (e, ds) => selectWaypoint(ds.waypointId || "");
+      CLICK_HANDLERS.openWaypointMenu = (e, ds) => openWaypointMenu(e, ds.waypointId || "");
+      CTX_HANDLERS.openWaypointMenu = (e, ds) => openWaypointMenu(e, ds.waypointId || "");
+      CLICK_HANDLERS.gotoEntityUri = (e, ds) => { e.preventDefault(); gotoEntityUri(ds.entityUri || ""); };
+      CLICK_HANDLERS.removeAffectedEntry = (e, ds) => removeAffectedEntry(ds.waypointId || "", ds.entryId || "");
+      CLICK_HANDLERS.toggleAffectedEntryMode = (e, ds) => toggleAffectedEntryMode(ds.waypointId || "", ds.entryId || "", ds.mode || "block");
+      CLICK_HANDLERS.closeWaypoint = (e, ds) => closeWaypoint(ds.waypointId || "");
+      CLICK_HANDLERS.reopenWaypoint = (e, ds) => reopenWaypoint(ds.waypointId || "");
+      CLICK_HANDLERS.openAddAffectedEntry = (e, ds) => openAddAffectedEntry(ds.waypointId || "");
+      CLICK_HANDLERS.submitAddAffectedEntry = (e, ds) => submitAddAffectedEntry(ds.waypointId || "");
+      CLICK_HANDLERS.openAppendBearing = (e, ds) => openAppendBearing(ds.waypointId || "");
+      CLICK_HANDLERS.submitAppendBearing = (e, ds) => submitAppendBearing(ds.waypointId || "");
+      CLICK_HANDLERS.submitCreateWaypoint = () => submitCreateWaypoint();
+      CLICK_HANDLERS.submitEditWaypoint = () => submitEditWaypoint();
+      CLICK_HANDLERS.saveWaypointAndResurvey = () => saveWaypointAndResurvey();
+      CLICK_HANDLERS.openAddRosterEntry = (ev, ds) => openAddRosterEntry(ds.waypointId || "");
+      CLICK_HANDLERS.submitAddRosterEntry = (ev, ds) => submitAddRosterEntry(ds.waypointId || "");
+      CLICK_HANDLERS.removeRosterEntry = (ev, ds) => removeRosterEntry(ds.waypointId || "", ds.entryId || "");
+      CLICK_HANDLERS.saveWaypointWithoutResurvey = () => saveWaypointWithoutResurvey();
+      CLICK_HANDLERS.openEditWaypoint = (e, ds) => openEditWaypoint(ds.waypointId || "");
+      CLICK_HANDLERS.toggleWaypointGuidance = () => toggleWaypointGuidance();
+      CLICK_HANDLERS.addEntryToWaypointFromMenu = (e, ds) => addEntryToWaypointFromMenu(ds.kind || "", ds.entryId || "", ds.waypointId || "");
+      CLICK_HANDLERS.openCreateWaypointFromMenu = (e, ds) => openCreateWaypointFromMenu(ds.kind || "", ds.entryId || "");
       document.addEventListener("click", (/** @type {MouseEvent} */ e) => {
         // The second click of a double-click opens the row instead of running
         // its ordinary action again -- the first click already selected it.
