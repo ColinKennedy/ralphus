@@ -5750,8 +5750,9 @@ impl Store {
     pub fn approve_guardian(&self, id: &str) -> Result<GuardianStatus> {
         if let Some(waypoint_id) = self.review_block_gating_waypoint(id)? {
             return Err(StoreError::InvalidTransition(format!(
-                "review {id} is held by open waypoint {waypoint_id}; close that waypoint or set \
-                 its affected entry for this review to advisory before approving"
+                "review {id} is held by open waypoint {waypoint_id}; its resolver releases it by \
+                 answering with a RALPHUS_BEARING line. To release it without an answer, set its \
+                 affected entry to advisory or close the waypoint"
             )));
         }
         match GuardianStatus::parse(&self.guardian_status_str(id)?) {
