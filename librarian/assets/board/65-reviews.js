@@ -161,9 +161,14 @@
         const list = visibleGuardians();
         if (!list.length) { el.innerHTML = `<div class="empty">No matching reviews.</div>`; return; }
         const bulkBar = guardianMultiSel.size > 1 ? reviewSelectionBar() : "";
+        // The ⋯ shares the title's line (the `.squad-row`/`.squad-actions` frame
+        // the Squads list uses) rather than claiming one of its own -- a third
+        // line per row costs a third of the list you can see at once.
         el.innerHTML = bulkBar + list.map((g) => `<div class="squad-item ${(g.id===selectedGuardian || guardianMultiSel.has(g.id))?"selected":""}" data-click="onReviewClick" data-ctx="openReviewMenu" data-guardian-id="${esc(g.id)}">
-          <button class="btn squadbtn" data-click="openReviewMenu" data-guardian-id="${esc(g.id)}" data-tip="Review actions — rename, hide, cancel, or delete this review.">⋯</button>
-          <div class="rid">${hiddenGuardianIds.has(g.id) ? `<span data-tip="You've hidden this review from your own view.\nIt's shown now because \"show hidden\" is on, or you navigated to it directly.\nA personal preference — it does not affect what other users see.">🙈</span> ` : ""}${esc(g.name)} ${arbiterBadge(g)}</div>
+          <div class="squad-row">
+            <div class="rid">${hiddenGuardianIds.has(g.id) ? `<span data-tip="You've hidden this review from your own view.\nIt's shown now because \"show hidden\" is on, or you navigated to it directly.\nA personal preference — it does not affect what other users see.">🙈</span> ` : ""}${esc(g.name)} ${arbiterBadge(g)}</div>
+            <div class="squad-actions"><button class="btn squadbtn" data-click="openReviewMenu" data-guardian-id="${esc(g.id)}" data-tip="Review actions — rename, hide, cancel, or delete this review.">⋯</button></div>
+          </div>
           <div class="meta">${pill(g.status)}${reviewSparkbar(g)}</div></div>`).join("");
       }
       /**
@@ -1556,8 +1561,10 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        * @returns {string}
        */
       function setupChip(gid, label, value, tip, warn) {
+        // The chip's own label doubles as the group it jumps to, so the setup
+        // modal opens on the field the chip was showing rather than at its top.
         return `<button class="setup-chip${warn ? " warn" : ""}" data-click="openEditReviewDetails" `
-          + `data-guardian-id="${esc(gid)}" data-tip="${esc(tip)}">`
+          + `data-guardian-id="${esc(gid)}" data-focus="${esc(label)}" data-tip="${esc(tip)}\n\nClick to edit — opens review setup on this setting.">`
           + `<span class="sc-k">${esc(label)}</span><b>${value}</b></button>`;
       }
       /**
@@ -1629,7 +1636,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           + `<span class="sc-k">review branch</span><b>${esc(g.review_branch || "—")}</b></span>`
           + `</div>`
           + `<button class="btn setup-edit" data-click="openEditReviewDetails" data-guardian-id="${esc(g.id)}" `
-          + `data-tip="Edit every setting for this review in one place — name, upstream, resolver, proof scope, build and squash options, PR settings and environment overrides.\nEvery chip to the left opens this same editor.\nNothing takes effect until you click Save; Save applies every change in one request and triggers at most one rebase.">`
+          + `data-tip="Edit this review's settings — name, upstream, resolver, proof scope, build and squash options, PR settings.\nEvery chip to the left opens this same editor, landing on the setting it shows.\nEnvironment overrides are not here: each section's ⋯ edits the environment its own commands run in.\nNothing takes effect until you click Save; Save applies every change in one request and triggers at most one rebase.">`
           + `✎ Edit setup</button></div>`;
       }
 
@@ -1816,7 +1823,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
               <div class="cmd-actions">
                 ${watchersHtml(`guardian:${g.id}`)}
                 <button class="icon-btn" data-click="toggleReviewDock" data-guardian-id="${esc(g.id)}" data-tip="Open the log drawer docked at the bottom of this review.\nIt follows whatever you select — the whole review, one branch, or one command — and stays open while you work instead of covering the page.">☰ Logs</button>
-                <button class="icon-btn" data-click="openEditReviewDetails" data-guardian-id="${esc(g.id)}" data-tip="Edit this review's settings — name, upstream branch, resolver, proof scope, build/squash options, PR settings, and environment overrides — all in one place.\nNothing takes effect until you click Save; Save applies every change in a single request and triggers at most one rebase.">✎ Setup</button>
+                <button class="icon-btn" data-click="openEditReviewDetails" data-guardian-id="${esc(g.id)}" data-tip="Edit this review's settings — name, upstream branch, resolver, proof scope, build/squash options, PR settings.\nEnvironment overrides live on each section's ⋯, next to the commands they govern.\nNothing takes effect until you click Save; Save applies every change in a single request and triggers at most one rebase.">✎ Setup</button>
                 <button class="btn squadbtn" data-click="openReviewTitleMenu" data-guardian-id="${esc(g.id)}" data-tip="Every other action for this review.">⋯</button>
               </div>
             </div>

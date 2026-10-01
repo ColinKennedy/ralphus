@@ -59,8 +59,30 @@
       function selectInspectorBranch(branchId) {
         inspectorBranchId = branchId;
         if (!reviewDockSticky) reviewDockScope = branchId;
-        renderReviewInspector();
+        // Switching branches while watching is still watching: the newly
+        // selected branch attaches too, rather than showing a collapsed pane
+        // that has to be opened again for every branch in the stack.
+        if (inspectorTab === "live" && !attachInspectorLive(branchId)) renderReviewInspector();
+        else if (inspectorTab !== "live") renderReviewInspector();
         renderReviewDock();
+      }
+      /**
+       * Attaches one branch's live pane and starts its first fetch. Returns
+       * whether it did the attaching (and so already re-rendered), so callers
+       * don't render twice.
+       * @param {string} branchId - The branch to attach.
+       * @returns {boolean}
+       */
+      function attachInspectorLive(branchId) {
+        inspectorLiveAttached[branchId] = true;
+        const g = guardians.find((x) => x.id === selectedGuardian);
+        if (!g) return false;
+        const key = `guardian|${g.id}|${branchId}`;
+        if (peekOpen[key]) return false;
+        peekOpen[key] = true;
+        renderReviewInspector();
+        fetchPeek(key, true);
+        return true;
       }
       /**
        * Switches inspector tabs. Opening Live attaches that branch's stream --
@@ -70,7 +92,14 @@
        */
       function setInspectorTab(tab) {
         inspectorTab = tab;
-        if (tab === "live" && inspectorBranchId) inspectorLiveAttached[inspectorBranchId] = true;
+        // Opening the Live tab IS the request to watch, so it attaches and
+        // shows the pane -- a second "Show Live View" click bought nothing,
+        // since nothing had loaded before the tab was opened either way.
+        // Opening the Live tab IS the request to watch, so it attaches and
+        // shows the pane -- a second "Show Live View" click bought nothing,
+        // since nothing had loaded before the tab was opened either way.
+        const bid = inspectorBranchId;
+        if (tab === "live" && bid && attachInspectorLive(bid)) return;
         renderReviewInspector();
       }
       /**
@@ -277,10 +306,82 @@
         if (!inspectorLiveAttached[b.id]) {
           return `<div class="empty" data-tip="Opening this tab attaches to the branch's resolver session. Nothing streams until then.">Not attached.</div>`;
         }
-        return `<div class="btn-row" style="position:relative;gap:0">${resolverTerminalBtns(g, b)}</div>
+        if (!b.worktree) {
+          return `<div class="empty">No worktree yet — a resolver session starts when this branch begins rebasing.</div>`;
+        }
+        const key = `guardian|${g.id}|${b.id}`;
+        // The attempt list is what makes walking back possible, and it is only
+        // fetched once this tab is open -- see the lazy-by-default rule.
+        if (historyAttempts[key] === undefined) fetchHistoryList(key);
+        return `${liveRunStepper(key)}
+          <div class="btn-row" style="position:relative;gap:0">${resolverTerminalBtns(g, b)}</div>
           ${resolverPeekBox(g, b)}
-          <div class="hint">Read-only — nothing typed here reaches the agent. The transcript is
-          captured per attempt, so it survives a restart.</div>`;
+          <div class="hint">Read-only — nothing typed here reaches the agent. Every attempt's text is
+          captured separately, so walking back survives a restart.</div>`;
+      }
+      /**
+       * The walk-back stepper over a branch's persisted resolver attempts.
+       *
+       * The durable attempt history (RAL-154) was only reachable as a list you
+       * opened and closed, which makes "what was it doing two attempts ago" a
+       * navigation exercise. Stepping one attempt at a time is the gesture that
+       * question actually wants, with the list still there behind the picker.
+       * @param {string} key - The peek key, `guardian|<gid>|<branchId>`.
+       * @returns {string}
+       */
+      function liveRunStepper(key) {
+        const attempts = historyAttempts[key];
+        if (attempts === undefined) {
+          return `<div class="run-step"><span class="rs-label">Loading attempts…</span></div>`;
+        }
+        if (!attempts.length) {
+          return `<div class="run-step" data-tip="A durable log is written once this branch's first resolver attempt finishes. Until then there is only the live pane below.">
+              <span class="rs-label">Live session only — no earlier attempts yet</span>
+            </div>`;
+        }
+        // Newest last, matching how the attempts are numbered.
+        const ordered = attempts.slice().sort((x, y) => x.attempt - y.attempt);
+        const viewing = historyViewing[key];
+        const curIdx = viewing
+          ? Math.max(0, ordered.findIndex((a) => a.attempt === viewing.attempt))
+          : ordered.length - 1;
+        const cur = ordered[curIdx];
+        const atLatest = curIdx === ordered.length - 1 && !viewing;
+        const when = cur && cur.modified_ms
+          ? new Date(cur.modified_ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+          : "";
+        return `<div class="run-step${atLatest ? "" : " past"}">
+            <button class="rs-nav" data-click="stepLiveAttempt" data-key="${esc(key)}" data-dir="-1" ${curIdx <= 0 ? "disabled" : ""}
+              data-tip="Step back to the previous resolver attempt on this branch.">&#9664;</button>
+            <button class="rs-pick" data-click="toggleHistory" data-key="${esc(key)}"
+              data-tip="Every persisted attempt for this branch, including each reattach.\nPick one to read its full log.">
+              <span class="rs-kind">attempt</span>
+              <span class="rs-label mono">${cur ? cur.attempt : "?"}${cur && cur.attempt === 0 ? " (initial)" : ""}</span>
+              <span class="rs-meta">${esc(when)}</span>
+              <span class="rs-count num">${curIdx + 1}/${ordered.length}</span> &#9662;</button>
+            <button class="rs-nav" data-click="stepLiveAttempt" data-key="${esc(key)}" data-dir="1" ${curIdx >= ordered.length - 1 ? "disabled" : ""}
+              data-tip="Step forward to the next resolver attempt on this branch.">&#9654;</button>
+            ${atLatest ? "" : `<button class="btn" data-click="closeHistoryAttempt" data-key="${esc(key)}"
+              data-tip="Jump back to the live pane — the newest attempt, still streaming.">&#8677; Latest</button>`}
+          </div>
+          ${atLatest ? "" : `<div class="histnote">Historical record — read-only. You are reading attempt ${cur ? cur.attempt : "?"}, not the live session.</div>`}`;
+      }
+      /**
+       * Steps the Live tab one resolver attempt backwards or forwards.
+       * @param {string} key - The peek key.
+       * @param {number} dir - -1 for the previous attempt, 1 for the next.
+       * @returns {void}
+       */
+      function stepLiveAttempt(key, dir) {
+        const attempts = (historyAttempts[key] || []).slice().sort((x, y) => x.attempt - y.attempt);
+        if (!attempts.length) return;
+        const viewing = historyViewing[key];
+        const curIdx = viewing
+          ? Math.max(0, attempts.findIndex((a) => a.attempt === viewing.attempt))
+          : attempts.length - 1;
+        const next = Math.min(attempts.length - 1, Math.max(0, curIdx + dir));
+        if (next === attempts.length - 1 && dir > 0 && !viewing) return;
+        viewHistoryAttempt(key, attempts[next].attempt);
       }
 
       /**
@@ -510,34 +611,38 @@
         manual: { label: "manual checks", note: "Written by the resolver agent against this stack's changes. Advisory — they never block approval." },
       };
       /**
-       * Which env scope each runnable section edits, and the endpoint behind it.
-       * The daemon exposes one scope per section (RAL-203); putting the editor
-       * on the section's own ⋯ is what makes "which scope am I changing"
-       * unambiguous.
-       * @type {{[kind: string]: {scope: string, url: string, label: string, tip: string}}}
+       * Which env scope each runnable section edits, and which resolved-env
+       * endpoint describes what that section actually ends up running in.
+       *
+       * `edit` is the writable scope; `resolvedUrl` is the read-only resolution
+       * of it for this section. They differ for check gates: the daemon composes
+       * the gates' environment from the daemon's own plus the build step's
+       * overrides, so the thing you edit is `build` while the thing you read
+       * back is `tests-env`.
+       * @type {{[kind: string]: {edit: string, resolvedUrl: string, label: string, tip: string}}}
        */
       const ENV_SCOPE_FOR_SECTION = {
         gates: {
-          scope: "tests",
-          url: "tests-env",
+          edit: "build",
+          resolvedUrl: "tests-env",
           label: "check gates",
-          tip: "The environment the check gates actually run in.\nResolved, not directly editable — the daemon composes it from the daemon environment plus the build step's overrides, so edit it there.",
+          tip: "Edit the environment the check gates run in.\nThe daemon composes it from its own environment plus the build step's overrides, so this edits the build step's — shared with test actions.",
         },
         manual: {
-          scope: "manual_checks",
-          url: "manual-checks-env",
+          edit: "manual_checks",
+          resolvedUrl: "manual-checks-env",
           label: "manual checks",
-          tip: "Environment overrides applied when the suggested manual checks run.",
+          tip: "Edit the environment overrides applied when the suggested manual checks run.\nThis scope is the manual-checks step's own — nothing else in the review uses it.",
         },
         actions: {
-          scope: "build",
-          url: "build-env",
+          edit: "build",
+          resolvedUrl: "build-env",
           label: "test actions",
-          tip: "Environment overrides for the build step, which is what test actions run against.",
+          tip: "Edit the environment overrides for the build step, which is what test actions run against.\nShared with the check gates, which resolve from the same layer.",
         },
       };
       /**
-       * Opens the resolved-environment viewer for one section's scope.
+       * Opens the environment-override editor for one section's writable scope.
        * @param {string} gid - The review id.
        * @param {string} kind - Which section's scope to open.
        * @returns {void}
@@ -546,7 +651,7 @@
         closeSquadMenu();
         const meta = ENV_SCOPE_FOR_SECTION[kind];
         if (!meta) return;
-        openEnvViewer(`/api/guardians/${gid}/${meta.url}`);
+        void openEnvOverridesEditor(gid, meta.edit, "", `/api/guardians/${gid}/${meta.resolvedUrl}`);
       }
       /**
        * The ⋯ button for one section heading.
@@ -588,7 +693,7 @@
           items.push(`<div data-click="regenManualChecks" data-guardian-id="${esc(gid)}" data-tip="Ask the resolver agent to write these checks again against the stack's current changes.\nRuns in the background and never blocks Approve or Merge / rebase.">↻ Regenerate</div>`);
         }
         if (kind === "gates") {
-          items.push(`<div data-click="openEditReviewDetails" data-guardian-id="${esc(gid)}" data-tip="Check gates are edited in the review's settings.">✎ Edit gates…</div>`);
+          items.push(`<div data-click="openEditReviewDetails" data-guardian-id="${esc(gid)}" data-focus="gates" data-tip="Open review setup on the build settings that decide whether gates run at all.\nThe gate commands themselves come from the project's review settings, not from here.">✎ Build settings…</div>`);
         }
         menu.innerHTML = items.join("");
         document.body.appendChild(menu);
@@ -618,7 +723,8 @@
         items.push(`<div data-click="scopeReviewDockToBranch" data-guardian-id="${esc(gid)}" data-branch-id="${esc(bid)}" data-tip="Open the log drawer scoped to this branch.">☰ Logs</div>`);
         if (b.worktree) {
           items.push(`<div class="sep"></div>`);
-          items.push(`<div data-click="inspectBranchFromMenu" data-branch-id="${esc(bid)}" data-tab="worktree" data-tip="Show this branch's worktree — its path, its conflicts, and its own environment layer.">🗂 Worktree &amp; environment</div>`);
+          items.push(`<div data-click="inspectBranchFromMenu" data-branch-id="${esc(bid)}" data-tab="worktree" data-tip="Show this branch's worktree — its path, its head, and what changed in it.">🗂 Worktree</div>`);
+          items.push(`<div data-click="openEnvOverridesEditor" data-guardian-id="${esc(gid)}" data-scope="branch" data-branch-id="${esc(bid)}" data-tip="Edit the environment overrides that apply to this one worktree.\nEvery other branch in the stack keeps its own; this is the layer on top of what the review already inherits.">⚙ Environment overrides…</div>`);
           items.push(`<div data-copy="${esc(b.worktree)}" onclick="copyText(event)" data-tip="Copy this worktree's absolute path.">⧉ Copy worktree path</div>`);
           items.push(`<div data-click="inspectBranchFromMenu" data-branch-id="${esc(bid)}" data-tab="live" data-tip="Watch this branch's resolver session. Nothing attaches until you open it.">▶ Live view</div>`);
         }

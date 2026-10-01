@@ -251,6 +251,50 @@
       .history-item { display: flex; align-items: center; justify-content: space-between; padding: 5px 8px; font-size: 11px; border-bottom: 1px solid var(--border); cursor: pointer; }
       .history-item:last-child { border-bottom: none; }
       .history-item:hover { background: var(--panel-2); }
+      /* The inspector's Live tab opens its pane with the tab, so the terminal
+         row is a collapse control and a menu -- not the pane's front door. It
+         reads at the secondary weight accordingly, and the peek head's own
+         "✕ Hide" stands down rather than offering the same action twice. */
+      #review-inspector .btn.primary[data-click="togglePeek"] {
+        background: var(--panel-2); border-color: var(--border); color: var(--muted);
+        font-size: 11.5px; padding: 2px 9px;
+      }
+      #review-inspector .btn.primary[data-click="togglePeek"]:hover { color: var(--text); border-color: var(--accent); }
+      #review-inspector .peek-head [data-click="togglePeekStopProp"] { display: none; }
+      /* The head carries a banner, times, toggles and controls; in a narrow
+         pane they wrap rather than pushing "Show Debug Messages" off the edge. */
+      #review-inspector .peek-head { flex-wrap: wrap; row-gap: 4px; }
+      #review-inspector .peek-head > span { flex-wrap: wrap; row-gap: 4px; }
+      /* A note explaining the control above it, not a statement in its own
+         right -- so it reads at the muted register, never at body weight. */
+      .hint { font-size: 11.5px; color: var(--muted); line-height: 1.45; margin-top: 6px; }
+      /* `.empty` is tuned for a whole tab having nothing in it -- centered under
+         40px of air. Inside a review that register is wrong: these are section
+         placeholders sitting between populated sections, and each one pushed the
+         next heading most of a screen further down. Left-aligned and tight, they
+         read as "this section is empty" instead of "the page ended here". */
+      #review-detail .empty, #review-inspector .empty {
+        margin: 2px 0 0; text-align: left; font-size: 12px;
+      }
+      /* Review setup modal: one group per setup-strip chip, so arriving from a
+         chip highlights the field that chip was showing. */
+      .setup-group { border-left: 2px solid transparent; padding-left: 8px; margin-left: -10px; border-radius: 0 4px 4px 0; }
+      .setup-group.focused { border-left-color: var(--accent); background: rgba(74,163,255,.09); }
+      .setup-group.focused > h3.section { color: var(--accent); }
+      /* Live-tab walk-back stepper: one attempt at a time through the durable
+         history above, with the picker still opening the full list. */
+      .run-step { display: flex; align-items: center; gap: 4px; margin-bottom: 6px; }
+      .run-step .rs-nav { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); border-radius: 5px; padding: 2px 7px; font-size: 11px; line-height: 1.4; cursor: pointer; }
+      .run-step .rs-nav:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+      .run-step .rs-nav:disabled { opacity: .35; cursor: default; }
+      .run-step .rs-pick { flex: 1; min-width: 0; display: flex; align-items: center; gap: 6px; background: var(--panel-2); border: 1px solid var(--border); color: var(--text); border-radius: 5px; padding: 2px 8px; font-size: 11px; cursor: pointer; text-align: left; }
+      .run-step .rs-pick:hover { border-color: var(--accent); }
+      .run-step .rs-kind { color: var(--muted); text-transform: uppercase; letter-spacing: .04em; font-size: 10px; }
+      .run-step .rs-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .run-step .rs-meta { color: var(--muted); }
+      .run-step .rs-count { margin-left: auto; color: var(--muted); }
+      .run-step.past .rs-pick { border-color: var(--muted); background: rgba(139,148,158,.12); }
+      .histnote { font-size: 11px; color: var(--muted); margin-bottom: 6px; }
       .warn { background: rgba(248,81,73,.12); border: 1px solid var(--failed); color: var(--failed); border-radius: 6px; padding: 8px; font-size: 12px; margin: 8px 0; }
       /* RAL-433 (originally RAL-108, review-actions only): board-action
          outcome toasts. Fixed bottom-right stack so a rejected action (e.g.

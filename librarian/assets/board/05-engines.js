@@ -106,6 +106,7 @@
         closeHistoryAttempt: (e, ds) => closeHistoryAttempt(ds.key || ""),
         viewHistoryAttempt: (e, ds) => viewHistoryAttempt(ds.key || "", Number(ds.attempt)),
         toggleHistory: (e, ds) => toggleHistory(ds.key || ""),
+        stepLiveAttempt: (e, ds) => stepLiveAttempt(ds.key || "", Number(ds.dir)),
         doPickStatus: (e, ds) => doPickStatus(ds.state || ""),
         selectAddDependencyTarget: (e, ds) => selectAddDependencyTarget(ds.squadId || ""),
         focusSel: (e, ds) => focusSel(ds.squadId || ""),
@@ -271,7 +272,8 @@
       CLICK_HANDLERS.openReviewTitleMenu = (e, ds) => openReviewTitleMenu(e, ds.guardianId || "");
       CLICK_HANDLERS.openReviewPrStacks = (e, ds) => openReviewPrStacks(ds.guardianId || "");
       CLICK_HANDLERS.openEnvViewer = (e, ds) => { e.stopPropagation(); openEnvViewer(ds.apiPath || ""); };
-      CLICK_HANDLERS.openEditReviewDetails = (e, ds) => openEditReviewDetails(ds.guardianId || "");
+      CLICK_HANDLERS.openEditReviewDetails = (e, ds) => openEditReviewDetails(ds.guardianId || "", ds.focus || "");
+      CLICK_HANDLERS.openEnvOverridesEditor = (e, ds) => { closeSquadMenu(); openEnvOverridesEditor(ds.guardianId || "", ds.scope || "", ds.branchId || ""); };
       CLICK_HANDLERS.addEnvOverrideRow = (e, ds) => addEnvOverrideRow(ds.scope || "", ds.branchId || "");
       CLICK_HANDLERS.removeEnvOverrideRow = (e, ds) => removeEnvOverrideRow(ds.scope || "", ds.branchId || "", Number(ds.i));
       CLICK_HANDLERS.overrideInheritedKey = (e, ds) => overrideInheritedKey(ds.scope || "", ds.branchId || "", ds.key || "", ds.value || "");
