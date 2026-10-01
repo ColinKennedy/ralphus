@@ -12,7 +12,7 @@
 //! affected entry's guidance into its review worktree via the existing
 //! `guardian_merge::start_feedback` path, and marks a squad-kind entry
 //! whose squad finished before any review ever formed for it `via-restack`.
-//! A separate, not-yet-implemented `pending_injections` mechanism
+//! A separate `pending_injections` mechanism
 //! ([`PendingInjectionView`]) is schema-only -- see
 //! `.agent/waypoints-phase0-decisions.md` for the full design.
 //!
@@ -26,7 +26,7 @@
 //! [`Store::maybe_auto_close_waypoints_for_affected_entry`] right after either
 //! transition lands. [`Store::close_waypoint_manually`]/
 //! [`Store::reopen_waypoint`] are the store-level primitives for manual
-//! close/reopen (HTTP/CLI surface is a later phase); a manual close takes
+//! close/reopen (HTTP, CLI and MCP surfaces all exist); a manual close takes
 //! effect for gating immediately, since `Store::squad_block_gating_waypoint`
 //! filters on live `state='open'` with no extra plumbing needed. Closing a
 //! waypoint (auto or manual) queues an optional one-time stand-down notice
@@ -329,8 +329,10 @@ pub struct BearingView {
     pub created_at_ms: i64,
 }
 
-/// One row of `pending_injections` (Phase 5/v2 mechanism; schema only in
-/// Phase 1 -- nothing yet enqueues, drains, or delivers these).
+/// One row of `pending_injections`: a queued piece of waypoint guidance for
+/// one specific cell. Written by [`Store::queue_advisory_bearing_injections`]
+/// when a bearing is appended, drained at cell dispatch, and rendered into
+/// that cell's prompt by [`render_injection_block`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PendingInjectionView {
     pub id: i64,
@@ -1255,6 +1257,30 @@ impl Store {
             .map_err(StoreError::from)
     }
 
+    /// Tell everything this waypoint was holding that it is no longer held.
+    ///
+    /// Closing lifts every block-mode hold at once, and until this existed
+    /// nothing said so: the entries were told when the hold went on
+    /// ([`notify_entry_blocked`]) and then simply stopped being held, which
+    /// reads from the outside like the first message was a dead end.
+    ///
+    /// Only entries that were actually being held are notified -- an advisory
+    /// entry was never held, and a block-mode entry the survey had already
+    /// cleared was already told.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn notify_affected_of_release(&self, waypoint_id: &str, reason: &str) -> StoreResult<()> {
+        for entry in self.list_affected_entries(waypoint_id)? {
+            let was_held = entry.mode == AffectedMode::Block
+                && entry.survey_verdict.as_deref() != Some("not_impacted");
+            if was_held {
+                notify_entry_released(self, waypoint_id, entry.kind, &entry.entry_id, reason);
+            }
+        }
+        Ok(())
+    }
+
     /// Add a review or squad to the waypoint's completion list.
     ///
     /// Idempotent: adding something already listed updates its note rather
@@ -1881,6 +1907,8 @@ impl Store {
         }
         let closed = self.close_waypoint(waypoint_id)?;
         if closed {
+            let _ = self.cancel_queued_injections_for_waypoint(waypoint_id);
+            let _ = self.notify_affected_of_release(waypoint_id, "the waypoint closed");
             crate::cartographer::Note::new("waypoints")
                 .scope("waypoint")
                 .emit(
@@ -1950,6 +1978,8 @@ impl Store {
     pub fn close_waypoint_manually(&self, id: &str) -> StoreResult<bool> {
         let closed = self.close_waypoint(id)?;
         if closed {
+            let _ = self.cancel_queued_injections_for_waypoint(id);
+            let _ = self.notify_affected_of_release(id, "the waypoint was closed by hand");
             crate::cartographer::Note::new("waypoints")
                 .scope("waypoint")
                 .emit(
@@ -2327,7 +2357,14 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
-    /// Cancel every still-queued injection in a batch. Cancel wins over a
+    /// Cancel every still-queued injection in one bearing's batch.
+    ///
+    /// The per-bearing counterpart of
+    /// [`Self::cancel_queued_injections_for_waypoint`]. Nothing calls it yet:
+    /// withdrawing a single bearing needs a bearing edit/delete surface, and
+    /// bearings are deliberately append-only in v1.
+    ///
+    /// Cancel wins over a
     /// concurrent drain: both use the same `status='queued'` guard, so
     /// whichever transaction commits first determines each row's outcome,
     /// and a row can never be both delivered and cancelled. Returns the
@@ -2339,6 +2376,26 @@ impl Store {
         let n = self.conn.execute(
             "UPDATE pending_injections SET status='cancelled', updated_at_ms=? WHERE batch_id=? AND status='queued'",
             params![now_ms(), batch_id],
+        )?;
+        Ok(n)
+    }
+
+    /// Cancel every still-queued injection belonging to one waypoint.
+    ///
+    /// Called when a waypoint closes. An injection is only delivered when its
+    /// target cell is next dispatched, so one queued against a cell that has
+    /// not run yet would otherwise arrive long after the waypoint it speaks
+    /// for is closed -- telling an agent to coordinate around something that
+    /// finished. Same `status='queued'` guard as the drain, so a row can
+    /// never be both delivered and cancelled.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn cancel_queued_injections_for_waypoint(&self, waypoint_id: &str) -> StoreResult<usize> {
+        let n = self.conn.execute(
+            "UPDATE pending_injections SET status='cancelled', updated_at_ms=?
+             WHERE waypoint_id=? AND status='queued'",
+            params![now_ms(), waypoint_id],
         )?;
         Ok(n)
     }
@@ -2817,7 +2874,13 @@ pub fn survey_candidate(
             &verdict.rationale,
         ),
         (false, _) => {
-            notify_entry_released(&guard, waypoint_id, candidate.kind, &candidate.entry_id);
+            notify_entry_released(
+                &guard,
+                waypoint_id,
+                candidate.kind,
+                &candidate.entry_id,
+                "the survey found its work is not impacted",
+            );
         }
     }
     let note = crate::cartographer::Note::new("waypoints").scope("waypoint");
@@ -3669,6 +3732,7 @@ pub fn notify_entry_released(
     waypoint_id: &str,
     kind: WaypointEntryKind,
     entry_id: &str,
+    reason: &str,
 ) {
     let (event, squad_scope) = match kind {
         WaypointEntryKind::Squad => (
@@ -3685,8 +3749,7 @@ pub fn notify_entry_released(
         &affected_entry_uri(kind, entry_id),
         crate::mailbox::MailboxPriority::Normal,
         &format!(
-            "Waypoint {waypoint_id} no longer holds this {} ({entry_id}): the survey found its \
-             work is not impacted.",
+            "Waypoint {waypoint_id} no longer holds this {} ({entry_id}): {reason}.",
             kind.as_str()
         ),
         squad_scope,
@@ -4178,6 +4241,15 @@ mod tests {
         store
             .set_affected_bearing_decision(waypoint_id, kind, entry_id, BearingDecision::Accepted)
             .unwrap();
+    }
+
+    /// How many mailbox messages exist, so a test can assert that an action
+    /// said something without caring which watcher it reached.
+    fn mailbox_len(store: &Store) -> i64 {
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM mailbox_messages", [], |r| r.get(0))
+            .unwrap_or(0)
     }
 
     fn open_waypoint(store: &Store, id: &str) {
@@ -6828,6 +6900,103 @@ mod tests {
                 .open_waypoints_affecting_squad("guardian-1")
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    /// An injection is only delivered when its target cell is next
+    /// dispatched. A cell that has not run yet would otherwise receive
+    /// guidance long after the waypoint it speaks for closed -- telling an
+    /// agent to coordinate around something already finished.
+    #[test]
+    fn closing_stops_delivering_guidance_that_was_still_queued() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_bare_squad(&store, "squad-1", SquadState::Done);
+        store
+            .add_affected_entry(
+                "waypoint-1",
+                WaypointEntryKind::Squad,
+                "squad-1",
+                AffectedMode::Advisory,
+            )
+            .unwrap();
+        store
+            .enqueue_injection(
+                "squad-1",
+                0,
+                0,
+                "coordinate with the rename",
+                Some("bearing-1"),
+                Some("waypoint-1"),
+            )
+            .unwrap();
+
+        assert!(store.close_waypoint_manually("waypoint-1").unwrap());
+
+        assert!(
+            store.drain_injections("squad-1", 0, 0).unwrap().is_empty(),
+            "a closed waypoint must not still have guidance waiting to deliver"
+        );
+    }
+
+    // ---- being released is news too ---------------------------------------
+
+    /// Someone told their work is held has to hear when it stops being held.
+    /// Closing lifts every hold at once, and for a long time said nothing --
+    /// so the only message anyone got was the one announcing the hold, which
+    /// reads from the outside like a dead end.
+    #[test]
+    fn closing_a_waypoint_tells_the_work_it_was_holding() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_bare_squad(&store, "squad-held", SquadState::Done);
+        store
+            .add_affected_entry(
+                "waypoint-1",
+                WaypointEntryKind::Squad,
+                "squad-held",
+                AffectedMode::Block,
+            )
+            .unwrap();
+        store
+            .set_affected_bearing_decision(
+                "waypoint-1",
+                WaypointEntryKind::Squad,
+                "squad-held",
+                BearingDecision::Accepted,
+            )
+            .unwrap();
+
+        let before = mailbox_len(&store);
+        assert!(store.maybe_auto_close_waypoint("waypoint-1").unwrap());
+        assert!(
+            mailbox_len(&store) > before,
+            "closing must notify what it was holding"
+        );
+    }
+
+    /// An advisory entry was never held, so telling it that it has been
+    /// released would be describing something that never happened.
+    #[test]
+    fn closing_says_nothing_to_work_it_was_never_holding() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_bare_squad(&store, "squad-advised", SquadState::Done);
+        store
+            .add_affected_entry(
+                "waypoint-1",
+                WaypointEntryKind::Squad,
+                "squad-advised",
+                AffectedMode::Advisory,
+            )
+            .unwrap();
+
+        let before = mailbox_len(&store);
+        assert!(store.maybe_auto_close_waypoint("waypoint-1").unwrap());
+        assert_eq!(
+            mailbox_len(&store),
+            before,
+            "an advisory entry was never held, so it was not released"
         );
     }
 

@@ -15425,6 +15425,23 @@ fn waypoint_remove_affected_entry(daemon: &Daemon, id: &str, entry_id: &str) -> 
     if let Err(e) = store.remove_affected_entry(id, entry.kind, entry_id) {
         return store_error(&e);
     }
+    // Removing the last entry that still owed an answer can complete phase 2,
+    // exactly as removing the last outstanding roster entry can complete
+    // phase 1 -- and nothing else re-reads the close condition on this path,
+    // so without this the waypoint stays open until some unrelated event
+    // happens to trigger a check.
+    // Dropping an entry releases whatever it was holding, and nothing else on
+    // this path says so.
+    if entry.mode == crate::waypoints::AffectedMode::Block {
+        crate::waypoints::notify_entry_released(
+            &store,
+            id,
+            entry.kind,
+            entry_id,
+            "it was removed from the waypoint's affected list",
+        );
+    }
+    let _ = store.maybe_auto_close_waypoint(id);
     match waypoint_detail(&store, id) {
         Ok(detail) => json(200, &detail),
         Err(e) => store_error(&e),
@@ -15471,6 +15488,34 @@ fn waypoint_patch_affected_entry(daemon: &Daemon, id: &str, entry_id: &str, body
         entry_id,
         mode,
     );
+    // De-escalating is the remediation `notify_entry_blocked` tells people to
+    // run, so the work it frees has to hear that it worked -- otherwise the
+    // only message anyone got was the one saying it was held.
+    if entry.mode == crate::waypoints::AffectedMode::Block
+        && mode == crate::waypoints::AffectedMode::Advisory
+    {
+        crate::waypoints::notify_entry_released(
+            &store,
+            id,
+            entry.kind,
+            entry_id,
+            "it was set to advisory, so it is no longer held",
+        );
+    }
+    // An advisory entry can also be escalated to block, and that holds work
+    // that was running a moment ago.
+    if entry.mode == crate::waypoints::AffectedMode::Advisory
+        && mode == crate::waypoints::AffectedMode::Block
+    {
+        crate::waypoints::notify_entry_blocked(
+            &store,
+            id,
+            None,
+            entry.kind,
+            entry_id,
+            "it was set to block mode by hand",
+        );
+    }
     match waypoint_detail(&store, id) {
         Ok(detail) => json(200, &detail),
         Err(e) => store_error(&e),

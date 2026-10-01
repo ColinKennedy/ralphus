@@ -3420,11 +3420,6 @@ fn run_cell_worker(
     // watching the work stop, so this line is the only thing that closes the
     // loop -- and for a `block`-mode entry, its absence is what keeps the
     // entry held.
-    // RAL-400 phase 2: the cell's answer to whatever waypoints affect its
-    // squad. A waypoint cannot tell whether its guidance was acted on by
-    // watching the work stop, so this line is the only thing that closes the
-    // loop -- and for a `block`-mode entry, its absence is what keeps the
-    // entry held.
     if let Some(report) = result.bearing.as_ref() {
         if let Some(decision) = crate::waypoints::BearingDecision::parse(&report.decision) {
             crate::waypoints::record_waypoint_answer(

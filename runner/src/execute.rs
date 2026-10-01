@@ -245,8 +245,7 @@ fn run_command(workspace: &Workspace, command: &str, timeout_sec: Option<u64>) -
             // become a genuine response rather than the stopgap it is now --
             // including receiving the guidance, which a command cell has no
             // prompt to carry. Parked until then.
-            result.bearing = parse_bearing(&out.stdout)
-                .map(|(decision, message)| crate::spec::BearingReport { decision, message });
+            result.bearing = bearing_from(&out.stdout);
             result
         }
         Ok(out) => {
@@ -578,6 +577,7 @@ fn run_with_backend(
                     compaction_count: total_compaction_count,
                     cost_usd: total_cost_usd,
                     cost_is_estimated: false,
+                    bearing: bearing_from(&outcome.summary),
                     summary: outcome.summary,
                     error: Some(format!(
                         "abandoned background job: agent ended its turn without checking the result of a backgrounded job (\"{job}\") after {bg_nudge_attempt} nudge attempts"
@@ -588,7 +588,6 @@ fn run_with_backend(
                     turns: total_turns,
                     retry_after_secs: None,
                     prophecies: Vec::new(),
-                    bearing: None,
                 };
             }
             bg_nudge_attempt += 1;
@@ -642,6 +641,7 @@ fn run_with_backend(
                         compaction_count: total_compaction_count,
                         cost_usd: total_cost_usd,
                         cost_is_estimated: false,
+                        bearing: bearing_from(&outcome.summary),
                         summary: outcome.summary,
                         error: Some(format!(
                             "abandoned background job: agent ended its turn without checking the result of a backgrounded job (\"{job}\"); this backend does not support nudging"
@@ -652,7 +652,6 @@ fn run_with_backend(
                         turns: total_turns,
                         retry_after_secs: None,
                         prophecies: Vec::new(),
-                        bearing: None,
                     };
                 }
                 Err(e) => return CellResult::failed(e.to_string(), ""),
@@ -730,6 +729,7 @@ fn run_with_backend(
                     compaction_count: total_compaction_count,
                     cost_usd: total_cost_usd,
                     cost_is_estimated: false,
+                    bearing: bearing_from(&outcome.summary),
                     summary: outcome.summary,
                     error: None,
                     proofed: Some(false),
@@ -738,7 +738,6 @@ fn run_with_backend(
                     turns: total_turns,
                     retry_after_secs: None,
                     prophecies: Vec::new(),
-                    bearing: None,
                 };
             }
             return CellResult {
@@ -751,6 +750,7 @@ fn run_with_backend(
                 compaction_count: total_compaction_count,
                 cost_usd: total_cost_usd,
                 cost_is_estimated: false,
+                bearing: bearing_from(&outcome.summary),
                 summary: outcome.summary,
                 error: Some(format!(
                     "still working after {MAX_ASYNC_ATTEMPTS} attempts: {reason}"
@@ -761,7 +761,6 @@ fn run_with_backend(
                 turns: total_turns,
                 retry_after_secs: None,
                 prophecies: Vec::new(),
-                bearing: None,
             };
         }
 
@@ -789,6 +788,7 @@ fn run_with_backend(
                 compaction_count: total_compaction_count,
                 cost_usd: total_cost_usd,
                 cost_is_estimated: false,
+                bearing: bearing_from(&summary),
                 summary,
                 error: None,
                 proofed: Some(verdict.unwrap_or(false)),
@@ -797,7 +797,6 @@ fn run_with_backend(
                 turns: total_turns,
                 retry_after_secs: None,
                 prophecies: Vec::new(),
-                bearing: None,
             };
         }
 
@@ -812,6 +811,7 @@ fn run_with_backend(
                 compaction_count: total_compaction_count,
                 cost_usd: total_cost_usd,
                 cost_is_estimated: false,
+                bearing: bearing_from(&outcome.summary),
                 summary: outcome.summary,
                 error: Some(format!(
                     "token budget exceeded: used {} tokens, budget was {}",
@@ -824,7 +824,6 @@ fn run_with_backend(
                 turns: total_turns,
                 retry_after_secs: None,
                 prophecies: Vec::new(),
-                bearing: None,
             };
         }
 
@@ -864,8 +863,7 @@ fn run_with_backend(
             turns: total_turns,
             retry_after_secs: None,
             prophecies: crate::prophecy::parse_prophecies(&outcome.summary),
-            bearing: parse_bearing(&outcome.summary)
-                .map(|(decision, message)| crate::spec::BearingReport { decision, message }),
+            bearing: bearing_from(&outcome.summary),
         };
     }
 
@@ -915,6 +913,7 @@ fn thrash_cell_result(
         compaction_count,
         cost_usd,
         cost_is_estimated: false,
+        bearing: bearing_from(&summary),
         summary,
         error: Some(crate::thrash::thrash_error_message(&spec.agent, detail)),
         proofed: None,
@@ -923,7 +922,6 @@ fn thrash_cell_result(
         ghost: None,
         retry_after_secs: None,
         prophecies: Vec::new(),
-        bearing: None,
     }
 }
 
@@ -999,6 +997,16 @@ enum GhostParse {
 /// a short bullet list -- the shape `GHOST_SYSTEM_PROMPT` asks for -- rather
 /// than trusting arbitrary trailing text. A model that goes off the rails
 /// right after writing the marker (drifting into an unrelated tangent
+/// [`parse_bearing`] in the shape `CellResult.bearing` wants.
+///
+/// Every exit path needs this, not just the successful one: an agent that
+/// answers a waypoint and *then* trips the budget, stall or background-job
+/// guard has still answered, and dropping the answer there leaves a
+/// `block`-mode entry held forever with no record that anyone replied.
+fn bearing_from(text: &str) -> Option<crate::spec::BearingReport> {
+    parse_bearing(text).map(|(decision, message)| crate::spec::BearingReport { decision, message })
+}
+
 /// The answer an agent gave a waypoint, parsed from its final reply.
 ///
 /// `RALPHUS_BEARING: <accepted|rejected|deferred>: <one line>`. The decision
@@ -1088,6 +1096,30 @@ fn tail(text: &str, limit: usize) -> String {
 mod tests {
     use super::*;
     use crate::backend::BackendError;
+
+    /// Every `CellResult` an agent run can produce must carry the answer, not
+    /// just the successful one. An agent that answers a waypoint and then
+    /// trips the budget, stall or background-job guard has still answered,
+    /// and dropping it there leaves a `block`-mode entry held forever with
+    /// nothing to show anyone replied.
+    ///
+    /// A source scan rather than a behavioural test: reaching all seven exit
+    /// paths needs seven different backend failures to be provoked, and the
+    /// regression this guards is someone adding an eighth.
+    #[test]
+    fn every_cell_result_carries_the_agents_answer() {
+        let src = include_str!("execute.rs");
+        let dropped: Vec<usize> = src
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.trim() == "bearing: None,")
+            .map(|(i, _)| i + 1)
+            .collect();
+        assert!(
+            dropped.is_empty(),
+            "these CellResult literals discard the agent's waypoint answer;              use `bearing_from(..)` on the same summary they report: {dropped:?}"
+        );
+    }
 
     #[test]
     fn parse_bearing_reads_a_well_formed_answer() {

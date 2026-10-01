@@ -140,10 +140,7 @@ def _reviews(page: Page) -> None:
         # The feedback thread moved into the branch inspector's own Feedback
         # tab, so it is reached by selecting the branch rather than by
         # expanding a merge-detail panel on the row.
-        page.evaluate(
-            "inspectBranchFromMenu("
-            f"{fixtures.REVIEWS_ROLLOUT_BRANCH_ID!r}, 'feedback')"
-        )
+        page.evaluate(f"inspectBranchFromMenu({fixtures.REVIEWS_ROLLOUT_BRANCH_ID!r}, 'feedback')")
         chat = page.locator(".fb-msg").first
         chat.wait_for()
         chat.scroll_into_view_if_needed()
@@ -152,9 +149,7 @@ def _reviews(page: Page) -> None:
         # Manual checks are no longer behind a popup menu -- they render
         # inline as runnable command rows. Expand the first one so this shot
         # shows something the overview above does not already show.
-        manual = page.locator(
-            'button[data-click="runCheck"][data-kind="manual"]'
-        ).first
+        manual = page.locator('button[data-click="runCheck"][data-kind="manual"]').first
         manual.wait_for()
         manual.scroll_into_view_if_needed()
         page.locator('button[data-click="toggleReviewCommandFull"]').last.click()
