@@ -306,6 +306,12 @@
       .setup-group.focused > h3.section { color: var(--accent); }
       /* The review's primary action and its menu, as one object: the thing you
          press most, with everything else one click further. */
+      /* A launched command: the board knows it was handed to a terminal and
+         when, never how it ended, so the chip reads as a fact rather than as a
+         pending outcome waiting to turn green. */
+      .cmd-status.launched { color: var(--accent); border-color: var(--accent-b); background: var(--accent-a); }
+      /* The parameter panel under an expanded command, sharing its frame. */
+      .cmd-full .cmd-params { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border-soft); font-family: var(--ui, inherit); }
       .split { display: inline-flex; flex: none; }
       .split .split-main { border-radius: 6px 0 0 6px; }
       .split .split-caret { border-radius: 0 6px 6px 0; border-left: 1px solid rgba(0,0,0,.28); padding: 4px 7px; }

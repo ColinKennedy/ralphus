@@ -180,6 +180,11 @@
           }
           const el = /** @type {HTMLElement|null} */ (target.closest ? target.closest("[data-card]") : null);
           if (!el) return;
+          // An anchor can be a whole row, so a control inside it must keep its
+          // own meaning: hovering a button shows that button's tooltip, not the
+          // row's card covering the thing you were reaching for.
+          const control = target.closest ? target.closest("button, a, input, select, textarea, [data-tip]") : null;
+          if (control && control !== el && el.contains(control)) return;
           if (el === anchor) { window.clearTimeout(closeTimer); return; }
           window.clearTimeout(openTimer);
           openTimer = window.setTimeout(() => show(el), OPEN_DELAY_MS);

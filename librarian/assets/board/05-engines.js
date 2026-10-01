@@ -169,11 +169,8 @@
       CLICK_HANDLERS.showLogsCopyMenu = (e, ds) => showLogsCopyMenu(e, ds.tab || "");
       CLICK_HANDLERS.copyLogsAs = (e, ds) => copyLogsAs(e, ds.tab || "", ds.scope || "current");
       CLICK_HANDLERS.openLinkedOutputPopup = (e, ds) => openLinkedOutputPopup(ds.key || "");
-      CLICK_HANDLERS.runSingleManualCheck = (e, ds) => { if (ds.runkey) markCommandRunning(ds.runkey); runSingleManualCheck(ds.guardianId || "", Number(ds.i)); };
-      CLICK_HANDLERS.runActionHint = (e, ds) => { if (ds.runkey) markCommandRunning(ds.runkey); runActionHint(ds.guardianId || "", Number(ds.i)); };
-      CLICK_HANDLERS.toggleCheckForm = (e, ds) => toggleCheckForm(ds.key || "");
       CLICK_HANDLERS.resolveCheckInput = (e, ds) => resolveCheckInput(ds.guardianId || "", ds.inputName || "");
-      CLICK_HANDLERS.runCheckWithInputs = (e, ds) => runCheckWithInputs(/** @type {"manual"|"action"} */ (ds.kind || "manual"), ds.guardianId || "", Number(ds.i));
+      CLICK_HANDLERS.runCheck = (e, ds) => runCheck(/** @type {"manual"|"action"} */ (ds.kind || "manual"), ds.guardianId || "", Number(ds.i));
       CLICK_HANDLERS.gotoWorktreeCell = (e, ds) => { worktreeMenuOpen = {}; gotoSquadItem(ds.squadId || "", "cell", Number(ds.ti), Number(ds.si), -1); };
       CLICK_HANDLERS.toggleWorktreeMenu = (e, ds) => toggleWorktreeMenu(ds.key || "");
       CLICK_HANDLERS.selectGuardian = (e, ds) => selectGuardian(ds.guardianId || "");

@@ -1206,41 +1206,75 @@
       /**
        * Per-command run state, keyed by `<gid>:<kind>:<index>`.
        *
-       * The daemon launches a command into a terminal and reports nothing back
-       * about how it ended -- `GuardianCheck` carries no exit code, status or
-       * duration, and there is no per-command result endpoint. So this tracks
-       * what the board genuinely knows: that you asked for it, and how long ago.
-       * It deliberately never claims "pass": inventing an outcome the backend
-       * never sent would be worse than admitting the gap. Surfacing a real
-       * pass/fail needs the daemon to record the tmux pane's RALPHUS_TMUX_DONE
-       * result per command.
-       * @type {{[key: string]: {state: string, startedMs: number, endedMs: number}}}
+       * The daemon spawns a command into its own detached terminal window and
+       * reports nothing back about how it ended -- `GuardianCheck` carries no
+       * exit code, status or duration, and there is no per-command result
+       * endpoint. The spawn succeeding is therefore the whole of what the board
+       * learns, and it is the end of the run as far as this page is concerned.
+       *
+       * So this records a launch, not a run in progress. It never showed a
+       * finish before because there is nothing that could report one -- the
+       * chip simply counted upward forever while the command had in fact
+       * exited. "launched, N ago" is the true statement.
+       * @type {{[key: string]: {launchedMs: number}}}
        */
       const commandRuns = {};
       /**
-       * Marks one command as launched, so its row can show it is running and
-       * for how long.
+       * Records that one command was handed to a terminal.
        * @param {string} key - The command's key.
        * @returns {void}
        */
-      function markCommandRunning(key) {
-        commandRuns[key] = { state: "running", startedMs: Date.now(), endedMs: 0 };
+      function markCommandLaunched(key) {
+        commandRuns[key] = { launchedMs: Date.now() };
+        startCommandAgoTicker();
         renderReviewDetail();
       }
       /**
-       * One command row's status chip and elapsed time.
+       * How long ago a launch happened, in the board's usual short form.
+       * @param {number} ms - Epoch milliseconds of the launch.
+       * @returns {string}
+       */
+      function commandAgo(ms) {
+        const secs = Math.max(0, Math.round((Date.now() - ms) / 1000));
+        if (secs < 60) return `${secs}s ago`;
+        const mins = Math.floor(secs / 60);
+        if (mins < 60) return `${mins}m ${secs % 60}s ago`;
+        return `${Math.floor(mins / 60)}h ${mins % 60}m ago`;
+      }
+      /** @type {number} Interval id keeping the "N ago" labels current, or 0 when idle. */
+      let commandAgoTimer = 0;
+      /**
+       * Keeps every launched-command label counting without re-rendering the
+       * pane: the text was only ever refreshed when something else happened to
+       * redraw the section, so it sat frozen until you clicked another row.
+       * @returns {void}
+       */
+      function startCommandAgoTicker() {
+        if (commandAgoTimer) return;
+        commandAgoTimer = window.setInterval(() => {
+          const els = document.querySelectorAll("[data-ago-ms]");
+          if (!els.length) { window.clearInterval(commandAgoTimer); commandAgoTimer = 0; return; }
+          els.forEach((el) => {
+            const ms = Number(/** @type {HTMLElement} */ (el).dataset.agoMs);
+            if (ms) el.textContent = commandAgo(ms);
+          });
+        }, 1000);
+      }
+      /**
+       * One command row's status chip.
        * @param {string} key - The command's key.
        * @returns {string}
        */
       function commandRunStatus(key) {
         const r = commandRuns[key];
         if (!r) {
-          return `<span class="cmd-status idle" data-tip="Not run from the board this session.\nThe daemon does not report a per-command result, so this only reflects runs you started here.">idle</span>`;
+          return `<span class="cmd-status idle" data-tip="Not run from the board this session.
+The daemon does not report a per-command result, so this only reflects runs you started here.">idle</span>`;
         }
-        const secs = Math.max(0, Math.round(((r.endedMs || Date.now()) - r.startedMs) / 1000));
-        const elapsed = secs >= 60 ? `${Math.floor(secs / 60)}m ${secs % 60}s` : `${secs}s`;
-        return `<span class="cmd-dur num" data-tip="How long ago this run was launched from the board.">${elapsed}</span>`
-          + `<span class="cmd-status running" data-tip="Launched in a terminal from the board.\nThe daemon reports no pass/fail for an individual command, so this cannot turn green on its own — open the command's logs to see how it ended.">running</span>`;
+        return `<span class="cmd-dur num" data-ago-ms="${r.launchedMs}" data-tip="When this command was handed to a terminal, counting up live.">${esc(commandAgo(r.launchedMs))}</span>`
+          + `<span class="cmd-status launched" data-tip="Handed to its own terminal window and running there.
+The daemon spawns that window detached and never hears from it again — it reports no exit code, duration or pass/fail for an individual command — so the board can say it was launched and when, and nothing more.
+The terminal window itself shows how it ended.">launched</span>`;
       }
 
       /** @type {string} The selected command's key, or "" for none. */
@@ -1303,17 +1337,31 @@
         return selectedCommandKey === key;
       }
       /**
-       * The expanded full-text block under a command row, or "" when collapsed.
+       * The expanded block under a command row, or "" when collapsed.
+       *
+       * For a parameterised check this is also where its values are edited, so
+       * one control means one thing: ▶ runs, + opens everything about the
+       * command -- what it will actually execute, and the fields that decide it.
        * @param {string} key - The command's key.
-       * @param {string} cmd - The command text.
+       * @param {string} cmd - The command text, with `{name}` placeholders intact.
+       * @param {{g: GuardianView, check: GuardianCheck, kind: string, i: number}} [opts] - The check this row runs, when it takes parameters. Omitted for a check gate, which takes none.
        * @returns {string}
        */
-      function commandFullBlock(key, cmd) {
+      function commandFullBlock(key, cmd, opts) {
         if (!commandFullOpen[key]) return "";
-        return `<div class="cmd-full mono">${esc(cmd)}
+        const check = opts && opts.check;
+        const hasInputs = !!(check && check.inputs && check.inputs.length);
+        // A parameterised check shows the command as it will actually run, with
+        // the current values substituted in, and its fields directly beneath --
+        // editing one and seeing the other change is the whole point of putting
+        // them in the same panel.
+        const shown = hasInputs ? substituteCheckInputs(cmd, checkInputValues(opts.g, check, key)) : cmd;
+        return `<div class="cmd-full mono">
+            <div id="cmd-preview-${esc(key)}">${esc(shown)}</div>
+            ${hasInputs ? renderCheckInputFields(opts.g, /** @type {"manual"|"action"} */ (opts.kind), opts.i, check) : ""}
             <div class="btn-row" style="margin-top:7px">
-              <button class="btn" data-copy="${esc(cmd)}" onclick="copyText(event)" data-tip="Copy the whole command.">⧉ Copy</button>
-              <button class="btn" data-click="toggleReviewCommandFull" data-key="${esc(key)}" data-tip="Collapse this command back to one line.">Collapse</button>
+              <button class="btn" data-copy="${esc(shown)}" onclick="copyText(event)" data-tip="Copy the command exactly as shown above.">⧉ Copy</button>
+              <button class="btn" data-click="toggleReviewCommandFull" data-key="${esc(key)}" data-tip="Collapse this back to one line.">Collapse</button>
             </div>
           </div>`;
       }

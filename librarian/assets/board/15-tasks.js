@@ -1388,8 +1388,6 @@
       let expandedBranches = new Set();
       /** @type {{[key: string]: boolean}} gid -> whether the manual-checks dropdown is open */
       let manualMenuOpen = {};
-      /** @type {{[key: string]: boolean}} "<gid>:<manual|action>:<index>" -> whether that check's inline input form is open (RAL-164) */
-      let checkFormOpen = {};
       /** @type {{[key: string]: boolean}} peek-key -> whether the terminal actions dropdown ("Open Terminal Log" / "Open Agent") is open */
       let terminalMenuOpen = {};
       /** @type {Set<string>} */

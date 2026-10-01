@@ -18,7 +18,7 @@
        * @param {GuardianCheck} check
        * @returns {string}
        */
-      function renderCheckInputForm(g, kind, i, check) {
+      function renderCheckInputFields(g, kind, i, check) {
         const key = `${g.id}:${kind}:${i}`;
         const values = g.input_values || {};
         const resolutions = g.input_resolutions || {};
@@ -27,29 +27,81 @@
           const current = Object.prototype.hasOwnProperty.call(values, inp.name) ? values[inp.name] : inp.default;
           const res = resolutions[inp.name];
           const resolving = !!res && res.status === "resolving";
-          const setTip = "Ask the resolver agent to pick a value for this input.\nWho/when: you don't know (or don't care) what value to use here — let the AI decide.\nFills the field below with its answer; you still press Run to actually execute.";
+          const setTip = "Ask the resolver agent to pick a value for this input.\nWho/when: you don't know (or don't care) what value to use here — let the AI decide.\nFills the field with its answer; the command above updates to match, and ▶ runs it.";
           const setBtn = `<button class="btn" ${resolving ? "disabled" : ""} data-click="resolveCheckInput" data-guardian-id="${esc(g.id)}" data-input-name="${esc(inp.name)}" data-tip="${setTip}">${resolving ? "Resolving…" : "Set it for me"}</button>`;
-          return `<div style="margin:4px 0">
-            <label style="display:block;font-size:11px;color:var(--dim);margin-bottom:2px" data-tip="${esc(inp.message)}">${esc(inp.message)}</label>
+          return `<div style="margin:6px 0 0">
+            <label for="${fieldId}" style="display:block;font-size:11px;color:var(--muted);margin-bottom:2px" data-tip="${esc(inp.message)}">${esc(inp.message)}</label>
             <div style="display:flex;gap:4px">
-              <input id="${fieldId}" type="text" value="${esc(current)}" style="flex:1;font-family:monospace;font-size:12px" data-tip="Value substituted for {${esc(inp.name)}} in the command.\nDefaults to the last value used on this review; press Run to use it, or edit first.">
+              <input id="${fieldId}" type="text" value="${esc(current)}" class="mono"
+                oninput="onCheckInputChange('${esc(key)}')"
+                style="flex:1;font-size:12px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:3px 6px"
+                data-tip="Substituted for {${esc(inp.name)}} in the command above, which updates as you type.\nStarts from the last value used on this review; ▶ runs with whatever is here.">
               ${setBtn}
             </div>
           </div>`;
         }).join("");
         const cleanupField = check.cleanup_command
-          ? `<label style="display:flex;align-items:center;gap:4px;font-size:11px;margin:4px 0" data-tip="Runs '${esc(check.cleanup_command)}' immediately before the main command — e.g. to stop a stale process from a previous run.\nWho/when: the command binds a port or leaves something running that a rerun would collide with.\nThis cannot be undone once the cleanup command executes.">
+          ? `<label style="display:flex;align-items:center;gap:5px;font-size:11px;margin:7px 0 0;color:var(--muted)" data-tip="Runs '${esc(check.cleanup_command)}' immediately before the main command — e.g. to stop a stale process from a previous run.\nWho/when: the command binds a port or leaves something running that a rerun would collide with.\nThis cannot be undone once the cleanup command executes.">
               <input type="checkbox" id="check-cleanup:${key}"> Stop stale process first
             </label>`
           : "";
-        return `<div style="border:1px solid var(--border);border-radius:6px;padding:8px;margin:4px 0;background:var(--panel-2);min-width:260px">
-          ${fields}
-          ${cleanupField}
-          <div class="btn-row" style="margin-top:4px">
-            <button class="btn primary" data-click="runCheckWithInputs" data-kind="${esc(kind)}" data-guardian-id="${esc(g.id)}" data-i="${i}" data-tip="Run this check with the values above.">▶ Run</button>
-            <button class="btn" data-click="toggleCheckForm" data-key="${esc(key)}" data-tip="Close this form without running.">Cancel</button>
-          </div>
-        </div>`;
+        return `<div class="cmd-params">${fields}${cleanupField}</div>`;
+      }
+      /**
+       * The values a parameterised check would run with right now: whatever is
+       * typed into its fields if they are on screen, otherwise the review's
+       * stored value for that input, otherwise the input's own default.
+       *
+       * Both the preview and the run path read this, so what the expanded panel
+       * shows is exactly what ▶ executes -- including when the panel is closed
+       * and there are no fields to read.
+       * @param {GuardianView} g - The review.
+       * @param {GuardianCheck} check - The check.
+       * @param {string} key - The command key, `<gid>:<kind>:<index>`.
+       * @returns {{[name: string]: string}}
+       */
+      function checkInputValues(g, check, key) {
+        const stored = g.input_values || {};
+        /** @type {{[name: string]: string}} */
+        const out = {};
+        for (const inp of check.inputs || []) {
+          const el = /** @type {HTMLInputElement|null} */ (document.getElementById(`check-input:${key}:${inp.name}`));
+          out[inp.name] = el
+            ? el.value
+            : String(Object.prototype.hasOwnProperty.call(stored, inp.name) ? stored[inp.name] : (inp.default ?? ""));
+        }
+        return out;
+      }
+      /**
+       * Substitutes `{name}` placeholders in a command with the given values.
+       * @param {string} cmd - The command template.
+       * @param {{[name: string]: string}} values - Value per input name.
+       * @returns {string}
+       */
+      function substituteCheckInputs(cmd, values) {
+        let out = cmd;
+        for (const [name, value] of Object.entries(values)) {
+          out = out.split(`{${name}}`).join(value);
+        }
+        return out;
+      }
+      /**
+       * Repaints a parameterised check's command preview as its fields change.
+       *
+       * Patches the one element rather than re-rendering the pane, so typing
+       * doesn't cost the caret its position.
+       * @param {string} key - The command key, `<gid>:<kind>:<index>`.
+       * @returns {void}
+       */
+      function onCheckInputChange(key) {
+        const el = document.getElementById(`cmd-preview-${key}`);
+        if (!el) return;
+        const [gid, kind, idx] = key.split(":");
+        const g = guardians.find((x) => x.id === gid);
+        if (!g) return;
+        const check = (kind === "manual" ? (g.manual_commands || []) : (g.action_hints || []))[Number(idx)];
+        if (!check) return;
+        el.textContent = substituteCheckInputs(check.command || "", checkInputValues(g, check, key));
       }
       // Render the inline cell-link button for a review branch row.
       // Prefers direct squad/task/cell indices from the API; falls back to cwd path matching.
@@ -671,36 +723,6 @@
         const resolving = active ? " · resolving…" : "";
         const tip = "Found: conflict blocks detected in the worktree\nFixed: files resolved in the working tree, not yet staged\nCommitted: files whose conflict resolutions are staged and committed to the branch";
         return `<div class="kv-row" data-tip="${tip}"><span class="k">conflicts</span><span>${found} found · ${fixed} fixed · ${committed} committed${resolving}</span></div>`;
-      }
-      /**
-       * One combined badge for the review's post-merge phase — the check gates
-       * and manual-checks generation that run *after* the merge is complete.
-       *
-       * A merge finishes when its branches are rebased, so the review already
-       * reads `in_review` while this is still running; this badge is what says
-       * there is work outstanding. A failure here is advisory — it is reported
-       * but never blocks approval or PR submission — so it uses `--warn`
-       * rather than `--failed`, which is reserved for states that stop a
-       * review progressing (docs/colors.md).
-       * @param {GuardianView} g the review to describe
-       * @returns {string} the badge markup, or "" when the phase has never run
-       */
-      function postMergeBadge(g) {
-        const status = g.post_merge_status;
-        if (!status) return "";
-        const started = g.post_merge_started_at_ms;
-        const finished = g.post_merge_finished_at_ms;
-        const secs = started && finished ? Math.max(0, Math.round((finished - started) / 1000)) : null;
-        const detail = g.post_merge_detail ? `\n\n${g.post_merge_detail}` : "";
-        const base = "Check gates and manual-checks generation run after the merge is already finished, so the review is usable while they work.\nA failure here is advisory: it is recorded but never blocks Approve or PR submission.";
-        if (status === "running") {
-          return `<span class="badge mono" style="color:var(--running);border-color:var(--running)" data-tip="Post-merge checks are still running — the build/test gate, the manual-checks generation, or both.\n${base}">post-merge: running…</span>`;
-        }
-        const ok = status === "ok";
-        const color = ok ? "var(--done)" : "var(--warn)";
-        const label = ok ? "post-merge: ok" : "post-merge: failed";
-        const took = secs === null ? "" : ` (${secs}s)`;
-        return `<span class="badge mono" style="color:${color};border-color:${color}" data-tip="${ok ? "Post-merge checks passed." : "A post-merge check reported a failure. The merge itself succeeded and the review is still approvable."}\n${base}${esc(detail)}">${label}${took}</span>`;
       }
       // RAL-193: this review's own agent cost -- conflict-resolution and
       // proof LLM calls made by the guardian merge machinery -- scoped to
@@ -1872,9 +1894,8 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         // render as the setup strip (reviewSetupStrip) directly under the
         // banner, where the display is also the edit affordance.
         el.innerHTML = `<div class="review-cmdbar">
-            <div class="cmd-row">
-              ${gdot(g.status)}<span class="rid">${esc(g.name)}</span> ${pill(g.status)} ${arbiterBadge(g)} ${postMergeBadge(g)}
-              <span class="mono hc-anchor cmd-id" style="cursor:pointer" data-card="gReviewId" data-guardian-id="${esc(g.id)}" data-copy="${esc(g.id)}" onclick="copyText(event)">${esc(g.id)}</span>
+            <div class="cmd-row hc-anchor" data-card="gReviewId" data-guardian-id="${esc(g.id)}">
+              ${gdot(g.status)}<span class="rid">${esc(g.name)}</span> ${pill(g.status)} ${arbiterBadge(g)}
               ${reviewCostChip(g)}
               <div class="cmd-actions">
                 ${watchersHtml(`guardian:${g.id}`)}
@@ -1938,7 +1959,6 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
             // exactly the thing you want to read before pressing it.
             const rows = hints.map((h, i) => {
               const key = `${g.id}:action:${i}`;
-              const open = !!checkFormOpen[key];
               const needsInput = !!(h.inputs && h.inputs.length);
               const label = esc(h.label || "Run");
               if (!h.command) {
@@ -1950,18 +1970,14 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
               }
               const cmdText = h.command || "";
               return `<div class="cmd-row selectable${isCommandRowSelected(key) ? " sel" : ""}" data-click="selectReviewCommandRow" data-guardian-id="${esc(g.id)}" data-key="${esc(key)}" data-cmd="${esc(cmdText)}" data-tip="Select this action to scope the log drawer to it.">
-                  <button class="cmd-run" data-click="${needsInput ? "toggleCheckForm" : "runActionHint"}" ${
-                    needsInput ? `data-key="${esc(key)}"` : `data-guardian-id="${esc(g.id)}" data-i="${i}" data-runkey="${esc(key)}"`}
-                    data-tip="${needsInput
-                      ? `This action needs values filled in first — click to expand.\nRun: ${esc(cmdText)}`
-                      : `Run this action in the built review worktree.\nRun: ${esc(cmdText)}`}">${needsInput ? (open ? "▲" : "▾") : "▶"}</button>
+                  <button class="cmd-run" data-click="runCheck" data-kind="action" data-guardian-id="${esc(g.id)}" data-i="${i}" data-runkey="${esc(key)}"
+                    data-tip="Run this action in the built review worktree.\nRun: ${esc(cmdText)}${needsInput ? `\nUses the values in + — its current ones, or this review's last ones if you have not opened it.` : ""}">▶</button>
                   <span class="cmd-label">${label}</span>
                   <span class="cmd-text mono" data-tip="${esc(cmdText)}">${esc(cmdText)}</span>
                   ${commandRunStatus(key)}
-                  <button class="cmd-expand" data-click="toggleReviewCommandFull" data-key="${esc(key)}" data-tip="Show or hide this command in full beneath its row.">${commandFullOpen[key] ? "−" : "+"}</button>
+                  <button class="cmd-expand" data-click="toggleReviewCommandFull" data-key="${esc(key)}" data-tip="${needsInput ? "Show this command in full, with its values filled in and editable beneath it." : "Show or hide this command in full beneath its row."}">${commandFullOpen[key] ? "−" : "+"}</button>
                   <button class="section-menu" data-click="openReviewCommandMenu" data-guardian-id="${esc(g.id)}" data-key="${esc(key)}" data-cmd="${esc(cmdText)}" data-tip="Actions for this check — its logs, its environment, copy it.">⋯</button>
-                </div>${commandFullBlock(key, cmdText)}
-                ${needsInput && open ? `<div class="cmd-form">${renderCheckInputForm(g, "action", i, h)}</div>` : ""}`;
+                </div>${commandFullBlock(key, cmdText, { g, check: h, kind: "action", i })}`;
             }).join("");
             return `<h3 class="section" data-tip="User-declared test actions from the task TOML [[review.action]] blocks.\nAuthored by the task author, not generated — each runs in the built review worktree.\nLabelled buttons give reviewers one-click access to targeted manual checks.">test actions${sectionMenuBtn(g.id, "actions")}</h3>
               ${reviewRunGroup(
@@ -1982,17 +1998,13 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
             const state = g.checks_state || (cmds.length ? "ready" : "waiting");
             const isReady = state === "ready";
             const menuOpen = !!manualMenuOpen[g.id];
+            // Every item here runs, including a parameterised one -- picking a
+            // command from a "run one of these" menu can only sensibly mean run
+            // it. Its values are edited from its row's + instead.
             const menuItems = cmds.map((cmd, i) => {
               const cmdText = cmd.command || "";
-              if (cmd.inputs && cmd.inputs.length) {
-                const key = `${g.id}:manual:${i}`;
-                const open = !!checkFormOpen[key];
-                return `<div style="padding:2px 4px">
-                  <div data-click="toggleCheckForm" data-key="${esc(key)}" style="padding:4px 8px;cursor:pointer;font-size:12px;font-family:monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:360px" data-tip="Run: ${esc(cmdText)}\nThis check needs some values filled in first — click to expand." onmouseover="this.style.background='var(--panel-2)'" onmouseout="this.style.background=''">${esc(cmdText)} ${open ? "▲" : "▾"}</div>
-                  ${open ? renderCheckInputForm(g, "manual", i, cmd) : ""}
-                </div>`;
-              }
-              return `<div data-click="runSingleManualCheck" data-guardian-id="${esc(g.id)}" data-i="${i}" style="padding:6px 12px;cursor:pointer;font-size:12px;font-family:monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:360px" data-tip="Run: ${esc(cmdText)}\nLaunches in the built review worktree." onmouseover="this.style.background='var(--panel-2)'" onmouseout="this.style.background=''">${esc(cmdText)}</div>`;
+              const needsInput = !!(cmd.inputs && cmd.inputs.length);
+              return `<div data-click="runCheck" data-kind="manual" data-guardian-id="${esc(g.id)}" data-i="${i}" style="padding:6px 12px;cursor:pointer;font-size:12px;font-family:monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:360px" data-tip="Run: ${esc(cmdText)}\nLaunches in the built review worktree.${needsInput ? "\nUses this review's current values for its parameters — edit them from the row's + in the section below." : ""}" onmouseover="this.style.background='var(--panel-2)'" onmouseout="this.style.background=''">${esc(cmdText)}</div>`;
             }).join("");
             const gateTip = isReady
               ? `Run all ${cmds.length} suggested manual check command(s) in a new terminal window.\nEach launches in the built review worktree.`
@@ -2017,19 +2029,14 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
                       const cmdText = cmd.command || "";
                       const key = `${g.id}:manual:${i}`;
                       const needsInput = !!(cmd.inputs && cmd.inputs.length);
-                      const open = !!checkFormOpen[key];
                       return `<div class="cmd-row selectable${isCommandRowSelected(key) ? " sel" : ""}" data-click="selectReviewCommandRow" data-guardian-id="${esc(g.id)}" data-key="${esc(key)}" data-cmd="${esc(cmdText)}" data-tip="Select this check to scope the log drawer to it.">
-                          <button class="cmd-run" data-click="${needsInput ? "toggleCheckForm" : "runSingleManualCheck"}" ${
-                            needsInput ? `data-key="${esc(key)}"` : `data-guardian-id="${esc(g.id)}" data-i="${i}" data-runkey="${esc(key)}"`}
-                            data-tip="${needsInput
-                              ? `This check needs values filled in first — click to expand.\nRun: ${esc(cmdText)}`
-                              : `Run just this one, in the built review worktree.\nRun: ${esc(cmdText)}`}">${needsInput ? (open ? "▲" : "▾") : "▶"}</button>
+                          <button class="cmd-run" data-click="runCheck" data-kind="manual" data-guardian-id="${esc(g.id)}" data-i="${i}" data-runkey="${esc(key)}"
+                            data-tip="Run this check in the built review worktree.\nRun: ${esc(cmdText)}${needsInput ? `\nUses the values in + — its current ones, or this review's last ones if you have not opened it.` : ""}">▶</button>
                           <span class="cmd-text mono" data-tip="${esc(cmdText)}">${esc(cmdText)}</span>
                           ${commandRunStatus(key)}
-                          <button class="cmd-expand" data-click="toggleReviewCommandFull" data-key="${esc(key)}" data-tip="Show or hide this command in full beneath its row.">${commandFullOpen[key] ? "−" : "+"}</button>
+                          <button class="cmd-expand" data-click="toggleReviewCommandFull" data-key="${esc(key)}" data-tip="${needsInput ? "Show this command in full, with its values filled in and editable beneath it." : "Show or hide this command in full beneath its row."}">${commandFullOpen[key] ? "−" : "+"}</button>
                           <button class="section-menu" data-click="openReviewCommandMenu" data-guardian-id="${esc(g.id)}" data-key="${esc(key)}" data-cmd="${esc(cmdText)}" data-tip="Actions for this check — its logs, its environment, copy it.">⋯</button>
-                        </div>${commandFullBlock(key, cmdText)}
-                        ${needsInput && open ? `<div class="cmd-form">${renderCheckInputForm(g, "manual", i, cmd)}</div>` : ""}`;
+                        </div>${commandFullBlock(key, cmdText, { g, check: cmd, kind: "manual", i })}`;
                     }).join(""))
                 : reviewRunGroup(runControl, waitingNote, "")}
               `;
@@ -3111,17 +3118,6 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         pendingMergeActions.delete(`${id}:regen`);
         tick();
       }
-      /**
-       * Runs a single suggested manual-check command by index.
-       * @param {string} id
-       * @param {number} index
-       * @returns {Promise<void>}
-       */
-      async function runSingleManualCheck(id, index) {
-        manualMenuOpen[id] = false;
-        renderReviewDetail();
-        await guardianAction(`/api/guardians/${id}/run-manual-commands`, { index });
-      }
       // RAL-77: run a user-declared action hint by index.
       /**
        * Runs a user-declared `[[review.action]]` hint by index.
@@ -3129,9 +3125,6 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        * @param {number} index
        * @returns {Promise<void>}
        */
-      async function runActionHint(id, index) {
-        await guardianAction(`/api/guardians/${id}/run-action-hint`, { index });
-      }
       /**
        * Runs every command-based test action for a review, in declaration
        * order. There is no run-all route for action hints the way there is for
@@ -3139,6 +3132,10 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        * per-index one. Prompt-based hints are skipped: they expand through the
        * resolver LLM before running and that path is not wired up, so firing
        * them would fail server-side rather than do nothing.
+       *
+       * Each one goes through the same path a row's ▶ uses, so every row it
+       * launches marks itself launched too -- running them all should leave the
+       * section saying exactly what running them one by one would.
        * @param {string} id - The review id.
        * @returns {Promise<void>}
        */
@@ -3147,26 +3144,15 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         if (!g) return;
         const runnable = (g.action_hints || [])
           .map((h, i) => ({ h: h, i: i }))
-          .filter((x) => !!x.h.command && !(x.h.inputs && x.h.inputs.length));
+          .filter((x) => !!x.h.command);
         if (!runnable.length) {
-          notify("info", "No test actions can be run without filling in their inputs first.");
+          notify("info", "No test actions declare a command to run.");
           return;
         }
-        for (const x of runnable) {
-          await guardianAction(`/api/guardians/${id}/run-action-hint`, { index: x.i });
-        }
+        for (const x of runnable) await runCheck("action", id, x.i);
       }
 
       // ---------- structured check inputs (RAL-164) ----------
-      /**
-       * Toggles a check's inline input form open/closed.
-       * @param {string} key - "<gid>:<manual|action>:<index>"
-       * @returns {void}
-       */
-      function toggleCheckForm(key) {
-        checkFormOpen[key] = !checkFormOpen[key];
-        renderReviewDetail();
-      }
       /**
        * Runs a manual-check or action-hint check that declares input fields,
        * reading current values from its inline form (submitted values become
@@ -3180,19 +3166,29 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         const g = guardians.find((x) => x.id === id);
         const check = g && (kind === "manual" ? (g.manual_commands || [])[index] : (g.action_hints || [])[index]);
         const key = `${id}:${kind}:${index}`;
-        /** @type {Record<string,string>} */
-        const inputs = {};
-        (check && check.inputs || []).forEach((inp) => {
-          const el = /** @type {HTMLInputElement|null} */ (document.getElementById(`check-input:${key}:${inp.name}`));
-          if (el) inputs[inp.name] = el.value;
-        });
+        // Pressing ▶ means run, always -- so a parameterised check runs with
+        // whatever its fields currently hold, or with the review's stored
+        // values when they are not on screen. It never silently becomes a
+        // "expand the form" button instead.
+        const inputs = (g && check) ? checkInputValues(g, check, key) : {};
         const cleanupEl = /** @type {HTMLInputElement|null} */ (document.getElementById(`check-cleanup:${key}`));
         const run_cleanup = !!(cleanupEl && cleanupEl.checked);
-        checkFormOpen[key] = false;
-        renderReviewDetail();
+        markCommandLaunched(key);
         const url = `/api/guardians/${id}/${kind === "manual" ? "run-manual-commands" : "run-action-hint"}`;
         await guardianAction(url, { index, inputs, run_cleanup });
         tick();
+      }
+      /**
+       * Runs one manual check or test action. The single meaning of the ▶ on a
+       * command row, whether or not that command takes parameters.
+       * @param {"manual"|"action"} kind - Which section the row belongs to.
+       * @param {string} id - The review id.
+       * @param {number} index - The command's index within its section.
+       * @returns {Promise<void>}
+       */
+      async function runCheck(kind, id, index) {
+        manualMenuOpen[id] = false;
+        await runCheckWithInputs(kind, id, index);
       }
       // "Set it for me" (RAL-164): delegates resolution of one named check
       // input to the resolver agent. Spam-proofing is enforced server-side
