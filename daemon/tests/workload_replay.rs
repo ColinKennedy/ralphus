@@ -258,6 +258,42 @@ fn carto_rows(store: &StoreMutex) -> i64 {
         .total
 }
 
+/// Milliseconds since the Unix epoch, matching how Cartographer stamps
+/// `at_ms` -- used to bound [`watchdog_row_count`] to the replay window.
+fn unix_ms_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock before epoch")
+        .as_millis() as i64
+}
+
+/// How many WS-B.3 guard-watchdog rows (`store_lock.rs`'s `Drop for
+/// StoreGuard`, source `"store_lock"`, message `"long store guard hold"`)
+/// landed in `[since_ms, until_ms]`. Any single write that happens to hold the
+/// store lock for >=100ms (`GUARD_HOLD_WARN_MS`) makes the watchdog log one
+/// of these on top of the write itself -- the module doc's "the WS-B.3 guard
+/// watchdog ... [is] in the measurement" already says this is expected, so a
+/// raw before/after row count has to account for it rather than treat it as
+/// a lost or duplicated write. `EVENT_MIX` also has a `"store_lock"` entry of
+/// its own (synthetic `"replayed event"` rows), so the watchdog's rows are
+/// told apart by message text, not source alone. The window is bounded on
+/// both ends -- not just `since_ms` -- so that the `before`/`after`
+/// `carto_rows` calls' own lock acquisitions (each watchdog-eligible too)
+/// never count themselves: their guard drops outside `[since_ms, until_ms]`.
+fn watchdog_row_count(store: &StoreMutex, since_ms: i64, until_ms: i64) -> i64 {
+    store
+        .lock()
+        .cartographer_query(&CartographerFilter {
+            source: Some("store_lock".to_string()),
+            q: Some("long store guard hold".to_string()),
+            since_ms: Some(since_ms),
+            until_ms: Some(until_ms),
+            ..CartographerFilter::recent(1)
+        })
+        .expect("count watchdog rows")
+        .total
+}
+
 #[test]
 // Wall-clock pacing, so this belongs in the `perf-tests` job with
 // `--test-threads 1` -- same reasoning as `board_contention.rs`.
@@ -267,14 +303,18 @@ fn the_captured_event_mix_replays_at_its_recorded_peak() {
     let store = StoreMutex::new(Store::open(&db).expect("open store"));
     let squad_ids = seed(&store);
     let before = carto_rows(&store);
+    let since_ms = unix_ms_now();
 
     let seconds = replay_seconds();
     let result = replay(&store, &squad_ids, BURST_PEAK_PER_SEC, seconds);
+    let until_ms = unix_ms_now();
     let after = carto_rows(&store);
+    let watchdog_rows = watchdog_row_count(&store, since_ms, until_ms);
+    let expected = result.requested as i64 + watchdog_rows;
 
     eprintln!(
         "replay burst-peak: requested {} at {BURST_PEAK_PER_SEC}/sec over {seconds}s, \
-         achieved {:.1}/sec, rows +{}",
+         achieved {:.1}/sec, rows +{} ({watchdog_rows} from the guard watchdog)",
         result.requested,
         result.achieved_rate,
         after - before
@@ -286,9 +326,12 @@ fn the_captured_event_mix_replays_at_its_recorded_peak() {
     );
     assert_eq!(
         after - before,
-        result.requested as i64,
-        "requested {} rows but the store holds {} more -- writes were lost",
+        expected,
+        "requested {} rows plus {} from the WS-B.3 guard watchdog firing on a \
+         slow write ({} expected) but the store holds {} more",
         result.requested,
+        watchdog_rows,
+        expected,
         after - before
     );
     assert!(
