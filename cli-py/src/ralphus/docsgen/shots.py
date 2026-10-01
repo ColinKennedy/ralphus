@@ -267,8 +267,12 @@ def _waypoints_overview(page: Page) -> None:
     ):
         _goto(page, base_url, "#/tasks")
         page.evaluate("showTab('waypoints', true)")
-        page.wait_for_selector("#waypoints .squad-item.selected")
-        page.wait_for_selector("#waypoint-detail .kv-row")
+        # The redesigned sidebar renders `.wp-card`s, not the shared
+        # `.squad-item` rows the first version borrowed.
+        page.wait_for_selector("#waypoints .wp-card.selected")
+        # The redesigned pane renders its scalars as `.wp-setup` chips rather
+        # than key/value rows; wait for an entry so both lists are on screen.
+        page.wait_for_selector("#waypoint-detail .wp-entry")
         _shoot(page, "waypoints-overview")
 
 

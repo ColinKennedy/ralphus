@@ -763,8 +763,9 @@ TASKS_ROUTES: Routes = {
 }
 
 # ---------------------------------------------------------------------------
-# Waypoints scenario (RAL-400) — one open waypoint with a partially delivered
-# squad roster, a delivery event, and a completed-work bearing.
+# Waypoints scenario (RAL-400) — one open waypoint showing both of its lists:
+# a roster (what must land for it to be carried out) and the affected work it
+# lands on, one entry of which has answered and one of which has not.
 # ---------------------------------------------------------------------------
 
 _WAYPOINT_ID = "waypoint-000000000001"
@@ -776,8 +777,17 @@ WAYPOINTS_ROUTES: Routes = {
             "label": "release coordination",
             "state": "open",
             "created_at_ms": 1_783_100_000_000,
-            "roster_count": 2,
+            "affected_count": 2,
             "projects": ["ralphus"],
+            "allow_advisory": True,
+            "updated_at_ms": 1_783_100_002_000,
+            "closed_at_ms": None,
+            "delivery_summary": {
+                "delivered": 1,
+                "via_restack": 0,
+                "failed": 0,
+                "undelivered": 1,
+            },
         }
     ],
     f"/api/waypoints/{_WAYPOINT_ID}": {
@@ -795,7 +805,21 @@ WAYPOINTS_ROUTES: Routes = {
             "failed": 0,
             "undelivered": 1,
         },
+        # What must land for this waypoint to be carried out. Curated by hand;
+        # nothing enrols here from the survey.
         "roster": [
+            {
+                "waypoint_id": _WAYPOINT_ID,
+                "kind": "squad",
+                "entry_id": "squad-000000000009",
+                "note": "the release migration itself",
+                "terminal": False,
+                "created_at_ms": 1_783_100_000_000,
+            },
+        ],
+        # What it lands on. One entry has answered; the other is still held
+        # because it has not.
+        "affected": [
             {
                 "waypoint_id": _WAYPOINT_ID,
                 "kind": "squad",
@@ -804,15 +828,25 @@ WAYPOINTS_ROUTES: Routes = {
                 "delivery_status": "delivered",
                 "survey_verdict": "impacted",
                 "survey_rationale": "The implementation changes the shared release path.",
+                "bearing_decision": "accepted",
+                "bearing_decided_at_ms": 1_783_100_002_000,
+                "stale_at_ms": None,
+                "created_at_ms": 1_783_100_000_000,
+                "updated_at_ms": 1_783_100_002_000,
             },
             {
                 "waypoint_id": _WAYPOINT_ID,
                 "kind": "review",
                 "entry_id": "guardian-000000000001",
-                "mode": "advisory",
+                "mode": "block",
                 "delivery_status": "undelivered",
                 "survey_verdict": None,
                 "survey_rationale": None,
+                "bearing_decision": None,
+                "bearing_decided_at_ms": None,
+                "stale_at_ms": None,
+                "created_at_ms": 1_783_100_000_000,
+                "updated_at_ms": 1_783_100_000_000,
             },
         ],
     },

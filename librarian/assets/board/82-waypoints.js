@@ -286,7 +286,8 @@
           </div>
           <div class="wp-card-meta">
             ${renderWaypointSpark(w)}
-            <span data-tip="How many squads and reviews this waypoint tracks.">${w.affected_count} affected${w.affected_count === 1 ? "" : "s"}</span>
+            <span data-tip="How many squads and reviews this waypoint lands on.
+Its roster -- the work that must land for it to be carried out -- is counted separately, on the waypoint itself.">${w.affected_count} affected</span>
             ${w.projects.length ? `<span class="wp-proj" data-tip="Projects inferred from the affected.">${esc(w.projects.join(", "))}</span>` : ""}
           </div>
         </div>`).join("");
