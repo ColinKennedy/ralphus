@@ -752,6 +752,37 @@ fn render_waypoint_detail(w: &Value) {
     ));
     crate::output::print_kv(&rows);
 
+    // The completion list first: it is what decides when the waypoint is done,
+    // and the affected list below is only held while it is outstanding.
+    let roster = w["roster"].as_array().cloned().unwrap_or_default();
+    if roster.is_empty() {
+        println!(
+            "
+no roster entries -- nothing specific has to land for this waypoint"
+        );
+    } else {
+        println!(
+            "
+roster (must land):"
+        );
+        let roster_rows: Vec<Vec<String>> = roster
+            .iter()
+            .map(|r| {
+                vec![
+                    r["kind"].as_str().unwrap_or_default().to_string(),
+                    r["entry_id"].as_str().unwrap_or_default().to_string(),
+                    if r["terminal"].as_bool().unwrap_or(false) {
+                        "landed".to_string()
+                    } else {
+                        "outstanding".to_string()
+                    },
+                    r["note"].as_str().unwrap_or_default().to_string(),
+                ]
+            })
+            .collect();
+        crate::output::print_table(&["KIND", "ENTRY_ID", "STATE", "NOTE"], &roster_rows);
+    }
+
     let affected = w["affected"].as_array().cloned().unwrap_or_default();
     if affected.is_empty() {
         println!("\nno affected entries");
@@ -768,11 +799,21 @@ fn render_waypoint_detail(w: &Value) {
                         .as_str()
                         .unwrap_or_default()
                         .to_string(),
+                    // Silence is not an answer, and for a block-mode entry it
+                    // is what is still holding it -- so say so rather than
+                    // leaving the column blank.
+                    match r["bearing_decision"].as_str() {
+                        Some(d) => d.to_string(),
+                        None if r["mode"].as_str() == Some("block") => {
+                            "awaiting answer".to_string()
+                        }
+                        None => "-".to_string(),
+                    },
                 ]
             })
             .collect();
         crate::output::print_table(
-            &["KIND", "ENTRY_ID", "MODE", "DELIVERY_STATUS"],
+            &["KIND", "ENTRY_ID", "MODE", "DELIVERY_STATUS", "ANSWER"],
             &affected_rows,
         );
     }
