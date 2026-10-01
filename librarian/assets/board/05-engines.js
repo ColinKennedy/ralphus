@@ -110,6 +110,7 @@
         jumpToLatestRun: (e, ds) => jumpToLatestRun(ds.branchId || ""),
         setLiveSub: (e, ds) => setLiveSub(ds.branchId || "", ds.sub || "terminal"),
         stepFeedbackReply: (e, ds) => stepFeedbackReply(ds.key || "", Number(ds.to)),
+        regenerateSummary: (e, ds) => regenerateSummary(ds.guardianId || ""),
         // The inspector's Live tab draws these as pill toggles whose on/off
         // state is read at render time, so flipping the underlying flag has to
         // re-render that pane -- `toggleShow*` only repaints the tape, which

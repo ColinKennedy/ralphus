@@ -905,9 +905,14 @@
       .cmd-expand:hover { color: var(--text); border-color: var(--muted); background: var(--panel-2); }
       /* The expanded full text of one command, under its row. */
       .cmd-full {
-        margin: 0; padding: 8px 10px 10px 41px; background: var(--bg);
-        border-bottom: 1px solid var(--border); font-size: 11px; line-height: 1.6;
-        white-space: pre-wrap; word-break: break-all; color: var(--text);
+        margin: 0; padding: 8px 10px 9px 41px; background: var(--bg);
+        border-bottom: 1px solid var(--border); font-size: 12.5px; line-height: 1.5;
+        color: var(--text);
+      }
+      /* `pre-wrap` belongs to the command text alone. On the panel it also
+         rendered the markup's own newlines and indentation, which is where the
+         screenfuls of blank space between these rows came from. */
+      .cmd-preview { white-space: pre-wrap; word-break: break-all; }
       }
       /* Selecting a command row reads the same as selecting a branch row. */
       .cmd-row.selectable { cursor: pointer; }

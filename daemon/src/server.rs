@@ -2128,6 +2128,10 @@ fn route_for_user(
                 Err(_) => error(400, "bad_request", "index must be a number", vec![]),
             }
         }
+        // ralphus[ignore-endpoint-cli]: board-only "this summary is wrong, write it again" action
+        ("POST", ["api", "guardians", id, "regenerate-summary"]) => {
+            guardian_regenerate_summary(daemon, id)
+        }
         // ralphus[ignore-endpoint-cli]: board inline 'resolve this residue for me' action
         ("POST", ["api", "guardians", id, "resolve-input"]) => {
             guardian_resolve_input(daemon, id, body)
@@ -15567,6 +15571,37 @@ fn guardian_run_manual_commands(daemon: &Daemon, id: &str, body: &str) -> Reply 
     } else {
         error(500, "terminal_error", &errors.join("; "), vec![])
     }
+}
+
+/// Ask for this review's change summary to be written again.
+///
+/// The automatic path deliberately skips a regeneration whose enabled-branch
+/// set is unchanged, since a rebuild that moved no branch cannot produce a
+/// different summary by itself. A reviewer pressing Regenerate is making the
+/// opposite claim -- same inputs, output still wrong -- so this forces it.
+///
+/// Returns promptly: the request joins the same debounced queue the automatic
+/// path uses, and the scheduler's sweep runs the LLM call off this thread.
+/// Rejected with 409 before the review is `in_review`, because the generator
+/// itself only runs from that state and the request would otherwise be
+/// accepted and then silently dropped.
+fn guardian_regenerate_summary(daemon: &Daemon, id: &str) -> Reply {
+    let g = match daemon.lock().get_guardian(id) {
+        Ok(g) => g,
+        Err(e) => return store_error(&e),
+    };
+    if !crate::guardian_merge::force_final_summary_regen(&daemon.store_handle(), id) {
+        return error(
+            409,
+            "not_in_review",
+            &format!(
+                "this review is {} — a change summary is written once its stack has finished rebasing and it reaches in_review",
+                g.status
+            ),
+            vec![],
+        );
+    }
+    json(200, &OpenTerminalResponse { ok: true })
 }
 
 /// Run a user-declared action hint from `[[review.action]]` (RAL-77).

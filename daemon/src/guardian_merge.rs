@@ -11606,6 +11606,33 @@ pub(crate) fn queue_final_summary_regen(store: &crate::store_lock::StoreHandle, 
         .request_final_summary(id, &signature, crate::store::now_ms(), force);
 }
 
+/// Request a fresh LLM change summary for a guardian whose enabled-branch set
+/// has not changed -- the reviewer asking for one directly.
+///
+/// [`queue_final_summary_regen`] exists for the automatic path and is
+/// deliberately a no-op when the signature matches, since a rebuild that did
+/// not add, remove or reorder a branch cannot produce a different summary on
+/// its own. A reviewer pressing Regenerate is saying the opposite: the inputs
+/// are the same and the output is still wrong, so run it again anyway. That is
+/// what `force` is for, and it is the only difference between the two.
+///
+/// Returns whether the request was accepted. [`generate_final_summary`] only
+/// runs for an `in_review` guardian, so asking for one before then would
+/// silently do nothing -- the caller is told instead.
+pub(crate) fn force_final_summary_regen(store: &crate::store_lock::StoreHandle, id: &str) -> bool {
+    let Ok(guardian) = store.lock().get_guardian(id) else {
+        return false;
+    };
+    if guardian.status != GuardianStatus::InReview.as_str() {
+        return false;
+    }
+    let signature = enabled_branch_signature(&guardian.branches);
+    store
+        .lock()
+        .request_final_summary(id, &signature, crate::store::now_ms(), true);
+    true
+}
+
 /// RAL-208: fire the LLM change-summary call for every guardian whose
 /// debounce window (see [`FINAL_SUMMARY_DEBOUNCE_MS`]) has elapsed since its
 /// last [`queue_final_summary_regen`] request. Called periodically from

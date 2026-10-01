@@ -1129,6 +1129,10 @@
         if (kind === "summary") {
           const g = guardians.find((x) => x.id === gid);
           const text = (g && g.change_summary) || "";
+          const inReview = !!g && g.status === "in_review";
+          items.push(inReview
+            ? `<div data-click="regenerateSummary" data-guardian-id="${esc(gid)}" data-tip="Ask the resolver agent to write this summary again from the stack's commits.\nUse it when the summary is stale or simply wrong — the automatic pass skips a rewrite when no branch was added, removed or reordered, which is exactly when it needs forcing.\nRuns in the background; the new text replaces this one when it lands.">↻ Regenerate</div>`
+            : `<div class="ctx-disabled" data-tip="A change summary is written once the stack has finished rebasing and the review reaches in_review.\nThis review is ${esc((g && g.status) || "not ready")}.">↻ Regenerate</div>`);
           items.push(text
             ? `<div data-copy="${esc(text)}" onclick="copyText(event)" data-tip="Copy this summary's text to the clipboard.">⧉ Copy summary</div>`
             : `<div class="ctx-disabled" data-tip="There is no summary to copy yet — one appears once a branch's source cell finishes.">⧉ Copy summary</div>`);
@@ -1509,7 +1513,7 @@
         // them in the same panel.
         const shown = hasInputs ? substituteCheckInputs(cmd, checkInputValues(opts.g, check, key)) : cmd;
         return `<div class="cmd-full mono">
-            <div id="cmd-preview-${esc(key)}">${esc(shown)}</div>
+            <div class="cmd-preview" id="cmd-preview-${esc(key)}">${esc(shown)}</div>
             ${hasInputs ? renderCheckInputFields(opts.g, /** @type {"manual"|"action"} */ (opts.kind), opts.i, check) : ""}
             ${commandResultBlock(key, shown)}
             <div class="btn-row" style="margin-top:7px">

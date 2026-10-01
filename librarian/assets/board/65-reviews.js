@@ -3099,6 +3099,21 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        * @returns {Promise<void>}
        */
       /**
+       * Asks the daemon to write this review's change summary again.
+       *
+       * The automatic pass skips a rewrite whose enabled-branch set is
+       * unchanged, which is precisely the case a reviewer wants to override, so
+       * this forces one. It lands through the same debounced queue, so the new
+       * text arrives on a later poll rather than immediately.
+       * @param {string} id - The review id.
+       * @returns {Promise<void>}
+       */
+      async function regenerateSummary(id) {
+        closeSquadMenu();
+        const resp = await guardianAction(`/api/guardians/${id}/regenerate-summary`);
+        if (resp && resp.ok) notify("info", "Summary regeneration requested — it runs in the background.");
+      }
+      /**
        * Runs every command-based test action for a review, in declaration
        * order. There is no run-all route for action hints the way there is for
        * manual checks (`/run-manual-commands`), so this fans out over the
