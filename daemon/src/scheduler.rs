@@ -634,7 +634,7 @@ pub fn run_loop(
             crate::waypoints::run_pending_surveys(&store, &waypoint_halts, &runner);
             crate::waypoints::run_pending_waypoint_resumes(&store, &cancellations);
             crate::waypoints::run_pending_deliveries(&store, &runner);
-            crate::waypoints::run_pending_stand_down_notices(&store, &runner);
+            crate::waypoints::run_pending_stand_down_notices(&store);
             crate::waypoints::run_pending_stale_notices(&store);
             last_waypoint_survey = std::time::Instant::now();
         }

@@ -989,6 +989,33 @@ impl Store {
         Ok(())
     }
 
+    /// Every cell of `squad_id` this waypoint actually advised -- i.e. that
+    /// had guidance queued for it, delivered or not.
+    ///
+    /// This is the precise audience for the waypoint's stand-down notice: the
+    /// cells that were told something are the ones for whom "that guidance is
+    /// now moot" is news. Returns `(task_idx, idx)` pairs, oldest first.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn waypoint_advised_cells(
+        &self,
+        waypoint_id: &str,
+        squad_id: &str,
+    ) -> StoreResult<Vec<(i64, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT target_task, target_idx FROM pending_injections
+             WHERE waypoint_id=? AND target_squad=?
+             ORDER BY target_task, target_idx",
+        )?;
+        let rows = stmt
+            .query_map(params![waypoint_id, squad_id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Queue one newly-appended bearing for delivery to every **advisory**
     /// squad roster entry on this waypoint, one injection per not-yet-finished
     /// cell. Returns how many injections were queued.
@@ -2534,10 +2561,7 @@ fn stand_down_text(waypoint: &WaypointView) -> String {
 /// on the calling (scheduler) thread gate what work happens; the
 /// potentially slow part (`start_feedback`'s spawned background thread) is
 /// not owned by this function's call stack at all.
-pub fn run_pending_stand_down_notices(
-    store: &crate::store_lock::StoreHandle,
-    runner: &Arc<dyn Runner>,
-) {
+pub fn run_pending_stand_down_notices(store: &crate::store_lock::StoreHandle) {
     let waypoint_ids = {
         let guard = store.lock();
         guard.list_closed_waypoint_ids().unwrap_or_default()
@@ -2557,7 +2581,7 @@ pub fn run_pending_stand_down_notices(
             }
             match entry.kind {
                 RosterEntryKind::Review => {
-                    stand_down_review(store, runner, &waypoint_id, &waypoint, &entry.entry_id);
+                    stand_down_review(store, &waypoint_id, &waypoint, &entry.entry_id);
                 }
                 RosterEntryKind::Squad => {
                     stand_down_squad(store, &waypoint_id, &waypoint, &entry.entry_id);
@@ -2567,63 +2591,72 @@ pub fn run_pending_stand_down_notices(
     }
 }
 
-/// Send one review roster entry's stand-down notice via the existing
-/// feedback path, then mark it sent. Leaves the entry pending (for a later
-/// sweep to retry) if the guardian has no ready branch yet, or if
-/// `start_feedback` reports `404`/`409` -- the same not-ready/gone races
-/// [`deliver_to_review`] already tolerates. Any other reply status is still
-/// marked sent: unlike ordinary guidance delivery, a stand-down notice is
-/// optional and best-effort, so there is no `Failed` outcome to track for
-/// it, and endlessly retrying a guardian that keeps erroring would be worse
-/// than dropping one advisory-only notice.
+/// Send one review roster entry's stand-down notice to the review's watchers.
+///
+/// Deliberately a plain mailbox notification, not the feedback path. The
+/// feedback path (`guardian_merge::start_feedback`) is how *guidance* reaches
+/// a review, and it works by dispatching the resolver agent -- it moves the
+/// review through `merging`/`actioning` and runs a real, billed agent turn.
+/// Spending that to deliver "no further action is needed" inverts the cost of
+/// the message against its content, and churns a settled review's status to
+/// say nothing. A stand-down is for the humans watching the review, so it goes
+/// where they are looking.
+///
+/// Dropping the feedback call also removes everything that existed only to
+/// serve it: the ready-branch precondition, and the `404`/`409` retry
+/// tolerance for a guardian that was not ready yet. A mailbox row has no such
+/// races, so the notice is sent once and marked, unconditionally.
 fn stand_down_review(
     store: &crate::store_lock::StoreHandle,
-    runner: &Arc<dyn Runner>,
     waypoint_id: &str,
     waypoint: &WaypointView,
     guardian_id: &str,
 ) {
-    let branch_id = {
-        let guard = store.lock();
-        let Ok(guardian) = guard.get_guardian(guardian_id) else {
-            return;
-        };
-        match topmost_ready_branch(&guardian) {
-            Some(branch) => branch.id.clone(),
-            None => return,
-        }
-    };
-    let reply = crate::guardian_merge::start_feedback(
-        Arc::clone(store),
-        Arc::clone(runner),
-        guardian_id,
-        &branch_id,
-        stand_down_text(waypoint),
-        Some(WAYPOINT_FEEDBACK_AUTHOR.to_string()),
+    let guard = store.lock();
+    let _ = guard.notify_watchers_with_context(
+        crate::monitor::NotifiableEventKind::WaypointAdvised,
+        &format!("guardian:{guardian_id}"),
+        crate::mailbox::MailboxPriority::Normal,
+        &stand_down_text(waypoint),
+        None,
+        None,
         None,
     );
-    if matches!(reply.status, 404 | 409) {
-        return;
-    }
-    let guard = store.lock();
     let _ = guard.mark_roster_entry_stood_down(waypoint_id, RosterEntryKind::Review, guardian_id);
-    let note = crate::cartographer::Note::new("waypoints")
+    crate::cartographer::Note::new("waypoints")
         .scope("waypoint")
-        .guardian(guardian_id);
-    note.emit(
-        &guard,
-        format!("waypoint {waypoint_id} sent stand-down notice to review {guardian_id}"),
-        serde_json::json!({
-            "waypoint_id": waypoint_id,
-            "guardian_id": guardian_id,
-            "branch_id": branch_id,
-            "reply_status": reply.status,
-        }),
-    );
+        .guardian(guardian_id)
+        .emit(
+            &guard,
+            format!("waypoint {waypoint_id} sent stand-down notice to review {guardian_id}"),
+            serde_json::json!({
+                "waypoint_id": waypoint_id,
+                "guardian_id": guardian_id,
+            }),
+        );
 }
 
-/// Send one squad roster entry's stand-down notice as a plain informational
-/// mailbox message, then mark it sent.
+/// Send one squad roster entry's stand-down notice, addressed to the cells
+/// this waypoint actually advised so their own watchers receive it.
+///
+/// A watch matches when the *watched* entity covers the message's entity
+/// ([`crate::entity_uri::EntityUri::covers`], parent to child only). A single
+/// row at `squad:{id}` therefore reaches squad-level watchers but never
+/// someone watching one specific cell -- so the people closest to the advised
+/// work were the ones who never heard the guidance had lapsed. Emitting per
+/// advised cell inverts that: cell watchers match exactly, and squad- and
+/// task-level watchers still match by covering those cells.
+///
+/// The audience is bounded to cells that actually had guidance queued for
+/// them ([`Store::waypoint_advised_cells`]), not every cell in the squad -- a
+/// cell that was never told anything does not need telling that it no longer
+/// applies. A squad the waypoint advised but never reached a cell of falls
+/// back to one squad-addressed row.
+///
+/// Proof steps are not addressed separately: a waypoint advises work, not the
+/// verification of it, and a proof-scope URI does not cover its cell, so a
+/// per-proof row would multiply the mail without reaching an audience the
+/// cell rows do not already serve.
 fn stand_down_squad(
     store: &crate::store_lock::StoreHandle,
     waypoint_id: &str,
@@ -2631,25 +2664,42 @@ fn stand_down_squad(
     squad_id: &str,
 ) {
     let guard = store.lock();
-    let _ = guard.notify_watchers(
-        crate::monitor::NotifiableEventKind::SquadAttributesChanged,
-        &format!("squad:{squad_id}"),
-        crate::mailbox::MailboxPriority::Normal,
-        &stand_down_text(waypoint),
-        Some(squad_id),
-    );
+    let advised = guard
+        .waypoint_advised_cells(waypoint_id, squad_id)
+        .unwrap_or_default();
+    let text = stand_down_text(waypoint);
+    if advised.is_empty() {
+        let _ = guard.notify_watchers(
+            crate::monitor::NotifiableEventKind::WaypointAdvised,
+            &format!("squad:{squad_id}"),
+            crate::mailbox::MailboxPriority::Normal,
+            &text,
+            Some(squad_id),
+        );
+    } else {
+        for (task_idx, idx) in &advised {
+            let _ = guard.notify_watchers(
+                crate::monitor::NotifiableEventKind::WaypointAdvised,
+                &format!("cell:{squad_id}:{task_idx}:{idx}"),
+                crate::mailbox::MailboxPriority::Normal,
+                &text,
+                Some(squad_id),
+            );
+        }
+    }
     let _ = guard.mark_roster_entry_stood_down(waypoint_id, RosterEntryKind::Squad, squad_id);
-    let note = crate::cartographer::Note::new("waypoints")
+    crate::cartographer::Note::new("waypoints")
         .scope("waypoint")
-        .squad(squad_id);
-    note.emit(
-        &guard,
-        format!("waypoint {waypoint_id} sent stand-down notice to squad {squad_id}"),
-        serde_json::json!({
-            "waypoint_id": waypoint_id,
-            "squad_id": squad_id,
-        }),
-    );
+        .squad(squad_id)
+        .emit(
+            &guard,
+            format!("waypoint {waypoint_id} sent stand-down notice to squad {squad_id}"),
+            serde_json::json!({
+                "waypoint_id": waypoint_id,
+                "squad_id": squad_id,
+                "advised_cells": advised.len(),
+            }),
+        );
 }
 
 /// Most survey classifications dispatched in a single sweep, across every
@@ -5164,6 +5214,133 @@ mod tests {
         );
     }
 
+    // ── stand-down notices (close-time, watcher-addressed only) ──────────
+
+    /// A `Runner` that fails the test if anything dispatches it. Stand-down
+    /// must never reach a runner: the whole point is that closing a waypoint
+    /// notifies people without spending an agent turn.
+    struct NoDispatchRunner;
+
+    impl crate::runner::Runner for NoDispatchRunner {
+        fn run(&self, _spec: &crate::runner::RunnerSpec) -> crate::runner::RunnerResult {
+            panic!("stand-down must not dispatch an agent");
+        }
+    }
+
+    #[test]
+    fn a_review_stand_down_notifies_watchers_without_dispatching_an_agent() {
+        // This used to go through `guardian_merge::start_feedback`, which runs
+        // the resolver agent and churns the review through merging/actioning
+        // -- a billed turn to deliver "no further action is needed".
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_bare_guardian(&store, "guardian-1");
+        open_review_branch(&store, "guardian-1", "feature-x");
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Review,
+                "guardian-1",
+                RosterMode::Advisory,
+            )
+            .unwrap();
+        assert!(store.close_waypoint("waypoint-1").unwrap());
+
+        let handle = handle(store);
+        // Registered but never used: a dispatch would panic.
+        let _never: Arc<dyn Runner> = Arc::new(NoDispatchRunner);
+        run_pending_stand_down_notices(&handle);
+
+        let store = handle.lock();
+        assert!(
+            store.list_roster_entries("waypoint-1").unwrap()[0]
+                .stand_down_at_ms
+                .is_some(),
+            "the entry must be marked stood-down"
+        );
+        let mail = mail(&store);
+        assert_eq!(mail.len(), 1, "exactly one notice: {mail:?}");
+        assert_eq!(
+            mail[0].entity_uri.as_deref(),
+            Some("guardian:guardian-1"),
+            "addressed to the review, so its watchers match"
+        );
+        assert!(mail[0].message.contains("no further action is needed"));
+    }
+
+    #[test]
+    fn a_squad_stand_down_is_addressed_to_each_cell_the_waypoint_advised() {
+        // A watch matches when the watched entity covers the message's, parent
+        // to child -- so a lone `squad:` row never reaches someone watching one
+        // specific cell, which is exactly the person closest to the advised
+        // work.
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_squad_with_cwd(&store, "squad-1", "/repo");
+        store
+            .conn
+            .execute(
+                "INSERT INTO cells(squad_id, task_idx, idx, sid, agent, state, prompt, cwd)
+                 VALUES('squad-1',0,1,'s0-1','claude-code','running','later','/repo')",
+                [],
+            )
+            .unwrap();
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-1",
+                RosterMode::Advisory,
+            )
+            .unwrap();
+        let bearing = seed_bearing(&store, "waypoint-1", "salute replaces greet");
+        store
+            .queue_advisory_bearing_injections("waypoint-1", &bearing)
+            .unwrap();
+        assert!(store.close_waypoint("waypoint-1").unwrap());
+
+        let handle = handle(store);
+        run_pending_stand_down_notices(&handle);
+
+        let store = handle.lock();
+        let uris: BTreeSet<String> = mail(&store)
+            .into_iter()
+            .filter_map(|m| m.entity_uri)
+            .collect();
+        assert!(
+            uris.contains("cell:squad-1:0:0") && uris.contains("cell:squad-1:0:1"),
+            "each advised cell must be addressed directly: {uris:?}"
+        );
+        assert!(
+            !uris.contains("squad:squad-1"),
+            "the squad-level row is the fallback only, not an extra copy: {uris:?}"
+        );
+    }
+
+    #[test]
+    fn a_squad_the_waypoint_never_reached_a_cell_of_falls_back_to_one_row() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_squad_with_cwd(&store, "squad-1", "/repo");
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-1",
+                RosterMode::Advisory,
+            )
+            .unwrap();
+        assert!(store.close_waypoint("waypoint-1").unwrap());
+
+        let handle = handle(store);
+        run_pending_stand_down_notices(&handle);
+
+        let store = handle.lock();
+        let sent = mail(&store);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].entity_uri.as_deref(), Some("squad:squad-1"));
+    }
+
     // ── scope project keying (registered project, not cwd basename) ──────
 
     #[test]
@@ -6451,8 +6628,8 @@ mod tests {
         assert!(store.close_waypoint("waypoint-1").unwrap());
 
         let handle = handle(store);
-        let runner: Arc<dyn crate::runner::Runner> = Arc::new(DeliveryTestRunner);
-        run_pending_stand_down_notices(&handle, &runner);
+
+        run_pending_stand_down_notices(&handle);
 
         let store = handle.lock();
         let entries = store.list_roster_entries("waypoint-1").unwrap();
@@ -6464,10 +6641,10 @@ mod tests {
             .mailbox_messages_for_client("client", false, None)
             .unwrap();
         assert_eq!(broadcast.len(), 1);
-        assert_eq!(
-            broadcast[0].event_kind.as_deref(),
-            Some("squad_attributes_changed")
-        );
+        // The notice is waypoint-advisory-channel traffic, not a generic squad
+        // attribute change: someone filtering their mail for waypoint guidance
+        // should see the stand-down alongside the advice it retires.
+        assert_eq!(broadcast[0].event_kind.as_deref(), Some("waypoint_advised"));
     }
 
     #[test]
@@ -6487,8 +6664,8 @@ mod tests {
         assert!(store.close_waypoint("waypoint-1").unwrap());
 
         let handle = handle(store);
-        let runner: Arc<dyn crate::runner::Runner> = Arc::new(DeliveryTestRunner);
-        run_pending_stand_down_notices(&handle, &runner);
+
+        run_pending_stand_down_notices(&handle);
 
         let store = handle.lock();
         let entries = store.list_roster_entries("waypoint-1").unwrap();
@@ -6514,14 +6691,23 @@ mod tests {
         assert!(store.close_waypoint("waypoint-1").unwrap());
 
         let handle = handle(store);
-        let runner: Arc<dyn crate::runner::Runner> = Arc::new(DeliveryTestRunner);
-        run_pending_stand_down_notices(&handle, &runner);
+
+        run_pending_stand_down_notices(&handle);
 
         let store = handle.lock();
         let entries = store.list_roster_entries("waypoint-1").unwrap();
+        // Previously this was deferred until the review had a built worktree,
+        // because the notice went out over the feedback path and that path
+        // needs somewhere to write. A mailbox row has no such precondition, so
+        // a review with no ready branch is notified immediately rather than
+        // waiting for a worktree it may never build.
         assert!(
-            entries[0].stand_down_at_ms.is_none(),
-            "with no ready branch yet, the notice must be left for a later sweep"
+            entries[0].stand_down_at_ms.is_some(),
+            "a watcher notice needs no ready branch, so it sends on the first sweep"
+        );
+        assert_eq!(
+            mail(&store)[0].entity_uri.as_deref(),
+            Some("guardian:guardian-1")
         );
     }
 
@@ -6541,8 +6727,8 @@ mod tests {
         assert!(store.close_waypoint("waypoint-1").unwrap());
 
         let handle = handle(store);
-        let runner: Arc<dyn crate::runner::Runner> = Arc::new(DeliveryTestRunner);
-        run_pending_stand_down_notices(&handle, &runner);
+
+        run_pending_stand_down_notices(&handle);
 
         let store = handle.lock();
         let entries = store.list_roster_entries("waypoint-1").unwrap();
@@ -6572,9 +6758,9 @@ mod tests {
         assert!(store.close_waypoint("waypoint-1").unwrap());
 
         let handle = handle(store);
-        let runner: Arc<dyn crate::runner::Runner> = Arc::new(DeliveryTestRunner);
-        run_pending_stand_down_notices(&handle, &runner);
-        run_pending_stand_down_notices(&handle, &runner);
+
+        run_pending_stand_down_notices(&handle);
+        run_pending_stand_down_notices(&handle);
 
         let store = handle.lock();
         let broadcast = store
