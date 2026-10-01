@@ -24,6 +24,34 @@
       let inspectorTab = "overview";
       /** @type {{[branchId: string]: boolean}} Branch ids whose Live view has been opened, and so attached. */
       const inspectorLiveAttached = {};
+      /**
+       * Which run the Live tab is walked back to, per branch. Absent (or past
+       * the end) means the newest run -- the live one.
+       * @type {{[branchId: string]: number}}
+       */
+      const liveRunIdx = {};
+      /**
+       * Which Live sub-view is showing, per branch: terminal | prompt | system.
+       * @type {{[branchId: string]: string}}
+       */
+      const liveSub = {};
+      /**
+       * One thing that ran for a branch -- a rebase pass, a final proof, a
+       * feedback revision, a PR submit, a post-merge gate. Derived from the
+       * review's Cartographer rows rather than stored anywhere: the daemon
+       * records each of these as events, and a run is the span between its
+       * start and end row.
+       * @typedef {object} BranchRun
+       * @property {string} id - Stable within one render, for the picker.
+       * @property {string} kind - rebase | proof | feedback | pr | gate.
+       * @property {string} label - Command text, or what the pass was doing.
+       * @property {number} atMs - When the run started.
+       * @property {string} outcome - passed / failed / resolved / conflicted / opened …
+       * @property {string} who - The agent or actor that ran it.
+       * @property {string} why - Why there is no transcript, when there is none.
+       * @property {boolean} hasTape - Whether a transcript can be shown for it.
+       * @property {number} elapsedMs - Measured duration, or 0 when the emitter reports none. Never estimated.
+       */
       /** @type {boolean} True while the log dock is expanded. */
       let reviewDockOpen = false;
       /**
@@ -295,9 +323,209 @@
         }
       }
       /**
-       * Live: the resolver's terminal for this branch. Nothing attaches until
-       * this tab is opened -- a branch row never renders a terminal, so the
-       * cost is paid once, on the click.
+       * Everything that ran for one branch, oldest first.
+       *
+       * "What was it doing at that time" is not a question about resolver tmux
+       * attempts alone -- a branch rebases, proves, revises against feedback,
+       * submits a PR, and sits under post-merge gates, and any of those is a
+       * point someone wants to walk back to. The daemon records each as a
+       * Cartographer event, so a run is the span between its start and end
+       * rows; this reads the rows the board already has for the review rather
+       * than asking for anything new.
+       *
+       * A run with no retained transcript is still listed. Knowing it happened,
+       * and that its text was not kept, beats silently omitting it.
+       * @param {GuardianView} g - The review.
+       * @param {GuardianBranch} b - The branch.
+       * @returns {BranchRun[]}
+       */
+      function branchRuns(g, b) {
+        const rows = reviewDockEvents[g.id];
+        if (!rows) return [];
+        /** @type {BranchRun[]} */
+        const runs = [];
+        const resolver = resolverOf(g);
+        // Branch attribution is not uniform across emitters: status transitions
+        // key on `payload.ref` (a branch id), the rebase/proof passes on
+        // `payload.branch` (a branch *name*), the PR and feedback-posting rows
+        // on `payload.branch_id`, and the feedback pass itself on
+        // `payload.position` (a stack ordinal -- which a reorder can move, so
+        // it is matched last and only when nothing better identifies the row).
+        const mine = rows.filter((r) => {
+          const p = r.payload || {};
+          return p.ref === b.id || p.branch === b.branch || p.branch_id === b.id
+            || (p.position !== undefined && p.position === b.position);
+        });
+        const ordered = mine.slice().sort((x, y) => x.at_ms - y.at_ms);
+        /**
+         * Closes the most recent still-running run of a kind.
+         * @param {string} kind - Which kind to close.
+         * @param {string} outcome - The outcome to record.
+         * @param {number} [ms] - Measured duration, when the emitter reports one.
+         * @returns {void}
+         */
+        const close = (kind, outcome, ms) => {
+          const open = [...runs].reverse().find((x) => x.kind === kind && x.outcome === "running");
+          if (!open) return;
+          open.outcome = outcome;
+          if (ms) open.elapsedMs = ms;
+        };
+        for (const r of ordered) {
+          const msg = r.message || "";
+          const p = r.payload || {};
+          if (msg.startsWith("conflicts starting")) {
+            const found = p.found ? ` · ${p.found} conflict${p.found === 1 ? "" : "s"}` : "";
+            runs.push({
+              id: `rebase-${r.id}`, kind: "rebase",
+              label: `rebase onto ${g.base_branch || "upstream"}${found}`,
+              atMs: r.at_ms, outcome: "running", elapsedMs: 0,
+              who: String(p.agent || resolver), why: "", hasTape: true,
+            });
+          } else if (msg.startsWith("conflicts resolved")) {
+            close("rebase", p.committed ? "resolved" : "resolved, nothing to commit");
+          } else if (msg.startsWith("conflicts failed")) {
+            close("rebase", "failed");
+          } else if (msg.startsWith("final proof starting")) {
+            runs.push({
+              id: `proof-${r.id}`, kind: "proof", label: "final proof",
+              atMs: r.at_ms, outcome: "running", elapsedMs: 0, who: resolver, why: "", hasTape: true,
+            });
+          } else if (msg.startsWith("final proof done")) {
+            close("proof", p.passed ? "passed" : "failed");
+          } else if (msg.startsWith("feedback applying")) {
+            runs.push({
+              id: `fb-${r.id}`, kind: "feedback", label: "feedback revision",
+              atMs: r.at_ms, outcome: "running", elapsedMs: 0, who: resolver, why: "", hasTape: true,
+            });
+          } else if (msg.startsWith("feedback done")) {
+            close("feedback", p.committed ? "committed" : "no change committed");
+          } else if (msg.startsWith("auto-submit queued") || msg.startsWith("PR submitted")) {
+            runs.push({
+              id: `pr-${r.id}`, kind: "pr", label: "PR stack submit", atMs: r.at_ms,
+              outcome: "submitted", elapsedMs: 0, who: "daemon", hasTape: false,
+              why: "Submitted through the forge's REST API — no terminal session, so there is no transcript to replay.",
+            });
+          } else if (p.phase === "commit_checks") {
+            // The gates that run inside this branch's own rebase. These are the
+            // one place the daemon records a command, an outcome and a measured
+            // duration together, so they are reported exactly as measured.
+            if (p.state === "started") {
+              runs.push({
+                id: `gate-${r.id}`, kind: "gate",
+                label: `${p.check_count || "?"} check gate${p.check_count === 1 ? "" : "s"}`,
+                atMs: r.at_ms, outcome: "running", elapsedMs: 0, who: "command", why: "", hasTape: false,
+              });
+            } else if (p.state === "passed" || p.state === "failed") {
+              const open = [...runs].reverse().find((x) => x.kind === "gate" && x.outcome === "running");
+              if (open) {
+                open.outcome = p.state;
+                open.elapsedMs = Number(p.elapsed_ms) || 0;
+                if (p.command) open.label = String(p.command);
+                open.why = "A check gate runs as a plain command inside the rebase, not under a tmux pane the board can replay. Its command, result and duration are recorded; its output is not.";
+              }
+            }
+          }
+        }
+        // Post-merge gates run once over the merged stack rather than per
+        // branch. They still belong in this walk-back -- they are part of what
+        // happened to this change -- but their result is the stack's, not this
+        // branch's alone, and the entry says so.
+        for (const r of rows) {
+          const msg = r.message || "";
+          if (!msg.startsWith("review auto_build")) continue;
+          const cmd = (r.payload && r.payload.command) || "";
+          runs.push({
+            id: `gate-${r.id}`, kind: "gate", label: String(cmd) || "auto-build",
+            atMs: r.at_ms, outcome: msg.includes("succeeded") ? "passed" : "failed",
+            who: "command", hasTape: false, elapsedMs: 0,
+            why: "The daemon inferred and ran this build once the whole stack had merged — over the merged result, not inside this branch's own session, and with no pane the board can replay. Its command and result are recorded; its output is not.",
+          });
+        }
+        // One timeline, in the order things actually happened.
+        runs.sort((x, y) => x.atMs - y.atMs);
+        return runs;
+      }
+      /**
+       * Formats a run's "05:12:30 · passed" metadata line.
+       * @param {BranchRun} run - The run.
+       * @returns {string}
+       */
+      function runMeta(run) {
+        const t = run.atMs
+          ? new Date(run.atMs).toLocaleTimeString([], { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" })
+          : "";
+        // Duration only where the daemon measured one -- a gate's elapsed_ms.
+        // Nothing here is derived from wall-clock guesses.
+        const dur = run.elapsedMs ? ` · ${fmtDurationMs(run.elapsedMs)}` : "";
+        return (run.outcome ? `${t} · ${run.outcome}` : t) + dur;
+      }
+      /**
+       * Formats a measured duration the way the rest of the board does.
+       * @param {number} ms - Milliseconds.
+       * @returns {string}
+       */
+      function fmtDurationMs(ms) {
+        const secs = Math.round(ms / 1000);
+        if (secs < 60) return `${secs}s`;
+        return `${Math.floor(secs / 60)}m ${secs % 60}s`;
+      }
+      /**
+       * Which run index the Live tab is showing for a branch, clamped to the
+       * list it actually has (runs grow as the branch works).
+       * @param {BranchRun[]} runs - The branch's runs.
+       * @param {string} bid - The branch id.
+       * @returns {number}
+       */
+      function curRunIdx(runs, bid) {
+        if (!runs.length) return -1;
+        const want = liveRunIdx[bid];
+        if (want === undefined) return runs.length - 1;
+        return Math.max(0, Math.min(runs.length - 1, want));
+      }
+      /**
+       * Steps the Live tab one run backwards or forwards.
+       * @param {string} bid - The branch id.
+       * @param {number} dir - -1 for the previous run, 1 for the next.
+       * @returns {void}
+       */
+      function stepBranchRun(bid, dir) {
+        const g = guardians.find((x) => x.id === selectedGuardian);
+        const b = g && g.branches ? g.branches.find((x) => x.id === bid) : null;
+        if (!g || !b) return;
+        const runs = branchRuns(g, b);
+        if (!runs.length) return;
+        liveRunIdx[bid] = Math.max(0, Math.min(runs.length - 1, curRunIdx(runs, bid) + dir));
+        renderReviewInspector();
+      }
+      /**
+       * Jumps the Live tab back to the newest run -- the live one.
+       * @param {string} bid - The branch id.
+       * @returns {void}
+       */
+      function jumpToLatestRun(bid) {
+        delete liveRunIdx[bid];
+        renderReviewInspector();
+      }
+      /**
+       * Switches the Live tab's sub-view.
+       * @param {string} bid - The branch id.
+       * @param {string} sub - terminal | prompt | system.
+       * @returns {void}
+       */
+      function setLiveSub(bid, sub) {
+        liveSub[bid] = sub;
+        renderReviewInspector();
+        if (sub === "system") {
+          const g = guardians.find((x) => x.id === selectedGuardian);
+          // Fetched on first open and dropped on leaving, like every other
+          // lazily-loaded pane -- reopening refetches rather than caching.
+          if (g) ensurePeekSystemPrompt(`guardian|${g.id}|${bid}`).then(() => renderReviewInspector());
+        }
+      }
+      /**
+       * Live: walk back through every run this branch had, and read whichever
+       * one you land on. Nothing attaches until this tab is opened -- a branch
+       * row never renders a terminal, so the cost is paid once, on the click.
        * @param {GuardianView} g - The review.
        * @param {GuardianBranch} b - The selected branch.
        * @returns {string}
@@ -310,78 +538,199 @@
           return `<div class="empty">No worktree yet — a resolver session starts when this branch begins rebasing.</div>`;
         }
         const key = `guardian|${g.id}|${b.id}`;
-        // The attempt list is what makes walking back possible, and it is only
-        // fetched once this tab is open -- see the lazy-by-default rule.
-        if (historyAttempts[key] === undefined) fetchHistoryList(key);
-        return `${liveRunStepper(key)}
-          <div class="btn-row" style="position:relative;gap:0">${resolverTerminalBtns(g, b)}</div>
-          ${resolverPeekBox(g, b)}
-          <div class="hint">Read-only — nothing typed here reaches the agent. Every attempt's text is
+        // The run list is derived from the review's event rows, which the log
+        // drawer also reads -- one fetch per review, on the first thing that
+        // needs it, rather than one per tab.
+        if (reviewDockEvents[g.id] === undefined) loadReviewDockEvents(g.id);
+        const runs = branchRuns(g, b);
+        const ri = curRunIdx(runs, b.id);
+        const run = ri >= 0 ? runs[ri] : null;
+        const isLatest = ri === runs.length - 1;
+        const sub = liveSub[b.id] || "terminal";
+        const ended = !!peekEnded[key];
+        // Only the newest pass that used a tmux pane has content the live view
+        // still holds: the pane is reused, so an earlier pass's text is no
+        // longer in it. "Am I looking at live content" therefore keys on the
+        // newest *taped* run, not the newest run overall -- a gate or a PR
+        // submit happening afterwards does not make the resolver's session
+        // historical, and labelling it so while showing its live output was a
+        // straight contradiction.
+        let newestTape = -1;
+        for (let i = 0; i < runs.length; i++) if (runs[i].hasTape) newestTape = i;
+        // Whether the pane still holds this run's text at all, separate from
+        // whether that text is still moving. A finished session's record is
+        // not "historical" in the sense the walk-back note means -- it is this
+        // run's own output, just no longer growing, and the liveness dot and
+        // the pane's own banner already say so.
+        const onNewestTape = !!run && run.hasTape && ri === newestTape;
+        const live = onNewestTape && !ended;
+
+        // 1 - who am I looking at, and is it still moving
+        const identity = `<div class="peek-head" style="margin-bottom:8px">
+            <span class="peek-dot${live ? "" : " ended"}"></span>
+            <span class="mono" style="font-size:11px">${esc(resolverOf(g))} · ${esc(b.branch)}</span>
+            <span style="flex:1"></span>
+            <span class="rg-sub" style="font-size:11px;color:var(--faint)">${live ? "streaming" : (isLatest ? "session ended" : "historical")}</span>
+            <button class="copy-btn" data-click="copyPeekText" data-key="${esc(key)}" data-tip="Copy what this tab is currently showing.">⧉</button>
+          </div>`;
+
+        // 2 - which run
+        const histBar = runs.length && run ? `<div class="histbar${onNewestTape ? "" : " past"}">
+            <button class="hnav" data-click="stepBranchRun" data-branch-id="${esc(b.id)}" data-dir="-1" ${ri <= 0 ? "disabled" : ""}
+              data-tip="Step back to the previous run on this branch.">&#9664;</button>
+            <button class="hpick" data-click="scopeReviewDockToBranch" data-guardian-id="${esc(g.id)}" data-branch-id="${esc(b.id)}"
+              data-tip="Every recorded run on this branch — rebases, final proofs, feedback revisions, PR submits, and the stack's post-merge gates.\nOpens the log drawer, where each run's own rows are listed.">
+              <span class="hkind ${esc(run.kind)}">${esc(run.kind)}</span>
+              <span class="hlabel mono">${esc(run.label)}</span>
+              <span class="hmeta">${esc(runMeta(run))}</span>
+              <span class="hcount num">${ri + 1}/${runs.length}</span> &#9662;</button>
+            <button class="hnav" data-click="stepBranchRun" data-branch-id="${esc(b.id)}" data-dir="1" ${ri >= runs.length - 1 ? "disabled" : ""}
+              data-tip="Step forward to the next run on this branch.">&#9654;</button>
+            ${isLatest ? "" : `<button class="btn" style="padding:3px 8px;font-size:11px" data-click="jumpToLatestRun" data-branch-id="${esc(b.id)}"
+              data-tip="Jump back to the newest run — the one still streaming.">&#8677; Latest</button>`}
+          </div>
+          ${(onNewestTape || !run.hasTape) ? "" : `<div class="histnote">You are walked back to ${esc(run.label)}
+            from ${esc(runMeta(run))} — an earlier pass than the one the pane below holds.</div>`}`
+          : `<div class="histbar"><span class="hpick" data-tip="Runs appear here as the daemon records them — a rebase pass, a final proof, a feedback revision, a PR submit, a post-merge gate.\nThis branch has not produced one yet.">
+              <span class="hkind">no runs</span><span class="hmeta">nothing recorded for this branch yet</span></span></div>`;
+
+        // 3 - how it is rendered. Terminal-only controls, but they stay put on
+        //     the prompt views rather than vanishing: appearing and disappearing
+        //     on every tab swap reflows the pane. aria-disabled, not `disabled`,
+        //     so the tooltip explaining why still fires.
+        const showDebug = peekShowsDebug(key);
+        const showThinking = peekShowsThinking(key);
+        const canThink = g.resolver_thinking_capable !== false;
+        const dead = sub !== "terminal";
+        const deadTip = "Applies to the Terminal view.\nSwitch to Terminal to use it.";
+        const ctl = `<div class="peek-ctl">
+            <button class="tgl ${showDebug ? "on" : ""}${dead ? " off" : ""}" ${dead ? 'aria-disabled="true"' : ""}
+              data-click="toggleShowDebugMessagesBtn" data-key="${esc(key)}"
+              data-tip="${dead ? deadTip : "Show ralphus's own diagnostic/telemetry events inline, where they happened.\nOff by default so routine monitoring shows what the agent did.\nThis only changes what is rendered here — the daemon's logs always keep everything."}">
+              <span class="bx"></span>Debug messages</button>
+            <input class="typefilter${(dead || !showDebug) ? " off" : ""}" placeholder="Filter types (e.g. read glob)"
+              value="${esc(peekTypeFilterInput[key] || "")}" ${(dead || !showDebug) ? "disabled" : ""}
+              oninput="setPeekTypeFilter('${esc(key)}',this.value)" aria-label="Filter log types"
+              data-tip="${dead ? deadTip : (!showDebug ? "Turn on Debug messages to filter by type." : "Show only bracket-tagged lines whose type contains any space-separated term.\nCase-insensitive; 'read glob' shows tool.Read and tool.Glob.")}">
+            ${canThink ? `<button class="tgl ${showThinking ? "on" : ""}${dead ? " off" : ""}" ${dead ? 'aria-disabled="true"' : ""}
+              data-click="toggleShowThinkingBtn" data-key="${esc(key)}"
+              data-tip="${dead ? deadTip : "Show the model's own reasoning expanded inline.\nOff folds each block to a single &lt;thinking…&gt; line.\nPurely a display choice — the reasoning is always captured, so toggling re-renders text already loaded without refetching."}">
+              <span class="bx"></span>Thinking</button>` : ""}
+          </div>`;
+
+        // 4 - which view, seated directly on what it switches
+        const subs = [["terminal", "Terminal"], ["prompt", "Prompt"], ["system", "System Prompt"]];
+        const tabs = `<div class="subtabs">${subs.map((s) => `<button class="subtab ${sub === s[0] ? "on" : ""}" `
+          + `data-click="setLiveSub" data-branch-id="${esc(b.id)}" data-sub="${s[0]}" `
+          + `data-tip="${esc(LIVE_SUB_TIP[s[0]])}">${s[1]}</button>`).join("")}</div>`;
+
+        const top = identity + histBar + ctl + tabs;
+        if (sub === "system") return top + liveSystemPromptView(g, key);
+        if (sub === "prompt") return top + livePromptView(g, b, run);
+        return top + liveTerminalView(g, b, key, run, ri === newestTape);
+      }
+      /** @type {{[sub: string]: string}} What each Live sub-view shows. */
+      const LIVE_SUB_TIP = {
+        terminal: "The run's captured terminal output.\nThe newest run streams; an earlier one is the daemon's persisted record of it.",
+        prompt: "The instruction this run's agent was given — the task it was asked to do, as opposed to the standing rules it works under.",
+        system: "The exact system prompt this run's agent received: ralphus's hidden instructions plus the resolver's authored prompt.\nRead-only reference — changing it means changing the resolver settings.\nAdmin-only view.",
+      };
+      /**
+       * The Live tab's Terminal view: the run's captured output, framed, with
+       * the controls that act on it underneath.
+       * @param {GuardianView} g - The review.
+       * @param {GuardianBranch} b - The branch.
+       * @param {string} key - The peek key.
+       * @param {BranchRun|null} run - The run being shown.
+       * @param {boolean} isLatest - Whether that run is the newest one that used
+       *   a tmux pane, and so the only one whose text the live view still holds.
+       * @returns {string}
+       */
+      function liveTerminalView(g, b, key, run, isLatest) {
+        const foot = `<div class="run-foot">
+            ${isLatest ? `<button class="btn" style="padding:3px 8px;font-size:11.5px" data-click="openGuardianBranchTerminalMenuItem" data-key="${esc(key)}" data-gid="${esc(g.id)}" data-bid="${esc(b.id)}" data-mode="open"
+              data-tip="Attach a real, interactive terminal to this session.\nShows the runner's own log/event stream, not the agent's conversation.">Open terminal</button>` : ""}
+            <button class="btn" style="padding:3px 8px;font-size:11.5px" data-click="scopeReviewDockToBranch" data-guardian-id="${esc(g.id)}" data-branch-id="${esc(b.id)}"
+              data-tip="Open this branch's log drawer alongside the transcript.">Logs</button>
+            <span class="rg-sub">${run ? esc(run.who) : ""}</span>
+          </div>`;
+        // A run the daemon recorded but kept no terminal text for still gets a
+        // shape -- "nothing was captured" is a fact about that run, not a
+        // broken pane, and the run's own result is still in the logs.
+        if (run && !run.hasTape) {
+          return `<div class="absent-run"><span class="ai">○</span>
+              <div class="abody"><div class="at">No transcript for this run</div>
+                <div class="as">${esc(run.why)}</div></div>
+            </div>${foot}`;
+        }
+        if (!isLatest) {
+          return `<div class="absent-run"><span class="ai">○</span>
+              <div class="abody"><div class="at">This run's terminal text is no longer reachable</div>
+                <div class="as">The persisted attempt log covers the branch's current pass and its reattaches;
+                  an earlier pass — a previous rebase, a proof, a feedback revision — wrote to the same pane and
+                  is not addressable on its own. What the run did, when, and how it ended is above and in the
+                  logs drawer; only its raw output is gone.</div></div>
+            </div>${foot}`;
+        }
+        const shown = peekContent[key];
+        return `<div class="runterm" id="peek-pre-${peekCssKey(key)}" style="height:${peekPaneHeight}px" tabindex="0" data-key="${esc(key)}"
+            onscroll="onPeekScroll(this.dataset.key)" onkeydown="handlePeekKeydown(event,this.dataset.key)"
+            data-tip="Scroll through this run's output.\nClick here then press Ctrl+End to jump to the latest, or Ctrl+Home for the start.">${shown !== undefined ? esc(shown) : "Loading…"}</div>${foot}
+          <div class="hint">Read-only — nothing typed here reaches the agent. Every run's text is
           captured separately, so walking back survives a restart.</div>`;
       }
       /**
-       * The walk-back stepper over a branch's persisted resolver attempts.
+       * The Live tab's Prompt view: the instruction this run's agent was given.
        *
-       * The durable attempt history (RAL-154) was only reachable as a list you
-       * opened and closed, which makes "what was it doing two attempts ago" a
-       * navigation exercise. Stepping one attempt at a time is the gesture that
-       * question actually wants, with the list still there behind the picker.
-       * @param {string} key - The peek key, `guardian|<gid>|<branchId>`.
+       * The daemon composes a resolver's prompt at dispatch and never persists
+       * it, so for most runs there is nothing to show and this says so rather
+       * than showing the system prompt again under a second label. A feedback
+       * revision is the exception -- the reviewer's own text is stored, and it
+       * is the substantive half of what that run was told to do.
+       * @param {GuardianView} g - The review.
+       * @param {GuardianBranch} b - The branch.
+       * @param {BranchRun|null} run - The run being shown.
        * @returns {string}
        */
-      function liveRunStepper(key) {
-        const attempts = historyAttempts[key];
-        if (attempts === undefined) {
-          return `<div class="run-step"><span class="rs-label">Loading attempts…</span></div>`;
+      function livePromptView(g, b, run) {
+        if (run && run.kind === "feedback") {
+          const msgs = branchMessages[b.id];
+          if (msgs === undefined) { loadBranchMessages(g.id, b.id); return `<div class="promptbox">Loading…</div>`; }
+          const last = [...msgs].reverse().find((m) => m.role === "user");
+          if (last) {
+            return `<div class="promptbox">${esc(last.text)}</div>
+              <div class="hint">The reviewer feedback this run was dispatched to act on. ralphus wraps it in
+              standing instructions before sending; only the authored half is retained, and this is it.</div>`;
+          }
         }
-        if (!attempts.length) {
-          return `<div class="run-step" data-tip="A durable log is written once this branch's first resolver attempt finishes. Until then there is only the live pane below.">
-              <span class="rs-label">Live session only — no earlier attempts yet</span>
-            </div>`;
-        }
-        // Newest last, matching how the attempts are numbered.
-        const ordered = attempts.slice().sort((x, y) => x.attempt - y.attempt);
-        const viewing = historyViewing[key];
-        const curIdx = viewing
-          ? Math.max(0, ordered.findIndex((a) => a.attempt === viewing.attempt))
-          : ordered.length - 1;
-        const cur = ordered[curIdx];
-        const atLatest = curIdx === ordered.length - 1 && !viewing;
-        const when = cur && cur.modified_ms
-          ? new Date(cur.modified_ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-          : "";
-        return `<div class="run-step${atLatest ? "" : " past"}">
-            <button class="rs-nav" data-click="stepLiveAttempt" data-key="${esc(key)}" data-dir="-1" ${curIdx <= 0 ? "disabled" : ""}
-              data-tip="Step back to the previous resolver attempt on this branch.">&#9664;</button>
-            <button class="rs-pick" data-click="toggleHistory" data-key="${esc(key)}"
-              data-tip="Every persisted attempt for this branch, including each reattach.\nPick one to read its full log.">
-              <span class="rs-kind">attempt</span>
-              <span class="rs-label mono">${cur ? cur.attempt : "?"}${cur && cur.attempt === 0 ? " (initial)" : ""}</span>
-              <span class="rs-meta">${esc(when)}</span>
-              <span class="rs-count num">${curIdx + 1}/${ordered.length}</span> &#9662;</button>
-            <button class="rs-nav" data-click="stepLiveAttempt" data-key="${esc(key)}" data-dir="1" ${curIdx >= ordered.length - 1 ? "disabled" : ""}
-              data-tip="Step forward to the next resolver attempt on this branch.">&#9654;</button>
-            ${atLatest ? "" : `<button class="btn" data-click="closeHistoryAttempt" data-key="${esc(key)}"
-              data-tip="Jump back to the live pane — the newest attempt, still streaming.">&#8677; Latest</button>`}
-          </div>
-          ${atLatest ? "" : `<div class="histnote">Historical record — read-only. You are reading attempt ${cur ? cur.attempt : "?"}, not the live session.</div>`}`;
+        return `<div class="absent-run"><span class="ai">○</span>
+            <div class="abody"><div class="at">This run's prompt was not retained</div>
+              <div class="as">A resolver's instruction is composed when the run is dispatched — naming the branch
+                and the exact conflicted files — and is not written to the store, so there is nothing to replay.
+                The standing half of what it was told is on the System Prompt tab; a feedback revision shows the
+                reviewer's own text here.</div></div>
+          </div>`;
       }
       /**
-       * Steps the Live tab one resolver attempt backwards or forwards.
+       * The Live tab's System Prompt view.
+       * @param {GuardianView} g - The review.
        * @param {string} key - The peek key.
-       * @param {number} dir - -1 for the previous attempt, 1 for the next.
-       * @returns {void}
+       * @returns {string}
        */
-      function stepLiveAttempt(key, dir) {
-        const attempts = (historyAttempts[key] || []).slice().sort((x, y) => x.attempt - y.attempt);
-        if (!attempts.length) return;
-        const viewing = historyViewing[key];
-        const curIdx = viewing
-          ? Math.max(0, attempts.findIndex((a) => a.attempt === viewing.attempt))
-          : attempts.length - 1;
-        const next = Math.min(attempts.length - 1, Math.max(0, curIdx + dir));
-        if (next === attempts.length - 1 && dir > 0 && !viewing) return;
-        viewHistoryAttempt(key, attempts[next].attempt);
+      function liveSystemPromptView(g, key) {
+        if (!currentUserIsAdmin) {
+          return `<div class="absent-run"><span class="ai">○</span>
+              <div class="abody"><div class="at">Admin-only view</div>
+                <div class="as">The effective system prompt is shown to administrators only.</div></div>
+            </div>`;
+        }
+        const ps = peekSystemPrompt[key];
+        const body = ps === undefined || ps === "loading" ? "Loading…" : peekPromptDisplay(ps);
+        return `<div class="promptbox">${esc(body)}</div>
+          <div class="run-foot"><button class="btn" style="padding:3px 8px;font-size:11.5px" data-click="openEditReviewDetails" data-guardian-id="${esc(g.id)}" data-focus="resolver"
+            data-tip="The authored half of this prompt comes from the resolver agent and model. Change those in review setup.">Resolver settings</button></div>
+          <div class="hint">Read-only — the effective system prompt actually appended to this agent
+          invocation: ralphus's hidden instructions plus the resolver's authored prompt.</div>`;
       }
 
       /**
