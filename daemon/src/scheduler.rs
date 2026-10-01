@@ -6792,6 +6792,8 @@ mod tests {
                     RunnerResult::failure("boom")
                 } else {
                     RunnerResult {
+                        bearing: None,
+                        thinking_stall_last_line: None,
                         retry_after_secs: None,
                         status: "done".to_string(),
                         tokens_in: 0,
@@ -6808,11 +6810,14 @@ mod tests {
                         agent_session_id: None,
                         ghost: None,
                         turns: None,
+                        prophecies: Vec::new(),
                     }
                 }
             } else {
                 self.repair_attempts.fetch_add(1, Ordering::SeqCst);
                 RunnerResult {
+                    bearing: None,
+                    thinking_stall_last_line: None,
                     retry_after_secs: None,
                     status: "done".to_string(),
                     tokens_in: 0,
@@ -6829,6 +6834,7 @@ mod tests {
                     agent_session_id: None,
                     ghost: None,
                     turns: None,
+                    prophecies: Vec::new(),
                 }
             }
         }
