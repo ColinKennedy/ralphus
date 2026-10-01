@@ -2533,10 +2533,10 @@ impl Store {
             // an explicit stop stays authoritative until a deliberate user
             // action resumes the review. Explicit transitions out use
             // dedicated paths instead: `claim_guardian_merge` (the board's
-            // "Merge / rebase" on a `merge_stopped` review) and
-            // `reopen_guardian` for terminal statuses. `cancelled` remains
-            // writable from `merge_stopped` so a stopped review can still be
-            // cancelled outright.
+            // "Merge / rebase" on a `merge_stopped` review),
+            // `approve_guardian`, and `reopen_guardian` for terminal
+            // statuses. `cancelled` remains writable from `merge_stopped` so
+            // a stopped review can still be cancelled outright.
             if (old == "cancelled" && status != GuardianStatus::Cancelled)
                 || (old == "merge_stopped"
                     && !matches!(
