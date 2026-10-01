@@ -1890,8 +1890,6 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           ${reviewSetupStrip(g)}
           ${reviewIdentityRow(g, isMultiProject)}
           ${renderChangeSummary(g)}
-          <h3 class="section">check gates${sectionMenuBtn(g.id, "gates")}</h3>${checks}
-          ${g.detail && !autoBuiltCmd ? `<div class="warn">${detailSummary(g.detail, "Review detail")}</div>` : ""}
           <h3 class="section">branches${sectionMenuBtn(g.id, "branches")}${canReorder ? ' <span class="k" style="text-transform:none;letter-spacing:0">— drag to reorder · toggle ⊙/⊘ to enable/disable</span>' : ""}${hasPending ? ' <span class="badge warn2" data-tip="Unsaved order or enable/disable changes — click Save to apply, or Discard to revert.">● unsaved changes</span>' : ""}</h3>
           ${allDisabled ? `<div class="warn" style="margin:4px 0 8px">All branches are disabled — saving will make this review a no-op (no rebase runs). Re-enable at least one branch before saving, or click Discard.</div>` : ""}
           ${isMultiProject ? `<div class="row" style="margin-bottom:8px;gap:4px">${(g.projects||[]).map((p) => {
@@ -1917,6 +1915,8 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
               ? `<div class="warn" style="margin:8px 0 4px">Some branches are not yet ready (still running or never submitted). Merge / rebase will offer to continue with just the ready branches.</div>`
               : "";
           })()}
+          <h3 class="section">check gates${sectionMenuBtn(g.id, "gates")}</h3>${checks}
+          ${g.detail && !autoBuiltCmd ? `<div class="warn">${detailSummary(g.detail, "Review detail")}</div>` : ""}
           ${(() => {
             // RAL-77: user-declared test actions from [[review.action]] in TOML.
             const hints = g.action_hints || [];
