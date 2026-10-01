@@ -232,12 +232,19 @@ fn run_command(workspace: &Workspace, command: &str, timeout_sec: Option<u64>) -
     match workspace.run_bash(command, timeout_sec) {
         Ok(out) if out.ok() => {
             let mut result = CellResult::done(tail(&out.stdout, COMMAND_TAIL_CHARS));
-            // A command-mode cell has no agent to reason about a waypoint, but
-            // it is still work a waypoint can hold -- and a block-mode entry
-            // is released only by an answer. Without reading one here, a squad
-            // whose cells are all commands could never answer, and would hold
-            // its waypoint open forever. Scanning stdout lets such a cell say
-            // so deliberately (`echo RALPHUS_BEARING: accepted: ...`).
+            // A command-mode cell has no agent to reason about a waypoint, so
+            // this is not somewhere a considered answer comes from today --
+            // only a script deliberately echoing one. It exists because a
+            // block-mode entry is released solely by an answer, and a squad
+            // whose cells are all commands would otherwise hold its waypoint
+            // open forever.
+            //
+            // TODO(RAL-488): remediating-command retry puts a real agent on
+            // this path (PR #281). Once that lands, the remediation pass can
+            // answer a waypoint the way a prompt cell does, and this should
+            // become a genuine response rather than the stopgap it is now --
+            // including receiving the guidance, which a command cell has no
+            // prompt to carry. Parked until then.
             result.bearing = parse_bearing(&out.stdout)
                 .map(|(decision, message)| crate::spec::BearingReport { decision, message });
             result
