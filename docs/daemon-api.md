@@ -4546,6 +4546,13 @@ waypoint's full timeline, matching the squad-timeline response family
 (`GET /api/squads/{id}/timeline`); there is no separate `.../timeline` route.
 `404 not_found` for an unknown waypoint id, rather than an empty array.
 
+RAL-400 left a `.../timeline` route conditional on the delivery view and a
+merged event-log view turning out to be different things. They did not. A
+squad's timeline merges rows from many sources because a squad *has* many
+sources; a waypoint's effects are already one chronological Cartographer
+stream selected by `scope = "waypoint"`, so a second route would return the
+same rows under a different name. Building it would make the two drift.
+
 Selected by Cartographer `scope = "waypoint"` and **not** by `source`: a
 waypoint's most consequential effects are recorded by the scheduler (a cell
 halted, an advisory injection delivered) and by the submit path (a squad

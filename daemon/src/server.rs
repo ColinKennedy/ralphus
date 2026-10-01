@@ -15170,18 +15170,37 @@ fn notify_affected_of_new_waypoint(
         crate::waypoints::AffectedMode,
     )],
 ) {
-    let impacted = affected
-        .iter()
-        .map(|(kind, entry_id, mode)| format!("{} {entry_id} ({})", kind.as_str(), mode.as_str()))
-        .collect::<Vec<_>>()
-        .join(", ");
     for (kind, entry_id, _mode) in affected {
         let entity_uri = match kind {
             crate::waypoints::WaypointEntryKind::Squad => format!("squad:{entry_id}"),
             crate::waypoints::WaypointEntryKind::Review => format!("guardian:{entry_id}"),
         };
+        // Lead with the entry this recipient actually watches -- a watch is
+        // an exact entity match, so whoever receives this message watches
+        // *this* entry, and opening with the full list made them hunt for
+        // their own among entries they have no stake in.
+        let others: Vec<&str> = affected
+            .iter()
+            .filter(|(k, e, _)| !(k == kind && e == entry_id))
+            .map(|(_, e, _)| e.as_str())
+            .collect();
+        let also = if others.is_empty() {
+            "It is the only work this waypoint names.".to_string()
+        } else {
+            format!(
+                "It also names {}: {}.",
+                if others.len() == 1 {
+                    "one other".to_string()
+                } else {
+                    format!("{} others", others.len())
+                },
+                others.join(", ")
+            )
+        };
         let text = format!(
-            "waypoint '{waypoint_id}' added this to its affected: {prompt:?}. affected: [{impacted}]"
+            "Waypoint '{waypoint_id}' now affects this {} ({entry_id}), in {} mode: {prompt:?}.              {also}",
+            kind.as_str(),
+            _mode.as_str()
         );
         if let Ok(message_id) = store.notify_watchers_with_context(
             crate::monitor::NotifiableEventKind::WaypointCreated,

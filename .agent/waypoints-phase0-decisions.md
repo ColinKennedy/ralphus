@@ -27,13 +27,11 @@ glossary entries are the short taken-word reference.
 ## RAL number
 
 **RAL-400** (this ticket's own number). `MILESTONE_PLAN.local.md`'s
-`RAL-???` placeholder cannot be fixed at the source — that file is
-git-ignored and lives only in the main checkout, outside every worktree a
-phase cell runs in, and this Phase 0 cell was explicitly told not to edit
-it. A grep of this worktree's tracked files for `RAL-\?\?\?` returns no
-matches, so there is nothing checked-in left to fix — this file is the
-substitute durable record naming the real number for every later phase to
-cite.
+`RAL-???` placeholder has been replaced at the source, along with the
+intro paragraph that still described the superseded milestone / pulse /
+member names. That file is git-ignored and lives only in the main
+checkout, so it is not carried by this branch; this file remains the
+checked-in record of the number and the settled terms.
 
 ## Already-settled decisions (confirmed verbatim, implement as-is)
 
@@ -291,7 +289,28 @@ Revisit only if per-candidate cost becomes the binding constraint *and*
 per-entry fail-closed semantics can be preserved inside a batch — e.g. a
 reply format where one unparseable entry fails only itself.
 
+## Watcher notification is per-entity, not per-project
+
+RAL-400's Phase 8 asks for a mailbox message "when a waypoint is created for
+a watched project". There is no such thing as watching a project: a watch is
+an exact `entity_uri` match (`Store::watchers_for_entity`), and the URI
+grammar has no `project:` form. Inventing one is a separate decision about
+what project-level watching means for every other event kind, not something
+to bolt on here.
+
+What ships instead reaches the same people. A waypoint is created over
+specific squads and reviews, and creation notifies the watchers of each of
+them; later enrolment notifies through the same path. Someone watching work
+in a project hears about any waypoint that touches that work, and hears
+nothing about waypoints that do not -- which is the actionable-matching
+requirement the ticket opens with, applied to notification.
+
+The message leads with the entry its recipient actually watches and names
+the rest only as context, since a watch is an exact match and the recipient
+has no stake in the others.
+
 ## Still open (explicitly deferred, not this cell's job)
 
 - Advisory stand-down optionality — deferred to Phase 6.
 - Mid-turn urgency — explicitly out of scope for the whole ticket.
+- Project-scoped watching — see above; needs its own decision, outside RAL-400.
