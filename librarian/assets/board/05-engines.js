@@ -129,6 +129,30 @@
         unpickSel: (e, ds) => unpickSel(ds.squadId || ""),
         onGraphNodeClick: (e, ds) => onGraphNodeClick(e, ds.squadId || "", /** @type {"task"|"cell"|"proof"} */ (ds.kind || ""), Number(ds.ti), Number(ds.si), Number(ds.vi)),
       };
+      // ---- Double-click delegation ----
+      // Rows whose single click already means something (select this one, scope
+      // the drawer to it) still need a way to open their detail without going
+      // for the small `+`. Double-click is that way, and it is delegated exactly
+      // like the single-click engine above so a row only has to name an action.
+      /** @type {{[action: string]: DelegatedHandler}} */
+      const DBLCLICK_HANDLERS = {
+        toggleReviewCommandFull: (e, ds) => toggleReviewCommandFull(ds.key || ""),
+        toggleBranch: (e, ds) => toggleBranch(e, ds.guardianId || "", ds.branchId || ""),
+      };
+      document.addEventListener("dblclick", (/** @type {MouseEvent} */ e) => {
+        const el = /** @type {HTMLElement|null} */ (/** @type {HTMLElement} */ (e.target).closest("[data-dblclick]"));
+        if (!el || !el.dataset.dblclick) return;
+        const handler = DBLCLICK_HANDLERS[el.dataset.dblclick];
+        if (!handler) return;
+        // A double-click leaves the word under the pointer selected. Left alone
+        // that selection is page-wide state: `userIsSelecting()` suppresses
+        // every later background re-render while it stands, so a row opened
+        // this way would freeze the pane it lives in until the user clicked
+        // elsewhere. Nobody double-clicking a row meant to select a word.
+        const sel = window.getSelection();
+        if (sel) sel.removeAllRanges();
+        handler(e, el.dataset);
+      }, true);
       /** @type {{[action: string]: DelegatedHandler}} */
       const CTX_HANDLERS = {
         openSquadMenu: (e, ds) => openSquadMenu(e, ds.squadId || ""),

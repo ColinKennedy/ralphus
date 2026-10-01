@@ -1752,7 +1752,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           const isBranchSel = selectedBranch[g.id] === b.branch;
           return `
           <div class="branch-item"${isEnabled ? "" : ' style="opacity:0.45"'}>
-            <div class="branch-row selectable${isBranchSel ? " sel" : ""}" data-branch="${esc(b.branch)}" data-branch-id="${esc(b.id)}" ${drag} data-click="selectBranchRow" data-guardian-id="${esc(g.id)}" data-tip="Click to inspect this branch in the pane on the right. Drag to reorder.">
+            <div class="branch-row selectable${isBranchSel ? " sel" : ""}" data-branch="${esc(b.branch)}" data-branch-id="${esc(b.id)}" ${drag} data-click="selectBranchRow" data-dblclick="toggleBranch" data-guardian-id="${esc(g.id)}" data-tip="Click to inspect this branch in the pane on the right.\nDouble-click to expand its detail here. Drag to reorder.">
               ${canReorder ? '<span class="grip" data-tip="Drag to reorder branches — the merge order determines the rebase stack.">⋮⋮</span>' : ""}
               <span class="branch-idx" data-tip="This branch's place in the rebase stack.">${i + 1}</span>
               ${toggle}
@@ -1801,7 +1801,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           `<span class="rg-when" data-tip="${esc(tip)}">${esc(text)}</span>`;
         const gateRow = (/** @type {string} */ cmd, /** @type {number} */ i, /** @type {string} */ icon, /** @type {string} */ iconTip, /** @type {string} */ iconColor) => {
           const key = `${g.id}:gate:${i}`;
-          return `<div class="cmd-row selectable${isCommandRowSelected(key) ? " sel" : ""}" data-click="selectReviewCommandRow" data-guardian-id="${esc(g.id)}" data-key="${esc(key)}" data-cmd="${esc(cmd)}" data-tip="Select this gate to scope the log drawer to it.">
+          return `<div class="cmd-row selectable${isCommandRowSelected(key) ? " sel" : ""}" data-click="selectReviewCommandRow" data-dblclick="toggleReviewCommandFull" data-guardian-id="${esc(g.id)}" data-key="${esc(key)}" data-cmd="${esc(cmd)}" data-tip="Select this gate to scope the log drawer to it.\nDouble-click to open it in full.">
               <span class="cmd-lock"${iconColor ? ` style="color:${iconColor}"` : ""} data-tip="${esc(iconTip)}">${icon}</span>
               <span class="cmd-text mono" data-tip="${esc(cmd)}">${esc(cmd)}</span>
               ${commandRunStatus(key)}
@@ -1912,7 +1912,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
                   </div>`;
               }
               const cmdText = h.command || "";
-              return `<div class="cmd-row selectable${isCommandRowSelected(key) ? " sel" : ""}" data-click="selectReviewCommandRow" data-guardian-id="${esc(g.id)}" data-key="${esc(key)}" data-cmd="${esc(cmdText)}" data-tip="Select this action to scope the log drawer to it.">
+              return `<div class="cmd-row selectable${isCommandRowSelected(key) ? " sel" : ""}" data-click="selectReviewCommandRow" data-dblclick="toggleReviewCommandFull" data-guardian-id="${esc(g.id)}" data-key="${esc(key)}" data-cmd="${esc(cmdText)}" data-tip="Select this action to scope the log drawer to it.\nDouble-click to open it in full.">
                   <button class="cmd-run" data-click="runCheck" data-kind="action" data-guardian-id="${esc(g.id)}" data-i="${i}" data-runkey="${esc(key)}"
                     data-tip="Run this action in the built review worktree.\nRun: ${esc(cmdText)}${needsInput ? `\nUses the values in + — its current ones, or this review's last ones if you have not opened it.` : ""}">▶</button>
                   <span class="cmd-label">${label}</span>
@@ -1972,7 +1972,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
                       const cmdText = cmd.command || "";
                       const key = `${g.id}:manual:${i}`;
                       const needsInput = !!(cmd.inputs && cmd.inputs.length);
-                      return `<div class="cmd-row selectable${isCommandRowSelected(key) ? " sel" : ""}" data-click="selectReviewCommandRow" data-guardian-id="${esc(g.id)}" data-key="${esc(key)}" data-cmd="${esc(cmdText)}" data-tip="Select this check to scope the log drawer to it.">
+                      return `<div class="cmd-row selectable${isCommandRowSelected(key) ? " sel" : ""}" data-click="selectReviewCommandRow" data-dblclick="toggleReviewCommandFull" data-guardian-id="${esc(g.id)}" data-key="${esc(key)}" data-cmd="${esc(cmdText)}" data-tip="Select this check to scope the log drawer to it.\nDouble-click to open it in full.">
                           <button class="cmd-run" data-click="runCheck" data-kind="manual" data-guardian-id="${esc(g.id)}" data-i="${i}" data-runkey="${esc(key)}"
                             data-tip="Run this check in the built review worktree.\nRun: ${esc(cmdText)}${needsInput ? `\nUses the values in + — its current ones, or this review's last ones if you have not opened it.` : ""}">▶</button>
                           <span class="cmd-text mono" data-tip="${esc(cmdText)}">${esc(cmdText)}</span>
