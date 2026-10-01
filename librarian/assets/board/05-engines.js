@@ -189,7 +189,6 @@
       CLICK_HANDLERS.unhideSquadMenuItem = (e, ds) => setSquadHiddenFromMenu(ds.squadId || "", false);
       CLICK_HANDLERS.hideReviewMenuItem = (e, ds) => setReviewHiddenFromMenu(ds.guardianId || "", true);
       CLICK_HANDLERS.unhideReviewMenuItem = (e, ds) => setReviewHiddenFromMenu(ds.guardianId || "", false);
-      CLICK_HANDLERS.toggleAgentInspect = (e, ds) => toggleAgentInspect(e, ds.tid || "");
       CLICK_HANDLERS.pullPrCommits = (e, ds) => pullPrCommits(ds.prId || "");
       CLICK_HANDLERS.submitPrStack = (e, ds) => submitPrStack(ds.guardianId || "");
       CLICK_HANDLERS.toggleBranch = (e, ds) => { e.stopPropagation(); toggleBranch(e, ds.guardianId || "", ds.branchId || ""); };

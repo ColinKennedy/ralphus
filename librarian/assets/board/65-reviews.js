@@ -937,36 +937,6 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         const items = c.files.map((f) => `<div class="branch-conflict-file mono">${esc(f)}</div>`).join("");
         return `<div class="branch-conflict-files" data-tip="${tip}">${items}</div>`;
       }
-      // RAL-88: a small inspect button revealing which agent (and model, if known)
-      // produced an AI-generated review artifact. `agent`/`model` are the stored
-      // provenance values (with a resolver fallback for pre-provenance guardians).
-      /**
-       * Renders a 🔍 button revealing the agent/model that produced an AI-generated review artifact.
-       * @param {string} gid
-       * @param {string} key
-       * @param {string} label
-       * @param {string} [agent]
-       * @param {string} [model]
-       * @returns {string}
-       */
-      function agentInspectBtn(gid, key, label, agent, model) {
-        const a = agent ? esc(agent) : "unknown";
-        const m = model ? ` · model: ${esc(model)}` : "";
-        const tid = `agi-${key}-${gid}`;
-        return ` <button class="copy-btn" data-tip="Reveal which agent${model ? " and model" : ""} generated this ${label}.\nWho/when: use it as a reviewer to judge or debug AI-produced review content.\nRead-only — it only reveals stored provenance." data-click="toggleAgentInspect" data-tid="${esc(tid)}">🔍</button>` +
-          `<span id="${tid}" style="display:none;margin-left:8px;font-size:12px;font-weight:normal;color:var(--muted)">agent: ${a}${m}</span>`;
-      }
-      /**
-       * Toggles an agent-inspect reveal span's visibility.
-       * @param {MouseEvent} ev
-       * @param {string} tid
-       * @returns {void}
-       */
-      function toggleAgentInspect(ev, tid) {
-        ev.stopPropagation();
-        const el = document.getElementById(tid);
-        if (el) el.style.display = el.style.display === "none" ? "inline" : "none";
-      }
       /**
        * Renders a review's change-summary section (git-log summary or LLM-authored final one).
        * @param {GuardianView} g
@@ -984,7 +954,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         // still no "generating" gap to report: from the client's view a
         // summary is either present or not yet computed.
         if (g.summary_state === "ready" && g.change_summary) {
-          return `<h3 class="section" data-tip="Computed from git log as each branch becomes ready — a plain commit-subject listing at first, replaced by an agent-written summary once that branch's review worktree is built.\nRecomputed whenever another branch becomes ready or the review is rebuilt.">what changed${agentInspectBtn(g.id, "summary", "change summary", g.summary_agent || g.resolver_agent, g.summary_model || g.resolver_model)}${sectionMenuBtn(g.id, "summary")}</h3>
+          return `<h3 class="section" data-tip="Computed from git log as each branch becomes ready — a plain commit-subject listing at first, replaced by an agent-written summary once that branch's review worktree is built.\nRecomputed whenever another branch becomes ready or the review is rebuilt.">what changed${sectionMenuBtn(g.id, "summary")}</h3>
             <div class="summary-box">${esc(g.change_summary)}</div>`;
         }
         return `<h3 class="section" data-tip="A summary appears here as soon as one branch's source task cell finishes — no need to wait for merging/rebasing.">what changed${sectionMenuBtn(g.id, "summary")}</h3><div class="empty">waiting for a branch to be ready…</div>`;
@@ -1993,7 +1963,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
             const waitingNote = state === "generating"
               ? `Every enabled branch has rebased cleanly, and the resolver agent is writing these now.`
               : `Not generated yet. The resolver agent writes these once every enabled branch has rebased with no pending conflicts — this review is still collecting or rebasing.`;
-            return `<h3 class="section" data-tip="Shell commands suggested by the resolver agent to manually verify these changes.\nSuggested against this stack's changes and advisory — they never block Approve or Merge / rebase.\nGenerated once when the review branch is rebuilt (or when the rebuilt stack's changes change), and re-generated on demand from this section's ⋯ menu.">manual checks${agentInspectBtn(g.id, "manual", "manual checks", g.manual_commands_agent || g.resolver_agent, g.manual_commands_model || g.resolver_model)}${sectionMenuBtn(g.id, "manual")}</h3>
+            return `<h3 class="section" data-tip="Shell commands suggested by the resolver agent to manually verify these changes.\nSuggested against this stack's changes and advisory — they never block Approve or Merge / rebase.\nGenerated once when the review branch is rebuilt (or when the rebuilt stack's changes change), and re-generated on demand from this section's ⋯ menu.">manual checks${sectionMenuBtn(g.id, "manual")}</h3>
               ${isReady && cmds.length
                 ? reviewRunGroup(
                   runControl,
