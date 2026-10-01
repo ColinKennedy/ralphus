@@ -336,6 +336,98 @@
         return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
       }
 
+      // ---- Review list quick filters ----
+      //
+      // The sidebar opened with five filter controls stacked above the list --
+      // a status popover, an agent popover, two origin checkboxes, a PR-status
+      // popover and a "show hidden" box -- which is a lot of chrome to read
+      // before reaching the reviews themselves. Most of the time the question
+      // is simply "what is still live, and what is waiting on me", so those
+      // two become one-press presets and the full set folds behind a
+      // disclosure. Nothing is removed: the presets write the same
+      // `reviewFilters.status` set the popovers do.
+
+      /** @type {{[preset: string]: {label: string, states: string[], tip: string}}} */
+      const REVIEW_QUICK_FILTERS = {
+        active: {
+          label: "Active",
+          states: ["collecting", "merging", "merge_failed", "merge_stopped", "in_review"],
+          tip: "Reviews you can still act on: collecting, rebasing, stalled, or waiting on review.",
+        },
+        needs: {
+          label: "Needs you",
+          states: ["in_review", "merge_failed", "merge_stopped"],
+          tip: "Reviews waiting on a human decision — ready to approve, or stalled and needing a call.",
+        },
+        closed: {
+          label: "Closed",
+          states: ["merged", "approved", "cancelled", "deployed"],
+          tip: "Reviews that are finished one way or another.",
+        },
+      };
+      /** @type {boolean} Whether the full filter set is disclosed. */
+      let reviewFiltersExpanded = false;
+
+      /**
+       * Which preset the current status set matches exactly, or "" when the
+       * selection is a custom one made through the full filter controls.
+       * @returns {string}
+       */
+      function activeReviewQuickFilter() {
+        const cur = [...reviewFilters.status].sort().join(",");
+        return Object.keys(REVIEW_QUICK_FILTERS).find(
+          (k) => REVIEW_QUICK_FILTERS[k].states.slice().sort().join(",") === cur,
+        ) || "";
+      }
+      /**
+       * Applies one quick-filter preset to the review list. Pressing the active
+       * preset again clears back to everything, so the control is never a trap.
+       * @param {string} preset - A key of {@link REVIEW_QUICK_FILTERS}.
+       * @returns {void}
+       */
+      function setReviewQuickFilter(preset) {
+        const def = REVIEW_QUICK_FILTERS[preset];
+        if (!def) return;
+        reviewFilters.status = activeReviewQuickFilter() === preset
+          ? new Set(GUARDIAN_STATES)
+          : new Set(def.states);
+        renderReviewQuickFilters();
+        renderReviewStatusFilters();
+        renderReviews();
+        syncHash();
+      }
+      /** Shows or hides the full filter controls. @returns {void} */
+      function toggleReviewFilters() {
+        reviewFiltersExpanded = !reviewFiltersExpanded;
+        renderReviewQuickFilters();
+      }
+      /**
+       * Renders the quick-filter segmented control and the disclosure that
+       * hides the full filter set.
+       * @returns {void}
+       */
+      function renderReviewQuickFilters() {
+        const host = document.getElementById("review-quick-filters");
+        if (!host) return;
+        const active = activeReviewQuickFilter();
+        // Counts come from the already-loaded list, so the control costs no
+        // request -- a lean index entry carries the status this keys on.
+        const counts = Object.fromEntries(Object.keys(REVIEW_QUICK_FILTERS).map((k) => [
+          k,
+          guardians.filter((g) => REVIEW_QUICK_FILTERS[k].states.includes(g.status)
+            && (reviewFilters.showHidden || !hiddenGuardianIds.has(g.id))).length,
+        ]));
+        host.innerHTML = `<div class="quick-seg">${Object.keys(REVIEW_QUICK_FILTERS).map((k) =>
+            `<button class="${active === k ? "on" : ""}" data-click="setReviewQuickFilter" data-preset="${k}" `
+            + `data-tip="${esc(REVIEW_QUICK_FILTERS[k].tip)}\nPress again to clear back to every status.">`
+            + `${REVIEW_QUICK_FILTERS[k].label}<span class="n num">${counts[k]}</span></button>`).join("")}</div>
+          <button class="filters-more" data-click="toggleReviewFilters" data-tip="The full status, agent, origin and PR-status filters.\nFolded away by default so the sidebar belongs to the review list rather than its controls.">${
+            reviewFiltersExpanded ? "− Fewer filters" : "+ More filters"}${
+            active ? "" : ` <span class="count-badge num">custom</span>`}</button>`;
+        const full = document.getElementById("review-full-filters");
+        if (full) full.style.display = reviewFiltersExpanded ? "" : "none";
+      }
+
       // ---- Section menus ----
       //
       // Every section of a review carries the same ⋯ menu, so "show me the log
@@ -389,6 +481,37 @@
         document.body.appendChild(menu);
         menu.style.left = Math.min(e.clientX, window.innerWidth - 200) + "px";
         menu.style.top = Math.min(e.clientY, window.innerHeight - 120) + "px";
+      }
+      /**
+       * Opens one command's ⋯ menu -- a check gate, for now. Commands are long
+       * and elided in their row, so "see the whole thing" and "copy it" need a
+       * home that is not the row itself.
+       * @param {MouseEvent} e - The click that opened it.
+       * @param {string} gid - The review id.
+       * @param {string} cmd - The command text.
+       * @returns {void}
+       */
+      function openReviewCommandMenu(e, gid, cmd) {
+        e.preventDefault(); e.stopPropagation(); closeSquadMenu();
+        const menu = document.createElement("div");
+        menu.className = "ctx-menu"; menu.id = "squad-menu";
+        menu.innerHTML = [
+          `<div data-click="showCommandText" data-cmd="${esc(cmd)}" data-tip="Show the whole command in a copyable popup — the row elides it to stay scannable.">🔍 Show full command</div>`,
+          `<div data-copy="${esc(cmd)}" onclick="copyText(event)" data-tip="Copy this command to the clipboard.">⧉ Copy command</div>`,
+          `<div data-click="scopeReviewDockToSection" data-guardian-id="${esc(gid)}" data-kind="gates" data-tip="Open the review's log drawer.">☰ Logs</div>`,
+        ].join("");
+        document.body.appendChild(menu);
+        menu.style.left = Math.min(e.clientX, window.innerWidth - 220) + "px";
+        menu.style.top = Math.min(e.clientY, window.innerHeight - 110) + "px";
+      }
+      /**
+       * Shows one command's full text in the board's shared copyable popup.
+       * @param {string} cmd - The command text.
+       * @returns {void}
+       */
+      function showCommandText(cmd) {
+        closeSquadMenu();
+        showTextPopup("Command", cmd);
       }
       /**
        * Opens the log drawer from a section's menu.

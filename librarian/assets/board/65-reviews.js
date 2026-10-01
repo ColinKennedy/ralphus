@@ -175,6 +175,7 @@
        */
       function renderReviews() {
         const el = byId("reviews");
+        renderReviewQuickFilters();
         renderReviewStatusFilters();
         renderReviewResolverFilters();
         renderReviewOriginFilters();
@@ -704,17 +705,19 @@
        * @returns {string}
        */
       function reviewIdentityRow(g, isMultiProject) {
-        const gate = (g.status === "collecting" && g.squad_id)
-          ? `<div class="kv-row"><span class="k" style="text-transform:none;letter-spacing:0">gate</span><span class="v">${
-            g.branches.some((b) => b.merge_status === "ready")
-              ? "tasks complete — rebase will start automatically"
-              : "starts automatically when its squad finishes — or start it now below"}</span></div>`
-          : "";
-        const squad = g.squad_id
-          ? `<div class="kv-row"><span class="k">from squad</span><span class="v"><a href="#" data-click="gotoSquad" data-squad-id="${esc(g.squad_id)}" style="color:var(--accent)" data-tip="Switch to the Squads tab and open this squad.">${esc(g.squad_id)}</a></span></div>`
-          : "";
         void isMultiProject;
-        return `${squad}${gate}<div class="kv-row"><span class="k">type</span><span class="v">${esc(g.review_type || "git")}</span></div>`;
+        // Only the collecting gate survives as a row: it is the one piece of
+        // identity that tells you what will happen next rather than what the
+        // review is. The rest (squad, type, project, review branch, combined
+        // worktree) moved into the setup strip's chips and the review-id
+        // hovercard -- a column of five read-only rows between the banner and
+        // the branch stack pushed the stack, the thing a reviewer opens a
+        // review to read, below the fold.
+        if (g.status !== "collecting" || !g.squad_id) return "";
+        return `<div class="kv-row"><span class="k" style="text-transform:none;letter-spacing:0">gate</span><span class="v">${
+          g.branches.some((b) => b.merge_status === "ready")
+            ? "tasks complete — rebase will start automatically"
+            : "starts automatically when its squad finishes — or start it now below"}</span></div>`;
       }
       /**
        * Renders the RAL-480 "already merged upstream" badge shared by
@@ -1465,9 +1468,19 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
       function reviewPipeline(g) {
         const at = reviewPipelineIndex(g.status);
         const stalled = ["merge_failed", "merge_stopped", "cancelled"].includes(g.status);
+        // The merged count belongs on the stage it describes. It used to be a
+        // standalone "merged N/M" row plus a progress bar directly under the
+        // banner, which said the same thing the rail now says positionally.
+        const branches = g.branches || [];
+        const enabled = branches.filter((b) => b.enabled !== false).length;
+        const merged = branches.filter((b) => b.enabled !== false
+          && ["done", "merged", "closed", "conflict_resolved"].includes(b.merge_status || "")).length;
+        /** @type {{[stop: string]: string}} */
+        const counts = { merging: enabled ? `${merged}/${enabled}` : "" };
         return `<div class="review-pipe">${REVIEW_PIPELINE.map((stop, i) => {
           const cls = i < at ? "done" : (i === at ? (stalled ? "stalled" : "now") : "");
           const mark = i < at ? "✓" : (i === at ? (stalled ? "!" : "●") : "");
+          const count = counts[stop] ? ` <span class="pipe-count num">${counts[stop]}</span>` : "";
           const tip = i < at
             ? `${REVIEW_PIPELINE_LABELS[stop]} — complete.`
             : i === at
@@ -1476,11 +1489,25 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
                 : `${REVIEW_PIPELINE_LABELS[stop]} — this review is here now.`)
               : `${REVIEW_PIPELINE_LABELS[stop]} — not reached yet.`;
           return `<span class="pipe-stop ${cls}" data-tip="${esc(tip)}">`
-            + `<span class="pipe-dot">${mark}</span>${REVIEW_PIPELINE_LABELS[stop]}</span>`
+            + `<span class="pipe-dot">${mark}</span>${REVIEW_PIPELINE_LABELS[stop]}${count}</span>`
             + (i < REVIEW_PIPELINE.length - 1 ? `<span class="pipe-line ${i < at ? "done" : ""}"></span>` : "");
         }).join("")}</div>`;
       }
 
+      /**
+       * How to name the repository a review's branches live in. Prefers the
+       * registered project's name over the on-disk path (RAL-396): a review can
+       * span a remote machine, so the path is not something the board can treat
+       * as stable or even knowable.
+       * @param {GuardianView} g - The review.
+       * @returns {string}
+       */
+      function projectLabelFor(g) {
+        if (g.projects && g.projects.length > 1) return `${g.projects.length} projects`;
+        if (g.project) return g.project;
+        const root = g.git_root || "";
+        return root.split(/[\\/]/).filter(Boolean).pop() || "—";
+      }
       /**
        * Builds one chip for the setup strip.
        * @param {string} gid - The review this chip edits.
@@ -1555,6 +1582,13 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
             g.skip_worktrees
               ? "The whole stack builds in one shared worktree instead of one per branch."
               : "Each branch rebases in its own worktree.")
+          // Identity chips. These are not settings, so they do not open the
+          // editor -- they carry hovercards instead, which is where the detail
+          // the old kv-rows spelled out now lives.
+          + `<span class="setup-chip ident" data-tip="${esc(`Where this review's branches live.\nProject: ${g.project || g.git_root || "—"}`)}">`
+          + `<span class="sc-k">project</span><b>${esc(projectLabelFor(g))}</b></span>`
+          + `<span class="setup-chip ident hc-anchor" data-card="gCombinedWorktree" data-guardian-id="${esc(g.id)}">`
+          + `<span class="sc-k">review branch</span><b>${esc(g.review_branch || "—")}</b></span>`
           + `</div>`
           + `<button class="btn setup-edit" data-click="openEditReviewDetails" data-guardian-id="${esc(g.id)}" `
           + `data-tip="Edit every setting for this review in one place — name, upstream, resolver, proof scope, build and squash options, PR settings and environment overrides.\nEvery chip to the left opens this same editor.\nNothing takes effect until you click Save; Save applies every change in one request and triggers at most one rebase.">`
@@ -1680,8 +1714,18 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         const autoBuildMatch = gDetail && autoBuildPrefixes.find((p) => gDetail.startsWith(p.prefix));
         const autoBuiltCmd = autoBuildMatch ? gDetail.slice(autoBuildMatch.prefix.length) : null;
         const gChecks = g.checks || [];
+        // Check gates render as a command list -- the same shape manual checks
+        // and test actions use -- rather than a row of chips. A gate is a
+        // command you want to read in full and whose outcome you want to see,
+        // so it gets a row of its own with its text elided rather than
+        // wrapping, and its own ⋯ for the log.
         const checks = gChecks.length
-          ? `<div class="row"${g.skip_auto_build ? ' style="opacity:.45"' : ""}>${gChecks.map((c) => `<span class="vchip" data-tip="Check gate — runs after each merge commit and on the combined review worktree.\nAll gates must pass before the review can be approved.">🔒 <span class="mono">${esc(c)}</span></span>`).join("")}</div>`
+          ? `<div class="cmd-list"${g.skip_auto_build ? ' style="opacity:.45"' : ""}>${gChecks.map((c, i) => `
+              <div class="cmd-row">
+                <span class="cmd-lock" data-tip="Check gate — runs after each merge commit and on the combined review worktree.\nAll gates must pass before the review can be approved.">🔒</span>
+                <span class="cmd-text mono" data-tip="${esc(c)}">${esc(c)}</span>
+                <button class="section-menu" data-click="openReviewCommandMenu" data-guardian-id="${esc(g.id)}" data-kind="gate" data-i="${i}" data-cmd="${esc(c)}" data-tip="Actions for this gate — copy it, or open the review's log.">⋯</button>
+              </div>`).join("")}</div>`
           : autoBuiltCmd
             ? `<div class="row"><span class="vchip" style="border-color:var(--done);color:var(--done)" data-tip="No check gates were configured for this review, so a build ran automatically once the stack finished merging, sourced from ${esc(autoBuildMatch ? autoBuildMatch.source : "")}.\nWho/when: nothing to do — this runs on its own so 'in review' reliably means the code builds, even when the review author configured no checks.\nConfigure explicit check gates above to replace this with your own build/test commands.">🔧 auto-built: <span class="mono">${esc(autoBuiltCmd)}</span></span></div>`
             : g.skip_auto_build
@@ -1694,7 +1738,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         // banner, where the display is also the edit affordance.
         el.innerHTML = `<div class="review-cmdbar">
             <div class="cmd-row">
-              ${gdot(g.status)}<span class="rid">${esc(g.name)}</span> ${pill(g.status)} ${arbiterBadge(g)}
+              ${gdot(g.status)}<span class="rid">${esc(g.name)}</span> ${pill(g.status)} ${arbiterBadge(g)} ${postMergeBadge(g)}
               <span class="mono hc-anchor cmd-id" style="cursor:pointer" data-card="gReviewId" data-guardian-id="${esc(g.id)}" data-copy="${esc(g.id)}" onclick="copyText(event)">${esc(g.id)}</span>
               ${reviewCostChip(g)}
               <span style="flex:1"></span>
@@ -1705,18 +1749,10 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
             </div>
             ${reviewPipeline(g)}
           </div>
-          ${mergeProgress(g)}
+          ${g.status === "merging" ? mergeProgress(g) : ""}
           ${conflictProgress(g)}
-          ${postMergeBadge(g) ? `<div class="kv-row"><span class="k">post-merge</span><span class="v">${postMergeBadge(g)}</span></div>` : ""}
           ${reviewSetupStrip(g)}
           ${reviewIdentityRow(g, isMultiProject)}
-          ${isMultiProject
-            ? `<div class="kv-row"><span class="k">projects</span><span class="v" style="display:flex;flex-direction:column;gap:2px">${(g.projects||[]).map((p) => `<span class="mono" style="font-size:11px">${esc(p)}</span>`).join("")}</span></div>`
-            : g.project
-              ? `<div class="kv-row"><span class="k">project</span><span class="v" data-tip="This review was created through the registered-project route. Its concrete git path may be machine-specific, so the project name is the stable identity shown here.">${esc(g.project)}</span></div>`
-              : `<div class="kv-row"><span class="k">git root</span><span class="mono">${esc(g.git_root)}</span></div>`}
-          <div class="kv-row"><span class="k">review branch</span><span class="mono">${esc(g.review_branch||"—")}</span></div>
-          ${g.combined_worktree ? `<div class="kv-row"><span class="k">combined worktree</span><span class="v mono hc-anchor" style="font-size:11px" data-card="gCombinedWorktree" data-guardian-id="${esc(g.id)}">${esc(g.combined_worktree)}</span></div>` : ""}
           ${renderChangeSummary(g)}
           ${combinedPrSection(g)}
           <h3 class="section">check gates${sectionMenuBtn(g.id, "gates")}</h3>${checks}

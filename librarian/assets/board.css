@@ -536,6 +536,56 @@
       .hc-anchor { border-bottom: 1px dotted var(--cancelled); cursor: help; }
       .hc-anchor:hover { border-bottom-color: var(--accent); color: var(--accent); }
 
+      /* ---- Review list quick filters ---- */
+      /* Two presets carry the common questions; the full filter set folds
+         behind a disclosure so the sidebar belongs to the list. */
+      #review-quick-filters { display: flex; flex-direction: column; gap: 6px; }
+      .quick-seg {
+        display: flex; background: var(--bg); border: 1px solid var(--border);
+        border-radius: 6px; padding: 2px; gap: 2px;
+      }
+      .quick-seg button {
+        flex: 1 1 auto; background: none; border: none; color: var(--muted);
+        font-size: 11.5px; padding: 4px 10px; border-radius: 5px; font-weight: 550;
+        white-space: nowrap; cursor: pointer;
+      }
+      .quick-seg button:hover { color: var(--text); background: var(--panel-2); }
+      .quick-seg button.on { background: var(--panel-2); color: var(--text); }
+      .quick-seg .n { color: var(--cancelled); font-size: 10.5px; margin-left: 4px; }
+      .quick-seg button.on .n { color: var(--muted); }
+      .filters-more {
+        background: none; border: none; color: var(--muted); font-size: 11.5px;
+        padding: 2px 0; text-align: left; cursor: pointer;
+      }
+      .filters-more:hover { color: var(--accent); }
+
+      /* ---- Command lists (check gates, and the shape manual checks share) ---- */
+      /* A command is something you read in full and whose outcome you want to
+         see, so it gets a row rather than a wrapping chip. Long commands elide
+         rather than reflowing the section; the row's ⋯ shows the whole thing. */
+      .cmd-list { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+      .cmd-row {
+        display: flex; align-items: center; gap: 9px; padding: 7px 10px;
+        border-bottom: 1px solid var(--border);
+      }
+      .cmd-row:last-child { border-bottom: none; }
+      .cmd-row:hover { background: var(--panel-2); }
+      .cmd-lock { flex: none; font-size: 11px; }
+      .cmd-text {
+        flex: 1; min-width: 0; font-size: 11.5px; color: var(--text);
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      }
+      /* The merged count sits on the stage it describes, not in a row of its own. */
+      .pipe-count {
+        font-size: 10px; color: var(--cancelled); background: var(--bg);
+        border: 1px solid var(--border); border-radius: 8px; padding: 0 5px; margin-left: 4px;
+      }
+      .pipe-stop.now .pipe-count { color: var(--accent); border-color: var(--accent); }
+      /* Identity chips are not settings: they describe the review rather than
+         configure it, so they carry hovercards instead of opening the editor. */
+      .setup-chip.ident { cursor: help; }
+      .setup-chip.ident:hover { border-color: var(--accent); }
+
       /* ---- Review list sparkbar ---- */
       /* The branch stack as segments, so the list answers "how far along is
          this review" at a glance rather than only "what status does it carry". */
@@ -620,7 +670,8 @@
       .review-cmdbar .cmd-row > .btn,
       .review-cmdbar .cmd-row > .icon-btn,
       .review-cmdbar .cmd-row > .cost-chip,
-      .review-cmdbar .cmd-row > .pill { flex: none; }
+      .review-cmdbar .cmd-row > .badge,
+      .review-cmdbar .cmd-row > .pill { flex: none; white-space: nowrap; }
       .cost-chip {
         font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px;
         color: var(--unverified); background: rgba(227,179,65,.13);

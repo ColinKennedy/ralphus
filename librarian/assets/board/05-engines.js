@@ -188,6 +188,10 @@
       CLICK_HANDLERS.toggleReviewDockSticky = (e) => { e.stopPropagation(); toggleReviewDockSticky(); };
       CLICK_HANDLERS.openReviewSectionMenu = (e, ds) => openReviewSectionMenu(e, ds.guardianId || "", ds.kind || "");
       CLICK_HANDLERS.scopeReviewDockToSection = (e, ds) => scopeReviewDockToSection(ds.guardianId || "");
+      CLICK_HANDLERS.openReviewCommandMenu = (e, ds) => openReviewCommandMenu(e, ds.guardianId || "", ds.cmd || "");
+      CLICK_HANDLERS.showCommandText = (e, ds) => showCommandText(ds.cmd || "");
+      CLICK_HANDLERS.setReviewQuickFilter = (e, ds) => setReviewQuickFilter(ds.preset || "");
+      CLICK_HANDLERS.toggleReviewFilters = () => toggleReviewFilters();
       CLICK_HANDLERS.showChatCopyMenu = (e, ds) => showChatCopyMenu(e, ds.guardianId || "", ds.branchId || "");
       CLICK_HANDLERS.toggleChatBubble = (e, ds) => { e.stopPropagation(); toggleChatBubble(ds.key || ""); };
       CLICK_HANDLERS.gotoSquad = (e, ds) => { e.preventDefault(); gotoSquad(ds.squadId || ""); };
