@@ -227,6 +227,7 @@ impl Workspace {
                     cwd: self.root.to_string_lossy().into_owned(),
                     program: String::new(),
                     args: vec![command.to_string()],
+                    env: env.clone(),
                 };
                 match self.with_provider(|p, spec| p.run_vcs(&req, spec)) {
                     Ok(out) => (true, out),
@@ -335,6 +336,35 @@ impl Workspace {
         }
     }
 
+    /// Copy one selected file or directory from this workspace into an exact
+    /// absolute destination on the daemon host.
+    pub fn materialize_to_daemon(
+        &self,
+        source: impl AsRef<Path>,
+        destination: impl AsRef<Path>,
+        executable: bool,
+    ) -> Result<(), String> {
+        let source = self.resolve(source);
+        let destination = destination.as_ref();
+        if !destination.is_absolute() {
+            return Err(format!(
+                "artifact destination must be absolute on the daemon host: {}",
+                destination.display()
+            ));
+        }
+        match &self.machine {
+            None => copy_local_artifact(&source, destination, executable),
+            Some(_) => self.with_provider(|provider, spec| {
+                provider.materialize(
+                    &source.to_string_lossy(),
+                    &destination.to_string_lossy(),
+                    executable,
+                    spec,
+                )
+            }),
+        }
+    }
+
     /// Resolve `path` against this workspace's root when relative, or take it
     /// as-is when already absolute.
     fn resolve(&self, path: impl AsRef<Path>) -> PathBuf {
@@ -436,9 +466,76 @@ impl Workspace {
             cwd: self.root.to_string_lossy().into_owned(),
             program: "git".to_string(),
             args: args.iter().map(|a| (*a).to_string()).collect(),
+            env: std::collections::BTreeMap::new(),
         };
         self.with_provider(|p, spec| p.run_vcs(&req, spec))
     }
+}
+
+fn copy_local_artifact(source: &Path, destination: &Path, executable: bool) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(source)
+        .map_err(|e| format!("could not inspect artifact {}: {e}", source.display()))?;
+    if metadata.file_type().is_symlink() {
+        let resolved = source.canonicalize().map_err(|e| {
+            format!(
+                "could not resolve artifact symlink {}: {e}",
+                source.display()
+            )
+        })?;
+        let root = source
+            .parent()
+            .unwrap_or(source)
+            .canonicalize()
+            .map_err(|e| e.to_string())?;
+        if !resolved.starts_with(&root) {
+            return Err(format!(
+                "artifact symlink escapes its declared root: {}",
+                source.display()
+            ));
+        }
+        return copy_local_artifact(&resolved, destination, executable);
+    }
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "could not create artifact destination {}: {e}",
+                parent.display()
+            )
+        })?;
+    }
+    if metadata.is_dir() {
+        std::fs::create_dir_all(destination).map_err(|e| {
+            format!(
+                "could not create artifact directory {}: {e}",
+                destination.display()
+            )
+        })?;
+        for entry in std::fs::read_dir(source).map_err(|e| {
+            format!(
+                "could not read artifact directory {}: {e}",
+                source.display()
+            )
+        })? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            copy_local_artifact(
+                &entry.path(),
+                &destination.join(entry.file_name()),
+                executable,
+            )?;
+        }
+    } else {
+        std::fs::copy(source, destination).map_err(|e| {
+            format!(
+                "could not copy artifact {} to {}: {e}",
+                source.display(),
+                destination.display()
+            )
+        })?;
+        if executable {
+            set_executable(destination)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]

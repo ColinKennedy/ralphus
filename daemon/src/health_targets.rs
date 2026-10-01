@@ -124,6 +124,7 @@ fn git_identity_check(
             "--get".to_string(),
             key.to_string(),
         ],
+        env: std::collections::BTreeMap::new(),
     };
     let id = if key == "user.name" {
         ID_REMOTE_GIT_IDENTITY_NAME
@@ -251,6 +252,7 @@ fn check_one_target(
         cwd: target.remote_root.clone(),
         program: "git".to_string(),
         args: vec!["--version".to_string()],
+        env: std::collections::BTreeMap::new(),
     };
     match provider.run_vcs(&version_req, &spec) {
         Ok(out) => checks.push(TargetCheck {

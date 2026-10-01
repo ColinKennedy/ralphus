@@ -1367,9 +1367,6 @@ pub struct ReviewDef {
     /// the convention-derived alias.
     #[serde(default)]
     pub match_pr_branch_name: Option<bool>,
-    /// Commands that gate this review before it becomes ready.
-    #[serde(default)]
-    pub checks: Vec<String>,
     /// Rendering format for the generated change summary.
     #[serde(default)]
     pub summary_format: Option<String>,
@@ -1390,6 +1387,11 @@ pub struct ReviewDef {
     /// User-declared test actions shown as labelled buttons in the board UI.
     #[serde(default)]
     pub action: Vec<ReviewActionDef>,
+    /// Ordered unattended work that makes this review's manual surfaces ready.
+    /// These steps run after the stack is rebuilt and before any manual action
+    /// is advertised as ready.
+    #[serde(default)]
+    pub prepare: Vec<PreparationStepDef>,
     /// This review's own declared build steps (RAL-342), run at merge/finalize
     /// time ahead of the project-level `.ralphus.toml [review] auto_build`
     /// default. Mutually exclusive with `skip_auto_build`. When multiple
@@ -1506,6 +1508,44 @@ pub struct AutoBuildDef {
     pub model: Option<String>,
 }
 
+/// One ordered unattended preparation step for a review or manual action.
+/// Exactly one of `command` or `prompt` is set.
+pub type PreparationStepDef = AutoBuildDef;
+
+/// Where a prepared artifact becomes available to its manual action.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactPlacementDef {
+    /// Copy the selected output to the machine where the action runs.
+    Copy,
+    /// Leave the output on the review/build machine; the action runs there.
+    Retain,
+    /// Use an author-provided shared filesystem path or URI without relaying
+    /// the payload through the daemon.
+    Shared,
+}
+
+/// One output produced by preparation and consumed by a manual action.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReviewArtifactDef {
+    /// File or directory relative to the prepared review checkout.
+    pub source: String,
+    /// Relative destination on the action machine for `copy` placement.
+    #[serde(default)]
+    pub destination: Option<String>,
+    /// Copy, retain on the review machine, or expose through shared storage.
+    pub placement: ArtifactPlacementDef,
+    /// Path or URI visible to the action for `shared` placement.
+    #[serde(default)]
+    pub shared_path: Option<String>,
+    /// Optional command whose success proves a shared output is usable.
+    #[serde(default)]
+    pub readiness_command: Option<String>,
+    /// Preserve or add executable permission after materialization.
+    #[serde(default)]
+    pub executable: bool,
+}
+
 /// A user-declared manual-test action shown as a labelled button in the review UI.
 ///
 /// Exactly one of `prompt` or `command` must be set. `command` is run directly
@@ -1523,6 +1563,22 @@ pub struct ReviewActionDef {
     /// Mutually exclusive with `prompt`.
     #[serde(default)]
     pub command: Option<String>,
+    /// What the reviewer should inspect while the action runs.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// A concise statement of what a successful observation looks like.
+    #[serde(default)]
+    pub success: Option<String>,
+    /// `daemon` or `review_machine`. Unset uses `daemon` for local reviews and
+    /// `review_machine` for remote reviews.
+    #[serde(default)]
+    pub run_on: Option<String>,
+    /// Ordered unattended steps specific to this action.
+    #[serde(default)]
+    pub prepare: Vec<PreparationStepDef>,
+    /// Outputs this action needs after preparation.
+    #[serde(default)]
+    pub artifact: Vec<ReviewArtifactDef>,
     /// Optional command run before `command`/the expanded `prompt`, e.g. to stop
     /// a stale process from a previous run. Opt-in at run time via a UI
     /// checkbox (RAL-164) -- coexists with either `prompt` or `command`, no

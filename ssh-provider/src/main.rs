@@ -5,8 +5,8 @@
 use std::io::Read;
 
 use ralphus_ssh_provider::{
-    UNIMPLEMENTED_VERBS, capabilities, cleanup, exec, fileops, job, ping, protocol, provision,
-    terminal,
+    UNIMPLEMENTED_VERBS, capabilities, cleanup, exec, fileops, job, materialize, ping, protocol,
+    provision, terminal,
 };
 
 struct Args {
@@ -245,6 +245,14 @@ fn main() {
             let payload = read_stdin();
             let config = exec_config(&args);
             match fileops::remove_path(&args.uri, &payload, &config) {
+                Ok(()) => protocol::reply_ok(),
+                Err(e) => protocol::reply_err(e),
+            }
+        }
+        "materialize" => {
+            let payload = read_stdin();
+            let config = exec_config(&args);
+            match materialize::run(&args.uri, &payload, &config) {
                 Ok(()) => protocol::reply_ok(),
                 Err(e) => protocol::reply_err(e),
             }
