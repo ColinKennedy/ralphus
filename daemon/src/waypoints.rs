@@ -3756,6 +3756,28 @@ pub fn notify_entry_released(
         None,
         None,
     );
+    // The mailbox only reaches watchers, and an entry often has none. A hold
+    // lifting is a change to the waypoint's own state, so it belongs in the
+    // waypoint's feed either way -- otherwise its timeline shows work being
+    // held and never shows it let go.
+    let note = crate::cartographer::Note::new("waypoints").scope("waypoint");
+    let note = match kind {
+        WaypointEntryKind::Squad => note.squad(entry_id),
+        WaypointEntryKind::Review => note.guardian(entry_id),
+    };
+    note.emit(
+        store,
+        format!(
+            "waypoint {waypoint_id} no longer holds {} {entry_id}: {reason}",
+            kind.as_str()
+        ),
+        serde_json::json!({
+            "waypoint_id": waypoint_id,
+            "kind": kind.as_str(),
+            "entry_id": entry_id,
+            "reason": reason,
+        }),
+    );
 }
 
 /// Wall-clock cap on one survey classification run through the subprocess
