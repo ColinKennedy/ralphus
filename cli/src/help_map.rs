@@ -1186,12 +1186,39 @@ token works (and as whom) and whether the forge is reachable. Never returns the 
     ),
 ];
 
+/// A waypoint's completion list: the reviews and squads whose landing IS
+/// this waypoint being carried out. Distinct from `affected`, which is the
+/// work the waypoint lands on.
 const WAYPOINT_ROSTER_CHILDREN: &[HelpNode] = &[
+    node(
+        "add",
+        &["waypoint_id [id]", "entry_id [id]"],
+        &["--note [text]"],
+        "Add a squad or review to a waypoint's completion list -- the work whose landing IS this \
+         waypoint being carried out. Distinct from the affected list, which is the work the \
+         waypoint lands on; nothing auto-enrolls here.",
+        false,
+        false,
+        &[],
+    ),
+    node(
+        "remove",
+        &["waypoint_id [id]", "entry_id [id]"],
+        &[],
+        "Drop a squad or review from a waypoint's completion list. Removing the last unfinished \
+         goal can complete the waypoint's first phase.",
+        false,
+        false,
+        &[],
+    ),
+];
+
+const WAYPOINT_AFFECTED_CHILDREN: &[HelpNode] = &[
     node(
         "add",
         &["waypoint_id [str]", "kind [review|squad]", "entry_id [str]"],
         &["--mode [block|advisory]"],
-        "Add (or upsert the mode of) one roster entry on a waypoint.",
+        "Add (or upsert the mode of) one affected entry on a waypoint.",
         false,
         false,
         &[],
@@ -1200,7 +1227,7 @@ const WAYPOINT_ROSTER_CHILDREN: &[HelpNode] = &[
         "remove",
         &["waypoint_id [str]", "entry_id [str]"],
         &[],
-        "Remove one roster entry from a waypoint.",
+        "Remove one affected entry from a waypoint.",
         false,
         false,
         &[],
@@ -1213,7 +1240,7 @@ const WAYPOINT_ROSTER_CHILDREN: &[HelpNode] = &[
             "mode [block|advisory]",
         ],
         &[],
-        "Override the block/advisory mode of one existing roster entry.",
+        "Override the block/advisory mode of one existing affected entry.",
         false,
         false,
         &[],
@@ -1249,9 +1276,9 @@ const WAYPOINT_CHILDREN: &[HelpNode] = &[
             "--agent [name]",
             "--model [name]",
             "--allow-advisory",
-            "--roster [kind:entry_id[:mode]...]",
+            "--affected [kind:entry_id[:mode]...]",
         ],
-        "Create a cross-squad waypoint coordinating the given roster of reviews/squads (RAL-400).",
+        "Create a cross-squad waypoint over the given affected reviews/squads -- the work it lands on (RAL-400).",
         false,
         false,
         &[],
@@ -1269,7 +1296,7 @@ const WAYPOINT_CHILDREN: &[HelpNode] = &[
         "get",
         &["waypoint_id [str]"],
         &[],
-        "Show one waypoint's settings, roster, tracked projects, and delivery summary.",
+        "Show one waypoint's settings, roster, affected entries, tracked projects, and delivery summary.",
         false,
         true, // ("waypoint", "get")
         &[],
@@ -1304,29 +1331,8 @@ const WAYPOINT_CHILDREN: &[HelpNode] = &[
             "--resurvey",
         ],
         "Update a waypoint's settings: label, guidance prompt, survey agent/model, and whether advisory \
-         roster entries are allowed. Survey verdicts are kept unless --resurvey re-queues every \
+         affected entries are allowed. Survey verdicts are kept unless --resurvey re-queues every \
          daemon-enrolled entry for re-judging; preview that first with 'waypoint resurvey-preview'.",
-        false,
-        false,
-        &[],
-    ),
-    node(
-        "goal-add",
-        &["waypoint_id [id]", "entry_id [id]"],
-        &["--note [text]"],
-        "Add a squad or review to a waypoint's completion list -- the work whose landing IS this \
-         waypoint being carried out. Distinct from the roster of affected work, which is what the \
-         waypoint lands on; nothing auto-enrolls here.",
-        false,
-        false,
-        &[],
-    ),
-    node(
-        "goal-remove",
-        &["waypoint_id [id]", "entry_id [id]"],
-        &[],
-        "Drop a squad or review from a waypoint's completion list. Removing the last unfinished \
-         goal can complete the waypoint's first phase.",
         false,
         false,
         &[],
@@ -1335,7 +1341,7 @@ const WAYPOINT_CHILDREN: &[HelpNode] = &[
         "resurvey-preview",
         &["waypoint_id [id]"],
         &[],
-        "Show what 'waypoint edit --resurvey' would re-judge: which daemon-enrolled roster entries \
+        "Show what 'waypoint edit --resurvey' would re-judge: which daemon-enrolled affected entries \
          get their verdict cleared, and which human-declared entries are left alone.",
         true,
         false,
@@ -1355,10 +1361,19 @@ const WAYPOINT_CHILDREN: &[HelpNode] = &[
         "roster",
         &[],
         &[],
-        "Add/remove/change the mode of a waypoint's roster entries.",
+        "Add/remove entries on a waypoint's completion list -- the work whose landing IS this \n         waypoint being carried out.",
         false,
         false,
         WAYPOINT_ROSTER_CHILDREN,
+    ),
+    node(
+        "affected",
+        &[],
+        &[],
+        "Add/remove/change the mode of a waypoint's affected entries.",
+        false,
+        false,
+        WAYPOINT_AFFECTED_CHILDREN,
     ),
     node(
         "bearing",
@@ -2437,7 +2452,7 @@ classification categories (RAL-318).",
             "waypoint",
             &[],
             &[],
-            "Coordinate cross-squad work: create waypoints, manage rosters, and track bearings/deliveries (RAL-400).",
+            "Coordinate cross-squad work: create waypoints, manage their roster and affected entries, and track bearings/deliveries (RAL-400).",
             false,
             false,
             WAYPOINT_CHILDREN,

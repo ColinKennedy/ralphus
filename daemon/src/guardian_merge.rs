@@ -6644,7 +6644,7 @@ pub fn run_feedback(
         if let Some(decision) = crate::waypoints::BearingDecision::parse(&report.decision) {
             crate::waypoints::record_waypoint_answer(
                 store,
-                crate::waypoints::RosterEntryKind::Review,
+                crate::waypoints::WaypointEntryKind::Review,
                 id,
                 decision,
                 &report.message,

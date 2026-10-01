@@ -1,16 +1,16 @@
       // ---------- Waypoints tab (RAL-400) ----------
-      // A waypoint is a cross-squad coordination join point: a roster of squads
+      // A waypoint is a cross-squad coordination join point: a affected of squads
       // and/or reviews that must (block mode) or may (advisory mode) check in
       // before the waypoint's own work proceeds. This chunk owns the whole
-      // "#/waypoints" tab: sidebar list + filters, detail pane (settings, roster,
-      // delivery feed, bearings), the create/add-roster-entry modals, and the
+      // "#/waypoints" tab: sidebar list + filters, detail pane (settings, affected,
+      // delivery feed, bearings), the create/add-affected-entry modals, and the
       // "Add to waypoint…" context-menu entry points wired from squads/reviews/
       // the squad graph.
 
       /** Every waypoint lifecycle state, in sidebar filter-chip order. */
       const WAYPOINT_STATES = ["open", "closed"];
 
-      /** Maps a RosterEntryView.delivery_status to the `docs/colors.md`-documented CSS variable used for its status dot. @type {{[key: string]: string}} */
+      /** Maps a AffectedEntryView.delivery_status to the `docs/colors.md`-documented CSS variable used for its status dot. @type {{[key: string]: string}} */
       const WAYPOINT_DELIVERY_COLORS = { undelivered: "--muted", delivered: "--done", via_restack: "--teal", failed: "--failed" };
 
       /** @typedef {object} WaypointFilters
@@ -53,25 +53,25 @@
        * @property {string} agent
        * @property {string} model
        * @property {boolean} allowAdvisory
-       * @property {Set<string>} picked - `kind:id` roster keys, create-only.
-       * @property {string} pickerKind - which roster tab is showing.
-       * @property {string} pickerQuery - the roster picker's filter text.
+       * @property {Set<string>} picked - `kind:id` affected keys, create-only.
+       * @property {string} pickerKind - which affected tab is showing.
+       * @property {string} pickerQuery - the affected picker's filter text.
        * @property {string} cwd - scopes the agent list, like the review edit modal does.
        * @property {{prompt: string, agent: string, model: string, allowAdvisory: boolean}} [original] - edit-only: the
        *   survey-affecting values the form opened with, so saving can tell whether re-judging is even on the table.
        */
       /**
        * @type {WaypointFormDraft|null} The open create/edit dialog's state. Held as a draft rather than read off the
-       * DOM so the dialog can re-render when the agent and roster lists arrive without discarding what was typed —
+       * DOM so the dialog can re-render when the agent and affected lists arrive without discarding what was typed —
        * the same reason the review edit modal keeps one.
        */
       let waypointFormDraft = null;
-      /** @type {{id: string, name: string}[]} Squads offered by the create dialog's roster picker, fetched when it opens. */
+      /** @type {{id: string, name: string}[]} Squads offered by the create dialog's affected picker, fetched when it opens. */
       let createWaypointSquads = [];
-      /** @type {{id: string, name: string}[]} Reviews offered by the create dialog's roster picker, fetched when it opens. */
+      /** @type {{id: string, name: string}[]} Reviews offered by the create dialog's affected picker, fetched when it opens. */
       let createWaypointReviews = [];
       /** Whether the detail pane's guidance block is expanded. Collapsed by default: a waypoint's guidance can run
-       * to many lines, and it should not push the roster and activity below the fold on every open. */
+       * to many lines, and it should not push the affected and activity below the fold on every open. */
       let waypointGuidanceExpanded = false;
       /** @type {string|null} */
       let selectedWaypointId = null;
@@ -241,13 +241,13 @@
        */
       function waypointStateBadge(state) {
         const tip = state === "closed"
-          ? "This waypoint is closed -- every roster entry has cleared or it was closed manually. No further deliveries are expected."
-          : "This waypoint is open -- at least one roster entry is still expected to check in.";
+          ? "This waypoint is closed -- every affected entry has cleared or it was closed manually. No further deliveries are expected."
+          : "This waypoint is open -- at least one affected entry is still expected to check in.";
         return `<span class="pill p-${esc(state)}" data-tip="${esc(tip)}">${esc(state)}</span>`;
       }
 
       /**
-       * Renders a roster entry's delivery-status dot using the `docs/colors.md`-documented color for that status.
+       * Renders a affected entry's delivery-status dot using the `docs/colors.md`-documented color for that status.
        * @param {string} deliveryStatus
        * @returns {string}
        */
@@ -257,7 +257,7 @@
       }
 
       /**
-       * Renders a roster entry's block/advisory mode badge.
+       * Renders a affected entry's block/advisory mode badge.
        * @param {string} mode
        * @returns {string}
        */
@@ -265,7 +265,7 @@
         const tip = mode === "advisory"
           ? "Advisory mode -- this entry is informational only and never halts anything."
           : "Block mode -- this entry can halt the waypoint's in-flight cells until it checks in.";
-        return `<span class="badge roster-${esc(mode)}" data-tip="${esc(tip)}">${esc(mode)}</span>`;
+        return `<span class="badge affected-${esc(mode)}" data-tip="${esc(tip)}">${esc(mode)}</span>`;
       }
 
       /**
@@ -286,16 +286,16 @@
           </div>
           <div class="wp-card-meta">
             ${renderWaypointSpark(w)}
-            <span data-tip="How many squads and reviews this waypoint tracks.">${w.roster_count} roster${w.roster_count === 1 ? "" : "s"}</span>
-            ${w.projects.length ? `<span class="wp-proj" data-tip="Projects inferred from the roster.">${esc(w.projects.join(", "))}</span>` : ""}
+            <span data-tip="How many squads and reviews this waypoint tracks.">${w.affected_count} affected${w.affected_count === 1 ? "" : "s"}</span>
+            ${w.projects.length ? `<span class="wp-proj" data-tip="Projects inferred from the affected.">${esc(w.projects.join(", "))}</span>` : ""}
           </div>
         </div>`).join("");
       }
 
       /**
-       * Renders a waypoint's roster as one segment per entry, coloured by that entry's delivery status — the same
+       * Renders a waypoint's affected as one segment per entry, coloured by that entry's delivery status — the same
        * vocabulary `wdot` uses. Progress read as shape rather than as a count, so a sidebar scan answers "how far
-       * along is this one" without opening it. Falls back to a single muted segment for an empty roster.
+       * along is this one" without opening it. Falls back to a single muted segment for an empty affected.
        * @param {WaypointListEntry} w
        * @returns {string}
        */
@@ -306,30 +306,30 @@
         for (const [status, n] of [["delivered", counts.delivered], ["via_restack", counts.via_restack], ["failed", counts.failed], ["undelivered", counts.undelivered]]) {
           for (let i = 0; i < Number(n); i += 1) segments.push(String(status));
         }
-        if (!segments.length) return `<span class="wp-spark" data-tip="No roster entries yet."><i></i></span>`;
-        const tip = `Roster delivery: ${counts.delivered} delivered, ${counts.via_restack} via restack, ${counts.failed} failed, ${counts.undelivered} undelivered.`;
+        if (!segments.length) return `<span class="wp-spark" data-tip="No affected entries yet."><i></i></span>`;
+        const tip = `Affected delivery: ${counts.delivered} delivered, ${counts.via_restack} via restack, ${counts.failed} failed, ${counts.undelivered} undelivered.`;
         const bars = segments.map((s) => `<i style="background:${cvar(WAYPOINT_DELIVERY_COLORS[s] || "--muted")}"></i>`).join("");
         return `<span class="wp-spark" data-tip="${esc(tip)}">${bars}</span>`;
       }
 
       /**
        * Renders the waypoint's lifecycle as a rail: open → surveyed → delivered → closed, with the step it is
-       * currently on marked. Each step is derived from real roster state rather than stored, so it cannot drift
+       * currently on marked. Each step is derived from real affected state rather than stored, so it cannot drift
        * from the data. Answers "what is this waypoint waiting on", which a delivered-count alone does not.
        * @param {WaypointDetail} w
        * @returns {string}
        */
       function renderWaypointPipeline(w) {
-        const total = w.roster.length;
-        const surveyed = w.roster.filter((e) => e.survey_verdict).length;
+        const total = w.affected.length;
+        const surveyed = w.affected.filter((e) => e.survey_verdict).length;
         const ds = w.delivery_summary;
         const reached = ds.delivered + ds.via_restack;
         const closed = w.state === "closed";
         const steps = [
-          { label: "open", done: true, tip: "The waypoint exists and is tracking its roster." },
-          { label: "surveyed", done: total > 0 && surveyed >= total, tip: `Relevance decided for ${surveyed} of ${total} roster entries.` },
-          { label: "delivered", done: total > 0 && reached >= total, tip: `Guidance reached ${reached} of ${total} roster entries.` },
-          { label: "closed", done: closed, tip: closed ? "Closed — no further deliveries are expected." : "Closes when every roster entry reaches a terminal state, or when closed by hand." },
+          { label: "open", done: true, tip: "The waypoint exists and is tracking its affected." },
+          { label: "surveyed", done: total > 0 && surveyed >= total, tip: `Relevance decided for ${surveyed} of ${total} affected entries.` },
+          { label: "delivered", done: total > 0 && reached >= total, tip: `Guidance reached ${reached} of ${total} affected entries.` },
+          { label: "closed", done: closed, tip: closed ? "Closed — no further deliveries are expected." : "Closes when every affected entry reaches a terminal state, or when closed by hand." },
         ];
         // A later step being reached implies the earlier ones: an entry added by
         // hand never gets a survey verdict, so "surveyed" would otherwise stay
@@ -458,11 +458,11 @@
       }
 
       /**
-       * Renders one roster entry row: kind icon, delivery dot, entity id (deep-linked), mode badge, and an expandable verdict/rationale.
-       * @param {RosterEntryView} entry
+       * Renders one affected entry row: kind icon, delivery dot, entity id (deep-linked), mode badge, and an expandable verdict/rationale.
+       * @param {AffectedEntryView} entry
        * @returns {string}
        */
-      function renderRosterEntryRow(entry) {
+      function renderAffectedEntryRow(entry) {
         const icon = entry.kind === "review" ? "🔀" : "🧩";
         const gotoFn = entry.kind === "review" ? "gotoReview" : "gotoSquad";
         const idAttr = entry.kind === "review" ? `data-guardian-id="${esc(entry.entry_id)}"` : `data-squad-id="${esc(entry.entry_id)}"`;
@@ -473,8 +473,8 @@
         const staleBadge = entry.stale_at_ms
           ? ` <span class="badge" style="color:var(--stale);border-color:var(--stale)" data-tip="This work finished while the waypoint was still open and had judged it impacted, so it landed without the waypoint's changes and may be stale.\nNothing has been re-run automatically.\nTo re-run it carrying its prior findings and this waypoint's bearings: ralphus waypoint redo ${esc(entry.waypoint_id)} ${esc(entry.entry_id)}">stale</span>`
           : "";
-        const removeBtn = `<button class="icon-btn" data-click="removeRosterEntry" data-waypoint-id="${esc(entry.waypoint_id)}" data-entry-id="${esc(entry.entry_id)}" data-tip="Remove this entry from the waypoint's roster.\nThis cannot be undone." style="font-size:11px;padding:1px 5px">✕</button>`;
-        const toggleModeBtn = `<button class="icon-btn" data-click="toggleRosterEntryMode" data-waypoint-id="${esc(entry.waypoint_id)}" data-entry-id="${esc(entry.entry_id)}" data-mode="${entry.mode === "advisory" ? "block" : "advisory"}" data-tip="Switch this entry to ${entry.mode === "advisory" ? "block" : "advisory"} mode.\n${entry.mode === "advisory" ? "Block holds this work until the waypoint closes." : "Advisory releases it while still delivering the guidance."}" style="font-size:11px;padding:1px 5px">⇄</button>`;
+        const removeBtn = `<button class="icon-btn" data-click="removeAffectedEntry" data-waypoint-id="${esc(entry.waypoint_id)}" data-entry-id="${esc(entry.entry_id)}" data-tip="Remove this entry from the waypoint's affected.\nThis cannot be undone." style="font-size:11px;padding:1px 5px">✕</button>`;
+        const toggleModeBtn = `<button class="icon-btn" data-click="toggleAffectedEntryMode" data-waypoint-id="${esc(entry.waypoint_id)}" data-entry-id="${esc(entry.entry_id)}" data-mode="${entry.mode === "advisory" ? "block" : "advisory"}" data-tip="Switch this entry to ${entry.mode === "advisory" ? "block" : "advisory"} mode.\n${entry.mode === "advisory" ? "Block holds this work until the waypoint closes." : "Advisory releases it while still delivering the guidance."}" style="font-size:11px;padding:1px 5px">⇄</button>`;
         return `<div class="wp-entry">
           <div class="wp-entry-top">
             ${wdot(entry.delivery_status)}
@@ -561,7 +561,7 @@
       }
 
       /**
-       * Renders the Waypoints tab's detail pane: settings, state, inferred projects, roster, delivery feed, and bearings.
+       * Renders the Waypoints tab's detail pane: settings, state, inferred projects, affected, delivery feed, and bearings.
        * @returns {void}
        */
       function renderWaypointDetail() {
@@ -572,7 +572,7 @@
         const entityUri = `waypoint:${w.id}`;
         const closeReopenBtn = w.state === "open"
           ? `<button class="btn" data-click="closeWaypoint" data-waypoint-id="${esc(w.id)}" data-tip="Close this waypoint manually.\nWho/when: the coordination is done even though some entries haven't formally checked in.\nClosing releases everything this waypoint holds.">■ Close</button>`
-          : `<button class="btn" data-click="reopenWaypoint" data-waypoint-id="${esc(w.id)}" data-tip="Reopen this waypoint.\nWho/when: more roster entries need to check in after it was closed.\nReopening makes it hold its block-mode entries again.">▶ Reopen</button>`;
+          : `<button class="btn" data-click="reopenWaypoint" data-waypoint-id="${esc(w.id)}" data-tip="Reopen this waypoint.\nWho/when: more affected entries need to check in after it was closed.\nReopening makes it hold its block-mode entries again.">▶ Reopen</button>`;
         el.innerHTML = `
           <div class="wp-cmdbar">
             <div class="wp-cmd-id">
@@ -590,17 +590,17 @@
           ${renderWaypointSetup(w)}
           <div class="wp-guidance">
             <div class="wp-guidance-head">
-              <span class="wp-guidance-label" data-tip="The coordination guidance this waypoint carries.\nIt is sent to the survey to decide which work is impacted, and delivered to the roster entries that are.">Guidance</span>
+              <span class="wp-guidance-label" data-tip="The coordination guidance this waypoint carries.\nIt is sent to the survey to decide which work is impacted, and delivered to the affected entries that are.">Guidance</span>
               <button class="btn sm" data-click="toggleWaypointGuidance" data-tip="${waypointGuidanceExpanded ? "Collapse the guidance back to a few lines." : "Show the full guidance. A waypoint's guidance can run long, so it is clamped by default."}">${waypointGuidanceExpanded ? "Collapse" : "Expand"}</button>
             </div>
             <div class="wp-prompt ${waypointGuidanceExpanded ? "is-open" : ""}">${esc(w.prompt)}</div>
           </div>
           <div class="wp-section">
-            <h4>Roster</h4>
+            <h4>Affected</h4>
             <span class="wp-section-rule"></span>
-            <button class="btn sm" data-click="openAddRosterEntry" data-waypoint-id="${esc(w.id)}" data-tip="Add a squad or review to this waypoint's roster by id.\nWho/when: you know a piece of work needs to respect this waypoint and don't want to wait for the survey to find it.">＋ Add</button>
+            <button class="btn sm" data-click="openAddAffectedEntry" data-waypoint-id="${esc(w.id)}" data-tip="Add a squad or review to this waypoint's affected by id.\nWho/when: you know a piece of work needs to respect this waypoint and don't want to wait for the survey to find it.">＋ Add</button>
           </div>
-          ${w.roster.length ? w.roster.map(renderRosterEntryRow).join("") : `<div class="empty">No roster entries.</div>`}
+          ${w.affected.length ? w.affected.map(renderAffectedEntryRow).join("") : `<div class="empty">No affected entries.</div>`}
           <div class="wp-section">
             <h4>Activity log</h4>
             <span class="wp-section-rule"></span>
@@ -610,7 +610,7 @@
           <div class="wp-section">
             <h4>Bearings</h4>
             <span class="wp-section-rule"></span>
-            <button class="btn sm" data-click="openAppendBearing" data-waypoint-id="${esc(w.id)}" data-tip="Append a bearing -- a permanent record of completed work for this waypoint.\nWho/when: use this once you've finished a piece of coordinated work and want other roster entries to see it happened.\nBearings are append-only; this cannot be undone or edited afterward.">＋ Add</button>
+            <button class="btn sm" data-click="openAppendBearing" data-waypoint-id="${esc(w.id)}" data-tip="Append a bearing -- a permanent record of completed work for this waypoint.\nWho/when: use this once you've finished a piece of coordinated work and want other affected entries to see it happened.\nBearings are append-only; this cannot be undone or edited afterward.">＋ Add</button>
           </div>
           ${renderWaypointBearings()}
         `;
@@ -642,33 +642,33 @@
         return `<div class="wp-setup">
           ${chip("agent", w.agent || "default", "The agent that runs this waypoint's relevance survey.\nAn API backend (claude, ollama) is called directly; a terminal agent (claude-code, codex) runs through the subprocess runner.", !w.agent)}
           ${chip("model", w.model || "default", "The model the survey agent runs as.", !w.model)}
-          ${chip("advisory", w.allow_advisory ? "allowed" : "not allowed", "Whether roster entries may be set to advisory mode, which delivers the guidance without holding the work.", !w.allow_advisory)}
-          ${chip("projects", w.projects.length ? w.projects.join(", ") : "none inferred", "Projects inferred by hopping through the roster's squads and reviews, resolved server-side.", !w.projects.length)}
-          ${chip("delivery", parts.length ? parts.join(" · ") : "nothing yet", "Roster-entry counts by delivery status.", !parts.length)}
+          ${chip("advisory", w.allow_advisory ? "allowed" : "not allowed", "Whether affected entries may be set to advisory mode, which delivers the guidance without holding the work.", !w.allow_advisory)}
+          ${chip("projects", w.projects.length ? w.projects.join(", ") : "none inferred", "Projects inferred by hopping through the affected's squads and reviews, resolved server-side.", !w.projects.length)}
+          ${chip("delivery", parts.length ? parts.join(" · ") : "nothing yet", "Affected-entry counts by delivery status.", !parts.length)}
         </div>`;
       }
 
       /**
-       * Removes one roster entry from a waypoint after confirmation, then refreshes the detail pane.
+       * Removes one affected entry from a waypoint after confirmation, then refreshes the detail pane.
        * @param {string} waypointId
        * @param {string} entryId
        * @returns {Promise<void>}
        */
-      async function removeRosterEntry(waypointId, entryId) {
-        if (!confirm(`Remove roster entry "${entryId}" from this waypoint? This cannot be undone.`)) return;
-        const resp = await del(`/api/waypoints/${waypointId}/roster/${entryId}`, { success: "Roster entry removed.", errorLabel: "remove roster entry" });
+      async function removeAffectedEntry(waypointId, entryId) {
+        if (!confirm(`Remove affected entry "${entryId}" from this waypoint? This cannot be undone.`)) return;
+        const resp = await del(`/api/waypoints/${waypointId}/affected/${entryId}`, { success: "Affected entry removed.", errorLabel: "remove affected entry" });
         if (resp.ok) { waypointDetail = await resp.json(); renderWaypointDetail(); }
       }
 
       /**
-       * Flips a roster entry's mode between block and advisory, then refreshes the detail pane.
+       * Flips a affected entry's mode between block and advisory, then refreshes the detail pane.
        * @param {string} waypointId
        * @param {string} entryId
        * @param {string} mode
        * @returns {Promise<void>}
        */
-      async function toggleRosterEntryMode(waypointId, entryId, mode) {
-        const resp = await patchJson(`/api/waypoints/${waypointId}/roster/${entryId}`, { mode }, { success: `Switched to ${mode} mode.`, errorLabel: "update roster entry mode" });
+      async function toggleAffectedEntryMode(waypointId, entryId, mode) {
+        const resp = await patchJson(`/api/waypoints/${waypointId}/affected/${entryId}`, { mode }, { success: `Switched to ${mode} mode.`, errorLabel: "update affected entry mode" });
         if (resp.ok) { waypointDetail = await resp.json(); renderWaypointDetail(); }
       }
 
@@ -693,7 +693,7 @@
       }
 
       /**
-       * Adds a roster entry to a waypoint (used by both the detail-pane "Add roster entry" flow and the "Add to waypoint…" context menu).
+       * Adds a affected entry to a waypoint (used by both the detail-pane "Add affected entry" flow and the "Add to waypoint…" context menu).
        * @param {string} waypointId
        * @param {string} kind
        * @param {string} entryId
@@ -702,7 +702,7 @@
        */
       async function addEntryToWaypoint(waypointId, kind, entryId, mode) {
         const body = mode ? { kind, entry_id: entryId, mode } : { kind, entry_id: entryId };
-        const resp = await post(`/api/waypoints/${waypointId}/roster`, body, { success: `Added ${entryId} to waypoint.`, errorLabel: "add roster entry" });
+        const resp = await post(`/api/waypoints/${waypointId}/affected`, body, { success: `Added ${entryId} to waypoint.`, errorLabel: "add affected entry" });
         if (resp.ok) {
           if (selectedWaypointId === waypointId) { waypointDetail = await resp.json(); renderWaypointDetail(); }
           await refreshWaypointsList();
@@ -711,20 +711,20 @@
       }
 
       /**
-       * Opens the "Add roster entry" modal for a waypoint: pick a kind (squad/review) and type its id.
+       * Opens the "Add affected entry" modal for a waypoint: pick a kind (squad/review) and type its id.
        * @param {string} waypointId
        * @returns {void}
        */
-      function openAddRosterEntry(waypointId) {
+      function openAddAffectedEntry(waypointId) {
         byId("modal-root").innerHTML = `<div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal">
-          <h3 style="margin-top:0">Add roster entry</h3>
+          <h3 style="margin-top:0">Add affected entry</h3>
           <div class="kv-row"><span class="k">kind</span><span class="v">
             <select id="rw-kind" data-tip="Whether the id below is a squad id or a review (guardian) id.">
               <option value="squad">squad</option>
               <option value="review">review</option>
             </select>
           </span></div>
-          <div class="kv-row"><span class="k">entry id</span><span class="v"><input type="text" id="rw-entry-id" placeholder="squad-... or guardian-..." style="width:100%" data-tip="The exact squad id or review id to add to this waypoint's roster."></span></div>
+          <div class="kv-row"><span class="k">entry id</span><span class="v"><input type="text" id="rw-entry-id" placeholder="squad-... or guardian-..." style="width:100%" data-tip="The exact squad id or review id to add to this waypoint's affected."></span></div>
           <div class="kv-row"><span class="k">mode</span><span class="v">
             <select id="rw-mode" data-tip="Block mode can halt this entry's in-flight cells; advisory mode is informational only and never halts anything.">
               <option value="block">block</option>
@@ -732,18 +732,18 @@
             </select>
           </span></div>
           <div class="btn-row">
-            <button class="btn" onclick="closeModal()" data-tip="Discard without adding a roster entry.">Cancel</button>
-            <button class="btn primary" data-click="submitAddRosterEntry" data-waypoint-id="${esc(waypointId)}" data-tip="Add this roster entry to the waypoint.">Add</button>
+            <button class="btn" onclick="closeModal()" data-tip="Discard without adding a affected entry.">Cancel</button>
+            <button class="btn primary" data-click="submitAddAffectedEntry" data-waypoint-id="${esc(waypointId)}" data-tip="Add this affected entry to the waypoint.">Add</button>
           </div>
         </div></div>`;
       }
 
       /**
-       * Reads the "Add roster entry" modal's fields and submits them, closing the modal on success.
+       * Reads the "Add affected entry" modal's fields and submits them, closing the modal on success.
        * @param {string} waypointId
        * @returns {Promise<void>}
        */
-      async function submitAddRosterEntry(waypointId) {
+      async function submitAddAffectedEntry(waypointId) {
         const kind = /** @type {HTMLSelectElement} */ (byId("rw-kind")).value;
         const entryId = /** @type {HTMLInputElement} */ (byId("rw-entry-id")).value.trim();
         const mode = /** @type {HTMLSelectElement} */ (byId("rw-mode")).value;
@@ -809,7 +809,7 @@
         const entityUri = `waypoint:${id}`;
         const items = [
           `<div data-click="toggleWatch" data-entity-uri="${esc(entityUri)}" data-tip="${isWatching(entityUri) ? "Stop receiving watcher notifications for this waypoint." : "Watch this waypoint and choose which mailbox priority tiers should notify you."}">${isWatching(entityUri) ? "◉ Unwatch" : "◎ Watch…"}</div>`,
-          `<div data-click="openAddRosterEntry" data-waypoint-id="${esc(id)}" data-tip="Add a squad or review to this waypoint's roster.">＋ Add roster entry</div>`,
+          `<div data-click="openAddAffectedEntry" data-waypoint-id="${esc(id)}" data-tip="Add a squad or review to this waypoint's affected.">＋ Add affected entry</div>`,
           w.state === "open"
             ? `<div data-click="closeWaypoint" data-waypoint-id="${esc(id)}" data-tip="Close this waypoint manually.">■ Close</div>`
             : `<div data-click="reopenWaypoint" data-waypoint-id="${esc(id)}" data-tip="Reopen this waypoint.">▶ Reopen</div>`,
@@ -829,7 +829,7 @@
       document.addEventListener("click", closeWaypointMenu);
 
       /**
-       * Opens the "create waypoint" modal, optionally pre-seeding one roster entry (e.g. from "Add to waypoint… → New waypoint…").
+       * Opens the "create waypoint" modal, optionally pre-seeding one affected entry (e.g. from "Add to waypoint… → New waypoint…").
        * @param {{kind: string, entry_id: string}} [seedEntry]
        * @returns {void}
        */
@@ -859,8 +859,8 @@
        * Opens the same form against an existing waypoint, for editing its settings.
        *
        * Edit and create are one dialog on one draft rather than two that drift: the fields are identical, and the
-       * only differences are the title, which button saves, and that the roster picker is create-only — an existing
-       * waypoint's roster is edited in place on the detail pane, where each entry has its own mode and verdict.
+       * only differences are the title, which button saves, and that the affected picker is create-only — an existing
+       * waypoint's affected is edited in place on the detail pane, where each entry has its own mode and verdict.
        * @param {string} waypointId
        * @returns {void}
        */
@@ -896,7 +896,7 @@
       }
 
       /**
-       * Records one form field as it is typed, so a re-render (after the agent list or the roster lists land) keeps
+       * Records one form field as it is typed, so a re-render (after the agent list or the affected lists land) keeps
        * what was already entered. The review edit modal uses the same draft-and-rerender shape for the same reason.
        * @param {string} field
        * @param {string|boolean} value
@@ -915,10 +915,10 @@
         const d = waypointFormDraft;
         if (!d) return;
         const editing = d.mode === "edit";
-        const rosterSection = editing
+        const affectedSection = editing
           ? ""
           : `<div class="wp-field">
-              <label>Roster</label>
+              <label>Affected</label>
               <div class="wp-picked" id="cw-picked" data-tip="The squads and reviews this waypoint tracks. Click one to remove it."></div>
               <div class="wp-picker">
                 <div class="wp-picker-tabs" id="cw-picker-tabs"></div>
@@ -951,7 +951,7 @@
                 <input type="text" id="cw-model" value="${esc(d.model)}" oninput="onWaypointFormField('model',this.value)" placeholder="default" data-tip="Optional model override for the survey agent. Leave empty to use that agent's own default.">
               </div>
             </div>
-            ${rosterSection}
+            ${affectedSection}
             <div class="wp-field">
               <label class="wp-check" data-tip="Lets the survey mark an entry advisory: it receives the guidance but is never held.\nOff means every impacted entry blocks until this waypoint closes."><input type="checkbox" id="cw-allow-advisory" ${d.allowAdvisory ? "checked" : ""} onchange="onWaypointFormField('allowAdvisory',this.checked)"> Allow advisory entries</label>
             </div>
@@ -975,7 +975,7 @@
       }
 
       /**
-       * Switches the roster picker between squads and reviews.
+       * Switches the affected picker between squads and reviews.
        * @param {string} kind
        * @returns {void}
        */
@@ -985,7 +985,7 @@
       }
 
       /**
-       * Filters the roster picker list as the search box is typed into.
+       * Filters the affected picker list as the search box is typed into.
        * @param {string} value
        * @returns {void}
        */
@@ -995,7 +995,7 @@
       }
 
       /**
-       * Adds or removes one roster candidate. Keyed `kind:id` so a squad and a review can never collide.
+       * Adds or removes one affected candidate. Keyed `kind:id` so a squad and a review can never collide.
        * @param {string} kind
        * @param {string} entryId
        * @param {boolean} on
@@ -1009,7 +1009,7 @@
       }
 
       /**
-       * Candidates for the roster picker, from the dialog's own fetch.
+       * Candidates for the affected picker, from the dialog's own fetch.
        * @returns {{[kind: string]: {id: string, name: string}[]}}
        */
       function createWaypointCandidates() {
@@ -1017,7 +1017,7 @@
       }
 
       /**
-       * Loads the squads and reviews the roster picker offers, when the dialog opens.
+       * Loads the squads and reviews the affected picker offers, when the dialog opens.
        *
        * Deliberately its own fetch rather than reading the shared `squads`/`guardians` globals: those are populated
        * by the Squads and Reviews tabs' own polls, so opening this dialog from the Waypoints tab showed whatever
@@ -1045,7 +1045,7 @@
       }
 
       /**
-       * Renders the roster picker's tabs, list and selected chips. Called on open and after every change, so the
+       * Renders the affected picker's tabs, list and selected chips. Called on open and after every change, so the
        * selected set and the list's checkboxes can never disagree.
        * @returns {void}
        */
@@ -1054,7 +1054,7 @@
         if (!d || !document.getElementById("cw-picker-list")) return;
         const all = createWaypointCandidates();
         byId("cw-picker-tabs").innerHTML = [["squad", "Squads"], ["review", "Reviews"]].map(([kind, label]) =>
-          `<button type="button" class="wp-picker-tab ${d.pickerKind === kind ? "on" : ""}" onclick="setCreateWaypointPickerKind('${kind}')" data-tip="Pick ${label.toLowerCase()} for this waypoint's roster.">${label}<span class="n">${all[kind].length}</span></button>`).join("");
+          `<button type="button" class="wp-picker-tab ${d.pickerKind === kind ? "on" : ""}" onclick="setCreateWaypointPickerKind('${kind}')" data-tip="Pick ${label.toLowerCase()} for this waypoint's affected.">${label}<span class="n">${all[kind].length}</span></button>`).join("");
 
         const q = d.pickerQuery;
         const rows = (all[d.pickerKind] || [])
@@ -1073,7 +1073,7 @@
         byId("cw-picked").innerHTML = [...d.picked].sort().map((key) => {
           const [kind, ...rest] = key.split(":");
           const id = rest.join(":");
-          return `<span class="wp-chip" onclick="toggleCreateWaypointPick('${esc(kind)}','${esc(id)}',false)" data-tip="Remove this entry from the roster."><span class="wp-chip-k">${esc(kind)}</span>${esc(id)} ✕</span>`;
+          return `<span class="wp-chip" onclick="toggleCreateWaypointPick('${esc(kind)}','${esc(id)}',false)" data-tip="Remove this entry from the affected."><span class="wp-chip-k">${esc(kind)}</span>${esc(id)} ✕</span>`;
         }).join("");
       }
 
@@ -1085,12 +1085,12 @@
         const d = waypointFormDraft;
         if (!d) return;
         if (!d.prompt.trim()) { notify("error", "Enter the guidance this waypoint carries."); return; }
-        const roster = [...d.picked].map((key) => {
+        const affected = [...d.picked].map((key) => {
           const [kind, ...rest] = key.split(":");
           return { kind, entry_id: rest.join(":") };
         });
-        if (!roster.length) { notify("error", "Pick at least one squad or review for the roster."); return; }
-        const body = { label: d.label.trim() || null, prompt: d.prompt.trim(), agent: d.agent || null, model: d.model.trim() || null, allow_advisory: d.allowAdvisory, roster };
+        if (!affected.length) { notify("error", "Pick at least one squad or review for the affected."); return; }
+        const body = { label: d.label.trim() || null, prompt: d.prompt.trim(), agent: d.agent || null, model: d.model.trim() || null, allow_advisory: d.allowAdvisory, affected };
         const resp = await post("/api/waypoints", body, { success: "Waypoint created.", errorLabel: "create waypoint" });
         if (resp.ok) {
           const created = await resp.json();
@@ -1126,7 +1126,7 @@
       }
 
       /**
-       * Writes the draft's settings back, optionally re-queueing every daemon-enrolled roster entry for the survey.
+       * Writes the draft's settings back, optionally re-queueing every daemon-enrolled affected entry for the survey.
        * @param {WaypointFormDraft} d
        * @param {boolean} resurvey
        * @returns {Promise<void>}
@@ -1212,8 +1212,8 @@
         e.preventDefault(); e.stopPropagation(); closeSquadMenu(); closeWaypointMenu();
         if (!waypoints.length) await refreshWaypointsList();
         const openWaypoints = waypoints.filter((w) => w.state === "open");
-        const rows = openWaypoints.map((w) => `<div data-click="addEntryToWaypointFromMenu" data-kind="${esc(kind)}" data-entry-id="${esc(entryId)}" data-waypoint-id="${esc(w.id)}" data-tip="Add this ${esc(kind)} to \"${esc(w.label || w.id)}\"'s roster.">📍 ${esc(w.label || w.id)}</div>`).join("");
-        const newRow = `<div data-click="openCreateWaypointFromMenu" data-kind="${esc(kind)}" data-entry-id="${esc(entryId)}" data-tip="Create a brand-new waypoint with this ${esc(kind)} as its first roster entry.">＋ New waypoint…</div>`;
+        const rows = openWaypoints.map((w) => `<div data-click="addEntryToWaypointFromMenu" data-kind="${esc(kind)}" data-entry-id="${esc(entryId)}" data-waypoint-id="${esc(w.id)}" data-tip="Add this ${esc(kind)} to \"${esc(w.label || w.id)}\"'s affected.">📍 ${esc(w.label || w.id)}</div>`).join("");
+        const newRow = `<div data-click="openCreateWaypointFromMenu" data-kind="${esc(kind)}" data-entry-id="${esc(entryId)}" data-tip="Create a brand-new waypoint with this ${esc(kind)} as its first affected entry.">＋ New waypoint…</div>`;
         const menu = document.createElement("div");
         menu.className = "ctx-menu"; menu.id = "waypoint-menu";
         menu.innerHTML = (rows || `<div style="color:var(--muted);cursor:default;padding:6px 10px">No open waypoints.</div>`) + newRow;
@@ -1246,7 +1246,7 @@
       }
 
       /**
-       * Cell-graph-only entry point: adds the cell's owning squad as a waypoint roster entry (cell-level roster entries stay out of scope for now).
+       * Cell-graph-only entry point: adds the cell's owning squad as a waypoint affected entry (cell-level affected entries stay out of scope for now).
        * @param {MouseEvent} e
        * @param {string} squadId
        * @returns {Promise<void>}

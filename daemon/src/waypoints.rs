@@ -2,14 +2,14 @@
 //! survey pass (Phase 2), squad gating (Phase 3), review-feedback delivery
 //! (Phase 4), and lifecycle (Phase 6).
 //!
-//! A waypoint is a named, open/closed join point that tracks a roster of
+//! A waypoint is a named, open/closed join point that tracks a affected of
 //! reviews/squads and accumulates append-only guidance ("bearings") for
-//! them. This module owns the roster/bearing/injection CRUD, the
+//! them. This module owns the affected/bearing/injection CRUD, the
 //! terminal-state auto-close computation, the survey (the LLM pass that
 //! decides, for every open review/non-terminal squad whose [`Scope`]
-//! overlaps a waypoint's, whether it is impacted and at what [`RosterMode`]),
+//! overlaps a waypoint's, whether it is impacted and at what [`AffectedMode`]),
 //! and delivery: [`run_pending_deliveries`] pushes an impacted review-kind
-//! roster entry's guidance into its review worktree via the existing
+//! affected entry's guidance into its review worktree via the existing
 //! `guardian_merge::start_feedback` path, and marks a squad-kind entry
 //! whose squad finished before any review ever formed for it `via-restack`.
 //! A separate, not-yet-implemented `pending_injections` mechanism
@@ -17,20 +17,20 @@
 //! `.agent/waypoints-phase0-decisions.md` for the full design.
 //!
 //! Lifecycle (Phase 6): [`Store::maybe_auto_close_waypoint`] closes a
-//! waypoint once every roster entry has reached a terminal state (a squad's
+//! waypoint once every affected entry has reached a terminal state (a squad's
 //! `done`/`cancelled`, per [`crate::store::SquadState::is_terminal_for_waypoint`];
 //! a review's `merged`/`cancelled`/`deployed`, per
 //! [`GuardianStatus::is_terminal_status`] -- both deliberately excluding
 //! `failed`/`merge_failed`, which may still be retried), hooked into
 //! `Store::set_squad_state`/`Store::set_guardian_status` via
-//! [`Store::maybe_auto_close_waypoints_for_roster_entry`] right after either
+//! [`Store::maybe_auto_close_waypoints_for_affected_entry`] right after either
 //! transition lands. [`Store::close_waypoint_manually`]/
 //! [`Store::reopen_waypoint`] are the store-level primitives for manual
 //! close/reopen (HTTP/CLI surface is a later phase); a manual close takes
 //! effect for gating immediately, since `Store::squad_block_gating_waypoint`
 //! filters on live `state='open'` with no extra plumbing needed. Closing a
 //! waypoint (auto or manual) queues an optional one-time stand-down notice
-//! for each *advisory*-mode roster entry (`Block`-mode entries get none --
+//! for each *advisory*-mode affected entry (`Block`-mode entries get none --
 //! gating simply lifting is itself the signal); [`run_pending_stand_down_notices`]
 //! is the scheduler sweep that sends them and marks each entry's
 //! `stand_down_at_ms` so a later waypoint reopen+reclose never re-sends one.
@@ -121,15 +121,15 @@ fn scopes_overlap(a: &Scope, b: &Scope) -> bool {
     }
 }
 
-/// Which kind of entity a roster entry or bearing producer refers to.
+/// Which kind of entity a affected entry or bearing producer refers to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum RosterEntryKind {
+pub enum WaypointEntryKind {
     Review,
     Squad,
 }
 
-impl RosterEntryKind {
+impl WaypointEntryKind {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -148,17 +148,17 @@ impl RosterEntryKind {
     }
 }
 
-/// Whether a roster entry's waypoint guidance is a hard gate (`block`,
+/// Whether a affected entry's waypoint guidance is a hard gate (`block`,
 /// delivery is required) or informational (`advisory`, delivery is
 /// best-effort). Only meaningful on waypoints with `allow_advisory = true`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum RosterMode {
+pub enum AffectedMode {
     Block,
     Advisory,
 }
 
-impl RosterMode {
+impl AffectedMode {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -177,7 +177,7 @@ impl RosterMode {
     }
 }
 
-/// Whether a roster entry's waypoint guidance has reached it yet.
+/// Whether a affected entry's waypoint guidance has reached it yet.
 /// `via_restack` distinguishes delivery folded into an unrelated rebase from
 /// a dedicated injection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -216,11 +216,11 @@ impl DeliveryStatus {
 /// with the survey's verdict about it, how its guidance was delivered, and
 /// how it answered.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct RosterEntryView {
+pub struct AffectedEntryView {
     pub waypoint_id: String,
-    pub kind: RosterEntryKind,
+    pub kind: WaypointEntryKind,
     pub entry_id: String,
-    pub mode: RosterMode,
+    pub mode: AffectedMode,
     pub survey_verdict: Option<String>,
     pub survey_rationale: Option<String>,
     pub delivery_status: DeliveryStatus,
@@ -232,7 +232,7 @@ pub struct RosterEntryView {
     /// needing a redo -- its waypoint closed while the survey had judged it
     /// `impacted`, so the work landed without the waypoint's own changes.
     /// `None` means not flagged. Purely advisory: nothing is re-run until
-    /// someone calls [`redo_roster_entry`]. See [`run_pending_stale_notices`].
+    /// someone calls [`redo_affected_entry`]. See [`run_pending_stale_notices`].
     pub stale_at_ms: Option<i64>,
     /// How this entry answered the waypoint, once it has. `None` means it has
     /// not -- which for a `block`-mode entry is exactly what holds it, and
@@ -246,14 +246,14 @@ pub struct RosterEntryView {
 /// One row of `waypoint_roster`: a review or squad whose landing *is* this
 /// waypoint being carried out.
 ///
-/// Deliberately thin next to [`RosterEntryView`]. A goal carries no survey
+/// Deliberately thin next to [`AffectedEntryView`]. A goal carries no survey
 /// verdict, no delivery status and no bearing, because none of those apply:
 /// it is not work the waypoint lands on, it is work the waypoint consists of.
 /// All it needs is to finish.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct RosterGoalView {
+pub struct RosterEntryView {
     pub waypoint_id: String,
-    pub kind: RosterEntryKind,
+    pub kind: WaypointEntryKind,
     pub entry_id: String,
     /// Why this is on the list, in whoever added it's own words.
     pub note: Option<String>,
@@ -320,7 +320,7 @@ impl BearingDecision {
 pub struct BearingView {
     pub id: i64,
     pub waypoint_id: String,
-    pub producer_kind: RosterEntryKind,
+    pub producer_kind: WaypointEntryKind,
     pub producer_id: String,
     pub summary: String,
     pub entity_uri: Option<String>,
@@ -369,7 +369,7 @@ pub struct WaypointView {
 /// costs, without the caller needing a second lookup per row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ResurveyTarget {
-    pub kind: RosterEntryKind,
+    pub kind: WaypointEntryKind,
     pub entry_id: String,
     /// The squad's label or the review's name; `None` when it has none.
     pub label: Option<String>,
@@ -393,11 +393,11 @@ pub struct ResurveyPreview {
 }
 
 /// A candidate identified by [`Store::waypoint_survey_candidates`]: an open
-/// review or non-terminal squad not already an explicit roster entry, whose
+/// review or non-terminal squad not already an explicit affected entry, whose
 /// own [`Scope`] overlaps the waypoint's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SurveyCandidate {
-    pub kind: RosterEntryKind,
+    pub kind: WaypointEntryKind,
     pub entry_id: String,
 }
 
@@ -408,7 +408,7 @@ pub struct SurveyCandidate {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SurveyVerdict {
     pub impacted: bool,
-    pub mode: RosterMode,
+    pub mode: AffectedMode,
     pub rationale: String,
 }
 
@@ -466,7 +466,7 @@ impl Store {
     }
 
     /// Create every `[[waypoint]]` block a submission declared (RAL-400
-    /// Phase 8), resolving each roster entry's sentinel to a real id:
+    /// Phase 8), resolving each affected entry's sentinel to a real id:
     /// `<<ralphus:new-squad>>` to this submission's own `squad_id`,
     /// `<<ralphus:new-review/<key>>>` to the guardian
     /// `crate::reviews::derive_reviews_with_full_prefetch` created for that
@@ -474,8 +474,8 @@ impl Store {
     /// [`Store::guardian_id_for_review_key`]), and a plain
     /// `<<review:<id>>>`/`<<squad:<id>>>` literally. Deliberately mirrors
     /// `POST /api/waypoints`'s own permissiveness: neither path checks that a
-    /// literal roster id names a real row, so a submission naming a typo'd
-    /// id behaves the same as the HTTP API would (a dangling roster entry
+    /// literal affected id names a real row, so a submission naming a typo'd
+    /// id behaves the same as the HTTP API would (a dangling affected entry
     /// that never delivers, not a rejected submission). Callers must run
     /// this only after review derivation has already succeeded for the same
     /// `squad_id`, so every same-file `[[review]]` block's guardian row
@@ -503,40 +503,41 @@ impl Store {
                 w.model.as_deref(),
                 w.allow_advisory,
             )?;
-            for entry in &w.roster {
+            for entry in &w.affected {
                 // `core::validate`'s `validate_waypoint_blocks` already
-                // rejects an unparseable roster entry offline -- a `None`
+                // rejects an unparseable affected entry offline -- a `None`
                 // here would mean the daemon is running against a task file
                 // that bypassed that check.
-                let Some(parsed) = ralphus_core::schema::parse_roster_entry_sentinel(entry) else {
+                let Some(parsed) = ralphus_core::schema::parse_affected_entry_sentinel(entry)
+                else {
                     return Err(StoreError::InvalidTransition(format!(
-                        "waypoint roster entry {entry:?} is not a valid sentinel"
+                        "waypoint affected entry {entry:?} is not a valid sentinel"
                     )));
                 };
                 let (kind, entry_id) = match parsed {
-                    ralphus_core::schema::RosterEntryRef::NewSquad => {
-                        (RosterEntryKind::Squad, squad_id.to_string())
+                    ralphus_core::schema::AffectedEntryRef::NewSquad => {
+                        (WaypointEntryKind::Squad, squad_id.to_string())
                     }
-                    ralphus_core::schema::RosterEntryRef::ExistingSquad(existing) => {
-                        (RosterEntryKind::Squad, existing)
+                    ralphus_core::schema::AffectedEntryRef::ExistingSquad(existing) => {
+                        (WaypointEntryKind::Squad, existing)
                     }
-                    ralphus_core::schema::RosterEntryRef::ExistingReview(raw) => {
+                    ralphus_core::schema::AffectedEntryRef::ExistingReview(raw) => {
                         match ralphus_core::schema::review_link_key(&raw) {
                             Some(key) => match self.guardian_id_for_review_key(squad_id, key)? {
-                                Some(guardian_id) => (RosterEntryKind::Review, guardian_id),
+                                Some(guardian_id) => (WaypointEntryKind::Review, guardian_id),
                                 None => {
                                     return Err(StoreError::InvalidTransition(format!(
-                                        "waypoint roster entry references review key \
+                                        "waypoint affected entry references review key \
                                          {key:?}, but no guardian was created for it in \
                                          squad {squad_id}"
                                     )));
                                 }
                             },
-                            None => (RosterEntryKind::Review, raw),
+                            None => (WaypointEntryKind::Review, raw),
                         }
                     }
                 };
-                self.add_roster_entry(&id, kind, &entry_id, RosterMode::Block)?;
+                self.add_affected_entry(&id, kind, &entry_id, AffectedMode::Block)?;
             }
         }
         Ok(())
@@ -590,7 +591,7 @@ impl Store {
     /// `cwd`. Keying scope matching on that silently partitioned one registered
     /// repository by subdirectory -- a cell in `repo/core` landed under
     /// `"core"` while a cell in `repo` landed under `"repo"`, so a waypoint
-    /// rostered from one could not match genuinely impacted work from the
+    /// affecteded from one could not match genuinely impacted work from the
     /// other. That is a false negative against the ticket's inclusion boundary,
     /// and the silent bypass its Risks section names.
     ///
@@ -610,7 +611,7 @@ impl Store {
     /// index and display project, and each cell's index and `cwd` -- rather than
     /// hydrating the squad through `get_squad`, which pulls every cell's prompt,
     /// command, env overrides, usage counters and agent settings to read two
-    /// fields off them. This runs per roster entry and per survey candidate, and
+    /// fields off them. This runs per affected entry and per survey candidate, and
     /// again for every open waypoint on submit, so the difference compounds.
     ///
     /// # Errors
@@ -747,10 +748,10 @@ impl Store {
     }
 
     /// A waypoint's aggregate [`Scope`], per project -- the union of every
-    /// roster entry's own [`Store::squad_scope_by_project`] /
+    /// affected entry's own [`Store::squad_scope_by_project`] /
     /// [`Store::review_scope_by_project`], merged project-by-project via
     /// [`union_scope`]. Applies the same aggregation identically to review
-    /// and squad roster entries, per Phase 0's design.
+    /// and squad affected entries, per Phase 0's design.
     ///
     /// # Errors
     /// Propagates any SQLite failure.
@@ -759,10 +760,10 @@ impl Store {
         waypoint_id: &str,
     ) -> StoreResult<BTreeMap<String, Scope>> {
         let mut merged: BTreeMap<String, Scope> = BTreeMap::new();
-        for entry in self.list_roster_entries(waypoint_id)? {
+        for entry in self.list_affected_entries(waypoint_id)? {
             let entry_scope = match entry.kind {
-                RosterEntryKind::Squad => self.squad_scope_by_project(&entry.entry_id)?,
-                RosterEntryKind::Review => self.review_scope_by_project(&entry.entry_id)?,
+                WaypointEntryKind::Squad => self.squad_scope_by_project(&entry.entry_id)?,
+                WaypointEntryKind::Review => self.review_scope_by_project(&entry.entry_id)?,
             };
             for (project, scope) in entry_scope {
                 merged
@@ -776,7 +777,7 @@ impl Store {
 
     /// The exact candidate set a waypoint's survey should invoke the LLM on
     /// (RAL-400 Phase 2): every open review / non-terminal squad that is not
-    /// already an explicit roster entry, whose own [`Scope`] overlaps the
+    /// already an explicit affected entry, whose own [`Scope`] overlaps the
     /// waypoint's aggregate scope for a shared project (see
     /// [`scopes_overlap`]). Computed entirely from already-stored scope data
     /// -- no model call happens here -- so this is the "narrowest set"
@@ -792,7 +793,7 @@ impl Store {
         if waypoint_scopes.is_empty() {
             return Ok(Vec::new());
         }
-        // A rostered entry is normally not a candidate -- an explicit
+        // A affecteded entry is normally not a candidate -- an explicit
         // declaration is never second-guessed by the classifier. The one
         // exception is an entry the *daemon* enrolled itself
         // (`auto_enrolled`) that hasn't been surveyed yet: submit-time
@@ -808,12 +809,14 @@ impl Store {
             .query_map(params![waypoint_id], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(stmt);
-        let already_on_roster: Vec<(RosterEntryKind, String)> = settled
+        let already_on_affected: Vec<(WaypointEntryKind, String)> = settled
             .into_iter()
-            .filter_map(|(kind, entry_id)| RosterEntryKind::parse(&kind).map(|k| (k, entry_id)))
+            .filter_map(|(kind, entry_id)| WaypointEntryKind::parse(&kind).map(|k| (k, entry_id)))
             .collect();
-        let is_rostered = |kind: RosterEntryKind, id: &str| {
-            already_on_roster.iter().any(|(k, e)| *k == kind && e == id)
+        let is_affecteded = |kind: WaypointEntryKind, id: &str| {
+            already_on_affected
+                .iter()
+                .any(|(k, e)| *k == kind && e == id)
         };
         let overlaps = |cand_scopes: &BTreeMap<String, Scope>| {
             cand_scopes.iter().any(|(project, scope)| {
@@ -833,12 +836,12 @@ impl Store {
         for (squad_id, state) in squad_rows {
             let is_terminal = crate::store::SquadState::parse(&state)
                 .is_some_and(crate::store::SquadState::is_terminal);
-            if is_terminal || is_rostered(RosterEntryKind::Squad, &squad_id) {
+            if is_terminal || is_affecteded(WaypointEntryKind::Squad, &squad_id) {
                 continue;
             }
             if overlaps(&self.squad_scope_by_project(&squad_id)?) {
                 candidates.push(SurveyCandidate {
-                    kind: RosterEntryKind::Squad,
+                    kind: WaypointEntryKind::Squad,
                     entry_id: squad_id,
                 });
             }
@@ -846,13 +849,13 @@ impl Store {
 
         for (guardian_id, status) in self.list_guardian_status_pairs()? {
             if GuardianStatus::is_terminal_status(&status)
-                || is_rostered(RosterEntryKind::Review, &guardian_id)
+                || is_affecteded(WaypointEntryKind::Review, &guardian_id)
             {
                 continue;
             }
             if overlaps(&self.review_scope_by_project(&guardian_id)?) {
                 candidates.push(SurveyCandidate {
-                    kind: RosterEntryKind::Review,
+                    kind: WaypointEntryKind::Review,
                     entry_id: guardian_id,
                 });
             }
@@ -920,18 +923,18 @@ impl Store {
         Ok(n > 0)
     }
 
-    /// Add (or update the mode of, if already present) one roster entry.
+    /// Add (or update the mode of, if already present) one affected entry.
     /// Unique on `(waypoint_id, kind, entry_id)` -- re-adding the same entry
     /// updates its `mode` in place rather than duplicating the row.
     ///
     /// # Errors
     /// Propagates any SQLite failure.
-    pub fn add_roster_entry(
+    pub fn add_affected_entry(
         &self,
         waypoint_id: &str,
-        kind: RosterEntryKind,
+        kind: WaypointEntryKind,
         entry_id: &str,
-        mode: RosterMode,
+        mode: AffectedMode,
     ) -> StoreResult<()> {
         let now = now_ms();
         self.conn.execute(
@@ -943,12 +946,12 @@ impl Store {
         Ok(())
     }
 
-    /// [`Self::add_roster_entry`] for an entry the *daemon* enrolled rather
+    /// [`Self::add_affected_entry`] for an entry the *daemon* enrolled rather
     /// than a human/agent declaring it -- submit-time scope overlap
     /// ([`Self::enroll_new_squad_in_open_waypoints`]) or the survey sweep's
     /// own discovery ([`survey_candidate`]).
     ///
-    /// Identical to `add_roster_entry` except it marks the row
+    /// Identical to `add_affected_entry` except it marks the row
     /// `auto_enrolled`, which is what makes it eligible to be surveyed. An
     /// already-present row keeps whatever flag it has: a human's explicit
     /// declaration is never silently converted into a surveyable one, and an
@@ -956,12 +959,12 @@ impl Store {
     ///
     /// # Errors
     /// Propagates any SQLite failure.
-    pub fn enroll_roster_entry(
+    pub fn enroll_affected_entry(
         &self,
         waypoint_id: &str,
-        kind: RosterEntryKind,
+        kind: WaypointEntryKind,
         entry_id: &str,
-        mode: RosterMode,
+        mode: AffectedMode,
     ) -> StoreResult<()> {
         let now = now_ms();
         self.conn.execute(
@@ -974,12 +977,12 @@ impl Store {
     }
 
     /// Enroll a just-submitted squad on every open waypoint whose scope
-    /// overlaps it, as a blocking, not-yet-surveyed roster entry. Returns the
+    /// overlaps it, as a blocking, not-yet-surveyed affected entry. Returns the
     /// waypoint ids it enrolled the squad on.
     ///
     /// This closes the submit-time gap the periodic survey sweep leaves open.
     /// The gate ([`Self::squad_block_gating_waypoint`]) is only consulted when
-    /// a squad is *claimed*, and a survey-discovered roster entry doesn't
+    /// a squad is *claimed*, and a survey-discovered affected entry doesn't
     /// exist until the next sweep -- up to
     /// `scheduler::WAYPOINT_SURVEY_INTERVAL` later. Without this, a squad
     /// submitted while a waypoint is open is dispatched immediately and
@@ -1018,32 +1021,32 @@ impl Store {
                 continue;
             }
             let already = self
-                .list_roster_entries(&waypoint_id)?
+                .list_affected_entries(&waypoint_id)?
                 .into_iter()
-                .any(|e| e.kind == RosterEntryKind::Squad && e.entry_id == squad_id);
+                .any(|e| e.kind == WaypointEntryKind::Squad && e.entry_id == squad_id);
             if already {
                 continue;
             }
-            self.enroll_roster_entry(
+            self.enroll_affected_entry(
                 &waypoint_id,
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 squad_id,
-                RosterMode::Block,
+                AffectedMode::Block,
             )?;
             enrolled.push(waypoint_id);
         }
         Ok(enrolled)
     }
 
-    /// Remove one roster entry. Returns `true` if a row was actually
+    /// Remove one affected entry. Returns `true` if a row was actually
     /// removed.
     ///
     /// # Errors
     /// Propagates any SQLite failure.
-    pub fn remove_roster_entry(
+    pub fn remove_affected_entry(
         &self,
         waypoint_id: &str,
-        kind: RosterEntryKind,
+        kind: WaypointEntryKind,
         entry_id: &str,
     ) -> StoreResult<bool> {
         let n = self.conn.execute(
@@ -1053,30 +1056,30 @@ impl Store {
         Ok(n > 0)
     }
 
-    /// Every roster entry for a waypoint, oldest first.
+    /// Every affected entry for a waypoint, oldest first.
     ///
     /// # Errors
     /// Propagates any SQLite failure.
-    pub fn list_roster_entries(&self, waypoint_id: &str) -> StoreResult<Vec<RosterEntryView>> {
+    pub fn list_affected_entries(&self, waypoint_id: &str) -> StoreResult<Vec<AffectedEntryView>> {
         let mut stmt = self.conn.prepare(
             "SELECT waypoint_id, kind, entry_id, mode, survey_verdict, survey_rationale, delivery_status, stand_down_at_ms, created_at_ms, updated_at_ms, stale_at_ms, bearing_decision, bearing_decided_at_ms
              FROM waypoint_affected WHERE waypoint_id=? ORDER BY created_at_ms, entry_id",
         )?;
         let rows = stmt
-            .query_map(params![waypoint_id], Self::map_roster_row)?
+            .query_map(params![waypoint_id], Self::map_affected_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
-    fn map_roster_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RosterEntryView> {
+    fn map_affected_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<AffectedEntryView> {
         let kind_s: String = r.get(1)?;
         let mode_s: String = r.get(3)?;
         let delivery_s: String = r.get(6)?;
-        Ok(RosterEntryView {
+        Ok(AffectedEntryView {
             waypoint_id: r.get(0)?,
-            kind: RosterEntryKind::parse(&kind_s).unwrap_or(RosterEntryKind::Squad),
+            kind: WaypointEntryKind::parse(&kind_s).unwrap_or(WaypointEntryKind::Squad),
             entry_id: r.get(2)?,
-            mode: RosterMode::parse(&mode_s).unwrap_or(RosterMode::Block),
+            mode: AffectedMode::parse(&mode_s).unwrap_or(AffectedMode::Block),
             survey_verdict: r.get(4)?,
             survey_rationale: r.get(5)?,
             delivery_status: DeliveryStatus::parse(&delivery_s)
@@ -1093,14 +1096,14 @@ impl Store {
         })
     }
 
-    /// Record a roster entry's delivery status transition.
+    /// Record a affected entry's delivery status transition.
     ///
     /// # Errors
     /// Propagates any SQLite failure.
-    pub fn set_roster_delivery_status(
+    pub fn set_affected_delivery_status(
         &self,
         waypoint_id: &str,
-        kind: RosterEntryKind,
+        kind: WaypointEntryKind,
         entry_id: &str,
         status: DeliveryStatus,
     ) -> StoreResult<()> {
@@ -1111,17 +1114,17 @@ impl Store {
         Ok(())
     }
 
-    /// Mark a roster entry's advisory stand-down notice as sent (RAL-400
+    /// Mark a affected entry's advisory stand-down notice as sent (RAL-400
     /// Phase 6, idempotency for [`run_pending_stand_down_notices`]). A no-op
     /// if already marked -- `stand_down_at_ms` is set once and never
     /// overwritten, so calling this twice keeps the original timestamp.
     ///
     /// # Errors
     /// Propagates any SQLite failure.
-    pub fn mark_roster_entry_stood_down(
+    pub fn mark_affected_entry_stood_down(
         &self,
         waypoint_id: &str,
-        kind: RosterEntryKind,
+        kind: WaypointEntryKind,
         entry_id: &str,
     ) -> StoreResult<()> {
         self.conn.execute(
@@ -1170,10 +1173,10 @@ impl Store {
     ///
     /// # Errors
     /// Propagates any SQLite failure.
-    pub fn roster_entry_delivery_status(
+    pub fn affected_entry_delivery_status(
         &self,
         waypoint_id: &str,
-        kind: RosterEntryKind,
+        kind: WaypointEntryKind,
         entry_id: &str,
     ) -> StoreResult<Option<DeliveryStatus>> {
         let raw: Option<String> = self
@@ -1233,7 +1236,7 @@ impl Store {
     /// The most recent waypoint to have affected this squad, open or closed.
     ///
     /// A cell resuming from a hold has usually outlived the hold: the gate
-    /// lifted because the waypoint's roster landed, and the waypoint may have
+    /// lifted because the waypoint's affected landed, and the waypoint may have
     /// closed on the same tick. Reporting "no waypoint" there would lose the
     /// one piece of context the resuming agent most needs.
     ///
@@ -1260,10 +1263,10 @@ impl Store {
     ///
     /// # Errors
     /// Propagates any SQLite failure.
-    pub fn add_roster_goal(
+    pub fn add_roster_entry(
         &self,
         waypoint_id: &str,
-        kind: RosterEntryKind,
+        kind: WaypointEntryKind,
         entry_id: &str,
         note: Option<&str>,
     ) -> StoreResult<()> {
@@ -1282,10 +1285,10 @@ impl Store {
     /// # Errors
     /// Returns [`StoreError::NotFound`] if that goal is not on the list;
     /// otherwise propagates any SQLite failure.
-    pub fn remove_roster_goal(
+    pub fn remove_roster_entry(
         &self,
         waypoint_id: &str,
-        kind: RosterEntryKind,
+        kind: WaypointEntryKind,
         entry_id: &str,
     ) -> StoreResult<()> {
         let n = self.conn.execute(
@@ -1303,7 +1306,7 @@ impl Store {
     ///
     /// # Errors
     /// Propagates any SQLite failure.
-    pub fn list_roster_goals(&self, waypoint_id: &str) -> StoreResult<Vec<RosterGoalView>> {
+    pub fn list_roster_entries(&self, waypoint_id: &str) -> StoreResult<Vec<RosterEntryView>> {
         let mut stmt = self.conn.prepare(
             "SELECT waypoint_id, kind, entry_id, note, created_at_ms
              FROM waypoint_roster WHERE waypoint_id=? ORDER BY created_at_ms ASC, entry_id ASC",
@@ -1316,10 +1319,10 @@ impl Store {
         drop(stmt);
         let mut out = Vec::with_capacity(raw.len());
         for (wp, kind_s, entry_id, note, created_at_ms) in raw {
-            let Some(kind) = RosterEntryKind::parse(&kind_s) else {
+            let Some(kind) = WaypointEntryKind::parse(&kind_s) else {
                 continue;
             };
-            out.push(RosterGoalView {
+            out.push(RosterEntryView {
                 waypoint_id: wp,
                 kind,
                 entry_id: entry_id.clone(),
@@ -1336,14 +1339,14 @@ impl Store {
     ///
     /// # Errors
     /// Propagates any SQLite failure.
-    fn entry_work_is_terminal(&self, kind: RosterEntryKind, entry_id: &str) -> StoreResult<bool> {
+    fn entry_work_is_terminal(&self, kind: WaypointEntryKind, entry_id: &str) -> StoreResult<bool> {
         Ok(match kind {
-            RosterEntryKind::Squad => match self.squad_state(entry_id) {
+            WaypointEntryKind::Squad => match self.squad_state(entry_id) {
                 Ok(state) => state.is_terminal_for_waypoint(),
                 Err(StoreError::NotFound) => false,
                 Err(e) => return Err(e),
             },
-            RosterEntryKind::Review => {
+            WaypointEntryKind::Review => {
                 let status: Option<String> = self
                     .conn
                     .query_row(
@@ -1368,7 +1371,7 @@ impl Store {
     pub fn set_affected_bearing_decision(
         &self,
         waypoint_id: &str,
-        kind: RosterEntryKind,
+        kind: WaypointEntryKind,
         entry_id: &str,
         decision: BearingDecision,
     ) -> StoreResult<()> {
@@ -1393,15 +1396,15 @@ impl Store {
     /// Whether every goal on the waypoint's completion list has finished --
     /// phase 1 of a waypoint being done.
     ///
-    /// An empty list is vacuously satisfied. A waypoint that names no goals
+    /// An empty list is vacuously satisfied. A waypoint that names no roster
     /// is a pure broadcast ("this is changing, tell me how it lands on you"),
     /// and the only thing left to wait for is the answers.
     ///
     /// # Errors
     /// Propagates any SQLite failure.
-    pub fn roster_goals_complete(&self, waypoint_id: &str) -> StoreResult<bool> {
+    pub fn roster_complete(&self, waypoint_id: &str) -> StoreResult<bool> {
         Ok(self
-            .list_roster_goals(waypoint_id)?
+            .list_roster_entries(waypoint_id)?
             .iter()
             .all(|g| g.terminal))
     }
@@ -1417,9 +1420,9 @@ impl Store {
     /// Propagates any SQLite failure.
     pub fn affected_have_answered(&self, waypoint_id: &str) -> StoreResult<bool> {
         Ok(self
-            .list_roster_entries(waypoint_id)?
+            .list_affected_entries(waypoint_id)?
             .iter()
-            .filter(|e| e.mode == RosterMode::Block)
+            .filter(|e| e.mode == AffectedMode::Block)
             .all(|e| e.bearing_decision.is_some()))
     }
 
@@ -1458,7 +1461,7 @@ impl Store {
         drop(stmt);
 
         let rows: Vec<(
-            RosterEntryKind,
+            WaypointEntryKind,
             String,
             String,
             Option<String>,
@@ -1467,19 +1470,19 @@ impl Store {
         )> = raw
             .into_iter()
             .filter_map(|(kind, entry_id, mode, verdict, delivery, auto)| {
-                RosterEntryKind::parse(&kind)
+                WaypointEntryKind::parse(&kind)
                     .map(|kind| (kind, entry_id, mode, verdict, delivery, auto))
             })
             .collect();
 
-        let labels = self.roster_entry_labels(
+        let labels = self.affected_entry_labels(
             &rows
                 .iter()
                 .map(|(kind, entry_id, ..)| (*kind, entry_id.clone()))
                 .collect::<Vec<_>>(),
         )?;
         let build = |(kind, entry_id, mode, verdict, delivery, _): &(
-            RosterEntryKind,
+            WaypointEntryKind,
             String,
             String,
             Option<String>,
@@ -1505,7 +1508,7 @@ impl Store {
         })
     }
 
-    /// Display names for a batch of roster entries, as `(kind, entry_id) ->
+    /// Display names for a batch of affected entries, as `(kind, entry_id) ->
     /// name`. One prepared statement per kind rather than one per entry; an
     /// entry whose row is gone (or which never had a name) maps to `None`
     /// rather than dropping out, so a caller can always account for every
@@ -1513,21 +1516,22 @@ impl Store {
     ///
     /// # Errors
     /// Propagates any SQLite failure.
-    fn roster_entry_labels(
+    fn affected_entry_labels(
         &self,
-        entries: &[(RosterEntryKind, String)],
-    ) -> StoreResult<std::collections::HashMap<(RosterEntryKind, String), Option<String>>> {
-        let mut out: std::collections::HashMap<(RosterEntryKind, String), Option<String>> = entries
-            .iter()
-            .map(|(k, id)| ((*k, id.clone()), None))
-            .collect();
+        entries: &[(WaypointEntryKind, String)],
+    ) -> StoreResult<std::collections::HashMap<(WaypointEntryKind, String), Option<String>>> {
+        let mut out: std::collections::HashMap<(WaypointEntryKind, String), Option<String>> =
+            entries
+                .iter()
+                .map(|(k, id)| ((*k, id.clone()), None))
+                .collect();
         for (kind, sql) in [
             (
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "SELECT label FROM squads WHERE id = ?",
             ),
             (
-                RosterEntryKind::Review,
+                WaypointEntryKind::Review,
                 "SELECT name FROM guardians WHERE id = ?",
             ),
         ] {
@@ -1575,7 +1579,7 @@ impl Store {
     /// Delivery-status counts for every waypoint at once, keyed by waypoint id.
     ///
     /// The list endpoint renders a progress meter per row, which previously
-    /// meant loading each waypoint's full roster -- every entry's verdict,
+    /// meant loading each waypoint's full affected -- every entry's verdict,
     /// rationale and timestamps -- just to tally four numbers off it, once per
     /// waypoint. This counts in SQL in a single pass instead, so listing N
     /// waypoints is one query rather than N.
@@ -1631,7 +1635,7 @@ impl Store {
     }
 
     /// Queue one newly-appended bearing for delivery to every **advisory**
-    /// squad roster entry on this waypoint, one injection per not-yet-finished
+    /// squad affected entry on this waypoint, one injection per not-yet-finished
     /// cell. Returns how many injections were queued.
     ///
     /// This is the advisory counterpart to the blocking path's ghost-fold. A
@@ -1662,8 +1666,8 @@ impl Store {
             .unwrap_or_else(|| bearing.summary.clone());
         let batch_id = format!("bearing-{}", bearing.id);
         let mut queued = 0usize;
-        for entry in self.list_roster_entries(waypoint_id)? {
-            if entry.mode != RosterMode::Advisory || entry.kind != RosterEntryKind::Squad {
+        for entry in self.list_affected_entries(waypoint_id)? {
+            if entry.mode != AffectedMode::Advisory || entry.kind != WaypointEntryKind::Squad {
                 continue;
             }
             let mut stmt = self.conn.prepare(
@@ -1690,9 +1694,9 @@ impl Store {
         Ok(queued)
     }
 
-    /// Flag a roster entry's already-finished work as possibly needing a
+    /// Flag a affected entry's already-finished work as possibly needing a
     /// redo. Idempotent, and set-once like
-    /// [`Self::mark_roster_entry_stood_down`] -- a reopen+reclose cycle never
+    /// [`Self::mark_affected_entry_stood_down`] -- a reopen+reclose cycle never
     /// re-flags an entry whose flag a redo already cleared, so the notice
     /// isn't re-sent for work someone has already dealt with.
     ///
@@ -1700,10 +1704,10 @@ impl Store {
     ///
     /// # Errors
     /// Propagates any SQLite failure.
-    pub fn mark_roster_entry_stale(
+    pub fn mark_affected_entry_stale(
         &self,
         waypoint_id: &str,
-        kind: RosterEntryKind,
+        kind: WaypointEntryKind,
         entry_id: &str,
     ) -> StoreResult<bool> {
         let now = now_ms();
@@ -1715,16 +1719,16 @@ impl Store {
         Ok(n > 0)
     }
 
-    /// Clear a roster entry's stale flag, once its redo has been kicked off
+    /// Clear a affected entry's stale flag, once its redo has been kicked off
     /// (or the flag dismissed). Returns `true` if a flag was actually
     /// cleared.
     ///
     /// # Errors
     /// Propagates any SQLite failure.
-    pub fn clear_roster_entry_stale(
+    pub fn clear_affected_entry_stale(
         &self,
         waypoint_id: &str,
-        kind: RosterEntryKind,
+        kind: WaypointEntryKind,
         entry_id: &str,
     ) -> StoreResult<bool> {
         let n = self.conn.execute(
@@ -1735,24 +1739,24 @@ impl Store {
         Ok(n > 0)
     }
 
-    /// Whether this roster entry's work has reached a terminal state -- the
-    /// same per-kind terminality [`Self::all_roster_entries_terminal`] uses,
-    /// for one entry instead of the whole roster.
+    /// Whether this affected entry's work has reached a terminal state -- the
+    /// same per-kind terminality [`Self::all_affected_entries_terminal`] uses,
+    /// for one entry instead of the whole affected.
     ///
     /// # Errors
     /// Propagates any SQLite failure.
-    pub fn roster_entry_work_is_terminal(
+    pub fn affected_entry_work_is_terminal(
         &self,
-        kind: RosterEntryKind,
+        kind: WaypointEntryKind,
         entry_id: &str,
     ) -> StoreResult<bool> {
         match kind {
-            RosterEntryKind::Squad => match self.squad_state(entry_id) {
+            WaypointEntryKind::Squad => match self.squad_state(entry_id) {
                 Ok(state) => Ok(state.is_terminal_for_waypoint()),
                 Err(StoreError::NotFound) => Ok(false),
                 Err(e) => Err(e),
             },
-            RosterEntryKind::Review => {
+            WaypointEntryKind::Review => {
                 let status: Option<String> = self
                     .conn
                     .query_row(
@@ -1768,15 +1772,15 @@ impl Store {
 
     /// Record one candidate's survey outcome (Phase 2): sets `mode` and the
     /// `survey_verdict`/`survey_rationale` columns. Does not itself add the
-    /// roster entry -- callers add it (or update its `mode` in place, since
-    /// [`Store::add_roster_entry`] is an upsert) before calling this.
+    /// affected entry -- callers add it (or update its `mode` in place, since
+    /// [`Store::add_affected_entry`] is an upsert) before calling this.
     ///
     /// # Errors
     /// Propagates any SQLite failure.
-    pub fn set_roster_survey_result(
+    pub fn set_affected_survey_result(
         &self,
         waypoint_id: &str,
-        kind: RosterEntryKind,
+        kind: WaypointEntryKind,
         entry_id: &str,
         verdict: &SurveyVerdict,
     ) -> StoreResult<()> {
@@ -1796,7 +1800,7 @@ impl Store {
         Ok(())
     }
 
-    /// Whether every roster entry on a waypoint has reached a terminal state
+    /// Whether every affected entry on a waypoint has reached a terminal state
     /// (squad terminal states, per [`SquadState::is_terminal_for_waypoint`]
     /// -- deliberately stricter than the generic [`SquadState::is_terminal`],
     /// since a `failed` squad can still be restarted back to `pending` via
@@ -1804,24 +1808,24 @@ impl Store {
     /// count the same as review terminal states, per
     /// [`GuardianStatus::is_terminal_status`], which already excludes
     /// `merge_failed` for the same reason). A waypoint with an empty
-    /// roster is never considered terminal -- there is nothing to have
+    /// affected is never considered terminal -- there is nothing to have
     /// finished yet.
     ///
     /// # Errors
     /// Propagates any SQLite failure.
-    pub fn all_roster_entries_terminal(&self, waypoint_id: &str) -> StoreResult<bool> {
-        let entries = self.list_roster_entries(waypoint_id)?;
+    pub fn all_affected_entries_terminal(&self, waypoint_id: &str) -> StoreResult<bool> {
+        let entries = self.list_affected_entries(waypoint_id)?;
         if entries.is_empty() {
             return Ok(false);
         }
         for entry in &entries {
             let terminal = match entry.kind {
-                RosterEntryKind::Squad => match self.squad_state(&entry.entry_id) {
+                WaypointEntryKind::Squad => match self.squad_state(&entry.entry_id) {
                     Ok(state) => state.is_terminal_for_waypoint(),
                     Err(StoreError::NotFound) => false,
                     Err(e) => return Err(e),
                 },
-                RosterEntryKind::Review => {
+                WaypointEntryKind::Review => {
                     let status: Option<String> = self
                         .conn
                         .query_row(
@@ -1843,9 +1847,9 @@ impl Store {
         Ok(true)
     }
 
-    /// Close a waypoint if every roster entry has reached a terminal state
+    /// Close a waypoint if every affected entry has reached a terminal state
     /// (RAL-400 Phase 6). A no-op (returns `false`) if the waypoint is
-    /// already closed, has no roster entries, or has at least one
+    /// already closed, has no affected entries, or has at least one
     /// still-active entry. Records a Cartographer row on an actual close.
     ///
     /// # Errors
@@ -1857,13 +1861,13 @@ impl Store {
         // A waypoint that names nothing and affects nothing has not finished,
         // it has not started -- closing one the moment it is created would be
         // the only thing this ever did for it.
-        if self.list_roster_goals(waypoint_id)?.is_empty()
-            && self.list_roster_entries(waypoint_id)?.is_empty()
+        if self.list_roster_entries(waypoint_id)?.is_empty()
+            && self.list_affected_entries(waypoint_id)?.is_empty()
         {
             return Ok(false);
         }
         // Phase 1: the work this waypoint consists of has landed.
-        if !self.roster_goals_complete(waypoint_id)? {
+        if !self.roster_complete(waypoint_id)? {
             return Ok(false);
         }
         // Phase 2: everything it lands on has said how it landed. Note the
@@ -1872,7 +1876,7 @@ impl Store {
         if !self.affected_have_answered(waypoint_id)? {
             return Ok(false);
         }
-        if !self.all_roster_entries_terminal(waypoint_id)? {
+        if !self.all_affected_entries_terminal(waypoint_id)? {
             return Ok(false);
         }
         let closed = self.close_waypoint(waypoint_id)?;
@@ -1882,7 +1886,7 @@ impl Store {
                 .emit(
                     self,
                     format!(
-                        "waypoint {waypoint_id} auto-closed: its roster landed and every blocking affected entry answered"
+                        "waypoint {waypoint_id} auto-closed: its affected landed and every blocking affected entry answered"
                     ),
                     serde_json::json!({"waypoint_id": waypoint_id, "reason": "auto"}),
                 );
@@ -1890,18 +1894,18 @@ impl Store {
         Ok(closed)
     }
 
-    /// Every open waypoint that rosters `(kind, entry_id)` -- the reverse
+    /// Every open waypoint that lists `(kind, entry_id)` as affected -- the reverse
     /// lookup behind the auto-close hooks in [`Store::set_squad_state`] and
     /// [`Store::set_guardian_status`], used to find which waypoints might now
-    /// be closeable after one of their roster entries just reached a
-    /// terminal state. Two waypoints may independently roster the same
+    /// be closeable after one of their affected entries just reached a
+    /// terminal state. Two waypoints may independently affected the same
     /// review/squad, so this can return more than one id.
     ///
     /// # Errors
     /// Propagates any SQLite failure.
-    pub fn waypoints_referencing_roster_entry(
+    pub fn waypoints_referencing_affected_entry(
         &self,
-        kind: RosterEntryKind,
+        kind: WaypointEntryKind,
         entry_id: &str,
     ) -> StoreResult<Vec<String>> {
         let mut stmt = self.conn.prepare(
@@ -1915,19 +1919,19 @@ impl Store {
         Ok(rows)
     }
 
-    /// Try to auto-close every open waypoint that rosters `(kind, entry_id)`
+    /// Try to auto-close every open waypoint that lists `(kind, entry_id)` as affected
     /// (RAL-400 Phase 6) -- called from [`Store::set_squad_state`] and
-    /// [`Store::set_guardian_status`] right after a roster entry's owning
+    /// [`Store::set_guardian_status`] right after a affected entry's owning
     /// squad/review transitions into a terminal state.
     ///
     /// # Errors
     /// Propagates any SQLite failure.
-    pub fn maybe_auto_close_waypoints_for_roster_entry(
+    pub fn maybe_auto_close_waypoints_for_affected_entry(
         &self,
-        kind: RosterEntryKind,
+        kind: WaypointEntryKind,
         entry_id: &str,
     ) -> StoreResult<()> {
-        for waypoint_id in self.waypoints_referencing_roster_entry(kind, entry_id)? {
+        for waypoint_id in self.waypoints_referencing_affected_entry(kind, entry_id)? {
             self.maybe_auto_close_waypoint(&waypoint_id)?;
         }
         Ok(())
@@ -1935,7 +1939,7 @@ impl Store {
 
     /// Manually close a waypoint (RAL-400 Phase 6). Unlike
     /// [`Store::maybe_auto_close_waypoint`], this always closes an open
-    /// waypoint regardless of roster state -- the whole point of a manual
+    /// waypoint regardless of affected state -- the whole point of a manual
     /// close is to override auto-close, e.g. to gate-release a squad whose
     /// review is still pending. Idempotent: closing an already-closed
     /// waypoint is a no-op. Takes effect for gating immediately, since
@@ -1959,7 +1963,7 @@ impl Store {
 
     /// Reopen a closed waypoint (RAL-400 Phase 6): flips it back to `open`
     /// and clears `closed_at_ms`. Idempotent: reopening an already-open
-    /// waypoint is a no-op. Deliberately does not reset any roster entry's
+    /// waypoint is a no-op. Deliberately does not reset any affected entry's
     /// `stand_down_at_ms` -- a later re-close must not re-send a stand-down
     /// notice that already went out.
     ///
@@ -1985,8 +1989,8 @@ impl Store {
     }
 
     /// The open waypoint (if any) that block-gates a squad (RAL-400 Phase 3,
-    /// scenario 1): a `kind='squad'` roster entry for `squad_id` whose `mode`
-    /// is `block` and whose owning waypoint is still `open`. A roster entry
+    /// scenario 1): a `kind='squad'` affected entry for `squad_id` whose `mode`
+    /// is `block` and whose owning waypoint is still `open`. A affected entry
     /// with `survey_verdict='not_impacted'` never gates regardless of `mode`
     /// (the survey found this squad isn't actually affected, so the `mode`
     /// column's leftover default value is moot -- see
@@ -1994,7 +1998,7 @@ impl Store {
     /// `survey_verdict` (not yet surveyed, or a manually-added entry) gates,
     /// matching Phase 0's fail-closed rule and giving Phase 3's "gate the
     /// squad until classification completes" its effect for free, since
-    /// [`survey_candidate`] already writes the `block`-mode roster row before
+    /// [`survey_candidate`] already writes the `block`-mode affected row before
     /// its LLM call resolves. Advisory-mode entries never gate (Phase 0: for
     /// a squad, advisory means "keep running, just inform").
     ///
@@ -2011,14 +2015,14 @@ impl Store {
 
     /// The first open waypoint holding this squad back from being scheduled.
     ///
-    /// A hold lasts only while the waypoint's own roster is still unfinished.
+    /// A hold lasts only while the waypoint's own affected is still unfinished.
     /// That is the whole shape of the thing: affected work is held because the
-    /// change it must take up does not exist yet, and once the roster lands
+    /// change it must take up does not exist yet, and once the affected lands
     /// there is nothing left to wait for -- the entry is released precisely so
     /// it can do the work and answer. Holding it through phase 2 as well would
     /// deadlock, since phase 2 is waiting on that answer.
     ///
-    /// The roster-complete half is decided in Rust rather than folded into the
+    /// The affected-complete half is decided in Rust rather than folded into the
     /// query: which squad and review states count as terminal is already
     /// stated once, in [`SquadState::is_terminal_for_waypoint`] and
     /// [`GuardianStatus::is_terminal_status`], and restating those literals in
@@ -2040,7 +2044,7 @@ impl Store {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(stmt);
         for waypoint_id in candidates {
-            if !self.roster_goals_complete(&waypoint_id)? {
+            if !self.roster_complete(&waypoint_id)? {
                 return Ok(Some(waypoint_id));
             }
         }
@@ -2080,14 +2084,14 @@ impl Store {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(stmt);
         for (waypoint_id, decision) in candidates {
-            if decision.is_none() || !self.roster_goals_complete(&waypoint_id)? {
+            if decision.is_none() || !self.roster_complete(&waypoint_id)? {
                 return Ok(Some(waypoint_id));
             }
         }
         Ok(None)
     }
 
-    /// Every cell currently halted because its squad-kind roster entry
+    /// Every cell currently halted because its squad-kind affected entry
     /// became `mode=block` on an open waypoint (RAL-400 Phase 3, see
     /// [`Store::mark_cell_waypoint_halted`]) -- `(squad_id, task_idx, idx)`
     /// triples, oldest halt first. Consumed by [`run_pending_waypoint_resumes`]
@@ -2109,20 +2113,20 @@ impl Store {
         Ok(rows)
     }
 
-    /// RAL-400 Phase 3: once a squad that carries a `kind='squad'` roster
+    /// RAL-400 Phase 3: once a squad that carries a `kind='squad'` affected
     /// entry completes and its review forms (`guardian_id` becomes known),
     /// retire that entry and add an equivalent `kind='review'` entry in its
     /// place -- same waypoint, mode, and survey verdict/rationale carried
     /// over -- so gating/delivery (Phase 4) continues through the review
     /// instead of the now-stale squad entry. A no-op if `squad_id` has no
-    /// squad-kind roster entry on any waypoint, and idempotent if called more
+    /// squad-kind affected entry on any waypoint, and idempotent if called more
     /// than once for the same `(squad_id, guardian_id)` pair (the review-kind
-    /// insert is the same `ON CONFLICT` upsert [`Store::add_roster_entry`]
+    /// insert is the same `ON CONFLICT` upsert [`Store::add_affected_entry`]
     /// uses elsewhere, keyed on `(waypoint_id, kind, entry_id)`).
     ///
     /// # Errors
     /// Propagates any SQLite failure.
-    pub fn transition_squad_roster_entries_to_review(
+    pub fn transition_squad_affected_entries_to_review(
         &self,
         squad_id: &str,
         guardian_id: &str,
@@ -2171,7 +2175,7 @@ impl Store {
     pub fn append_waypoint_bearing(
         &self,
         waypoint_id: &str,
-        producer_kind: RosterEntryKind,
+        producer_kind: WaypointEntryKind,
         producer_id: &str,
         summary: &str,
         entity_uri: Option<&str>,
@@ -2223,8 +2227,8 @@ impl Store {
                 Ok(BearingView {
                     id: r.get(0)?,
                     waypoint_id: r.get(1)?,
-                    producer_kind: RosterEntryKind::parse(&kind_s)
-                        .unwrap_or(RosterEntryKind::Squad),
+                    producer_kind: WaypointEntryKind::parse(&kind_s)
+                        .unwrap_or(WaypointEntryKind::Squad),
                     producer_id: r.get(3)?,
                     summary: r.get(4)?,
                     entity_uri: r.get(5)?,
@@ -2239,7 +2243,7 @@ impl Store {
 
     /// This waypoint's merged delivery/event history (RAL-400 Phase 7): every
     /// Cartographer row this module has emitted for `waypoint_id`
-    /// (creation, roster changes, manual close/reopen, auto-close, bearing
+    /// (creation, affected changes, manual close/reopen, auto-close, bearing
     /// appends, ...), oldest first. Backs `GET /api/waypoints/{id}/deliveries`,
     /// the waypoint analog of [`crate::timeline::build_squad_timeline`].
     ///
@@ -2465,10 +2469,10 @@ impl Store {
     /// rows were deleted mid-sweep still classifies (fail-closed, per this
     /// module's survey contract) instead of aborting the sweep.
     #[must_use]
-    pub fn describe_candidate_for_survey(&self, kind: RosterEntryKind, entry_id: &str) -> String {
+    pub fn describe_candidate_for_survey(&self, kind: WaypointEntryKind, entry_id: &str) -> String {
         let described = match kind {
-            RosterEntryKind::Squad => self.describe_squad_for_survey(entry_id),
-            RosterEntryKind::Review => self.describe_review_for_survey(entry_id),
+            WaypointEntryKind::Squad => self.describe_squad_for_survey(entry_id),
+            WaypointEntryKind::Review => self.describe_review_for_survey(entry_id),
         };
         described.unwrap_or_else(|_| format!("{} {entry_id}", kind.as_str()))
     }
@@ -2489,11 +2493,11 @@ impl Store {
     }
 }
 
-/// Halt a squad's in-flight cell after a roster entry was *explicitly*
+/// Halt a squad's in-flight cell after a affected entry was *explicitly*
 /// declared or escalated to `mode=block` on an open waypoint.
 ///
 /// [`survey_candidate`] already does this for candidates it discovers, but an
-/// explicit roster entry never goes through the survey at all -- it is
+/// explicit affected entry never goes through the survey at all -- it is
 /// excluded from [`Store::waypoint_survey_candidates`] by design (a human or
 /// agent named it directly, so the declaration is never second-guessed). That
 /// left the registry unsignalled on every explicit path, so a squad whose
@@ -2510,7 +2514,7 @@ impl Store {
 /// Re-apply this waypoint's holds to work that is already in flight.
 ///
 /// A waypoint's gate is not a property of its affected entries alone -- it
-/// also depends on whether its own roster has landed. Adding a goal to an
+/// also depends on whether its own affected has landed. Adding a goal to an
 /// open waypoint therefore turns an open gate into a closed one for every
 /// block-mode squad it affects, and those squads may be running right now.
 /// Without this they run on, unaware, until they finish: the gate is only
@@ -2519,7 +2523,7 @@ impl Store {
 ///
 /// Safe to call when nothing changed: `cancel` is a no-op for a squad with
 /// no registered token, and the per-squad gate is re-checked here so a
-/// waypoint whose roster is still complete halts nothing.
+/// waypoint whose affected is still complete halts nothing.
 pub fn resignal_waypoint_holds(
     store: &Store,
     waypoint_halts: &crate::cancel::WaypointHalts,
@@ -2528,11 +2532,11 @@ pub fn resignal_waypoint_holds(
     if !store.waypoint_is_open(waypoint_id).unwrap_or(false) {
         return;
     }
-    let Ok(entries) = store.list_roster_entries(waypoint_id) else {
+    let Ok(entries) = store.list_affected_entries(waypoint_id) else {
         return;
     };
     for entry in entries {
-        if entry.kind != RosterEntryKind::Squad || entry.mode != RosterMode::Block {
+        if entry.kind != WaypointEntryKind::Squad || entry.mode != AffectedMode::Block {
             continue;
         }
         if matches!(
@@ -2548,11 +2552,11 @@ pub fn signal_explicit_block_halt(
     store: &Store,
     waypoint_halts: &crate::cancel::WaypointHalts,
     waypoint_id: &str,
-    kind: RosterEntryKind,
+    kind: WaypointEntryKind,
     entry_id: &str,
-    mode: RosterMode,
+    mode: AffectedMode,
 ) {
-    if kind != RosterEntryKind::Squad || mode != RosterMode::Block {
+    if kind != WaypointEntryKind::Squad || mode != AffectedMode::Block {
         return;
     }
     if !store.waypoint_is_open(waypoint_id).unwrap_or(false) {
@@ -2657,9 +2661,9 @@ fn parse_survey_reply(reply: &str, allow_advisory: bool) -> Option<SurveyVerdict
     }
     let impacted = impacted?;
     let mode = if impacted && allow_advisory && advisory {
-        RosterMode::Advisory
+        AffectedMode::Advisory
     } else {
-        RosterMode::Block
+        AffectedMode::Block
     };
     if rationale.is_empty() {
         rationale = "model gave no rationale".to_string();
@@ -2683,12 +2687,12 @@ fn resolve_survey_verdict(
     match call_result {
         Ok(reply) => parse_survey_reply(&reply, allow_advisory).unwrap_or_else(|| SurveyVerdict {
             impacted: true,
-            mode: RosterMode::Block,
+            mode: AffectedMode::Block,
             rationale: format!("unparseable survey reply, failing closed: {reply:?}"),
         }),
         Err(e) => SurveyVerdict {
             impacted: true,
-            mode: RosterMode::Block,
+            mode: AffectedMode::Block,
             rationale: format!("survey call failed, failing closed: {e}"),
         },
     }
@@ -2696,14 +2700,14 @@ fn resolve_survey_verdict(
 
 /// Survey one candidate against a waypoint (RAL-400 Phase 2): resolve the
 /// survey agent/model, invoke the LLM once, and durably record the outcome
-/// -- via [`Store::add_roster_entry`] + [`Store::set_roster_survey_result`]
-/// and a Cartographer row -- on every path, including failure. The roster
+/// -- via [`Store::add_affected_entry`] + [`Store::set_affected_survey_result`]
+/// and a Cartographer row -- on every path, including failure. The affected
 /// entry is written regardless of the `impacted` verdict (not only when
 /// `true`): the row is the single place both the positive and negative
 /// outcome are recorded, it stops a later scheduler tick from re-surveying
 /// the same still-non-terminal candidate every interval, and it is what a
 /// later phase's delivery/gating logic must consult (`survey_verdict`) to
-/// know whether this roster entry actually blocks/advises.
+/// know whether this affected entry actually blocks/advises.
 ///
 /// One LLM call per candidate, not batched across a waypoint's whole
 /// candidate set: a batched reply covering N candidates at once would be
@@ -2734,24 +2738,24 @@ pub fn survey_candidate(
 ) -> StoreResult<SurveyVerdict> {
     let guard = store.lock();
     let waypoint = guard.get_waypoint(waypoint_id)?;
-    // `enroll_roster_entry`, not `add_roster_entry`: a discovered candidate is
+    // `enroll_affected_entry`, not `add_affected_entry`: a discovered candidate is
     // daemon-enrolled, so it stays surveyable if this survey call fails and a
     // later sweep has to retry it.
-    guard.enroll_roster_entry(
+    guard.enroll_affected_entry(
         waypoint_id,
         candidate.kind,
         &candidate.entry_id,
-        RosterMode::Block,
+        AffectedMode::Block,
     )?;
     drop(guard);
-    // RAL-400 Phase 3: the roster entry above just went from "not rostered"
+    // RAL-400 Phase 3: the affected entry above just went from "not affecteded"
     // (unblocked) to `mode=block`. A squad-kind candidate may have a cell
     // actively running right now -- `cancel` is a no-op when nothing is
     // registered under this squad id, so this is safe to call unconditionally
     // rather than first checking squad/cell state. Review-kind candidates
     // never have a runner-registered token (a review has no cell of its own
     // to halt), so this is scoped to `Squad` only.
-    if candidate.kind == RosterEntryKind::Squad {
+    if candidate.kind == WaypointEntryKind::Squad {
         waypoint_halts.cancel(&candidate.entry_id);
     }
 
@@ -2791,12 +2795,12 @@ pub fn survey_candidate(
     let verdict = resolve_survey_verdict(call_result, waypoint.allow_advisory);
 
     let guard = store.lock();
-    guard.set_roster_survey_result(waypoint_id, candidate.kind, &candidate.entry_id, &verdict)?;
+    guard.set_affected_survey_result(waypoint_id, candidate.kind, &candidate.entry_id, &verdict)?;
     // Tell the entity's watchers what the verdict means for them. Every branch
     // notifies, including the release: someone told their work was held needs
     // to hear when it isn't any more, or the first message reads as a dead end.
     match (verdict.impacted, verdict.mode) {
-        (true, RosterMode::Block) => notify_entry_blocked(
+        (true, AffectedMode::Block) => notify_entry_blocked(
             &guard,
             waypoint_id,
             Some(&waypoint),
@@ -2804,7 +2808,7 @@ pub fn survey_candidate(
             &candidate.entry_id,
             &format!("the survey judged it impacted ({})", verdict.rationale),
         ),
-        (true, RosterMode::Advisory) => notify_entry_advised(
+        (true, AffectedMode::Advisory) => notify_entry_advised(
             &guard,
             waypoint_id,
             Some(&waypoint),
@@ -2818,8 +2822,8 @@ pub fn survey_candidate(
     }
     let note = crate::cartographer::Note::new("waypoints").scope("waypoint");
     let note = match candidate.kind {
-        RosterEntryKind::Squad => note.squad(&candidate.entry_id),
-        RosterEntryKind::Review => note.guardian(&candidate.entry_id),
+        WaypointEntryKind::Squad => note.squad(&candidate.entry_id),
+        WaypointEntryKind::Review => note.guardian(&candidate.entry_id),
     };
     note.emit(
         &guard,
@@ -2913,12 +2917,12 @@ pub fn run_pending_surveys(
 
 /// Scheduler-owned periodic sweep (RAL-400 Phase 3): the other half of a
 /// waypoint halt. `run_cell_worker`'s `is_waypoint_halted()` branch stops a
-/// cell the moment its squad-kind roster entry becomes `mode=block`, but
+/// cell the moment its squad-kind affected entry becomes `mode=block`, but
 /// nothing else in that codepath ever hands the cell back -- a waypoint can
-/// close, de-escalate to advisory, or lose its last blocking roster entry at
+/// close, de-escalate to advisory, or lose its last blocking affected entry at
 /// any later time, with no single call site to hook a "resume now" trigger
 /// onto (unlike the halt itself, which is driven directly by
-/// [`survey_candidate`] flipping a roster entry to `block`). So this sweep
+/// [`survey_candidate`] flipping a affected entry to `block`). So this sweep
 /// re-checks every currently-halted cell on the same cadence as
 /// [`run_pending_surveys`], purely synchronous store reads/writes (no LLM
 /// call, no thread-spawn needed).
@@ -2994,7 +2998,7 @@ pub const WAYPOINT_FEEDBACK_AUTHOR: &str = "Waypoint";
 /// itself enforces (its synchronous 409 "run the review merge before giving
 /// feedback" path) -- checked here first so a not-yet-built review is simply
 /// skipped for this sweep (left `Undelivered` for a later one to retry)
-/// rather than surfaced as a `Failed` roster entry.
+/// rather than surfaced as a `Failed` affected entry.
 fn topmost_ready_branch(
     guardian: &crate::guardian::GuardianView,
 ) -> Option<&crate::guardian::BranchView> {
@@ -3060,7 +3064,7 @@ pub fn render_bearing_block(waypoint_id: &str, bearings: &[BearingView]) -> Opti
 }
 
 /// Scheduler-owned periodic sweep (RAL-400 Phase 4): deliver every open
-/// waypoint's guidance to every roster entry judged impacted. A `NULL` or
+/// waypoint's guidance to every affected entry judged impacted. A `NULL` or
 /// `"impacted"` `survey_verdict` both count as impacted here (mirroring
 /// [`Store::squad_block_gating_waypoint`]'s own fail-closed reading of that
 /// column); only an explicit `"not_impacted"` skips delivery.
@@ -3076,11 +3080,11 @@ pub fn render_bearing_block(waypoint_id: &str, bearings: &[BearingView]) -> Opti
 ///   review worktree to write feedback into. If such a squad has already
 ///   gone terminal (done/failed/cancelled) -- the "done-but-unreviewed" case,
 ///   where the squad finished before a review ever formed for it and before
-///   this ticket's gating could apply -- its roster entry is marked
+///   this ticket's gating could apply -- its affected entry is marked
 ///   `via-restack` so the UI can say honestly that its guidance will only
 ///   reach it later, folded into the restack/rebase that runs once its
 ///   eventual review is built (at which point
-///   `Store::transition_squad_roster_entries_to_review` converts the entry
+///   `Store::transition_squad_affected_entries_to_review` converts the entry
 ///   to `Review`-kind and this sweep starts delivering to it directly). A
 ///   still-running squad's entry is left untouched -- there is nothing to do
 ///   for it yet.
@@ -3104,7 +3108,9 @@ pub fn run_pending_deliveries(
             let Ok(waypoint) = guard.get_waypoint(&waypoint_id) else {
                 continue;
             };
-            let entries = guard.list_roster_entries(&waypoint_id).unwrap_or_default();
+            let entries = guard
+                .list_affected_entries(&waypoint_id)
+                .unwrap_or_default();
             (waypoint, entries)
         };
         for entry in entries {
@@ -3115,7 +3121,7 @@ pub fn run_pending_deliveries(
                 continue;
             }
             match entry.kind {
-                RosterEntryKind::Review => {
+                WaypointEntryKind::Review => {
                     deliver_to_review(
                         store,
                         runner,
@@ -3125,7 +3131,7 @@ pub fn run_pending_deliveries(
                         &entry.entry_id,
                     );
                 }
-                RosterEntryKind::Squad => {
+                WaypointEntryKind::Squad => {
                     mark_done_but_unreviewed_squad(store, &waypoint_id, &entry.entry_id);
                 }
             }
@@ -3134,10 +3140,10 @@ pub fn run_pending_deliveries(
 }
 
 /// Deliver one waypoint's guidance to one review's topmost ready branch via
-/// the existing feedback path, recording the outcome on the roster entry.
+/// the existing feedback path, recording the outcome on the affected entry.
 /// Leaves the entry `Undelivered` (for a later sweep to retry) if the
 /// guardian has no ready branch yet, or if `start_feedback` itself reports
-/// `404` (stale roster entry, guardian/branch since gone) or `409` (branch
+/// `404` (stale affected entry, guardian/branch since gone) or `409` (branch
 /// has no worktree yet -- an ordinary not-built-yet race, not a failure); any
 /// other reply status is recorded as `Failed`.
 fn deliver_to_review(
@@ -3174,8 +3180,12 @@ fn deliver_to_review(
         _ => DeliveryStatus::Failed,
     };
     let guard = store.lock();
-    let _ =
-        guard.set_roster_delivery_status(waypoint_id, RosterEntryKind::Review, guardian_id, status);
+    let _ = guard.set_affected_delivery_status(
+        waypoint_id,
+        WaypointEntryKind::Review,
+        guardian_id,
+        status,
+    );
     let note = crate::cartographer::Note::new("waypoints")
         .scope("waypoint")
         .guardian(guardian_id);
@@ -3194,7 +3204,7 @@ fn deliver_to_review(
     );
 }
 
-/// Mark a squad-kind roster entry `via-restack` once its squad has gone
+/// Mark a squad-kind affected entry `via-restack` once its squad has gone
 /// terminal without a review ever having formed for it (the "done-but-
 /// unreviewed" case). A no-op if the squad is not yet terminal, or is gone
 /// entirely (treated the same as "not yet terminal" -- nothing to mark).
@@ -3208,9 +3218,9 @@ fn mark_done_but_unreviewed_squad(
     if !terminal {
         return;
     }
-    let _ = guard.set_roster_delivery_status(
+    let _ = guard.set_affected_delivery_status(
         waypoint_id,
-        RosterEntryKind::Squad,
+        WaypointEntryKind::Squad,
         squad_id,
         DeliveryStatus::ViaRestack,
     );
@@ -3242,15 +3252,15 @@ fn mark_done_but_unreviewed_squad(
 /// Returns the waypoints that accepted the answer.
 pub fn record_waypoint_answer(
     store: &crate::store_lock::StoreHandle,
-    kind: RosterEntryKind,
+    kind: WaypointEntryKind,
     entry_id: &str,
     decision: BearingDecision,
     message: &str,
 ) -> Vec<String> {
     let guard = store.lock();
     let waypoints = match kind {
-        RosterEntryKind::Squad => guard.open_waypoints_affecting_squad(entry_id),
-        RosterEntryKind::Review => guard.open_waypoints_affecting_review(entry_id),
+        WaypointEntryKind::Squad => guard.open_waypoints_affecting_squad(entry_id),
+        WaypointEntryKind::Review => guard.open_waypoints_affecting_review(entry_id),
     }
     .unwrap_or_default();
     let mut answered = Vec::new();
@@ -3265,8 +3275,8 @@ pub fn record_waypoint_answer(
             guard.append_waypoint_bearing(waypoint_id, kind, entry_id, message, None, None, None);
         let note = crate::cartographer::Note::new("waypoints").scope("waypoint");
         let note = match kind {
-            RosterEntryKind::Squad => note.squad(entry_id),
-            RosterEntryKind::Review => note.guardian(entry_id),
+            WaypointEntryKind::Squad => note.squad(entry_id),
+            WaypointEntryKind::Review => note.guardian(entry_id),
         };
         note.emit(
             &guard,
@@ -3297,7 +3307,7 @@ pub fn record_waypoint_answer(
 /// The guidance block a cell carries back into its own prompt when it resumes
 /// from a waypoint hold.
 ///
-/// A halted cell is released once the waypoint's roster has landed, and its
+/// A halted cell is released once the waypoint's affected has landed, and its
 /// worktree is rebased onto that change on the way back in. Both of those are
 /// invisible to the agent: it just gets re-invoked. Without this it resumes
 /// with no idea a waypoint ever held it, let alone what the waypoint wanted.
@@ -3357,14 +3367,14 @@ fn stand_down_text(waypoint: &WaypointView) -> String {
 }
 
 /// Scheduler-owned periodic sweep (RAL-400 Phase 6): send each closed
-/// waypoint's *advisory*-mode roster entries a one-time stand-down notice
+/// waypoint's *advisory*-mode affected entries a one-time stand-down notice
 /// once their waypoint has closed (auto- or manually). `Block`-mode entries
 /// never get one -- once their waypoint closes, gating simply lifts (see
 /// `Store::squad_block_gating_waypoint`'s live `state='open'` filter), which
 /// is itself the signal; a separate notice would be redundant.
 ///
 /// Idempotent per entry via `stand_down_at_ms`
-/// ([`Store::mark_roster_entry_stood_down`]) -- reopening a waypoint does not
+/// ([`Store::mark_affected_entry_stood_down`]) -- reopening a waypoint does not
 /// reset it (see [`Store::reopen_waypoint`]'s doc comment), so a later
 /// re-close never re-sends a notice that already went out.
 ///
@@ -3394,18 +3404,20 @@ pub fn run_pending_stand_down_notices(store: &crate::store_lock::StoreHandle) {
             let Ok(waypoint) = guard.get_waypoint(&waypoint_id) else {
                 continue;
             };
-            let entries = guard.list_roster_entries(&waypoint_id).unwrap_or_default();
+            let entries = guard
+                .list_affected_entries(&waypoint_id)
+                .unwrap_or_default();
             (waypoint, entries)
         };
         for entry in entries {
-            if entry.mode != RosterMode::Advisory || entry.stand_down_at_ms.is_some() {
+            if entry.mode != AffectedMode::Advisory || entry.stand_down_at_ms.is_some() {
                 continue;
             }
             match entry.kind {
-                RosterEntryKind::Review => {
+                WaypointEntryKind::Review => {
                     stand_down_review(store, &waypoint_id, &waypoint, &entry.entry_id);
                 }
-                RosterEntryKind::Squad => {
+                WaypointEntryKind::Squad => {
                     stand_down_squad(store, &waypoint_id, &waypoint, &entry.entry_id);
                 }
             }
@@ -3413,7 +3425,7 @@ pub fn run_pending_stand_down_notices(store: &crate::store_lock::StoreHandle) {
     }
 }
 
-/// Send one review roster entry's stand-down notice to the review's watchers.
+/// Send one review affected entry's stand-down notice to the review's watchers.
 ///
 /// Deliberately a plain mailbox notification, not the feedback path. The
 /// feedback path (`guardian_merge::start_feedback`) is how *guidance* reaches
@@ -3444,7 +3456,8 @@ fn stand_down_review(
         None,
         None,
     );
-    let _ = guard.mark_roster_entry_stood_down(waypoint_id, RosterEntryKind::Review, guardian_id);
+    let _ =
+        guard.mark_affected_entry_stood_down(waypoint_id, WaypointEntryKind::Review, guardian_id);
     crate::cartographer::Note::new("waypoints")
         .scope("waypoint")
         .guardian(guardian_id)
@@ -3458,7 +3471,7 @@ fn stand_down_review(
         );
 }
 
-/// Send one squad roster entry's stand-down notice, addressed to the cells
+/// Send one squad affected entry's stand-down notice, addressed to the cells
 /// this waypoint actually advised so their own watchers receive it.
 ///
 /// A watch matches when the *watched* entity covers the message's entity
@@ -3509,7 +3522,7 @@ fn stand_down_squad(
             );
         }
     }
-    let _ = guard.mark_roster_entry_stood_down(waypoint_id, RosterEntryKind::Squad, squad_id);
+    let _ = guard.mark_affected_entry_stood_down(waypoint_id, WaypointEntryKind::Squad, squad_id);
     crate::cartographer::Note::new("waypoints")
         .scope("waypoint")
         .squad(squad_id)
@@ -3547,17 +3560,17 @@ fn stand_down_squad(
 /// section of `.agent/waypoints-phase0-decisions.md`.
 const SURVEY_MAX_PER_SWEEP: usize = 8;
 
-/// The `EntityUri` string for one roster entry, as the mailbox and watch
+/// The `EntityUri` string for one affected entry, as the mailbox and watch
 /// machinery address it.
 #[must_use]
-pub fn roster_entry_uri(kind: RosterEntryKind, entry_id: &str) -> String {
+pub fn affected_entry_uri(kind: WaypointEntryKind, entry_id: &str) -> String {
     match kind {
-        RosterEntryKind::Squad => format!("squad:{entry_id}"),
-        RosterEntryKind::Review => format!("guardian:{entry_id}"),
+        WaypointEntryKind::Squad => format!("squad:{entry_id}"),
+        WaypointEntryKind::Review => format!("guardian:{entry_id}"),
     }
 }
 
-/// Notify a roster entry's watchers that an open waypoint is now **holding**
+/// Notify a affected entry's watchers that an open waypoint is now **holding**
 /// it, so work that is blocked says so instead of sitting silently.
 ///
 /// Carries remediation per RAL-502 (this is a blocked state): both ways out --
@@ -3572,7 +3585,7 @@ pub fn notify_entry_blocked(
     store: &Store,
     waypoint_id: &str,
     waypoint: Option<&WaypointView>,
-    kind: RosterEntryKind,
+    kind: WaypointEntryKind,
     entry_id: &str,
     detail: &str,
 ) {
@@ -3582,22 +3595,22 @@ pub fn notify_entry_blocked(
     );
     let message = format!(
         "This {} ({entry_id}) is held by open {which}: {detail}. It stays held until the waypoint \
-         closes or this roster entry is set to advisory.",
+         closes or this affected entry is set to advisory.",
         kind.as_str()
     );
     let remediation = crate::mailbox::Remediation::SuggestedCommand {
-        command: format!("ralphus waypoint roster mode {waypoint_id} {entry_id} advisory"),
+        command: format!("ralphus waypoint affected mode {waypoint_id} {entry_id} advisory"),
         purpose: "release this entry without closing the waypoint, if it only needs to be aware \
                   of the guidance rather than wait for it"
             .to_string(),
     };
     let squad_scope = match kind {
-        RosterEntryKind::Squad => Some(entry_id),
-        RosterEntryKind::Review => None,
+        WaypointEntryKind::Squad => Some(entry_id),
+        WaypointEntryKind::Review => None,
     };
     let _ = store.notify_watchers_with_remediation(
         crate::monitor::NotifiableEventKind::WaypointBlocked,
-        &roster_entry_uri(kind, entry_id),
+        &affected_entry_uri(kind, entry_id),
         crate::mailbox::MailboxPriority::Normal,
         &message,
         &remediation,
@@ -3607,7 +3620,7 @@ pub fn notify_entry_blocked(
     );
 }
 
-/// Notify a roster entry's watchers that a waypoint's guidance applies to it
+/// Notify a affected entry's watchers that a waypoint's guidance applies to it
 /// in `advisory` mode -- not held, but expected to account for the guidance.
 ///
 /// Informational, so it goes through `notify_watchers_with_context` rather
@@ -3617,7 +3630,7 @@ pub fn notify_entry_advised(
     store: &Store,
     waypoint_id: &str,
     waypoint: Option<&WaypointView>,
-    kind: RosterEntryKind,
+    kind: WaypointEntryKind,
     entry_id: &str,
     detail: &str,
 ) {
@@ -3632,12 +3645,12 @@ pub fn notify_entry_advised(
         kind.as_str()
     );
     let squad_scope = match kind {
-        RosterEntryKind::Squad => Some(entry_id),
-        RosterEntryKind::Review => None,
+        WaypointEntryKind::Squad => Some(entry_id),
+        WaypointEntryKind::Review => None,
     };
     let _ = store.notify_watchers_with_context(
         crate::monitor::NotifiableEventKind::WaypointAdvised,
-        &roster_entry_uri(kind, entry_id),
+        &affected_entry_uri(kind, entry_id),
         crate::mailbox::MailboxPriority::Normal,
         &message,
         squad_scope,
@@ -3646,7 +3659,7 @@ pub fn notify_entry_advised(
     );
 }
 
-/// Notify that a waypoint has stopped holding a roster entry because the
+/// Notify that a waypoint has stopped holding a affected entry because the
 /// survey found no impact. Uses the entity's own ordinary status-change kind,
 /// not a waypoint-specific one: nothing is blocked and nothing is advised, the
 /// entity simply became runnable again, and someone who was told it was held
@@ -3654,22 +3667,22 @@ pub fn notify_entry_advised(
 pub fn notify_entry_released(
     store: &Store,
     waypoint_id: &str,
-    kind: RosterEntryKind,
+    kind: WaypointEntryKind,
     entry_id: &str,
 ) {
     let (event, squad_scope) = match kind {
-        RosterEntryKind::Squad => (
+        WaypointEntryKind::Squad => (
             crate::monitor::NotifiableEventKind::SquadAttributesChanged,
             Some(entry_id),
         ),
-        RosterEntryKind::Review => (
+        WaypointEntryKind::Review => (
             crate::monitor::NotifiableEventKind::ReviewStatusChanged,
             None,
         ),
     };
     let _ = store.notify_watchers_with_context(
         event,
-        &roster_entry_uri(kind, entry_id),
+        &affected_entry_uri(kind, entry_id),
         crate::mailbox::MailboxPriority::Normal,
         &format!(
             "Waypoint {waypoint_id} no longer holds this {} ({entry_id}): the survey found its \
@@ -3719,16 +3732,16 @@ fn direct_chat_handles(backend: &str) -> bool {
 /// `git_root`. `None` when neither is recorded, which makes the caller fall
 /// back to the direct-chat transport (a terminal agent cannot be spawned
 /// without somewhere to spawn it).
-fn survey_candidate_cwd(store: &Store, kind: RosterEntryKind, entry_id: &str) -> Option<String> {
+fn survey_candidate_cwd(store: &Store, kind: WaypointEntryKind, entry_id: &str) -> Option<String> {
     match kind {
-        RosterEntryKind::Squad => store.get_squad(entry_id).ok().and_then(|squad| {
+        WaypointEntryKind::Squad => store.get_squad(entry_id).ok().and_then(|squad| {
             squad.tasks.iter().find_map(|task| {
                 task.cells
                     .iter()
                     .find_map(|cell| cell.cwd.clone().filter(|c| !c.trim().is_empty()))
             })
         }),
-        RosterEntryKind::Review => store
+        WaypointEntryKind::Review => store
             .get_guardian(entry_id)
             .ok()
             .map(|g| g.git_root)
@@ -3902,7 +3915,7 @@ pub fn render_injection_block(injections: &[PendingInjectionView], rebased: bool
 /// The message body for a stale-work notice. Names the waypoint whose closure
 /// triggered it, so a reader can tell *which* coordination point their
 /// finished work predates.
-fn stale_notice_text(waypoint: &WaypointView, kind: RosterEntryKind, entry_id: &str) -> String {
+fn stale_notice_text(waypoint: &WaypointView, kind: WaypointEntryKind, entry_id: &str) -> String {
     let which = match &waypoint.label {
         Some(label) => format!("waypoint \"{label}\""),
         None => format!("waypoint {}", waypoint.id),
@@ -3916,7 +3929,7 @@ fn stale_notice_text(waypoint: &WaypointView, kind: RosterEntryKind, entry_id: &
     )
 }
 
-/// Scheduler-owned periodic sweep: flag any roster entry whose work finished
+/// Scheduler-owned periodic sweep: flag any affected entry whose work finished
 /// **while its waypoint was still open** and whose survey had judged it
 /// `impacted`, so a human can decide whether to redo it.
 ///
@@ -3938,7 +3951,7 @@ fn stale_notice_text(waypoint: &WaypointView, kind: RosterEntryKind, entry_id: &
 /// a single-project repo has `Scope::RepoWide`, so it can legitimately cover
 /// every squad in the project -- auto-redoing on that basis would re-run an
 /// unbounded amount of finished work and spend real money with no one asking.
-/// Acting on a flag is [`redo_roster_entry`], via `ralphus waypoint redo`.
+/// Acting on a flag is [`redo_affected_entry`], via `ralphus waypoint redo`.
 ///
 /// Costs no LLM calls: it only reads verdicts the survey already recorded.
 /// That is also its one limitation -- work that was *already terminal before
@@ -3949,7 +3962,7 @@ fn stale_notice_text(waypoint: &WaypointView, kind: RosterEntryKind, entry_id: &
 /// which is unbounded; it is left out on purpose.
 ///
 /// Idempotent per entry via `stale_at_ms`
-/// ([`Store::mark_roster_entry_stale`]), which a redo clears, so an entry
+/// ([`Store::mark_affected_entry_stale`]), which a redo clears, so an entry
 /// already dealt with is never re-flagged.
 pub fn run_pending_stale_notices(store: &crate::store_lock::StoreHandle) {
     let waypoint_ids = {
@@ -3962,7 +3975,9 @@ pub fn run_pending_stale_notices(store: &crate::store_lock::StoreHandle) {
             let Ok(waypoint) = guard.get_waypoint(&waypoint_id) else {
                 continue;
             };
-            let entries = guard.list_roster_entries(&waypoint_id).unwrap_or_default();
+            let entries = guard
+                .list_affected_entries(&waypoint_id)
+                .unwrap_or_default();
             (waypoint, entries)
         };
         for entry in entries {
@@ -3971,13 +3986,13 @@ pub fn run_pending_stale_notices(store: &crate::store_lock::StoreHandle) {
             }
             let guard = store.lock();
             if !guard
-                .roster_entry_work_is_terminal(entry.kind, &entry.entry_id)
+                .affected_entry_work_is_terminal(entry.kind, &entry.entry_id)
                 .unwrap_or(false)
             {
                 continue;
             }
             if !guard
-                .mark_roster_entry_stale(&waypoint_id, entry.kind, &entry.entry_id)
+                .mark_affected_entry_stale(&waypoint_id, entry.kind, &entry.entry_id)
                 .unwrap_or(false)
             {
                 continue;
@@ -3992,26 +4007,26 @@ pub fn run_pending_stale_notices(store: &crate::store_lock::StoreHandle) {
             // and nothing has failed), and the remediation-carrying variant
             // asserts it is only used for the failure/blocked event kinds. The
             // next-step command is therefore part of the message body, the
-            // same way the new-waypoint roster notice states its own.
+            // same way the new-waypoint affected notice states its own.
             let next_step = match entry.kind {
-                RosterEntryKind::Squad => format!(
+                WaypointEntryKind::Squad => format!(
                     " To re-run it with its prior findings and this waypoint's bearings \
                      carried into the new run: `ralphus waypoint redo {waypoint_id} {}`.",
                     entry.entry_id
                 ),
-                RosterEntryKind::Review => format!(
+                WaypointEntryKind::Review => format!(
                     " A review has no cells of its own to re-run -- inspect this waypoint's \
                      bearings with `ralphus waypoint get {waypoint_id}`, then redo the squad \
                      behind this review if its work needs regenerating."
                 ),
             };
             let entity_uri = match entry.kind {
-                RosterEntryKind::Squad => format!("squad:{}", entry.entry_id),
-                RosterEntryKind::Review => format!("guardian:{}", entry.entry_id),
+                WaypointEntryKind::Squad => format!("squad:{}", entry.entry_id),
+                WaypointEntryKind::Review => format!("guardian:{}", entry.entry_id),
             };
             let squad_scope = match entry.kind {
-                RosterEntryKind::Squad => Some(entry.entry_id.as_str()),
-                RosterEntryKind::Review => None,
+                WaypointEntryKind::Squad => Some(entry.entry_id.as_str()),
+                WaypointEntryKind::Review => None,
             };
             let body = format!(
                 "{}{next_step}",
@@ -4028,8 +4043,8 @@ pub fn run_pending_stale_notices(store: &crate::store_lock::StoreHandle) {
             );
             let note = crate::cartographer::Note::new("waypoints").scope("waypoint");
             let note = match entry.kind {
-                RosterEntryKind::Squad => note.squad(&entry.entry_id),
-                RosterEntryKind::Review => note.guardian(&entry.entry_id),
+                WaypointEntryKind::Squad => note.squad(&entry.entry_id),
+                WaypointEntryKind::Review => note.guardian(&entry.entry_id),
             };
             note.emit(
                 &guard,
@@ -4048,7 +4063,7 @@ pub fn run_pending_stale_notices(store: &crate::store_lock::StoreHandle) {
     }
 }
 
-/// Redo one stale-flagged squad roster entry: fold the waypoint's bearings
+/// Redo one stale-flagged squad affected entry: fold the waypoint's bearings
 /// into every cell's ghost note, reset the squad to `pending`, and clear the
 /// flag. Returns the squads this dirtied downstream (same as
 /// [`Store::restart_squad`]).
@@ -4070,23 +4085,23 @@ pub fn run_pending_stale_notices(store: &crate::store_lock::StoreHandle) {
 /// and redoing the squad behind it is the meaningful action.
 ///
 /// # Errors
-/// [`StoreError::NotFound`] if the waypoint or roster entry doesn't exist;
+/// [`StoreError::NotFound`] if the waypoint or affected entry doesn't exist;
 /// [`StoreError::InvalidTransition`] for a review-kind entry; otherwise
 /// propagates any SQLite failure.
-pub fn redo_roster_entry(
+pub fn redo_affected_entry(
     store: &Store,
     waypoint_id: &str,
     entry_id: &str,
 ) -> StoreResult<Vec<String>> {
     let _ = store.get_waypoint(waypoint_id)?;
     let entry = store
-        .list_roster_entries(waypoint_id)?
+        .list_affected_entries(waypoint_id)?
         .into_iter()
         .find(|e| e.entry_id == entry_id)
         .ok_or(StoreError::NotFound)?;
-    if entry.kind != RosterEntryKind::Squad {
+    if entry.kind != WaypointEntryKind::Squad {
         return Err(StoreError::InvalidTransition(format!(
-            "roster entry {entry_id} on waypoint {waypoint_id} is a review, which has no cells \
+            "affected entry {entry_id} on waypoint {waypoint_id} is a review, which has no cells \
              of its own to re-run -- redo the squad that produced it instead"
         )));
     }
@@ -4129,7 +4144,7 @@ pub fn redo_roster_entry(
     }
 
     let dirtied = store.restart_squad(entry_id)?;
-    let _ = store.clear_roster_entry_stale(waypoint_id, RosterEntryKind::Squad, entry_id);
+    let _ = store.clear_affected_entry_stale(waypoint_id, WaypointEntryKind::Squad, entry_id);
     crate::cartographer::Note::new("waypoints")
         .scope("waypoint")
         .squad(entry_id)
@@ -4159,7 +4174,7 @@ mod tests {
     /// Records the answer a blocking affected entry owes its waypoint, so a
     /// test about *terminality* can reach phase 2 without also restating the
     /// bearing contract each time. See `Store::affected_have_answered`.
-    fn answer(store: &Store, waypoint_id: &str, kind: RosterEntryKind, entry_id: &str) {
+    fn answer(store: &Store, waypoint_id: &str, kind: WaypointEntryKind, entry_id: &str) {
         store
             .set_affected_bearing_decision(waypoint_id, kind, entry_id, BearingDecision::Accepted)
             .unwrap();
@@ -4239,90 +4254,90 @@ mod tests {
     }
 
     #[test]
-    fn roster_add_remove_review_and_squad_entries() {
+    fn affected_add_remove_review_and_squad_entries() {
         let store = Store::open_in_memory().unwrap();
         open_waypoint(&store, "waypoint-1");
 
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Review,
+                WaypointEntryKind::Review,
                 "guardian-1",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-1",
-                RosterMode::Advisory,
+                AffectedMode::Advisory,
             )
             .unwrap();
 
-        let entries = store.list_roster_entries("waypoint-1").unwrap();
+        let entries = store.list_affected_entries("waypoint-1").unwrap();
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].kind, RosterEntryKind::Review);
-        assert_eq!(entries[0].mode, RosterMode::Block);
-        assert_eq!(entries[1].kind, RosterEntryKind::Squad);
-        assert_eq!(entries[1].mode, RosterMode::Advisory);
+        assert_eq!(entries[0].kind, WaypointEntryKind::Review);
+        assert_eq!(entries[0].mode, AffectedMode::Block);
+        assert_eq!(entries[1].kind, WaypointEntryKind::Squad);
+        assert_eq!(entries[1].mode, AffectedMode::Advisory);
 
         assert!(
             store
-                .remove_roster_entry("waypoint-1", RosterEntryKind::Review, "guardian-1")
+                .remove_affected_entry("waypoint-1", WaypointEntryKind::Review, "guardian-1")
                 .unwrap()
         );
         assert!(
             !store
-                .remove_roster_entry("waypoint-1", RosterEntryKind::Review, "guardian-1")
+                .remove_affected_entry("waypoint-1", WaypointEntryKind::Review, "guardian-1")
                 .unwrap()
         );
-        let entries = store.list_roster_entries("waypoint-1").unwrap();
+        let entries = store.list_affected_entries("waypoint-1").unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].kind, RosterEntryKind::Squad);
+        assert_eq!(entries[0].kind, WaypointEntryKind::Squad);
     }
 
     #[test]
-    fn re_adding_a_roster_entry_updates_mode_in_place() {
+    fn re_adding_a_affected_entry_updates_mode_in_place() {
         let store = Store::open_in_memory().unwrap();
         open_waypoint(&store, "waypoint-1");
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-1",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-1",
-                RosterMode::Advisory,
+                AffectedMode::Advisory,
             )
             .unwrap();
-        let entries = store.list_roster_entries("waypoint-1").unwrap();
+        let entries = store.list_affected_entries("waypoint-1").unwrap();
         assert_eq!(entries.len(), 1, "re-adding must not duplicate the row");
-        assert_eq!(entries[0].mode, RosterMode::Advisory);
+        assert_eq!(entries[0].mode, AffectedMode::Advisory);
     }
 
     #[test]
-    fn auto_close_requires_every_roster_entry_terminal_squad_and_review_alike() {
+    fn auto_close_requires_every_affected_entry_terminal_squad_and_review_alike() {
         let store = Store::open_in_memory().unwrap();
         open_waypoint(&store, "waypoint-1");
 
         let squad_id = "squad-1";
         insert_bare_squad(&store, squad_id, SquadState::Pending);
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 squad_id,
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
-        answer(&store, "waypoint-1", RosterEntryKind::Squad, squad_id);
+        answer(&store, "waypoint-1", WaypointEntryKind::Squad, squad_id);
         assert!(!store.maybe_auto_close_waypoint("waypoint-1").unwrap());
         assert!(store.waypoint_is_open("waypoint-1").unwrap());
 
@@ -4350,19 +4365,19 @@ mod tests {
         insert_bare_squad(&store, squad_a, SquadState::Pending);
         insert_bare_squad(&store, squad_b, SquadState::Pending);
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 squad_a,
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 squad_b,
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
         store.set_squad_state(squad_a, SquadState::Done).unwrap();
@@ -4373,7 +4388,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_close_never_fires_on_an_empty_roster() {
+    fn auto_close_never_fires_on_an_empty_affected() {
         let store = Store::open_in_memory().unwrap();
         open_waypoint(&store, "waypoint-1");
         assert!(!store.maybe_auto_close_waypoint("waypoint-1").unwrap());
@@ -4386,14 +4401,14 @@ mod tests {
         open_waypoint(&store, "waypoint-1");
         insert_bare_squad(&store, "squad-1", SquadState::Pending);
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-1",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
-        answer(&store, "waypoint-1", RosterEntryKind::Squad, "squad-1");
+        answer(&store, "waypoint-1", WaypointEntryKind::Squad, "squad-1");
 
         store
             .set_squad_state("squad-1", SquadState::Failed)
@@ -4416,14 +4431,19 @@ mod tests {
         open_waypoint(&store, "waypoint-1");
         insert_bare_guardian(&store, "guardian-1");
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Review,
+                WaypointEntryKind::Review,
                 "guardian-1",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
-        answer(&store, "waypoint-1", RosterEntryKind::Review, "guardian-1");
+        answer(
+            &store,
+            "waypoint-1",
+            WaypointEntryKind::Review,
+            "guardian-1",
+        );
 
         store
             .set_guardian_status("guardian-1", GuardianStatus::MergeFailed, Some("conflict"))
@@ -4449,23 +4469,28 @@ mod tests {
         insert_bare_squad(&store, "squad-1", SquadState::Pending);
         insert_bare_guardian(&store, "guardian-1");
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-1",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Review,
+                WaypointEntryKind::Review,
                 "guardian-1",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
-        answer(&store, "waypoint-1", RosterEntryKind::Squad, "squad-1");
-        answer(&store, "waypoint-1", RosterEntryKind::Review, "guardian-1");
+        answer(&store, "waypoint-1", WaypointEntryKind::Squad, "squad-1");
+        answer(
+            &store,
+            "waypoint-1",
+            WaypointEntryKind::Review,
+            "guardian-1",
+        );
 
         store
             .set_guardian_status("guardian-1", GuardianStatus::Cancelled, None)
@@ -4482,46 +4507,61 @@ mod tests {
     }
 
     #[test]
-    fn two_waypoints_sharing_a_roster_entry_close_independently() {
+    fn two_waypoints_sharing_a_affected_entry_close_independently() {
         let store = Store::open_in_memory().unwrap();
         open_waypoint(&store, "waypoint-1");
         open_waypoint(&store, "waypoint-2");
         insert_bare_squad(&store, "squad-shared", SquadState::Pending);
         insert_bare_squad(&store, "squad-only-2", SquadState::Pending);
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-shared",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-2",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-shared",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-2",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-only-2",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
-        answer(&store, "waypoint-1", RosterEntryKind::Squad, "squad-shared");
-        answer(&store, "waypoint-2", RosterEntryKind::Squad, "squad-shared");
-        answer(&store, "waypoint-2", RosterEntryKind::Squad, "squad-only-2");
+        answer(
+            &store,
+            "waypoint-1",
+            WaypointEntryKind::Squad,
+            "squad-shared",
+        );
+        answer(
+            &store,
+            "waypoint-2",
+            WaypointEntryKind::Squad,
+            "squad-shared",
+        );
+        answer(
+            &store,
+            "waypoint-2",
+            WaypointEntryKind::Squad,
+            "squad-only-2",
+        );
 
         store
             .set_squad_state("squad-shared", SquadState::Done)
             .unwrap();
         assert!(
             !store.waypoint_is_open("waypoint-1").unwrap(),
-            "waypoint-1's only roster entry is now terminal, so it should auto-close"
+            "waypoint-1's only affected entry is now terminal, so it should auto-close"
         );
         assert!(
             store.waypoint_is_open("waypoint-2").unwrap(),
@@ -4533,21 +4573,21 @@ mod tests {
             .unwrap();
         assert!(
             !store.waypoint_is_open("waypoint-2").unwrap(),
-            "waypoint-2's last roster entry is now terminal, so it should auto-close too"
+            "waypoint-2's last affected entry is now terminal, so it should auto-close too"
         );
     }
 
     #[test]
-    fn manual_close_overrides_non_terminal_roster_and_is_idempotent() {
+    fn manual_close_overrides_non_terminal_affected_and_is_idempotent() {
         let store = Store::open_in_memory().unwrap();
         open_waypoint(&store, "waypoint-1");
         insert_bare_squad(&store, "squad-1", SquadState::Pending);
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-1",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
 
@@ -4564,11 +4604,11 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         open_waypoint(&store, "waypoint-1");
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-1",
-                RosterMode::Advisory,
+                AffectedMode::Advisory,
             )
             .unwrap();
         insert_bare_squad(&store, "squad-1", SquadState::Pending);
@@ -4579,9 +4619,9 @@ mod tests {
         );
 
         store
-            .mark_roster_entry_stood_down("waypoint-1", RosterEntryKind::Squad, "squad-1")
+            .mark_affected_entry_stood_down("waypoint-1", WaypointEntryKind::Squad, "squad-1")
             .unwrap();
-        let stood_down_at = store.list_roster_entries("waypoint-1").unwrap()[0]
+        let stood_down_at = store.list_affected_entries("waypoint-1").unwrap()[0]
             .stand_down_at_ms
             .unwrap();
 
@@ -4593,7 +4633,7 @@ mod tests {
             "reopening an already-open waypoint must be a no-op"
         );
 
-        let entries = store.list_roster_entries("waypoint-1").unwrap();
+        let entries = store.list_affected_entries("waypoint-1").unwrap();
         assert_eq!(
             entries[0].stand_down_at_ms,
             Some(stood_down_at),
@@ -4602,29 +4642,29 @@ mod tests {
     }
 
     #[test]
-    fn mark_roster_entry_stood_down_is_idempotent() {
+    fn mark_affected_entry_stood_down_is_idempotent() {
         let store = Store::open_in_memory().unwrap();
         open_waypoint(&store, "waypoint-1");
         insert_bare_squad(&store, "squad-1", SquadState::Pending);
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-1",
-                RosterMode::Advisory,
+                AffectedMode::Advisory,
             )
             .unwrap();
 
         store
-            .mark_roster_entry_stood_down("waypoint-1", RosterEntryKind::Squad, "squad-1")
+            .mark_affected_entry_stood_down("waypoint-1", WaypointEntryKind::Squad, "squad-1")
             .unwrap();
-        let first = store.list_roster_entries("waypoint-1").unwrap()[0]
+        let first = store.list_affected_entries("waypoint-1").unwrap()[0]
             .stand_down_at_ms
             .unwrap();
         store
-            .mark_roster_entry_stood_down("waypoint-1", RosterEntryKind::Squad, "squad-1")
+            .mark_affected_entry_stood_down("waypoint-1", WaypointEntryKind::Squad, "squad-1")
             .unwrap();
-        let second = store.list_roster_entries("waypoint-1").unwrap()[0]
+        let second = store.list_affected_entries("waypoint-1").unwrap()[0]
             .stand_down_at_ms
             .unwrap();
         assert_eq!(
@@ -4641,7 +4681,7 @@ mod tests {
         let b1 = store
             .append_waypoint_bearing(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-1",
                 "first summary",
                 None,
@@ -4652,7 +4692,7 @@ mod tests {
         let b2 = store
             .append_waypoint_bearing(
                 "waypoint-1",
-                RosterEntryKind::Review,
+                WaypointEntryKind::Review,
                 "guardian-1",
                 "second summary",
                 Some("squad:squad-1"),
@@ -4684,7 +4724,7 @@ mod tests {
         store
             .append_waypoint_bearing(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-1",
                 "for one",
                 None,
@@ -4695,7 +4735,7 @@ mod tests {
         store
             .append_waypoint_bearing(
                 "waypoint-2",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-2",
                 "for two",
                 None,
@@ -4726,7 +4766,7 @@ mod tests {
         let completed = store
             .append_waypoint_bearing(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-completed",
                 "renamed the shared helper to `resolve_thing`",
                 Some("squad:squad-completed"),
@@ -4738,7 +4778,7 @@ mod tests {
         let requested = store
             .append_waypoint_bearing(
                 "waypoint-1",
-                RosterEntryKind::Review,
+                WaypointEntryKind::Review,
                 "guardian-requested",
                 "please rename your call sites to use the new helper name",
                 None,
@@ -4750,7 +4790,7 @@ mod tests {
         let proposed = store
             .append_waypoint_bearing(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-proposed",
                 "considering removing the helper entirely in a future pass",
                 None,
@@ -5043,7 +5083,7 @@ mod tests {
     }
 
     #[test]
-    fn waypoint_scope_unions_squad_and_review_roster_entries_repo_wide_wins() {
+    fn waypoint_scope_unions_squad_and_review_affected_entries_repo_wide_wins() {
         let store = Store::open_in_memory().unwrap();
         open_waypoint(&store, "waypoint-1");
 
@@ -5058,19 +5098,19 @@ mod tests {
         insert_bare_cell(&store, "squad-b", 0, 0, None, None);
 
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Review,
+                WaypointEntryKind::Review,
                 "guardian-1",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-b",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
 
@@ -5079,7 +5119,7 @@ mod tests {
     }
 
     #[test]
-    fn waypoint_scope_unions_disjoint_areas_across_roster_entries() {
+    fn waypoint_scope_unions_disjoint_areas_across_affected_entries() {
         let store = Store::open_in_memory().unwrap();
         open_waypoint(&store, "waypoint-1");
 
@@ -5094,19 +5134,19 @@ mod tests {
         insert_cell_subproject(&store, "squad-b", 0, 0, "billing", false);
 
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-a",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-b",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
 
@@ -5141,7 +5181,7 @@ mod tests {
         )
         .unwrap();
         assert!(verdict.impacted);
-        assert_eq!(verdict.mode, RosterMode::Block);
+        assert_eq!(verdict.mode, AffectedMode::Block);
         assert_eq!(verdict.rationale, "touches the auth flow");
     }
 
@@ -5174,21 +5214,21 @@ mod tests {
         // allow_advisory=true, impacted=yes, MODE: advisory -> Advisory.
         let verdict =
             parse_survey_reply("IMPACTED: yes\nMODE: advisory\nRATIONALE: fyi only", true).unwrap();
-        assert_eq!(verdict.mode, RosterMode::Advisory);
+        assert_eq!(verdict.mode, AffectedMode::Advisory);
 
         // allow_advisory=true, impacted=yes, MODE: block -> Block.
         let verdict = parse_survey_reply("IMPACTED: yes\nMODE: block\nRATIONALE: r", true).unwrap();
-        assert_eq!(verdict.mode, RosterMode::Block);
+        assert_eq!(verdict.mode, AffectedMode::Block);
 
         // allow_advisory=true but impacted=no -> always Block regardless of MODE.
         let verdict =
             parse_survey_reply("IMPACTED: no\nMODE: advisory\nRATIONALE: r", true).unwrap();
-        assert_eq!(verdict.mode, RosterMode::Block);
+        assert_eq!(verdict.mode, AffectedMode::Block);
 
         // allow_advisory=false -> a MODE line is ignored entirely, always Block.
         let verdict =
             parse_survey_reply("IMPACTED: yes\nMODE: advisory\nRATIONALE: r", false).unwrap();
-        assert_eq!(verdict.mode, RosterMode::Block);
+        assert_eq!(verdict.mode, AffectedMode::Block);
     }
 
     // ── resolve_survey_verdict (fail-closed + advisory de-escalation) ──────
@@ -5197,7 +5237,7 @@ mod tests {
     fn resolve_survey_verdict_fails_closed_on_call_error() {
         let verdict = resolve_survey_verdict(Err("connection refused".to_string()), false);
         assert!(verdict.impacted);
-        assert_eq!(verdict.mode, RosterMode::Block);
+        assert_eq!(verdict.mode, AffectedMode::Block);
         assert!(verdict.rationale.contains("connection refused"));
     }
 
@@ -5206,7 +5246,7 @@ mod tests {
         let verdict =
             resolve_survey_verdict(Ok("the model rambled without a verdict".to_string()), false);
         assert!(verdict.impacted);
-        assert_eq!(verdict.mode, RosterMode::Block);
+        assert_eq!(verdict.mode, AffectedMode::Block);
         assert!(verdict.rationale.contains("unparseable"));
     }
 
@@ -5220,7 +5260,7 @@ mod tests {
             true,
         );
         assert!(verdict.impacted);
-        assert_eq!(verdict.mode, RosterMode::Advisory);
+        assert_eq!(verdict.mode, AffectedMode::Advisory);
     }
 
     #[test]
@@ -5230,7 +5270,7 @@ mod tests {
             false,
         );
         assert!(verdict.impacted);
-        assert_eq!(verdict.mode, RosterMode::Block);
+        assert_eq!(verdict.mode, AffectedMode::Block);
     }
 
     #[test]
@@ -5240,7 +5280,7 @@ mod tests {
             true,
         );
         assert!(!verdict.impacted);
-        assert_eq!(verdict.mode, RosterMode::Block);
+        assert_eq!(verdict.mode, AffectedMode::Block);
     }
 
     // ── waypoint_survey_candidates (matching-model population) ─────────────
@@ -5250,19 +5290,19 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         open_waypoint(&store, "waypoint-1");
 
-        // Seed the waypoint's scope with one roster entry in project "core",
-        // area "auth" -- standing in for whatever adds the initial roster
+        // Seed the waypoint's scope with one affected entry in project "core",
+        // area "auth" -- standing in for whatever adds the initial affected
         // entry a waypoint is declared against.
         insert_bare_squad(&store, "squad-seed", SquadState::Pending);
         insert_bare_task(&store, "squad-seed", 0, "core");
         insert_bare_cell(&store, "squad-seed", 0, 0, None, None);
         insert_cell_subproject(&store, "squad-seed", 0, 0, "auth", false);
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-seed",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
 
@@ -5290,9 +5330,9 @@ mod tests {
         assert_eq!(
             candidates.len(),
             1,
-            "unrelated-area/project candidates must gain zero roster/survey state: {candidates:?}"
+            "unrelated-area/project candidates must gain zero affected/survey state: {candidates:?}"
         );
-        assert_eq!(candidates[0].kind, RosterEntryKind::Squad);
+        assert_eq!(candidates[0].kind, WaypointEntryKind::Squad);
         assert_eq!(candidates[0].entry_id, "squad-match");
     }
 
@@ -5302,17 +5342,17 @@ mod tests {
         open_waypoint(&store, "waypoint-1");
 
         // Seed the waypoint against both "auth" and "billing" via two
-        // separately-scoped roster entries.
+        // separately-scoped affected entries.
         insert_bare_squad(&store, "squad-seed-auth", SquadState::Pending);
         insert_bare_task(&store, "squad-seed-auth", 0, "core");
         insert_bare_cell(&store, "squad-seed-auth", 0, 0, None, None);
         insert_cell_subproject(&store, "squad-seed-auth", 0, 0, "auth", false);
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-seed-auth",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
 
@@ -5321,11 +5361,11 @@ mod tests {
         insert_bare_cell(&store, "squad-seed-billing", 0, 0, None, None);
         insert_cell_subproject(&store, "squad-seed-billing", 0, 0, "billing", false);
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-seed-billing",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
 
@@ -5353,18 +5393,18 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         open_waypoint(&store, "waypoint-1");
 
-        // Seed roster entry whose cell never got a subproject resolution --
+        // Seed affected entry whose cell never got a subproject resolution --
         // this project's scope can't be safely narrowed, so it goes
         // repo-wide (conservative fallback), per Phase 0.
         insert_bare_squad(&store, "squad-seed", SquadState::Pending);
         insert_bare_task(&store, "squad-seed", 0, "core");
         insert_bare_cell(&store, "squad-seed", 0, 0, None, None);
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-seed",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
         assert_eq!(
@@ -5402,7 +5442,7 @@ mod tests {
     }
 
     #[test]
-    fn survey_candidates_exclude_terminal_and_already_rostered_entries() {
+    fn survey_candidates_exclude_terminal_and_already_affecteded_entries() {
         let store = Store::open_in_memory().unwrap();
         open_waypoint(&store, "waypoint-1");
 
@@ -5411,11 +5451,11 @@ mod tests {
         insert_bare_cell(&store, "squad-seed", 0, 0, None, None);
         insert_cell_subproject(&store, "squad-seed", 0, 0, "auth", false);
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-seed",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
 
@@ -5425,18 +5465,18 @@ mod tests {
         insert_bare_cell(&store, "squad-done", 0, 0, None, None);
         insert_cell_subproject(&store, "squad-done", 0, 0, "auth", false);
 
-        // Overlapping scope but already an explicit roster entry -> excluded
+        // Overlapping scope but already an explicit affected entry -> excluded
         // (it's already been surveyed/tracked, not a fresh candidate).
-        insert_bare_squad(&store, "squad-already-rostered", SquadState::Pending);
-        insert_bare_task(&store, "squad-already-rostered", 0, "core");
-        insert_bare_cell(&store, "squad-already-rostered", 0, 0, None, None);
-        insert_cell_subproject(&store, "squad-already-rostered", 0, 0, "auth", false);
+        insert_bare_squad(&store, "squad-already-affecteded", SquadState::Pending);
+        insert_bare_task(&store, "squad-already-affecteded", 0, "core");
+        insert_bare_cell(&store, "squad-already-affecteded", 0, 0, None, None);
+        insert_cell_subproject(&store, "squad-already-affecteded", 0, 0, "auth", false);
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
-                "squad-already-rostered",
-                RosterMode::Block,
+                WaypointEntryKind::Squad,
+                "squad-already-affecteded",
+                AffectedMode::Block,
             )
             .unwrap();
 
@@ -5471,24 +5511,24 @@ mod tests {
         let candidates = store.waypoint_survey_candidates("waypoint-1").unwrap();
         let squad_ids: Vec<&str> = candidates
             .iter()
-            .filter(|c| c.kind == RosterEntryKind::Squad)
+            .filter(|c| c.kind == WaypointEntryKind::Squad)
             .map(|c| c.entry_id.as_str())
             .collect();
         let review_ids: Vec<&str> = candidates
             .iter()
-            .filter(|c| c.kind == RosterEntryKind::Review)
+            .filter(|c| c.kind == WaypointEntryKind::Review)
             .map(|c| c.entry_id.as_str())
             .collect();
         assert_eq!(
             squad_ids,
             vec!["squad-for-merged-review", "squad-for-open-review"],
-            "the squads backing both reviews are themselves fresh, non-terminal, un-rostered candidates too"
+            "the squads backing both reviews are themselves fresh, non-terminal, un-affecteded candidates too"
         );
         assert_eq!(review_ids, vec!["guardian-open"]);
     }
 
     #[test]
-    fn survey_candidates_empty_until_the_waypoint_has_a_seeded_roster_scope() {
+    fn survey_candidates_empty_until_the_waypoint_has_a_seeded_affected_scope() {
         let store = Store::open_in_memory().unwrap();
         open_waypoint(&store, "waypoint-1");
         insert_bare_squad(&store, "squad-1", SquadState::Pending);
@@ -5496,7 +5536,7 @@ mod tests {
         insert_bare_cell(&store, "squad-1", 0, 0, None, None);
         insert_cell_subproject(&store, "squad-1", 0, 0, "auth", false);
 
-        // A waypoint with an empty roster has no aggregate scope to overlap
+        // A waypoint with an empty affected has no aggregate scope to overlap
         // against, so it must select nothing rather than guess.
         assert!(
             store
@@ -5535,17 +5575,17 @@ mod tests {
         // give it an unfinished goal to be held against.
         insert_bare_squad(&store, "squad-goal", SquadState::Pending);
         store
-            .add_roster_goal("waypoint-1", RosterEntryKind::Squad, "squad-goal", None)
+            .add_roster_entry("waypoint-1", WaypointEntryKind::Squad, "squad-goal", None)
             .unwrap();
         insert_bare_squad(&store, "squad-1", SquadState::Running);
         insert_bare_task(&store, "squad-1", 0, "core");
         insert_bare_cell(&store, "squad-1", 0, 0, None, None);
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-1",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
         halt_cell(&store, "squad-1", 0, 0);
@@ -5571,11 +5611,11 @@ mod tests {
         insert_bare_task(&store, "squad-1", 0, "core");
         insert_bare_cell(&store, "squad-1", 0, 0, None, None);
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-1",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
         halt_cell(&store, "squad-1", 0, 0);
@@ -5606,11 +5646,11 @@ mod tests {
         insert_bare_task(&store, "squad-1", 0, "core");
         insert_bare_cell(&store, "squad-1", 0, 0, None, None);
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-1",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
         halt_cell(&store, "squad-1", 0, 0);
@@ -5682,11 +5722,11 @@ mod tests {
         insert_bare_guardian(&store, "guardian-1");
         open_review_branch(&store, "guardian-1", "feature-x");
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Review,
+                WaypointEntryKind::Review,
                 "guardian-1",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
 
@@ -5695,7 +5735,7 @@ mod tests {
         run_pending_deliveries(&handle, &runner, &crate::cancel::Cancellations::new());
 
         let store = handle.lock();
-        let entries = store.list_roster_entries("waypoint-1").unwrap();
+        let entries = store.list_affected_entries("waypoint-1").unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].delivery_status, DeliveryStatus::Delivered);
     }
@@ -5707,21 +5747,21 @@ mod tests {
         insert_bare_guardian(&store, "guardian-1");
         open_review_branch(&store, "guardian-1", "feature-x");
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Review,
+                WaypointEntryKind::Review,
                 "guardian-1",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
         store
-            .set_roster_survey_result(
+            .set_affected_survey_result(
                 "waypoint-1",
-                RosterEntryKind::Review,
+                WaypointEntryKind::Review,
                 "guardian-1",
                 &SurveyVerdict {
                     impacted: false,
-                    mode: RosterMode::Block,
+                    mode: AffectedMode::Block,
                     rationale: "no overlap".to_string(),
                 },
             )
@@ -5732,7 +5772,7 @@ mod tests {
         run_pending_deliveries(&handle, &runner, &crate::cancel::Cancellations::new());
 
         let store = handle.lock();
-        let entries = store.list_roster_entries("waypoint-1").unwrap();
+        let entries = store.list_affected_entries("waypoint-1").unwrap();
         assert_eq!(
             entries[0].delivery_status,
             DeliveryStatus::Undelivered,
@@ -5746,11 +5786,11 @@ mod tests {
         open_waypoint(&store, "waypoint-1");
         insert_bare_squad(&store, "squad-1", SquadState::Done);
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-1",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
 
@@ -5759,7 +5799,7 @@ mod tests {
         run_pending_deliveries(&handle, &runner, &crate::cancel::Cancellations::new());
 
         let store = handle.lock();
-        let entries = store.list_roster_entries("waypoint-1").unwrap();
+        let entries = store.list_affected_entries("waypoint-1").unwrap();
         assert_eq!(entries[0].delivery_status, DeliveryStatus::ViaRestack);
     }
 
@@ -5769,11 +5809,11 @@ mod tests {
         open_waypoint(&store, "waypoint-1");
         insert_bare_squad(&store, "squad-1", SquadState::Running);
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-1",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
 
@@ -5782,7 +5822,7 @@ mod tests {
         run_pending_deliveries(&handle, &runner, &crate::cancel::Cancellations::new());
 
         let store = handle.lock();
-        let entries = store.list_roster_entries("waypoint-1").unwrap();
+        let entries = store.list_affected_entries("waypoint-1").unwrap();
         assert_eq!(
             entries[0].delivery_status,
             DeliveryStatus::Undelivered,
@@ -5798,7 +5838,7 @@ mod tests {
         // RAL-400 Phase 4 AC: fully-done/cancelled squads are excluded from
         // the classification population *by construction* -- this covers the
         // `Cancelled` terminal variant specifically, alongside the existing
-        // `survey_candidates_exclude_terminal_and_already_rostered_entries`
+        // `survey_candidates_exclude_terminal_and_already_affecteded_entries`
         // test's coverage of `Done`.
         let store = Store::open_in_memory().unwrap();
         open_waypoint(&store, "waypoint-1");
@@ -5808,11 +5848,11 @@ mod tests {
         insert_bare_cell(&store, "squad-seed", 0, 0, None, None);
         insert_cell_subproject(&store, "squad-seed", 0, 0, "auth", false);
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-seed",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
 
@@ -5832,7 +5872,7 @@ mod tests {
     // ── auto-enrollment + surveyability (submit-time gating gap) ─────────
 
     #[test]
-    fn an_explicitly_declared_roster_entry_is_never_a_survey_candidate() {
+    fn an_explicitly_declared_affected_entry_is_never_a_survey_candidate() {
         // The classifier must never get the chance to downgrade a human's
         // declaration to `not_impacted` and release a gate they asked for.
         let store = Store::open_in_memory().unwrap();
@@ -5841,11 +5881,11 @@ mod tests {
         insert_bare_task(&store, "squad-seed", 0, "core");
         insert_bare_cell(&store, "squad-seed", 0, 0, None, None);
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-seed",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
 
@@ -5853,7 +5893,7 @@ mod tests {
         assert!(
             !candidates
                 .iter()
-                .any(|c| c.entry_id == "squad-seed" && c.kind == RosterEntryKind::Squad),
+                .any(|c| c.entry_id == "squad-seed" && c.kind == WaypointEntryKind::Squad),
             "an explicit (non-auto-enrolled) entry must stay out of the survey \
              population even with a NULL verdict: {candidates:?}"
         );
@@ -5862,7 +5902,7 @@ mod tests {
     #[test]
     fn an_auto_enrolled_entry_stays_surveyable_until_it_has_a_verdict() {
         // Submit-time enrollment writes a blocking, unsurveyed row on
-        // purpose. If such a row were treated as "already rostered" it would
+        // purpose. If such a row were treated as "already affecteded" it would
         // never be surveyed, and its NULL verdict would block the squad
         // forever -- so it must remain a candidate until a verdict lands, and
         // drop out once one does.
@@ -5872,11 +5912,11 @@ mod tests {
         insert_bare_task(&store, "squad-seed", 0, "core");
         insert_bare_cell(&store, "squad-seed", 0, 0, None, None);
         store
-            .enroll_roster_entry(
+            .enroll_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-seed",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
 
@@ -5884,18 +5924,18 @@ mod tests {
         assert!(
             candidates
                 .iter()
-                .any(|c| c.entry_id == "squad-seed" && c.kind == RosterEntryKind::Squad),
+                .any(|c| c.entry_id == "squad-seed" && c.kind == WaypointEntryKind::Squad),
             "an auto-enrolled entry with no verdict must still be surveyable: {candidates:?}"
         );
 
         store
-            .set_roster_survey_result(
+            .set_affected_survey_result(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-seed",
                 &SurveyVerdict {
                     impacted: false,
-                    mode: RosterMode::Block,
+                    mode: AffectedMode::Block,
                     rationale: "unrelated".to_string(),
                 },
             )
@@ -5920,18 +5960,18 @@ mod tests {
         // give it an unfinished goal to be held against.
         insert_bare_squad(&store, "squad-goal", SquadState::Pending);
         store
-            .add_roster_goal("waypoint-1", RosterEntryKind::Squad, "squad-goal", None)
+            .add_roster_entry("waypoint-1", WaypointEntryKind::Squad, "squad-goal", None)
             .unwrap();
         // Seed entry so the waypoint has a scope to overlap against.
         insert_bare_squad(&store, "squad-seed", SquadState::Pending);
         insert_bare_task(&store, "squad-seed", 0, "core");
         insert_bare_cell(&store, "squad-seed", 0, 0, None, None);
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-seed",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
 
@@ -5969,11 +6009,11 @@ mod tests {
         insert_bare_cell(&store, "squad-seed", 0, 0, None, None);
         insert_cell_subproject(&store, "squad-seed", 0, 0, "auth", false);
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-seed",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
 
@@ -6021,7 +6061,7 @@ mod tests {
             )
             .unwrap();
 
-        let described = store.describe_candidate_for_survey(RosterEntryKind::Squad, "squad-1");
+        let described = store.describe_candidate_for_survey(WaypointEntryKind::Squad, "squad-1");
         assert!(
             described.contains("rewrite-greet-callers"),
             "description must name the task: {described}"
@@ -6041,7 +6081,7 @@ mod tests {
         // A candidate whose rows vanished mid-sweep must still classify
         // (fail-closed) rather than abort the whole sweep.
         let store = Store::open_in_memory().unwrap();
-        let described = store.describe_candidate_for_survey(RosterEntryKind::Squad, "squad-gone");
+        let described = store.describe_candidate_for_survey(WaypointEntryKind::Squad, "squad-gone");
         assert_eq!(described, "squad squad-gone");
     }
 
@@ -6081,11 +6121,11 @@ mod tests {
         insert_bare_guardian(&store, "guardian-1");
         open_review_branch(&store, "guardian-1", "feature-x");
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Review,
+                WaypointEntryKind::Review,
                 "guardian-1",
-                RosterMode::Advisory,
+                AffectedMode::Advisory,
             )
             .unwrap();
         assert!(store.close_waypoint("waypoint-1").unwrap());
@@ -6097,7 +6137,7 @@ mod tests {
 
         let store = handle.lock();
         assert!(
-            store.list_roster_entries("waypoint-1").unwrap()[0]
+            store.list_affected_entries("waypoint-1").unwrap()[0]
                 .stand_down_at_ms
                 .is_some(),
             "the entry must be marked stood-down"
@@ -6130,11 +6170,11 @@ mod tests {
             )
             .unwrap();
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-1",
-                RosterMode::Advisory,
+                AffectedMode::Advisory,
             )
             .unwrap();
         let bearing = seed_bearing(&store, "waypoint-1", "salute replaces greet");
@@ -6167,11 +6207,11 @@ mod tests {
         open_waypoint(&store, "waypoint-1");
         insert_squad_with_cwd(&store, "squad-1", "/repo");
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-1",
-                RosterMode::Advisory,
+                AffectedMode::Advisory,
             )
             .unwrap();
         assert!(store.close_waypoint("waypoint-1").unwrap());
@@ -6233,7 +6273,7 @@ mod tests {
 
     #[test]
     fn a_waypoint_matches_impacted_work_elsewhere_in_the_same_registered_repo() {
-        // The end-to-end shape of the bug above: a waypoint rostered from a
+        // The end-to-end shape of the bug above: a waypoint affecteded from a
         // subdirectory must still enrol genuinely impacted work submitted from
         // the repository root.
         let store = Store::open_in_memory().unwrap();
@@ -6251,11 +6291,11 @@ mod tests {
             )
             .unwrap();
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-seed",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
 
@@ -6310,7 +6350,7 @@ mod tests {
             &handle,
             "waypoint-1",
             &SurveyCandidate {
-                kind: RosterEntryKind::Squad,
+                kind: WaypointEntryKind::Squad,
                 entry_id: "squad-1".to_string(),
             },
             &Cancellations::new(),
@@ -6405,11 +6445,11 @@ mod tests {
             )
             .unwrap();
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Review,
+                WaypointEntryKind::Review,
                 &guardian_id,
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
 
@@ -6421,11 +6461,11 @@ mod tests {
 
         // De-escalating releases it, without closing the waypoint.
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Review,
+                WaypointEntryKind::Review,
                 &guardian_id,
-                RosterMode::Advisory,
+                AffectedMode::Advisory,
             )
             .unwrap();
         assert_eq!(
@@ -6448,11 +6488,11 @@ mod tests {
             )
             .unwrap();
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Review,
+                WaypointEntryKind::Review,
                 &guardian_id,
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
         assert!(store.approve_guardian(&guardian_id).is_err());
@@ -6479,11 +6519,11 @@ mod tests {
             )
             .unwrap();
         store
-            .enroll_roster_entry(
+            .enroll_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Review,
+                WaypointEntryKind::Review,
                 &guardian_id,
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
         assert_eq!(
@@ -6496,13 +6536,13 @@ mod tests {
         assert!(store.approve_guardian(&guardian_id).is_err());
 
         store
-            .set_roster_survey_result(
+            .set_affected_survey_result(
                 "waypoint-1",
-                RosterEntryKind::Review,
+                WaypointEntryKind::Review,
                 &guardian_id,
                 &SurveyVerdict {
                     impacted: false,
-                    mode: RosterMode::Block,
+                    mode: AffectedMode::Block,
                     rationale: "unrelated".to_string(),
                 },
             )
@@ -6722,11 +6762,11 @@ mod tests {
         open_waypoint(&store, "waypoint-1");
         insert_bare_guardian(&store, "guardian-1");
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Review,
+                WaypointEntryKind::Review,
                 "guardian-1",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
 
@@ -6739,7 +6779,7 @@ mod tests {
         store
             .set_affected_bearing_decision(
                 "waypoint-1",
-                RosterEntryKind::Review,
+                WaypointEntryKind::Review,
                 "guardian-1",
                 BearingDecision::Accepted,
             )
@@ -6762,19 +6802,19 @@ mod tests {
         insert_bare_guardian(&store, "guardian-1");
         insert_bare_guardian(&store, "guardian-2");
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Review,
+                WaypointEntryKind::Review,
                 "guardian-1",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-2",
-                RosterEntryKind::Review,
+                WaypointEntryKind::Review,
                 "guardian-2",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
 
@@ -6794,24 +6834,24 @@ mod tests {
     // ---- phase 1 releases, phase 2 closes ---------------------------------
 
     /// Affected work is held because the change it must take up does not
-    /// exist yet. Once the roster lands it has to be released -- it cannot
+    /// exist yet. Once the affected lands it has to be released -- it cannot
     /// answer the waypoint while the waypoint is preventing it from running,
     /// and phase 2 is waiting on exactly that answer.
     #[test]
-    fn a_block_hold_lifts_once_the_roster_lands() {
+    fn a_block_hold_lifts_once_the_affected_lands() {
         let store = Store::open_in_memory().unwrap();
         open_waypoint(&store, "waypoint-1");
         insert_bare_squad(&store, "squad-goal", SquadState::Pending);
         insert_bare_squad(&store, "squad-downstream", SquadState::Pending);
         store
-            .add_roster_goal("waypoint-1", RosterEntryKind::Squad, "squad-goal", None)
+            .add_roster_entry("waypoint-1", WaypointEntryKind::Squad, "squad-goal", None)
             .unwrap();
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-downstream",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
 
@@ -6832,23 +6872,23 @@ mod tests {
                 .squad_block_gating_waypoint("squad-downstream")
                 .unwrap(),
             None,
-            "released the moment the roster lands, so it can do the work and answer"
+            "released the moment the affected lands, so it can do the work and answer"
         );
     }
 
-    /// A waypoint that names no roster is a broadcast: there is no phase-1
+    /// A waypoint that names no affected is a broadcast: there is no phase-1
     /// change to wait for, so its affected work is never held -- only asked.
     #[test]
-    fn an_empty_roster_never_holds_affected_work() {
+    fn an_empty_affected_never_holds_affected_work() {
         let store = Store::open_in_memory().unwrap();
         open_waypoint(&store, "waypoint-1");
         insert_bare_squad(&store, "squad-downstream", SquadState::Pending);
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-downstream",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
         assert_eq!(
@@ -6859,35 +6899,35 @@ mod tests {
         );
     }
 
-    /// The two phases are separate gates, and both must pass. A landed roster
+    /// The two phases are separate gates, and both must pass. A landed affected
     /// alone does not close a waypoint whose affected work never answered --
     /// that was the whole failure mode of keeping one list.
     #[test]
-    fn a_landed_roster_does_not_close_a_waypoint_nobody_answered() {
+    fn a_landed_affected_does_not_close_a_waypoint_nobody_answered() {
         let store = Store::open_in_memory().unwrap();
         open_waypoint(&store, "waypoint-1");
         insert_bare_squad(&store, "squad-goal", SquadState::Done);
         insert_bare_squad(&store, "squad-downstream", SquadState::Done);
         store
-            .add_roster_goal("waypoint-1", RosterEntryKind::Squad, "squad-goal", None)
+            .add_roster_entry("waypoint-1", WaypointEntryKind::Squad, "squad-goal", None)
             .unwrap();
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-downstream",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
 
-        assert!(store.roster_goals_complete("waypoint-1").unwrap());
+        assert!(store.roster_complete("waypoint-1").unwrap());
         assert!(!store.affected_have_answered("waypoint-1").unwrap());
         assert!(!store.maybe_auto_close_waypoint("waypoint-1").unwrap());
 
         answer(
             &store,
             "waypoint-1",
-            RosterEntryKind::Squad,
+            WaypointEntryKind::Squad,
             "squad-downstream",
         );
         assert!(store.maybe_auto_close_waypoint("waypoint-1").unwrap());
@@ -6902,17 +6942,17 @@ mod tests {
         open_waypoint(&store, "waypoint-1");
         insert_bare_squad(&store, "squad-downstream", SquadState::Done);
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-downstream",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
         store
             .set_affected_bearing_decision(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-downstream",
                 BearingDecision::Rejected,
             )
@@ -6929,11 +6969,11 @@ mod tests {
         open_waypoint(&store, "waypoint-1");
         insert_bare_squad(&store, "squad-advised", SquadState::Done);
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-advised",
-                RosterMode::Advisory,
+                AffectedMode::Advisory,
             )
             .unwrap();
         assert!(store.affected_have_answered("waypoint-1").unwrap());
@@ -6951,30 +6991,30 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         open_waypoint(&store, "waypoint-1");
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-explicit",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
         store
-            .enroll_roster_entry(
+            .enroll_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-auto",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
         for entry in ["squad-explicit", "squad-auto"] {
             store
-                .set_roster_survey_result(
+                .set_affected_survey_result(
                     "waypoint-1",
-                    RosterEntryKind::Squad,
+                    WaypointEntryKind::Squad,
                     entry,
                     &SurveyVerdict {
                         impacted: false,
-                        mode: RosterMode::Block,
+                        mode: AffectedMode::Block,
                         rationale: "unrelated".to_string(),
                     },
                 )
@@ -6989,9 +7029,9 @@ mod tests {
             "only the daemon-enrolled entry should be re-queued"
         );
 
-        let roster = store.list_roster_entries("waypoint-1").unwrap();
+        let affected = store.list_affected_entries("waypoint-1").unwrap();
         let verdict = |id: &str| {
-            roster
+            affected
                 .iter()
                 .find(|e| e.entry_id == id)
                 .expect("entry present")
@@ -7019,32 +7059,32 @@ mod tests {
         insert_bare_task(&store, "squad-seed", 0, "core");
         insert_bare_cell(&store, "squad-seed", 0, 0, None, None);
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-seed",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
         insert_bare_squad(&store, "squad-auto", SquadState::Pending);
         insert_bare_task(&store, "squad-auto", 0, "core");
         insert_bare_cell(&store, "squad-auto", 0, 0, None, None);
         store
-            .enroll_roster_entry(
+            .enroll_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-auto",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
         store
-            .set_roster_survey_result(
+            .set_affected_survey_result(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-auto",
                 &SurveyVerdict {
                     impacted: true,
-                    mode: RosterMode::Block,
+                    mode: AffectedMode::Block,
                     rationale: "touches it".to_string(),
                 },
             )
@@ -7073,20 +7113,20 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         open_waypoint(&store, "waypoint-1");
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-explicit",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
         for entry in ["squad-auto-a", "squad-auto-b"] {
             store
-                .enroll_roster_entry(
+                .enroll_affected_entry(
                     "waypoint-1",
-                    RosterEntryKind::Squad,
+                    WaypointEntryKind::Squad,
                     entry,
-                    RosterMode::Block,
+                    AffectedMode::Block,
                 )
                 .unwrap();
         }
@@ -7128,32 +7168,32 @@ mod tests {
         // give it an unfinished goal to be held against.
         insert_bare_squad(&store, "squad-goal", SquadState::Pending);
         store
-            .add_roster_goal("waypoint-1", RosterEntryKind::Squad, "squad-goal", None)
+            .add_roster_entry("waypoint-1", WaypointEntryKind::Squad, "squad-goal", None)
             .unwrap();
         store
-            .enroll_roster_entry(
+            .enroll_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-blocked",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
         store
-            .enroll_roster_entry(
+            .enroll_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-advisory",
-                RosterMode::Advisory,
+                AffectedMode::Advisory,
             )
             .unwrap();
         store
-            .set_roster_survey_result(
+            .set_affected_survey_result(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-blocked",
                 &SurveyVerdict {
                     impacted: false,
-                    mode: RosterMode::Block,
+                    mode: AffectedMode::Block,
                     rationale: "cleared".to_string(),
                 },
             )
@@ -7199,9 +7239,9 @@ mod tests {
     }
 
     #[test]
-    fn the_grouped_delivery_count_agrees_with_the_roster_it_summarises() {
+    fn the_grouped_delivery_count_agrees_with_the_affected_it_summarises() {
         // The list endpoint counts delivery statuses in SQL instead of
-        // hydrating each roster, which means the status strings are written in
+        // hydrating each affected, which means the status strings are written in
         // two places. They must not drift -- `via-restack` is hyphenated in the
         // column and underscored in the JSON field, which is exactly the kind
         // of pair that silently stops matching.
@@ -7214,15 +7254,15 @@ mod tests {
             ("squad-d", DeliveryStatus::Undelivered),
         ] {
             store
-                .add_roster_entry(
+                .add_affected_entry(
                     "waypoint-1",
-                    RosterEntryKind::Squad,
+                    WaypointEntryKind::Squad,
                     entry,
-                    RosterMode::Block,
+                    AffectedMode::Block,
                 )
                 .unwrap();
             store
-                .set_roster_delivery_status("waypoint-1", RosterEntryKind::Squad, entry, status)
+                .set_affected_delivery_status("waypoint-1", WaypointEntryKind::Squad, entry, status)
                 .unwrap();
         }
 
@@ -7354,7 +7394,7 @@ mod tests {
             &handle,
             "waypoint-1",
             &SurveyCandidate {
-                kind: RosterEntryKind::Squad,
+                kind: WaypointEntryKind::Squad,
                 entry_id: "squad-1".to_string(),
             },
             &Cancellations::new(),
@@ -7418,7 +7458,7 @@ mod tests {
             &handle,
             "waypoint-1",
             &SurveyCandidate {
-                kind: RosterEntryKind::Squad,
+                kind: WaypointEntryKind::Squad,
                 entry_id: "squad-1".to_string(),
             },
             &Cancellations::new(),
@@ -7427,7 +7467,7 @@ mod tests {
         .unwrap();
 
         assert!(verdict.impacted, "an unclassifiable reply must fail closed");
-        assert_eq!(verdict.mode, RosterMode::Block);
+        assert_eq!(verdict.mode, AffectedMode::Block);
     }
 
     #[test]
@@ -7441,11 +7481,11 @@ mod tests {
         open_waypoint(&store, "waypoint-1");
         insert_squad_with_cwd(&store, "squad-seed", "/repo");
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-seed",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
         let over = SURVEY_MAX_PER_SWEEP + 4;
@@ -7486,16 +7526,16 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         insert_squad_with_cwd(&store, "squad-1", "/repo/checkout");
         assert_eq!(
-            survey_candidate_cwd(&store, RosterEntryKind::Squad, "squad-1").as_deref(),
+            survey_candidate_cwd(&store, WaypointEntryKind::Squad, "squad-1").as_deref(),
             Some("/repo/checkout")
         );
         insert_bare_guardian(&store, "guardian-1");
         assert!(
-            survey_candidate_cwd(&store, RosterEntryKind::Review, "guardian-1").is_some(),
+            survey_candidate_cwd(&store, WaypointEntryKind::Review, "guardian-1").is_some(),
             "a review resolves to its guardian's git root"
         );
         assert_eq!(
-            survey_candidate_cwd(&store, RosterEntryKind::Squad, "squad-missing"),
+            survey_candidate_cwd(&store, WaypointEntryKind::Squad, "squad-missing"),
             None,
             "an unknown candidate has no cwd, which falls back to the direct API"
         );
@@ -7527,7 +7567,7 @@ mod tests {
         store
             .append_waypoint_bearing(
                 waypoint_id,
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-producer",
                 summary,
                 None,
@@ -7543,21 +7583,21 @@ mod tests {
         open_waypoint(&store, "waypoint-1");
         insert_squad_with_cell(&store, "squad-1", SquadState::Done, "done");
         store
-            .enroll_roster_entry(
+            .enroll_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-1",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
         store
-            .set_roster_survey_result(
+            .set_affected_survey_result(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-1",
                 &SurveyVerdict {
                     impacted: true,
-                    mode: RosterMode::Block,
+                    mode: AffectedMode::Block,
                     rationale: "touches the renamed function".to_string(),
                 },
             )
@@ -7568,7 +7608,7 @@ mod tests {
         run_pending_stale_notices(&handle);
 
         let store = handle.lock();
-        let entries = store.list_roster_entries("waypoint-1").unwrap();
+        let entries = store.list_affected_entries("waypoint-1").unwrap();
         assert!(
             entries[0].stale_at_ms.is_some(),
             "finished impacted work must be flagged stale once the waypoint closes"
@@ -7591,21 +7631,21 @@ mod tests {
         // Finished, but the survey cleared it -> nothing to redo.
         insert_squad_with_cell(&store, "squad-clear", SquadState::Done, "done");
         store
-            .enroll_roster_entry(
+            .enroll_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-clear",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
         store
-            .set_roster_survey_result(
+            .set_affected_survey_result(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-clear",
                 &SurveyVerdict {
                     impacted: false,
-                    mode: RosterMode::Block,
+                    mode: AffectedMode::Block,
                     rationale: "unrelated".to_string(),
                 },
             )
@@ -7613,21 +7653,21 @@ mod tests {
         // Impacted, but still running -> not finished, so not stale.
         insert_squad_with_cell(&store, "squad-live", SquadState::Running, "running");
         store
-            .enroll_roster_entry(
+            .enroll_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-live",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
         store
-            .set_roster_survey_result(
+            .set_affected_survey_result(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-live",
                 &SurveyVerdict {
                     impacted: true,
-                    mode: RosterMode::Block,
+                    mode: AffectedMode::Block,
                     rationale: "touches it".to_string(),
                 },
             )
@@ -7637,7 +7677,7 @@ mod tests {
         run_pending_stale_notices(&handle);
 
         let store = handle.lock();
-        for entry in store.list_roster_entries("waypoint-1").unwrap() {
+        for entry in store.list_affected_entries("waypoint-1").unwrap() {
             assert!(
                 entry.stale_at_ms.is_none(),
                 "{} must not be flagged stale",
@@ -7657,21 +7697,21 @@ mod tests {
         open_waypoint(&store, "waypoint-1");
         insert_squad_with_cell(&store, "squad-gated", SquadState::Done, "done");
         store
-            .enroll_roster_entry(
+            .enroll_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-gated",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
         store
-            .set_roster_survey_result(
+            .set_affected_survey_result(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-gated",
                 &SurveyVerdict {
                     impacted: true,
-                    mode: RosterMode::Block,
+                    mode: AffectedMode::Block,
                     rationale: "touches it".to_string(),
                 },
             )
@@ -7683,7 +7723,7 @@ mod tests {
 
         let store = handle.lock();
         assert!(
-            store.list_roster_entries("waypoint-1").unwrap()[0]
+            store.list_affected_entries("waypoint-1").unwrap()[0]
                 .stale_at_ms
                 .is_none(),
             "work that ran after the waypoint closed already has its changes"
@@ -7703,21 +7743,21 @@ mod tests {
         open_waypoint(&store, "waypoint-1");
         insert_squad_with_cell(&store, "squad-1", SquadState::Done, "done");
         store
-            .enroll_roster_entry(
+            .enroll_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-1",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
         store
-            .set_roster_survey_result(
+            .set_affected_survey_result(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-1",
                 &SurveyVerdict {
                     impacted: true,
-                    mode: RosterMode::Block,
+                    mode: AffectedMode::Block,
                     rationale: "touches it".to_string(),
                 },
             )
@@ -7727,9 +7767,9 @@ mod tests {
         run_pending_stale_notices(&handle);
         {
             let store = handle.lock();
-            redo_roster_entry(&store, "waypoint-1", "squad-1").unwrap();
+            redo_affected_entry(&store, "waypoint-1", "squad-1").unwrap();
             assert!(
-                store.list_roster_entries("waypoint-1").unwrap()[0]
+                store.list_affected_entries("waypoint-1").unwrap()[0]
                     .stale_at_ms
                     .is_none(),
                 "a redo must clear the stale flag"
@@ -7740,7 +7780,7 @@ mod tests {
         run_pending_stale_notices(&handle);
         let store = handle.lock();
         assert!(
-            store.list_roster_entries("waypoint-1").unwrap()[0]
+            store.list_affected_entries("waypoint-1").unwrap()[0]
                 .stale_at_ms
                 .is_none(),
             "a re-queued squad must not be re-flagged as stale"
@@ -7757,11 +7797,11 @@ mod tests {
         open_waypoint(&store, "waypoint-1");
         insert_squad_with_cell(&store, "squad-1", SquadState::Done, "done");
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-1",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
         seed_bearing(&store, "waypoint-1", "salute() now lives in src/greet.py");
@@ -7781,7 +7821,7 @@ mod tests {
             )
             .unwrap();
 
-        redo_roster_entry(&store, "waypoint-1", "squad-1").unwrap();
+        redo_affected_entry(&store, "waypoint-1", "squad-1").unwrap();
 
         assert_eq!(
             store.squad_state("squad-1").unwrap(),
@@ -7811,11 +7851,11 @@ mod tests {
         open_waypoint(&store, "waypoint-1");
         insert_squad_with_cell(&store, "squad-1", SquadState::Done, "done");
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-1",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
         seed_bearing(&store, "waypoint-1", "salute() now lives in src/greet.py");
@@ -7844,7 +7884,7 @@ mod tests {
             )
             .unwrap();
 
-        redo_roster_entry(&store, "waypoint-1", "squad-1").unwrap();
+        redo_affected_entry(&store, "waypoint-1", "squad-1").unwrap();
 
         let ghost = store.get_ghost(&uri).unwrap().expect("ghost present");
         assert!(
@@ -7879,16 +7919,16 @@ mod tests {
         open_waypoint(&store, "waypoint-1");
         insert_squad_with_cell(&store, "squad-1", SquadState::Done, "done");
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-1",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
         seed_bearing(&store, "waypoint-1", "salute() now lives in src/greet.py");
 
-        redo_roster_entry(&store, "waypoint-1", "squad-1").unwrap();
+        redo_affected_entry(&store, "waypoint-1", "squad-1").unwrap();
 
         let ghost = store
             .get_ghost(&crate::ghost::cell_uri("squad-1", 0, 0))
@@ -7908,14 +7948,14 @@ mod tests {
         open_waypoint(&store, "waypoint-1");
         insert_bare_guardian(&store, "guardian-1");
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Review,
+                WaypointEntryKind::Review,
                 "guardian-1",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
-        let err = redo_roster_entry(&store, "waypoint-1", "guardian-1").unwrap_err();
+        let err = redo_affected_entry(&store, "waypoint-1", "guardian-1").unwrap_err();
         assert!(
             matches!(err, StoreError::InvalidTransition(ref m) if m.contains("redo the squad")),
             "a review-kind redo must be refused and point at its squad, got {err:?}"
@@ -7927,7 +7967,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         open_waypoint(&store, "waypoint-1");
         assert!(matches!(
-            redo_roster_entry(&store, "waypoint-1", "squad-nope").unwrap_err(),
+            redo_affected_entry(&store, "waypoint-1", "squad-nope").unwrap_err(),
             StoreError::NotFound
         ));
     }
@@ -7959,11 +7999,11 @@ mod tests {
             )
             .unwrap();
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-1",
-                RosterMode::Advisory,
+                AffectedMode::Advisory,
             )
             .unwrap();
 
@@ -8003,11 +8043,11 @@ mod tests {
         open_waypoint(&store, "waypoint-1");
         insert_squad_with_cell(&store, "squad-1", SquadState::Running, "running");
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-1",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
         let bearing = seed_bearing(&store, "waypoint-1", "guidance");
@@ -8026,11 +8066,11 @@ mod tests {
         open_waypoint(&store, "waypoint-1");
         insert_squad_with_cell(&store, "squad-1", SquadState::Running, "running");
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-1",
-                RosterMode::Advisory,
+                AffectedMode::Advisory,
             )
             .unwrap();
         let bearing = seed_bearing(&store, "waypoint-1", "guidance");
@@ -8053,11 +8093,11 @@ mod tests {
         open_waypoint(&store, "waypoint-1");
         insert_squad_with_cell(&store, "squad-1", SquadState::Running, "running");
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-1",
-                RosterMode::Advisory,
+                AffectedMode::Advisory,
             )
             .unwrap();
         let bearing = seed_bearing(&store, "waypoint-1", "salute() replaces greet()");
@@ -8082,11 +8122,11 @@ mod tests {
         open_waypoint(&store, "waypoint-1");
         insert_bare_squad(&store, "squad-1", SquadState::Done);
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-1",
-                RosterMode::Advisory,
+                AffectedMode::Advisory,
             )
             .unwrap();
         assert!(store.close_waypoint("waypoint-1").unwrap());
@@ -8096,7 +8136,7 @@ mod tests {
         run_pending_stand_down_notices(&handle);
 
         let store = handle.lock();
-        let entries = store.list_roster_entries("waypoint-1").unwrap();
+        let entries = store.list_affected_entries("waypoint-1").unwrap();
         assert!(
             entries[0].stand_down_at_ms.is_some(),
             "an advisory squad entry must be marked stood-down once notified"
@@ -8118,11 +8158,11 @@ mod tests {
         insert_bare_guardian(&store, "guardian-1");
         open_review_branch(&store, "guardian-1", "feature-x");
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Review,
+                WaypointEntryKind::Review,
                 "guardian-1",
-                RosterMode::Advisory,
+                AffectedMode::Advisory,
             )
             .unwrap();
         assert!(store.close_waypoint("waypoint-1").unwrap());
@@ -8132,7 +8172,7 @@ mod tests {
         run_pending_stand_down_notices(&handle);
 
         let store = handle.lock();
-        let entries = store.list_roster_entries("waypoint-1").unwrap();
+        let entries = store.list_affected_entries("waypoint-1").unwrap();
         assert!(
             entries[0].stand_down_at_ms.is_some(),
             "a review entry with a ready branch must be marked stood-down once feedback is sent"
@@ -8145,11 +8185,11 @@ mod tests {
         open_waypoint(&store, "waypoint-1");
         insert_bare_guardian(&store, "guardian-1");
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Review,
+                WaypointEntryKind::Review,
                 "guardian-1",
-                RosterMode::Advisory,
+                AffectedMode::Advisory,
             )
             .unwrap();
         assert!(store.close_waypoint("waypoint-1").unwrap());
@@ -8159,7 +8199,7 @@ mod tests {
         run_pending_stand_down_notices(&handle);
 
         let store = handle.lock();
-        let entries = store.list_roster_entries("waypoint-1").unwrap();
+        let entries = store.list_affected_entries("waypoint-1").unwrap();
         // Previously this was deferred until the review had a built worktree,
         // because the notice went out over the feedback path and that path
         // needs somewhere to write. A mailbox row has no such precondition, so
@@ -8181,11 +8221,11 @@ mod tests {
         open_waypoint(&store, "waypoint-1");
         insert_bare_squad(&store, "squad-1", SquadState::Done);
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-1",
-                RosterMode::Block,
+                AffectedMode::Block,
             )
             .unwrap();
         assert!(store.close_waypoint("waypoint-1").unwrap());
@@ -8195,7 +8235,7 @@ mod tests {
         run_pending_stand_down_notices(&handle);
 
         let store = handle.lock();
-        let entries = store.list_roster_entries("waypoint-1").unwrap();
+        let entries = store.list_affected_entries("waypoint-1").unwrap();
         assert!(
             entries[0].stand_down_at_ms.is_none(),
             "block-mode entries never get a stand-down notice -- gating simply lifting is the signal"
@@ -8212,11 +8252,11 @@ mod tests {
         open_waypoint(&store, "waypoint-1");
         insert_bare_squad(&store, "squad-1", SquadState::Done);
         store
-            .add_roster_entry(
+            .add_affected_entry(
                 "waypoint-1",
-                RosterEntryKind::Squad,
+                WaypointEntryKind::Squad,
                 "squad-1",
-                RosterMode::Advisory,
+                AffectedMode::Advisory,
             )
             .unwrap();
         assert!(store.close_waypoint("waypoint-1").unwrap());

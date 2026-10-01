@@ -48,7 +48,7 @@ pub struct Daemon {
     /// so a real interactive resume session can safely take over.
     detachments: crate::cancel::Detachments,
     /// Per-squad waypoint-halt tokens (RAL-400 Phase 3), shared with the
-    /// scheduler's `SubprocessRunner` so a squad-kind roster entry
+    /// scheduler's `SubprocessRunner` so a squad-kind affected entry
     /// transitioning to `mode=block` can stop every currently-running cell
     /// in that squad immediately, without marking them terminally cancelled.
     waypoint_halts: crate::cancel::WaypointHalts,
@@ -2186,23 +2186,25 @@ fn route_for_user(
         ("POST", ["api", "waypoints"]) => waypoint_create(daemon, body),
         ("GET", ["api", "waypoints"]) => waypoint_list(daemon, query),
         ("GET", ["api", "waypoints", id]) => waypoint_get(daemon, id),
+        ("POST", ["api", "waypoints", id, "affected"]) => {
+            waypoint_add_affected_entry(daemon, id, body)
+        }
+        ("DELETE", ["api", "waypoints", id, "affected", entry_id]) => {
+            waypoint_remove_affected_entry(daemon, id, entry_id)
+        }
+        ("PATCH", ["api", "waypoints", id, "affected", entry_id]) => {
+            waypoint_patch_affected_entry(daemon, id, entry_id, body)
+        }
+        ("PATCH", ["api", "waypoints", id]) => waypoint_update(daemon, id, body),
         ("POST", ["api", "waypoints", id, "roster"]) => waypoint_add_roster_entry(daemon, id, body),
         ("DELETE", ["api", "waypoints", id, "roster", entry_id]) => {
             waypoint_remove_roster_entry(daemon, id, entry_id)
         }
-        ("PATCH", ["api", "waypoints", id, "roster", entry_id]) => {
-            waypoint_patch_roster_entry(daemon, id, entry_id, body)
-        }
-        ("PATCH", ["api", "waypoints", id]) => waypoint_update(daemon, id, body),
-        ("POST", ["api", "waypoints", id, "goals"]) => waypoint_add_goal(daemon, id, body),
-        ("DELETE", ["api", "waypoints", id, "goals", entry_id]) => {
-            waypoint_remove_goal(daemon, id, entry_id)
-        }
         ("GET", ["api", "waypoints", id, "resurvey-preview"]) => {
             waypoint_resurvey_preview(daemon, id)
         }
-        ("POST", ["api", "waypoints", id, "roster", entry_id, "redo"]) => {
-            waypoint_redo_roster_entry(daemon, id, entry_id)
+        ("POST", ["api", "waypoints", id, "affected", entry_id, "redo"]) => {
+            waypoint_redo_affected_entry(daemon, id, entry_id)
         }
         ("POST", ["api", "waypoints", id, "close"]) => waypoint_close(daemon, id),
         ("POST", ["api", "waypoints", id, "reopen"]) => waypoint_reopen(daemon, id),
@@ -6753,7 +6755,7 @@ fn run_submit_followup(
                         &guard,
                         waypoint_id,
                         waypoint.as_ref(),
-                        crate::waypoints::RosterEntryKind::Squad,
+                        crate::waypoints::WaypointEntryKind::Squad,
                         &squad_id,
                         "its work overlaps the waypoint's scope, so it is held pending the \
                          relevance survey",
@@ -14837,11 +14839,11 @@ fn pr_refresh_ci(daemon: &Daemon, pr_id: &str) -> Reply {
 }
 
 // RAL-400 Phase 7: cross-squad waypoints HTTP surface. See `crate::waypoints`
-// for the underlying store methods (roster/bearing/scope semantics) and
+// for the underlying store methods (affected/bearing/scope semantics) and
 // `docs/glossary.md` for the squad/task/cell/proof/waypoint vocabulary.
 
 #[derive(Deserialize)]
-struct CreateWaypointRosterEntryBody {
+struct CreateWaypointAffectedEntryBody {
     kind: String,
     entry_id: String,
     #[serde(default)]
@@ -14860,11 +14862,11 @@ struct CreateWaypointBody {
     #[serde(default)]
     allow_advisory: bool,
     /// At least one entry is required -- see `waypoint_create`'s doc comment.
-    roster: Vec<CreateWaypointRosterEntryBody>,
+    affected: Vec<CreateWaypointAffectedEntryBody>,
 }
 
 #[derive(Deserialize)]
-struct AddRosterEntryBody {
+struct AddAffectedEntryBody {
     kind: String,
     entry_id: String,
     #[serde(default)]
@@ -14872,7 +14874,7 @@ struct AddRosterEntryBody {
 }
 
 #[derive(Deserialize)]
-struct PatchRosterEntryBody {
+struct PatchAffectedEntryBody {
     mode: String,
 }
 
@@ -14889,9 +14891,9 @@ struct AppendBearingBody {
     commit_summary: Option<String>,
 }
 
-/// Roster-entry counts by [`crate::waypoints::DeliveryStatus`], for a
+/// Affected-entry counts by [`crate::waypoints::DeliveryStatus`], for a
 /// waypoint's list/detail views -- lets a caller show "3/5 delivered"
-/// without shipping every roster row to a list poll.
+/// without shipping every affected row to a list poll.
 #[derive(Serialize, Default)]
 struct DeliverySummary {
     undelivered: usize,
@@ -14901,9 +14903,9 @@ struct DeliverySummary {
 }
 
 impl DeliverySummary {
-    fn from_roster(roster: &[crate::waypoints::RosterEntryView]) -> Self {
+    fn from_affected(affected: &[crate::waypoints::AffectedEntryView]) -> Self {
         let mut summary = Self::default();
-        for entry in roster {
+        for entry in affected {
             match entry.delivery_status {
                 crate::waypoints::DeliveryStatus::Undelivered => summary.undelivered += 1,
                 crate::waypoints::DeliveryStatus::Delivered => summary.delivered += 1,
@@ -14916,11 +14918,11 @@ impl DeliverySummary {
 }
 
 /// Lean per-waypoint projection for `GET /api/waypoints`'s list view --
-/// everything a list poll needs without hydrating the full roster or the
+/// everything a list poll needs without hydrating the full affected or the
 /// (potentially large) prompt. Mirrors `GuardianIndexEntry`'s relationship
 /// to the full `GuardianView`.
 #[derive(Deserialize)]
-struct AddGoalBody {
+struct AddRosterEntryBody {
     kind: String,
     entry_id: String,
     note: Option<String>,
@@ -14934,7 +14936,7 @@ struct UpdateWaypointBody {
     model: Option<String>,
     #[serde(default)]
     allow_advisory: bool,
-    /// Opt-in: also put every daemon-enrolled roster entry back in the
+    /// Opt-in: also put every daemon-enrolled affected entry back in the
     /// classifier's queue, so the next sweep re-judges it against the saved
     /// guidance. Off by default -- re-judging can re-hold work that the old
     /// guidance had released, so it is something a caller asks for after
@@ -14951,8 +14953,8 @@ struct WaypointListEntry {
     state: String,
     allow_advisory: bool,
     projects: Vec<String>,
-    roster_count: usize,
-    /// Roster-entry counts by delivery status, so the sidebar can render each
+    affected_count: usize,
+    /// Affected-entry counts by delivery status, so the sidebar can render each
     /// waypoint's progress without a second request per row.
     delivery_summary: DeliverySummary,
     created_at_ms: i64,
@@ -14960,7 +14962,7 @@ struct WaypointListEntry {
     closed_at_ms: Option<i64>,
 }
 
-/// Full `GET /api/waypoints/{id}` response: settings, roster, and a delivery
+/// Full `GET /api/waypoints/{id}` response: settings, roster, affected, and a delivery
 /// summary. `prompt` is redacted the same way every other user-authored
 /// content field is before it leaves the daemon (see
 /// `ralphus_core::redact::redact_secrets`) -- a waypoint's prompt is
@@ -14978,33 +14980,33 @@ struct WaypointDetail {
     updated_at_ms: i64,
     closed_at_ms: Option<i64>,
     projects: Vec<String>,
-    roster: Vec<crate::waypoints::RosterEntryView>,
+    affected: Vec<crate::waypoints::AffectedEntryView>,
     /// The waypoint's completion list (phase 1) -- what its landing
-    /// requires, as opposed to `roster`, which is what it lands on.
-    goals: Vec<crate::waypoints::RosterGoalView>,
+    /// requires, as opposed to `affected`, which is what it lands on.
+    roster: Vec<crate::waypoints::RosterEntryView>,
     delivery_summary: DeliverySummary,
 }
 
 /// A waypoint's tracked projects, sorted. Mirrors
 /// `Store::waypoint_scope_by_project`'s per-entry aggregation, except a
-/// roster entry whose squad/review no longer exists
+/// affected entry whose squad/review no longer exists
 /// (`Store::squad_scope_by_project` reports that as `StoreError::NotFound`,
 /// unlike `Store::review_scope_by_project`'s plain-empty-result-set
 /// behavior for a missing review) contributes no scope instead of failing
-/// the whole waypoint view -- a waypoint's roster referencing a
+/// the whole waypoint view -- a waypoint's affected referencing a
 /// since-deleted/pruned squad must not 404/500 an otherwise-valid waypoint.
 fn waypoint_projects(store: &Store, waypoint_id: &str) -> crate::store::Result<Vec<String>> {
     let mut projects = BTreeSet::new();
-    for entry in store.list_roster_entries(waypoint_id)? {
+    for entry in store.list_affected_entries(waypoint_id)? {
         let scope = match entry.kind {
-            crate::waypoints::RosterEntryKind::Squad => {
+            crate::waypoints::WaypointEntryKind::Squad => {
                 match store.squad_scope_by_project(&entry.entry_id) {
                     Ok(scope) => scope,
                     Err(StoreError::NotFound) => continue,
                     Err(e) => return Err(e),
                 }
             }
-            crate::waypoints::RosterEntryKind::Review => {
+            crate::waypoints::WaypointEntryKind::Review => {
                 store.review_scope_by_project(&entry.entry_id)?
             }
         };
@@ -15014,52 +15016,54 @@ fn waypoint_projects(store: &Store, waypoint_id: &str) -> crate::store::Result<V
 }
 
 /// `POST /api/waypoints` -- create a new open waypoint with its initial
-/// roster. At least one roster entry is required: a waypoint's tracked
-/// projects are inferred entirely from its roster (see
-/// `crate::waypoints::Store::waypoint_scope_by_project`), so an empty roster
+/// affected. At least one affected entry is required: a waypoint's tracked
+/// projects are inferred entirely from its affected (see
+/// `crate::waypoints::Store::waypoint_scope_by_project`), so an empty affected
 /// would mean nobody to coordinate with and no projects to classify against.
 fn waypoint_create(daemon: &Daemon, body: &str) -> Reply {
     let Ok(req) = serde_json::from_str::<CreateWaypointBody>(body) else {
         return error(
             400,
             "bad_request",
-            "body must be {prompt, roster: [{kind, entry_id, mode?}], label?, agent?, model?, allow_advisory?}",
+            "body must be {prompt, affected: [{kind, entry_id, mode?}], label?, agent?, model?, allow_advisory?}",
             vec![],
         );
     };
     if req.prompt.trim().is_empty() {
         return error(400, "bad_request", "prompt must not be empty", vec![]);
     }
-    if req.roster.is_empty() {
+    if req.affected.is_empty() {
         return error(
             400,
             "bad_request",
-            "roster must include at least one entry",
+            "affected must include at least one entry",
             vec![],
         );
     }
-    let mut parsed_roster = Vec::with_capacity(req.roster.len());
-    for entry in &req.roster {
-        let Some(kind) = crate::waypoints::RosterEntryKind::parse(&entry.kind) else {
+    let mut parsed_affected = Vec::with_capacity(req.affected.len());
+    for entry in &req.affected {
+        let Some(kind) = crate::waypoints::WaypointEntryKind::parse(&entry.kind) else {
             return error(
                 400,
                 "bad_request",
                 &format!(
-                    "roster entry kind must be \"review\" or \"squad\", got {:?}",
+                    "affected entry kind must be \"review\" or \"squad\", got {:?}",
                     entry.kind
                 ),
                 vec![],
             );
         };
         let mode = match entry.mode.as_deref() {
-            None => crate::waypoints::RosterMode::Block,
-            Some(m) => match crate::waypoints::RosterMode::parse(m) {
+            None => crate::waypoints::AffectedMode::Block,
+            Some(m) => match crate::waypoints::AffectedMode::parse(m) {
                 Some(mode) => mode,
                 None => {
                     return error(
                         400,
                         "bad_request",
-                        &format!("roster entry mode must be \"block\" or \"advisory\", got {m:?}"),
+                        &format!(
+                            "affected entry mode must be \"block\" or \"advisory\", got {m:?}"
+                        ),
                         vec![],
                     );
                 }
@@ -15069,11 +15073,11 @@ fn waypoint_create(daemon: &Daemon, body: &str) -> Reply {
             return error(
                 400,
                 "bad_request",
-                "roster entry_id must not be empty",
+                "affected entry_id must not be empty",
                 vec![],
             );
         }
-        parsed_roster.push((kind, entry.entry_id.clone(), mode));
+        parsed_affected.push((kind, entry.entry_id.clone(), mode));
     }
     let store = daemon.lock();
     let id = match store.next_id("waypoint_seq", "waypoint") {
@@ -15091,8 +15095,8 @@ fn waypoint_create(daemon: &Daemon, body: &str) -> Reply {
         return store_error(&e);
     }
     let waypoint_halts = daemon.waypoint_halts_handle();
-    for (kind, entry_id, mode) in &parsed_roster {
-        if let Err(e) = store.add_roster_entry(&id, *kind, entry_id, *mode) {
+    for (kind, entry_id, mode) in &parsed_affected {
+        if let Err(e) = store.add_affected_entry(&id, *kind, entry_id, *mode) {
             return store_error(&e);
         }
         crate::waypoints::signal_explicit_block_halt(
@@ -15104,39 +15108,39 @@ fn waypoint_create(daemon: &Daemon, body: &str) -> Reply {
             *mode,
         );
     }
-    notify_roster_of_new_waypoint(&store, &id, &req.prompt, &parsed_roster);
+    notify_affected_of_new_waypoint(&store, &id, &req.prompt, &parsed_affected);
     json(201, &IdResponse { id })
 }
 
-/// RAL-400 Phase 8: once a waypoint's roster is in place, tell each roster
+/// RAL-400 Phase 8: once a waypoint's affected is in place, tell each affected
 /// entry's own watchers it now has a waypoint to account for -- mirrors
 /// [`enqueue_waypoint_halt_mailbox`]'s one-notification-per-entity shape
 /// (scheduler.rs), except this is an ordinary status change, not a
 /// failure/blocked state, so it goes through
 /// `notify_watchers_with_context` at [`MailboxPriority::Normal`] rather than
 /// `notify_watchers_with_remediation`.
-fn notify_roster_of_new_waypoint(
+fn notify_affected_of_new_waypoint(
     store: &Store,
     waypoint_id: &str,
     prompt: &str,
-    roster: &[(
-        crate::waypoints::RosterEntryKind,
+    affected: &[(
+        crate::waypoints::WaypointEntryKind,
         String,
-        crate::waypoints::RosterMode,
+        crate::waypoints::AffectedMode,
     )],
 ) {
-    let impacted = roster
+    let impacted = affected
         .iter()
         .map(|(kind, entry_id, mode)| format!("{} {entry_id} ({})", kind.as_str(), mode.as_str()))
         .collect::<Vec<_>>()
         .join(", ");
-    for (kind, entry_id, _mode) in roster {
+    for (kind, entry_id, _mode) in affected {
         let entity_uri = match kind {
-            crate::waypoints::RosterEntryKind::Squad => format!("squad:{entry_id}"),
-            crate::waypoints::RosterEntryKind::Review => format!("guardian:{entry_id}"),
+            crate::waypoints::WaypointEntryKind::Squad => format!("squad:{entry_id}"),
+            crate::waypoints::WaypointEntryKind::Review => format!("guardian:{entry_id}"),
         };
         let text = format!(
-            "waypoint '{waypoint_id}' added this to its roster: {prompt:?}. roster: [{impacted}]"
+            "waypoint '{waypoint_id}' added this to its affected: {prompt:?}. affected: [{impacted}]"
         );
         if let Ok(message_id) = store.notify_watchers_with_context(
             crate::monitor::NotifiableEventKind::WaypointCreated,
@@ -15152,7 +15156,7 @@ fn notify_roster_of_new_waypoint(
                 .scope("waypoint")
                 .emit(
                     store,
-                    "mailbox message enqueued for new waypoint roster entry",
+                    "mailbox message enqueued for new waypoint affected entry",
                     serde_json::json!({
                         "message_id": message_id,
                         "waypoint_id": waypoint_id,
@@ -15181,7 +15185,7 @@ fn waypoint_list(daemon: &Daemon, query: &str) -> Reply {
     }
     let store = daemon.lock();
     // One grouped count for every waypoint, taken before the loop rather than a
-    // roster hydration per row inside it.
+    // affected hydration per row inside it.
     let delivery_counts = match store.waypoint_delivery_counts() {
         Ok(counts) => counts,
         Err(e) => return store_error(&e),
@@ -15215,7 +15219,7 @@ fn waypoint_list(daemon: &Daemon, query: &str) -> Reply {
             }
         }
         // Counted in SQL for every waypoint in one pass before this loop, not
-        // by hydrating each waypoint's roster here to tally four numbers off it.
+        // by hydrating each waypoint's affected here to tally four numbers off it.
         let counts = delivery_counts.get(&id);
         let get = |status: &str| -> usize {
             counts
@@ -15229,7 +15233,7 @@ fn waypoint_list(daemon: &Daemon, query: &str) -> Reply {
             via_restack: get("via-restack"),
             failed: get("failed"),
         };
-        let roster_count = delivery_summary.undelivered
+        let affected_count = delivery_summary.undelivered
             + delivery_summary.delivered
             + delivery_summary.via_restack
             + delivery_summary.failed;
@@ -15239,7 +15243,7 @@ fn waypoint_list(daemon: &Daemon, query: &str) -> Reply {
             state: view.state,
             allow_advisory: view.allow_advisory,
             projects,
-            roster_count,
+            affected_count,
             delivery_summary,
             created_at_ms: view.created_at_ms,
             updated_at_ms: view.updated_at_ms,
@@ -15250,16 +15254,16 @@ fn waypoint_list(daemon: &Daemon, query: &str) -> Reply {
     json(200, &entries)
 }
 
-/// Assemble the full `WaypointDetail` (settings, roster, tracked projects,
+/// Assemble the full `WaypointDetail` (settings, roster, affected, tracked projects,
 /// delivery summary) for one waypoint. Shared by every handler that returns
-/// a waypoint's state, so a roster mutation or a lifecycle change reflects
+/// a waypoint's state, so a affected mutation or a lifecycle change reflects
 /// the same shape a caller would get back from `GET /api/waypoints/{id}`.
 fn waypoint_detail(store: &Store, id: &str) -> crate::store::Result<WaypointDetail> {
     let view = store.get_waypoint(id)?;
+    let affected = store.list_affected_entries(id)?;
     let roster = store.list_roster_entries(id)?;
-    let goals = store.list_roster_goals(id)?;
     let projects = waypoint_projects(store, id)?;
-    let delivery_summary = DeliverySummary::from_roster(&roster);
+    let delivery_summary = DeliverySummary::from_affected(&affected);
     Ok(WaypointDetail {
         id: view.id,
         label: view.label,
@@ -15272,13 +15276,13 @@ fn waypoint_detail(store: &Store, id: &str) -> crate::store::Result<WaypointDeta
         updated_at_ms: view.updated_at_ms,
         closed_at_ms: view.closed_at_ms,
         projects,
+        affected,
         roster,
-        goals,
         delivery_summary,
     })
 }
 
-/// `GET /api/waypoints/{id}` -- settings, roster, tracked projects, and a
+/// `GET /api/waypoints/{id}` -- settings, roster, affected, tracked projects, and a
 /// delivery summary.
 fn waypoint_get(daemon: &Daemon, id: &str) -> Reply {
     let store = daemon.lock();
@@ -15288,10 +15292,10 @@ fn waypoint_get(daemon: &Daemon, id: &str) -> Reply {
     }
 }
 
-/// `POST /api/waypoints/{id}/roster` -- add (or update the mode of) one
-/// roster entry after creation.
-fn waypoint_add_roster_entry(daemon: &Daemon, id: &str, body: &str) -> Reply {
-    let Ok(req) = serde_json::from_str::<AddRosterEntryBody>(body) else {
+/// `POST /api/waypoints/{id}/affected` -- add (or update the mode of) one
+/// affected entry after creation.
+fn waypoint_add_affected_entry(daemon: &Daemon, id: &str, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<AddAffectedEntryBody>(body) else {
         return error(
             400,
             "bad_request",
@@ -15299,7 +15303,7 @@ fn waypoint_add_roster_entry(daemon: &Daemon, id: &str, body: &str) -> Reply {
             vec![],
         );
     };
-    let Some(kind) = crate::waypoints::RosterEntryKind::parse(&req.kind) else {
+    let Some(kind) = crate::waypoints::WaypointEntryKind::parse(&req.kind) else {
         return error(
             400,
             "bad_request",
@@ -15308,8 +15312,8 @@ fn waypoint_add_roster_entry(daemon: &Daemon, id: &str, body: &str) -> Reply {
         );
     };
     let mode = match req.mode.as_deref() {
-        None => crate::waypoints::RosterMode::Block,
-        Some(m) => match crate::waypoints::RosterMode::parse(m) {
+        None => crate::waypoints::AffectedMode::Block,
+        Some(m) => match crate::waypoints::AffectedMode::parse(m) {
             Some(mode) => mode,
             None => {
                 return error(
@@ -15325,11 +15329,11 @@ fn waypoint_add_roster_entry(daemon: &Daemon, id: &str, body: &str) -> Reply {
         return error(400, "bad_request", "entry_id must not be empty", vec![]);
     }
     let store = daemon.lock();
-    // Waypoint existence isn't checked separately -- `add_roster_entry`
+    // Waypoint existence isn't checked separately -- `add_affected_entry`
     // itself carries no foreign key to `waypoints`, but `get_waypoint` below
     // (which the caller needs regardless, to see the change take effect)
     // reports a missing waypoint as 404.
-    if let Err(e) = store.add_roster_entry(id, kind, &req.entry_id, mode) {
+    if let Err(e) = store.add_affected_entry(id, kind, &req.entry_id, mode) {
         return store_error(&e);
     }
     crate::waypoints::signal_explicit_block_halt(
@@ -15346,38 +15350,38 @@ fn waypoint_add_roster_entry(daemon: &Daemon, id: &str, body: &str) -> Reply {
     }
 }
 
-/// Find the roster entry addressed by `entry_id` within one waypoint's
-/// roster, regardless of its `kind` -- review ids (`guardian-...`) and squad
+/// Find the affected entry addressed by `entry_id` within one waypoint's
+/// affected, regardless of its `kind` -- review ids (`guardian-...`) and squad
 /// ids (`squad-...`) use non-colliding prefixes, so the path alone is enough
 /// to disambiguate without a separate `kind` query parameter.
-fn find_roster_entry(
+fn find_affected_entry(
     store: &Store,
     waypoint_id: &str,
     entry_id: &str,
-) -> crate::store::Result<Option<crate::waypoints::RosterEntryView>> {
+) -> crate::store::Result<Option<crate::waypoints::AffectedEntryView>> {
     Ok(store
-        .list_roster_entries(waypoint_id)?
+        .list_affected_entries(waypoint_id)?
         .into_iter()
         .find(|entry| entry.entry_id == entry_id))
 }
 
-/// `DELETE /api/waypoints/{id}/roster/{entry_id}` -- remove one roster
+/// `DELETE /api/waypoints/{id}/affected/{entry_id}` -- remove one affected
 /// entry.
-fn waypoint_remove_roster_entry(daemon: &Daemon, id: &str, entry_id: &str) -> Reply {
+fn waypoint_remove_affected_entry(daemon: &Daemon, id: &str, entry_id: &str) -> Reply {
     let store = daemon.lock();
-    let entry = match find_roster_entry(&store, id, entry_id) {
+    let entry = match find_affected_entry(&store, id, entry_id) {
         Ok(Some(entry)) => entry,
         Ok(None) => {
             return error(
                 404,
                 "not_found",
-                &format!("no roster entry {entry_id:?} on waypoint {id:?}"),
+                &format!("no affected entry {entry_id:?} on waypoint {id:?}"),
                 vec![],
             );
         }
         Err(e) => return store_error(&e),
     };
-    if let Err(e) = store.remove_roster_entry(id, entry.kind, entry_id) {
+    if let Err(e) = store.remove_affected_entry(id, entry.kind, entry_id) {
         return store_error(&e);
     }
     match waypoint_detail(&store, id) {
@@ -15386,15 +15390,15 @@ fn waypoint_remove_roster_entry(daemon: &Daemon, id: &str, entry_id: &str) -> Re
     }
 }
 
-/// `PATCH /api/waypoints/{id}/roster/{entry_id}` -- a human override of the
-/// survey's block/advisory mode decision for one roster entry. Reuses
-/// `add_roster_entry`'s mode-only upsert, which never touches the entry's
+/// `PATCH /api/waypoints/{id}/affected/{entry_id}` -- a human override of the
+/// survey's block/advisory mode decision for one affected entry. Reuses
+/// `add_affected_entry`'s mode-only upsert, which never touches the entry's
 /// `survey_verdict`/`survey_rationale`.
-fn waypoint_patch_roster_entry(daemon: &Daemon, id: &str, entry_id: &str, body: &str) -> Reply {
-    let Ok(req) = serde_json::from_str::<PatchRosterEntryBody>(body) else {
+fn waypoint_patch_affected_entry(daemon: &Daemon, id: &str, entry_id: &str, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<PatchAffectedEntryBody>(body) else {
         return error(400, "bad_request", "body must be {mode}", vec![]);
     };
-    let Some(mode) = crate::waypoints::RosterMode::parse(&req.mode) else {
+    let Some(mode) = crate::waypoints::AffectedMode::parse(&req.mode) else {
         return error(
             400,
             "bad_request",
@@ -15403,19 +15407,19 @@ fn waypoint_patch_roster_entry(daemon: &Daemon, id: &str, entry_id: &str, body: 
         );
     };
     let store = daemon.lock();
-    let entry = match find_roster_entry(&store, id, entry_id) {
+    let entry = match find_affected_entry(&store, id, entry_id) {
         Ok(Some(entry)) => entry,
         Ok(None) => {
             return error(
                 404,
                 "not_found",
-                &format!("no roster entry {entry_id:?} on waypoint {id:?}"),
+                &format!("no affected entry {entry_id:?} on waypoint {id:?}"),
                 vec![],
             );
         }
         Err(e) => return store_error(&e),
     };
-    if let Err(e) = store.add_roster_entry(id, entry.kind, entry_id, mode) {
+    if let Err(e) = store.add_affected_entry(id, entry.kind, entry_id, mode) {
         return store_error(&e);
     }
     crate::waypoints::signal_explicit_block_halt(
@@ -15435,7 +15439,7 @@ fn waypoint_patch_roster_entry(daemon: &Daemon, id: &str, entry_id: &str, body: 
 /// `PATCH /api/waypoints/{id}` -- update one waypoint's settings (label,
 /// guidance prompt, survey agent/model, whether advisory entries are allowed).
 ///
-/// Roster membership is not edited here: an entry carries its own mode,
+/// Affected membership is not edited here: an entry carries its own mode,
 /// verdict and delivery state, so it has its own endpoints rather than being
 /// replaced wholesale by a settings save.
 fn waypoint_update(daemon: &Daemon, id: &str, body: &str) -> Reply {
@@ -15490,15 +15494,15 @@ fn waypoint_update(daemon: &Daemon, id: &str, body: &str) -> Reply {
     }
 }
 
-/// `POST /api/waypoints/{id}/goals` -- add a review or squad to the
+/// `POST /api/waypoints/{id}/roster` -- add a review or squad to the
 /// waypoint's completion list (phase 1).
 ///
-/// Separate from `/roster`, which is the list of work this waypoint *lands
+/// Separate from `/affected`, which is the list of work this waypoint *lands
 /// on*. Those answer different questions -- "what must be true for this to be
 /// done" versus "who needs to hear about it" -- and nothing auto-enrolls
 /// here, because the first is a statement of intent.
-fn waypoint_add_goal(daemon: &Daemon, id: &str, body: &str) -> Reply {
-    let Ok(req) = serde_json::from_str::<AddGoalBody>(body) else {
+fn waypoint_add_roster_entry(daemon: &Daemon, id: &str, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<AddRosterEntryBody>(body) else {
         return error(
             400,
             "bad_request",
@@ -15506,7 +15510,7 @@ fn waypoint_add_goal(daemon: &Daemon, id: &str, body: &str) -> Reply {
             vec![],
         );
     };
-    let Some(kind) = crate::waypoints::RosterEntryKind::parse(&req.kind) else {
+    let Some(kind) = crate::waypoints::WaypointEntryKind::parse(&req.kind) else {
         return error(
             400,
             "bad_request",
@@ -15518,7 +15522,7 @@ fn waypoint_add_goal(daemon: &Daemon, id: &str, body: &str) -> Reply {
         return error(400, "bad_request", "entry_id must not be empty", vec![]);
     }
     let store = daemon.lock();
-    if let Err(e) = store.add_roster_goal(id, kind, &req.entry_id, req.note.as_deref()) {
+    if let Err(e) = store.add_roster_entry(id, kind, &req.entry_id, req.note.as_deref()) {
         return store_error(&e);
     }
     crate::cartographer::Note::new("server")
@@ -15540,17 +15544,17 @@ fn waypoint_add_goal(daemon: &Daemon, id: &str, body: &str) -> Reply {
     }
 }
 
-/// `DELETE /api/waypoints/{id}/goals/{entry_id}` -- drop a goal from the
+/// `DELETE /api/waypoints/{id}/roster/{entry_id}` -- drop a goal from the
 /// completion list. Removing the last unfinished goal can complete phase 1,
 /// so this re-checks whether the waypoint is now closeable.
-fn waypoint_remove_goal(daemon: &Daemon, id: &str, entry_id: &str) -> Reply {
+fn waypoint_remove_roster_entry(daemon: &Daemon, id: &str, entry_id: &str) -> Reply {
     let kind = if entry_id.starts_with("guardian-") {
-        crate::waypoints::RosterEntryKind::Review
+        crate::waypoints::WaypointEntryKind::Review
     } else {
-        crate::waypoints::RosterEntryKind::Squad
+        crate::waypoints::WaypointEntryKind::Squad
     };
     let store = daemon.lock();
-    if let Err(e) = store.remove_roster_goal(id, kind, entry_id) {
+    if let Err(e) = store.remove_roster_entry(id, kind, entry_id) {
         return store_error(&e);
     }
     let _ = store.maybe_auto_close_waypoint(id);
@@ -15575,16 +15579,16 @@ fn waypoint_resurvey_preview(daemon: &Daemon, id: &str) -> Reply {
     }
 }
 
-/// `POST /api/waypoints/{id}/roster/{entry_id}/redo` -- re-run one
-/// stale-flagged squad roster entry, carrying its prior findings and the
+/// `POST /api/waypoints/{id}/affected/{entry_id}/redo` -- re-run one
+/// stale-flagged squad affected entry, carrying its prior findings and the
 /// waypoint's bearings into the new run
-/// (`crate::waypoints::redo_roster_entry`).
+/// (`crate::waypoints::redo_affected_entry`).
 ///
-/// Replies with the refreshed waypoint detail, like every other roster
+/// Replies with the refreshed waypoint detail, like every other affected
 /// mutation, so a caller sees the flag cleared in the same round trip.
-fn waypoint_redo_roster_entry(daemon: &Daemon, id: &str, entry_id: &str) -> Reply {
+fn waypoint_redo_affected_entry(daemon: &Daemon, id: &str, entry_id: &str) -> Reply {
     let store = daemon.lock();
-    if let Err(e) = crate::waypoints::redo_roster_entry(&store, id, entry_id) {
+    if let Err(e) = crate::waypoints::redo_affected_entry(&store, id, entry_id) {
         return store_error(&e);
     }
     match waypoint_detail(&store, id) {
@@ -15594,7 +15598,7 @@ fn waypoint_redo_roster_entry(daemon: &Daemon, id: &str, entry_id: &str) -> Repl
 }
 
 /// `POST /api/waypoints/{id}/close` -- manual lifecycle control: close a
-/// waypoint regardless of whether every roster entry has reached a terminal
+/// waypoint regardless of whether every affected entry has reached a terminal
 /// state yet.
 fn waypoint_close(daemon: &Daemon, id: &str) -> Reply {
     let store = daemon.lock();
@@ -15634,7 +15638,7 @@ fn waypoint_append_bearing(daemon: &Daemon, id: &str, body: &str) -> Reply {
             vec![],
         );
     };
-    let Some(producer_kind) = crate::waypoints::RosterEntryKind::parse(&req.producer_kind) else {
+    let Some(producer_kind) = crate::waypoints::WaypointEntryKind::parse(&req.producer_kind) else {
         return error(
             400,
             "bad_request",
@@ -15676,9 +15680,9 @@ fn waypoint_append_bearing(daemon: &Daemon, id: &str, body: &str) -> Reply {
     // happens to pick it up.
     if queued > 0 {
         let waypoint = store.get_waypoint(id).ok();
-        for entry in store.list_roster_entries(id).unwrap_or_default() {
-            if entry.mode != crate::waypoints::RosterMode::Advisory
-                || entry.kind != crate::waypoints::RosterEntryKind::Squad
+        for entry in store.list_affected_entries(id).unwrap_or_default() {
+            if entry.mode != crate::waypoints::AffectedMode::Advisory
+                || entry.kind != crate::waypoints::WaypointEntryKind::Squad
             {
                 continue;
             }
@@ -31097,15 +31101,15 @@ remediation_attempts=1
     // RAL-400 Phase 7: cross-squad waypoints HTTP surface
     // -----------------------------------------------------------------------
 
-    fn create_waypoint_body(prompt: &str, roster: serde_json::Value) -> String {
+    fn create_waypoint_body(prompt: &str, affected: serde_json::Value) -> String {
         serde_json::to_string(&serde_json::json!({
             "prompt": prompt,
-            "roster": roster,
+            "affected": affected,
         }))
         .unwrap()
     }
 
-    /// Create a waypoint with a single `review`-kind roster entry with a
+    /// Create a waypoint with a single `review`-kind affected entry with a
     /// fake id -- `review_scope_by_project` (unlike `squad_scope_by_project`)
     /// doesn't error on an id that doesn't correspond to a real guardian, so
     /// this is the cheapest way to get a valid waypoint without also
@@ -31133,7 +31137,7 @@ remediation_attempts=1
     }
 
     #[test]
-    fn waypoint_create_requires_at_least_one_roster_entry() {
+    fn waypoint_create_requires_at_least_one_affected_entry() {
         let d = daemon();
         let body = create_waypoint_body("coordinate the thing", serde_json::json!([]));
         let r = route(&d, "POST", "/api/waypoints", &body);
@@ -31141,7 +31145,7 @@ remediation_attempts=1
     }
 
     #[test]
-    fn waypoint_create_rejects_invalid_roster_kind() {
+    fn waypoint_create_rejects_invalid_affected_kind() {
         let d = daemon();
         let body = create_waypoint_body(
             "coordinate the thing",
@@ -31152,7 +31156,7 @@ remediation_attempts=1
     }
 
     #[test]
-    fn waypoint_create_rejects_invalid_roster_mode() {
+    fn waypoint_create_rejects_invalid_affected_mode() {
         let d = daemon();
         let body = create_waypoint_body(
             "coordinate the thing",
@@ -31173,14 +31177,14 @@ remediation_attempts=1
         assert_eq!(v["id"], id);
         assert_eq!(v["state"], "open");
         assert_eq!(v["prompt"], "coordinate the thing");
-        assert_eq!(v["roster"].as_array().unwrap().len(), 1);
-        assert_eq!(v["roster"][0]["kind"], "review");
-        assert_eq!(v["roster"][0]["entry_id"], "guardian-fake");
+        assert_eq!(v["affected"].as_array().unwrap().len(), 1);
+        assert_eq!(v["affected"][0]["kind"], "review");
+        assert_eq!(v["affected"][0]["entry_id"], "guardian-fake");
         assert_eq!(v["delivery_summary"]["undelivered"], 1);
     }
 
     #[test]
-    fn waypoint_create_notifies_watchers_of_each_roster_entry() {
+    fn waypoint_create_notifies_watchers_of_each_affected_entry() {
         let d = daemon();
         let squad_id = submit_squad(&d);
         d.lock()
@@ -31299,8 +31303,8 @@ remediation_attempts=1
     }
 
     #[test]
-    fn waypoint_list_tolerates_roster_entry_for_deleted_squad() {
-        // A squad-kind roster entry whose squad id doesn't exist must not
+    fn waypoint_list_tolerates_affected_entry_for_deleted_squad() {
+        // A squad-kind affected entry whose squad id doesn't exist must not
         // 404/500 the whole list -- `Store::squad_scope_by_project` errors
         // on a missing squad (unlike the review-scope lookup), so the
         // `waypoint_list`/`waypoint_get` handlers must tolerate that per
@@ -31325,7 +31329,7 @@ remediation_attempts=1
     }
 
     #[test]
-    fn waypoint_roster_add_remove_and_patch() {
+    fn waypoint_affected_add_remove_and_patch() {
         let d = daemon();
         let id = create_waypoint_with_fake_review(&d);
 
@@ -31338,23 +31342,23 @@ remediation_attempts=1
         let r = route(
             &d,
             "POST",
-            &format!("/api/waypoints/{id}/roster"),
+            &format!("/api/waypoints/{id}/affected"),
             &add_body,
         );
         assert_eq!(r.status, 200, "{}", r.body);
         let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
-        assert_eq!(v["roster"].as_array().unwrap().len(), 2);
+        assert_eq!(v["affected"].as_array().unwrap().len(), 2);
 
         let patch_body = serde_json::to_string(&serde_json::json!({ "mode": "block" })).unwrap();
         let r = route(
             &d,
             "PATCH",
-            &format!("/api/waypoints/{id}/roster/squad-fake"),
+            &format!("/api/waypoints/{id}/affected/squad-fake"),
             &patch_body,
         );
         assert_eq!(r.status, 200, "{}", r.body);
         let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
-        let patched = v["roster"]
+        let patched = v["affected"]
             .as_array()
             .unwrap()
             .iter()
@@ -31365,7 +31369,7 @@ remediation_attempts=1
         let r = route(
             &d,
             "PATCH",
-            &format!("/api/waypoints/{id}/roster/squad-missing"),
+            &format!("/api/waypoints/{id}/affected/squad-missing"),
             &patch_body,
         );
         assert_eq!(r.status, 404, "{}", r.body);
@@ -31373,17 +31377,17 @@ remediation_attempts=1
         let r = route(
             &d,
             "DELETE",
-            &format!("/api/waypoints/{id}/roster/squad-fake"),
+            &format!("/api/waypoints/{id}/affected/squad-fake"),
             "",
         );
         assert_eq!(r.status, 200, "{}", r.body);
         let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
-        assert_eq!(v["roster"].as_array().unwrap().len(), 1);
+        assert_eq!(v["affected"].as_array().unwrap().len(), 1);
 
         let r = route(
             &d,
             "DELETE",
-            &format!("/api/waypoints/{id}/roster/squad-fake"),
+            &format!("/api/waypoints/{id}/affected/squad-fake"),
             "",
         );
         assert_eq!(r.status, 404, "{}", r.body);

@@ -1949,10 +1949,10 @@ impl DaemonClient {
         agent: Option<&str>,
         model: Option<&str>,
         allow_advisory: bool,
-        roster: &[Value],
+        affected: &[Value],
     ) -> Result<Value, DaemonError> {
         let mut body =
-            json!({"prompt": prompt, "allow_advisory": allow_advisory, "roster": roster});
+            json!({"prompt": prompt, "allow_advisory": allow_advisory, "affected": affected});
         set_if_some(&mut body, "label", label.map(str::to_string));
         set_if_some(&mut body, "agent", agent.map(str::to_string));
         set_if_some(&mut body, "model", model.map(str::to_string));
@@ -1975,7 +1975,7 @@ impl DaemonClient {
         self.get(&format!("/api/waypoints/{waypoint_id}"))
     }
 
-    pub fn waypoint_add_roster_entry(
+    pub fn waypoint_add_affected_entry(
         &self,
         waypoint_id: &str,
         kind: &str,
@@ -1984,25 +1984,28 @@ impl DaemonClient {
     ) -> Result<Value, DaemonError> {
         let mut body = json!({"kind": kind, "entry_id": entry_id});
         set_if_some(&mut body, "mode", mode.map(str::to_string));
-        self.post(&format!("/api/waypoints/{waypoint_id}/roster"), Some(body))
+        self.post(
+            &format!("/api/waypoints/{waypoint_id}/affected"),
+            Some(body),
+        )
     }
 
-    pub fn waypoint_remove_roster_entry(
+    pub fn waypoint_remove_affected_entry(
         &self,
         waypoint_id: &str,
         entry_id: &str,
     ) -> Result<Value, DaemonError> {
-        self.delete(&format!("/api/waypoints/{waypoint_id}/roster/{entry_id}"))
+        self.delete(&format!("/api/waypoints/{waypoint_id}/affected/{entry_id}"))
     }
 
-    pub fn waypoint_patch_roster_entry(
+    pub fn waypoint_patch_affected_entry(
         &self,
         waypoint_id: &str,
         entry_id: &str,
         mode: &str,
     ) -> Result<Value, DaemonError> {
         self.patch(
-            &format!("/api/waypoints/{waypoint_id}/roster/{entry_id}"),
+            &format!("/api/waypoints/{waypoint_id}/affected/{entry_id}"),
             Some(json!({"mode": mode})),
         )
     }
@@ -2037,7 +2040,7 @@ impl DaemonClient {
         self.patch(&format!("/api/waypoints/{waypoint_id}"), Some(body))
     }
 
-    pub fn waypoint_add_goal(
+    pub fn waypoint_add_roster_entry(
         &self,
         waypoint_id: &str,
         kind: &str,
@@ -2045,28 +2048,28 @@ impl DaemonClient {
         note: Option<&str>,
     ) -> Result<Value, DaemonError> {
         let body = serde_json::json!({ "kind": kind, "entry_id": entry_id, "note": note });
-        self.post(&format!("/api/waypoints/{waypoint_id}/goals"), Some(body))
+        self.post(&format!("/api/waypoints/{waypoint_id}/roster"), Some(body))
     }
 
-    pub fn waypoint_remove_goal(
+    pub fn waypoint_remove_roster_entry(
         &self,
         waypoint_id: &str,
         entry_id: &str,
     ) -> Result<Value, DaemonError> {
-        self.delete(&format!("/api/waypoints/{waypoint_id}/goals/{entry_id}"))
+        self.delete(&format!("/api/waypoints/{waypoint_id}/roster/{entry_id}"))
     }
 
     pub fn waypoint_resurvey_preview(&self, waypoint_id: &str) -> Result<Value, DaemonError> {
         self.get(&format!("/api/waypoints/{waypoint_id}/resurvey-preview"))
     }
 
-    pub fn waypoint_redo_roster_entry(
+    pub fn waypoint_redo_affected_entry(
         &self,
         waypoint_id: &str,
         entry_id: &str,
     ) -> Result<Value, DaemonError> {
         self.post(
-            &format!("/api/waypoints/{waypoint_id}/roster/{entry_id}/redo"),
+            &format!("/api/waypoints/{waypoint_id}/affected/{entry_id}/redo"),
             None,
         )
     }

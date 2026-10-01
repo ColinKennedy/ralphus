@@ -1264,7 +1264,7 @@
           : `<div data-click="toggleWatch" data-entity-uri="${esc(squadUri)}" data-tip="${isWatching(squadUri) ? "Stop receiving watcher notifications for this squad." : "Watch this whole squad and choose which mailbox priority tiers should notify you."}">${isWatching(squadUri) ? "◉ Unwatch" : "◎ Watch…"}</div>`);
         items.push(menuBatchSize > 1
           ? `<div class="ctx-disabled" data-tip="${singleOnlyTip("Add to waypoint")}">📍 Add to waypoint…</div>`
-          : `<div onclick="openAddToWaypointMenu(event,'squad','${esc(id)}')" data-tip="Add this squad to a cross-squad waypoint's roster, or create a new waypoint from it.">📍 Add to waypoint…</div>`);
+          : `<div onclick="openAddToWaypointMenu(event,'squad','${esc(id)}')" data-tip="Add this squad to a cross-squad waypoint's affected, or create a new waypoint from it.">📍 Add to waypoint…</div>`);
         if (menuBatchSize > 1) {
           items.push(`<div data-click="hideSquadMenuItem" data-squad-id="${esc(id)}" data-tip="Hide all ${menuBatchSize} selected squads from your own view — they stay fully intact and keep running/counting normally.\nWho/when: use this to declutter your list of squads you don't need to watch right now.\nA personal preference — it never affects what other users see, and can be undone any time via \"show hidden\".">🙈 Hide ${menuBatchSize}</div>`);
           items.push(`<div data-click="unhideSquadMenuItem" data-squad-id="${esc(id)}" data-tip="Show all ${menuBatchSize} selected squads again in your own view, if hidden.\nWho/when: use this to undo an earlier hide across a whole selection.\nA personal preference — it never affects what other users see.">👁 Unhide ${menuBatchSize}</div>`);

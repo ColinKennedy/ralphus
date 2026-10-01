@@ -1899,7 +1899,7 @@ fn enqueue_cell_failure_mailbox(
 }
 
 /// RAL-400 Phase 3: broadcast a mailbox message when a squad's in-flight
-/// cell is halted because its squad-kind roster entry just became
+/// cell is halted because its squad-kind affected entry just became
 /// `mode=block` on an open waypoint. Mirrors
 /// [`enqueue_cell_failure_mailbox`]'s shape, but this is a blocked state, not
 /// a failure -- the cell resumes automatically once the waypoint closes or
@@ -2692,7 +2692,7 @@ fn run_cell_worker(
         if was_waypoint_halted {
             let rebased = rebase_resumed_cell_onto_upstream(row);
             // Which waypoint held it. Gone by now in the normal case -- the
-            // hold lifted because its roster landed -- so fall back to the
+            // hold lifted because its affected landed -- so fall back to the
             // most recent one that affects this squad rather than reporting
             // nothing.
             let waypoint = guard
@@ -2842,9 +2842,9 @@ fn run_cell_worker(
         let rebased = injected.iter().any(|i| {
             i.waypoint_id.as_deref().is_some_and(|wp| {
                 matches!(
-                    store.lock().roster_entry_delivery_status(
+                    store.lock().affected_entry_delivery_status(
                         wp,
-                        crate::waypoints::RosterEntryKind::Squad,
+                        crate::waypoints::WaypointEntryKind::Squad,
                         &i.target_squad,
                     ),
                     Ok(Some(crate::waypoints::DeliveryStatus::ViaRestack))
@@ -3199,7 +3199,7 @@ fn run_cell_worker(
     // about to take over; automation picks back up only via the explicit
     // resume-automation trigger, not by falling through to the normal
     // done/failed path below.
-    // RAL-400 Phase 3: a squad-kind roster entry just became `mode=block` on
+    // RAL-400 Phase 3: a squad-kind affected entry just became `mode=block` on
     // an open waypoint while this cell was actively running (the trigger is
     // `waypoints::survey_candidate` calling `.cancel(squad_id)` on the
     // `WaypointHalts` registry this runner attempt was polling). Like a
@@ -3429,7 +3429,7 @@ fn run_cell_worker(
         if let Some(decision) = crate::waypoints::BearingDecision::parse(&report.decision) {
             crate::waypoints::record_waypoint_answer(
                 store,
-                crate::waypoints::RosterEntryKind::Squad,
+                crate::waypoints::WaypointEntryKind::Squad,
                 squad_id,
                 decision,
                 &report.message,
@@ -5786,19 +5786,19 @@ mod tests {
                 )
                 .unwrap();
             guard
-                .add_roster_entry(
+                .add_affected_entry(
                     "waypoint-1",
-                    crate::waypoints::RosterEntryKind::Squad,
+                    crate::waypoints::WaypointEntryKind::Squad,
                     &id,
-                    crate::waypoints::RosterMode::Block,
+                    crate::waypoints::AffectedMode::Block,
                 )
                 .unwrap();
             // A squad's hold lasts while its waypoint's own work is unfinished,
             // so give this waypoint a goal that has not landed.
             guard
-                .add_roster_goal(
+                .add_roster_entry(
                     "waypoint-1",
-                    crate::waypoints::RosterEntryKind::Squad,
+                    crate::waypoints::WaypointEntryKind::Squad,
                     "squad-wp-goal",
                     None,
                 )
@@ -5877,19 +5877,19 @@ mod tests {
                 )
                 .unwrap();
             guard
-                .add_roster_entry(
+                .add_affected_entry(
                     "waypoint-1",
-                    crate::waypoints::RosterEntryKind::Squad,
+                    crate::waypoints::WaypointEntryKind::Squad,
                     &id,
-                    crate::waypoints::RosterMode::Block,
+                    crate::waypoints::AffectedMode::Block,
                 )
                 .unwrap();
             // A squad's hold lasts while its waypoint's own work is unfinished,
             // so give this waypoint a goal that has not landed.
             guard
-                .add_roster_goal(
+                .add_roster_entry(
                     "waypoint-1",
-                    crate::waypoints::RosterEntryKind::Squad,
+                    crate::waypoints::WaypointEntryKind::Squad,
                     "squad-wp-goal",
                     None,
                 )
@@ -5897,7 +5897,7 @@ mod tests {
             guard
                 .append_waypoint_bearing(
                     "waypoint-1",
-                    crate::waypoints::RosterEntryKind::Review,
+                    crate::waypoints::WaypointEntryKind::Review,
                     "other-review",
                     "renamed the shared auth trait",
                     None,

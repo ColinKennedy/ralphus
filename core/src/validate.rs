@@ -306,7 +306,7 @@ pub const WAYPOINT_KEYS: &[&str] = &[
     "agent",
     "model",
     "allow_advisory",
-    "roster",
+    "affected",
 ];
 /// RAL-395: the literal placeholder every `auto_fix_prompt_template` must
 /// contain -- shared between `[[review]]` submission validation
@@ -2047,12 +2047,12 @@ fn validate_review_blocks(value: Option<&toml::Value>, ctx: &mut Ctx) {
 }
 
 /// Validate top-level `[[waypoint]]` blocks (RAL-400): unknown keys, the
-/// required `prompt`, a non-empty `roster` whose entries are all well-formed
-/// sentinels (see [`crate::schema::parse_roster_entry_sentinel`]), and
+/// required `prompt`, a non-empty `affected` whose entries are all well-formed
+/// sentinels (see [`crate::schema::parse_affected_entry_sentinel`]), and
 /// agent-aware `model` requiredness (see
 /// [`crate::schema::agent_requires_waypoint_model`]).
 ///
-/// A roster entry naming an *existing* review/squad
+/// A affected entry naming an *existing* review/squad
 /// (`<<review:<id>>>`/`<<squad:<id>>>`) cannot be checked here -- whether
 /// that id exists is only knowable once the daemon's database is in the
 /// loop, the same core/daemon split [`check_review`] already draws for a
@@ -2143,40 +2143,40 @@ fn validate_waypoint_blocks(root: &toml::Table, value: Option<&toml::Value>, ctx
             }
         }
 
-        match table.get("roster") {
+        match table.get("affected") {
             None => ctx.error(
                 &wpath,
                 ErrorKind::MissingRequired,
-                "'roster' is required and must name at least one review/squad",
+                "'affected' is required and must name at least one review/squad",
                 header,
             ),
             Some(v) => match v.as_array() {
-                None => check_type(ctx, table, "roster", Ty::StrArray, &wpath, header),
+                None => check_type(ctx, table, "affected", Ty::StrArray, &wpath, header),
                 Some(items) => {
                     if items.is_empty() {
                         ctx.error(
-                            &format!("{wpath}.roster"),
+                            &format!("{wpath}.affected"),
                             ErrorKind::InvalidValue,
-                            "'roster' must name at least one review/squad",
-                            ctx.key_line(header, "roster"),
+                            "'affected' must name at least one review/squad",
+                            ctx.key_line(header, "affected"),
                         );
                     }
                     for (i, entry) in items.iter().enumerate() {
-                        let epath = format!("{wpath}.roster[{i}]");
+                        let epath = format!("{wpath}.affected[{i}]");
                         let Some(s) = entry.as_str() else {
                             ctx.error(
                                 &epath,
                                 ErrorKind::WrongType,
-                                "each 'roster' entry must be a string",
+                                "each 'affected' entry must be a string",
                                 None,
                             );
                             continue;
                         };
-                        let Some(parsed) = crate::schema::parse_roster_entry_sentinel(s) else {
+                        let Some(parsed) = crate::schema::parse_affected_entry_sentinel(s) else {
                             ctx.error(
                                 &epath,
                                 ErrorKind::InvalidValue,
-                                "roster entry must be wrapped in \"<<...>>\" sentinel syntax, \
+                                "affected entry must be wrapped in \"<<...>>\" sentinel syntax, \
                                  e.g. \"<<review:backend>>\", \"<<squad:squad-abc>>\", \
                                  \"<<ralphus:new-review/<key>>>\", or \"<<ralphus:new-squad>>\"",
                                 None,
@@ -2184,7 +2184,7 @@ fn validate_waypoint_blocks(root: &toml::Table, value: Option<&toml::Value>, ctx
                             continue;
                         };
                         match parsed {
-                            crate::schema::RosterEntryRef::ExistingReview(id)
+                            crate::schema::AffectedEntryRef::ExistingReview(id)
                                 if id.starts_with("ralphus:") =>
                             {
                                 if !review_ids.contains(id.as_str()) {
@@ -2192,7 +2192,7 @@ fn validate_waypoint_blocks(root: &toml::Table, value: Option<&toml::Value>, ctx
                                         &epath,
                                         ErrorKind::InvalidValue,
                                         format!(
-                                            "roster entry \"{s}\" names a same-file placeholder \
+                                            "affected entry \"{s}\" names a same-file placeholder \
                                              that does not match any [[review]].id in this \
                                              submission"
                                         ),
@@ -2200,18 +2200,18 @@ fn validate_waypoint_blocks(root: &toml::Table, value: Option<&toml::Value>, ctx
                                     );
                                 }
                             }
-                            crate::schema::RosterEntryRef::NewSquad if !has_task_group => {
+                            crate::schema::AffectedEntryRef::NewSquad if !has_task_group => {
                                 ctx.error(
                                     &epath,
                                     ErrorKind::InvalidValue,
-                                    "roster entry \"<<ralphus:new-squad>>\" requires at least \
+                                    "affected entry \"<<ralphus:new-squad>>\" requires at least \
                                      one [[task]] in this submission",
                                     None,
                                 );
                             }
-                            crate::schema::RosterEntryRef::ExistingReview(_)
-                            | crate::schema::RosterEntryRef::ExistingSquad(_)
-                            | crate::schema::RosterEntryRef::NewSquad => {}
+                            crate::schema::AffectedEntryRef::ExistingReview(_)
+                            | crate::schema::AffectedEntryRef::ExistingSquad(_)
+                            | crate::schema::AffectedEntryRef::NewSquad => {}
                         }
                     }
                 }
@@ -3160,10 +3160,10 @@ prompt = "make it build"
         assert_eq!(e.line, Some(3));
     }
 
-    // ── RAL-400: waypoint roster ─────────────────────────────────────────────
+    // ── RAL-400: waypoint affected ─────────────────────────────────────────────
 
     #[test]
-    fn waypoint_roster_must_be_non_empty() {
+    fn waypoint_affected_must_be_non_empty() {
         let src = r#"
 [[task]]
 name = "build"
@@ -3176,17 +3176,17 @@ remediation_attempts = 3
 
 [[waypoint]]
 prompt = "gate on review"
-roster = []
+affected = []
 "#;
         let r = validate_toml(src);
         r.errors
             .iter()
-            .find(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("roster"))
-            .expect("an empty roster must be rejected");
+            .find(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("affected"))
+            .expect("an empty affected must be rejected");
     }
 
     #[test]
-    fn waypoint_roster_is_required() {
+    fn waypoint_affected_is_required() {
         let src = r#"
 [[task]]
 name = "build"
@@ -3203,8 +3203,8 @@ prompt = "gate on review"
         let r = validate_toml(src);
         r.errors
             .iter()
-            .find(|e| e.kind == ErrorKind::MissingRequired && e.message.contains("roster"))
-            .expect("an omitted roster must be rejected");
+            .find(|e| e.kind == ErrorKind::MissingRequired && e.message.contains("affected"))
+            .expect("an omitted affected must be rejected");
     }
 
     #[test]

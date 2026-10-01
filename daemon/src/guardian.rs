@@ -1591,7 +1591,7 @@ impl Store {
         Ok(ids)
     }
 
-    /// Resolves a `ralphus:new-review/<key>` roster placeholder (RAL-400) to
+    /// Resolves a `ralphus:new-review/<key>` affected placeholder (RAL-400) to
     /// the real guardian id `derive_reviews_with_full_prefetch` created for
     /// it in this squad's submission, or `None` if no guardian recorded that
     /// `review_key` for this squad.
@@ -2637,12 +2637,12 @@ impl Store {
             }
             if GuardianStatus::is_terminal_status(status.as_str()) {
                 // RAL-400 Phase 6: a review reaching `merged`/`cancelled`/
-                // `deployed` may be the last non-terminal roster entry on one
+                // `deployed` may be the last non-terminal affected entry on one
                 // or more open waypoints. `is_terminal_status` already
                 // excludes `merge_failed`, since a failed merge may still be
                 // retried and so is not "finished" for this purpose.
-                let _ = self.maybe_auto_close_waypoints_for_roster_entry(
-                    crate::waypoints::RosterEntryKind::Review,
+                let _ = self.maybe_auto_close_waypoints_for_affected_entry(
+                    crate::waypoints::WaypointEntryKind::Review,
                     id,
                 );
             }
@@ -5751,7 +5751,7 @@ impl Store {
         if let Some(waypoint_id) = self.review_block_gating_waypoint(id)? {
             return Err(StoreError::InvalidTransition(format!(
                 "review {id} is held by open waypoint {waypoint_id}; close that waypoint or set \
-                 its roster entry for this review to advisory before approving"
+                 its affected entry for this review to advisory before approving"
             )));
         }
         match GuardianStatus::parse(&self.guardian_status_str(id)?) {

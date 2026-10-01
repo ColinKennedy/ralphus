@@ -55,7 +55,7 @@ pub struct TaskFile {
     #[serde(default)]
     pub review: Vec<ReviewDef>,
     /// Top-level waypoint (RAL-400) declarations: named, open/closed join
-    /// points a `roster` of reviews/squads must respect. See [`WaypointDef`].
+    /// points a `affected` of reviews/squads must respect. See [`WaypointDef`].
     #[serde(default)]
     pub waypoint: Vec<WaypointDef>,
 }
@@ -1027,10 +1027,10 @@ pub fn parse_cell_review_sentinel(review: &str) -> Option<&str> {
     review_link_key(inner).is_some().then_some(inner)
 }
 
-/// Sentinel prefix for a `[[waypoint]].roster` entry naming an
+/// Sentinel prefix for a `[[waypoint]].affected` entry naming an
 /// already-declared squad, `<<squad:<id>>>` (RAL-400). Structurally
 /// identical to [`REVIEW_REF_PREFIX`]'s `<<review:...>>` form -- see
-/// [`parse_roster_entry_sentinel`].
+/// [`parse_affected_entry_sentinel`].
 pub const SQUAD_REF_PREFIX: &str = "<<squad:";
 
 /// Sentinel naming the squad this same submission itself creates,
@@ -1039,16 +1039,16 @@ pub const SQUAD_REF_PREFIX: &str = "<<squad:";
 /// submission file always produces exactly one squad, so there is nothing
 /// to disambiguate between multiple same-file candidates the way several
 /// `[[review]]` blocks require. See
-/// `.agent/waypoints-phase0-decisions.md`'s "Roster-reference sentinel
+/// `.agent/waypoints-phase0-decisions.md`'s "Affected-reference sentinel
 /// grammar" section.
 pub const NEW_SQUAD_SENTINEL: &str = "<<ralphus:new-squad>>";
 
-/// A parsed, well-formed `[[waypoint]].roster` entry (RAL-400). Every
-/// roster entry must be wrapped in `<<...>>`, mirroring
+/// A parsed, well-formed `[[waypoint]].affected` entry (RAL-400). Every
+/// affected entry must be wrapped in `<<...>>`, mirroring
 /// [`parse_cell_review_sentinel`]'s rule that a bare/unwrapped id is
 /// invalid -- see `core/src/validate.rs`'s `check_review` precedent.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RosterEntryRef {
+pub enum AffectedEntryRef {
     /// `<<review:<id>>>` -- an existing `[[review]].id` in the daemon (or,
     /// same-file, a `[[review]]` block's own id/placeholder in this
     /// submission).
@@ -1060,22 +1060,23 @@ pub enum RosterEntryRef {
     NewSquad,
 }
 
-/// Parse a `[[waypoint]].roster` entry (RAL-400). Returns `None` for a
+/// Parse a `[[waypoint]].affected` entry (RAL-400). Returns `None` for a
 /// bare/unwrapped or otherwise malformed value -- callers reject those at
 /// validation time exactly as [`parse_cell_review_sentinel`] does for a
 /// cell's `review` field.
 #[must_use]
-pub fn parse_roster_entry_sentinel(entry: &str) -> Option<RosterEntryRef> {
+pub fn parse_affected_entry_sentinel(entry: &str) -> Option<AffectedEntryRef> {
     if entry == NEW_SQUAD_SENTINEL {
-        return Some(RosterEntryRef::NewSquad);
+        return Some(AffectedEntryRef::NewSquad);
     }
     if let Some(inner) = entry
         .strip_prefix(SQUAD_REF_PREFIX)
         .and_then(|s| s.strip_suffix(">>"))
     {
-        return (!inner.is_empty()).then(|| RosterEntryRef::ExistingSquad(inner.to_string()));
+        return (!inner.is_empty()).then(|| AffectedEntryRef::ExistingSquad(inner.to_string()));
     }
-    parse_cell_review_sentinel(entry).map(|inner| RosterEntryRef::ExistingReview(inner.to_string()))
+    parse_cell_review_sentinel(entry)
+        .map(|inner| AffectedEntryRef::ExistingReview(inner.to_string()))
 }
 
 /// The reserved `machine` value naming the daemon's own host. Also the
@@ -1550,9 +1551,9 @@ pub struct ReviewActionInputDef {
 }
 
 /// A top-level waypoint declaration via `[[waypoint]]` (RAL-400): a named,
-/// open/closed join point a `roster` of reviews/squads must respect. No
+/// open/closed join point a `affected` of reviews/squads must respect. No
 /// `project` field -- a waypoint's project(s) are inferred by hopping
-/// through its roster entries' own projects, the same "projects are
+/// through its affected entries' own projects, the same "projects are
 /// inferred, not declared" principle used elsewhere in this schema. See
 /// `.agent/waypoints-phase0-decisions.md` for the full design record.
 #[derive(Debug, Clone, Deserialize)]
@@ -1560,7 +1561,7 @@ pub struct WaypointDef {
     /// GUI label; falls back to a generated id when unset.
     #[serde(default)]
     pub label: Option<String>,
-    /// The guidance/instruction this waypoint publishes to its roster and
+    /// The guidance/instruction this waypoint publishes to its affected and
     /// survey candidates. Required, no silent default.
     pub prompt: String,
     /// Backend that runs this waypoint's survey classification pass, e.g.
@@ -1573,7 +1574,7 @@ pub struct WaypointDef {
     /// [`agent_requires_waypoint_model`].
     #[serde(default)]
     pub model: Option<String>,
-    /// Whether a roster entry may be left in advisory mode (delivered for
+    /// Whether a affected entry may be left in advisory mode (delivered for
     /// awareness without blocking) rather than always defaulting to block.
     /// Defaults off -- the survey's per-entry mode decision still applies,
     /// this only gates whether it's allowed to land on advisory at all.
@@ -1581,12 +1582,12 @@ pub struct WaypointDef {
     pub allow_advisory: bool,
     /// The reviews/squads this waypoint tracks as impacted. Each entry must
     /// be a `<<review:<id>>>` / `<<squad:<id>>>` / `<<ralphus:new-review/<key>>>` /
-    /// `<<ralphus:new-squad>>` sentinel -- see [`parse_roster_entry_sentinel`].
-    /// Must name at least one entry; a waypoint with zero roster entries is
+    /// `<<ralphus:new-squad>>` sentinel -- see [`parse_affected_entry_sentinel`].
+    /// Must name at least one entry; a waypoint with zero affected entries is
     /// rejected at creation (vacuous terminality is not a valid starting
     /// state).
     #[serde(default)]
-    pub roster: Vec<String>,
+    pub affected: Vec<String>,
 }
 
 /// One proof step. Exactly one of `command` / `brain` / `prompt` must be set.

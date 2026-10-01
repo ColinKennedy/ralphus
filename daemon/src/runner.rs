@@ -459,7 +459,7 @@ const TOOLS_SYSTEM_PROMPT: &str = "## Regarding Tools\nPrefer `rg` for shell sea
      behavior. In shell examples, use `rg \"pattern\" .`.";
 // RAL-400 Phase 5: the invariant half of the waypoint-injection contract.
 // This is static and unconditional -- present on every cell/proof dispatch,
-// whether or not this particular cell is actually roster'd to any waypoint --
+// whether or not this particular cell is actually affected'd to any waypoint --
 // so an agent never sees a bearing block for the first time without having
 // already been told what it means. The dynamic half (the waypoint's current
 // bearing list itself, rendered by `crate::waypoints::render_bearing_block`)
@@ -1228,7 +1228,7 @@ impl RunnerResult {
     }
 
     /// RAL-400 Phase 3: a cell halted because its squad just became gated
-    /// behind an open block-mode waypoint roster entry -- neither success nor
+    /// behind an open block-mode waypoint affected entry -- neither success nor
     /// failure, mirroring [`Self::detached`]'s "don't regress the board's
     /// numbers" reasoning. Deliberately a distinct status string from
     /// `"detached"` even though both resolve to [`NodeState::Running`] and
@@ -1380,7 +1380,7 @@ impl RunnerResult {
     }
 
     /// RAL-400 Phase 3: a cell halted because its squad became gated behind
-    /// an open block-mode waypoint roster entry -- see
+    /// an open block-mode waypoint affected entry -- see
     /// [`Self::waypoint_halted`]. Distinct from [`Self::is_detached`] so the
     /// scheduler can record the halt under its own DB column and Cartographer
     /// scope, and resume it automatically rather than waiting for a human
@@ -3598,7 +3598,7 @@ mod tests {
         assert!(background < tools && tools < waypoints && waypoints < conclusion);
         // RAL-400 Phase 5: every cell/proof agent path must carry the
         // invariant waypoint-handling contract, whether or not this
-        // particular cell is roster'd to a waypoint.
+        // particular cell is affected'd to a waypoint.
         assert!(
             sp.contains("waypoint bearing block"),
             "missing waypoint contract: {sp}"

@@ -104,7 +104,7 @@ impl EntityUri {
     /// `(squad_id, task_idx)`; a `Cell` covers only the cell-scoped `Proof`s
     /// under its `(squad_id, task_idx, cell_idx)`. `Proof`, `Guardian`, and
     /// `Waypoint` are leaves — they cover only themselves (a waypoint's
-    /// roster entries are separate top-level entities in their own right,
+    /// affected entries are separate top-level entities in their own right,
     /// not children nested under the waypoint).
     #[must_use]
     pub fn covers(&self, other: &Self) -> bool {

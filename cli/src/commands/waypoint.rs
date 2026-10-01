@@ -1,5 +1,5 @@
 //! `ralphus waypoint ...` -- RAL-400 cross-squad waypoints: create/list/get/
-//! close/reopen a waypoint, manage its roster and bearing feed. A thin HTTP
+//! close/reopen a waypoint, manage its affected and bearing feed. A thin HTTP
 //! client over `DaemonClient`'s `waypoint_*` methods, following the same
 //! parse/dispatch/render shape as `review.rs`'s nested subcommands
 //! (`upstream`/`pr`/`branch`).
@@ -20,7 +20,7 @@ pub enum WaypointCommand {
         agent: Option<String>,
         model: Option<String>,
         allow_advisory: bool,
-        roster: Vec<String>,
+        affected: Vec<String>,
     },
     List {
         project: Option<String>,
@@ -51,16 +51,16 @@ pub enum WaypointCommand {
     ResurveyPreview {
         waypoint_id: String,
     },
-    GoalAdd {
+    RosterAdd {
         waypoint_id: String,
         entry_id: String,
         note: Option<String>,
     },
-    GoalRemove {
+    RosterRemove {
         waypoint_id: String,
         entry_id: String,
     },
-    Roster(WaypointRosterCommand),
+    Affected(WaypointAffectedCommand),
     Bearing(WaypointBearingCommand),
     Bearings {
         waypoint_id: String,
@@ -72,7 +72,7 @@ pub enum WaypointCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WaypointRosterCommand {
+pub enum WaypointAffectedCommand {
     Help,
     Add {
         waypoint_id: String,
@@ -118,7 +118,7 @@ pub fn parse(args: &[String]) -> WaypointCommand {
             let agent = scanner.take_value("--agent").ok().flatten();
             let model = scanner.take_value("--model").ok().flatten();
             let allow_advisory = scanner.take_bool("--allow-advisory");
-            let roster = scanner.take_repeated("--roster").unwrap_or_default();
+            let affected = scanner.take_repeated("--affected").unwrap_or_default();
             match prompt {
                 Some(prompt) => WaypointCommand::Create {
                     prompt,
@@ -126,10 +126,10 @@ pub fn parse(args: &[String]) -> WaypointCommand {
                     agent,
                     model,
                     allow_advisory,
-                    roster,
+                    affected,
                 },
                 None => WaypointCommand::UsageError(
-                    "create requires --prompt <text> and at least one --roster kind:entry_id[:mode]"
+                    "create requires --prompt <text> and at least one --affected kind:entry_id[:mode]"
                         .to_string(),
                 ),
             }
@@ -148,32 +148,6 @@ pub fn parse(args: &[String]) -> WaypointCommand {
         Some("reopen") => with_waypoint_id(scanner, |waypoint_id| WaypointCommand::Reopen {
             waypoint_id,
         }),
-        Some("goal-add") => {
-            let note = scanner.take_value("--note").ok().flatten();
-            let rest = scanner.remaining();
-            match (rest.first(), rest.get(1)) {
-                (Some(waypoint_id), Some(entry_id)) => WaypointCommand::GoalAdd {
-                    waypoint_id: waypoint_id.clone(),
-                    entry_id: entry_id.clone(),
-                    note,
-                },
-                _ => WaypointCommand::UsageError(
-                    "goal-add requires <waypoint_id> <entry_id>".to_string(),
-                ),
-            }
-        }
-        Some("goal-remove") => {
-            let rest = scanner.remaining();
-            match (rest.first(), rest.get(1)) {
-                (Some(waypoint_id), Some(entry_id)) => WaypointCommand::GoalRemove {
-                    waypoint_id: waypoint_id.clone(),
-                    entry_id: entry_id.clone(),
-                },
-                _ => WaypointCommand::UsageError(
-                    "goal-remove requires <waypoint_id> <entry_id>".to_string(),
-                ),
-            }
-        }
         Some("resurvey-preview") => match scanner.remaining().first() {
             Some(waypoint_id) => WaypointCommand::ResurveyPreview {
                 waypoint_id: waypoint_id.clone(),
@@ -220,7 +194,44 @@ pub fn parse(args: &[String]) -> WaypointCommand {
                 ),
             }
         }
-        Some("roster") => WaypointCommand::Roster(parse_roster(&scanner.remaining())),
+        Some("roster") => {
+            let rest = scanner.remaining();
+            let sub = rest.first().map(String::as_str);
+            let mut inner = Scanner::new(&rest[1.min(rest.len())..]);
+            match sub {
+                Some("add") => {
+                    let note = inner.take_value("--note").ok().flatten();
+                    let args = inner.remaining();
+                    match (args.first(), args.get(1)) {
+                        (Some(waypoint_id), Some(entry_id)) => WaypointCommand::RosterAdd {
+                            waypoint_id: waypoint_id.clone(),
+                            entry_id: entry_id.clone(),
+                            note,
+                        },
+                        _ => WaypointCommand::UsageError(
+                            "roster add requires <waypoint_id> <entry_id>".to_string(),
+                        ),
+                    }
+                }
+                Some("remove") => {
+                    let args = inner.remaining();
+                    match (args.first(), args.get(1)) {
+                        (Some(waypoint_id), Some(entry_id)) => WaypointCommand::RosterRemove {
+                            waypoint_id: waypoint_id.clone(),
+                            entry_id: entry_id.clone(),
+                        },
+                        _ => WaypointCommand::UsageError(
+                            "roster remove requires <waypoint_id> <entry_id>".to_string(),
+                        ),
+                    }
+                }
+                other => WaypointCommand::UsageError(format!(
+                    "unknown roster subcommand: {}",
+                    other.unwrap_or("(none)")
+                )),
+            }
+        }
+        Some("affected") => WaypointCommand::Affected(parse_affected(&scanner.remaining())),
         Some("bearing") => WaypointCommand::Bearing(parse_bearing(&scanner.remaining())),
         Some("bearings") => with_waypoint_id(scanner, |waypoint_id| WaypointCommand::Bearings {
             waypoint_id,
@@ -242,52 +253,52 @@ fn with_waypoint_id(
     }
 }
 
-fn parse_roster(args: &[String]) -> WaypointRosterCommand {
+fn parse_affected(args: &[String]) -> WaypointAffectedCommand {
     let mut scanner = Scanner::new(&args[1.min(args.len())..]);
     match args.first().map(String::as_str) {
-        None | Some("help" | "--help" | "-h") => WaypointRosterCommand::Help,
+        None | Some("help" | "--help" | "-h") => WaypointAffectedCommand::Help,
         Some("add") => {
             let mode = scanner.take_value("--mode").ok().flatten();
             let rest = scanner.remaining();
             match (rest.first(), rest.get(1), rest.get(2)) {
-                (Some(waypoint_id), Some(kind), Some(entry_id)) => WaypointRosterCommand::Add {
+                (Some(waypoint_id), Some(kind), Some(entry_id)) => WaypointAffectedCommand::Add {
                     waypoint_id: waypoint_id.clone(),
                     kind: kind.clone(),
                     entry_id: entry_id.clone(),
                     mode,
                 },
-                _ => WaypointRosterCommand::UsageError(
-                    "roster add requires <waypoint_id> <kind> <entry_id>".to_string(),
+                _ => WaypointAffectedCommand::UsageError(
+                    "affected add requires <waypoint_id> <kind> <entry_id>".to_string(),
                 ),
             }
         }
         Some("remove") => {
             let rest = scanner.remaining();
             match (rest.first(), rest.get(1)) {
-                (Some(waypoint_id), Some(entry_id)) => WaypointRosterCommand::Remove {
+                (Some(waypoint_id), Some(entry_id)) => WaypointAffectedCommand::Remove {
                     waypoint_id: waypoint_id.clone(),
                     entry_id: entry_id.clone(),
                 },
-                _ => WaypointRosterCommand::UsageError(
-                    "roster remove requires <waypoint_id> <entry_id>".to_string(),
+                _ => WaypointAffectedCommand::UsageError(
+                    "affected remove requires <waypoint_id> <entry_id>".to_string(),
                 ),
             }
         }
         Some("mode") => {
             let rest = scanner.remaining();
             match (rest.first(), rest.get(1), rest.get(2)) {
-                (Some(waypoint_id), Some(entry_id), Some(mode)) => WaypointRosterCommand::Mode {
+                (Some(waypoint_id), Some(entry_id), Some(mode)) => WaypointAffectedCommand::Mode {
                     waypoint_id: waypoint_id.clone(),
                     entry_id: entry_id.clone(),
                     mode: mode.clone(),
                 },
-                _ => WaypointRosterCommand::UsageError(
-                    "roster mode requires <waypoint_id> <entry_id> <mode>".to_string(),
+                _ => WaypointAffectedCommand::UsageError(
+                    "affected mode requires <waypoint_id> <entry_id> <mode>".to_string(),
                 ),
             }
         }
-        Some(other) => WaypointRosterCommand::UsageError(format!(
-            "unknown waypoint roster subcommand: {other}"
+        Some(other) => WaypointAffectedCommand::UsageError(format!(
+            "unknown waypoint affected subcommand: {other}"
         )),
     }
 }
@@ -326,9 +337,9 @@ fn parse_bearing(args: &[String]) -> WaypointBearingCommand {
     }
 }
 
-/// Parse one `--roster kind:entry_id[:mode]` flag value into the JSON body
+/// Parse one `--affected kind:entry_id[:mode]` flag value into the JSON body
 /// shape `client.waypoint_create` expects.
-pub fn parse_roster_spec(spec: &str) -> Result<Value, CommandError> {
+pub fn parse_affected_spec(spec: &str) -> Result<Value, CommandError> {
     let mut parts = spec.splitn(3, ':');
     let kind = parts.next().filter(|s| !s.is_empty());
     let entry_id = parts.next().filter(|s| !s.is_empty());
@@ -342,7 +353,7 @@ pub fn parse_roster_spec(spec: &str) -> Result<Value, CommandError> {
             Ok(entry)
         }
         _ => Err(CommandError::Usage(format!(
-            "invalid --roster spec {spec:?}: expected kind:entry_id[:mode]"
+            "invalid --affected spec {spec:?}: expected kind:entry_id[:mode]"
         ))),
     }
 }
@@ -367,11 +378,11 @@ pub fn dispatch(cmd: WaypointCommand, opts: &GlobalOpts) -> i32 {
             agent,
             model,
             allow_advisory,
-            roster,
+            affected,
         } => run_and_report(opts, None, || {
-            let mut entries = Vec::with_capacity(roster.len());
-            for spec in &roster {
-                entries.push(parse_roster_spec(spec)?);
+            let mut entries = Vec::with_capacity(affected.len());
+            for spec in &affected {
+                entries.push(parse_affected_spec(spec)?);
             }
             let created = client.waypoint_create(
                 &prompt,
@@ -383,7 +394,7 @@ pub fn dispatch(cmd: WaypointCommand, opts: &GlobalOpts) -> i32 {
             )?;
             // `POST /api/waypoints` replies `201 {"id": ...}`, not a waypoint
             // detail, so rendering the reply directly printed a detail view
-            // with every field blank and "no roster entries". Read the
+            // with every field blank and "no affected entries". Read the
             // just-created waypoint back so both the human and `--json`
             // output match every other `waypoint` subcommand. If that read
             // fails the create still succeeded, so fall back to the id reply
@@ -411,12 +422,12 @@ pub fn dispatch(cmd: WaypointCommand, opts: &GlobalOpts) -> i32 {
             emit(opts, &result, render_waypoint_detail);
             Ok(())
         }),
-        WaypointCommand::GoalAdd {
+        WaypointCommand::RosterAdd {
             waypoint_id,
             entry_id,
             note,
         } => run_and_report(opts, None, || {
-            // Kind is inferred from the id's prefix, the same way the roster
+            // Kind is inferred from the id's prefix, the same way the affected
             // remove path does it -- an id already says which it is.
             let kind = if entry_id.starts_with("guardian-") {
                 "review"
@@ -424,15 +435,15 @@ pub fn dispatch(cmd: WaypointCommand, opts: &GlobalOpts) -> i32 {
                 "squad"
             };
             let result =
-                client.waypoint_add_goal(&waypoint_id, kind, &entry_id, note.as_deref())?;
+                client.waypoint_add_roster_entry(&waypoint_id, kind, &entry_id, note.as_deref())?;
             emit(opts, &result, render_waypoint_detail);
             Ok(())
         }),
-        WaypointCommand::GoalRemove {
+        WaypointCommand::RosterRemove {
             waypoint_id,
             entry_id,
         } => run_and_report(opts, None, || {
-            let result = client.waypoint_remove_goal(&waypoint_id, &entry_id)?;
+            let result = client.waypoint_remove_roster_entry(&waypoint_id, &entry_id)?;
             emit(opts, &result, render_waypoint_detail);
             Ok(())
         }),
@@ -487,7 +498,7 @@ pub fn dispatch(cmd: WaypointCommand, opts: &GlobalOpts) -> i32 {
             waypoint_id,
             entry_id,
         } => run_and_report(opts, None, || {
-            let result = client.waypoint_redo_roster_entry(&waypoint_id, &entry_id)?;
+            let result = client.waypoint_redo_affected_entry(&waypoint_id, &entry_id)?;
             emit(opts, &result, render_waypoint_detail);
             Ok(())
         }),
@@ -496,7 +507,7 @@ pub fn dispatch(cmd: WaypointCommand, opts: &GlobalOpts) -> i32 {
             emit(opts, &result, render_waypoint_detail);
             Ok(())
         }),
-        WaypointCommand::Roster(c) => dispatch_roster(c, opts, &client),
+        WaypointCommand::Affected(c) => dispatch_affected(c, opts, &client),
         WaypointCommand::Bearing(c) => dispatch_bearing(c, opts, &client),
         WaypointCommand::Bearings { waypoint_id } => run_and_report(opts, None, || {
             let result = client.waypoint_list_bearings(&waypoint_id)?;
@@ -511,31 +522,31 @@ pub fn dispatch(cmd: WaypointCommand, opts: &GlobalOpts) -> i32 {
     }
 }
 
-fn dispatch_roster(
-    cmd: WaypointRosterCommand,
+fn dispatch_affected(
+    cmd: WaypointAffectedCommand,
     opts: &GlobalOpts,
     client: &crate::client::DaemonClient,
 ) -> i32 {
     match cmd {
-        WaypointRosterCommand::Help => {
+        WaypointAffectedCommand::Help => {
             println!(
                 "{}",
-                crate::help_map::command_help(&["waypoint", "roster"])
-                    .expect("waypoint roster help exists")
+                crate::help_map::command_help(&["waypoint", "affected"])
+                    .expect("waypoint affected help exists")
             );
             0
         }
-        WaypointRosterCommand::UsageError(m) => {
+        WaypointAffectedCommand::UsageError(m) => {
             println!("usage error: {m}");
             2
         }
-        WaypointRosterCommand::Add {
+        WaypointAffectedCommand::Add {
             waypoint_id,
             kind,
             entry_id,
             mode,
         } => run_and_report(opts, None, || {
-            let result = client.waypoint_add_roster_entry(
+            let result = client.waypoint_add_affected_entry(
                 &waypoint_id,
                 &kind,
                 &entry_id,
@@ -544,20 +555,20 @@ fn dispatch_roster(
             emit(opts, &result, render_waypoint_detail);
             Ok(())
         }),
-        WaypointRosterCommand::Remove {
+        WaypointAffectedCommand::Remove {
             waypoint_id,
             entry_id,
         } => run_and_report(opts, None, || {
-            let result = client.waypoint_remove_roster_entry(&waypoint_id, &entry_id)?;
+            let result = client.waypoint_remove_affected_entry(&waypoint_id, &entry_id)?;
             emit(opts, &result, render_waypoint_detail);
             Ok(())
         }),
-        WaypointRosterCommand::Mode {
+        WaypointAffectedCommand::Mode {
             waypoint_id,
             entry_id,
             mode,
         } => run_and_report(opts, None, || {
-            let result = client.waypoint_patch_roster_entry(&waypoint_id, &entry_id, &mode)?;
+            let result = client.waypoint_patch_affected_entry(&waypoint_id, &entry_id, &mode)?;
             emit(opts, &result, render_waypoint_detail);
             Ok(())
         }),
@@ -635,7 +646,7 @@ fn render_waypoint_list(waypoints: &Value) {
                 w["id"].as_str().unwrap_or_default().to_string(),
                 w["label"].as_str().unwrap_or_default().to_string(),
                 w["state"].as_str().unwrap_or_default().to_string(),
-                w["roster_count"].to_string(),
+                w["affected_count"].to_string(),
                 w["projects"]
                     .as_array()
                     .map(|ps| {
@@ -741,12 +752,12 @@ fn render_waypoint_detail(w: &Value) {
     ));
     crate::output::print_kv(&rows);
 
-    let roster = w["roster"].as_array().cloned().unwrap_or_default();
-    if roster.is_empty() {
-        println!("\nno roster entries");
+    let affected = w["affected"].as_array().cloned().unwrap_or_default();
+    if affected.is_empty() {
+        println!("\nno affected entries");
     } else {
-        println!("\nroster:");
-        let roster_rows: Vec<Vec<String>> = roster
+        println!("\naffected:");
+        let affected_rows: Vec<Vec<String>> = affected
             .iter()
             .map(|r| {
                 vec![
@@ -762,7 +773,7 @@ fn render_waypoint_detail(w: &Value) {
             .collect();
         crate::output::print_table(
             &["KIND", "ENTRY_ID", "MODE", "DELIVERY_STATUS"],
-            &roster_rows,
+            &affected_rows,
         );
     }
 
@@ -821,32 +832,32 @@ mod tests {
 
     #[test]
     fn parse_create_requires_prompt() {
-        match parse(&v(&["create", "--roster", "squad:squad-1"])) {
+        match parse(&v(&["create", "--affected", "squad:squad-1"])) {
             WaypointCommand::UsageError(_) => {}
             other => panic!("unexpected: {other:?}"),
         }
     }
 
     #[test]
-    fn parse_create_with_prompt_and_roster() {
+    fn parse_create_with_prompt_and_affected() {
         match parse(&v(&[
             "create",
             "--prompt",
             "coordinate the release",
-            "--roster",
+            "--affected",
             "squad:squad-1",
-            "--roster",
+            "--affected",
             "review:review-2:advisory",
             "--allow-advisory",
         ])) {
             WaypointCommand::Create {
                 prompt,
-                roster,
+                affected,
                 allow_advisory,
                 ..
             } => {
                 assert_eq!(prompt, "coordinate the release");
-                assert_eq!(roster, vec!["squad:squad-1", "review:review-2:advisory"]);
+                assert_eq!(affected, vec!["squad:squad-1", "review:review-2:advisory"]);
                 assert!(allow_advisory);
             }
             other => panic!("unexpected: {other:?}"),
@@ -901,9 +912,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_roster_add_remove_mode() {
-        match parse(&v(&["roster", "add", "waypoint-1", "squad", "squad-2"])) {
-            WaypointCommand::Roster(WaypointRosterCommand::Add {
+    fn parse_affected_add_remove_mode() {
+        match parse(&v(&["affected", "add", "waypoint-1", "squad", "squad-2"])) {
+            WaypointCommand::Affected(WaypointAffectedCommand::Add {
                 waypoint_id,
                 kind,
                 entry_id,
@@ -917,7 +928,7 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         }
         match parse(&v(&[
-            "roster",
+            "affected",
             "add",
             "--mode",
             "advisory",
@@ -925,13 +936,13 @@ mod tests {
             "review",
             "review-2",
         ])) {
-            WaypointCommand::Roster(WaypointRosterCommand::Add { mode, .. }) => {
+            WaypointCommand::Affected(WaypointAffectedCommand::Add { mode, .. }) => {
                 assert_eq!(mode.as_deref(), Some("advisory"));
             }
             other => panic!("unexpected: {other:?}"),
         }
-        match parse(&v(&["roster", "remove", "waypoint-1", "squad-2"])) {
-            WaypointCommand::Roster(WaypointRosterCommand::Remove {
+        match parse(&v(&["affected", "remove", "waypoint-1", "squad-2"])) {
+            WaypointCommand::Affected(WaypointAffectedCommand::Remove {
                 waypoint_id,
                 entry_id,
             }) => {
@@ -940,8 +951,8 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
-        match parse(&v(&["roster", "mode", "waypoint-1", "squad-2", "block"])) {
-            WaypointCommand::Roster(WaypointRosterCommand::Mode {
+        match parse(&v(&["affected", "mode", "waypoint-1", "squad-2", "block"])) {
+            WaypointCommand::Affected(WaypointAffectedCommand::Mode {
                 waypoint_id,
                 entry_id,
                 mode,
@@ -955,13 +966,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_roster_usage_errors() {
-        match parse(&v(&["roster", "add", "waypoint-1", "squad"])) {
-            WaypointCommand::Roster(WaypointRosterCommand::UsageError(_)) => {}
+    fn parse_affected_usage_errors() {
+        match parse(&v(&["affected", "add", "waypoint-1", "squad"])) {
+            WaypointCommand::Affected(WaypointAffectedCommand::UsageError(_)) => {}
             other => panic!("unexpected: {other:?}"),
         }
-        match parse(&v(&["roster", "bogus"])) {
-            WaypointCommand::Roster(WaypointRosterCommand::UsageError(_)) => {}
+        match parse(&v(&["affected", "bogus"])) {
+            WaypointCommand::Affected(WaypointAffectedCommand::UsageError(_)) => {}
             other => panic!("unexpected: {other:?}"),
         }
     }
@@ -1006,18 +1017,18 @@ mod tests {
     }
 
     #[test]
-    fn roster_spec_parses_kind_entry_and_optional_mode() {
-        let entry = parse_roster_spec("squad:squad-1").unwrap();
+    fn affected_spec_parses_kind_entry_and_optional_mode() {
+        let entry = parse_affected_spec("squad:squad-1").unwrap();
         assert_eq!(entry["kind"], "squad");
         assert_eq!(entry["entry_id"], "squad-1");
         assert!(entry.get("mode").is_none());
 
-        let entry = parse_roster_spec("review:review-2:advisory").unwrap();
+        let entry = parse_affected_spec("review:review-2:advisory").unwrap();
         assert_eq!(entry["kind"], "review");
         assert_eq!(entry["entry_id"], "review-2");
         assert_eq!(entry["mode"], "advisory");
 
-        assert!(parse_roster_spec("bogus").is_err());
-        assert!(parse_roster_spec("").is_err());
+        assert!(parse_affected_spec("bogus").is_err());
+        assert!(parse_affected_spec("").is_err());
     }
 }

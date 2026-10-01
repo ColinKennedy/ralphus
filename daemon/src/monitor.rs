@@ -30,14 +30,14 @@ pub enum NotifiableEventKind {
     SquadFailed,
     ReviewFailed,
     /// RAL-400 Phase 3: a squad's in-flight cell was halted because its
-    /// squad-kind roster entry just became `mode=block` on an open waypoint.
+    /// squad-kind affected entry just became `mode=block` on an open waypoint.
     /// Not a failure in the ordinary sense (the cell will resume
     /// automatically once the waypoint closes or de-escalates), but RAL-502
     /// still requires remediation guidance since it is a blocked state --
     /// see [`Store::notify_watchers_with_remediation`]'s broadened assert.
     SquadWaypointHalted,
     /// RAL-400 Phase 8: a new waypoint just added a review or squad to its
-    /// roster, notifying that roster entry's own watchers.
+    /// affected, notifying that affected entry's own watchers.
     WaypointCreated,
     /// RAL-400: this squad or review is now held by an open waypoint and
     /// cannot proceed until it closes or the entry de-escalates to advisory.

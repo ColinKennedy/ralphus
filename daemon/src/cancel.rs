@@ -144,7 +144,7 @@ pub type Detachments = Cancellations;
 pub type DetachToken = CancelToken;
 
 /// A per-squad "halt immediately" signal (RAL-400 Phase 3) for a squad that
-/// just became gated behind an open block-mode waypoint roster entry.
+/// just became gated behind an open block-mode waypoint affected entry.
 /// Structurally identical to [`Cancellations`]/[`CancelToken`] and to
 /// [`Detachments`]/[`DetachToken`] -- register a token when a cell's
 /// subprocess starts, poll it in the same loop, trip it externally -- but a
