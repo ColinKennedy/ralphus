@@ -3212,6 +3212,52 @@ fn mark_done_but_unreviewed_squad(
     );
 }
 
+/// The guidance block a cell carries back into its own prompt when it resumes
+/// from a waypoint hold.
+///
+/// A halted cell is released once the waypoint's roster has landed, and its
+/// worktree is rebased onto that change on the way back in. Both of those are
+/// invisible to the agent: it just gets re-invoked. Without this it resumes
+/// with no idea a waypoint ever held it, let alone what the waypoint wanted.
+///
+/// `rebased` says whether the release actually moved the worktree. When it
+/// did, the change is already present locally and the likely correct action
+/// is none -- saying so is cheaper than letting the agent rediscover it by
+/// diffing, and stops it re-implementing work its own tree already contains.
+pub fn render_resume_guidance(waypoint: &WaypointView, rebased: bool) -> String {
+    let which = match &waypoint.label {
+        Some(label) => format!("waypoint \"{label}\" ({})", waypoint.id),
+        None => format!("waypoint {}", waypoint.id),
+    };
+    let mut out = format!(
+        "--- Waypoint guidance ({which}) ---\nYour work was held while this waypoint's own \
+         change was still being made. That change has now landed, and you are being resumed.\n\n\
+         {}\n\n",
+        waypoint.prompt.trim()
+    );
+    if rebased {
+        out.push_str(
+            "Your worktree was rebased onto the branch carrying that change before you were \
+             resumed, so you most likely already have it. Check whether it is present before \
+             doing anything: if it is, there is nothing here for you to implement, and saying \
+             so is the whole of what is wanted. Act only on whatever part of this your own work \
+             still does not reflect.\n\n",
+        );
+    } else {
+        out.push_str(
+            "Your worktree was not rebased, so inspect the current state of the code yourself \
+             rather than assuming the described change is present locally.\n\n",
+        );
+    }
+    out.push_str(
+        "Before you finish, answer this waypoint with a line of the form \
+         `RALPHUS_BEARING: <accepted|rejected|deferred>: <one line>`. Declining is a legitimate \
+         answer; staying silent is not, and is what keeps your work held.\n\
+         --- End waypoint guidance ---\n",
+    );
+    out
+}
+
 /// Render a closed waypoint's stand-down notice text (RAL-400 Phase 6),
 /// shared by both the squad (`notify_watchers`) and review (`start_feedback`)
 /// delivery paths.
@@ -6531,6 +6577,56 @@ mod tests {
             rebased.contains("nothing here for you to do"),
             "it must say doing nothing is a legitimate outcome: {rebased}"
         );
+    }
+
+    /// A resumed cell is re-invoked with no memory of having been held, so
+    /// the guidance has to say what happened and what is wanted. The rebased
+    /// wording matters most: the change is already in its tree, and an agent
+    /// told only "make this change" would set about remaking it.
+    #[test]
+    fn resume_guidance_states_the_change_landed_and_asks_for_an_answer() {
+        let waypoint = WaypointView {
+            id: "waypoint-1".to_string(),
+            label: Some("rename greet".to_string()),
+            prompt: "greet() is renamed to salute().".to_string(),
+            agent: None,
+            model: None,
+            allow_advisory: false,
+            state: "open".to_string(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            closed_at_ms: None,
+        };
+
+        let rebased = render_resume_guidance(&waypoint, true);
+        assert!(rebased.contains("rename greet"), "{rebased}");
+        assert!(
+            rebased.contains("greet() is renamed to salute()."),
+            "{rebased}"
+        );
+        assert!(
+            rebased.contains("rebased onto the branch carrying that change"),
+            "a rebased resume must say the change is already present: {rebased}"
+        );
+        assert!(
+            rebased.contains("nothing here for you to implement"),
+            "it must name doing nothing as a legitimate outcome: {rebased}"
+        );
+        assert!(
+            rebased.contains("RALPHUS_BEARING:"),
+            "a held cell must be told how to release itself: {rebased}"
+        );
+
+        // Without a rebase the change may genuinely be absent, so the
+        // opposite instruction applies -- claiming it was already delivered
+        // would be a lie the agent cannot check cheaply.
+        let plain = render_resume_guidance(&waypoint, false);
+        assert!(
+            !plain.contains("rebased onto the branch carrying that change"),
+            "{plain}"
+        );
+        assert!(plain.contains("was not rebased"), "{plain}");
+        assert!(plain.contains("RALPHUS_BEARING:"), "{plain}");
     }
 
     // ---- phase 1 releases, phase 2 closes ---------------------------------

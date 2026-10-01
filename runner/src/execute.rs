@@ -230,7 +230,18 @@ pub fn run_cell(spec: &CellSpec, keep_temporary_files: bool) -> CellResult {
 
 fn run_command(workspace: &Workspace, command: &str, timeout_sec: Option<u64>) -> CellResult {
     match workspace.run_bash(command, timeout_sec) {
-        Ok(out) if out.ok() => CellResult::done(tail(&out.stdout, COMMAND_TAIL_CHARS)),
+        Ok(out) if out.ok() => {
+            let mut result = CellResult::done(tail(&out.stdout, COMMAND_TAIL_CHARS));
+            // A command-mode cell has no agent to reason about a waypoint, but
+            // it is still work a waypoint can hold -- and a block-mode entry
+            // is released only by an answer. Without reading one here, a squad
+            // whose cells are all commands could never answer, and would hold
+            // its waypoint open forever. Scanning stdout lets such a cell say
+            // so deliberately (`echo RALPHUS_BEARING: accepted: ...`).
+            result.bearing = parse_bearing(&out.stdout)
+                .map(|(decision, message)| crate::spec::BearingReport { decision, message });
+            result
+        }
         Ok(out) => {
             let detail = tail(&out.stderr, COMMAND_TAIL_CHARS);
             let detail = if detail.is_empty() {

@@ -2689,22 +2689,59 @@ fn run_cell_worker(
             guard.cell_waypoint_halted_at_ms(squad_id, row.task_idx, row.idx),
             Ok(Some(_))
         );
-        if was_waypoint_halted && rebase_resumed_cell_onto_upstream(row) {
-            crate::cartographer::Note::new("waypoints")
-                .scope("waypoint")
-                .squad(squad_id)
-                .cell(&row.cell_id)
-                .emit(
-                    &guard,
-                    format!(
-                        "cell {} rebased onto upstream before resuming from its waypoint hold",
-                        row.cell_id
-                    ),
-                    serde_json::json!({
-                        "squad_id": squad_id,
-                        "cell_id": row.cell_id,
-                    }),
-                );
+        if was_waypoint_halted {
+            let rebased = rebase_resumed_cell_onto_upstream(row);
+            // Which waypoint held it. Gone by now in the normal case -- the
+            // hold lifted because its roster landed -- so fall back to the
+            // most recent one that affects this squad rather than reporting
+            // nothing.
+            let waypoint = guard
+                .open_waypoints_affecting_squad(squad_id)
+                .unwrap_or_default()
+                .into_iter()
+                .next()
+                .or_else(|| guard.last_waypoint_affecting_squad(squad_id).ok().flatten());
+            if let Some(waypoint_id) = waypoint {
+                if let Ok(view) = guard.get_waypoint(&waypoint_id) {
+                    // The agent is about to be re-invoked with no memory of
+                    // having been held. The ghost is the existing channel for
+                    // carrying context across an attempt boundary, so the
+                    // guidance rides in on it.
+                    let uri = crate::ghost::cell_uri(squad_id, row.task_idx, row.idx);
+                    let revision =
+                        crate::ghost::current_revision(row.cwd.as_deref().unwrap_or_default());
+                    let _ = guard.upsert_ghost(
+                        &uri,
+                        crate::ghost::KIND_CELL,
+                        Some(squad_id),
+                        None,
+                        &crate::waypoints::render_resume_guidance(&view, rebased),
+                        revision.as_deref(),
+                    );
+                }
+                crate::cartographer::Note::new("waypoints")
+                    .scope("waypoint")
+                    .squad(squad_id)
+                    .cell(&row.cell_id)
+                    .emit(
+                        &guard,
+                        format!(
+                            "cell {} resumed from its waypoint hold{}",
+                            row.cell_id,
+                            if rebased {
+                                ", rebased onto upstream first"
+                            } else {
+                                " without a rebase"
+                            }
+                        ),
+                        serde_json::json!({
+                            "waypoint_id": waypoint_id,
+                            "squad_id": squad_id,
+                            "cell_id": row.cell_id,
+                            "rebased": rebased,
+                        }),
+                    );
+            }
         }
         let _ = guard.clear_cell_waypoint_halted(squad_id, row.task_idx, row.idx);
         // RAL-435: same reasoning, for a stale `delayed_until_ms` left behind
