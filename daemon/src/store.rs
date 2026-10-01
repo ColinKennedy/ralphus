@@ -13429,6 +13429,11 @@ command = "y"
         store
             .add_roster_entry("waypoint-1", RosterEntryKind::Squad, &b, RosterMode::Block)
             .unwrap();
+        // A squad's hold lasts while its waypoint's own work is unfinished,
+        // so give this waypoint a goal that has not landed.
+        store
+            .add_roster_goal("waypoint-1", RosterEntryKind::Squad, "squad-wp-goal", None)
+            .unwrap();
         assert!(
             !store.list_ready().unwrap().contains(&b),
             "b starts out waypoint-gated"
@@ -16046,6 +16051,11 @@ command = "check-c"
                 RosterMode::Block,
             )
             .unwrap();
+        // A squad's hold lasts while its waypoint's own work is unfinished,
+        // so give this waypoint a goal that has not landed.
+        store
+            .add_roster_goal("waypoint-1", RosterEntryKind::Squad, "squad-wp-goal", None)
+            .unwrap();
 
         assert!(
             !store.list_ready().unwrap().contains(&squad),
@@ -16127,6 +16137,11 @@ command = "check-c"
                 &squad,
                 RosterMode::Block,
             )
+            .unwrap();
+        // A squad's hold lasts while its waypoint's own work is unfinished,
+        // so give this waypoint a goal that has not landed.
+        store
+            .add_roster_goal("waypoint-1", RosterEntryKind::Squad, "squad-wp-goal", None)
             .unwrap();
         store
             .set_roster_survey_result(

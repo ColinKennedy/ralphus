@@ -1165,6 +1165,29 @@ impl Store {
         Ok(())
     }
 
+    /// One affected entry's delivery status, or `None` if this waypoint does
+    /// not affect that entry.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn roster_entry_delivery_status(
+        &self,
+        waypoint_id: &str,
+        kind: RosterEntryKind,
+        entry_id: &str,
+    ) -> StoreResult<Option<DeliveryStatus>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT delivery_status FROM waypoint_affected
+                 WHERE waypoint_id=? AND kind=? AND entry_id=?",
+                params![waypoint_id, kind.as_str(), entry_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(raw.as_deref().and_then(DeliveryStatus::parse))
+    }
+
     /// Add a review or squad to the waypoint's completion list.
     ///
     /// Idempotent: adding something already listed updates its note rather
@@ -1919,20 +1942,45 @@ impl Store {
     /// # Errors
     /// Propagates any SQLite failure.
     pub fn squad_block_gating_waypoint(&self, squad_id: &str) -> StoreResult<Option<String>> {
-        self.conn
-            .query_row(
-                "SELECT wr.waypoint_id FROM waypoint_affected wr
-                 JOIN waypoints w ON w.id = wr.waypoint_id
-                 WHERE wr.kind = 'squad' AND wr.entry_id = ? AND wr.mode = 'block'
-                   AND (wr.survey_verdict IS NULL OR wr.survey_verdict = 'impacted')
-                   AND w.state = 'open'
-                 ORDER BY wr.created_at_ms ASC
-                 LIMIT 1",
-                params![squad_id],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(StoreError::from)
+        self.first_gating_waypoint(squad_id)
+    }
+
+    /// The first open waypoint holding this squad back from being scheduled.
+    ///
+    /// A hold lasts only while the waypoint's own roster is still unfinished.
+    /// That is the whole shape of the thing: affected work is held because the
+    /// change it must take up does not exist yet, and once the roster lands
+    /// there is nothing left to wait for -- the entry is released precisely so
+    /// it can do the work and answer. Holding it through phase 2 as well would
+    /// deadlock, since phase 2 is waiting on that answer.
+    ///
+    /// The roster-complete half is decided in Rust rather than folded into the
+    /// query: which squad and review states count as terminal is already
+    /// stated once, in [`SquadState::is_terminal_for_waypoint`] and
+    /// [`GuardianStatus::is_terminal_status`], and restating those literals in
+    /// SQL is how the two quietly stop agreeing.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    fn first_gating_waypoint(&self, entry_id: &str) -> StoreResult<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT wr.waypoint_id FROM waypoint_affected wr
+             JOIN waypoints w ON w.id = wr.waypoint_id
+             WHERE wr.kind = 'squad' AND wr.entry_id = ? AND wr.mode = 'block'
+               AND (wr.survey_verdict IS NULL OR wr.survey_verdict = 'impacted')
+               AND w.state = 'open'
+             ORDER BY wr.created_at_ms ASC",
+        )?;
+        let candidates: Vec<String> = stmt
+            .query_map(params![entry_id], |r| r.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+        for waypoint_id in candidates {
+            if !self.roster_goals_complete(&waypoint_id)? {
+                return Ok(Some(waypoint_id));
+            }
+        }
+        Ok(None)
     }
 
     /// The first open waypoint holding this *review*, if any -- the review
@@ -1949,20 +1997,30 @@ impl Store {
     /// # Errors
     /// Propagates any SQLite failure.
     pub fn review_block_gating_waypoint(&self, guardian_id: &str) -> StoreResult<Option<String>> {
-        self.conn
-            .query_row(
-                "SELECT wr.waypoint_id FROM waypoint_affected wr
-                 JOIN waypoints w ON w.id = wr.waypoint_id
-                 WHERE wr.kind = 'review' AND wr.entry_id = ? AND wr.mode = 'block'
-                   AND (wr.survey_verdict IS NULL OR wr.survey_verdict = 'impacted')
-                   AND w.state = 'open'
-                 ORDER BY wr.created_at_ms ASC
-                 LIMIT 1",
-                params![guardian_id],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(StoreError::from)
+        // A review's hold is on its *approval*, not on its work, so unlike a
+        // squad it can be held right up until it answers: it stays able to
+        // run, resolve and report a bearing the whole time, and only merging
+        // is withheld. That makes "has it answered yet" a usable release
+        // condition here, where for a squad -- whose hold is on being
+        // scheduled at all -- it would be circular.
+        let mut stmt = self.conn.prepare(
+            "SELECT wr.waypoint_id, wr.bearing_decision FROM waypoint_affected wr
+             JOIN waypoints w ON w.id = wr.waypoint_id
+             WHERE wr.kind = 'review' AND wr.entry_id = ? AND wr.mode = 'block'
+               AND (wr.survey_verdict IS NULL OR wr.survey_verdict = 'impacted')
+               AND w.state = 'open'
+             ORDER BY wr.created_at_ms ASC",
+        )?;
+        let candidates: Vec<(String, Option<String>)> = stmt
+            .query_map(params![guardian_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+        for (waypoint_id, decision) in candidates {
+            if decision.is_none() || !self.roster_goals_complete(&waypoint_id)? {
+                return Ok(Some(waypoint_id));
+            }
+        }
+        Ok(None)
     }
 
     /// Every cell currently halted because its squad-kind roster entry
@@ -3587,7 +3645,7 @@ pub fn render_prophecy_block(prophecies: &[crate::prophecy::ProphecyView]) -> Op
 /// injection, and matches `WAYPOINT_SYSTEM_PROMPT`'s contract that injected
 /// waypoint information is expected rather than anomalous.
 #[must_use]
-pub fn render_injection_block(injections: &[PendingInjectionView]) -> String {
+pub fn render_injection_block(injections: &[PendingInjectionView], rebased: bool) -> String {
     let mut out = String::from("--- Advisory waypoint guidance ---\n");
     out.push_str(
         "The following guidance was published while this work was in flight. It is advisory: \
@@ -3595,6 +3653,20 @@ pub fn render_injection_block(injections: &[PendingInjectionView]) -> String {
          assuming the described changes are already present locally, and respond as \
          applicable to your own task.\n\n",
     );
+    if rebased {
+        // Without this, an agent reads guidance describing a change and sets
+        // out to make it -- having just been rebased onto a branch where it
+        // is already made. The likely correct action here is none at all, and
+        // saying so is cheaper than letting it rediscover that by diffing.
+        out.push_str(
+            "You have most likely received this change already: your work was rebased onto the \
+             branch carrying it before this ran. So treat this as notice that something moved \
+             underneath you rather than as a task -- check whether the change is already \
+             present, and if it is, there is nothing here for you to do beyond saying so. \
+             Act only on whatever part of the guidance your own work still does not \
+             reflect.\n\n",
+        );
+    }
     for injection in injections {
         out.push_str(injection.payload.trim());
         out.push('\n');
@@ -5235,6 +5307,12 @@ mod tests {
     fn resume_sweep_leaves_a_halted_cell_alone_while_the_waypoint_still_blocks() {
         let store = Store::open_in_memory().unwrap();
         open_waypoint(&store, "waypoint-1");
+        // A squad's hold lasts while the waypoint's own work is unfinished, so
+        // give it an unfinished goal to be held against.
+        insert_bare_squad(&store, "squad-goal", SquadState::Pending);
+        store
+            .add_roster_goal("waypoint-1", RosterEntryKind::Squad, "squad-goal", None)
+            .unwrap();
         insert_bare_squad(&store, "squad-1", SquadState::Running);
         insert_bare_task(&store, "squad-1", 0, "core");
         insert_bare_cell(&store, "squad-1", 0, 0, None, None);
@@ -5614,6 +5692,12 @@ mod tests {
         // permanently unsurveyable) before the waypoint ever sees it.
         let store = Store::open_in_memory().unwrap();
         open_waypoint(&store, "waypoint-1");
+        // A squad's hold lasts while the waypoint's own work is unfinished, so
+        // give it an unfinished goal to be held against.
+        insert_bare_squad(&store, "squad-goal", SquadState::Pending);
+        store
+            .add_roster_goal("waypoint-1", RosterEntryKind::Squad, "squad-goal", None)
+            .unwrap();
         // Seed entry so the waypoint has a scope to overlap against.
         insert_bare_squad(&store, "squad-seed", SquadState::Pending);
         insert_bare_task(&store, "squad-seed", 0, "core");
@@ -6315,6 +6399,193 @@ mod tests {
         );
     }
 
+    /// Work that was rebased onto the change already has it. Telling it to go
+    /// make the change would send it to redo work its own tree already
+    /// reflects, so the guidance has to arrive framed as notice, not as a
+    /// task.
+    #[test]
+    fn guidance_delivered_after_a_rebase_says_so() {
+        let injections = vec![PendingInjectionView {
+            id: 1,
+            target_squad: "squad-1".to_string(),
+            target_task: 0,
+            target_idx: 0,
+            payload: "rename greet() to salute()".to_string(),
+            status: "queued".to_string(),
+            batch_id: None,
+            waypoint_id: Some("waypoint-1".to_string()),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        }];
+
+        let plain = render_injection_block(&injections, false);
+        assert!(plain.contains("rename greet() to salute()"));
+        assert!(
+            !plain.contains("rebased onto the branch"),
+            "an injection that did not follow a rebase must not claim one: {plain}"
+        );
+
+        let rebased = render_injection_block(&injections, true);
+        assert!(rebased.contains("rename greet() to salute()"));
+        assert!(
+            rebased.contains("rebased onto the branch"),
+            "a post-rebase injection must say the change is probably already present: {rebased}"
+        );
+        assert!(
+            rebased.contains("nothing here for you to do"),
+            "it must say doing nothing is a legitimate outcome: {rebased}"
+        );
+    }
+
+    // ---- phase 1 releases, phase 2 closes ---------------------------------
+
+    /// Affected work is held because the change it must take up does not
+    /// exist yet. Once the roster lands it has to be released -- it cannot
+    /// answer the waypoint while the waypoint is preventing it from running,
+    /// and phase 2 is waiting on exactly that answer.
+    #[test]
+    fn a_block_hold_lifts_once_the_roster_lands() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_bare_squad(&store, "squad-goal", SquadState::Pending);
+        insert_bare_squad(&store, "squad-downstream", SquadState::Pending);
+        store
+            .add_roster_goal("waypoint-1", RosterEntryKind::Squad, "squad-goal", None)
+            .unwrap();
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-downstream",
+                RosterMode::Block,
+            )
+            .unwrap();
+
+        assert_eq!(
+            store
+                .squad_block_gating_waypoint("squad-downstream")
+                .unwrap(),
+            Some("waypoint-1".to_string()),
+            "held while the waypoint's own work is unfinished"
+        );
+
+        store
+            .set_squad_state("squad-goal", SquadState::Done)
+            .unwrap();
+
+        assert_eq!(
+            store
+                .squad_block_gating_waypoint("squad-downstream")
+                .unwrap(),
+            None,
+            "released the moment the roster lands, so it can do the work and answer"
+        );
+    }
+
+    /// A waypoint that names no roster is a broadcast: there is no phase-1
+    /// change to wait for, so its affected work is never held -- only asked.
+    #[test]
+    fn an_empty_roster_never_holds_affected_work() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_bare_squad(&store, "squad-downstream", SquadState::Pending);
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-downstream",
+                RosterMode::Block,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .squad_block_gating_waypoint("squad-downstream")
+                .unwrap(),
+            None
+        );
+    }
+
+    /// The two phases are separate gates, and both must pass. A landed roster
+    /// alone does not close a waypoint whose affected work never answered --
+    /// that was the whole failure mode of keeping one list.
+    #[test]
+    fn a_landed_roster_does_not_close_a_waypoint_nobody_answered() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_bare_squad(&store, "squad-goal", SquadState::Done);
+        insert_bare_squad(&store, "squad-downstream", SquadState::Done);
+        store
+            .add_roster_goal("waypoint-1", RosterEntryKind::Squad, "squad-goal", None)
+            .unwrap();
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-downstream",
+                RosterMode::Block,
+            )
+            .unwrap();
+
+        assert!(store.roster_goals_complete("waypoint-1").unwrap());
+        assert!(!store.affected_have_answered("waypoint-1").unwrap());
+        assert!(!store.maybe_auto_close_waypoint("waypoint-1").unwrap());
+
+        answer(
+            &store,
+            "waypoint-1",
+            RosterEntryKind::Squad,
+            "squad-downstream",
+        );
+        assert!(store.maybe_auto_close_waypoint("waypoint-1").unwrap());
+    }
+
+    /// Declining is an answer. A waypoint must be able to finish even when
+    /// the work it landed on decided not to take it up -- otherwise
+    /// "rejected" would just be a way to hang the waypoint forever.
+    #[test]
+    fn a_rejected_decision_satisfies_phase_two_like_any_other() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_bare_squad(&store, "squad-downstream", SquadState::Done);
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-downstream",
+                RosterMode::Block,
+            )
+            .unwrap();
+        store
+            .set_affected_bearing_decision(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-downstream",
+                BearingDecision::Rejected,
+            )
+            .unwrap();
+        assert!(store.affected_have_answered("waypoint-1").unwrap());
+        assert!(store.maybe_auto_close_waypoint("waypoint-1").unwrap());
+    }
+
+    /// An advisory entry is told what changed and left alone. Waiting on one
+    /// to answer would make advisory mode mean nothing.
+    #[test]
+    fn an_advisory_entry_owes_no_answer() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_bare_squad(&store, "squad-advised", SquadState::Done);
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-advised",
+                RosterMode::Advisory,
+            )
+            .unwrap();
+        assert!(store.affected_have_answered("waypoint-1").unwrap());
+        assert!(store.maybe_auto_close_waypoint("waypoint-1").unwrap());
+    }
+
     // ---- re-survey after a settings edit ---------------------------------
 
     /// A re-survey only re-judges what the *daemon* enrolled. A human
@@ -6499,6 +6770,12 @@ mod tests {
     fn the_preview_flags_entries_a_resurvey_would_re_hold() {
         let store = Store::open_in_memory().unwrap();
         open_waypoint(&store, "waypoint-1");
+        // A squad's hold lasts while the waypoint's own work is unfinished, so
+        // give it an unfinished goal to be held against.
+        insert_bare_squad(&store, "squad-goal", SquadState::Pending);
+        store
+            .add_roster_goal("waypoint-1", RosterEntryKind::Squad, "squad-goal", None)
+            .unwrap();
         store
             .enroll_roster_entry(
                 "waypoint-1",
@@ -7434,7 +7711,7 @@ mod tests {
             .queue_advisory_bearing_injections("waypoint-1", &bearing)
             .unwrap();
         let drained = store.drain_injections("squad-1", 0, 0).unwrap();
-        let block = render_injection_block(&drained);
+        let block = render_injection_block(&drained, false);
         assert!(block.contains("does not block this cell"));
         assert!(block.contains("salute() replaces greet()"));
         assert!(

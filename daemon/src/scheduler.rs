@@ -2728,7 +2728,23 @@ fn run_cell_worker(
             .unwrap_or_default()
     };
     if !injected.is_empty() {
-        let block = crate::waypoints::render_injection_block(&injected);
+        // A squad whose entry is marked `via-restack` already had the
+        // waypoint's change folded into it by a rebase rather than by a
+        // dedicated injection, so the guidance it is about to read describes
+        // work that is most likely already done in its own tree.
+        let rebased = injected.iter().any(|i| {
+            i.waypoint_id.as_deref().is_some_and(|wp| {
+                matches!(
+                    store.lock().roster_entry_delivery_status(
+                        wp,
+                        crate::waypoints::RosterEntryKind::Squad,
+                        &i.target_squad,
+                    ),
+                    Ok(Some(crate::waypoints::DeliveryStatus::ViaRestack))
+                )
+            })
+        });
+        let block = crate::waypoints::render_injection_block(&injected, rebased);
         spec.prompt = spec.prompt.map(|p| format!("{block}{p}"));
         let guard = store.lock();
         crate::cartographer::Note::new("scheduler")
@@ -5645,6 +5661,16 @@ mod tests {
                     crate::waypoints::RosterMode::Block,
                 )
                 .unwrap();
+            // A squad's hold lasts while its waypoint's own work is unfinished,
+            // so give this waypoint a goal that has not landed.
+            guard
+                .add_roster_goal(
+                    "waypoint-1",
+                    crate::waypoints::RosterEntryKind::Squad,
+                    "squad-wp-goal",
+                    None,
+                )
+                .unwrap();
             guard
                 .create_watch(
                     "colin",
@@ -5724,6 +5750,16 @@ mod tests {
                     crate::waypoints::RosterEntryKind::Squad,
                     &id,
                     crate::waypoints::RosterMode::Block,
+                )
+                .unwrap();
+            // A squad's hold lasts while its waypoint's own work is unfinished,
+            // so give this waypoint a goal that has not landed.
+            guard
+                .add_roster_goal(
+                    "waypoint-1",
+                    crate::waypoints::RosterEntryKind::Squad,
+                    "squad-wp-goal",
+                    None,
                 )
                 .unwrap();
             guard
