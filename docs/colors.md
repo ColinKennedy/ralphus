@@ -42,7 +42,7 @@ role in the table below, then use it.
 | `--unverified` | `#e3b341` | *(shared)* | semantic (review reached done with no build/test verification, RAL-101) |
 | `--waiting` | `#f778ba` | *(shared)* | status (a `pending` squad held back by a scheduler down-time window, RAL-122) |
 | `--solo` | `#ffa657` | *(shared)* | semantic (a task marked "soloed" — its siblings are paused, RAL-157) |
-| `--stale` | `#db6d28` | *(shared)* | semantic (content that has fallen behind: Live View's no-fresh-pane-output-for-a-while from a still-running cell, RAL-170; and a waypoint roster entry whose finished work predates the waypoint's own changes, RAL-400) |
+| `--stale` | `#db6d28` | *(shared)* | semantic (content that has fallen behind: Live View's no-fresh-pane-output-for-a-while from a still-running cell, RAL-170; and a waypoint affected entry whose finished work predates the waypoint's own changes, RAL-400) |
 | `--empty` | `#ff9492` | *(shared)* | semantic (a review branch that contributes no changes — fails the review, RAL-190) |
 | `--drift` | `#f0883e` | *(shared)* | semantic (a submitted PR's remote branch and its review worktree have diverged, RAL-190) |
 | `--incomplete` | `#db6d28` | *(shared)* | semantic (uber-log-viewer data that may be pruned/truncated, RAL-155) |

@@ -225,9 +225,11 @@ produced no pane output.
 | GET | `/api/waypoints/{id}` | [One waypoint's full detail](#waypoints-ral-400): settings, roster, bearings |
 | PATCH | `/api/waypoints/{id}` | [Update a waypoint's settings](#waypoints-ral-400): label, guidance prompt, survey agent/model, advisory policy |
 | GET | `/api/waypoints/{id}/resurvey-preview` | [What re-running the survey would act on](#waypoints-ral-400), resolved before anything changes |
-| POST | `/api/waypoints/{id}/roster` | Add a squad or review roster entry |
-| DELETE | `/api/waypoints/{id}/roster/{entry_id}` | Remove a roster entry |
-| PATCH | `/api/waypoints/{id}/roster/{entry_id}` | Field-selective update of a roster entry (currently `mode`) |
+| POST | `/api/waypoints/{id}/roster` | Add to the [completion list](#waypoints-ral-400) — what must land for this waypoint to be carried out |
+| DELETE | `/api/waypoints/{id}/roster/{entry_id}` | Drop an entry from the completion list |
+| POST | `/api/waypoints/{id}/affected` | Add a squad or review the waypoint lands on |
+| DELETE | `/api/waypoints/{id}/affected/{entry_id}` | Remove an affected entry |
+| PATCH | `/api/waypoints/{id}/affected/{entry_id}` | Field-selective update of an affected entry (currently `mode`) |
 | POST | `/api/waypoints/{id}/close` | Manually close a waypoint |
 | POST | `/api/waypoints/{id}/reopen` | Reopen a closed waypoint |
 | POST | `/api/waypoints/{id}/bearings` | [Append a bearing](#waypoints-ral-400) (append-only, no edit/delete) |
@@ -4429,8 +4431,37 @@ re-judged, so nothing there is newly held.
 preview, which would read as "this would do nothing".
 
 #### `POST /api/waypoints/{id}/roster`
+Add a review or squad to the waypoint's **completion list** — the work whose
+landing *is* this waypoint being carried out.
+```json
+{ "kind": "squad", "entry_id": "squad-000000000099", "note": "the rename itself" }
+```
+`kind` is `"squad"` or `"review"`; `note` is optional. Idempotent: adding
+something already listed updates its note rather than erroring.
+
+Nothing is ever added here automatically. What must be true for a waypoint to
+be done is a statement of intent, not something the survey can discover — the
+survey only ever populates the *affected* list.
+
+A roster entry carries no mode, no verdict and no delivery state, because
+none apply to work the waypoint consists of. All it has to do is finish. Each
+entry comes back with a derived `terminal` flag rather than a stored one, so
+it cannot go stale against the squad/review it names.
+
+Adding an entry re-applies the waypoint's holds: a new outstanding entry
+turns an open gate into a closed one, and the block-mode affected work it now
+holds may already be running. Returns the updated `WaypointDetail`.
+
+#### `DELETE /api/waypoints/{id}/roster/{entry_id}`
+Drop one entry from the completion list (`kind` is inferred from `entry_id`'s
+prefix). Removing the last outstanding entry can complete the waypoint's first
+phase, so this re-checks whether the waypoint is now closeable. `404
+not_found` if that entry is not on the list. Returns the updated
+`WaypointDetail`.
+
+#### `POST /api/waypoints/{id}/affected`
 Add a roster entry, or update an existing one's `mode` (same underlying
-upsert as `PATCH .../roster/{entry_id}`).
+upsert as `PATCH .../affected/{entry_id}`).
 ```json
 { "kind": "squad", "entry_id": "squad-000000000099", "mode": "advisory" }
 ```
@@ -4439,13 +4470,13 @@ roster entries (`mode` optional, defaults to `"block"`). Returns the
 waypoint's `WaypointDetail`; a nonexistent `id` surfaces as `404 not_found`
 from the `get_waypoint` lookup used to build that response.
 
-#### `DELETE /api/waypoints/{id}/roster/{entry_id}`
+#### `DELETE /api/waypoints/{id}/affected/{entry_id}`
 Remove one roster entry (`kind` is inferred from `entry_id`'s prefix —
 `squad-...` vs. `guardian-...` — so no `kind` query parameter is needed).
 `404 not_found` if `entry_id` isn't on this waypoint's roster. Returns the
 updated `WaypointDetail`.
 
-#### `PATCH /api/waypoints/{id}/roster/{entry_id}`
+#### `PATCH /api/waypoints/{id}/affected/{entry_id}`
 A human override of a roster entry's block/advisory mode (e.g. overruling
 the survey's own verdict) — never touches that entry's `survey_verdict`/
 `survey_rationale`.

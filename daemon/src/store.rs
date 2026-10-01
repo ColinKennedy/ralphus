@@ -13461,12 +13461,12 @@ command = "y"
             )
             .unwrap();
         // A squad's hold lasts while its waypoint's own work is unfinished,
-        // so give this waypoint a goal that has not landed.
+        // so give this waypoint a roster entry that has not landed.
         store
             .add_roster_entry(
                 "waypoint-1",
                 WaypointEntryKind::Squad,
-                "squad-wp-goal",
+                "squad-wp-roster",
                 None,
             )
             .unwrap();
@@ -16088,12 +16088,12 @@ command = "check-c"
             )
             .unwrap();
         // A squad's hold lasts while its waypoint's own work is unfinished,
-        // so give this waypoint a goal that has not landed.
+        // so give this waypoint a roster entry that has not landed.
         store
             .add_roster_entry(
                 "waypoint-1",
                 WaypointEntryKind::Squad,
-                "squad-wp-goal",
+                "squad-wp-roster",
                 None,
             )
             .unwrap();
@@ -16180,12 +16180,12 @@ command = "check-c"
             )
             .unwrap();
         // A squad's hold lasts while its waypoint's own work is unfinished,
-        // so give this waypoint a goal that has not landed.
+        // so give this waypoint a roster entry that has not landed.
         store
             .add_roster_entry(
                 "waypoint-1",
                 WaypointEntryKind::Squad,
-                "squad-wp-goal",
+                "squad-wp-roster",
                 None,
             )
             .unwrap();

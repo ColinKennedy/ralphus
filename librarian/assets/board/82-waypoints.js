@@ -480,11 +480,74 @@
             ${wdot(entry.delivery_status)}
             ${link}
             ${waypointModeBadge(entry.mode)}
-            <span class="badge" style="color:var(--muted);border-color:var(--border)" data-tip="Whether this waypoint's guidance has reached this entry yet.">${esc(entry.delivery_status)}</span>${staleBadge}
+            <span class="badge" style="color:var(--muted);border-color:var(--border)" data-tip="Whether this waypoint's guidance has reached this entry yet.">${esc(entry.delivery_status)}</span>${staleBadge}${renderBearingDecisionBadge(entry)}
             <span class="wp-entry-actions">${toggleModeBtn}${removeBtn}</span>
           </div>
           ${verdict}
         </div>`;
+      }
+
+      /**
+       * One row of the waypoint's completion list.
+       *
+       * Deliberately thinner than an affected row: a roster entry carries no survey verdict, no delivery status and
+       * no answer, because none apply. It is not work the waypoint lands on, it is work the waypoint consists of.
+       * All it has to do is finish.
+       * @param {RosterEntryView} entry
+       * @returns {string}
+       */
+      function renderRosterEntryRow(entry) {
+        const icon = entry.kind === "review" ? "\u{1F500}" : "\u{1F9E9}";
+        const gotoFn = entry.kind === "review" ? "gotoReview" : "gotoSquad";
+        const idAttr = entry.kind === "review" ? `data-guardian-id="${esc(entry.entry_id)}"` : `data-squad-id="${esc(entry.entry_id)}"`;
+        const link = `<a class="wp-entry-id" href="#" data-click="${gotoFn}" ${idAttr} data-tip="Open this ${esc(entry.kind)}'s own page.">${icon} ${esc(entry.entry_id)}</a>`;
+        const state = entry.terminal
+          ? `<span class="badge" style="color:var(--done);border-color:var(--done)" data-tip="This has finished. Once every roster entry has, the waypoint's own work has landed.">landed</span>`
+          : `<span class="badge" style="color:var(--queued);border-color:var(--queued)" data-tip="This has not finished yet, so the waypoint's own work has not landed \u2014 which is what holds its block-mode affected entries.">outstanding</span>`;
+        const note = entry.note ? `<div class="wp-entry-note">${esc(entry.note)}</div>` : "";
+        const removeBtn = `<button class="icon-btn" data-click="removeRosterEntry" data-waypoint-id="${esc(w0().id)}" data-entry-id="${esc(entry.entry_id)}" data-tip="Drop this from the completion list.\nRemoving the last outstanding entry can complete the waypoint's first phase.\nThis cannot be undone." style="font-size:11px;padding:1px 5px">\u2715</button>`;
+        return `<div class="wp-entry">
+          <div class="wp-entry-top">
+            ${link}
+            ${state}
+            <span class="wp-entry-actions">${removeBtn}</span>
+          </div>
+          ${note}
+        </div>`;
+      }
+
+      /**
+       * The waypoint currently open in the detail pane. A roster row needs its id for the remove action, and a
+       * roster entry -- unlike an affected one -- does not carry its own `waypoint_id`.
+       * @returns {WaypointDetail}
+       */
+      function w0() {
+        return /** @type {WaypointDetail} */ (waypointDetail);
+      }
+
+      /**
+       * The answer this entry gave the waypoint, as a badge.
+       *
+       * A waypoint cannot tell whether its guidance was acted on by watching the work stop, so an entry says so
+       * itself. Deciding *not* to act is a real answer and reads as one here; what reads as outstanding is silence,
+       * which for a block-mode entry is also what is still holding it.
+       * @param {AffectedEntryView} entry
+       * @returns {string}
+       */
+      function renderBearingDecisionBadge(entry) {
+        const decision = entry.bearing_decision;
+        if (!decision) {
+          // Only worth flagging where the absence costs something.
+          if (entry.mode !== "block") return "";
+          return ` <span class="badge" style="color:var(--queued);border-color:var(--queued)" data-tip="This entry has not answered the waypoint yet, and is blocking because of it.\nIt answers by ending its run with a RALPHUS_BEARING: line.">awaiting answer</span>`;
+        }
+        const color = decision === "accepted" ? "--done" : decision === "rejected" ? "--failed" : "--queued";
+        const why = decision === "accepted"
+          ? "This entry took the waypoint's guidance up in its work."
+          : decision === "rejected"
+            ? "This entry considered the guidance and deliberately did not act on it. That is a valid answer, and it no longer blocks."
+            : "The guidance applies here, but this entry is not acting on it now.";
+        return ` <span class="badge" style="color:var(${color});border-color:var(${color})" data-tip="${why}">${esc(decision)}</span>`;
       }
 
       /**
@@ -595,6 +658,12 @@
             </div>
             <div class="wp-prompt ${waypointGuidanceExpanded ? "is-open" : ""}">${esc(w.prompt)}</div>
           </div>
+          <div class="wp-section">
+            <h4>Roster</h4>
+            <span class="wp-section-rule"></span>
+            <button class="btn sm" data-click="openAddRosterEntry" data-waypoint-id="${esc(w.id)}" data-tip="Add a squad or review to this waypoint's completion list -- the work whose landing IS this waypoint being carried out.\nNothing is added here automatically: what must be true for this to be done is a statement of intent, not something the survey can discover.">＋ Add</button>
+          </div>
+          ${(w.roster || []).length ? w.roster.map(renderRosterEntryRow).join("") : `<div class="empty">No roster entries \u2014 nothing specific has to land for this waypoint to be carried out.</div>`}
           <div class="wp-section">
             <h4>Affected</h4>
             <span class="wp-section-rule"></span>
@@ -711,6 +780,58 @@
       }
 
       /**
+       * Opens the "add a roster entry" dialog -- the completion list, not the affected one.
+       *
+       * No mode and no survey here: a roster entry is work the waypoint consists of, so the only thing asked of it
+       * is that it finish. The note is for whoever reads this later wondering why this particular squad is what
+       * "done" means.
+       * @param {string} waypointId
+       * @returns {void}
+       */
+      function openAddRosterEntry(waypointId) {
+        byId("modal-root").innerHTML = `<div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal">
+          <h3 style="margin-top:0">Add roster entry</h3>
+          <p class="wp-rs-lead">The roster is what must land for this waypoint to be carried out. Its block-mode affected entries stay held until every roster entry here has finished.</p>
+          <div class="kv-row"><span class="k">entry id</span><span class="v"><input type="text" id="rw-goal-id" placeholder="squad-... or guardian-..." style="width:100%" data-tip="The exact squad id or review id whose landing IS this waypoint being carried out.\nWhich kind it is comes from the id itself."></span></div>
+          <div class="kv-row"><span class="k">note</span><span class="v"><input type="text" id="rw-goal-note" placeholder="why this is what done means" style="width:100%" data-tip="Optional. Why this entry is on the completion list, for whoever reads it later."></span></div>
+          <div class="btn-row">
+            <button class="btn" onclick="closeModal()" data-tip="Discard without adding a roster entry.">Cancel</button>
+            <button class="btn primary" data-click="submitAddRosterEntry" data-waypoint-id="${esc(waypointId)}" data-tip="Add this to the waypoint's completion list.">Add</button>
+          </div>
+        </div></div>`;
+      }
+
+      /**
+       * Sends the "add roster entry" dialog.
+       * @param {string} waypointId
+       * @returns {Promise<void>}
+       */
+      async function submitAddRosterEntry(waypointId) {
+        const entryId = /** @type {HTMLInputElement} */ (byId("rw-goal-id")).value.trim();
+        if (!entryId) { notify("error", "A roster entry needs an id."); return; }
+        const note = /** @type {HTMLInputElement} */ (byId("rw-goal-note")).value.trim();
+        // The id says which kind it is, the same way the remove route infers it.
+        const kind = entryId.startsWith("guardian-") ? "review" : "squad";
+        const resp = await post(`/api/waypoints/${waypointId}/roster`, { kind, entry_id: entryId, note: note || null },
+          { success: "Added to the roster.", errorLabel: "add roster entry" });
+        if (resp.ok) { closeModal(); waypointDetail = await resp.json(); renderWaypointDetail(); }
+      }
+
+      /**
+       * Drops one entry from the waypoint's completion list. Removing the last outstanding one can complete the
+       * waypoint's first phase, which is why it re-renders rather than only removing a row.
+       * @param {string} waypointId
+       * @param {string} entryId
+       * @returns {Promise<void>}
+       */
+      async function removeRosterEntry(waypointId, entryId) {
+        if (!confirm("Drop this from the waypoint's completion list?")) return;
+        const resp = await del(`/api/waypoints/${waypointId}/roster/${entryId}`,
+          { success: "Removed from the roster.", errorLabel: "remove roster entry" });
+        if (resp.ok) { waypointDetail = await resp.json(); await refreshWaypointsList(); renderWaypoints(); renderWaypointDetail(); }
+      }
+
+      /**
        * Opens the "Add affected entry" modal for a waypoint: pick a kind (squad/review) and type its id.
        * @param {string} waypointId
        * @returns {void}
@@ -732,7 +853,7 @@
             </select>
           </span></div>
           <div class="btn-row">
-            <button class="btn" onclick="closeModal()" data-tip="Discard without adding a affected entry.">Cancel</button>
+            <button class="btn" onclick="closeModal()" data-tip="Discard without adding an affected entry.">Cancel</button>
             <button class="btn primary" data-click="submitAddAffectedEntry" data-waypoint-id="${esc(waypointId)}" data-tip="Add this affected entry to the waypoint.">Add</button>
           </div>
         </div></div>`;

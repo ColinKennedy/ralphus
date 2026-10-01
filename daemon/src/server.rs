@@ -15529,13 +15529,16 @@ fn waypoint_add_roster_entry(daemon: &Daemon, id: &str, body: &str) -> Reply {
         .scope("waypoint")
         .emit(
             &store,
-            format!("waypoint {id} goal added: {} {}", req.kind, req.entry_id),
+            format!(
+                "waypoint {id} roster entry added: {} {}",
+                req.kind, req.entry_id
+            ),
             serde_json::json!({ "waypoint_id": id, "kind": req.kind, "entry_id": req.entry_id }),
         );
-    // A new goal closes a gate that may have been open, and the affected work
+    // A new roster entry closes a gate that may have been open, and the affected work
     // it now holds can already be running.
     crate::waypoints::resignal_waypoint_holds(&store, &daemon.waypoint_halts, id);
-    // Adding a goal can only ever make a waypoint less complete, so there is
+    // Adding a roster entry can only ever make a waypoint less complete, so there is
     // nothing to re-close here -- but removing one can, which is why the
     // delete handler does check.
     match waypoint_detail(&store, id) {
@@ -15544,8 +15547,8 @@ fn waypoint_add_roster_entry(daemon: &Daemon, id: &str, body: &str) -> Reply {
     }
 }
 
-/// `DELETE /api/waypoints/{id}/roster/{entry_id}` -- drop a goal from the
-/// completion list. Removing the last unfinished goal can complete phase 1,
+/// `DELETE /api/waypoints/{id}/roster/{entry_id}` -- drop an entry from the
+/// completion list. Removing the last unfinished entry can complete phase 1,
 /// so this re-checks whether the waypoint is now closeable.
 fn waypoint_remove_roster_entry(daemon: &Daemon, id: &str, entry_id: &str) -> Reply {
     let kind = if entry_id.starts_with("guardian-") {

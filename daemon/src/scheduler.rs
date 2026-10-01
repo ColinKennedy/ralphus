@@ -5794,12 +5794,12 @@ mod tests {
                 )
                 .unwrap();
             // A squad's hold lasts while its waypoint's own work is unfinished,
-            // so give this waypoint a goal that has not landed.
+            // so give this waypoint a roster entry that has not landed.
             guard
                 .add_roster_entry(
                     "waypoint-1",
                     crate::waypoints::WaypointEntryKind::Squad,
-                    "squad-wp-goal",
+                    "squad-wp-roster",
                     None,
                 )
                 .unwrap();
@@ -5885,12 +5885,12 @@ mod tests {
                 )
                 .unwrap();
             // A squad's hold lasts while its waypoint's own work is unfinished,
-            // so give this waypoint a goal that has not landed.
+            // so give this waypoint a roster entry that has not landed.
             guard
                 .add_roster_entry(
                     "waypoint-1",
                     crate::waypoints::WaypointEntryKind::Squad,
-                    "squad-wp-goal",
+                    "squad-wp-roster",
                     None,
                 )
                 .unwrap();

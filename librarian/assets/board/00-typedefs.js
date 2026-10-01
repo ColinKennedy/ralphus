@@ -1045,8 +1045,26 @@
        * @property {DeliveryStatus} delivery_status
        * @property {number|null} stand_down_at_ms - set once this entry's advisory stand-down notice has been sent.
        * @property {number|null} stale_at_ms - set when this entry's work finished while the waypoint was still open and had judged it impacted, so it landed without the waypoint's own changes. Advisory: nothing is re-run until `ralphus waypoint redo`.
+       * @property {string|null} [bearing_decision] - how this entry answered the waypoint: "accepted", "rejected" or "deferred". Null means it has not answered, which for a block-mode entry is what is still holding it.
+       * @property {number|null} [bearing_decided_at_ms]
        * @property {number} created_at_ms
        * @property {number} updated_at_ms
+       */
+
+      /**
+       * One row of a waypoint's ROSTER -- its completion list. A review or squad
+       * whose landing IS this waypoint being carried out, as opposed to
+       * `AffectedEntryView`, which is work the waypoint lands on.
+       *
+       * Deliberately thin: no survey verdict, no delivery status, no answer,
+       * because none of those apply to work the waypoint consists of.
+       * @typedef {object} RosterEntryView
+       * @property {string} waypoint_id
+       * @property {AffectedEntryKind} kind
+       * @property {string} entry_id - a squad id or review (guardian) id, depending on `kind`.
+       * @property {string|null} [note] - why this is on the list, in whoever added it's own words.
+       * @property {boolean} terminal - whether it has finished. Derived per read, so it cannot go stale against the squad/review it describes.
+       * @property {number} created_at_ms
        */
       /**
        * One append-only bearing (a chronicle of actual completed work) on a
@@ -1104,7 +1122,8 @@
        * @property {number} updated_at_ms
        * @property {number|null} closed_at_ms
        * @property {string[]} projects - server-resolved project names (RAL-396); render as-is.
-       * @property {AffectedEntryView[]} affected
+       * @property {RosterEntryView[]} roster - the completion list: what must land for this waypoint to be carried out.
+       * @property {AffectedEntryView[]} affected - the work this waypoint lands on.
        * @property {DeliverySummary} delivery_summary
        */
       /**
