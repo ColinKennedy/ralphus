@@ -3652,7 +3652,10 @@ fn settle_pr_merge_states(
         if !all_merged {
             return any_branch_freshly_marked_merged;
         }
-        let merged = store.lock().set_guardian_status(id, crate::guardian::GuardianStatus::Merged, None).is_ok();
+        let merged = store
+            .lock()
+            .set_guardian_status(id, crate::guardian::GuardianStatus::Merged, None)
+            .is_ok();
         if merged {
             // A `MutexGuard` temporary produced in an `if let` scrutinee lives
             // for the whole `if let` (it desugars to `match`), so binding the
