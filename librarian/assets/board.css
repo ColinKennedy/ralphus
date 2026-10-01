@@ -1398,3 +1398,51 @@
 
       .wp-entry-id, .wp-feed-body a, .wp-feed-refs a { color: var(--accent); text-decoration: none; }
       .wp-entry-id:hover, .wp-feed-body a:hover, .wp-feed-refs a:hover { text-decoration: underline; }
+
+      /* ---------- Waypoint create dialog -----------------------------------
+         The dialog was built from `.kv-row`s, which are a read-only display
+         primitive: a narrow grey key column beside whatever you put in the
+         value cell. Used as a form it gives bare unstyled inputs of differing
+         widths, hard against their labels, with no grouping. These are form
+         styles instead. */
+      .wp-form { display: flex; flex-direction: column; gap: 13px; }
+      .wp-field { display: flex; flex-direction: column; gap: 5px; }
+      .wp-field > label { font-size: 11.5px; font-weight: 600; letter-spacing: .03em;
+        text-transform: uppercase; color: var(--muted); }
+      .wp-field .wp-hint { font-size: 11.5px; color: var(--muted); }
+      .wp-field input[type="text"], .wp-field textarea, .wp-field select {
+        width: 100%; background: var(--bg); border: 1px solid var(--border); color: var(--text);
+        border-radius: 7px; padding: 7px 9px; font: 13px/1.45 inherit; }
+      .wp-field textarea { height: 86px; min-height: 86px; resize: vertical; }
+      .wp-field input[type="text"]:focus, .wp-field textarea:focus, .wp-field select:focus {
+        outline: none; border-color: var(--accent); }
+      .wp-field-row { display: flex; gap: 13px; }
+      .wp-field-row > .wp-field { flex: 1; min-width: 0; }
+      .wp-check { display: flex; align-items: center; gap: 7px; font-size: 13px;
+        color: var(--text); text-transform: none; letter-spacing: 0; font-weight: 400; }
+
+      /* Roster picker: two tabs over one scrolling list, so squads and reviews
+         are chosen the same way without doubling the dialog's height. */
+      .wp-picker { border: 1px solid var(--border); border-radius: 7px; overflow: hidden; }
+      .wp-picker-tabs { display: flex; gap: 2px; padding: 5px 5px 0; background: var(--panel-2); }
+      .wp-picker-tab { background: none; border: none; color: var(--muted); font-size: 12px;
+        font-weight: 550; padding: 5px 11px; border-radius: 6px 6px 0 0; }
+      .wp-picker-tab:hover { color: var(--text); }
+      .wp-picker-tab.on { background: var(--bg); color: var(--text); }
+      .wp-picker-tab .n { color: var(--muted); font-size: 11px; margin-left: 4px; }
+      .wp-picker-search { padding: 6px 7px; background: var(--panel-2);
+        border-bottom: 1px solid var(--border); }
+      .wp-picker-list { max-height: 210px; overflow-y: auto; background: var(--bg); }
+      .wp-pick-row { display: flex; align-items: center; gap: 8px; padding: 5px 9px;
+        font-size: 12.5px; cursor: pointer; }
+      .wp-pick-row:hover { background: var(--panel-2); }
+      .wp-pick-row input { margin: 0; }
+      .wp-pick-id { font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+        font-size: 11.5px; color: var(--muted); }
+      .wp-pick-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+        white-space: nowrap; }
+      .wp-picked { display: flex; flex-wrap: wrap; gap: 5px; }
+      .wp-picked:empty::after { content: "Nothing selected yet — a waypoint needs at least one.";
+        color: var(--muted); font-size: 11.5px; }
+      .wp-picked .wp-chip { cursor: pointer; }
+      .wp-picked .wp-chip:hover { border-color: var(--failed); color: var(--failed); }

@@ -44,6 +44,18 @@
         if (parsed.status) waypointFilters.status = new Set(parsed.status);
         if (parsed.projects) waypointFilters.projects = new Set(parsed.projects);
       }
+      /** @type {Set<string>} `kind:id` keys chosen in the create dialog's roster picker. */
+      let createWaypointPicked = new Set();
+      /** Which tab the create dialog's roster picker is showing: "squad" or "review". */
+      let createWaypointPickerKind = "squad";
+      /** Current free-text filter in the create dialog's roster picker. */
+      let createWaypointPickerQuery = "";
+      /** Survey agent chosen in the create dialog, from the shared agent `<select>`. */
+      let createWaypointAgent = "";
+      /** @type {{id: string, name: string}[]} Squads offered by the create dialog's roster picker, fetched when it opens. */
+      let createWaypointSquads = [];
+      /** @type {{id: string, name: string}[]} Reviews offered by the create dialog's roster picker, fetched when it opens. */
+      let createWaypointReviews = [];
       /** @type {string|null} */
       let selectedWaypointId = null;
       /** @type {WaypointListEntry[]} */
@@ -454,7 +466,7 @@
        * @returns {string}
        */
       function renderWaypointDeliveryFeed() {
-        if (!waypointDeliveries.length) return `<div class="empty">Nothing has happened yet.</div>`;
+        if (!waypointDeliveries.length) return `<div class="empty">Nothing has happened to this waypoint yet.</div>`;
         return waypointDeliveries.slice().sort((a, b) => b.at_ms - a.at_ms).map((ev) => `<div class="wp-feed-row">
           <span class="wp-feed-when" data-tip="When this effect was recorded.">${esc(new Date(ev.at_ms).toLocaleString())}</span>
           <span class="wp-feed-body">${esc(ev.message)}${renderWaypointEffectTarget(ev)}</span>
@@ -504,11 +516,17 @@
       function renderWaypointBearings() {
         if (!waypointBearings.length) return `<div class="empty">No bearings reported yet.</div>`;
         return waypointBearings.slice().sort((a, b) => b.id - a.id).map((b) => {
-          const link = b.entity_uri ? `<a href="#" data-click="gotoEntityUri" data-entity-uri="${esc(b.entity_uri)}" data-tip="Open the entity this bearing was reported against.">${esc(b.entity_uri)}</a>` : "";
+          // Who published it, as a link. The producer is the squad or review
+          // that did the work, so this is the jump to the worktree it was done
+          // in — previously the row named the work without saying whose it was.
+          const producer = b.producer_kind === "review"
+            ? `<a href="#" data-click="gotoReview" data-guardian-id="${esc(b.producer_id)}" data-tip="Open the review that published this bearing, and its worktree.">🔀 ${esc(b.producer_id)}</a>`
+            : `<a href="#" data-click="gotoSquad" data-squad-id="${esc(b.producer_id)}" data-tip="Open the squad that published this bearing, and its worktree.">🧩 ${esc(b.producer_id)}</a>`;
+          const link = b.entity_uri ? `<a href="#" data-click="gotoEntityUri" data-entity-uri="${esc(b.entity_uri)}" data-tip="Open the specific entity this bearing points at.">${esc(b.entity_uri)}</a>` : "";
           const commit = b.commit_id
             ? `<span class="mono" data-tip="A lead for narrowing an investigation, not an assertion that the base you are looking at already contains this commit.">${esc(b.commit_id.slice(0, 12))}${b.commit_summary ? ` — ${esc(b.commit_summary)}` : ""}</span>`
             : "";
-          const refs = (link || commit) ? `<div class="wp-feed-refs">${commit}${link}</div>` : "";
+          const refs = `<div class="wp-feed-refs">${producer}${commit}${link}</div>`;
           return `<div class="wp-feed-row">
             <span class="wp-feed-when" data-tip="When this bearing was appended. Bearings are append-only and never edited.">${esc(new Date(b.created_at_ms).toLocaleString())}</span>
             <span class="wp-feed-body">${esc(b.summary)}${refs}</span>
@@ -551,8 +569,9 @@
           </div>
           ${w.roster.length ? w.roster.map(renderRosterEntryRow).join("") : `<div class="empty">No roster entries.</div>`}
           <div class="wp-section">
-            <h4>Effects</h4>
+            <h4>Activity log</h4>
             <span class="wp-section-rule"></span>
+            <a class="btn sm" href="#/cartographer?scope=waypoint&q=${esc(w.id)}" data-tip="Open this in the Logs tab, where it can be filtered, searched and paged further back.\nThis section is the same log, narrowed to the rows that name this waypoint.">Open in Logs</a>
           </div>
           ${renderWaypointDeliveryFeed()}
           <div class="wp-section">
@@ -782,47 +801,197 @@
        * @returns {void}
        */
       function openCreateWaypoint(seedEntry) {
-        const seedRow = seedEntry
-          ? `<div class="kv-row"><span class="k">roster</span><span class="v mono">${esc(seedEntry.kind)}:${esc(seedEntry.entry_id)}</span></div>`
-          : `<div class="kv-row"><span class="k">roster</span><span class="v"><input type="text" id="cw-roster-kind" placeholder="squad or review" style="width:90px" data-tip="Kind of the first roster entry: squad or review."> <input type="text" id="cw-roster-id" placeholder="entry id" style="width:220px" data-tip="Id of the first roster entry. A waypoint needs at least one roster entry to be created."></span></div>`;
-        byId("modal-root").innerHTML = `<div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal">
+        createWaypointPicked = new Set();
+        createWaypointPickerKind = "squad";
+        createWaypointPickerQuery = "";
+        createWaypointAgent = "";
+        if (seedEntry) createWaypointPicked.add(`${seedEntry.kind}:${seedEntry.entry_id}`);
+        byId("modal-root").innerHTML = `<div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal" style="width:620px;max-width:94vw">
           <h3 style="margin-top:0">Create waypoint</h3>
-          <div class="kv-row"><span class="k">label</span><span class="v"><input type="text" id="cw-label" style="width:100%" placeholder="(optional)" data-tip="A short human-readable label for this waypoint."></span></div>
-          <div class="kv-row"><span class="k">prompt</span><span class="v"><textarea id="cw-prompt" style="width:100%;min-height:60px" placeholder="what this waypoint is coordinating" data-tip="Required. Describes what this waypoint is coordinating -- shown (redacted) to roster entries."></textarea></span></div>
-          <div class="kv-row"><span class="k">agent</span><span class="v"><input type="text" id="cw-agent" style="width:100%" placeholder="(default)" data-tip="Optional agent backend override for this waypoint's own work."></span></div>
-          <div class="kv-row"><span class="k">model</span><span class="v"><input type="text" id="cw-model" style="width:100%" placeholder="(default)" data-tip="Optional model override for this waypoint's own work."></span></div>
-          <div class="kv-row"><span class="k">advisory</span><span class="v"><label style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="cw-allow-advisory" data-tip="Allow roster entries to be added in advisory mode (informational only, never halts anything).">allow advisory entries</label></span></div>
-          ${seedRow}
+          <div class="wp-form">
+            <div class="wp-field">
+              <label for="cw-label">Label</label>
+              <input type="text" id="cw-label" placeholder="optional, e.g. rename greet to salute" data-tip="A short human-readable name. Shown wherever this waypoint appears; the id is used when it has none.">
+            </div>
+            <div class="wp-field">
+              <label for="cw-prompt">Guidance</label>
+              <textarea id="cw-prompt" placeholder="What is changing, and which work has to account for it?" data-tip="Required. This is what the survey reads to decide which work is impacted, and what gets delivered to the entries that are.\nWrite it so someone who has not seen the change can tell whether their own work touches it."></textarea>
+              <span class="wp-hint">Read by the survey to decide impact, and delivered to the work it affects.</span>
+            </div>
+            <div class="wp-field-row">
+              <div class="wp-field">
+                <label for="cw-agent">Survey agent</label>
+                ${renderAgentSelectHtml("cw-agent", "", "", "onCreateWaypointAgentChange", "", "The agent that decides which work this waypoint affects.\nAn API backend (claude, ollama) is called directly; a terminal agent (claude-code, codex, pi) runs through the subprocess runner.\nLeave as the default unless you want a specific one.")}
+              </div>
+              <div class="wp-field">
+                <label for="cw-model">Model</label>
+                <input type="text" id="cw-model" placeholder="default" data-tip="Optional model override for the survey agent. Leave empty to use that agent's own default.">
+              </div>
+            </div>
+            <div class="wp-field">
+              <label>Roster</label>
+              <div class="wp-picked" id="cw-picked" data-tip="The squads and reviews this waypoint tracks. Click one to remove it."></div>
+              <div class="wp-picker">
+                <div class="wp-picker-tabs" id="cw-picker-tabs"></div>
+                <div class="wp-picker-search">
+                  <input type="text" id="cw-picker-q" placeholder="filter by name or id…" oninput="onCreateWaypointPickerQuery(this.value)" data-tip="Narrow the list below by name or id.">
+                </div>
+                <div class="wp-picker-list" id="cw-picker-list"></div>
+              </div>
+              <span class="wp-hint">At least one is required. Hidden squads and reviews are not listed.</span>
+            </div>
+            <div class="wp-field">
+              <label class="wp-check" data-tip="Lets the survey mark an entry advisory: it receives the guidance but is never held.\nOff means every impacted entry blocks until this waypoint closes."><input type="checkbox" id="cw-allow-advisory"> Allow advisory entries</label>
+            </div>
+          </div>
           <div class="btn-row">
             <button class="btn" onclick="closeModal()" data-tip="Discard without creating a waypoint.">Cancel</button>
-            <button class="btn primary" data-click="submitCreateWaypoint" data-seed-kind="${seedEntry ? esc(seedEntry.kind) : ""}" data-seed-entry-id="${seedEntry ? esc(seedEntry.entry_id) : ""}" data-tip="Create this waypoint.">Create</button>
+            <button class="btn primary" data-click="submitCreateWaypoint" data-tip="Create this waypoint. It starts holding its block-mode entries immediately.">Create</button>
           </div>
         </div></div>`;
+        renderCreateWaypointPicker();
+        // Paint the dialog first, fill the picker when its lists land — opening
+        // should never wait on a request.
+        void loadCreateWaypointCandidates().then(() => {
+          if (document.getElementById("cw-picker-list")) renderCreateWaypointPicker();
+        });
       }
 
       /**
-       * Reads the "create waypoint" modal's fields and submits them, closing the modal and selecting the new waypoint on success.
-       * @param {string} seedKind
-       * @param {string} seedEntryId
+       * Records the survey agent chosen in the create dialog. The shared agent `<select>` dispatches through a
+       * named global, so this is its handler rather than a value read at submit time.
+       * @param {string} value
+       * @returns {void}
+       */
+      function onCreateWaypointAgentChange(value) {
+        createWaypointAgent = value;
+      }
+
+      /**
+       * Switches the roster picker between squads and reviews.
+       * @param {string} kind
+       * @returns {void}
+       */
+      function setCreateWaypointPickerKind(kind) {
+        createWaypointPickerKind = kind;
+        renderCreateWaypointPicker();
+      }
+
+      /**
+       * Filters the roster picker list as the search box is typed into.
+       * @param {string} value
+       * @returns {void}
+       */
+      function onCreateWaypointPickerQuery(value) {
+        createWaypointPickerQuery = value.toLowerCase();
+        renderCreateWaypointPicker();
+      }
+
+      /**
+       * Adds or removes one roster candidate. Keyed `kind:id` so a squad and a review can never collide.
+       * @param {string} kind
+       * @param {string} entryId
+       * @param {boolean} on
+       * @returns {void}
+       */
+      function toggleCreateWaypointPick(kind, entryId, on) {
+        const key = `${kind}:${entryId}`;
+        if (on) createWaypointPicked.add(key); else createWaypointPicked.delete(key);
+        renderCreateWaypointPicker();
+      }
+
+      /**
+       * Every squad and review a waypoint may be rostered against, excluding the ones hidden by the user — a hidden
+       * entity is one they have deliberately removed from view, so offering it here would reintroduce it.
+       * @returns {{[kind: string]: {id: string, name: string}[]}}
+       */
+      function createWaypointCandidates() {
+        return { squad: createWaypointSquads, review: createWaypointReviews };
+      }
+
+      /**
+       * Loads the squads and reviews the roster picker offers, when the dialog opens.
+       *
+       * Deliberately its own fetch rather than reading the shared `squads`/`guardians` globals: those are populated
+       * by the Squads and Reviews tabs' own polls, so opening this dialog from the Waypoints tab showed whatever
+       * those tabs had last left behind — in practice an empty review list, because nothing had visited that tab.
+       * Fetching here also means the lists are only pulled when someone actually opens the picker.
+       *
+       * Hidden squads and reviews are dropped: a hidden entity is one the user deliberately removed from view, so
+       * offering it here would quietly reintroduce it.
        * @returns {Promise<void>}
        */
-      async function submitCreateWaypoint(seedKind, seedEntryId) {
+      async function loadCreateWaypointCandidates() {
+        const [taskIndex, reviewIndex] = await Promise.all([
+          fetch("/api/tasks").then((r) => (r.ok ? r.json() : { squads: [] })).catch(() => ({ squads: [] })),
+          fetch("/api/guardian-index").then((r) => (r.ok ? r.json() : [])).catch(() => []),
+        ]);
+        createWaypointSquads = (taskIndex.squads || [])
+          .filter((/** @type {SquadView} */ sq) => !hiddenSquadIds.has(sq.id))
+          .map((/** @type {SquadView} */ sq) => ({
+            id: sq.id,
+            name: sq.label || (sq.tasks && sq.tasks[0] ? sq.tasks[0].name : "") || sq.id,
+          }));
+        createWaypointReviews = (reviewIndex || [])
+          .filter((/** @type {{id: string}} */ g) => !hiddenGuardianIds.has(g.id))
+          .map((/** @type {{id: string, name?: string}} */ g) => ({ id: g.id, name: g.name || g.id }));
+      }
+
+      /**
+       * Renders the roster picker's tabs, list and selected chips. Called on open and after every change, so the
+       * selected set and the list's checkboxes can never disagree.
+       * @returns {void}
+       */
+      function renderCreateWaypointPicker() {
+        const all = createWaypointCandidates();
+        const tabs = byId("cw-picker-tabs");
+        tabs.innerHTML = [["squad", "Squads"], ["review", "Reviews"]].map(([kind, label]) =>
+          `<button type="button" class="wp-picker-tab ${createWaypointPickerKind === kind ? "on" : ""}" onclick="setCreateWaypointPickerKind('${kind}')" data-tip="Pick ${label.toLowerCase()} for this waypoint's roster.">${label}<span class="n">${all[kind].length}</span></button>`).join("");
+
+        const q = createWaypointPickerQuery;
+        const rows = (all[createWaypointPickerKind] || [])
+          .filter((/** @type {{id: string, name: string}} */ c) => !q || c.id.toLowerCase().includes(q) || c.name.toLowerCase().includes(q));
+        const list = byId("cw-picker-list");
+        list.innerHTML = rows.length
+          ? rows.map((/** @type {{id: string, name: string}} */ c) => {
+              const key = `${createWaypointPickerKind}:${c.id}`;
+              const on = createWaypointPicked.has(key);
+              return `<label class="wp-pick-row" data-tip="${esc(c.id)}">
+                <input type="checkbox" ${on ? "checked" : ""} onchange="toggleCreateWaypointPick('${esc(createWaypointPickerKind)}','${esc(c.id)}',this.checked)">
+                <span class="wp-pick-name">${esc(c.name)}</span>
+                <span class="wp-pick-id">${esc(c.id)}</span>
+              </label>`;
+            }).join("")
+          : `<div class="empty" style="padding:10px">${q ? "Nothing matches that." : "None available."}</div>`;
+        byId("cw-picker-q").setAttribute("placeholder", rows.length ? "filter by name or id…" : "loading…");
+
+        byId("cw-picked").innerHTML = [...createWaypointPicked].sort().map((key) => {
+          const [kind, ...rest] = key.split(":");
+          const id = rest.join(":");
+          return `<span class="wp-chip" onclick="toggleCreateWaypointPick('${esc(kind)}','${esc(id)}',false)" data-tip="Remove this entry from the roster."><span class="wp-chip-k">${esc(kind)}</span>${esc(id)} ✕</span>`;
+        }).join("");
+      }
+
+      /**
+       * Reads the create dialog and submits it, then opens the new waypoint.
+       * @returns {Promise<void>}
+       */
+      /**
+       * Reads the create dialog and submits it, then opens the new waypoint.
+       * @returns {Promise<void>}
+       */
+      async function submitCreateWaypoint() {
         const prompt = /** @type {HTMLTextAreaElement} */ (byId("cw-prompt")).value.trim();
-        if (!prompt) { notify("error", "Enter a prompt."); return; }
-        let roster;
-        if (seedEntryId) {
-          roster = [{ kind: seedKind, entry_id: seedEntryId }];
-        } else {
-          const kind = /** @type {HTMLInputElement} */ (byId("cw-roster-kind")).value.trim().toLowerCase();
-          const entryId = /** @type {HTMLInputElement} */ (byId("cw-roster-id")).value.trim();
-          if (!kind || !entryId) { notify("error", "A waypoint needs at least one roster entry."); return; }
-          roster = [{ kind, entry_id: entryId }];
-        }
+        if (!prompt) { notify("error", "Enter the guidance this waypoint carries."); return; }
+        const roster = [...createWaypointPicked].map((key) => {
+          const [kind, ...rest] = key.split(":");
+          return { kind, entry_id: rest.join(":") };
+        });
+        if (!roster.length) { notify("error", "Pick at least one squad or review for the roster."); return; }
         const label = /** @type {HTMLInputElement} */ (byId("cw-label")).value.trim();
-        const agent = /** @type {HTMLInputElement} */ (byId("cw-agent")).value.trim();
         const model = /** @type {HTMLInputElement} */ (byId("cw-model")).value.trim();
         const allowAdvisory = /** @type {HTMLInputElement} */ (byId("cw-allow-advisory")).checked;
-        const body = { label: label || null, prompt, agent: agent || null, model: model || null, allow_advisory: allowAdvisory, roster };
+        const body = { label: label || null, prompt, agent: createWaypointAgent || null, model: model || null, allow_advisory: allowAdvisory, roster };
         const resp = await post("/api/waypoints", body, { success: "Waypoint created.", errorLabel: "create waypoint" });
         if (resp.ok) {
           const created = await resp.json();
