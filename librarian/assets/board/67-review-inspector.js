@@ -269,7 +269,7 @@
         return `<div class="hint" style="margin:0 0 10px">What you write here is routed into
             <span class="mono">${esc(b.branch)}</span>'s worktree as a change request. The resolver
             agent amends the branch and replies.</div>
-          ${branchFeedbackSection(g, b)}
+          ${feedbackThread(g, b)}
           <div class="fb-composer">
             <textarea id="fb-input-${esc(b.id)}" rows="3" ${sending ? "disabled" : ""}
               placeholder="Ask for a change on ${esc(b.branch)}…"
@@ -278,8 +278,144 @@
               <button class="btn primary" ${sending ? "disabled" : ""} data-click="sendBranchFeedback"
                 data-guardian-id="${esc(g.id)}" data-branch-id="${esc(b.id)}"
                 data-tip="Send this to the resolver agent.\nIt is recorded on the branch's thread immediately; the agent's reply appears here when it finishes.">${sending ? "Sending…" : "Send"}</button>
+              <button class="btn" data-click="showChatCopyMenu" data-guardian-id="${esc(g.id)}" data-branch-id="${esc(b.id)}"
+                data-tip="Copy this whole thread — every request and reply — as Markdown or as raw JSON.">Copy thread</button>
             </div>
           </div>`;
+      }
+      /**
+       * The branch's feedback thread as a conversation.
+       *
+       * Consecutive resolver messages are one bubble with a stepper rather than
+       * a stack of separate ones: they are that agent's successive replies to
+       * the same request, so "did it fail repeatedly before it got there" is a
+       * question about one exchange, and the stepper is what answers it.
+       * @param {GuardianView} g - The review.
+       * @param {GuardianBranch} b - The branch.
+       * @returns {string}
+       */
+      function feedbackThread(g, b) {
+        const key = `${g.id}:${b.id}`;
+        if (branchMessages[key] === undefined) loadBranchMessages(g.id, b.id);
+        const msgs = branchMessages[key] || [];
+        if (!msgs.length) {
+          return `<div class="absent-run" style="margin-bottom:12px"><span class="ai">○</span>
+              <div class="abody"><div class="at">No change requests yet</div>
+                <div class="as">Ask for a change below and it is routed straight into this branch's worktree.
+                  The same thread is reachable from the CLI:
+                  <span class="mono">ralphus review feedback &lt;selector&gt; &lt;text&gt;</span>.</div></div>
+            </div>`;
+        }
+        /** @type {string[]} */
+        const out = [];
+        for (let i = 0; i < msgs.length;) {
+          const m = msgs[i];
+          if (m.role === "reviewer") {
+            out.push(feedbackBubble(key, m, "you", m.author || "you", feedbackStatusChip(m), g, b));
+            i++;
+            continue;
+          }
+          // Collect this agent's run of replies, and show whichever one the
+          // reader has stepped to.
+          const group = [];
+          while (i < msgs.length && msgs[i].role !== "reviewer") { group.push(msgs[i]); i++; }
+          const gk = `${key}:g${group[0].seq}`;
+          const idx = Math.max(0, Math.min(group.length - 1, feedbackReplyIdx[gk] ?? (group.length - 1)));
+          const foot = feedbackReplyFoot(gk, group, idx, g, b);
+          out.push(feedbackBubble(key, group[idx], "resolver", "resolver", foot, g, b));
+        }
+        return `<div class="fb-thread">${out.join("")}</div>`;
+      }
+      /**
+       * One message bubble.
+       * @param {string} key - The thread key.
+       * @param {ChatMessage} m - The message.
+       * @param {string} side - "you" or "resolver".
+       * @param {string} who - The label shown on it.
+       * @param {string} foot - Trailing status/stepper markup, or "".
+       * @param {GuardianView} g - The review.
+       * @param {GuardianBranch} b - The branch.
+       * @returns {string}
+       */
+      function feedbackBubble(key, m, side, who, foot, g, b) {
+        void g; void b;
+        const bubbleKey = `${key}:${m.seq}`;
+        const text = stripRoute(m.text);
+        const expanded = expandedChatBubbles.has(bubbleKey);
+        // Elide on length as well as on line count -- a long single-line
+        // paragraph is exactly the case the old first-line rule missed.
+        const long = text.includes("\n") || text.length > 180;
+        const shown = (!long || expanded) ? text : `${text.slice(0, 180).trimEnd()}…`;
+        const t = fmtMsgTime(m.at_ms);
+        return `<div class="fb-msg ${side}">
+            <div class="fb-head">
+              <span class="fb-who">${esc(who)}</span>
+              ${t ? `<span class="fb-time" data-tip="${esc(fmtMsgTimeFull(m.at_ms))}, your local time.">${esc(t)}</span>` : ""}
+            </div>
+            ${long ? `<button class="fb-expand" data-click="toggleChatBubble" data-key="${esc(bubbleKey)}"
+              data-tip="${expanded ? "Collapse this message." : "Expand to read the whole message."}">${expanded ? "−" : "+"}</button>` : ""}
+            <div class="fb-body">${esc(shown)}</div>
+            ${foot}
+          </div>`;
+      }
+      /**
+       * A reviewer message's completion chip, straight from the status the
+       * daemon records for that one message (RAL-380).
+       * @param {ChatMessage} m - The reviewer message.
+       * @returns {string}
+       */
+      function feedbackStatusChip(m) {
+        const s = m.action_status;
+        if (!s) return "";
+        const label = { received: "accepted", done: "applied", failed: "failed", superseded: "superseded" }[s] || s;
+        const tip = {
+          received: "Accepted — the resolver agent has picked this request up and started applying it.",
+          done: "Applied — the resolver agent's pass for this request finished successfully.",
+          failed: "Failed — the resolver agent's pass for this request, or a check before it, did not succeed.",
+          superseded: "Superseded — a newer request arrived on this branch before this one finished, so its outcome no longer stands.",
+        }[s] || "This request's recorded completion status.";
+        return `<div class="fb-foot"><span class="fb-chip ${esc(s)}" data-tip="${esc(tip)}">${esc(label)}</span></div>`;
+      }
+      /**
+       * The footer under a resolver bubble: which reply of the run you are on,
+       * and the way to its logs.
+       * @param {string} gk - The group key.
+       * @param {ChatMessage[]} group - Every reply in this run.
+       * @param {number} idx - Which one is showing.
+       * @param {GuardianView} g - The review.
+       * @param {GuardianBranch} b - The branch.
+       * @returns {string}
+       */
+      function feedbackReplyFoot(gk, group, idx, g, b) {
+        const stepper = group.length > 1
+          ? `<span class="fb-attempt" data-tip="This agent replied ${group.length} times to the same request — step through them to see what it tried before the reply you are reading.">
+              <span>reply ${idx + 1} of ${group.length}</span>
+              <button class="hnav" data-click="stepFeedbackReply" data-key="${esc(gk)}" data-to="${idx - 1}" ${idx <= 0 ? "disabled" : ""}
+                data-tip="The reply before this one.">&#9664;</button>
+              <button class="hnav" data-click="stepFeedbackReply" data-key="${esc(gk)}" data-to="${idx + 1}" ${idx >= group.length - 1 ? "disabled" : ""}
+                data-tip="The reply after this one.">&#9654;</button>
+            </span>`
+          : "";
+        return `<div class="fb-foot">${stepper}
+            <button class="btn fb-logs" style="padding:1px 7px;font-size:10.5px" data-click="scopeReviewDockToBranch"
+              data-guardian-id="${esc(g.id)}" data-branch-id="${esc(b.id)}"
+              data-tip="Open this branch's log drawer — what the resolver was doing while it wrote this.">logs</button>
+          </div>`;
+      }
+      /** @type {{[groupKey: string]: number}} Which reply of a resolver run is showing. */
+      const feedbackReplyIdx = {};
+      /**
+       * Steps a resolver run's reply selection. The target index is carried on
+       * the button rather than derived here, since an unstepped group defaults
+       * to its newest reply and this has no way to know how many there are.
+       * @param {string} gk - The group key.
+       * @param {number} to - The reply index to show.
+       * @returns {void}
+       */
+      function stepFeedbackReply(gk, to) {
+        if (!Number.isFinite(to) || to < 0) return;
+        feedbackReplyIdx[gk] = to;
+        renderReviewInspector();
       }
       /** @type {Set<string>} Branch keys with a feedback post in flight, so Send cannot be double-fired. */
       const feedbackSending = new Set();
@@ -694,9 +830,11 @@
        */
       function livePromptView(g, b, run) {
         if (run && run.kind === "feedback") {
-          const msgs = branchMessages[b.id];
+          const msgs = branchMessages[`${g.id}:${b.id}`];
           if (msgs === undefined) { loadBranchMessages(g.id, b.id); return `<div class="promptbox">Loading…</div>`; }
-          const last = [...msgs].reverse().find((m) => m.role === "user");
+          // The daemon's roles are "reviewer" and "guardian" -- there is no
+          // "user" role, so matching one never found anything.
+          const last = [...msgs].reverse().find((m) => m.role === "reviewer");
           if (last) {
             return `<div class="promptbox">${esc(last.text)}</div>
               <div class="hint">The reviewer feedback this run was dispatched to act on. ralphus wraps it in

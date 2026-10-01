@@ -2443,6 +2443,9 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
       function toggleChatBubble(key) {
         if (expandedChatBubbles.has(key)) expandedChatBubbles.delete(key); else expandedChatBubbles.add(key);
         renderReviewDetail();
+        // The same bubbles render in the inspector's Feedback tab, which is its
+        // own pane -- without this, expanding one there did nothing visible.
+        renderReviewInspector();
       }
       /**
        * Renders one review branch's read-only feedback thread (RAL-272):

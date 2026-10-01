@@ -304,6 +304,68 @@
       .setup-group { border-left: 2px solid transparent; padding-left: 8px; margin-left: -10px; border-radius: 0 4px 4px 0; }
       .setup-group.focused { border-left-color: var(--accent); background: rgba(74,163,255,.09); }
       .setup-group.focused > h3.section { color: var(--accent); }
+      /* ---- Feedback tab: the branch's change-request thread ----
+         A conversation, so it is laid out as one: your request and the
+         resolver's reply are different speakers and sit on opposite sides,
+         each labelled with who said it and when. */
+      .fb-thread { display: flex; flex-direction: column; gap: 10px; margin-bottom: 12px; }
+      .fb-msg { max-width: 86%; border-radius: 10px; padding: 8px 11px; position: relative; }
+      .fb-msg.you { align-self: flex-end; background: var(--accent); color: #fff; }
+      .fb-msg.resolver { align-self: flex-start; background: var(--panel-2); border: 1px solid var(--border-soft); }
+      .fb-head { display: flex; align-items: baseline; gap: 7px; margin-bottom: 4px; padding-right: 22px; }
+      .fb-who { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .6px; }
+      .fb-msg.you .fb-who { color: rgba(255,255,255,.92); }
+      .fb-msg.resolver .fb-who { color: var(--muted); }
+      .fb-time { font-size: 10px; }
+      .fb-msg.you .fb-time { color: rgba(255,255,255,.72); }
+      .fb-msg.resolver .fb-time { color: var(--faint); }
+      .fb-body { font-size: 12.5px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+      .fb-msg.resolver .fb-body { color: var(--text); }
+      /* Top-right so it sits clear of the text at any length, and stays put
+         when the body expands rather than travelling with the last line. */
+      .fb-expand {
+        position: absolute; top: 6px; right: 7px; width: 19px; height: 19px;
+        display: grid; place-items: center; border-radius: 4px; font-size: 12px; line-height: 1;
+        background: transparent; border: 1px solid var(--border); color: var(--muted);
+      }
+      .fb-msg.you .fb-expand { border-color: rgba(255,255,255,.4); color: rgba(255,255,255,.9); }
+      .fb-msg.you .fb-expand:hover { background: rgba(255,255,255,.18); }
+      .fb-msg.resolver .fb-expand:hover { border-color: var(--accent); color: var(--accent); }
+      .fb-foot {
+        display: flex; align-items: center; gap: 8px; margin-top: 8px; padding-top: 7px;
+        border-top: 1px solid var(--border-soft); font-size: 10.5px; color: var(--faint);
+      }
+      .fb-attempt {
+        display: inline-flex; align-items: center; gap: 5px; background: var(--bg);
+        border: 1px solid var(--border); border-radius: 20px; padding: 1px 4px 1px 9px;
+      }
+      .fb-attempt .hnav { width: 17px; height: 17px; font-size: 7px; }
+      .fb-chip {
+        border-radius: 20px; padding: 0 7px; line-height: 16px; font-size: 10px; font-weight: 600;
+        border: 1px solid var(--border); color: var(--muted);
+      }
+      .fb-chip.done { color: var(--done); border-color: var(--done-b); background: var(--done-a); }
+      .fb-chip.received { color: var(--accent); border-color: var(--accent-b); background: var(--accent-a); }
+      .fb-chip.failed { color: var(--failed); border-color: var(--failed-b); background: var(--failed-a); }
+      .fb-chip.superseded { color: var(--unverified); border-color: var(--amber-b); background: var(--amber-a); }
+      .fb-foot .fb-logs { margin-left: auto; }
+      /* Your own bubble is already painted in the accent, so a status chip
+         drawn from the accent palette disappears into it. Inside that bubble
+         the chips read against the fill instead, keeping failure red-adjacent
+         enough to still carry its meaning. */
+      .fb-msg.you .fb-foot { border-top-color: rgba(255,255,255,.28); color: rgba(255,255,255,.78); }
+      .fb-msg.you .fb-chip { background: rgba(255,255,255,.16); border-color: rgba(255,255,255,.42); color: #fff; }
+      .fb-msg.you .fb-chip.failed { background: var(--failed); border-color: var(--failed); color: #fff; }
+      /* The composer inherited nothing, so it rendered as a raw white box in a
+         dark pane. It is a first-class control here, not an afterthought. */
+      .fb-composer textarea {
+        width: 100%; box-sizing: border-box; resize: vertical; min-height: 64px;
+        background: var(--bg); color: var(--text); border: 1px solid var(--border);
+        border-radius: 8px; padding: 9px 10px; font: 12.5px/1.5 inherit;
+      }
+      .fb-composer textarea:focus { outline: none; border-color: var(--accent); }
+      .fb-composer textarea::placeholder { color: var(--faint); }
+
       /* ---- Live tab: walk back through every run this branch had ----
          The bar leads (which run am I looking at), the display toggles follow
          (how is it rendered), and the tab strip sits directly on the content it

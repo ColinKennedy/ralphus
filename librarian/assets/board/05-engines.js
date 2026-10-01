@@ -109,6 +109,7 @@
         stepBranchRun: (e, ds) => stepBranchRun(ds.branchId || "", Number(ds.dir)),
         jumpToLatestRun: (e, ds) => jumpToLatestRun(ds.branchId || ""),
         setLiveSub: (e, ds) => setLiveSub(ds.branchId || "", ds.sub || "terminal"),
+        stepFeedbackReply: (e, ds) => stepFeedbackReply(ds.key || "", Number(ds.to)),
         toggleShowDebugMessagesBtn: (e, ds) => toggleShowDebugMessages(ds.key || "", !peekShowsDebug(ds.key || "")),
         toggleShowThinkingBtn: (e, ds) => toggleShowThinking(ds.key || "", !peekShowsThinking(ds.key || "")),
         doPickStatus: (e, ds) => doPickStatus(ds.state || ""),
