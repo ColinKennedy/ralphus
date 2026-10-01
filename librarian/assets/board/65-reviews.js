@@ -2501,12 +2501,21 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         e.stopPropagation();
         const existing = document.getElementById("chat-copy-menu");
         if (existing) { existing.remove(); return; }
-        const rect = /** @type {HTMLElement} */ (e.currentTarget).getBoundingClientRect();
+        // Click handling is delegated from `document`, so `currentTarget` is
+        // the document -- which has no bounding box. Reading one off it threw,
+        // and the menu never opened at all. Resolve the button that was
+        // actually clicked instead.
+        const btn = /** @type {HTMLElement|null} */ (
+          /** @type {HTMLElement} */ (e.target).closest("[data-click]"));
+        const rect = (btn || /** @type {HTMLElement} */ (e.target)).getBoundingClientRect();
         const menu = document.createElement("div");
         menu.id = "chat-copy-menu";
         menu.className = "copy-menu";
-        menu.style.top = (rect.bottom + 4) + "px";
-        menu.style.left = rect.left + "px";
+        // Anchored above the button when it sits low in the viewport, so the
+        // composer's own copy control doesn't open a menu off the bottom edge.
+        const below = rect.bottom + 4;
+        menu.style.top = (below + 80 > window.innerHeight ? Math.max(4, rect.top - 72) : below) + "px";
+        menu.style.left = Math.min(rect.left, window.innerWidth - 160) + "px";
         menu.innerHTML = `<div class="copy-menu-item" data-click="copyChatAs" data-guardian-id="${esc(gid)}" data-branch-id="${esc(bid)}" data-format="markdown">Markdown</div><div class="copy-menu-item" data-click="copyChatAs" data-guardian-id="${esc(gid)}" data-branch-id="${esc(bid)}" data-format="json">JSON</div>`;
         document.body.appendChild(menu);
         setTimeout(() => document.addEventListener("click", () => { const m = document.getElementById("chat-copy-menu"); if (m) m.remove(); }, { once: true }), 0);

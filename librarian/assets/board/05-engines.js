@@ -110,8 +110,18 @@
         jumpToLatestRun: (e, ds) => jumpToLatestRun(ds.branchId || ""),
         setLiveSub: (e, ds) => setLiveSub(ds.branchId || "", ds.sub || "terminal"),
         stepFeedbackReply: (e, ds) => stepFeedbackReply(ds.key || "", Number(ds.to)),
-        toggleShowDebugMessagesBtn: (e, ds) => toggleShowDebugMessages(ds.key || "", !peekShowsDebug(ds.key || "")),
-        toggleShowThinkingBtn: (e, ds) => toggleShowThinking(ds.key || "", !peekShowsThinking(ds.key || "")),
+        // The inspector's Live tab draws these as pill toggles whose on/off
+        // state is read at render time, so flipping the underlying flag has to
+        // re-render that pane -- `toggleShow*` only repaints the tape, which
+        // left the pill looking untouched and the control looking dead.
+        toggleShowDebugMessagesBtn: (e, ds) => {
+          toggleShowDebugMessages(ds.key || "", !peekShowsDebug(ds.key || ""));
+          renderReviewInspector();
+        },
+        toggleShowThinkingBtn: (e, ds) => {
+          toggleShowThinking(ds.key || "", !peekShowsThinking(ds.key || ""));
+          renderReviewInspector();
+        },
         doPickStatus: (e, ds) => doPickStatus(ds.state || ""),
         selectAddDependencyTarget: (e, ds) => selectAddDependencyTarget(ds.squadId || ""),
         focusSel: (e, ds) => focusSel(ds.squadId || ""),

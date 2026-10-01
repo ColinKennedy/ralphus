@@ -913,12 +913,13 @@
               ? (reviewDockCommand.length > 40 ? `${reviewDockCommand.slice(0, 40)}…` : reviewDockCommand)
               : "whole review");
         }
+        // The label says what clicking does, not what the drawer is currently
+        // tracking -- "following selection" described an internal mode and
+        // read as a status, so the one control on the bar looked like a label.
+        // Whether it follows the selection is the sticky toggle's business,
+        // and that toggle already says so itself.
         const hint = document.getElementById("review-dock-hint");
-        if (hint) {
-          hint.textContent = !reviewDockOpen
-            ? "click to open"
-            : (reviewDockSticky ? "pinned — ignoring selection" : "following selection");
-        }
+        if (hint) hint.textContent = reviewDockOpen ? "close" : "open";
         const body = document.getElementById("review-dock-body");
         if (!body) return;
         if (!reviewDockOpen) { body.innerHTML = ""; return; }

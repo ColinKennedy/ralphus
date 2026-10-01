@@ -169,6 +169,27 @@ test("the log dock lives inside the review column, not over the page", () => {
   assert.match(reviews, /id="review-dock-sticky"/, "the dock needs its sticky pin");
 });
 
+test("the log dock's header toggles it, so an opened dock can be closed again", () => {
+  const reviews = boardHtml.slice(boardHtml.indexOf('<main id="reviews-page"'));
+  const head = reviews.slice(reviews.indexOf('id="review-dock-head"'));
+  const headEl = head.slice(0, head.indexOf(">") + 1);
+  // The dock shipped with no handler on its header at all: the "Logs" buttons
+  // could open it and nothing could close it, so it read as permanently open.
+  assert.match(
+    headEl,
+    /data-click="toggleReviewDock"/,
+    "clicking the dock's header bar must toggle it — without this the dock can only ever be opened",
+  );
+  // The sticky pin lives inside that header; delegation resolves the nearest
+  // data-click ancestor, so it must keep its own action or pinning would
+  // collapse the drawer instead.
+  assert.match(
+    head.slice(0, head.indexOf("</div>")),
+    /id="review-dock-sticky"[^>]*data-click="toggleReviewDockSticky"/,
+    "the sticky pin keeps its own action so it does not fall through to the header's toggle",
+  );
+});
+
 test("narrow screens stack the Reviews panes, hide the splitter, and wrap the header tabs", () => {
   const small = boardCss.slice(boardCss.indexOf("@media (max-width: 720px)"));
   assert.ok(small.length > 0, "a small-screen media query must exist for iPhones and other narrow viewports");

@@ -1021,6 +1021,10 @@
       }
       .dock-hint { font-size: 11px; color: var(--cancelled); }
       .dock-caret { color: var(--cancelled); font-size: 11px; }
+      /* The whole bar toggles the drawer, so the two things that read as the
+         control brighten together on hover rather than looking inert. */
+      .log-dock .dock-head:hover .dock-hint,
+      .log-dock .dock-head:hover .dock-caret { color: var(--text); }
       .log-dock .dock-body {
         flex: 1; overflow-y: auto; padding: 6px 0;
         font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px;

@@ -139,12 +139,12 @@
       <div class="review-main">
         <div class="col center"><div id="review-detail"><div class="empty">Select a review.</div></div></div>
         <div class="log-dock closed" id="review-log-dock">
-          <div class="dock-head" id="review-dock-head" data-tip="Open the log drawer for this review. It stays docked here rather than covering the page, and follows whatever you have selected.">
+          <div class="dock-head" id="review-dock-head" data-click="toggleReviewDock" data-tip="Click anywhere on this bar to open or close the log drawer.&#10;It stays docked here rather than covering the page, and shows whatever you have selected — the whole review, one branch, or one command.">
             <span class="dock-title">Logs</span>
             <span class="pill" id="review-dock-scope">whole review</span>
             <button class="tgl" id="review-dock-sticky" data-click="toggleReviewDockSticky" data-tip="Off: the drawer follows whatever you select.&#10;On: it stays pinned to what it is showing now, no matter what you select.&#10;Not remembered — a refresh always comes back to following the selection."><span class="bx"></span><span>sticky</span></button>
             <span style="flex:1"></span>
-            <span class="dock-hint" id="review-dock-hint">click to open</span>
+            <span class="dock-hint" id="review-dock-hint">open</span>
             <span class="dock-caret" id="review-dock-caret">&#9650;</span>
           </div>
           <div class="dock-body" id="review-dock-body"></div>
