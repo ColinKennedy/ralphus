@@ -261,9 +261,37 @@ wording this file settles). A later Phase 10 documentation sweep can still
 expand or adjust these entries; it will find them already present rather
 than missing.
 
+## Batch-vs-per-candidate survey classification — resolved
+
+**Decision: one LLM call per candidate. Not batched.** The ticket's own
+instruction was "attempt batching only if straightforward, default to
+per-candidate calls otherwise," and batching is not straightforward here for a
+reason specific to this feature rather than to effort.
+
+Fail-closed classification is per roster entry, and it is load-bearing for
+safety: an error, timeout or unparseable reply resolves that entry to
+impacted + block. Batching N candidates into one call makes that failure
+domain N-wide — one bad call escalates from "one squad held" to "every squad
+in the batch held", and the same applies to a single mis-parse in a reply that
+has to carry N verdicts. Coarsening the blast radius of the mechanism the
+ticket's Risks section calls out as the thing that must not be got wrong is a
+bad trade for a cost saving.
+
+The cost pressure batching would relieve is real, and it got sharper once a
+terminal agent (`claude-code`, `codex`) became a supported classifier, where
+the dominant cost is process spawn and context load rather than tokens. But
+the right lever for that is bounding how many classifications run at once,
+not widening what a single failure takes down with it — hence
+`waypoints::SURVEY_MAX_PER_SWEEP`, which caps dispatch per sweep and defers
+the remainder to the next one. Deferring is safe where batching is not: a
+deferred candidate keeps the NULL verdict the gate already treats as blocking,
+so the cap costs latency and never a missed gate.
+
+Revisit only if per-candidate cost becomes the binding constraint *and*
+per-entry fail-closed semantics can be preserved inside a batch — e.g. a
+reply format where one unparseable entry fails only itself.
+
 ## Still open (explicitly deferred, not this cell's job)
 
-- Batch-vs-per-candidate survey classification cost/failure-isolation
-  tradeoff — deferred to Phase 2.
 - Advisory stand-down optionality — deferred to Phase 6.
 - Mid-turn urgency — explicitly out of scope for the whole ticket.

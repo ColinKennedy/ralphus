@@ -28,6 +28,22 @@
 
       /** @type {WaypointFilters} */
       let waypointFilters = defaultWaypointFilters();
+
+      /**
+       * Applies sidebar filters parsed out of a `#/waypoints?...` hash. `parseHash` runs in an earlier chunk than this
+       * one and cannot touch `waypointFilters` directly — the first call happens while chunk 80 is still loading, before
+       * this chunk exists — so it hands the raw values over and this applies them once the tab is actually shown.
+       * A `null` field means that parameter was absent from the hash and keeps its default.
+       * @param {{q: string|null, status: string[]|null, projects: string[]|null}|null|undefined} parsed
+       * @returns {void}
+       */
+      function applyWaypointHashFilters(parsed) {
+        waypointFilters = defaultWaypointFilters();
+        if (!parsed) return;
+        if (parsed.q !== null && parsed.q !== undefined) waypointFilters.q = parsed.q;
+        if (parsed.status) waypointFilters.status = new Set(parsed.status);
+        if (parsed.projects) waypointFilters.projects = new Set(parsed.projects);
+      }
       /** @type {string|null} */
       let selectedWaypointId = null;
       /** @type {WaypointListEntry[]} */
@@ -712,4 +728,20 @@
        */
       async function openSetWaypointFromCell(e, squadId) {
         await openAddToWaypointMenu(e, "squad", squadId);
+      }
+
+      // Initial `#/waypoints…` routing, handled here rather than alongside every
+      // other tab's in chunk 80. That branch runs while chunk 80 loads, and every
+      // function it needs is defined in this chunk, which loads after it — so it
+      // threw a ReferenceError and took the whole initial route down with it,
+      // leaving every `#/waypoints` deep link on the default tab. Running it at
+      // the end of this chunk is the point at which those functions exist.
+      // `pendingHash` is deliberately left set, so `pollWaypoints` can still
+      // apply `waypointId` once the list has loaded — the same handoff the
+      // reviews and tasks tabs use.
+      if (typeof pendingHash !== "undefined" && pendingHash && pendingHash.tab === "waypoints") {
+        applyWaypointHashFilters(pendingHash.waypointHashFilters);
+        renderWaypointStatusFilters();
+        renderWaypointProjectFilterChips();
+        showTab("waypoints");
       }

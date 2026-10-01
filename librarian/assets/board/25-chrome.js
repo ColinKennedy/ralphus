@@ -306,6 +306,7 @@
        * @property {{[key: string]: string}} [cartoQuery]
        * @property {string|null} [squadId]
        * @property {string|null} [waypointId]
+       * @property {{q: string|null, status: string[]|null, projects: string[]|null}} [waypointHashFilters] raw Waypoints sidebar filters from the hash, applied by the Waypoints chunk (`applyWaypointHashFilters`) rather than here — that chunk loads after the first `parseHash()` call. A `null` field means the parameter was absent.
        * @property {string|null} [sel] legacy `kind:ti:si[:vi]` selector
        * @property {ParsedUri|null} [uri] RAL-188 selection, when the hash carried one
        */
@@ -504,11 +505,25 @@
           const [head] = splitHashSel(raw);
           const [path, query] = head.split("?");
           const p = new URLSearchParams(query || "");
-          waypointFilters = defaultWaypointFilters();
-          const pq = p.get("q"); if (pq !== null) waypointFilters.q = pq.toLowerCase();
-          const pstatus = p.get("status"); if (pstatus !== null) waypointFilters.status = new Set(pstatus.split(",").filter(Boolean));
-          const pproject = p.get("project"); if (pproject !== null) waypointFilters.projects = new Set(pproject.split(",").filter(Boolean));
-          return { tab: "waypoints", waypointId: path.split("/")[1] || null };
+          // Parsed into a plain object rather than assigned straight into the
+          // Waypoints chunk's own `waypointFilters`: the first `parseHash()`
+          // runs while chunk 80 loads, before chunk 82 has defined that state,
+          // so touching it here threw a ReferenceError and took the whole hash
+          // route down with it -- every `#/waypoints` deep link silently fell
+          // back to the default tab. The Waypoints chunk applies this itself
+          // once it is loaded, via `applyWaypointHashFilters`.
+          const pq = p.get("q");
+          const pstatus = p.get("status");
+          const pproject = p.get("project");
+          return {
+            tab: "waypoints",
+            waypointId: path.split("/")[1] || null,
+            waypointHashFilters: {
+              q: pq === null ? null : pq.toLowerCase(),
+              status: pstatus === null ? null : pstatus.split(",").filter(Boolean),
+              projects: pproject === null ? null : pproject.split(",").filter(Boolean),
+            },
+          };
         }
         if (raw.startsWith("squads")) return parseSquadsHashBody(raw);
         if (raw.startsWith("tasks")) {

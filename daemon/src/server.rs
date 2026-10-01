@@ -6363,6 +6363,26 @@ fn submit(daemon: &Daemon, body: &str, query: &str, user_header: Option<&str>) -
     let mut has_triage = false;
     for (task_idx, task) in file.task.iter().enumerate() {
         for (idx, cell) in task.cell.iter().enumerate() {
+            // RAL-400: seed a declared `subprojects` for *every* cell, not
+            // only Triage-opted-in ones. This seeding was written for RAL-346
+            // Triage pooling and lived inside the `triage` guard below;
+            // RAL-400 then reused `SubprojectResolution` as the waypoint
+            // scope partition and inherited that restriction, so an ordinary
+            // cell -- the overwhelming majority -- always resolved
+            // `Unresolved`, every scope degraded to `RepoWide`, and the
+            // ticket's whole cost boundary ("classify only the affected
+            // candidates, not 998 needless model calls") silently never
+            // engaged. A declared subproject is a statement about the cell,
+            // independent of whether it opted into Triage.
+            if !cell.subprojects.is_empty() {
+                let _ = store.set_cell_subprojects(
+                    &squad_id,
+                    task_idx as i64,
+                    idx as i64,
+                    &cell.subprojects,
+                    false,
+                );
+            }
             if !cell.triage {
                 continue;
             }
@@ -6414,10 +6434,9 @@ fn submit(daemon: &Daemon, body: &str, query: &str, user_header: Option<&str>) -
                     cwd: cell.cwd.clone(),
                     context,
                 });
-            } else {
-                let _ =
-                    store.set_cell_subprojects(&squad_id, task_idx, idx, &cell.subprojects, false);
             }
+            // The non-empty case is seeded unconditionally above, for every
+            // cell rather than only Triage ones.
         }
     }
     drop(store);

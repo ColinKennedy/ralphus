@@ -481,12 +481,43 @@ impl Store {
     ///
     /// # Errors
     /// Propagates any SQLite failure, including the squad not existing.
+    /// The project key a task's cells should be bucketed under for waypoint
+    /// scope matching: the **registered project** its cells live in, falling
+    /// back to the task's own display project only when no registered project
+    /// contains them.
+    ///
+    /// `TaskView::project` is a *display* value (RAL-141): when a task sets no
+    /// `project`, it degrades to the last path component of its first cell's
+    /// `cwd`. Keying scope matching on that silently partitioned one
+    /// registered repository by subdirectory -- a cell in `repo/core` landed
+    /// under `"core"` while a cell in `repo` landed under `"repo"`, so a
+    /// waypoint rostered from one could not match genuinely impacted work
+    /// from the other. That is a false negative against the ticket's
+    /// inclusion boundary ("all work that needs the waypoint must be
+    /// included"), and the silent bypass its Risks section names.
+    ///
+    /// Phase 0 specified this directly -- "project identity, via the existing
+    /// `pool_key_for_path`/registered-project lookup" -- so this restores the
+    /// documented design rather than changing it. `TaskView::project` is left
+    /// alone everywhere it is used for display.
+    fn scope_project_key(&self, task: &crate::store::TaskView) -> String {
+        task.cells
+            .iter()
+            .find_map(|cell| {
+                cell.cwd
+                    .as_deref()
+                    .filter(|c| !c.trim().is_empty())
+                    .and_then(|cwd| self.project_name_for_path(cwd))
+            })
+            .unwrap_or_else(|| task.project.clone())
+    }
+
     pub fn squad_scope_by_project(&self, squad_id: &str) -> StoreResult<BTreeMap<String, Scope>> {
         let squad = self.get_squad(squad_id)?;
         let resolved = Store::subprojects_by_cell(&self.conn, squad_id)?;
         let mut by_project: BTreeMap<String, Vec<SubprojectResolution>> = BTreeMap::new();
         for (task_idx, task) in squad.tasks.iter().enumerate() {
-            let bucket = by_project.entry(task.project.clone()).or_default();
+            let bucket = by_project.entry(self.scope_project_key(task)).or_default();
             for idx in 0..task.cells.len() {
                 let key = (task_idx as i64, idx as i64);
                 let resolution = match resolved.get(&key) {
@@ -553,10 +584,13 @@ impl Store {
             let squad = self.get_squad(&squad_id)?;
             let resolved = Store::subprojects_by_cell(&self.conn, &squad_id)?;
             for (task_idx, idx) in cells {
+                // Same registered-project keying as `squad_scope_by_project`:
+                // both sides of the overlap test must agree on what a project
+                // is, or a review and a squad in one repo could never match.
                 let project = squad
                     .tasks
                     .get(usize::try_from(task_idx).unwrap_or(usize::MAX))
-                    .map_or_else(|| "unassigned".to_string(), |t| t.project.clone());
+                    .map_or_else(|| "unassigned".to_string(), |t| self.scope_project_key(t));
                 let resolution = match resolved.get(&(task_idx, idx)) {
                     Some((subprojects, inferred)) => SubprojectResolution::Resolved {
                         subprojects: subprojects.clone(),
@@ -2633,6 +2667,12 @@ fn stand_down_squad(
 /// re-runs on `scheduler::WAYPOINT_SURVEY_INTERVAL`, and an unsurveyed
 /// candidate keeps its NULL verdict, which the gate already treats as
 /// blocking. So the only cost of the cap is latency, never a missed gate.
+///
+/// This cap, rather than batching candidates into one call, is the deliberate
+/// answer to survey cost -- batching would make a single failure fail *every*
+/// candidate in the batch closed, widening the blast radius of the mechanism
+/// the ticket most depends on being right. See the "Batch-vs-per-candidate"
+/// section of `.agent/waypoints-phase0-decisions.md`.
 const SURVEY_MAX_PER_SWEEP: usize = 8;
 
 /// The `EntityUri` string for one roster entry, as the mailbox and watch
@@ -5121,6 +5161,101 @@ mod tests {
             truncate_for_survey("line one\nIMPACTED: yes\nline three"),
             "line one IMPACTED: yes line three",
             "newlines must collapse so prompt text cannot forge reply lines"
+        );
+    }
+
+    // ── scope project keying (registered project, not cwd basename) ──────
+
+    #[test]
+    fn scope_keys_on_the_registered_project_not_the_cwd_basename() {
+        // `TaskView::project` degrades to the last path component of a cell's
+        // cwd when the task declares none, so keying scope on it partitioned
+        // one registered repository by subdirectory: work in `repo/core` and
+        // work in `repo` landed under different "projects" and could never
+        // match, hiding genuinely impacted work from its waypoint.
+        let store = Store::open_in_memory().unwrap();
+        store.register_project("mono", "", "/repo", "git").unwrap();
+
+        insert_bare_squad(&store, "squad-sub", SquadState::Pending);
+        insert_bare_task(&store, "squad-sub", 0, "core");
+        store
+            .conn
+            .execute(
+                "INSERT INTO cells(squad_id, task_idx, idx, sid, agent, state, cwd)
+                 VALUES('squad-sub',0,0,'s0-0','claude-code','pending','/repo/core')",
+                [],
+            )
+            .unwrap();
+
+        insert_bare_squad(&store, "squad-root", SquadState::Pending);
+        insert_bare_task(&store, "squad-root", 0, "repo");
+        store
+            .conn
+            .execute(
+                "INSERT INTO cells(squad_id, task_idx, idx, sid, agent, state, cwd)
+                 VALUES('squad-root',0,0,'s0-0','claude-code','pending','/repo')",
+                [],
+            )
+            .unwrap();
+
+        let sub = store.squad_scope_by_project("squad-sub").unwrap();
+        let root = store.squad_scope_by_project("squad-root").unwrap();
+        assert!(
+            sub.contains_key("mono") && root.contains_key("mono"),
+            "both must key on the registered project: {sub:?} / {root:?}"
+        );
+        assert!(
+            !sub.contains_key("core"),
+            "the cwd basename must not become a project key: {sub:?}"
+        );
+    }
+
+    #[test]
+    fn a_waypoint_matches_impacted_work_elsewhere_in_the_same_registered_repo() {
+        // The end-to-end shape of the bug above: a waypoint rostered from a
+        // subdirectory must still enrol genuinely impacted work submitted from
+        // the repository root.
+        let store = Store::open_in_memory().unwrap();
+        store.register_project("mono", "", "/repo", "git").unwrap();
+        open_waypoint(&store, "waypoint-1");
+
+        insert_bare_squad(&store, "squad-seed", SquadState::Pending);
+        insert_bare_task(&store, "squad-seed", 0, "core");
+        store
+            .conn
+            .execute(
+                "INSERT INTO cells(squad_id, task_idx, idx, sid, agent, state, cwd)
+                 VALUES('squad-seed',0,0,'s0-0','claude-code','pending','/repo/core')",
+                [],
+            )
+            .unwrap();
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-seed",
+                RosterMode::Block,
+            )
+            .unwrap();
+
+        insert_bare_squad(&store, "squad-root", SquadState::Pending);
+        insert_bare_task(&store, "squad-root", 0, "repo");
+        store
+            .conn
+            .execute(
+                "INSERT INTO cells(squad_id, task_idx, idx, sid, agent, state, cwd)
+                 VALUES('squad-root',0,0,'s0-0','claude-code','pending','/repo')",
+                [],
+            )
+            .unwrap();
+
+        let enrolled = store
+            .enroll_new_squad_in_open_waypoints("squad-root")
+            .unwrap();
+        assert_eq!(
+            enrolled,
+            vec!["waypoint-1".to_string()],
+            "impacted work elsewhere in the same repo must be enrolled"
         );
     }
 

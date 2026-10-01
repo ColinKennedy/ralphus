@@ -852,6 +852,7 @@
             showTab("reviews");
           } else if (h.tab === "waypoints") {
             if (h.waypointId) selectedWaypointId = h.waypointId;
+            applyWaypointHashFilters(h.waypointHashFilters);
             renderWaypointStatusFilters();
             renderWaypointProjectFilterChips();
             showTab("waypoints");
@@ -890,7 +891,10 @@
       renderStatusFilters(); renderSortChips(); renderTtStatusFilters(); renderTtAgentFilter(); renderReviewStatusFilters(); renderReviewResolverFilters(); renderReviewOriginFilters(); renderReviewPrStatusFilter();
       if (pendingHash && pendingHash.tab === "reviews") { showTab("reviews"); }  // keep pendingHash for pollReviews to apply guardianId
       else if (pendingHash && pendingHash.tab === "tasks") { showTab("tasks"); }  // keep pendingHash for pollTasksTab to apply the selection
-      else if (pendingHash && pendingHash.tab === "waypoints") { renderWaypointStatusFilters(); renderWaypointProjectFilterChips(); showTab("waypoints"); }  // keep pendingHash for pollWaypoints to apply waypointId
+      // No `waypoints` branch here on purpose: this runs while chunk 80 loads,
+      // and every function that branch needs lives in chunk 82, which has not
+      // loaded yet -- so it threw and took the whole initial route with it.
+      // Chunk 82 handles its own initial hash at the end of its own load.
       else if (pendingHash && pendingHash.tab === "resources") { pendingHash = null; showTab("resources"); }
       else if (pendingHash && pendingHash.tab === "queue") { pendingHash = null; showTab("queue"); }
       else if (pendingHash && pendingHash.tab === "cartographer") { applyCartoQuery(pendingHash.cartoQuery || {}); pendingHash = null; showTab("cartographer"); }
