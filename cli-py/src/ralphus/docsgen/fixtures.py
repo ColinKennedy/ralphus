@@ -1061,7 +1061,12 @@ REVIEWS_MESSAGES: tuple[Json, ...] = (
 
 REVIEWS_ROUTES: Routes = {
     "/api/tasks": _empty_board(),
+    # The sidebar polls the lean `/api/guardian-index`; the detail pane then
+    # fetches the full review by id. Serving only `/api/guardians` left the
+    # tab rendering "No reviews." forever.
+    "/api/guardian-index": [REVIEWS_GUARDIAN],
     "/api/guardians": [REVIEWS_GUARDIAN],
+    f"/api/guardians/{_GUARDIAN_ID}": REVIEWS_GUARDIAN,
     f"/api/guardians/{_GUARDIAN_ID}/branches/{REVIEWS_ROLLOUT_BRANCH_ID}/messages": {
         "messages": list(REVIEWS_MESSAGES)
     },

@@ -28,7 +28,7 @@ once you click **Save**, which re-runs the stacked rebase in the new shape.
 
 ## Running manual checks
 
-![The manual-checks dropdown open, showing individual suggested commands](../screenshots/reviews-manual-checks.png)
+![The manual-checks section of a review, listing the agent's suggested commands with one expanded to show its full text](../screenshots/reviews-manual-checks.png)
 
 Alongside the automated check gates, an agent suggests shell commands worth
 running by hand to sanity-check the change. The suggestions are computed once,
