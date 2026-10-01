@@ -16350,12 +16350,8 @@ fn build_check_command_line(
     marker_path: &std::path::Path,
     log_path: &std::path::Path,
 ) -> Option<PreparedCheck> {
-    let (resolved, body) = build_check_command_body(
-        check,
-        submitted_inputs,
-        stored_inputs,
-        run_cleanup,
-    )?;
+    let (resolved, body) =
+        build_check_command_body(check, submitted_inputs, stored_inputs, run_cleanup)?;
     let marker = marker_path.display().to_string();
     let log = log_path.display().to_string();
     // cd /d sets both drive and directory on Windows before running the command.
@@ -16395,6 +16391,49 @@ fn build_check_command_body(
         resolved.clone()
     };
     Some((resolved, body))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_remote_check_command_line(
+    daemon: &Daemon,
+    guardian: &crate::guardian::GuardianView,
+    check: &crate::guardian::GuardianCheck,
+    submitted_inputs: &std::collections::HashMap<String, String>,
+    run_cleanup: bool,
+    marker_path: &std::path::Path,
+    log_path: &std::path::Path,
+) -> Result<PreparedCheck, String> {
+    let machine = guardian
+        .machine
+        .as_deref()
+        .ok_or_else(|| "action requested review_machine but this review is local".to_string())?;
+    let cwd = check
+        .prepared_cwd
+        .as_deref()
+        .or(guardian.combined_worktree.as_deref())
+        .ok_or_else(|| "review has no prepared worktree".to_string())?;
+    let (resolved, body) =
+        build_check_command_body(check, submitted_inputs, &guardian.input_values, run_cleanup)
+            .ok_or_else(|| "prepared action has no runnable command".to_string())?;
+    let remote_command = format!("cd '{}' && {body}", cwd.replace('\'', "'\\''"));
+    let provider = {
+        let store = daemon.lock();
+        crate::remote_runner::provider_from_store(&store, machine)?
+    }
+    .ok_or_else(|| format!("review machine {machine:?} resolved to the daemon host"))?;
+    let (program, args) = provider.terminal_invocation(&remote_command, 120, 40);
+    let invocation = ralphus_core::shellcmd::build_program_command_line("cmd", &program, &args);
+    let marker = marker_path.display();
+    let log = log_path.display();
+    let line = format!(
+        "({invocation}) > \"{log}\" 2>&1 & echo !ERRORLEVEL!>\"{marker}\" & type \"{log}\""
+    );
+    Ok(PreparedCheck {
+        resolved_command: resolved,
+        args: vec!["/V:ON".to_string(), "/K".to_string(), line],
+        marker_path: marker_path.to_path_buf(),
+        log_path: log_path.to_path_buf(),
+    })
 }
 
 /// Gap between polls of a launched check's exit-code marker file. Short enough
@@ -16778,16 +16817,37 @@ fn guardian_run_manual_commands(daemon: &Daemon, id: &str, body: &str) -> Reply 
             .unwrap_or_else(|| g.git_root.clone());
         let marker = new_check_run_marker(id, "manual", *index);
         let log = check_run_log_path(id, "manual", *index);
-        let Some(prepared) = build_check_command_line(
-            &cwd,
-            check,
-            &req.inputs,
-            &g.input_values,
-            req.run_cleanup,
-            &marker,
-            &log,
-        ) else {
-            continue;
+        let run_remote = check.run_on.as_deref() == Some("review_machine")
+            || (check.run_on.is_none() && g.machine.is_some());
+        let prepared = if run_remote {
+            match build_remote_check_command_line(
+                daemon,
+                &g,
+                check,
+                &req.inputs,
+                req.run_cleanup,
+                &marker,
+                &log,
+            ) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    errors.push(error);
+                    continue;
+                }
+            }
+        } else {
+            let Some(prepared) = build_check_command_line(
+                &cwd,
+                check,
+                &req.inputs,
+                &g.input_values,
+                req.run_cleanup,
+                &marker,
+                &log,
+            ) else {
+                continue;
+            };
+            prepared
         };
         match spawn_in_terminal(None, "cmd", &prepared.args, &g.manual_checks_env) {
             Ok(()) => watch_check_run(daemon.store_handle(), id, "manual", *index, &prepared),
@@ -16906,15 +16966,33 @@ fn guardian_run_action_hint(daemon: &Daemon, id: &str, body: &str) -> Reply {
         .unwrap_or_else(|| g.git_root.clone());
     let marker = new_check_run_marker(id, "action", req.index);
     let log = check_run_log_path(id, "action", req.index);
-    if let Some(prepared) = build_check_command_line(
-        &cwd,
-        &hint,
-        &req.inputs,
-        &g.input_values,
-        req.run_cleanup,
-        &marker,
-        &log,
-    ) {
+    let run_remote = hint.run_on.as_deref() == Some("review_machine")
+        || (hint.run_on.is_none() && g.machine.is_some());
+    let prepared = if run_remote {
+        match build_remote_check_command_line(
+            daemon,
+            &g,
+            &hint,
+            &req.inputs,
+            req.run_cleanup,
+            &marker,
+            &log,
+        ) {
+            Ok(prepared) => Some(prepared),
+            Err(message) => return error(500, "terminal_error", &message, vec![]),
+        }
+    } else {
+        build_check_command_line(
+            &cwd,
+            &hint,
+            &req.inputs,
+            &g.input_values,
+            req.run_cleanup,
+            &marker,
+            &log,
+        )
+    };
+    if let Some(prepared) = prepared {
         let result = spawn_in_terminal(None, "cmd", &prepared.args, &g.manual_checks_env);
         if !req.inputs.is_empty() {
             let _ = daemon.lock().merge_guardian_input_values(id, &req.inputs);
@@ -18835,6 +18913,7 @@ mod tests {
             prompt: None,
             cleanup_command: Some("echo would-clean".to_string()),
             inputs: vec![],
+            ..crate::guardian::GuardianCheck::default()
         };
         let empty = std::collections::HashMap::new();
         let prepared = build_check_command_line(
@@ -18862,6 +18941,7 @@ mod tests {
             prompt: None,
             cleanup_command: Some("ralphus-daemon stop --port {port}".to_string()),
             inputs: vec![check_input("port", "Port", "7890")],
+            ..crate::guardian::GuardianCheck::default()
         };
         let submitted = std::collections::HashMap::from([("port".to_string(), "9001".to_string())]);
         let stored = std::collections::HashMap::new();
@@ -18896,6 +18976,7 @@ mod tests {
             prompt: Some("open localhost:3000".to_string()),
             cleanup_command: None,
             inputs: vec![],
+            ..crate::guardian::GuardianCheck::default()
         };
         let empty = std::collections::HashMap::new();
         assert!(
@@ -18920,6 +19001,7 @@ mod tests {
             prompt: None,
             cleanup_command: None,
             inputs: vec![],
+            ..crate::guardian::GuardianCheck::default()
         };
         let empty = std::collections::HashMap::new();
         let prepared = build_check_command_line(
@@ -18967,6 +19049,7 @@ mod tests {
             prompt: None,
             cleanup_command: None,
             inputs: vec![],
+            ..crate::guardian::GuardianCheck::default()
         };
         let empty = std::collections::HashMap::new();
         let prepared = build_check_command_line(
@@ -19223,6 +19306,7 @@ mod tests {
                         "7890",
                         crate::guardian::CheckInputType::Int,
                     )],
+                    ..crate::guardian::GuardianCheck::default()
                 }],
                 None,
                 None,
@@ -19267,6 +19351,7 @@ mod tests {
                         "7890",
                         crate::guardian::CheckInputType::Int,
                     )],
+                    ..crate::guardian::GuardianCheck::default()
                 }],
             )
             .unwrap();
@@ -19311,6 +19396,7 @@ mod tests {
                         "7890",
                         crate::guardian::CheckInputType::Int,
                     )],
+                    ..crate::guardian::GuardianCheck::default()
                 }],
                 None,
                 None,
@@ -19356,6 +19442,7 @@ mod tests {
                         "7890",
                         crate::guardian::CheckInputType::Int,
                     )],
+                    ..crate::guardian::GuardianCheck::default()
                 }],
             )
             .unwrap();

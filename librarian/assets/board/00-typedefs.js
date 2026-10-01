@@ -258,6 +258,13 @@
        * @property {string} [label]
        * @property {string} [command]
        * @property {string} [prompt]
+       * @property {string} [description]
+       * @property {string} [success]
+       * @property {string} [run_on] - "daemon" | "review_machine"
+       * @property {string} [preparation_state] - "preparing" | "transferring" | "ready" | "failed"
+       * @property {string} [preparation_detail]
+       * @property {number} [prepared_at_ms]
+       * @property {string} [prepared_cwd]
        * @property {string} [cleanup_command]
        * @property {CheckInput[]} [inputs]
        */
@@ -347,6 +354,7 @@
        * @property {string} [manual_commands_agent_session_id]
        * @property {boolean} [manual_commands_thinking_capable] - RAL-516: whether the effective manual-checks agent can emit thinking output at all (backend capability folded with any per-profile override, computed server-side). The Live View hides its "Show Thinking" checkbox entirely when this is `false`.
        * @property {GuardianCheck[]} [action_hints]
+       * @property {object[]} [preparation] - Ordered unattended steps completed before manual controls become ready.
        * @property {Record<string,string>} [input_values]
        * @property {Record<string,InputResolution>} [input_resolutions]
        * @property {string} [resolver_agent]

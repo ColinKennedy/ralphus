@@ -505,7 +505,7 @@ fn actions_to_hints(actions: &[ReviewActionDef]) -> Vec<GuardianCheck> {
             prompt: a.prompt.clone(),
             description: a.description.clone(),
             success: a.success.clone(),
-            run_on: a.run_on.clone(),
+            run_on: Some(a.run_on.clone().unwrap_or_else(|| "daemon".to_string())),
             prepare: a.prepare.iter().map(into_guardian_auto_build).collect(),
             artifacts: a
                 .artifact
@@ -522,6 +522,8 @@ fn actions_to_hints(actions: &[ReviewActionDef]) -> Vec<GuardianCheck> {
                     shared_path: artifact.shared_path.clone(),
                     readiness_command: artifact.readiness_command.clone(),
                     executable: artifact.executable,
+                    target_os: artifact.target_os.clone(),
+                    target_arch: artifact.target_arch.clone(),
                 })
                 .collect(),
             cleanup_command: a.cleanup_command.clone(),

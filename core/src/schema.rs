@@ -1544,6 +1544,13 @@ pub struct ReviewArtifactDef {
     /// Preserve or add executable permission after materialization.
     #[serde(default)]
     pub executable: bool,
+    /// Operating-system family this artifact was built for, such as
+    /// `windows`, `linux`, or `macos`.
+    #[serde(default)]
+    pub target_os: Option<String>,
+    /// CPU architecture this artifact was built for, such as `x86_64`.
+    #[serde(default)]
+    pub target_arch: Option<String>,
 }
 
 /// A user-declared manual-test action shown as a labelled button in the review UI.
