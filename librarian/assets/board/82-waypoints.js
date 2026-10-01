@@ -335,7 +335,17 @@
       async function pollWaypoints() {
         const seq = ++waypointPollSeq;
         try {
-          const fresh = await (await fetch("/api/waypoints")).json();
+          // Which waypoint the detail pane will show is usually already known —
+          // from the hash on a deep link, or from the current selection on a
+          // refresh — so its three requests do not have to queue behind the
+          // list. Only a first visit with no hash has to wait for the list to
+          // learn which waypoint to open.
+          const hashWant = (pendingHash && pendingHash.tab === "waypoints" && pendingHash.waypointId) || null;
+          const knownId = hashWant || selectedWaypointId;
+          const listPromise = fetch("/api/waypoints").then((r) => r.json());
+          const earlyDetail = knownId ? fetchWaypointDetailBundle(knownId) : null;
+
+          const fresh = await listPromise;
           if (seq !== waypointPollSeq) { console.debug("pollWaypoints: superseded, abandoning"); return; }
           waypoints = fresh;
           if (pendingHash && pendingHash.tab === "waypoints") {
@@ -350,20 +360,33 @@
           renderWaypoints();
           if (selectedWaypointId) {
             const id = selectedWaypointId;
-            const [detail, bearings, deliveries] = await Promise.all([
-              fetch(`/api/waypoints/${id}`).then((r) => (r.ok ? r.json() : null)),
-              fetch(`/api/waypoints/${id}/bearings`).then((r) => (r.ok ? r.json() : [])),
-              fetch(`/api/waypoints/${id}/deliveries`).then((r) => (r.ok ? r.json() : [])),
-            ]);
+            // Reuse the in-flight bundle when the guess held; otherwise the
+            // list picked a different waypoint and that one is fetched now.
+            const bundle = (earlyDetail && knownId === id) ? await earlyDetail : await fetchWaypointDetailBundle(id);
             if (seq !== waypointPollSeq) { console.debug("pollWaypoints: superseded, abandoning"); return; }
-            waypointDetail = detail;
-            waypointBearings = bearings;
-            waypointDeliveries = deliveries;
+            waypointDetail = bundle.detail;
+            waypointBearings = bundle.bearings;
+            waypointDeliveries = bundle.deliveries;
             renderWaypointDetail();
           }
           byId("conn").className = "dot on";
           markUpdated();
         } catch (e) { byId("conn").className = "dot off"; }
+      }
+
+      /**
+       * Fetches one waypoint's detail, bearings and effect feed together. Split out so the poller can start it
+       * before the sidebar list has landed, whenever the waypoint to show is already known.
+       * @param {string} id
+       * @returns {Promise<{detail: WaypointDetail|null, bearings: BearingView[], deliveries: WaypointEventEntry[]}>}
+       */
+      async function fetchWaypointDetailBundle(id) {
+        const [detail, bearings, deliveries] = await Promise.all([
+          fetch(`/api/waypoints/${id}`).then((r) => (r.ok ? r.json() : null)),
+          fetch(`/api/waypoints/${id}/bearings`).then((r) => (r.ok ? r.json() : [])),
+          fetch(`/api/waypoints/${id}/deliveries`).then((r) => (r.ok ? r.json() : [])),
+        ]);
+        return { detail, bearings, deliveries };
       }
 
       /**

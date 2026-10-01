@@ -1714,6 +1714,12 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_carto_at ON cartographer_events(at_ms);
             CREATE INDEX IF NOT EXISTS idx_carto_guardian ON cartographer_events(guardian_id);
             CREATE INDEX IF NOT EXISTS idx_carto_source ON cartographer_events(source);
+            -- A scope-filtered feed (the waypoint effect feed is the first)
+            -- otherwise full-scans this table, and `cartographer_query` runs a
+            -- COUNT(*) per page on top of the page itself -- so the cost is
+            -- two scans per page, growing with every row the daemon has ever
+            -- logged. `at_ms` rides along because every such feed orders by it.
+            CREATE INDEX IF NOT EXISTS idx_carto_scope_at ON cartographer_events(scope, at_ms);
             -- WS-D.2: partial rather than full. `squad_id`/`cell_id`/`task`
             -- are NULL on ~99% of rows, and Cartographer inserts are the
             -- daemon's highest-volume write; see the WS-D.2 migration block
@@ -3406,6 +3412,7 @@ impl Store {
             // so a delivered injection can be attributed back to it in that
             // waypoint's consolidated event feed.
             "ALTER TABLE pending_injections ADD COLUMN waypoint_id TEXT",
+            "CREATE INDEX IF NOT EXISTS idx_carto_scope_at ON cartographer_events(scope, at_ms)",
         ] {
             let _ = self.conn.execute(stmt, []);
         }

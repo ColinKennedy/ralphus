@@ -307,15 +307,10 @@ pub struct SurveyVerdict {
     pub rationale: String,
 }
 
-/// Page size for [`Store::waypoint_deliveries`]'s internal pagination loop.
-const WAYPOINT_EVENTS_PAGE_SIZE: i64 = 500;
-/// Conservative cap on how many `source="waypoints"` Cartographer rows
-/// (across every waypoint, not just the one being queried) one
-/// [`Store::waypoint_deliveries`] call scans before giving up -- the
-/// underlying query can only filter by `source`/`scope`, not by a specific
-/// waypoint id, so this bounds the pagination loop's worst case. Mirrors
-/// `crate::timeline::MAX_EVENTS`'s role for squad timelines.
-const WAYPOINT_MAX_SCANNED_EVENTS: i64 = 5000;
+/// Most effects one waypoint's feed returns. The query is now attribution-
+/// filtered in SQL, so this bounds a single waypoint's own history rather than
+/// how much of the Cartographer table gets scanned looking for it.
+const WAYPOINT_MAX_EVENTS: i64 = 2000;
 
 /// One entry in a waypoint's delivery/event history (RAL-400 Phase 7,
 /// `GET /api/waypoints/{id}/deliveries`): a Cartographer row this module
@@ -481,54 +476,86 @@ impl Store {
     ///
     /// # Errors
     /// Propagates any SQLite failure, including the squad not existing.
-    /// The project key a task's cells should be bucketed under for waypoint
-    /// scope matching: the **registered project** its cells live in, falling
-    /// back to the task's own display project only when no registered project
-    /// contains them.
+    /// The project key a task's cells are bucketed under for waypoint scope
+    /// matching: the **registered project** the cells live in, falling back to
+    /// the task's own display project when no registered project contains them.
     ///
     /// `TaskView::project` is a *display* value (RAL-141): when a task sets no
     /// `project`, it degrades to the last path component of its first cell's
-    /// `cwd`. Keying scope matching on that silently partitioned one
-    /// registered repository by subdirectory -- a cell in `repo/core` landed
-    /// under `"core"` while a cell in `repo` landed under `"repo"`, so a
-    /// waypoint rostered from one could not match genuinely impacted work
-    /// from the other. That is a false negative against the ticket's
-    /// inclusion boundary ("all work that needs the waypoint must be
-    /// included"), and the silent bypass its Risks section names.
+    /// `cwd`. Keying scope matching on that silently partitioned one registered
+    /// repository by subdirectory -- a cell in `repo/core` landed under
+    /// `"core"` while a cell in `repo` landed under `"repo"`, so a waypoint
+    /// rostered from one could not match genuinely impacted work from the
+    /// other. That is a false negative against the ticket's inclusion boundary,
+    /// and the silent bypass its Risks section names.
     ///
     /// Phase 0 specified this directly -- "project identity, via the existing
     /// `pool_key_for_path`/registered-project lookup" -- so this restores the
-    /// documented design rather than changing it. `TaskView::project` is left
-    /// alone everywhere it is used for display.
-    fn scope_project_key(&self, task: &crate::store::TaskView) -> String {
-        task.cells
-            .iter()
-            .find_map(|cell| {
-                cell.cwd
-                    .as_deref()
-                    .filter(|c| !c.trim().is_empty())
-                    .and_then(|cwd| self.project_name_for_path(cwd))
-            })
-            .unwrap_or_else(|| task.project.clone())
+    /// documented design. `TaskView::project` is left alone everywhere it is
+    /// used for display.
+    fn scope_project_key(&self, cwd: Option<&str>, display_project: &str) -> String {
+        cwd.filter(|c| !c.trim().is_empty())
+            .and_then(|c| self.project_name_for_path(c))
+            .unwrap_or_else(|| display_project.to_string())
     }
 
+    /// A squad's aggregate [`Scope`], per project.
+    ///
+    /// Reads only the four columns scope matching actually needs -- each task's
+    /// index and display project, and each cell's index and `cwd` -- rather than
+    /// hydrating the squad through `get_squad`, which pulls every cell's prompt,
+    /// command, env overrides, usage counters and agent settings to read two
+    /// fields off them. This runs per roster entry and per survey candidate, and
+    /// again for every open waypoint on submit, so the difference compounds.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
     pub fn squad_scope_by_project(&self, squad_id: &str) -> StoreResult<BTreeMap<String, Scope>> {
-        let squad = self.get_squad(squad_id)?;
         let resolved = Store::subprojects_by_cell(&self.conn, squad_id)?;
-        let mut by_project: BTreeMap<String, Vec<SubprojectResolution>> = BTreeMap::new();
-        for (task_idx, task) in squad.tasks.iter().enumerate() {
-            let bucket = by_project.entry(self.scope_project_key(task)).or_default();
-            for idx in 0..task.cells.len() {
-                let key = (task_idx as i64, idx as i64);
-                let resolution = match resolved.get(&key) {
-                    Some((subprojects, inferred)) => SubprojectResolution::Resolved {
-                        subprojects: subprojects.clone(),
-                        inferred: *inferred,
-                    },
-                    None => SubprojectResolution::Unresolved,
-                };
-                bucket.push(resolution);
+        let mut stmt = self.conn.prepare(
+            "SELECT t.idx, t.project, c.idx, c.cwd
+             FROM tasks t JOIN cells c ON c.squad_id = t.squad_id AND c.task_idx = t.idx
+             WHERE t.squad_id = ? ORDER BY t.idx, c.idx",
+        )?;
+        let rows = stmt
+            .query_map(params![squad_id], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+
+        // One project key per task, resolved from that task's first cell with a
+        // cwd -- `project_name_for_path` reads the whole project table on every
+        // call, so it is asked once per task rather than once per cell.
+        let mut task_key: BTreeMap<i64, String> = BTreeMap::new();
+        for (task_idx, project, _, cwd) in &rows {
+            if task_key.contains_key(task_idx) {
+                continue;
             }
+            let display = project
+                .clone()
+                .unwrap_or_else(|| crate::store::fallback_project_identifier(cwd.as_deref()));
+            task_key.insert(*task_idx, self.scope_project_key(cwd.as_deref(), &display));
+        }
+
+        let mut by_project: BTreeMap<String, Vec<SubprojectResolution>> = BTreeMap::new();
+        for (task_idx, _, cell_idx, _) in &rows {
+            let Some(key) = task_key.get(task_idx) else {
+                continue;
+            };
+            let resolution = match resolved.get(&(*task_idx, *cell_idx)) {
+                Some((subprojects, inferred)) => SubprojectResolution::Resolved {
+                    subprojects: subprojects.clone(),
+                    inferred: *inferred,
+                },
+                None => SubprojectResolution::Unresolved,
+            };
+            by_project.entry(key.clone()).or_default().push(resolution);
         }
         Ok(by_project
             .into_iter()
@@ -590,7 +617,13 @@ impl Store {
                 let project = squad
                     .tasks
                     .get(usize::try_from(task_idx).unwrap_or(usize::MAX))
-                    .map_or_else(|| "unassigned".to_string(), |t| self.scope_project_key(t));
+                    .map_or_else(
+                        || "unassigned".to_string(),
+                        |t| {
+                            let cwd = t.cells.iter().find_map(|c| c.cwd.as_deref());
+                            self.scope_project_key(cwd, &t.project)
+                        },
+                    );
                 let resolution = match resolved.get(&(task_idx, idx)) {
                     Some((subprojects, inferred)) => SubprojectResolution::Resolved {
                         subprojects: subprojects.clone(),
@@ -987,6 +1020,37 @@ impl Store {
             params![now_ms(), now_ms(), waypoint_id, kind.as_str(), entry_id],
         )?;
         Ok(())
+    }
+
+    /// Delivery-status counts for every waypoint at once, keyed by waypoint id.
+    ///
+    /// The list endpoint renders a progress meter per row, which previously
+    /// meant loading each waypoint's full roster -- every entry's verdict,
+    /// rationale and timestamps -- just to tally four numbers off it, once per
+    /// waypoint. This counts in SQL in a single pass instead, so listing N
+    /// waypoints is one query rather than N.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn waypoint_delivery_counts(&self) -> StoreResult<BTreeMap<String, BTreeMap<String, i64>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT waypoint_id, delivery_status, COUNT(*) FROM waypoint_roster
+             GROUP BY waypoint_id, delivery_status",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut out: BTreeMap<String, BTreeMap<String, i64>> = BTreeMap::new();
+        for (waypoint_id, status, n) in rows {
+            out.entry(waypoint_id).or_default().insert(status, n);
+        }
+        Ok(out)
     }
 
     /// Every cell of `squad_id` this waypoint actually advised -- i.e. that
@@ -1585,53 +1649,48 @@ impl Store {
     /// # Errors
     /// Propagates any SQLite failure.
     pub fn waypoint_deliveries(&self, waypoint_id: &str) -> StoreResult<Vec<WaypointEventEntry>> {
-        let mut matched = Vec::new();
-        let mut offset = 0i64;
-        let mut scanned = 0i64;
-        loop {
-            // Deliberately filtered by `scope` only, never by `source`. A
-            // waypoint's most consequential effects are emitted by the
-            // scheduler (a cell halted, an advisory injection delivered) and
-            // the submit path (a squad enrolled and gated), not by this
-            // module -- filtering on `source = "waypoints"` dropped every one
-            // of them, so this feed showed the survey's decisions while
-            // showing nothing the waypoint actually did to a squad or cell.
-            // That is the worst shape for an audit view: it looked complete.
-            let filter = crate::cartographer::CartographerFilter {
-                scope: Some("waypoint".to_string()),
-                limit: WAYPOINT_EVENTS_PAGE_SIZE,
-                offset,
-                ascending: true,
-                ..crate::cartographer::CartographerFilter::default()
-            };
-            let page = self.cartographer_query(&filter)?;
-            let got = page.rows.len() as i64;
-            let total = page.total;
-            scanned += got;
-            for row in page.rows {
-                if payload_names_waypoint(&row.payload, waypoint_id) {
-                    matched.push(WaypointEventEntry {
-                        at_ms: row.at_ms,
-                        level: row.level,
-                        message: row.message,
-                        payload: row.payload,
-                        squad_id: row.squad_id,
-                        guardian_id: row.guardian_id,
-                        cell_id: row.cell_id,
-                        task: row.task,
-                        source: row.source,
-                    });
-                }
-            }
-            offset += WAYPOINT_EVENTS_PAGE_SIZE;
-            if got < WAYPOINT_EVENTS_PAGE_SIZE
-                || offset >= total
-                || scanned >= WAYPOINT_MAX_SCANNED_EVENTS
-            {
-                break;
-            }
-        }
-        Ok(matched)
+        // Attribution is matched in SQL, not in Rust. This used to page the
+        // whole `scope='waypoint'` slice into memory -- full rows, up to
+        // `WAYPOINT_MAX_SCANNED_EVENTS` of them, with `cartographer_query`
+        // running its own `COUNT(*)` per page on top -- and then keep the
+        // handful whose payload named this waypoint. That is fetching a large
+        // object to pull a small piece out of it, and the cost grew with every
+        // row the daemon had ever logged rather than with this waypoint's own
+        // history.
+        //
+        // The `waypoint_ids` arm is the array shape one effect spanning
+        // several waypoints uses; `json_each`
+        // expands it so both shapes match in one pass.
+        //
+        // Only the columns `WaypointEventEntry` actually carries are selected:
+        // `id`, `log_path` and `admin_only` are never rendered.
+        let mut stmt = self.conn.prepare(
+            "SELECT at_ms, level, source, message, squad_id, guardian_id, cell_id, task, payload
+             FROM cartographer_events
+             WHERE scope = 'waypoint'
+               AND (json_extract(payload, '$.waypoint_id') = ?1
+                    OR EXISTS (SELECT 1 FROM json_each(payload, '$.waypoint_ids')
+                               WHERE json_each.value = ?1))
+             ORDER BY at_ms ASC
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![waypoint_id, WAYPOINT_MAX_EVENTS], |r| {
+                let payload: String = r.get(8)?;
+                Ok(WaypointEventEntry {
+                    at_ms: r.get(0)?,
+                    level: r.get(1)?,
+                    source: r.get(2)?,
+                    message: r.get(3)?,
+                    squad_id: r.get(4)?,
+                    guardian_id: r.get(5)?,
+                    cell_id: r.get(6)?,
+                    task: r.get(7)?,
+                    payload: serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null),
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Queue an injection payload for one cell, optionally as part of a
@@ -2858,27 +2917,6 @@ pub fn notify_entry_released(
         None,
         None,
     );
-}
-
-/// Whether a Cartographer row's payload attributes it to `waypoint_id`.
-///
-/// Accepts both shapes in use: a scalar `waypoint_id` (most emitters), and a
-/// `waypoint_ids` array for an effect that genuinely spans several waypoints
-/// at once -- one submit enrolling a squad on every overlapping waypoint, or
-/// one injection drain carrying guidance from more than one. Reporting such an
-/// effect under only its first waypoint would hide it from the others.
-fn payload_names_waypoint(payload: &serde_json::Value, waypoint_id: &str) -> bool {
-    if payload
-        .get("waypoint_id")
-        .and_then(serde_json::Value::as_str)
-        == Some(waypoint_id)
-    {
-        return true;
-    }
-    payload
-        .get("waypoint_ids")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(waypoint_id)))
 }
 
 /// Wall-clock cap on one survey classification run through the subprocess
@@ -5777,6 +5815,51 @@ mod tests {
                 .any(|e| e.cell_id.as_deref() == Some("cell-0") && e.message.contains("halted")),
             "a halt must be attributable to the cell it stopped: {events:?}"
         );
+    }
+
+    #[test]
+    fn the_grouped_delivery_count_agrees_with_the_roster_it_summarises() {
+        // The list endpoint counts delivery statuses in SQL instead of
+        // hydrating each roster, which means the status strings are written in
+        // two places. They must not drift -- `via-restack` is hyphenated in the
+        // column and underscored in the JSON field, which is exactly the kind
+        // of pair that silently stops matching.
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        for (entry, status) in [
+            ("squad-a", DeliveryStatus::Delivered),
+            ("squad-b", DeliveryStatus::ViaRestack),
+            ("squad-c", DeliveryStatus::Failed),
+            ("squad-d", DeliveryStatus::Undelivered),
+        ] {
+            store
+                .add_roster_entry(
+                    "waypoint-1",
+                    RosterEntryKind::Squad,
+                    entry,
+                    RosterMode::Block,
+                )
+                .unwrap();
+            store
+                .set_roster_delivery_status("waypoint-1", RosterEntryKind::Squad, entry, status)
+                .unwrap();
+        }
+
+        let counts = store.waypoint_delivery_counts().unwrap();
+        let mine = counts.get("waypoint-1").expect("counted");
+        for status in [
+            DeliveryStatus::Delivered,
+            DeliveryStatus::ViaRestack,
+            DeliveryStatus::Failed,
+            DeliveryStatus::Undelivered,
+        ] {
+            assert_eq!(
+                mine.get(status.as_str()).copied().unwrap_or(0),
+                1,
+                "{} must be counted under the string the column stores",
+                status.as_str()
+            );
+        }
     }
 
     #[test]

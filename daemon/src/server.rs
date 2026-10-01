@@ -15144,6 +15144,12 @@ fn waypoint_list(daemon: &Daemon, query: &str) -> Reply {
         }
     }
     let store = daemon.lock();
+    // One grouped count for every waypoint, taken before the loop rather than a
+    // roster hydration per row inside it.
+    let delivery_counts = match store.waypoint_delivery_counts() {
+        Ok(counts) => counts,
+        Err(e) => return store_error(&e),
+    };
     let mut ids = Vec::new();
     if state_filter.as_deref() != Some("closed") {
         match store.list_open_waypoint_ids() {
@@ -15172,15 +15178,25 @@ fn waypoint_list(daemon: &Daemon, query: &str) -> Reply {
                 continue;
             }
         }
-        // The roster is already loaded to count it, so the delivery rollup is
-        // free here -- and it lets the sidebar show each waypoint's progress as
-        // a shape instead of forcing the detail pane open to learn it.
-        let roster = match store.list_roster_entries(&id) {
-            Ok(roster) => roster,
-            Err(e) => return store_error(&e),
+        // Counted in SQL for every waypoint in one pass before this loop, not
+        // by hydrating each waypoint's roster here to tally four numbers off it.
+        let counts = delivery_counts.get(&id);
+        let get = |status: &str| -> usize {
+            counts
+                .and_then(|c| c.get(status))
+                .and_then(|n| usize::try_from(*n).ok())
+                .unwrap_or(0)
         };
-        let roster_count = roster.len();
-        let delivery_summary = DeliverySummary::from_roster(&roster);
+        let delivery_summary = DeliverySummary {
+            undelivered: get("undelivered"),
+            delivered: get("delivered"),
+            via_restack: get("via-restack"),
+            failed: get("failed"),
+        };
+        let roster_count = delivery_summary.undelivered
+            + delivery_summary.delivered
+            + delivery_summary.via_restack
+            + delivery_summary.failed;
         entries.push(WaypointListEntry {
             id: view.id,
             label: view.label,
