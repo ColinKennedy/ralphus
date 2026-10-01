@@ -310,11 +310,21 @@
       .run-result { margin-top: 9px; padding-top: 9px; border-top: 1px solid var(--border-soft); }
       .run-result-head { display: flex; align-items: center; gap: 8px; margin-bottom: 7px; font-family: var(--ui, inherit); }
       .run-result-head .rg-sub { font-size: 11.5px; color: var(--faint); }
+      /* Capped in lines, not pixels, so the chosen height means the same thing
+         at any type scale. A long build log scrolls inside the box instead of
+         pushing every row beneath it off the page. */
       .run-out {
         background: var(--terminal-bg); border: 1px solid var(--border); border-radius: 7px;
         padding: 9px 10px; font-size: 12px; line-height: 1.55; color: #b9c4d0;
-        white-space: pre-wrap; word-break: break-word; max-height: 320px; overflow: auto;
+        white-space: pre-wrap; word-break: break-word; overflow: auto;
+        max-height: calc(var(--run-out-lines, 5) * 1.55em + 20px);
       }
+      .run-out[data-unbounded] { max-height: none; }
+      .run-out-size {
+        background: var(--bg); border: 1px solid var(--border); color: var(--muted);
+        border-radius: 20px; padding: 1px 6px; font-size: 11px;
+      }
+      .run-out-size:hover { color: var(--text); border-color: var(--accent); }
       .run-out.empty-out {
         background: var(--bg); color: var(--muted); font-family: var(--ui, inherit);
         border-style: dashed; white-space: normal;

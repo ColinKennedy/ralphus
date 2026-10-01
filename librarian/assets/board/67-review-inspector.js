@@ -1242,6 +1242,35 @@
        * @type {{[key: string]: {state: string, output: string, truncated: boolean}}}
        */
       const commandRunOutput = {};
+      /** @type {number[]} Offered output heights, in lines; 0 means "no limit". */
+      const RUN_OUT_SIZES = [5, 15, 40, 0];
+      /**
+       * How many lines of a run's output to show before it scrolls.
+       *
+       * Five by default, because a check that prints a thousand lines would
+       * otherwise push every row beneath it off the page, and the interesting
+       * part of a build log is almost always its tail. Remembered across
+       * sessions like the board's other size preferences.
+       * @returns {number}
+       */
+      function runOutLines() {
+        // Tested for presence before parsing: "no limit" is stored as 0, and an
+        // absent key parses to 0 too -- reading them the same way would hand
+        // every unset browser the uncapped height this exists to avoid.
+        const raw = localStorage.getItem("ralphus-run-out-lines");
+        if (raw === null) return 5;
+        const n = Number(raw);
+        return RUN_OUT_SIZES.includes(n) ? n : 5;
+      }
+      /**
+       * Sets how tall every run-output box is, and repaints.
+       * @param {string} value - A line count from {@link RUN_OUT_SIZES}.
+       * @returns {void}
+       */
+      function setRunOutLines(value) {
+        localStorage.setItem("ralphus-run-out-lines", String(Number(value) || 0));
+        renderReviewDetail();
+      }
       /**
        * Fetches one finished run's captured output.
        * @param {string} key - The command's key, `<gid>:<kind>:<index>`.
@@ -1301,6 +1330,12 @@
         // for a run that produced any.
         if (r.hasOutput && !commandRunOutput[key]) void fetchCheckRunOutput(key);
         const out = commandRunOutput[key];
+        const lines = runOutLines();
+        const ready = out && out.state === "ready";
+        const lineCount = ready ? out.output.replace(/\n$/, "").split("\n").length : 0;
+        // The box caps itself in lines rather than pixels, so the setting means
+        // the same thing whatever the type scale is, and scrolls past the cap.
+        const box = `class="run-out"${lines ? ` style="--run-out-lines:${lines}"` : ' data-unbounded="1"'}`;
         const pane = !r.hasOutput
           ? `<div class="run-out empty-out">This run printed nothing.</div>`
           : !out || out.state === "loading"
@@ -1309,11 +1344,25 @@
               ? `<div class="run-out empty-out">Could not load this run's output.</div>`
               : out.state === "none"
                 ? `<div class="run-out empty-out">No output was recorded for this run.</div>`
-                : `<div class="run-out">${out.truncated ? `<div class="out-trunc">Showing the last 256 KiB — earlier output was dropped.</div>` : ""}${esc(out.output)}</div>`;
+                : `<div ${box}>${out.truncated ? `<div class="out-trunc">Showing the last 256 KiB — earlier output was dropped.</div>` : ""}${esc(out.output)}</div>`;
+        // Offered whenever there is output, not only while it overflows:
+        // hiding it once the log fits strands whoever just chose a taller
+        // setting with no way back to a shorter one.
+        const sizer = ready && lineCount > 1
+          ? `<select class="run-out-size" onchange="setRunOutLines(this.value)"
+              aria-label="Output height"
+              data-tip="How much of this output to show before it scrolls.\nFive lines by default — a check that prints thousands would otherwise push everything below it off the page.\nRemembered for every run.">${RUN_OUT_SIZES.map((n) =>
+                `<option value="${n}"${n === lines ? " selected" : ""}>${n ? `${n} lines` : "full height"}</option>`).join("")}</select>`
+          : "";
+        const count = ready && lineCount > 1
+          ? `<span class="rg-sub" data-tip="How many lines this run printed.">${lineCount} lines</span>`
+          : "";
         return `<div class="run-result">
-            <div class="run-result-head">${verdict}<span class="rg-sub">ran for ${esc(fmtRunTime(r.elapsedMs))}</span>
-              <button class="copy-btn" style="margin-left:auto" data-copy="${esc(commandRunMarkdown(key, cmd))}" onclick="copyText(event)"
-                data-tip="Copy this run as Markdown — the command, how it ended, and its output in a fenced block.">⧉</button>
+            <div class="run-result-head">${verdict}<span class="rg-sub">ran for ${esc(fmtRunTime(r.elapsedMs))}</span>${count}
+              <span style="margin-left:auto;display:flex;align-items:center;gap:6px">${sizer}
+                <button class="copy-btn" data-copy="${esc(commandRunMarkdown(key, cmd))}" onclick="copyText(event)"
+                  data-tip="Copy this run as Markdown — the command, how it ended, and its output in a fenced block.\nCopies the whole output, not just the part shown.">⧉</button>
+              </span>
             </div>
             ${pane}
           </div>`;
