@@ -15079,20 +15079,44 @@ fn reject_invalid_check_inputs(
     ))
 }
 
-/// Build the full `cmd /K` command line for running a check (RAL-164):
-/// substitutes input placeholders (see [`substitute_check_inputs`]) and, when
-/// `run_cleanup` is set and the check declares a `cleanup_command`, chains it
-/// before the main command with `&` (not `&&`) so a cleanup that "fails"
-/// because there was nothing to kill doesn't block the main command from
-/// running. `None` when the check has no `command` (e.g. a prompt-kind
-/// action hint).
+/// One board-launched check, prepared for [`spawn_in_terminal`].
+struct PreparedCheck {
+    /// The check's own command with input placeholders substituted — the form
+    /// recorded in Cartographer and shown on the board, without the `cd`
+    /// prefix and marker plumbing [`PreparedCheck::args`] carries.
+    resolved_command: String,
+    /// Arguments to pass `cmd`.
+    args: Vec<String>,
+    /// File the launched window writes the body's exit code into the moment it
+    /// finishes, polled by [`watch_check_run`]'s thread.
+    marker_path: std::path::PathBuf,
+}
+
+/// Build the `cmd` invocation for running a check (RAL-164): substitutes input
+/// placeholders (see [`substitute_check_inputs`]) and, when `run_cleanup` is
+/// set and the check declares a `cleanup_command`, chains it before the main
+/// command with `&` (not `&&`) so a cleanup that "fails" because there was
+/// nothing to kill doesn't block the main command from running. `None` when the
+/// check has no `command` (e.g. a prompt-kind action hint).
+///
+/// The command line ends by echoing the body's exit code into `marker_path`,
+/// which is how the daemon learns the run finished and how long it took
+/// without closing the window — `/K` keeps it open so the user can read the
+/// output, and the `&` before the echo runs it whatever the body's status was.
+/// `/V:ON` turns on delayed expansion so `!ERRORLEVEL!` is resolved when that
+/// line executes; `%ERRORLEVEL%` would be substituted while `cmd` parses the
+/// single quoted command line, before the body has run, and would always
+/// report the wrong value. Delayed expansion also keeps the redirection
+/// correct: `cmd` splits on the literal `>` before expanding `!...!`, so an
+/// exit code of `1` can't be misread as a `1>` stdout-redirect token.
 fn build_check_command_line(
     cwd: &str,
     check: &crate::guardian::GuardianCheck,
     submitted_inputs: &std::collections::HashMap<String, String>,
     stored_inputs: &std::collections::HashMap<String, String>,
     run_cleanup: bool,
-) -> Option<String> {
+    marker_path: &std::path::Path,
+) -> Option<PreparedCheck> {
     let cmd = check.command.as_ref()?;
     let resolved = substitute_check_inputs(cmd, &check.inputs, submitted_inputs, stored_inputs);
     let body = if run_cleanup {
@@ -15109,10 +15133,165 @@ fn build_check_command_line(
             },
         )
     } else {
-        resolved
+        resolved.clone()
     };
+    let marker = marker_path.display().to_string();
     // cd /d sets both drive and directory on Windows before running the command.
-    Some(format!("cd /d \"{cwd}\" && {body}"))
+    let line = format!("cd /d \"{cwd}\" && ({body}) & echo !ERRORLEVEL!>\"{marker}\"");
+    Some(PreparedCheck {
+        resolved_command: resolved,
+        args: vec!["/V:ON".to_string(), "/K".to_string(), line],
+        marker_path: marker_path.to_path_buf(),
+    })
+}
+
+/// Gap between polls of a launched check's exit-code marker file. Short enough
+/// that a quick check's recorded duration is accurate to well under a second,
+/// long enough that an idle watcher thread costs nothing.
+const CHECK_RUN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How long a watcher waits for a launched check's marker before giving up and
+/// recording the run as timed out. Generous enough for a genuinely long manual
+/// check (a full build-and-soak), bounded so a window the user closed without
+/// letting the command finish doesn't leave a thread alive for the daemon's
+/// whole lifetime.
+const CHECK_RUN_MARKER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
+/// A fresh, unique path for one check launch's exit-code marker, under the
+/// daemon's own state directory (`~/.ralphus/check-runs`) so it is writable
+/// wherever the daemon runs. The process id and a monotonic counter keep two
+/// launches of the same check — from this daemon, or a second one sharing the
+/// state directory — off the same file. Creates the directory; a failure there
+/// only means no marker is ever written, which the watcher reports as a
+/// timeout.
+fn new_check_run_marker(guardian_id: &str, kind: &str, index: usize) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let dir = crate::state_dir().join("check-runs");
+    let _ = std::fs::create_dir_all(&dir);
+    let safe_id: String = guardian_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    dir.join(format!("{safe_id}-{kind}-{index}-{pid}-{seq}.exit"))
+}
+
+/// The exit code a finished check wrote to its marker, or `None` while the file
+/// is absent or still being written — `echo` emits the code followed by a line
+/// ending, so content without one is a partial read.
+fn read_check_run_marker(path: &std::path::Path) -> Option<i32> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    if !raw.contains('\n') {
+        return None;
+    }
+    raw.trim().parse::<i32>().ok()
+}
+
+/// Write one `check_run`-scoped Cartographer row for a board-launched check.
+fn check_run_note(
+    store: &crate::store_lock::StoreHandle,
+    guardian_id: &str,
+    level: crate::logging::LogLevel,
+    message: &str,
+    payload: serde_json::Value,
+) {
+    crate::cartographer::Note::new("server")
+        .level(level)
+        .scope("check_run")
+        .guardian(guardian_id)
+        // allow-lock-io: Note::emit is a synchronous Cartographer DB insert,
+        // no network/subprocess work of its own.
+        .emit(&store.lock(), message, payload);
+}
+
+/// Record that a board-launched check started, then watch for its completion
+/// in the background so the board can show a real duration and exit code
+/// instead of only "launched".
+///
+/// The launched window writes its exit code to `marker_path` the moment the
+/// body finishes (see [`build_check_command_line`]), so a thread polling for
+/// that file learns the outcome without the window having to close and without
+/// the daemon waiting on a child it deliberately detached. The thread holds no
+/// store lock while sleeping — it takes one only for the single insert at the
+/// end — and the caller returns as soon as this function has emitted the
+/// "started" row.
+///
+/// `kind` is `"manual"` for a generated manual check and `"action"` for a
+/// `[[review.action]]` hint; `index` is the check's position in that list.
+fn watch_check_run(
+    store: crate::store_lock::StoreHandle,
+    guardian_id: &str,
+    kind: &'static str,
+    index: usize,
+    prepared: &PreparedCheck,
+) {
+    check_run_note(
+        &store,
+        guardian_id,
+        crate::logging::LogLevel::INFO,
+        "check run started",
+        serde_json::json!({
+            "kind": kind,
+            "index": index,
+            "command": prepared.resolved_command,
+        }),
+    );
+
+    let guardian_id = guardian_id.to_string();
+    let marker_path = prepared.marker_path.clone();
+    std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let exit_code = loop {
+            if let Some(code) = read_check_run_marker(&marker_path) {
+                break Some(code);
+            }
+            if started.elapsed() >= CHECK_RUN_MARKER_TIMEOUT {
+                break None;
+            }
+            std::thread::sleep(CHECK_RUN_POLL_INTERVAL);
+        };
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let _ = std::fs::remove_file(&marker_path);
+        let (level, payload) = match exit_code {
+            Some(0) => (
+                crate::logging::LogLevel::INFO,
+                serde_json::json!({
+                    "kind": kind,
+                    "index": index,
+                    "elapsed_ms": elapsed_ms,
+                    "exit_code": 0,
+                }),
+            ),
+            Some(code) => (
+                crate::logging::LogLevel::WARNING,
+                serde_json::json!({
+                    "kind": kind,
+                    "index": index,
+                    "elapsed_ms": elapsed_ms,
+                    "exit_code": code,
+                }),
+            ),
+            None => (
+                crate::logging::LogLevel::WARNING,
+                serde_json::json!({
+                    "kind": kind,
+                    "index": index,
+                    "elapsed_ms": elapsed_ms,
+                    "timed_out": true,
+                }),
+            ),
+        };
+        check_run_note(&store, &guardian_id, level, "check run finished", payload);
+    });
 }
 
 /// Run one or all LLM-generated manual review commands as fire-and-forget
@@ -15150,18 +15329,22 @@ fn guardian_run_manual_commands(daemon: &Daemon, id: &str, body: &str) -> Reply 
         );
     }
 
-    let to_run: Vec<crate::guardian::GuardianCheck> = match req.index {
+    // Paired with each check's own position in `manual_commands`, so a
+    // single-index run still reports the index the board asked for.
+    let to_run: Vec<(usize, crate::guardian::GuardianCheck)> = match req.index {
         Some(i) => {
             if i >= g.manual_commands.len() {
                 return error(400, "out_of_range", "command index out of range", vec![]);
             }
-            vec![g.manual_commands[i].clone()]
+            vec![(i, g.manual_commands[i].clone())]
         }
-        None => g.manual_commands.clone(),
+        None => g.manual_commands.iter().cloned().enumerate().collect(),
     };
 
+    let checks: Vec<crate::guardian::GuardianCheck> =
+        to_run.iter().map(|(_, check)| check.clone()).collect();
     if let Some(reply) =
-        reject_invalid_check_inputs(daemon, id, &to_run, &req.inputs, &g.input_values)
+        reject_invalid_check_inputs(daemon, id, &checks, &req.inputs, &g.input_values)
     {
         return reply;
     }
@@ -15171,19 +15354,21 @@ fn guardian_run_manual_commands(daemon: &Daemon, id: &str, body: &str) -> Reply 
     // Fall back to git_root only if the review hasn't been built yet.
     let cwd = g.combined_worktree.clone().unwrap_or(g.git_root.clone());
     let mut errors: Vec<String> = Vec::new();
-    for check in &to_run {
-        let Some(full_cmd) =
-            build_check_command_line(&cwd, check, &req.inputs, &g.input_values, req.run_cleanup)
-        else {
+    for (index, check) in &to_run {
+        let marker = new_check_run_marker(id, "manual", *index);
+        let Some(prepared) = build_check_command_line(
+            &cwd,
+            check,
+            &req.inputs,
+            &g.input_values,
+            req.run_cleanup,
+            &marker,
+        ) else {
             continue;
         };
-        if let Err(e) = spawn_in_terminal(
-            None,
-            "cmd",
-            &["/K".to_string(), full_cmd],
-            &g.manual_checks_env,
-        ) {
-            errors.push(e);
+        match spawn_in_terminal(None, "cmd", &prepared.args, &g.manual_checks_env) {
+            Ok(()) => watch_check_run(daemon.store_handle(), id, "manual", *index, &prepared),
+            Err(e) => errors.push(e),
         }
     }
 
@@ -15250,20 +15435,24 @@ fn guardian_run_action_hint(daemon: &Daemon, id: &str, body: &str) -> Reply {
     // worktree via the same terminal-spawning mechanism, so they inherit it
     // too: prefer the built review worktree over the original repo root.
     let cwd = g.combined_worktree.clone().unwrap_or(g.git_root.clone());
-    if let Some(full_cmd) =
-        build_check_command_line(&cwd, &hint, &req.inputs, &g.input_values, req.run_cleanup)
-    {
-        let result = spawn_in_terminal(
-            None,
-            "cmd",
-            &["/K".to_string(), full_cmd],
-            &g.manual_checks_env,
-        );
+    let marker = new_check_run_marker(id, "action", req.index);
+    if let Some(prepared) = build_check_command_line(
+        &cwd,
+        &hint,
+        &req.inputs,
+        &g.input_values,
+        req.run_cleanup,
+        &marker,
+    ) {
+        let result = spawn_in_terminal(None, "cmd", &prepared.args, &g.manual_checks_env);
         if !req.inputs.is_empty() {
             let _ = daemon.lock().merge_guardian_input_values(id, &req.inputs);
         }
         match result {
-            Ok(()) => json(200, &OpenTerminalResponse { ok: true }),
+            Ok(()) => {
+                watch_check_run(daemon.store_handle(), id, "action", req.index, &prepared);
+                json(200, &OpenTerminalResponse { ok: true })
+            }
             Err(e) => error(500, "terminal_error", &e, vec![]),
         }
     } else {
@@ -17138,6 +17327,11 @@ mod tests {
         );
     }
 
+    /// A fixed marker path, so the command-line assertions below are exact.
+    fn marker() -> std::path::PathBuf {
+        std::path::PathBuf::from("C:/state/check-runs/g1-manual-0-1-0.exit")
+    }
+
     #[test]
     fn build_check_command_line_without_cleanup_is_plain() {
         let check = crate::guardian::GuardianCheck {
@@ -17148,9 +17342,14 @@ mod tests {
             inputs: vec![],
         };
         let empty = std::collections::HashMap::new();
-        let line =
-            build_check_command_line("C:/repo", &check, &empty, &empty, false).expect("command");
-        assert_eq!(line, "cd /d \"C:/repo\" && cargo test");
+        let prepared =
+            build_check_command_line("C:/repo", &check, &empty, &empty, false, &marker())
+                .expect("command");
+        assert_eq!(prepared.resolved_command, "cargo test");
+        assert_eq!(
+            prepared.args[2],
+            "cd /d \"C:/repo\" && (cargo test) & echo !ERRORLEVEL!>\"C:/state/check-runs/g1-manual-0-1-0.exit\""
+        );
     }
 
     #[test]
@@ -17164,11 +17363,16 @@ mod tests {
         };
         let submitted = std::collections::HashMap::from([("port".to_string(), "9001".to_string())]);
         let stored = std::collections::HashMap::new();
-        let line = build_check_command_line("C:/repo", &check, &submitted, &stored, true)
-            .expect("command");
+        let prepared =
+            build_check_command_line("C:/repo", &check, &submitted, &stored, true, &marker())
+                .expect("command");
         assert_eq!(
-            line,
-            "cd /d \"C:/repo\" && (ralphus-daemon stop --port 9001) & ralphus-daemon serve --port 9001"
+            prepared.resolved_command,
+            "ralphus-daemon serve --port 9001"
+        );
+        assert_eq!(
+            prepared.args[2],
+            "cd /d \"C:/repo\" && ((ralphus-daemon stop --port 9001) & ralphus-daemon serve --port 9001) & echo !ERRORLEVEL!>\"C:/state/check-runs/g1-manual-0-1-0.exit\""
         );
     }
 
@@ -17182,7 +17386,77 @@ mod tests {
             inputs: vec![],
         };
         let empty = std::collections::HashMap::new();
-        assert!(build_check_command_line("C:/repo", &check, &empty, &empty, false).is_none());
+        assert!(
+            build_check_command_line("C:/repo", &check, &empty, &empty, false, &marker()).is_none()
+        );
+    }
+
+    #[test]
+    fn build_check_command_line_writes_exit_code_marker_with_delayed_expansion() {
+        let check = crate::guardian::GuardianCheck {
+            label: None,
+            command: Some("cargo test".to_string()),
+            prompt: None,
+            cleanup_command: None,
+            inputs: vec![],
+        };
+        let empty = std::collections::HashMap::new();
+        let prepared =
+            build_check_command_line("C:/repo", &check, &empty, &empty, false, &marker())
+                .expect("command");
+
+        // Delayed expansion must be on, or `!ERRORLEVEL!` stays a literal; and
+        // `/K` must still follow it, or the window closes before the user can
+        // read the output.
+        assert_eq!(prepared.args[0], "/V:ON");
+        assert_eq!(prepared.args[1], "/K");
+
+        let line = &prepared.args[2];
+        // `!...!`, not `%...%`: the latter is substituted while cmd parses this
+        // one quoted command line, before the body has run.
+        assert!(
+            line.ends_with("& echo !ERRORLEVEL!>\"C:/state/check-runs/g1-manual-0-1-0.exit\""),
+            "marker write not appended: {line}"
+        );
+        assert!(
+            !line.contains("%ERRORLEVEL%"),
+            "parse-time expansion: {line}"
+        );
+        // A plain `&` before the echo, so the exit code is recorded for a
+        // failing body too.
+        assert!(
+            !line.contains("&& echo !ERRORLEVEL!"),
+            "short-circuited: {line}"
+        );
+        assert_eq!(prepared.marker_path, marker());
+    }
+
+    #[test]
+    fn read_check_run_marker_waits_for_a_complete_line() {
+        let dir = std::env::temp_dir().join(format!(
+            "ralphus-check-run-marker-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("m.exit");
+
+        // Absent.
+        assert_eq!(read_check_run_marker(&path), None);
+        // Mid-write: cmd's `echo` always terminates the line, so content
+        // without a line ending is a partial read, not an exit code.
+        std::fs::write(&path, "1").expect("write");
+        assert_eq!(read_check_run_marker(&path), None);
+        // Complete, in the exact `echo` form (CRLF).
+        std::fs::write(&path, "1\r\n").expect("write");
+        assert_eq!(read_check_run_marker(&path), Some(1));
+        std::fs::write(&path, "0\r\n").expect("write");
+        assert_eq!(read_check_run_marker(&path), Some(0));
+        // A negative Windows status code round-trips.
+        std::fs::write(&path, "-1073741819\r\n").expect("write");
+        assert_eq!(read_check_run_marker(&path), Some(-1_073_741_819));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -----------------------------------------------------------------------

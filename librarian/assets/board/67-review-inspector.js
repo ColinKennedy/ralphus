@@ -174,7 +174,7 @@
           <div class="insp-head">
             <div class="insp-title">
               ${gdot(b.merge_status || "pending")}
-              <span class="t mono hc-anchor" data-card="gBranch" data-guardian-id="${esc(g.id)}" data-branch-id="${esc(b.id)}">${esc(b.branch)}</span>
+              <span class="t mono" data-tip="${esc(b.branch)}">${esc(b.branch)}</span>
               ${pill(b.merge_status || "pending")}
             </div>
             <div class="insp-tabs">${tabs.map(([k, label, tip]) =>
@@ -1126,6 +1126,13 @@
         if (kind === "gates") {
           items.push(`<div data-click="openEditReviewDetails" data-guardian-id="${esc(gid)}" data-focus="gates" data-tip="Open review setup on the build settings that decide whether gates run at all.\nThe gate commands themselves come from the project's review settings, not from here.">✎ Build settings…</div>`);
         }
+        if (kind === "summary") {
+          const g = guardians.find((x) => x.id === gid);
+          const text = (g && g.change_summary) || "";
+          items.push(text
+            ? `<div data-copy="${esc(text)}" onclick="copyText(event)" data-tip="Copy this summary's text to the clipboard.">⧉ Copy summary</div>`
+            : `<div class="ctx-disabled" data-tip="There is no summary to copy yet — one appears once a branch's source cell finishes.">⧉ Copy summary</div>`);
+        }
         menu.innerHTML = items.join("");
         document.body.appendChild(menu);
         menu.style.left = Math.min(e.clientX, window.innerWidth - 200) + "px";
@@ -1206,75 +1213,129 @@
       /**
        * Per-command run state, keyed by `<gid>:<kind>:<index>`.
        *
-       * The daemon spawns a command into its own detached terminal window and
-       * reports nothing back about how it ended -- `GuardianCheck` carries no
-       * exit code, status or duration, and there is no per-command result
-       * endpoint. The spawn succeeding is therefore the whole of what the board
-       * learns, and it is the end of the run as far as this page is concerned.
-       *
-       * So this records a launch, not a run in progress. It never showed a
-       * finish before because there is nothing that could report one -- the
-       * chip simply counted upward forever while the command had in fact
-       * exited. "launched, N ago" is the true statement.
-       * @type {{[key: string]: {launchedMs: number}}}
+       * A command runs in its own terminal window, which `/K` keeps open after
+       * the command itself exits -- so the window still being there says nothing
+       * about whether the work finished. The command writes its exit code to a
+       * marker file the instant its body ends, and the daemon watches for that
+       * and records a `check run finished` event carrying the measured duration.
+       * Until that event arrives the run genuinely is still going and the
+       * elapsed figure counts; once it lands the figure is how long it ran for,
+       * and stops.
+       * @typedef {object} CommandRun
+       * @property {number} launchedMs - When the board asked for it.
+       * @property {number} elapsedMs - Measured run duration, or 0 while still running.
+       * @property {number} exitCode - The process exit code, once finished.
+       * @property {boolean} done - Whether the finish event has arrived.
+       * @property {boolean} timedOut - Set when the daemon gave up waiting rather than observing an exit.
        */
+      /** @type {{[key: string]: CommandRun}} */
       const commandRuns = {};
       /**
-       * Records that one command was handed to a terminal.
-       * @param {string} key - The command's key.
+       * Records that one command was handed to a terminal, and starts watching
+       * for the daemon's completion event.
+       * @param {string} key - The command's key, `<gid>:<kind>:<index>`.
        * @returns {void}
        */
       function markCommandLaunched(key) {
-        commandRuns[key] = { launchedMs: Date.now() };
-        startCommandAgoTicker();
+        commandRuns[key] = { launchedMs: Date.now(), elapsedMs: 0, exitCode: 0, done: false, timedOut: false };
+        startCommandRunTicker();
         renderReviewDetail();
       }
       /**
-       * How long ago a launch happened, in the board's usual short form.
-       * @param {number} ms - Epoch milliseconds of the launch.
+       * Formats a run duration the way the command rows show it.
+       * @param {number} ms - Milliseconds.
        * @returns {string}
        */
-      function commandAgo(ms) {
-        const secs = Math.max(0, Math.round((Date.now() - ms) / 1000));
-        if (secs < 60) return `${secs}s ago`;
+      function fmtRunTime(ms) {
+        const secs = Math.max(0, Math.round(ms / 1000));
+        if (secs < 60) return `${secs}s`;
         const mins = Math.floor(secs / 60);
-        if (mins < 60) return `${mins}m ${secs % 60}s ago`;
-        return `${Math.floor(mins / 60)}h ${mins % 60}m ago`;
+        if (mins < 60) return `${mins}m ${secs % 60}s`;
+        return `${Math.floor(mins / 60)}h ${mins % 60}m`;
       }
-      /** @type {number} Interval id keeping the "N ago" labels current, or 0 when idle. */
-      let commandAgoTimer = 0;
+      /** @type {number} Interval id driving the live elapsed labels, or 0 when nothing is running. */
+      let commandRunTimer = 0;
       /**
-       * Keeps every launched-command label counting without re-rendering the
-       * pane: the text was only ever refreshed when something else happened to
-       * redraw the section, so it sat frozen until you clicked another row.
+       * Keeps running commands' elapsed labels advancing, and polls for the
+       * completion events that stop them.
+       *
+       * Both live in one timer so it stops itself once the last run settles: a
+       * label refreshed only when something else redrew the section sat frozen,
+       * and one with nothing to stop it counted upward long after the command
+       * had exited.
        * @returns {void}
        */
-      function startCommandAgoTicker() {
-        if (commandAgoTimer) return;
-        commandAgoTimer = window.setInterval(() => {
-          const els = document.querySelectorAll("[data-ago-ms]");
-          if (!els.length) { window.clearInterval(commandAgoTimer); commandAgoTimer = 0; return; }
-          els.forEach((el) => {
-            const ms = Number(/** @type {HTMLElement} */ (el).dataset.agoMs);
-            if (ms) el.textContent = commandAgo(ms);
+      function startCommandRunTicker() {
+        if (commandRunTimer) return;
+        let ticksSincePoll = 0;
+        commandRunTimer = window.setInterval(() => {
+          const pending = Object.keys(commandRuns).filter((k) => !commandRuns[k].done);
+          if (!pending.length) { window.clearInterval(commandRunTimer); commandRunTimer = 0; return; }
+          document.querySelectorAll("[data-run-since]").forEach((el) => {
+            const ms = Number(/** @type {HTMLElement} */ (el).dataset.runSince);
+            if (ms) el.textContent = fmtRunTime(Date.now() - ms);
           });
+          ticksSincePoll += 1;
+          if (ticksSincePoll >= 2) { ticksSincePoll = 0; void pollCommandRunResults(pending); }
         }, 1000);
       }
       /**
-       * One command row's status chip.
+       * Settles whichever launched commands the daemon has reported finishing.
+       *
+       * Asks only about reviews actually waiting on a result, and only while one
+       * is -- the ticker stops polling as soon as nothing is outstanding.
+       * @param {string[]} pending - Keys of commands still waiting on a result.
+       * @returns {Promise<void>}
+       */
+      async function pollCommandRunResults(pending) {
+        const gids = [...new Set(pending.map((k) => k.split(":")[0]))];
+        for (const gid of gids) {
+          try {
+            const r = await fetch(`/api/cartographer?guardian_id=${encodeURIComponent(gid)}&scope=check_run&limit=100`);
+            if (!r.ok) continue;
+            /** @type {{rows: CartographerRow[]}} */
+            const data = await r.json();
+            let settled = false;
+            for (const row of data.rows || []) {
+              if (!(row.message || "").startsWith("check run finished")) continue;
+              const p = row.payload || {};
+              const run = commandRuns[`${gid}:${p.kind}:${p.index}`];
+              // A finish row older than this launch describes an earlier run of
+              // the same command, not the one being waited on.
+              if (!run || run.done || row.at_ms < run.launchedMs) continue;
+              run.done = true;
+              run.elapsedMs = Number(p.elapsed_ms) || 0;
+              run.exitCode = Number(p.exit_code) || 0;
+              run.timedOut = !!p.timed_out;
+              settled = true;
+            }
+            if (settled) renderReviewDetail();
+          } catch { /* a missed poll settles on the next tick */ }
+        }
+      }
+      /**
+       * One command row's elapsed time and outcome.
        * @param {string} key - The command's key.
        * @returns {string}
        */
       function commandRunStatus(key) {
         const r = commandRuns[key];
         if (!r) {
-          return `<span class="cmd-status idle" data-tip="Not run from the board this session.
-The daemon does not report a per-command result, so this only reflects runs you started here.">idle</span>`;
+          return `<span class="cmd-status idle" data-tip="Not run from the board this session.\nRuns started from a terminal, or before this page was loaded, are not reflected here.">idle</span>`;
         }
-        return `<span class="cmd-dur num" data-ago-ms="${r.launchedMs}" data-tip="When this command was handed to a terminal, counting up live.">${esc(commandAgo(r.launchedMs))}</span>`
-          + `<span class="cmd-status launched" data-tip="Handed to its own terminal window and running there.
-The daemon spawns that window detached and never hears from it again — it reports no exit code, duration or pass/fail for an individual command — so the board can say it was launched and when, and nothing more.
-The terminal window itself shows how it ended.">launched</span>`;
+        if (!r.done) {
+          return `<span class="cmd-dur num" data-run-since="${r.launchedMs}" data-tip="How long this command has been running, counting up live.">${esc(fmtRunTime(Date.now() - r.launchedMs))}</span>`
+            + `<span class="cmd-status running" data-tip="Running in its own terminal window.\nThis settles the moment the command exits. The window stays open afterwards so you can read the output, so the window being there does not mean it is still working.">running</span>`;
+        }
+        if (r.timedOut) {
+          return `<span class="cmd-dur num" data-tip="How long the daemon waited before it stopped watching.">${esc(fmtRunTime(r.elapsedMs))}</span>`
+            + `<span class="cmd-status idle" data-tip="The daemon stopped waiting for this command to report back.\nIt may still be running in its terminal; nothing here can say how it ended.">gave up</span>`;
+        }
+        const ok = r.exitCode === 0;
+        return `<span class="cmd-dur num" data-tip="How long this command ran for, from launch to exit.">ran ${esc(fmtRunTime(r.elapsedMs))}</span>`
+          + `<span class="cmd-status ${ok ? "passed" : "failed"}" data-tip="${ok
+            ? "Exited 0, reported by the command itself when its body finished."
+            : `Exited ${r.exitCode}, reported by the command itself when its body finished.\nIts terminal window has the output.`}">${ok ? "passed" : `failed (${r.exitCode})`}</span>`;
       }
 
       /** @type {string} The selected command's key, or "" for none. */

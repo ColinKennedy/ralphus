@@ -984,10 +984,10 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         // still no "generating" gap to report: from the client's view a
         // summary is either present or not yet computed.
         if (g.summary_state === "ready" && g.change_summary) {
-          return `<h3 class="section" data-tip="Computed from git log as each branch becomes ready — a plain commit-subject listing at first, replaced by an agent-written summary once that branch's review worktree is built.\nRecomputed whenever another branch becomes ready or the review is rebuilt.">change summary${agentInspectBtn(g.id, "summary", "change summary", g.summary_agent || g.resolver_agent, g.summary_model || g.resolver_model)}${sectionMenuBtn(g.id, "summary")}</h3>
-            <div style="font-size:13px;line-height:1.55;white-space:pre-wrap;border:1px solid var(--border);border-radius:6px;padding:10px 12px;background:var(--bg);color:var(--text)">${esc(g.change_summary)}</div>`;
+          return `<h3 class="section" data-tip="Computed from git log as each branch becomes ready — a plain commit-subject listing at first, replaced by an agent-written summary once that branch's review worktree is built.\nRecomputed whenever another branch becomes ready or the review is rebuilt.">what changed${agentInspectBtn(g.id, "summary", "change summary", g.summary_agent || g.resolver_agent, g.summary_model || g.resolver_model)}${sectionMenuBtn(g.id, "summary")}</h3>
+            <div class="summary-box">${esc(g.change_summary)}</div>`;
         }
-        return `<h3 class="section" data-tip="A summary appears here as soon as one branch's source task cell finishes — no need to wait for merging/rebasing.">change summary${sectionMenuBtn(g.id, "summary")}</h3><div class="empty">waiting for a branch to be ready…</div>`;
+        return `<h3 class="section" data-tip="A summary appears here as soon as one branch's source task cell finishes — no need to wait for merging/rebasing.">what changed${sectionMenuBtn(g.id, "summary")}</h3><div class="empty">waiting for a branch to be ready…</div>`;
       }
       // ---------- PR submission + sync (RAL-117/RAL-190) ----------
       /** RAL-395: PR lifecycle-state color roles, reusing existing status hues (docs/colors.md) rather than inventing new ones -- mirrors the Tasks tab's `TT_PR_COLORS` (10-tab-registry.js) so the two surfaces never drift apart on what a PR state means visually. */
@@ -1421,33 +1421,6 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         };
       });
 
-      registerHoverCard("gBranch", (ds) => {
-        const hit = hcBranch(ds);
-        if (!hit) return null;
-        const g = hit.g, b = hit.b;
-        const src = b.source_squad_id
-          ? `${esc(b.source_squad_id)}${b.source_cell_idx === undefined ? "" : ` · cell ${b.source_cell_idx}`}`
-          : "—";
-        const place = hcStackPlace(g, b);
-        return {
-          title: "Branch",
-          badge: pill(b.merge_status || "pending"),
-          body: hcKv(
-            hcRow("position", b.enabled === false
-              ? "not in the stack"
-              : `${place.place} of ${place.total} in the stack`)
-            + hcRow("rebases onto", esc(place.onto), "mono")
-            + hcRow("in stack", b.enabled === false ? "disabled" : "enabled")
-            + hcRow("source", src, "mono")
-            + hcRow("status", esc(b.detail || "—")),
-          )
-            + (b.is_empty
-              ? hcNote("<b>Adds no diff</b> over the branch beneath it, which fails the review.")
-              : ""),
-          foot: `<button class="btn" data-tip="Copy this branch's name." data-copy="${esc(b.branch)}" onclick="copyText(event)">Copy name</button>`,
-        };
-      });
-
       registerHoverCard("gReviewId", (ds) => {
         const g = hcGuardian(ds);
         if (!g) return null;
@@ -1814,7 +1787,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
               <span class="branch-idx" data-tip="This branch's place in the rebase stack.">${i + 1}</span>
               ${toggle}
               <span>${gdot(b.merge_status || "")}</span>
-              <span class="mono hc-anchor" style="flex:1${isEnabled ? "" : ";color:var(--muted)"}" data-card="gBranch" data-guardian-id="${esc(g.id)}" data-branch-id="${esc(b.id)}">${esc(b.branch)}</span>
+              <span class="mono" style="flex:1${isEnabled ? "" : ";color:var(--muted)"}" data-tip="${esc(b.branch)}\nSelect it to read its position, source and status in the inspector.">${esc(b.branch)}</span>
               ${isEnabled ? `${branchBadge(b)} ${pill(b.merge_status || "")} ${branchPrLink(g, b)}` : '<span class="badge" style="color:var(--muted);border-color:var(--border);font-size:11px">disabled</span>'}
               ${enableToggle}${reEnableIcon}${branchMenuBtn}
             </div>
