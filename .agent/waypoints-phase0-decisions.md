@@ -309,6 +309,29 @@ The message leads with the entry its recipient actually watches and names
 the rest only as context, since a watch is an exact match and the recipient
 has no stake in the others.
 
+## Halted cells resume, they are not restarted
+
+RAL-400 left this open: when a waypoint closes after halting an in-flight
+cell, does the squad auto-resume the same conversation, or is a hard stop
+acceptable with a manual `squad restart` afterward? **Confirmed by the user:
+auto-resume.**
+
+So a halt keeps the cell's `agent_session_id`, and `run_pending_waypoint_resumes`
+re-dispatches it once the gate lifts. Two things have to happen on the way
+back in, and both are easy to miss:
+
+- The worktree is rebased onto its upstream first. A cell is held *because*
+  the change it must take up does not exist yet; resuming against the tree as
+  it stood at halt time means it still cannot see that change.
+- The waypoint's guidance rides in on the cell's ghost, saying the change is
+  most likely already present after the rebase and that finding nothing to do
+  is a legitimate outcome. Without it the agent is re-invoked with no idea it
+  was ever held, and sets about re-implementing work its own tree contains.
+
+This is the plan doc's Phase 5 parking design, minus the graceful half
+(turn-end checkpointing, live-conversation injection, backend-specific
+resume) which stays deferred to v2.
+
 ## Still open (explicitly deferred, not this cell's job)
 
 - Advisory stand-down optionality — deferred to Phase 6.
