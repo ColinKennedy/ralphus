@@ -192,6 +192,9 @@
       CLICK_HANDLERS.showCommandText = (e, ds) => showCommandText(ds.cmd || "");
       CLICK_HANDLERS.setReviewQuickFilter = (e, ds) => setReviewQuickFilter(ds.preset || "");
       CLICK_HANDLERS.toggleReviewFilters = () => toggleReviewFilters();
+      CLICK_HANDLERS.openReviewBranchMenu = (e, ds) => openReviewBranchMenu(e, ds.guardianId || "", ds.branchId || "", ds.canMove === "1");
+      CLICK_HANDLERS.inspectBranchFromMenu = (e, ds) => inspectBranchFromMenu(ds.branchId || "", ds.tab || "overview");
+      CLICK_HANDLERS.scopeReviewDockToBranch = (e, ds) => scopeReviewDockToBranch(ds.guardianId || "", ds.branchId || "");
       CLICK_HANDLERS.showChatCopyMenu = (e, ds) => showChatCopyMenu(e, ds.guardianId || "", ds.branchId || "");
       CLICK_HANDLERS.toggleChatBubble = (e, ds) => { e.stopPropagation(); toggleChatBubble(ds.key || ""); };
       CLICK_HANDLERS.gotoSquad = (e, ds) => { e.preventDefault(); gotoSquad(ds.squadId || ""); };

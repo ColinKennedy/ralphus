@@ -423,7 +423,11 @@
             + `${REVIEW_QUICK_FILTERS[k].label}<span class="n num">${counts[k]}</span></button>`).join("")}</div>
           <button class="filters-more" data-click="toggleReviewFilters" data-tip="The full status, agent, origin and PR-status filters.\nFolded away by default so the sidebar belongs to the review list rather than its controls.">${
             reviewFiltersExpanded ? "− Fewer filters" : "+ More filters"}${
-            active ? "" : ` <span class="count-badge num">custom</span>`}</button>`;
+            // "custom" means a selection the presets cannot express -- not
+            // simply "everything", which is the default and the state pressing
+            // an active preset returns you to.
+            (active || reviewFilters.status.size === GUARDIAN_STATES.length)
+              ? "" : ` <span class="count-badge num">custom</span>`}</button>`;
         const full = document.getElementById("review-full-filters");
         if (full) full.style.display = reviewFiltersExpanded ? "" : "none";
       }
@@ -482,6 +486,70 @@
         menu.style.left = Math.min(e.clientX, window.innerWidth - 200) + "px";
         menu.style.top = Math.min(e.clientY, window.innerHeight - 120) + "px";
       }
+      /**
+       * Opens one branch's ⋯ menu. Gathers everything that acts on a single
+       * branch or its worktree, which previously sat on the row as bare glyphs
+       * (⇄ to move it) or not at all (its env layer, its logs).
+       * @param {MouseEvent} e - The click that opened it.
+       * @param {string} gid - The review id.
+       * @param {string} bid - The branch id.
+       * @param {boolean} canMove - Whether moving this branch to another review is currently allowed.
+       * @returns {void}
+       */
+      function openReviewBranchMenu(e, gid, bid, canMove) {
+        e.preventDefault(); e.stopPropagation(); closeSquadMenu();
+        const g = guardians.find((x) => x.id === gid);
+        const b = g && g.branches ? g.branches.find((x) => x.id === bid) : null;
+        if (!b) return;
+        const menu = document.createElement("div");
+        menu.className = "ctx-menu"; menu.id = "squad-menu";
+        /** @type {string[]} */
+        const items = [];
+        items.push(`<div data-click="inspectBranchFromMenu" data-branch-id="${esc(bid)}" data-tab="overview" data-tip="Open this branch in the inspector pane.">◉ Inspect branch</div>`);
+        items.push(`<div data-click="scopeReviewDockToBranch" data-guardian-id="${esc(gid)}" data-branch-id="${esc(bid)}" data-tip="Open the log drawer scoped to this branch.">☰ Logs</div>`);
+        if (b.worktree) {
+          items.push(`<div class="sep"></div>`);
+          items.push(`<div data-click="inspectBranchFromMenu" data-branch-id="${esc(bid)}" data-tab="worktree" data-tip="Show this branch's worktree — its path, its conflicts, and its own environment layer.">🗂 Worktree &amp; environment</div>`);
+          items.push(`<div data-copy="${esc(b.worktree)}" onclick="copyText(event)" data-tip="Copy this worktree's absolute path.">⧉ Copy worktree path</div>`);
+          items.push(`<div data-click="inspectBranchFromMenu" data-branch-id="${esc(bid)}" data-tab="live" data-tip="Watch this branch's resolver session. Nothing attaches until you open it.">▶ Live view</div>`);
+        }
+        if (canMove) {
+          items.push(`<div class="sep"></div>`);
+          items.push(`<div data-click="openMoveBranchMenu" data-guardian-id="${esc(gid)}" data-branch-id="${esc(bid)}" data-tip="Move this branch to a different review.\nWho/when: a change needs to ship independently of the review it started in — this review is stalled but this branch is ready, or another review needs just this branch.\nBoth reviews rebuild afterward.\nThis cannot be undone.">⇄ Move to another review…</div>`);
+        }
+        menu.innerHTML = items.join("");
+        document.body.appendChild(menu);
+        menu.style.left = Math.min(e.clientX, window.innerWidth - 230) + "px";
+        menu.style.top = Math.min(e.clientY, window.innerHeight - 190) + "px";
+      }
+      /**
+       * Selects a branch into the inspector on a chosen tab, from its ⋯ menu.
+       * @param {string} bid - The branch id.
+       * @param {string} tab - Which inspector tab to open.
+       * @returns {void}
+       */
+      function inspectBranchFromMenu(bid, tab) {
+        closeSquadMenu();
+        inspectorBranchId = bid;
+        if (!reviewDockSticky) reviewDockScope = bid;
+        setInspectorTab(tab);
+        renderReviewDock();
+      }
+      /**
+       * Opens the log drawer scoped to one branch, from its ⋯ menu. An explicit
+       * ask beats the pin, which exists to stop *incidental* scope changes.
+       * @param {string} gid - The review id.
+       * @param {string} bid - The branch id.
+       * @returns {void}
+       */
+      function scopeReviewDockToBranch(gid, bid) {
+        closeSquadMenu();
+        reviewDockScope = bid;
+        if (!reviewDockOpen) toggleReviewDock();
+        else renderReviewDock();
+        if (reviewDockEvents[gid] === undefined) loadReviewDockEvents(gid);
+      }
+
       /**
        * Opens one command's ⋯ menu -- a check gate, for now. Commands are long
        * and elided in their row, so "see the whole thing" and "copy it" need a

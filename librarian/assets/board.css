@@ -563,7 +563,29 @@
       /* A command is something you read in full and whose outcome you want to
          see, so it gets a row rather than a wrapping chip. Long commands elide
          rather than reflowing the section; the row's ⋯ shows the whole thing. */
-      .cmd-list { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+      .cmd-list, .rungroup { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+      /* A run-group leads with what its commands promise, so a section is not
+         just a list of strings whose contract you have to remember. */
+      .rg-head { padding: 7px 10px; border-bottom: 1px solid var(--border); background: var(--panel-2); }
+      .rg-note { font-size: 11.5px; color: var(--muted); line-height: 1.5; }
+      .rg-head.rg-run { display: flex; align-items: center; gap: 10px; }
+      .rg-head.rg-run .rg-note { flex: 1; min-width: 0; }
+      /* Per-command run control. The commands used to be hidden behind a ▾
+         dropdown, so you could run them all or go hunting; they are rows now,
+         each with its own run. */
+      .cmd-run {
+        flex: none; background: none; border: 1px solid var(--border); color: var(--muted);
+        border-radius: 5px; width: 22px; height: 20px; display: grid; place-items: center;
+        font-size: 9px; cursor: pointer;
+      }
+      .cmd-run:hover { color: var(--accent); border-color: var(--accent); background: rgba(74,163,255,.13); }
+      .cmd-form { padding: 6px 10px 10px 41px; border-bottom: 1px solid var(--border); }
+      /* A test action's label is authored; the command beside it is what will
+         actually run, which is the part worth reading before pressing it. */
+      .cmd-label { flex: none; font-size: 11.5px; font-weight: 600; color: var(--text); }
+      .cmd-run:disabled { opacity: .5; cursor: not-allowed; }
+      .absent-note.warn { border-color: var(--unverified); color: var(--unverified); }
+      .absent-note.warn b { color: var(--unverified); }
       .cmd-row {
         display: flex; align-items: center; gap: 9px; padding: 7px 10px;
         border-bottom: 1px solid var(--border);
