@@ -236,6 +236,42 @@ items.push(`<div data-tip="Cancel this squad — stops all running cells." oncli
 
 **Do not use the native `title` attribute** for new tooltips — it renders with browser default styling and ignores the dark theme. The `title` attribute can remain on existing splitter elements (they already use `data-tip`) but should not be added to new elements.
 
+## Lazy by default: never load ahead of the user
+
+The board is expected to stay snappy on a cold open, and it gets there by
+fetching as little as possible until something is actually asked for. Treat
+that as a hard constraint on every new surface, not a nice-to-have — a tab,
+a panel, a hovercard or an inspector pane that quietly widens a request is
+the single easiest way to regress first paint.
+
+The rules:
+
+- **Nothing fetches until it is opened.** A collapsed panel, an unopened tab
+  and an un-hovered card must issue zero requests. Render the affordance,
+  fetch on the first open — the Live View's System Prompt tab
+  (`peekSystemPrompt` in `board/30-live-view.js`) is the reference shape:
+  absent until opened, `"loading"` while in flight, dropped on close so the
+  next open refetches.
+- **Ask for the fields you use, not the object that contains them.** Do not
+  pull a full `GuardianView`/`SquadView` to read two properties. If a view
+  needs a couple of fields the lean list endpoint does not carry, prefer a
+  narrow endpoint over widening the list payload for everyone.
+- **Never widen a shared request for one consumer.** A panel that needs an
+  extra field must not add it to a response every other view already pays
+  for. The lean index (`/api/guardian-index`) exists precisely so the list
+  is cheap; keep per-entity detail behind the per-entity fetch.
+- **Derived/decorative UI reads already-loaded state or renders nothing.**
+  Hovercards in particular are pure over what the board already has (see
+  `board/22-hovercards.js`) — a renderer returns `null` rather than
+  triggering a load for a card the user may never open.
+- **Re-render must not re-fetch.** A display toggle (show debug, expand
+  thinking, filter types) re-renders text already in memory; if flipping a
+  checkbox costs a request, the data was fetched at the wrong layer.
+
+When you genuinely cannot avoid a new load, make it on-demand and say so in
+the code comment — an eager fetch added "just in case" is the thing this
+section exists to prevent.
+
 ## Project display: name, never a raw path (RAL-396)
 
 When a board view shows the project a cell/worktree belongs to, it must

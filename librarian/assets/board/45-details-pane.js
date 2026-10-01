@@ -455,7 +455,7 @@
         return `<h3 class="section">environment overrides (${esc(label)})</h3>
           ${banner}
           ${rows}
-          <div class="kv-row">${envViewerBtn(apiPath, `this ${label}`)}<button class="btn" data-click="addEnvOverrideAt" data-api-path="${esc(apiPath)}" data-tip="Set a persistent environment-variable override for this ${esc(label)} (hierarchical env overrides, extending RAL-150).\nUse this to retry with a different model/resolver, feature flag, or credential scoped to just this ${esc(label)}, without editing and resubmitting the TOML.\nOverrides a parent scope's value for the same key; applies the next time this ${esc(label)} executes, and stays set across any number of retries until removed.">+ Add override</button></div>`;
+          <div class="kv-row"><button class="btn" data-click="addEnvOverrideAt" data-api-path="${esc(apiPath)}" data-tip="Set a persistent environment-variable override for this ${esc(label)} (hierarchical env overrides, extending RAL-150).\nUse this to retry with a different model/resolver, feature flag, or credential scoped to just this ${esc(label)}, without editing and resubmitting the TOML.\nOverrides a parent scope's value for the same key; applies the next time this ${esc(label)} executes, and stays set across any number of retries until removed.">+ Add override</button></div>`;
       }
       /**
        * Renders the "environment overrides" section of the squad details pane.
@@ -659,15 +659,20 @@
         ensureGuardianDetailLoaded(gid);
       }
       /**
-       * Toggles a branch row's selection within a review's branch list.
+       * Toggles a branch row's selection within a review's branch list, and
+       * binds the Reviews tab's inspector (and, unless pinned, its log dock)
+       * to the same branch -- one selection drives every pane.
        * @param {MouseEvent} e
        * @param {string} gid
        * @param {string} branch
+       * @param {string} [branchId] - Stable branch id, for the panes that address a branch by id rather than name.
        * @returns {void}
        */
-      function selectBranchRow(e, gid, branch) {
+      function selectBranchRow(e, gid, branch, branchId) {
         // Toggle: clicking a selected branch deselects it; clicking another selects it.
-        selectedBranch[gid] = selectedBranch[gid] === branch ? null : branch;
+        const deselecting = selectedBranch[gid] === branch;
+        selectedBranch[gid] = deselecting ? null : branch;
+        if (branchId) selectInspectorBranch(deselecting ? "" : branchId);
         // RAL-481: preserve the pane's own scroll across a switch between
         // worktrees/branches in the same review, instead of a bare
         // renderReviewDetail() jumping back to the top. Any open

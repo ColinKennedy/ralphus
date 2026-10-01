@@ -51,6 +51,25 @@ role in the table below, then use it.
 | `--delayed` | `#79c0ff` | *(shared)* | semantic (a cell waiting out a recognized, retryable provider rate limit before automatically resuming, RAL-435) |
 | `--arbiter` | `#7c3aed` | *(shared)* | semantic (a review automatically created by the Arbiter/Triage subsystem rather than an authored `[[review]]`, RAL-318) |
 | `--terminal-bg` | `#000000` | *(shared)* | surface (the remote terminal relay's xterm.js panel background, RAL-355 Phase 10) |
+| `--faint` | `#6e7681` | `#818b98` | chrome (tertiary text — metadata that annotates a value without competing with it) |
+| `--border-soft` | `#262c34` | `#e4e8ec` | chrome (divider *inside* one component, where `--border` would read as a seam between two separate things) |
+
+### Status tints (`-a` fill / `-b` border)
+
+A status-tinted surface — a pill, a badge, a highlighted row — needs a fill and
+a border that belong to the same status. These pairs spell that once, so a
+tinted surface looks the same everywhere instead of each call site inventing
+its own `rgba()`. **Use these rather than writing a new `rgba()` of a status
+hue.** The light theme runs them lighter: the dark alphas read as dirty washes
+on a white ground.
+
+| Variable | Dark | Light | Pairs with |
+|---|---|---|---|
+| `--accent-a` / `--accent-b` | `rgba(74,163,255,.13)` / `.32` | `rgba(9,105,218,.08)` / `.28` | `--accent` |
+| `--done-a` / `--done-b` | `rgba(63,185,80,.13)` / `.34` | `rgba(26,127,55,.08)` / `.28` | `--done` |
+| `--failed-a` / `--failed-b` | `rgba(248,81,73,.13)` / `.34` | `rgba(207,34,46,.08)` / `.28` | `--failed` |
+| `--queued-a` / `--queued-b` | `rgba(163,113,247,.13)` / `.34` | `rgba(130,80,223,.08)` / `.28` | `--queued` |
+| `--amber-a` / `--amber-b` | `rgba(227,179,65,.13)` / `.34` | `rgba(154,103,0,.08)` / `.28` | `--unverified` / `--ignored` (caution only) |
 
 "*(shared)*" = not overridden in the light theme; the same hue is used in both.
 

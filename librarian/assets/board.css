@@ -18,10 +18,33 @@
         --delayed: #79c0ff;
         --arbiter: #7c3aed;
         --terminal-bg: #000000;
+        /* A third text weight below --muted, for metadata that must stay
+           readable without competing with the value it annotates (a run's
+           timestamp beside its command, a position counter beside its label). */
+        --faint: #6e7681;
+        /* A divider inside a component, where the full --border would read as
+           a seam between two separate things rather than one thing's parts. */
+        --border-soft: #262c34;
+        /* Tint pairs: `-a` is a fill behind a status, `-b` the border that
+           goes with it. Spelled once here so a status-tinted surface is the
+           same everywhere instead of each site inventing its own rgba(). */
+        --accent-a: rgba(74,163,255,.13); --accent-b: rgba(74,163,255,.32);
+        --done-a: rgba(63,185,80,.13); --done-b: rgba(63,185,80,.34);
+        --failed-a: rgba(248,81,73,.13); --failed-b: rgba(248,81,73,.34);
+        --queued-a: rgba(163,113,247,.13); --queued-b: rgba(163,113,247,.34);
+        --amber-a: rgba(227,179,65,.13); --amber-b: rgba(227,179,65,.34);
       }
       [data-theme="light"] {
         --bg: #ffffff; --panel: #f6f8fa; --panel-2: #eef1f4; --border: #d0d7de;
         --text: #1f2328; --muted: #656d76; --accent: #0969da;
+        --faint: #818b98; --border-soft: #e4e8ec;
+        /* Tints run lighter on a white ground -- the dark-theme alphas read as
+           dirty washes rather than as a status. */
+        --accent-a: rgba(9,105,218,.08); --accent-b: rgba(9,105,218,.28);
+        --done-a: rgba(26,127,55,.08); --done-b: rgba(26,127,55,.28);
+        --failed-a: rgba(207,34,46,.08); --failed-b: rgba(207,34,46,.28);
+        --queued-a: rgba(130,80,223,.08); --queued-b: rgba(130,80,223,.28);
+        --amber-a: rgba(154,103,0,.08); --amber-b: rgba(154,103,0,.28);
       }
       * { box-sizing: border-box; }
       body { margin: 0; background: var(--bg); color: var(--text);
@@ -60,7 +83,23 @@
       main#tasks-page { display: grid; grid-template-columns: 1fr 3px var(--task-details-w, 340px); height: calc(100vh - 51px); }
       /* RAL-417: the Reviews sidebar is variable-width and draggable like the Squads one --
          the same var-driven track + `.splitter` pattern; the 300px fallback is the old fixed width. */
-      main#reviews-page { display: grid; grid-template-columns: var(--reviews-sidebar-w, 300px) 6px 1fr; height: calc(100vh - 51px); }
+      /* Three panes: the review list, the review itself, and an inspector that
+         binds to the selected branch. The middle column owns the log dock, so
+         the drawer spans the review without covering the inspector. */
+      main#reviews-page {
+        display: grid;
+        grid-template-columns: var(--reviews-sidebar-w, 300px) 6px 1fr 6px var(--review-inspector-w, 360px);
+        height: calc(100vh - 51px);
+      }
+      .review-main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+      /* min-width:0 so the column can actually be narrower than its widest
+         child; without it a single unshrinkable row forces the whole pane to
+         scroll sideways and clips everything past the fold. */
+      .review-main > .col.center { flex: 1; min-height: 0; min-width: 0; overflow-x: hidden; }
+      .review-inspector {
+        border-left: 1px solid var(--border); background: var(--panel);
+        display: flex; flex-direction: column; min-height: 0; overflow: hidden;
+      }
       main#resources-page { height: calc(100vh - 51px); overflow-y: auto; padding: 18px 20px; }
       .res-table { width: 100%; border-collapse: collapse; font-size: 13px; }
       .res-table th { text-align: right; padding: 6px 12px; color: var(--muted); font-weight: 500; cursor: pointer; white-space: nowrap; user-select: none; }
@@ -235,6 +274,252 @@
       .history-item { display: flex; align-items: center; justify-content: space-between; padding: 5px 8px; font-size: 11px; border-bottom: 1px solid var(--border); cursor: pointer; }
       .history-item:last-child { border-bottom: none; }
       .history-item:hover { background: var(--panel-2); }
+      /* The inspector's Live tab opens its pane with the tab, so the terminal
+         row is a collapse control and a menu -- not the pane's front door. It
+         reads at the secondary weight accordingly, and the peek head's own
+         "✕ Hide" stands down rather than offering the same action twice. */
+      #review-inspector .btn.primary[data-click="togglePeek"] {
+        background: var(--panel-2); border-color: var(--border); color: var(--muted);
+        font-size: 11.5px; padding: 2px 9px;
+      }
+      #review-inspector .btn.primary[data-click="togglePeek"]:hover { color: var(--text); border-color: var(--accent); }
+      #review-inspector .peek-head [data-click="togglePeekStopProp"] { display: none; }
+      /* The head carries a banner, times, toggles and controls; in a narrow
+         pane they wrap rather than pushing "Show Debug Messages" off the edge. */
+      #review-inspector .peek-head { flex-wrap: wrap; row-gap: 4px; }
+      #review-inspector .peek-head > span { flex-wrap: wrap; row-gap: 4px; }
+      /* A note explaining the control above it, not a statement in its own
+         right -- so it reads at the muted register, never at body weight. */
+      .hint { font-size: 12.5px; color: var(--muted); line-height: 1.45; margin-top: 6px; }
+      /* `.empty` is tuned for a whole tab having nothing in it -- centered under
+         40px of air. Inside a review that register is wrong: these are section
+         placeholders sitting between populated sections, and each one pushed the
+         next heading most of a screen further down. Left-aligned and tight, they
+         read as "this section is empty" instead of "the page ended here". */
+      #review-detail .empty, #review-inspector .empty {
+        margin: 2px 0 0; text-align: left; font-size: 13px;
+      }
+      /* Review setup modal: one group per setup-strip chip, so arriving from a
+         chip highlights the field that chip was showing. */
+      .setup-group { border-left: 2px solid transparent; padding-left: 8px; margin-left: -10px; border-radius: 0 4px 4px 0; }
+      .setup-group.focused { border-left-color: var(--accent); background: rgba(74,163,255,.09); }
+      .setup-group.focused > h3.section { color: var(--accent); }
+      /* The review's primary action and its menu, as one object: the thing you
+         press most, with everything else one click further. */
+      /* What a finished run did, under the command that did it. */
+      .run-result { margin-top: 9px; padding-top: 9px; border-top: 1px solid var(--border-soft); }
+      .run-result-head { display: flex; align-items: center; gap: 8px; margin-bottom: 7px; font-family: var(--ui, inherit); }
+      .run-result-head .rg-sub { font-size: 11.5px; color: var(--faint); }
+      /* Capped in lines, not pixels, so the chosen height means the same thing
+         at any type scale. A long build log scrolls inside the box instead of
+         pushing every row beneath it off the page. */
+      .run-out {
+        background: var(--terminal-bg); border: 1px solid var(--border); border-radius: 7px;
+        padding: 9px 10px; font-size: 12px; line-height: 1.55; color: #b9c4d0;
+        white-space: pre-wrap; word-break: break-word; overflow: auto;
+        max-height: calc(var(--run-out-lines, 5) * 1.55em + 20px);
+      }
+      .run-out[data-unbounded] { max-height: none; }
+      .run-out-size {
+        background: var(--bg); border: 1px solid var(--border); color: var(--muted);
+        border-radius: 20px; padding: 1px 6px; font-size: 11px;
+      }
+      .run-out-size:hover { color: var(--text); border-color: var(--accent); }
+      .run-out.empty-out {
+        background: var(--bg); color: var(--muted); font-family: var(--ui, inherit);
+        border-style: dashed; white-space: normal;
+      }
+      .out-trunc { color: var(--unverified); margin-bottom: 6px; font-family: var(--ui, inherit); font-size: 11.5px; }
+      .cmd-status.passed { color: var(--done); border-color: var(--done-b); background: var(--done-a); }
+      .cmd-status.failed { color: var(--failed); border-color: var(--failed-b); background: var(--failed-a); }
+      /* A launched command: the board knows it was handed to a terminal and
+         when, never how it ended, so the chip reads as a fact rather than as a
+         pending outcome waiting to turn green. */
+      .cmd-status.launched { color: var(--accent); border-color: var(--accent-b); background: var(--accent-a); }
+      /* The parameter panel under an expanded command, sharing its frame. */
+      .cmd-full .cmd-params { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border-soft); font-family: var(--ui, inherit); }
+      .split { display: inline-flex; flex: none; }
+      .split .split-main { border-radius: 6px 0 0 6px; }
+      .split .split-caret { border-radius: 0 6px 6px 0; border-left: 1px solid rgba(0,0,0,.28); padding: 4px 7px; }
+      .split > span { display: inline-flex; }
+      /* A heading inside the actions menu, naming what its group acts on. */
+      .ctx-menu .ctx-group {
+        padding: 5px 10px 2px; font-size: 9.5px; font-weight: 700; letter-spacing: .7px;
+        text-transform: uppercase; color: var(--faint); cursor: default;
+      }
+      .ctx-menu .ctx-group:hover { background: transparent; }
+
+      /* ---- Feedback tab: the branch's change-request thread ----
+         A conversation, so it is laid out as one: your request and the
+         resolver's reply are different speakers and sit on opposite sides,
+         each labelled with who said it and when. */
+      /* The copy control sits top-right of the tab, where the board's other
+         copy affordances live, rather than as a labelled button competing with
+         Send down in the composer. */
+      .fb-top { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 10px; }
+      .fb-top .copy-btn { flex: none; margin-left: auto; }
+      .fb-thread { display: flex; flex-direction: column; gap: 10px; margin-bottom: 12px; }
+      .fb-msg { max-width: 86%; border-radius: 10px; padding: 8px 11px; position: relative; }
+      .fb-msg.you { align-self: flex-end; background: var(--accent); color: #fff; }
+      .fb-msg.resolver { align-self: flex-start; background: var(--panel-2); border: 1px solid var(--border-soft); }
+      .fb-head { display: flex; align-items: baseline; gap: 7px; margin-bottom: 4px; padding-right: 22px; }
+      .fb-who { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .6px; }
+      .fb-msg.you .fb-who { color: rgba(255,255,255,.92); }
+      .fb-msg.resolver .fb-who { color: var(--muted); }
+      .fb-time { font-size: 10px; }
+      .fb-msg.you .fb-time { color: rgba(255,255,255,.72); }
+      .fb-msg.resolver .fb-time { color: var(--faint); }
+      .fb-body { font-size: 12.5px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+      .fb-msg.resolver .fb-body { color: var(--text); }
+      /* Top-right so it sits clear of the text at any length, and stays put
+         when the body expands rather than travelling with the last line. */
+      .fb-expand {
+        position: absolute; top: 6px; right: 7px; width: 19px; height: 19px;
+        display: grid; place-items: center; border-radius: 4px; font-size: 12px; line-height: 1;
+        background: transparent; border: 1px solid var(--border); color: var(--muted);
+      }
+      .fb-msg.you .fb-expand { border-color: rgba(255,255,255,.4); color: rgba(255,255,255,.9); }
+      .fb-msg.you .fb-expand:hover { background: rgba(255,255,255,.18); }
+      .fb-msg.resolver .fb-expand:hover { border-color: var(--accent); color: var(--accent); }
+      .fb-foot {
+        display: flex; align-items: center; gap: 8px; margin-top: 8px; padding-top: 7px;
+        border-top: 1px solid var(--border-soft); font-size: 10.5px; color: var(--faint);
+      }
+      .fb-attempt {
+        display: inline-flex; align-items: center; gap: 5px; background: var(--bg);
+        border: 1px solid var(--border); border-radius: 20px; padding: 1px 4px 1px 9px;
+      }
+      .fb-attempt .hnav { width: 17px; height: 17px; font-size: 7px; }
+      .fb-chip {
+        border-radius: 20px; padding: 0 7px; line-height: 16px; font-size: 10px; font-weight: 600;
+        border: 1px solid var(--border); color: var(--muted);
+      }
+      .fb-chip.done { color: var(--done); border-color: var(--done-b); background: var(--done-a); }
+      .fb-chip.received { color: var(--accent); border-color: var(--accent-b); background: var(--accent-a); }
+      .fb-chip.failed { color: var(--failed); border-color: var(--failed-b); background: var(--failed-a); }
+      .fb-chip.superseded { color: var(--unverified); border-color: var(--amber-b); background: var(--amber-a); }
+      .fb-foot .fb-logs { margin-left: auto; }
+      /* Your own bubble is already painted in the accent, so a status chip
+         drawn from the accent palette disappears into it. Inside that bubble
+         the chips read against the fill instead, keeping failure red-adjacent
+         enough to still carry its meaning. */
+      .fb-msg.you .fb-foot { border-top-color: rgba(255,255,255,.28); color: rgba(255,255,255,.78); }
+      .fb-msg.you .fb-chip { background: rgba(255,255,255,.16); border-color: rgba(255,255,255,.42); color: #fff; }
+      .fb-msg.you .fb-chip.failed { background: var(--failed); border-color: var(--failed); color: #fff; }
+      /* The composer inherited nothing, so it rendered as a raw white box in a
+         dark pane. It is a first-class control here, not an afterthought. */
+      .fb-composer textarea {
+        width: 100%; box-sizing: border-box; resize: vertical; min-height: 64px;
+        background: var(--bg); color: var(--text); border: 1px solid var(--border);
+        border-radius: 8px; padding: 9px 10px; font: 12.5px/1.5 inherit;
+      }
+      .fb-composer textarea:focus { outline: none; border-color: var(--accent); }
+      .fb-composer textarea::placeholder { color: var(--faint); }
+
+      /* ---- Live tab: walk back through every run this branch had ----
+         The bar leads (which run am I looking at), the display toggles follow
+         (how is it rendered), and the tab strip sits directly on the content it
+         switches. A run with no captured text is still listed: knowing it
+         happened and that its text wasn't retained beats silently omitting it. */
+      .histbar { display: flex; align-items: center; gap: 5px; margin-bottom: 8px; }
+      .histbar .hnav {
+        background: var(--bg); border: 1px solid var(--border); color: var(--muted);
+        border-radius: 5px; width: 22px; height: 22px; display: grid; place-items: center;
+        font-size: 8px; flex: none;
+      }
+      .histbar .hnav:hover:not(:disabled) { color: var(--accent); border-color: var(--accent); }
+      .histbar .hnav:disabled { opacity: .35; cursor: default; }
+      .histbar .hpick {
+        flex: 1; min-width: 0; display: flex; align-items: center; gap: 6px;
+        background: var(--bg); border: 1px solid var(--border); border-radius: 5px;
+        padding: 3px 8px; font-size: 10.5px; color: var(--muted); overflow: hidden;
+      }
+      .histbar .hpick:hover { border-color: var(--accent); }
+      .histbar.past .hpick { border-color: var(--amber-b); background: var(--amber-a); }
+      .hkind {
+        font-size: 8.5px; text-transform: uppercase; letter-spacing: .5px; font-weight: 700;
+        border-radius: 3px; padding: 0 4px; line-height: 13px; flex: none;
+        color: var(--faint); border: 1px solid var(--border);
+      }
+      .hkind.rebase { color: var(--queued); border-color: var(--queued-b); }
+      .hkind.gate { color: var(--done); border-color: var(--done-b); }
+      .hkind.feedback { color: var(--accent); border-color: var(--accent-b); }
+      .hkind.proof { color: var(--unverified); border-color: var(--amber-b); }
+      .hkind.pr { color: var(--teal); border-color: var(--teal); }
+      .hlabel { color: var(--text); font-size: 10.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .hmeta { color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; }
+      .hcount { color: var(--faint); flex: none; }
+      .histnote {
+        background: var(--amber-a); border: 1px solid var(--amber-b); border-radius: 7px;
+        padding: 6px 9px; font-size: 10.5px; color: var(--unverified); margin-bottom: 8px;
+        line-height: 1.5;
+      }
+      /* Display toggles. They govern only the Terminal view but stay put on the
+         prompt views rather than vanishing -- appearing and disappearing on every
+         tab swap reflows the pane, which is more distracting than a dimmed
+         control that says why it is dimmed. `aria-disabled` and a class, never
+         the `disabled` attribute: a truly disabled button dispatches no mouse
+         events, so its explanatory tooltip would never fire. */
+      .peek-ctl { display: flex; align-items: center; gap: 6px; margin-bottom: 7px; flex-wrap: wrap; }
+      .tgl {
+        display: inline-flex; align-items: center; gap: 6px; background: var(--bg);
+        border: 1px solid var(--border); color: var(--muted); border-radius: 20px;
+        padding: 2px 9px; font-size: 10.5px; white-space: nowrap;
+      }
+      .tgl .bx {
+        width: 9px; height: 9px; border-radius: 2px; border: 1px solid var(--faint);
+        flex: none; background: transparent; position: relative;
+        transition: background .12s, border-color .12s;
+      }
+      .tgl.on { color: var(--accent); border-color: var(--accent-b); background: var(--accent-a); }
+      .tgl.on .bx { background: var(--accent); border-color: var(--accent); }
+      .tgl.on .bx::after {
+        content: ""; position: absolute; left: 2.5px; top: .5px; width: 2.5px; height: 5.5px;
+        border: solid var(--bg); border-width: 0 1.5px 1.5px 0; transform: rotate(42deg);
+      }
+      .tgl.off, .typefilter.off { opacity: .35; cursor: not-allowed; }
+      .tgl.off:hover { color: var(--muted); border-color: var(--border); background: var(--bg); }
+      .tgl.off.on:hover { color: var(--accent); border-color: var(--accent-b); background: var(--accent-a); }
+      .typefilter {
+        background: var(--bg); border: 1px solid var(--border); color: var(--text);
+        border-radius: 20px; padding: 2px 9px; font-size: 10.5px; flex: 1; min-width: 110px;
+      }
+      /* The view tabs are tabs, not more toggles -- they get the seated tab-strip
+         treatment so they never read as another row of pills. */
+      .subtabs {
+        display: flex; gap: 2px; padding: 3px 6px 0; background: var(--panel-2);
+        border-bottom: 1px solid var(--border); border-radius: 7px 7px 0 0; margin: 0 0 10px;
+      }
+      .subtab {
+        background: none; border: none; color: var(--muted); font-size: 11px;
+        padding: 5px 11px; border-radius: 6px 6px 0 0; font-weight: 500;
+      }
+      .subtab:hover { color: var(--text); }
+      .subtab.on { color: var(--accent); background: var(--accent-a); font-weight: 650; }
+      .runterm {
+        background: var(--terminal-bg); border: 1px solid var(--border); border-radius: 7px;
+        font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+        font-size: 10.5px; line-height: 1.62; padding: 9px 10px;
+        overflow: auto; color: #b9c4d0; white-space: pre-wrap; word-break: break-word;
+      }
+      .runterm.past { border-color: var(--amber-b); }
+      .promptbox {
+        background: var(--bg); border: 1px solid var(--border); border-radius: 7px;
+        padding: 10px 11px; font-size: 10.5px; line-height: 1.62; color: var(--text);
+        white-space: pre-wrap; word-break: break-word; max-height: 300px; overflow: auto;
+        font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+      }
+      /* A run that produced no transcript still gets a shape, so "nothing was
+         captured" reads as a fact about that run and not as a broken pane. */
+      .absent-run {
+        border: 1px dashed var(--border); border-radius: 10px; background: var(--panel);
+        display: flex; align-items: flex-start; gap: 10px; padding: 12px 13px;
+      }
+      .absent-run .ai { color: var(--faint); font-size: 14px; line-height: 1.2; }
+      .absent-run .at { font-size: 12px; color: var(--text); margin-bottom: 2px; }
+      .absent-run .as { font-size: 11px; color: var(--muted); line-height: 1.5; }
+      .run-foot { display: flex; gap: 6px; margin-top: 9px; align-items: center; }
+      .run-foot .rg-sub { margin-left: auto; font-size: 11px; color: var(--faint); }
       .warn { background: rgba(248,81,73,.12); border: 1px solid var(--failed); color: var(--failed); border-radius: 6px; padding: 8px; font-size: 12px; margin: 8px 0; }
       /* RAL-433 (originally RAL-108, review-actions only): board-action
          outcome toasts. Fixed bottom-right stack so a rejected action (e.g.
@@ -476,6 +761,437 @@
         box-shadow: 0 4px 16px rgba(0,0,0,.5); opacity: 0; transition: opacity .1s;
       }
       #board-tip.show { opacity: 1; }
+
+      /* ---- Entity hovercards ---- */
+      /* Anchored, interactive sibling to the tooltip above: a tooltip says what
+         a control does, a hovercard says what a value *is*. Anchored rather than
+         cursor-following, and pointer-events enabled, so the action row at the
+         bottom can actually be clicked. See board/22-hovercards.js. */
+      #board-card {
+        position: fixed; z-index: 210; width: 330px;
+        background: var(--panel); color: var(--text); border: 1px solid var(--border);
+        border-radius: 8px; overflow: hidden; font-size: 12px; font-weight: normal;
+        box-shadow: 0 10px 34px rgba(0,0,0,.55);
+        opacity: 0; visibility: hidden; transition: opacity .1s;
+      }
+      #board-card.show { opacity: 1; visibility: visible; }
+      .hc-head {
+        display: flex; align-items: center; gap: 7px; padding: 8px 11px;
+        background: var(--panel-2); border-bottom: 1px solid var(--border);
+      }
+      .hc-title {
+        font-size: 9.5px; text-transform: uppercase; letter-spacing: .7px;
+        color: var(--muted); font-weight: 700;
+      }
+      .hc-sp { flex: 1; }
+      .hc-body { padding: 10px 11px; }
+      .hc-kv {
+        display: grid; grid-template-columns: 78px 1fr; gap: 4px 10px;
+        align-items: baseline; margin: 0; font-size: 11.5px;
+      }
+      .hc-kv dt { color: var(--cancelled); }
+      .hc-kv dd { margin: 0; overflow-wrap: anywhere; }
+      .hc-note { margin: 8px 0 0; font-size: 10.5px; color: var(--cancelled); line-height: 1.5; }
+      .hc-path {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10.5px;
+        color: var(--muted); word-break: break-all; background: var(--bg);
+        border: 1px solid var(--border); border-radius: 6px; padding: 6px 7px; margin-bottom: 9px;
+      }
+      .hc-foot {
+        display: flex; gap: 5px; padding: 8px 11px;
+        border-top: 1px solid var(--border); background: var(--panel-2);
+      }
+      .hc-foot .btn { padding: 2px 8px; font-size: 11.5px; }
+      /* Marks a value as carrying a hovercard: a dotted underline is the
+         conventional "there is more here" cue, and distinguishes an
+         inspectable value from ordinary monospace text around it. */
+      .hc-anchor { border-bottom: 1px dotted var(--cancelled); cursor: help; }
+      .hc-anchor:hover { border-bottom-color: var(--accent); color: var(--accent); }
+
+      /* ---- Review list quick filters ---- */
+      /* Two presets carry the common questions; the full filter set folds
+         behind a disclosure so the sidebar belongs to the list. */
+      #review-quick-filters { display: flex; flex-direction: column; gap: 6px; }
+      .quick-seg {
+        display: flex; background: var(--bg); border: 1px solid var(--border);
+        border-radius: 6px; padding: 2px; gap: 2px;
+      }
+      .quick-seg button {
+        flex: 1 1 auto; background: none; border: none; color: var(--muted);
+        font-size: 11.5px; padding: 4px 10px; border-radius: 5px; font-weight: 550;
+        white-space: nowrap; cursor: pointer;
+      }
+      .quick-seg button:hover { color: var(--text); background: var(--panel-2); }
+      .quick-seg button.on { background: var(--panel-2); color: var(--text); }
+      .quick-seg .n { color: var(--cancelled); font-size: 10.5px; margin-left: 4px; }
+      .quick-seg button.on .n { color: var(--muted); }
+      .filters-more {
+        background: none; border: none; color: var(--muted); font-size: 11.5px;
+        padding: 2px 0; text-align: left; cursor: pointer;
+      }
+      .filters-more:hover { color: var(--accent); }
+
+      /* ---- Command lists (check gates, and the shape manual checks share) ---- */
+      /* A command is something you read in full and whose outcome you want to
+         see, so it gets a row rather than a wrapping chip. Long commands elide
+         rather than reflowing the section; the row's ⋯ shows the whole thing. */
+      /* ---- Review pane density ----
+         The sections were built from the board's general-purpose spacing, which
+         is tuned for the sparser Squads tab. A review is a dense document --
+         a stack, three command lists, a summary -- so it reads better tighter:
+         the text can then carry its own size instead of being lost in padding.
+         Section headings also sit on their own rule rather than floating. */
+      /* Type scale for the review pane.
+         The content here was set two steps below the body text it sits in --
+         11.5px commands, 10.5px headings against a 14px base -- so the page
+         could only be read by zooming the browser, and the space the small text
+         did not fill read as the layout being loose. Content now sits just
+         below the base size and the vertical rhythm is tightened to match, so
+         the same screen holds more and every line of it is legible. */
+      #review-detail, #review-inspector { font-size: 13.5px; }
+      #review-detail h3.section {
+        display: flex; align-items: center; gap: 8px;
+        margin: 13px 0 6px; font-size: 12.5px; letter-spacing: .8px;
+      }
+      #review-detail h3.section::after {
+        content: ""; flex: 1; height: 1px; background: var(--border); opacity: .55;
+      }
+      #review-detail .kv-row { margin: 2px 0; }
+      .review-main > .col.center { padding: 12px 16px; }
+      /* The summary reads as a raised card rather than a hole punched in the
+         page: it is the one block of prose here, and the lighter ground is what
+         separates it from the dark pane instead of a border alone. */
+      .summary-box {
+        font-size: 13.5px; line-height: 1.55; white-space: pre-wrap;
+        border: 1px solid var(--border-soft); border-radius: 8px;
+        padding: 11px 13px; background: var(--panel); color: var(--text);
+      }
+
+      .cmd-list, .rungroup { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+      /* A run-group leads with what its commands promise, so a section is not
+         just a list of strings whose contract you have to remember. */
+      .rg-head { padding: 6px 10px; border-bottom: 1px solid var(--border); background: var(--panel-2); }
+      .rg-note { font-size: 12.5px; color: var(--muted); line-height: 1.5; }
+      .rg-head.rg-run { display: flex; align-items: center; gap: 10px; }
+      .rg-head.rg-run .rg-note { flex: 1; min-width: 0; }
+      .rg-runbtn { flex: none; padding: 4px 12px; font-size: 12px; font-weight: 600; }
+      /* Check gates have no manual trigger — the daemon runs them after each
+         merge commit — so their slot carries when-it-runs rather than a button
+         that would do nothing. Same position, same rhythm, no false affordance. */
+      .rg-when {
+        flex: none; font-size: 10.5px; text-transform: uppercase; letter-spacing: .5px;
+        font-weight: 700; color: var(--cancelled); background: var(--bg);
+        border: 1px solid var(--border); border-radius: 20px; padding: 3px 10px; cursor: help;
+      }
+      .rg-warn { color: var(--unverified); }
+      /* Per-command run control. The commands used to be hidden behind a ▾
+         dropdown, so you could run them all or go hunting; they are rows now,
+         each with its own run. */
+      .cmd-run {
+        flex: none; background: none; border: 1px solid var(--border); color: var(--muted);
+        border-radius: 5px; width: 22px; height: 20px; display: grid; place-items: center;
+        font-size: 9px; cursor: pointer;
+      }
+      .cmd-run:hover { color: var(--accent); border-color: var(--accent); background: rgba(74,163,255,.13); }
+      .cmd-form { padding: 6px 10px 10px 41px; border-bottom: 1px solid var(--border); }
+      /* A test action's label is authored; the command beside it is what will
+         actually run, which is the part worth reading before pressing it. */
+      .cmd-label { flex: none; font-size: 13.5px; font-weight: 600; color: var(--text); }
+      .cmd-run:disabled { opacity: .5; cursor: not-allowed; }
+      /* A command row's trailing controls: how long ago it was launched, what
+         the board knows about it, expand, and its ⋯. */
+      .cmd-dur { flex: none; font-size: 11px; color: var(--cancelled); }
+      .cmd-status {
+        flex: none; font-size: 11px; border-radius: 20px; padding: 1px 8px;
+        border: 1px solid var(--border); color: var(--cancelled); background: var(--bg);
+      }
+      .cmd-status.idle { opacity: .6; }
+      .cmd-status.running { color: var(--accent); border-color: var(--accent); background: rgba(74,163,255,.13); }
+      .cmd-expand {
+        flex: none; background: none; border: 1px solid var(--border); color: var(--cancelled);
+        border-radius: 5px; width: 20px; height: 20px; line-height: 1; font-size: 12px;
+        cursor: pointer; display: grid; place-items: center;
+      }
+      .cmd-expand:hover { color: var(--text); border-color: var(--muted); background: var(--panel-2); }
+      /* The expanded full text of one command, under its row. */
+      .cmd-full {
+        margin: 0; padding: 8px 10px 9px 41px; background: var(--bg);
+        border-bottom: 1px solid var(--border); font-size: 12.5px; line-height: 1.5;
+        color: var(--text);
+      }
+      /* `pre-wrap` belongs to the command text alone. On the panel it also
+         rendered the markup's own newlines and indentation, which is where the
+         screenfuls of blank space between these rows came from. */
+      .cmd-preview { white-space: pre-wrap; word-break: break-all; }
+      }
+      /* Selecting a command row reads the same as selecting a branch row. */
+      .cmd-row.selectable { cursor: pointer; }
+      .cmd-row.sel { background: rgba(74,163,255,.13); box-shadow: inset 2px 0 0 var(--accent); }
+      .absent-note.warn { border-color: var(--unverified); color: var(--unverified); }
+      .absent-note.warn b { color: var(--unverified); }
+      .cmd-row {
+        display: flex; align-items: center; gap: 9px; padding: 5px 10px;
+        border-bottom: 1px solid var(--border);
+      }
+      .cmd-row:last-child { border-bottom: none; }
+      .cmd-row:hover { background: var(--panel-2); }
+      .cmd-lock { flex: none; font-size: 11px; }
+      .cmd-text {
+        flex: 1; min-width: 0; font-size: 13.5px; color: var(--text);
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      }
+      /* The merged count sits on the stage it describes, not in a row of its own. */
+      .pipe-count {
+        font-size: 10px; color: var(--cancelled); background: var(--bg);
+        border: 1px solid var(--border); border-radius: 8px; padding: 0 5px; margin-left: 4px;
+      }
+      .pipe-stop.now .pipe-count { color: var(--accent); border-color: var(--accent); }
+      /* Identity chips are not settings: they describe the review rather than
+         configure it, so they carry hovercards instead of opening the editor. */
+      .setup-chip.ident { cursor: help; }
+      .setup-chip.ident:hover { border-color: var(--accent); }
+
+      /* ---- Review list sparkbar ---- */
+      /* The branch stack as segments, so the list answers "how far along is
+         this review" at a glance rather than only "what status does it carry". */
+      #reviews .meta { display: flex; align-items: center; gap: 7px; }
+      .spark { display: flex; gap: 2px; flex: 1; min-width: 0; align-items: center; }
+      .spark i { flex: 1; height: 3px; border-radius: 2px; background: var(--border); min-width: 3px; }
+      .spark i.s-done, .spark i.s-merged { background: var(--done); }
+      .spark i.s-conflict_resolved { background: var(--queued); }
+      .spark i.s-failed { background: var(--failed); }
+      .spark i.s-ready, .spark i.s-in_progress { background: var(--accent); }
+      .spark i.s-proof_pending { background: var(--materializing); }
+      .spark i.off { background: var(--border); opacity: .5; }
+      .spark-count { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; flex: none; }
+
+      /* Every review section carries the same ⋯ menu, so "show me this
+         section's log" is one gesture in a consistent place. */
+      .section-menu {
+        background: none; border: 1px solid var(--border); color: var(--cancelled);
+        border-radius: 5px; padding: 0 6px; font-size: 11px; line-height: 1.5;
+        margin-left: 6px; cursor: pointer; vertical-align: middle;
+      }
+      .section-menu:hover { color: var(--text); border-color: var(--muted); background: var(--panel-2); }
+
+      /* ---- Review branch inspector ---- */
+      /* Per-branch detail was a disclosure nested inside a branch row, so
+         reading one branch pushed the rest of the stack off-screen. As its own
+         pane it sits beside the stack instead of inside it. */
+      .insp-head { padding: 10px 12px 0; border-bottom: 1px solid var(--border); flex: none; }
+      .insp-title { display: flex; align-items: center; gap: 7px; margin-bottom: 9px; }
+      .insp-title .t {
+        font-size: 12.5px; font-weight: 650; flex: 1; min-width: 0;
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      }
+      .insp-tabs { display: flex; gap: 1px; }
+      .insp-tab {
+        background: none; border: none; border-bottom: 2px solid transparent;
+        color: var(--muted); font-size: 11.5px; padding: 6px 9px; font-weight: 550;
+        position: relative; cursor: pointer;
+      }
+      .insp-tab:hover { color: var(--text); }
+      .insp-tab.on { color: var(--text); border-bottom-color: var(--accent); }
+      .insp-badge {
+        position: absolute; top: 2px; right: 1px; background: var(--queued); color: var(--bg);
+        font-size: 9px; font-weight: 700; border-radius: 8px; padding: 0 4px; line-height: 12px;
+      }
+      .insp-body { overflow-y: auto; flex: 1; padding: 12px; }
+      .insp-kv {
+        display: grid; grid-template-columns: 96px 1fr; gap: 4px 10px;
+        align-items: baseline; margin: 0; font-size: 12px;
+      }
+      .insp-kv dt { color: var(--cancelled); font-size: 12.5px; }
+      .insp-kv dd { margin: 0; overflow-wrap: anywhere; }
+      .insp-pr { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; }
+      .insp-pr-head { display: flex; align-items: center; gap: 7px; }
+      .insp-pr-title { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .insp-pr-sub { font-size: 11px; color: var(--muted); margin-top: 4px; }
+      /* The stack's rebase order, shown on the row rather than inferred from
+         position -- the branch list is an ordered stack, not a set. */
+      .branch-idx {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10.5px;
+        color: var(--cancelled); background: var(--bg); border: 1px solid var(--border);
+        border-radius: 4px; padding: 0 5px; line-height: 16px; flex: none;
+      }
+
+      /* ---- Review command bar ---- */
+      /* Identity, state and the review's lifecycle in one block at the top, so
+         "where is this review and what do I do about it" is answered without
+         scrolling. */
+      .review-cmdbar { margin-bottom: 4px; }
+      /* The actions travel together: grouped in one flex child pinned right, so
+         when the column is too narrow they wrap as a block rather than leaving
+         a single orphaned ⋯ on its own line — and, critically, rather than
+         overflowing and clipping, which is what `nowrap` with unshrinkable
+         children did. The name and id give way first. */
+      .review-cmdbar .cmd-row {
+        display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0;
+      }
+      .review-cmdbar .rid {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 16px;
+        font-weight: 650; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      }
+      .review-cmdbar .cmd-id {
+        color: var(--cancelled); font-size: 11px; min-width: 0; flex-shrink: 1;
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      }
+      .review-cmdbar .cmd-actions {
+        display: flex; align-items: center; gap: 6px; margin-left: auto; flex: none;
+      }
+      .review-cmdbar .cost-chip,
+      .review-cmdbar .badge,
+      .review-cmdbar .pill { flex: none; white-space: nowrap; }
+      .cost-chip {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px;
+        color: var(--unverified); background: rgba(227,179,65,.13);
+        border: 1px solid rgba(227,179,65,.34); border-radius: 20px; padding: 1px 8px; cursor: help;
+      }
+      .cost-chip.over { color: var(--failed); border-color: var(--failed); background: rgba(248,81,73,.13); }
+
+      /* Lifecycle rail: the stages a review passes through, with where it is
+         now. Replaces inferring state from a status pill alone. */
+      .review-pipe { display: flex; align-items: center; margin: 10px 0 2px; }
+      .pipe-stop {
+        display: flex; align-items: center; gap: 6px; font-size: 11.5px;
+        color: var(--cancelled); white-space: nowrap;
+      }
+      .pipe-dot {
+        width: 15px; height: 15px; border-radius: 50%; border: 1.5px solid var(--border);
+        display: grid; place-items: center; font-size: 9px; background: var(--bg); color: var(--cancelled);
+      }
+      .pipe-stop.done { color: var(--muted); }
+      .pipe-stop.done .pipe-dot { border-color: var(--done); background: rgba(63,185,80,.13); color: var(--done); }
+      .pipe-stop.now { color: var(--text); font-weight: 600; }
+      .pipe-stop.now .pipe-dot {
+        border-color: var(--accent); background: rgba(74,163,255,.13); color: var(--accent);
+        box-shadow: 0 0 0 3px rgba(74,163,255,.13);
+      }
+      .pipe-stop.stalled { color: var(--failed); font-weight: 600; }
+      .pipe-stop.stalled .pipe-dot { border-color: var(--failed); background: rgba(248,81,73,.13); color: var(--failed); }
+      .pipe-line { flex: 1; height: 1.5px; background: var(--border); margin: 0 8px; min-width: 12px; border-radius: 2px; }
+      .pipe-line.done { background: rgba(63,185,80,.34); }
+
+      /* ---- Review log dock ---- */
+      /* The audit log as a drawer docked under the review rather than a modal
+         over it, so it can stay open while you work through the stack. */
+      .log-dock {
+        display: flex; flex-direction: column; flex: none;
+        background: var(--panel); border-top: 1px solid var(--border);
+      }
+      .log-dock.closed { height: 30px; }
+      .log-dock.open { height: 300px; }
+      .log-dock .dock-head {
+        display: flex; align-items: center; gap: 8px; padding: 0 14px; height: 30px;
+        flex: none; border-bottom: 1px solid var(--border); cursor: pointer;
+      }
+      .log-dock .dock-head:hover { background: var(--panel-2); }
+      .dock-title {
+        font-size: 11px; font-weight: 650; text-transform: uppercase;
+        letter-spacing: .8px; color: var(--muted);
+      }
+      .dock-hint { font-size: 11px; color: var(--cancelled); }
+      .dock-caret { color: var(--cancelled); font-size: 11px; }
+      /* The whole bar toggles the drawer, so the two things that read as the
+         control brighten together on hover rather than looking inert. */
+      .log-dock .dock-head:hover .dock-hint,
+      .log-dock .dock-head:hover .dock-caret { color: var(--text); }
+      .log-dock .dock-body {
+        flex: 1; overflow-y: auto; padding: 6px 0;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px;
+      }
+      .log-dock.closed .dock-body { display: none; }
+      .dock-row { display: grid; grid-template-columns: 74px 84px 1fr; gap: 10px; padding: 2px 14px; align-items: baseline; }
+      .dock-row:hover { background: var(--panel-2); }
+      .dock-row .t { color: var(--cancelled); font-variant-numeric: tabular-nums; font-size: 10.5px; }
+      .dock-row .s { font-size: 10px; text-transform: uppercase; letter-spacing: .4px; overflow: hidden; text-overflow: ellipsis; }
+      .dock-row .m { color: var(--muted); overflow-wrap: anywhere; }
+      .dock-row.info .s { color: var(--accent); }
+      .dock-row.ok .s { color: var(--done); }
+      .dock-row.warn .s { color: var(--unverified); }
+      .dock-row.err .s { color: var(--failed); }
+      .dock-row.err .m { color: var(--text); }
+
+      /* One toggle component for the small on/off controls (sticky, and the
+         Live view's display switches). The box is drawn in CSS rather than a
+         ☐/☑ glyph -- a unicode box renders at whatever weight the font feels
+         like, which reads as a bright blob against this palette. */
+      .tgl {
+        display: inline-flex; align-items: center; gap: 6px; background: var(--bg);
+        border: 1px solid var(--border); color: var(--muted); border-radius: 20px;
+        padding: 2px 9px; font-size: 10.5px; white-space: nowrap; cursor: pointer;
+      }
+      .tgl:hover { color: var(--text); border-color: var(--cancelled); }
+      .tgl .bx {
+        width: 9px; height: 9px; border-radius: 2px; border: 1px solid var(--cancelled);
+        flex: none; background: transparent; position: relative;
+      }
+      .tgl.on { color: var(--accent); border-color: var(--accent); background: rgba(74,163,255,.13); }
+      .tgl.on .bx { background: var(--accent); border-color: var(--accent); }
+      .tgl.on .bx::after {
+        content: ""; position: absolute; left: 2.5px; top: .5px; width: 2.5px; height: 5.5px;
+        border: solid var(--bg); border-width: 0 1.5px 1.5px 0; transform: rotate(42deg);
+      }
+
+      /* ---- Review setup strip ---- */
+      /* The review's settings as one row of chips instead of a column of
+         read-only kv-rows. Every chip opens the Edit Details modal, so the
+         display and the edit affordance are the same object. */
+      .setup-strip {
+        display: flex; align-items: center; gap: 8px;
+        margin: 8px 0 10px; padding: 7px 0;
+        border-top: 1px solid var(--border); border-bottom: 1px solid var(--border);
+      }
+      .setup-chips {
+        display: flex; align-items: center; gap: 6px; flex-wrap: nowrap;
+        overflow-x: auto; flex: 1; min-width: 0; scrollbar-width: none;
+      }
+      .setup-chips::-webkit-scrollbar { height: 0; }
+      .setup-chips > * { flex: none; }
+      .setup-chip {
+        display: inline-flex; align-items: center; gap: 6px;
+        background: var(--bg); border: 1px solid var(--border); color: var(--muted);
+        border-radius: 20px; padding: 3px 10px; font-size: 12.5px; cursor: pointer;
+        white-space: nowrap;
+      }
+      .setup-chip:hover { border-color: var(--accent); color: var(--text); }
+      .setup-chip b {
+        font-weight: 600; color: var(--text);
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px;
+      }
+      .setup-chip .sc-k {
+        color: var(--cancelled); text-transform: uppercase; letter-spacing: .5px;
+        font-size: 9.5px; font-weight: 700;
+      }
+      /* A review that nothing verifies is the one setting worth shouting about. */
+      .setup-chip.warn { border-color: var(--unverified); color: var(--unverified); }
+      .setup-chip.warn b { color: var(--unverified); }
+      .setup-edit { flex: none; padding: 3px 10px; font-size: 12px; }
+
+      /* A section with nothing in it says so, and says what would fill it —
+         a section that simply vanishes reads as "not applicable here". */
+      .absent-note {
+        border: 1px dashed var(--border); border-radius: 8px;
+        padding: 9px 11px; font-size: 12px; color: var(--muted); line-height: 1.55;
+      }
+
+      /* ---- Review decision row ---- */
+      /* Merge / Approve / Cancel sit two thirds down the pane, after the branch
+         stack and its warnings, because that is where they belong in reading
+         order -- you decide *after* reading the stack. But a reviewer scrolled
+         into the manual checks then has to scroll back up to act. Sticking the
+         row to the bottom of the scroll container keeps the decision reachable
+         from anywhere without moving it out of its context. */
+      /* Bleeds to the column edges via negative margins matching .center's
+         18px/20px padding, so the row spans the pane rather than floating
+         inside it. Solid --bg (not a fade) because the column has no
+         background of its own to fade into. */
+      .review-actions {
+        position: sticky; bottom: 0; z-index: 3;
+        margin: 10px -20px -18px; padding: 10px 20px;
+        background: var(--bg); border-top: 1px solid var(--border);
+      }
+
       /* ---- Queue tab (RAL Queue) ---- */
       #queue-page { padding: 16px; overflow: auto; }
       .queue-wrap { max-width: 80%; margin: 0 auto; padding-bottom: 80px; }

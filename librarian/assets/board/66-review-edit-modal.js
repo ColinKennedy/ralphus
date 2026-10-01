@@ -72,17 +72,30 @@
        * @property {{[project: string]: boolean}} squash
        * @property {string[]} originalSquashOn
        * @property {string[]} projects
-       * @property {EnvScopeDraft} buildEnv
-       * @property {{[key: string]: string}} buildEnvInherited
-       * @property {EnvScopeDraft} manualChecksEnv
-       * @property {{[key: string]: string}} manualChecksEnvInherited
-       * @property {{[branchId: string]: EnvScopeDraft}} branchEnv
-       * @property {{[branchId: string]: {[key: string]: string}}} branchEnvInherited
-       * @property {{id: string, branch: string}[]} branches
+       * @property {string} focus - Which setup-strip chip opened this modal ("onto", "resolver", "proof", "squash", "gates", "worktrees"), or "" when opened from the editor button. The matching group is highlighted and scrolled to.
+       */
+
+      /**
+       * One environment-override scope opened on its own, from the ⋯ of the
+       * section it governs rather than from the review's Setup modal.
+       *
+       * Piling all four scopes into Setup meant reading a stack of tables and
+       * working out which one applied to the commands you were looking at. A
+       * scope reached from its own section needs no such disambiguation, so
+       * this editor shows exactly one — and Setup no longer shows any.
+       * @typedef {object} EnvEditDraft
+       * @property {string} gid
+       * @property {string} scope - "build" | "manual_checks" | "branch"
+       * @property {string} branchId - Empty unless `scope` is "branch".
+       * @property {string} title - Human-readable scope label, e.g. "test actions".
+       * @property {{[key: string]: string}} inherited
+       * @property {EnvScopeDraft} sd
        */
 
       /** @type {ReviewEditDraft|null} */
       let reviewEditDraft = null;
+      /** @type {EnvEditDraft|null} */
+      let envEditDraft = null;
 
       const REVIEW_EDIT_INPUT_STYLE = "background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:2px 5px;font-size:12px";
       const REVIEW_EDIT_TEXTAREA_STYLE = "width:100%;box-sizing:border-box;resize:vertical;font-family:inherit;font-size:12px;padding:6px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px";
@@ -111,14 +124,6 @@
        * @returns {ReviewEditDraft}
        */
       function buildReviewEditDraft(g) {
-        /** @type {{[branchId: string]: EnvScopeDraft}} */
-        const branchEnv = {};
-        /** @type {{[branchId: string]: {[key: string]: string}}} */
-        const branchEnvInherited = {};
-        for (const b of g.branches) {
-          branchEnv[b.id] = envScopeDraftFromOwn(b.env_overrides || {});
-          branchEnvInherited[b.id] = b.inherited_env || {};
-        }
         const squashOn = g.squash_projects || [];
         const projects = (g.projects && g.projects.length) ? g.projects : [g.git_root || ""];
         /** @type {{[project: string]: boolean}} */
@@ -162,13 +167,7 @@
           squash,
           originalSquashOn: squashOn.slice(),
           projects,
-          buildEnv: envScopeDraftFromOwn(g.build_env_overrides || {}),
-          buildEnvInherited: g.combined_env || {},
-          manualChecksEnv: envScopeDraftFromOwn(g.manual_checks_env_overrides || {}),
-          manualChecksEnvInherited: g.combined_env || {},
-          branchEnv,
-          branchEnvInherited,
-          branches: g.branches.map((b) => ({ id: b.id, branch: b.branch })),
+          focus: "",
         };
       }
 
@@ -181,9 +180,14 @@
        * in full detail, so it fetches it itself via `fetchGuardianDetail`
        * (see `70-sse.js`) when missing.
        * @param {string} gid
+       * @param {string} [focus] - A setup-strip chip key ("onto", "resolver",
+       *   "proof", "squash", "gates", "worktrees"). The chip is both the
+       *   display of a setting and the way in to editing it, so arriving from
+       *   one lands on the field it showed rather than at the top of a modal
+       *   you then have to search.
        * @returns {Promise<void>}
        */
-      async function openEditReviewDetails(gid) {
+      async function openEditReviewDetails(gid, focus) {
         let g = guardians.find((x) => x.id === gid);
         if (!g) return;
         if (!g.branches) {
@@ -192,6 +196,7 @@
           if (!g || !g.branches) { notify("error", "Failed to load review details."); return; }
         }
         const draft = buildReviewEditDraft(g);
+        draft.focus = focus || "";
         reviewEditDraft = draft;
         renderReviewEditModal();
         const cwd = g.git_root || (g.projects && g.projects[0]) || "";
@@ -208,17 +213,18 @@
       }
 
       /**
-       * Resolves which `EnvScopeDraft` a scope/branch pair addresses.
+       * Resolves which `EnvScopeDraft` a scope/branch pair addresses. Only the
+       * standalone per-scope editor edits environment overrides now, so this
+       * resolves against whichever scope that editor currently has open.
        * @param {string} scope - "build" | "manual_checks" | "branch"
        * @param {string} branchId - Ignored unless `scope` is "branch".
        * @returns {EnvScopeDraft|null}
        */
       function reviewEditScopeDraft(scope, branchId) {
-        if (!reviewEditDraft) return null;
-        if (scope === "build") return reviewEditDraft.buildEnv;
-        if (scope === "manual_checks") return reviewEditDraft.manualChecksEnv;
-        if (scope === "branch" && branchId) return reviewEditDraft.branchEnv[branchId] || null;
-        return null;
+        const d = envEditDraft;
+        if (!d || d.scope !== scope) return null;
+        if (scope === "branch" && d.branchId !== branchId) return null;
+        return d.sd;
       }
 
       /**
@@ -380,7 +386,7 @@
         const sd = reviewEditScopeDraft(scope, branchId);
         if (!sd || !sd.rows[index]) return;
         sd.rows[index].tombstone = checked;
-        renderReviewEditModal();
+        renderEnvOverridesEditor();
       }
       /**
        * Adds a blank, freshly-editable env-override row to a scope.
@@ -392,7 +398,7 @@
         const sd = reviewEditScopeDraft(scope, branchId);
         if (!sd) return;
         sd.rows.push({ key: "", value: "", tombstone: false, readOnlyKey: false });
-        renderReviewEditModal();
+        renderEnvOverridesEditor();
       }
       /**
        * Adds a draft row pre-filled from a currently-inherited key, ready to
@@ -407,7 +413,7 @@
         const sd = reviewEditScopeDraft(scope, branchId);
         if (!sd) return;
         sd.rows.push({ key, value, tombstone: false, readOnlyKey: true });
-        renderReviewEditModal();
+        renderEnvOverridesEditor();
       }
       /**
        * Removes a draft env-override row. If the row's key was one of this
@@ -424,7 +430,7 @@
         const row = sd.rows[index];
         if (sd.originalOwnKeys.has(row.key)) sd.removedOwnKeys.add(row.key);
         sd.rows.splice(index, 1);
-        renderReviewEditModal();
+        renderEnvOverridesEditor();
       }
 
       /**
@@ -459,6 +465,99 @@
           ${inheritedHtml}
           <button class="btn" style="padding:2px 8px;font-size:11px;margin-top:4px" data-click="addEnvOverrideRow" data-scope="${esc(scope)}" data-branch-id="${esc(branchId || "")}" data-tip="Add a new environment-variable override for ${esc(title)}. Applies on Save.">+ Add override</button>
         </div>`;
+      }
+
+      /**
+       * Opens the standalone environment-override editor for one scope, reached
+       * from the ⋯ of the section that scope governs.
+       *
+       * The review's own detail already carries every scope's saved overrides
+       * and its inherited layer, so this opens from state the board has rather
+       * than fetching anything — except when reached for a review that has
+       * never been the open one, where there is no detail to read yet.
+       * @param {string} gid
+       * @param {string} scope - "build" | "manual_checks" | "branch"
+       * @param {string} branchId - Empty unless `scope` is "branch".
+       * @returns {Promise<void>}
+       */
+      async function openEnvOverridesEditor(gid, scope, branchId) {
+        let g = guardians.find((x) => x.id === gid);
+        if (!g) return;
+        if (!g.branches) {
+          await fetchGuardianDetail(gid);
+          g = guardians.find((x) => x.id === gid);
+          if (!g || !g.branches) { notify("error", "Failed to load review details."); return; }
+        }
+        const review = g;
+        if (scope === "branch") {
+          const b = review.branches.find((x) => x.id === branchId);
+          if (!b) { notify("error", "That branch is no longer part of this review."); return; }
+          envEditDraft = {
+            gid, scope, branchId,
+            title: `branch ${b.branch}`,
+            inherited: b.inherited_env || {},
+            sd: envScopeDraftFromOwn(b.env_overrides || {}),
+          };
+        } else if (scope === "manual_checks") {
+          envEditDraft = {
+            gid, scope, branchId: "",
+            title: "manual checks",
+            inherited: review.combined_env || {},
+            sd: envScopeDraftFromOwn(review.manual_checks_env_overrides || {}),
+          };
+        } else {
+          envEditDraft = {
+            gid, scope: "build", branchId: "",
+            title: "the build step — check gates and test actions",
+            inherited: review.combined_env || {},
+            sd: envScopeDraftFromOwn(review.build_env_overrides || {}),
+          };
+        }
+        renderEnvOverridesEditor();
+      }
+      /**
+       * Closes the per-scope environment-override editor, discarding its draft.
+       * @returns {void}
+       */
+      function closeEnvOverridesEditor() {
+        envEditDraft = null;
+        closeModal();
+      }
+      /**
+       * Renders the per-scope environment-override editor from `envEditDraft`.
+       * @returns {void}
+       */
+      function renderEnvOverridesEditor() {
+        const d = envEditDraft;
+        if (!d) return;
+        byId("modal-root").innerHTML = `<div class="modal-bg" onclick="if(event.target===this)closeEnvOverridesEditor()"><div class="modal" style="width:620px;max-width:94vw">
+            <h2 data-tip="Environment variables this one surface overrides.\nEverything not listed here is inherited — the inherited layer is listed below the overrides.\nNothing is sent until Save.">Environment — ${esc(d.title)}</h2>
+            ${renderReviewEditEnvScope(d.scope, d.branchId, d.title, d.inherited, d.sd)}
+            <div class="btn-row" style="margin-top:12px;justify-content:flex-end"><button class="btn" onclick="closeEnvOverridesEditor()" data-tip="Close without applying anything typed here.">Cancel</button><button class="btn primary" onclick="saveEnvOverridesEditor()" data-tip="Apply this scope's overrides in one request. Only this scope is touched — no other environment, and no other review setting.">Save</button></div>
+          </div></div>`;
+      }
+      /**
+       * Saves the per-scope environment-override editor through the same
+       * `POST .../details` route the Setup modal uses, sending only this one
+       * scope's patch.
+       * @returns {Promise<void>}
+       */
+      async function saveEnvOverridesEditor() {
+        const d = envEditDraft;
+        if (!d) return;
+        const patch = envPatchFromScopeDraft(d.sd);
+        if (envPatchIsEmpty(patch)) { closeEnvOverridesEditor(); return; }
+        /** @type {{[key: string]: *}} */
+        const body = {};
+        if (d.scope === "branch") body.branch_env = { [d.branchId]: patch };
+        else if (d.scope === "manual_checks") body.manual_checks_env = patch;
+        else body.build_env = patch;
+        const resp = await guardianAction(`/api/guardians/${d.gid}/details`, body);
+        if (resp && resp.ok) {
+          notify("success", `Environment saved for ${d.title}.`);
+          closeEnvOverridesEditor();
+          tick();
+        }
       }
 
       /**
@@ -577,35 +676,38 @@
           return `<label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Collapse this git project's task branches to a single squashed commit each in the review worktree. Applies on the next Merge / rebase.">
             <input type="checkbox" ${draft.squash[p] ? "checked" : ""} onchange="onEditSquashToggle(${JSON.stringify(p)},this.checked)">squash${draft.projects.length > 1 ? ` — <span class="mono" style="font-size:11px">${esc(label)}</span>` : " each task branch to a single commit"}</label>`;
         }).join("");
-        const buildEnvSection = renderReviewEditEnvScope("build", "", "the build step", draft.buildEnvInherited, draft.buildEnv);
-        const manualChecksEnvSection = renderReviewEditEnvScope("manual_checks", "", "the manual-checks step", draft.manualChecksEnvInherited, draft.manualChecksEnv);
-        const branchEnvSections = draft.branches.map((b) => renderReviewEditEnvScope("branch", b.id, `branch ${b.branch}`, draft.branchEnvInherited[b.id] || {}, draft.branchEnv[b.id])).join("");
+        const grp = (/** @type {string} */ key) => `class="setup-group${draft.focus === key ? " focused" : ""}" data-setup-group="${key}"`;
         byId("modal-root").innerHTML = `<div class="modal-bg" onclick="if(event.target===this)closeEditReviewDetails()"><div class="modal review-edit-modal">
-            <h2>Edit Details</h2>
+            <h2>Review setup</h2>
             <div class="edit-form">
               <label data-tip="Display name for this review — shown in the sidebar list. Applies on Save.">name<input type="text" value="${esc(draft.name)}" oninput="onEditName(this.value)"></label>
-              <label data-tip="The branch every submitted branch is rebased onto. Type or focus to load remote branch suggestions. Triggers a rebase on Save.">upstream branch<input type="text" class="mono" list="base-datalist" value="${esc(draft.baseBranch)}" onfocus="loadBaseBranches(${JSON.stringify(draft.gid)})" oninput="onEditBaseBranch(this.value)"><datalist id="base-datalist">${(baseBranchCache[draft.gid] || []).map((b) => `<option value="${esc(b)}"></option>`).join("")}</datalist></label>
             </div>
-            ${resolverSection}
-            ${proofScopeSection}
-            <h3 class="section">check gates</h3>
-            <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:6px" data-tip="Skip the finalize-time build/check step entirely. Applies on Save.">
-              <input type="checkbox" ${draft.skipAutoBuild ? "checked" : ""} onchange="onEditSkipAutoBuild(this.checked)">skip auto-build</label>
-            <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Build the entire branch stack in one shared worktree instead of isolated per-branch worktrees. Applies on Save.">
-              <input type="checkbox" ${draft.skipWorktrees ? "checked" : ""} onchange="onEditSkipWorktrees(this.checked)">skip per-branch worktrees</label>
-            <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Overrides the project default for this review only: when its upstream branch moves, don't automatically rebuild/rebase this review's stack onto the new tip. Use for a review whose auto-rebase keeps getting in the way (e.g. one under heavy manual conflict resolution). You can still start a merge/rebase manually at any time, individually or via the review list's bulk Merge/Rebase action, regardless of this setting. Applies on Save.">
-              <input type="checkbox" ${draft.skipBaseUpdates ? "checked" : ""} onchange="onEditSkipBaseUpdates(this.checked)">skip automatic base-branch rebasing</label>
-            <h3 class="section">squash</h3>${squashSection}
+            <div ${grp("onto")}><h3 class="section">upstream</h3>
+              <div class="edit-form">
+                <label data-tip="The branch every submitted branch is rebased onto. Type or focus to load remote branch suggestions. Triggers a rebase on Save.">upstream branch<input type="text" class="mono" list="base-datalist" value="${esc(draft.baseBranch)}" onfocus="loadBaseBranches(${JSON.stringify(draft.gid)})" oninput="onEditBaseBranch(this.value)"><datalist id="base-datalist">${(baseBranchCache[draft.gid] || []).map((b) => `<option value="${esc(b)}"></option>`).join("")}</datalist></label>
+              </div></div>
+            <div ${grp("resolver")}><h3 class="section">resolver</h3>${resolverSection}</div>
+            <div ${grp("proof")}><h3 class="section">proof</h3>${proofScopeSection}</div>
+            <div ${grp("gates")}><h3 class="section">build &amp; rebase</h3>
+              <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:6px" data-tip="Skip the finalize-time build/check step entirely. Applies on Save.">
+                <input type="checkbox" ${draft.skipAutoBuild ? "checked" : ""} onchange="onEditSkipAutoBuild(this.checked)">skip auto-build</label>
+              <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Overrides the project default for this review only: when its upstream branch moves, don't automatically rebuild/rebase this review's stack onto the new tip. Use for a review whose auto-rebase keeps getting in the way (e.g. one under heavy manual conflict resolution). You can still start a merge/rebase manually at any time, individually or via the review list's bulk Merge/Rebase action, regardless of this setting. Applies on Save.">
+                <input type="checkbox" ${draft.skipBaseUpdates ? "checked" : ""} onchange="onEditSkipBaseUpdates(this.checked)">skip automatic base-branch rebasing</label>
+              <div class="hint">The gate commands themselves live in the review's check gates section, next to their logs — editing one there also edits its environment.</div></div>
+            <div ${grp("worktrees")}><h3 class="section">worktrees</h3>
+              <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:6px" data-tip="Build the entire branch stack in one shared worktree instead of isolated per-branch worktrees. Applies on Save.">
+                <input type="checkbox" ${draft.skipWorktrees ? "checked" : ""} onchange="onEditSkipWorktrees(this.checked)">skip per-branch worktrees</label></div>
+            <div ${grp("squash")}><h3 class="section">squash</h3>${squashSection}</div>
             <h3 class="section">pull requests</h3>
             ${renderPrSettingsFieldsHtml(draft.separatePrBranch, draft.matchPrBranchName, draft.autoSubmitPrStack, draft.dualRootPr, "onEditSeparatePrBranch", "onEditMatchPrBranchName", "onEditAutoSubmitPrStack", "onEditDualRootPr")}
             ${renderAutoFixFieldsHtml(draft.autoFixPrErrors, draft.autoFixPromptTemplate, draft.discourageTests, "onEditAutoFixPrErrors", "onEditAutoFixPromptTemplate", "onEditDiscourageTests")}
-            <h3 class="section">environment overrides</h3>
-            ${buildEnvSection}
-            ${manualChecksEnvSection}
-            ${branchEnvSections}
             <div id="review-edit-err" class="verr"></div>
             <div class="btn-row" style="margin-top:12px"><button class="btn" onclick="closeEditReviewDetails()">Cancel</button><button class="btn primary" onclick="saveReviewEditDetails()" data-tip="Apply every change made in this modal in a single request. At most one rebase is triggered, only if something rebase-relevant changed.">Save</button></div>
           </div></div>`;
+        if (draft.focus) {
+          const el = document.querySelector(`[data-setup-group="${draft.focus}"]`);
+          if (el) el.scrollIntoView({ block: "center" });
+        }
       }
 
       /**
@@ -679,20 +781,6 @@
         if (JSON.stringify(squashOn) !== JSON.stringify(draft.originalSquashOn.slice().sort())) {
           body.squash_projects = squashOn;
         }
-        const buildPatch = envPatchFromScopeDraft(draft.buildEnv);
-        if (!envPatchIsEmpty(buildPatch)) body.build_env = buildPatch;
-        const manualPatch = envPatchFromScopeDraft(draft.manualChecksEnv);
-        if (!envPatchIsEmpty(manualPatch)) body.manual_checks_env = manualPatch;
-        /** @type {{[branchId: string]: *}} */
-        const branchEnvBody = {};
-        for (const b of draft.branches) {
-          const sd = draft.branchEnv[b.id];
-          if (!sd) continue;
-          const patch = envPatchFromScopeDraft(sd);
-          if (!envPatchIsEmpty(patch)) branchEnvBody[b.id] = patch;
-        }
-        if (Object.keys(branchEnvBody).length) body.branch_env = branchEnvBody;
-
         if (Object.keys(body).length === 0) { closeEditReviewDetails(); return; }
         const resp = await guardianAction(`/api/guardians/${draft.gid}/details`, body);
         if (resp && resp.ok) {

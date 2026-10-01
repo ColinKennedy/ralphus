@@ -133,8 +133,61 @@ test("the Reviews splitter carries no data-invert (dragging right widens the sid
 
 // ---------- board.css wiring (the closest thing this repo has to browser coverage) ----------
 
-test("board.css drives the Reviews grid off the --reviews-sidebar-w track with a 6px splitter column", () => {
-  assert.match(boardCss, /main#reviews-page \{ display: grid; grid-template-columns: var\(--reviews-sidebar-w, 300px\) 6px 1fr; height: calc\(100vh - 51px\); \}/);
+test("board.css drives the Reviews grid off both width vars with 6px splitter columns", () => {
+  // Three panes now: the review list, the review itself, and the branch
+  // inspector -- each resizable pane on its own var, separated by a 6px
+  // splitter track.
+  assert.match(
+    boardCss,
+    /grid-template-columns: var\(--reviews-sidebar-w, 300px\) 6px 1fr 6px var\(--review-inspector-w, 360px\);/,
+    "the Reviews grid must drive the sidebar and the inspector off their own vars, with a splitter track between each pane",
+  );
+  assert.match(boardCss, /main#reviews-page \{/);
+});
+
+test("the branch inspector is a resizable pane with its own preference key", () => {
+  assert.match(
+    boardSource,
+    /"--review-inspector-w": \{ key: "ralphus-review-inspector-w"/,
+    "the inspector needs its own SPLIT_CFG entry, under its own key, so resizing it never moves the Reviews sidebar",
+  );
+  const reviews = boardHtml.slice(boardHtml.indexOf('<main id="reviews-page"'));
+  assert.match(reviews, /class="splitter" data-var="--review-inspector-w" data-invert="1"/,
+    "the inspector sits on the right, so its splitter inverts: dragging left widens it");
+  assert.match(reviews, /id="review-inspector"/, "the inspector pane must exist in the reviews page");
+});
+
+test("the log dock lives inside the review column, not over the page", () => {
+  const reviews = boardHtml.slice(boardHtml.indexOf('<main id="reviews-page"'));
+  const dockAt = reviews.indexOf('id="review-log-dock"');
+  const inspectorAt = reviews.indexOf('id="review-inspector"');
+  assert.ok(dockAt > -1, "the reviews page must carry the log dock");
+  assert.ok(
+    dockAt < inspectorAt,
+    "the dock belongs to the review's own column, so it spans the review without covering the inspector",
+  );
+  assert.match(reviews, /id="review-dock-sticky"/, "the dock needs its sticky pin");
+});
+
+test("the log dock's header toggles it, so an opened dock can be closed again", () => {
+  const reviews = boardHtml.slice(boardHtml.indexOf('<main id="reviews-page"'));
+  const head = reviews.slice(reviews.indexOf('id="review-dock-head"'));
+  const headEl = head.slice(0, head.indexOf(">") + 1);
+  // The dock shipped with no handler on its header at all: the "Logs" buttons
+  // could open it and nothing could close it, so it read as permanently open.
+  assert.match(
+    headEl,
+    /data-click="toggleReviewDock"/,
+    "clicking the dock's header bar must toggle it — without this the dock can only ever be opened",
+  );
+  // The sticky pin lives inside that header; delegation resolves the nearest
+  // data-click ancestor, so it must keep its own action or pinning would
+  // collapse the drawer instead.
+  assert.match(
+    head.slice(0, head.indexOf("</div>")),
+    /id="review-dock-sticky"[^>]*data-click="toggleReviewDockSticky"/,
+    "the sticky pin keeps its own action so it does not fall through to the header's toggle",
+  );
 });
 
 test("narrow screens stack the Reviews panes, hide the splitter, and wrap the header tabs", () => {

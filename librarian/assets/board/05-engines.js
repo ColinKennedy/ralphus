@@ -106,12 +106,81 @@
         closeHistoryAttempt: (e, ds) => closeHistoryAttempt(ds.key || ""),
         viewHistoryAttempt: (e, ds) => viewHistoryAttempt(ds.key || "", Number(ds.attempt)),
         toggleHistory: (e, ds) => toggleHistory(ds.key || ""),
+        stepBranchRun: (e, ds) => stepBranchRun(ds.branchId || "", Number(ds.dir)),
+        jumpToLatestRun: (e, ds) => jumpToLatestRun(ds.branchId || ""),
+        setLiveSub: (e, ds) => setLiveSub(ds.branchId || "", ds.sub || "terminal"),
+        stepFeedbackReply: (e, ds) => stepFeedbackReply(ds.key || "", Number(ds.to)),
+        regenerateSummary: (e, ds) => regenerateSummary(ds.guardianId || ""),
+        // The inspector's Live tab draws these as pill toggles whose on/off
+        // state is read at render time, so flipping the underlying flag has to
+        // re-render that pane -- `toggleShow*` only repaints the tape, which
+        // left the pill looking untouched and the control looking dead.
+        toggleShowDebugMessagesBtn: (e, ds) => {
+          toggleShowDebugMessages(ds.key || "", !peekShowsDebug(ds.key || ""));
+          renderReviewInspector();
+        },
+        toggleShowThinkingBtn: (e, ds) => {
+          toggleShowThinking(ds.key || "", !peekShowsThinking(ds.key || ""));
+          renderReviewInspector();
+        },
         doPickStatus: (e, ds) => doPickStatus(ds.state || ""),
         selectAddDependencyTarget: (e, ds) => selectAddDependencyTarget(ds.squadId || ""),
         focusSel: (e, ds) => focusSel(ds.squadId || ""),
         unpickSel: (e, ds) => unpickSel(ds.squadId || ""),
         onGraphNodeClick: (e, ds) => onGraphNodeClick(e, ds.squadId || "", /** @type {"task"|"cell"|"proof"} */ (ds.kind || ""), Number(ds.ti), Number(ds.si), Number(ds.vi)),
       };
+      // ---- Double-click delegation ----
+      // Rows whose single click already means something (select this one, scope
+      // the drawer to it) still need a way to open their detail without going
+      // for the small `+`. Double-click is that way, and it is delegated exactly
+      // like the single-click engine above so a row only has to name an action.
+      /** @type {{[action: string]: DelegatedHandler}} */
+      const DBLCLICK_HANDLERS = {
+        toggleReviewCommandFull: (e, ds) => toggleReviewCommandFull(ds.key || ""),
+        toggleBranch: (e, ds) => toggleBranch(e, ds.guardianId || "", ds.branchId || ""),
+      };
+      /**
+       * The last row a `data-dblclick` click landed on, and when.
+       * @type {{id: string, at: number}}
+       */
+      let lastDblCandidate = { id: "", at: 0 };
+      /** How long after the first click a second one still counts as a double. */
+      const DBLCLICK_WINDOW_MS = 450;
+      /**
+       * Handles the second click of a double-click on a `data-dblclick` row.
+       *
+       * The browser's own `dblclick` event is unusable here: these rows act on
+       * their *first* click too (select the command, inspect the branch), and
+       * that action re-renders the pane, replacing the row's DOM node. The two
+       * clicks then land on different elements, which is precisely the case a
+       * browser refuses to call a double-click -- so no `dblclick` ever fires.
+       * Pairing the clicks by the row's identity instead of its node survives
+       * the node being swapped underneath.
+       * @param {MouseEvent} e - The click being considered.
+       * @returns {boolean} Whether this click was consumed as a double-click.
+       */
+      function handledAsDoubleClick(e) {
+        const el = /** @type {HTMLElement|null} */ (/** @type {HTMLElement} */ (e.target).closest("[data-dblclick]"));
+        if (!el || !el.dataset.dblclick) { lastDblCandidate = { id: "", at: 0 }; return false; }
+        const id = `${el.dataset.dblclick}|${el.dataset.key || ""}|${el.dataset.branchId || ""}`;
+        const now = Date.now();
+        if (lastDblCandidate.id !== id || now - lastDblCandidate.at > DBLCLICK_WINDOW_MS) {
+          lastDblCandidate = { id, at: now };
+          return false;
+        }
+        lastDblCandidate = { id: "", at: 0 };
+        const handler = DBLCLICK_HANDLERS[el.dataset.dblclick];
+        if (!handler) return false;
+        // A double-click leaves the word under the pointer selected. Left alone
+        // that selection is page-wide state: `userIsSelecting()` suppresses
+        // every later background re-render while it stands, so a row opened
+        // this way would freeze the pane it lives in until the user clicked
+        // elsewhere. Nobody double-clicking a row meant to select a word.
+        const sel = window.getSelection();
+        if (sel) sel.removeAllRanges();
+        handler(e, el.dataset);
+        return true;
+      }
       /** @type {{[action: string]: DelegatedHandler}} */
       const CTX_HANDLERS = {
         openSquadMenu: (e, ds) => openSquadMenu(e, ds.squadId || ""),
@@ -153,11 +222,8 @@
       CLICK_HANDLERS.showLogsCopyMenu = (e, ds) => showLogsCopyMenu(e, ds.tab || "");
       CLICK_HANDLERS.copyLogsAs = (e, ds) => copyLogsAs(e, ds.tab || "", ds.scope || "current");
       CLICK_HANDLERS.openLinkedOutputPopup = (e, ds) => openLinkedOutputPopup(ds.key || "");
-      CLICK_HANDLERS.runSingleManualCheck = (e, ds) => runSingleManualCheck(ds.guardianId || "", Number(ds.i));
-      CLICK_HANDLERS.runActionHint = (e, ds) => runActionHint(ds.guardianId || "", Number(ds.i));
-      CLICK_HANDLERS.toggleCheckForm = (e, ds) => toggleCheckForm(ds.key || "");
       CLICK_HANDLERS.resolveCheckInput = (e, ds) => resolveCheckInput(ds.guardianId || "", ds.inputName || "");
-      CLICK_HANDLERS.runCheckWithInputs = (e, ds) => runCheckWithInputs(/** @type {"manual"|"action"} */ (ds.kind || "manual"), ds.guardianId || "", Number(ds.i));
+      CLICK_HANDLERS.runCheck = (e, ds) => runCheck(/** @type {"manual"|"action"} */ (ds.kind || "manual"), ds.guardianId || "", Number(ds.i));
       CLICK_HANDLERS.gotoWorktreeCell = (e, ds) => { worktreeMenuOpen = {}; gotoSquadItem(ds.squadId || "", "cell", Number(ds.ti), Number(ds.si), -1); };
       CLICK_HANDLERS.toggleWorktreeMenu = (e, ds) => toggleWorktreeMenu(ds.key || "");
       CLICK_HANDLERS.selectGuardian = (e, ds) => selectGuardian(ds.guardianId || "");
@@ -175,14 +241,30 @@
       CLICK_HANDLERS.unhideSquadMenuItem = (e, ds) => setSquadHiddenFromMenu(ds.squadId || "", false);
       CLICK_HANDLERS.hideReviewMenuItem = (e, ds) => setReviewHiddenFromMenu(ds.guardianId || "", true);
       CLICK_HANDLERS.unhideReviewMenuItem = (e, ds) => setReviewHiddenFromMenu(ds.guardianId || "", false);
-      CLICK_HANDLERS.toggleAgentInspect = (e, ds) => toggleAgentInspect(e, ds.tid || "");
       CLICK_HANDLERS.pullPrCommits = (e, ds) => pullPrCommits(ds.prId || "");
       CLICK_HANDLERS.submitPrStack = (e, ds) => submitPrStack(ds.guardianId || "");
       CLICK_HANDLERS.toggleBranch = (e, ds) => { e.stopPropagation(); toggleBranch(e, ds.guardianId || "", ds.branchId || ""); };
       CLICK_HANDLERS.toggleBranchEnabled = (e, ds) => { e.stopPropagation(); toggleBranchEnabled(ds.guardianId || "", ds.branch || ""); };
       CLICK_HANDLERS.dismissReenable = (e, ds) => { e.stopPropagation(); dismissReenable(ds.guardianId || "", ds.branchId || ""); };
       CLICK_HANDLERS.openMoveBranchMenu = (e, ds) => { e.stopPropagation(); openMoveBranchMenu(e, ds.guardianId || "", ds.branchId || ""); };
-      CLICK_HANDLERS.selectBranchRow = (e, ds) => selectBranchRow(e, ds.guardianId || "", ds.branch || "");
+      CLICK_HANDLERS.selectBranchRow = (e, ds) => selectBranchRow(e, ds.guardianId || "", ds.branch || "", ds.branchId || "");
+      CLICK_HANDLERS.setInspectorTab = (e, ds) => setInspectorTab(ds.tab || "overview");
+      CLICK_HANDLERS.toggleReviewDock = () => toggleReviewDock();
+      CLICK_HANDLERS.toggleReviewDockSticky = (e) => { e.stopPropagation(); toggleReviewDockSticky(); };
+      CLICK_HANDLERS.openReviewSectionMenu = (e, ds) => openReviewSectionMenu(e, ds.guardianId || "", ds.kind || "");
+      CLICK_HANDLERS.scopeReviewDockToSection = (e, ds) => scopeReviewDockToSection(ds.guardianId || "");
+      CLICK_HANDLERS.openReviewCommandMenu = (e, ds) => openReviewCommandMenu(e, ds.guardianId || "", ds.cmd || "", ds.key || "");
+      CLICK_HANDLERS.setReviewQuickFilter = (e, ds) => setReviewQuickFilter(ds.preset || "");
+      CLICK_HANDLERS.toggleReviewFilters = () => toggleReviewFilters();
+      CLICK_HANDLERS.openReviewBranchMenu = (e, ds) => openReviewBranchMenu(e, ds.guardianId || "", ds.branchId || "", ds.canMove === "1");
+      CLICK_HANDLERS.inspectBranchFromMenu = (e, ds) => inspectBranchFromMenu(ds.branchId || "", ds.tab || "overview");
+      CLICK_HANDLERS.scopeReviewDockToBranch = (e, ds) => scopeReviewDockToBranch(ds.guardianId || "", ds.branchId || "");
+      CLICK_HANDLERS.runAllActionHints = (e, ds) => runAllActionHints(ds.guardianId || "");
+      CLICK_HANDLERS.selectReviewCommandRow = (e, ds) => selectReviewCommandRow(ds.guardianId || "", ds.key || "", ds.cmd || "");
+      CLICK_HANDLERS.scopeReviewDockToCommand = (e, ds) => scopeReviewDockToCommand(ds.guardianId || "", ds.key || "", ds.cmd || "");
+      CLICK_HANDLERS.toggleReviewCommandFull = (e, ds) => toggleReviewCommandFull(ds.key || "");
+      CLICK_HANDLERS.sendBranchFeedback = (e, ds) => sendBranchFeedback(ds.guardianId || "", ds.branchId || "");
+      CLICK_HANDLERS.openSectionEnv = (e, ds) => openSectionEnv(ds.guardianId || "", ds.kind || "");
       CLICK_HANDLERS.showChatCopyMenu = (e, ds) => showChatCopyMenu(e, ds.guardianId || "", ds.branchId || "");
       CLICK_HANDLERS.toggleChatBubble = (e, ds) => { e.stopPropagation(); toggleChatBubble(ds.key || ""); };
       CLICK_HANDLERS.gotoSquad = (e, ds) => { e.preventDefault(); gotoSquad(ds.squadId || ""); };
@@ -253,8 +335,8 @@
       CLICK_HANDLERS.openReviewLogs = (e, ds) => openReviewLogs(ds.guardianId || "");
       CLICK_HANDLERS.openReviewTitleMenu = (e, ds) => openReviewTitleMenu(e, ds.guardianId || "");
       CLICK_HANDLERS.openReviewPrStacks = (e, ds) => openReviewPrStacks(ds.guardianId || "");
-      CLICK_HANDLERS.openEnvViewer = (e, ds) => { e.stopPropagation(); openEnvViewer(ds.apiPath || ""); };
-      CLICK_HANDLERS.openEditReviewDetails = (e, ds) => openEditReviewDetails(ds.guardianId || "");
+      CLICK_HANDLERS.openEditReviewDetails = (e, ds) => openEditReviewDetails(ds.guardianId || "", ds.focus || "");
+      CLICK_HANDLERS.openEnvOverridesEditor = (e, ds) => { closeSquadMenu(); openEnvOverridesEditor(ds.guardianId || "", ds.scope || "", ds.branchId || ""); };
       CLICK_HANDLERS.addEnvOverrideRow = (e, ds) => addEnvOverrideRow(ds.scope || "", ds.branchId || "");
       CLICK_HANDLERS.removeEnvOverrideRow = (e, ds) => removeEnvOverrideRow(ds.scope || "", ds.branchId || "", Number(ds.i));
       CLICK_HANDLERS.overrideInheritedKey = (e, ds) => overrideInheritedKey(ds.scope || "", ds.branchId || "", ds.key || "", ds.value || "");
@@ -268,6 +350,9 @@
       CLICK_HANDLERS.forceDeleteAgentProfile = (e, ds) => forceDeleteAgentProfile(ds.name || "");
       CLICK_HANDLERS.removeAgentProfileEnvRow = (e, ds) => removeAgentProfileEnvRow(Number(ds.i));
       document.addEventListener("click", (/** @type {MouseEvent} */ e) => {
+        // The second click of a double-click opens the row instead of running
+        // its ordinary action again -- the first click already selected it.
+        if (handledAsDoubleClick(e)) return;
         const el = /** @type {HTMLElement|null} */ (/** @type {HTMLElement} */ (e.target).closest("[data-click]"));
         if (!el || !el.dataset.click) return;
         const handler = CLICK_HANDLERS[el.dataset.click];

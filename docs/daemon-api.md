@@ -154,6 +154,7 @@ where one exists.
 | POST | `/api/guardians/{id}/reopen` | Reopen a cancelled, merged, or approved review (→ `collecting`) and immediately try a fresh merge pass if the daemon has capacity |
 | POST | `/api/guardians/{id}/run-manual-commands` | Spawn manual-check commands **on the daemon host** |
 | POST | `/api/guardians/{id}/run-action-hint` | Spawn a `command`-kind action hint **on the daemon host**; `prompt`-kind is `501` |
+| GET | `/api/guardians/{id}/check-runs/{kind}/{index}/output` | [Captured output of the last run of one board-launched check](#get-apiguardiansidcheck-runskindindexoutput) |
 | POST | `/api/guardians/{id}/resolve-input` | [Delegate a named check input to the resolver agent](#post-apiguardiansidresolve-input) ("set it for me", RAL-164) |
 
 Four routes above are flagged "on the daemon host": they call
@@ -2258,6 +2259,41 @@ SQL upsert (`Store::claim_guardian_input_resolution`) and loses, getting
 declares an input with that name. A daemon restart while a resolution is
 `resolving` resets it to `failed` on the next startup (crash recovery,
 mirrors merge recovery) so the UI never shows a permanently-stuck spinner.
+
+### `GET /api/guardians/{id}/check-runs/{kind}/{index}/output`
+The captured output of the **last** run of one board-launched check, read on
+demand so the board only fetches output a reviewer actually expanded. `kind` is
+`manual` (a `manual_commands` entry) or `action` (an `action_hints` entry) —
+anything else is `400 bad_request`, as is a non-numeric `index`. `index` is the
+check's position in that list.
+
+```json
+{
+  "available": true,
+  "output": "running 12 tests\n...",
+  "exit_code": 1,
+  "elapsed_ms": 42150,
+  "truncated": false,
+  "timed_out": false
+}
+```
+
+`available` is `false` (with a `200`, an empty `output`, and null
+`exit_code`/`elapsed_ms`) when no run of that check has finished — never run,
+or the current run is still going. `output` is the **tail** of the run's
+combined stdout/stderr, capped at 256 KiB; `truncated` says the start was
+dropped to fit. `timed_out` marks a run whose window never reported an exit
+code within the watcher's 6-hour budget, in which case `exit_code` is null.
+
+The daemon learns a run finished because the launched `cmd /V:ON /K` window
+echoes `!ERRORLEVEL!` into a per-launch marker file under
+`~/.ralphus/check-runs` the moment the command body exits, which a background
+thread polls; the window stays open (`/K`) and `type`s the captured log so its
+output is still readable there. Each finished run emits a `check_run`-scoped
+Cartographer row (`check run started` / `check run finished`), the latter
+carrying `has_output` so the board knows whether to offer the expander.
+Output and result files are stable per `(guardian, kind, index)`, so a new run
+of the same check overwrites its predecessor rather than accumulating.
 
 ### `GET /api/guardians/{id}/branches/{branch_id}/conflicts`
 The live list of files still carrying unresolved `<<<<<<<` merge-conflict
