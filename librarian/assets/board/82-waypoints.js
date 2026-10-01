@@ -326,9 +326,30 @@
       function renderWaypointDeliveryFeed() {
         if (!waypointDeliveries.length) return `<div class="empty" style="margin-top:8px">No delivery events yet.</div>`;
         return waypointDeliveries.slice().sort((a, b) => b.at_ms - a.at_ms).map((ev) => `<div class="kv-row">
-          <span class="k mono" style="font-size:11px" data-tip="When this delivery event was recorded.">${esc(new Date(ev.at_ms).toLocaleString())}</span>
-          <span class="v"><span class="badge" style="color:var(--muted);border-color:var(--border)">${esc(ev.level)}</span> ${esc(ev.message)}</span>
+          <span class="k mono" style="font-size:11px" data-tip="When this effect was recorded.">${esc(new Date(ev.at_ms).toLocaleString())}</span>
+          <span class="v"><span class="badge" style="color:var(--muted);border-color:var(--border)">${esc(ev.level)}</span> ${esc(ev.message)}${renderWaypointEffectTarget(ev)}</span>
         </div>`).join("");
+      }
+
+      /**
+       * Renders which entity a waypoint effect landed on, as deep links. This is what makes the feed a view of
+       * what the waypoint did to each squad/cell/review rather than a flat message log — a halt is only meaningful
+       * once you can see which cell it stopped. Returns an empty string for an effect with no entity refs.
+       * @param {WaypointEventEntry} ev
+       * @returns {string}
+       */
+      function renderWaypointEffectTarget(ev) {
+        const parts = [];
+        if (ev.squad_id) {
+          const label = ev.cell_id ? `${ev.squad_id} / ${ev.task ? `${ev.task} / ` : ""}${ev.cell_id}` : ev.squad_id;
+          parts.push(`<a href="#" data-click="gotoSquad" data-squad-id="${esc(ev.squad_id)}" data-tip="Open the squad this effect landed on.">🧩 ${esc(label)}</a>`);
+        }
+        if (ev.guardian_id) {
+          parts.push(`<a href="#" data-click="gotoReview" data-guardian-id="${esc(ev.guardian_id)}" data-tip="Open the review this effect landed on.">🔀 ${esc(ev.guardian_id)}</a>`);
+        }
+        if (!parts.length) return "";
+        const src = `<span class="badge" style="color:var(--muted);border-color:var(--border)" data-tip="The subsystem that recorded this effect.\nA 'waypoint' row is a survey decision; 'scheduler' and 'submit' rows are actions taken on it.">${esc(ev.source)}</span>`;
+        return `<div style="font-size:12px;color:var(--muted);padding-top:2px">${src} ${parts.join(" ")}</div>`;
       }
 
       /**

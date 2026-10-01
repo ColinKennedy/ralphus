@@ -5740,7 +5740,20 @@ impl Store {
     /// review after halting its merge, without resuming or completing it).
     /// Distinct from the forge-driven `merged` transition -- see
     /// [`GuardianStatus::Approved`].
+    ///
+    /// Refuses while an open waypoint holds this review in `block` mode:
+    /// RAL-400 defines block mode for a review as holding approval, and
+    /// without this check the hold existed on paper only. A review's hold is
+    /// on approval rather than on its work precisely so it can keep running
+    /// and report the bearing that releases it; de-escalating the entry to
+    /// `advisory` or closing the waypoint release it too.
     pub fn approve_guardian(&self, id: &str) -> Result<GuardianStatus> {
+        if let Some(waypoint_id) = self.review_block_gating_waypoint(id)? {
+            return Err(StoreError::InvalidTransition(format!(
+                "review {id} is held by open waypoint {waypoint_id}; close that waypoint or set \
+                 its roster entry for this review to advisory before approving"
+            )));
+        }
         match GuardianStatus::parse(&self.guardian_status_str(id)?) {
             Some(GuardianStatus::InReview | GuardianStatus::MergeStopped) => {
                 self.set_guardian_status(id, GuardianStatus::Approved, None)?;

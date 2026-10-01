@@ -4421,18 +4421,49 @@ same way the `POST` response is.
 ```
 
 #### `GET /api/waypoints/{id}/deliveries`
-The waypoint's Cartographer-backed event/delivery history, oldest first —
-creation, roster changes, survey verdicts, deliveries, bearings,
-closes/reopens. This doubles as the waypoint's full timeline, matching the
-squad-timeline response family (`GET /api/squads/{id}/timeline`); there is
-no separate `.../timeline` route. `404 not_found` for an unknown waypoint
-id, rather than an empty array.
+Every recorded effect of the waypoint, oldest first — creation, roster
+changes, survey verdicts, submit-time gating, halted cells, advisory
+deliveries, bearings, stale flags, redos, closes/reopens. This doubles as the
+waypoint's full timeline, matching the squad-timeline response family
+(`GET /api/squads/{id}/timeline`); there is no separate `.../timeline` route.
+`404 not_found` for an unknown waypoint id, rather than an empty array.
+
+Selected by Cartographer `scope = "waypoint"` and **not** by `source`: a
+waypoint's most consequential effects are recorded by the scheduler (a cell
+halted, an advisory injection delivered) and by the submit path (a squad
+enrolled and gated), not by the waypoints module. Each row carries the
+Cartographer entity refs (`squad_id`, `guardian_id`, `cell_id`, `task`) and
+its `source`, so the feed reads as *what this waypoint did to each squad,
+cell and review* rather than a flat message list — `source` is what separates
+a decision the survey made from an action taken on it.
+
+A row is attributed to a waypoint by either a scalar `payload.waypoint_id` or
+a `payload.waypoint_ids` array; the array form exists because one effect can
+legitimately span several waypoints at once (one submit enrolling a squad on
+every overlapping waypoint, one injection drain carrying guidance from more
+than one), and such an effect appears under each of them.
 ```json
 [
   {
     "at_ms": 1732999999000,
     "level": "INFO",
+    "source": "scheduler",
+    "message": "cell halted by waypoint block",
+    "squad_id": "squad-000000000042",
+    "guardian_id": null,
+    "cell_id": "cell-0",
+    "task": "rewrite-greet-callers",
+    "payload": { "waypoint_id": "waypoint-000000000003", "tokens_in": 12, "tokens_out": 340 }
+  },
+  {
+    "at_ms": 1732999999500,
+    "level": "INFO",
+    "source": "waypoints",
     "message": "waypoint waypoint-000000000003 received a bearing from squad squad-000000000042",
+    "squad_id": "squad-000000000042",
+    "guardian_id": null,
+    "cell_id": null,
+    "task": null,
     "payload": { "waypoint_id": "waypoint-000000000003", "bearing_id": 1, "producer_kind": "squad", "producer_id": "squad-000000000042" }
   }
 ]

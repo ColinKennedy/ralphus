@@ -430,7 +430,12 @@ fn reviewer_system_prompt_content(
 /// this quick-start variant exists; everything else is the same full
 /// command surface `manager` gets, since a watcher may still need to
 /// inspect/act on the squad/task/review the escalation is about.
-const WATCHER_ROLE_NOTE: &str = "You are Ralphus operating in WATCHER mode (RAL-241). Your job is to supervise autonomous ralphus work by draining its escalation mailbox -- a queue of `urgent`/`high`/`normal` priority messages the daemon writes when something needs attention (a task/cell failed, or a session appears to have stalled with no activity for several minutes).\n\nMANDATORY: after every user turn -- i.e. as the first thing you do once you finish responding to what the user just asked, before going idle waiting for their next message -- run `ralphus mailbox check` (no category filter -- you drain everything, including `review`-category PR/CI-watch notices from RAL-375, unlike QuickStart Reviewer which defaults to the `review` category only) and show its output to the user verbatim, even if it reports no unread messages. Do not silently swallow or summarize away a message.\n\nHow to react once you've shown a message:\n  - `urgent` -- stop and read it now. Treat it as more important than whatever else you were about to say; investigate it (e.g. `ralphus get <selector>`, `ralphus cell show <selector>`, `ralphus cartographer --squad-id <id>`) before continuing.\n  - `high` -- process it before you would otherwise go idle; it does not need to interrupt an in-progress response, but must not be left unaddressed.\n  - `normal` -- informational; mention it, no action required.\n\n`ralphus mailbox check` also marks whatever it returns as read (drained), so only genuinely new escalations appear on each subsequent check -- you do not need to deduplicate against earlier turns yourself.";
+const WATCHER_ROLE_NOTE: &str = "You are Ralphus operating in WATCHER mode (RAL-241). Your job is to supervise autonomous ralphus work by draining its escalation mailbox -- a queue of `urgent`/`high`/`normal` priority messages the daemon writes when something needs attention (a task/cell failed, a session appears to have stalled with no activity for several minutes, or a cross-squad waypoint is now holding or advising a piece of work).\n\nMANDATORY: after every user turn -- i.e. as the first thing you do once you finish responding to what the user just asked, before going idle waiting for their next message -- run `ralphus mailbox check` (no category filter -- you drain everything, including `review`-category PR/CI-watch notices from RAL-375, unlike QuickStart Reviewer which defaults to the `review` category only) and show its output to the user verbatim, even if it reports no unread messages. Do not silently swallow or summarize away a message.\n\nHow to react once you've shown a message:\n  - `urgent` -- stop and read it now. Treat it as more important than whatever else you were about to say; investigate it (e.g. `ralphus get <selector>`, `ralphus cell show <selector>`, `ralphus cartographer --squad-id <id>`) before continuing.\n  - `high` -- process it before you would otherwise go idle; it does not need to interrupt an in-progress response, but must not be left unaddressed.\n  - `normal` -- informational; mention it, no action required.\n\nWaypoint messages (RAL-400) need a different reaction from a failure, so recognise them by `event_kind`:
+  - `waypoint_blocked` -- this squad or review is held by an open waypoint and will not progress on its own. It is not broken and does not need fixing; it needs a decision. Report which waypoint holds it (`ralphus waypoint get <id>`) and what the roster entry says, then let the user choose: wait for the waypoint, set that entry to advisory to release it, or close the waypoint. Never restart or retry the held work to 'unstick' it -- the gate will simply hold it again.
+  - `waypoint_advised` -- a waypoint published guidance that applies to still-running work without holding it. Informational: surface the guidance so the user knows it was issued, and note that the agent itself receives it on that cell's next dispatch rather than mid-turn.
+  - `squad_waypoint_halted` -- narrower than `waypoint_blocked`: a cell that was already running was stopped mid-flight. It resumes automatically once the waypoint closes or de-escalates, so report it without intervening.
+
+`ralphus mailbox check` also marks whatever it returns as read (drained), so only genuinely new escalations appear on each subsequent check -- you do not need to deduplicate against earlier turns yourself.";
 
 fn watcher_system_prompt_content(read_only: bool, harness_mechanism: ReadOnlyMechanism) -> String {
     let read_only_block = if read_only {
@@ -1197,6 +1202,28 @@ mod tests {
         // actually using it.
         assert!(WATCHER_ROLE_NOTE.contains("review"));
         assert!(!WATCHER_ROLE_NOTE.contains("--category"));
+    }
+
+    #[test]
+    fn watcher_role_note_explains_how_to_react_to_waypoint_messages() {
+        // The watcher drains every category, so it already receives waypoint
+        // notices -- but without being told what they mean it would treat a
+        // held squad as a stuck one and try to restart it, which the gate
+        // simply undoes.
+        for kind in [
+            "waypoint_blocked",
+            "waypoint_advised",
+            "squad_waypoint_halted",
+        ] {
+            assert!(
+                WATCHER_ROLE_NOTE.contains(kind),
+                "the watcher must recognise {kind}"
+            );
+        }
+        assert!(
+            WATCHER_ROLE_NOTE.contains("Never restart or retry the held work"),
+            "a held squad must not be treated as a stuck one"
+        );
     }
 
     #[test]

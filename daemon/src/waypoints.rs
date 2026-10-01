@@ -263,6 +263,11 @@ pub struct PendingInjectionView {
     pub payload: String,
     pub status: String,
     pub batch_id: Option<String>,
+    /// The waypoint whose guidance this injection carries. Lets a drained
+    /// injection be attributed back to its waypoint without re-deriving it
+    /// from the payload text -- which the consolidated waypoint event feed
+    /// needs in order to report the delivery at all.
+    pub waypoint_id: Option<String>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
 }
@@ -321,6 +326,18 @@ pub struct WaypointEventEntry {
     pub level: String,
     pub message: String,
     pub payload: serde_json::Value,
+    /// Which entity this effect landed on. Carried straight through from the
+    /// Cartographer row's own refs, which is what turns a flat event list into
+    /// a view of what a waypoint did *to each squad, cell and review* -- the
+    /// reason to look at this feed at all.
+    pub squad_id: Option<String>,
+    pub guardian_id: Option<String>,
+    pub cell_id: Option<String>,
+    pub task: Option<String>,
+    /// The subsystem that recorded the effect (`waypoints`, `scheduler`,
+    /// `submit`, `server`). Worth surfacing because it distinguishes a
+    /// decision the survey made from an action the scheduler took on it.
+    pub source: String,
 }
 
 impl Store {
@@ -984,7 +1001,14 @@ impl Store {
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             drop(stmt);
             for (task_idx, idx) in targets {
-                self.enqueue_injection(&entry.entry_id, task_idx, idx, &payload, Some(&batch_id))?;
+                self.enqueue_injection(
+                    &entry.entry_id,
+                    task_idx,
+                    idx,
+                    &payload,
+                    Some(&batch_id),
+                    Some(waypoint_id),
+                )?;
                 queued += 1;
             }
         }
@@ -1305,6 +1329,36 @@ impl Store {
             .map_err(StoreError::from)
     }
 
+    /// The first open waypoint holding this *review*, if any -- the review
+    /// counterpart of [`Self::squad_block_gating_waypoint`], with the same
+    /// fail-closed verdict reading (a NULL verdict still blocks, since an
+    /// unsurveyed entry is not a cleared one).
+    ///
+    /// Phase 0 defines block mode for a review as "hold approval until the
+    /// waypoint closes", but nothing consulted that: a `block`-mode review
+    /// entry received its feedback and was then free to be approved and
+    /// merged anyway, which is exactly the silent-bypass the ticket's Risks
+    /// section warns about. [`Store::approve_guardian`] now checks this.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn review_block_gating_waypoint(&self, guardian_id: &str) -> StoreResult<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT wr.waypoint_id FROM waypoint_roster wr
+                 JOIN waypoints w ON w.id = wr.waypoint_id
+                 WHERE wr.kind = 'review' AND wr.entry_id = ? AND wr.mode = 'block'
+                   AND (wr.survey_verdict IS NULL OR wr.survey_verdict = 'impacted')
+                   AND w.state = 'open'
+                 ORDER BY wr.created_at_ms ASC
+                 LIMIT 1",
+                params![guardian_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
     /// Every cell currently halted because its squad-kind roster entry
     /// became `mode=block` on an open waypoint (RAL-400 Phase 3, see
     /// [`Store::mark_cell_waypoint_halted`]) -- `(squad_id, task_idx, idx)`
@@ -1474,8 +1528,15 @@ impl Store {
         let mut offset = 0i64;
         let mut scanned = 0i64;
         loop {
+            // Deliberately filtered by `scope` only, never by `source`. A
+            // waypoint's most consequential effects are emitted by the
+            // scheduler (a cell halted, an advisory injection delivered) and
+            // the submit path (a squad enrolled and gated), not by this
+            // module -- filtering on `source = "waypoints"` dropped every one
+            // of them, so this feed showed the survey's decisions while
+            // showing nothing the waypoint actually did to a squad or cell.
+            // That is the worst shape for an audit view: it looked complete.
             let filter = crate::cartographer::CartographerFilter {
-                source: Some("waypoints".to_string()),
                 scope: Some("waypoint".to_string()),
                 limit: WAYPOINT_EVENTS_PAGE_SIZE,
                 offset,
@@ -1487,17 +1548,17 @@ impl Store {
             let total = page.total;
             scanned += got;
             for row in page.rows {
-                if row
-                    .payload
-                    .get("waypoint_id")
-                    .and_then(serde_json::Value::as_str)
-                    == Some(waypoint_id)
-                {
+                if payload_names_waypoint(&row.payload, waypoint_id) {
                     matched.push(WaypointEventEntry {
                         at_ms: row.at_ms,
                         level: row.level,
                         message: row.message,
                         payload: row.payload,
+                        squad_id: row.squad_id,
+                        guardian_id: row.guardian_id,
+                        cell_id: row.cell_id,
+                        task: row.task,
+                        source: row.source,
                     });
                 }
             }
@@ -1513,7 +1574,11 @@ impl Store {
     }
 
     /// Queue an injection payload for one cell, optionally as part of a
-    /// batch. Phase 5/v2 mechanism -- nothing drives this yet in Phase 1-4.
+    /// batch, attributed to the waypoint whose guidance it carries.
+    ///
+    /// `waypoint_id` is what lets the delivery show up in that waypoint's own
+    /// event feed once drained; without it a delivered injection is invisible
+    /// to any per-waypoint view.
     ///
     /// # Errors
     /// Propagates any SQLite failure.
@@ -1524,12 +1589,13 @@ impl Store {
         target_idx: i64,
         payload: &str,
         batch_id: Option<&str>,
+        waypoint_id: Option<&str>,
     ) -> StoreResult<i64> {
         let now = now_ms();
         self.conn.execute(
-            "INSERT INTO pending_injections(target_squad, target_task, target_idx, payload, status, batch_id, created_at_ms, updated_at_ms)
-             VALUES(?,?,?,?,'queued',?,?,?)",
-            params![target_squad, target_task, target_idx, payload, batch_id, now, now],
+            "INSERT INTO pending_injections(target_squad, target_task, target_idx, payload, status, batch_id, waypoint_id, created_at_ms, updated_at_ms)
+             VALUES(?,?,?,?,'queued',?,?,?,?)",
+            params![target_squad, target_task, target_idx, payload, batch_id, waypoint_id, now, now],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -1565,7 +1631,7 @@ impl Store {
         target_idx: i64,
     ) -> StoreResult<Vec<PendingInjectionView>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, target_squad, target_task, target_idx, payload, status, batch_id, created_at_ms, updated_at_ms
+            "SELECT id, target_squad, target_task, target_idx, payload, status, batch_id, created_at_ms, updated_at_ms, waypoint_id
              FROM pending_injections
              WHERE target_squad=? AND target_task=? AND target_idx=? AND status='queued'
              ORDER BY id ASC",
@@ -1695,6 +1761,7 @@ impl Store {
             batch_id: r.get(6)?,
             created_at_ms: r.get(7)?,
             updated_at_ms: r.get(8)?,
+            waypoint_id: r.get(9)?,
         })
     }
 }
@@ -1965,6 +2032,30 @@ pub fn survey_candidate(
 
     let guard = store.lock();
     guard.set_roster_survey_result(waypoint_id, candidate.kind, &candidate.entry_id, &verdict)?;
+    // Tell the entity's watchers what the verdict means for them. Every branch
+    // notifies, including the release: someone told their work was held needs
+    // to hear when it isn't any more, or the first message reads as a dead end.
+    match (verdict.impacted, verdict.mode) {
+        (true, RosterMode::Block) => notify_entry_blocked(
+            &guard,
+            waypoint_id,
+            Some(&waypoint),
+            candidate.kind,
+            &candidate.entry_id,
+            &format!("the survey judged it impacted ({})", verdict.rationale),
+        ),
+        (true, RosterMode::Advisory) => notify_entry_advised(
+            &guard,
+            waypoint_id,
+            Some(&waypoint),
+            candidate.kind,
+            &candidate.entry_id,
+            &verdict.rationale,
+        ),
+        (false, _) => {
+            notify_entry_released(&guard, waypoint_id, candidate.kind, &candidate.entry_id);
+        }
+    }
     let note = crate::cartographer::Note::new("waypoints").scope("waypoint");
     let note = match candidate.kind {
         RosterEntryKind::Squad => note.squad(&candidate.entry_id),
@@ -2543,6 +2634,162 @@ fn stand_down_squad(
 /// candidate keeps its NULL verdict, which the gate already treats as
 /// blocking. So the only cost of the cap is latency, never a missed gate.
 const SURVEY_MAX_PER_SWEEP: usize = 8;
+
+/// The `EntityUri` string for one roster entry, as the mailbox and watch
+/// machinery address it.
+#[must_use]
+pub fn roster_entry_uri(kind: RosterEntryKind, entry_id: &str) -> String {
+    match kind {
+        RosterEntryKind::Squad => format!("squad:{entry_id}"),
+        RosterEntryKind::Review => format!("guardian:{entry_id}"),
+    }
+}
+
+/// Notify a roster entry's watchers that an open waypoint is now **holding**
+/// it, so work that is blocked says so instead of sitting silently.
+///
+/// Carries remediation per RAL-502 (this is a blocked state): both ways out --
+/// de-escalate the entry, or close the waypoint -- are named, since neither is
+/// discoverable from the entity's own page.
+///
+/// `detail` distinguishes *why* it is held (gated at submit pending survey, a
+/// confirmed `block` verdict, a held approval), because the same entity can be
+/// notified more than once as that progresses and an undifferentiated repeat
+/// reads as spam rather than news.
+pub fn notify_entry_blocked(
+    store: &Store,
+    waypoint_id: &str,
+    waypoint: Option<&WaypointView>,
+    kind: RosterEntryKind,
+    entry_id: &str,
+    detail: &str,
+) {
+    let which = waypoint.and_then(|w| w.label.clone()).map_or_else(
+        || format!("waypoint {waypoint_id}"),
+        |l| format!("waypoint \"{l}\""),
+    );
+    let message = format!(
+        "This {} ({entry_id}) is held by open {which}: {detail}. It stays held until the waypoint \
+         closes or this roster entry is set to advisory.",
+        kind.as_str()
+    );
+    let remediation = crate::mailbox::Remediation::SuggestedCommand {
+        command: format!("ralphus waypoint roster mode {waypoint_id} {entry_id} advisory"),
+        purpose: "release this entry without closing the waypoint, if it only needs to be aware \
+                  of the guidance rather than wait for it"
+            .to_string(),
+    };
+    let squad_scope = match kind {
+        RosterEntryKind::Squad => Some(entry_id),
+        RosterEntryKind::Review => None,
+    };
+    let _ = store.notify_watchers_with_remediation(
+        crate::monitor::NotifiableEventKind::WaypointBlocked,
+        &roster_entry_uri(kind, entry_id),
+        crate::mailbox::MailboxPriority::Normal,
+        &message,
+        &remediation,
+        squad_scope,
+        None,
+        None,
+    );
+}
+
+/// Notify a roster entry's watchers that a waypoint's guidance applies to it
+/// in `advisory` mode -- not held, but expected to account for the guidance.
+///
+/// Informational, so it goes through `notify_watchers_with_context` rather
+/// than the remediation-carrying variant: nothing is stuck and there is no
+/// corrective command to run.
+pub fn notify_entry_advised(
+    store: &Store,
+    waypoint_id: &str,
+    waypoint: Option<&WaypointView>,
+    kind: RosterEntryKind,
+    entry_id: &str,
+    detail: &str,
+) {
+    let which = waypoint.and_then(|w| w.label.clone()).map_or_else(
+        || format!("waypoint {waypoint_id}"),
+        |l| format!("waypoint \"{l}\""),
+    );
+    let message = format!(
+        "Open {which} advises this {} ({entry_id}): {detail}. It is not held -- inspect the \
+         current state of the code rather than assuming the described change is already present, \
+         and respond as applicable.",
+        kind.as_str()
+    );
+    let squad_scope = match kind {
+        RosterEntryKind::Squad => Some(entry_id),
+        RosterEntryKind::Review => None,
+    };
+    let _ = store.notify_watchers_with_context(
+        crate::monitor::NotifiableEventKind::WaypointAdvised,
+        &roster_entry_uri(kind, entry_id),
+        crate::mailbox::MailboxPriority::Normal,
+        &message,
+        squad_scope,
+        None,
+        None,
+    );
+}
+
+/// Notify that a waypoint has stopped holding a roster entry because the
+/// survey found no impact. Uses the entity's own ordinary status-change kind,
+/// not a waypoint-specific one: nothing is blocked and nothing is advised, the
+/// entity simply became runnable again, and someone who was told it was held
+/// needs to hear that it isn't.
+pub fn notify_entry_released(
+    store: &Store,
+    waypoint_id: &str,
+    kind: RosterEntryKind,
+    entry_id: &str,
+) {
+    let (event, squad_scope) = match kind {
+        RosterEntryKind::Squad => (
+            crate::monitor::NotifiableEventKind::SquadAttributesChanged,
+            Some(entry_id),
+        ),
+        RosterEntryKind::Review => (
+            crate::monitor::NotifiableEventKind::ReviewStatusChanged,
+            None,
+        ),
+    };
+    let _ = store.notify_watchers_with_context(
+        event,
+        &roster_entry_uri(kind, entry_id),
+        crate::mailbox::MailboxPriority::Normal,
+        &format!(
+            "Waypoint {waypoint_id} no longer holds this {} ({entry_id}): the survey found its \
+             work is not impacted.",
+            kind.as_str()
+        ),
+        squad_scope,
+        None,
+        None,
+    );
+}
+
+/// Whether a Cartographer row's payload attributes it to `waypoint_id`.
+///
+/// Accepts both shapes in use: a scalar `waypoint_id` (most emitters), and a
+/// `waypoint_ids` array for an effect that genuinely spans several waypoints
+/// at once -- one submit enrolling a squad on every overlapping waypoint, or
+/// one injection drain carrying guidance from more than one. Reporting such an
+/// effect under only its first waypoint would hide it from the others.
+fn payload_names_waypoint(payload: &serde_json::Value, waypoint_id: &str) -> bool {
+    if payload
+        .get("waypoint_id")
+        .and_then(serde_json::Value::as_str)
+        == Some(waypoint_id)
+    {
+        return true;
+    }
+    payload
+        .get("waypoint_ids")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(waypoint_id)))
+}
 
 /// Wall-clock cap on one survey classification run through the subprocess
 /// runner. A terminal agent has no built-in bound, and a survey is a small
@@ -3636,10 +3883,10 @@ mod tests {
     fn injection_drain_is_exactly_once() {
         let store = Store::open_in_memory().unwrap();
         store
-            .enqueue_injection("squad-1", 0, 0, "payload a", None)
+            .enqueue_injection("squad-1", 0, 0, "payload a", None, Some("waypoint-1"))
             .unwrap();
         store
-            .enqueue_injection("squad-1", 0, 0, "payload b", None)
+            .enqueue_injection("squad-1", 0, 0, "payload b", None, Some("waypoint-1"))
             .unwrap();
 
         let drained = store.drain_injections("squad-1", 0, 0).unwrap();
@@ -3657,7 +3904,14 @@ mod tests {
     fn injection_cancel_wins_over_a_later_drain() {
         let store = Store::open_in_memory().unwrap();
         store
-            .enqueue_injection("squad-1", 0, 0, "payload", Some("batch-1"))
+            .enqueue_injection(
+                "squad-1",
+                0,
+                0,
+                "payload",
+                Some("batch-1"),
+                Some("waypoint-1"),
+            )
             .unwrap();
 
         let cancelled = store.cancel_injection_batch("batch-1").unwrap();
@@ -3680,10 +3934,24 @@ mod tests {
     fn injection_batches_only_affect_their_own_batch() {
         let store = Store::open_in_memory().unwrap();
         store
-            .enqueue_injection("squad-1", 0, 0, "payload a", Some("batch-1"))
+            .enqueue_injection(
+                "squad-1",
+                0,
+                0,
+                "payload a",
+                Some("batch-1"),
+                Some("waypoint-1"),
+            )
             .unwrap();
         store
-            .enqueue_injection("squad-1", 0, 0, "payload b", Some("batch-2"))
+            .enqueue_injection(
+                "squad-1",
+                0,
+                0,
+                "payload b",
+                Some("batch-2"),
+                Some("waypoint-1"),
+            )
             .unwrap();
 
         store.cancel_injection_batch("batch-1").unwrap();
@@ -3696,10 +3964,10 @@ mod tests {
     fn injection_drain_is_scoped_per_target_cell() {
         let store = Store::open_in_memory().unwrap();
         store
-            .enqueue_injection("squad-1", 0, 0, "for cell a", None)
+            .enqueue_injection("squad-1", 0, 0, "for cell a", None, Some("waypoint-1"))
             .unwrap();
         store
-            .enqueue_injection("squad-1", 0, 1, "for cell b", None)
+            .enqueue_injection("squad-1", 0, 1, "for cell b", None, Some("waypoint-1"))
             .unwrap();
 
         let drained_a = store.drain_injections("squad-1", 0, 0).unwrap();
@@ -4854,6 +5122,371 @@ mod tests {
             "line one IMPACTED: yes line three",
             "newlines must collapse so prompt text cannot forge reply lines"
         );
+    }
+
+    // ── blocked / advised notifications ──────────────────────────────────
+
+    fn mail(store: &Store) -> Vec<crate::mailbox::MailboxMessageView> {
+        store
+            .mailbox_messages_for_client("client", false, None)
+            .unwrap()
+    }
+
+    /// Drive one survey to a chosen verdict through a canned runner, so the
+    /// notification each verdict produces can be asserted without a live
+    /// model.
+    fn survey_with_reply(reply: &str) -> Vec<crate::mailbox::MailboxMessageView> {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .create_waypoint(
+                "waypoint-1",
+                Some("greet rename"),
+                "greet() is being renamed",
+                Some("claude-code"),
+                Some("sonnet"),
+                true,
+            )
+            .unwrap();
+        insert_squad_with_cwd(&store, "squad-1", "/repo");
+        let handle = handle(store);
+        let as_runner: Arc<dyn Runner> = SurveyTestRunner::new(reply);
+        survey_candidate(
+            &handle,
+            "waypoint-1",
+            &SurveyCandidate {
+                kind: RosterEntryKind::Squad,
+                entry_id: "squad-1".to_string(),
+            },
+            &Cancellations::new(),
+            &as_runner,
+        )
+        .unwrap();
+        let guard = handle.lock();
+        mail(&guard)
+    }
+
+    #[test]
+    fn a_block_verdict_notifies_that_the_work_is_held_with_a_way_out() {
+        let messages =
+            survey_with_reply("IMPACTED: yes\nMODE: block\nRATIONALE: touches src/app.py");
+        let blocked: Vec<_> = messages
+            .iter()
+            .filter(|m| m.event_kind.as_deref() == Some("waypoint_blocked"))
+            .collect();
+        assert_eq!(blocked.len(), 1, "one blocked notice: {messages:?}");
+        assert!(
+            blocked[0].message.contains("touches src/app.py"),
+            "the notice must say why it is held: {}",
+            blocked[0].message
+        );
+        assert!(
+            blocked[0].message.contains("advisory"),
+            "a blocked state must name a way out (RAL-502): {}",
+            blocked[0].message
+        );
+    }
+
+    #[test]
+    fn an_advisory_verdict_notifies_without_claiming_the_work_is_held() {
+        let messages =
+            survey_with_reply("IMPACTED: yes\nMODE: advisory\nRATIONALE: only reads the helper");
+        let advised: Vec<_> = messages
+            .iter()
+            .filter(|m| m.event_kind.as_deref() == Some("waypoint_advised"))
+            .collect();
+        assert_eq!(advised.len(), 1, "one advised notice: {messages:?}");
+        assert!(
+            advised[0].message.contains("not held"),
+            "advisory must not read as blocking: {}",
+            advised[0].message
+        );
+        assert!(
+            advised[0].message.contains("inspect the current state"),
+            "must carry the don't-assume-it's-landed contract: {}",
+            advised[0].message
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.event_kind.as_deref() == Some("waypoint_blocked")),
+            "an advisory verdict must never emit a blocked notice"
+        );
+    }
+
+    #[test]
+    fn a_not_impacted_verdict_notifies_that_the_hold_is_lifted() {
+        // Someone told their squad was gated at submit needs to hear when the
+        // survey clears it, or the first notice reads as a dead end.
+        let messages = survey_with_reply("IMPACTED: no\nRATIONALE: docs only");
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.message.contains("no longer holds")),
+            "a release must be announced: {messages:?}"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.event_kind.as_deref() == Some("waypoint_blocked")),
+            "a cleared entry must not be reported as blocked"
+        );
+    }
+
+    #[test]
+    fn an_open_block_mode_waypoint_holds_a_reviews_approval() {
+        // RAL-400 defines block mode for a review as holding approval until
+        // the waypoint closes. Nothing consulted that before, so a blocked
+        // review could be approved and merged anyway -- the silent bypass the
+        // ticket's Risks section warns about.
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        let guardian_id = store.create_guardian("r", "main", "/repo").unwrap();
+        store
+            .set_guardian_status(
+                &guardian_id,
+                crate::guardian::GuardianStatus::InReview,
+                None,
+            )
+            .unwrap();
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Review,
+                &guardian_id,
+                RosterMode::Block,
+            )
+            .unwrap();
+
+        let err = store.approve_guardian(&guardian_id).unwrap_err();
+        assert!(
+            matches!(err, StoreError::InvalidTransition(ref m) if m.contains("waypoint-1")),
+            "approval must be refused and name the waypoint, got {err:?}"
+        );
+
+        // De-escalating releases it, without closing the waypoint.
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Review,
+                &guardian_id,
+                RosterMode::Advisory,
+            )
+            .unwrap();
+        assert_eq!(
+            store.approve_guardian(&guardian_id).unwrap(),
+            crate::guardian::GuardianStatus::Merged,
+            "an advisory entry must never hold approval"
+        );
+    }
+
+    #[test]
+    fn closing_a_waypoint_releases_a_held_reviews_approval() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        let guardian_id = store.create_guardian("r", "main", "/repo").unwrap();
+        store
+            .set_guardian_status(
+                &guardian_id,
+                crate::guardian::GuardianStatus::InReview,
+                None,
+            )
+            .unwrap();
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Review,
+                &guardian_id,
+                RosterMode::Block,
+            )
+            .unwrap();
+        assert!(store.approve_guardian(&guardian_id).is_err());
+        assert!(store.close_waypoint("waypoint-1").unwrap());
+        assert_eq!(
+            store.approve_guardian(&guardian_id).unwrap(),
+            crate::guardian::GuardianStatus::Merged
+        );
+    }
+
+    #[test]
+    fn an_unsurveyed_review_entry_holds_approval_fail_closed() {
+        // A NULL verdict is not a cleared one: the same fail-closed reading
+        // the squad gate uses must apply to reviews, or an entry awaiting its
+        // survey would be approvable in the window before it runs.
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        let guardian_id = store.create_guardian("r", "main", "/repo").unwrap();
+        store
+            .set_guardian_status(
+                &guardian_id,
+                crate::guardian::GuardianStatus::InReview,
+                None,
+            )
+            .unwrap();
+        store
+            .enroll_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Review,
+                &guardian_id,
+                RosterMode::Block,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .review_block_gating_waypoint(&guardian_id)
+                .unwrap()
+                .as_deref(),
+            Some("waypoint-1")
+        );
+        assert!(store.approve_guardian(&guardian_id).is_err());
+
+        store
+            .set_roster_survey_result(
+                "waypoint-1",
+                RosterEntryKind::Review,
+                &guardian_id,
+                &SurveyVerdict {
+                    impacted: false,
+                    mode: RosterMode::Block,
+                    rationale: "unrelated".to_string(),
+                },
+            )
+            .unwrap();
+        assert!(
+            store.approve_guardian(&guardian_id).is_ok(),
+            "a not-impacted verdict must release the approval hold"
+        );
+    }
+
+    // ── consolidated effect feed (waypoint_deliveries) ───────────────────
+
+    /// Record a waypoint-scoped Cartographer row as some other subsystem
+    /// would, so the feed can be tested for the cross-source coverage that is
+    /// the whole point of it.
+    fn log_waypoint_effect(
+        store: &Store,
+        source: &'static str,
+        message: &'static str,
+        squad_id: Option<&str>,
+        cell_id: Option<&str>,
+        payload: serde_json::Value,
+    ) {
+        store
+            .cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::INFO,
+                source,
+                message,
+                scope: Some("waypoint"),
+                squad_id,
+                guardian_id: None,
+                cell_id,
+                task: None,
+                log_path: None,
+                payload,
+                admin_only: false,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn the_effect_feed_includes_rows_from_every_subsystem_not_just_waypoints() {
+        // This feed previously filtered `source = "waypoints"`, which dropped
+        // every effect the scheduler and submit path record -- the cell halts,
+        // the advisory deliveries, the submit-time gating. It showed the
+        // survey's decisions and nothing the waypoint actually did, while
+        // looking complete.
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+
+        log_waypoint_effect(
+            &store,
+            "waypoints",
+            "survey verdict",
+            Some("squad-1"),
+            None,
+            serde_json::json!({"waypoint_id": "waypoint-1"}),
+        );
+        log_waypoint_effect(
+            &store,
+            "scheduler",
+            "cell halted by waypoint block",
+            Some("squad-1"),
+            Some("cell-0"),
+            serde_json::json!({"waypoint_id": "waypoint-1"}),
+        );
+        log_waypoint_effect(
+            &store,
+            "submit",
+            "squad enrolled pending survey",
+            Some("squad-2"),
+            None,
+            // Array shape: one submit can enrol a squad on several waypoints.
+            serde_json::json!({"waypoint_ids": ["waypoint-1", "waypoint-9"]}),
+        );
+        log_waypoint_effect(
+            &store,
+            "scheduler",
+            "delivered queued waypoint injection(s)",
+            Some("squad-3"),
+            Some("cell-0"),
+            serde_json::json!({"waypoint_ids": ["waypoint-1"]}),
+        );
+        // Another waypoint's effect must not leak in.
+        log_waypoint_effect(
+            &store,
+            "scheduler",
+            "cell halted by waypoint block",
+            Some("squad-4"),
+            Some("cell-0"),
+            serde_json::json!({"waypoint_id": "waypoint-other"}),
+        );
+
+        let events = store.waypoint_deliveries("waypoint-1").unwrap();
+        let sources: BTreeSet<&str> = events.iter().map(|e| e.source.as_str()).collect();
+        assert!(
+            sources.contains("scheduler") && sources.contains("submit"),
+            "the feed must carry scheduler and submit effects, got {sources:?}"
+        );
+        assert_eq!(
+            events.len(),
+            4,
+            "four effects name this waypoint: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.squad_id.as_deref() == Some("squad-4")),
+            "another waypoint's effects must not leak in"
+        );
+        // The entity refs are what make this a per-squad/per-cell view rather
+        // than a flat log.
+        assert!(
+            events
+                .iter()
+                .any(|e| e.cell_id.as_deref() == Some("cell-0") && e.message.contains("halted")),
+            "a halt must be attributable to the cell it stopped: {events:?}"
+        );
+    }
+
+    #[test]
+    fn an_effect_spanning_several_waypoints_appears_under_each_of_them() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        open_waypoint(&store, "waypoint-2");
+        log_waypoint_effect(
+            &store,
+            "submit",
+            "squad enrolled pending survey",
+            Some("squad-1"),
+            None,
+            serde_json::json!({"waypoint_ids": ["waypoint-1", "waypoint-2"]}),
+        );
+        for id in ["waypoint-1", "waypoint-2"] {
+            assert_eq!(
+                store.waypoint_deliveries(id).unwrap().len(),
+                1,
+                "{id} must see the shared effect"
+            );
+        }
     }
 
     // ── survey transport: terminal agents via the runner ─────────────────

@@ -2744,6 +2744,13 @@ fn run_cell_worker(
                 serde_json::json!({
                     "count": injected.len(),
                     "cell_id": row.cell_id,
+                    // One drain can carry guidance from several waypoints, so
+                    // report every distinct one -- each needs this delivery to
+                    // show up in its own event feed.
+                    "waypoint_ids": injected
+                        .iter()
+                        .filter_map(|i| i.waypoint_id.clone())
+                        .collect::<std::collections::BTreeSet<_>>(),
                 }),
             );
     }
@@ -3132,6 +3139,10 @@ fn run_cell_worker(
             task: Some(&row.task_name),
             log_path: None,
             payload: serde_json::json!({
+                // Attributing the halt to its waypoint is what lets the halt
+                // appear in that waypoint's own event feed -- the single most
+                // important effect it has, and previously absent from it.
+                "waypoint_id": waypoint_id,
                 "tokens_in": result.tokens_in,
                 "tokens_out": result.tokens_out,
                 "cache_creation_tokens": result.cache_creation_tokens,

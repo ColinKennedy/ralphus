@@ -6716,6 +6716,22 @@ fn run_submit_followup(
         let guard = store_handle.lock();
         match guard.enroll_new_squad_in_open_waypoints(&squad_id) {
             Ok(enrolled) if !enrolled.is_empty() => {
+                // The squad is gated from this moment, so say so now rather
+                // than leaving it to look merely slow to start. The survey's
+                // own verdict notification follows within a sweep and either
+                // confirms the hold or releases it.
+                for waypoint_id in &enrolled {
+                    let waypoint = guard.get_waypoint(waypoint_id).ok();
+                    crate::waypoints::notify_entry_blocked(
+                        &guard,
+                        waypoint_id,
+                        waypoint.as_ref(),
+                        crate::waypoints::RosterEntryKind::Squad,
+                        &squad_id,
+                        "its work overlaps the waypoint's scope, so it is held pending the \
+                         relevance survey",
+                    );
+                }
                 crate::cartographer::Note::new("submit")
                     .squad(&squad_id)
                     .scope("waypoint")
@@ -15429,6 +15445,28 @@ fn waypoint_append_bearing(daemon: &Daemon, id: &str, body: &str) -> Reply {
     let queued = store
         .queue_advisory_bearing_injections(id, &bearing)
         .unwrap_or(0);
+    // A queued injection only reaches the agent on its next dispatch, which
+    // may be a while. Tell the humans watching that work now, so advisory
+    // guidance is visible as it is published rather than only once some cell
+    // happens to pick it up.
+    if queued > 0 {
+        let waypoint = store.get_waypoint(id).ok();
+        for entry in store.list_roster_entries(id).unwrap_or_default() {
+            if entry.mode != crate::waypoints::RosterMode::Advisory
+                || entry.kind != crate::waypoints::RosterEntryKind::Squad
+            {
+                continue;
+            }
+            crate::waypoints::notify_entry_advised(
+                &store,
+                id,
+                waypoint.as_ref(),
+                entry.kind,
+                &entry.entry_id,
+                &format!("new bearing: {}", bearing.summary),
+            );
+        }
+    }
     crate::cartographer::Note::new("waypoints")
         .scope("waypoint")
         .emit(

@@ -1114,4 +1114,9 @@
        * @property {string} level
        * @property {string} message
        * @property {object} payload
+       * @property {string|null} squad_id - the squad this effect landed on, if any.
+       * @property {string|null} guardian_id - the review this effect landed on, if any.
+       * @property {string|null} cell_id - the cell this effect landed on, if any.
+       * @property {string|null} task - the task name owning `cell_id`, if any.
+       * @property {string} source - the subsystem that recorded it (`waypoints`, `scheduler`, `submit`, `server`), which distinguishes a survey decision from an action taken on it.
        */

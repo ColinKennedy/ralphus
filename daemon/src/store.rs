@@ -2345,6 +2345,7 @@ impl Store {
                 payload        TEXT NOT NULL,
                 status         TEXT NOT NULL DEFAULT 'queued',
                 batch_id       TEXT,
+                waypoint_id    TEXT,
                 created_at_ms  INTEGER NOT NULL,
                 updated_at_ms  INTEGER NOT NULL
             );
@@ -3401,6 +3402,10 @@ impl Store {
             // acting on it is `waypoints::redo_roster_entry`, never automatic.
             // NULL means not flagged. See `run_pending_stale_notices`.
             "ALTER TABLE waypoint_roster ADD COLUMN stale_at_ms INTEGER",
+            // RAL-400: which waypoint's guidance a queued injection carries,
+            // so a delivered injection can be attributed back to it in that
+            // waypoint's consolidated event feed.
+            "ALTER TABLE pending_injections ADD COLUMN waypoint_id TEXT",
         ] {
             let _ = self.conn.execute(stmt, []);
         }

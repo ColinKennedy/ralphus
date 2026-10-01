@@ -39,6 +39,21 @@ pub enum NotifiableEventKind {
     /// RAL-400 Phase 8: a new waypoint just added a review or squad to its
     /// roster, notifying that roster entry's own watchers.
     WaypointCreated,
+    /// RAL-400: this squad or review is now held by an open waypoint and
+    /// cannot proceed until it closes or the entry de-escalates to advisory.
+    ///
+    /// Distinct from [`Self::SquadWaypointHalted`], which reports the narrower
+    /// event of an *already-running cell* being stopped. This one covers work
+    /// that is held before it ever starts (gated at submit, or by a `block`
+    /// survey verdict) and a review whose approval is held -- states that
+    /// previously produced no notification at all, so work could sit blocked
+    /// indefinitely with nothing saying why. A blocked state, so it carries
+    /// remediation per RAL-502.
+    WaypointBlocked,
+    /// RAL-400: a waypoint's guidance applies to this squad or review in
+    /// `advisory` mode -- it is not held, but it is expected to take the
+    /// guidance into account. Informational, so no remediation.
+    WaypointAdvised,
 }
 
 impl NotifiableEventKind {
@@ -53,6 +68,8 @@ impl NotifiableEventKind {
             Self::ReviewFailed => "review_failed",
             Self::SquadWaypointHalted => "squad_waypoint_halted",
             Self::WaypointCreated => "waypoint_created",
+            Self::WaypointBlocked => "waypoint_blocked",
+            Self::WaypointAdvised => "waypoint_advised",
         }
     }
 }
@@ -127,6 +144,7 @@ impl Store {
                 NotifiableEventKind::SquadFailed
                     | NotifiableEventKind::ReviewFailed
                     | NotifiableEventKind::SquadWaypointHalted
+                    | NotifiableEventKind::WaypointBlocked
             ),
             "notify_watchers_with_remediation is for failure/blocked events only; use notify_watchers_with_context for ordinary status changes"
         );
