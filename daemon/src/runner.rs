@@ -1240,6 +1240,7 @@ impl RunnerResult {
     #[must_use]
     pub fn waypoint_halted(usage: LiveUsage, agent_session_id: Option<String>) -> Self {
         Self {
+            thinking_stall_last_line: None,
             status: "waypoint_halted".to_string(),
             tokens_in: usage.tokens_in,
             tokens_out: usage.tokens_out,
@@ -1292,6 +1293,7 @@ impl RunnerResult {
         agent_session_id: Option<String>,
     ) -> Self {
         Self {
+            bearing: None,
             status: "rate_limited".to_string(),
             tokens_in,
             tokens_out,

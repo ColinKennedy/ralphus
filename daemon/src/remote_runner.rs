@@ -1654,6 +1654,7 @@ mod tests {
         fn run(&self, spec: &RunnerSpec) -> RunnerResult {
             self.seen.lock().unwrap().push(spec.cell_id.clone());
             RunnerResult {
+                bearing: None,
                 thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "done".to_string(),

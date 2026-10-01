@@ -3071,7 +3071,11 @@ pub fn render_bearing_block(waypoint_id: &str, bearings: &[BearingView]) -> Opti
 /// the calling (scheduler) thread, gating what work happens; the potentially
 /// slow part (`start_feedback`'s spawned background thread) is not owned by
 /// this function's call stack at all, so no thread-spawn is needed here.
-pub fn run_pending_deliveries(store: &crate::store_lock::StoreHandle, runner: &Arc<dyn Runner>) {
+pub fn run_pending_deliveries(
+    store: &crate::store_lock::StoreHandle,
+    runner: &Arc<dyn Runner>,
+    cancellations: &crate::cancel::Cancellations,
+) {
     let waypoint_ids = {
         let guard = store.lock();
         guard.list_open_waypoint_ids().unwrap_or_default()
@@ -3094,7 +3098,14 @@ pub fn run_pending_deliveries(store: &crate::store_lock::StoreHandle, runner: &A
             }
             match entry.kind {
                 RosterEntryKind::Review => {
-                    deliver_to_review(store, runner, &waypoint_id, &waypoint, &entry.entry_id);
+                    deliver_to_review(
+                        store,
+                        runner,
+                        cancellations,
+                        &waypoint_id,
+                        &waypoint,
+                        &entry.entry_id,
+                    );
                 }
                 RosterEntryKind::Squad => {
                     mark_done_but_unreviewed_squad(store, &waypoint_id, &entry.entry_id);
@@ -3114,6 +3125,7 @@ pub fn run_pending_deliveries(store: &crate::store_lock::StoreHandle, runner: &A
 fn deliver_to_review(
     store: &crate::store_lock::StoreHandle,
     runner: &Arc<dyn Runner>,
+    cancellations: &crate::cancel::Cancellations,
     waypoint_id: &str,
     waypoint: &WaypointView,
     guardian_id: &str,
@@ -3131,6 +3143,7 @@ fn deliver_to_review(
     let reply = crate::guardian_merge::start_feedback(
         Arc::clone(store),
         Arc::clone(runner),
+        cancellations.clone(),
         guardian_id,
         &branch_id,
         waypoint_feedback_text(waypoint),
@@ -5551,7 +5564,7 @@ mod tests {
 
         let handle = handle(store);
         let runner: Arc<dyn crate::runner::Runner> = Arc::new(DeliveryTestRunner);
-        run_pending_deliveries(&handle, &runner);
+        run_pending_deliveries(&handle, &runner, &crate::cancel::Cancellations::new());
 
         let store = handle.lock();
         let entries = store.list_roster_entries("waypoint-1").unwrap();
@@ -5588,7 +5601,7 @@ mod tests {
 
         let handle = handle(store);
         let runner: Arc<dyn crate::runner::Runner> = Arc::new(DeliveryTestRunner);
-        run_pending_deliveries(&handle, &runner);
+        run_pending_deliveries(&handle, &runner, &crate::cancel::Cancellations::new());
 
         let store = handle.lock();
         let entries = store.list_roster_entries("waypoint-1").unwrap();
@@ -5615,7 +5628,7 @@ mod tests {
 
         let handle = handle(store);
         let runner: Arc<dyn crate::runner::Runner> = Arc::new(DeliveryTestRunner);
-        run_pending_deliveries(&handle, &runner);
+        run_pending_deliveries(&handle, &runner, &crate::cancel::Cancellations::new());
 
         let store = handle.lock();
         let entries = store.list_roster_entries("waypoint-1").unwrap();
@@ -5638,7 +5651,7 @@ mod tests {
 
         let handle = handle(store);
         let runner: Arc<dyn crate::runner::Runner> = Arc::new(DeliveryTestRunner);
-        run_pending_deliveries(&handle, &runner);
+        run_pending_deliveries(&handle, &runner, &crate::cancel::Cancellations::new());
 
         let store = handle.lock();
         let entries = store.list_roster_entries("waypoint-1").unwrap();
@@ -6289,7 +6302,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             store.approve_guardian(&guardian_id).unwrap(),
-            crate::guardian::GuardianStatus::Merged,
+            crate::guardian::GuardianStatus::Approved,
             "an advisory entry must never hold approval"
         );
     }
@@ -6318,7 +6331,7 @@ mod tests {
         assert!(store.close_waypoint("waypoint-1").unwrap());
         assert_eq!(
             store.approve_guardian(&guardian_id).unwrap(),
-            crate::guardian::GuardianStatus::Merged
+            crate::guardian::GuardianStatus::Approved
         );
     }
 

@@ -633,7 +633,7 @@ pub fn run_loop(
         if last_waypoint_survey.elapsed() >= WAYPOINT_SURVEY_INTERVAL {
             crate::waypoints::run_pending_surveys(&store, &waypoint_halts, &runner);
             crate::waypoints::run_pending_waypoint_resumes(&store, &cancellations);
-            crate::waypoints::run_pending_deliveries(&store, &runner);
+            crate::waypoints::run_pending_deliveries(&store, &runner, &cancellations);
             crate::waypoints::run_pending_stand_down_notices(&store);
             crate::waypoints::run_pending_stale_notices(&store);
             last_waypoint_survey = std::time::Instant::now();
@@ -2177,6 +2177,7 @@ fn run_cell_with_rate_limit_retries<'a>(
                 ThinkingStallOutcome::Retry => continue,
                 ThinkingStallOutcome::Terminate(message) => {
                     let failed = RunnerResult {
+                        bearing: None,
                         status: "failed".to_string(),
                         tokens_in: total_tokens_in,
                         tokens_out: total_tokens_out,
@@ -5445,6 +5446,7 @@ mod tests {
                 RunnerResult::failure("intentional failure")
             } else {
                 RunnerResult {
+                    bearing: None,
                     thinking_stall_last_line: None,
                     retry_after_secs: None,
                     status: "done".to_string(),
@@ -5479,6 +5481,7 @@ mod tests {
     impl Runner for ProphecyRunner {
         fn run(&self, _spec: &RunnerSpec) -> RunnerResult {
             RunnerResult {
+                bearing: None,
                 thinking_stall_last_line: None,
                 status: "done".to_string(),
                 tokens_in: 1,
@@ -5554,6 +5557,7 @@ mod tests {
                 *seen_prompt.lock().unwrap() = spec.prompt.clone();
             }
             RunnerResult {
+                bearing: None,
                 thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "done".to_string(),
@@ -6001,6 +6005,7 @@ mod tests {
                         );
                     }
                     RunnerResult {
+                        bearing: None,
                         thinking_stall_last_line: None,
                         retry_after_secs: None,
                         status: "done".to_string(),
@@ -6034,6 +6039,7 @@ mod tests {
                         released = cv.wait(released).expect("mutex poisoned");
                     }
                     RunnerResult {
+                        bearing: None,
                         thinking_stall_last_line: None,
                         retry_after_secs: None,
                         status: "done".to_string(),
@@ -6194,6 +6200,7 @@ mod tests {
             *self.seen_resume_agent_session_id.lock().unwrap() =
                 Some(spec.resume_agent_session_id.clone());
             RunnerResult {
+                bearing: None,
                 thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "done".to_string(),
@@ -6490,6 +6497,7 @@ mod tests {
                 );
             }
             RunnerResult {
+                bearing: None,
                 thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "done".to_string(),
@@ -6635,6 +6643,7 @@ mod tests {
             self.rendezvous();
             self.current.fetch_sub(1, Ordering::SeqCst);
             RunnerResult {
+                bearing: None,
                 thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "done".to_string(),
@@ -7251,6 +7260,7 @@ mod tests {
                         RunnerResult::failure("first attempt fails")
                     } else {
                         RunnerResult {
+                            bearing: None,
                             thinking_stall_last_line: None,
                             retry_after_secs: None,
                             status: "done".to_string(),
@@ -7275,6 +7285,7 @@ mod tests {
                     self.b_started.store(true, Ordering::SeqCst);
                     std::thread::sleep(Duration::from_millis(400));
                     RunnerResult {
+                        bearing: None,
                         thinking_stall_last_line: None,
                         retry_after_secs: None,
                         status: "done".to_string(),
@@ -7403,6 +7414,7 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(5));
                 }
                 return RunnerResult {
+                    bearing: None,
                     thinking_stall_last_line: None,
                     retry_after_secs: None,
                     status: "done".to_string(),
@@ -7429,6 +7441,7 @@ mod tests {
                     return RunnerResult::failure("first proof attempt fails");
                 }
                 return RunnerResult {
+                    bearing: None,
                     thinking_stall_last_line: None,
                     retry_after_secs: None,
                     status: "done".to_string(),
@@ -7453,6 +7466,7 @@ mod tests {
                 self.finalize_started.store(true, Ordering::SeqCst);
             }
             RunnerResult {
+                bearing: None,
                 thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "done".to_string(),
@@ -7593,6 +7607,7 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(5));
                 }
                 return RunnerResult {
+                    bearing: None,
                     thinking_stall_last_line: None,
                     retry_after_secs: None,
                     status: "done".to_string(),
@@ -7620,6 +7635,7 @@ mod tests {
                 }
             }
             RunnerResult {
+                bearing: None,
                 thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "done".to_string(),
@@ -7750,6 +7766,7 @@ mod tests {
                 RunnerResult::failure("intentional failure")
             } else {
                 RunnerResult {
+                    bearing: None,
                     thinking_stall_last_line: None,
                     retry_after_secs: None,
                     status: "done".to_string(),
@@ -7992,6 +8009,7 @@ mod tests {
                 )
             } else {
                 RunnerResult {
+                    bearing: None,
                     thinking_stall_last_line: None,
                     retry_after_secs: None,
                     status: "done".to_string(),
@@ -8340,6 +8358,7 @@ mod tests {
                 ));
             }
             RunnerResult {
+                bearing: None,
                 thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "done".to_string(),
@@ -8410,6 +8429,7 @@ mod tests {
                 .unwrap()
                 .push((spec.proof, spec.system_prompt.clone()));
             RunnerResult {
+                bearing: None,
                 thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "done".to_string(),
@@ -8638,6 +8658,7 @@ mod tests {
                     .push((spec.agent.clone(), spec.model.clone()));
             }
             RunnerResult {
+                bearing: None,
                 thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "done".to_string(),
@@ -8712,6 +8733,7 @@ mod tests {
                 }
             }
             RunnerResult {
+                bearing: None,
                 thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "done".to_string(),
@@ -8913,6 +8935,7 @@ mod tests {
                 RunnerResult::failure("intentional failure")
             } else {
                 RunnerResult {
+                    bearing: None,
                     thinking_stall_last_line: None,
                     retry_after_secs: None,
                     status: "done".to_string(),
@@ -9039,6 +9062,7 @@ mod tests {
                 return RunnerResult::failure("blocking runner was never cancelled");
             }
             RunnerResult {
+                bearing: None,
                 thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "done".to_string(),
@@ -9543,6 +9567,7 @@ mod tests {
                 .unwrap_or_default();
             self.calls.lock().unwrap().push(label);
             RunnerResult {
+                bearing: None,
                 thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "done".to_string(),
@@ -9807,6 +9832,7 @@ mod tests {
         fn run(&self, spec: &RunnerSpec) -> RunnerResult {
             self.seen.lock().unwrap().push(spec.env_overrides.clone());
             RunnerResult {
+                bearing: None,
                 thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "done".to_string(),
@@ -9977,6 +10003,7 @@ mod tests {
             git(&["add", "."]);
             git(&["commit", "--message", "cell work"]);
             RunnerResult {
+                bearing: None,
                 thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "done".to_string(),
@@ -10345,6 +10372,7 @@ mod tests {
                 .unwrap()
                 .push((spec.cell_id.clone(), spec.resume_agent_session_id.clone()));
             RunnerResult {
+                bearing: None,
                 thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "done".to_string(),
@@ -10519,6 +10547,7 @@ mod tests {
                 .unwrap()
                 .push((spec.cell_id.clone(), spec.assigned_agent_session_id.clone()));
             RunnerResult {
+                bearing: None,
                 thinking_stall_last_line: None,
                 retry_after_secs: None,
                 status: "done".to_string(),
