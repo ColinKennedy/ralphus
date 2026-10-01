@@ -58,7 +58,11 @@
         // The Reviews tab's branch inspector. Its own preference key, like the
         // sidebar's, so resizing one never moves the other. Dragged from the
         // left edge, hence `data-invert="1"` on its splitter.
-        "--review-inspector-w": { key: "ralphus-review-inspector-w", def: 360, min: 280, max: 720 },
+        // No static max: a flat 720px cap stopped the inspector around a third
+        // of a wide screen, while the sidebar opposite it could grow freely.
+        // Its ceiling is computed by reviewInspectorMaxW() instead, so it can
+        // take as much room as the review pane can spare.
+        "--review-inspector-w": { key: "ralphus-review-inspector-w", def: 360, min: 280 },
       };
       const MIN_CENTER_W = 240; // guard rail for the middle graph pane, matching --sidebar-w's existing min-width pattern
       // RALPHUS-REVIEWS-SPLIT:BEGIN
@@ -86,6 +90,23 @@
       function reviewsSidebarMaxW() {
         return reviewsSidebarMaxWFor(window.innerWidth);
       }
+      /**
+       * The branch inspector's dynamic max width: everything the viewport has
+       * left once the review list and a readable review pane are accounted for.
+       * Mirrors reviewsSidebarMaxW rather than the flat cap it replaces, which
+       * stopped the inspector a third of the way across a wide screen while the
+       * sidebar opposite it could be dragged freely.
+       * @returns {number}
+       */
+      function reviewInspectorMaxW() {
+        const sidebarW = parseFloat(getComputedStyle(document.documentElement)
+          .getPropertyValue("--reviews-sidebar-w")) || SPLIT_CFG["--reviews-sidebar-w"].def;
+        // 12px covers both splitter tracks between the three panes.
+        return Math.max(
+          SPLIT_CFG["--review-inspector-w"].min,
+          window.innerWidth - sidebarW - 12 - MIN_REVIEW_DETAIL_W,
+        );
+      }
       // RALPHUS-REVIEWS-SPLIT:END
       /**
        * Computes the details pane's dynamic max width so the center graph pane never collapses below MIN_CENTER_W.
@@ -108,7 +129,7 @@
        * @param {SplitCfgEntry} c
        * @returns {number}
        */
-      function paneMax(varName, c) { return varName === "--details-w" ? detailsMaxW() : varName === "--task-details-w" ? taskDetailsMaxW() : varName === "--reviews-sidebar-w" ? reviewsSidebarMaxW() : (c.max ?? Infinity); }
+      function paneMax(varName, c) { return varName === "--details-w" ? detailsMaxW() : varName === "--task-details-w" ? taskDetailsMaxW() : varName === "--reviews-sidebar-w" ? reviewsSidebarMaxW() : varName === "--review-inspector-w" ? reviewInspectorMaxW() : (c.max ?? Infinity); }
       /** @type {{el: Element, varName: string, invert: boolean, startX: number, startW: number, min: number}|null} */
       let splitDrag = null;
       /**

@@ -566,6 +566,22 @@
       /* A command is something you read in full and whose outcome you want to
          see, so it gets a row rather than a wrapping chip. Long commands elide
          rather than reflowing the section; the row's ⋯ shows the whole thing. */
+      /* ---- Review pane density ----
+         The sections were built from the board's general-purpose spacing, which
+         is tuned for the sparser Squads tab. A review is a dense document --
+         a stack, three command lists, a summary -- so it reads better tighter:
+         the text can then carry its own size instead of being lost in padding.
+         Section headings also sit on their own rule rather than floating. */
+      #review-detail h3.section {
+        display: flex; align-items: center; gap: 8px;
+        margin: 16px 0 7px; font-size: 10.5px; letter-spacing: .9px;
+      }
+      #review-detail h3.section::after {
+        content: ""; flex: 1; height: 1px; background: var(--border); opacity: .55;
+      }
+      #review-detail .kv-row { margin: 2px 0; }
+      .review-main > .col.center { padding: 14px 18px; }
+
       .cmd-list, .rungroup { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
       /* A run-group leads with what its commands promise, so a section is not
          just a list of strings whose contract you have to remember. */
@@ -597,6 +613,30 @@
          actually run, which is the part worth reading before pressing it. */
       .cmd-label { flex: none; font-size: 11.5px; font-weight: 600; color: var(--text); }
       .cmd-run:disabled { opacity: .5; cursor: not-allowed; }
+      /* A command row's trailing controls: how long ago it was launched, what
+         the board knows about it, expand, and its ⋯. */
+      .cmd-dur { flex: none; font-size: 10.5px; color: var(--cancelled); }
+      .cmd-status {
+        flex: none; font-size: 10px; border-radius: 20px; padding: 1px 8px;
+        border: 1px solid var(--border); color: var(--cancelled); background: var(--bg);
+      }
+      .cmd-status.idle { opacity: .6; }
+      .cmd-status.running { color: var(--accent); border-color: var(--accent); background: rgba(74,163,255,.13); }
+      .cmd-expand {
+        flex: none; background: none; border: 1px solid var(--border); color: var(--cancelled);
+        border-radius: 5px; width: 20px; height: 20px; line-height: 1; font-size: 12px;
+        cursor: pointer; display: grid; place-items: center;
+      }
+      .cmd-expand:hover { color: var(--text); border-color: var(--muted); background: var(--panel-2); }
+      /* The expanded full text of one command, under its row. */
+      .cmd-full {
+        margin: 0; padding: 8px 10px 10px 41px; background: var(--bg);
+        border-bottom: 1px solid var(--border); font-size: 11px; line-height: 1.6;
+        white-space: pre-wrap; word-break: break-all; color: var(--text);
+      }
+      /* Selecting a command row reads the same as selecting a branch row. */
+      .cmd-row.selectable { cursor: pointer; }
+      .cmd-row.sel { background: rgba(74,163,255,.13); box-shadow: inset 2px 0 0 var(--accent); }
       .absent-note.warn { border-color: var(--unverified); color: var(--unverified); }
       .absent-note.warn b { color: var(--unverified); }
       .cmd-row {

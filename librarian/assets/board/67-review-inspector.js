@@ -33,6 +33,8 @@
        * @type {string}
        */
       let reviewDockScope = "review";
+      /** @type {string} The command text when the dock is scoped to one command, for its header. */
+      let reviewDockCommand = "";
       /** @type {boolean} When true the dock ignores selection changes. */
       let reviewDockSticky = false;
 
@@ -205,10 +207,63 @@
        * @returns {string}
        */
       function inspectorFeedbackTab(g, b) {
+        const key = `${g.id}:${b.id}`;
+        const sending = feedbackSending.has(key);
         return `<div class="hint" style="margin:0 0 10px">What you write here is routed into
             <span class="mono">${esc(b.branch)}</span>'s worktree as a change request. The resolver
             agent amends the branch and replies.</div>
-          ${branchFeedbackSection(g, b)}`;
+          ${branchFeedbackSection(g, b)}
+          <div class="fb-composer">
+            <textarea id="fb-input-${esc(b.id)}" rows="3" ${sending ? "disabled" : ""}
+              placeholder="Ask for a change on ${esc(b.branch)}…"
+              data-tip="Describe the change you want on this branch. The resolver agent edits it in its own worktree, amends the commit, and replies in this thread.\nCtrl+Enter sends."></textarea>
+            <div class="btn-row" style="margin-top:6px">
+              <button class="btn primary" ${sending ? "disabled" : ""} data-click="sendBranchFeedback"
+                data-guardian-id="${esc(g.id)}" data-branch-id="${esc(b.id)}"
+                data-tip="Send this to the resolver agent.\nIt is recorded on the branch's thread immediately; the agent's reply appears here when it finishes.">${sending ? "Sending…" : "Send"}</button>
+            </div>
+          </div>`;
+      }
+      /** @type {Set<string>} Branch keys with a feedback post in flight, so Send cannot be double-fired. */
+      const feedbackSending = new Set();
+      /**
+       * Posts a change request onto one branch's feedback thread. Until now the
+       * board could only *read* this thread (RAL-272) -- giving feedback meant
+       * leaving for the CLI, which is a strange gap on the surface whose whole
+       * job is reviewing.
+       * @param {string} gid - The review id.
+       * @param {string} bid - The branch id.
+       * @returns {Promise<void>}
+       */
+      async function sendBranchFeedback(gid, bid) {
+        const el = /** @type {HTMLTextAreaElement|null} */ (document.getElementById(`fb-input-${bid}`));
+        const text = (el && el.value || "").trim();
+        if (!text) { notify("warn", "Write the change you want before sending."); return; }
+        const key = `${gid}:${bid}`;
+        if (feedbackSending.has(key)) return;
+        feedbackSending.add(key);
+        renderReviewInspector();
+        try {
+          const r = await fetch(`/api/guardians/${gid}/branches/${bid}/feedback`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ feedback: text }),
+          });
+          if (!r.ok) {
+            const detail = await r.text();
+            notify("error", `Feedback was not sent: ${detail.slice(0, 200)}`);
+            return;
+          }
+          if (el) el.value = "";
+          notify("success", "Feedback sent to the resolver agent.");
+          // Re-read the thread so the message appears without a manual refresh.
+          loadBranchMessages(gid, bid);
+        } catch (e) {
+          notify("error", `Feedback was not sent: ${e}`);
+        } finally {
+          feedbackSending.delete(key);
+          renderReviewInspector();
+        }
       }
       /**
        * Live: the resolver's terminal for this branch. Nothing attaches until
@@ -261,7 +316,15 @@
         const g = guardians.find((x) => x.id === selectedGuardian);
         const b = (g && g.branches ? g.branches.find((x) => x.id === reviewDockScope) : null) || null;
         const scopeEl = document.getElementById("review-dock-scope");
-        if (scopeEl) scopeEl.textContent = b ? b.branch : "whole review";
+        if (scopeEl) {
+          // Three kinds of scope: the whole review, one branch, or one command.
+          const cmdScoped = !b && reviewDockScope !== "review" && !!reviewDockCommand;
+          scopeEl.textContent = b
+            ? b.branch
+            : (cmdScoped
+              ? (reviewDockCommand.length > 40 ? `${reviewDockCommand.slice(0, 40)}…` : reviewDockCommand)
+              : "whole review");
+        }
         const hint = document.getElementById("review-dock-hint");
         if (hint) {
           hint.textContent = !reviewDockOpen
@@ -447,6 +510,45 @@
         manual: { label: "manual checks", note: "Written by the resolver agent against this stack's changes. Advisory — they never block approval." },
       };
       /**
+       * Which env scope each runnable section edits, and the endpoint behind it.
+       * The daemon exposes one scope per section (RAL-203); putting the editor
+       * on the section's own ⋯ is what makes "which scope am I changing"
+       * unambiguous.
+       * @type {{[kind: string]: {scope: string, url: string, label: string, tip: string}}}
+       */
+      const ENV_SCOPE_FOR_SECTION = {
+        gates: {
+          scope: "tests",
+          url: "tests-env",
+          label: "check gates",
+          tip: "The environment the check gates actually run in.\nResolved, not directly editable — the daemon composes it from the daemon environment plus the build step's overrides, so edit it there.",
+        },
+        manual: {
+          scope: "manual_checks",
+          url: "manual-checks-env",
+          label: "manual checks",
+          tip: "Environment overrides applied when the suggested manual checks run.",
+        },
+        actions: {
+          scope: "build",
+          url: "build-env",
+          label: "test actions",
+          tip: "Environment overrides for the build step, which is what test actions run against.",
+        },
+      };
+      /**
+       * Opens the resolved-environment viewer for one section's scope.
+       * @param {string} gid - The review id.
+       * @param {string} kind - Which section's scope to open.
+       * @returns {void}
+       */
+      function openSectionEnv(gid, kind) {
+        closeSquadMenu();
+        const meta = ENV_SCOPE_FOR_SECTION[kind];
+        if (!meta) return;
+        openEnvViewer(`/api/guardians/${gid}/${meta.url}`);
+      }
+      /**
        * The ⋯ button for one section heading.
        * @param {string} gid - The review id.
        * @param {string} kind - Which section, keyed into {@link REVIEW_SECTION_MENUS}.
@@ -474,6 +576,13 @@
         const items = [
           `<div data-click="scopeReviewDockToSection" data-guardian-id="${esc(gid)}" data-kind="${esc(kind)}" data-tip="Open the log drawer for this review.\n${esc(meta.note)}">☰ Logs</div>`,
         ];
+        // Environment lives with the thing it applies to. Each runnable
+        // section edits its own scope from here, rather than every scope being
+        // piled into the review's settings modal where you had to work out
+        // which one governed what you were looking at.
+        if (ENV_SCOPE_FOR_SECTION[kind]) {
+          items.push(`<div data-click="openSectionEnv" data-guardian-id="${esc(gid)}" data-kind="${esc(kind)}" data-tip="${esc(ENV_SCOPE_FOR_SECTION[kind].tip)}">⚙ Environment overrides…</div>`);
+        }
         if (kind === "manual") {
           items.push(`<div data-click="runAllManualChecks" data-guardian-id="${esc(gid)}" data-tip="Run every suggested manual check, each in the built review worktree.">▶ Run all</div>`);
           items.push(`<div data-click="regenManualChecks" data-guardian-id="${esc(gid)}" data-tip="Ask the resolver agent to write these checks again against the stack's current changes.\nRuns in the background and never blocks Approve or Merge / rebase.">↻ Regenerate</div>`);
@@ -550,6 +659,128 @@
         if (reviewDockEvents[gid] === undefined) loadReviewDockEvents(gid);
       }
 
+      // ---- Command rows as selections ----
+      //
+      // A command row is a selection in the same sense a branch row is: picking
+      // one scopes the log drawer to it. That makes "what did this command
+      // actually do" the same gesture as "what did this branch actually do",
+      // instead of a different control in a different place.
+
+      /**
+       * Per-command run state, keyed by `<gid>:<kind>:<index>`.
+       *
+       * The daemon launches a command into a terminal and reports nothing back
+       * about how it ended -- `GuardianCheck` carries no exit code, status or
+       * duration, and there is no per-command result endpoint. So this tracks
+       * what the board genuinely knows: that you asked for it, and how long ago.
+       * It deliberately never claims "pass": inventing an outcome the backend
+       * never sent would be worse than admitting the gap. Surfacing a real
+       * pass/fail needs the daemon to record the tmux pane's RALPHUS_TMUX_DONE
+       * result per command.
+       * @type {{[key: string]: {state: string, startedMs: number, endedMs: number}}}
+       */
+      const commandRuns = {};
+      /**
+       * Marks one command as launched, so its row can show it is running and
+       * for how long.
+       * @param {string} key - The command's key.
+       * @returns {void}
+       */
+      function markCommandRunning(key) {
+        commandRuns[key] = { state: "running", startedMs: Date.now(), endedMs: 0 };
+        renderReviewDetail();
+      }
+      /**
+       * One command row's status chip and elapsed time.
+       * @param {string} key - The command's key.
+       * @returns {string}
+       */
+      function commandRunStatus(key) {
+        const r = commandRuns[key];
+        if (!r) {
+          return `<span class="cmd-status idle" data-tip="Not run from the board this session.\nThe daemon does not report a per-command result, so this only reflects runs you started here.">idle</span>`;
+        }
+        const secs = Math.max(0, Math.round(((r.endedMs || Date.now()) - r.startedMs) / 1000));
+        const elapsed = secs >= 60 ? `${Math.floor(secs / 60)}m ${secs % 60}s` : `${secs}s`;
+        return `<span class="cmd-dur num" data-tip="How long ago this run was launched from the board.">${elapsed}</span>`
+          + `<span class="cmd-status running" data-tip="Launched in a terminal from the board.\nThe daemon reports no pass/fail for an individual command, so this cannot turn green on its own — open the command's logs to see how it ended.">running</span>`;
+      }
+
+      /** @type {string} The selected command's key, or "" for none. */
+      let selectedCommandKey = "";
+      /** @type {{[key: string]: boolean}} Command keys whose full text is expanded under the row. */
+      const commandFullOpen = {};
+
+      /**
+       * Selects one command row, scoping the log drawer to it unless pinned.
+       * @param {string} gid - The review id.
+       * @param {string} key - The command's key, `<gid>:<kind>:<index>`.
+       * @param {string} cmd - The command text, for the drawer's header.
+       * @returns {void}
+       */
+      function selectReviewCommandRow(gid, key, cmd) {
+        selectedCommandKey = selectedCommandKey === key ? "" : key;
+        if (!reviewDockSticky) {
+          reviewDockScope = selectedCommandKey ? key : "review";
+          reviewDockCommand = selectedCommandKey ? cmd : "";
+        }
+        renderReviewDetail();
+        renderReviewDock();
+      }
+      /**
+       * Scopes the log drawer to one command and opens it. An explicit ask
+       * beats the sticky pin, which guards against incidental scope changes.
+       * @param {string} gid - The review id.
+       * @param {string} key - The command's key.
+       * @param {string} cmd - The command text.
+       * @returns {void}
+       */
+      function scopeReviewDockToCommand(gid, key, cmd) {
+        closeSquadMenu();
+        selectedCommandKey = key;
+        reviewDockScope = key;
+        reviewDockCommand = cmd;
+        if (!reviewDockOpen) toggleReviewDock();
+        else renderReviewDock();
+        if (reviewDockEvents[gid] === undefined) loadReviewDockEvents(gid);
+        renderReviewDetail();
+      }
+      /**
+       * Expands or collapses one command's full text beneath its row. The row
+       * elides so the section stays scannable; this is how you read the rest
+       * without leaving the page for a popup.
+       * @param {string} key - The command's key.
+       * @returns {void}
+       */
+      function toggleReviewCommandFull(key) {
+        closeSquadMenu();
+        commandFullOpen[key] = !commandFullOpen[key];
+        renderReviewDetail();
+      }
+      /**
+       * Whether one command row is the selected one.
+       * @param {string} key - The command's key.
+       * @returns {boolean}
+       */
+      function isCommandRowSelected(key) {
+        return selectedCommandKey === key;
+      }
+      /**
+       * The expanded full-text block under a command row, or "" when collapsed.
+       * @param {string} key - The command's key.
+       * @param {string} cmd - The command text.
+       * @returns {string}
+       */
+      function commandFullBlock(key, cmd) {
+        if (!commandFullOpen[key]) return "";
+        return `<div class="cmd-full mono">${esc(cmd)}
+            <div class="btn-row" style="margin-top:7px">
+              <button class="btn" data-copy="${esc(cmd)}" onclick="copyText(event)" data-tip="Copy the whole command.">⧉ Copy</button>
+              <button class="btn" data-click="toggleReviewCommandFull" data-key="${esc(key)}" data-tip="Collapse this command back to one line.">Collapse</button>
+            </div>
+          </div>`;
+      }
+
       /**
        * Opens one command's ⋯ menu -- a check gate, for now. Commands are long
        * and elided in their row, so "see the whole thing" and "copy it" need a
@@ -557,29 +788,22 @@
        * @param {MouseEvent} e - The click that opened it.
        * @param {string} gid - The review id.
        * @param {string} cmd - The command text.
+       * @param {string} anchorKey - The command's key, `<gid>:<kind>:<index>`.
        * @returns {void}
        */
-      function openReviewCommandMenu(e, gid, cmd) {
+      function openReviewCommandMenu(e, gid, cmd, anchorKey) {
         e.preventDefault(); e.stopPropagation(); closeSquadMenu();
         const menu = document.createElement("div");
         menu.className = "ctx-menu"; menu.id = "squad-menu";
+        const key = anchorKey;
         menu.innerHTML = [
-          `<div data-click="showCommandText" data-cmd="${esc(cmd)}" data-tip="Show the whole command in a copyable popup — the row elides it to stay scannable.">🔍 Show full command</div>`,
+          `<div data-click="toggleReviewCommandFull" data-key="${esc(key)}" data-tip="Show the whole command under its row — the row elides it to keep the section scannable.">🔍 ${commandFullOpen[key] ? "Collapse" : "Show full command"}</div>`,
           `<div data-copy="${esc(cmd)}" onclick="copyText(event)" data-tip="Copy this command to the clipboard.">⧉ Copy command</div>`,
-          `<div data-click="scopeReviewDockToSection" data-guardian-id="${esc(gid)}" data-kind="gates" data-tip="Open the review's log drawer.">☰ Logs</div>`,
+          `<div data-click="scopeReviewDockToCommand" data-guardian-id="${esc(gid)}" data-key="${esc(key)}" data-cmd="${esc(cmd)}" data-tip="Open the log drawer scoped to this command.">☰ Logs for this command</div>`,
         ].join("");
         document.body.appendChild(menu);
         menu.style.left = Math.min(e.clientX, window.innerWidth - 220) + "px";
         menu.style.top = Math.min(e.clientY, window.innerHeight - 110) + "px";
-      }
-      /**
-       * Shows one command's full text in the board's shared copyable popup.
-       * @param {string} cmd - The command text.
-       * @returns {void}
-       */
-      function showCommandText(cmd) {
-        closeSquadMenu();
-        showTextPopup("Command", cmd);
       }
       /**
        * Opens the log drawer from a section's menu.

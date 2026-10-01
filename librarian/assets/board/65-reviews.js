@@ -662,22 +662,18 @@
         if (!hasAttempt && !hasCumulative) return "";
         const cap = g.maximum_budget_usd;
         const overCap = cap != null && (g.cumulative_cost_usd ?? 0) > cap;
-        // Several backends (ollama, codex, the native pydantic runner) report
-        // no dollar figure at all. A chip reading "N/A" is worse than no chip:
-        // it looks like a failure rather than a backend that simply does not
-        // price its calls. Fall back to the token count, which every backend
-        // does report, and let the tooltip carry the rest.
+        // Always the money, never a token count: tokens are not comparable
+        // across models, so a token figure sitting where a reader scans for
+        // "what has this cost" is actively misleading. Cumulative, so it covers
+        // every rebase attempt rather than only the latest.
         const priced = (g.cumulative_cost_usd ?? 0) > 0;
-        const tokens = (g.cumulative_tokens_in ?? 0) + (g.cumulative_tokens_out ?? 0);
-        const label = priced
-          ? fmtCostUsd(g.cumulative_cost_usd)
-          : (tokens >= 1000 ? `${Math.round(tokens / 1000)}k tok` : `${tokens} tok`);
+        const label = fmtCostUsd(g.cumulative_cost_usd);
         const tip = "This review's own conflict-resolution and proof agent spend, summed across every rebase attempt."
           + " It excludes the tasks/cells that fed into the review."
           + `\nThis attempt: input ${g.attempt_tokens_in ?? 0} · output ${g.attempt_tokens_out ?? 0} · ${fmtCostUsd(g.attempt_cost_usd)}`
           + `\nAll attempts: input ${g.cumulative_tokens_in ?? 0} · output ${g.cumulative_tokens_out ?? 0} · ${fmtCostUsd(g.cumulative_cost_usd)}`
           + (cap ? `\nBudget cap: $${cap.toFixed(4)} — once exceeded the daemon stops making resolver/proof calls and fails the review.` : "")
-          + (priced ? "" : "\nThis review's agent backend reports no dollar figure, so this shows tokens instead — it does not mean the work was free.");
+          + (priced ? "" : "\nN/A means this review's agent backend reported no dollar figure at all (ollama, codex and the native runner never do) — it does not mean the work was free.");
         return `<span class="cost-chip${overCap ? " over" : ""}" data-tip="${esc(tip)}">`
           + `${esc(label)}${overCap ? " ⚠" : ""}</span>`;
       }
@@ -1408,53 +1404,90 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         deployed: "Deploy",
       };
       /**
-       * Where a review's status sits on {@link REVIEW_PIPELINE}. Statuses that
-       * are not themselves stops on the rail (merge_failed, merge_stopped,
-       * cancelled) resolve to the stage they stalled in, so the rail still
-       * shows how far the review got rather than collapsing to the start.
-       * @param {string} status - The review's status.
-       * @returns {number}
+       * Each pipeline stage's own state, computed independently.
+       *
+       * A review is not a single point on a line. Branches rebase concurrently,
+       * post-merge gates run while the stack is already readable, and auto-fix
+       * can be pushing commits to a PR while a later branch is still merging --
+       * so "collect", "rebase" and "review" are routinely live at the same
+       * time. Reading one status enum and lighting a single dot misreported all
+       * of that; every stage now answers for itself, and more than one can be
+       * active at once.
+       * @param {GuardianView} g - The review.
+       * @returns {{[stop: string]: string}} Per-stage state: "done" | "now" | "stalled" | "idle".
        */
-      function reviewPipelineIndex(status) {
-        const at = REVIEW_PIPELINE.indexOf(status);
-        if (at >= 0) return at;
-        if (status === "merge_failed" || status === "merge_stopped" || status === "cancelled") {
-          return REVIEW_PIPELINE.indexOf("merging");
+      function reviewPipelineStates(g) {
+        const branches = (g.branches || []).filter((b) => b.enabled !== false);
+        const anyBranch = (/** @type {(b: GuardianBranch) => boolean} */ f) => branches.some(f);
+        const terminal = (/** @type {GuardianBranch} */ b) =>
+          ["done", "merged", "closed", "conflict_resolved", "failed"].includes(b.merge_status || "");
+
+        // Collect: any contributing cell still producing its branch.
+        const collecting = g.status === "collecting"
+          || anyBranch((b) => b.source_cell_state !== undefined && b.source_cell_state !== "done");
+        // Rebase: any branch actively mid-rebase, or the review as a whole is.
+        const rebasing = g.status === "merging"
+          || anyBranch((b) => b.merge_status === "in_progress"
+            || (b.rebase_commands_total !== null && b.rebase_commands_total !== undefined));
+        const rebaseFailed = g.status === "merge_failed" || g.status === "merge_stopped"
+          || anyBranch((b) => b.merge_status === "failed");
+        const rebaseDone = branches.length > 0 && branches.every(terminal);
+        // Review: the stack is readable. Post-merge work (check gates,
+        // manual-checks generation) runs here and never blocks it.
+        const reviewing = g.status === "in_review" || g.post_merge_status === "running";
+        const approved = ["approved", "merged", "deployed"].includes(g.status);
+        const deployed = g.status === "deployed";
+
+        /** @type {{[stop: string]: string}} */
+        const st = {
+          collecting: collecting ? "now" : (branches.length ? "done" : "idle"),
+          merging: rebaseFailed ? "stalled" : (rebasing ? "now" : (rebaseDone ? "done" : "idle")),
+          in_review: approved ? "done" : (reviewing ? "now" : "idle"),
+          approved: deployed ? "done" : (approved ? "now" : "idle"),
+          deployed: deployed ? "now" : "idle",
+        };
+        if (g.status === "cancelled") {
+          Object.keys(st).forEach((k) => { if (st[k] === "now") st[k] = "stalled"; });
         }
-        return 0;
+        return st;
       }
       /**
-       * Renders the lifecycle rail: each stop marked done, current, or not yet
-       * reached.
+       * Renders the lifecycle rail. Several stages can read as live at once --
+       * see {@link reviewPipelineStates} for why that is the normal case here
+       * rather than an edge one.
        * @param {GuardianView} g - The review.
        * @returns {string}
        */
       function reviewPipeline(g) {
-        const at = reviewPipelineIndex(g.status);
-        const stalled = ["merge_failed", "merge_stopped", "cancelled"].includes(g.status);
-        // The merged count belongs on the stage it describes. It used to be a
-        // standalone "merged N/M" row plus a progress bar directly under the
-        // banner, which said the same thing the rail now says positionally.
-        const branches = g.branches || [];
-        const enabled = branches.filter((b) => b.enabled !== false).length;
-        const merged = branches.filter((b) => b.enabled !== false
-          && ["done", "merged", "closed", "conflict_resolved"].includes(b.merge_status || "")).length;
+        const st = reviewPipelineStates(g);
+        const branches = (g.branches || []).filter((b) => b.enabled !== false);
+        const merged = branches.filter((b) =>
+          ["done", "merged", "closed", "conflict_resolved"].includes(b.merge_status || "")).length;
         /** @type {{[stop: string]: string}} */
-        const counts = { merging: enabled ? `${merged}/${enabled}` : "" };
+        const counts = { merging: branches.length ? `${merged}/${branches.length}` : "" };
+        /** @type {{[stop: string]: string}} */
+        const TIPS = {
+          collecting: "Waiting on the task cells that produce this review's branches.",
+          merging: "Rebasing the stack. Branches rebase concurrently, so this can be live while other stages are too.",
+          in_review: "The stack is readable and can be approved. Post-merge gates and manual-check generation run here without blocking it.",
+          approved: "Approved, whether or not its PR stack has merged.",
+          deployed: "Shipped.",
+        };
+        /** @type {{[state: string]: string}} */
+        const WORD = { done: "complete", now: "in progress now", stalled: "stalled here", idle: "not started" };
         return `<div class="review-pipe">${REVIEW_PIPELINE.map((stop, i) => {
-          const cls = i < at ? "done" : (i === at ? (stalled ? "stalled" : "now") : "");
-          const mark = i < at ? "✓" : (i === at ? (stalled ? "!" : "●") : "");
+          const state = st[stop] || "idle";
+          const cls = state === "idle" ? "" : state;
+          const mark = state === "done" ? "✓" : (state === "now" ? "●" : (state === "stalled" ? "!" : ""));
           const count = counts[stop] ? ` <span class="pipe-count num">${counts[stop]}</span>` : "";
-          const tip = i < at
-            ? `${REVIEW_PIPELINE_LABELS[stop]} — complete.`
-            : i === at
-              ? (stalled
-                ? `${REVIEW_PIPELINE_LABELS[stop]} — this review stalled here (${g.status.replace(/_/g, " ")}).`
-                : `${REVIEW_PIPELINE_LABELS[stop]} — this review is here now.`)
-              : `${REVIEW_PIPELINE_LABELS[stop]} — not reached yet.`;
+          const tip = `${REVIEW_PIPELINE_LABELS[stop]} — ${WORD[state]}.\n${TIPS[stop]}`;
+          // A connector reads "done" only when the stage behind it is, so a
+          // later stage going live early never retroactively colours an earlier
+          // one that is still running.
+          const line = i < REVIEW_PIPELINE.length - 1
+            ? `<span class="pipe-line ${state === "done" ? "done" : ""}"></span>` : "";
           return `<span class="pipe-stop ${cls}" data-tip="${esc(tip)}">`
-            + `<span class="pipe-dot">${mark}</span>${REVIEW_PIPELINE_LABELS[stop]}${count}</span>`
-            + (i < REVIEW_PIPELINE.length - 1 ? `<span class="pipe-line ${i < at ? "done" : ""}"></span>` : "");
+            + `<span class="pipe-dot">${mark}</span>${REVIEW_PIPELINE_LABELS[stop]}${count}</span>${line}`;
         }).join("")}</div>`;
       }
 
@@ -1738,12 +1771,16 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         // one by hand, so a button here would be a lie.
         const gateBadge = (/** @type {string} */ text, /** @type {string} */ tip) =>
           `<span class="rg-when" data-tip="${esc(tip)}">${esc(text)}</span>`;
-        const gateRow = (/** @type {string} */ cmd, /** @type {number} */ i, /** @type {string} */ icon, /** @type {string} */ iconTip, /** @type {string} */ iconColor) =>
-          `<div class="cmd-row">
-            <span class="cmd-lock"${iconColor ? ` style="color:${iconColor}"` : ""} data-tip="${esc(iconTip)}">${icon}</span>
-            <span class="cmd-text mono" data-tip="${esc(cmd)}">${esc(cmd)}</span>
-            <button class="section-menu" data-click="openReviewCommandMenu" data-guardian-id="${esc(g.id)}" data-kind="gate" data-i="${i}" data-cmd="${esc(cmd)}" data-tip="Actions for this gate — show it in full, copy it, or open the review's log.">⋯</button>
-          </div>`;
+        const gateRow = (/** @type {string} */ cmd, /** @type {number} */ i, /** @type {string} */ icon, /** @type {string} */ iconTip, /** @type {string} */ iconColor) => {
+          const key = `${g.id}:gate:${i}`;
+          return `<div class="cmd-row selectable${isCommandRowSelected(key) ? " sel" : ""}" data-click="selectReviewCommandRow" data-guardian-id="${esc(g.id)}" data-key="${esc(key)}" data-cmd="${esc(cmd)}" data-tip="Select this gate to scope the log drawer to it.">
+              <span class="cmd-lock"${iconColor ? ` style="color:${iconColor}"` : ""} data-tip="${esc(iconTip)}">${icon}</span>
+              <span class="cmd-text mono" data-tip="${esc(cmd)}">${esc(cmd)}</span>
+              ${commandRunStatus(key)}
+              <button class="cmd-expand" data-click="toggleReviewCommandFull" data-key="${esc(key)}" data-tip="Show or hide this gate in full beneath its row.">${commandFullOpen[key] ? "−" : "+"}</button>
+              <button class="section-menu" data-click="openReviewCommandMenu" data-guardian-id="${esc(g.id)}" data-key="${esc(key)}" data-cmd="${esc(cmd)}" data-tip="Actions for this gate — its logs, its environment, copy it.">⋯</button>
+            </div>${commandFullBlock(key, cmd)}`;
+        };
         const checks = gChecks.length
           ? reviewRunGroup(
             gateBadge("runs after merge", "Check gates are run by the daemon after each merge commit and on the combined worktree. There is no way to trigger one by hand from here."),
@@ -1914,16 +1951,18 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
                   </div>`;
               }
               const cmdText = h.command || "";
-              return `<div class="cmd-row">
+              return `<div class="cmd-row selectable${isCommandRowSelected(key) ? " sel" : ""}" data-click="selectReviewCommandRow" data-guardian-id="${esc(g.id)}" data-key="${esc(key)}" data-cmd="${esc(cmdText)}" data-tip="Select this action to scope the log drawer to it.">
                   <button class="cmd-run" data-click="${needsInput ? "toggleCheckForm" : "runActionHint"}" ${
-                    needsInput ? `data-key="${esc(key)}"` : `data-guardian-id="${esc(g.id)}" data-i="${i}"`}
+                    needsInput ? `data-key="${esc(key)}"` : `data-guardian-id="${esc(g.id)}" data-i="${i}" data-runkey="${esc(key)}"`}
                     data-tip="${needsInput
                       ? `This action needs values filled in first — click to expand.\nRun: ${esc(cmdText)}`
                       : `Run this action in the built review worktree.\nRun: ${esc(cmdText)}`}">${needsInput ? (open ? "▲" : "▾") : "▶"}</button>
                   <span class="cmd-label">${label}</span>
                   <span class="cmd-text mono" data-tip="${esc(cmdText)}">${esc(cmdText)}</span>
-                  <button class="section-menu" data-click="openReviewCommandMenu" data-guardian-id="${esc(g.id)}" data-kind="action" data-i="${i}" data-cmd="${esc(cmdText)}" data-tip="Actions for this check — show it in full, copy it, or open the review's log.">⋯</button>
-                </div>
+                  ${commandRunStatus(key)}
+                  <button class="cmd-expand" data-click="toggleReviewCommandFull" data-key="${esc(key)}" data-tip="Show or hide this command in full beneath its row.">${commandFullOpen[key] ? "−" : "+"}</button>
+                  <button class="section-menu" data-click="openReviewCommandMenu" data-guardian-id="${esc(g.id)}" data-key="${esc(key)}" data-cmd="${esc(cmdText)}" data-tip="Actions for this check — its logs, its environment, copy it.">⋯</button>
+                </div>${commandFullBlock(key, cmdText)}
                 ${needsInput && open ? `<div class="cmd-form">${renderCheckInputForm(g, "action", i, h)}</div>` : ""}`;
             }).join("");
             return `<h3 class="section" data-tip="User-declared test actions from the task TOML [[review.action]] blocks.\nLabelled buttons give reviewers one-click access to targeted manual checks.">test actions${sectionMenuBtn(g.id, "actions")}</h3>
@@ -1981,15 +2020,17 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
                       const key = `${g.id}:manual:${i}`;
                       const needsInput = !!(cmd.inputs && cmd.inputs.length);
                       const open = !!checkFormOpen[key];
-                      return `<div class="cmd-row">
+                      return `<div class="cmd-row selectable${isCommandRowSelected(key) ? " sel" : ""}" data-click="selectReviewCommandRow" data-guardian-id="${esc(g.id)}" data-key="${esc(key)}" data-cmd="${esc(cmdText)}" data-tip="Select this check to scope the log drawer to it.">
                           <button class="cmd-run" data-click="${needsInput ? "toggleCheckForm" : "runSingleManualCheck"}" ${
-                            needsInput ? `data-key="${esc(key)}"` : `data-guardian-id="${esc(g.id)}" data-i="${i}"`}
+                            needsInput ? `data-key="${esc(key)}"` : `data-guardian-id="${esc(g.id)}" data-i="${i}" data-runkey="${esc(key)}"`}
                             data-tip="${needsInput
                               ? `This check needs values filled in first — click to expand.\nRun: ${esc(cmdText)}`
                               : `Run just this one, in the built review worktree.\nRun: ${esc(cmdText)}`}">${needsInput ? (open ? "▲" : "▾") : "▶"}</button>
                           <span class="cmd-text mono" data-tip="${esc(cmdText)}">${esc(cmdText)}</span>
-                          <button class="section-menu" data-click="openReviewCommandMenu" data-guardian-id="${esc(g.id)}" data-kind="manual" data-i="${i}" data-cmd="${esc(cmdText)}" data-tip="Actions for this check — show it in full, copy it, or open the review's log.">⋯</button>
-                        </div>
+                          ${commandRunStatus(key)}
+                          <button class="cmd-expand" data-click="toggleReviewCommandFull" data-key="${esc(key)}" data-tip="Show or hide this command in full beneath its row.">${commandFullOpen[key] ? "−" : "+"}</button>
+                          <button class="section-menu" data-click="openReviewCommandMenu" data-guardian-id="${esc(g.id)}" data-key="${esc(key)}" data-cmd="${esc(cmdText)}" data-tip="Actions for this check — its logs, its environment, copy it.">⋯</button>
+                        </div>${commandFullBlock(key, cmdText)}
                         ${needsInput && open ? `<div class="cmd-form">${renderCheckInputForm(g, "manual", i, cmd)}</div>` : ""}`;
                     }).join(""))
                 : reviewRunGroup(runControl, waitingNote, "")}
