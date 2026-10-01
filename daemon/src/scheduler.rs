@@ -1716,6 +1716,46 @@ fn execute_squad_inner(
 /// Returns `Some(error_message)` when the rebase was attempted but failed
 /// (the caller must fail the cell), or `None` when either no rebase was
 /// needed or the rebase succeeded.
+/// Bring a waypoint-halted cell's worktree up to date before it resumes.
+///
+/// A cell is held on a waypoint because the change it must take up does not
+/// exist yet. By the time the hold lifts that change has landed -- but it
+/// landed on the upstream branch, not in this worktree, which has been
+/// sitting at whatever it was when the halt began. Resuming without this, the
+/// cell reads guidance describing a change it cannot see, and either
+/// re-implements it or reports it missing.
+///
+/// A conflict is not fatal, for the same reason it is not in
+/// [`try_upstream_rebase`]: `rebase_onto` has already aborted and left the
+/// worktree clean, the cell's own work is unaffected, and failing it
+/// permanently would need a human to unpick a branch before the cell could
+/// ever run again. The cell resumes on its current branch and the guidance
+/// block tells it to check the state itself.
+///
+/// Returns whether a rebase actually landed, so the caller can say so.
+fn rebase_resumed_cell_onto_upstream(row: &crate::store::CellRow) -> bool {
+    let Some(cwd) = row.cwd.as_deref() else {
+        return false;
+    };
+    let cwd = std::path::Path::new(cwd);
+    let Ok(upstream) = crate::reviews::worktree_upstream(cwd) else {
+        // No tracking ref: a plain checkout, or a worktree never routed
+        // through `ensure_worktree`. Nothing to rebase onto.
+        return false;
+    };
+    if let Err(e) = crate::reviews::rebase_onto(cwd, &upstream) {
+        // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
+        crate::rlog!(
+            WARNING,
+            "ralphus: resuming cell '{}' could not rebase onto '{upstream}'; \
+             running it on its current branch: {e}",
+            row.cell_id
+        );
+        return false;
+    }
+    true
+}
+
 fn try_upstream_rebase(
     row: &crate::store::CellRow,
     cells: &[crate::store::CellRow],
@@ -2214,6 +2254,7 @@ fn run_cell_with_rate_limit_retries<'a>(
                 });
             }
             let failed = RunnerResult {
+                bearing: None,
                 status: "failed".to_string(),
                 tokens_in: total_tokens_in,
                 tokens_out: total_tokens_out,
@@ -2636,6 +2677,34 @@ fn run_cell_worker(
         // RAL-400 Phase 3: same reasoning, for a stale `waypoint_halted_at_ms`
         // left behind by a previous attempt that was halted by a since-closed
         // waypoint.
+        //
+        // A cell that really was halted is resuming into a world that moved
+        // while it waited -- the waypoint's change has landed upstream since.
+        // Rebase before clearing the flag, so it resumes against a tree that
+        // actually contains what its guidance is about. Done under the lock
+        // like the rest of this block; the rebase is a local, already-fetched
+        // worktree operation, not a network round trip.
+        let was_waypoint_halted = matches!(
+            guard.cell_waypoint_halted_at_ms(squad_id, row.task_idx, row.idx),
+            Ok(Some(_))
+        );
+        if was_waypoint_halted && rebase_resumed_cell_onto_upstream(row) {
+            crate::cartographer::Note::new("waypoints")
+                .scope("waypoint")
+                .squad(squad_id)
+                .cell(&row.cell_id)
+                .emit(
+                    &guard,
+                    format!(
+                        "cell {} rebased onto upstream before resuming from its waypoint hold",
+                        row.cell_id
+                    ),
+                    serde_json::json!({
+                        "squad_id": squad_id,
+                        "cell_id": row.cell_id,
+                    }),
+                );
+        }
         let _ = guard.clear_cell_waypoint_halted(squad_id, row.task_idx, row.idx);
         // RAL-435: same reasoning, for a stale `delayed_until_ms` left behind
         // by a previous attempt that was still waiting out a rate limit when
@@ -3308,6 +3377,63 @@ fn run_cell_worker(
     // trust-kill of this cell should also publish a ghost through this
     // same path before the cell's state flips to `Killed`, so the partial
     // work isn't lost -- there is no hook for that here today.
+    // RAL-400 phase 2: the cell's answer to whatever waypoints affect its
+    // squad. A waypoint cannot tell whether its guidance was acted on by
+    // watching the work stop, so this line is the only thing that closes the
+    // loop -- and for a `block`-mode entry, its absence is what keeps the
+    // entry held.
+    if let Some(report) = result.bearing.as_ref() {
+        if let Some(decision) = crate::waypoints::BearingDecision::parse(&report.decision) {
+            let guard = store.lock();
+            let waypoints = guard
+                .open_waypoints_affecting_squad(squad_id)
+                .unwrap_or_default();
+            for waypoint_id in &waypoints {
+                if guard
+                    .set_affected_bearing_decision(
+                        waypoint_id,
+                        crate::waypoints::RosterEntryKind::Squad,
+                        squad_id,
+                        decision,
+                    )
+                    .is_ok()
+                {
+                    let _ = guard.append_waypoint_bearing(
+                        waypoint_id,
+                        crate::waypoints::RosterEntryKind::Squad,
+                        squad_id,
+                        &report.message,
+                        None,
+                        None,
+                        None,
+                    );
+                    crate::cartographer::Note::new("waypoints")
+                        .scope("waypoint")
+                        .squad(squad_id)
+                        .emit(
+                            &guard,
+                            format!(
+                                "waypoint {waypoint_id} answered by squad {squad_id}: {}",
+                                decision.as_str()
+                            ),
+                            serde_json::json!({
+                                "waypoint_id": waypoint_id,
+                                "squad_id": squad_id,
+                                "decision": decision.as_str(),
+                                "message": report.message,
+                            }),
+                        );
+                }
+            }
+            drop(guard);
+            // An answer can be the last thing a waypoint was waiting for.
+            for waypoint_id in &waypoints {
+                let guard = store.lock();
+                let _ = guard.maybe_auto_close_waypoint(waypoint_id);
+            }
+        }
+    }
+
     if let Some(ghost_text) = result.ghost.as_deref().map(str::trim) {
         if !ghost_text.is_empty() {
             let uri = crate::ghost::cell_uri(squad_id, row.task_idx, row.idx);

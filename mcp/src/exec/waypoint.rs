@@ -71,6 +71,22 @@ pub fn execute(cmd: WaypointCommand, client: &DaemonClient) -> ExecResult {
                 resurvey,
             )?)
         }
+        WaypointCommand::GoalAdd {
+            waypoint_id,
+            entry_id,
+            note,
+        } => {
+            let kind = if entry_id.starts_with("guardian-") {
+                "review"
+            } else {
+                "squad"
+            };
+            Ok(client.waypoint_add_goal(&waypoint_id, kind, &entry_id, note.as_deref())?)
+        }
+        WaypointCommand::GoalRemove {
+            waypoint_id,
+            entry_id,
+        } => Ok(client.waypoint_remove_goal(&waypoint_id, &entry_id)?),
         WaypointCommand::ResurveyPreview { waypoint_id } => {
             Ok(client.waypoint_resurvey_preview(&waypoint_id)?)
         }

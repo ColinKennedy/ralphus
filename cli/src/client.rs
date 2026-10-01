@@ -2037,6 +2037,25 @@ impl DaemonClient {
         self.patch(&format!("/api/waypoints/{waypoint_id}"), Some(body))
     }
 
+    pub fn waypoint_add_goal(
+        &self,
+        waypoint_id: &str,
+        kind: &str,
+        entry_id: &str,
+        note: Option<&str>,
+    ) -> Result<Value, DaemonError> {
+        let body = serde_json::json!({ "kind": kind, "entry_id": entry_id, "note": note });
+        self.post(&format!("/api/waypoints/{waypoint_id}/goals"), Some(body))
+    }
+
+    pub fn waypoint_remove_goal(
+        &self,
+        waypoint_id: &str,
+        entry_id: &str,
+    ) -> Result<Value, DaemonError> {
+        self.delete(&format!("/api/waypoints/{waypoint_id}/goals/{entry_id}"))
+    }
+
     pub fn waypoint_resurvey_preview(&self, waypoint_id: &str) -> Result<Value, DaemonError> {
         self.get(&format!("/api/waypoints/{waypoint_id}/resurvey-preview"))
     }

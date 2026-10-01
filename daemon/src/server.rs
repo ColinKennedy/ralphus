@@ -2194,6 +2194,10 @@ fn route_for_user(
             waypoint_patch_roster_entry(daemon, id, entry_id, body)
         }
         ("PATCH", ["api", "waypoints", id]) => waypoint_update(daemon, id, body),
+        ("POST", ["api", "waypoints", id, "goals"]) => waypoint_add_goal(daemon, id, body),
+        ("DELETE", ["api", "waypoints", id, "goals", entry_id]) => {
+            waypoint_remove_goal(daemon, id, entry_id)
+        }
         ("GET", ["api", "waypoints", id, "resurvey-preview"]) => {
             waypoint_resurvey_preview(daemon, id)
         }
@@ -14916,6 +14920,13 @@ impl DeliverySummary {
 /// (potentially large) prompt. Mirrors `GuardianIndexEntry`'s relationship
 /// to the full `GuardianView`.
 #[derive(Deserialize)]
+struct AddGoalBody {
+    kind: String,
+    entry_id: String,
+    note: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct UpdateWaypointBody {
     label: Option<String>,
     prompt: String,
@@ -14968,6 +14979,9 @@ struct WaypointDetail {
     closed_at_ms: Option<i64>,
     projects: Vec<String>,
     roster: Vec<crate::waypoints::RosterEntryView>,
+    /// The waypoint's completion list (phase 1) -- what its landing
+    /// requires, as opposed to `roster`, which is what it lands on.
+    goals: Vec<crate::waypoints::RosterGoalView>,
     delivery_summary: DeliverySummary,
 }
 
@@ -15243,6 +15257,7 @@ fn waypoint_list(daemon: &Daemon, query: &str) -> Reply {
 fn waypoint_detail(store: &Store, id: &str) -> crate::store::Result<WaypointDetail> {
     let view = store.get_waypoint(id)?;
     let roster = store.list_roster_entries(id)?;
+    let goals = store.list_roster_goals(id)?;
     let projects = waypoint_projects(store, id)?;
     let delivery_summary = DeliverySummary::from_roster(&roster);
     Ok(WaypointDetail {
@@ -15258,6 +15273,7 @@ fn waypoint_detail(store: &Store, id: &str) -> crate::store::Result<WaypointDeta
         closed_at_ms: view.closed_at_ms,
         projects,
         roster,
+        goals,
         delivery_summary,
     })
 }
@@ -15468,6 +15484,76 @@ fn waypoint_update(daemon: &Daemon, id: &str, body: &str) -> Reply {
                 "resurveyed_entries": resurveyed,
             }),
         );
+    match waypoint_detail(&store, id) {
+        Ok(detail) => json(200, &detail),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `POST /api/waypoints/{id}/goals` -- add a review or squad to the
+/// waypoint's completion list (phase 1).
+///
+/// Separate from `/roster`, which is the list of work this waypoint *lands
+/// on*. Those answer different questions -- "what must be true for this to be
+/// done" versus "who needs to hear about it" -- and nothing auto-enrolls
+/// here, because the first is a statement of intent.
+fn waypoint_add_goal(daemon: &Daemon, id: &str, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<AddGoalBody>(body) else {
+        return error(
+            400,
+            "bad_request",
+            "body must be {kind, entry_id, note?}",
+            vec![],
+        );
+    };
+    let Some(kind) = crate::waypoints::RosterEntryKind::parse(&req.kind) else {
+        return error(
+            400,
+            "bad_request",
+            "kind must be \"squad\" or \"review\"",
+            vec![],
+        );
+    };
+    if req.entry_id.trim().is_empty() {
+        return error(400, "bad_request", "entry_id must not be empty", vec![]);
+    }
+    let store = daemon.lock();
+    if let Err(e) = store.add_roster_goal(id, kind, &req.entry_id, req.note.as_deref()) {
+        return store_error(&e);
+    }
+    crate::cartographer::Note::new("server")
+        .scope("waypoint")
+        .emit(
+            &store,
+            format!("waypoint {id} goal added: {} {}", req.kind, req.entry_id),
+            serde_json::json!({ "waypoint_id": id, "kind": req.kind, "entry_id": req.entry_id }),
+        );
+    // A new goal closes a gate that may have been open, and the affected work
+    // it now holds can already be running.
+    crate::waypoints::resignal_waypoint_holds(&store, &daemon.waypoint_halts, id);
+    // Adding a goal can only ever make a waypoint less complete, so there is
+    // nothing to re-close here -- but removing one can, which is why the
+    // delete handler does check.
+    match waypoint_detail(&store, id) {
+        Ok(detail) => json(200, &detail),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `DELETE /api/waypoints/{id}/goals/{entry_id}` -- drop a goal from the
+/// completion list. Removing the last unfinished goal can complete phase 1,
+/// so this re-checks whether the waypoint is now closeable.
+fn waypoint_remove_goal(daemon: &Daemon, id: &str, entry_id: &str) -> Reply {
+    let kind = if entry_id.starts_with("guardian-") {
+        crate::waypoints::RosterEntryKind::Review
+    } else {
+        crate::waypoints::RosterEntryKind::Squad
+    };
+    let store = daemon.lock();
+    if let Err(e) = store.remove_roster_goal(id, kind, entry_id) {
+        return store_error(&e);
+    }
+    let _ = store.maybe_auto_close_waypoint(id);
     match waypoint_detail(&store, id) {
         Ok(detail) => json(200, &detail),
         Err(e) => store_error(&e),

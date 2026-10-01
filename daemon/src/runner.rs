@@ -960,6 +960,15 @@ impl RunnerSpec {
 }
 
 /// The JSON result read from the runner's stdout (mirrors the runner's `CellResult`).
+/// Mirrors the runner's `BearingReport`. `decision` was validated against the
+/// closed set by the runner, so an unparseable value here means a runner from
+/// a different build, not an agent typo.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RunnerBearingReport {
+    pub decision: String,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct RunnerResult {
     /// `"done"` or `"failed"`.
@@ -1061,6 +1070,13 @@ pub struct RunnerResult {
     /// back to the resumed attempt as recovery context.
     #[serde(default)]
     pub thinking_stall_last_line: Option<String>,
+    /// How this cell answered the waypoints affecting its squad, parsed by
+    /// the runner from a `RALPHUS_BEARING:` line. Mirrors the runner's
+    /// `BearingReport`; duplicated rather than shared for the same reason
+    /// every other field here is -- the daemon has no compile-time dependency
+    /// on the runner crate.
+    #[serde(default)]
+    pub bearing: Option<RunnerBearingReport>,
 }
 
 /// Wire shape of one prophecy marker in a [`RunnerResult`], mirroring
@@ -1096,6 +1112,7 @@ impl RunnerResult {
             retry_after_secs: None,
             prophecies: Vec::new(),
             thinking_stall_last_line: None,
+            bearing: None,
         }
     }
 
@@ -1137,6 +1154,7 @@ impl RunnerResult {
             retry_after_secs: None,
             prophecies: Vec::new(),
             thinking_stall_last_line: None,
+            bearing: None,
         }
     }
 
@@ -1171,6 +1189,7 @@ impl RunnerResult {
             retry_after_secs: None,
             prophecies: Vec::new(),
             thinking_stall_last_line: None,
+            bearing: None,
         }
     }
 
@@ -1204,6 +1223,7 @@ impl RunnerResult {
             retry_after_secs: None,
             prophecies: Vec::new(),
             thinking_stall_last_line: None,
+            bearing: None,
         }
     }
 
@@ -1237,6 +1257,7 @@ impl RunnerResult {
             ghost: None,
             retry_after_secs: None,
             prophecies: Vec::new(),
+            bearing: None,
         }
     }
 
@@ -1336,6 +1357,7 @@ impl RunnerResult {
             retry_after_secs: None,
             prophecies: Vec::new(),
             thinking_stall_last_line: Some(last_line),
+            bearing: None,
         }
     }
 
@@ -4332,6 +4354,7 @@ mod tests {
             retry_after_secs: None,
             prophecies: Vec::new(),
             thinking_stall_last_line: None,
+            bearing: None,
         };
         assert!(r.proof_passed());
 

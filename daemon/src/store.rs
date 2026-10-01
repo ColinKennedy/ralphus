@@ -10049,6 +10049,32 @@ impl Store {
         Ok(())
     }
 
+    /// When this cell was halted by a waypoint, or `None` if it was not.
+    ///
+    /// Read at re-dispatch to tell a cell genuinely resuming from a hold from
+    /// one whose flag is merely stale -- only the former needs its worktree
+    /// brought up to date with the change it was waiting for.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn cell_waypoint_halted_at_ms(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        idx: i64,
+    ) -> Result<Option<i64>> {
+        let v: Option<Option<i64>> = self
+            .conn
+            .query_row(
+                "SELECT waypoint_halted_at_ms FROM cells
+                 WHERE squad_id=? AND task_idx=? AND idx=?",
+                params![squad_id, task_idx, idx],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(v.flatten())
+    }
+
     /// Clears a cell's `waypoint_halted_at_ms`, called at the same point
     /// `run_cell_worker` sets the cell's `NodeState` back to `Running` for a
     /// fresh dispatch. Unconditional (no-op if it was already clear),

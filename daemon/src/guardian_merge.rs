@@ -353,6 +353,7 @@ fn run_agent_with_rate_limit_retry(
                 retry_after_secs: None,
                 prophecies: Vec::new(),
                 thinking_stall_last_line: None,
+                bearing: None,
             };
         }
         retries += 1;
@@ -13730,6 +13731,7 @@ mod tests {
             ghost: None,
             turns: None,
             prophecies: Vec::new(),
+            bearing: None,
         }
     }
 
@@ -13909,6 +13911,7 @@ mod tests {
                 turns: None,
                 ghost: None,
                 prophecies: Vec::new(),
+                bearing: None,
             }
         }
     }
@@ -14147,6 +14150,7 @@ mod tests {
                 turns: None,
                 ghost: None,
                 prophecies: Vec::new(),
+                bearing: None,
             }
         }
     }
@@ -17101,6 +17105,7 @@ mod tests {
                 ghost: None,
                 turns: None,
                 prophecies: Vec::new(),
+                bearing: None,
             }
         }
     }
@@ -17580,6 +17585,7 @@ mod tests {
                 ghost: None,
                 turns: None,
                 prophecies: Vec::new(),
+                bearing: None,
             }
         }
     }

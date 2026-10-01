@@ -570,6 +570,7 @@ fn run_with_backend(
                     turns: total_turns,
                     retry_after_secs: None,
                     prophecies: Vec::new(),
+                    bearing: None,
                 };
             }
             bg_nudge_attempt += 1;
@@ -633,6 +634,7 @@ fn run_with_backend(
                         turns: total_turns,
                         retry_after_secs: None,
                         prophecies: Vec::new(),
+                        bearing: None,
                     };
                 }
                 Err(e) => return CellResult::failed(e.to_string(), ""),
@@ -718,6 +720,7 @@ fn run_with_backend(
                     turns: total_turns,
                     retry_after_secs: None,
                     prophecies: Vec::new(),
+                    bearing: None,
                 };
             }
             return CellResult {
@@ -740,6 +743,7 @@ fn run_with_backend(
                 turns: total_turns,
                 retry_after_secs: None,
                 prophecies: Vec::new(),
+                bearing: None,
             };
         }
 
@@ -775,6 +779,7 @@ fn run_with_backend(
                 turns: total_turns,
                 retry_after_secs: None,
                 prophecies: Vec::new(),
+                bearing: None,
             };
         }
 
@@ -801,6 +806,7 @@ fn run_with_backend(
                 turns: total_turns,
                 retry_after_secs: None,
                 prophecies: Vec::new(),
+                bearing: None,
             };
         }
 
@@ -840,6 +846,8 @@ fn run_with_backend(
             turns: total_turns,
             retry_after_secs: None,
             prophecies: crate::prophecy::parse_prophecies(&outcome.summary),
+            bearing: parse_bearing(&outcome.summary)
+                .map(|(decision, message)| crate::spec::BearingReport { decision, message }),
         };
     }
 
@@ -897,6 +905,7 @@ fn thrash_cell_result(
         ghost: None,
         retry_after_secs: None,
         prophecies: Vec::new(),
+        bearing: None,
     }
 }
 
@@ -972,6 +981,40 @@ enum GhostParse {
 /// a short bullet list -- the shape `GHOST_SYSTEM_PROMPT` asks for -- rather
 /// than trusting arbitrary trailing text. A model that goes off the rails
 /// right after writing the marker (drifting into an unrelated tangent
+/// The answer an agent gave a waypoint, parsed from its final reply.
+///
+/// `RALPHUS_BEARING: <accepted|rejected|deferred>: <one line>`. The decision
+/// is a closed set -- an agent writing anything else has not answered, and is
+/// treated as having not answered rather than having its prose stored as if
+/// it were a decision, because a `block`-mode entry is released on the
+/// strength of this and "maybe" is not a release condition.
+///
+/// Last occurrence wins, like every other marker here: an agent that revises
+/// its answer mid-reply means the later one.
+fn parse_bearing(text: &str) -> Option<(String, String)> {
+    /// A bearing is a one-line answer, not a report. Anything longer is
+    /// either the agent continuing past its own marker or prose that belongs
+    /// in the ghost instead.
+    const BEARING_MAX_CHARS: usize = 500;
+    let idx = text.rfind("RALPHUS_BEARING:")?;
+    let rest = text[idx + "RALPHUS_BEARING:".len()..]
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim();
+    // `accepted: took it up` -- split once, so a message may contain colons.
+    let (decision, message) = rest.split_once(':')?;
+    let decision = match decision.trim().to_ascii_lowercase().as_str() {
+        d @ ("accepted" | "rejected" | "deferred") => d.to_string(),
+        _ => return None,
+    };
+    let message = message.trim();
+    if message.is_empty() {
+        return None;
+    }
+    Some((decision, message.chars().take(BEARING_MAX_CHARS).collect()))
+}
+
 /// instead of stopping) must not have that tangent carried into the next
 /// attempt's prompt: parsing stops at the first line that isn't a bullet,
 /// rather than consuming to the end of the reply or [`GHOST_MAX_CHARS`]. An
@@ -1027,6 +1070,69 @@ fn tail(text: &str, limit: usize) -> String {
 mod tests {
     use super::*;
     use crate::backend::BackendError;
+
+    #[test]
+    fn parse_bearing_reads_a_well_formed_answer() {
+        assert_eq!(
+            parse_bearing(
+                "done.
+
+RALPHUS_BEARING: accepted: renamed every call site"
+            ),
+            Some((
+                "accepted".to_string(),
+                "renamed every call site".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_bearing_accepts_every_decision_and_is_case_insensitive() {
+        for (raw, want) in [
+            ("ACCEPTED", "accepted"),
+            ("Rejected", "rejected"),
+            ("deferred", "deferred"),
+        ] {
+            assert_eq!(
+                parse_bearing(&format!("RALPHUS_BEARING: {raw}: because")),
+                Some((want.to_string(), "because".to_string())),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_bearing_rejects_a_decision_outside_the_closed_set() {
+        // A `block`-mode entry is released on the strength of this, and
+        // "maybe" is not a release condition -- an unrecognised word has to
+        // read as "did not answer", not as some fourth decision.
+        assert_eq!(parse_bearing("RALPHUS_BEARING: maybe: unsure"), None);
+        assert_eq!(parse_bearing("RALPHUS_BEARING: accepted"), None);
+        assert_eq!(parse_bearing("RALPHUS_BEARING: accepted:   "), None);
+        assert_eq!(parse_bearing("no marker at all"), None);
+    }
+
+    #[test]
+    fn parse_bearing_keeps_the_last_answer_and_only_its_own_line() {
+        let reply = "RALPHUS_BEARING: deferred: first thought
+                     RALPHUS_BEARING: accepted: on reflection, did it
+                     and then some trailing prose that is not part of the answer";
+        assert_eq!(
+            parse_bearing(reply),
+            Some(("accepted".to_string(), "on reflection, did it".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_bearing_keeps_colons_inside_the_message() {
+        assert_eq!(
+            parse_bearing("RALPHUS_BEARING: rejected: not here: that lives in core"),
+            Some((
+                "rejected".to_string(),
+                "not here: that lives in core".to_string()
+            ))
+        );
+    }
 
     #[test]
     fn short_prompt_hash_matches_known_vector_prefix() {

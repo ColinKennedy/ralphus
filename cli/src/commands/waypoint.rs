@@ -51,6 +51,15 @@ pub enum WaypointCommand {
     ResurveyPreview {
         waypoint_id: String,
     },
+    GoalAdd {
+        waypoint_id: String,
+        entry_id: String,
+        note: Option<String>,
+    },
+    GoalRemove {
+        waypoint_id: String,
+        entry_id: String,
+    },
     Roster(WaypointRosterCommand),
     Bearing(WaypointBearingCommand),
     Bearings {
@@ -139,6 +148,32 @@ pub fn parse(args: &[String]) -> WaypointCommand {
         Some("reopen") => with_waypoint_id(scanner, |waypoint_id| WaypointCommand::Reopen {
             waypoint_id,
         }),
+        Some("goal-add") => {
+            let note = scanner.take_value("--note").ok().flatten();
+            let rest = scanner.remaining();
+            match (rest.first(), rest.get(1)) {
+                (Some(waypoint_id), Some(entry_id)) => WaypointCommand::GoalAdd {
+                    waypoint_id: waypoint_id.clone(),
+                    entry_id: entry_id.clone(),
+                    note,
+                },
+                _ => WaypointCommand::UsageError(
+                    "goal-add requires <waypoint_id> <entry_id>".to_string(),
+                ),
+            }
+        }
+        Some("goal-remove") => {
+            let rest = scanner.remaining();
+            match (rest.first(), rest.get(1)) {
+                (Some(waypoint_id), Some(entry_id)) => WaypointCommand::GoalRemove {
+                    waypoint_id: waypoint_id.clone(),
+                    entry_id: entry_id.clone(),
+                },
+                _ => WaypointCommand::UsageError(
+                    "goal-remove requires <waypoint_id> <entry_id>".to_string(),
+                ),
+            }
+        }
         Some("resurvey-preview") => match scanner.remaining().first() {
             Some(waypoint_id) => WaypointCommand::ResurveyPreview {
                 waypoint_id: waypoint_id.clone(),
@@ -373,6 +408,31 @@ pub fn dispatch(cmd: WaypointCommand, opts: &GlobalOpts) -> i32 {
         }),
         WaypointCommand::Close { waypoint_id } => run_and_report(opts, None, || {
             let result = client.waypoint_close(&waypoint_id)?;
+            emit(opts, &result, render_waypoint_detail);
+            Ok(())
+        }),
+        WaypointCommand::GoalAdd {
+            waypoint_id,
+            entry_id,
+            note,
+        } => run_and_report(opts, None, || {
+            // Kind is inferred from the id's prefix, the same way the roster
+            // remove path does it -- an id already says which it is.
+            let kind = if entry_id.starts_with("guardian-") {
+                "review"
+            } else {
+                "squad"
+            };
+            let result =
+                client.waypoint_add_goal(&waypoint_id, kind, &entry_id, note.as_deref())?;
+            emit(opts, &result, render_waypoint_detail);
+            Ok(())
+        }),
+        WaypointCommand::GoalRemove {
+            waypoint_id,
+            entry_id,
+        } => run_and_report(opts, None, || {
+            let result = client.waypoint_remove_goal(&waypoint_id, &entry_id)?;
             emit(opts, &result, render_waypoint_detail);
             Ok(())
         }),

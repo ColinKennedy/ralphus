@@ -261,6 +261,15 @@ fn str_list(obj: &serde_json::Map<String, Value>, key: &str) -> Result<Vec<Strin
 
 /// The outcome the daemon reads back from stdout. Mirrors the daemon's
 /// `RunnerResult`.
+/// A cell's answer to the waypoints affecting its squad, as parsed from a
+/// `RALPHUS_BEARING:` line. `decision` is already validated against the
+/// closed set, so the daemon can trust it without re-checking.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BearingReport {
+    pub decision: String,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CellResult {
     pub status: String,
@@ -327,6 +336,11 @@ pub struct CellResult {
     /// append-only, so the agent may report several insights in one reply.
     #[serde(default)]
     pub prophecies: Vec<crate::prophecy::ProphecyMarker>,
+    /// How this cell answered any waypoint affecting its squad, if it did.
+    /// `None` means it never emitted a `RALPHUS_BEARING:` line -- which for a
+    /// `block`-mode entry is what keeps it held.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearing: Option<BearingReport>,
 }
 
 impl CellResult {
@@ -350,6 +364,7 @@ impl CellResult {
             ghost: None,
             retry_after_secs: None,
             prophecies: Vec::new(),
+            bearing: None,
         }
     }
 
@@ -373,6 +388,7 @@ impl CellResult {
             ghost: None,
             retry_after_secs: None,
             prophecies: Vec::new(),
+            bearing: None,
         }
     }
 
@@ -418,6 +434,7 @@ impl CellResult {
             ghost: None,
             retry_after_secs: Some(retry_after_secs),
             prophecies: Vec::new(),
+            bearing: None,
         }
     }
 
@@ -461,6 +478,7 @@ impl CellResult {
             ghost: None,
             retry_after_secs: None,
             prophecies: Vec::new(),
+            bearing: None,
         }
     }
 

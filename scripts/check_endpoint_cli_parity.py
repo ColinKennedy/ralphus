@@ -128,6 +128,8 @@ ENDPOINT_TO_CLI: dict[str, list[str]] = {
     "DELETE /api/waypoints/{id}/roster/{entry_id}": ["waypoint roster remove"],
     "PATCH /api/waypoints/{id}/roster/{entry_id}": ["waypoint roster mode"],
     "PATCH /api/waypoints/{id}": ["waypoint edit"],
+    "POST /api/waypoints/{id}/goals": ["waypoint goal-add"],
+    "DELETE /api/waypoints/{id}/goals/{entry_id}": ["waypoint goal-remove"],
     "GET /api/waypoints/{id}/resurvey-preview": ["waypoint resurvey-preview"],
     "POST /api/waypoints/{id}/roster/{entry_id}/redo": ["waypoint redo"],
     "POST /api/waypoints/{id}/close": ["waypoint close"],

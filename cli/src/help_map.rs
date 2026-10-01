@@ -1311,6 +1311,27 @@ const WAYPOINT_CHILDREN: &[HelpNode] = &[
         &[],
     ),
     node(
+        "goal-add",
+        &["waypoint_id [id]", "entry_id [id]"],
+        &["--note [text]"],
+        "Add a squad or review to a waypoint's completion list -- the work whose landing IS this \
+         waypoint being carried out. Distinct from the roster of affected work, which is what the \
+         waypoint lands on; nothing auto-enrolls here.",
+        false,
+        false,
+        &[],
+    ),
+    node(
+        "goal-remove",
+        &["waypoint_id [id]", "entry_id [id]"],
+        &[],
+        "Drop a squad or review from a waypoint's completion list. Removing the last unfinished \
+         goal can complete the waypoint's first phase.",
+        false,
+        false,
+        &[],
+    ),
+    node(
         "resurvey-preview",
         &["waypoint_id [id]"],
         &[],

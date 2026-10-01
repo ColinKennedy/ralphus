@@ -1188,6 +1188,52 @@ impl Store {
         Ok(raw.as_deref().and_then(DeliveryStatus::parse))
     }
 
+    /// Every open waypoint this squad is an affected entry of -- who a
+    /// `RALPHUS_BEARING:` line from one of its cells is answering.
+    ///
+    /// A squad can be affected by more than one waypoint at a time, and the
+    /// guidance for all of them arrives in the same prompt, so one answer is
+    /// recorded against each. The marker carries no waypoint id to split them
+    /// by, and asking an agent to repeat itself per waypoint would make the
+    /// common case (exactly one) worse to serve the rare one.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn open_waypoints_affecting_squad(&self, squad_id: &str) -> StoreResult<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT wa.waypoint_id FROM waypoint_affected wa
+             JOIN waypoints w ON w.id = wa.waypoint_id
+             WHERE wa.kind = 'squad' AND wa.entry_id = ? AND w.state = 'open'
+             ORDER BY wa.created_at_ms ASC",
+        )?;
+        let out: Vec<String> = stmt
+            .query_map(params![squad_id], |r| r.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(out)
+    }
+
+    /// The most recent waypoint to have affected this squad, open or closed.
+    ///
+    /// A cell resuming from a hold has usually outlived the hold: the gate
+    /// lifted because the waypoint's roster landed, and the waypoint may have
+    /// closed on the same tick. Reporting "no waypoint" there would lose the
+    /// one piece of context the resuming agent most needs.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn last_waypoint_affecting_squad(&self, squad_id: &str) -> StoreResult<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT waypoint_id FROM waypoint_affected
+                 WHERE kind = 'squad' AND entry_id = ?
+                 ORDER BY created_at_ms DESC LIMIT 1",
+                params![squad_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
     /// Add a review or squad to the waypoint's completion list.
     ///
     /// Idempotent: adding something already listed updates its note rather
@@ -2443,6 +2489,43 @@ impl Store {
 /// cell until the resume sweep un-parked it). `cancel` is itself a no-op when
 /// nothing is registered under the id, so no squad/cell state check is needed
 /// before calling it.
+/// Re-apply this waypoint's holds to work that is already in flight.
+///
+/// A waypoint's gate is not a property of its affected entries alone -- it
+/// also depends on whether its own roster has landed. Adding a goal to an
+/// open waypoint therefore turns an open gate into a closed one for every
+/// block-mode squad it affects, and those squads may be running right now.
+/// Without this they run on, unaware, until they finish: the gate is only
+/// consulted when a squad is *claimed*, so nothing re-reads it for work
+/// already past that point.
+///
+/// Safe to call when nothing changed: `cancel` is a no-op for a squad with
+/// no registered token, and the per-squad gate is re-checked here so a
+/// waypoint whose roster is still complete halts nothing.
+pub fn resignal_waypoint_holds(
+    store: &Store,
+    waypoint_halts: &crate::cancel::WaypointHalts,
+    waypoint_id: &str,
+) {
+    if !store.waypoint_is_open(waypoint_id).unwrap_or(false) {
+        return;
+    }
+    let Ok(entries) = store.list_roster_entries(waypoint_id) else {
+        return;
+    };
+    for entry in entries {
+        if entry.kind != RosterEntryKind::Squad || entry.mode != RosterMode::Block {
+            continue;
+        }
+        if matches!(
+            store.squad_block_gating_waypoint(&entry.entry_id),
+            Ok(Some(_))
+        ) {
+            waypoint_halts.cancel(&entry.entry_id);
+        }
+    }
+}
+
 pub fn signal_explicit_block_halt(
     store: &Store,
     waypoint_halts: &crate::cancel::WaypointHalts,
