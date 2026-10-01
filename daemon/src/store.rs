@@ -1446,6 +1446,35 @@ impl Store {
                 ",
             );
         }
+        // RAL-400: `waypoint_roster` used to hold both of a waypoint's lists
+        // at once -- the work it is *about*, and the downstream work it lands
+        // on. Those have different lifecycles, so they are now two tables:
+        // `waypoint_roster` (the curated completion list) and
+        // `waypoint_affected` (what the survey discovers, gates, and collects
+        // bearing decisions from). Every pre-split row was an affected entry
+        // -- that is what the survey, gating and delivery columns on it were
+        // for -- so the old table becomes `waypoint_affected` wholesale and
+        // the batch below creates an empty `waypoint_roster` in its place.
+        //
+        // Has to run *before* the batch for the same reason the rename above
+        // does: `CREATE TABLE IF NOT EXISTS waypoint_roster` would otherwise
+        // see the old fat table, do nothing, and leave this rename moving the
+        // only copy of the data out from under the new schema.
+        let roster_is_pre_split: bool = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('waypoint_roster') WHERE name='mode'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            > 0;
+        if roster_is_pre_split {
+            let _ = self.conn.execute(
+                "ALTER TABLE waypoint_roster RENAME TO waypoint_affected",
+                [],
+            );
+        }
         self.conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS meta (
@@ -2303,7 +2332,8 @@ impl Store {
                 closed_at_ms   INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_waypoints_state ON waypoints(state);
-            -- RAL-400: one review/squad this waypoint tracks. `kind` is
+            -- RAL-400: one review/squad this waypoint lands on -- work it
+            -- affects rather than work it consists of. `kind` is
             -- `review`/`squad`; `entry_id` is that review's or squad's id.
             -- `mode` (`block`/`advisory`) and the survey verdict/rationale
             -- are the Phase 2 survey pass's output -- both left NULL/default
@@ -2319,19 +2349,39 @@ impl Store {
             -- `delivery_status` cannot double as this flag, since it is
             -- already permanently consumed by the entry's first real
             -- bearing-delivery outcome.
+            CREATE TABLE IF NOT EXISTS waypoint_affected (
+                waypoint_id           TEXT NOT NULL,
+                kind                  TEXT NOT NULL,
+                entry_id              TEXT NOT NULL,
+                mode                  TEXT NOT NULL DEFAULT 'block',
+                survey_verdict        TEXT,
+                survey_rationale      TEXT,
+                delivery_status       TEXT NOT NULL DEFAULT 'undelivered',
+                stand_down_at_ms      INTEGER,
+                auto_enrolled         INTEGER NOT NULL DEFAULT 0,
+                stale_at_ms           INTEGER,
+                bearing_decision      TEXT,
+                bearing_decided_at_ms INTEGER,
+                created_at_ms         INTEGER NOT NULL,
+                updated_at_ms         INTEGER NOT NULL,
+                PRIMARY KEY (waypoint_id, kind, entry_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_waypoint_affected_entry
+                ON waypoint_affected(kind, entry_id);
+            -- RAL-400: the waypoint's own completion list -- the reviews and
+            -- squads whose landing *is* this waypoint being carried out.
+            -- Curated by hand: nothing auto-enrolls here, because what must
+            -- be true for this to be done is a statement of intent, not
+            -- something a classifier can discover. Phase 1 of a waypoint's
+            -- completion is every row here reaching a terminal state; phase 2
+            -- is every blocking `waypoint_affected` row answering with a
+            -- bearing decision.
             CREATE TABLE IF NOT EXISTS waypoint_roster (
-                waypoint_id      TEXT NOT NULL,
-                kind             TEXT NOT NULL,
-                entry_id         TEXT NOT NULL,
-                mode             TEXT NOT NULL DEFAULT 'block',
-                survey_verdict   TEXT,
-                survey_rationale TEXT,
-                delivery_status  TEXT NOT NULL DEFAULT 'undelivered',
-                stand_down_at_ms INTEGER,
-                auto_enrolled    INTEGER NOT NULL DEFAULT 0,
-                stale_at_ms      INTEGER,
-                created_at_ms    INTEGER NOT NULL,
-                updated_at_ms    INTEGER NOT NULL,
+                waypoint_id   TEXT NOT NULL,
+                kind          TEXT NOT NULL,
+                entry_id      TEXT NOT NULL,
+                note          TEXT,
+                created_at_ms INTEGER NOT NULL,
                 PRIMARY KEY (waypoint_id, kind, entry_id)
             );
             CREATE INDEX IF NOT EXISTS idx_waypoint_roster_entry
@@ -3401,13 +3451,19 @@ impl Store {
             // Only auto-enrolled entries are eligible to be surveyed, so an
             // explicit declaration is never second-guessed by the classifier
             // -- see `waypoints::Store::waypoint_survey_candidates`.
-            "ALTER TABLE waypoint_roster ADD COLUMN auto_enrolled INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE waypoint_affected ADD COLUMN auto_enrolled INTEGER NOT NULL DEFAULT 0",
             // RAL-400: when this entry's already-finished work was flagged as
             // possibly needing a redo, because its waypoint closed while the
             // survey had judged it `impacted`. Advisory and non-blocking --
             // acting on it is `waypoints::redo_roster_entry`, never automatic.
             // NULL means not flagged. See `run_pending_stale_notices`.
-            "ALTER TABLE waypoint_roster ADD COLUMN stale_at_ms INTEGER",
+            "ALTER TABLE waypoint_affected ADD COLUMN stale_at_ms INTEGER",
+            // RAL-400: how this affected entry answered the waypoint --
+            // `accepted`/`rejected`/`deferred`, reported by the agent as a
+            // `RALPHUS_BEARING:` line. NULL means it has not answered yet,
+            // which for a `block`-mode entry is what holds it.
+            "ALTER TABLE waypoint_affected ADD COLUMN bearing_decision TEXT",
+            "ALTER TABLE waypoint_affected ADD COLUMN bearing_decided_at_ms INTEGER",
             // RAL-400: which waypoint's guidance a queued injection carries,
             // so a delivered injection can be attributed back to it in that
             // waypoint's consolidated event feed.
@@ -10941,7 +10997,7 @@ impl Store {
             Self::deps_satisfied_in(satisfied, &Self::squad_depends_on_conn(conn, squad_id)?);
         let blocking_waypoint: Option<String> = conn
             .query_row(
-                "SELECT wr.waypoint_id FROM waypoint_roster wr
+                "SELECT wr.waypoint_id FROM waypoint_affected wr
                  JOIN waypoints w ON w.id = wr.waypoint_id
                  WHERE wr.kind = 'squad' AND wr.entry_id = ? AND wr.mode = 'block'
                    AND (wr.survey_verdict IS NULL OR wr.survey_verdict = 'impacted')
@@ -13358,7 +13414,7 @@ command = "y"
         // RAL-400 Phase 3 AC(e): a squad's restart cascade must still correctly
         // dirty a downstream squad that happens to be waypoint-block-gated, and
         // must not clear that gate as a side effect -- the restart cascade only
-        // ever touches squads/cells/tasks rows, never `waypoint_roster`.
+        // ever touches squads/cells/tasks rows, never `waypoint_affected`.
         use crate::waypoints::{RosterEntryKind, RosterMode};
 
         let mut store = Store::open_in_memory().unwrap();

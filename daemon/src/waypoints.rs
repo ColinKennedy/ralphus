@@ -212,7 +212,9 @@ impl DeliveryStatus {
     }
 }
 
-/// One row of `waypoint_roster`.
+/// One row of `waypoint_affected`: a unit of work this waypoint lands on,
+/// with the survey's verdict about it, how its guidance was delivered, and
+/// how it answered.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RosterEntryView {
     pub waypoint_id: String,
@@ -232,8 +234,83 @@ pub struct RosterEntryView {
     /// `None` means not flagged. Purely advisory: nothing is re-run until
     /// someone calls [`redo_roster_entry`]. See [`run_pending_stale_notices`].
     pub stale_at_ms: Option<i64>,
+    /// How this entry answered the waypoint, once it has. `None` means it has
+    /// not -- which for a `block`-mode entry is exactly what holds it, and
+    /// what keeps the waypoint out of phase 2. See [`BearingDecision`].
+    pub bearing_decision: Option<BearingDecision>,
+    pub bearing_decided_at_ms: Option<i64>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+}
+
+/// One row of `waypoint_roster`: a review or squad whose landing *is* this
+/// waypoint being carried out.
+///
+/// Deliberately thin next to [`RosterEntryView`]. A goal carries no survey
+/// verdict, no delivery status and no bearing, because none of those apply:
+/// it is not work the waypoint lands on, it is work the waypoint consists of.
+/// All it needs is to finish.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RosterGoalView {
+    pub waypoint_id: String,
+    pub kind: RosterEntryKind,
+    pub entry_id: String,
+    /// Why this is on the list, in whoever added it's own words.
+    pub note: Option<String>,
+    /// Whether this goal has reached a terminal state. Derived per read
+    /// rather than stored, so it cannot go stale against the squad/review it
+    /// describes.
+    pub terminal: bool,
+    pub created_at_ms: i64,
+}
+
+/// How a unit of affected work answered a waypoint's guidance.
+///
+/// A waypoint asks downstream work to do something. Whether it was done is
+/// not something the daemon can observe -- a squad finishing proves it
+/// stopped, not that it complied -- so the answer is stated, by the agent
+/// that did the work, as a `RALPHUS_BEARING:` line. Declining is a valid
+/// answer and is recorded as one; what is not valid is silence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BearingDecision {
+    /// The guidance was taken up in this work.
+    Accepted,
+    /// The guidance was considered and deliberately not taken up.
+    Rejected,
+    /// The guidance applies but was not acted on now.
+    Deferred,
+}
+
+impl BearingDecision {
+    /// The wire/storage spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Rejected => "rejected",
+            Self::Deferred => "deferred",
+        }
+    }
+
+    /// Parses a decision, case-insensitively. A closed set: an agent writing
+    /// anything else has not answered, and is treated as not having answered
+    /// rather than having its prose stored as if it were a decision.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "accepted" => Some(Self::Accepted),
+            "rejected" => Some(Self::Rejected),
+            "deferred" => Some(Self::Deferred),
+            _ => None,
+        }
+    }
+
+    /// Every decision, for callers rendering the closed set.
+    #[must_use]
+    pub fn all() -> [Self; 3] {
+        [Self::Accepted, Self::Rejected, Self::Deferred]
+    }
 }
 
 /// One row of `waypoint_bearings`. Append-only: rows are created via
@@ -724,7 +801,7 @@ impl Store {
         // so they must stay surveyable or their NULL verdict would block
         // forever.
         let mut stmt = self.conn.prepare(
-            "SELECT kind, entry_id FROM waypoint_roster
+            "SELECT kind, entry_id FROM waypoint_affected
              WHERE waypoint_id=? AND NOT (auto_enrolled=1 AND survey_verdict IS NULL)",
         )?;
         let settled: Vec<(String, String)> = stmt
@@ -858,7 +935,7 @@ impl Store {
     ) -> StoreResult<()> {
         let now = now_ms();
         self.conn.execute(
-            "INSERT INTO waypoint_roster(waypoint_id, kind, entry_id, mode, delivery_status, created_at_ms, updated_at_ms)
+            "INSERT INTO waypoint_affected(waypoint_id, kind, entry_id, mode, delivery_status, created_at_ms, updated_at_ms)
              VALUES(?,?,?,?,'undelivered',?,?)
              ON CONFLICT(waypoint_id, kind, entry_id) DO UPDATE SET mode=excluded.mode, updated_at_ms=excluded.updated_at_ms",
             params![waypoint_id, kind.as_str(), entry_id, mode.as_str(), now, now],
@@ -888,7 +965,7 @@ impl Store {
     ) -> StoreResult<()> {
         let now = now_ms();
         self.conn.execute(
-            "INSERT INTO waypoint_roster(waypoint_id, kind, entry_id, mode, delivery_status, auto_enrolled, created_at_ms, updated_at_ms)
+            "INSERT INTO waypoint_affected(waypoint_id, kind, entry_id, mode, delivery_status, auto_enrolled, created_at_ms, updated_at_ms)
              VALUES(?,?,?,?,'undelivered',1,?,?)
              ON CONFLICT(waypoint_id, kind, entry_id) DO UPDATE SET mode=excluded.mode, updated_at_ms=excluded.updated_at_ms",
             params![waypoint_id, kind.as_str(), entry_id, mode.as_str(), now, now],
@@ -970,7 +1047,7 @@ impl Store {
         entry_id: &str,
     ) -> StoreResult<bool> {
         let n = self.conn.execute(
-            "DELETE FROM waypoint_roster WHERE waypoint_id=? AND kind=? AND entry_id=?",
+            "DELETE FROM waypoint_affected WHERE waypoint_id=? AND kind=? AND entry_id=?",
             params![waypoint_id, kind.as_str(), entry_id],
         )?;
         Ok(n > 0)
@@ -982,8 +1059,8 @@ impl Store {
     /// Propagates any SQLite failure.
     pub fn list_roster_entries(&self, waypoint_id: &str) -> StoreResult<Vec<RosterEntryView>> {
         let mut stmt = self.conn.prepare(
-            "SELECT waypoint_id, kind, entry_id, mode, survey_verdict, survey_rationale, delivery_status, stand_down_at_ms, created_at_ms, updated_at_ms, stale_at_ms
-             FROM waypoint_roster WHERE waypoint_id=? ORDER BY created_at_ms, entry_id",
+            "SELECT waypoint_id, kind, entry_id, mode, survey_verdict, survey_rationale, delivery_status, stand_down_at_ms, created_at_ms, updated_at_ms, stale_at_ms, bearing_decision, bearing_decided_at_ms
+             FROM waypoint_affected WHERE waypoint_id=? ORDER BY created_at_ms, entry_id",
         )?;
         let rows = stmt
             .query_map(params![waypoint_id], Self::map_roster_row)?
@@ -1008,6 +1085,11 @@ impl Store {
             created_at_ms: r.get(8)?,
             updated_at_ms: r.get(9)?,
             stale_at_ms: r.get(10)?,
+            bearing_decision: r
+                .get::<_, Option<String>>(11)?
+                .as_deref()
+                .and_then(BearingDecision::parse),
+            bearing_decided_at_ms: r.get(12)?,
         })
     }
 
@@ -1023,7 +1105,7 @@ impl Store {
         status: DeliveryStatus,
     ) -> StoreResult<()> {
         self.conn.execute(
-            "UPDATE waypoint_roster SET delivery_status=?, updated_at_ms=? WHERE waypoint_id=? AND kind=? AND entry_id=?",
+            "UPDATE waypoint_affected SET delivery_status=?, updated_at_ms=? WHERE waypoint_id=? AND kind=? AND entry_id=?",
             params![status.as_str(), now_ms(), waypoint_id, kind.as_str(), entry_id],
         )?;
         Ok(())
@@ -1043,7 +1125,7 @@ impl Store {
         entry_id: &str,
     ) -> StoreResult<()> {
         self.conn.execute(
-            "UPDATE waypoint_roster SET stand_down_at_ms=?, updated_at_ms=?
+            "UPDATE waypoint_affected SET stand_down_at_ms=?, updated_at_ms=?
              WHERE waypoint_id=? AND kind=? AND entry_id=? AND stand_down_at_ms IS NULL",
             params![now_ms(), now_ms(), waypoint_id, kind.as_str(), entry_id],
         )?;
@@ -1083,6 +1165,177 @@ impl Store {
         Ok(())
     }
 
+    /// Add a review or squad to the waypoint's completion list.
+    ///
+    /// Idempotent: adding something already listed updates its note rather
+    /// than erroring, so a caller correcting a note does not have to remove
+    /// and re-add.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn add_roster_goal(
+        &self,
+        waypoint_id: &str,
+        kind: RosterEntryKind,
+        entry_id: &str,
+        note: Option<&str>,
+    ) -> StoreResult<()> {
+        self.conn.execute(
+            "INSERT INTO waypoint_roster(waypoint_id, kind, entry_id, note, created_at_ms)
+             VALUES(?,?,?,?,?)
+             ON CONFLICT(waypoint_id, kind, entry_id) DO UPDATE SET note=excluded.note",
+            params![waypoint_id, kind.as_str(), entry_id, note, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// Drop a goal from the waypoint's completion list. Removing the last
+    /// unfinished goal can make the waypoint closeable, which is the point.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::NotFound`] if that goal is not on the list;
+    /// otherwise propagates any SQLite failure.
+    pub fn remove_roster_goal(
+        &self,
+        waypoint_id: &str,
+        kind: RosterEntryKind,
+        entry_id: &str,
+    ) -> StoreResult<()> {
+        let n = self.conn.execute(
+            "DELETE FROM waypoint_roster WHERE waypoint_id=? AND kind=? AND entry_id=?",
+            params![waypoint_id, kind.as_str(), entry_id],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
+    /// The waypoint's completion list, each goal carrying whether it has
+    /// finished yet.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn list_roster_goals(&self, waypoint_id: &str) -> StoreResult<Vec<RosterGoalView>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT waypoint_id, kind, entry_id, note, created_at_ms
+             FROM waypoint_roster WHERE waypoint_id=? ORDER BY created_at_ms ASC, entry_id ASC",
+        )?;
+        let raw: Vec<(String, String, String, Option<String>, i64)> = stmt
+            .query_map(params![waypoint_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+        let mut out = Vec::with_capacity(raw.len());
+        for (wp, kind_s, entry_id, note, created_at_ms) in raw {
+            let Some(kind) = RosterEntryKind::parse(&kind_s) else {
+                continue;
+            };
+            out.push(RosterGoalView {
+                waypoint_id: wp,
+                kind,
+                entry_id: entry_id.clone(),
+                note,
+                terminal: self.entry_work_is_terminal(kind, &entry_id)?,
+                created_at_ms,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Whether a review/squad has reached a terminal state, by the same
+    /// per-kind reading the rest of the waypoint module uses.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    fn entry_work_is_terminal(&self, kind: RosterEntryKind, entry_id: &str) -> StoreResult<bool> {
+        Ok(match kind {
+            RosterEntryKind::Squad => match self.squad_state(entry_id) {
+                Ok(state) => state.is_terminal_for_waypoint(),
+                Err(StoreError::NotFound) => false,
+                Err(e) => return Err(e),
+            },
+            RosterEntryKind::Review => {
+                let status: Option<String> = self
+                    .conn
+                    .query_row(
+                        "SELECT status FROM guardians WHERE id=?",
+                        params![entry_id],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                match status {
+                    Some(s) => GuardianStatus::is_terminal_status(&s),
+                    None => false,
+                }
+            }
+        })
+    }
+
+    /// Record how one affected entry answered this waypoint.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::NotFound`] if that entry is not affected by this
+    /// waypoint; otherwise propagates any SQLite failure.
+    pub fn set_affected_bearing_decision(
+        &self,
+        waypoint_id: &str,
+        kind: RosterEntryKind,
+        entry_id: &str,
+        decision: BearingDecision,
+    ) -> StoreResult<()> {
+        let n = self.conn.execute(
+            "UPDATE waypoint_affected SET bearing_decision=?, bearing_decided_at_ms=?, updated_at_ms=?
+             WHERE waypoint_id=? AND kind=? AND entry_id=?",
+            params![
+                decision.as_str(),
+                now_ms(),
+                now_ms(),
+                waypoint_id,
+                kind.as_str(),
+                entry_id
+            ],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
+    /// Whether every goal on the waypoint's completion list has finished --
+    /// phase 1 of a waypoint being done.
+    ///
+    /// An empty list is vacuously satisfied. A waypoint that names no goals
+    /// is a pure broadcast ("this is changing, tell me how it lands on you"),
+    /// and the only thing left to wait for is the answers.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn roster_goals_complete(&self, waypoint_id: &str) -> StoreResult<bool> {
+        Ok(self
+            .list_roster_goals(waypoint_id)?
+            .iter()
+            .all(|g| g.terminal))
+    }
+
+    /// Whether every affected entry that owes this waypoint an answer has
+    /// given one -- phase 2 of a waypoint being done.
+    ///
+    /// Only `block`-mode entries owe an answer. An advisory entry is told
+    /// what changed and left alone; waiting on one would make "advisory"
+    /// mean nothing.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn affected_have_answered(&self, waypoint_id: &str) -> StoreResult<bool> {
+        Ok(self
+            .list_roster_entries(waypoint_id)?
+            .iter()
+            .filter(|e| e.mode == RosterMode::Block)
+            .all(|e| e.bearing_decision.is_some()))
+    }
+
     /// What a re-survey of this waypoint would act on, so the caller can show
     /// it before committing to one.
     ///
@@ -1101,7 +1354,7 @@ impl Store {
         let _ = self.get_waypoint(waypoint_id)?;
         let mut stmt = self.conn.prepare(
             "SELECT kind, entry_id, mode, survey_verdict, delivery_status, auto_enrolled
-             FROM waypoint_roster WHERE waypoint_id=? ORDER BY created_at_ms ASC, entry_id ASC",
+             FROM waypoint_affected WHERE waypoint_id=? ORDER BY created_at_ms ASC, entry_id ASC",
         )?;
         let raw: Vec<(String, String, String, Option<String>, String, bool)> = stmt
             .query_map(params![waypoint_id], |r| {
@@ -1224,7 +1477,7 @@ impl Store {
     /// Propagates any SQLite failure.
     pub fn clear_auto_enrolled_survey_verdicts(&self, waypoint_id: &str) -> StoreResult<usize> {
         let n = self.conn.execute(
-            "UPDATE waypoint_roster
+            "UPDATE waypoint_affected
              SET survey_verdict=NULL, survey_rationale=NULL, updated_at_ms=?
              WHERE waypoint_id=? AND auto_enrolled=1",
             params![now_ms(), waypoint_id],
@@ -1244,7 +1497,7 @@ impl Store {
     /// Propagates any SQLite failure.
     pub fn waypoint_delivery_counts(&self) -> StoreResult<BTreeMap<String, BTreeMap<String, i64>>> {
         let mut stmt = self.conn.prepare(
-            "SELECT waypoint_id, delivery_status, COUNT(*) FROM waypoint_roster
+            "SELECT waypoint_id, delivery_status, COUNT(*) FROM waypoint_affected
              GROUP BY waypoint_id, delivery_status",
         )?;
         let rows = stmt
@@ -1368,7 +1621,7 @@ impl Store {
     ) -> StoreResult<bool> {
         let now = now_ms();
         let n = self.conn.execute(
-            "UPDATE waypoint_roster SET stale_at_ms=?, updated_at_ms=?
+            "UPDATE waypoint_affected SET stale_at_ms=?, updated_at_ms=?
              WHERE waypoint_id=? AND kind=? AND entry_id=? AND stale_at_ms IS NULL",
             params![now, now, waypoint_id, kind.as_str(), entry_id],
         )?;
@@ -1388,7 +1641,7 @@ impl Store {
         entry_id: &str,
     ) -> StoreResult<bool> {
         let n = self.conn.execute(
-            "UPDATE waypoint_roster SET stale_at_ms=NULL, updated_at_ms=?
+            "UPDATE waypoint_affected SET stale_at_ms=NULL, updated_at_ms=?
              WHERE waypoint_id=? AND kind=? AND entry_id=? AND stale_at_ms IS NOT NULL",
             params![now_ms(), waypoint_id, kind.as_str(), entry_id],
         )?;
@@ -1441,7 +1694,7 @@ impl Store {
         verdict: &SurveyVerdict,
     ) -> StoreResult<()> {
         self.conn.execute(
-            "UPDATE waypoint_roster SET mode=?, survey_verdict=?, survey_rationale=?, updated_at_ms=?
+            "UPDATE waypoint_affected SET mode=?, survey_verdict=?, survey_rationale=?, updated_at_ms=?
              WHERE waypoint_id=? AND kind=? AND entry_id=?",
             params![
                 verdict.mode.as_str(),
@@ -1514,6 +1767,24 @@ impl Store {
         if !self.waypoint_is_open(waypoint_id)? {
             return Ok(false);
         }
+        // A waypoint that names nothing and affects nothing has not finished,
+        // it has not started -- closing one the moment it is created would be
+        // the only thing this ever did for it.
+        if self.list_roster_goals(waypoint_id)?.is_empty()
+            && self.list_roster_entries(waypoint_id)?.is_empty()
+        {
+            return Ok(false);
+        }
+        // Phase 1: the work this waypoint consists of has landed.
+        if !self.roster_goals_complete(waypoint_id)? {
+            return Ok(false);
+        }
+        // Phase 2: everything it lands on has said how it landed. Note the
+        // order -- downstream work cannot honestly answer "did you take this
+        // up" until the change it is answering about actually exists.
+        if !self.affected_have_answered(waypoint_id)? {
+            return Ok(false);
+        }
         if !self.all_roster_entries_terminal(waypoint_id)? {
             return Ok(false);
         }
@@ -1524,7 +1795,7 @@ impl Store {
                 .emit(
                     self,
                     format!(
-                        "waypoint {waypoint_id} auto-closed: every roster entry reached a terminal state"
+                        "waypoint {waypoint_id} auto-closed: its roster landed and every blocking affected entry answered"
                     ),
                     serde_json::json!({"waypoint_id": waypoint_id, "reason": "auto"}),
                 );
@@ -1547,7 +1818,7 @@ impl Store {
         entry_id: &str,
     ) -> StoreResult<Vec<String>> {
         let mut stmt = self.conn.prepare(
-            "SELECT wr.waypoint_id FROM waypoint_roster wr
+            "SELECT wr.waypoint_id FROM waypoint_affected wr
              JOIN waypoints w ON w.id = wr.waypoint_id
              WHERE wr.kind = ? AND wr.entry_id = ? AND w.state = 'open'",
         )?;
@@ -1650,7 +1921,7 @@ impl Store {
     pub fn squad_block_gating_waypoint(&self, squad_id: &str) -> StoreResult<Option<String>> {
         self.conn
             .query_row(
-                "SELECT wr.waypoint_id FROM waypoint_roster wr
+                "SELECT wr.waypoint_id FROM waypoint_affected wr
                  JOIN waypoints w ON w.id = wr.waypoint_id
                  WHERE wr.kind = 'squad' AND wr.entry_id = ? AND wr.mode = 'block'
                    AND (wr.survey_verdict IS NULL OR wr.survey_verdict = 'impacted')
@@ -1680,7 +1951,7 @@ impl Store {
     pub fn review_block_gating_waypoint(&self, guardian_id: &str) -> StoreResult<Option<String>> {
         self.conn
             .query_row(
-                "SELECT wr.waypoint_id FROM waypoint_roster wr
+                "SELECT wr.waypoint_id FROM waypoint_affected wr
                  JOIN waypoints w ON w.id = wr.waypoint_id
                  WHERE wr.kind = 'review' AND wr.entry_id = ? AND wr.mode = 'block'
                    AND (wr.survey_verdict IS NULL OR wr.survey_verdict = 'impacted')
@@ -1736,7 +2007,7 @@ impl Store {
     ) -> StoreResult<()> {
         let mut stmt = self.conn.prepare(
             "SELECT waypoint_id, mode, survey_verdict, survey_rationale
-             FROM waypoint_roster WHERE kind='squad' AND entry_id=?",
+             FROM waypoint_affected WHERE kind='squad' AND entry_id=?",
         )?;
         let rows = stmt
             .query_map(params![squad_id], |r| {
@@ -1752,7 +2023,7 @@ impl Store {
         let now = now_ms();
         for (waypoint_id, mode, survey_verdict, survey_rationale) in rows {
             self.conn.execute(
-                "INSERT INTO waypoint_roster(waypoint_id, kind, entry_id, mode, survey_verdict, survey_rationale, delivery_status, created_at_ms, updated_at_ms)
+                "INSERT INTO waypoint_affected(waypoint_id, kind, entry_id, mode, survey_verdict, survey_rationale, delivery_status, created_at_ms, updated_at_ms)
                  VALUES(?,'review',?,?,?,?,'undelivered',?,?)
                  ON CONFLICT(waypoint_id, kind, entry_id) DO UPDATE SET
                      mode=excluded.mode,
@@ -1762,7 +2033,7 @@ impl Store {
                 params![waypoint_id, guardian_id, mode, survey_verdict, survey_rationale, now, now],
             )?;
             self.conn.execute(
-                "DELETE FROM waypoint_roster WHERE waypoint_id=? AND kind='squad' AND entry_id=?",
+                "DELETE FROM waypoint_affected WHERE waypoint_id=? AND kind='squad' AND entry_id=?",
                 params![waypoint_id, squad_id],
             )?;
         }
@@ -3589,6 +3860,15 @@ mod tests {
     use crate::store::{NodeState, SquadState};
     use crate::store_lock::StoreMutex;
 
+    /// Records the answer a blocking affected entry owes its waypoint, so a
+    /// test about *terminality* can reach phase 2 without also restating the
+    /// bearing contract each time. See `Store::affected_have_answered`.
+    fn answer(store: &Store, waypoint_id: &str, kind: RosterEntryKind, entry_id: &str) {
+        store
+            .set_affected_bearing_decision(waypoint_id, kind, entry_id, BearingDecision::Accepted)
+            .unwrap();
+    }
+
     fn open_waypoint(store: &Store, id: &str) {
         store
             .create_waypoint(id, Some("label"), "prompt text", None, None, false)
@@ -3746,6 +4026,7 @@ mod tests {
                 RosterMode::Block,
             )
             .unwrap();
+        answer(&store, "waypoint-1", RosterEntryKind::Squad, squad_id);
         assert!(!store.maybe_auto_close_waypoint("waypoint-1").unwrap());
         assert!(store.waypoint_is_open("waypoint-1").unwrap());
 
@@ -3816,6 +4097,7 @@ mod tests {
                 RosterMode::Block,
             )
             .unwrap();
+        answer(&store, "waypoint-1", RosterEntryKind::Squad, "squad-1");
 
         store
             .set_squad_state("squad-1", SquadState::Failed)
@@ -3845,6 +4127,7 @@ mod tests {
                 RosterMode::Block,
             )
             .unwrap();
+        answer(&store, "waypoint-1", RosterEntryKind::Review, "guardian-1");
 
         store
             .set_guardian_status("guardian-1", GuardianStatus::MergeFailed, Some("conflict"))
@@ -3885,6 +4168,8 @@ mod tests {
                 RosterMode::Block,
             )
             .unwrap();
+        answer(&store, "waypoint-1", RosterEntryKind::Squad, "squad-1");
+        answer(&store, "waypoint-1", RosterEntryKind::Review, "guardian-1");
 
         store
             .set_guardian_status("guardian-1", GuardianStatus::Cancelled, None)
@@ -3931,6 +4216,9 @@ mod tests {
                 RosterMode::Block,
             )
             .unwrap();
+        answer(&store, "waypoint-1", RosterEntryKind::Squad, "squad-shared");
+        answer(&store, "waypoint-2", RosterEntryKind::Squad, "squad-shared");
+        answer(&store, "waypoint-2", RosterEntryKind::Squad, "squad-only-2");
 
         store
             .set_squad_state("squad-shared", SquadState::Done)
