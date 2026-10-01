@@ -38,6 +38,7 @@ pub mod exec;
 pub mod fileops;
 pub mod job;
 pub mod layout;
+pub mod materialize;
 pub mod ping;
 pub mod protocol;
 pub mod provision;

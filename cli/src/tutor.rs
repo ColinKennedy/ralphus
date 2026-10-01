@@ -525,8 +525,9 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                 Set false to have every later merge or rebase regenerate
                 the checks from the freshly stacked diff.
 
- [[review.auto_build]]  (zero or more per [[review]])
- Declare the build steps that run at merge/finalize time (RAL-342).
+ [[review.prepare]]  (zero or more per [[review]])
+ Declare ordered unattended work that makes manual actions ready before a
+ reviewer presses Run.
  Each entry is run in order. Exactly ONE of `prompt` or `command`
  is required per entry.
 
@@ -550,14 +551,70 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                                        project-level default.
 
  [[review.action]]  (zero or more per [[review]])
- User-declared labelled buttons shown in the review pane.
+ User-declared labelled buttons shown in the review pane. Every action is
+ optional to run and never blocks approval.
  Exactly ONE of `prompt` or `command` is required per entry.
 
  Key     Type    Notes
  label   string  REQUIRED. Text shown on the UI button.
  command string  ONE-OF Verbatim shell command run in a terminal.
  prompt  string  ONE-OF Hint text forwarded to the resolver LLM
-                 to expand into a runnable command before running.
+                 to expand into a runnable command during preparation.
+ run_on  string         "daemon" or "review_machine".
+ description string     What the reviewer should inspect.
+ success string         What a successful observation looks like.
+
+ [[review.action.prepare]] uses the same command/prompt shape as
+ [[review.prepare]] for action-specific setup.
+
+ [[review.action.artifact]] declares selected prepared outputs:
+ source             relative path produced in the review checkout
+ placement          "copy", "retain", or "shared"
+ destination        relative daemon-side path (required for "copy")
+ shared_path        network path/URI (required for "shared")
+ readiness_command  proves shared output is usable (required for "shared")
+ executable         preserve/add executable mode where supported
+
+ Placement recipes:
+
+ 1. Local build and local test: review has no remote machine. Prepare and Run
+    both use the retained local review checkout; no transfer is needed.
+
+    [[review.prepare]]
+    command = "cargo build --bin demo"
+
+    [[review.action]]
+    label = "Run local demo"
+    command = "target/debug/demo"
+    run_on = "daemon"
+
+ 2. Remote build, local test: assign [[review]] machine, build there, and
+    copy only the selected executable/resources back before Run enables.
+
+    [[review.action]]
+    label = "Run copied desktop build"
+    command = "staged/demo"
+    run_on = "daemon"
+
+      [[review.action.artifact]]
+      source = "target/release/demo"
+      destination = "staged/demo"
+      placement = "copy"
+      executable = true
+
+ 3. Shared/network placement: preparation publishes to a mounted share or
+    artifact store. Ralphus verifies readiness but does not relay the payload.
+
+    [[review.action]]
+    label = "Exercise shared build"
+    command = "//build-share/demo/current/demo"
+    run_on = "daemon"
+
+      [[review.action.artifact]]
+      source = "target/release/demo"
+      placement = "shared"
+      shared_path = "//build-share/demo/current/demo"
+      readiness_command = "test -x /mnt/build-share/demo/current/demo"
 
 ---------------------------------------------------------------
  Triage (RAL-318) -- auto-review opt-in, alternative to [[review]]
@@ -1023,20 +1080,23 @@ auto_fix_pr_errors = true  # dispatch the resolver agent to fix a failing PR/MR 
 auto_cancel_outdated_pr_pipelines = true  # on by default; cancel stale CI runs when a newer commit is force-pushed
 cache_manual_checks = true  # on by default; compute manual checks once at first branch creation (RAL-521)
 
-# Build step 1: static command (run verbatim in shell).
-[[review.auto_build]]
+# Shared preparation runs before any manual action is enabled.
+[[review.prepare]]
 command = "cargo build --release"
 
-# Build step 2: agent-driven command (agent figures out the build).
+# Agent-driven preparation is also supported and runs in declaration order.
 # If agent/model are unset here, they inherit from the review's agent/model above.
-[[review.auto_build]]
+[[review.prepare]]
 prompt  = "Build this Rust project. Figure out what build tool to use and run it."
 agent   = "{<insert recommended agent here>}"  # optional: uses review's agent if unset
 
 # Optional: user-declared test buttons shown in the review pane.
 [[review.action]]
 label   = "Run tests"
-command = "cargo test --all-targets"
+command = "target/debug/my-test-runner"
+description = "Run the already-built focused test executable."
+success = "The focused scenario completes and prints PASS."
+run_on = "daemon"
 
 [[review.action]]
 label  = "Frontend smoke test"

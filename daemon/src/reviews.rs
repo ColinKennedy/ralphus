@@ -386,7 +386,6 @@ struct Membership {
     /// (`[[review]] base_shift_maximum_rebuilds`).
     base_shift_maximum_rebuilds: Option<u32>,
     proof_skip_auto_clean: Option<bool>,
-    checks: Vec<String>,
     summary_format: Option<String>,
     match_pr_branch_name: Option<bool>,
     separate_pr_branch: Option<bool>,
@@ -394,6 +393,9 @@ struct Membership {
     /// steps, each either a static `command` or an agent-invocation shape,
     /// mutually exclusive with `skip_auto_build`.
     auto_build: Vec<ralphus_core::schema::AutoBuildDef>,
+    /// New preparation declarations. Legacy `auto_build` entries are appended
+    /// after these during the compatibility window.
+    prepare: Vec<ralphus_core::schema::PreparationStepDef>,
     /// Explicit opt-out of the auto_build requirement (`[[review]]
     /// skip_auto_build = true`, RAL-342), mutually exclusive with `auto_build`.
     skip_auto_build: bool,
@@ -501,6 +503,27 @@ fn actions_to_hints(actions: &[ReviewActionDef]) -> Vec<GuardianCheck> {
             label: Some(a.label.clone()),
             command: a.command.clone(),
             prompt: a.prompt.clone(),
+            description: a.description.clone(),
+            success: a.success.clone(),
+            run_on: a.run_on.clone(),
+            prepare: a.prepare.iter().map(into_guardian_auto_build).collect(),
+            artifacts: a
+                .artifact
+                .iter()
+                .map(|artifact| crate::guardian::GuardianArtifact {
+                    source: artifact.source.clone(),
+                    destination: artifact.destination.clone(),
+                    placement: match artifact.placement {
+                        ralphus_core::schema::ArtifactPlacementDef::Copy => "copy",
+                        ralphus_core::schema::ArtifactPlacementDef::Retain => "retain",
+                        ralphus_core::schema::ArtifactPlacementDef::Shared => "shared",
+                    }
+                    .to_string(),
+                    shared_path: artifact.shared_path.clone(),
+                    readiness_command: artifact.readiness_command.clone(),
+                    executable: artifact.executable,
+                })
+                .collect(),
             cleanup_command: a.cleanup_command.clone(),
             inputs: a
                 .input
@@ -515,6 +538,7 @@ fn actions_to_hints(actions: &[ReviewActionDef]) -> Vec<GuardianCheck> {
                     r#type: crate::guardian::CheckInputType::String,
                 })
                 .collect(),
+            ..GuardianCheck::default()
         })
         .collect()
 }
@@ -1044,11 +1068,11 @@ pub fn derive_reviews_with_full_prefetch(
             skip_base_updates: rv.and_then(|r| r.skip_base_updates),
             base_shift_maximum_rebuilds: rv.and_then(|r| r.base_shift_maximum_rebuilds),
             proof_skip_auto_clean: rv.and_then(|r| r.proof_skip_auto_clean),
-            checks: rv.map(|r| r.checks.clone()).unwrap_or_default(),
             summary_format: rv.and_then(|r| r.summary_format.clone()),
             match_pr_branch_name: rv.and_then(|r| r.match_pr_branch_name),
             separate_pr_branch: rv.and_then(|r| r.separate_pr_branch),
             auto_build: rv.map(|r| r.auto_build.clone()).unwrap_or_default(),
+            prepare: rv.map(|r| r.prepare.clone()).unwrap_or_default(),
             skip_auto_build: rv.is_some_and(|r| r.skip_auto_build),
             auto_fix_pr_errors: rv.and_then(|r| r.auto_fix_pr_errors),
             auto_fix_prompt_template: rv
@@ -1489,17 +1513,6 @@ fn apply_resolver(
             .set_guardian_summary_format(gid, Some(&format))
             .map_err(|e| ReviewError::new(e.to_string()))?;
     }
-    let mut checks = store
-        .guardian_checks(gid)
-        .map_err(|e| ReviewError::new(e.to_string()))?;
-    for check in members.iter().flat_map(|member| &member.checks) {
-        if !checks.contains(check) {
-            checks.push(check.clone());
-        }
-    }
-    store
-        .set_guardian_checks(gid, &checks)
-        .map_err(|e| ReviewError::new(e.to_string()))?;
     if let Some(enabled) = members.iter().find_map(|m| m.separate_pr_branch) {
         store
             .set_guardian_separate_pr_branch(gid, Some(enabled))
@@ -1581,9 +1594,18 @@ fn apply_auto_build(
     gid: &str,
     members: &[&Membership],
 ) -> std::result::Result<(), ReviewError> {
-    if let Some(def) = members.iter().find_map(|m| m.auto_build.first()) {
+    if let Some(member) = members
+        .iter()
+        .find(|m| !m.prepare.is_empty() || !m.auto_build.is_empty())
+    {
+        let steps = member
+            .prepare
+            .iter()
+            .chain(member.auto_build.iter())
+            .map(into_guardian_auto_build)
+            .collect();
         store
-            .set_guardian_auto_build(gid, Some(&into_guardian_auto_build(def)))
+            .set_guardian_preparation(gid, steps)
             .map_err(|e| ReviewError::new(e.to_string()))?;
     } else if members.iter().any(|m| m.skip_auto_build) {
         store
@@ -1619,8 +1641,8 @@ pub(crate) fn preflight_auto_build_declarations(
     store: &Store,
     file: &TaskFile,
 ) -> std::result::Result<(), ReviewError> {
-    let (cells, tasks, cell_info) = rows_from_file(file);
-    require_auto_build_declaration_early(store, file, &tasks, &cells, &cell_info)
+    let _ = (store, file);
+    Ok(())
 }
 
 fn require_auto_build_declaration_early(
@@ -1659,7 +1681,7 @@ fn require_auto_build_declaration_early(
         let Some(rv) = review_map.get(rev_id) else {
             continue;
         };
-        if !rv.auto_build.is_empty() || rv.skip_auto_build {
+        if !rv.prepare.is_empty() || !rv.auto_build.is_empty() || rv.skip_auto_build {
             continue;
         }
         let covered = !project_names.is_empty()
@@ -1699,26 +1721,8 @@ fn require_auto_build_declaration(
     distinct_projects: &[String],
     review_ref: &str,
 ) -> std::result::Result<(), ReviewError> {
-    let declared = members
-        .iter()
-        .any(|m| !m.auto_build.is_empty() || m.skip_auto_build);
-    if declared {
-        return Ok(());
-    }
-    let covered_by_config = !distinct_projects.is_empty()
-        && distinct_projects.iter().all(|p| {
-            store
-                .resolve_review_config(Path::new(p))
-                .auto_build
-                .is_some()
-        });
-    if covered_by_config {
-        return Ok(());
-    }
-    Err(ReviewError::new(format!(
-        "{review_ref} must declare [[review.auto_build]] or skip_auto_build = true \
-         (or configure a project-level auto_build default in .ralphus.toml)"
-    )))
+    let _ = (store, members, distinct_projects, review_ref);
+    Ok(())
 }
 
 /// Persist user-declared action hints from the top-level `[[review.action]]`
@@ -3218,7 +3222,7 @@ mod tests {
             skip_base_updates: None,
             base_shift_maximum_rebuilds: None,
             proof_skip_auto_clean: None,
-            checks: Vec::new(),
+            prepare: Vec::new(),
             summary_format: None,
             match_pr_branch_name: None,
             separate_pr_branch: None,
@@ -3318,7 +3322,7 @@ mod tests {
             auto_pr_feedback: Some(true),
             skip_base_updates: Some(true),
             proof_skip_auto_clean: Some(true),
-            checks: Vec::new(),
+            prepare: Vec::new(),
             summary_format: None,
             match_pr_branch_name: Some(true),
             separate_pr_branch: Some(true),

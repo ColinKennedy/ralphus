@@ -86,15 +86,6 @@ impl ValidationReport {
             line,
         });
     }
-
-    fn warning(&mut self, path: &str, kind: ErrorKind, msg: impl Into<String>, line: Option<u32>) {
-        self.warnings.push(ValidationError {
-            path: path.to_string(),
-            kind,
-            message: msg.into(),
-            line,
-        });
-    }
 }
 
 /// Shared validation context: the raw source, the line index, and the report
@@ -109,10 +100,6 @@ struct Ctx<'a> {
 impl Ctx<'_> {
     fn error(&mut self, path: &str, kind: ErrorKind, msg: impl Into<String>, line: Option<u32>) {
         self.report.error(path, kind, msg, line);
-    }
-
-    fn warning(&mut self, path: &str, kind: ErrorKind, msg: impl Into<String>, line: Option<u32>) {
-        self.report.warning(path, kind, msg, line);
     }
 
     fn key_line(&self, header: Option<u32>, key: &str) -> Option<u32> {
@@ -277,6 +264,7 @@ pub const REVIEW_KEYS: &[&str] = &[
     "machine",
     "upstream",
     "action",
+    "prepare",
     "maximum_budget_usd",
     "proof_scope",
     "auto_submit_pr_stack",
@@ -290,12 +278,10 @@ pub const REVIEW_KEYS: &[&str] = &[
     "separate_pr_branch",
     "dual_root_pr",
     "auto_build",
-    "skip_auto_build",
     "auto_fix_pr_errors",
     "auto_fix_prompt_template",
     "discourage_tests_during_auto_pull_request_fixes",
     "auto_cancel_outdated_pr_pipelines",
-    "checks",
     "summary_format",
     "cache_manual_checks",
 ];
@@ -324,8 +310,27 @@ pub fn auto_fix_template_has_placeholder(template: &str) -> bool {
     template.contains(AUTO_FIX_PROMPT_PLACEHOLDER)
 }
 
-const REVIEW_ACTION_KEYS: &[&str] = &["label", "prompt", "command", "cleanup_command", "input"];
+const REVIEW_ACTION_KEYS: &[&str] = &[
+    "label",
+    "prompt",
+    "command",
+    "description",
+    "success",
+    "run_on",
+    "prepare",
+    "artifact",
+    "cleanup_command",
+    "input",
+];
 const REVIEW_ACTION_INPUT_KEYS: &[&str] = &["name", "message", "default"];
+const REVIEW_ARTIFACT_KEYS: &[&str] = &[
+    "source",
+    "destination",
+    "placement",
+    "shared_path",
+    "readiness_command",
+    "executable",
+];
 const AUTO_BUILD_KEYS: &[&str] = &[
     "command",
     "prompt",
@@ -1961,7 +1966,6 @@ fn validate_review_blocks(value: Option<&toml::Value>, ctx: &mut Ctx) {
                 ctx.key_line(header, "skip_auto_clean"),
             );
         }
-        check_type(ctx, table, "checks", Ty::StrArray, &rpath, header);
         check_type(ctx, table, "summary_format", Ty::Str, &rpath, header);
         if let Some(format) = table.get("summary_format").and_then(toml::Value::as_str) {
             if !crate::schema::SUMMARY_FORMAT_VALUES.contains(&format) {
@@ -1980,8 +1984,8 @@ fn validate_review_blocks(value: Option<&toml::Value>, ctx: &mut Ctx) {
                 );
             }
         }
-        check_type(ctx, table, "skip_auto_build", Ty::Bool, &rpath, header);
         validate_auto_build_table(table, &rpath, ctx, header);
+        validate_preparation_array(table.get("prepare"), &format!("{rpath}.prepare"), ctx);
         check_type(ctx, table, "auto_fix_pr_errors", Ty::Bool, &rpath, header);
         check_type(
             ctx,
@@ -2242,17 +2246,6 @@ fn validate_auto_build_table(table: &toml::Table, rpath: &str, ctx: &mut Ctx, he
         .unwrap_or(false);
 
     let Some(value) = table.get("auto_build") else {
-        if !skip_auto_build {
-            ctx.warning(
-                rpath,
-                ErrorKind::MissingRequired,
-                "neither [[review.auto_build]] nor skip_auto_build = true is set -- the \
-                 daemon will reject this submission at materialization time unless every \
-                 project involved has a project-level `.ralphus.toml [review] auto_build` \
-                 default configured",
-                header,
-            );
-        }
         return;
     };
     let Some(arr) = value.as_array() else {
@@ -2366,6 +2359,83 @@ fn validate_auto_build_table(table: &toml::Table, rpath: &str, ctx: &mut Ctx, he
     }
 }
 
+/// Validate ordered preparation steps. The entry shape intentionally matches
+/// the legacy `auto_build` declaration so old declarations can be translated
+/// without changing their command/agent semantics.
+fn validate_preparation_array(value: Option<&toml::Value>, path: &str, ctx: &mut Ctx) {
+    let Some(value) = value else { return };
+    let Some(entries) = value.as_array() else {
+        ctx.error(
+            path,
+            ErrorKind::WrongType,
+            "preparation must be an array of tables",
+            None,
+        );
+        return;
+    };
+    for (idx, entry) in entries.iter().enumerate() {
+        let Some(step) = entry.as_table() else {
+            ctx.error(
+                &format!("{path}[{idx}]"),
+                ErrorKind::WrongType,
+                "preparation step must be a table",
+                None,
+            );
+            continue;
+        };
+        validate_preparation_step(step, &format!("{path}[{idx}]"), ctx);
+    }
+}
+
+fn validate_preparation_step(step: &toml::Table, path: &str, ctx: &mut Ctx) {
+    unknown_keys(ctx, step, AUTO_BUILD_KEYS, path, None);
+    let command = step.contains_key("command");
+    let prompt = step.contains_key("prompt");
+    if command == prompt {
+        ctx.error(
+            path,
+            if command {
+                ErrorKind::ConflictingKeys
+            } else {
+                ErrorKind::MissingRequired
+            },
+            "preparation step requires exactly one of 'command' or 'prompt'",
+            None,
+        );
+    }
+    check_type(ctx, step, "command", Ty::Str, path, None);
+    check_type(ctx, step, "prompt", Ty::Str, path, None);
+    check_type(ctx, step, "system_prompt", Ty::Str, path, None);
+    check_type(ctx, step, "system_prompt_position", Ty::Str, path, None);
+    check_type(ctx, step, "agent", Ty::Str, path, None);
+    check_type(ctx, step, "model", Ty::Str, path, None);
+    if command {
+        for key in ["system_prompt", "system_prompt_position", "agent", "model"] {
+            if step.contains_key(key) {
+                ctx.error(
+                    &format!("{path}.{key}"),
+                    ErrorKind::InvalidValue,
+                    format!("'{key}' is only valid with a prompt preparation step"),
+                    None,
+                );
+            }
+        }
+    }
+    if let Some(position) = step
+        .get("system_prompt_position")
+        .and_then(toml::Value::as_str)
+    {
+        if position != crate::schema::SYSTEM_PROMPT_POSITION_APPEND {
+            ctx.error(
+                &format!("{path}.system_prompt_position"),
+                ErrorKind::InvalidValue,
+                "'system_prompt_position' must be \"append\"",
+                None,
+            );
+        }
+    }
+}
+
 /// Validate `[[review.action]]` entries. Each entry must have `label` plus exactly
 /// one of `prompt` or `command`.
 fn validate_review_action_array(value: Option<&toml::Value>, path: &str, ctx: &mut Ctx) {
@@ -2435,8 +2505,143 @@ fn validate_review_action_array(value: Option<&toml::Value>, path: &str, ctx: &m
         // `cleanup_command` is optional and independent of the prompt/command
         // XOR above -- it coexists with either.
         check_type(ctx, table, "cleanup_command", Ty::Str, &apath, None);
+        check_type(ctx, table, "description", Ty::Str, &apath, None);
+        check_type(ctx, table, "success", Ty::Str, &apath, None);
+        check_type(ctx, table, "run_on", Ty::Str, &apath, None);
+        if let Some(run_on) = table.get("run_on").and_then(toml::Value::as_str) {
+            if !matches!(run_on, "daemon" | "review_machine") {
+                ctx.error(
+                    &format!("{apath}.run_on"),
+                    ErrorKind::InvalidValue,
+                    "'run_on' must be \"daemon\" or \"review_machine\"",
+                    None,
+                );
+            }
+        }
+
+        validate_preparation_array(table.get("prepare"), &format!("{apath}.prepare"), ctx);
+        validate_review_artifact_array(table.get("artifact"), &format!("{apath}.artifact"), ctx);
 
         validate_review_action_input_array(table.get("input"), &format!("{apath}.input"), ctx);
+    }
+}
+
+fn safe_relative_artifact_path(value: &str) -> bool {
+    let normalized = value.replace('\\', "/");
+    !normalized.is_empty()
+        && !normalized.starts_with('/')
+        && !normalized.contains(':')
+        && normalized
+            .split('/')
+            .all(|component| !matches!(component, "" | "." | ".."))
+}
+
+fn validate_review_artifact_array(value: Option<&toml::Value>, path: &str, ctx: &mut Ctx) {
+    let Some(value) = value else { return };
+    let Some(arr) = value.as_array() else {
+        ctx.error(
+            path,
+            ErrorKind::WrongType,
+            "[[review.action.artifact]] must be an array of tables",
+            None,
+        );
+        return;
+    };
+    for (idx, item) in arr.iter().enumerate() {
+        let artifact_path = format!("{path}[{idx}]");
+        let Some(table) = item.as_table() else {
+            ctx.error(
+                &artifact_path,
+                ErrorKind::WrongType,
+                "each [[review.action.artifact]] must be a table",
+                None,
+            );
+            continue;
+        };
+        unknown_keys(ctx, table, REVIEW_ARTIFACT_KEYS, &artifact_path, None);
+        for key in [
+            "source",
+            "destination",
+            "placement",
+            "shared_path",
+            "readiness_command",
+        ] {
+            check_type(ctx, table, key, Ty::Str, &artifact_path, None);
+        }
+        check_type(ctx, table, "executable", Ty::Bool, &artifact_path, None);
+        let source = table.get("source").and_then(toml::Value::as_str);
+        if source.is_none() {
+            ctx.error(
+                &artifact_path,
+                ErrorKind::MissingRequired,
+                "review action artifact requires 'source'",
+                None,
+            );
+        } else if !source.is_some_and(safe_relative_artifact_path) {
+            ctx.error(
+                &format!("{artifact_path}.source"),
+                ErrorKind::InvalidValue,
+                "artifact source must be a non-empty relative path without traversal",
+                None,
+            );
+        }
+        if let Some(destination) = table.get("destination").and_then(toml::Value::as_str) {
+            if !safe_relative_artifact_path(destination) {
+                ctx.error(
+                    &format!("{artifact_path}.destination"),
+                    ErrorKind::InvalidValue,
+                    "artifact destination must be a non-empty relative path without traversal",
+                    None,
+                );
+            }
+        }
+        let placement = table.get("placement").and_then(toml::Value::as_str);
+        if !matches!(placement, Some("copy" | "retain" | "shared")) {
+            ctx.error(
+                &format!("{artifact_path}.placement"),
+                ErrorKind::InvalidValue,
+                "artifact placement must be \"copy\", \"retain\", or \"shared\"",
+                None,
+            );
+        }
+        match placement {
+            Some("copy") if table.get("destination").is_none() => ctx.error(
+                &artifact_path,
+                ErrorKind::MissingRequired,
+                "copy artifact requires 'destination'",
+                None,
+            ),
+            Some("shared")
+                if table.get("shared_path").is_none()
+                    || table.get("readiness_command").is_none() =>
+            {
+                ctx.error(
+                    &artifact_path,
+                    ErrorKind::MissingRequired,
+                    "shared artifact requires 'shared_path' and 'readiness_command'",
+                    None,
+                )
+            }
+            Some("retain")
+                if table.get("destination").is_some() || table.get("shared_path").is_some() =>
+            {
+                ctx.error(
+                    &artifact_path,
+                    ErrorKind::ConflictingKeys,
+                    "retain artifact cannot set destination or shared_path",
+                    None,
+                )
+            }
+            _ => {}
+        }
+        if placement != Some("shared") && table.get("readiness_command").is_some() {
+            ctx.error(
+                &format!("{artifact_path}.readiness_command"),
+                ErrorKind::InvalidValue,
+                "readiness_command is only valid for shared artifacts",
+                None,
+            );
+        }
     }
 }
 

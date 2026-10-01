@@ -59,6 +59,13 @@
        * @property {string[]} [depends_on]
        * @property {string} [command]
        * @property {string} [prompt]
+       * @property {string} [description]
+       * @property {string} [success]
+       * @property {string} [run_on]
+       * @property {string} [preparation_state] - "waiting" | "preparing" | "transferring" | "ready" | "failed" | "stale"
+       * @property {string} [preparation_detail]
+       * @property {number} [prepared_at_ms]
+       * @property {string} [prepared_cwd]
        * @property {string|null} [system_prompt]
        * @property {string} [agent_session_id]
        * @property {string} [machine] - RAL-185/RAL-288: where this cell is routed. Absent/undefined means the daemon's own host.
@@ -333,8 +340,7 @@
        * @property {string} [review_type]
        * @property {string} [review_branch]
        * @property {string} [combined_worktree]
-       * @property {string[]} [checks]
-       * @property {string} [checks_state] - "ready" | "generating" | "waiting"
+       * @property {string} [checks_state] - "ready" | "generating" | "waiting" | "failed"
        * @property {GuardianCheck[]} [manual_commands]
        * @property {string} [manual_commands_agent]
        * @property {string} [manual_commands_model]

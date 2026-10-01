@@ -16350,6 +16350,32 @@ fn build_check_command_line(
     marker_path: &std::path::Path,
     log_path: &std::path::Path,
 ) -> Option<PreparedCheck> {
+    let (resolved, body) = build_check_command_body(
+        check,
+        submitted_inputs,
+        stored_inputs,
+        run_cleanup,
+    )?;
+    let marker = marker_path.display().to_string();
+    let log = log_path.display().to_string();
+    // cd /d sets both drive and directory on Windows before running the command.
+    let line = format!(
+        "cd /d \"{cwd}\" && ({body}) > \"{log}\" 2>&1 & echo !ERRORLEVEL!>\"{marker}\" & type \"{log}\""
+    );
+    Some(PreparedCheck {
+        resolved_command: resolved,
+        args: vec!["/V:ON".to_string(), "/K".to_string(), line],
+        marker_path: marker_path.to_path_buf(),
+        log_path: log_path.to_path_buf(),
+    })
+}
+
+fn build_check_command_body(
+    check: &crate::guardian::GuardianCheck,
+    submitted_inputs: &std::collections::HashMap<String, String>,
+    stored_inputs: &std::collections::HashMap<String, String>,
+    run_cleanup: bool,
+) -> Option<(String, String)> {
     let cmd = check.command.as_ref()?;
     let resolved = substitute_check_inputs(cmd, &check.inputs, submitted_inputs, stored_inputs);
     let body = if run_cleanup {
@@ -16368,18 +16394,7 @@ fn build_check_command_line(
     } else {
         resolved.clone()
     };
-    let marker = marker_path.display().to_string();
-    let log = log_path.display().to_string();
-    // cd /d sets both drive and directory on Windows before running the command.
-    let line = format!(
-        "cd /d \"{cwd}\" && ({body}) > \"{log}\" 2>&1 & echo !ERRORLEVEL!>\"{marker}\" & type \"{log}\""
-    );
-    Some(PreparedCheck {
-        resolved_command: resolved,
-        args: vec!["/V:ON".to_string(), "/K".to_string(), line],
-        marker_path: marker_path.to_path_buf(),
-        log_path: log_path.to_path_buf(),
-    })
+    Some((resolved, body))
 }
 
 /// Gap between polls of a launched check's exit-code marker file. Short enough
@@ -16750,9 +16765,17 @@ fn guardian_run_manual_commands(daemon: &Daemon, id: &str, body: &str) -> Reply 
     // Run against the built review worktree (e.g. `<id>-review`), not the
     // original repo — that's the checkout the commands are meant to verify
     // Fall back to git_root only if the review hasn't been built yet.
-    let cwd = g.combined_worktree.clone().unwrap_or(g.git_root.clone());
     let mut errors: Vec<String> = Vec::new();
     for (index, check) in &to_run {
+        if check.preparation_state.as_deref() != Some("ready") {
+            errors.push(format!("manual check {index} is not ready"));
+            continue;
+        }
+        let cwd = check
+            .prepared_cwd
+            .clone()
+            .or_else(|| g.combined_worktree.clone())
+            .unwrap_or_else(|| g.git_root.clone());
         let marker = new_check_run_marker(id, "manual", *index);
         let log = check_run_log_path(id, "manual", *index);
         let Some(prepared) = build_check_command_line(
@@ -16851,6 +16874,17 @@ fn guardian_run_action_hint(daemon: &Daemon, id: &str, body: &str) -> Reply {
         }
     };
 
+    if hint.preparation_state.as_deref() != Some("ready") {
+        return error(
+            409,
+            "action_not_ready",
+            hint.preparation_detail
+                .as_deref()
+                .unwrap_or("this action is still being prepared"),
+            vec![],
+        );
+    }
+
     if let Some(reply) = reject_invalid_check_inputs(
         daemon,
         id,
@@ -16865,7 +16899,11 @@ fn guardian_run_action_hint(daemon: &Daemon, id: &str, body: &str) -> Reply {
     // manual-checks environment -- action hints run in the same combined
     // worktree via the same terminal-spawning mechanism, so they inherit it
     // too: prefer the built review worktree over the original repo root.
-    let cwd = g.combined_worktree.clone().unwrap_or(g.git_root.clone());
+    let cwd = hint
+        .prepared_cwd
+        .clone()
+        .or_else(|| g.combined_worktree.clone())
+        .unwrap_or_else(|| g.git_root.clone());
     let marker = new_check_run_marker(id, "action", req.index);
     let log = check_run_log_path(id, "action", req.index);
     if let Some(prepared) = build_check_command_line(
@@ -16889,11 +16927,10 @@ fn guardian_run_action_hint(daemon: &Daemon, id: &str, body: &str) -> Reply {
             Err(e) => error(500, "terminal_error", &e, vec![]),
         }
     } else {
-        // prompt-kind hints are stored for display only; LLM expansion is not yet implemented.
         error(
-            501,
-            "not_implemented",
-            "prompt-kind action hints cannot be run directly yet",
+            409,
+            "action_not_prepared",
+            "prompt action has not expanded into a runnable command",
             vec![],
         )
     }

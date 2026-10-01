@@ -7710,6 +7710,7 @@ fn manual_push_clears_stale_manual_commands() {
                 prompt: None,
                 cleanup_command: None,
                 inputs: vec![],
+                ..GuardianCheck::default()
             }],
             None,
             None,
