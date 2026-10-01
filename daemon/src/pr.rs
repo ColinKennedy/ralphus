@@ -9469,6 +9469,7 @@ mod tests {
     impl Runner for ScriptedRunner {
         fn run(&self, _spec: &RunnerSpec) -> crate::runner::RunnerResult {
             crate::runner::RunnerResult {
+                bearing: None,
                 retry_after_secs: None,
                 status: "done".to_string(),
                 tokens_in: 0,
