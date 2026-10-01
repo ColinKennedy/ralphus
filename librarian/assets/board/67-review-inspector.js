@@ -1227,9 +1227,93 @@
        * @property {number} exitCode - The process exit code, once finished.
        * @property {boolean} done - Whether the finish event has arrived.
        * @property {boolean} timedOut - Set when the daemon gave up waiting rather than observing an exit.
+       * @property {boolean} hasOutput - Whether the daemon captured any output for this run.
        */
       /** @type {{[key: string]: CommandRun}} */
       const commandRuns = {};
+      /**
+       * Captured output per command key, fetched only when a finished run is
+       * actually expanded -- the transcript is up to 256 KiB and most runs are
+       * never opened.
+       * @type {{[key: string]: {state: string, output: string, truncated: boolean}}}
+       */
+      const commandRunOutput = {};
+      /**
+       * Fetches one finished run's captured output.
+       * @param {string} key - The command's key, `<gid>:<kind>:<index>`.
+       * @returns {Promise<void>}
+       */
+      async function fetchCheckRunOutput(key) {
+        if (commandRunOutput[key]) return;
+        commandRunOutput[key] = { state: "loading", output: "", truncated: false };
+        const [gid, kind, idx] = key.split(":");
+        try {
+          const r = await fetch(`/api/guardians/${encodeURIComponent(gid)}/check-runs/${encodeURIComponent(kind)}/${encodeURIComponent(idx)}/output`);
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          const d = await r.json();
+          commandRunOutput[key] = d.available
+            ? { state: "ready", output: String(d.output || ""), truncated: !!d.truncated }
+            : { state: "none", output: "", truncated: false };
+        } catch {
+          commandRunOutput[key] = { state: "error", output: "", truncated: false };
+        }
+        renderReviewDetail();
+      }
+      /**
+       * One finished run as Markdown -- the command, how it ended, and its
+       * output in a fenced block, ready to paste into an issue or hand to
+       * another agent.
+       * @param {string} key - The command's key.
+       * @param {string} cmd - The command text.
+       * @returns {string}
+       */
+      function commandRunMarkdown(key, cmd) {
+        const r = commandRuns[key];
+        if (!r) return cmd;
+        const how = r.timedOut
+          ? "gave up waiting"
+          : `exited ${r.exitCode}${r.exitCode === 0 ? " (passed)" : " (failed)"}`;
+        const out = commandRunOutput[key];
+        const body = out && out.state === "ready" && out.output
+          ? `\n\n\`\`\`\n${out.truncated ? "…output truncated to the last 256 KiB…\n" : ""}${out.output}\n\`\`\`\n`
+          : "\n";
+        return `\`${cmd}\`\n\n- ${how}\n- ran for ${fmtRunTime(r.elapsedMs)}\n${body}`;
+      }
+      /**
+       * The result panel under an expanded command that has finished: how it
+       * ended, and what it printed.
+       * @param {string} key - The command's key.
+       * @param {string} cmd - The command text.
+       * @returns {string}
+       */
+      function commandResultBlock(key, cmd) {
+        const r = commandRuns[key];
+        if (!r || !r.done) return "";
+        const ok = !r.timedOut && r.exitCode === 0;
+        const verdict = r.timedOut
+          ? `<span class="cmd-status idle">gave up</span>`
+          : `<span class="cmd-status ${ok ? "passed" : "failed"}">${ok ? "passed" : `failed · exit ${r.exitCode}`}</span>`;
+        // The output itself is only fetched once this panel is open, and only
+        // for a run that produced any.
+        if (r.hasOutput && !commandRunOutput[key]) void fetchCheckRunOutput(key);
+        const out = commandRunOutput[key];
+        const pane = !r.hasOutput
+          ? `<div class="run-out empty-out">This run printed nothing.</div>`
+          : !out || out.state === "loading"
+            ? `<div class="run-out empty-out">Loading output…</div>`
+            : out.state === "error"
+              ? `<div class="run-out empty-out">Could not load this run's output.</div>`
+              : out.state === "none"
+                ? `<div class="run-out empty-out">No output was recorded for this run.</div>`
+                : `<div class="run-out">${out.truncated ? `<div class="out-trunc">Showing the last 256 KiB — earlier output was dropped.</div>` : ""}${esc(out.output)}</div>`;
+        return `<div class="run-result">
+            <div class="run-result-head">${verdict}<span class="rg-sub">ran for ${esc(fmtRunTime(r.elapsedMs))}</span>
+              <button class="copy-btn" style="margin-left:auto" data-copy="${esc(commandRunMarkdown(key, cmd))}" onclick="copyText(event)"
+                data-tip="Copy this run as Markdown — the command, how it ended, and its output in a fenced block.">⧉</button>
+            </div>
+            ${pane}
+          </div>`;
+      }
       /**
        * Records that one command was handed to a terminal, and starts watching
        * for the daemon's completion event.
@@ -1237,7 +1321,9 @@
        * @returns {void}
        */
       function markCommandLaunched(key) {
-        commandRuns[key] = { launchedMs: Date.now(), elapsedMs: 0, exitCode: 0, done: false, timedOut: false };
+        commandRuns[key] = { launchedMs: Date.now(), elapsedMs: 0, exitCode: 0, done: false, timedOut: false, hasOutput: false };
+        // A rerun's result replaces the last one rather than showing it again.
+        delete commandRunOutput[key];
         startCommandRunTicker();
         renderReviewDetail();
       }
@@ -1307,6 +1393,11 @@
               run.elapsedMs = Number(p.elapsed_ms) || 0;
               run.exitCode = Number(p.exit_code) || 0;
               run.timedOut = !!p.timed_out;
+              run.hasOutput = !!p.has_output;
+              // A result nobody can see is not a result: finishing opens the
+              // row's panel so what happened is on screen, rather than behind a
+              // click you have to know to make.
+              commandFullOpen[`${gid}:${p.kind}:${p.index}`] = true;
               settled = true;
             }
             if (settled) renderReviewDetail();
@@ -1420,6 +1511,7 @@
         return `<div class="cmd-full mono">
             <div id="cmd-preview-${esc(key)}">${esc(shown)}</div>
             ${hasInputs ? renderCheckInputFields(opts.g, /** @type {"manual"|"action"} */ (opts.kind), opts.i, check) : ""}
+            ${commandResultBlock(key, shown)}
             <div class="btn-row" style="margin-top:7px">
               <button class="btn" data-copy="${esc(shown)}" onclick="copyText(event)" data-tip="Copy the command exactly as shown above.">⧉ Copy</button>
               <button class="btn" data-click="toggleReviewCommandFull" data-key="${esc(key)}" data-tip="Collapse this back to one line.">Collapse</button>

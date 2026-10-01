@@ -306,6 +306,22 @@
       .setup-group.focused > h3.section { color: var(--accent); }
       /* The review's primary action and its menu, as one object: the thing you
          press most, with everything else one click further. */
+      /* What a finished run did, under the command that did it. */
+      .run-result { margin-top: 9px; padding-top: 9px; border-top: 1px solid var(--border-soft); }
+      .run-result-head { display: flex; align-items: center; gap: 8px; margin-bottom: 7px; font-family: var(--ui, inherit); }
+      .run-result-head .rg-sub { font-size: 11.5px; color: var(--faint); }
+      .run-out {
+        background: var(--terminal-bg); border: 1px solid var(--border); border-radius: 7px;
+        padding: 9px 10px; font-size: 12px; line-height: 1.55; color: #b9c4d0;
+        white-space: pre-wrap; word-break: break-word; max-height: 320px; overflow: auto;
+      }
+      .run-out.empty-out {
+        background: var(--bg); color: var(--muted); font-family: var(--ui, inherit);
+        border-style: dashed; white-space: normal;
+      }
+      .out-trunc { color: var(--unverified); margin-bottom: 6px; font-family: var(--ui, inherit); font-size: 11.5px; }
+      .cmd-status.passed { color: var(--done); border-color: var(--done-b); background: var(--done-a); }
+      .cmd-status.failed { color: var(--failed); border-color: var(--failed-b); background: var(--failed-a); }
       /* A launched command: the board knows it was handed to a terminal and
          when, never how it ended, so the chip reads as a fact rather than as a
          pending outcome waiting to turn green. */
