@@ -14919,6 +14919,9 @@ struct WaypointListEntry {
     allow_advisory: bool,
     projects: Vec<String>,
     roster_count: usize,
+    /// Roster-entry counts by delivery status, so the sidebar can render each
+    /// waypoint's progress without a second request per row.
+    delivery_summary: DeliverySummary,
     created_at_ms: i64,
     updated_at_ms: i64,
     closed_at_ms: Option<i64>,
@@ -15169,10 +15172,15 @@ fn waypoint_list(daemon: &Daemon, query: &str) -> Reply {
                 continue;
             }
         }
-        let roster_count = match store.list_roster_entries(&id) {
-            Ok(roster) => roster.len(),
+        // The roster is already loaded to count it, so the delivery rollup is
+        // free here -- and it lets the sidebar show each waypoint's progress as
+        // a shape instead of forcing the detail pane open to learn it.
+        let roster = match store.list_roster_entries(&id) {
+            Ok(roster) => roster,
             Err(e) => return store_error(&e),
         };
+        let roster_count = roster.len();
+        let delivery_summary = DeliverySummary::from_roster(&roster);
         entries.push(WaypointListEntry {
             id: view.id,
             label: view.label,
@@ -15180,6 +15188,7 @@ fn waypoint_list(daemon: &Daemon, query: &str) -> Reply {
             allow_advisory: view.allow_advisory,
             projects,
             roster_count,
+            delivery_summary,
             created_at_ms: view.created_at_ms,
             updated_at_ms: view.updated_at_ms,
             closed_at_ms: view.closed_at_ms,

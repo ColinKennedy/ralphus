@@ -1,5 +1,0 @@
-[ 2424554ms] TypeError: NetworkError when attempting to fetch resource.
-    at toggleRosterEntryMode (http://127.0.0.1:7477/board/82-waypoints.js:462:28)
-    at async*CLICK_HANDLERS.toggleRosterEntryMode (http://127.0.0.1:7477/board/05-engines.js:270:78)
-    at  (http://127.0.0.1:7477/board/05-engines.js:284:29)
-    at EventListener.handleEvent* (http://127.0.0.1:7477/board/05-engines.js:280:16)

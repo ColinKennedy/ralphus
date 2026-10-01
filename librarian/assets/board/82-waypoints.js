@@ -250,11 +250,69 @@
         if (!waypoints.length) { el.innerHTML = `<div class="empty">No waypoints.</div>`; return; }
         const list = visibleWaypoints();
         if (!list.length) { el.innerHTML = `<div class="empty">No matching waypoints.</div>`; return; }
-        el.innerHTML = list.map((w) => `<div class="squad-item ${w.id === selectedWaypointId ? "selected" : ""}" data-click="selectWaypoint" data-ctx="openWaypointMenu" data-waypoint-id="${esc(w.id)}">
-          <button class="btn squadbtn" data-click="openWaypointMenu" data-waypoint-id="${esc(w.id)}" data-tip="Waypoint actions — watch, add a roster entry, or close/reopen this waypoint.">⋯</button>
-          <div class="rid">${esc(w.label || w.id)}</div>
-          <div class="meta">${waypointStateBadge(w.state)}<span>${w.roster_count} roster${w.roster_count === 1 ? "" : "s"}</span>${w.projects.length ? ` · ${esc(w.projects.join(", "))}` : ""}</div>
+        el.innerHTML = list.map((w) => `<div class="wp-card ${w.id === selectedWaypointId ? "selected" : ""}" data-click="selectWaypoint" data-ctx="openWaypointMenu" data-waypoint-id="${esc(w.id)}" data-tip="Open this waypoint.\nRight-click for actions.">
+          <div class="wp-card-top">
+            <div class="wp-card-name">${esc(w.label || w.id)}</div>
+            ${waypointStateBadge(w.state)}
+          </div>
+          <div class="wp-card-meta">
+            ${renderWaypointSpark(w)}
+            <span data-tip="How many squads and reviews this waypoint tracks.">${w.roster_count} roster${w.roster_count === 1 ? "" : "s"}</span>
+            ${w.projects.length ? `<span class="wp-proj" data-tip="Projects inferred from the roster.">${esc(w.projects.join(", "))}</span>` : ""}
+          </div>
         </div>`).join("");
+      }
+
+      /**
+       * Renders a waypoint's roster as one segment per entry, coloured by that entry's delivery status — the same
+       * vocabulary `wdot` uses. Progress read as shape rather than as a count, so a sidebar scan answers "how far
+       * along is this one" without opening it. Falls back to a single muted segment for an empty roster.
+       * @param {WaypointListEntry} w
+       * @returns {string}
+       */
+      function renderWaypointSpark(w) {
+        const counts = w.delivery_summary;
+        /** @type {string[]} */
+        const segments = [];
+        for (const [status, n] of [["delivered", counts.delivered], ["via_restack", counts.via_restack], ["failed", counts.failed], ["undelivered", counts.undelivered]]) {
+          for (let i = 0; i < Number(n); i += 1) segments.push(String(status));
+        }
+        if (!segments.length) return `<span class="wp-spark" data-tip="No roster entries yet."><i></i></span>`;
+        const tip = `Roster delivery: ${counts.delivered} delivered, ${counts.via_restack} via restack, ${counts.failed} failed, ${counts.undelivered} undelivered.`;
+        const bars = segments.map((s) => `<i style="background:${cvar(WAYPOINT_DELIVERY_COLORS[s] || "--muted")}"></i>`).join("");
+        return `<span class="wp-spark" data-tip="${esc(tip)}">${bars}</span>`;
+      }
+
+      /**
+       * Renders the waypoint's lifecycle as a rail: open → surveyed → delivered → closed, with the step it is
+       * currently on marked. Each step is derived from real roster state rather than stored, so it cannot drift
+       * from the data. Answers "what is this waypoint waiting on", which a delivered-count alone does not.
+       * @param {WaypointDetail} w
+       * @returns {string}
+       */
+      function renderWaypointPipeline(w) {
+        const total = w.roster.length;
+        const surveyed = w.roster.filter((e) => e.survey_verdict).length;
+        const ds = w.delivery_summary;
+        const reached = ds.delivered + ds.via_restack;
+        const closed = w.state === "closed";
+        const steps = [
+          { label: "open", done: true, tip: "The waypoint exists and is tracking its roster." },
+          { label: "surveyed", done: total > 0 && surveyed >= total, tip: `Relevance decided for ${surveyed} of ${total} roster entries.` },
+          { label: "delivered", done: total > 0 && reached >= total, tip: `Guidance reached ${reached} of ${total} roster entries.` },
+          { label: "closed", done: closed, tip: closed ? "Closed — no further deliveries are expected." : "Closes when every roster entry reaches a terminal state, or when closed by hand." },
+        ];
+        // A later step being reached implies the earlier ones: an entry added by
+        // hand never gets a survey verdict, so "surveyed" would otherwise stay
+        // pending behind a waypoint that has already delivered and closed.
+        const furthest = steps.reduce((acc, s, i) => (s.done ? i : acc), 0);
+        for (let i = 0; i < furthest; i += 1) steps[i].done = true;
+        const nowIdx = steps.findIndex((s) => !s.done);
+        return `<div class="wp-pipe">${steps.map((s, i) => {
+          const cls = s.done ? "is-done" : (i === nowIdx ? "is-now" : "");
+          const line = i < steps.length - 1 ? `<span class="wp-pline ${steps[i + 1].done || s.done ? "is-done" : ""}"></span>` : "";
+          return `<span class="wp-step ${cls}" data-tip="${esc(s.tip)}"><span class="wp-pdot">${s.done ? "✓" : ""}</span>${esc(s.label)}</span>${line}`;
+        }).join("")}</div>`;
       }
 
       /**
@@ -317,21 +375,24 @@
         const icon = entry.kind === "review" ? "🔀" : "🧩";
         const gotoFn = entry.kind === "review" ? "gotoReview" : "gotoSquad";
         const idAttr = entry.kind === "review" ? `data-guardian-id="${esc(entry.entry_id)}"` : `data-squad-id="${esc(entry.entry_id)}"`;
-        const link = `<a href="#" data-click="${gotoFn}" ${idAttr} data-tip="Open this ${esc(entry.kind)}'s own page.">${icon} ${esc(entry.entry_id)}</a>`;
+        const link = `<a class="wp-entry-id" href="#" data-click="${gotoFn}" ${idAttr} data-tip="Open this ${esc(entry.kind)}'s own page.">${icon} ${esc(entry.entry_id)}</a>`;
         const verdict = entry.survey_verdict
-          ? `<details style="margin-top:2px"><summary data-tip="Show the relevance-assessment verdict and rationale the survey pass recorded for this entry.">${esc(entry.survey_verdict)}</summary><div style="color:var(--muted);font-size:12px;padding:2px 0 0 12px">${esc(entry.survey_rationale || "(no rationale recorded)")}</div></details>`
+          ? `<details class="wp-entry-why"><summary data-tip="Show the relevance verdict and rationale the survey recorded for this entry.">${esc(entry.survey_verdict)}</summary><div style="padding:4px 0 0 12px">${esc(entry.survey_rationale || "(no rationale recorded)")}</div></details>`
           : "";
         const staleBadge = entry.stale_at_ms
           ? ` <span class="badge" style="color:var(--stale);border-color:var(--stale)" data-tip="This work finished while the waypoint was still open and had judged it impacted, so it landed without the waypoint's changes and may be stale.\nNothing has been re-run automatically.\nTo re-run it carrying its prior findings and this waypoint's bearings: ralphus waypoint redo ${esc(entry.waypoint_id)} ${esc(entry.entry_id)}">stale</span>`
           : "";
         const removeBtn = `<button class="icon-btn" data-click="removeRosterEntry" data-waypoint-id="${esc(entry.waypoint_id)}" data-entry-id="${esc(entry.entry_id)}" data-tip="Remove this entry from the waypoint's roster.\nThis cannot be undone." style="font-size:11px;padding:1px 5px">✕</button>`;
-        const toggleModeBtn = `<button class="icon-btn" data-click="toggleRosterEntryMode" data-waypoint-id="${esc(entry.waypoint_id)}" data-entry-id="${esc(entry.entry_id)}" data-mode="${entry.mode === "advisory" ? "block" : "advisory"}" data-tip="Switch this entry to ${entry.mode === "advisory" ? "block" : "advisory"} mode." style="font-size:11px;padding:1px 5px">⇄</button>`;
-        return `<div class="kv-row" style="align-items:flex-start">
-          <span class="k">${wdot(entry.delivery_status)}</span>
-          <span class="v" style="flex:1">
-            <div>${link} ${waypointModeBadge(entry.mode)} <span class="badge" style="color:var(--muted);border-color:var(--border)" data-tip="Delivery status for this roster entry.">${esc(entry.delivery_status)}</span>${staleBadge} ${toggleModeBtn}${removeBtn}</div>
-            ${verdict}
-          </span>
+        const toggleModeBtn = `<button class="icon-btn" data-click="toggleRosterEntryMode" data-waypoint-id="${esc(entry.waypoint_id)}" data-entry-id="${esc(entry.entry_id)}" data-mode="${entry.mode === "advisory" ? "block" : "advisory"}" data-tip="Switch this entry to ${entry.mode === "advisory" ? "block" : "advisory"} mode.\n${entry.mode === "advisory" ? "Block holds this work until the waypoint closes." : "Advisory releases it while still delivering the guidance."}" style="font-size:11px;padding:1px 5px">⇄</button>`;
+        return `<div class="wp-entry">
+          <div class="wp-entry-top">
+            ${wdot(entry.delivery_status)}
+            ${link}
+            ${waypointModeBadge(entry.mode)}
+            <span class="badge" style="color:var(--muted);border-color:var(--border)" data-tip="Whether this waypoint's guidance has reached this entry yet.">${esc(entry.delivery_status)}</span>${staleBadge}
+            <span class="wp-entry-actions">${toggleModeBtn}${removeBtn}</span>
+          </div>
+          ${verdict}
         </div>`;
       }
 
@@ -340,10 +401,10 @@
        * @returns {string}
        */
       function renderWaypointDeliveryFeed() {
-        if (!waypointDeliveries.length) return `<div class="empty" style="margin-top:8px">No delivery events yet.</div>`;
-        return waypointDeliveries.slice().sort((a, b) => b.at_ms - a.at_ms).map((ev) => `<div class="kv-row">
-          <span class="k mono" style="font-size:11px" data-tip="When this effect was recorded.">${esc(new Date(ev.at_ms).toLocaleString())}</span>
-          <span class="v"><span class="badge" style="color:var(--muted);border-color:var(--border)">${esc(ev.level)}</span> ${esc(ev.message)}${renderWaypointEffectTarget(ev)}</span>
+        if (!waypointDeliveries.length) return `<div class="empty">Nothing has happened yet.</div>`;
+        return waypointDeliveries.slice().sort((a, b) => b.at_ms - a.at_ms).map((ev) => `<div class="wp-feed-row">
+          <span class="wp-feed-when" data-tip="When this effect was recorded.">${esc(new Date(ev.at_ms).toLocaleString())}</span>
+          <span class="wp-feed-body">${esc(ev.message)}${renderWaypointEffectTarget(ev)}</span>
         </div>`).join("");
       }
 
@@ -364,8 +425,8 @@
           parts.push(`<a href="#" data-click="gotoReview" data-guardian-id="${esc(ev.guardian_id)}" data-tip="Open the review this effect landed on.">🔀 ${esc(ev.guardian_id)}</a>`);
         }
         if (!parts.length) return "";
-        const src = `<span class="badge" style="color:var(--muted);border-color:var(--border)" data-tip="The subsystem that recorded this effect.\nA 'waypoint' row is a survey decision; 'scheduler' and 'submit' rows are actions taken on it.">${esc(ev.source)}</span>`;
-        return `<div style="font-size:12px;color:var(--muted);padding-top:2px">${src} ${parts.join(" ")}</div>`;
+        const src = `<span class="wp-src" data-tip="The subsystem that recorded this effect.\nA 'waypoints' row is a survey decision; 'scheduler' and 'submit' rows are actions taken on it.">${esc(ev.source)}</span>`;
+        return `<div class="wp-feed-refs">${src}${parts.join("")}</div>`;
       }
 
       /**
@@ -388,20 +449,18 @@
        * @returns {string}
        */
       function renderWaypointBearings() {
-        const rows = waypointBearings.length
-          ? waypointBearings.slice().sort((a, b) => b.id - a.id).map((b) => {
-              const link = b.entity_uri ? ` · <a href="#" data-click="gotoEntityUri" data-entity-uri="${esc(b.entity_uri)}" data-tip="Open the entity this bearing was reported against.">${esc(b.entity_uri)}</a>` : "";
-              const commit = b.commit_id
-                ? `<div style="color:var(--muted);font-size:11px" data-tip="A narrowing aid, not an assertion the currently-viewed base already contains this commit.">commit ${esc(b.commit_id.slice(0, 12))}${b.commit_summary ? ` — ${esc(b.commit_summary)}` : ""}</div>`
-                : "";
-              return `<div class="kv-row" style="align-items:flex-start">
-                <span class="k mono" style="font-size:11px">${esc(new Date(b.created_at_ms).toLocaleString())}</span>
-                <span class="v">${esc(b.summary)}${link}${commit}</span>
-              </div>`;
-            }).join("")
-          : `<div class="empty" style="margin-top:8px">No bearings reported yet.</div>`;
-        const addBtn = `<button class="btn" data-click="openAppendBearing" data-waypoint-id="${esc(waypointDetail ? waypointDetail.id : "")}" data-tip="Append a bearing -- a permanent record of completed work for this waypoint.\nWho/when: use this once you've finished a piece of coordinated work and want other roster entries to see it happened.\nBearings are append-only; this cannot be undone or edited afterward.">＋ Add bearing</button>`;
-        return `${addBtn}${rows}`;
+        if (!waypointBearings.length) return `<div class="empty">No bearings reported yet.</div>`;
+        return waypointBearings.slice().sort((a, b) => b.id - a.id).map((b) => {
+          const link = b.entity_uri ? `<a href="#" data-click="gotoEntityUri" data-entity-uri="${esc(b.entity_uri)}" data-tip="Open the entity this bearing was reported against.">${esc(b.entity_uri)}</a>` : "";
+          const commit = b.commit_id
+            ? `<span class="mono" data-tip="A lead for narrowing an investigation, not an assertion that the base you are looking at already contains this commit.">${esc(b.commit_id.slice(0, 12))}${b.commit_summary ? ` — ${esc(b.commit_summary)}` : ""}</span>`
+            : "";
+          const refs = (link || commit) ? `<div class="wp-feed-refs">${commit}${link}</div>` : "";
+          return `<div class="wp-feed-row">
+            <span class="wp-feed-when" data-tip="When this bearing was appended. Bearings are append-only and never edited.">${esc(new Date(b.created_at_ms).toLocaleString())}</span>
+            <span class="wp-feed-body">${esc(b.summary)}${refs}</span>
+          </div>`;
+        }).join("");
       }
 
       /**
@@ -414,29 +473,74 @@
         if (!waypointDetail || waypointDetail.id !== selectedWaypointId) { el.innerHTML = `<div class="empty">Loading waypoint…</div>`; return; }
         const w = waypointDetail;
         const entityUri = `waypoint:${w.id}`;
-        const ds = w.delivery_summary;
         const closeReopenBtn = w.state === "open"
-          ? `<button class="btn" data-click="closeWaypoint" data-waypoint-id="${esc(w.id)}" data-tip="Close this waypoint manually.\nWho/when: the coordination is done even though some entries haven't formally checked in.">■ Close</button>`
-          : `<button class="btn" data-click="reopenWaypoint" data-waypoint-id="${esc(w.id)}" data-tip="Reopen this waypoint.\nWho/when: more roster entries need to check in after it was closed.">▶ Reopen</button>`;
+          ? `<button class="btn" data-click="closeWaypoint" data-waypoint-id="${esc(w.id)}" data-tip="Close this waypoint manually.\nWho/when: the coordination is done even though some entries haven't formally checked in.\nClosing releases everything this waypoint holds.">■ Close</button>`
+          : `<button class="btn" data-click="reopenWaypoint" data-waypoint-id="${esc(w.id)}" data-tip="Reopen this waypoint.\nWho/when: more roster entries need to check in after it was closed.\nReopening makes it hold its block-mode entries again.">▶ Reopen</button>`;
         el.innerHTML = `
-          <div class="row" style="justify-content:space-between;align-items:flex-start">
-            <div><h3 style="margin:0">${esc(w.label || w.id)}</h3><div class="mono" style="color:var(--muted);font-size:12px">${esc(w.id)}</div></div>
-            <div class="row" style="gap:6px">${waypointStateBadge(w.state)}<button class="btn" data-click="toggleWatch" data-entity-uri="${esc(entityUri)}" data-tip="${isWatching(entityUri) ? "Stop receiving watcher notifications for this waypoint." : "Watch this waypoint and choose which mailbox priority tiers should notify you."}">${isWatching(entityUri) ? "◉ Unwatch" : "◎ Watch…"}</button>${closeReopenBtn}</div>
+          <div class="wp-cmdbar">
+            <div class="wp-cmd-id">
+              <div class="wp-cmd-name">${esc(w.label || w.id)}</div>
+              <div class="wp-cmd-sub mono" data-tip="This waypoint's id. Use it with the ralphus waypoint commands.">${esc(w.id)}</div>
+            </div>
+            <div class="wp-cmd-actions">
+              ${waypointStateBadge(w.state)}
+              <button class="btn" data-click="toggleWatch" data-entity-uri="${esc(entityUri)}" data-tip="${isWatching(entityUri) ? "Stop receiving watcher notifications for this waypoint." : "Watch this waypoint and choose which mailbox priority tiers should notify you."}">${isWatching(entityUri) ? "◉ Unwatch" : "◎ Watch…"}</button>
+              ${closeReopenBtn}
+            </div>
           </div>
-          <div class="kv-row"><span class="k">prompt</span><span class="v">${esc(w.prompt)}</span></div>
-          <div class="kv-row"><span class="k">agent</span><span class="v">${esc(w.agent || "(default)")}</span></div>
-          <div class="kv-row"><span class="k">model</span><span class="v">${esc(w.model || "(default)")}</span></div>
-          <div class="kv-row"><span class="k">advisory</span><span class="v" data-tip="Whether roster entries may be added in advisory mode (informational only, never halts anything).">${w.allow_advisory ? "allowed" : "not allowed"}</span></div>
-          <div class="kv-row"><span class="k">projects</span><span class="v" data-tip="Projects inferred by hopping through the roster's squads/reviews, resolved server-side.">${w.projects.length ? esc(w.projects.join(", ")) : "(none inferred)"}</span></div>
-          <div class="kv-row"><span class="k">delivery</span><span class="v" data-tip="Roster-entry counts by delivery status.">${ds.delivered}/${w.roster.length} delivered${ds.via_restack ? ` · ${ds.via_restack} via restack` : ""}${ds.failed ? ` · ${ds.failed} failed` : ""}${ds.undelivered ? ` · ${ds.undelivered} undelivered` : ""}</span></div>
-          <h4 style="margin:14px 0 4px">Roster</h4>
-          <button class="btn" data-click="openAddRosterEntry" data-waypoint-id="${esc(w.id)}" data-tip="Add a squad or review to this waypoint's roster by id.">＋ Add roster entry</button>
-          ${w.roster.length ? w.roster.map(renderRosterEntryRow).join("") : `<div class="empty" style="margin-top:8px">No roster entries.</div>`}
-          <h4 style="margin:14px 0 4px">Delivery feed</h4>
+          ${renderWaypointPipeline(w)}
+          ${renderWaypointSetup(w)}
+          <div class="wp-prompt" data-tip="The coordination guidance this waypoint carries.\nIt is sent to the survey to decide which work is impacted, and delivered to the roster entries that are.">${esc(w.prompt)}</div>
+          <div class="wp-section">
+            <h4>Roster</h4>
+            <span class="wp-section-rule"></span>
+            <button class="btn sm" data-click="openAddRosterEntry" data-waypoint-id="${esc(w.id)}" data-tip="Add a squad or review to this waypoint's roster by id.\nWho/when: you know a piece of work needs to respect this waypoint and don't want to wait for the survey to find it.">＋ Add</button>
+          </div>
+          ${w.roster.length ? w.roster.map(renderRosterEntryRow).join("") : `<div class="empty">No roster entries.</div>`}
+          <div class="wp-section">
+            <h4>Effects</h4>
+            <span class="wp-section-rule"></span>
+          </div>
           ${renderWaypointDeliveryFeed()}
-          <h4 style="margin:14px 0 4px">Bearings</h4>
+          <div class="wp-section">
+            <h4>Bearings</h4>
+            <span class="wp-section-rule"></span>
+            <button class="btn sm" data-click="openAppendBearing" data-waypoint-id="${esc(w.id)}" data-tip="Append a bearing -- a permanent record of completed work for this waypoint.\nWho/when: use this once you've finished a piece of coordinated work and want other roster entries to see it happened.\nBearings are append-only; this cannot be undone or edited afterward.">＋ Add</button>
+          </div>
           ${renderWaypointBearings()}
         `;
+      }
+
+      /**
+       * Renders the waypoint's settings as a row of chips. These are short scalars — agent, model, whether advisory
+       * entries are permitted, the inferred projects, the delivery rollup — and a key/value row each spent a screen
+       * of height to say very little. The prompt is deliberately not a chip: it is prose and gets its own block.
+       * @param {WaypointDetail} w
+       * @returns {string}
+       */
+      function renderWaypointSetup(w) {
+        const ds = w.delivery_summary;
+        const parts = [
+          ds.delivered ? `${ds.delivered} delivered` : "",
+          ds.via_restack ? `${ds.via_restack} via restack` : "",
+          ds.failed ? `${ds.failed} failed` : "",
+          ds.undelivered ? `${ds.undelivered} undelivered` : "",
+        ].filter(Boolean);
+        /**
+         * @param {string} k
+         * @param {string} v
+         * @param {string} tip
+         * @param {boolean} [muted]
+         * @returns {string}
+         */
+        const chip = (k, v, tip, muted) => `<span class="wp-chip ${muted ? "is-muted" : ""}" data-tip="${esc(tip)}"><span class="wp-chip-k">${esc(k)}</span>${esc(v)}</span>`;
+        return `<div class="wp-setup">
+          ${chip("agent", w.agent || "default", "The agent that runs this waypoint's relevance survey.\nAn API backend (claude, ollama) is called directly; a terminal agent (claude-code, codex) runs through the subprocess runner.", !w.agent)}
+          ${chip("model", w.model || "default", "The model the survey agent runs as.", !w.model)}
+          ${chip("advisory", w.allow_advisory ? "allowed" : "not allowed", "Whether roster entries may be set to advisory mode, which delivers the guidance without holding the work.", !w.allow_advisory)}
+          ${chip("projects", w.projects.length ? w.projects.join(", ") : "none inferred", "Projects inferred by hopping through the roster's squads and reviews, resolved server-side.", !w.projects.length)}
+          ${chip("delivery", parts.length ? parts.join(" · ") : "nothing yet", "Roster-entry counts by delivery status.", !parts.length)}
+        </div>`;
       }
 
       /**

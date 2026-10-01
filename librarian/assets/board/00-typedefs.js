@@ -1084,6 +1084,7 @@
        * @property {boolean} allow_advisory
        * @property {string[]} projects - server-resolved project names (RAL-396); render as-is.
        * @property {number} roster_count
+       * @property {DeliverySummary} delivery_summary - roster-entry counts by delivery status, so the sidebar can show progress without a request per row.
        * @property {number} created_at_ms
        * @property {number} updated_at_ms
        * @property {number|null} closed_at_ms

@@ -1283,3 +1283,118 @@
         main#reviews-page .splitter { display: none; }
         main#reviews-page .sidebar { max-height: 45vh; }
       }
+
+
+      /* ---------- Waypoints tab (RAL-400) ----------------------------------
+         Every colour here resolves from a `docs/colors.md` token. Tints use
+         `color-mix` against an existing token rather than a new hex, so a
+         waypoint surface can be washed with a status colour without adding a
+         hue to the palette -- change the token and the tint follows it. */
+
+      /* Sidebar card. Replaces the flat `.squad-item` row: a waypoint carries
+         more state than an id and a badge (roster progress, project, how it
+         was closed), and a card gives that room without a second line of
+         chrome. Selection is a tinted ground plus a left stripe, matching how
+         a selected branch reads elsewhere. */
+      .wp-card { position: relative; display: block; width: 100%; text-align: left;
+        background: none; border: 1px solid transparent; border-radius: 10px;
+        padding: 9px 10px 8px; margin-bottom: 3px; overflow: hidden; cursor: pointer; }
+      .wp-card:hover { background: var(--panel-2); }
+      .wp-card.selected { background: color-mix(in srgb, var(--accent) 13%, transparent); }
+      .wp-card.selected::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0;
+        width: 2px; background: var(--accent); }
+      .wp-card-top { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
+      .wp-card-name { flex: 1; min-width: 0; font-size: 13px; font-weight: 600;
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .wp-card-meta { display: flex; align-items: center; gap: 7px; font-size: 11px;
+        color: var(--muted); white-space: nowrap; }
+      .wp-card-meta .wp-proj { overflow: hidden; text-overflow: ellipsis; }
+
+      /* Roster progress as N segments, one per entry, coloured by delivery
+         status. Encodes progress in form so the list reads at a glance rather
+         than forcing a count to be parsed. */
+      .wp-spark { display: flex; gap: 2px; flex: none; width: 54px; height: 3px; align-items: center; }
+      .wp-spark i { flex: 1; height: 3px; border-radius: 2px; background: var(--border); }
+
+      /* Command bar: identity, state and the one action that matters, pinned
+         above the scroll so they survive a long roster. */
+      .wp-cmdbar { display: flex; align-items: flex-start; gap: 10px; padding: 12px 0 11px;
+        border-bottom: 1px solid var(--border); margin-bottom: 11px; }
+      .wp-cmd-id { min-width: 0; }
+      .wp-cmd-name { font-size: 16px; font-weight: 650; letter-spacing: -.2px;
+        overflow-wrap: anywhere; }
+      .wp-cmd-sub { font-size: 12px; color: var(--muted); margin-top: 1px; }
+      .wp-cmd-actions { display: flex; align-items: center; gap: 6px; margin-left: auto; flex: none; }
+
+      /* Lifecycle rail. A waypoint moves open -> surveyed -> delivered ->
+         closed, and which of those is pending is the question a reader
+         actually has. A bare "0/2 delivered" answers a smaller one. */
+      .wp-pipe { display: flex; align-items: center; margin: 0 0 12px; max-width: 560px; }
+      .wp-step { display: flex; align-items: center; gap: 6px; font-size: 11.5px;
+        color: var(--muted); white-space: nowrap; }
+      .wp-step .wp-pdot { width: 15px; height: 15px; border-radius: 50%; flex: none;
+        border: 1.5px solid var(--border); background: var(--bg); color: var(--muted);
+        display: grid; place-items: center; font-size: 9px; line-height: 1; }
+      .wp-step.is-done .wp-pdot { border-color: var(--done);
+        background: color-mix(in srgb, var(--done) 16%, transparent); color: var(--done); }
+      .wp-step.is-now { color: var(--text); font-weight: 600; }
+      .wp-step.is-now .wp-pdot { border-color: var(--accent);
+        background: color-mix(in srgb, var(--accent) 16%, transparent); color: var(--accent);
+        box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 13%, transparent); }
+      .wp-pline { flex: 1; min-width: 12px; height: 1.5px; margin: 0 8px;
+        background: var(--border); border-radius: 2px; }
+      .wp-pline.is-done { background: color-mix(in srgb, var(--done) 40%, transparent); }
+
+      /* Settings as a chip strip rather than a column of read-only key/value
+         rows: these are short scalars, and a row each spends a screen of
+         height to say very little. */
+      .wp-setup { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
+      .wp-chip { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px;
+        background: var(--panel-2); border: 1px solid var(--border); border-radius: 20px;
+        padding: 3px 10px; color: var(--text); }
+      .wp-chip .wp-chip-k { color: var(--muted); }
+      .wp-chip.is-muted { color: var(--muted); }
+
+      /* The prompt is prose, not a property, so it gets a readable block with
+         a quiet rule rather than a key/value row that would clip it. */
+      /* Capped to a readable measure: the detail pane is as wide as the window,
+         and prose set to 1700px is a line a reader loses their place in. */
+      .wp-prompt { border-left: 2px solid var(--border); padding: 2px 0 2px 11px;
+        margin: 0 0 14px; color: var(--text); font-size: 13px; line-height: 1.55;
+        max-width: 92ch; }
+
+      .wp-section { display: flex; align-items: center; gap: 8px; margin: 18px 0 8px; }
+      .wp-section h4 { margin: 0; font-size: 12px; font-weight: 650; letter-spacing: .3px;
+        text-transform: uppercase; color: var(--muted); }
+      .wp-section-rule { flex: 1; height: 1px; background: var(--border); }
+
+      /* One roster entry. The dot/pill vocabulary carries the state so the row
+         itself can stay quiet; actions only surface on hover to keep a long
+         roster from reading as a wall of buttons. */
+      .wp-entry { border: 1px solid var(--border); border-radius: 8px; background: var(--panel);
+        padding: 8px 10px; margin-bottom: 6px; }
+      .wp-entry:hover { border-color: var(--muted); }
+      .wp-entry-top { display: flex; align-items: center; gap: 7px; }
+      .wp-entry-id { font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+        font-size: 12px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .wp-entry-actions { display: flex; align-items: center; gap: 4px; margin-left: auto;
+        flex: none; opacity: 0; transition: opacity .1s; }
+      .wp-entry:hover .wp-entry-actions, .wp-entry:focus-within .wp-entry-actions { opacity: 1; }
+      .wp-entry-why { margin-top: 6px; font-size: 12px; color: var(--muted); }
+      .wp-entry-why summary { cursor: pointer; }
+
+      /* Feed and bearings share a left rail so a reader can see at a glance
+         that both are chronological records rather than settings. */
+      .wp-feed-row { display: flex; gap: 10px; padding: 7px 0 7px 11px;
+        border-left: 2px solid var(--border); }
+      .wp-feed-row:hover { border-left-color: var(--accent); }
+      .wp-feed-when { flex: none; width: 112px; font-size: 11px; color: var(--muted);
+        font-variant-numeric: tabular-nums; }
+      .wp-feed-body { min-width: 0; flex: 1; font-size: 12.5px; }
+      .wp-feed-refs { margin-top: 3px; font-size: 11.5px; color: var(--muted);
+        display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+      .wp-src { font-size: 10.5px; letter-spacing: .04em; text-transform: uppercase;
+        color: var(--muted); border: 1px solid var(--border); border-radius: 4px; padding: 0 5px; }
+
+      .wp-entry-id, .wp-feed-body a, .wp-feed-refs a { color: var(--accent); text-decoration: none; }
+      .wp-entry-id:hover, .wp-feed-body a:hover, .wp-feed-refs a:hover { text-decoration: underline; }
