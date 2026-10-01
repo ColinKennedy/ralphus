@@ -856,6 +856,10 @@
             renderWaypointStatusFilters();
             renderWaypointProjectFilterChips();
             showTab("waypoints");
+            // Same reason as `selectWaypoint`: navigating to a different
+            // waypoint has to fetch it, or the pane sits on "Loading waypoint…"
+            // until the next poll tick.
+            if (h.waypointId) void loadWaypointDetail(h.waypointId);
           } else if (h.tab === "resources") {
             showTab("resources");
           } else if (h.tab === "queue") {

@@ -325,6 +325,36 @@
         syncHash(true);
         renderWaypoints();
         renderWaypointDetail();
+        // Selecting used to change which waypoint the pane *claims* to show
+        // without fetching it, so `renderWaypointDetail` fell through to its
+        // "Loading waypoint…" branch — `waypointDetail` still held the previous
+        // waypoint — and stayed there until the next `pollWaypoints` tick. SSE
+        // only ticks on daemon activity, so on an idle daemon that was the 60s
+        // fallback interval: up to a minute of "Loading" for data that answers
+        // in milliseconds.
+        void loadWaypointDetail(id);
+      }
+
+      /**
+       * Fetches and renders one waypoint's detail pane immediately, for a selection that must not wait for the next
+       * poll. Takes a `waypointPollSeq` ticket like `pollWaypoints` does, so whichever request was issued last is the
+       * one that renders — a fast click through several waypoints settles on the one actually selected, not on
+       * whichever response happens to land last.
+       * @param {string} id
+       * @returns {Promise<void>}
+       */
+      async function loadWaypointDetail(id) {
+        const seq = ++waypointPollSeq;
+        try {
+          const bundle = await fetchWaypointDetailBundle(id);
+          if (seq !== waypointPollSeq) { console.debug("loadWaypointDetail: superseded, abandoning"); return; }
+          waypointDetail = bundle.detail;
+          waypointBearings = bundle.bearings;
+          waypointDeliveries = bundle.deliveries;
+          renderWaypointDetail();
+        } catch (e) {
+          console.debug("loadWaypointDetail failed", e);
+        }
       }
 
       /**
