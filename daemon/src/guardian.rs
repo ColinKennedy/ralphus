@@ -7872,6 +7872,50 @@ mod tests {
     }
 
     #[test]
+    fn base_shift_exhaustion_fields_serialize_for_the_review_level_notice_the_board_checks() {
+        // RAL-537: the board's review-level rebase-exhaustion notice compares
+        // `base_shift_rebuild_attempts` against `effective_base_shift_maximum_rebuilds`
+        // on the serialized GuardianView JSON -- pin both field names and the
+        // not-yet-exhausted/exhausted transition here so a rename or a
+        // changed comparison breaks a test instead of silently breaking the
+        // notice. Unlike the per-PR auto-fix badge (see `pr.rs`'s
+        // `auto_fix_last_outcome_serializes_to_the_exhausted_sentinel_the_board_checks`),
+        // this counter is shared across the whole review, not any one
+        // branch -- RAL-542 tracks that gap.
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store
+            .set_guardian_base_shift_maximum_rebuilds(&id, Some(2))
+            .unwrap();
+
+        let before = store.get_guardian(&id).unwrap();
+        let before_json = serde_json::to_value(&before).unwrap();
+        assert_eq!(before_json["base_shift_rebuild_attempts"], 0);
+        assert_eq!(before_json["effective_base_shift_maximum_rebuilds"], 2);
+
+        let targets = BTreeMap::from([("/repo".to_string(), "aaa111".to_string())]);
+        store
+            .start_guardian_base_shift_campaign(&id, &targets)
+            .unwrap();
+        store
+            .record_guardian_base_shift_rebuild_failure(&id, &targets)
+            .unwrap();
+        store
+            .record_guardian_base_shift_rebuild_failure(&id, &targets)
+            .unwrap();
+
+        let after = store.get_guardian(&id).unwrap();
+        let after_json = serde_json::to_value(&after).unwrap();
+        assert_eq!(after_json["base_shift_rebuild_attempts"], 2);
+        assert_eq!(after_json["effective_base_shift_maximum_rebuilds"], 2);
+        assert!(
+            after_json["base_shift_rebuild_attempts"].as_u64()
+                >= after_json["effective_base_shift_maximum_rebuilds"].as_u64(),
+            "attempts must have reached the cap for the board's notice to fire"
+        );
+    }
+
+    #[test]
     fn match_pr_branch_name_is_stamped_false_at_creation_when_no_project_default() {
         // Unlike `skip_base_updates` (left `NULL`/"inherit" forever), a new
         // review stamps a concrete value from the owning project's effective

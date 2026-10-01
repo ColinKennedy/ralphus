@@ -1093,6 +1093,72 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
             ${autoFixOutcome}
           </div>`;
       }
+      // RALPHUS-AUTO-FIX-EXHAUSTED-BADGE:BEGIN
+      /**
+       * Renders a badge for a worktree chip when unattended CI auto-fix has
+       * exhausted its attempt budget (RAL-537) on one of this branch's open
+       * PR(s) -- a per-branch/per-PR concern, unlike the review-wide
+       * base-shift rebuild exhaustion notice (`rebaseExhaustedNotice`
+       * below), which is a single counter shared across every branch in the
+       * review. A branch can carry up to one open PR per `pr_kind`
+       * ("parent" and "stack" -- dual_root_pr mode), so both are checked;
+       * if both are exhausted the tooltip names both, using the approved
+       * copy built from the live PR number/attempt count per PR (the
+       * backend's own `auto_fix_error` string says the same thing but isn't
+       * worded to match that approved copy, so it isn't substituted in
+       * here). Appended as its own element beside `branchBadge()`'s output
+       * rather than folded into it -- `branchBadge()` is a strict one-badge-at-a-time
+       * priority chain and this can be true independently of whatever it
+       * shows. Clears within one poll cycle of "Merge / rebase" being
+       * pressed, since that resets `auto_fix_attempt_count` and
+       * `auto_fix_last_outcome` server-side (`reset_open_pr_auto_fix_attempts`).
+       * Takes `prs` explicitly (rather than reading the `pullRequests`
+       * module-level cache itself) so this stays pure and slice-testable,
+       * matching the `rebaseExhaustedNotice` convention below.
+       * @param {PullRequestView[]} prs
+       * @param {GuardianBranch} b
+       * @returns {string}
+       */
+      function autoFixExhaustedBadge(prs, b) {
+        const exhausted = prs
+          .filter((p) => p.branch_id === b.id && p.state === "open" && p.auto_fix_last_outcome === "exhausted");
+        if (!exhausted.length) return "";
+        const tip = exhausted.map((p) =>
+          `Auto-fix gave up on PR #${p.pr_number ?? "?"}: tried ${p.auto_fix_attempt_count} time(s) to fix CI failures automatically and stopped, so it doesn't keep pushing broken fixes and burning CI runs. Press 'Merge / rebase' to reset this and let auto-fix try again — or fix the CI failure yourself first.`
+        ).join("\n\n");
+        return `<span class="badge" style="color:var(--muted);border-color:var(--border);font-size:11px" data-tip="${esc(tip)}">⚠ auto-fix exhausted</span>`;
+      }
+      // RALPHUS-AUTO-FIX-EXHAUSTED-BADGE:END
+      // RALPHUS-REBASE-EXHAUSTED-NOTICE:BEGIN
+      /**
+       * Renders the review-level notice (RAL-537) for when the base-shift
+       * rebuild campaign (RAL-507) has exhausted its attempt budget --
+       * unlike `autoFixExhaustedBadge` above, `base_shift_rebuild_attempts`
+       * is a single counter shared across every branch in the review (one
+       * rebuild pass rebases every affected branch together), not something
+       * attributable to any one worktree chip, so this renders once above
+       * the worktree list rather than as a per-branch badge (RAL-542 tracks
+       * the gap that one bad worktree can exhaust the budget for the whole
+       * review). `canReorder` is the same terminal-status check already
+       * computed by the caller for the branch-reorder affordance -- reused
+       * here so the notice doesn't linger once the review can no longer be
+       * acted on (merged/cancelled/deployed/approved). Clears within one
+       * poll cycle of "Merge / rebase" being pressed, since that resets
+       * `base_shift_rebuild_attempts` server-side
+       * (`clear_guardian_base_shift_campaign`).
+       * @param {GuardianView} g
+       * @param {boolean} canReorder
+       * @returns {string}
+       */
+      function rebaseExhaustedNotice(g, canReorder) {
+        if (!canReorder) return "";
+        const attempts = g.base_shift_rebuild_attempts || 0;
+        const max = g.effective_base_shift_maximum_rebuilds || 0;
+        if (max <= 0 || attempts < max) return "";
+        const tip = `The base branch moved, and automatic rebasing stopped after ${attempts} failed attempt(s) against the same new base (cap: ${max}). This applies to the whole review — one bad worktree can use up the budget for all of them. The review is left as-is awaiting human action. Press 'Merge / rebase' to reset and start a fresh automatic attempt.`;
+        return `<div style="color:var(--muted);border:1px solid var(--border);border-radius:6px;padding:8px;font-size:12px;margin:8px 0" data-tip="${esc(tip)}">⚠ Automatic rebasing stopped after ${attempts}/${max} failed attempt(s) against the new base branch — press "Merge / rebase" to reset and try again.</div>`;
+      }
+      // RALPHUS-REBASE-EXHAUSTED-NOTICE:END
       /**
        * Renders one compact clickable PR/MR badge (RAL-478, split out of
        * `branchPrLink` by RAL-<new> so a dual_root_pr mode root branch can
@@ -1758,7 +1824,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
               ${toggle}
               <span>${gdot(b.merge_status || "")}</span>
               <span class="mono" style="flex:1${isEnabled ? "" : ";color:var(--muted)"}" data-tip="${esc(b.branch)}\nSelect it to read its position, source and status in the inspector.">${esc(b.branch)}</span>
-              ${isEnabled ? `${branchBadge(b)} ${pill(b.merge_status || "")} ${branchPrLink(g, b)}` : '<span class="badge" style="color:var(--muted);border-color:var(--border);font-size:11px">disabled</span>'}
+              ${isEnabled ? `${branchBadge(b)} ${autoFixExhaustedBadge(pullRequests[g.id] || [], b)} ${pill(b.merge_status || "")} ${branchPrLink(g, b)}` : '<span class="badge" style="color:var(--muted);border-color:var(--border);font-size:11px">disabled</span>'}
               ${enableToggle}${reEnableIcon}${branchMenuBtn}
             </div>
             ${branchConflictBar(b)}
@@ -1854,6 +1920,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           ${reviewSetupStrip(g)}
           ${reviewIdentityRow(g, isMultiProject)}
           ${renderChangeSummary(g)}
+          ${rebaseExhaustedNotice(g, canReorder)}
           <h3 class="section">branches${sectionMenuBtn(g.id, "branches")}${canReorder ? ' <span class="k" style="text-transform:none;letter-spacing:0">— drag to reorder · toggle ⊙/⊘ to enable/disable</span>' : ""}${hasPending ? ' <span class="badge warn2" data-tip="Unsaved order or enable/disable changes — click Save to apply, or Discard to revert.">● unsaved changes</span>' : ""}</h3>
           ${allDisabled ? `<div class="warn" style="margin:4px 0 8px">All branches are disabled — saving will make this review a no-op (no rebase runs). Re-enable at least one branch before saving, or click Discard.</div>` : ""}
           ${isMultiProject ? `<div class="row" style="margin-bottom:8px;gap:4px">${(g.projects||[]).map((p) => {
