@@ -2121,6 +2121,13 @@ fn route_for_user(
         ("POST", ["api", "guardians", id, "run-action-hint"]) => {
             guardian_run_action_hint(daemon, id, body)
         }
+        // ralphus[ignore-endpoint-cli]: lazily expands output captured by the board's own daemon-host check launcher; the headless CLI `review checks run` already streams its command's output to the caller
+        ("GET", ["api", "guardians", id, "check-runs", kind, index, "output"]) => {
+            match index.parse::<usize>() {
+                Ok(i) => guardian_check_run_output(id, kind, i),
+                Err(_) => error(400, "bad_request", "index must be a number", vec![]),
+            }
+        }
         // ralphus[ignore-endpoint-cli]: board inline 'resolve this residue for me' action
         ("POST", ["api", "guardians", id, "resolve-input"]) => {
             guardian_resolve_input(daemon, id, body)
@@ -15090,6 +15097,9 @@ struct PreparedCheck {
     /// File the launched window writes the body's exit code into the moment it
     /// finishes, polled by [`watch_check_run`]'s thread.
     marker_path: std::path::PathBuf,
+    /// File the body's stdout and stderr are redirected to, served by
+    /// [`guardian_check_run_output`].
+    log_path: std::path::PathBuf,
 }
 
 /// Build the `cmd` invocation for running a check (RAL-164): substitutes input
@@ -15099,16 +15109,24 @@ struct PreparedCheck {
 /// nothing to kill doesn't block the main command from running. `None` when the
 /// check has no `command` (e.g. a prompt-kind action hint).
 ///
-/// The command line ends by echoing the body's exit code into `marker_path`,
-/// which is how the daemon learns the run finished and how long it took
-/// without closing the window — `/K` keeps it open so the user can read the
-/// output, and the `&` before the echo runs it whatever the body's status was.
-/// `/V:ON` turns on delayed expansion so `!ERRORLEVEL!` is resolved when that
-/// line executes; `%ERRORLEVEL%` would be substituted while `cmd` parses the
-/// single quoted command line, before the body has run, and would always
-/// report the wrong value. Delayed expansion also keeps the redirection
-/// correct: `cmd` splits on the literal `>` before expanding `!...!`, so an
-/// exit code of `1` can't be misread as a `1>` stdout-redirect token.
+/// The body's stdout and stderr go to `log_path` so the board can show what
+/// happened without the user hunting for the window, and the window `type`s
+/// that file once the body finishes so its output is still readable there.
+/// `cmd` has no tee, and routing the body through a pipe would make
+/// `ERRORLEVEL` the pipe's last stage rather than the body's, so a check's
+/// output reaches the window when the body exits rather than line by line as
+/// it is produced.
+///
+/// Between the two, the body's exit code is echoed into `marker_path`, which is
+/// how the daemon learns the run finished and how long it took without closing
+/// the window — `/K` keeps it open, and the `&` before the echo runs it
+/// whatever the body's status was. `/V:ON` turns on delayed expansion so
+/// `!ERRORLEVEL!` is resolved when that line executes; `%ERRORLEVEL%` would be
+/// substituted while `cmd` parses the single quoted command line, before the
+/// body has run, and would always report the wrong value. Delayed expansion
+/// also keeps the redirection correct: `cmd` splits on the literal `>` before
+/// expanding `!...!`, so an exit code of `1` can't be misread as a `1>`
+/// stdout-redirect token.
 fn build_check_command_line(
     cwd: &str,
     check: &crate::guardian::GuardianCheck,
@@ -15116,6 +15134,7 @@ fn build_check_command_line(
     stored_inputs: &std::collections::HashMap<String, String>,
     run_cleanup: bool,
     marker_path: &std::path::Path,
+    log_path: &std::path::Path,
 ) -> Option<PreparedCheck> {
     let cmd = check.command.as_ref()?;
     let resolved = substitute_check_inputs(cmd, &check.inputs, submitted_inputs, stored_inputs);
@@ -15136,12 +15155,16 @@ fn build_check_command_line(
         resolved.clone()
     };
     let marker = marker_path.display().to_string();
+    let log = log_path.display().to_string();
     // cd /d sets both drive and directory on Windows before running the command.
-    let line = format!("cd /d \"{cwd}\" && ({body}) & echo !ERRORLEVEL!>\"{marker}\"");
+    let line = format!(
+        "cd /d \"{cwd}\" && ({body}) > \"{log}\" 2>&1 & echo !ERRORLEVEL!>\"{marker}\" & type \"{log}\""
+    );
     Some(PreparedCheck {
         resolved_command: resolved,
         args: vec!["/V:ON".to_string(), "/K".to_string(), line],
         marker_path: marker_path.to_path_buf(),
+        log_path: log_path.to_path_buf(),
     })
 }
 
@@ -15157,19 +15180,25 @@ const CHECK_RUN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_m
 /// whole lifetime.
 const CHECK_RUN_MARKER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
 
-/// A fresh, unique path for one check launch's exit-code marker, under the
-/// daemon's own state directory (`~/.ralphus/check-runs`) so it is writable
-/// wherever the daemon runs. The process id and a monotonic counter keep two
-/// launches of the same check — from this daemon, or a second one sharing the
-/// state directory — off the same file. Creates the directory; a failure there
-/// only means no marker is ever written, which the watcher reports as a
-/// timeout.
-fn new_check_run_marker(guardian_id: &str, kind: &str, index: usize) -> std::path::PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
+/// Most captured check output [`guardian_check_run_output`] returns, read from
+/// the end of the log — enough to hold a failing test run's tail, small enough
+/// that a check that spewed for an hour can't blow up a board response.
+const CHECK_RUN_OUTPUT_LIMIT: u64 = 256 * 1024;
 
+/// Directory holding board-launched checks' exit-code markers, captured output,
+/// and recorded results, under the daemon's own state directory
+/// (`~/.ralphus/check-runs`) so it is writable wherever the daemon runs.
+/// Creates the directory; a failure there only means no marker is ever written,
+/// which [`watch_check_run`] reports as a timeout.
+fn check_run_dir() -> std::path::PathBuf {
     let dir = crate::state_dir().join("check-runs");
     let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// A guardian id reduced to the characters a file name may carry, so a crafted
+/// id cannot reach outside [`check_run_dir`].
+fn check_run_file_stem(guardian_id: &str, kind: &str, index: usize) -> String {
     let safe_id: String = guardian_id
         .chars()
         .map(|c| {
@@ -15180,9 +15209,41 @@ fn new_check_run_marker(guardian_id: &str, kind: &str, index: usize) -> std::pat
             }
         })
         .collect();
+    format!("{safe_id}-{kind}-{index}")
+}
+
+/// Where this check's captured output and recorded result live. Stable per
+/// `(guardian, kind, index)`, so each run of the same check overwrites its
+/// predecessor instead of leaving a file behind per launch.
+fn check_run_log_path(guardian_id: &str, kind: &str, index: usize) -> std::path::PathBuf {
+    check_run_dir().join(format!(
+        "{}.log",
+        check_run_file_stem(guardian_id, kind, index)
+    ))
+}
+
+/// Companion of [`check_run_log_path`] holding the run's [`CheckRunResult`].
+fn check_run_result_path(guardian_id: &str, kind: &str, index: usize) -> std::path::PathBuf {
+    check_run_dir().join(format!(
+        "{}.json",
+        check_run_file_stem(guardian_id, kind, index)
+    ))
+}
+
+/// A fresh, unique path for one check launch's exit-code marker. The process id
+/// and a monotonic counter keep two launches of the same check — from this
+/// daemon, or a second one sharing the state directory — off the same file,
+/// so a previous launch's leftover marker can never be mistaken for this one's.
+fn new_check_run_marker(guardian_id: &str, kind: &str, index: usize) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
-    dir.join(format!("{safe_id}-{kind}-{index}-{pid}-{seq}.exit"))
+    check_run_dir().join(format!(
+        "{}-{pid}-{seq}.exit",
+        check_run_file_stem(guardian_id, kind, index)
+    ))
 }
 
 /// The exit code a finished check wrote to its marker, or `None` while the file
@@ -15194,6 +15255,120 @@ fn read_check_run_marker(path: &std::path::Path) -> Option<i32> {
         return None;
     }
     raw.trim().parse::<i32>().ok()
+}
+
+/// What [`watch_check_run`] records for the last run of one check, alongside its
+/// captured output. Persisted as JSON rather than kept in memory so the board
+/// can still expand a finished check's output after a daemon restart, and so
+/// reading it never has to take the store lock.
+#[derive(Serialize, Deserialize)]
+struct CheckRunResult {
+    /// The body's exit code, absent when the watcher gave up waiting.
+    exit_code: Option<i32>,
+    /// Wall-clock time from launch to the marker appearing.
+    elapsed_ms: u64,
+    /// The watcher hit [`CHECK_RUN_MARKER_TIMEOUT`] without seeing a marker.
+    timed_out: bool,
+}
+
+/// Reply for `GET /api/guardians/{id}/check-runs/{kind}/{index}/output`.
+#[derive(Serialize)]
+struct CheckRunOutputReply {
+    /// A finished run was recorded for this check; everything else below is
+    /// meaningful only when this is set.
+    available: bool,
+    /// The tail of the run's combined stdout/stderr, at most
+    /// [`CHECK_RUN_OUTPUT_LIMIT`] bytes.
+    output: String,
+    exit_code: Option<i32>,
+    elapsed_ms: Option<u64>,
+    /// Output longer than the cap, so `output` starts mid-stream.
+    truncated: bool,
+    /// The run never reported an exit code — see [`CheckRunResult::timed_out`].
+    timed_out: bool,
+}
+
+/// The tail of a check's captured output, with whether anything was dropped to
+/// fit [`CHECK_RUN_OUTPUT_LIMIT`]. Lossy UTF-8, because a command's output is
+/// arbitrary bytes and the cap can land mid-character.
+fn read_check_run_output(path: &std::path::Path) -> (String, bool) {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return (String::new(), false);
+    };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let truncated = len > CHECK_RUN_OUTPUT_LIMIT;
+    if truncated {
+        let Ok(back) = i64::try_from(CHECK_RUN_OUTPUT_LIMIT) else {
+            return (String::new(), false);
+        };
+        if file.seek(SeekFrom::End(-back)).is_err() {
+            return (String::new(), false);
+        }
+    }
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() {
+        return (String::new(), false);
+    }
+    (String::from_utf8_lossy(&bytes).into_owned(), truncated)
+}
+
+/// Serve the captured output of the last run of one board-launched check
+/// (`GET /api/guardians/{id}/check-runs/{kind}/{index}/output`). Read on demand
+/// so the board only pulls output a reviewer actually expanded; `available` is
+/// `false` when no run has finished for this check yet.
+fn guardian_check_run_output(id: &str, kind: &str, index: usize) -> Reply {
+    if kind != "manual" && kind != "action" {
+        return error(
+            400,
+            "bad_request",
+            "kind must be \"manual\" or \"action\"",
+            vec![],
+        );
+    }
+    check_run_output_reply(
+        &check_run_result_path(id, kind, index),
+        &check_run_log_path(id, kind, index),
+    )
+}
+
+/// [`guardian_check_run_output`]'s body, over explicit paths so it is testable
+/// without writing into the daemon's real state directory.
+fn check_run_output_reply(result_path: &std::path::Path, log_path: &std::path::Path) -> Reply {
+    let Ok(raw) = std::fs::read_to_string(result_path) else {
+        return json(
+            200,
+            &CheckRunOutputReply {
+                available: false,
+                output: String::new(),
+                exit_code: None,
+                elapsed_ms: None,
+                truncated: false,
+                timed_out: false,
+            },
+        );
+    };
+    let Ok(result) = serde_json::from_str::<CheckRunResult>(&raw) else {
+        return error(
+            500,
+            "check_run_unreadable",
+            "recorded check run could not be parsed",
+            vec![],
+        );
+    };
+    let (output, truncated) = read_check_run_output(log_path);
+    json(
+        200,
+        &CheckRunOutputReply {
+            available: true,
+            output,
+            exit_code: result.exit_code,
+            elapsed_ms: Some(result.elapsed_ms),
+            truncated,
+            timed_out: result.timed_out,
+        },
+    )
 }
 
 /// Write one `check_run`-scoped Cartographer row for a board-launched check.
@@ -15225,6 +15400,9 @@ fn check_run_note(
 /// end — and the caller returns as soon as this function has emitted the
 /// "started" row.
 ///
+/// On completion it also persists a [`CheckRunResult`] beside the captured
+/// output, which is what [`guardian_check_run_output`] serves.
+///
 /// `kind` is `"manual"` for a generated manual check and `"action"` for a
 /// `[[review.action]]` hint; `index` is the check's position in that list.
 fn watch_check_run(
@@ -15234,6 +15412,11 @@ fn watch_check_run(
     index: usize,
     prepared: &PreparedCheck,
 ) {
+    let result_path = check_run_result_path(guardian_id, kind, index);
+    // The previous run's recorded result would otherwise be served as this
+    // one's while this one is still going.
+    let _ = std::fs::remove_file(&result_path);
+
     check_run_note(
         &store,
         guardian_id,
@@ -15248,6 +15431,7 @@ fn watch_check_run(
 
     let guardian_id = guardian_id.to_string();
     let marker_path = prepared.marker_path.clone();
+    let log_path = prepared.log_path.clone();
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
         let exit_code = loop {
@@ -15261,34 +15445,34 @@ fn watch_check_run(
         };
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let _ = std::fs::remove_file(&marker_path);
-        let (level, payload) = match exit_code {
-            Some(0) => (
-                crate::logging::LogLevel::INFO,
-                serde_json::json!({
-                    "kind": kind,
-                    "index": index,
-                    "elapsed_ms": elapsed_ms,
-                    "exit_code": 0,
-                }),
-            ),
-            Some(code) => (
-                crate::logging::LogLevel::WARNING,
-                serde_json::json!({
-                    "kind": kind,
-                    "index": index,
-                    "elapsed_ms": elapsed_ms,
-                    "exit_code": code,
-                }),
-            ),
-            None => (
-                crate::logging::LogLevel::WARNING,
-                serde_json::json!({
-                    "kind": kind,
-                    "index": index,
-                    "elapsed_ms": elapsed_ms,
-                    "timed_out": true,
-                }),
-            ),
+        let has_output = std::fs::metadata(&log_path).is_ok_and(|m| m.len() > 0);
+        let result = CheckRunResult {
+            exit_code,
+            elapsed_ms,
+            timed_out: exit_code.is_none(),
+        };
+        if let Ok(encoded) = serde_json::to_string(&result) {
+            let _ = std::fs::write(&result_path, encoded);
+        }
+        let mut payload = serde_json::json!({
+            "kind": kind,
+            "index": index,
+            "elapsed_ms": elapsed_ms,
+            "has_output": has_output,
+        });
+        let level = match exit_code {
+            Some(code) => {
+                payload["exit_code"] = serde_json::json!(code);
+                if code == 0 {
+                    crate::logging::LogLevel::INFO
+                } else {
+                    crate::logging::LogLevel::WARNING
+                }
+            }
+            None => {
+                payload["timed_out"] = serde_json::json!(true);
+                crate::logging::LogLevel::WARNING
+            }
         };
         check_run_note(&store, &guardian_id, level, "check run finished", payload);
     });
@@ -15356,6 +15540,7 @@ fn guardian_run_manual_commands(daemon: &Daemon, id: &str, body: &str) -> Reply 
     let mut errors: Vec<String> = Vec::new();
     for (index, check) in &to_run {
         let marker = new_check_run_marker(id, "manual", *index);
+        let log = check_run_log_path(id, "manual", *index);
         let Some(prepared) = build_check_command_line(
             &cwd,
             check,
@@ -15363,6 +15548,7 @@ fn guardian_run_manual_commands(daemon: &Daemon, id: &str, body: &str) -> Reply 
             &g.input_values,
             req.run_cleanup,
             &marker,
+            &log,
         ) else {
             continue;
         };
@@ -15436,6 +15622,7 @@ fn guardian_run_action_hint(daemon: &Daemon, id: &str, body: &str) -> Reply {
     // too: prefer the built review worktree over the original repo root.
     let cwd = g.combined_worktree.clone().unwrap_or(g.git_root.clone());
     let marker = new_check_run_marker(id, "action", req.index);
+    let log = check_run_log_path(id, "action", req.index);
     if let Some(prepared) = build_check_command_line(
         &cwd,
         &hint,
@@ -15443,6 +15630,7 @@ fn guardian_run_action_hint(daemon: &Daemon, id: &str, body: &str) -> Reply {
         &g.input_values,
         req.run_cleanup,
         &marker,
+        &log,
     ) {
         let result = spawn_in_terminal(None, "cmd", &prepared.args, &g.manual_checks_env);
         if !req.inputs.is_empty() {
@@ -17332,6 +17520,29 @@ mod tests {
         std::path::PathBuf::from("C:/state/check-runs/g1-manual-0-1-0.exit")
     }
 
+    /// The stable per-check output path paired with [`marker`].
+    fn check_log() -> std::path::PathBuf {
+        std::path::PathBuf::from("C:/state/check-runs/g1-manual-0.log")
+    }
+
+    /// The marker write and output redirection every launch carries, as it
+    /// appears at the end of the command line.
+    const CHECK_TAIL: &str = " > \"C:/state/check-runs/g1-manual-0.log\" 2>&1 \
+         & echo !ERRORLEVEL!>\"C:/state/check-runs/g1-manual-0-1-0.exit\" \
+         & type \"C:/state/check-runs/g1-manual-0.log\"";
+
+    /// A private scratch directory for one test's marker/log/result files.
+    fn check_run_scratch(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ralphus-check-run-{label}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create check-run scratch dir");
+        dir
+    }
+
     #[test]
     fn build_check_command_line_without_cleanup_is_plain() {
         let check = crate::guardian::GuardianCheck {
@@ -17342,13 +17553,20 @@ mod tests {
             inputs: vec![],
         };
         let empty = std::collections::HashMap::new();
-        let prepared =
-            build_check_command_line("C:/repo", &check, &empty, &empty, false, &marker())
-                .expect("command");
+        let prepared = build_check_command_line(
+            "C:/repo",
+            &check,
+            &empty,
+            &empty,
+            false,
+            &marker(),
+            &check_log(),
+        )
+        .expect("command");
         assert_eq!(prepared.resolved_command, "cargo test");
         assert_eq!(
             prepared.args[2],
-            "cd /d \"C:/repo\" && (cargo test) & echo !ERRORLEVEL!>\"C:/state/check-runs/g1-manual-0-1-0.exit\""
+            format!("cd /d \"C:/repo\" && (cargo test){CHECK_TAIL}")
         );
     }
 
@@ -17363,16 +17581,26 @@ mod tests {
         };
         let submitted = std::collections::HashMap::from([("port".to_string(), "9001".to_string())]);
         let stored = std::collections::HashMap::new();
-        let prepared =
-            build_check_command_line("C:/repo", &check, &submitted, &stored, true, &marker())
-                .expect("command");
+        let prepared = build_check_command_line(
+            "C:/repo",
+            &check,
+            &submitted,
+            &stored,
+            true,
+            &marker(),
+            &check_log(),
+        )
+        .expect("command");
         assert_eq!(
             prepared.resolved_command,
             "ralphus-daemon serve --port 9001"
         );
         assert_eq!(
             prepared.args[2],
-            "cd /d \"C:/repo\" && ((ralphus-daemon stop --port 9001) & ralphus-daemon serve --port 9001) & echo !ERRORLEVEL!>\"C:/state/check-runs/g1-manual-0-1-0.exit\""
+            format!(
+                "cd /d \"C:/repo\" && ((ralphus-daemon stop --port 9001) \
+                 & ralphus-daemon serve --port 9001){CHECK_TAIL}"
+            )
         );
     }
 
@@ -17387,7 +17615,16 @@ mod tests {
         };
         let empty = std::collections::HashMap::new();
         assert!(
-            build_check_command_line("C:/repo", &check, &empty, &empty, false, &marker()).is_none()
+            build_check_command_line(
+                "C:/repo",
+                &check,
+                &empty,
+                &empty,
+                false,
+                &marker(),
+                &check_log()
+            )
+            .is_none()
         );
     }
 
@@ -17401,9 +17638,16 @@ mod tests {
             inputs: vec![],
         };
         let empty = std::collections::HashMap::new();
-        let prepared =
-            build_check_command_line("C:/repo", &check, &empty, &empty, false, &marker())
-                .expect("command");
+        let prepared = build_check_command_line(
+            "C:/repo",
+            &check,
+            &empty,
+            &empty,
+            false,
+            &marker(),
+            &check_log(),
+        )
+        .expect("command");
 
         // Delayed expansion must be on, or `!ERRORLEVEL!` stays a literal; and
         // `/K` must still follow it, or the window closes before the user can
@@ -17415,7 +17659,7 @@ mod tests {
         // `!...!`, not `%...%`: the latter is substituted while cmd parses this
         // one quoted command line, before the body has run.
         assert!(
-            line.ends_with("& echo !ERRORLEVEL!>\"C:/state/check-runs/g1-manual-0-1-0.exit\""),
+            line.contains("& echo !ERRORLEVEL!>\"C:/state/check-runs/g1-manual-0-1-0.exit\""),
             "marker write not appended: {line}"
         );
         assert!(
@@ -17432,13 +17676,49 @@ mod tests {
     }
 
     #[test]
+    fn build_check_command_line_captures_output_and_still_shows_it_in_the_window() {
+        let check = crate::guardian::GuardianCheck {
+            label: None,
+            command: Some("cargo test".to_string()),
+            prompt: None,
+            cleanup_command: None,
+            inputs: vec![],
+        };
+        let empty = std::collections::HashMap::new();
+        let prepared = build_check_command_line(
+            "C:/repo",
+            &check,
+            &empty,
+            &empty,
+            false,
+            &marker(),
+            &check_log(),
+        )
+        .expect("command");
+        let line = &prepared.args[2];
+
+        // stdout and stderr both land in the log, and the redirection binds to
+        // the whole body group rather than its last command.
+        assert!(
+            line.contains("(cargo test) > \"C:/state/check-runs/g1-manual-0.log\" 2>&1"),
+            "body output not captured: {line}"
+        );
+        // The marker is written from the redirected body's status, before the
+        // window echoes the log back -- so the recorded exit code is the
+        // command's, not `type`'s.
+        let echo_at = line.find("echo !ERRORLEVEL!").expect("marker write");
+        let type_at = line.find("type \"").expect("log replay");
+        assert!(echo_at < type_at, "type runs before the marker: {line}");
+        assert!(
+            line.ends_with("& type \"C:/state/check-runs/g1-manual-0.log\""),
+            "window does not replay the captured output: {line}"
+        );
+        assert_eq!(prepared.log_path, check_log());
+    }
+
+    #[test]
     fn read_check_run_marker_waits_for_a_complete_line() {
-        let dir = std::env::temp_dir().join(format!(
-            "ralphus-check-run-marker-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&dir).expect("temp dir");
+        let dir = check_run_scratch("marker");
         let path = dir.join("m.exit");
 
         // Absent.
@@ -17447,16 +17727,126 @@ mod tests {
         // without a line ending is a partial read, not an exit code.
         std::fs::write(&path, "1").expect("write");
         assert_eq!(read_check_run_marker(&path), None);
-        // Complete, in the exact `echo` form (CRLF).
-        std::fs::write(&path, "1\r\n").expect("write");
+        // The exact bytes cmd writes: the code, a trailing space (cmd keeps the
+        // space that preceded the `&` separating the echo from the next
+        // command), then CRLF.
+        std::fs::write(&path, "1 \r\n").expect("write");
         assert_eq!(read_check_run_marker(&path), Some(1));
-        std::fs::write(&path, "0\r\n").expect("write");
+        std::fs::write(&path, "0 \r\n").expect("write");
         assert_eq!(read_check_run_marker(&path), Some(0));
         // A negative Windows status code round-trips.
         std::fs::write(&path, "-1073741819\r\n").expect("write");
         assert_eq!(read_check_run_marker(&path), Some(-1_073_741_819));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_run_output_reply_reports_a_recorded_run() {
+        let dir = check_run_scratch("output");
+        let result = dir.join("r.json");
+        let log = dir.join("r.log");
+        std::fs::write(
+            &result,
+            r#"{"exit_code":1,"elapsed_ms":4200,"timed_out":false}"#,
+        )
+        .expect("write result");
+        std::fs::write(&log, "test failed\n").expect("write log");
+
+        let r = check_run_output_reply(&result, &log);
+        assert_eq!(r.status, 200);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["available"], serde_json::json!(true));
+        assert_eq!(v["output"], serde_json::json!("test failed\n"));
+        assert_eq!(v["exit_code"], serde_json::json!(1));
+        assert_eq!(v["elapsed_ms"], serde_json::json!(4200));
+        assert_eq!(v["truncated"], serde_json::json!(false));
+        assert_eq!(v["timed_out"], serde_json::json!(false));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_run_output_reply_is_unavailable_before_any_run_finishes() {
+        let dir = check_run_scratch("output-none");
+        let r = check_run_output_reply(&dir.join("missing.json"), &dir.join("missing.log"));
+        assert_eq!(r.status, 200);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["available"], serde_json::json!(false));
+        assert_eq!(v["output"], serde_json::json!(""));
+        assert_eq!(v["exit_code"], serde_json::Value::Null);
+        assert_eq!(v["elapsed_ms"], serde_json::Value::Null);
+        assert_eq!(v["truncated"], serde_json::json!(false));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_run_output_reply_marks_a_timed_out_run() {
+        let dir = check_run_scratch("output-timeout");
+        let result = dir.join("r.json");
+        std::fs::write(
+            &result,
+            r#"{"exit_code":null,"elapsed_ms":21600000,"timed_out":true}"#,
+        )
+        .expect("write result");
+
+        let r = check_run_output_reply(&result, &dir.join("absent.log"));
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["available"], serde_json::json!(true));
+        assert_eq!(v["timed_out"], serde_json::json!(true));
+        assert_eq!(v["exit_code"], serde_json::Value::Null);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_run_output_reply_truncates_to_the_tail_of_a_long_log() {
+        let dir = check_run_scratch("output-big");
+        let result = dir.join("r.json");
+        let log = dir.join("r.log");
+        std::fs::write(
+            &result,
+            r#"{"exit_code":0,"elapsed_ms":10,"timed_out":false}"#,
+        )
+        .expect("write result");
+        let limit = usize::try_from(CHECK_RUN_OUTPUT_LIMIT).expect("cap fits usize");
+        let mut big = "x".repeat(limit);
+        big.push_str("TAIL");
+        std::fs::write(&log, &big).expect("write log");
+
+        let r = check_run_output_reply(&result, &log);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["truncated"], serde_json::json!(true));
+        let output = v["output"].as_str().expect("output");
+        assert_eq!(output.len(), limit);
+        assert!(output.ends_with("TAIL"), "tail not preserved");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_run_output_route_rejects_an_unknown_kind_and_a_non_numeric_index() {
+        let d = daemon();
+        let id = d.lock().create_guardian("g", "main", "/r").unwrap();
+
+        let r = route(
+            &d,
+            "GET",
+            &format!("/api/guardians/{id}/check-runs/sideways/0/output"),
+            "",
+        );
+        assert_eq!(r.status, 400);
+        assert!(r.body.contains("bad_request"), "{}", r.body);
+
+        let r = route(
+            &d,
+            "GET",
+            &format!("/api/guardians/{id}/check-runs/manual/not-a-number/output"),
+            "",
+        );
+        assert_eq!(r.status, 400);
+        assert!(r.body.contains("bad_request"), "{}", r.body);
     }
 
     // -----------------------------------------------------------------------
