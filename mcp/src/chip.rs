@@ -9,14 +9,22 @@
 /// One positional or option chip, parsed out of its `help_map.rs` text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chip {
-    /// The positional's bare name, or the option's flag including `--`.
+    /// The positional's bare name, or the option's flag including `--`. For
+    /// a tri-state chip this is just the positive spelling -- the negative
+    /// spelling is derived the same way `commands::review::take_tri_bool`
+    /// derives it.
     pub name: String,
     pub required: bool,
     pub repeatable: bool,
     /// `Some(choices)` for a `name [a|b|c]` literal-choice chip.
     pub choices: Option<Vec<String>>,
-    /// `false` for a bare boolean option chip (`--all`, no `[...]`).
+    /// `false` for a bare boolean option chip (`--all`, no `[...]`) or a
+    /// tri-state chip (`--flag/--no-flag`).
     pub takes_value: bool,
+    /// `true` for a `--flag/--no-flag` tri-state option chip, mirroring
+    /// Python's `argparse.BooleanOptionalAction` (this crate's
+    /// `commands::review::take_tri_bool`).
+    pub tri_state: bool,
 }
 
 impl Chip {
@@ -42,6 +50,17 @@ impl Chip {
 #[must_use]
 pub fn parse_chip(text: &str) -> Chip {
     let Some(bracket_start) = text.find('[') else {
+        if let Some((positive, _negative)) = text.split_once('/') {
+            // A tri-state option chip, e.g. "--skip-auto-build/--no-skip-auto-build".
+            return Chip {
+                name: positive.to_string(),
+                required: false,
+                repeatable: false,
+                choices: None,
+                takes_value: false,
+                tri_state: true,
+            };
+        }
         // A bare boolean option chip, e.g. "--all".
         return Chip {
             name: text.to_string(),
@@ -49,6 +68,7 @@ pub fn parse_chip(text: &str) -> Chip {
             repeatable: false,
             choices: None,
             takes_value: false,
+            tri_state: false,
         };
     };
     let name = text[..bracket_start].trim().to_string();
@@ -76,6 +96,7 @@ pub fn parse_chip(text: &str) -> Chip {
         repeatable,
         choices,
         takes_value: true,
+        tri_state: false,
     }
 }
 
@@ -128,5 +149,14 @@ mod tests {
         let c = parse_chip("--dry-run [value]");
         assert!(c.takes_value);
         assert_eq!(c.property_name(), "dry_run");
+    }
+
+    #[test]
+    fn parses_tri_state_option() {
+        let c = parse_chip("--skip-auto-build/--no-skip-auto-build");
+        assert_eq!(c.name, "--skip-auto-build");
+        assert!(c.tri_state);
+        assert!(!c.takes_value);
+        assert_eq!(c.property_name(), "skip_auto_build");
     }
 }
