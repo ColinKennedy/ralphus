@@ -1764,40 +1764,93 @@ fn fallback_pr_description(commits: &str, template: Option<&str>) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     match (template, subjects.is_empty()) {
-        (Some(template), false) => format!("{template}\n\n## Branch changes\n\n{subjects}"),
+        (Some(template), false) => insert_after_first_heading(template, &subjects),
         (Some(template), true) => template.to_string(),
         (None, _) => subjects,
     }
 }
 
-#[derive(Deserialize)]
-struct SuggestedPr {
-    title: String,
-    #[serde(default)]
-    description: String,
-    /// RAL-<new>: ids (from the numbered list the prompt gave the model) of
-    /// the prophecies the model judged reviewer-relevant. Absent/empty
-    /// whenever the branch had no unpublished prophecies to judge, or an
-    /// older-shaped response omitted the field entirely.
-    #[serde(default)]
-    relevant_prophecy_ids: Vec<i64>,
+/// Insert `body` immediately after the template's first markdown heading --
+/// the section most templates reserve for a change summary (`## Overview`,
+/// `## Summary`, ...) -- instead of appending it as a brand-new section after
+/// *everything* in the template, including a trailing checklist. A bare
+/// append there read as "no description at all" to a reader who didn't
+/// scroll past the template's own boilerplate to find it. Falls back to
+/// appending a `## Branch changes` section when the template has no heading
+/// to anchor to.
+fn insert_after_first_heading(template: &str, body: &str) -> String {
+    let mut offset = 0usize;
+    for line in template.split_inclusive('\n') {
+        offset += line.len();
+        if line.trim_start().starts_with('#') {
+            let (head, tail) = template.split_at(offset);
+            return format!("{head}\n{body}\n\n{tail}");
+        }
+    }
+    format!("{template}\n\n## Branch changes\n\n{body}")
 }
 
-/// Parse the resolver agent's `{"title": ..., "description": ..., \
-/// "relevant_prophecy_ids": [...]}` response, tolerating a chatty model that
-/// wraps the object in prose (same `{...}`-substring fallback used by
-/// `guardian_merge::parse_manual_commands_response`).
+/// Case-insensitive `line.strip_prefix(prefix)`, returning the trimmed rest.
+fn strip_prefix_ci<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
+    (line.len() >= prefix.len()
+        && line.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes()))
+    .then(|| line[prefix.len()..].trim())
+}
+
+/// Parse the resolver agent's plain-text response:
+///
+/// ```text
+/// TITLE: <title>
+/// RELEVANT_PROPHECY_IDS: 2, 7
+/// ===DESCRIPTION===
+/// <markdown description, verbatim, to the end of the response>
+/// ```
+///
+/// `RELEVANT_PROPHECY_IDS` is only present when the prompt asked for it.
+/// This used to be a JSON envelope (`{"title": ..., "description": ...}`),
+/// but that meant every multi-line template or code fence the model echoed
+/// back into the description had to survive being correctly `\n`/quote-
+/// escaped inside a JSON string -- a bare literal newline inside a JSON
+/// string is already invalid per spec, and weaker/local models routinely
+/// got this wrong on exactly the multi-section, code-fence-bearing
+/// templates this feature exists for. A good description would silently
+/// fail to parse and fall back to the deterministic path, which is why PR
+/// descriptions often looked unfilled in practice. The plain-text format
+/// needs no escaping at all -- the description is just the literal tail of
+/// the response -- so a model only has to get two short header lines right.
+/// Tolerates a chatty preamble before `TITLE:` and a stray code fence
+/// wrapped around the whole response.
 fn parse_suggested_pr(text: &str) -> Option<(String, String, Vec<i64>)> {
-    serde_json::from_str::<SuggestedPr>(text)
-        .ok()
-        .or_else(|| {
-            let start = text.find('{')?;
-            let end = text.rfind('}')?;
-            (end > start)
-                .then(|| serde_json::from_str::<SuggestedPr>(&text[start..=end]).ok())
-                .flatten()
+    const MARKER: &str = "===DESCRIPTION===";
+    let text = text.trim();
+    let text = text
+        .strip_prefix("```")
+        .map(|rest| rest.split_once('\n').map_or(rest, |(_, after)| after))
+        .unwrap_or(text);
+    let text = text.strip_suffix("```").unwrap_or(text).trim_end();
+
+    let marker_at = text.find(MARKER)?;
+    let (head, tail) = text.split_at(marker_at);
+    let description = tail[MARKER.len()..]
+        .trim_start_matches(['\n', '\r'])
+        .trim_end()
+        .to_string();
+    let title = head
+        .lines()
+        .rev()
+        .find_map(|line| strip_prefix_ci(line.trim(), "TITLE:"))
+        .filter(|t| !t.is_empty())?
+        .to_string();
+    let relevant_prophecy_ids = head
+        .lines()
+        .find_map(|line| strip_prefix_ci(line.trim(), "RELEVANT_PROPHECY_IDS:"))
+        .map(|ids| {
+            ids.split(|c: char| !c.is_ascii_digit())
+                .filter_map(|tok| tok.parse().ok())
+                .collect()
         })
-        .map(|s| (s.title, s.description, s.relevant_prophecy_ids))
+        .unwrap_or_default();
+    Some((title, description, relevant_prophecy_ids))
 }
 
 /// Synthesize a suggested PR title + description from one branch's unique
@@ -1897,14 +1950,20 @@ fn synthesize_pr_text(
     let template_note = template.map_or_else(String::new, |t| {
         format!(
             "\n\nThe target repository has a pull-request template you MUST \
-             follow -- fill it in, keeping its section headers intact:\n\n{t}"
+             follow -- fill it in, keeping its section headers intact. Put \
+             the change summary in the template's first section (commonly \
+             named Overview/Summary/Description), right under its heading. \
+             Do not append a new section after the template's existing \
+             content (e.g. after a checklist) -- that reads as no \
+             description at all to a reviewer who doesn't scroll past the \
+             template's own boilerplate:\n\n{t}"
         )
     });
     // RAL-<new>: ask the same call that writes the description to also judge
     // which of this branch's unpublished prophecies are worth a reviewer's
     // time -- see the function doc for why this rides the existing call
     // instead of a second one.
-    let (prophecy_note, prophecy_schema_note) = if prophecies.is_empty() {
+    let (prophecy_note, prophecy_format_note) = if prophecies.is_empty() {
         (String::new(), String::new())
     } else {
         let numbered = prophecies
@@ -1923,7 +1982,9 @@ fn synthesize_pr_text(
                  branch a push landed on, routine rebase bookkeeping): those duplicate \
                  what the diff already shows and give the reviewer nothing to act on."
             ),
-            ", \"relevant_prophecy_ids\": [...]".to_string(),
+            "RELEVANT_PROPHECY_IDS: <comma-separated ids from the notes above that are \
+             reviewer-relevant, or leave blank>\n"
+                .to_string(),
         )
     };
     let prompt = format!(
@@ -1934,11 +1995,17 @@ fn synthesize_pr_text(
          UNIQUE COMMITS (oldest first):\n\n{commits}\n\n\
          UNIQUE DIFF STAT:\n\n{diff_stat}\n\n\
          UNIQUE DIFF:\n\n{patch}\n\n\
-         Respond with ONLY a JSON object of the form \
-         {{\"title\": \"...\", \"description\": \"...\"{prophecy_schema_note}}}. The title \
-         must be a single concise line under 72 characters. The description should be a \
-         few sentences of markdown explaining what changed and why, focused on \
-         developer intent rather than file-level detail.{template_note}{prophecy_note}"
+         Respond in EXACTLY this plain-text format and nothing else -- no JSON, no \
+         escaping, no code fence around the whole response, no commentary before or \
+         after it:\n\n\
+         TITLE: <a single concise line, under 72 characters>\n\
+         {prophecy_format_note}\
+         ===DESCRIPTION===\n\
+         <the complete PR description, written as literal markdown -- its own \
+         headings, code fences, checklists, and blank lines exactly as they should \
+         appear in the PR, with no quoting or escaping of any of it>\n\n\
+         The description should explain what changed and why, focused on developer \
+         intent rather than file-level detail.{template_note}{prophecy_note}"
     );
     let pr_cwd = guardian
         .branches
@@ -9534,9 +9601,7 @@ mod tests {
             ),
         ];
         let runner = ScriptedRunner(
-            "{\"title\": \"Add x\", \"description\": \"Adds x.\", \
-             \"relevant_prophecy_ids\": [2, 7]}"
-                .to_string(),
+            "TITLE: Add x\nRELEVANT_PROPHECY_IDS: 2, 7\n===DESCRIPTION===\nAdds x.".to_string(),
         );
 
         let (title, description, relevant) =
@@ -17815,32 +17880,95 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
     }
 
     #[test]
-    fn parse_suggested_pr_handles_wrapped_json() {
+    fn parse_suggested_pr_handles_a_chatty_preamble_and_no_prophecy_ids() {
         let (t, d, ids) = parse_suggested_pr(
-            "Sure! {\"title\": \"Fix bug\", \"description\": \"Fixes it.\"} done.",
+            "Sure, here you go!\n\nTITLE: Fix bug\n===DESCRIPTION===\nFixes it.",
         )
         .unwrap();
         assert_eq!(t, "Fix bug");
         assert_eq!(d, "Fixes it.");
         assert!(
             ids.is_empty(),
-            "no relevant_prophecy_ids given must default empty"
+            "no RELEVANT_PROPHECY_IDS line given must default empty"
         );
     }
 
     #[test]
     fn parse_suggested_pr_extracts_relevant_prophecy_ids() {
         let (_, _, ids) = parse_suggested_pr(
-            "{\"title\": \"Fix bug\", \"description\": \"Fixes it.\", \
-             \"relevant_prophecy_ids\": [2, 5]}",
+            "TITLE: Fix bug\nRELEVANT_PROPHECY_IDS: 2, 5\n===DESCRIPTION===\nFixes it.",
         )
         .unwrap();
         assert_eq!(ids, vec![2, 5]);
     }
 
     #[test]
+    fn parse_suggested_pr_preserves_multiline_markdown_with_no_escaping() {
+        // The whole point of the plain-text format: a template with
+        // headings, a fenced code block, and a checklist round-trips
+        // byte-for-byte, with no JSON-escaping for the model to get wrong.
+        let description = "## Overview\n\nAdds the thing.\n\n\
+             ## How To Run\n\n```sh\nfoo.py --branch main\n```\n\n\
+             ## Checklist\n\n- [ ] I have tested the change myself\n";
+        let response = format!("TITLE: Add the thing\n===DESCRIPTION===\n{description}");
+        let (title, parsed_description, _) = parse_suggested_pr(&response).unwrap();
+        assert_eq!(title, "Add the thing");
+        assert_eq!(parsed_description, description.trim_end());
+    }
+
+    #[test]
+    fn parse_suggested_pr_strips_a_code_fence_wrapped_around_the_whole_response() {
+        let (t, d, _) =
+            parse_suggested_pr("```\nTITLE: Fix bug\n===DESCRIPTION===\nFixes it.\n```").unwrap();
+        assert_eq!(t, "Fix bug");
+        assert_eq!(d, "Fixes it.");
+    }
+
+    #[test]
     fn parse_suggested_pr_rejects_garbage() {
-        assert!(parse_suggested_pr("no json here").is_none());
+        assert!(parse_suggested_pr("no marker here").is_none());
+    }
+
+    #[test]
+    fn fallback_pr_description_lands_under_the_templates_first_heading_not_after_the_checklist() {
+        let template = "## Overview\n\n\
+             ## How To Run\n\
+             Use this\n\n\
+             ```sh\n\
+             foo.py --branch %{source_branch}\n\
+             ```\n\n\
+             ## Checklist\n\n\
+             - [ ] I have read the contributing guidelines\n\
+             - [ ] I have tested the change myself\n";
+        let commits = "commit abc\nsubject: add widget support\n\nbody\n---\n";
+
+        let description = fallback_pr_description(commits, Some(template));
+
+        let overview_pos = description.find("## Overview").unwrap();
+        let body_pos = description.find("- add widget support").unwrap();
+        let how_to_run_pos = description.find("## How To Run").unwrap();
+        let checklist_pos = description.find("## Checklist").unwrap();
+        assert!(
+            overview_pos < body_pos && body_pos < how_to_run_pos,
+            "expected the change summary right after ## Overview and before \
+             ## How To Run, got:\n{description}"
+        );
+        assert!(
+            body_pos < checklist_pos,
+            "the change summary must not land after the checklist, got:\n{description}"
+        );
+    }
+
+    #[test]
+    fn fallback_pr_description_appends_a_section_when_template_has_no_heading() {
+        let description = fallback_pr_description(
+            "commit abc\nsubject: add widget support\n\nbody\n---\n",
+            Some("no headings here"),
+        );
+        assert_eq!(
+            description,
+            "no headings here\n\n## Branch changes\n\n- add widget support"
+        );
     }
 
     struct CapturingFailureRunner(Mutex<Option<RunnerSpec>>);
