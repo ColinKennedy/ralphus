@@ -876,14 +876,16 @@ Guardian exists to surface, and is almost never what you want.
       system_prompt_position = "append"
       prompt                 = "{<ticket text>}"
 
- 3. PROMPT PROOF steps: one per check (format, lint, test). Each is
-    a `prompt` proof step whose text runs the command and fixes on
-    failure, e.g.:
-      prompt = "Run `cargo test --all-targets`. If it fails, fix the
-                cause and re-run, up to 3 times. If still failing,
-                fail with an error. Do NOT commit and do NOT push."
-    (Use a `command` proof step instead only for a pure pass/fail gate
-    with no auto-fix.)
+ 3. REMEDIATING COMMAND PROOF steps: one per deterministic check
+    (format, lint, test). The orchestrator runs the command, gives a
+    failed attempt's captured output to the owning cell's resolved
+    agent/model to repair, and re-runs the exact command itself, e.g.:
+      [[task.cell.proof]]
+      command              = "cargo test --all-targets"
+      remediation_attempts = 3
+    `remediation_attempts` counts total command executions, including
+    the first. Use a `prompt` proof instead when the proof itself cannot
+    be expressed as a deterministic terminal command.
 
  4. FINALIZE cell (depends on the proof steps passing): an AI cell
     that stages only the intended SOURCE files -- deliberately NOT

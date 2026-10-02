@@ -1,12 +1,10 @@
-# RAL-241 manual-verification repro: a cell whose own command succeeds, but
-# whose attached command-kind proof exits nonzero.
+# RAL-241 manual-verification repro: a cell whose own remediating command
+# succeeds, but whose attached remediating command proof exits nonzero.
 #
-# Before this fix, a cell body succeeding masked a failing proof from the
-# escalation mailbox entirely -- the daemon's scheduler only ever broadcast
-# an `urgent` message from the cell body's own outcome
-# (daemon/src/scheduler.rs::enqueue_cell_failure_mailbox), never from a
-# proof step that ran afterward. The cell below intentionally exercises that
-# gap: `command` succeeds, its proof does not.
+# The cell body succeeds on its first execution. Its proof runs all three
+# configured command executions and the intervening repair passes, but the
+# unconditional `exit 1` remains unsuccessful. The scheduler then broadcasts
+# the proof failure through the escalation mailbox.
 #
 # Usage:
 #   ralphus submit examples/mailbox/repro-proof-fail.toml
@@ -20,6 +18,8 @@ name = "mailbox-repro-proof-fail"
 [[task.cell]]
 cwd = "."
 command = "exit 0"
+remediation_attempts = 3
 
 [[task.cell.proof]]
 command = "exit 1"
+remediation_attempts = 3
