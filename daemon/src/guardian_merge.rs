@@ -9526,38 +9526,49 @@ fn final_checks(
         )
     };
 
+    // Explicit check gates (already run, during the merge itself, by
+    // `run_commit_checks`) take full priority over any build/preparation
+    // step -- a review-declared `[[review.prepare]]`/`[[review.auto_build]]`
+    // AND the project's default preparation command are both skipped
+    // entirely when `checks` is configured, not just the project default.
+    // This matters even for a review with no preparation steps of its own:
+    // `create_guardian_keyed` eagerly stamps the project's default build
+    // command into this same `preparation` storage at creation time
+    // whenever `.ralphus.toml` already declares one, so `preparation` being
+    // non-empty does not by itself mean a review actually opted into it --
+    // only the absence of explicit checks does.
     let mut notes = Vec::new();
-    for def in &preparation {
-        if cancel.is_cancelled() {
-            return Err("preparation cancelled because the review changed".to_string());
-        }
-        notes.push(run_review_auto_build(
-            store,
-            runner,
-            id,
-            root,
-            combined_str,
-            &env,
-            def,
-            cancel,
-        )?);
-    }
-    // With no explicit preparation and no explicit check gates (those already
-    // ran during the merge -- running the project default here too would be
-    // a redundant second build), use the project's default preparation
-    // command. Resolve it before launching the subprocess so the global
-    // store lock is never held for the duration of a build.
-    let auto_build_cmd = store.lock().resolve_review_config(root.root()).auto_build;
-    if preparation.is_empty() && checks.is_empty() {
-        if let Some(cmd) = auto_build_cmd {
-            if !root
-                .at(combined_str)
-                .run_command_with_env(&cmd, &env, cancel)
-                .0
-            {
-                return Err(format!("preparation failed: {cmd}"));
+    if checks.is_empty() {
+        for def in &preparation {
+            if cancel.is_cancelled() {
+                return Err("preparation cancelled because the review changed".to_string());
             }
-            notes.push(format!("prepared via project default: {cmd}"));
+            notes.push(run_review_auto_build(
+                store,
+                runner,
+                id,
+                root,
+                combined_str,
+                &env,
+                def,
+                cancel,
+            )?);
+        }
+        // With no explicit preparation either, use the project's default
+        // preparation command. Resolve it before launching the subprocess so
+        // the global store lock is never held for the duration of a build.
+        if preparation.is_empty() {
+            let auto_build_cmd = store.lock().resolve_review_config(root.root()).auto_build;
+            if let Some(cmd) = auto_build_cmd {
+                if !root
+                    .at(combined_str)
+                    .run_command_with_env(&cmd, &env, cancel)
+                    .0
+                {
+                    return Err(format!("preparation failed: {cmd}"));
+                }
+                notes.push(format!("prepared via project default: {cmd}"));
+            }
         }
     }
     prepare_action_hints(store, runner, id, root, combined_str, &env, cancel)?;
