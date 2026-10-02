@@ -18,7 +18,6 @@ VALIDATE = REPO_ROOT / "core" / "src" / "validate.rs"
 # Settings-API key -> TOML key. Renames are documented here rather than hidden
 # in the source parser.
 MAPPING = {
-    "skip_auto_build": "skip_auto_build",
     "skip_worktrees": "skip_worktrees",
     "resolver_agent": "agent",
     "resolver_model": "model",

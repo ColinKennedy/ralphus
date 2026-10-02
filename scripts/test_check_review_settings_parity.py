@@ -14,7 +14,7 @@ pub const REVIEW_KEYS: &[&str] = &[
 '''
 SERVER = '''
 struct GuardianSettingsBody {
-    skip_auto_build: Option<bool>,
+    skip_auto_build: Option<bool>, // ralphus[ignore-review-parity]: retained endpoint compatibility control
 }
 '''
 
@@ -32,7 +32,7 @@ class ReviewSettingsParityTests(unittest.TestCase):
 struct GuardianSettingsBody {
     // ralphus[ignore-review-parity]: endpoint-only migration control, not a review setting
     endpoint_only: Option<bool>,
-    skip_auto_build: Option<bool>,
+    skip_auto_build: Option<bool>, // ralphus[ignore-review-parity]: retained endpoint compatibility control
 }
 '''
         self.assertEqual(source_violations(source, VALIDATE), [])
@@ -42,7 +42,7 @@ struct GuardianSettingsBody {
 struct GuardianSettingsBody {
     // ralphus[ignore-review-parity]: no
     endpoint_only: Option<bool>,
-    skip_auto_build: Option<bool>,
+    skip_auto_build: Option<bool>, // ralphus[ignore-review-parity]: retained endpoint compatibility control
 }
 '''
         self.assertIn("substantive", source_violations(source, VALIDATE)[0])
