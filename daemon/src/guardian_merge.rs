@@ -9173,8 +9173,15 @@ pub fn run_guardian_post_merge(
     let watch_superseded = Arc::clone(&superseded);
     let watch_store = store.clone();
     let watch_id = id.to_string();
+    // Runs on its own spawned thread -- `_preparation_lease` above is an
+    // unrelated, review-scoped `Arc<Mutex<()>>` (serializes concurrent
+    // preparation attempts for this review), never touched here, and stays
+    // held by the outer/caller thread this entire time regardless of what
+    // this watcher does; the static lock-reentrancy scan below can't tell
+    // it apart from a `StoreMutex` guard by name alone.
     let watcher = std::thread::spawn(move || {
         loop {
+            // allow-lock-io: see the doc comment above this thread::spawn call
             std::thread::sleep(std::time::Duration::from_secs(2));
             if watch_cancel.is_cancelled() {
                 return;
@@ -14926,7 +14933,9 @@ mod tests {
         let store = Arc::new(crate::store_lock::StoreMutex::new(
             Store::open_in_memory().unwrap(),
         ));
-        let id = guardian_with_port_input(&store.lock());
+        let guard = store.lock();
+        let id = guardian_with_port_input(&guard);
+        drop(guard);
         let runner: Arc<dyn Runner> = Arc::new(FixedValueRunner("9001"));
         let sem = Arc::new(Semaphore::new(4));
 
@@ -14956,7 +14965,9 @@ mod tests {
         let store = Arc::new(crate::store_lock::StoreMutex::new(
             Store::open_in_memory().unwrap(),
         ));
-        let id = guardian_with_port_input(&store.lock());
+        let guard = store.lock();
+        let id = guardian_with_port_input(&guard);
+        drop(guard);
         let runner: Arc<dyn Runner> = Arc::new(FixedValueRunner("9001"));
         let sem = Arc::new(Semaphore::new(4));
 
@@ -14970,7 +14981,9 @@ mod tests {
         let store = Arc::new(crate::store_lock::StoreMutex::new(
             Store::open_in_memory().unwrap(),
         ));
-        let id = guardian_with_port_input(&store.lock());
+        let guard = store.lock();
+        let id = guardian_with_port_input(&guard);
+        drop(guard);
         // Pre-claim, simulating a resolution already in flight from a
         // concurrent request.
         store
@@ -16050,7 +16063,9 @@ mod tests {
         // while the retained unsafe one reads as claimed by the review that
         // still owns it.
         {
-            let view = worktree_retirement_view(&store.lock()).unwrap();
+            let guard = store.lock();
+            let view = worktree_retirement_view(&guard).unwrap();
+            drop(guard);
             let safe = view
                 .entries
                 .iter()
@@ -16203,7 +16218,9 @@ mod tests {
                 .unwrap();
         }
 
-        let view = worktree_retirement_view(&store.lock()).unwrap();
+        let guard = store.lock();
+        let view = worktree_retirement_view(&guard).unwrap();
+        drop(guard);
         assert_eq!(view.age_threshold_days, 30);
         let state_of = |id: &str, v: &WorktreeRetirementView| {
             v.entries
@@ -16237,7 +16254,9 @@ mod tests {
                 None,
             )
             .unwrap();
-        let view2 = worktree_retirement_view(&store.lock()).unwrap();
+        let guard = store.lock();
+        let view2 = worktree_retirement_view(&guard).unwrap();
+        drop(guard);
         let failed_entry = view2
             .entries
             .iter()
@@ -16264,7 +16283,9 @@ mod tests {
                 )
                 .unwrap();
         }
-        let view3 = worktree_retirement_view(&store.lock()).unwrap();
+        let guard = store.lock();
+        let view3 = worktree_retirement_view(&guard).unwrap();
+        drop(guard);
         let retired_entry = view3
             .entries
             .iter()
