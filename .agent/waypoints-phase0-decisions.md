@@ -309,6 +309,72 @@ The message leads with the entry its recipient actually watches and names
 the rest only as context, since a watch is an exact match and the recipient
 has no stake in the others.
 
+## Halted cells resume, they are not restarted
+
+RAL-400 left this open: when a waypoint closes after halting an in-flight
+cell, does the squad auto-resume the same conversation, or is a hard stop
+acceptable with a manual `squad restart` afterward? **Confirmed by the user:
+auto-resume.**
+
+So a halt keeps the cell's `agent_session_id`, and `run_pending_waypoint_resumes`
+re-dispatches it once the gate lifts. Two things have to happen on the way
+back in, and both are easy to miss:
+
+- The worktree is rebased onto its upstream first. A cell is held *because*
+  the change it must take up does not exist yet; resuming against the tree as
+  it stood at halt time means it still cannot see that change.
+- The waypoint's guidance rides in on the cell's ghost, saying the change is
+  most likely already present after the rebase and that finding nothing to do
+  is a legitimate outcome. Without it the agent is re-invoked with no idea it
+  was ever held, and sets about re-implementing work its own tree contains.
+
+This is the plan doc's Phase 5 parking design, minus the graceful half
+(turn-end checkpointing, live-conversation injection, backend-specific
+resume) which stays deferred to v2.
+
+## Phase 11 walkthrough: what was proven against a live daemon
+
+Two registered projects, one of them a monorepo with two independently
+edited areas, plus four squads and a review. The point of the setup was the
+ticket's actionable-matching requirement: include everything that needs the
+waypoint, touch nothing that does not.
+
+A waypoint whose only affected entry was the `auth` squad, with an
+outstanding roster entry so its holds were live:
+
+| work | where | outcome |
+|---|---|---|
+| squad-1 `auth work`, in flight | projA / auth | **halted mid-cell** |
+| squad-4 `more auth work`, submitted after | projA / auth | **enrolled at submit, gated before it ran** |
+| squad-2 `billing work`, in flight | projA / billing | untouched, no roster state |
+| squad-3 `other project work` | projB | untouched, no roster state |
+
+The two untouched squads are the whole claim: a sibling area in the *same*
+project and a different project both stayed out, and neither cost a model
+call. That the sweep was alive at the time is proven by squad-4, which it
+did pick up -- so the zero is selectivity, not inactivity.
+
+The survey then ran live against squad-4 and returned `impacted=false`,
+which released it; it resumed and ran to completion. squad-1 stayed held,
+correctly: it is an explicit entry, and the classifier never second-guesses
+a human declaration.
+
+For the review kind: approval was refused while a `block` entry held it,
+with the waypoint named in the error. Setting the entry to advisory released
+it -- the next refusal came from the review's own state machine ("it is
+collecting"), not the waypoint.
+
+Two defects this surfaced, both fixed in the same change: the approval error
+named only the escape hatches and not the resolver's own `RALPHUS_BEARING`
+answer, which is the normal way a review gets released; and a hold lifting
+was invisible in the waypoint's feed, because the release only notified
+watchers and an entry often has none.
+
+Not covered here: a review resolver answering end-to-end, which needs a real
+agent on a built review worktree. The store-level release is unit-tested
+(`a_review_can_answer_and_release_its_own_approval`), and the equivalent
+agent-answers-and-closes loop was verified live on the squad path.
+
 ## Still open (explicitly deferred, not this cell's job)
 
 - Advisory stand-down optionality — deferred to Phase 6.
