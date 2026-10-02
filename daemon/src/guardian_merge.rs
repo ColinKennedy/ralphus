@@ -9699,6 +9699,17 @@ fn prepare_generated_manual_checks(
     let model = guardian.manual_commands_model;
     let mut failures = Vec::new();
     for index in 0..checks.len() {
+        // RAL-521: a check already successfully prepared by an earlier pass
+        // and left untouched by generation above (generation skipped because
+        // the result is cached, or the diff basis simply hasn't changed)
+        // must not be re-run here -- that would redo the work for nothing and
+        // blow away its `prepared_at_ms` stamp on every later merge/rebase.
+        // Generation always hands back fresh commands with `prepared_at_ms`
+        // unset (see `parse_manual_commands_response`), so this only skips
+        // checks generation did not just (re)produce.
+        if checks[index].prepared_at_ms.is_some() {
+            continue;
+        }
         checks[index].preparation_state = Some("preparing".to_string());
         checks[index].preparation_detail = None;
         checks[index].prepared_at_ms = None;
