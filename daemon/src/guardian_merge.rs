@@ -8802,19 +8802,28 @@ fn invalidate_guardian_preparation(store: &crate::store_lock::StoreHandle, id: &
         return;
     };
 
-    let mut commands = current.manual_commands;
-    for command in &mut commands {
-        command.preparation_state = Some("stale".to_string());
-        command.preparation_detail = Some(detail.to_string());
-        command.prepared_at_ms = None;
-        command.prepared_cwd = None;
+    // RAL-521: a review whose manual checks are cached is not about to have
+    // its underlying diff basis change just because a rebase/feedback pass
+    // was claimed -- `post_merge_jobs_inner` makes that same call once the
+    // new tip is actually known, and resets this state itself if generation
+    // does end up needing to rerun. Marking it stale here too would only
+    // flash the board and, worse, erase `prepared_at_ms` before that later,
+    // better-informed check gets to see it was never actually invalidated.
+    if manual_checks_should_generate(&current) {
+        let mut commands = current.manual_commands;
+        for command in &mut commands {
+            command.preparation_state = Some("stale".to_string());
+            command.preparation_detail = Some(detail.to_string());
+            command.prepared_at_ms = None;
+            command.prepared_cwd = None;
+        }
+        let _ = store.lock().set_guardian_manual_commands(
+            id,
+            &commands,
+            current.manual_commands_agent.as_deref(),
+            current.manual_commands_model.as_deref(),
+        );
     }
-    let _ = store.lock().set_guardian_manual_commands(
-        id,
-        &commands,
-        current.manual_commands_agent.as_deref(),
-        current.manual_commands_model.as_deref(),
-    );
 
     let mut actions = current.action_hints;
     for action in &mut actions {
