@@ -1247,6 +1247,17 @@ mod tests {
     }
 
     #[test]
+    fn tutor_teaches_all_manual_preparation_placements() {
+        assert!(TASK_TUTOR.contains("[[review.prepare]]"));
+        assert!(TASK_TUTOR.contains("1. Local build and local test"));
+        assert!(TASK_TUTOR.contains("2. Remote build, local test"));
+        assert!(TASK_TUTOR.contains("3. Shared/network placement"));
+        assert!(TASK_TUTOR.contains("placement = \"copy\""));
+        assert!(TASK_TUTOR.contains("placement = \"shared\""));
+        assert!(TASK_TUTOR.contains("run_on = \"daemon\""));
+    }
+
+    #[test]
     fn tutor_uses_wrapped_worktree_placeholders_for_cwd_examples() {
         assert!(TASK_TUTOR.contains("cwd    = \"<<ralphus:new-worktree/hello?upstream=main>>\""));
         assert!(

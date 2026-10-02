@@ -23,7 +23,7 @@ provider's business.
 > branching on scheme. Guardian
 > reviews now dispatch to a remote review's assigned machine too (RAL-185
 > Phase 3/RAL-201) — the merge worktree, stacked rebase, conflict-resolution
-> agent, chat/feedback/summary agent invocations, and check gates all route
+> agent, chat/feedback/summary agent invocations, and manual preparation all route
 > through the review's machine. See `REMOTE.local.md` for the full phase
 > history and its "Known limitations" section for what still runs local-only
 > even on a remote review (build-config resolution, the empty-branch VCS

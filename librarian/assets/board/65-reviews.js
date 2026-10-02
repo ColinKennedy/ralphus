@@ -1501,7 +1501,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        * Each pipeline stage's own state, computed independently.
        *
        * A review is not a single point on a line. Branches rebase concurrently,
-       * post-merge gates run while the stack is already readable, and auto-fix
+       * manual preparation runs while the stack is already readable, and auto-fix
        * can be pushing commits to a PR while a later branch is still merging --
        * so "collect", "rebase" and "review" are routinely live at the same
        * time. Reading one status enum and lighting a single dot misreported all
@@ -1563,7 +1563,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         const TIPS = {
           collecting: "Waiting on the task cells that produce this review's branches.",
           merging: "Rebasing the stack. Branches rebase concurrently, so this can be live while other stages are too.",
-          in_review: "The stack is readable and can be approved. Post-merge gates and manual-check generation run here without blocking it.",
+          in_review: "The stack is readable and can be approved. Manual-check preparation runs here without blocking it.",
           approved: "Approved, whether or not its PR stack has merged.",
           deployed: "Shipped.",
         };
@@ -1681,9 +1681,11 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           : (squashCount ? "on" : "off");
         const proof = (g.effective_proof_scope || "each_branch").replace(/_/g, " ");
         const model = g.resolver_model ? ` · ${esc(g.resolver_model)}` : "";
-        const preparationText = g.post_merge_status === "ok"
+        const preparationRevoked = [...(g.action_hints || []), ...(g.manual_commands || [])]
+          .some((check) => check.preparation_state === "stale" || check.preparation_state === "waiting");
+        const preparationText = !preparationRevoked && g.post_merge_status === "ok"
           ? "ready"
-          : g.post_merge_status === "failed" ? "failed" : "pending";
+          : !preparationRevoked && g.post_merge_status === "failed" ? "failed" : "pending";
         return `<div class="setup-strip">`
           + `<div class="setup-chips">`
           + setupChip(g.id, "onto", esc(g.base_branch || "—"),
@@ -1815,7 +1817,10 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
             ${detail}
           </div>`;
         }).join("");
-        const preparationState = g.post_merge_status || "waiting";
+        const manualSurfaceStates = [...(g.action_hints || []), ...(g.manual_commands || [])]
+          .map((check) => check.preparation_state);
+        const hasRevokedPreparation = manualSurfaceStates.some((state) => state === "stale" || state === "waiting");
+        const preparationState = hasRevokedPreparation ? "waiting" : (g.post_merge_status || "waiting");
         const preparationCount = (g.preparation || []).length;
         const preparationText = preparationState === "ok"
           ? `Ready${preparationCount ? ` — ${preparationCount} review preparation step(s) completed.` : "."}`

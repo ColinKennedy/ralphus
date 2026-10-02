@@ -694,6 +694,22 @@ mod tests {
     }
 
     #[test]
+    fn cancelling_preparation_never_waits_for_its_workspace_gate() {
+        let mem = StoreMemory::new();
+        let (_, token, gate) = mem.begin_guardian_preparation("g1");
+        let _lease = gate.lock();
+
+        let started = std::time::Instant::now();
+        mem.cancel_guardian_preparation("g1");
+
+        assert!(token.is_cancelled());
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "a rebase would be blocked behind the old preparation checkout"
+        );
+    }
+
+    #[test]
     fn reset_thinking_stall_strikes_for_run_clears_only_that_runs_keys() {
         let mem = StoreMemory::new();
         let branch_key = crate::tmux::session_name("guardian-g1", "AUTO_BUILD", "branch-a");

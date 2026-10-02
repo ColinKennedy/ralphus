@@ -30,9 +30,9 @@ model. Concretely, that means:
   declare shell-command or prompt-based proof steps that actually run and
   actually gate whether the work is considered done.
 - **Review is a first-class workflow.** Guardian reviews stack each task's
-  branch into a rebased review branch, resolve conflicts with an agent, run
-  check gates, and give you a feedback channel to steer changes before they
-  ship — see [Reviews](views/reviews.md).
+  branch into a rebased review branch, resolve conflicts with an agent,
+  prepare manual checks before a reviewer arrives, and give you a feedback
+  channel to steer changes before they ship — see [Reviews](views/reviews.md).
 
 ## Who this is for
 
