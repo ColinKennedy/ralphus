@@ -1235,8 +1235,11 @@ fn no_checks_configured_runs_project_auto_build_default() {
     assert_eq!(view.post_merge_status.as_deref(), Some("ok"));
     assert_eq!(
         view.post_merge_detail.as_deref(),
-        Some("prepared via project default: echo built > autobuild_ran.txt"),
-        "the post-merge phase must record the stamped review auto-build for the Reviews UI"
+        Some("prepared via declared command group"),
+        "the .ralphus.toml write above happens before derive_reviews creates the guardian, \
+         so create_guardian_keyed's creation-time stamping already captured the project \
+         default into this review's own preparation -- by the time final_checks runs, it's \
+         a declared command group, not the lazy project-default fallback"
     );
     let _ = std::fs::remove_dir_all(&base);
 }
