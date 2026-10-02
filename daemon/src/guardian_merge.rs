@@ -9308,10 +9308,15 @@ fn final_checks(
     combined_str: &str,
     cancel: &CancelToken,
 ) -> std::result::Result<Option<String>, String> {
-    let (preparation, env) = {
+    let (preparation, checks, env) = {
         let guard = store.lock();
         (
             guard.guardian_preparation(id).unwrap_or_default(),
+            // Explicit check gates already ran during the merge itself
+            // (`run_commit_checks`, per branch) -- their presence here is
+            // only to decide whether the project default below would be a
+            // redundant second build, not to run them again.
+            guard.guardian_checks(id).unwrap_or_default(),
             // RAL-203: run under the same environment the combined worktree's
             // branches were built with (`combined_env`), plus this review's
             // own build-step overrides -- a check gate like `cargo test` is
@@ -9339,11 +9344,13 @@ fn final_checks(
             cancel,
         )?);
     }
-    // With no explicit preparation, use the project's default preparation
-    // command. Resolve it before launching the subprocess so the global store
-    // lock is never held for the duration of a build.
+    // With no explicit preparation and no explicit check gates (those already
+    // ran during the merge -- running the project default here too would be
+    // a redundant second build), use the project's default preparation
+    // command. Resolve it before launching the subprocess so the global
+    // store lock is never held for the duration of a build.
     let auto_build_cmd = store.lock().resolve_review_config(root.root()).auto_build;
-    if preparation.is_empty() {
+    if preparation.is_empty() && checks.is_empty() {
         if let Some(cmd) = auto_build_cmd {
             if !root
                 .at(combined_str)
