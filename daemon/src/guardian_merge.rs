@@ -9529,6 +9529,43 @@ fn final_checks(
 /// treats this tier as "handled" once it fires and falls through to `InReview`
 /// exactly as if this tier had been absent. `None` only when `def` describes
 /// no runnable step (defensive; `core::validate` should never allow this).
+/// Expand a direct worktree text marker into its declared branch text. The
+/// upstream is validation metadata; interpolation deliberately does not create
+/// or switch a worktree.
+fn expand_worktree_text(raw: &str) -> std::result::Result<String, String> {
+    ralphus_core::schema::replace_text_placeholders(raw, |body| {
+        let reference = ralphus_core::schema::parse_worktree_text_ref(body)
+            .map_err(|error| format!("invalid worktree text placeholder: {error:?}"))?;
+        Ok::<_, String>(reference.map(|reference| {
+            reference.text_fn.map_or_else(
+                || reference.branch.to_string(),
+                |function| function.apply(reference.branch),
+            )
+        }))
+    })
+}
+
+/// Resolve text-only worktree markers in the command and shared-artifact
+/// fields persisted for a manual action before its readiness is published.
+fn expand_check_worktree_text(
+    check: &mut crate::guardian::GuardianCheck,
+) -> std::result::Result<(), String> {
+    for value in [&mut check.command, &mut check.cleanup_command] {
+        if let Some(value) = value {
+            *value = expand_worktree_text(value)?;
+        }
+    }
+    for artifact in &mut check.artifacts {
+        if let Some(path) = &mut artifact.shared_path {
+            *path = expand_worktree_text(path)?;
+        }
+        if let Some(command) = &mut artifact.readiness_command {
+            *command = expand_worktree_text(command)?;
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_review_auto_build(
     store: &crate::store_lock::StoreHandle,
@@ -9540,50 +9577,61 @@ fn run_review_auto_build(
     def: &crate::guardian::GuardianAutoBuild,
     cancel: &CancelToken,
 ) -> std::result::Result<String, String> {
-    if let Some(cmd) = def.command.as_deref() {
-        let ok = root
-            .at(combined_str)
-            .run_command_with_env(cmd, env, cancel)
-            .0;
-        let _ = store
-            .lock()
-            .cartographer_log(crate::cartographer::CartographerEntry {
-                level: if ok {
-                    crate::logging::LogLevel::INFO
-                } else {
-                    crate::logging::LogLevel::WARNING
-                },
-                source: "guardian",
-                message: if ok {
-                    "review auto_build succeeded"
-                } else {
-                    "review auto_build failed"
-                },
-                scope: Some("guardian"),
-                squad_id: None,
-                guardian_id: Some(id),
-                cell_id: None,
-                task: None,
-                log_path: None,
-                payload: serde_json::json!({"command": cmd}),
-                admin_only: false,
-            });
-        if !ok {
-            let _ = store.lock().set_guardian_notice(
-                id,
-                "auto_build_failed",
-                &format!(
-                    "This review's declared auto_build command failed: {cmd}. The review has \
+    let mut preparation_env = env.clone();
+    for (key, value) in &def.environment {
+        preparation_env.insert(key.clone(), expand_worktree_text(value)?);
+    }
+    let commands = if def.commands.is_empty() {
+        def.command.clone().into_iter().collect()
+    } else {
+        def.commands.clone()
+    };
+    if !commands.is_empty() {
+        for raw_command in commands {
+            let cmd = expand_worktree_text(&raw_command)?;
+            let ok = root
+                .at(combined_str)
+                .run_command_with_env(&cmd, &preparation_env, cancel)
+                .0;
+            let _ = store
+                .lock()
+                .cartographer_log(crate::cartographer::CartographerEntry {
+                    level: if ok {
+                        crate::logging::LogLevel::INFO
+                    } else {
+                        crate::logging::LogLevel::WARNING
+                    },
+                    source: "guardian",
+                    message: if ok {
+                        "review auto_build succeeded"
+                    } else {
+                        "review auto_build failed"
+                    },
+                    scope: Some("guardian"),
+                    squad_id: None,
+                    guardian_id: Some(id),
+                    cell_id: None,
+                    task: None,
+                    log_path: None,
+                    payload: serde_json::json!({"command": cmd}),
+                    admin_only: false,
+                });
+            if !ok {
+                let _ = store.lock().set_guardian_notice(
+                    id,
+                    "auto_build_failed",
+                    &format!(
+                        "This review's declared auto_build command failed: {cmd}. The review has \
                      still moved to In Review -- check the build output and re-run manually if \
                      needed."
-                ),
-            );
+                    ),
+                );
+            }
+            if !ok {
+                return Err(format!("preparation command failed: {cmd}"));
+            }
         }
-        return if ok {
-            Ok(format!("prepared via declared command: {cmd}"))
-        } else {
-            Err(format!("preparation command failed: {cmd}"))
-        };
+        return Ok("prepared via declared command group".to_string());
     }
 
     // Agent-invocation shape: `def.prompt` (plus optional system prompt/agent/model).
@@ -9648,7 +9696,7 @@ fn run_review_auto_build(
         assigned_agent_session_id: None,
         env_overrides: {
             let mut e = resolved.env.clone();
-            e.extend(env.clone());
+            e.extend(preparation_env);
             e
         },
         machine: root.machine().map(str::to_string),
@@ -9725,6 +9773,7 @@ fn prepare_action_hints(
         .map_err(|e| e.to_string())?
         .action_hints;
     let mut failures = Vec::new();
+    let mut completed_groups = std::collections::HashSet::new();
     for index in 0..hints.len() {
         hints[index].preparation_state = Some("preparing".to_string());
         hints[index].preparation_detail = None;
@@ -9735,6 +9784,7 @@ fn prepare_action_hints(
             .map_err(|e| e.to_string())?;
 
         let result = (|| {
+            expand_check_worktree_text(&mut hints[index])?;
             if hints[index].command.is_none() {
                 if let Some(prompt) = hints[index].prompt.as_deref() {
                     hints[index].command = Some(expand_action_prompt(
@@ -9757,7 +9807,12 @@ fn prepare_action_hints(
                 if cancel.is_cancelled() {
                     return Err("preparation cancelled because the review changed".to_string());
                 }
+                let fingerprint = serde_json::to_string(step).map_err(|error| error.to_string())?;
+                if completed_groups.contains(&fingerprint) {
+                    continue;
+                }
                 run_review_auto_build(store, runner, id, root, combined_str, env, step, cancel)?;
+                completed_groups.insert(fingerprint);
             }
             if !hints[index].artifacts.is_empty() {
                 hints[index].preparation_state = Some("transferring".to_string());
@@ -18330,6 +18385,86 @@ mod tests {
     }
 
     #[test]
+    fn equal_action_preparation_groups_are_deduplicated_and_expand_worktree_text() {
+        let (base, repo, _fwt) = make_repo("deduplicate-action-preparation");
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let commands = if cfg!(windows) {
+            vec![
+                "echo %OUTPUT_NAME%>> group-count.txt".to_string(),
+                "echo second>> group-count.txt".to_string(),
+            ]
+        } else {
+            vec![
+                "printf '%s\\n' \"$OUTPUT_NAME\" >> group-count.txt".to_string(),
+                "printf 'second\\n' >> group-count.txt".to_string(),
+            ]
+        };
+        let group = crate::guardian::GuardianAutoBuild {
+            commands,
+            environment: std::collections::BTreeMap::from([(
+                "OUTPUT_NAME".to_string(),
+                "<<ralphus:new-worktree/RAL-999-add_widget?upstream=main&text=basename({})>>"
+                    .to_string(),
+            )]),
+            ..crate::guardian::GuardianAutoBuild::default()
+        };
+        let id = {
+            let guard = store.lock();
+            let id = guard
+                .create_guardian("r", "main", &repo.to_string_lossy())
+                .unwrap();
+            guard
+                .set_guardian_action_hints(
+                    &id,
+                    &[
+                        crate::guardian::GuardianCheck {
+                            label: Some("First".to_string()),
+                            command: Some("echo <<ralphus:new-worktree/RAL-999-add_widget?upstream=main&text=basename({})>>".to_string()),
+                            prepare: vec![group.clone()],
+                            ..crate::guardian::GuardianCheck::default()
+                        },
+                        crate::guardian::GuardianCheck {
+                            label: Some("Second".to_string()),
+                            command: Some("echo second".to_string()),
+                            prepare: vec![group],
+                            ..crate::guardian::GuardianCheck::default()
+                        },
+                    ],
+                )
+                .unwrap();
+            id
+        };
+
+        final_checks(
+            &store,
+            &FixedValueRunner("unused"),
+            &id,
+            &Workspace::local(&repo),
+            &repo.to_string_lossy(),
+            &CancelToken::never(),
+        )
+        .expect("deduplicated preparation succeeds");
+
+        let review = store.lock().get_guardian(&id).unwrap();
+        assert!(
+            review
+                .action_hints
+                .iter()
+                .all(|action| action.preparation_state.as_deref() == Some("ready"))
+        );
+        assert_eq!(
+            review.action_hints[0].command.as_deref(),
+            Some("echo RAL-999-add_widget")
+        );
+        let lines = std::fs::read_to_string(repo.join("group-count.txt")).unwrap();
+        assert_eq!(lines.lines().count(), 2, "the equal group must run once");
+        assert!(lines.contains("RAL-999-add_widget"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn generated_check_preparation_runs_before_the_check_becomes_ready() {
         let (base, repo, _fwt) = make_repo("prepare-generated-check");
         let store = Arc::new(crate::store_lock::StoreMutex::new(
@@ -18527,11 +18662,13 @@ mod tests {
                     &id,
                     Some(&crate::guardian::GuardianAutoBuild {
                         command: Some("exit 0".to_string()),
+                        commands: Vec::new(),
                         prompt: None,
                         system_prompt: None,
                         system_prompt_position: None,
                         agent: None,
                         model: None,
+                        environment: std::collections::BTreeMap::new(),
                     }),
                 )
                 .unwrap();
@@ -18607,11 +18744,13 @@ mod tests {
                     &id,
                     Some(&crate::guardian::GuardianAutoBuild {
                         command: None,
+                        commands: Vec::new(),
                         prompt: Some("build the thing".to_string()),
                         system_prompt: None,
                         system_prompt_position: None,
                         agent: None,
                         model: None,
+                        environment: std::collections::BTreeMap::new(),
                     }),
                 )
                 .unwrap();

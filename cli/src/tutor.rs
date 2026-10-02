@@ -532,7 +532,9 @@ Tip: validate before submitting -- `ralphus validate file.toml`
  is required per entry.
 
  Key                     Type           Notes
- command                 string  ONE-OF Verbatim shell command run directly.
+ command                 string|string[] ONE-OF One command, or an ordered
+                                       command group run directly. Every command
+                                       completes before the group is ready.
  prompt                  string  ONE-OF Agent prompt to figure out and run the
                                        build. The agent is inferred from the
                                        review's `agent` field (or the
@@ -549,6 +551,8 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                                        step (only valid with `prompt`). Unset falls
                                        back to the review's `model`, then the
                                        project-level default.
+ environment             table          String environment overrides applied to
+                                       every command or agent call in this group.
 
  [[review.action]]  (zero or more per [[review]])
  User-declared labelled buttons shown in the review pane. Every action is
@@ -562,10 +566,20 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                  to expand into a runnable command during preparation.
  run_on  string         "daemon" (default) or "review_machine".
  description string     What the reviewer should inspect.
- success string         What a successful observation looks like.
+ success string         Optional guidance on what to inspect. Omit it for the
+                        normal "exit code 0" manual action.
 
- [[review.action.prepare]] uses the same command/prompt shape as
- [[review.prepare]] for action-specific setup.
+[[review.action.prepare]] belongs to the immediately preceding
+[[review.action]] and uses the same command/prompt shape as [[review.prepare]]
+for action-specific setup. Its command may be one string or an ordered
+string array; environment overrides apply to that whole group. Equal action
+preparation groups are run once per preparation generation and satisfy every
+action that declares them.
+
+Preparation/action commands, group environment values, shared_path, and
+readiness_command may embed <<ralphus:new-worktree/BRANCH?upstream=UPSTREAM
+&text=basename({})>>. This is text interpolation only: it expands to BRANCH
+(or its requested text transform) and does not create another worktree.
 
  [[review.action.artifact]] declares selected prepared outputs:
  source             relative path produced in the review checkout
@@ -583,7 +597,8 @@ Tip: validate before submitting -- `ralphus validate file.toml`
     both use the retained local review checkout; no transfer is needed.
 
     [[review.prepare]]
-    command = "cargo build --bin demo"
+    command = ["cargo build --bin demo", "cargo test --bin demo"]
+    environment = { RUST_LOG = "demo=debug" }
 
     [[review.action]]
     label = "Run local demo"
@@ -611,14 +626,21 @@ Tip: validate before submitting -- `ralphus validate file.toml`
 
     [[review.action]]
     label = "Exercise shared build"
-    command = "//build-share/demo/current/demo"
+    command = "//build-share/demo/<<ralphus:new-worktree/RAL-999-add_widget?upstream=main&text=basename({})>>/demo"
     run_on = "daemon"
+
+      [[review.action.prepare]]
+      command = [
+        "cmake -S . -B /mnt/build-share/<<ralphus:new-worktree/RAL-999-add_widget?upstream=main&text=basename({})>>/build",
+        "cmake --build /mnt/build-share/<<ralphus:new-worktree/RAL-999-add_widget?upstream=main&text=basename({})>>/build --target demo"
+      ]
+      environment = { BUILD_FLAVOR = "release" }
 
       [[review.action.artifact]]
       source = "target/release/demo"
       placement = "shared"
-      shared_path = "//build-share/demo/current/demo"
-      readiness_command = "test -x /mnt/build-share/demo/current/demo"
+      shared_path = "//build-share/demo/<<ralphus:new-worktree/RAL-999-add_widget?upstream=main&text=basename({})>>/demo"
+      readiness_command = "test -x /mnt/build-share/demo/<<ralphus:new-worktree/RAL-999-add_widget?upstream=main&text=basename({})>>/demo"
 
 ---------------------------------------------------------------
  Triage (RAL-318) -- auto-review opt-in, alternative to [[review]]

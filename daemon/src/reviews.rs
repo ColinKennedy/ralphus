@@ -504,7 +504,7 @@ fn actions_to_hints(actions: &[ReviewActionDef]) -> Vec<GuardianCheck> {
             description: a.description.clone(),
             success: a.success.clone(),
             run_on: Some(a.run_on.clone().unwrap_or_else(|| "daemon".to_string())),
-            prepare: a.prepare.iter().map(into_guardian_auto_build).collect(),
+            prepare: a.prepare.iter().map(into_guardian_preparation).collect(),
             artifacts: a
                 .artifact
                 .iter()
@@ -1560,11 +1560,33 @@ fn into_guardian_auto_build(
 ) -> crate::guardian::GuardianAutoBuild {
     crate::guardian::GuardianAutoBuild {
         command: def.command.clone(),
+        commands: Vec::new(),
         prompt: def.prompt.clone(),
         system_prompt: def.system_prompt.clone(),
         system_prompt_position: def.system_prompt_position.clone(),
         agent: def.agent.clone(),
         model: def.model.clone(),
+        environment: std::collections::BTreeMap::new(),
+    }
+}
+
+/// Convert a declared preparation group, preserving its ordered command list
+/// and per-group environment overrides.
+fn into_guardian_preparation(
+    def: &ralphus_core::schema::PreparationStepDef,
+) -> crate::guardian::GuardianAutoBuild {
+    crate::guardian::GuardianAutoBuild {
+        command: None,
+        commands: def
+            .command
+            .as_ref()
+            .map_or_else(Vec::new, |command| command.commands()),
+        prompt: def.prompt.clone(),
+        system_prompt: def.system_prompt.clone(),
+        system_prompt_position: def.system_prompt_position.clone(),
+        agent: def.agent.clone(),
+        model: def.model.clone(),
+        environment: def.environment.clone(),
     }
 }
 
@@ -1582,8 +1604,8 @@ fn apply_auto_build(
         let steps = member
             .prepare
             .iter()
-            .chain(member.auto_build.iter())
-            .map(into_guardian_auto_build)
+            .map(into_guardian_preparation)
+            .chain(member.auto_build.iter().map(into_guardian_auto_build))
             .collect();
         store
             .set_guardian_preparation(gid, steps)

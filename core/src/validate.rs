@@ -340,6 +340,15 @@ const AUTO_BUILD_KEYS: &[&str] = &[
     "agent",
     "model",
 ];
+const PREPARATION_KEYS: &[&str] = &[
+    "command",
+    "prompt",
+    "system_prompt",
+    "system_prompt_position",
+    "agent",
+    "model",
+    "environment",
+];
 const PROOF_KEYS: &[&str] = &[
     "id",
     "command",
@@ -2389,7 +2398,7 @@ fn validate_preparation_array(value: Option<&toml::Value>, path: &str, ctx: &mut
 }
 
 fn validate_preparation_step(step: &toml::Table, path: &str, ctx: &mut Ctx) {
-    unknown_keys(ctx, step, AUTO_BUILD_KEYS, path, None);
+    unknown_keys(ctx, step, PREPARATION_KEYS, path, None);
     let command = step.contains_key("command");
     let prompt = step.contains_key("prompt");
     if command == prompt {
@@ -2404,12 +2413,13 @@ fn validate_preparation_step(step: &toml::Table, path: &str, ctx: &mut Ctx) {
             None,
         );
     }
-    check_type(ctx, step, "command", Ty::Str, path, None);
+    check_preparation_command(ctx, step, path);
     check_type(ctx, step, "prompt", Ty::Str, path, None);
     check_type(ctx, step, "system_prompt", Ty::Str, path, None);
     check_type(ctx, step, "system_prompt_position", Ty::Str, path, None);
     check_type(ctx, step, "agent", Ty::Str, path, None);
     check_type(ctx, step, "model", Ty::Str, path, None);
+    check_preparation_environment(ctx, step, path);
     if command {
         for key in ["system_prompt", "system_prompt_position", "agent", "model"] {
             if step.contains_key(key) {
@@ -2434,6 +2444,157 @@ fn validate_preparation_step(step: &toml::Table, path: &str, ctx: &mut Ctx) {
                 None,
             );
         }
+    }
+}
+
+/// Validate a preparation command group: one non-empty string or a non-empty
+/// array of non-empty strings.
+fn check_preparation_command(ctx: &mut Ctx, step: &toml::Table, path: &str) {
+    let Some(value) = step.get("command") else {
+        return;
+    };
+    match value {
+        toml::Value::String(command) => {
+            if command.trim().is_empty() {
+                ctx.error(
+                    &format!("{path}.command"),
+                    ErrorKind::InvalidValue,
+                    "preparation command must not be empty",
+                    None,
+                );
+            }
+            check_worktree_text_placeholders(ctx, &format!("{path}.command"), command);
+        }
+        toml::Value::Array(commands) => {
+            if commands.is_empty() {
+                ctx.error(
+                    &format!("{path}.command"),
+                    ErrorKind::InvalidValue,
+                    "preparation command array must not be empty",
+                    None,
+                );
+            }
+            for (index, command) in commands.iter().enumerate() {
+                let command_path = format!("{path}.command[{index}]");
+                let Some(command) = command.as_str() else {
+                    ctx.error(
+                        &command_path,
+                        ErrorKind::WrongType,
+                        "every preparation command must be a string",
+                        None,
+                    );
+                    continue;
+                };
+                if command.trim().is_empty() {
+                    ctx.error(
+                        &command_path,
+                        ErrorKind::InvalidValue,
+                        "preparation command must not be empty",
+                        None,
+                    );
+                }
+                check_worktree_text_placeholders(ctx, &command_path, command);
+            }
+        }
+        _ => ctx.error(
+            &format!("{path}.command"),
+            ErrorKind::WrongType,
+            "preparation command must be a string or an array of strings",
+            None,
+        ),
+    }
+}
+
+/// Validate preparation-group environment overrides. They have the same safe
+/// key and string-value contract as other execution environments.
+fn check_preparation_environment(ctx: &mut Ctx, step: &toml::Table, path: &str) {
+    let Some(value) = step.get("environment") else {
+        return;
+    };
+    let Some(environment) = value.as_table() else {
+        ctx.error(
+            &format!("{path}.environment"),
+            ErrorKind::WrongType,
+            "preparation environment must be a table of string values",
+            None,
+        );
+        return;
+    };
+    for (key, value) in environment {
+        let value_path = format!("{path}.environment.{key}");
+        if !is_valid_env_key(key) {
+            ctx.error(
+                &value_path,
+                ErrorKind::InvalidValue,
+                format!(
+                    "environment key \"{key}\" is not a valid identifier \
+                     (must match [A-Za-z_][A-Za-z0-9_]*)"
+                ),
+                None,
+            );
+        }
+        let Some(value) = value.as_str() else {
+            ctx.error(
+                &value_path,
+                ErrorKind::WrongType,
+                "preparation environment values must be strings",
+                None,
+            );
+            continue;
+        };
+        check_worktree_text_placeholders(ctx, &value_path, value);
+    }
+}
+
+/// Reject malformed worktree text placeholders in review preparation/action
+/// fields before a build can reach a shell with an unintended literal path.
+fn check_worktree_text_placeholders(ctx: &mut Ctx, path: &str, raw: &str) {
+    for body in crate::schema::text_placeholders(raw) {
+        let parsed = crate::schema::parse_worktree_text_ref(body);
+        let Err(error) = parsed else { continue };
+        use crate::schema::{LinkedFieldQueryError as QueryError, WorktreeTextRefError};
+        let detail = match error {
+            WorktreeTextRefError::MissingUpstream => {
+                "worktree text placeholders require '?upstream=<upstream>'"
+            }
+            WorktreeTextRefError::DuplicateParameter(name) => {
+                return ctx.error(
+                    path,
+                    ErrorKind::InvalidValue,
+                    format!("worktree text placeholder repeats query parameter \"{name}\""),
+                    None,
+                );
+            }
+            WorktreeTextRefError::UnknownParameter(name) => {
+                return ctx.error(
+                    path,
+                    ErrorKind::InvalidValue,
+                    format!(
+                        "worktree text placeholder has unknown query parameter \"{name}\"; \
+                         use 'upstream' and optional 'text=basename({{}})'"
+                    ),
+                    None,
+                );
+            }
+            WorktreeTextRefError::InvalidTextQuery(QueryError::EmptyExpression) => {
+                "worktree text placeholder has an empty text transform"
+            }
+            WorktreeTextRefError::InvalidTextQuery(QueryError::MalformedExpression) => {
+                "worktree text transform must be '<function>({})', e.g. 'basename({})'"
+            }
+            WorktreeTextRefError::InvalidTextQuery(QueryError::UnknownFunction(name)) => {
+                return ctx.error(
+                    path,
+                    ErrorKind::InvalidValue,
+                    format!("worktree text placeholder has unknown text function \"{name}\""),
+                    None,
+                );
+            }
+            WorktreeTextRefError::InvalidTextQuery(QueryError::UnknownParam) => {
+                "worktree text transform is invalid"
+            }
+        };
+        ctx.error(path, ErrorKind::InvalidValue, detail, None);
     }
 }
 
@@ -2509,6 +2670,11 @@ fn validate_review_action_array(value: Option<&toml::Value>, path: &str, ctx: &m
         check_type(ctx, table, "description", Ty::Str, &apath, None);
         check_type(ctx, table, "success", Ty::Str, &apath, None);
         check_type(ctx, table, "run_on", Ty::Str, &apath, None);
+        for key in ["command", "cleanup_command"] {
+            if let Some(value) = table.get(key).and_then(toml::Value::as_str) {
+                check_worktree_text_placeholders(ctx, &format!("{apath}.{key}"), value);
+            }
+        }
         if let Some(run_on) = table.get("run_on").and_then(toml::Value::as_str) {
             if !matches!(run_on, "daemon" | "review_machine") {
                 ctx.error(
@@ -2589,6 +2755,11 @@ fn validate_review_artifact_array(value: Option<&toml::Value>, path: &str, ctx: 
             "readiness_command",
         ] {
             check_type(ctx, table, key, Ty::Str, &artifact_path, None);
+        }
+        for key in ["shared_path", "readiness_command"] {
+            if let Some(value) = table.get(key).and_then(toml::Value::as_str) {
+                check_worktree_text_placeholders(ctx, &format!("{artifact_path}.{key}"), value);
+            }
         }
         check_type(ctx, table, "executable", Ty::Bool, &artifact_path, None);
         check_type(ctx, table, "target_os", Ty::Str, &artifact_path, None);
@@ -5583,6 +5754,27 @@ target_arch = "x86_64"
 "#;
         let report = validate_toml(src);
         assert!(report.is_ok(), "{:?}", report.errors);
+    }
+
+    #[test]
+    fn review_action_preparation_command_group_environment_and_worktree_text_are_valid() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Run\"\ncommand=\"/share/<<ralphus:new-worktree/RAL-999-add_widget?upstream=main&text=basename({})>>/demo\"\n[[review.action.prepare]]\ncommand=[\"cmake -S . -B build\",\"cmake --build build\"]\nenvironment={ BUILD_ROOT=\"/share/<<ralphus:new-worktree/RAL-999-add_widget?upstream=main&text=basename({})>>\" }\n";
+        let result = validate_toml(src);
+        assert!(result.is_ok(), "{:?}", result.errors);
+    }
+
+    #[test]
+    fn review_action_preparation_rejects_malformed_worktree_text() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Run\"\ncommand=\"run\"\n[[review.action.prepare]]\ncommand=\"build <<ralphus:new-worktree/x?text=basename({})>>\"\n";
+        let result = validate_toml(src);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|error| error.message.contains("require '?upstream")),
+            "{:?}",
+            result.errors
+        );
     }
 
     #[test]

@@ -178,6 +178,10 @@ pub struct GuardianAutoBuild {
     /// exclusive with the agent-invocation fields below).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
+    /// Ordered shell commands belonging to one preparation group. All must
+    /// finish before the group is ready.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<String>,
     /// Prompt forwarded to the build agent (mutually exclusive with `command`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
@@ -195,6 +199,10 @@ pub struct GuardianAutoBuild {
     /// Model override for the build agent invocation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Environment overrides applied to every command or agent invocation in
+    /// this preparation group.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub environment: std::collections::BTreeMap<String, String>,
 }
 
 /// Lifecycle state of a guardian/review.
@@ -1473,11 +1481,13 @@ impl Store {
             .map(|command| {
                 serde_json::to_string(&GuardianAutoBuild {
                     command: Some(command.to_string()),
+                    commands: Vec::new(),
                     prompt: None,
                     system_prompt: None,
                     system_prompt_position: None,
                     agent: None,
                     model: None,
+                    environment: std::collections::BTreeMap::new(),
                 })
             })
             .transpose()
@@ -8183,11 +8193,13 @@ mod tests {
 
         let command_build = GuardianAutoBuild {
             command: Some("make build".to_string()),
+            commands: Vec::new(),
             prompt: None,
             system_prompt: None,
             system_prompt_position: None,
             agent: None,
             model: None,
+            environment: std::collections::BTreeMap::new(),
         };
         store
             .set_guardian_auto_build(&id, Some(&command_build))
@@ -8200,11 +8212,13 @@ mod tests {
 
         let agent_build = GuardianAutoBuild {
             command: None,
+            commands: Vec::new(),
             prompt: Some("build the project".to_string()),
             system_prompt: Some("you are a build agent".to_string()),
             system_prompt_position: Some("append".to_string()),
             agent: Some("claude".to_string()),
             model: Some("sonnet".to_string()),
+            environment: std::collections::BTreeMap::new(),
         };
         store
             .set_guardian_auto_build(&id, Some(&agent_build))
