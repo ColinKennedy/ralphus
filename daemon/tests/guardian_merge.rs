@@ -3341,7 +3341,7 @@ fn auto_build_runs_when_no_checks_configured() {
     assert!(
         view.post_merge_detail
             .unwrap_or_default()
-            .contains("auto-built"),
+            .contains("prepared via project default"),
         "expected the auto-build note to surface on the post-merge phase"
     );
     let _ = std::fs::remove_dir_all(&root);
@@ -3774,7 +3774,7 @@ fn failing_auto_build_is_advisory_and_does_not_fail_the_merge() {
     assert!(
         view.post_merge_detail
             .unwrap_or_default()
-            .contains("auto-build failed")
+            .contains("preparation failed")
     );
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -3803,7 +3803,7 @@ fn configured_checks_are_not_double_built_by_auto_build() {
         !view
             .post_merge_detail
             .unwrap_or_default()
-            .contains("auto-built"),
+            .contains("prepared via project default"),
         "the configured check gate should take priority over the auto-build default"
     );
     let _ = std::fs::remove_dir_all(&root);
@@ -3866,7 +3866,7 @@ fn review_declared_auto_build_command_wins_over_project_default() {
     assert!(
         view.post_merge_detail
             .unwrap_or_default()
-            .contains("auto-built via review auto_build"),
+            .contains("prepared via declared command group"),
         "expected the review-declared auto_build note, not the project default"
     );
     let _ = std::fs::remove_dir_all(&root);

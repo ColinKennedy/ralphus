@@ -1235,7 +1235,7 @@ fn no_checks_configured_runs_project_auto_build_default() {
     assert_eq!(view.post_merge_status.as_deref(), Some("ok"));
     assert_eq!(
         view.post_merge_detail.as_deref(),
-        Some("auto-built via review auto_build: echo built > autobuild_ran.txt"),
+        Some("prepared via project default: echo built > autobuild_ran.txt"),
         "the post-merge phase must record the stamped review auto-build for the Reviews UI"
     );
     let _ = std::fs::remove_dir_all(&base);
@@ -1288,7 +1288,7 @@ fn checks_configured_does_not_also_run_auto_build() {
     assert_eq!(view.post_merge_status.as_deref(), Some("ok"));
     assert_ne!(
         view.post_merge_detail.as_deref(),
-        Some("auto-built via project default: exit 1"),
+        Some("prepared via project default: exit 1"),
         "auto-build must not be recorded as having run when explicit checks are configured"
     );
 
