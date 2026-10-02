@@ -9337,62 +9337,10 @@ fn post_merge_jobs_inner(
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| tip.clone());
 
-    // Scratch checkout of the tip. Sibling of the combined worktree, with its
-    // own branch, so the jobs' byproducts land here instead of dirtying the
-    // combined worktree a future merge reuses -- and so a failed deletion can
-    // never wedge the combined worktree itself.
-    let pm_dir = combined_path
-        .parent()
-        .map(|p| p.join(POST_MERGE_WORKTREE_DIR))
-        .ok_or_else(|| "combined worktree path has no parent".to_string())?;
-    let pm_ws = ws_root.at(&pm_dir);
-    let pm_str = pm_dir.to_string_lossy().to_string();
-    // Invalidate the prior prepared generation before touching its retained
-    // checkout. The board must never offer a Run button while the directory
-    // behind it is being reset for a newer review tip.
-    // Bind the read result before updating either collection. An `if let`
-    // scrutinee temporary would otherwise retain the non-reentrant store lock
-    // for the entire body and deadlock on the first update.
-    let current_result = store.lock().get_guardian(id);
-    if let Ok(current) = current_result {
-        let mut commands = current.manual_commands;
-        for command in &mut commands {
-            command.preparation_state = Some("preparing".to_string());
-            command.preparation_detail = Some("review preparation is refreshing".to_string());
-            command.prepared_at_ms = None;
-        }
-        let _ = store.lock().set_guardian_manual_commands(
-            id,
-            &commands,
-            current.manual_commands_agent.as_deref(),
-            current.manual_commands_model.as_deref(),
-        );
-        let mut actions = current.action_hints;
-        for action in &mut actions {
-            action.preparation_state = Some("preparing".to_string());
-            action.preparation_detail = Some("review preparation is refreshing".to_string());
-            action.prepared_at_ms = None;
-        }
-        let _ = store.lock().set_guardian_action_hints(id, &actions);
-    }
-    // A detached checkout retained for manual use after preparation. It has no
-    // named branch and is refreshed in place when Windows file locks prevent a
-    // remove/add cycle.
-    if pm_ws.root().exists() {
-        let _ = combined_ws.git(&["worktree", "remove", "--force", &pm_str]);
-    }
-    if !pm_ws.root().exists() {
-        combined_ws
-            .git(&["worktree", "add", "--detach", &pm_str, &tip])
-            .map_err(|e| format!("post-merge scratch checkout failed: {e}"))?;
-    } else {
-        pm_ws
-            .git(&["checkout", "-f", "--detach", &tip])
-            .map_err(|e| format!("post-merge scratch reset failed: {e}"))?;
-        let _ = pm_ws.git(&["clean", "-fdx"]);
-    }
-
-    // The project base commit this generation diffs against.
+    // The project base commit this generation diffs against. Resolved here,
+    // ahead of the scratch-checkout reset below, purely from `combined_ws` --
+    // so the cache decision it feeds is known before deciding whether that
+    // reset also needs to invalidate the manual-commands state.
     let proj_str = proj.to_string_lossy().to_string();
     let base_sha = guardian
         .base_commits
@@ -9423,6 +9371,76 @@ fn post_merge_jobs_inner(
         g.effective_cache_manual_checks && g.manual_checks_cached && g.manual_checks_basis.is_some()
     });
     let generate_manual = jobs.manual_checks && !cached && (!commands_present || basis_changed);
+
+    // Scratch checkout of the tip. Sibling of the combined worktree, with its
+    // own branch, so the jobs' byproducts land here instead of dirtying the
+    // combined worktree a future merge reuses -- and so a failed deletion can
+    // never wedge the combined worktree itself.
+    let pm_dir = combined_path
+        .parent()
+        .map(|p| p.join(POST_MERGE_WORKTREE_DIR))
+        .ok_or_else(|| "combined worktree path has no parent".to_string())?;
+    let pm_ws = ws_root.at(&pm_dir);
+    let pm_str = pm_dir.to_string_lossy().to_string();
+    // Invalidate the prior prepared generation before touching its retained
+    // checkout. The board must never offer a Run button while the directory
+    // behind it is being reset for a newer review tip.
+    //
+    // RAL-521: a review whose manual checks are cached (`generate_manual` is
+    // false) is not having that checkout reset out from under its already-
+    // `"ready"` commands below -- so invalidating them here too would only
+    // flash the board to "preparing" and re-stamp `prepared_at_ms` for
+    // nothing once `prepare_generated_manual_checks` reruns them. Only do
+    // this when generation is actually about to (re)run.
+    //
+    // Bind the read result before updating either collection. An `if let`
+    // scrutinee temporary would otherwise retain the non-reentrant store lock
+    // for the entire body and deadlock on the first update.
+    if generate_manual {
+        let current_result = store.lock().get_guardian(id);
+        if let Ok(current) = current_result {
+            let mut commands = current.manual_commands;
+            for command in &mut commands {
+                command.preparation_state = Some("preparing".to_string());
+                command.preparation_detail = Some("review preparation is refreshing".to_string());
+                command.prepared_at_ms = None;
+            }
+            let _ = store.lock().set_guardian_manual_commands(
+                id,
+                &commands,
+                current.manual_commands_agent.as_deref(),
+                current.manual_commands_model.as_deref(),
+            );
+        }
+    }
+    {
+        let current_result = store.lock().get_guardian(id);
+        if let Ok(current) = current_result {
+            let mut actions = current.action_hints;
+            for action in &mut actions {
+                action.preparation_state = Some("preparing".to_string());
+                action.preparation_detail = Some("review preparation is refreshing".to_string());
+                action.prepared_at_ms = None;
+            }
+            let _ = store.lock().set_guardian_action_hints(id, &actions);
+        }
+    }
+    // A detached checkout retained for manual use after preparation. It has no
+    // named branch and is refreshed in place when Windows file locks prevent a
+    // remove/add cycle.
+    if pm_ws.root().exists() {
+        let _ = combined_ws.git(&["worktree", "remove", "--force", &pm_str]);
+    }
+    if !pm_ws.root().exists() {
+        combined_ws
+            .git(&["worktree", "add", "--detach", &pm_str, &tip])
+            .map_err(|e| format!("post-merge scratch checkout failed: {e}"))?;
+    } else {
+        pm_ws
+            .git(&["checkout", "-f", "--detach", &tip])
+            .map_err(|e| format!("post-merge scratch reset failed: {e}"))?;
+        let _ = pm_ws.git(&["clean", "-fdx"]);
+    }
 
     // Generated checks may declare their own setup, so generation must finish
     // before the common preparation pass can decide any button is ready.
