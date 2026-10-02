@@ -38,7 +38,7 @@ its own once the waypoint's survey clears or the waypoint closes — see
 
 Once a task's cell finishes on its own branch, an optional **Guardian
 review** can stack that branch (and others) into a single rebased review
-branch, resolve merge conflicts with an agent, run your declared check gates,
+branch, resolve merge conflicts with an agent, prepare optional manual checks,
 and give you a per-branch feedback thread to request changes before anything
 ships. See [Reviews](views/reviews.md) for the full picture, including how
 branch order relates to task dependencies.
@@ -65,7 +65,7 @@ couple of seconds. It has nine tabs:
 |---|---|
 | [Tasks](views/tasks.md) | Every squad, its tasks and cells, and the details of any one you select. |
 | [Queue](views/queue.md) | Reordering priority among everything currently ready to run. |
-| [Reviews](views/reviews.md) | Guardian merge reviews: branch stacking, conflict resolution, check gates, per-branch feedback. |
+| [Reviews](views/reviews.md) | Guardian merge reviews: branch stacking, conflict resolution, prepared manual checks, per-branch feedback. |
 | [Waypoints](views/waypoints.md) | Cross-squad coordination join points: roster, survey verdicts, delivery feed, bearings. |
 | [Resources](views/resources.md) | Live CPU/RAM/GPU usage per running cell. |
 | [Logs](views/cartographer.md) | The unified Cartographer event log, filterable and drillable. |

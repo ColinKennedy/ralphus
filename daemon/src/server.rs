@@ -6300,17 +6300,6 @@ fn submit(daemon: &Daemon, body: &str, query: &str, user_header: Option<&str>) -
         return error(400, "project_validation_failed", &msg, vec![]);
     }
 
-    // Review build declarations can be resolved from registered project
-    // configuration without materializing a worktree. Reject them here so a
-    // submit never succeeds only to fail asynchronously during materialization.
-    let review_preflight = {
-        let store = daemon.lock();
-        crate::reviews::preflight_auto_build_declarations(&store, &file)
-    };
-    if let Err(e) = review_preflight {
-        return error(400, "review_validation_failed", &e.message, vec![]);
-    }
-
     // Every `machine` value must name a registered provider at a supported
     // contract version (RAL-185). Core validated the syntax offline; only the
     // daemon can see the registry.
@@ -19550,6 +19539,7 @@ mod tests {
                 &[crate::guardian::GuardianCheck {
                     label: Some("Serve locally".to_string()),
                     command: Some("ralphus-daemon serve --port {port}".to_string()),
+                    preparation_state: Some("ready".to_string()),
                     prompt: None,
                     cleanup_command: None,
                     inputs: vec![check_input_typed(
@@ -19641,6 +19631,7 @@ mod tests {
                 &[crate::guardian::GuardianCheck {
                     label: Some("Serve locally".to_string()),
                     command: Some("ralphus-daemon serve --port {port}".to_string()),
+                    preparation_state: Some("ready".to_string()),
                     prompt: None,
                     cleanup_command: None,
                     inputs: vec![check_input_typed(
@@ -21893,7 +21884,7 @@ ANTHROPIC_AUTH_TOKEN = { from_env = "RALPHUS_AGENT_PROFILES_HEALTH_ROUTE_TEST_VA
     }
 
     #[test]
-    fn submit_rejects_review_without_a_build_declaration_before_materializing() {
+    fn submit_accepts_review_without_a_preparation_declaration() {
         let d = daemon();
         let repo = tmp_git_repo("review-build-preflight");
         let project = register_body("proj", &repo.to_string_lossy(), "");
@@ -21905,10 +21896,8 @@ ANTHROPIC_AUTH_TOKEN = { from_env = "RALPHUS_AGENT_PROFILES_HEALTH_ROUTE_TEST_VA
                     [[review]]\nid=\"ralphus:new-review/r\"\n";
         let r = route(&d, "POST", "/api/squads", &submit_body(toml));
 
-        assert_eq!(r.status, 400, "{}", r.body);
-        assert!(r.body.contains("review_validation_failed"), "{}", r.body);
-        assert!(r.body.contains("auto_build"), "{}", r.body);
-        assert!(d.lock().list_squads().unwrap().is_empty());
+        assert_eq!(r.status, 201, "{}", r.body);
+        assert_eq!(d.lock().list_squads().unwrap().len(), 1);
     }
 
     #[test]
@@ -22213,7 +22202,7 @@ machine=\"incredibuild:B\"
 
         let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\n\
                     [[task.cell]]\nid=\"work\"\ncwd=\"<<ralphus:new-worktree/feat?upstream=main>>\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n\
-                    [[review]]\nid=\"r\"\nskip_auto_build=true\n";
+                    [[review]]\nid=\"r\"\n";
         let r = route(&d, "POST", "/api/squads", &submit_body(toml));
         assert_eq!(r.status, 201, "{}", r.body);
         let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();

@@ -323,7 +323,7 @@
       const PROJECT_REVIEW_SETTINGS_BASE_SHIFT_CAP_TIP = "Maximum unattended rebuild attempts per base-shift retry campaign (a persistent conflict, failed proof, or outage stops automatic rebasing once spent, and the mailbox says so). Blank inherits the file-config/global value shown below; manual Merge/rebase resets the budget.";
       const PROJECT_REVIEW_SETTINGS_BUDGET_TIP = "USD spend cap applied to a future review's own resolver/prover cost when neither its [[review]] block nor the Arbiter sets one. Blank means unbounded (inherits the file-config/global value shown below).";
       const PROJECT_REVIEW_SETTINGS_MACHINE_TIP = "The machine (scheme:uri, or \"local\") a future review's worktrees and merge run on when nothing more specific sets one. Blank inherits the file-config/global value shown below.";
-      const PROJECT_REVIEW_SETTINGS_AUTO_BUILD_TIP = "The build/test command run at finalize time in place of check gates, for a future review that declares no explicit [[review.auto_build]] steps and no [[review]] skip_auto_build. Blank inherits the file-config value shown below.";
+      const PROJECT_REVIEW_SETTINGS_AUTO_BUILD_TIP = "Compatibility default used to prepare manual checks for a future review with no explicit [[review.prepare]] steps. New task files should declare preparation next to the review or action. Blank inherits the file-config value shown below.";
 
       /**
        * Renders the Review Settings modal from `projectReviewSettingsDraft`.
@@ -344,14 +344,14 @@
             <div class="kv-row"><span class="k">machine</span><input type="text" class="mono" style="${REVIEW_EDIT_INPUT_STYLE};width:200px" value="${esc(draft.machine)}" placeholder="inherits: ${esc(draft.effective.machine || "local")}" oninput="onProjectEditMachine(this.value)" data-tip="${PROJECT_REVIEW_SETTINGS_MACHINE_TIP}"></div>
             <div class="kv-row"><span class="k">maximum budget usd</span><input type="number" step="0.01" min="0" class="mono" style="${REVIEW_EDIT_INPUT_STYLE};width:120px" value="${draft.maximumBudgetUsd === null ? "" : esc(String(draft.maximumBudgetUsd))}" placeholder="${draft.effective.maximum_budget_usd === undefined ? "unbounded" : esc(String(draft.effective.maximum_budget_usd))}" oninput="onProjectEditMaximumBudgetUsd(this.value)" data-tip="${PROJECT_REVIEW_SETTINGS_BUDGET_TIP}"></div>
             ${proofScopeSection}
-            <h3 class="section">check gates</h3>
+            <h3 class="section">review workspace</h3>
             <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:6px" data-tip="Build the entire branch stack in one shared worktree instead of isolated per-branch worktrees, for a future review that declares no explicit skip_worktrees of its own.">
               <input type="checkbox" ${draft.skipWorktrees ? "checked" : ""} onchange="onProjectEditSkipWorktrees(this.checked)">skip per-branch worktrees</label>
             <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Skip the automatic base-branch auto-update rebuild, for a future review that declares no explicit skip_base_updates of its own.">
               <input type="checkbox" ${draft.skipBaseUpdates ? "checked" : ""} onchange="onProjectEditSkipBaseUpdates(this.checked)">skip base-branch auto-updates</label>
             <div class="kv-row"><span class="k">base-shift rebuild cap</span><input type="number" min="1" step="1" class="mono" style="${REVIEW_EDIT_INPUT_STYLE};width:80px" value="${draft.baseShiftMaximumRebuilds === null ? "" : esc(String(draft.baseShiftMaximumRebuilds))}" placeholder="${draft.effective.base_shift_maximum_rebuilds === undefined ? "3" : esc(String(draft.effective.base_shift_maximum_rebuilds))}" oninput="onProjectEditBaseShiftMaximumRebuilds(this.value)" data-tip="${PROJECT_REVIEW_SETTINGS_BASE_SHIFT_CAP_TIP}"></div>
             <div style="margin-top:8px">
-              <label for="project-auto-build-input" style="font-size:12px;color:var(--muted);display:block;margin-bottom:4px" data-tip="${PROJECT_REVIEW_SETTINGS_AUTO_BUILD_TIP}">auto-build command</label>
+              <label for="project-auto-build-input" style="font-size:12px;color:var(--muted);display:block;margin-bottom:4px" data-tip="${PROJECT_REVIEW_SETTINGS_AUTO_BUILD_TIP}">default preparation command</label>
               <input id="project-auto-build-input" type="text" class="mono" style="${REVIEW_EDIT_INPUT_STYLE};width:100%;box-sizing:border-box" value="${esc(draft.autoBuild)}" placeholder="inherits: ${esc(draft.effective.auto_build || "(none)")}" oninput="onProjectEditAutoBuild(this.value)" data-tip="${PROJECT_REVIEW_SETTINGS_AUTO_BUILD_TIP}">
             </div>
             <h3 class="section">pull requests</h3>

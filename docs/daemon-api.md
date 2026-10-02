@@ -136,8 +136,8 @@ where one exists.
 | POST | `/api/guardians/{id}/branches/{branch_id}/link_cell` | [Link a cell/task to an already-attached branch](#post-apiguardiansidbranchesbranch_idlink_cell) (RAL-392) |
 | POST | `/api/guardians/{id}/branches/{branch_id}/env` | [Set/unset/clear this review worktree's env overrides](#post-apiguardiansidbranchesbidenv--review-worktree-overrides) (RAL-191) |
 | GET | `/api/guardians/{id}/branches/{branch_id}/env` | [Resolved environment variables](#get-env--resolved-environment-views-ral-324) for that review worktree (RAL-324) |
-| GET | `/api/guardians/{id}/build-env` | Resolved environment variables for the finalize-time auto-build step (RAL-324) |
-| GET | `/api/guardians/{id}/tests-env` | Resolved environment variables for the check gates (tests) — the build step's layer under its own entry point (RAL-324) |
+| GET | `/api/guardians/{id}/build-env` | Resolved environment variables for review preparation (RAL-324) |
+| GET | `/api/guardians/{id}/tests-env` | Legacy alias for the stored automated-check environment while existing reviews drain (RAL-324) |
 | GET | `/api/guardians/{id}/manual-checks-env` | Resolved environment variables for the manual-checks step (RAL-324) |
 | GET | `/api/guardians/{id}/branches/{branch_id}/conflicts` | [Live conflicting-files list](#get-apiguardiansidbranchesbranch_idconflicts) for the board's Reviews UI (RAL-148) |
 | POST | `/api/guardians/{id}/branches/{branch_id}/open-terminal` | Spawn a resolver terminal **on the daemon host** |
@@ -154,12 +154,12 @@ where one exists.
 | POST | `/api/guardians/{id}/approve` | Approve an in_review or merge_stopped guardian (RAL-535) |
 | POST | `/api/guardians/{id}/cancel` | Cancel a review |
 | POST | `/api/guardians/{id}/reopen` | Reopen a cancelled, merged, or approved review (→ `collecting`) and immediately try a fresh merge pass if the daemon has capacity |
-| POST | `/api/guardians/{id}/run-manual-commands` | Spawn manual-check commands **on the daemon host** |
-| POST | `/api/guardians/{id}/run-action-hint` | Spawn a `command`-kind action hint **on the daemon host**; `prompt`-kind is `501` |
+| POST | `/api/guardians/{id}/run-manual-commands` | Launch a ready manual-check command at its prepared execution location; `409` until ready |
+| POST | `/api/guardians/{id}/run-action-hint` | Launch a ready authored action at its prepared execution location; prompt actions are expanded during preparation |
 | GET | `/api/guardians/{id}/check-runs/{kind}/{index}/output` | [Captured output of the last run of one board-launched check](#get-apiguardiansidcheck-runskindindexoutput) |
 | POST | `/api/guardians/{id}/resolve-input` | [Delegate a named check input to the resolver agent](#post-apiguardiansidresolve-input) ("set it for me", RAL-164) |
 
-Four routes above are flagged "on the daemon host": they call
+The terminal/debug routes explicitly flagged "on the daemon host" call
 `spawn_in_terminal`/open a GUI terminal window (or, for the read-only
 snapshot case below, an external viewer) on whatever machine runs
 `ralphus-daemon`, which only makes sense when the daemon and the caller share
@@ -1683,14 +1683,14 @@ build|tests|manual-checks|worktree]`. All five are read-only and build the
 same paths above (`cli/src/commands/env.rs`).
 
 **Board:** a "🔎 Resolved env" button on every `environment overrides` section
-and on a review's `check gates` section, opening a read-only popup table.
+and on a review's manual-preparation section, opening a read-only popup table.
 
 #### `POST /api/guardians/{id}/branches/{bid}/env` — review-worktree overrides
 
 A review worktree is assembled from a cell's work, so by default it runs
 under **that cell's resolved environment** (`squad < task < cell`): the
 conflict resolver, the dedicated final-proof pass, reviewer-feedback routing,
-and this branch's check gates are all spawned with it. Without that, an agent
+and this branch's automated proof commands are all spawned with it. Without that, an agent
 resolving conflicts would verify the code against a different environment than
 the one it was written under.
 
@@ -1726,7 +1726,7 @@ tombstone for a never-inherited key is a harmless no-op.
 
 The **combined** review worktree spans every enabled branch at once, rebased
 onto the last one in stack order, so anything that runs against it — the
-finalize-time build/check-gate step and the manual-checks step (see below) —
+manual-preparation and manual-check steps (see below) —
 uses the last enabled branch's own resolved environment (highest `position`)
 instead of one earlier branch's or a
 merge of all of them: that branch's code is what's actually checked out at the
@@ -1735,9 +1735,8 @@ are not in the combined worktree either. This is exposed on `GuardianView` as
 `combined_env` (`{key: value}`, no per-key provenance — it's already a plain
 resolved environment, not an overridable layer itself).
 
-**Remote caveat:** a check gate running on a remote machine still runs without
-these overrides — `remote_runner::RunRequest` has no env field, so rather than
-half-applying them the remote path is left exactly as it was.
+Remote preparation receives these overrides through the provider request, the
+same as local preparation.
 
 #### `POST /api/guardians/{id}/build-env` / `.../manual-checks-env` — combined-worktree step overrides (RAL-203)
 
@@ -1747,7 +1746,7 @@ shadowing the guardian-level `combined_env` baseline described above:
 
 | Endpoint | Governs |
 |---|---|
-| `POST /api/guardians/{id}/build-env` | The finalize-time build/check-gate step run against the combined worktree (`final_checks` in `guardian_merge.rs`) — explicit `checks`, the project's `.ralphus.toml [review] auto_build`, or an AI-inferred build command. |
+| `POST /api/guardians/{id}/build-env` | Ordered review preparation in the retained prepared checkout (`final_checks` in `guardian_merge.rs`) — explicit `[[review.prepare]]` steps, with the project's legacy `.ralphus.toml [review] auto_build` as a compatibility fallback. |
 | `POST /api/guardians/{id}/manual-checks-env` | The manual-checks step: the LLM-suggested commands run via `ralphus review checks run` or the board's "Run all" (`guardian_run_manual_commands` in `server.rs`), and `[[review.action]]` hints, which share the same execution path. |
 
 Setting one never affects the other — a build-only override does not leak into
@@ -2115,9 +2114,9 @@ Advisory by construction, like every post-merge job: it never gates
 
 #### The post-merge phase (RAL-520)
 Once a merge/rebase settles a stack, the review moves to `in_review`
-immediately and the remaining jobs — the check gates and manual-checks
-generation — run in an **independent post-merge worker**, against a scratch
-worktree of the finished stack, never inside the combined worktree itself.
+immediately and manual-check generation, preparation, and artifact placement
+run in an **independent post-merge worker**, against a retained prepared
+checkout of the finished stack, never inside the combined worktree itself.
 Consequences:
 
 - Post-merge state (`post_merge_status`, `post_merge_detail`) is advisory

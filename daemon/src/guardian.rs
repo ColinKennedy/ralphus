@@ -1170,15 +1170,9 @@ pub struct GuardianView {
     /// When [`Self::notice_kind`] was recorded (epoch ms). `None` alongside
     /// `notice_kind: None`.
     pub notice_at_ms: Option<i64>,
-    /// This review's declared build step (RAL-342), from `[[review.auto_build]]`.
-    /// `None` means the review declared `skip_auto_build = true` instead --
-    /// unlike [`Self::resolver_agent`]-style overrides, `None` here is never
-    /// "inherit the project config default": every guardian created after
-    /// the RAL-342 migration has exactly one of this field or
-    /// [`Self::skip_auto_build`] set, enforced at submit time
-    /// (`reviews::require_auto_build_declaration`). A guardian created
-    /// before that migration shipped simply has no auto_build tier at
-    /// finalize time (see `guardian_merge::final_checks`).
+    /// Preparation steps persisted for this review. The serialized field name
+    /// keeps existing database rows readable; an empty list is a valid review
+    /// that needs no preparation command.
     #[serde(rename = "preparation")]
     pub auto_build: Vec<GuardianAutoBuild>,
     /// The summary format stamped when this review was created.
@@ -4563,11 +4557,17 @@ impl Store {
     /// `in_review`. The two jobs it covers run concurrently against a scratch
     /// checkout of the finished stack; see [`GuardianView::post_merge_status`].
     pub fn start_guardian_post_merge(&self, id: &str) -> Result<i64> {
-        let started = crate::store::now_ms();
+        let now = crate::store::now_ms();
         self.conn.execute(
             "UPDATE guardians SET post_merge_status='running', post_merge_detail=NULL, \
-             post_merge_started_at_ms=?, post_merge_finished_at_ms=NULL WHERE id=?",
-            params![started, id],
+             post_merge_started_at_ms=MAX(?, COALESCE(post_merge_started_at_ms + 1, ?)), \
+             post_merge_finished_at_ms=NULL WHERE id=?",
+            params![now, now, id],
+        )?;
+        let started = self.conn.query_row(
+            "SELECT post_merge_started_at_ms FROM guardians WHERE id=?",
+            params![id],
+            |row| row.get(0),
         )?;
         Ok(started)
     }
@@ -10206,5 +10206,26 @@ mod tests {
             store.link_review_cell(&gid, &branch_id, &squad, 9, 9),
             Err(StoreError::NotFound)
         ));
+    }
+
+    #[test]
+    fn post_merge_start_stamps_are_strictly_monotonic() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("R", "main", "/repo").unwrap();
+
+        let first = store.start_guardian_post_merge(&id).unwrap();
+        let second = store.start_guardian_post_merge(&id).unwrap();
+
+        assert!(second > first);
+        assert!(
+            !store
+                .finish_guardian_post_merge(&id, first, true, None)
+                .unwrap()
+        );
+        assert!(
+            store
+                .finish_guardian_post_merge(&id, second, true, None)
+                .unwrap()
+        );
     }
 }
