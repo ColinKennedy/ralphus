@@ -54,10 +54,6 @@ const REVIEW_DEF_ONLY_EXCLUSIONS: &[(&str, &str)] = &[
         "outside this review-default parity contract",
     ),
     (
-        "skip_auto_build",
-        "an opt-out has no project default counterpart",
-    ),
-    (
         "auto_fix_pr_errors",
         "outside this review-default parity contract",
     ),

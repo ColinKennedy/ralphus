@@ -13340,6 +13340,7 @@ struct CreateGuardianBody {
 #[derive(Deserialize)]
 struct GuardianSettingsBody {
     #[serde(default)]
+    // ralphus[ignore-review-parity]: retained only for stored guardian compatibility settings; preparation is optional and new task files use `[[review.prepare]]` instead of a `[[review]]` key
     skip_auto_build: Option<bool>,
     #[serde(default)]
     skip_worktrees: Option<bool>,

@@ -9352,10 +9352,8 @@ fn expand_worktree_text(raw: &str) -> std::result::Result<String, String> {
 fn expand_check_worktree_text(
     check: &mut crate::guardian::GuardianCheck,
 ) -> std::result::Result<(), String> {
-    for value in [&mut check.command, &mut check.cleanup_command] {
-        if let Some(value) = value {
-            *value = expand_worktree_text(value)?;
-        }
+    for value in [&mut check.command, &mut check.cleanup_command].into_iter().flatten() {
+        *value = expand_worktree_text(value)?;
     }
     for artifact in &mut check.artifacts {
         if let Some(path) = &mut artifact.shared_path {
