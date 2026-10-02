@@ -55,8 +55,12 @@ impl Tool {
                 continue;
             };
             if !chip.takes_value {
-                if value.as_bool() == Some(true) {
-                    argv.push(chip.name.clone());
+                match (chip.tri_state, value.as_bool()) {
+                    (_, Some(true)) => argv.push(chip.name.clone()),
+                    (true, Some(false)) => {
+                        argv.push(format!("--no-{}", &chip.name[2..]));
+                    }
+                    _ => {}
                 }
                 continue;
             }
@@ -309,6 +313,70 @@ mod tests {
             .find(|t| t.path == ["task", "show"])
             .expect("task show tool");
         assert!(tool.build_argv(&Map::new()).is_err());
+    }
+
+    /// Every MCP tool-schema property key must satisfy Anthropic's tool-name
+    /// regex (`^[a-zA-Z0-9_.-]{1,64}$`) -- a tri-state chip's `/`-joined
+    /// `help_map.rs` text (e.g. `"--auto-fix-pr-errors/--no-auto-fix-pr-errors"`)
+    /// used to leak the `/` straight into the property name when `chip.rs`
+    /// didn't recognize the tri-state shape, which LiteLLM/Anthropic both
+    /// reject.
+    #[test]
+    fn all_tool_property_keys_satisfy_the_anthropic_name_regex() {
+        fn is_valid(key: &str) -> bool {
+            !key.is_empty()
+                && key.len() <= 64
+                && key
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+        }
+        let mut bad = Vec::new();
+        for tool in all_tools() {
+            let Some(props) = tool.input_schema["properties"].as_object() else {
+                continue;
+            };
+            for key in props.keys() {
+                if !is_valid(key) {
+                    bad.push(format!("{}: {key:?}", tool.name));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "property keys violating ^[a-zA-Z0-9_.-]{{1,64}}$:\n{}",
+            bad.join("\n")
+        );
+    }
+
+    /// A tri-state chip's `false` must survive the MCP round trip
+    /// (`build_argv` -> `commands::parse_args`) as `Some(false)`, not be
+    /// silently dropped the way a plain bare-boolean chip drops `false`.
+    #[test]
+    fn tri_state_false_round_trips_through_build_argv_and_parse_args() {
+        use ralphus_cli::commands::review::ReviewCommand;
+        use ralphus_cli::commands::{self, Command};
+
+        let tools = all_tools();
+        let tool = tools
+            .iter()
+            .find(|t| t.path == ["review", "settings"])
+            .expect("review settings tool");
+        let mut args = Map::new();
+        args.insert("selector".to_string(), json!("squad-1/review"));
+        args.insert("skip_auto_build".to_string(), json!(false));
+        let argv = tool.build_argv(&args).unwrap();
+        assert!(
+            argv.contains(&"--no-skip-auto-build".to_string()),
+            "{argv:?}"
+        );
+        match commands::parse_args(&argv) {
+            Command::Review(ReviewCommand::Settings {
+                skip_auto_build, ..
+            }) => {
+                assert_eq!(skip_auto_build, Some(false));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     #[test]
