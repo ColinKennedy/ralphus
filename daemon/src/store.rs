@@ -1592,6 +1592,7 @@ impl Store {
                 queue_rank    REAL,
                 env_overrides TEXT NOT NULL DEFAULT '{}',
                 materialized_env_overrides TEXT,
+                restart_note TEXT,
                 started_at_ms  INTEGER,
                 finished_at_ms INTEGER,
                 completed_active_duration_ms INTEGER NOT NULL DEFAULT 0,
@@ -3335,6 +3336,7 @@ impl Store {
             "ALTER TABLE cells ADD COLUMN remediation_attempts INTEGER",
             "ALTER TABLE proofs ADD COLUMN mode TEXT",
             "ALTER TABLE proofs ADD COLUMN remediation_attempts INTEGER",
+            "ALTER TABLE proofs ADD COLUMN restart_note TEXT",
             // RAL-505: per-review opt-in to tell the resolver agent
             // dispatched for an automatic PR/MR fix to prefer automatic
             // formatters/linters/static analysis and avoid broad or
@@ -7602,6 +7604,55 @@ impl Store {
             .optional()?)
     }
 
+    /// Store human-authored restart guidance on the exact selected proof.
+    /// A proof restart resets the whole sequence, so earlier proof steps must
+    /// not receive guidance written for a later one.
+    pub fn set_proof_restart_note(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        scope: &str,
+        cell_idx: i64,
+        idx: i64,
+        note: &str,
+    ) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE proofs SET restart_note=? WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=?",
+            params![note, squad_id, task_idx, scope, cell_idx, idx],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
+    /// Remove and return the restart guidance for one proof execution.
+    pub fn take_proof_restart_note(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        scope: &str,
+        cell_idx: i64,
+        idx: i64,
+    ) -> Result<Option<String>> {
+        let note = self
+            .conn
+            .query_row(
+                "SELECT restart_note FROM proofs WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=?",
+                params![squad_id, task_idx, scope, cell_idx, idx],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        if note.is_some() {
+            self.conn.execute(
+                "UPDATE proofs SET restart_note=NULL WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=?",
+                params![squad_id, task_idx, scope, cell_idx, idx],
+            )?;
+        }
+        Ok(note)
+    }
+
     /// Closes a proof's current active interval while retaining its `running`
     /// state, for a scheduler wait that does not execute agent work.
     pub fn stop_proof_active_interval(
@@ -8689,7 +8740,7 @@ impl Store {
             params![squad_id],
         )?;
         self.conn.execute(
-            "UPDATE proofs SET state='pending', completed_active_duration_ms=0, active_started_at_ms=NULL, env_out_of_date=0 WHERE squad_id=?",
+            "UPDATE proofs SET state='pending', completed_active_duration_ms=0, active_started_at_ms=NULL, env_out_of_date=0, restart_note=NULL WHERE squad_id=?",
             params![squad_id],
         )?;
         Ok(())
@@ -9274,7 +9325,7 @@ impl Store {
                 params![squad_id, s.task_idx, s.idx],
             )?;
             self.conn.execute(
-                "UPDATE proofs SET state='pending', completed_active_duration_ms=0, active_started_at_ms=NULL, env_out_of_date=0 WHERE squad_id=? AND task_idx=? AND scope='cell' AND cell_idx=?",
+                "UPDATE proofs SET state='pending', completed_active_duration_ms=0, active_started_at_ms=NULL, env_out_of_date=0, restart_note=NULL WHERE squad_id=? AND task_idx=? AND scope='cell' AND cell_idx=?",
                 params![squad_id, s.task_idx, s.idx],
             )?;
         }
@@ -9284,7 +9335,7 @@ impl Store {
                 params![squad_id, t.idx],
             )?;
             self.conn.execute(
-                "UPDATE proofs SET state='pending', completed_active_duration_ms=0, active_started_at_ms=NULL, env_out_of_date=0 WHERE squad_id=? AND task_idx=? AND scope='task'",
+                "UPDATE proofs SET state='pending', completed_active_duration_ms=0, active_started_at_ms=NULL, env_out_of_date=0, restart_note=NULL WHERE squad_id=? AND task_idx=? AND scope='task'",
                 params![squad_id, t.idx],
             )?;
         }
@@ -9411,7 +9462,7 @@ impl Store {
                 params![squad_id, s.task_idx, s.idx],
             )?;
             self.conn.execute(
-                "UPDATE proofs SET state='pending', env_out_of_date=0 WHERE squad_id=? AND task_idx=? AND scope='cell' AND cell_idx=?",
+                "UPDATE proofs SET state='pending', env_out_of_date=0, restart_note=NULL WHERE squad_id=? AND task_idx=? AND scope='cell' AND cell_idx=?",
                 params![squad_id, s.task_idx, s.idx],
             )?;
         }
@@ -9421,7 +9472,7 @@ impl Store {
                 params![squad_id, t.idx],
             )?;
             self.conn.execute(
-                "UPDATE proofs SET state='pending', env_out_of_date=0 WHERE squad_id=? AND task_idx=? AND scope='task'",
+                "UPDATE proofs SET state='pending', env_out_of_date=0, restart_note=NULL WHERE squad_id=? AND task_idx=? AND scope='task'",
                 params![squad_id, t.idx],
             )?;
         }
@@ -9506,6 +9557,26 @@ impl Store {
             roots.to_vec()
         };
         for (task_idx, idx) in targets {
+            let uri = crate::ghost::cell_uri(squad_id, task_idx, idx);
+            self.set_ghost_user_note(&uri, crate::ghost::KIND_CELL, Some(squad_id), None, note)?;
+        }
+        Ok(())
+    }
+
+    /// Apply proof-restart guidance only to cells downstream of `roots`.
+    /// The selected proof receives its own exact note; its owning cell must
+    /// not retain a second copy for a later cell execution.
+    pub fn apply_restart_user_note_to_downstream(
+        &self,
+        squad_id: &str,
+        roots: &[(i64, i64)],
+        note: &str,
+    ) -> Result<()> {
+        for (task_idx, idx) in self
+            .forward_reachable_cell_indices(squad_id, roots)?
+            .into_iter()
+            .filter(|target| !roots.contains(target))
+        {
             let uri = crate::ghost::cell_uri(squad_id, task_idx, idx);
             self.set_ghost_user_note(&uri, crate::ghost::KIND_CELL, Some(squad_id), None, note)?;
         }
@@ -10722,7 +10793,7 @@ impl Store {
                 params![squad_id, task_idx, idx],
             )?;
             self.conn.execute(
-                "UPDATE proofs SET state='pending' WHERE squad_id=? AND task_idx=? AND scope='cell' AND cell_idx=?",
+                "UPDATE proofs SET state='pending', restart_note=NULL WHERE squad_id=? AND task_idx=? AND scope='cell' AND cell_idx=?",
                 params![squad_id, task_idx, idx],
             )?;
             self.conn.execute(
@@ -10772,7 +10843,7 @@ impl Store {
         // — the cell body stays Done so the scheduler's proof-only path
         // re-runs proofs without re-running the cell.
         self.conn.execute(
-            "UPDATE proofs SET state='pending', env_out_of_date=0 WHERE squad_id=? AND task_idx=? AND scope='cell' AND cell_idx=?",
+            "UPDATE proofs SET state='pending', env_out_of_date=0, restart_note=NULL WHERE squad_id=? AND task_idx=? AND scope='cell' AND cell_idx=?",
             params![squad_id, task_idx, cell_idx],
         )?;
         self.revive_failed_downstream_cells(squad_id, &[(task_idx, cell_idx)])?;
@@ -10860,7 +10931,7 @@ impl Store {
         // finalizer fires immediately and re-runs only the task-level
         // proofs, without re-running any cell body.
         self.conn.execute(
-            "UPDATE proofs SET state='pending', env_out_of_date=0 WHERE squad_id=? AND task_idx=? AND scope='task'",
+            "UPDATE proofs SET state='pending', env_out_of_date=0, restart_note=NULL WHERE squad_id=? AND task_idx=? AND scope='task'",
             params![squad_id, task_idx],
         )?;
         let roots: Vec<(i64, i64)> = self
@@ -15982,6 +16053,34 @@ command = "check-c"
         assert_eq!(vs[2].state, "pending", "vi=2 must be reset to pending");
         assert_eq!(squad.tasks[0].state, "pending");
         assert_eq!(squad.state, "pending");
+    }
+
+    #[test]
+    fn proof_restart_note_is_exact_and_consumed_once() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store
+            .insert_squad(&parse(THREE_CELL_PROOFS), None, false)
+            .unwrap();
+
+        store
+            .set_proof_restart_note(&id, 0, "cell", 0, 1, "inspect the flaky fixture")
+            .unwrap();
+
+        assert_eq!(
+            store.take_proof_restart_note(&id, 0, "cell", 0, 0).unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .take_proof_restart_note(&id, 0, "cell", 0, 1)
+                .unwrap()
+                .as_deref(),
+            Some("inspect the flaky fixture")
+        );
+        assert_eq!(
+            store.take_proof_restart_note(&id, 0, "cell", 0, 1).unwrap(),
+            None
+        );
     }
 
     #[test]

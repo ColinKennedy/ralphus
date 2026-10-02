@@ -2766,10 +2766,11 @@ fn run_cell_worker(
     // upstream cell already learned. This goes into the prompt text
     // itself (not `system_prompt`), since `append_system_prompt` is only
     // honoured by the claude-code backend today and every agent must see it.
-    let ghost_context = {
+    let (ghost_context, restart_guidance) = {
         let guard = store.lock();
         let own_uri = crate::ghost::cell_uri(squad_id, row.task_idx, row.idx);
         let own = guard.get_ghost(&own_uri).ok().flatten();
+        let restart_guidance = guard.take_ghost_user_note(&own_uri).ok().flatten();
         let parents: Vec<(String, crate::ghost::GhostView)> = plan.deps[i]
             .iter()
             .filter_map(|&d| {
@@ -2782,7 +2783,10 @@ fn run_cell_worker(
                     .map(|g| (format!("{}/{}", dep.task_name, dep.cell_id), g))
             })
             .collect();
-        crate::ghost::format_context_block(own.as_ref(), &parents)
+        (
+            crate::ghost::format_context_block(own.as_ref(), &parents),
+            restart_guidance,
+        )
     };
     let selection =
         match resolve_agent_selection(store, &row.agent, row.cwd.as_deref().unwrap_or(".")) {
@@ -3200,6 +3204,7 @@ fn run_cell_worker(
             agent: &row.agent,
             executable: spec.executable.as_deref(),
             model: row.model.as_deref(),
+            first_attempt_guidance: None,
         };
         last_repair_result = Some(crate::remediation::run_repair_pass(
             runner,
@@ -3207,6 +3212,11 @@ fn run_cell_worker(
             &spec,
             remediation_attempt,
             &repair_agent,
+            if remediation_attempt == 1 {
+                restart_guidance.as_deref()
+            } else {
+                None
+            },
         ));
         remediation_attempt += 1;
     };
@@ -5003,6 +5013,10 @@ fn run_proofs(
             merged
         };
         register_secret_named_env_values(store, &env_overrides);
+        let restart_guidance = store
+            .lock()
+            .take_proof_restart_note(squad_id, task_idx, scope, cell_idx, idx)
+            .unwrap_or_default();
         let (passed, output, proof_claude_id, proof_usage) = match kind.as_str() {
             "command" => {
                 crate::rlog!(
@@ -5078,6 +5092,7 @@ fn run_proofs(
                     agent: &selection.backend,
                     executable: selection.executable.as_deref(),
                     model: repair_model,
+                    first_attempt_guidance: restart_guidance.as_deref(),
                 };
                 // RAL-488 interview Q1: resolved once per proof step rather
                 // than hoisted to `run_proofs`'s top, since the vast majority
@@ -5144,7 +5159,11 @@ fn run_proofs(
                     position,
                     proof_id.as_deref(),
                 );
-                let prompt = format!("{spec}\n\n{proof_context}");
+                let mut prompt = format!("{spec}\n\n{proof_context}");
+                if let Some(guidance) = restart_guidance.as_deref() {
+                    prompt.push_str("\n\nHuman guidance for this restarted proof:\n\n");
+                    prompt.push_str(guidance);
+                }
                 let mut runner_spec = RunnerSpec::for_proof(
                     squad_id,
                     task_name,

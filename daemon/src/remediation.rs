@@ -49,6 +49,7 @@ pub struct RepairAgent<'a> {
     pub agent: &'a str,
     pub executable: Option<&'a str>,
     pub model: Option<&'a str>,
+    pub first_attempt_guidance: Option<&'a str>,
 }
 
 /// Run `command_spec` (a `command`-kind [`RunnerSpec`]), and on failure --
@@ -124,6 +125,11 @@ pub fn run_command_with_remediation(
             command_spec,
             attempt,
             repair_agent,
+            if attempt == 1 {
+                repair_agent.first_attempt_guidance
+            } else {
+                None
+            },
         ));
         if cancel.is_cancelled() {
             break;
@@ -346,6 +352,7 @@ pub(crate) fn run_repair_pass(
     command_spec: &RunnerSpec,
     attempt: u32,
     repair_agent: &RepairAgent<'_>,
+    restart_guidance: Option<&str>,
 ) -> RunnerResult {
     let session_name = crate::tmux::session_name(
         &command_spec.squad_id,
@@ -377,11 +384,17 @@ pub(crate) fn run_repair_pass(
         .command
         .as_deref()
         .unwrap_or("<unknown command>");
-    let prompt = format!(
+    let mut prompt = format!(
         "A command you must fix just failed (nonzero exit) in `{}`:\n\n    {command}\n\n{output_note}\n\n\
          Diagnose why it failed and fix the underlying issue in the code.",
         command_spec.cwd,
     );
+    if let Some(guidance) = restart_guidance {
+        prompt.push_str(
+            "\n\nA human supplied the following guidance for this first repair attempt only:\n\n",
+        );
+        prompt.push_str(guidance);
+    }
 
     let mut spec = command_spec.clone();
     spec.cell_id = format!("{}-remediate-{attempt}", command_spec.cell_id);
@@ -521,6 +534,7 @@ mod tests {
             agent: "claude-code",
             executable: None,
             model: Some("claude-sonnet-5"),
+            first_attempt_guidance: None,
         }
     }
 
@@ -602,6 +616,47 @@ mod tests {
         );
         assert_eq!(seen[2].cell_id, "cell-1");
         assert_eq!(seen[2].command.as_deref(), Some("cargo build"));
+    }
+
+    #[test]
+    fn restart_guidance_reaches_only_the_first_repair_pass() {
+        let runner = ScriptedRunner::new(vec![failed(), done(), failed(), done(), done()]);
+        let spec = command_spec("squad-1", "cell-1", "cargo build");
+        let repair_agent = RepairAgent {
+            first_attempt_guidance: Some("focus on the generated bindings"),
+            ..repair_agent()
+        };
+        let result = run_command_with_remediation(
+            &runner,
+            &CancelToken::never(),
+            &spec,
+            ralphus_core::schema::COMMAND_MODE_REMEDIATING,
+            Some(3),
+            &repair_agent,
+            None,
+        );
+
+        assert!(result.is_done());
+        let seen = runner.seen.lock().unwrap();
+        assert_eq!(seen.len(), 5);
+        for command_attempt in [&seen[0], &seen[2], &seen[4]] {
+            assert_eq!(command_attempt.command.as_deref(), Some("cargo build"));
+            assert_eq!(command_attempt.prompt, None);
+        }
+        assert!(
+            seen[1]
+                .prompt
+                .as_deref()
+                .unwrap()
+                .contains("focus on the generated bindings")
+        );
+        assert!(
+            !seen[3]
+                .prompt
+                .as_deref()
+                .unwrap()
+                .contains("focus on the generated bindings")
+        );
     }
 
     #[test]
