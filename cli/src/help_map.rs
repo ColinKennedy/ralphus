@@ -1604,6 +1604,16 @@ const MAILBOX_CHILDREN: &[HelpNode] = &[
         false, // mutates read state.
         &[],
     ),
+    node(
+        "follow",
+        &[],
+        &[],
+        "Push extension of `check` (RAL-241): opens the daemon's /api/events stream and prints \
+         one line per mailbox escalation as it arrives, instead of polling. Runs until killed.",
+        false,
+        true, // read-only: only ever reads the event stream, never drains/mutates.
+        &[],
+    ),
 ];
 
 const QUEUE_CHILDREN: &[HelpNode] = &[

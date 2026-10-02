@@ -57,12 +57,37 @@ impl EventKind {
     }
 }
 
-/// One pushed event: the Cartographer row that was just persisted, plus the
-/// derived `kind` used as the SSE `event:` name.
+/// A mailbox escalation pushed the moment it's enqueued (RAL-241 push
+/// extension) -- carries just enough of a mailbox message for a subscriber
+/// to decide whether to act, without coupling this module to `mailbox.rs`'s
+/// row/table shape.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MailboxNotice {
+    pub message_id: String,
+    pub priority: String,
+    pub message: String,
+    pub squad_id: Option<String>,
+    pub task: Option<String>,
+    pub cell_id: Option<String>,
+    pub entity_uri: Option<String>,
+    pub category: Option<String>,
+}
+
+/// A pushed Cartographer-backed event: the row that was just persisted,
+/// plus the derived `kind` used as the SSE `event:` name.
 #[derive(Debug, Clone)]
-pub struct BusEvent {
+pub struct CartographerBusEvent {
     pub kind: EventKind,
     pub row: CartographerRow,
+}
+
+/// One pushed event, broadcast to every connected SSE subscriber: either a
+/// Cartographer-backed daemon state change, or a mailbox escalation (RAL-241
+/// push extension) raised outside the Cartographer pipeline.
+#[derive(Debug, Clone)]
+pub enum BusEvent {
+    Cartographer(CartographerBusEvent),
+    Mailbox(MailboxNotice),
 }
 
 struct Subscriber {
@@ -116,10 +141,22 @@ impl EventBus {
     /// disconnected (its SSE thread exited) is pruned here, so a browser tab
     /// closed without a clean teardown doesn't leak a slot forever.
     pub fn publish(&self, row: CartographerRow) {
-        let event = BusEvent {
+        let event = BusEvent::Cartographer(CartographerBusEvent {
             kind: EventKind::for_row(&row),
             row,
-        };
+        });
+        self.broadcast(event);
+    }
+
+    /// Broadcast a mailbox escalation (RAL-241 push extension) to every
+    /// live subscriber -- same channel, same drop-on-full/prune-on-disconnect
+    /// semantics as [`EventBus::publish`], so a mailbox push costs nothing
+    /// extra for a client already holding the `/api/events` connection open.
+    pub fn publish_mailbox(&self, notice: MailboxNotice) {
+        self.broadcast(BusEvent::Mailbox(notice));
+    }
+
+    fn broadcast(&self, event: BusEvent) {
         let mut subs = self.subscribers.lock().unwrap();
         subs.retain(|s| match s.tx.try_send(event.clone()) {
             Ok(()) | Err(TrySendError::Full(_)) => true,
@@ -156,12 +193,39 @@ mod tests {
         }
     }
 
+    fn notice(message_id: &str, priority: &str) -> MailboxNotice {
+        MailboxNotice {
+            message_id: message_id.to_string(),
+            priority: priority.to_string(),
+            message: "hi".to_string(),
+            squad_id: None,
+            task: None,
+            cell_id: None,
+            entity_uri: None,
+            category: None,
+        }
+    }
+
+    fn expect_cartographer(event: BusEvent) -> CartographerBusEvent {
+        match event {
+            BusEvent::Cartographer(ev) => ev,
+            BusEvent::Mailbox(_) => panic!("expected a Cartographer event, got a mailbox one"),
+        }
+    }
+
+    fn expect_mailbox(event: BusEvent) -> MailboxNotice {
+        match event {
+            BusEvent::Mailbox(n) => n,
+            BusEvent::Cartographer(_) => panic!("expected a mailbox event, got a Cartographer one"),
+        }
+    }
+
     #[test]
     fn subscribe_then_publish_delivers_the_event() {
         let bus = EventBus::new();
         let (_id, rx) = bus.subscribe();
         bus.publish(row(None, Some("squad-1")));
-        let event = rx.recv().expect("event delivered");
+        let event = expect_cartographer(rx.recv().expect("event delivered"));
         assert_eq!(event.kind, EventKind::Squad);
         assert_eq!(event.row.squad_id.as_deref(), Some("squad-1"));
     }
@@ -171,7 +235,7 @@ mod tests {
         let bus = EventBus::new();
         let (_id, rx) = bus.subscribe();
         bus.publish(row(Some("guardian-1"), Some("squad-1")));
-        let event = rx.recv().unwrap();
+        let event = expect_cartographer(rx.recv().unwrap());
         assert_eq!(event.kind, EventKind::Guardian);
     }
 
@@ -180,8 +244,28 @@ mod tests {
         let bus = EventBus::new();
         let (_id, rx) = bus.subscribe();
         bus.publish(row(None, None));
-        let event = rx.recv().unwrap();
+        let event = expect_cartographer(rx.recv().unwrap());
         assert_eq!(event.kind, EventKind::Other);
+    }
+
+    #[test]
+    fn subscribe_then_publish_mailbox_delivers_the_notice() {
+        let bus = EventBus::new();
+        let (_id, rx) = bus.subscribe();
+        bus.publish_mailbox(notice("msg-1", "urgent"));
+        let delivered = expect_mailbox(rx.recv().expect("event delivered"));
+        assert_eq!(delivered.message_id, "msg-1");
+        assert_eq!(delivered.priority, "urgent");
+    }
+
+    #[test]
+    fn mailbox_and_cartographer_events_share_one_subscriber_stream() {
+        let bus = EventBus::new();
+        let (_id, rx) = bus.subscribe();
+        bus.publish(row(None, Some("squad-1")));
+        bus.publish_mailbox(notice("msg-1", "high"));
+        expect_cartographer(rx.recv().unwrap());
+        expect_mailbox(rx.recv().unwrap());
     }
 
     #[test]

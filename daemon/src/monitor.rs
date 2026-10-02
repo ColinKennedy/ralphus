@@ -14,6 +14,7 @@
 use rusqlite::params;
 use serde::Serialize;
 
+use crate::events::MailboxNotice;
 use crate::mailbox::{self, MailboxPriority, Remediation};
 use crate::store::{Result, Store};
 
@@ -114,6 +115,16 @@ impl Store {
             "UPDATE mailbox_messages SET event_kind=?1 WHERE id=?2",
             params![event.as_str(), id],
         )?;
+        self.event_bus().publish_mailbox(MailboxNotice {
+            message_id: id.clone(),
+            priority: priority.as_str().to_string(),
+            message: message.to_string(),
+            squad_id: squad_id.map(str::to_string),
+            task: task.map(str::to_string),
+            cell_id: cell_id.map(str::to_string),
+            entity_uri: Some(entity_uri.to_string()),
+            category: None,
+        });
         Ok(id)
     }
 
@@ -162,6 +173,16 @@ impl Store {
             "UPDATE mailbox_messages SET event_kind=?1 WHERE id=?2",
             params![event.as_str(), id],
         )?;
+        self.event_bus().publish_mailbox(MailboxNotice {
+            message_id: id.clone(),
+            priority: priority.as_str().to_string(),
+            message: format!("{message} {}", remediation.render()),
+            squad_id: squad_id.map(str::to_string),
+            task: task.map(str::to_string),
+            cell_id: cell_id.map(str::to_string),
+            entity_uri: Some(entity_uri.to_string()),
+            category: None,
+        });
         Ok(id)
     }
 
@@ -335,5 +356,67 @@ mod tests {
             personal[0].event_kind.as_deref(),
             Some("squad_content_changed")
         );
+    }
+
+    #[test]
+    fn notify_watchers_pushes_a_mailbox_bus_event() {
+        let store = Store::open_in_memory().unwrap();
+        let (_sub_id, rx) = store.event_bus().subscribe();
+        let id = store
+            .notify_watchers(
+                NotifiableEventKind::SquadContentChanged,
+                "task:squad-1:0",
+                MailboxPriority::Normal,
+                "task changed",
+                None,
+            )
+            .unwrap();
+
+        let event = rx.recv().expect("mailbox event delivered");
+        match event {
+            crate::events::BusEvent::Mailbox(notice) => {
+                assert_eq!(notice.message_id, id);
+                assert_eq!(notice.priority, "normal");
+                assert_eq!(notice.message, "task changed");
+                assert_eq!(notice.entity_uri.as_deref(), Some("task:squad-1:0"));
+            }
+            crate::events::BusEvent::Cartographer(_) => {
+                panic!("expected a mailbox event, got a Cartographer one")
+            }
+        }
+    }
+
+    #[test]
+    fn notify_watchers_with_remediation_pushes_the_rendered_message() {
+        let store = Store::open_in_memory().unwrap();
+        insert_squad(&store, "squad-1");
+        let (_sub_id, rx) = store.event_bus().subscribe();
+        store
+            .notify_watchers_with_remediation(
+                NotifiableEventKind::SquadFailed,
+                "squad:squad-1",
+                MailboxPriority::Urgent,
+                "squad squad-1 failed to materialize: disk full",
+                &mailbox::Remediation::ManualInterventionRequired {
+                    guidance: "free disk space, then run `ralphus squad retry squad-1`".to_string(),
+                },
+                Some("squad-1"),
+                None,
+                None,
+            )
+            .unwrap();
+
+        let event = rx.recv().expect("mailbox event delivered");
+        match event {
+            crate::events::BusEvent::Mailbox(notice) => {
+                assert_eq!(notice.priority, "urgent");
+                assert!(notice.message.contains("disk full"));
+                assert!(notice.message.contains("Manual intervention required:"));
+                assert_eq!(notice.squad_id.as_deref(), Some("squad-1"));
+            }
+            crate::events::BusEvent::Cartographer(_) => {
+                panic!("expected a mailbox event, got a Cartographer one")
+            }
+        }
     }
 }

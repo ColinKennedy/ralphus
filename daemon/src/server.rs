@@ -18563,10 +18563,15 @@ X-Accel-Buffering: no\r\n\
     let mut ok = writer.write_all(preamble.as_bytes()).is_ok() && writer.flush().is_ok();
     while ok {
         ok = match rx.recv_timeout(SSE_HEARTBEAT) {
-            Ok(event) => {
+            Ok(crate::events::BusEvent::Cartographer(event)) => {
                 let payload =
                     serde_json::to_string(&event.row).unwrap_or_else(|_| "{}".to_string());
                 let line = format!("event: {}\ndata: {payload}\n\n", event.kind.as_str());
+                writer.write_all(line.as_bytes()).is_ok()
+            }
+            Ok(crate::events::BusEvent::Mailbox(notice)) => {
+                let payload = serde_json::to_string(&notice).unwrap_or_else(|_| "{}".to_string());
+                let line = format!("event: mailbox\ndata: {payload}\n\n");
                 writer.write_all(line.as_bytes()).is_ok()
             }
             Err(RecvTimeoutError::Timeout) => writer.write_all(b": heartbeat\n\n").is_ok(),

@@ -988,6 +988,25 @@ impl DaemonClient {
         self.get(&format!("/api/prophecies/{entity_uri}"))
     }
 
+    // ---- events (RAL-222) -----------------------------------------------
+
+    /// `POST /api/events/ticket` -- mints a short-lived, single-use ticket
+    /// for the `GET /api/events` SSE stream (RAL-222). Used by `ralphus
+    /// mailbox follow` (RAL-241 push extension) to open that stream itself,
+    /// the same way `librarian/assets/board/70-sse.js` does from the
+    /// browser -- a ticket is needed because the GET itself can't carry an
+    /// `Authorization` header the way a one-shot JSON call can.
+    pub fn mint_events_ticket(&self) -> Result<String, DaemonError> {
+        let body = self.post("/api/events/ticket", None)?;
+        body.get("ticket")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| DaemonError {
+                message: "daemon response missing \"ticket\" field".to_string(),
+                status_code: None,
+            })
+    }
+
     // ---- mailbox (RAL-241) ---------------------------------------------
 
     /// `POST /api/mailbox/register` -- returns `{"client_id": "..."}`.
