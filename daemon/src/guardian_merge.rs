@@ -9426,8 +9426,16 @@ fn post_merge_jobs_inner(
 
     // Generated checks may declare their own setup, so generation must finish
     // before the common preparation pass can decide any button is ready.
+    //
+    // Per `generate_manual_commands`'s own doc comment, its failures are
+    // silent -- a missing command list is better than failing the whole
+    // post-merge gate (and the checks/`final_checks` below) over an agent
+    // that produced nothing. Propagating it with `?` here would regress a
+    // review with no manual checks requested at all back to a hard failure
+    // whenever generation errors (e.g. no agent configured in a test/CI
+    // fixture).
     if generate_manual {
-        generate_manual_commands(
+        if let Err(e) = generate_manual_commands(
             store,
             runner,
             id,
@@ -9436,7 +9444,12 @@ fn post_merge_jobs_inner(
             &tip,
             Some(&pm_ws),
             cancel,
-        )?;
+        ) {
+            crate::rlog!(
+                WARNING,
+                "ralphus [guardian] review {id} manual-commands generation failed: {e}"
+            );
+        }
     }
     let outcome = if cancel.is_cancelled() {
         Err("preparation cancelled because the review changed".to_string())
