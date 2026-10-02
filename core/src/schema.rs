@@ -507,6 +507,87 @@ pub fn parse_worktree_placeholder_upstream(cwd: &str) -> Option<&str> {
     Some(value)
 }
 
+/// A worktree placeholder embedded as text in a review preparation/action
+/// field. It identifies the declared branch and can optionally transform that
+/// branch for a deterministic output path; it never materializes a worktree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorktreeTextRef<'a> {
+    /// Branch text declared by the placeholder.
+    pub branch: &'a str,
+    /// Tracking upstream declared by the placeholder.
+    pub upstream: &'a str,
+    /// Optional transform applied to [`Self::branch`] during interpolation.
+    pub text_fn: Option<TextFn>,
+}
+
+/// Why a text-embedded worktree placeholder is invalid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorktreeTextRefError<'a> {
+    /// The placeholder omitted its required worktree upstream.
+    MissingUpstream,
+    /// One query parameter occurred more than once.
+    DuplicateParameter(&'a str),
+    /// The placeholder named a query parameter other than `upstream` or `text`.
+    UnknownParameter(&'a str),
+    /// The `text` query could not be parsed as a registered text transform.
+    InvalidTextQuery(LinkedFieldQueryError<'a>),
+}
+
+/// Parse a `ralphus:new-worktree/<branch>?upstream=<upstream>[&text=<fn>({})]`
+/// marker used as text interpolation in review preparation/action fields.
+///
+/// A non-worktree marker returns `Ok(None)`. The `upstream` parameter remains
+/// mandatory so the marker has the same unambiguous branch declaration as a
+/// cell worktree placeholder. `text` defaults to the declared branch itself.
+pub fn parse_worktree_text_ref(
+    marker: &str,
+) -> Result<Option<WorktreeTextRef<'_>>, WorktreeTextRefError<'_>> {
+    let Some(rest) = marker.strip_prefix(WORKTREE_PLACEHOLDER_PREFIX) else {
+        return Ok(None);
+    };
+    let Some((branch, query)) = rest.split_once('?') else {
+        return Err(WorktreeTextRefError::MissingUpstream);
+    };
+    if branch.is_empty() {
+        return Err(WorktreeTextRefError::MissingUpstream);
+    }
+    let mut upstream = None;
+    let mut text_fn = None;
+    for parameter in query.split('&') {
+        let Some((name, value)) = parameter.split_once('=') else {
+            return Err(WorktreeTextRefError::UnknownParameter(parameter));
+        };
+        match name {
+            "upstream" => {
+                if upstream.replace(value).is_some() {
+                    return Err(WorktreeTextRefError::DuplicateParameter("upstream"));
+                }
+                if value.is_empty() {
+                    return Err(WorktreeTextRefError::MissingUpstream);
+                }
+            }
+            "text" => {
+                if text_fn.is_some() {
+                    return Err(WorktreeTextRefError::DuplicateParameter("text"));
+                }
+                text_fn = Some(
+                    parse_text_fn_expression(value)
+                        .map_err(WorktreeTextRefError::InvalidTextQuery)?,
+                );
+            }
+            _ => return Err(WorktreeTextRefError::UnknownParameter(name)),
+        }
+    }
+    let Some(upstream) = upstream else {
+        return Err(WorktreeTextRefError::MissingUpstream);
+    };
+    Ok(Some(WorktreeTextRef {
+        branch,
+        upstream,
+        text_fn,
+    }))
+}
+
 /// Byte offset of the `>>` that closes the `<<` whose body starts at
 /// `body_start`, or `None` when the run is unterminated.
 ///
@@ -568,6 +649,37 @@ pub fn text_placeholders(text: &str) -> Vec<&str> {
         offset = close + 2;
     }
     out
+}
+
+/// Replace selected wrapped text placeholders while preserving every marker
+/// the caller does not recognize. Nested sentinels use the same closing-rule
+/// as [`text_placeholders`].
+pub fn replace_text_placeholders<E>(
+    text: &str,
+    mut replace: impl FnMut(&str) -> Result<Option<String>, E>,
+) -> Result<String, E> {
+    let mut out = String::with_capacity(text.len());
+    let mut offset = 0usize;
+    while let Some(open_rel) = text[offset..].find("<<") {
+        let open = offset + open_rel;
+        out.push_str(&text[offset..open]);
+        let body_start = open + 2;
+        let Some(close) = placeholder_close(text, body_start) else {
+            out.push_str(&text[open..]);
+            return Ok(out);
+        };
+        let body = &text[body_start..close];
+        if let Some(value) = replace(body)? {
+            out.push_str(&value);
+        } else {
+            out.push_str("<<");
+            out.push_str(body);
+            out.push_str(">>");
+        }
+        offset = close + 2;
+    }
+    out.push_str(&text[offset..]);
+    Ok(out)
 }
 
 /// The first worktree placeholder found in `text`, either as the whole string
@@ -886,6 +998,11 @@ pub fn parse_linked_field_query(query: &str) -> Result<TextFn, LinkedFieldQueryE
     let expr = query
         .strip_prefix("text=")
         .ok_or(LinkedFieldQueryError::UnknownParam)?;
+    parse_text_fn_expression(expr)
+}
+
+/// Parse the expression portion of a `text=<function>({})` query.
+pub fn parse_text_fn_expression(expr: &str) -> Result<TextFn, LinkedFieldQueryError<'_>> {
     if expr.is_empty() {
         return Err(LinkedFieldQueryError::EmptyExpression);
     }
@@ -1508,9 +1625,55 @@ pub struct AutoBuildDef {
     pub model: Option<String>,
 }
 
-/// One ordered unattended preparation step for a review or manual action.
-/// Exactly one of `command` or `prompt` is set.
-pub type PreparationStepDef = AutoBuildDef;
+/// One or several ordered shell commands in a preparation group.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum PreparationCommandDef {
+    /// One shell command.
+    One(String),
+    /// Several shell commands which share one environment and fail as a group.
+    Many(Vec<String>),
+}
+
+impl PreparationCommandDef {
+    /// Return this group's commands in declaration order.
+    #[must_use]
+    pub fn commands(&self) -> Vec<String> {
+        match self {
+            Self::One(command) => vec![command.clone()],
+            Self::Many(commands) => commands.clone(),
+        }
+    }
+}
+
+/// One ordered unattended preparation group for a review or manual action.
+/// Exactly one of `command` or `prompt` is set. Command groups can carry a
+/// single string or an ordered string array and may override their environment.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PreparationStepDef {
+    /// One shell command or an ordered list of shell commands, mutually
+    /// exclusive with `prompt`.
+    #[serde(default)]
+    pub command: Option<PreparationCommandDef>,
+    /// Prompt forwarded to a headless agent, mutually exclusive with `command`.
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// Appended system prompt for an agent preparation group.
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    /// Position of `system_prompt` in the agent's system instruction.
+    #[serde(default)]
+    pub system_prompt_position: Option<String>,
+    /// Agent backend override for a prompt preparation group.
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// Agent model override for a prompt preparation group.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Environment overrides applied only while this group prepares.
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
+}
 
 /// Where a prepared artifact becomes available to its manual action.
 #[derive(Debug, Clone, Deserialize)]
@@ -2874,6 +3037,41 @@ mod tests {
         );
         assert_eq!(text_placeholders("<<one>><<two>>"), vec!["one", "two"]);
         assert!(text_placeholders("<<unterminated").is_empty());
+    }
+
+    #[test]
+    fn worktree_text_ref_supports_branch_basename_interpolation() {
+        let reference = parse_worktree_text_ref(
+            "ralphus:new-worktree/RAL-999-add_widget?upstream=main&text=basename({})",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(reference.branch, "RAL-999-add_widget");
+        assert_eq!(reference.upstream, "main");
+        assert_eq!(
+            reference.text_fn.unwrap().apply(reference.branch),
+            "RAL-999-add_widget"
+        );
+        assert!(matches!(
+            parse_worktree_text_ref("ralphus:new-worktree/a?upstream=main&bad=value"),
+            Err(WorktreeTextRefError::UnknownParameter("bad"))
+        ));
+    }
+
+    #[test]
+    fn replace_text_placeholders_preserves_unknown_markers() {
+        let replaced = replace_text_placeholders(
+            "a <<ralphus:new-worktree/feature?upstream=main>> b <<other>>",
+            |body| {
+                Ok::<_, ()>(
+                    parse_worktree_text_ref(body)
+                        .unwrap()
+                        .map(|reference| reference.branch.to_string()),
+                )
+            },
+        )
+        .unwrap();
+        assert_eq!(replaced, "a feature b <<other>>");
     }
 
     #[test]

@@ -3845,11 +3845,13 @@ fn review_declared_auto_build_command_wins_over_project_default() {
             &id,
             Some(&GuardianAutoBuild {
                 command: Some("test -f a.txt".to_string()),
+                commands: Vec::new(),
                 prompt: None,
                 system_prompt: None,
                 system_prompt_position: None,
                 agent: None,
                 model: None,
+                environment: std::collections::BTreeMap::new(),
             }),
         )
         .unwrap();
@@ -3913,11 +3915,13 @@ fn review_declared_auto_build_agent_failure_is_advisory_not_fatal() {
             &id,
             Some(&GuardianAutoBuild {
                 command: None,
+                commands: Vec::new(),
                 prompt: Some("build the thing".to_string()),
                 system_prompt: None,
                 system_prompt_position: None,
                 agent: None,
                 model: None,
+                environment: std::collections::BTreeMap::new(),
             }),
         )
         .unwrap();
