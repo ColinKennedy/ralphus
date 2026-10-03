@@ -334,6 +334,8 @@ the daemon's hourly Free-tier background sweep
 | `review pr find <forge> <repo> <pr_number>` | Look up the PR row for a forge PR/MR number |
 | `review pr update <pr_id> [--pr-number] [--pr-url] [--branch-alias] [--state]` | Mutate the recorded PR mapping (e.g. after a reopen) |
 | `review pr comments <pr_id>` | List a PR's comments, flagging which are already actioned |
+| `review pr forge-cache` | List every PR's cached forge state (drift/comments/CI poll timestamps and statuses) |
+| `review pr poll-status <pr_id>` | Show when each poll last ran for a PR, its outcome, when it is next due, and the last feedback applied |
 | `review pr pull-feedback <pr_id>` | Action a PR's un-actioned feedback into the owning worktree |
 | `review pr pull-from-pr <pr_id>` | Pull a reviewer's commits pushed directly to the PR branch into the owning worktree, resolving conflicts and restacking downstream branches (RAL-190) |
 
@@ -775,6 +777,8 @@ use; see `READ_ONLY_NOTE`.
             - (read-only-safe) comments pr_id [id]  {List a PR's comments/notes.}
             - (read-only-safe) find forge [github|gitlab] repo [str] pr_number [integer]  {Look up the ralphus PR row for a forge PR/MR number.}
             - (read-only-safe) list selector [uri]  {List PRs submitted for a review.}
+            - (read-only-safe) forge-cache  {List every PR's cached forge state (drift/comments/CI poll timestamps and statuses).}
+            - (read-only-safe) poll-status pr_id [str]  {Show when each poll (CI, branch drift, PR comments) last ran for a PR, how it went, when it is next due, and the last feedback applied.}
             - pull-feedback pr_id [id]  {Action a PR's un-actioned feedback into the owning review worktree.}
             - pull-from-pr pr_id [id]  {Pull a reviewer's commits pushed directly to the PR branch back into the owning review worktree, resolving conflicts and restacking downstream branches (RAL-190).}
             - (read-only-safe) show pr_id [id]  {Show one PR row.}

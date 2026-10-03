@@ -84,6 +84,10 @@ pub struct CartographerFilter {
     /// knew the owning task's name at emit time (most cell/proof-scoped
     /// events do; squad-level `Store::log_event`-derived transitions do not).
     pub task: Option<String>,
+    /// RAL-553: rows attributable to this branch id -- `payload.branch_id` or
+    /// `payload.ref` equals it. Combine with `guardian_id` so the payload
+    /// scan only visits that review's rows.
+    pub branch_id: Option<String>,
     /// Substring match against the message (case-insensitive).
     pub q: Option<String>,
     /// Only rows at or after this time (Unix epoch milliseconds).
@@ -394,6 +398,15 @@ impl Store {
         }
         eq_clause!("cell_id", filter.cell_id);
         eq_clause!("task", filter.task);
+        if let Some(branch_id) = filter.branch_id.as_ref() {
+            clauses.push(
+                "(json_valid(payload) AND (json_extract(payload, '$.branch_id') = ? \
+                 OR json_extract(payload, '$.ref') = ?))"
+                    .to_string(),
+            );
+            values.push(Box::new(branch_id.clone()));
+            values.push(Box::new(branch_id.clone()));
+        }
         if !filter.include_admin_only {
             clauses.push("admin_only = 0".to_string());
         }
@@ -594,6 +607,23 @@ mod tests {
         let page = store.cartographer_query(&filter).unwrap();
         assert_eq!(page.total, 1);
         assert_eq!(page.rows[0].message, "a");
+    }
+
+    #[test]
+    fn filters_by_branch_id_on_payload_branch_id_or_ref() {
+        let store = Store::open_in_memory().unwrap();
+        Note::new("ci-watch").emit(&store, "a", serde_json::json!({"branch_id": "br-1"}));
+        Note::new("guardian").emit(&store, "b", serde_json::json!({"ref": "br-1"}));
+        Note::new("guardian").emit(&store, "c", serde_json::json!({"branch_id": "br-2"}));
+        Note::new("guardian").emit(&store, "d", serde_json::json!({}));
+
+        let filter = CartographerFilter {
+            branch_id: Some("br-1".to_string()),
+            limit: 10,
+            ..Default::default()
+        };
+        let page = store.cartographer_query(&filter).unwrap();
+        assert_eq!(page.total, 2);
     }
 
     #[test]

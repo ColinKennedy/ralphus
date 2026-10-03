@@ -138,8 +138,10 @@
       function toggleReviewDock() {
         reviewDockOpen = !reviewDockOpen;
         renderReviewDock();
-        if (reviewDockOpen && selectedGuardian && reviewDockEvents[selectedGuardian] === undefined) {
-          loadReviewDockEvents(selectedGuardian);
+        if (reviewDockTimer) { clearInterval(reviewDockTimer); reviewDockTimer = null; }
+        if (reviewDockOpen) {
+          reviewDockTimer = setInterval(refreshReviewDock, REVIEW_DOCK_REFRESH_MS);
+          refreshReviewDock();
         }
       }
       /** Toggles whether the dock ignores selection changes. @returns {void} */
@@ -273,6 +275,74 @@
         return inspectorOverviewTab(g, b);
       }
       /**
+       * @typedef {object} PrPollEntry
+       * @property {string} kind - ci | drift | comments.
+       * @property {string} state - ok | error | never | inactive | disabled.
+       * @property {number|null} last_checked_at_ms
+       * @property {string|null} error
+       * @property {number} interval_ms
+       * @property {number|null} next_due_at_ms
+       * @property {string|null} reason
+       */
+      /**
+       * @typedef {object} PrPollStatus
+       * @property {number} now_ms
+       * @property {PrPollEntry[]} polls
+       * @property {{outcome: string|null, applied_at_ms: number|null}} feedback
+       */
+      /**
+       * Poll status per PR id, loaded on demand once a branch with that PR is
+       * selected. `null` while loading or when the request failed.
+       * @type {{[prId: string]: PrPollStatus|null}}
+       */
+      const prPollStatus = {};
+      /**
+       * Fetches `GET /api/pull-requests/{id}/poll-status` once per PR.
+       * @param {string} prId - The PR id.
+       * @returns {Promise<void>}
+       */
+      async function loadPrPollStatus(prId) {
+        prPollStatus[prId] = null;
+        try {
+          const r = await fetch(`/api/pull-requests/${encodeURIComponent(prId)}/poll-status`);
+          if (r.ok) prPollStatus[prId] = await r.json();
+        } catch {
+          prPollStatus[prId] = null;
+        }
+        renderReviewInspector();
+      }
+      /**
+       * The poll-status block for one PR; requests it the first time it is
+       * rendered, so nothing loads before a branch is selected.
+       * @param {string} prId - The PR id.
+       * @returns {string}
+       */
+      function prPollStatusHtml(prId) {
+        if (prPollStatus[prId] === undefined) { loadPrPollStatus(prId); return `<div class="insp-pr-sub">polls: loading…</div>`; }
+        const st = prPollStatus[prId];
+        if (!st) return `<div class="insp-pr-sub">polls: unavailable</div>`;
+        const now = Date.now();
+        /** @type {{[kind: string]: string}} */
+        const labels = { ci: "CI check", drift: "branch drift", comments: "PR comments" };
+        const rows = st.polls.map((p) => {
+          const last = p.last_checked_at_ms ? `${fmtRelativeAge(now - p.last_checked_at_ms)} ago` : "never";
+          const live = p.state !== "inactive" && p.state !== "disabled";
+          const overdue = live && p.next_due_at_ms !== null && now > p.next_due_at_ms + p.interval_ms;
+          const next = live && p.next_due_at_ms
+            ? (p.next_due_at_ms > now ? `next in ${fmtRelativeAge(p.next_due_at_ms - now)}` : "due now")
+            : "";
+          const detail = p.state === "error" ? `failed: ${p.error || "unknown"}` : (p.reason || p.state);
+          const colour = p.state === "error" || overdue ? "var(--failed)" : "var(--muted)";
+          const tip = `Last ran ${last}; polled every ${fmtRelativeAge(p.interval_ms)}.${overdue ? "\nStale: it has missed more than one interval." : ""}`;
+          return `<div class="insp-pr-sub" style="color:${colour}" data-tip="${esc(tip)}">${esc(labels[p.kind] || p.kind)}: ${esc(last)} · ${esc(detail)}${next ? ` · ${esc(next)}` : ""}${overdue ? " · stale" : ""}</div>`;
+        });
+        const fb = st.feedback && st.feedback.applied_at_ms
+          ? `${st.feedback.outcome || "applied"} ${fmtRelativeAge(now - st.feedback.applied_at_ms)} ago`
+          : "none yet";
+        rows.push(`<div class="insp-pr-sub" data-tip="When review feedback was last applied to this branch, and how that went.">last feedback: ${esc(fb)}</div>`);
+        return rows.join("");
+      }
+      /**
        * Overview: identity, stack position, source, and PR status.
        * @param {GuardianView} g - The review.
        * @param {GuardianBranch} b - The selected branch.
@@ -305,6 +375,7 @@
             ? prs.map((p) => `<div class="insp-pr">
                 <div class="insp-pr-head">${branchPrBadge(p, prs.length > 1)}<span class="insp-pr-title">${esc(p.title || "")}</span></div>
                 <div class="insp-pr-sub">base <span class="mono">${esc(p.base_ref || "—")}</span> · ${esc(p.state)}</div>
+                ${prPollStatusHtml(p.id)}
               </div>`).join("")
             : `<div class="empty" style="padding:8px 0" data-tip="Submitting folds this branch into the review's existing PR stack — it is never submitted on its own, which is what keeps the stack's base chain intact.">Not submitted yet.</div>`}`;
       }
@@ -546,6 +617,20 @@
         }
       }
       /**
+       * Whether a Cartographer row is attributable to a branch, by payload
+       * (`ref` / `branch_id` ids, `branch` name, optionally the stack
+       * `position`) -- not by message text.
+       * @param {CartographerRow} r - One Cartographer event.
+       * @param {GuardianBranch} b - The branch.
+       * @param {boolean} byPosition - Also match the stack ordinal (last resort).
+       * @returns {boolean}
+       */
+      function rowBelongsToBranch(r, b, byPosition) {
+        const p = r.payload || {};
+        return p.ref === b.id || p.branch === b.branch || p.branch_id === b.id
+          || (byPosition && p.position !== undefined && p.position === b.position);
+      }
+      /**
        * Every agent session this branch ran, oldest first.
        *
        * "What was it doing at that time" is not a question about rebase
@@ -577,11 +662,7 @@
         // on `payload.branch_id`, and the feedback pass itself on
         // `payload.position` (a stack ordinal -- which a reorder can move, so
         // it is matched last and only when nothing better identifies the row).
-        const mine = rows.filter((r) => {
-          const p = r.payload || {};
-          return p.ref === b.id || p.branch === b.branch || p.branch_id === b.id
-            || (p.position !== undefined && p.position === b.position);
-        });
+        const mine = rows.filter((r) => rowBelongsToBranch(r, b, true));
         const ordered = mine.slice().sort((x, y) => x.at_ms - y.at_ms);
         /**
          * Closes the most recent still-running run of a kind.
@@ -938,12 +1019,22 @@
           sticky.className = `tgl${reviewDockSticky ? " on" : ""}`;
           sticky.setAttribute("aria-pressed", reviewDockSticky ? "true" : "false");
         }
+<<<<<<< HEAD
         const branchWorktrees = /** @type {HTMLInputElement|null} */ (
           document.getElementById("review-dock-branch-worktrees")
         );
         if (branchWorktrees) branchWorktrees.checked = reviewDockIncludeBranchWorktrees;
+        const dbg = document.getElementById("review-dock-debug");
+        if (dbg) {
+          dbg.className = `tgl${reviewDockHideDebug ? " on" : ""}`;
+          dbg.setAttribute("aria-pressed", reviewDockHideDebug ? "true" : "false");
+        }
         const g = guardians.find((x) => x.id === selectedGuardian);
         const b = (g && g.branches ? g.branches.find((x) => x.id === reviewDockScope) : null) || null;
+        if (reviewDockOpen && g && b && reviewDockBranchEvents[`${g.id}|${b.id}`] === undefined) {
+          reviewDockBranchEvents[`${g.id}|${b.id}`] = [];
+          loadReviewDockBranchEvents(g.id, b.id);
+        }
         const scopeEl = document.getElementById("review-dock-scope");
         if (scopeEl) {
           // Three kinds of scope: the whole review, one branch, or one command.
@@ -981,7 +1072,8 @@
        * @returns {{at: string, source: string, kind: string, message: string}[]}
        */
       function reviewDockRows(g, b) {
-        const raw = reviewDockEvents[g.id] || [];
+        const all = reviewDockEvents[g.id] || [];
+        const raw = reviewDockHideDebug ? all.filter((r) => (r.level || "").toUpperCase() !== "DEBUG") : all;
         /**
          * @param {CartographerRow} r - One Cartographer event.
          * @returns {{at: string, source: string, kind: string, message: string}}
@@ -1001,7 +1093,19 @@
         // branch scope legitimately matches nothing. Showing an empty drawer
         // over 38 unshown rows reads as "no logs"; fall back to the whole
         // review and say that is what happened.
-        const mine = raw.filter((r) => (r.message || "").includes(b.branch));
+        // Matched on payload (`branch_id` / `ref` / `branch`) as well as the
+        // message text, and merged with the rows fetched for this branch alone
+        // so a quiet branch is not crowded out by the review-wide row cap.
+        /** @type {Map<number, CartographerRow>} */
+        const byId = new Map();
+        for (const r of raw) {
+          if (rowBelongsToBranch(r, b, false) || (r.message || "").includes(b.branch)) byId.set(r.id, r);
+        }
+        for (const r of reviewDockBranchEvents[`${g.id}|${b.id}`] || []) {
+          if (reviewDockHideDebug && (r.level || "").toUpperCase() === "DEBUG") continue;
+          byId.set(r.id, r);
+        }
+        const mine = [...byId.values()].sort((x, y) => x.at_ms - y.at_ms);
         if (mine.length) return mine.map(shape);
         return [{
           at: "—",
@@ -1701,6 +1805,53 @@
        * @type {{[guardianId: string]: CartographerRow[]}}
        */
       const reviewDockEvents = {};
+      /**
+       * Cartographer rows for one branch alone (`<guardianId>|<branchId>`),
+       * fetched with the daemon's `branch_id` filter and a small limit.
+       * @type {{[key: string]: CartographerRow[]}}
+       */
+      const reviewDockBranchEvents = {};
+      /** @type {boolean} Hides DEBUG rows in the dock; on by default. */
+      let reviewDockHideDebug = true;
+      /** @type {number} How often an open dock re-fetches its rows. */
+      const REVIEW_DOCK_REFRESH_MS = 10000;
+      /** @type {ReturnType<typeof setInterval>|null} */
+      let reviewDockTimer = null;
+      /**
+       * Loads one branch's own Cartographer rows for the dock.
+       * @param {string} gid - The review id.
+       * @param {string} bid - The branch id.
+       * @returns {Promise<void>}
+       */
+      async function loadReviewDockBranchEvents(gid, bid) {
+        try {
+          const r = await fetch(`/api/cartographer?guardian_id=${encodeURIComponent(gid)}&branch_id=${encodeURIComponent(bid)}&limit=100`);
+          if (!r.ok) return;
+          /** @type {{rows: CartographerRow[]}} */
+          const data = await r.json();
+          reviewDockBranchEvents[`${gid}|${bid}`] = data.rows || [];
+        } catch {
+          return;
+        }
+        renderReviewDock();
+      }
+      /**
+       * Re-fetches what the open dock shows. Only ever runs while the dock is
+       * open and a review is selected.
+       * @returns {void}
+       */
+      function refreshReviewDock() {
+        if (!reviewDockOpen || !selectedGuardian) return;
+        loadReviewDockEvents(selectedGuardian);
+        const g = guardians.find((x) => x.id === selectedGuardian);
+        const b = g && g.branches ? g.branches.find((x) => x.id === reviewDockScope) : null;
+        if (b) loadReviewDockBranchEvents(selectedGuardian, b.id);
+      }
+      /** Toggles whether the dock hides DEBUG rows. @returns {void} */
+      function toggleReviewDockDebug() {
+        reviewDockHideDebug = !reviewDockHideDebug;
+        renderReviewDock();
+      }
       /**
        * Loads this review's Cartographer events for the dock. Called only from
        * the dock's own open path, never from the review's render.

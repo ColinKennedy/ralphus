@@ -6454,6 +6454,9 @@ pub fn run_feedback_registered(
     )
 }
 
+/// RAL-553: the pass's outcome (`applied`, `no_changes` or `failed`) is
+/// stored against the branch's open PR, so the inspector can show when
+/// feedback was last applied and how it went.
 #[allow(clippy::too_many_arguments)]
 pub fn run_feedback(
     store: &crate::store_lock::StoreHandle,
@@ -6483,6 +6486,65 @@ pub fn run_feedback(
             "review feedback is changing the stack; preparation will refresh afterward",
         );
     }
+
+    let outcome = run_feedback_pass(
+        store,
+        runner,
+        id,
+        branch_id,
+        feedback,
+        message_seq,
+        require_proof,
+        cancel,
+    );
+    record_feedback_outcome(store, id, branch_id, &outcome);
+    outcome
+}
+
+/// Persist [`run_feedback`]'s outcome on the branch's open PR rows. A branch
+/// without an open PR has nowhere to record it, which is fine -- the PR
+/// poll-status view is the only reader.
+fn record_feedback_outcome(
+    store: &crate::store_lock::StoreHandle,
+    id: &str,
+    branch_id: &str,
+    outcome: &FeedbackOutcome,
+) {
+    let guard = store.lock();
+    let branch_failed = guard.get_guardian(id).ok().is_some_and(|g| {
+        g.branches
+            .iter()
+            .any(|b| b.id == branch_id && b.merge_status == "failed")
+    });
+    let label = if outcome.committed {
+        "applied"
+    } else if branch_failed || outcome.proof_passed == Some(false) {
+        "failed"
+    } else {
+        "no_changes"
+    };
+    let Ok(prs) = guard.list_pull_requests_for_guardian(id) else {
+        return;
+    };
+    for pr in prs
+        .iter()
+        .filter(|p| p.state == "open" && p.branch_id.as_deref() == Some(branch_id))
+    {
+        let _ = guard.record_pr_feedback_outcome(&pr.id, label);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_feedback_pass(
+    store: &crate::store_lock::StoreHandle,
+    runner: &dyn Runner,
+    id: &str,
+    branch_id: &str,
+    feedback: &str,
+    message_seq: Option<i64>,
+    require_proof: bool,
+    cancel: &CancelToken,
+) -> FeedbackOutcome {
     // RAL-380: mark the reviewer message this call was invoked for as
     // `Failed` -- used on every early-exit path below that bails out before
     // the resolver agent (and therefore the main completion block further

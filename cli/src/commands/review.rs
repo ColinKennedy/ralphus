@@ -284,6 +284,10 @@ pub enum ReviewPrCommand {
     Comments {
         pr_id: String,
     },
+    ForgeCache,
+    PollStatus {
+        pr_id: String,
+    },
     PullFeedback {
         pr_id: String,
     },
@@ -830,6 +834,11 @@ fn parse_pr(args: &[String]) -> ReviewPrCommand {
         }
         Some("comments") => match scanner.remaining().into_iter().next() {
             Some(pr_id) => ReviewPrCommand::Comments { pr_id },
+            None => ReviewPrCommand::UsageError("missing required <pr_id> argument".to_string()),
+        },
+        Some("forge-cache") => ReviewPrCommand::ForgeCache,
+        Some("poll-status") => match scanner.remaining().into_iter().next() {
+            Some(pr_id) => ReviewPrCommand::PollStatus { pr_id },
             None => ReviewPrCommand::UsageError("missing required <pr_id> argument".to_string()),
         },
         Some("pull-feedback") => match scanner.remaining().into_iter().next() {
@@ -1920,6 +1929,16 @@ fn dispatch_pr(cmd: ReviewPrCommand, opts: &GlobalOpts, client: &DaemonClient) -
             emit(opts, &result, render_pr_comments);
             Ok(())
         }),
+        ReviewPrCommand::ForgeCache => run_and_report(opts, None, || {
+            let result = client.pr_forge_cache_index()?;
+            emit(opts, &result, render_pr_forge_cache);
+            Ok(())
+        }),
+        ReviewPrCommand::PollStatus { pr_id } => run_and_report(opts, None, || {
+            let result = client.pr_poll_status(&pr_id)?;
+            emit(opts, &result, render_pr_poll_status);
+            Ok(())
+        }),
         ReviewPrCommand::PullFeedback { pr_id } => run_and_report(opts, None, || {
             let result = client.pr_action_feedback(&pr_id)?;
             emit(opts, &result, |_| {
@@ -2782,6 +2801,65 @@ fn render_pr_list(rows: &Value) {
             r["id"], r["pr_number"], r["state"], r["title"]
         );
     }
+}
+
+fn render_pr_forge_cache(rows: &Value) {
+    let rows = rows.as_array().cloned().unwrap_or_default();
+    if rows.is_empty() {
+        println!("no cached forge state");
+        return;
+    }
+    let at = |v: &Value| v.as_i64().map_or("-".to_string(), |ms| ms.to_string());
+    let st = |v: &Value| v.as_str().unwrap_or("-").to_string();
+    for r in &rows {
+        println!(
+            "{}  ci:{}@{}  drift:{}@{}  comments:{}@{}  feedback:{}@{}",
+            r["pr_id"],
+            st(&r["ci_check_status"]),
+            at(&r["ci_checked_at_ms"]),
+            st(&r["drift_status"]),
+            at(&r["drift_checked_at_ms"]),
+            st(&r["comments_status"]),
+            at(&r["comments_checked_at_ms"]),
+            st(&r["feedback_outcome"]),
+            at(&r["feedback_applied_at_ms"]),
+        );
+    }
+}
+
+fn render_pr_poll_status(status: &Value) {
+    println!("pr {}", status["pr_id"]);
+    for p in status["polls"].as_array().cloned().unwrap_or_default() {
+        let at = |k: &str| {
+            p[k].as_i64()
+                .map_or("never".to_string(), |ms| ms.to_string())
+        };
+        println!(
+            "  {:<9} state:{}  last:{} ({})  next due:{}  interval:{}ms{}{}",
+            p["kind"].as_str().unwrap_or("?"),
+            p["state"].as_str().unwrap_or("?"),
+            at("last_checked_at_ms"),
+            p["status"].as_str().unwrap_or("-"),
+            at("next_due_at_ms"),
+            p["interval_ms"].as_i64().unwrap_or(0),
+            p["reason"]
+                .as_str()
+                .map(|r| format!("  reason: {r}"))
+                .unwrap_or_default(),
+            p["error"]
+                .as_str()
+                .map(|e| format!("  error: {e}"))
+                .unwrap_or_default(),
+        );
+    }
+    let fb = &status["feedback"];
+    println!(
+        "  feedback  outcome:{}  applied:{}",
+        fb["outcome"].as_str().unwrap_or("-"),
+        fb["applied_at_ms"]
+            .as_i64()
+            .map_or("never".to_string(), |ms| ms.to_string())
+    );
 }
 
 fn render_pr_comments(rows: &Value) {
