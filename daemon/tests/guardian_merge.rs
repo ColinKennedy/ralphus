@@ -4936,6 +4936,14 @@ fn base_shift_rebuild_budget_caps_repeated_failures_and_notifies_once() {
         "the notice must explain why automatic rebasing stopped: {}",
         notices[0].message
     );
+    assert!(
+        notices[0].message.contains("Manual intervention required:")
+            && notices[0]
+                .message
+                .contains(&format!("ralphus review merge {id}")),
+        "RAL-502: a blocked-state notice must carry remediation: {}",
+        notices[0].message
+    );
     assert_eq!(
         notices[0].entity_uri.as_deref(),
         Some(format!("guardian:{id}").as_str())

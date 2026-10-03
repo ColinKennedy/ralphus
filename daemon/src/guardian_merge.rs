@@ -8721,18 +8721,24 @@ fn notify_base_shift_budget_exhausted(
          The base branch moved, and automatic rebasing stopped for {project_list} after \
          reaching the retry cap (cap: {maximum_rebuilds} attempt(s) against the same new base). \
          The affected worktree(s) are left as-is awaiting human action; any other worktree in \
-         this review keeps rebasing normally.\n\n\
-         To retry: press Merge / rebase (or run `ralphus review merge`) after intervening -- \
-         that resets every worktree's budget and starts a fresh automatic campaign.\n",
+         this review keeps rebasing normally.",
         name = guardian.name,
         project_list = project_names.join(", "),
     );
+    let remediation = crate::mailbox::Remediation::ManualInterventionRequired {
+        guidance: format!(
+            "find and fix what keeps the rebuild failing, then press Merge / rebase (or run \
+             `ralphus review merge {id}`) -- that resets every worktree's budget and starts a \
+             fresh automatic campaign"
+        ),
+    };
     let entity_uri = format!("guardian:{id}");
     let enqueued = {
         let guard = store.lock();
-        guard.enqueue_mailbox_message_ex(
+        guard.enqueue_error_mailbox_message(
             crate::mailbox::MailboxPriority::High,
             &text,
+            &remediation,
             None,
             None,
             None,
