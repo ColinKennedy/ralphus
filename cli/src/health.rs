@@ -277,30 +277,71 @@ fn check_daemon(daemon_url: &str) -> Vec<CheckResult> {
             "No task can be submitted, monitored, or managed -- and every other check below that talks to the daemon will also fail or be silently skipped.",
             "Start the daemon (`ralphus-daemon`), or fix --daemon-url/$RALPHUS_DAEMON_URL to point at a running one.",
         )],
-        Ok(health) => {
-            let version = health["version"].as_str().unwrap_or("?");
-            let name = health["name"].as_str().unwrap_or("?");
-            let mut results = vec![CheckResult::new(
+        Ok(health) => check_daemon_health_for(&health),
+    }
+}
+
+/// Pure core of [`check_daemon`]'s reachable-daemon path: takes the already-
+/// fetched `/api/daemon` JSON response rather than calling the daemon
+/// itself, so tests can exercise db/watchdog escalation (RAL-544) without a
+/// live daemon process.
+///
+/// Reachability alone isn't health -- a daemon that answers HTTP 200 can
+/// still report a broken database probe or a watchdog that has given up
+/// reaching the store lock. Both are read straight off the same response the
+/// version/warnings fields already come from, so the diagnostic detail (db
+/// status, consecutive stalls, last-ok age) survives into the CLI's own
+/// report instead of being collapsed into a bare "unreachable".
+fn check_daemon_health_for(health: &serde_json::Value) -> Vec<CheckResult> {
+    let version = health["version"].as_str().unwrap_or("?");
+    let name = health["name"].as_str().unwrap_or("?");
+    let mut results = vec![CheckResult::new(
+        "daemon",
+        PASS,
+        format!("reachable ({name} {version})"),
+        "The CLI can submit and monitor tasks.",
+        "No action needed.",
+    )];
+    if let Some(warnings) = health["warnings"].as_array() {
+        for w in warnings {
+            results.push(CheckResult::new(
                 "daemon",
-                PASS,
-                format!("reachable ({name} {version})"),
-                "The CLI can submit and monitor tasks.",
-                "No action needed.",
-            )];
-            if let Some(warnings) = health["warnings"].as_array() {
-                for w in warnings {
-                    results.push(CheckResult::new(
-                        "daemon",
-                        WARN,
-                        w.as_str().unwrap_or_default().to_string(),
-                        "The daemon itself flagged a condition worth attention; specifics vary by warning.",
-                        "See the daemon's own logs/documentation for this warning.",
-                    ));
-                }
-            }
-            results
+                WARN,
+                w.as_str().unwrap_or_default().to_string(),
+                "The daemon itself flagged a condition worth attention; specifics vary by warning.",
+                "See the daemon's own logs/documentation for this warning.",
+            ));
         }
     }
+    match health["db"].as_str() {
+        Some("ok") | None => {}
+        Some(db) => results.push(CheckResult::new(
+            "daemon",
+            FAIL,
+            format!("database probe reported db=\"{db}\""),
+            "The daemon is reachable but cannot reliably read its own store -- task state, submissions, and the board may be stale or fail outright.",
+            "Check the daemon's own logs for the underlying database error; restart the daemon if it persists.",
+        )),
+    }
+    if health["watchdog"]["stalled"].as_bool() == Some(true) {
+        let consecutive = health["watchdog"]["consecutive_stalls"]
+            .as_u64()
+            .unwrap_or(0);
+        let last_ok_age = health["watchdog"]["last_ok_age_ms"].as_i64();
+        let age_detail = last_ok_age
+            .map(|ms| format!(", last reachable {ms}ms ago"))
+            .unwrap_or_default();
+        results.push(CheckResult::new(
+            "daemon",
+            FAIL,
+            format!(
+                "watchdog reports the store lock unreachable ({consecutive} consecutive stall(s){age_detail})"
+            ),
+            "The daemon's own liveness watchdog cannot reach its store lock -- it may be deadlocked and unable to make progress on any task.",
+            "Check the daemon's logs for the store-lock holder breadcrumb (file:line, hold duration); restart the daemon if it does not recover.",
+        ));
+    }
+    results
 }
 
 /// Whether `git` itself (the binary check, [`check_git`]) is a hard
@@ -1202,6 +1243,273 @@ fn check_thrash_min_turn_gap(cwd: &Path) -> CheckResult {
     )
 }
 
+/// Reads `[agent.health]` as a raw TOML table from `path`, if the file
+/// exists and parses -- same "raw table, not the typed loader" reasoning as
+/// [`read_thrash_table`]: `ralphus_daemon::config::load_agent_health_config`'s
+/// typed `AgentHealthConfig` deserialize can't tell "key absent" apart from
+/// "key present but invalid" (both collapse to `None` once resolved through
+/// its `thinking_stall_*` methods), and this check needs to warn on the
+/// latter.
+fn read_agent_health_table(path: &Path) -> Option<toml::Table> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let root: toml::Table = text.parse().ok()?;
+    root.get("agent")?
+        .as_table()?
+        .get("health")?
+        .as_table()
+        .cloned()
+}
+
+/// The field-specific parts of an `[agent.health]` integer-scalar check --
+/// bundled into one struct (rather than four more arguments on
+/// [`check_agent_health_int_field_for`]) to stay under clippy's
+/// `too_many_arguments` limit.
+struct AgentHealthIntFieldSpec<'a> {
+    field: &'a str,
+    check_name: &'a str,
+    /// The field's own lower bound (`2` for the window size, `1` for the
+    /// consecutive-sample count, `0` for the span), unlike
+    /// `check_thrash_field_for`'s hardcoded `>= 0`.
+    min: i64,
+    default: i64,
+}
+
+/// Validates one `[agent.health]` integer scalar (RAL-536) for `cwd`,
+/// mirroring [`check_thrash_field_for`]'s shape: PASS reports the resolved
+/// value and its source; a present-but-invalid value is a WARN, not a FAIL,
+/// since every `AgentHealthConfig` resolver method (`thinking_stall_window_lines`,
+/// `thinking_stall_min_consecutive_samples`, `thinking_stall_min_span_ms`)
+/// silently falls back to its own default rather than blocking thinking-stall
+/// detection.
+fn check_agent_health_int_field_for(
+    global_table: Option<&toml::Table>,
+    global_path: Option<&Path>,
+    project_table: Option<&toml::Table>,
+    project_path: Option<&Path>,
+    spec: &AgentHealthIntFieldSpec<'_>,
+) -> CheckResult {
+    let AgentHealthIntFieldSpec {
+        field,
+        check_name,
+        min,
+        default,
+    } = *spec;
+    let (raw, src_path) = if let Some(v) = project_table.and_then(|t| t.get(field)) {
+        (Some(v), project_path)
+    } else if let Some(v) = global_table.and_then(|t| t.get(field)) {
+        (Some(v), global_path)
+    } else {
+        (None, None)
+    };
+
+    let Some(raw) = raw else {
+        return CheckResult::new(
+            check_name,
+            PASS,
+            format!("agent.health.{field} unset; using default {default}"),
+            "Thinking-stall detection uses the built-in default for this field.",
+            "No action needed.",
+        );
+    };
+    let src_str = src_path
+        .map(|p| format!(" (from {})", p.display()))
+        .unwrap_or_default();
+    match raw.as_integer() {
+        None => CheckResult::new(
+            check_name,
+            WARN,
+            format!(
+                "agent.health.{field} is not a number{src_str} -- falling back to the default {default}"
+            ),
+            "The configured value is ignored; thinking-stall detection silently uses the default instead.",
+            format!("Set agent.health.{field} to an integer >= {min}."),
+        ),
+        Some(n) if n < min => CheckResult::new(
+            check_name,
+            WARN,
+            format!(
+                "agent.health.{field} is {n}{src_str}; must be >= {min} -- falling back to the default {default}"
+            ),
+            "The configured value is ignored; thinking-stall detection silently uses the default instead.",
+            format!("Set agent.health.{field} to an integer >= {min}."),
+        ),
+        Some(n) => CheckResult::new(
+            check_name,
+            PASS,
+            format!("agent.health.{field}={n}{src_str}"),
+            "Thinking-stall detection uses this configured value.",
+            "No action needed.",
+        )
+        .with_provenance(
+            src_path
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+        ),
+    }
+}
+
+/// Validates `.ralphus.toml`'s `[agent.health] thinking_stall_window_lines`
+/// (RAL-536) -- the rolling-window size, in lines, the thinking-stall
+/// detector keeps for its vocabulary-diversity ratio.
+fn check_agent_health_window_lines(cwd: &Path) -> CheckResult {
+    let global_path = ralphus_daemon::config::global_config_path();
+    let project_path = ralphus_daemon::config::find_project_config(cwd);
+    let global_table = global_path.as_deref().and_then(read_agent_health_table);
+    let project_table = project_path.as_deref().and_then(read_agent_health_table);
+    check_agent_health_int_field_for(
+        global_table.as_ref(),
+        global_path.as_deref(),
+        project_table.as_ref(),
+        project_path.as_deref(),
+        &AgentHealthIntFieldSpec {
+            field: "thinking_stall_window_lines",
+            check_name: "agent-health-window-lines",
+            min: 2,
+            default: ralphus_daemon::config::AgentHealthConfig::default()
+                .thinking_stall_window_lines() as i64,
+        },
+    )
+}
+
+/// Validates `.ralphus.toml`'s `[agent.health]
+/// thinking_stall_min_consecutive_samples` (RAL-536) -- consecutive
+/// low-diversity samples required before the thinking-stall detector
+/// escalates.
+fn check_agent_health_min_consecutive_samples(cwd: &Path) -> CheckResult {
+    let global_path = ralphus_daemon::config::global_config_path();
+    let project_path = ralphus_daemon::config::find_project_config(cwd);
+    let global_table = global_path.as_deref().and_then(read_agent_health_table);
+    let project_table = project_path.as_deref().and_then(read_agent_health_table);
+    check_agent_health_int_field_for(
+        global_table.as_ref(),
+        global_path.as_deref(),
+        project_table.as_ref(),
+        project_path.as_deref(),
+        &AgentHealthIntFieldSpec {
+            field: "thinking_stall_min_consecutive_samples",
+            check_name: "agent-health-min-consecutive-samples",
+            min: 1,
+            default: i64::from(
+                ralphus_daemon::config::AgentHealthConfig::default()
+                    .thinking_stall_min_consecutive_samples(),
+            ),
+        },
+    )
+}
+
+/// Validates `.ralphus.toml`'s `[agent.health] thinking_stall_min_span_ms`
+/// (RAL-536) -- the minimum time span a low-diversity streak must cover
+/// before the thinking-stall detector escalates.
+fn check_agent_health_min_span_ms(cwd: &Path) -> CheckResult {
+    let global_path = ralphus_daemon::config::global_config_path();
+    let project_path = ralphus_daemon::config::find_project_config(cwd);
+    let global_table = global_path.as_deref().and_then(read_agent_health_table);
+    let project_table = project_path.as_deref().and_then(read_agent_health_table);
+    check_agent_health_int_field_for(
+        global_table.as_ref(),
+        global_path.as_deref(),
+        project_table.as_ref(),
+        project_path.as_deref(),
+        &AgentHealthIntFieldSpec {
+            field: "thinking_stall_min_span_ms",
+            check_name: "agent-health-min-span-ms",
+            min: 0,
+            default: ralphus_daemon::config::AgentHealthConfig::default()
+                .thinking_stall_min_span_ms(),
+        },
+    )
+}
+
+/// Validates `.ralphus.toml`'s `[agent.health]
+/// thinking_stall_diversity_threshold` (RAL-536) -- the only `f64`/bounded-
+/// range field in `[agent.health]`, so it gets its own bounds check rather
+/// than reusing [`check_agent_health_int_field_for`]'s integer `>= min`
+/// shape. PASS reports the resolved value and its source; a
+/// present-but-invalid value is a WARN, not a FAIL, mirroring every other
+/// `[agent.health]` field.
+fn check_agent_health_diversity_threshold_for(
+    global_table: Option<&toml::Table>,
+    global_path: Option<&Path>,
+    project_table: Option<&toml::Table>,
+    project_path: Option<&Path>,
+) -> CheckResult {
+    const FIELD: &str = "thinking_stall_diversity_threshold";
+    const CHECK_NAME: &str = "agent-health-diversity-threshold";
+    let default =
+        ralphus_daemon::config::AgentHealthConfig::default().thinking_stall_diversity_threshold();
+
+    let (raw, src_path) = if let Some(v) = project_table.and_then(|t| t.get(FIELD)) {
+        (Some(v), project_path)
+    } else if let Some(v) = global_table.and_then(|t| t.get(FIELD)) {
+        (Some(v), global_path)
+    } else {
+        (None, None)
+    };
+
+    let Some(raw) = raw else {
+        return CheckResult::new(
+            CHECK_NAME,
+            PASS,
+            format!("agent.health.{FIELD} unset; using default {default}"),
+            "Thinking-stall detection uses the built-in default for this field.",
+            "No action needed.",
+        );
+    };
+    let src_str = src_path
+        .map(|p| format!(" (from {})", p.display()))
+        .unwrap_or_default();
+    match raw
+        .as_float()
+        .or_else(|| raw.as_integer().map(|n| n as f64))
+    {
+        None => CheckResult::new(
+            CHECK_NAME,
+            WARN,
+            format!(
+                "agent.health.{FIELD} is not a number{src_str} -- falling back to the default {default}"
+            ),
+            "The configured value is ignored; thinking-stall detection silently uses the default instead.",
+            format!("Set agent.health.{FIELD} to a number in (0.0, 1.0]."),
+        ),
+        Some(n) if !(n > 0.0 && n <= 1.0) => CheckResult::new(
+            CHECK_NAME,
+            WARN,
+            format!(
+                "agent.health.{FIELD} is {n}{src_str}; must be in (0.0, 1.0] -- falling back to the default {default}"
+            ),
+            "The configured value is ignored; thinking-stall detection silently uses the default instead.",
+            format!("Set agent.health.{FIELD} to a number in (0.0, 1.0]."),
+        ),
+        Some(n) => CheckResult::new(
+            CHECK_NAME,
+            PASS,
+            format!("agent.health.{FIELD}={n}{src_str}"),
+            "Thinking-stall detection uses this configured value.",
+            "No action needed.",
+        )
+        .with_provenance(
+            src_path
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+        ),
+    }
+}
+
+/// Validates `.ralphus.toml`'s `[agent.health]
+/// thinking_stall_diversity_threshold` (RAL-536) for `cwd`.
+fn check_agent_health_diversity_threshold(cwd: &Path) -> CheckResult {
+    let global_path = ralphus_daemon::config::global_config_path();
+    let project_path = ralphus_daemon::config::find_project_config(cwd);
+    let global_table = global_path.as_deref().and_then(read_agent_health_table);
+    let project_table = project_path.as_deref().and_then(read_agent_health_table);
+    check_agent_health_diversity_threshold_for(
+        global_table.as_ref(),
+        global_path.as_deref(),
+        project_table.as_ref(),
+        project_path.as_deref(),
+    )
+}
+
 /// Validates `.ralphus.toml`'s `[forge] pull_request_branch_convention`
 /// (RAL-244) for `cwd`, reusing the daemon's own layered resolution
 /// (`ralphus_daemon::config::resolve_forge` -- global config under the
@@ -1655,6 +1963,15 @@ pub fn run_checks(
     results.push(check_tool_arg_truncate_chars(cwd).with_id(ID_TOOL_ARG_TRUNCATE_CHARS));
     results.push(check_thrash_max_compactions(cwd).with_id(ID_THRASH_MAX_COMPACTIONS));
     results.push(check_thrash_min_turn_gap(cwd).with_id(ID_THRASH_MIN_TURN_GAP));
+    results.push(check_agent_health_window_lines(cwd).with_id(ID_AGENT_HEALTH_WINDOW_LINES));
+    results.push(
+        check_agent_health_diversity_threshold(cwd).with_id(ID_AGENT_HEALTH_DIVERSITY_THRESHOLD),
+    );
+    results.push(
+        check_agent_health_min_consecutive_samples(cwd)
+            .with_id(ID_AGENT_HEALTH_MIN_CONSECUTIVE_SAMPLES),
+    );
+    results.push(check_agent_health_min_span_ms(cwd).with_id(ID_AGENT_HEALTH_MIN_SPAN_MS));
     results
         .push(check_pull_request_branch_convention(cwd).with_id(ID_PULL_REQUEST_BRANCH_CONVENTION));
     results.extend(check_templates());
@@ -1941,6 +2258,271 @@ mod tests {
         assert_eq!(result.status, PASS);
         assert!(result.detail.contains("thrash.max_compactions=4"));
         assert!(result.detail.contains("/project/.ralphus.toml"));
+    }
+
+    // ── check_agent_health_int_field_for (RAL-544) ────────────────────────
+
+    #[test]
+    fn check_agent_health_int_field_passes_unset() {
+        let result = check_agent_health_int_field_for(
+            None,
+            None,
+            None,
+            None,
+            &AgentHealthIntFieldSpec {
+                field: "thinking_stall_window_lines",
+                check_name: "agent-health-window-lines",
+                min: 2,
+                default: 12,
+            },
+        );
+        assert_eq!(result.status, PASS);
+        assert!(result.detail.contains("unset"));
+        assert!(result.detail.contains("12"));
+    }
+
+    #[test]
+    fn check_agent_health_int_field_passes_with_a_valid_value() {
+        let table: toml::Table = "thinking_stall_window_lines = 20".parse().unwrap();
+        let path = Path::new("/tmp/.ralphus.toml");
+        let result = check_agent_health_int_field_for(
+            None,
+            None,
+            Some(&table),
+            Some(path),
+            &AgentHealthIntFieldSpec {
+                field: "thinking_stall_window_lines",
+                check_name: "agent-health-window-lines",
+                min: 2,
+                default: 12,
+            },
+        );
+        assert_eq!(result.status, PASS);
+        assert!(
+            result
+                .detail
+                .contains("agent.health.thinking_stall_window_lines=20")
+        );
+        assert!(result.detail.contains("/tmp/.ralphus.toml"));
+    }
+
+    #[test]
+    fn check_agent_health_int_field_warns_on_value_below_min() {
+        let table: toml::Table = "thinking_stall_min_consecutive_samples = 0"
+            .parse()
+            .unwrap();
+        let result = check_agent_health_int_field_for(
+            None,
+            None,
+            Some(&table),
+            None,
+            &AgentHealthIntFieldSpec {
+                field: "thinking_stall_min_consecutive_samples",
+                check_name: "agent-health-min-consecutive-samples",
+                min: 1,
+                default: 4,
+            },
+        );
+        assert_eq!(result.status, WARN);
+        assert!(result.detail.contains('0'));
+        assert!(result.detail.contains("must be >= 1"));
+    }
+
+    #[test]
+    fn check_agent_health_int_field_warns_on_non_numeric_value() {
+        let table: toml::Table = "thinking_stall_window_lines = \"nope\"".parse().unwrap();
+        let result = check_agent_health_int_field_for(
+            None,
+            None,
+            Some(&table),
+            None,
+            &AgentHealthIntFieldSpec {
+                field: "thinking_stall_window_lines",
+                check_name: "agent-health-window-lines",
+                min: 2,
+                default: 12,
+            },
+        );
+        assert_eq!(result.status, WARN);
+        assert!(result.detail.contains("not a number"));
+    }
+
+    #[test]
+    fn check_agent_health_int_field_prefers_project_over_global() {
+        let global: toml::Table = "thinking_stall_window_lines = 30".parse().unwrap();
+        let project: toml::Table = "thinking_stall_window_lines = 20".parse().unwrap();
+        let global_path = Path::new("/global/config.toml");
+        let project_path = Path::new("/project/.ralphus.toml");
+        let result = check_agent_health_int_field_for(
+            Some(&global),
+            Some(global_path),
+            Some(&project),
+            Some(project_path),
+            &AgentHealthIntFieldSpec {
+                field: "thinking_stall_window_lines",
+                check_name: "agent-health-window-lines",
+                min: 2,
+                default: 12,
+            },
+        );
+        assert_eq!(result.status, PASS);
+        assert!(
+            result
+                .detail
+                .contains("agent.health.thinking_stall_window_lines=20")
+        );
+        assert!(result.detail.contains("/project/.ralphus.toml"));
+    }
+
+    // ── check_agent_health_diversity_threshold_for (RAL-544) ──────────────
+
+    #[test]
+    fn check_agent_health_diversity_threshold_passes_unset() {
+        let result = check_agent_health_diversity_threshold_for(None, None, None, None);
+        assert_eq!(result.status, PASS);
+        assert!(result.detail.contains("unset"));
+    }
+
+    #[test]
+    fn check_agent_health_diversity_threshold_passes_with_a_valid_value() {
+        let table: toml::Table = "thinking_stall_diversity_threshold = 0.5".parse().unwrap();
+        let path = Path::new("/tmp/.ralphus.toml");
+        let result =
+            check_agent_health_diversity_threshold_for(None, None, Some(&table), Some(path));
+        assert_eq!(result.status, PASS);
+        assert!(
+            result
+                .detail
+                .contains("agent.health.thinking_stall_diversity_threshold=0.5")
+        );
+    }
+
+    #[test]
+    fn check_agent_health_diversity_threshold_warns_above_one() {
+        let table: toml::Table = "thinking_stall_diversity_threshold = 1.5".parse().unwrap();
+        let result = check_agent_health_diversity_threshold_for(None, None, Some(&table), None);
+        assert_eq!(result.status, WARN);
+        assert!(result.detail.contains("must be in (0.0, 1.0]"));
+    }
+
+    #[test]
+    fn check_agent_health_diversity_threshold_warns_on_zero() {
+        // The bound is exclusive at zero -- a 0.0 threshold would mean
+        // "any sample counts as low-diversity," which is never useful.
+        let table: toml::Table = "thinking_stall_diversity_threshold = 0.0".parse().unwrap();
+        let result = check_agent_health_diversity_threshold_for(None, None, Some(&table), None);
+        assert_eq!(result.status, WARN);
+    }
+
+    #[test]
+    fn check_agent_health_diversity_threshold_warns_on_non_numeric_value() {
+        let table: toml::Table = "thinking_stall_diversity_threshold = \"nope\""
+            .parse()
+            .unwrap();
+        let result = check_agent_health_diversity_threshold_for(None, None, Some(&table), None);
+        assert_eq!(result.status, WARN);
+        assert!(result.detail.contains("not a number"));
+    }
+
+    #[test]
+    fn check_agent_health_diversity_threshold_prefers_project_over_global() {
+        let global: toml::Table = "thinking_stall_diversity_threshold = 0.9".parse().unwrap();
+        let project: toml::Table = "thinking_stall_diversity_threshold = 0.2".parse().unwrap();
+        let global_path = Path::new("/global/config.toml");
+        let project_path = Path::new("/project/.ralphus.toml");
+        let result = check_agent_health_diversity_threshold_for(
+            Some(&global),
+            Some(global_path),
+            Some(&project),
+            Some(project_path),
+        );
+        assert_eq!(result.status, PASS);
+        assert!(
+            result
+                .detail
+                .contains("agent.health.thinking_stall_diversity_threshold=0.2")
+        );
+        assert!(result.detail.contains("/project/.ralphus.toml"));
+    }
+
+    // ── check_daemon_health_for (RAL-544) ─────────────────────────────────
+
+    #[test]
+    fn check_daemon_health_passes_on_a_plain_reachable_response() {
+        let health = serde_json::json!({
+            "name": "ralphus-daemon",
+            "version": "0.1.0",
+            "db": "ok",
+            "watchdog": {
+                "stalled": false,
+                "consecutive_stalls": 0,
+                "total_stalls": 0,
+                "last_ok_age_ms": 500,
+                "worst_wait_ms": 10,
+            },
+        });
+        let results = check_daemon_health_for(&health);
+        assert!(results.iter().all(|r| r.status == PASS));
+    }
+
+    #[test]
+    fn check_daemon_health_fails_on_a_bad_db_probe() {
+        let health = serde_json::json!({
+            "name": "ralphus-daemon",
+            "version": "0.1.0",
+            "db": "error: disk I/O error",
+        });
+        let results = check_daemon_health_for(&health);
+        let db_result = results
+            .iter()
+            .find(|r| r.detail.contains("database probe"))
+            .expect("missing db failure result");
+        assert_eq!(db_result.status, FAIL);
+        assert!(db_result.detail.contains("disk I/O error"));
+        // The daemon is still reachable, so that PASS must survive alongside
+        // the db failure rather than being replaced by it.
+        assert!(results.iter().any(|r| r.status == PASS));
+    }
+
+    #[test]
+    fn check_daemon_health_fails_on_a_stalled_watchdog() {
+        let health = serde_json::json!({
+            "name": "ralphus-daemon",
+            "version": "0.1.0",
+            "db": "ok",
+            "watchdog": {
+                "stalled": true,
+                "consecutive_stalls": 3,
+                "total_stalls": 5,
+                "last_ok_age_ms": 45_000,
+                "worst_wait_ms": 5_000,
+            },
+        });
+        let results = check_daemon_health_for(&health);
+        let watchdog_result = results
+            .iter()
+            .find(|r| r.detail.contains("watchdog"))
+            .expect("missing watchdog failure result");
+        assert_eq!(watchdog_result.status, FAIL);
+        assert!(watchdog_result.detail.contains('3'));
+        assert!(watchdog_result.detail.contains("45000ms"));
+    }
+
+    #[test]
+    fn check_daemon_health_preserves_existing_warnings_alongside_new_failures() {
+        let health = serde_json::json!({
+            "name": "ralphus-daemon",
+            "version": "0.1.0",
+            "db": "error: locked",
+            "warnings": ["some pre-existing warning"],
+        });
+        let results = check_daemon_health_for(&health);
+        assert!(
+            results
+                .iter()
+                .any(|r| r.status == WARN && r.detail.contains("some pre-existing warning"))
+        );
+        assert!(results.iter().any(|r| r.status == FAIL));
     }
 
     // ── check_templates (RAL-297) ─────────────────────────────────────────
