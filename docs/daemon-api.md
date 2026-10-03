@@ -66,6 +66,7 @@ where one exists.
 | POST | `/api/queue/set-position` | Move item(s) to an absolute/relative position |
 | GET | `/api/squads/{id}` | [One squad's full detail](#get-apisquadsid) |
 | GET | `/api/squads/{id}/worktrees` | [Per-cell worktree/project/upstream](#get-apisquadsidworktrees) |
+| GET | `/api/squads/{id}/diff` | [A running cell's live worktree diff](#get-apisquadsiddiff) |
 | GET | `/api/squads/{id}/logs` | [State-transition audit log](#get-apisquadsidlogs) |
 | GET | `/api/squads/{id}/timeline` | [Merged, chronological uber-log-viewer](#get-apisquadsidtimeline) for the whole squad (RAL-155) |
 | GET | `/api/squads/{id}/graph` | [Internal cell dependency graph](#get-apisquadsidgraph) |
@@ -3483,6 +3484,24 @@ as within-squad `depends_on` resolution). Shape:
   "edges": [ { "from": "squad-000000000001", "to": "squad-000000000002" } ]
 }
 ```
+
+### `GET /api/squads/{id}/diff`
+RAL-550: a running cell's live worktree changes. The runner (on whichever host
+holds the worktree, local or SSH-remote) pushes a numstat-only summary over the
+`RALPHUS_EVENT:` stderr channel (`source: "worktree-diff"`) whenever the
+worktree changes; the daemon never polls. The push bumps a per-cell version in
+`StoreMemory` and is also written to Cartographer (so it reaches SSE).
+
+`?task=<idx>&cell=<idx>` selects the cell. `&summary=1` returns only the pushed
+counts (no git). Otherwise the full diff is computed on request, only when the
+cell is dirty, and cached against the version so repeat calls are free:
+```json
+{ "squad_id": "squad-1", "task_idx": 0, "cell_idx": 0, "version": 3,
+  "summary": { "baseline": "<sha>", "files_changed": 2, "files_added": 1, "files_removed": 0, "lines_added": 10, "lines_removed": 1 },
+  "diff": "diff --git ...", "recomputed": true }
+```
+`409 worktree_unavailable` when the worktree is not on the daemon's host
+(remote machine): use `summary=1`.
 
 ### `GET /api/squads/{id}/worktrees`
 Per-cell git info for the detail pane's read-only rows (CCTL-148; `upstream`

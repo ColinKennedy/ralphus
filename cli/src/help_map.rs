@@ -1899,6 +1899,15 @@ const CELL_CHILDREN: &[HelpNode] = &[
         true, // ("cell", "worktree")
         &[],
     ),
+    node(
+        "diff",
+        &["selector [str]"],
+        &["--summary"],
+        "Show a running cell's live worktree diff (full diff computed only when changes were pushed).",
+        false,
+        true, // ("cell", "diff")
+        &[],
+    ),
 ];
 
 // ralphus[ignore-endpoint-cli]: prints the CLI's own compiled help_map registered_leaves tree; no daemon call

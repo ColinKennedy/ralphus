@@ -76,6 +76,38 @@ struct ActivityState {
     escalated: HashMap<String, i64>,
 }
 
+/// RAL-550: what the daemon knows about one running cell's worktree diff,
+/// learned purely from the runner's pushed `worktree-diff` events -- the daemon
+/// never polls for it.
+#[derive(Default, Clone)]
+pub struct CellDiffState {
+    /// Bumped by every pushed change event.
+    pub version: u64,
+    /// The latest pushed numstat summary (`files_changed`, `lines_added`, ...).
+    pub summary: serde_json::Value,
+    /// The full diff last pulled on demand, and the `version` it was computed at.
+    cached: Option<(u64, String)>,
+    /// Recency tick, so the map can be bounded by evicting the stalest cell.
+    touched: u64,
+}
+
+impl CellDiffState {
+    /// A pushed change has not been pulled yet (or nothing was ever pulled).
+    #[must_use]
+    pub fn is_dirty(&self) -> bool {
+        self.cached.as_ref().is_none_or(|(v, _)| *v != self.version)
+    }
+}
+
+#[derive(Default)]
+struct CellDiffs {
+    cells: HashMap<String, CellDiffState>,
+    tick: u64,
+}
+
+/// Cells whose diff state is retained before the stalest is evicted.
+const MAX_TRACKED_CELL_DIFFS: usize = 256;
+
 /// Per-guardian debounce bookkeeping for the LLM-authored final change summary
 /// (RAL-208).
 ///
@@ -124,6 +156,10 @@ pub struct StoreMemory {
     /// despite both being about "is this session stalled" -- this counter
     /// tracks completed automatic restarts, not liveness.
     thinking_stall_strikes: Mutex<HashMap<String, u32>>,
+    /// RAL-550: per-cell live-diff staleness, see [`CellDiffState`]. Independent
+    /// of every other group: only the runner-event forwarder writes the version
+    /// and only the on-demand diff pull reads/clears it.
+    cell_diffs: Mutex<CellDiffs>,
 }
 
 impl StoreMemory {
@@ -386,11 +422,106 @@ impl StoreMemory {
             .lock()
             .retain(|k, _| !k.starts_with(&prefix));
     }
+
+    // ---- live cell diff (RAL-550) ----
+
+    /// The key for one cell's diff state.
+    #[must_use]
+    pub fn cell_diff_key(squad_id: &str, cell_id: &str) -> String {
+        format!("{squad_id}/{cell_id}")
+    }
+
+    fn with_cell_diff<R>(&self, key: &str, f: impl FnOnce(&mut CellDiffState) -> R) -> R {
+        let mut guard = self.cell_diffs.lock();
+        guard.tick += 1;
+        let tick = guard.tick;
+        if !guard.cells.contains_key(key) && guard.cells.len() >= MAX_TRACKED_CELL_DIFFS {
+            if let Some(stalest) = guard
+                .cells
+                .iter()
+                .min_by_key(|(_, s)| s.touched)
+                .map(|(k, _)| k.clone())
+            {
+                guard.cells.remove(&stalest);
+            }
+        }
+        let state = guard.cells.entry(key.to_string()).or_default();
+        state.touched = tick;
+        f(state)
+    }
+
+    /// Record a pushed change: bump the version (marking the diff dirty) and
+    /// keep the latest summary.
+    pub fn note_cell_diff_changed(&self, key: &str, summary: serde_json::Value) {
+        self.with_cell_diff(key, |s| {
+            s.version += 1;
+            s.summary = summary;
+        });
+    }
+
+    /// The tracked state for `key`, if any push (or pull) has happened.
+    #[must_use]
+    pub fn cell_diff_state(&self, key: &str) -> Option<CellDiffState> {
+        self.cell_diffs.lock().cells.get(key).cloned()
+    }
+
+    /// The cached full diff when it is still current (not dirty).
+    #[must_use]
+    pub fn fresh_cell_diff(&self, key: &str) -> Option<(u64, String)> {
+        let guard = self.cell_diffs.lock();
+        let state = guard.cells.get(key)?;
+        match &state.cached {
+            Some((v, diff)) if *v == state.version => Some((*v, diff.clone())),
+            _ => None,
+        }
+    }
+
+    /// Cache `diff` as computed at `version`; the dirty flag only clears if no
+    /// newer push landed while it was being computed.
+    pub fn store_cell_diff(&self, key: &str, version: u64, diff: String) {
+        self.with_cell_diff(key, |s| s.cached = Some((version, diff)));
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pushed_change_marks_the_cell_diff_dirty_until_it_is_pulled() {
+        let m = StoreMemory::default();
+        let key = StoreMemory::cell_diff_key("squad-1", "c0");
+        assert!(m.fresh_cell_diff(&key).is_none());
+        m.note_cell_diff_changed(&key, serde_json::json!({"files_changed": 1}));
+        let state = m.cell_diff_state(&key).unwrap();
+        assert!(state.is_dirty());
+        assert_eq!(state.version, 1);
+
+        m.store_cell_diff(&key, 1, "diff".into());
+        assert!(!m.cell_diff_state(&key).unwrap().is_dirty());
+        assert_eq!(m.fresh_cell_diff(&key), Some((1, "diff".to_string())));
+
+        // A push after the pull makes the cache stale again.
+        m.note_cell_diff_changed(&key, serde_json::json!({"files_changed": 2}));
+        assert!(m.cell_diff_state(&key).unwrap().is_dirty());
+        assert!(m.fresh_cell_diff(&key).is_none());
+        // A pull that raced a newer push must not clear the dirty flag.
+        m.store_cell_diff(&key, 1, "old".into());
+        assert!(m.cell_diff_state(&key).unwrap().is_dirty());
+    }
+
+    #[test]
+    fn cell_diff_state_is_bounded_by_evicting_the_stalest_cell() {
+        let m = StoreMemory::default();
+        for i in 0..=MAX_TRACKED_CELL_DIFFS {
+            m.note_cell_diff_changed(&format!("k{i}"), serde_json::json!({}));
+        }
+        assert!(m.cell_diff_state("k0").is_none());
+        assert!(
+            m.cell_diff_state(&format!("k{MAX_TRACKED_CELL_DIFFS}"))
+                .is_some()
+        );
+    }
 
     #[test]
     fn a_lease_is_exclusive_and_only_its_owner_can_release_it() {

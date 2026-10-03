@@ -1653,6 +1653,7 @@ fn route_for_user(
         ("GET", ["api", "resolve"]) => resolve_uri_endpoint(daemon, query),
         ("GET", ["api", "squads", id]) => get_squad(daemon, id),
         ("GET", ["api", "squads", id, "worktrees"]) => squad_worktrees(daemon, id),
+        ("GET", ["api", "squads", id, "diff"]) => cell_diff(daemon, id, query),
         ("GET", ["api", "squads", id, "logs"]) => squad_logs(daemon, id),
         ("GET", ["api", "squads", id, "timeline"]) => squad_timeline(daemon, id),
         ("GET", ["api", "squads", id, "graph"]) => squad_graph(daemon, id),
@@ -7362,6 +7363,88 @@ fn squad_worktrees(daemon: &Daemon, id: &str) -> Reply {
         }
     }
     json(200, &paths)
+}
+
+/// RAL-550: a cell's live worktree diff, pulled on demand. The runner pushes a
+/// numstat summary whenever the worktree changes (`worktree-diff` events); that
+/// only marks the cell dirty in `StoreMemory`. `?task=<idx>&cell=<idx>` picks
+/// the cell. With `&summary=1` the pushed counts are returned without touching
+/// git. Otherwise the full diff is computed only when the cell is dirty (or was
+/// never pulled) and cached against the push version, so repeat calls with
+/// nothing new are free. A cell whose worktree is not on this host (SSH
+/// machine) still reports its pushed summary but has no pullable full diff.
+fn cell_diff(daemon: &Daemon, id: &str, query: &str) -> Reply {
+    let idx = |key: &str| query_param(query, key).and_then(|v| v.parse::<i64>().ok());
+    let (Some(task_idx), Some(cell_idx)) = (idx("task"), idx("cell")) else {
+        return error(
+            400,
+            "bad_request",
+            "GET /api/squads/{id}/diff needs '?task=<idx>&cell=<idx>'",
+            vec![],
+        );
+    };
+    let summary_only = query_param(query, "summary").is_some_and(|v| v == "1" || v == "true");
+    let rows = match daemon.lock().cells_of(id) {
+        Ok(r) => r,
+        Err(e) => return store_error(&e),
+    };
+    let Some(row) = rows
+        .iter()
+        .find(|r| r.task_idx == task_idx && r.idx == cell_idx)
+    else {
+        return error(404, "not_found", "no such cell", vec![]);
+    };
+    let memory = daemon.lock().memory();
+    let key = crate::store_memory::StoreMemory::cell_diff_key(id, &row.cell_id);
+    let state = memory.cell_diff_state(&key);
+    let version = state.as_ref().map_or(0, |s| s.version);
+    let summary = state
+        .as_ref()
+        .map_or(serde_json::Value::Null, |s| s.summary.clone());
+    let mut body = serde_json::json!({
+        "squad_id": id,
+        "task_idx": task_idx,
+        "cell_idx": cell_idx,
+        "version": version,
+        "summary": summary,
+    });
+    if summary_only {
+        return json(200, &body);
+    }
+    if let Some((_, diff)) = memory.fresh_cell_diff(&key) {
+        body["diff"] = diff.into();
+        body["recomputed"] = false.into();
+        return json(200, &body);
+    }
+    let worktree = row
+        .cwd
+        .as_deref()
+        .map(std::path::Path::new)
+        .filter(|p| p.is_dir());
+    let Some(worktree) = worktree else {
+        return error(
+            409,
+            "worktree_unavailable",
+            "this cell's worktree is not on the daemon's host (remote machine?); only the pushed summary is available -- use '?summary=1'",
+            vec![],
+        );
+    };
+    let baseline = summary
+        .get("baseline")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let diff = match crate::guardian_merge::cell_diff(worktree, baseline.as_deref()) {
+        Ok(d) => d,
+        Err(e) => return error(422, "diff_failed", &e, vec![]),
+    };
+    // Without a single push the daemon has no way to learn of later edits, so
+    // a never-pushed diff is recomputed each time rather than cached.
+    if version > 0 {
+        memory.store_cell_diff(&key, version, diff.clone());
+    }
+    body["diff"] = diff.into();
+    body["recomputed"] = true.into();
+    json(200, &body)
 }
 
 /// The execution/transition log for a squad (CCTL-99). Latest 500 entries,

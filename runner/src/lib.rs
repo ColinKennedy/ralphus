@@ -26,3 +26,4 @@ pub mod shellcmd;
 pub mod spec;
 pub mod thrash;
 pub mod tools;
+pub mod worktree_diff;

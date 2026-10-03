@@ -276,6 +276,7 @@ the daemon's hourly Free-tier background sweep
 |---|---|
 | `cell show <selector>` | Cell detail (incl. tokens, cost, agent, model, cwd) |
 | `cell worktree <selector>` | The worktree/project a cell is using |
+| `cell diff <selector> [--summary]` | A running cell's live worktree diff (full diff only recomputed after the runner pushes a change) |
 | `cell reviews <selector>` | Reviews this cell's branch participates in |
 | `cell set-status <selector> <state>` | Override a cell's status |
 | `cell restart <selector>` | Restart a cell and its downstream |

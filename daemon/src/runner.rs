@@ -49,6 +49,11 @@ pub const THINKING_MARKER: &str = "RALPHUS_THINKING: ";
 /// cell's own `tokens_in`/`tokens_out`/`cost_usd` columns don't already hold.
 const LIVE_USAGE_MESSAGE: &str = "live usage";
 
+/// RAL-550: the runner's push that a cell's worktree changed. Must match
+/// `runner/src/worktree_diff.rs`'s `WORKTREE_DIFF_SOURCE`/`WORKTREE_DIFF_MESSAGE`.
+const WORKTREE_DIFF_SOURCE: &str = "worktree-diff";
+const WORKTREE_DIFF_MESSAGE: &str = "diff changed";
+
 /// One structured event forwarded from the runner subprocess over the
 /// `RALPHUS_EVENT:` stderr marker (RAL-98). `squad_id`/`cell_id`/`task` fall
 /// back to the owning [`RunnerSpec`] when the event itself omits them.
@@ -3356,6 +3361,17 @@ pub(crate) fn forward_runner_event(
         );
         live_usage = Some(usage);
     }
+    // RAL-550: a pushed worktree change only marks the cell's diff dirty (in
+    // `StoreMemory`, no SQL); the full diff is computed on request, never here.
+    if event.source == WORKTREE_DIFF_SOURCE && event.message == WORKTREE_DIFF_MESSAGE {
+        let key = crate::store_memory::StoreMemory::cell_diff_key(
+            event.squad_id.as_deref().unwrap_or(squad_id),
+            event.cell_id.as_deref().unwrap_or(cell_id),
+        );
+        guard
+            .memory()
+            .note_cell_diff_changed(&key, event.payload.clone());
+    }
     if event.message != LIVE_USAGE_MESSAGE {
         let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
             level,
@@ -4542,6 +4558,33 @@ mod tests {
             "no injection when subproject is absent"
         );
         assert!(spec.system_prompt_position.is_none());
+    }
+
+    #[test]
+    fn a_worktree_diff_event_marks_the_cell_dirty_and_lands_in_cartographer() {
+        // Local cells reach `forward_runner_event` from the tmux poll loop and
+        // SSH-remote cells from `remote_runner`'s live stderr relay (same
+        // function), so one event line proves the daemon half of both paths.
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let line = "{\"source\":\"worktree-diff\",\"message\":\"diff changed\",\"level\":\"info\",\"payload\":{\"baseline\":\"abc\",\"files_changed\":2,\"lines_added\":5,\"lines_removed\":1}}";
+        forward_runner_event(Some(&store), "squad-1", "cell-a", "build", line);
+        forward_runner_event(Some(&store), "squad-1", "cell-a", "build", line);
+
+        let key = crate::store_memory::StoreMemory::cell_diff_key("squad-1", "cell-a");
+        let state = store.lock().memory().cell_diff_state(&key).unwrap();
+        assert_eq!(state.version, 2);
+        assert!(state.is_dirty());
+        assert_eq!(state.summary["files_changed"], 2);
+        let other = crate::store_memory::StoreMemory::cell_diff_key("squad-1", "cell-b");
+        assert!(store.lock().memory().cell_diff_state(&other).is_none());
+
+        let page = store
+            .lock()
+            .cartographer_query(&crate::cartographer::CartographerFilter::recent(10))
+            .unwrap();
+        assert_eq!(page.total, 2, "each push is recorded in Cartographer");
     }
 
     #[test]

@@ -1622,6 +1622,8 @@
       let anchorId = null;
       /** @type {{[key: string]: {[key: string]: CellPathInfo}}} squadId -> { "ti:si": CellPathInfo }, lazily loaded (CCTL-148) */
       let squadPaths = {};
+      /** @type {{[key: string]: {at: number, summary: CellDiffSummary|null}}} RAL-550: "squadId:ti:ci" -> last pushed worktree-diff summary and when it was fetched */
+      let cellDiffs = {};
       /** @type {{[key: string]: boolean}} "gid:pos" -> bool, worktree cells dropdown open (RAL-71) */
       let worktreeMenuOpen = {};
       /** @type {{[key: string]: boolean}} peek key -> bool, live tmux pane "Read-only terminal" boxes currently expanded (RAL-102) */

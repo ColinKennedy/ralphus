@@ -926,6 +926,45 @@
         } catch (_) { delete squadPaths[id]; }
       }
       /**
+       * RAL-550: the runner-pushed summary of what a cell's worktree has
+       * changed, cached per cell. Reading it kicks off a refetch (at most one
+       * per 2s) whose result re-renders `rerender`; the daemon answers from
+       * pushed state, so this never makes it run git.
+       * @param {string} squadId
+       * @param {number} taskIdx
+       * @param {number} cellIdx
+       * @param {() => void} rerender
+       * @returns {CellDiffSummary|null}
+       */
+      function cellDiffSummary(squadId, taskIdx, cellIdx, rerender) {
+        const key = `${squadId}:${taskIdx}:${cellIdx}`;
+        const cur = cellDiffs[key];
+        if (!cur || Date.now() - cur.at > 2000) {
+          cellDiffs[key] = { at: Date.now(), summary: cur ? cur.summary : null };
+          fetch(`/api/squads/${squadId}/diff?task=${taskIdx}&cell=${cellIdx}&summary=1`)
+            .then((res) => (res.ok ? res.json() : null))
+            .then((body) => {
+              const summary = body && body.summary && typeof body.summary === "object" ? body.summary : null;
+              const changed = JSON.stringify(summary) !== JSON.stringify((cellDiffs[key] || {}).summary);
+              cellDiffs[key] = { at: Date.now(), summary };
+              if (changed) rerender();
+            })
+            .catch(() => {});
+        }
+        return cellDiffs[key].summary;
+      }
+      /**
+       * Renders the RAL-550 "changes" key/value row from a pushed summary, or
+       * an empty string while nothing has been pushed.
+       * @param {CellDiffSummary|null} d
+       * @returns {string}
+       */
+      function cellDiffRow(d) {
+        if (!d || d.files_changed === undefined) return "";
+        const tip = "Pushed live by the runner as the cell's worktree changes (committed, uncommitted and untracked files since the cell started).\nThe full diff is pulled on demand with `ralphus cell diff`.";
+        return `<div class="kv-row" data-tip="${tip}"><span class="k">changes</span><span class="v mono">${d.files_changed} files · <span style="color:var(--done)">+${d.lines_added || 0}</span> <span style="color:var(--failed)">−${d.lines_removed || 0}</span></span></div>`;
+      }
+      /**
        * Renders the RAL-304 context-window controls row (`maximum_context`/
        * `auto_compact_threshold`) for the cell details pane, or an empty
        * string when neither is set — most cells set neither, so the row is
@@ -1030,6 +1069,8 @@
         if (!squadPaths[r.id]) loadSquadPaths(r.id);
         const paths = (squadPaths[r.id] || {})[`${sel.taskIdx}:${sel.cellIdx}`];
         const project = paths ? (paths.project || "— (not a git worktree)") : "…";
+        const diffRow = cellDiffRow(cellDiffSummary(r.id, sel.taskIdx, sel.cellIdx,
+          () => { if (selectedSquadId === r.id && sel.kind === "cell") preserveUserState(document.getElementById("details"), renderDetails); }));
         const agentTip = cellAgentInheritanceTip(t, s);
         const modelTip = cellModelInheritanceTip(t, s);
         // Only shown once the git check resolves and confirms this cell's
@@ -1090,6 +1131,7 @@
           <div class="kv-row"><span class="k">project</span><span class="v mono">${esc(project)}${paths && paths.project ? copyBtn(paths.project) : ""}</span></div>
           <div class="kv-row"><span class="k">worktree</span><span class="v mono">${esc(s.cwd || "—")}${s.cwd ? copyBtn(s.cwd) : ""}</span></div>
           ${upstreamRow}
+          ${diffRow}
           <div class="kv-row" data-tip="${TOKENS_COST_TIP}"><span class="k">tokens</span><span class="v">${usageSummary(s)}${s.maximum_budget_usd ? ` <span style="color:var(--muted)">/ cap $${s.maximum_budget_usd.toFixed(4)}</span>` : ""}${estimatedBadge(s.cost_is_estimated)}</span></div>
           ${s.turns != null ? `<div class="kv-row" data-tip="${TURNS_TIP}"><span class="k">turns</span><span class="v">${s.turns}</span></div>` : ""}
           <div class="kv-row" data-tip="${COMPACTION_TIP}"><span class="k">compaction</span><span class="v">${compactionSummary(s, s.model)}</span></div>

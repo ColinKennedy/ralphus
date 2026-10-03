@@ -493,6 +493,66 @@ pub(crate) fn git(root: &Path, args: &[&str]) -> std::result::Result<String, Str
     GitVcs.run(root, args)
 }
 
+/// RAL-550: the full diff of a cell's worktree since `baseline` (the commit
+/// the runner's watcher started from; `HEAD` when unknown): committed and
+/// uncommitted changes from `git diff`, plus each untracked file rendered as an
+/// all-added new file. The index is never touched. Files over 1 MiB or binary
+/// are listed without a body. This is the only place the daemon computes a
+/// cell's full diff, and only on request -- see `server::cell_diff`.
+pub(crate) fn cell_diff(
+    worktree: &Path,
+    baseline: Option<&str>,
+) -> std::result::Result<String, String> {
+    const MAX_UNTRACKED_BODY_BYTES: u64 = 1024 * 1024;
+    let mut out = git(
+        worktree,
+        &[
+            "diff",
+            "--no-color",
+            "--no-renames",
+            baseline.unwrap_or("HEAD"),
+        ],
+    )?;
+    let untracked = git(
+        worktree,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+    )?;
+    for rel in untracked.split('\0').filter(|p| !p.is_empty()) {
+        out.push_str(&format!(
+            "diff --git a/{rel} b/{rel}
+new file mode 100644
+--- /dev/null
++++ b/{rel}
+"
+        ));
+        let path = worktree.join(rel);
+        let small = std::fs::metadata(&path)
+            .is_ok_and(|m| m.is_file() && m.len() <= MAX_UNTRACKED_BODY_BYTES);
+        let Some(text) = small
+            .then(|| std::fs::read(&path).ok())
+            .flatten()
+            .and_then(|b| String::from_utf8(b).ok())
+        else {
+            out.push_str(
+                "(binary or large file omitted)
+",
+            );
+            continue;
+        };
+        let lines: Vec<&str> = text.lines().collect();
+        if lines.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("@@ -0,0 +1,{} @@\n", lines.len()));
+        for line in lines {
+            out.push('+');
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    Ok(out)
+}
+
 /// Push `wt`'s current `local_branch` after a feedback commit (RAL-<new>).
 ///
 /// Deliberately not PR-system-aware: this doesn't know or care whether
@@ -15156,13 +15216,17 @@ mod tests {
         ));
         let old = crate::store::now_ms() - WORKTREE_RETIREMENT_AGE_MS - 1;
 
-        let guard = store.lock();
-        let id = guard
-            .create_guardian("watched", "main", &repo.to_string_lossy())
-            .unwrap();
-        guard.add_guardian_branch(&id, "watched").unwrap();
-        let branch_id = guard.get_guardian(&id).unwrap().branches[0].id.clone();
-        let wt = worktree_dir(&repo.to_string_lossy(), &id).join("wt-test");
+        let (id, branch_id, wt) = {
+            let guard = store.lock();
+            let id = guard
+                .create_guardian("watched", "main", &repo.to_string_lossy())
+                .unwrap();
+            guard.add_guardian_branch(&id, "watched").unwrap();
+            let branch_id = guard.get_guardian(&id).unwrap().branches[0].id.clone();
+            let wt = worktree_dir(&repo.to_string_lossy(), &id).join("wt-test");
+            (id, branch_id, wt)
+        };
+
         std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
         g(
             &repo,
@@ -15175,29 +15239,32 @@ mod tests {
                 "main",
             ],
         );
-        guard
-            .set_branch_review(
-                &id,
-                &branch_id,
-                &format!("guardian/{id}/wt-watched"),
-                &wt.to_string_lossy(),
-            )
-            .unwrap();
-        guard
-            .conn
-            .execute(
-                "UPDATE guardians SET status=?1, updated_at_ms=?2 WHERE id=?3",
-                rusqlite::params!["deployed", old, id],
-            )
-            .unwrap();
-        guard
-            .create_watch(
-                "colin",
-                &format!("guardian:{id}"),
-                &[crate::mailbox::MailboxPriority::High],
-            )
-            .unwrap();
-        drop(guard);
+
+        {
+            let guard = store.lock();
+            guard
+                .set_branch_review(
+                    &id,
+                    &branch_id,
+                    &format!("guardian/{id}/wt-watched"),
+                    &wt.to_string_lossy(),
+                )
+                .unwrap();
+            guard
+                .conn
+                .execute(
+                    "UPDATE guardians SET status=?1, updated_at_ms=?2 WHERE id=?3",
+                    rusqlite::params!["deployed", old, id],
+                )
+                .unwrap();
+            guard
+                .create_watch(
+                    "colin",
+                    &format!("guardian:{id}"),
+                    &[crate::mailbox::MailboxPriority::High],
+                )
+                .unwrap();
+        }
 
         retire_stale_worktrees(&store);
 

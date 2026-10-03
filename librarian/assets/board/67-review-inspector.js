@@ -208,11 +208,19 @@
           ? `${esc(b.source_squad_id)}${b.source_cell_idx === undefined ? "" : ` · cell ${b.source_cell_idx}`}`
           : "—";
         const prs = (pullRequests[g.id] || []).filter((p) => p.branch_id === b.id);
+        // RAL-550: the runner-pushed change summary of the cell behind this branch.
+        const diffRow = (b.source_squad_id && b.source_task_idx != null && b.source_cell_idx != null)
+          ? cellDiffSummary(b.source_squad_id, b.source_task_idx, b.source_cell_idx, renderReviewInspector)
+          : null;
+        const changes = diffRow && diffRow.files_changed !== undefined
+          ? `<dt>changes</dt><dd class="mono" data-tip="Pushed live by the runner as the source cell's worktree changes; pull the full diff with 'ralphus cell diff'.">${diffRow.files_changed} files · <span style="color:var(--done)">+${diffRow.lines_added || 0}</span> <span style="color:var(--failed)">−${diffRow.lines_removed || 0}</span></dd>`
+          : "";
         return `<dl class="insp-kv">
             <dt>state</dt><dd>${pill(b.merge_status || "pending")}</dd>
             <dt>position</dt><dd>${b.enabled === false ? "not in the stack" : `${place.place} of ${place.total}`}</dd>
             <dt>rebases onto</dt><dd class="mono">${esc(place.onto)}</dd>
             <dt>source</dt><dd class="mono">${src}</dd>
+            ${changes}
             <dt>detail</dt><dd style="color:var(--muted)">${esc(b.detail || "—")}</dd>
           </dl>
           ${b.is_empty ? `<div class="warn" style="margin-top:10px">Adds no diff over the branch beneath it, which fails the review.</div>` : ""}
