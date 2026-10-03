@@ -1523,6 +1523,7 @@ impl Store {
             "UPDATE guardians SET auto_build_json=? WHERE id=?",
             params![auto_build_json, id],
         )?;
+        self.auto_subscribe_review_submitter(&id, owner.as_deref())?;
         // RAL-<new>: a new review coming into existence is the single most
         // consequential event in this file, and every route into it
         // (`create_guardian_for_squad`/`_for_project`/`_keyed` directly) went

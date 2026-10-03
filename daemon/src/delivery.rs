@@ -79,6 +79,42 @@ fn row_to_client(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewClientView> 
 }
 
 impl Store {
+    /// Subscribe a registered client to a review. Repeating the same request is
+    /// intentionally idempotent, which is important when a submit/retry races
+    /// the default submitter enrollment.
+    pub fn subscribe_review_client(&self, guardian_id: &str, client_id: &str) -> StoreResult<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO guardian_recipients(guardian_id, client_id, subscribed_at_ms) VALUES(?1, ?2, ?3)",
+            rusqlite::params![guardian_id, client_id, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// Enrol the review owner onto their current local client when their
+    /// delivery preference allows it. The default client is created lazily so
+    /// submitters need no preceding setup for V1.
+    pub fn auto_subscribe_review_submitter(
+        &self,
+        guardian_id: &str,
+        owner: Option<&str>,
+    ) -> StoreResult<()> {
+        let Some(owner) = owner else {
+            return Ok(());
+        };
+        if !self
+            .review_delivery_preferences(owner)?
+            .auto_register_submitter
+        {
+            return Ok(());
+        }
+        let clients = self.review_clients_for_user(owner)?;
+        let client = clients
+            .into_iter()
+            .find(|client| client.enabled)
+            .unwrap_or(self.upsert_review_client(owner, "Current machine", true)?);
+        self.subscribe_review_client(guardian_id, &client.id)
+    }
+
     /// Register or update a V1 local review client for `user_name`.
     pub fn upsert_review_client(
         &self,
