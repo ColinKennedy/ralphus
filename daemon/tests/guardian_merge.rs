@@ -2984,10 +2984,11 @@ fn cancelling_a_review_stops_an_in_flight_feedback_agent() {
         "feedback agent never started"
     );
 
-    // This is the same cancellation signal the HTTP review-cancel handler
-    // sends before it changes the review's durable state.
-    stop_merge_worker_for_cancel(&cancellations, &id);
-    store.lock().cancel_guardian(&id).unwrap();
+    // Stop must wait for the registered feedback worker before it reports the
+    // durable stopped state; otherwise a resolver could publish after the
+    // board had already acknowledged Stop.
+    let stop_reply = stop_guardian_merge(Arc::clone(&store), cancellations.clone(), &id);
+    assert_eq!(stop_reply.status, 200, "{}", stop_reply.body);
 
     let key = format!("guardian:{id}");
     for _ in 0..600 {
@@ -3004,7 +3005,10 @@ fn cancelling_a_review_stops_an_in_flight_feedback_agent() {
         !cancellations.is_active(&key),
         "feedback worker remained registered after cancellation"
     );
-    assert_eq!(store.lock().get_guardian(&id).unwrap().status, "cancelled");
+    assert_eq!(
+        store.lock().get_guardian(&id).unwrap().status,
+        "merge_stopped"
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }

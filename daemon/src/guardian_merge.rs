@@ -4501,7 +4501,15 @@ pub fn stop_guardian_merge(
     let key = format!("guardian:{id}");
     cancellations.cancel(&key);
     kill_guardian_agent_sessions(&store, id);
-    let _ = wait_for_merge_worker_stop(&cancellations, &key);
+    if !wait_for_merge_worker_stop(&cancellations, &key) {
+        return reply(
+            409,
+            &error_body(
+                "merge_still_stopping",
+                "the review is still stopping; retry Stop shortly",
+            ),
+        );
+    }
     match store.lock().stop_guardian_merge(id) {
         Ok(status) => {
             // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
@@ -4679,32 +4687,24 @@ pub fn start_feedback(
     };
     let sid = id.to_string();
     let bid = branch_id.to_string();
-    // Register before spawning so cancellation between this acknowledgement
-    // and the background thread starting still reaches the feedback agent.
-    // Review merges, feedback, and their downstream work share this key.
-    let cancellation_key = format!("guardian:{sid}");
-    let cancel = cancellations.register(&cancellation_key);
     std::thread::spawn(move || {
-        if !cancel.is_cancelled() {
-            record_feedback_reply(&store, &sid, &bid, &feature, &feedback);
-            let outcome = run_feedback(
-                &store,
-                runner.as_ref(),
-                &sid,
-                &bid,
-                &feedback,
-                Some(message_seq),
-                false,
-                &cancel,
-            );
-            crate::rlog!(
-                INFO,
-                "ralphus [guardian] review {sid} feedback outcome committed={} pushed={}",
-                outcome.committed,
-                outcome.pushed
-            );
-        }
-        cancellations.remove(&cancellation_key);
+        record_feedback_reply(&store, &sid, &bid, &feature, &feedback);
+        let outcome = run_feedback_registered(
+            &store,
+            runner.as_ref(),
+            &cancellations,
+            &sid,
+            &bid,
+            &feedback,
+            Some(message_seq),
+            false,
+        );
+        crate::rlog!(
+            INFO,
+            "ralphus [guardian] review {sid} feedback outcome committed={} pushed={}",
+            outcome.committed,
+            outcome.pushed
+        );
     });
     reply(202, "{\"status\":\"applying_feedback\"}")
 }
@@ -6420,6 +6420,40 @@ fn commit_step_reference_notes(
 /// (`dispatch_pr_auto_fix`) requests `true`, since it must gate specifically
 /// on the agent's own verdict rather than "committed without erroring" (an
 /// agent that gives up without editing anything still reports `Done` today).
+///
+/// Registers the feedback worker under the review's shared cancellation key.
+/// Stop waits for this registration to clear before it acknowledges
+/// `merge_stopped`, making the token checks in [`run_feedback`] a real
+/// non-publishing boundary rather than a best-effort hint.
+#[allow(clippy::too_many_arguments)]
+pub fn run_feedback_registered(
+    store: &crate::store_lock::StoreHandle,
+    runner: &dyn Runner,
+    cancellations: &Cancellations,
+    id: &str,
+    branch_id: &str,
+    feedback: &str,
+    message_seq: Option<i64>,
+    require_proof: bool,
+) -> FeedbackOutcome {
+    let key = format!("guardian:{id}");
+    let cancel = cancellations.register(&key);
+    let _cleanup = CancellationCleanup {
+        cancellations: cancellations.clone(),
+        key,
+    };
+    run_feedback(
+        store,
+        runner,
+        id,
+        branch_id,
+        feedback,
+        message_seq,
+        require_proof,
+        &cancel,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_feedback(
     store: &crate::store_lock::StoreHandle,
@@ -6489,6 +6523,10 @@ pub fn run_feedback(
             return FeedbackOutcome::default();
         }
     };
+    if cancel.is_cancelled() || guardian.status == GuardianStatus::MergeStopped.as_str() {
+        fail_message();
+        return FeedbackOutcome::default();
+    }
     let _git_operation =
         git_review_operation_guard(Path::new(&guardian.git_root), guardian.machine.as_deref());
     let base = guardian.base_branch.clone();
@@ -6517,6 +6555,17 @@ pub fn run_feedback(
     // claimed first; spins until that restack finishes and releases every
     // lease it implicitly held off.
     let lease_owner = format!("feedback:{branch_id}");
+    macro_rules! stop_feedback {
+        () => {{
+            log_merge_cancelled(store, id);
+            let _ = store
+                .lock()
+                .release_guardian_worktree_lease(id, branch_id, &lease_owner);
+            let _ = store.lock().clear_branch_pending_feedback(id, branch_id);
+            fail_message();
+            return FeedbackOutcome::default();
+        }};
+    }
     loop {
         let acquired =
             store
@@ -6545,10 +6594,7 @@ pub fn run_feedback(
             // own doc comment) -- this one, waiting to acquire the branch
             // worktree lease, didn't, so a feedback round cancelled here left
             // no trace distinguishing it from any other silent bail-out.
-            log_merge_cancelled(store, id);
-            let _ = store.lock().clear_branch_pending_feedback(id, branch_id);
-            fail_message();
-            return FeedbackOutcome::default();
+            stop_feedback!();
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
@@ -6769,13 +6815,7 @@ pub fn run_feedback(
     );
     let _ = record_guardian_call_cost(store, id, Some(branch_id), "feedback", &result);
     if cancel.is_cancelled() {
-        log_merge_cancelled(store, id);
-        let _ = store
-            .lock()
-            .release_guardian_worktree_lease(id, branch_id, &lease_owner);
-        let _ = store.lock().clear_branch_pending_feedback(id, branch_id);
-        fail_message();
-        return FeedbackOutcome::default();
+        stop_feedback!();
     }
     // RAL-400 phase 2: a waypoint delivers its guidance to a review as
     // feedback on this branch, authored `Waypoint`, and this resolver is the
@@ -6827,6 +6867,9 @@ pub fn run_feedback(
     let mut committed = false;
     let mut commit_step_detail: Option<String> = None;
     if attempt_commit {
+        if cancel.is_cancelled() {
+            stop_feedback!();
+        }
         // RAL-<new>: give the target branch itself the same dedicated
         // final-proof pass a cleanly-rebased branch already gets during a
         // restack (see `drive_rebase`'s identical `allows_for_clean_branch`
@@ -6849,9 +6892,15 @@ pub fn run_feedback(
                 cancel,
             );
             proof_note = Some(note);
+            if cancel.is_cancelled() {
+                stop_feedback!();
+            }
         }
 
         if leftover_dirty {
+            if cancel.is_cancelled() {
+                stop_feedback!();
+            }
             // RAL-<new>: a dedicated agent decides what belongs in the commit
             // -- see `run_commit_step`'s own doc comment for why this
             // replaced a blind `git add --all` gated on a text-sniffed "did
@@ -6899,6 +6948,9 @@ pub fn run_feedback(
         }
 
         if committed {
+            if cancel.is_cancelled() {
+                stop_feedback!();
+            }
             // RAL-<new>: push the review branch itself -- force only when we
             // did NOT amend (a plain new commit may not fast-forward the
             // remote's previous review push; an amend is a routine extension
@@ -6939,6 +6991,12 @@ pub fn run_feedback(
                     None,
                 ))
             });
+            // This is deliberately adjacent to the first publishing command:
+            // Stop waits for this worker to leave, so it cannot acknowledge
+            // `merge_stopped` while a feedback push remains possible.
+            if cancel.is_cancelled() {
+                stop_feedback!();
+            }
             let push_result =
                 match push_feedback_branch(&wt, &review_branch, !squash, push_remote.as_deref()) {
                     Ok(sha) => Ok(sha),
@@ -6955,6 +7013,9 @@ pub fn run_feedback(
                             is_final_branch,
                             cancel,
                         ) {
+                            Ok(()) if cancel.is_cancelled() => {
+                                stop_feedback!();
+                            }
                             Ok(()) => push_feedback_branch(
                                 &wt,
                                 &review_branch,
@@ -7222,6 +7283,9 @@ pub fn run_feedback(
     // feedback pass on another branch of this same guardian (still holding
     // its own lease) simply leaves the request queued rather than racing
     // this restack against that branch's in-flight edit.
+    if cancel.is_cancelled() {
+        stop_feedback!();
+    }
     {
         let guard = store.lock();
         guard.request_guardian_restack(id, position);
@@ -7318,6 +7382,9 @@ pub fn run_feedback(
     // `auto_fix_during_collection_folds_into_stack_once_the_straggler_lands`).
     let mut halted_on_still_collecting = false;
     for ob in &downstream {
+        if cancel.is_cancelled() {
+            stop_feedback!();
+        }
         if ob.merge_status == MergeStatus::Pending.as_str() {
             halted_on_still_collecting = true;
             break;
@@ -7838,11 +7905,12 @@ pub fn review_maintenance(
             continue;
         };
         let store = Arc::clone(store);
+        let cancellations = cancellations.clone();
         std::thread::spawn(move || {
             let _claim = claim;
             let runner =
                 crate::runner::SubprocessRunner::from_env().with_cartographer(Arc::clone(&store));
-            crate::ci_watch::poll_open_pr_ci_status(&store, &runner, &id);
+            crate::ci_watch::poll_open_pr_ci_status(&store, &runner, &cancellations, &id);
         });
     }
 
@@ -7890,7 +7958,7 @@ pub fn review_maintenance(
             // the guardian opted in. Placed alongside `check_pr_merges` since
             // both are cheap, best-effort per-guardian forge checks that
             // never block the rebuild/rebase work below.
-            crate::ci_watch::poll_open_pr_ci_status(&store, runner.as_ref(), &id);
+            crate::ci_watch::poll_open_pr_ci_status(&store, runner.as_ref(), &cancellations, &id);
             // Pull remote PR commits before considering a local base shift or
             // manual worktree push. This keeps the review's source of truth
             // current and prevents a later branch sync from treating remote
