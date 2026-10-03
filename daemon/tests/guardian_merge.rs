@@ -2968,11 +2968,14 @@ fn cancelling_a_review_stops_an_in_flight_feedback_agent() {
     );
     assert_eq!(reply.status, 202);
 
-    for _ in 0..200 {
+    // Git/worktree setup happens in the background worker before the runner
+    // starts. Nextest isolates this test so concurrent Git-heavy tests cannot
+    // starve the worker on Windows.
+    for _ in 0..2000 {
         if runner.started.load(Ordering::SeqCst) {
             break;
         }
-        std::thread::sleep(Duration::from_millis(5));
+        std::thread::sleep(Duration::from_millis(10));
     }
     assert!(
         runner.started.load(Ordering::SeqCst),
@@ -2985,11 +2988,11 @@ fn cancelling_a_review_stops_an_in_flight_feedback_agent() {
     store.lock().cancel_guardian(&id).unwrap();
 
     let key = format!("guardian:{id}");
-    for _ in 0..200 {
+    for _ in 0..600 {
         if runner.stopped.load(Ordering::SeqCst) && !cancellations.is_active(&key) {
             break;
         }
-        std::thread::sleep(Duration::from_millis(5));
+        std::thread::sleep(Duration::from_millis(10));
     }
     assert!(
         runner.stopped.load(Ordering::SeqCst),

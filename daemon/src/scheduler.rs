@@ -670,6 +670,10 @@ pub fn tick(
         let cancellations = cancellations.clone();
         let summary_queue = Arc::clone(summary_queue);
         std::thread::spawn(move || {
+            let _guard = crate::guardian_merge::CancellationCleanup {
+                cancellations: cancellations.clone(),
+                key: squad_id.clone(),
+            };
             execute_squad_inner(
                 &store,
                 runner.as_ref(),
@@ -679,7 +683,6 @@ pub fn tick(
                 &summary_queue,
                 &cancellations,
             );
-            cancellations.remove(&squad_id);
         });
     }
 }
@@ -2763,10 +2766,11 @@ fn run_cell_worker(
     // upstream cell already learned. This goes into the prompt text
     // itself (not `system_prompt`), since `append_system_prompt` is only
     // honoured by the claude-code backend today and every agent must see it.
-    let ghost_context = {
+    let (ghost_context, restart_guidance) = {
         let guard = store.lock();
         let own_uri = crate::ghost::cell_uri(squad_id, row.task_idx, row.idx);
         let own = guard.get_ghost(&own_uri).ok().flatten();
+        let restart_guidance = guard.take_ghost_user_note(&own_uri).ok().flatten();
         let parents: Vec<(String, crate::ghost::GhostView)> = plan.deps[i]
             .iter()
             .filter_map(|&d| {
@@ -2779,7 +2783,10 @@ fn run_cell_worker(
                     .map(|g| (format!("{}/{}", dep.task_name, dep.cell_id), g))
             })
             .collect();
-        crate::ghost::format_context_block(own.as_ref(), &parents)
+        (
+            crate::ghost::format_context_block(own.as_ref(), &parents),
+            restart_guidance,
+        )
     };
     let selection =
         match resolve_agent_selection(store, &row.agent, row.cwd.as_deref().unwrap_or(".")) {
@@ -3129,7 +3136,26 @@ fn run_cell_worker(
         row.remediation_attempts.and_then(|n| u32::try_from(n).ok()),
     );
     let mut remediation_attempt = 1u32;
-    let (result, resumed_permit) = loop {
+    // RAL-488 interview Q1: resolved/snapshotted once, before the first
+    // attempt, and only when a repair pass could actually happen -- most
+    // cells never touch remediation at all (a `prompt` cell, or a `command`
+    // cell with `total_attempts == 1`), so this keeps the store-lock +
+    // `for_project_root` lookup off that common path.
+    let vcs = if total_attempts > 1 {
+        crate::remediation::resolve_vcs_for_remediation(store, &spec.cwd)
+    } else {
+        None
+    };
+    let snapshot = if total_attempts > 1 {
+        crate::remediation::SnapshotGuard::new(
+            vcs.as_deref()
+                .and_then(|v| crate::remediation::snapshot_worktree_before_retries(v, &spec)),
+        )
+    } else {
+        crate::remediation::SnapshotGuard::none()
+    };
+    let mut last_repair_result: Option<RunnerResult> = None;
+    let (mut result, resumed_permit) = loop {
         // RAL-435: `run_cancellable` wrapped in a retry loop that catches a
         // recognized, retryable Pi rate limit, waits out its suggested delay
         // (releasing `_permit` for the duration), and resumes the same agent
@@ -3171,25 +3197,43 @@ fn run_cell_worker(
              failed, starting repair pass",
             row.cell_id,
         );
+        if let (Some(v), Some(dir)) = (vcs.as_deref(), snapshot.path()) {
+            crate::remediation::restore_worktree_before_repair(v, &spec, dir, remediation_attempt);
+        }
         let repair_agent = crate::remediation::RepairAgent {
             agent: &row.agent,
             executable: spec.executable.as_deref(),
             model: row.model.as_deref(),
+            first_attempt_guidance: None,
         };
-        // The store lock must not be held across this call -- the repair pass
-        // runs an agent through the tmux runner, which takes the same
-        // (non-reentrant) lock itself.
-        crate::remediation::run_repair_pass(
-            store,
+        last_repair_result = Some(crate::remediation::run_repair_pass(
             runner,
             cancel,
             &spec,
             remediation_attempt,
             &repair_agent,
-        );
+            if remediation_attempt == 1 {
+                restart_guidance.as_deref()
+            } else {
+                None
+            },
+        ));
         remediation_attempt += 1;
     };
     _permit = resumed_permit;
+    // RAL-488 interview Q3: once the budget is exhausted, report both the
+    // last command attempt's own output and the last repair agent's own
+    // diagnosis -- mirrors `run_command_with_remediation`'s own exhaustion
+    // handling for the proof-dispatch path. Left untouched (and `error`
+    // stays whatever the last attempt itself set) when a repair pass never
+    // ran at all, e.g. a `mode = "raw"` cell whose single attempt failed.
+    if !result.is_done() {
+        if let Some(repair) = &last_repair_result {
+            result.error = Some(crate::remediation::combine_exhaustion_diagnostics(
+                &result, repair,
+            ));
+        }
+    }
     // RAL-288 Stage 6: a deliberate human-triggered detach mid-task is
     // neither success nor failure -- record whatever usage/session-id was
     // captured live (so the board's numbers don't regress), but never run
@@ -4286,13 +4330,16 @@ fn start_reviews(
                     Arc::clone(&store),
                 ));
                 let token = cancellations.register(&format!("guardian:{gid}"));
+                let _guard = crate::guardian_merge::CancellationCleanup {
+                    cancellations: cancellations.clone(),
+                    key: format!("guardian:{gid}"),
+                };
                 // RAL-265: use the incremental staged merge so a guardian can
                 // begin rebasing as soon as its first branch's cell is done,
                 // resuming from already-built `Done` tips as later branches
                 // finish, and only finalizing to `InReview` once every branch is
                 // rebased.
                 crate::guardian_merge::run_merge_staged(&store, runner.as_ref(), &gid, &token);
-                cancellations.remove(&format!("guardian:{gid}"));
             }
         });
     }
@@ -4966,6 +5013,10 @@ fn run_proofs(
             merged
         };
         register_secret_named_env_values(store, &env_overrides);
+        let restart_guidance = store
+            .lock()
+            .take_proof_restart_note(squad_id, task_idx, scope, cell_idx, idx)
+            .unwrap_or_default();
         let (passed, output, proof_claude_id, proof_usage) = match kind.as_str() {
             "command" => {
                 crate::rlog!(
@@ -5041,12 +5092,14 @@ fn run_proofs(
                     agent: &selection.backend,
                     executable: selection.executable.as_deref(),
                     model: repair_model,
+                    first_attempt_guidance: restart_guidance.as_deref(),
                 };
-                // The store lock must not be held across this call -- it runs
-                // the command through the tmux runner, which takes the same
-                // (non-reentrant) lock itself.
+                // RAL-488 interview Q1: resolved once per proof step rather
+                // than hoisted to `run_proofs`'s top, since the vast majority
+                // of proof steps are `prompt`/`brain`/`approval` kinds that
+                // never touch remediation at all.
+                let vcs = crate::remediation::resolve_vcs_for_remediation(store, cwd);
                 let result: RunnerResult = crate::remediation::run_command_with_remediation(
-                    store,
                     runner,
                     cancel,
                     &runner_spec,
@@ -5055,13 +5108,10 @@ fn run_proofs(
                         .unwrap_or(ralphus_core::schema::COMMAND_MODE_RAW),
                     proof_remediation_attempts.and_then(|n| u32::try_from(n).ok()),
                     &repair_agent,
+                    vcs.as_deref(),
                 );
                 let passed = result.is_done();
-                let output = match &result.error {
-                    Some(err) if result.summary.is_empty() => err.clone(),
-                    Some(err) => format!("{}\n{err}", result.summary),
-                    None => result.summary.clone(),
-                };
+                let output = crate::remediation::diagnostic_text(&result);
                 let usage = crate::store::RecordedUsage::from(&result);
                 (passed, output, None, usage)
             }
@@ -5109,7 +5159,11 @@ fn run_proofs(
                     position,
                     proof_id.as_deref(),
                 );
-                let prompt = format!("{spec}\n\n{proof_context}");
+                let mut prompt = format!("{spec}\n\n{proof_context}");
+                if let Some(guidance) = restart_guidance.as_deref() {
+                    prompt.push_str("\n\nHuman guidance for this restarted proof:\n\n");
+                    prompt.push_str(guidance);
+                }
                 let mut runner_spec = RunnerSpec::for_proof(
                     squad_id,
                     task_name,
@@ -6708,6 +6762,173 @@ mod tests {
         let guard = store.lock();
         assert_eq!(guard.squad_state(&id).unwrap(), SquadState::Failed);
         assert_eq!(guard.get_squad(&id).unwrap().tasks[0].state, "failed");
+    }
+
+    /// A directory that resolves to a valid, but non-git, `Vcs` target for a
+    /// remediation retry loop: `resolve_vcs_for_remediation` still returns a
+    /// `GitVcs` adapter (an unregistered project defaults to the `"git"`
+    /// kind), but every git subcommand it runs against this directory fails
+    /// cleanly ("not a git repository") rather than mutating anything -- so
+    /// `snapshot_worktree_before_retries` returns `None` and
+    /// `restore_worktree_before_repair` is never reached. Deliberately not a
+    /// real git repo: these tests exercise the cell-dispatch retry loop's
+    /// attempt/repair bookkeeping, not `GitVcs`'s own snapshot/restore
+    /// mechanics (already covered by `remediation.rs`'s own dedicated test),
+    /// and a real repo here would risk running `git reset --hard`/`git clean
+    /// -fd` against whatever directory the test happens to run from -- see
+    /// this repo's own root `AGENTS.md` "never run `git stash`" rule and the
+    /// same worktree-safety concern it is guarding against.
+    fn remediation_test_cwd(tag: &str) -> std::path::PathBuf {
+        let seq = TEST_DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("ral488-scheduler-remediation-{tag}-{seq}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn remediating_cell_toml(cwd: &Path, remediation_attempts: u32) -> String {
+        format!(
+            "[[task]]\nname=\"build\"\n[[task.cell]]\ncwd={:?}\ncommand=\"do-thing\"\nmode=\"remediating\"\nremediation_attempts={remediation_attempts}\n",
+            cwd.to_string_lossy()
+        )
+    }
+
+    /// A `Runner` test double for the cell-dispatch remediation loop:
+    /// distinguishes a command attempt (`spec.command` set) from a repair
+    /// pass (`spec.prompt` set, per `run_repair_pass`) and counts each
+    /// separately, failing the first `fail_command_times` command attempts.
+    struct RemediationCellRunner {
+        fail_command_times: u32,
+        command_attempts: Arc<std::sync::atomic::AtomicU32>,
+        repair_attempts: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    impl Runner for RemediationCellRunner {
+        fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+            use std::sync::atomic::Ordering;
+            if spec.command.is_some() {
+                let n = self.command_attempts.fetch_add(1, Ordering::SeqCst);
+                if n < self.fail_command_times {
+                    RunnerResult::failure("boom")
+                } else {
+                    RunnerResult {
+                        bearing: None,
+                        thinking_stall_last_line: None,
+                        retry_after_secs: None,
+                        status: "done".to_string(),
+                        tokens_in: 0,
+                        tokens_out: 0,
+                        cache_creation_tokens: 0,
+                        cache_read_tokens: 0,
+                        compaction_input_tokens: 0,
+                        compaction_count: 0,
+                        cost_usd: 0.0,
+                        cost_is_estimated: false,
+                        summary: "ok".to_string(),
+                        error: None,
+                        proofed: spec.proof.then_some(true),
+                        agent_session_id: None,
+                        ghost: None,
+                        turns: None,
+                        prophecies: Vec::new(),
+                    }
+                }
+            } else {
+                self.repair_attempts.fetch_add(1, Ordering::SeqCst);
+                RunnerResult {
+                    bearing: None,
+                    thinking_stall_last_line: None,
+                    retry_after_secs: None,
+                    status: "done".to_string(),
+                    tokens_in: 0,
+                    tokens_out: 0,
+                    cache_creation_tokens: 0,
+                    cache_read_tokens: 0,
+                    compaction_input_tokens: 0,
+                    compaction_count: 0,
+                    cost_usd: 0.0,
+                    cost_is_estimated: false,
+                    summary: "repaired".to_string(),
+                    error: None,
+                    proofed: None,
+                    agent_session_id: None,
+                    ghost: None,
+                    turns: None,
+                    prophecies: Vec::new(),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cell_dispatch_remediates_and_retries_until_success() {
+        let cwd = remediation_test_cwd("repair-success");
+        let (store, id) = store_with(&remediating_cell_toml(&cwd, 3));
+        let command_attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let repair_attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let runner = RemediationCellRunner {
+            fail_command_times: 1,
+            command_attempts: Arc::clone(&command_attempts),
+            repair_attempts: Arc::clone(&repair_attempts),
+        };
+        execute_squad(&store, &runner, &id);
+
+        assert_eq!(store.lock().squad_state(&id).unwrap(), SquadState::Done);
+        assert_eq!(
+            command_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "first command attempt fails, second (post-repair) succeeds"
+        );
+        assert_eq!(
+            repair_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one repair pass runs between the failing and succeeding attempts"
+        );
+        let guard = store.lock();
+        let cell = &guard.get_squad(&id).unwrap().tasks[0].cells[0];
+        assert_eq!(cell.state, "done");
+        assert_eq!(cell.error, None);
+    }
+
+    #[test]
+    fn cell_dispatch_exhausts_remediation_attempts_and_records_combined_diagnostics() {
+        let cwd = remediation_test_cwd("exhaustion");
+        let (store, id) = store_with(&remediating_cell_toml(&cwd, 2));
+        let command_attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let repair_attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let runner = RemediationCellRunner {
+            fail_command_times: u32::MAX,
+            command_attempts: Arc::clone(&command_attempts),
+            repair_attempts: Arc::clone(&repair_attempts),
+        };
+        execute_squad(&store, &runner, &id);
+
+        assert_eq!(store.lock().squad_state(&id).unwrap(), SquadState::Failed);
+        assert_eq!(
+            command_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "remediation_attempts=2 allows exactly 2 command attempts"
+        );
+        assert_eq!(
+            repair_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one repair pass runs, between the two command attempts"
+        );
+        let guard = store.lock();
+        let cell = &guard.get_squad(&id).unwrap().tasks[0].cells[0];
+        assert_eq!(cell.state, "failed");
+        let error = cell.error.clone().unwrap();
+        assert!(
+            error.contains("Remediation attempts exhausted"),
+            "error was: {error}"
+        );
+        assert!(
+            error.contains("Last command output") && error.contains("boom"),
+            "error was: {error}"
+        );
+        assert!(
+            error.contains("Last repair agent diagnosis") && error.contains("repaired"),
+            "error was: {error}"
+        );
     }
 
     /// A runner whose `preflight_runner_executable` always fails, simulating

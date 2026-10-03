@@ -110,7 +110,8 @@ ralphus status                     # list squads; `ralphus status <squad-id>` fo
 ralphus check health                # check the local setup
 ```
 
-A minimal `task.toml` (a deterministic command cell — no model needed):
+A minimal `task.toml` (command cells remediate failures with the resolved
+agent by default):
 
 ```toml
 [[task]]
@@ -118,8 +119,10 @@ name = "hello"
 [[task.cell]]
 cwd = "/absolute/path/to/a/dir"     # must be a real directory
 command = "echo hello > out.txt"
+remediation_attempts = 3             # total command executions, including the first
 [[task.cell.proof]]
 command = "test -f out.txt"          # fmt/lint/test-style gate
+remediation_attempts = 3
 ```
 
 For an AI cell, replace `command` with a `prompt` and pick a model — local:
