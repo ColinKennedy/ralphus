@@ -182,6 +182,8 @@
                 k === "feedback" && unread ? `<span class="insp-badge" data-tip="You left feedback the resolver has not answered yet.">1</span>` : ""}</button>`).join("")}</div>
           </div>
           <div class="insp-body">${inspectorTabBody(g, b)}</div>`;
+        // The rewrite above recreated any live `.runterm` at scrollTop 0.
+        restorePeekScrollPositions();
       }
       /**
        * Body for whichever inspector tab is active. Only this one runs, so a
@@ -766,9 +768,10 @@
             </div>${foot}`;
         }
         const shown = peekContent[key];
-        return `<div class="runterm" id="peek-pre-${peekCssKey(key)}" style="height:${peekPaneHeight}px" tabindex="0" data-key="${esc(key)}"
+        return `<div style="position:relative"><div class="runterm" id="peek-pre-${peekCssKey(key)}" style="height:${peekPaneHeight}px" tabindex="0" data-key="${esc(key)}"
             onscroll="onPeekScroll(this.dataset.key)" onkeydown="handlePeekKeydown(event,this.dataset.key)"
-            data-tip="Scroll through this run's output.\nClick here then press Ctrl+End to jump to the latest, or Ctrl+Home for the start.">${shown !== undefined ? esc(shown) : "Loading…"}</div>${foot}
+            data-tip="Scroll through this run's output.\nClick here then press Ctrl+End to jump to the latest, or Ctrl+Home for the start.">${shown !== undefined ? esc(shown) : "Loading…"}</div>
+          <button id="peek-jump-${peekCssKey(key)}" class="peek-jump-btn" style="display:none" data-click="peekScrollToBottom" data-key="${esc(key)}" data-tip="Jump to the latest output.\nAppears once you've scrolled up from the bottom — also triggerable with Ctrl+End while the terminal is focused.">↓ Jump to latest</button></div>${foot}
           <div class="hint">Read-only — nothing typed here reaches the agent. Every run's text is
           captured separately, so walking back survives a restart.</div>`;
       }
