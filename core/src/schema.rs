@@ -1675,47 +1675,6 @@ pub struct PreparationStepDef {
     pub environment: BTreeMap<String, String>,
 }
 
-/// Where a prepared artifact becomes available to its manual action.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ArtifactPlacementDef {
-    /// Copy the selected output to the machine where the action runs.
-    Copy,
-    /// Leave the output on the review/build machine; the action runs there.
-    Retain,
-    /// Use an author-provided shared filesystem path or URI without relaying
-    /// the payload through the daemon.
-    Shared,
-}
-
-/// One output produced by preparation and consumed by a manual action.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ReviewArtifactDef {
-    /// File or directory relative to the prepared review checkout.
-    pub source: String,
-    /// Relative destination on the action machine for `copy` placement.
-    #[serde(default)]
-    pub destination: Option<String>,
-    /// Copy, retain on the review machine, or expose through shared storage.
-    pub placement: ArtifactPlacementDef,
-    /// Path or URI visible to the action for `shared` placement.
-    #[serde(default)]
-    pub shared_path: Option<String>,
-    /// Optional command whose success proves a shared output is usable.
-    #[serde(default)]
-    pub readiness_command: Option<String>,
-    /// Preserve or add executable permission after materialization.
-    #[serde(default)]
-    pub executable: bool,
-    /// Operating-system family this artifact was built for, such as
-    /// `windows`, `linux`, or `macos`.
-    #[serde(default)]
-    pub target_os: Option<String>,
-    /// CPU architecture this artifact was built for, such as `x86_64`.
-    #[serde(default)]
-    pub target_arch: Option<String>,
-}
-
 /// A user-declared manual-test action shown as a labelled button in the review UI.
 ///
 /// Exactly one of `prompt` or `command` must be set. `command` is run directly
@@ -1739,16 +1698,9 @@ pub struct ReviewActionDef {
     /// A concise statement of what a successful observation looks like.
     #[serde(default)]
     pub success: Option<String>,
-    /// `daemon` or `review_machine`. Unset uses `daemon` for local reviews and
-    /// `review_machine` for remote reviews.
-    #[serde(default)]
-    pub run_on: Option<String>,
     /// Ordered unattended steps specific to this action.
     #[serde(default)]
     pub prepare: Vec<PreparationStepDef>,
-    /// Outputs this action needs after preparation.
-    #[serde(default)]
-    pub artifact: Vec<ReviewArtifactDef>,
     /// Optional command run before `command`/the expanded `prompt`, e.g. to stop
     /// a stale process from a previous run. Opt-in at run time via a UI
     /// checkbox (RAL-164) -- coexists with either `prompt` or `command`, no
