@@ -1135,30 +1135,42 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
       // RALPHUS-REBASE-EXHAUSTED-NOTICE:BEGIN
       /**
        * Renders the review-level notice (RAL-537) for when the base-shift
-       * rebuild campaign (RAL-507) has exhausted its attempt budget --
-       * unlike `autoFixExhaustedBadge` above, `base_shift_rebuild_attempts`
-       * is a single counter shared across every branch in the review (one
-       * rebuild pass rebases every affected branch together), not something
-       * attributable to any one worktree chip, so this renders once above
-       * the worktree list rather than as a per-branch badge (RAL-542 tracks
-       * the gap that one bad worktree can exhaust the budget for the whole
-       * review). `canReorder` is the same terminal-status check already
+       * rebuild campaign (RAL-507) has exhausted its attempt budget for one
+       * or more of the review's worktrees. The budget is tracked per
+       * worktree (RAL-542, `base_shift_rebuild_attempts_by_project`), so the
+       * notice names only the worktrees at or over the cap -- the others keep
+       * rebasing automatically. The whole-review `base_shift_rebuild_attempts`
+       * scalar counts failed passes, not any one worktree's spend, so it is
+       * consulted only for a review row that carries no per-worktree map.
+       * Renders once above the worktree list rather than as a per-branch
+       * badge. `canReorder` is the same terminal-status check already
        * computed by the caller for the branch-reorder affordance -- reused
        * here so the notice doesn't linger once the review can no longer be
        * acted on (merged/cancelled/deployed/approved). Clears within one
-       * poll cycle of "Merge / rebase" being pressed, since that resets
-       * `base_shift_rebuild_attempts` server-side
-       * (`clear_guardian_base_shift_campaign`).
+       * poll cycle of "Merge / rebase" being pressed, since that resets the
+       * budget server-side (`clear_guardian_base_shift_campaign`).
        * @param {GuardianView} g
        * @param {boolean} canReorder
        * @returns {string}
        */
       function rebaseExhaustedNotice(g, canReorder) {
         if (!canReorder) return "";
-        const attempts = g.base_shift_rebuild_attempts || 0;
         const max = g.effective_base_shift_maximum_rebuilds || 0;
-        if (max <= 0 || attempts < max) return "";
-        const tip = `The base branch moved, and automatic rebasing stopped after ${attempts} failed attempt(s) against the same new base (cap: ${max}). This applies to the whole review — one bad worktree can use up the budget for all of them. The review is left as-is awaiting human action. Press 'Merge / rebase' to reset and start a fresh automatic attempt.`;
+        if (max <= 0) return "";
+        const byProject = g.base_shift_rebuild_attempts_by_project;
+        if (byProject) {
+          const spent = Object.entries(byProject).filter(([, n]) => (n || 0) >= max);
+          if (!spent.length) return "";
+          const names = spent
+            .map(([root]) => root.split(/[\\/]/).filter(Boolean).pop() || root)
+            .join(", ");
+          const worst = Math.max(...spent.map(([, n]) => n));
+          const tip = `The base branch moved, and automatic rebasing stopped for ${names} after ${worst} failed attempt(s) against the same new base (cap: ${max}). Any other worktree in this review keeps rebasing automatically. The affected worktree(s) are left as-is awaiting human action. Press 'Merge / rebase' to reset and start a fresh automatic attempt.`;
+          return `<div style="color:var(--muted);border:1px solid var(--border);border-radius:6px;padding:8px;font-size:12px;margin:8px 0" data-tip="${esc(tip)}">⚠ Automatic rebasing stopped for ${esc(names)} after ${worst}/${max} failed attempt(s) against the new base branch — press "Merge / rebase" to reset and try again.</div>`;
+        }
+        const attempts = g.base_shift_rebuild_attempts || 0;
+        if (attempts < max) return "";
+        const tip = `The base branch moved, and automatic rebasing stopped after ${attempts} failed attempt(s) against the same new base (cap: ${max}). The review is left as-is awaiting human action. Press 'Merge / rebase' to reset and start a fresh automatic attempt.`;
         return `<div style="color:var(--muted);border:1px solid var(--border);border-radius:6px;padding:8px;font-size:12px;margin:8px 0" data-tip="${esc(tip)}">⚠ Automatic rebasing stopped after ${attempts}/${max} failed attempt(s) against the new base branch — press "Merge / rebase" to reset and try again.</div>`;
       }
       // RALPHUS-REBASE-EXHAUSTED-NOTICE:END
