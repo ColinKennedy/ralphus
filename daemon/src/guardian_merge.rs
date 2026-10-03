@@ -10804,6 +10804,39 @@ pub(crate) fn collect_base_fetch_targets(
     targets
 }
 
+/// Every guardian id a `target` serves -- i.e. every maintained guardian
+/// whose (project root, machine, base branch) matches `target` after the
+/// same expansion [`collect_base_fetch_targets`] performs. A `BaseFetchTarget`
+/// is deliberately guardian-id-agnostic (it dedups the actual git fetch
+/// across guardians that share one), but poll health (RAL-545) is attributed
+/// back to every guardian it serves, since that is the unit a user watches.
+fn guardian_ids_for_target(
+    inputs: &[GuardianBaseFetchInfo],
+    target: &BaseFetchTarget,
+) -> Vec<String> {
+    let mut ids = Vec::new();
+    for g in inputs {
+        if !matches!(
+            g.status.as_str(),
+            "in_review" | "merge_failed" | "merging" | "merge_stopped"
+        ) {
+            continue;
+        }
+        if g.machine != target.machine || g.base_branch != target.base_branch {
+            continue;
+        }
+        let projects: &[String] = if g.projects.is_empty() {
+            std::slice::from_ref(&g.git_root)
+        } else {
+            &g.projects
+        };
+        if projects.iter().any(|p| Path::new(p) == target.root) {
+            ids.push(g.guardian_id.clone());
+        }
+    }
+    ids
+}
+
 /// Best-effort: refresh the local ref for one base-branch fetch target, or
 /// determine there is nothing to fetch and no-op successfully.
 ///
@@ -10881,17 +10914,25 @@ pub fn poll_base_branch_freshness_once(store: &crate::store_lock::StoreHandle) {
         let Some(claim) = InFlightClaim::acquire(&BASE_FETCH_IN_FLIGHT, &key) else {
             continue;
         };
+        let guardian_ids = guardian_ids_for_target(&inputs, &target);
         let store = Arc::clone(store);
         std::thread::spawn(move || {
             let _claim = claim;
-            if let Err(e) = fetch_base_branch(&store, &target) {
-                crate::rlog!(
-                    DEBUG,
-                    "ralphus [guardian] base-branch freshness fetch skipped for {} ({}): {e}",
-                    target.base_branch,
-                    target.root.display()
-                );
-                let guard = store.lock();
+            let result = fetch_base_branch(&store, &target);
+            let outcome = match &result {
+                Ok(()) => crate::poller_health::PollOutcome::Healthy,
+                Err(e) => {
+                    crate::rlog!(
+                        DEBUG,
+                        "ralphus [guardian] base-branch freshness fetch skipped for {} ({}): {e}",
+                        target.base_branch,
+                        target.root.display()
+                    );
+                    crate::poller_health::PollOutcome::Unhealthy { error: e.clone() }
+                }
+            };
+            let guard = store.lock();
+            if let Err(e) = &result {
                 crate::cartographer::Note::new("guardian")
                     .scope("guardian")
                     .level(crate::logging::LogLevel::DEBUG)
@@ -10904,6 +10945,14 @@ pub fn poll_base_branch_freshness_once(store: &crate::store_lock::StoreHandle) {
                             "error": e.to_string(),
                         }),
                     );
+            }
+            drop(guard);
+            for guardian_id in &guardian_ids {
+                let _ = store.lock().record_poll_outcome(
+                    crate::poller_health::PollerKind::BaseBranchFetch,
+                    guardian_id,
+                    &outcome,
+                );
             }
         });
     }

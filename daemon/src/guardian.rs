@@ -3668,6 +3668,11 @@ impl Store {
         if n == 0 {
             Err(StoreError::NotFound)
         } else {
+            // RAL-545: a changed upstream invalidates this review's
+            // suppressed-message/backoff state so the next poll is logged
+            // fresh, instead of possibly staying suppressed under the old
+            // target's streak.
+            let _ = self.clear_poller_health_for_guardian(id);
             Ok(())
         }
     }
@@ -3706,6 +3711,8 @@ impl Store {
             ],
         )?;
         if n > 0 {
+            // RAL-545: see the matching note in `set_guardian_base_branch_at`.
+            let _ = self.clear_poller_health_for_guardian(id);
             return Ok(true);
         }
         let exists: bool = self.conn.query_row(

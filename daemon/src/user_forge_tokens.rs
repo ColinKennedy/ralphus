@@ -64,6 +64,12 @@ impl Store {
             payload: serde_json::json!({ "user": user, "host": host }),
             admin_only: false,
         });
+        // RAL-545: a changed token invalidates every review's upstream-poll
+        // backoff/suppressed-mailbox state, not just reviews owned by `user`
+        // -- a review's forge calls can run under a different user's token
+        // than the one editing it (fork routing), so narrowing this to
+        // `user`'s own reviews could leave a stale suppression in place.
+        let _ = self.clear_all_poller_health();
         Ok(())
     }
 
@@ -151,6 +157,10 @@ impl Store {
                 payload: serde_json::json!({ "user": user, "host": host }),
                 admin_only: false,
             });
+            // RAL-545: see the matching note in `set_user_forge_token` -- a
+            // removed token invalidates every review's upstream-poll state,
+            // not just reviews owned by `user`.
+            let _ = self.clear_all_poller_health();
         }
         Ok(n > 0)
     }

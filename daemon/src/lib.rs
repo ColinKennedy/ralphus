@@ -40,6 +40,7 @@ pub mod monitor;
 pub mod otel;
 pub mod perf_timing;
 pub mod plan;
+pub mod poller_health;
 pub mod pr;
 pub mod procreg;
 pub mod project_forks;
