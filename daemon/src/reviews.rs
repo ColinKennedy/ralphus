@@ -503,27 +503,7 @@ fn actions_to_hints(actions: &[ReviewActionDef]) -> Vec<GuardianCheck> {
             prompt: a.prompt.clone(),
             description: a.description.clone(),
             success: a.success.clone(),
-            run_on: Some(a.run_on.clone().unwrap_or_else(|| "daemon".to_string())),
             prepare: a.prepare.iter().map(into_guardian_preparation).collect(),
-            artifacts: a
-                .artifact
-                .iter()
-                .map(|artifact| crate::guardian::GuardianArtifact {
-                    source: artifact.source.clone(),
-                    destination: artifact.destination.clone(),
-                    placement: match artifact.placement {
-                        ralphus_core::schema::ArtifactPlacementDef::Copy => "copy",
-                        ralphus_core::schema::ArtifactPlacementDef::Retain => "retain",
-                        ralphus_core::schema::ArtifactPlacementDef::Shared => "shared",
-                    }
-                    .to_string(),
-                    shared_path: artifact.shared_path.clone(),
-                    readiness_command: artifact.readiness_command.clone(),
-                    executable: artifact.executable,
-                    target_os: artifact.target_os.clone(),
-                    target_arch: artifact.target_arch.clone(),
-                })
-                .collect(),
             cleanup_command: a.cleanup_command.clone(),
             shared_store: a.shared_store.as_ref().map(|store| {
                 crate::guardian::GuardianSharedStore {
