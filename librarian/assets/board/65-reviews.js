@@ -324,7 +324,7 @@
             ? `<div data-click="unhideReviewMenuItem" data-guardian-id="${esc(id)}" data-tip="Show this review again in your own view.\nWho/when: use this to undo an earlier hide.\nA personal preference — it never affects what other users see.">👁 Unhide</div>`
             : `<div data-click="hideReviewMenuItem" data-guardian-id="${esc(id)}" data-tip="Hide this review from your own view — it stays fully intact and keeps running/counting normally.\nWho/when: use this to declutter your list of reviews you don't need to watch right now.\nA personal preference — it never affects what other users see, and can be undone any time via \"show hidden\".">🙈 Hide</div>`);
         }
-        items.push(`<div data-click="mergeReviewFromMenu" data-guardian-id="${esc(id)}" data-tip="Start (or resume) a fresh merge/rebase — rebases each enabled branch onto the base, resolving conflicts with the AI agent, then runs check gates.\nWho/when: use this to force a rebase right now instead of waiting for the automatic one, e.g. right after enabling/disabling branches, or on a review with automatic rebasing turned off.\nRuns regardless of this review's 'Skip automatic rebasing' setting -- that setting only gates the automatic sweep, not this manual trigger.\nReviews not currently eligible (already merging, merged, cancelled, or deployed) are skipped and reported.${esc(batchTip)}">⇄ Merge / rebase</div>`);
+        items.push(`<div data-click="mergeReviewFromMenu" data-guardian-id="${esc(id)}" data-tip="Start (or resume) a fresh merge/rebase — rebases each enabled branch onto the base, resolves conflicts, then prepares manual checks.\nWho/when: use this to force a rebase right now instead of waiting for the automatic one, e.g. right after enabling/disabling branches, or on a review with automatic rebasing turned off.\nRuns regardless of this review's 'Skip automatic rebasing' setting -- that setting only gates the automatic sweep, not this manual trigger.\nReviews not currently eligible (already merging, merged, cancelled, or deployed) are skipped and reported.${esc(batchTip)}">⇄ Merge / rebase</div>`);
         if (canCancel) items.push(`<div class="danger" data-click="cancelReview" data-guardian-id="${esc(id)}" data-tip="Cancel this review — stops the current merge and discards its result.\nThe review can be restarted afterward.\nThis cannot be undone.${esc(batchTip)}">⊘ Cancel review</div>`);
         if (g.status === "cancelled") items.push(`<div data-click="reopenReview" data-guardian-id="${esc(id)}" data-tip="Reopen this cancelled review and immediately stage in whatever branches are already ready, without waiting for the rest.\nUse this when a review was cancelled by mistake, or you want to retry it without recreating it from scratch.\nAny branch still waiting on its task keeps the review in collecting until it finishes.${esc(batchTip)}">↺ Reopen review</div>`);
         items.push(`<div class="danger" data-click="deleteReview" data-guardian-id="${esc(id)}" data-tip="Delete this review and remove all review worktrees permanently.\nThis cannot be undone.${esc(batchTip)}">🗑 Delete</div>`);
@@ -1278,7 +1278,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           enabled: true,
           tip: resuming
             ? "Resume the stopped rebase from where it left off — rebuilds the review stack from the first remaining worktree.\nA review left stopped mid-rebase is paused, not cancelled: branches and worktrees are kept.\nThis also gives each open PR one fresh automatic CI-fix attempt."
-            : "Start the Guardian: rebase each branch onto the prior in the stack, resolve conflicts with the AI agent, and run check gates.\nThis also gives each open PR one fresh automatic CI-fix attempt.\nOnly available when status is collecting, in_review, merge_stopped, or merge_failed.",
+            : "Start the Guardian: rebase each branch onto the prior in the stack, resolve conflicts with the AI agent, and prepare manual checks.\nThis also gives each open PR one fresh automatic CI-fix attempt.\nOnly available when status is collecting, in_review, merge_stopped, or merge_failed.",
         };
       }
 
@@ -1455,7 +1455,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
               + hcRow("upstream", esc(g.base_branch || "—"), "mono")
               + hcRow("branches", `${(g.branches || []).filter((b) => b.enabled !== false).length} enabled of ${(g.branches || []).length}`),
             )
-            + hcNote("The whole stack rebased into one tree — what the check gates actually run against."),
+            + hcNote("The whole stack rebased into one tree — the checkout prepared for manual checks."),
           foot: `<button class="btn" data-tip="Copy this worktree's absolute path." data-copy="${esc(g.combined_worktree)}" onclick="copyText(event)">Copy path</button>`,
         };
       });
@@ -1501,7 +1501,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        * Each pipeline stage's own state, computed independently.
        *
        * A review is not a single point on a line. Branches rebase concurrently,
-       * post-merge gates run while the stack is already readable, and auto-fix
+       * manual preparation runs while the stack is already readable, and auto-fix
        * can be pushing commits to a PR while a later branch is still merging --
        * so "collect", "rebase" and "review" are routinely live at the same
        * time. Reading one status enum and lighting a single dot misreported all
@@ -1526,8 +1526,8 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         const rebaseFailed = g.status === "merge_failed" || g.status === "merge_stopped"
           || anyBranch((b) => b.merge_status === "failed");
         const rebaseDone = branches.length > 0 && branches.every(terminal);
-        // Review: the stack is readable. Post-merge work (check gates,
-        // manual-checks generation) runs here and never blocks it.
+        // Review: the stack is readable. Manual-check preparation runs here
+        // and never blocks approval.
         const reviewing = g.status === "in_review" || g.post_merge_status === "running";
         const approved = ["approved", "merged", "deployed"].includes(g.status);
         const deployed = g.status === "deployed";
@@ -1563,7 +1563,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         const TIPS = {
           collecting: "Waiting on the task cells that produce this review's branches.",
           merging: "Rebasing the stack. Branches rebase concurrently, so this can be live while other stages are too.",
-          in_review: "The stack is readable and can be approved. Post-merge gates and manual-check generation run here without blocking it.",
+          in_review: "The stack is readable and can be approved. Manual-check preparation runs here without blocking it.",
           approved: "Approved, whether or not its PR stack has merged.",
           deployed: "Shipped.",
         };
@@ -1673,7 +1673,6 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        * @returns {string}
        */
       function reviewSetupStrip(g) {
-        const gates = (g.checks || []).length;
         const squashOn = g.squash_projects || [];
         const projects = (g.projects && g.projects.length) ? g.projects : [g.git_root || ""];
         const squashCount = projects.filter((p) => squashOn.includes(p)).length;
@@ -1682,21 +1681,11 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           : (squashCount ? "on" : "off");
         const proof = (g.effective_proof_scope || "each_branch").replace(/_/g, " ");
         const model = g.resolver_model ? ` · ${esc(g.resolver_model)}` : "";
-        // Gates is the one setting that can leave a review provably unverified,
-        // so it is the one that earns the warning register.
-        //
-        // With no gates and auto-build allowed, the chip must report what has
-        // actually happened rather than what is intended: the daemon only
-        // infers and runs a build once the stack finishes merging. Saying
-        // "auto" before then reads as "already verified" and contradicts the
-        // check-gates section right below, which is still warning that nothing
-        // has verified this review yet. Same `auto-built via ` prefix the
-        // daemon writes into `detail` that the section keys off.
-        const autoBuilt = (g.detail || "").startsWith("auto-built via ");
-        const unverified = gates === 0 && !!g.skip_auto_build;
-        const gatesText = gates
-          ? `${gates}`
-          : (g.skip_auto_build ? "none" : (autoBuilt ? "auto-built" : "inferred"));
+        const preparationRevoked = [...(g.action_hints || []), ...(g.manual_commands || [])]
+          .some((check) => check.preparation_state === "stale" || check.preparation_state === "waiting");
+        const preparationText = !preparationRevoked && g.post_merge_status === "ok"
+          ? "ready"
+          : !preparationRevoked && g.post_merge_status === "failed" ? "failed" : "pending";
         return `<div class="setup-strip">`
           + `<div class="setup-chips">`
           + setupChip(g.id, "onto", esc(g.base_branch || "—"),
@@ -1707,15 +1696,8 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
             `How often the dedicated LLM proof pass runs${g.proof_scope ? "" : " — currently the project default"}.`)
           + setupChip(g.id, "squash", esc(squashText),
             "Whether each task branch collapses to a single commit in the review worktree.\nScope is per git project, so a multi-project review sets it independently.")
-          + setupChip(g.id, "gates", esc(gatesText),
-            unverified
-              ? "No check gates, and skip auto-build is on — nothing verifies this review. It can reach 'in review', and be approved, without a single build or test having run.\nAdd a gate, or set [review] auto_build in the project's .ralphus.toml."
-              : gates
-                ? `${gates} check gate(s) must pass before this review can be approved.`
-                : autoBuilt
-                  ? "No gates configured, so the daemon inferred a build command and ran it once the stack merged. See the check gates section for which command."
-                  : "No gates configured. The daemon will infer a build command from the diff once the stack finishes merging — until then nothing has verified this review.",
-            unverified)
+          + `<span class="setup-chip ident" data-tip="Manual-check preparation status. Preparation is advisory and never blocks approval.">`
+          + `<span class="sc-k">preparation</span><b>${esc(preparationText)}</b></span>`
           + setupChip(g.id, "worktrees", g.skip_worktrees ? "shared" : "per-branch",
             g.skip_worktrees
               ? "The whole stack builds in one shared worktree instead of one per branch."
@@ -1734,7 +1716,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
       }
 
       /**
-       * Renders the full review detail pane (branch stack, checks, manual commands, chat, etc).
+       * Renders the full review detail pane (branch stack, manual actions, commands, chat, etc).
        * @returns {void}
        */
       function renderReviewDetail() {
@@ -1835,72 +1817,20 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
             ${detail}
           </div>`;
         }).join("");
-        // RAL-101/RAL-110: when no explicit check gates are configured, the
-        // daemon falls back first to the project's `auto_build` default
-        // (`.ralphus.toml`), and — if that isn't configured either — to a
-        // build command the resolver agent infers from the diff in the same
-        // call that generates the manual-check commands. Either way this runs
-        // once the stack finishes merging, so "in review" still means
-        // "testable" instead of silently reporting done with zero
-        // verification. The daemon records what happened as g.detail,
-        // prefixed distinctively so the UI can tell it apart from an
-        // unrelated merge-failure/opt-out detail string.
-        const autoBuildPrefixes = [
-          { prefix: "auto-built via project default: ", source: "the project's .ralphus.toml [review] auto_build" },
-          { prefix: "auto-built via inferred build command: ", source: "the resolver agent, inferred from the diff" },
-        ];
-        const gDetail = g.detail || "";
-        const autoBuildMatch = gDetail && autoBuildPrefixes.find((p) => gDetail.startsWith(p.prefix));
-        const autoBuiltCmd = autoBuildMatch ? gDetail.slice(autoBuildMatch.prefix.length) : null;
-        const gChecks = g.checks || [];
-        // Check gates render as a command list -- the same shape manual checks
-        // and test actions use -- rather than a row of chips. A gate is a
-        // command you want to read in full and whose outcome you want to see,
-        // so it gets a row of its own with its text elided rather than
-        // wrapping, and its own ⋯ for the log.
-        // Check gates as a run-group: a header saying what the gates promise,
-        // then one row per command. Previously a row of wrapping chips for the
-        // configured case and a lone coloured chip for every other case, which
-        // gave four quite different situations the same undifferentiated shape.
-        // Check gates wear the same frame as the other runnable sections.
-        // Their run slot is a badge, not a button: gates fire automatically
-        // after each merge commit and the daemon exposes no route to trigger
-        // one by hand, so a button here would be a lie.
-        const gateBadge = (/** @type {string} */ text, /** @type {string} */ tip) =>
-          `<span class="rg-when" data-tip="${esc(tip)}">${esc(text)}</span>`;
-        const gateRow = (/** @type {string} */ cmd, /** @type {number} */ i, /** @type {string} */ icon, /** @type {string} */ iconTip, /** @type {string} */ iconColor) => {
-          const key = `${g.id}:gate:${i}`;
-          return `<div class="cmd-row selectable${isCommandRowSelected(key) ? " sel" : ""}" data-click="selectReviewCommandRow" data-dblclick="toggleReviewCommandFull" data-guardian-id="${esc(g.id)}" data-key="${esc(key)}" data-cmd="${esc(cmd)}" data-tip="Select this gate to scope the log drawer to it.\nDouble-click to open it in full.">
-              <span class="cmd-lock"${iconColor ? ` style="color:${iconColor}"` : ""} data-tip="${esc(iconTip)}">${icon}</span>
-              <span class="cmd-text mono" data-tip="${esc(cmd)}">${esc(cmd)}</span>
-              ${commandRunStatus(key)}
-              <button class="cmd-expand" data-click="toggleReviewCommandFull" data-key="${esc(key)}" data-tip="Show or hide this gate in full beneath its row.">${commandFullOpen[key] ? "−" : "+"}</button>
-              <button class="section-menu" data-click="openReviewCommandMenu" data-guardian-id="${esc(g.id)}" data-key="${esc(key)}" data-cmd="${esc(cmd)}" data-tip="Actions for this gate — its logs, its environment, copy it.">⋯</button>
-            </div>${commandFullBlock(key, cmd)}`;
-        };
-        const checks = gChecks.length
-          ? reviewRunGroup(
-            gateBadge("runs after merge", "Check gates are run by the daemon after each merge commit and on the combined worktree. There is no way to trigger one by hand from here."),
-            `All ${gChecks.length} must pass before this review can be approved.${
-              g.skip_auto_build ? " <b>Skip auto-build is on, so these are skipped.</b>" : ""}`,
-            gChecks.map((c, i) => gateRow(c, i, "🔒", "Check gate — runs after each merge commit and on the combined review worktree.\nAll gates must pass before the review can be approved.", "")).join(""),
-            !!g.skip_auto_build)
-          : autoBuiltCmd
-            ? reviewRunGroup(
-              gateBadge("auto-built", `No gates were configured, so this build command was inferred and run once the stack merged — sourced from ${autoBuildMatch ? autoBuildMatch.source : ""}.`),
-              `No gates configured, so a build was inferred and run once the stack merged. Nothing to do.`,
-              gateRow(autoBuiltCmd, 0, "🔧", "Inferred and run automatically, so 'in review' still means the code builds even with no gates configured.", "var(--done)"))
-            : reviewRunGroup(
-              gateBadge(g.skip_auto_build ? "nothing runs" : "after merge",
-                g.skip_auto_build
-                  ? "No gates, and skip auto-build is on — nothing verifies this review at any point."
-                  : "The daemon infers a build command from the diff once the stack finishes merging."),
-              g.skip_auto_build
-                ? `<b class="rg-warn">Nothing verifies this review.</b> No check gates, and skip auto-build is on — it can reach <i>in review</i> and be approved without a build or test having run. Add a gate in Setup, or set <span class="mono">[review] auto_build</span> in the project's <span class="mono">.ralphus.toml</span>.`
-                : `No check gates configured. A build is inferred from the diff once the stack finishes merging — until then, nothing has verified this review.`,
-              "")
-;
-        // RAL-410 moved skip-auto-build/skip-per-branch-worktrees, squash,
+        const manualSurfaceStates = [...(g.action_hints || []), ...(g.manual_commands || [])]
+          .map((check) => check.preparation_state);
+        const hasRevokedPreparation = manualSurfaceStates.some((state) => state === "stale" || state === "waiting");
+        const preparationState = hasRevokedPreparation ? "waiting" : (g.post_merge_status || "waiting");
+        const preparationCount = (g.preparation || []).length;
+        const preparationText = preparationState === "ok"
+          ? `Ready${preparationCount ? ` — ${preparationCount} review preparation step(s) completed.` : "."}`
+          : preparationState === "failed"
+            ? `Preparation failed: ${esc(g.post_merge_detail || "See review logs for details.")}`
+            : preparationState === "running"
+              ? "Preparing manual checks now. Run buttons unlock when every action is ready."
+              : "Waiting for the combined review checkout before preparation starts.";
+        const preparationClass = preparationState === "failed" ? "warn" : "";
+        // RAL-410 moved skip-per-branch-worktrees, squash,
         // resolver agent/model and proof scope into the "Edit Details" modal
         // but left a column of read-only kv-rows behind for them. Those now
         // render as the setup strip (reviewSetupStrip) directly under the
@@ -1949,8 +1879,9 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
               ? `<div class="warn" style="margin:8px 0 4px">Some branches are not yet ready (still running or never submitted). Merge / rebase will offer to continue with just the ready branches.</div>`
               : "";
           })()}
-          <h3 class="section">check gates${sectionMenuBtn(g.id, "gates")}</h3>${checks}
-          ${g.detail && !autoBuiltCmd ? `<div class="warn">${detailSummary(g.detail, "Review detail")}</div>` : ""}
+          <h3 class="section" data-tip="Preparation runs automatically before you arrive. It builds the combined review, expands prompt actions, and places declared artifacts so manual checks launch immediately.">manual-check preparation</h3>
+          <div class="${preparationClass}" data-tip="Preparation is advisory and never blocks approval. A failure keeps its details visible and disables only the affected manual action.">${preparationText}</div>
+          ${g.detail ? `<div class="warn">${detailSummary(g.detail, "Review detail")}</div>` : ""}
           ${(() => {
             // RAL-77: user-declared test actions from [[review.action]] in TOML.
             const hints = g.action_hints || [];
@@ -1966,7 +1897,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
                   `None declared. Test actions are authored in <span class="mono">[[review.action]]</span> blocks in the task file — unlike manual checks below, which the resolver agent writes for you.`,
                   "")}`;
             }
-            // Same command-list shape as check gates and manual checks. A
+            // Same command-list shape as manual checks. A
             // labelled button alone hid what the action would actually run,
             // which for a one-click check against someone else's branch is
             // exactly the thing you want to read before pressing it.
@@ -1974,11 +1905,16 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
               const key = `${g.id}:action:${i}`;
               const needsInput = !!(h.inputs && h.inputs.length);
               const label = esc(h.label || "Run");
-              if (!h.command) {
+              const ready = h.preparation_state === "ready" && !!h.command;
+              if (!ready) {
+                const status = h.preparation_state || "waiting";
+                const detail = h.preparation_detail || (h.prompt
+                  ? "The resolver will expand this prompt into a command during preparation."
+                  : "Preparation has not completed yet.");
                 return `<div class="cmd-row" style="opacity:.55">
-                    <button class="cmd-run" disabled data-tip="Prompt-based test actions expand via the resolver LLM before running, and that expansion isn't wired up — only command-based [[review.action]] entries are runnable today.">▶</button>
+                    <button class="cmd-run" disabled data-tip="${esc(status)} — ${esc(detail)}">▶</button>
                     <span class="cmd-label">${label}</span>
-                    <span class="cmd-text mono" data-tip="Prompt: ${esc(h.prompt || "")}">${esc(h.prompt || "(prompt)")}</span>
+                    <span class="cmd-text mono" data-tip="${esc(detail)}">${esc(status)}</span>
                   </div>`;
               }
               const cmdText = h.command || "";
@@ -1994,8 +1930,8 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
             }).join("");
             return `<h3 class="section" data-tip="User-declared test actions from the task TOML [[review.action]] blocks.\nAuthored by the task author, not generated — each runs in the built review worktree.\nLabelled buttons give reviewers one-click access to targeted manual checks.">test actions${sectionMenuBtn(g.id, "actions")}</h3>
               ${reviewRunGroup(
-                reviewRunControl(g, "actions", hints.some((h) => h.command && !(h.inputs && h.inputs.length)), "▶ Run all",
-                  "Run every command-based test action, each in the built review worktree.\nActions needing input are skipped — run those from their own row."),
+                reviewRunControl(g, "actions", hints.some((h) => h.preparation_state === "ready" && h.command && !(h.inputs && h.inputs.length)), "▶ Run all",
+                  "Run every ready action, each from its already-prepared location.\nActions needing input are skipped — run those from their own row."),
                 "",
                 rows)}`;
           })()}
@@ -2022,17 +1958,21 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
             const gateTip = isReady
               ? `Run all ${cmds.length} suggested manual check command(s) in a new terminal window.\nEach launches in the built review worktree.`
               : state === "generating"
-                ? "Generating suggested manual check commands now — every enabled branch has finished rebasing cleanly and the resolver agent is producing them.\nThis button enables once they're ready."
-                : "Manual checks aren't generated yet — they're only produced after every enabled branch in this review has finished rebasing with no pending conflicts.\nStill collecting or rebasing branches.";
-            const label = isReady ? "▶ Run all" : (state === "generating" ? "▶ Generating…" : "▶ Run all");
+                ? "Preparing manual checks now — commands, builds, and declared artifact placement complete before this button enables."
+                : state === "failed"
+                  ? "Preparation failed. The recorded detail and logs explain what to repair; approval remains available."
+                  : "Manual checks are waiting for the combined review checkout before preparation starts.";
+            const label = isReady ? "▶ Run all" : (state === "generating" ? "▶ Preparing…" : "▶ Run all");
             const runControl = reviewRunControl(g, "manual", isReady && !!cmds.length, label, gateTip);
             // What the section says about itself while it has nothing to show.
             // It used to be a lone disabled button labelled "Waiting on
             // branches…" with a stray Live View button beside it, which read
             // as a different, older widget than the populated case.
             const waitingNote = state === "generating"
-              ? `Every enabled branch has rebased cleanly, and the resolver agent is writing these now.`
-              : `Not generated yet. The resolver agent writes these once every enabled branch has rebased with no pending conflicts — this review is still collecting or rebasing.`;
+              ? `The stage is being set now: commands, builds, and artifacts are prepared before the controls unlock.`
+              : state === "failed"
+                ? `Preparation failed, but this advisory result never blocks approval. See the review detail and logs for remediation.`
+                : `Waiting for the combined review checkout. No manual-check control unlocks until its prerequisites are ready.`;
             return `<h3 class="section" data-tip="Shell commands suggested by the resolver agent to manually verify these changes.\nSuggested against this stack's changes and advisory — they never block Approve or Merge / rebase.\nGenerated once when the review branch is rebuilt (or when the rebuilt stack's changes change), and re-generated on demand from this section's ⋯ menu.">manual checks${sectionMenuBtn(g.id, "manual")}</h3>
               ${isReady && cmds.length
                 ? reviewRunGroup(
@@ -2706,8 +2646,6 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
                 <div id="cr-path-field" class="hidden">
                   <label data-tip="Absolute path to an unregistered git repository. Use this only when the review is not based on a registered project.">git root (absolute path)<input id="cr-root" placeholder="C:/path/to/repo"></label>
                 </div>
-                <label data-tip="Shell commands to run as check gates after each merge commit (comma-separated). Leave blank to skip gates. Example: cargo test, npm test">checks (comma-separated shell commands, optional)<input id="cr-checks" placeholder="cargo test"></label>
-                <label style="display:flex;align-items:center;gap:6px;margin-top:10px" data-tip="Skip the finalize-time build/check step entirely: explicit check gates, the project's .ralphus.toml auto_build default, and the AI-inferred build command are all skipped.\nGates are still stored — you can re-enable this later."><input type="checkbox" id="cr-skip-auto-build" style="width:auto;margin:0">skip auto-build</label>
                 <label style="display:flex;align-items:center;gap:6px;margin-top:6px" data-tip="Use one shared worktree for the entire stack instead of per-branch worktrees. Faster for large repos."><input type="checkbox" id="cr-skip-worktrees" style="width:auto;margin:0">skip per-branch worktrees (large repos)</label>
               </div>
               <div id="cr-other-fields" class="hidden"><div class="empty" style="margin:12px 0">No extra fields for this review type yet.</div></div>
@@ -2762,11 +2700,9 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           byId("cr-err").textContent = "only git reviews can be created here for now";
           return;
         }
-        const checks = v("cr-checks") ? v("cr-checks").split(",").map((s) => s.trim()).filter(Boolean) : [];
-        const skip_auto_build = /** @type {HTMLInputElement} */ (document.getElementById("cr-skip-auto-build")).checked;
         const skip_worktrees = /** @type {HTMLInputElement} */ (document.getElementById("cr-skip-worktrees")).checked;
         /** @type {Record<string, unknown>} */
-        const body = { name: v("cr-name"), review_type, base_branch: v("cr-base"), checks, skip_auto_build, skip_worktrees };
+        const body = { name: v("cr-name"), review_type, base_branch: v("cr-base"), skip_worktrees };
         const targetKind = /** @type {HTMLSelectElement} */ (document.getElementById("cr-target-kind")).value;
         if (targetKind === "project") {
           const project = /** @type {HTMLSelectElement} */ (document.getElementById("cr-project")).value;
@@ -3234,7 +3170,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
       }
 
       // ---------- review-ready banner (CCTL-145) ----------
-      // A guardian in `in_review` has its stack built and all check gates passed —
+      // A guardian in `in_review` has its stack built; preparation remains advisory —
       // the "ready to act on" signal. Show a dismissible banner that jumps to it.
       /**
        * Renders the dismissible "review is ready" banner for every in_review guardian.

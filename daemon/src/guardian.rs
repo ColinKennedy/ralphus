@@ -96,7 +96,7 @@ pub struct InputResolutionView {
 /// can carry an optional `cleanup_command` and named, defaulted `inputs`.
 /// Exactly one of `command` (verbatim shell) or `prompt` (forwarded to LLM)
 /// is set.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GuardianCheck {
     /// Button label shown in the UI. `None` for AI-synthesized manual checks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -107,6 +107,34 @@ pub struct GuardianCheck {
     /// Prompt forwarded to the LLM to expand into a command (mutually exclusive with `command`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
+    /// What the reviewer should observe while this action runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Human-facing success criteria. This is guidance, never an approval gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub success: Option<String>,
+    /// `daemon` or `review_machine`; unset selects the review machine for a
+    /// remote review and the daemon for a local review.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_on: Option<String>,
+    /// Ordered unattended work specific to this action.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prepare: Vec<GuardianAutoBuild>,
+    /// Outputs this action consumes after preparation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<GuardianArtifact>,
+    /// `waiting`, `preparing`, `transferring`, `ready`, `failed`, or `stale`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation_state: Option<String>,
+    /// Actionable preparation or transfer detail, especially on failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation_detail: Option<String>,
+    /// Epoch milliseconds when this action most recently became ready.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_at_ms: Option<i64>,
+    /// Daemon-host working directory for a copied remote artifact set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_cwd: Option<String>,
     /// Optional command run before `command`/the expanded `prompt`, e.g. to
     /// stop a stale process from a previous run. Opt-in at run time via a UI
     /// checkbox.
@@ -118,6 +146,25 @@ pub struct GuardianCheck {
     pub inputs: Vec<CheckInput>,
 }
 
+/// One prepared output and how it becomes visible to a manual action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuardianArtifact {
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<String>,
+    pub placement: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness_command: Option<String>,
+    #[serde(default)]
+    pub executable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_os: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_arch: Option<String>,
+}
+
 /// This review's own declared build step (RAL-342), authored via
 /// `[[review.auto_build]]` and resolved once at submit time
 /// (`reviews::derive_reviews`, converted from `ralphus_core::schema::AutoBuildDef`)
@@ -125,12 +172,16 @@ pub struct GuardianCheck {
 /// a static shell `command`, or an agent invocation described by the
 /// remaining fields -- exactly one of the two shapes is populated, enforced
 /// by `core::validate` at parse time.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct GuardianAutoBuild {
     /// Verbatim shell command to run against the combined worktree (mutually
     /// exclusive with the agent-invocation fields below).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
+    /// Ordered shell commands belonging to one preparation group. All must
+    /// finish before the group is ready.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<String>,
     /// Prompt forwarded to the build agent (mutually exclusive with `command`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
@@ -148,6 +199,10 @@ pub struct GuardianAutoBuild {
     /// Model override for the build agent invocation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Environment overrides applied to every command or agent invocation in
+    /// this preparation group.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub environment: std::collections::BTreeMap<String, String>,
 }
 
 /// Lifecycle state of a guardian/review.
@@ -1100,16 +1155,11 @@ pub struct GuardianView {
     /// When [`Self::notice_kind`] was recorded (epoch ms). `None` alongside
     /// `notice_kind: None`.
     pub notice_at_ms: Option<i64>,
-    /// This review's declared build step (RAL-342), from `[[review.auto_build]]`.
-    /// `None` means the review declared `skip_auto_build = true` instead --
-    /// unlike [`Self::resolver_agent`]-style overrides, `None` here is never
-    /// "inherit the project config default": every guardian created after
-    /// the RAL-342 migration has exactly one of this field or
-    /// [`Self::skip_auto_build`] set, enforced at submit time
-    /// (`reviews::require_auto_build_declaration`). A guardian created
-    /// before that migration shipped simply has no auto_build tier at
-    /// finalize time (see `guardian_merge::final_checks`).
-    pub auto_build: Option<GuardianAutoBuild>,
+    /// Preparation steps persisted for this review. The serialized field name
+    /// keeps existing database rows readable; an empty list is a valid review
+    /// that needs no preparation command.
+    #[serde(rename = "preparation")]
+    pub auto_build: Vec<GuardianAutoBuild>,
     /// The summary format stamped when this review was created.
     pub summary_format: Option<String>,
     /// The summary format used by the merge engine.
@@ -1408,11 +1458,13 @@ impl Store {
             .map(|command| {
                 serde_json::to_string(&GuardianAutoBuild {
                     command: Some(command.to_string()),
+                    commands: Vec::new(),
                     prompt: None,
                     system_prompt: None,
                     system_prompt_position: None,
                     agent: None,
                     model: None,
+                    environment: std::collections::BTreeMap::new(),
                 })
             })
             .transpose()
@@ -3007,8 +3059,19 @@ impl Store {
         id: &str,
         auto_build: Option<&GuardianAutoBuild>,
     ) -> Result<()> {
-        let json =
-            auto_build.map(|b| serde_json::to_string(b).unwrap_or_else(|_| "{}".to_string()));
+        self.set_guardian_preparation(id, auto_build.into_iter().cloned().collect())
+    }
+
+    /// Store all ordered preparation steps. The existing JSON column is kept
+    /// so databases migrate without copying payloads; readers accept both the
+    /// former single-object representation and the current array.
+    pub fn set_guardian_preparation(
+        &self,
+        id: &str,
+        preparation: Vec<GuardianAutoBuild>,
+    ) -> Result<()> {
+        let json = (!preparation.is_empty())
+            .then(|| serde_json::to_string(&preparation).unwrap_or_else(|_| "[]".to_string()));
         let n = self.conn.execute(
             "UPDATE guardians SET auto_build_json=?, updated_at_ms=? WHERE id=?",
             params![json, crate::store::now_ms(), id],
@@ -3022,6 +3085,11 @@ impl Store {
 
     /// This review's declared build step -- see [`GuardianView::auto_build`].
     pub fn guardian_auto_build(&self, id: &str) -> Result<Option<GuardianAutoBuild>> {
+        Ok(self.guardian_preparation(id)?.into_iter().next())
+    }
+
+    /// This review's ordered preparation steps.
+    pub fn guardian_preparation(&self, id: &str) -> Result<Vec<GuardianAutoBuild>> {
         let json: Option<String> = self
             .conn
             .query_row(
@@ -3031,7 +3099,16 @@ impl Store {
             )
             .optional()?
             .ok_or(StoreError::NotFound)?;
-        Ok(json.as_deref().and_then(|s| serde_json::from_str(s).ok()))
+        let Some(json) = json else {
+            return Ok(Vec::new());
+        };
+        if let Ok(steps) = serde_json::from_str::<Vec<GuardianAutoBuild>>(&json) {
+            return Ok(steps);
+        }
+        Ok(serde_json::from_str::<GuardianAutoBuild>(&json)
+            .ok()
+            .into_iter()
+            .collect())
     }
 
     /// Set the summary rendering format stored for this review.
@@ -4276,11 +4353,17 @@ impl Store {
     /// `in_review`. The two jobs it covers run concurrently against a scratch
     /// checkout of the finished stack; see [`GuardianView::post_merge_status`].
     pub fn start_guardian_post_merge(&self, id: &str) -> Result<i64> {
-        let started = crate::store::now_ms();
+        let now = crate::store::now_ms();
         self.conn.execute(
             "UPDATE guardians SET post_merge_status='running', post_merge_detail=NULL, \
-             post_merge_started_at_ms=?, post_merge_finished_at_ms=NULL WHERE id=?",
-            params![started, id],
+             post_merge_started_at_ms=MAX(?, COALESCE(post_merge_started_at_ms + 1, ?)), \
+             post_merge_finished_at_ms=NULL WHERE id=?",
+            params![now, now, id],
+        )?;
+        let started = self.conn.query_row(
+            "SELECT post_merge_started_at_ms FROM guardians WHERE id=?",
+            params![id],
+            |row| row.get(0),
         )?;
         Ok(started)
     }
@@ -5304,7 +5387,13 @@ impl Store {
             .iter()
             .filter(|b| b.merge_status == "failed")
             .count();
-        let checks_state: &'static str = if !manual_commands.is_empty() {
+        let checks_state: &'static str = if row.post_merge_status.as_deref() == Some("ok") {
+            "ready"
+        } else if row.post_merge_status.as_deref() == Some("failed") {
+            "failed"
+        } else if row.post_merge_status.as_deref() == Some("running") {
+            "generating"
+        } else if !manual_commands.is_empty() {
             "ready"
         } else if row.status == "merging"
             && !enabled_branches.is_empty()
@@ -5336,7 +5425,15 @@ impl Store {
         let auto_build = row
             .auto_build_json
             .as_deref()
-            .and_then(|json| serde_json::from_str::<GuardianAutoBuild>(json).ok());
+            .map(|json| {
+                serde_json::from_str::<Vec<GuardianAutoBuild>>(json).unwrap_or_else(|_| {
+                    serde_json::from_str::<GuardianAutoBuild>(json)
+                        .ok()
+                        .into_iter()
+                        .collect()
+                })
+            })
+            .unwrap_or_default();
 
         // RAL-168: resolve this review's own Proof-scope override (if any)
         // against the project-level `.ralphus.toml [review] default_proof_scope`
@@ -6660,6 +6757,7 @@ mod tests {
                     prompt: None,
                     cleanup_command: None,
                     inputs: vec![],
+                    ..GuardianCheck::default()
                 }],
                 None,
                 None,
@@ -6682,6 +6780,7 @@ mod tests {
                 prompt: None,
                 cleanup_command: None,
                 inputs: vec![],
+                ..GuardianCheck::default()
             },
             GuardianCheck {
                 label: None,
@@ -6694,6 +6793,7 @@ mod tests {
                     default: "7890".to_string(),
                     r#type: CheckInputType::Int,
                 }],
+                ..GuardianCheck::default()
             },
         ];
         store
@@ -6726,6 +6826,7 @@ mod tests {
                 default: "7890".to_string(),
                 r#type: CheckInputType::Int,
             }],
+            ..GuardianCheck::default()
         }];
         store.set_guardian_action_hints(&id, &hints).unwrap();
         let g = store.get_guardian(&id).unwrap();
@@ -7590,47 +7691,51 @@ mod tests {
     }
 
     #[test]
-    fn auto_build_defaults_none_and_round_trips_both_shapes() {
+    fn preparation_defaults_empty_and_accepts_legacy_single_step_writes() {
         let store = Store::open_in_memory().unwrap();
         let id = store.create_guardian("r", "main", "/repo").unwrap();
-        assert!(store.get_guardian(&id).unwrap().auto_build.is_none());
+        assert!(store.get_guardian(&id).unwrap().auto_build.is_empty());
         assert!(store.guardian_auto_build(&id).unwrap().is_none());
 
         let command_build = GuardianAutoBuild {
             command: Some("make build".to_string()),
+            commands: Vec::new(),
             prompt: None,
             system_prompt: None,
             system_prompt_position: None,
             agent: None,
             model: None,
+            environment: std::collections::BTreeMap::new(),
         };
         store
             .set_guardian_auto_build(&id, Some(&command_build))
             .unwrap();
         assert_eq!(
             store.get_guardian(&id).unwrap().auto_build,
-            Some(command_build.clone())
+            vec![command_build.clone()]
         );
         assert_eq!(store.guardian_auto_build(&id).unwrap(), Some(command_build));
 
         let agent_build = GuardianAutoBuild {
             command: None,
+            commands: Vec::new(),
             prompt: Some("build the project".to_string()),
             system_prompt: Some("you are a build agent".to_string()),
             system_prompt_position: Some("append".to_string()),
             agent: Some("claude".to_string()),
             model: Some("sonnet".to_string()),
+            environment: std::collections::BTreeMap::new(),
         };
         store
             .set_guardian_auto_build(&id, Some(&agent_build))
             .unwrap();
         assert_eq!(
             store.get_guardian(&id).unwrap().auto_build,
-            Some(agent_build)
+            vec![agent_build]
         );
 
         store.set_guardian_auto_build(&id, None).unwrap();
-        assert!(store.get_guardian(&id).unwrap().auto_build.is_none());
+        assert!(store.get_guardian(&id).unwrap().auto_build.is_empty());
 
         assert!(store.set_guardian_auto_build("nope", None).is_err());
     }
@@ -9621,5 +9726,26 @@ mod tests {
             store.link_review_cell(&gid, &branch_id, &squad, 9, 9),
             Err(StoreError::NotFound)
         ));
+    }
+
+    #[test]
+    fn post_merge_start_stamps_are_strictly_monotonic() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("R", "main", "/repo").unwrap();
+
+        let first = store.start_guardian_post_merge(&id).unwrap();
+        let second = store.start_guardian_post_merge(&id).unwrap();
+
+        assert!(second > first);
+        assert!(
+            !store
+                .finish_guardian_post_merge(&id, first, true, None)
+                .unwrap()
+        );
+        assert!(
+            store
+                .finish_guardian_post_merge(&id, second, true, None)
+                .unwrap()
+        );
     }
 }

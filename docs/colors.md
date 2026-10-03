@@ -218,15 +218,6 @@ caution-reserved `ignored` status), and `info`/`debug`/`trace` use the neutral
 display; it exists only because no existing role fit this new concept
 (see "Adding a new UI element" below).
 
-### Unverified review — `--unverified` only (RAL-101)
-The Reviews panel's "check gates" section uses `--unverified` for exactly one
-case: a review reached `in_review` with **no** explicit check gates *and* no
-project `auto_build` default configured, so it carries zero build/test
-verification. This is a distinct concept from the caution-reserved `ignored`
-status and from Cartographer's `--warn` log severity — reuse neither for it;
-`--unverified` exists only because no existing role fit this new concept
-(see "Adding a new UI element" below).
-
 ### Down-time waiting — `--waiting` only (RAL-122)
 A squad that is `pending` purely because a configured scheduler down-time
 window (`[daemon]` in `.ralphus.toml`) is currently active is shown with the

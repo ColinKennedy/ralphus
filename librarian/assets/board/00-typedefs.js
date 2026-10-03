@@ -59,6 +59,13 @@
        * @property {string[]} [depends_on]
        * @property {string} [command]
        * @property {string} [prompt]
+       * @property {string} [description]
+       * @property {string} [success]
+       * @property {string} [run_on]
+       * @property {string} [preparation_state] - "waiting" | "preparing" | "transferring" | "ready" | "failed" | "stale"
+       * @property {string} [preparation_detail]
+       * @property {number} [prepared_at_ms]
+       * @property {string} [prepared_cwd]
        * @property {string|null} [system_prompt]
        * @property {string} [agent_session_id]
        * @property {string} [machine] - RAL-185/RAL-288: where this cell is routed. Absent/undefined means the daemon's own host.
@@ -251,6 +258,13 @@
        * @property {string} [label]
        * @property {string} [command]
        * @property {string} [prompt]
+       * @property {string} [description]
+       * @property {string} [success]
+       * @property {string} [run_on] - "daemon" | "review_machine"
+       * @property {string} [preparation_state] - "preparing" | "transferring" | "ready" | "failed"
+       * @property {string} [preparation_detail]
+       * @property {number} [prepared_at_ms]
+       * @property {string} [prepared_cwd]
        * @property {string} [cleanup_command]
        * @property {CheckInput[]} [inputs]
        */
@@ -333,14 +347,14 @@
        * @property {string} [review_type]
        * @property {string} [review_branch]
        * @property {string} [combined_worktree]
-       * @property {string[]} [checks]
-       * @property {string} [checks_state] - "ready" | "generating" | "waiting"
+       * @property {string} [checks_state] - "ready" | "generating" | "waiting" | "failed"
        * @property {GuardianCheck[]} [manual_commands]
        * @property {string} [manual_commands_agent]
        * @property {string} [manual_commands_model]
        * @property {string} [manual_commands_agent_session_id]
        * @property {boolean} [manual_commands_thinking_capable] - RAL-516: whether the effective manual-checks agent can emit thinking output at all (backend capability folded with any per-profile override, computed server-side). The Live View hides its "Show Thinking" checkbox entirely when this is `false`.
        * @property {GuardianCheck[]} [action_hints]
+       * @property {object[]} [preparation] - Ordered unattended steps completed before manual controls become ready.
        * @property {Record<string,string>} [input_values]
        * @property {Record<string,InputResolution>} [input_resolutions]
        * @property {string} [resolver_agent]
@@ -371,7 +385,7 @@
        * @property {number} [merge_attempt] - RAL-193: current merge-attempt counter, bumped once per rebase/re-merge.
        * @property {number|null} [manual_checks_started_at_ms] - RAL-259: epoch-ms when this review's manual-checks generation agent most recently began work, or null if generation hasn't started yet. Persists after generation finishes.
        * @property {number|null} [manual_checks_finished_at_ms] - epoch-ms when this review's manual-checks generation agent most recently finished work, or null if generation hasn't completed yet. Shown alongside `manual_checks_started_at_ms` once the Live View shows a historical record.
-       * @property {string|null} [post_merge_status] - the post-merge phase's rolled-up state: "running" while the check gates and/or manual-checks generation are still working against an already-finished stack, then "ok" or "failed"; null for a review that has never completed a merge. The review's own status is `in_review` throughout — a merge is complete once its branches are rebased, and these jobs run after it. "failed" is advisory and never blocks approval or PR submission.
+       * @property {string|null} [post_merge_status] - manual-preparation state: "running" while preparation and manual-check generation work against an already-finished stack, then "ok" or "failed"; null before the first completed merge. The review stays `in_review` throughout, and a failure is advisory.
        * @property {string|null} [post_merge_detail] - the post-merge phase's note: what failed when `post_merge_status` is "failed", otherwise the gate's own summary (e.g. which build command ran). Null when there is nothing to report.
        * @property {number|null} [post_merge_started_at_ms] - epoch-ms when the post-merge phase most recently started, or null if it has never run.
        * @property {number|null} [post_merge_finished_at_ms] - epoch-ms when the post-merge phase most recently finished, or null while it is still running.

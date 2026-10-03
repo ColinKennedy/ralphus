@@ -49,8 +49,6 @@
        * @property {string} originalProofScope
        * @property {boolean} proofSkipAutoClean
        * @property {boolean} originalProofSkipAutoClean
-       * @property {boolean} skipAutoBuild
-       * @property {boolean} originalSkipAutoBuild
        * @property {boolean} skipWorktrees
        * @property {boolean} originalSkipWorktrees
        * @property {boolean} skipBaseUpdates - RAL-514: this review's own override for whether the automatic base-branch auto-update rebuild is skipped.
@@ -72,7 +70,7 @@
        * @property {{[project: string]: boolean}} squash
        * @property {string[]} originalSquashOn
        * @property {string[]} projects
-       * @property {string} focus - Which setup-strip chip opened this modal ("onto", "resolver", "proof", "squash", "gates", "worktrees"), or "" when opened from the editor button. The matching group is highlighted and scrolled to.
+       * @property {string} focus - Which setup-strip chip opened this modal ("onto", "resolver", "proof", "squash", "worktrees"), or "" when opened from the editor button. The matching group is highlighted and scrolled to.
        */
 
       /**
@@ -131,7 +129,6 @@
         for (const p of projects) squash[p] = squashOn.includes(p);
         const proofScope = g.effective_proof_scope || "each_branch";
         const proofSkipAutoClean = !!g.effective_proof_skip_auto_clean;
-        const skipAutoBuild = !!g.skip_auto_build;
         const skipWorktrees = !!g.skip_worktrees;
         const skipBaseUpdates = !!g.effective_skip_base_updates;
         const separatePrBranch = !!g.effective_separate_pr_branch;
@@ -154,7 +151,6 @@
           originalResolverModel: g.resolver_model || "",
           proofScope, originalProofScope: proofScope,
           proofSkipAutoClean, originalProofSkipAutoClean: proofSkipAutoClean,
-          skipAutoBuild, originalSkipAutoBuild: skipAutoBuild,
           skipWorktrees, originalSkipWorktrees: skipWorktrees,
           skipBaseUpdates, originalSkipBaseUpdates: skipBaseUpdates,
           separatePrBranch, originalSeparatePrBranch: separatePrBranch,
@@ -181,7 +177,7 @@
        * (see `70-sse.js`) when missing.
        * @param {string} gid
        * @param {string} [focus] - A setup-strip chip key ("onto", "resolver",
-       *   "proof", "squash", "gates", "worktrees"). The chip is both the
+       *   "proof", "squash", "worktrees"). The chip is both the
        *   display of a setting and the way in to editing it, so arriving from
        *   one lands on the field it showed rather than at the top of a modal
        *   you then have to search.
@@ -273,12 +269,6 @@
        * @returns {void}
        */
       function onEditProofSkipAutoClean(checked) { if (reviewEditDraft) reviewEditDraft.proofSkipAutoClean = checked; }
-      /**
-       * Stages the skip-auto-build flag.
-       * @param {boolean} checked
-       * @returns {void}
-       */
-      function onEditSkipAutoBuild(checked) { if (reviewEditDraft) reviewEditDraft.skipAutoBuild = checked; }
       /**
        * Stages the skip-per-branch-worktrees flag.
        * @param {boolean} checked
@@ -508,7 +498,7 @@
         } else {
           envEditDraft = {
             gid, scope: "build", branchId: "",
-            title: "the build step — check gates and test actions",
+            title: "manual-check preparation and test actions",
             inherited: review.combined_env || {},
             sd: envScopeDraftFromOwn(review.build_env_overrides || {}),
           };
@@ -688,12 +678,10 @@
               </div></div>
             <div ${grp("resolver")}><h3 class="section">resolver</h3>${resolverSection}</div>
             <div ${grp("proof")}><h3 class="section">proof</h3>${proofScopeSection}</div>
-            <div ${grp("gates")}><h3 class="section">build &amp; rebase</h3>
-              <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:6px" data-tip="Skip the finalize-time build/check step entirely. Applies on Save.">
-                <input type="checkbox" ${draft.skipAutoBuild ? "checked" : ""} onchange="onEditSkipAutoBuild(this.checked)">skip auto-build</label>
+            <div><h3 class="section">rebase</h3>
               <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Overrides the project default for this review only: when its upstream branch moves, don't automatically rebuild/rebase this review's stack onto the new tip. Use for a review whose auto-rebase keeps getting in the way (e.g. one under heavy manual conflict resolution). You can still start a merge/rebase manually at any time, individually or via the review list's bulk Merge/Rebase action, regardless of this setting. Applies on Save.">
                 <input type="checkbox" ${draft.skipBaseUpdates ? "checked" : ""} onchange="onEditSkipBaseUpdates(this.checked)">skip automatic base-branch rebasing</label>
-              <div class="hint">The gate commands themselves live in the review's check gates section, next to their logs — editing one there also edits its environment.</div></div>
+              <div class="hint">Manual-check preparation is declared in task TOML and runs automatically before its controls unlock.</div></div>
             <div ${grp("worktrees")}><h3 class="section">worktrees</h3>
               <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:6px" data-tip="Build the entire branch stack in one shared worktree instead of isolated per-branch worktrees. Applies on Save.">
                 <input type="checkbox" ${draft.skipWorktrees ? "checked" : ""} onchange="onEditSkipWorktrees(this.checked)">skip per-branch worktrees</label></div>
@@ -767,7 +755,6 @@
           body.proof_scope = draft.proofScope;
           body.proof_skip_auto_clean = draft.proofSkipAutoClean;
         }
-        if (draft.skipAutoBuild !== draft.originalSkipAutoBuild) body.skip_auto_build = draft.skipAutoBuild;
         if (draft.skipWorktrees !== draft.originalSkipWorktrees) body.skip_worktrees = draft.skipWorktrees;
         if (draft.skipBaseUpdates !== draft.originalSkipBaseUpdates) body.skip_base_updates = draft.skipBaseUpdates;
         if (draft.separatePrBranch !== draft.originalSeparatePrBranch) body.separate_pr_branch = draft.separatePrBranch;

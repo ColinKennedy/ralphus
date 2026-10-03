@@ -32,6 +32,7 @@ const SUPPORTED_OPS: &[&str] = &[
     "read-file",
     "write-file",
     "remove-path",
+    "materialize",
     "cleanup",
     "capabilities",
     "terminal",
@@ -124,6 +125,7 @@ mod tests {
         assert!(ops.iter().any(|v| v == "provision"));
         assert!(ops.iter().any(|v| v == "run"));
         assert!(ops.iter().any(|v| v == "terminal"));
+        assert!(ops.iter().any(|v| v == "materialize"));
         assert!(
             !ops.iter().any(|v| v == "channel"),
             "channel is not implemented"

@@ -469,10 +469,10 @@
        * for the review rather than asking for anything new.
        *
        * Only passes that ran under a pane are listed. A PR submit goes out over
-       * the forge's REST API and a check gate runs as a plain command, so
+       * the forge's REST API and preparation commands run as plain commands, so
        * neither ever had a transcript -- an entry for one could only ever say
        * "nothing to show here", which is a walk-back stop that cannot be walked
-       * to. Both stay recorded elsewhere: gates in the check-gates section,
+       * to. Both stay recorded elsewhere: preparation in its readiness section,
        * both of them in the logs drawer.
        * @param {GuardianView} g - The review.
        * @param {GuardianBranch} b - The branch.
@@ -673,7 +673,7 @@
             <button class="hnav" data-click="stepBranchRun" data-branch-id="${esc(b.id)}" data-dir="-1" ${ri <= 0 ? "disabled" : ""}
               data-tip="Step back to the previous run on this branch.">&#9664;</button>
             <button class="hpick" data-click="scopeReviewDockToBranch" data-guardian-id="${esc(g.id)}" data-branch-id="${esc(b.id)}"
-              data-tip="Every agent session this branch ran — rebases, final proofs, feedback revisions.\nOpens the log drawer, where each run's own rows are listed, along with the PR submits and check gates that never had a session to replay.">
+              data-tip="Every agent session this branch ran — rebases, final proofs, feedback revisions.\nOpens the log drawer, where each run's own rows are listed alongside non-agent operations such as PR submission.">
               <span class="hkind ${esc(run.kind)}">${esc(run.kind)}</span>
               <span class="hlabel mono">${esc(run.label)}</span>
               <span class="hmeta">${esc(runMeta(run))}</span>
@@ -1042,7 +1042,6 @@
       /** @type {{[kind: string]: {label: string, note: string}}} What each section's menu is about. */
       const REVIEW_SECTION_MENUS = {
         summary: { label: "change summary", note: "Written from git log as branches become ready, then replaced by an agent-written summary." },
-        gates: { label: "check gates", note: "Run after each merge commit and on the combined worktree. All must pass before approval." },
         branches: { label: "branch stack", note: "The rebase stack, in order. Each branch rebases onto the one above it." },
         actions: { label: "test actions", note: "Declared by the task author in [[review.action]] blocks." },
         manual: { label: "manual checks", note: "Written by the resolver agent against this stack's changes. Advisory — they never block approval." },
@@ -1050,17 +1049,11 @@
       /**
        * Which env scope each runnable section edits.
        *
-       * `edit` is the writable scope. Check gates and test actions share one:
-       * the daemon composes the gates' environment from the daemon's own plus
-       * the build step's overrides, so both sections edit `build`.
+       * `edit` is the writable scope. Test actions use the preparation/build
+       * environment; generated manual checks have their own override layer.
        * @type {{[kind: string]: {edit: string, label: string, tip: string}}}
        */
       const ENV_SCOPE_FOR_SECTION = {
-        gates: {
-          edit: "build",
-          label: "check gates",
-          tip: "Edit the environment the check gates run in.\nThe daemon composes it from its own environment plus the build step's overrides, so this edits the build step's — shared with test actions.",
-        },
         manual: {
           edit: "manual_checks",
           label: "manual checks",
@@ -1069,7 +1062,7 @@
         actions: {
           edit: "build",
           label: "test actions",
-          tip: "Edit the environment overrides for the build step, which is what test actions run against.\nShared with the check gates, which resolve from the same layer.",
+          tip: "Edit the environment overrides used by preparation and authored test actions.",
         },
       };
       /**
@@ -1122,9 +1115,6 @@
         if (kind === "manual") {
           items.push(`<div data-click="runAllManualChecks" data-guardian-id="${esc(gid)}" data-tip="Run every suggested manual check, each in the built review worktree.">▶ Run all</div>`);
           items.push(`<div data-click="regenManualChecks" data-guardian-id="${esc(gid)}" data-tip="Ask the resolver agent to write these checks again against the stack's current changes.\nRuns in the background and never blocks Approve or Merge / rebase.">↻ Regenerate</div>`);
-        }
-        if (kind === "gates") {
-          items.push(`<div data-click="openEditReviewDetails" data-guardian-id="${esc(gid)}" data-focus="gates" data-tip="Open review setup on the build settings that decide whether gates run at all.\nThe gate commands themselves come from the project's review settings, not from here.">✎ Build settings…</div>`);
         }
         if (kind === "summary") {
           const g = guardians.find((x) => x.id === gid);
@@ -1549,7 +1539,7 @@
        * command -- what it will actually execute, and the fields that decide it.
        * @param {string} key - The command's key.
        * @param {string} cmd - The command text, with `{name}` placeholders intact.
-       * @param {{g: GuardianView, check: GuardianCheck, kind: string, i: number}} [opts] - The check this row runs, when it takes parameters. Omitted for a check gate, which takes none.
+       * @param {{g: GuardianView, check: GuardianCheck, kind: string, i: number}} [opts] - The manual check this row runs, when it takes parameters.
        * @returns {string}
        */
       function commandFullBlock(key, cmd, opts) {
@@ -1573,7 +1563,7 @@
       }
 
       /**
-       * Opens one command's ⋯ menu -- a check gate, for now. Commands are long
+       * Opens one command's ⋯ menu. Commands are long
        * and elided in their row, so "see the whole thing" and "copy it" need a
        * home that is not the row itself.
        * @param {MouseEvent} e - The click that opened it.

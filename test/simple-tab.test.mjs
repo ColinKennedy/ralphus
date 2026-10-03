@@ -224,10 +224,9 @@ test("ntPlannedGenerationKinds only includes manual_checks when reviewMode is ex
   assert.deepEqual(ntPlannedGenerationKinds(freshState({ reviewMode: "explicit", generateManualChecks: true })), ["manual_checks"]);
 });
 
-test("ntPlannedGenerationKinds only includes auto_build_steps when reviewMode is explicit, auto-build isn't skipped, and the checkbox is set", () => {
-  assert.deepEqual(ntPlannedGenerationKinds(freshState({ reviewMode: "explicit", skipAutoBuild: true, generateAutoBuild: true })), [], "generateAutoBuild while skipped must not plan a job");
-  assert.deepEqual(ntPlannedGenerationKinds(freshState({ reviewMode: "auto", skipAutoBuild: false, generateAutoBuild: true })), [], "generateAutoBuild outside an explicit review must not plan a job");
-  assert.deepEqual(ntPlannedGenerationKinds(freshState({ reviewMode: "explicit", skipAutoBuild: false, generateAutoBuild: true })), ["auto_build_steps"]);
+test("ntPlannedGenerationKinds only includes preparation generation for an explicit review", () => {
+  assert.deepEqual(ntPlannedGenerationKinds(freshState({ reviewMode: "auto", generateAutoBuild: true })), [], "preparation generation outside an explicit review must not plan a job");
+  assert.deepEqual(ntPlannedGenerationKinds(freshState({ reviewMode: "explicit", generateAutoBuild: true })), ["auto_build_steps"]);
 });
 
 test("ntPlannedGenerationKinds includes every kind when everything is opted in", () => {

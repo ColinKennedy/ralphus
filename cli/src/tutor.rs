@@ -525,13 +525,16 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                 Set false to have every later merge or rebase regenerate
                 the checks from the freshly stacked diff.
 
- [[review.auto_build]]  (zero or more per [[review]])
- Declare the build steps that run at merge/finalize time (RAL-342).
+ [[review.prepare]]  (zero or more per [[review]])
+ Declare ordered unattended work that makes manual actions ready before a
+ reviewer presses Run.
  Each entry is run in order. Exactly ONE of `prompt` or `command`
  is required per entry.
 
  Key                     Type           Notes
- command                 string  ONE-OF Verbatim shell command run directly.
+ command                 string|string[] ONE-OF One command, or an ordered
+                                       command group run directly. Every command
+                                       completes before the group is ready.
  prompt                  string  ONE-OF Agent prompt to figure out and run the
                                        build. The agent is inferred from the
                                        review's `agent` field (or the
@@ -548,16 +551,96 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                                        step (only valid with `prompt`). Unset falls
                                        back to the review's `model`, then the
                                        project-level default.
+ environment             table          String environment overrides applied to
+                                       every command or agent call in this group.
 
  [[review.action]]  (zero or more per [[review]])
- User-declared labelled buttons shown in the review pane.
+ User-declared labelled buttons shown in the review pane. Every action is
+ optional to run and never blocks approval.
  Exactly ONE of `prompt` or `command` is required per entry.
 
  Key     Type    Notes
  label   string  REQUIRED. Text shown on the UI button.
  command string  ONE-OF Verbatim shell command run in a terminal.
  prompt  string  ONE-OF Hint text forwarded to the resolver LLM
-                 to expand into a runnable command before running.
+                 to expand into a runnable command during preparation.
+ run_on  string         "daemon" (default) or "review_machine".
+ description string     What the reviewer should inspect.
+ success string         Optional guidance on what to inspect. Omit it for the
+                        normal "exit code 0" manual action.
+
+[[review.action.prepare]] belongs to the immediately preceding
+[[review.action]] and uses the same command/prompt shape as [[review.prepare]]
+for action-specific setup. Its command may be one string or an ordered
+string array; environment overrides apply to that whole group. Equal action
+preparation groups are run once per preparation generation and satisfy every
+action that declares them.
+
+Preparation/action commands, group environment values, shared_path, and
+readiness_command may embed <<ralphus:new-worktree/BRANCH?upstream=UPSTREAM
+&text=basename({})>>. This is text interpolation only: it expands to BRANCH
+(or its requested text transform) and does not create another worktree.
+
+ [[review.action.artifact]] declares selected prepared outputs:
+ source             relative path produced in the review checkout
+ placement          "copy", "retain", or "shared"
+ destination        relative daemon-side path (required for "copy")
+ shared_path        network path/URI (required for "shared")
+ readiness_command  proves shared output is usable (required for "shared")
+ executable         preserve/add executable mode where supported
+ target_os          required for executable artifacts (windows/linux/macos)
+ target_arch        required for executable artifacts (x86_64/aarch64/etc.)
+
+ Placement recipes:
+
+ 1. Local build and local test: review has no remote machine. Prepare and Run
+    both use the retained local review checkout; no transfer is needed.
+
+    [[review.prepare]]
+    command = ["cargo build --bin demo", "cargo test --bin demo"]
+    environment = { RUST_LOG = "demo=debug" }
+
+    [[review.action]]
+    label = "Run local demo"
+    command = "target/debug/demo"
+    run_on = "daemon"
+
+ 2. Remote build, local test: assign [[review]] machine, build there, and
+    copy only the selected executable/resources back before Run enables.
+
+    [[review.action]]
+    label = "Run copied desktop build"
+    command = "staged/demo"
+    run_on = "daemon"
+
+      [[review.action.artifact]]
+      source = "target/release/demo"
+      destination = "staged/demo"
+      placement = "copy"
+      executable = true
+      target_os = "windows"
+      target_arch = "x86_64"
+
+ 3. Shared/network placement: preparation publishes to a mounted share or
+    artifact store. Ralphus verifies readiness but does not relay the payload.
+
+    [[review.action]]
+    label = "Exercise shared build"
+    command = "//build-share/demo/<<ralphus:new-worktree/RAL-999-add_widget?upstream=main&text=basename({})>>/demo"
+    run_on = "daemon"
+
+      [[review.action.prepare]]
+      command = [
+        "cmake -S . -B /mnt/build-share/<<ralphus:new-worktree/RAL-999-add_widget?upstream=main&text=basename({})>>/build",
+        "cmake --build /mnt/build-share/<<ralphus:new-worktree/RAL-999-add_widget?upstream=main&text=basename({})>>/build --target demo"
+      ]
+      environment = { BUILD_FLAVOR = "release" }
+
+      [[review.action.artifact]]
+      source = "target/release/demo"
+      placement = "shared"
+      shared_path = "//build-share/demo/<<ralphus:new-worktree/RAL-999-add_widget?upstream=main&text=basename({})>>/demo"
+      readiness_command = "test -x /mnt/build-share/demo/<<ralphus:new-worktree/RAL-999-add_widget?upstream=main&text=basename({})>>/demo"
 
 ---------------------------------------------------------------
  Triage (RAL-318) -- auto-review opt-in, alternative to [[review]]
@@ -1025,20 +1108,23 @@ auto_fix_pr_errors = true  # dispatch the resolver agent to fix a failing PR/MR 
 auto_cancel_outdated_pr_pipelines = true  # on by default; cancel stale CI runs when a newer commit is force-pushed
 cache_manual_checks = true  # on by default; compute manual checks once at first branch creation (RAL-521)
 
-# Build step 1: static command (run verbatim in shell).
-[[review.auto_build]]
+# Shared preparation runs before any manual action is enabled.
+[[review.prepare]]
 command = "cargo build --release"
 
-# Build step 2: agent-driven command (agent figures out the build).
+# Agent-driven preparation is also supported and runs in declaration order.
 # If agent/model are unset here, they inherit from the review's agent/model above.
-[[review.auto_build]]
+[[review.prepare]]
 prompt  = "Build this Rust project. Figure out what build tool to use and run it."
 agent   = "{<insert recommended agent here>}"  # optional: uses review's agent if unset
 
 # Optional: user-declared test buttons shown in the review pane.
 [[review.action]]
 label   = "Run tests"
-command = "cargo test --all-targets"
+command = "target/debug/my-test-runner"
+description = "Run the already-built focused test executable."
+success = "The focused scenario completes and prints PASS."
+run_on = "daemon"
 
 [[review.action]]
 label  = "Frontend smoke test"
@@ -1182,6 +1268,17 @@ mod tests {
         assert!(TASK_TUTOR.contains("[[task]]"));
         assert!(TASK_TUTOR.contains("[[task.cell]]"));
         assert!(TASK_TUTOR.contains("[[review]]"));
+    }
+
+    #[test]
+    fn tutor_teaches_all_manual_preparation_placements() {
+        assert!(TASK_TUTOR.contains("[[review.prepare]]"));
+        assert!(TASK_TUTOR.contains("1. Local build and local test"));
+        assert!(TASK_TUTOR.contains("2. Remote build, local test"));
+        assert!(TASK_TUTOR.contains("3. Shared/network placement"));
+        assert!(TASK_TUTOR.contains("placement = \"copy\""));
+        assert!(TASK_TUTOR.contains("placement = \"shared\""));
+        assert!(TASK_TUTOR.contains("run_on = \"daemon\""));
     }
 
     #[test]

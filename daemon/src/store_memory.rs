@@ -40,6 +40,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use parking_lot::{Mutex, RwLock};
 
+use crate::cancel::CancelToken;
+
 /// The worktree-lease / restack interlock. See the module doc comment for why
 /// these three live under one lock.
 #[derive(Default)]
@@ -98,6 +100,13 @@ struct SummaryDebounce {
     repair_attempted: bool,
 }
 
+#[derive(Default)]
+struct PreparationState {
+    next_generation: u64,
+    active: HashMap<String, (u64, CancelToken)>,
+    gates: HashMap<String, std::sync::Arc<Mutex<()>>>,
+}
+
 /// One `Store`'s non-database state. Cloning the `Arc` is cheap and touches no
 /// lock, so a caller can hold a handle to this without holding the store.
 #[derive(Default)]
@@ -124,12 +133,62 @@ pub struct StoreMemory {
     /// despite both being about "is this session stalled" -- this counter
     /// tracks completed automatic restarts, not liveness.
     thinking_stall_strikes: Mutex<HashMap<String, u32>>,
+    /// Per-review ownership for advisory preparation. Starting a newer
+    /// generation cancels the prior token immediately, while the per-review
+    /// gate keeps their retained checkout and artifacts from being mutated by
+    /// two workers at once.
+    preparation: Mutex<PreparationState>,
 }
 
 impl StoreMemory {
     #[must_use]
     pub fn new() -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self::default())
+    }
+
+    // ---- review preparation ownership ----
+
+    /// Supersede any active preparation and reserve the next generation.
+    /// The caller locks the returned gate before touching prepared files.
+    pub fn begin_guardian_preparation(
+        &self,
+        guardian_id: &str,
+    ) -> (u64, CancelToken, std::sync::Arc<Mutex<()>>) {
+        let mut state = self.preparation.lock();
+        if let Some((_, token)) = state.active.get(guardian_id) {
+            token.cancel();
+        }
+        state.next_generation = state.next_generation.saturating_add(1);
+        let generation = state.next_generation;
+        let token = CancelToken::new();
+        state
+            .active
+            .insert(guardian_id.to_string(), (generation, token.clone()));
+        let gate = state
+            .gates
+            .entry(guardian_id.to_string())
+            .or_insert_with(|| std::sync::Arc::new(Mutex::new(())))
+            .clone();
+        (generation, token, gate)
+    }
+
+    /// Cancel preparation as soon as work starts changing the review basis.
+    pub fn cancel_guardian_preparation(&self, guardian_id: &str) {
+        if let Some((_, token)) = self.preparation.lock().active.get(guardian_id) {
+            token.cancel();
+        }
+    }
+
+    /// Release ownership only if this is still the newest generation.
+    pub fn finish_guardian_preparation(&self, guardian_id: &str, generation: u64) {
+        let mut state = self.preparation.lock();
+        let current = state
+            .active
+            .get(guardian_id)
+            .is_some_and(|(active, _)| *active == generation);
+        if current {
+            state.active.remove(guardian_id);
+        }
     }
 
     // ---- worktree leases / restack interlock ----
@@ -606,6 +665,47 @@ mod tests {
             mem.thinking_stall_strikes("s2"),
             1,
             "resetting one session's strikes reset an unrelated session too"
+        );
+    }
+
+    #[test]
+    fn newer_preparation_generation_immediately_cancels_the_old_one() {
+        let mem = StoreMemory::new();
+        let (first_generation, first, _) = mem.begin_guardian_preparation("g1");
+        assert!(!first.is_cancelled());
+
+        let (second_generation, second, _) = mem.begin_guardian_preparation("g1");
+
+        assert!(first.is_cancelled());
+        assert!(!second.is_cancelled());
+        assert!(second_generation > first_generation);
+    }
+
+    #[test]
+    fn preparation_generations_share_an_exclusive_review_gate() {
+        let mem = StoreMemory::new();
+        let (_, _, first_gate) = mem.begin_guardian_preparation("g1");
+        let first_lease = first_gate.lock();
+        let (_, _, second_gate) = mem.begin_guardian_preparation("g1");
+
+        assert!(second_gate.try_lock().is_none());
+        drop(first_lease);
+        assert!(second_gate.try_lock().is_some());
+    }
+
+    #[test]
+    fn cancelling_preparation_never_waits_for_its_workspace_gate() {
+        let mem = StoreMemory::new();
+        let (_, token, gate) = mem.begin_guardian_preparation("g1");
+        let _lease = gate.lock();
+
+        let started = std::time::Instant::now();
+        mem.cancel_guardian_preparation("g1");
+
+        assert!(token.is_cancelled());
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "a rebase would be blocked behind the old preparation checkout"
         );
     }
 

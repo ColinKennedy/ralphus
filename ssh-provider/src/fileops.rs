@@ -39,6 +39,8 @@ struct RunRequest {
     program: String,
     #[serde(default)]
     args: Vec<String>,
+    #[serde(default)]
+    env: std::collections::BTreeMap<String, String>,
 }
 
 /// Marker this module's `run` script always appends to its combined
@@ -167,22 +169,44 @@ pub fn run(
         .map_err(|e| format!("could not parse the run request on stdin: {e}"))?;
     require_absolute_posix_path(&req.cwd)?;
     require_under_configured_root(&req.cwd, config)?;
-    if req.program != "git" {
+    if req.program != "git" && !(req.program.is_empty() && req.args.len() == 1) {
         return Err(format!(
-            "ralphus-ssh-provider's run only supports \"git\" today; got {:?}",
+            "ralphus-ssh-provider's run supports git argv or one authored shell command; got {:?}",
             req.program
         ));
     }
-    let quoted_args = req
-        .args
-        .iter()
-        .map(|a| shell_quote_single(a))
-        .collect::<Vec<_>>()
-        .join(" ");
+    for key in req.env.keys() {
+        if key.is_empty()
+            || !key
+                .chars()
+                .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+        {
+            return Err(format!("invalid environment key in run request: {key:?}"));
+        }
+    }
+    let invocation = if req.program == "git" {
+        let quoted_args = req
+            .args
+            .iter()
+            .map(|a| shell_quote_single(a))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("{} {quoted_args}", shell_quote_single(&req.program))
+    } else {
+        let assignments = req
+            .env
+            .iter()
+            .map(|(key, value)| shell_quote_single(&format!("{key}={value}")))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!(
+            "env {assignments} sh -c {}",
+            shell_quote_single(&req.args[0])
+        )
+    };
     let script = format!(
-        "cd {cwd} && {{ {program} {quoted_args}; }} 2>&1; printf '\\n{marker}%s\\n' \"$?\"",
+        "cd {cwd} && {{ {invocation}; }} 2>&1; printf '\\n{marker}%s\\n' \"$?\"",
         cwd = shell_quote_single(&req.cwd),
-        program = shell_quote_single(&req.program),
         marker = RUN_EXIT_MARKER,
     );
     let raw = ssh_command(&target, &script, config, None)?;

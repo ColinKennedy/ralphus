@@ -6297,17 +6297,6 @@ fn submit(daemon: &Daemon, body: &str, query: &str, user_header: Option<&str>) -
         return error(400, "project_validation_failed", &msg, vec![]);
     }
 
-    // Review build declarations can be resolved from registered project
-    // configuration without materializing a worktree. Reject them here so a
-    // submit never succeeds only to fail asynchronously during materialization.
-    let review_preflight = {
-        let store = daemon.lock();
-        crate::reviews::preflight_auto_build_declarations(&store, &file)
-    };
-    if let Err(e) = review_preflight {
-        return error(400, "review_validation_failed", &e.message, vec![]);
-    }
-
     // Every `machine` value must name a registered provider at a supported
     // contract version (RAL-185). Core validated the syntax offline; only the
     // daemon can see the registry.
@@ -13386,6 +13375,7 @@ struct CreateGuardianBody {
 #[derive(Deserialize)]
 struct GuardianSettingsBody {
     #[serde(default)]
+    // ralphus[ignore-review-parity]: retained only for stored guardian compatibility settings; preparation is optional and new task files use `[[review.prepare]]` instead of a `[[review]]` key
     skip_auto_build: Option<bool>,
     #[serde(default)]
     skip_worktrees: Option<bool>,
@@ -16385,6 +16375,28 @@ fn build_check_command_line(
     marker_path: &std::path::Path,
     log_path: &std::path::Path,
 ) -> Option<PreparedCheck> {
+    let (resolved, body) =
+        build_check_command_body(check, submitted_inputs, stored_inputs, run_cleanup)?;
+    let marker = marker_path.display().to_string();
+    let log = log_path.display().to_string();
+    // cd /d sets both drive and directory on Windows before running the command.
+    let line = format!(
+        "cd /d \"{cwd}\" && ({body}) > \"{log}\" 2>&1 & echo !ERRORLEVEL!>\"{marker}\" & type \"{log}\""
+    );
+    Some(PreparedCheck {
+        resolved_command: resolved,
+        args: vec!["/V:ON".to_string(), "/K".to_string(), line],
+        marker_path: marker_path.to_path_buf(),
+        log_path: log_path.to_path_buf(),
+    })
+}
+
+fn build_check_command_body(
+    check: &crate::guardian::GuardianCheck,
+    submitted_inputs: &std::collections::HashMap<String, String>,
+    stored_inputs: &std::collections::HashMap<String, String>,
+    run_cleanup: bool,
+) -> Option<(String, String)> {
     let cmd = check.command.as_ref()?;
     let resolved = substitute_check_inputs(cmd, &check.inputs, submitted_inputs, stored_inputs);
     let body = if run_cleanup {
@@ -16403,13 +16415,45 @@ fn build_check_command_line(
     } else {
         resolved.clone()
     };
-    let marker = marker_path.display().to_string();
-    let log = log_path.display().to_string();
-    // cd /d sets both drive and directory on Windows before running the command.
+    Some((resolved, body))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_remote_check_command_line(
+    daemon: &Daemon,
+    guardian: &crate::guardian::GuardianView,
+    check: &crate::guardian::GuardianCheck,
+    submitted_inputs: &std::collections::HashMap<String, String>,
+    run_cleanup: bool,
+    marker_path: &std::path::Path,
+    log_path: &std::path::Path,
+) -> Result<PreparedCheck, String> {
+    let machine = guardian
+        .machine
+        .as_deref()
+        .ok_or_else(|| "action requested review_machine but this review is local".to_string())?;
+    let cwd = check
+        .prepared_cwd
+        .as_deref()
+        .or(guardian.combined_worktree.as_deref())
+        .ok_or_else(|| "review has no prepared worktree".to_string())?;
+    let (resolved, body) =
+        build_check_command_body(check, submitted_inputs, &guardian.input_values, run_cleanup)
+            .ok_or_else(|| "prepared action has no runnable command".to_string())?;
+    let remote_command = format!("cd '{}' && {body}", cwd.replace('\'', "'\\''"));
+    let provider = {
+        let store = daemon.lock();
+        crate::remote_runner::provider_from_store(&store, machine)?
+    }
+    .ok_or_else(|| format!("review machine {machine:?} resolved to the daemon host"))?;
+    let (program, args) = provider.terminal_invocation(&remote_command, 120, 40);
+    let invocation = ralphus_core::shellcmd::build_program_command_line("cmd", &program, &args);
+    let marker = marker_path.display();
+    let log = log_path.display();
     let line = format!(
-        "cd /d \"{cwd}\" && ({body}) > \"{log}\" 2>&1 & echo !ERRORLEVEL!>\"{marker}\" & type \"{log}\""
+        "({invocation}) > \"{log}\" 2>&1 & echo !ERRORLEVEL!>\"{marker}\" & type \"{log}\""
     );
-    Some(PreparedCheck {
+    Ok(PreparedCheck {
         resolved_command: resolved,
         args: vec!["/V:ON".to_string(), "/K".to_string(), line],
         marker_path: marker_path.to_path_buf(),
@@ -16785,21 +16829,50 @@ fn guardian_run_manual_commands(daemon: &Daemon, id: &str, body: &str) -> Reply 
     // Run against the built review worktree (e.g. `<id>-review`), not the
     // original repo — that's the checkout the commands are meant to verify
     // Fall back to git_root only if the review hasn't been built yet.
-    let cwd = g.combined_worktree.clone().unwrap_or(g.git_root.clone());
     let mut errors: Vec<String> = Vec::new();
     for (index, check) in &to_run {
+        if check.preparation_state.as_deref() != Some("ready") {
+            errors.push(format!("manual check {index} is not ready"));
+            continue;
+        }
+        let cwd = check
+            .prepared_cwd
+            .clone()
+            .or_else(|| g.combined_worktree.clone())
+            .unwrap_or_else(|| g.git_root.clone());
         let marker = new_check_run_marker(id, "manual", *index);
         let log = check_run_log_path(id, "manual", *index);
-        let Some(prepared) = build_check_command_line(
-            &cwd,
-            check,
-            &req.inputs,
-            &g.input_values,
-            req.run_cleanup,
-            &marker,
-            &log,
-        ) else {
-            continue;
+        let run_remote = check.run_on.as_deref() == Some("review_machine")
+            || (check.run_on.is_none() && g.machine.is_some());
+        let prepared = if run_remote {
+            match build_remote_check_command_line(
+                daemon,
+                &g,
+                check,
+                &req.inputs,
+                req.run_cleanup,
+                &marker,
+                &log,
+            ) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    errors.push(error);
+                    continue;
+                }
+            }
+        } else {
+            let Some(prepared) = build_check_command_line(
+                &cwd,
+                check,
+                &req.inputs,
+                &g.input_values,
+                req.run_cleanup,
+                &marker,
+                &log,
+            ) else {
+                continue;
+            };
+            prepared
         };
         match spawn_in_terminal(None, "cmd", &prepared.args, &g.manual_checks_env) {
             Ok(()) => watch_check_run(daemon.store_handle(), id, "manual", *index, &prepared),
@@ -16886,6 +16959,17 @@ fn guardian_run_action_hint(daemon: &Daemon, id: &str, body: &str) -> Reply {
         }
     };
 
+    if hint.preparation_state.as_deref() != Some("ready") {
+        return error(
+            409,
+            "action_not_ready",
+            hint.preparation_detail
+                .as_deref()
+                .unwrap_or("this action is still being prepared"),
+            vec![],
+        );
+    }
+
     if let Some(reply) = reject_invalid_check_inputs(
         daemon,
         id,
@@ -16900,18 +16984,40 @@ fn guardian_run_action_hint(daemon: &Daemon, id: &str, body: &str) -> Reply {
     // manual-checks environment -- action hints run in the same combined
     // worktree via the same terminal-spawning mechanism, so they inherit it
     // too: prefer the built review worktree over the original repo root.
-    let cwd = g.combined_worktree.clone().unwrap_or(g.git_root.clone());
+    let cwd = hint
+        .prepared_cwd
+        .clone()
+        .or_else(|| g.combined_worktree.clone())
+        .unwrap_or_else(|| g.git_root.clone());
     let marker = new_check_run_marker(id, "action", req.index);
     let log = check_run_log_path(id, "action", req.index);
-    if let Some(prepared) = build_check_command_line(
-        &cwd,
-        &hint,
-        &req.inputs,
-        &g.input_values,
-        req.run_cleanup,
-        &marker,
-        &log,
-    ) {
+    let run_remote = hint.run_on.as_deref() == Some("review_machine")
+        || (hint.run_on.is_none() && g.machine.is_some());
+    let prepared = if run_remote {
+        match build_remote_check_command_line(
+            daemon,
+            &g,
+            &hint,
+            &req.inputs,
+            req.run_cleanup,
+            &marker,
+            &log,
+        ) {
+            Ok(prepared) => Some(prepared),
+            Err(message) => return error(500, "terminal_error", &message, vec![]),
+        }
+    } else {
+        build_check_command_line(
+            &cwd,
+            &hint,
+            &req.inputs,
+            &g.input_values,
+            req.run_cleanup,
+            &marker,
+            &log,
+        )
+    };
+    if let Some(prepared) = prepared {
         let result = spawn_in_terminal(None, "cmd", &prepared.args, &g.manual_checks_env);
         if !req.inputs.is_empty() {
             let _ = daemon.lock().merge_guardian_input_values(id, &req.inputs);
@@ -16924,11 +17030,10 @@ fn guardian_run_action_hint(daemon: &Daemon, id: &str, body: &str) -> Reply {
             Err(e) => error(500, "terminal_error", &e, vec![]),
         }
     } else {
-        // prompt-kind hints are stored for display only; LLM expansion is not yet implemented.
         error(
-            501,
-            "not_implemented",
-            "prompt-kind action hints cannot be run directly yet",
+            409,
+            "action_not_prepared",
+            "prompt action has not expanded into a runnable command",
             vec![],
         )
     }
@@ -18838,6 +18943,7 @@ mod tests {
             prompt: None,
             cleanup_command: Some("echo would-clean".to_string()),
             inputs: vec![],
+            ..crate::guardian::GuardianCheck::default()
         };
         let empty = std::collections::HashMap::new();
         let prepared = build_check_command_line(
@@ -18865,6 +18971,7 @@ mod tests {
             prompt: None,
             cleanup_command: Some("ralphus-daemon stop --port {port}".to_string()),
             inputs: vec![check_input("port", "Port", "7890")],
+            ..crate::guardian::GuardianCheck::default()
         };
         let submitted = std::collections::HashMap::from([("port".to_string(), "9001".to_string())]);
         let stored = std::collections::HashMap::new();
@@ -18899,6 +19006,7 @@ mod tests {
             prompt: Some("open localhost:3000".to_string()),
             cleanup_command: None,
             inputs: vec![],
+            ..crate::guardian::GuardianCheck::default()
         };
         let empty = std::collections::HashMap::new();
         assert!(
@@ -18923,6 +19031,7 @@ mod tests {
             prompt: None,
             cleanup_command: None,
             inputs: vec![],
+            ..crate::guardian::GuardianCheck::default()
         };
         let empty = std::collections::HashMap::new();
         let prepared = build_check_command_line(
@@ -18970,6 +19079,7 @@ mod tests {
             prompt: None,
             cleanup_command: None,
             inputs: vec![],
+            ..crate::guardian::GuardianCheck::default()
         };
         let empty = std::collections::HashMap::new();
         let prepared = build_check_command_line(
@@ -19226,6 +19336,7 @@ mod tests {
                         "7890",
                         crate::guardian::CheckInputType::Int,
                     )],
+                    ..crate::guardian::GuardianCheck::default()
                 }],
                 None,
                 None,
@@ -19262,6 +19373,7 @@ mod tests {
                 &[crate::guardian::GuardianCheck {
                     label: Some("Serve locally".to_string()),
                     command: Some("ralphus-daemon serve --port {port}".to_string()),
+                    preparation_state: Some("ready".to_string()),
                     prompt: None,
                     cleanup_command: None,
                     inputs: vec![check_input_typed(
@@ -19270,6 +19382,7 @@ mod tests {
                         "7890",
                         crate::guardian::CheckInputType::Int,
                     )],
+                    ..crate::guardian::GuardianCheck::default()
                 }],
             )
             .unwrap();
@@ -19314,6 +19427,7 @@ mod tests {
                         "7890",
                         crate::guardian::CheckInputType::Int,
                     )],
+                    ..crate::guardian::GuardianCheck::default()
                 }],
                 None,
                 None,
@@ -19351,6 +19465,7 @@ mod tests {
                 &[crate::guardian::GuardianCheck {
                     label: Some("Serve locally".to_string()),
                     command: Some("ralphus-daemon serve --port {port}".to_string()),
+                    preparation_state: Some("ready".to_string()),
                     prompt: None,
                     cleanup_command: None,
                     inputs: vec![check_input_typed(
@@ -19359,6 +19474,7 @@ mod tests {
                         "7890",
                         crate::guardian::CheckInputType::Int,
                     )],
+                    ..crate::guardian::GuardianCheck::default()
                 }],
             )
             .unwrap();
@@ -21602,7 +21718,7 @@ ANTHROPIC_AUTH_TOKEN = { from_env = "RALPHUS_AGENT_PROFILES_HEALTH_ROUTE_TEST_VA
     }
 
     #[test]
-    fn submit_rejects_review_without_a_build_declaration_before_materializing() {
+    fn submit_accepts_review_without_a_preparation_declaration() {
         let d = daemon();
         let repo = tmp_git_repo("review-build-preflight");
         let project = register_body("proj", &repo.to_string_lossy(), "");
@@ -21614,10 +21730,8 @@ ANTHROPIC_AUTH_TOKEN = { from_env = "RALPHUS_AGENT_PROFILES_HEALTH_ROUTE_TEST_VA
                     [[review]]\nid=\"ralphus:new-review/r\"\n";
         let r = route(&d, "POST", "/api/squads", &submit_body(toml));
 
-        assert_eq!(r.status, 400, "{}", r.body);
-        assert!(r.body.contains("review_validation_failed"), "{}", r.body);
-        assert!(r.body.contains("auto_build"), "{}", r.body);
-        assert!(d.lock().list_squads().unwrap().is_empty());
+        assert_eq!(r.status, 201, "{}", r.body);
+        assert_eq!(d.lock().list_squads().unwrap().len(), 1);
     }
 
     #[test]
@@ -21922,7 +22036,7 @@ machine=\"incredibuild:B\"
 
         let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\n\
                     [[task.cell]]\nid=\"work\"\ncwd=\"<<ralphus:new-worktree/feat?upstream=main>>\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n\
-                    [[review]]\nid=\"r\"\nskip_auto_build=true\n";
+                    [[review]]\nid=\"r\"\n";
         let r = route(&d, "POST", "/api/squads", &submit_body(toml));
         assert_eq!(r.status, 201, "{}", r.body);
         let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();

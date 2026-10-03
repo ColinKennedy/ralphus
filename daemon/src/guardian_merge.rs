@@ -4204,6 +4204,15 @@ pub(crate) fn kickoff_merge(
         );
         return Ok(StartMergeOutcome::AlreadyInProgress);
     }
+    // The settled tip is no longer authoritative. Stop its advisory build
+    // before this merge worker starts changing the stack; the next settled
+    // tip will enqueue a fresh generation.
+    store.lock_free_memory().cancel_guardian_preparation(id);
+    invalidate_guardian_preparation(
+        &store,
+        id,
+        "review is rebasing; preparation will refresh after the new stack settles",
+    );
     crate::rlog!(
         INFO,
         "ralphus [guardian] review {id} merge starting branches={} (kickoff {}ms)",
@@ -6323,6 +6332,14 @@ pub fn run_feedback(
     require_proof: bool,
     cancel: &CancelToken,
 ) -> FeedbackOutcome {
+    // Feedback and unattended PR fixes both flow through this function. Their
+    // edits supersede any preparation based on the previous review tip.
+    store.lock_free_memory().cancel_guardian_preparation(id);
+    invalidate_guardian_preparation(
+        store,
+        id,
+        "review feedback is changing the stack; preparation will refresh afterward",
+    );
     // RAL-380: mark the reviewer message this call was invoked for as
     // `Failed` -- used on every early-exit path below that bails out before
     // the resolver agent (and therefore the main completion block further
@@ -6353,7 +6370,10 @@ pub fn run_feedback(
                 .set_message_action_status(seq, FeedbackActionStatus::Failed);
         }
     };
-    let guardian = match store.lock().get_guardian(id) {
+    // Bind the result so the store guard is dropped before an error path logs
+    // through `fail_message`, which acquires the same store lock.
+    let guardian_result = store.lock().get_guardian(id);
+    let guardian = match guardian_result {
         Ok(g) => g,
         Err(_) => {
             fail_message();
@@ -8793,6 +8813,51 @@ pub(crate) fn maybe_spawn_post_merge(store: &crate::store_lock::StoreHandle, id:
     spawn_guardian_post_merge(store, id, PostMergeJobs::ALL);
 }
 
+/// Revoke every manual surface tied to the previous settled tip.
+///
+/// This runs as soon as a rebase or feedback pass is claimed, before that
+/// work can spend time waiting on a git-operation guard. The board and API
+/// therefore stop offering commands from an obsolete prepared checkout at
+/// the same moment the old preparation process is cancelled.
+fn invalidate_guardian_preparation(store: &crate::store_lock::StoreHandle, id: &str, detail: &str) {
+    let current_result = store.lock().get_guardian(id);
+    let Ok(current) = current_result else {
+        return;
+    };
+
+    // RAL-521: a review whose manual checks are cached is not about to have
+    // its underlying diff basis change just because a rebase/feedback pass
+    // was claimed -- `post_merge_jobs_inner` makes that same call once the
+    // new tip is actually known, and resets this state itself if generation
+    // does end up needing to rerun. Marking it stale here too would only
+    // flash the board and, worse, erase `prepared_at_ms` before that later,
+    // better-informed check gets to see it was never actually invalidated.
+    if manual_checks_should_generate(&current) {
+        let mut commands = current.manual_commands;
+        for command in &mut commands {
+            command.preparation_state = Some("stale".to_string());
+            command.preparation_detail = Some(detail.to_string());
+            command.prepared_at_ms = None;
+            command.prepared_cwd = None;
+        }
+        let _ = store.lock().set_guardian_manual_commands(
+            id,
+            &commands,
+            current.manual_commands_agent.as_deref(),
+            current.manual_commands_model.as_deref(),
+        );
+    }
+
+    let mut actions = current.action_hints;
+    for action in &mut actions {
+        action.preparation_state = Some("stale".to_string());
+        action.preparation_detail = Some(detail.to_string());
+        action.prepared_at_ms = None;
+        action.prepared_cwd = None;
+    }
+    let _ = store.lock().set_guardian_action_hints(id, &actions);
+}
+
 /// Spawn the post-merge worker unconditionally (caller checked preconditions).
 ///
 /// No-op when spawning is disabled (in-process tests): tests that exercise
@@ -8876,6 +8941,31 @@ pub fn run_guardian_post_merge(
         return;
     };
 
+    // A newer generation cancels this one immediately, then waits for this
+    // review's preparation gate before reusing its retained checkout. This
+    // makes supersession deterministic instead of relying on the status poll
+    // below to notice the overlap after both workers have started touching
+    // the same files.
+    let memory = store.lock_free_memory();
+    let (generation, cancel, preparation_gate) = memory.begin_guardian_preparation(id);
+    let _preparation_lease = preparation_gate.lock();
+    if cancel.is_cancelled() {
+        memory.finish_guardian_preparation(id, generation);
+        return;
+    }
+    let guardian = match store.lock().get_guardian(id) {
+        Ok(g)
+            if g.status.as_str() == GuardianStatus::InReview.as_str()
+                && g.combined_worktree.as_deref() == Some(combined_str.as_str()) =>
+        {
+            g
+        }
+        _ => {
+            memory.finish_guardian_preparation(id, generation);
+            return;
+        }
+    };
+
     let _review_op =
         git_review_operation_guard(Path::new(&guardian.git_root), guardian.machine.as_deref());
     let started_at = match store.lock().start_guardian_post_merge(id) {
@@ -8903,14 +8993,20 @@ pub fn run_guardian_post_merge(
     // `in_review` (a new merge/rebase claimed it) or a newer post-merge run
     // starts, cancel this run's jobs; only the run whose started_at stamp
     // still matches records an outcome.
-    let cancel = CancelToken::new();
     let superseded = Arc::new(AtomicBool::new(false));
     let watch_cancel = cancel.clone();
     let watch_superseded = Arc::clone(&superseded);
     let watch_store = store.clone();
     let watch_id = id.to_string();
+    // Runs on its own spawned thread -- `_preparation_lease` above is an
+    // unrelated, review-scoped `Arc<Mutex<()>>` (serializes concurrent
+    // preparation attempts for this review), never touched here, and stays
+    // held by the outer/caller thread this entire time regardless of what
+    // this watcher does; the static lock-reentrancy scan below can't tell
+    // it apart from a `StoreMutex` guard by name alone.
     let watcher = std::thread::spawn(move || {
         loop {
+            // allow-lock-io: see the doc comment above this thread::spawn call
             std::thread::sleep(std::time::Duration::from_secs(2));
             if watch_cancel.is_cancelled() {
                 return;
@@ -8934,7 +9030,7 @@ pub fn run_guardian_post_merge(
 
     // Stop the supersede watcher: the run is over, one way or the other. The
     // superseded flag was sampled by the watcher before this cancel.
-    let was_superseded = superseded.load(Ordering::Relaxed);
+    let was_superseded = cancel.is_cancelled() || superseded.load(Ordering::Relaxed);
     cancel.cancel();
 
     // Record the outcome. A failure is advisory by construction: the review
@@ -8946,20 +9042,59 @@ pub fn run_guardian_post_merge(
         Err(e) => (false, Some(e.as_str())),
     };
     let recorded = if was_superseded {
-        // Superseded: record the interruption only when this run still owns
-        // the outcome slot (a newer run's stamp replaces ours, and its
-        // `finish` would then be the one that lands).
-        store.lock().finish_guardian_post_merge(
-            id,
-            started_at,
-            false,
-            Some("post-merge job interrupted (the review changed or a newer run started)"),
-        )
+        // A newer merge or preparation generation owns the next visible
+        // outcome. Leaving the old row in `running` for the few milliseconds
+        // until that owner starts avoids a false failure notification and,
+        // more importantly, prevents an obsolete build from publishing any
+        // terminal state.
+        Ok(false)
     } else {
         store
             .lock()
             .finish_guardian_post_merge(id, started_at, ok, detail)
     };
+    if recorded.as_ref().is_ok_and(|recorded| *recorded) && !was_superseded {
+        let entity_uri = format!("guardian:{id}");
+        if ok {
+            let action_count = store
+                .lock()
+                .get_guardian(id)
+                .map(|guardian| guardian.action_hints.len() + guardian.manual_commands.len())
+                .unwrap_or(0);
+            let _ = store.lock().notify_watchers(
+                crate::monitor::NotifiableEventKind::ReviewManualChecksReady,
+                &entity_uri,
+                crate::mailbox::MailboxPriority::Normal,
+                &format!(
+                    "Review \"{}\" has {action_count} manual check{} prepared and ready to run.",
+                    guardian.name,
+                    if action_count == 1 { "" } else { "s" }
+                ),
+                guardian.squad_id.as_deref(),
+            );
+        } else {
+            let remediation = crate::mailbox::Remediation::ManualInterventionRequired {
+                guidance: format!(
+                    "open review {} and inspect its preparation detail; use Regenerate after correcting the command, machine, or artifact declaration",
+                    id
+                ),
+            };
+            let _ = store.lock().notify_watchers_with_remediation(
+                crate::monitor::NotifiableEventKind::ReviewManualChecksFailed,
+                &entity_uri,
+                crate::mailbox::MailboxPriority::High,
+                &format!(
+                    "Review \"{}\" finished manual preparation with a failure: {}",
+                    guardian.name,
+                    detail.unwrap_or("unknown preparation failure")
+                ),
+                &remediation,
+                guardian.squad_id.as_deref(),
+                None,
+                None,
+            );
+        }
+    }
     phase_note(
         store,
         id,
@@ -8992,6 +9127,7 @@ pub fn run_guardian_post_merge(
         }),
     );
     let _ = watcher.join();
+    memory.finish_guardian_preparation(id, generation);
 }
 
 /// The worker's body: check out a scratch worktree at the combined review
@@ -9042,37 +9178,10 @@ fn post_merge_jobs_inner(
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| tip.clone());
 
-    // Scratch checkout of the tip. Sibling of the combined worktree, with its
-    // own branch, so the jobs' byproducts land here instead of dirtying the
-    // combined worktree a future merge reuses -- and so a failed deletion can
-    // never wedge the combined worktree itself.
-    let pm_dir = combined_path
-        .parent()
-        .map(|p| p.join(POST_MERGE_WORKTREE_DIR))
-        .ok_or_else(|| "combined worktree path has no parent".to_string())?;
-    let pm_ws = ws_root.at(&pm_dir);
-    let pm_str = pm_dir.to_string_lossy().to_string();
-    // Scratch checkout of the tip: a detached `git worktree add` at the tip --
-    // deliberately not a named branch and not the lease/recovery machinery the
-    // review worktrees use, since this checkout is disposable by construction
-    // (the jobs read it; nothing commits to it) and must never fight the next
-    // merge over a branch name. Reuse the previous scratch in place when a
-    // Windows file lock keeps `worktree remove` from deleting it.
-    if pm_ws.root().exists() {
-        let _ = combined_ws.git(&["worktree", "remove", "--force", &pm_str]);
-    }
-    if !pm_ws.root().exists() {
-        combined_ws
-            .git(&["worktree", "add", "--detach", &pm_str, &tip])
-            .map_err(|e| format!("post-merge scratch checkout failed: {e}"))?;
-    } else {
-        pm_ws
-            .git(&["checkout", "-f", "--detach", &tip])
-            .map_err(|e| format!("post-merge scratch reset failed: {e}"))?;
-        let _ = pm_ws.git(&["clean", "-fdx"]);
-    }
-
-    // The project base commit this generation diffs against.
+    // The project base commit this generation diffs against. Resolved here,
+    // ahead of the scratch-checkout reset below, purely from `combined_ws` --
+    // so the cache decision it feeds is known before deciding whether that
+    // reset also needs to invalidate the manual-commands state.
     let proj_str = proj.to_string_lossy().to_string();
     let base_sha = guardian
         .base_commits
@@ -9104,55 +9213,123 @@ fn post_merge_jobs_inner(
     });
     let generate_manual = jobs.manual_checks && !cached && (!commands_present || basis_changed);
 
-    // Both jobs read the scratch worktree and neither reads the other's
-    // output, so they run concurrently.
-    let outcome = std::thread::scope(|scope| {
-        let manual = generate_manual.then(|| {
-            scope.spawn(|| {
-                generate_manual_commands(
-                    store,
-                    runner,
-                    id,
-                    &ws_root.at(&proj),
-                    &base_sha,
-                    &tip,
-                    Some(&pm_ws),
-                    cancel,
-                );
-            })
-        });
-        let checks = if jobs.checks {
-            final_checks(store, runner, id, &ws_root.at(&proj), &pm_str, cancel)
-        } else {
-            Ok(None)
-        };
-        if let Some(handle) = manual {
-            let _ = handle.join();
+    // Scratch checkout of the tip. Sibling of the combined worktree, with its
+    // own branch, so the jobs' byproducts land here instead of dirtying the
+    // combined worktree a future merge reuses -- and so a failed deletion can
+    // never wedge the combined worktree itself.
+    let pm_dir = combined_path
+        .parent()
+        .map(|p| p.join(POST_MERGE_WORKTREE_DIR))
+        .ok_or_else(|| "combined worktree path has no parent".to_string())?;
+    let pm_ws = ws_root.at(&pm_dir);
+    let pm_str = pm_dir.to_string_lossy().to_string();
+    // Invalidate the prior prepared generation before touching its retained
+    // checkout. The board must never offer a Run button while the directory
+    // behind it is being reset for a newer review tip.
+    //
+    // RAL-521: a review whose manual checks are cached (`generate_manual` is
+    // false) is not having that checkout reset out from under its already-
+    // `"ready"` commands below -- so invalidating them here too would only
+    // flash the board to "preparing" and re-stamp `prepared_at_ms` for
+    // nothing once `prepare_generated_manual_checks` reruns them. Only do
+    // this when generation is actually about to (re)run.
+    //
+    // Bind the read result before updating either collection. An `if let`
+    // scrutinee temporary would otherwise retain the non-reentrant store lock
+    // for the entire body and deadlock on the first update.
+    if generate_manual {
+        let current_result = store.lock().get_guardian(id);
+        if let Ok(current) = current_result {
+            let mut commands = current.manual_commands;
+            for command in &mut commands {
+                command.preparation_state = Some("preparing".to_string());
+                command.preparation_detail = Some("review preparation is refreshing".to_string());
+                command.prepared_at_ms = None;
+            }
+            let _ = store.lock().set_guardian_manual_commands(
+                id,
+                &commands,
+                current.manual_commands_agent.as_deref(),
+                current.manual_commands_model.as_deref(),
+            );
         }
-        checks
-    });
+    }
+    {
+        let current_result = store.lock().get_guardian(id);
+        if let Ok(current) = current_result {
+            let mut actions = current.action_hints;
+            for action in &mut actions {
+                action.preparation_state = Some("preparing".to_string());
+                action.preparation_detail = Some("review preparation is refreshing".to_string());
+                action.prepared_at_ms = None;
+            }
+            let _ = store.lock().set_guardian_action_hints(id, &actions);
+        }
+    }
+    // A detached checkout retained for manual use after preparation. It has no
+    // named branch and is refreshed in place when Windows file locks prevent a
+    // remove/add cycle.
+    if pm_ws.root().exists() {
+        let _ = combined_ws.git(&["worktree", "remove", "--force", &pm_str]);
+    }
+    if !pm_ws.root().exists() {
+        combined_ws
+            .git(&["worktree", "add", "--detach", &pm_str, &tip])
+            .map_err(|e| format!("post-merge scratch checkout failed: {e}"))?;
+    } else {
+        pm_ws
+            .git(&["checkout", "-f", "--detach", &tip])
+            .map_err(|e| format!("post-merge scratch reset failed: {e}"))?;
+        let _ = pm_ws.git(&["clean", "-fdx"]);
+    }
 
-    // Remove the scratch worktree best-effort; a leftover directory is swept
-    // by the next `worktree_add_or_reset` on this path, and a failed deletion
-    // must never fail the (already recorded) post-merge outcome.
-    let _ = combined_ws.git(&["worktree", "remove", "--force", &pm_str]);
-    let _ = combined_ws.git(&["worktree", "prune"]);
+    // Generated checks may declare their own setup, so generation must finish
+    // before the common preparation pass can decide any button is ready.
+    //
+    // Per `generate_manual_commands`'s own doc comment, its failures are
+    // silent -- a missing command list is better than failing the whole
+    // post-merge gate (and the checks/`final_checks` below) over an agent
+    // that produced nothing. Propagating it with `?` here would regress a
+    // review with no manual checks requested at all back to a hard failure
+    // whenever generation errors (e.g. no agent configured in a test/CI
+    // fixture).
+    if generate_manual {
+        if let Err(e) = generate_manual_commands(
+            store,
+            runner,
+            id,
+            &ws_root.at(&proj),
+            &base_sha,
+            &tip,
+            Some(&pm_ws),
+            cancel,
+        ) {
+            crate::rlog!(
+                WARNING,
+                "ralphus [guardian] review {id} manual-commands generation failed: {e}"
+            );
+        }
+    }
+    let outcome = if cancel.is_cancelled() {
+        Err("preparation cancelled because the review changed".to_string())
+    } else if jobs.checks {
+        final_checks(store, runner, id, &ws_root.at(&proj), &pm_str, cancel)
+    } else {
+        Ok(None)
+    };
+
+    // The prepared checkout is intentionally retained. Manual actions run in
+    // this exact directory, so build output remains warm after the worker
+    // finishes. The next generation resets it only after marking the prior
+    // generation stale.
     outcome
 }
 
-/// Run the review's check gates against the finished combined worktree.
+/// Prepare every manual surface against the finished combined worktree.
 ///
-/// Four-tier precedence (RAL-342, replacing the old RAL-110 AI-guessed build):
-/// skip (opt-out) → this review's own explicit `checks` gates → this review's
-/// declared `[[review.auto_build]]` step → the project's `.ralphus.toml`
-/// `auto_build` default → nothing. Only one tier ever runs.
-///
-/// Returns `Some(note)` when checks were opted out, a review auto_build ran, or
-/// the config auto-build (local or remote) ran (so the UI can show what
-/// happened), `None` when explicit checks ran and passed or nothing ran at all,
-/// or `Err` on an explicit check gate failure. Per RAL-342 Q5, a failed
-/// review-declared auto_build is deliberately NOT an `Err` -- see the inline
-/// comment on that tier below.
+/// Review-level steps run first, followed by each action's own steps and
+/// artifact placement. The project `auto_build` setting remains a compatibility
+/// fallback only when the review declares no preparation steps.
 fn final_checks(
     store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
@@ -9161,12 +9338,15 @@ fn final_checks(
     combined_str: &str,
     cancel: &CancelToken,
 ) -> std::result::Result<Option<String>, String> {
-    let (skip_auto_build, checks, auto_build, env) = {
+    let (preparation, checks, env) = {
         let guard = store.lock();
         (
-            guard.guardian_skip_auto_build(id).unwrap_or(false),
+            guard.guardian_preparation(id).unwrap_or_default(),
+            // Explicit check gates already ran during the merge itself
+            // (`run_commit_checks`, per branch) -- their presence here is
+            // only to decide whether the project default below would be a
+            // redundant second build, not to run them again.
             guard.guardian_checks(id).unwrap_or_default(),
-            guard.guardian_auto_build(id).unwrap_or_default(),
             // RAL-203: run under the same environment the combined worktree's
             // branches were built with (`combined_env`), plus this review's
             // own build-step overrides -- a check gate like `cargo test` is
@@ -9178,61 +9358,54 @@ fn final_checks(
         )
     };
 
-    if skip_auto_build {
-        return Ok((!checks.is_empty()).then(|| "check gates skipped (opt-out)".to_string()));
-    }
-    if !checks.is_empty() {
-        for cmd in &checks {
-            // RAL-239: same reasoning as `run_commit_checks` -- don't start the
-            // next final check gate once the review has been cancelled.
+    // Explicit check gates (already run, during the merge itself, by
+    // `run_commit_checks`) take full priority over any build/preparation
+    // step -- a review-declared `[[review.prepare]]`/`[[review.auto_build]]`
+    // AND the project's default preparation command are both skipped
+    // entirely when `checks` is configured, not just the project default.
+    // This matters even for a review with no preparation steps of its own:
+    // `create_guardian_keyed` eagerly stamps the project's default build
+    // command into this same `preparation` storage at creation time
+    // whenever `.ralphus.toml` already declares one, so `preparation` being
+    // non-empty does not by itself mean a review actually opted into it --
+    // only the absence of explicit checks does.
+    let mut notes = Vec::new();
+    if checks.is_empty() {
+        for def in &preparation {
             if cancel.is_cancelled() {
-                return Err("cancelled".to_string());
+                return Err("preparation cancelled because the review changed".to_string());
             }
-            if !root
-                .at(combined_str)
-                .run_command_with_env(cmd, &env, cancel)
-                .0
-            {
-                return Err(format!("check failed: {cmd}"));
+            notes.push(run_review_auto_build(
+                store,
+                runner,
+                id,
+                root,
+                combined_str,
+                &env,
+                def,
+                cancel,
+            )?);
+        }
+        // With no explicit preparation either, use the project's default
+        // preparation command. Resolve it before launching the subprocess so
+        // the global store lock is never held for the duration of a build.
+        if preparation.is_empty() {
+            let auto_build_cmd = store.lock().resolve_review_config(root.root()).auto_build;
+            if let Some(cmd) = auto_build_cmd {
+                if !root
+                    .at(combined_str)
+                    .run_command_with_env(&cmd, &env, cancel)
+                    .0
+                {
+                    return Err(format!("preparation failed: {cmd}"));
+                }
+                notes.push(format!("prepared via project default: {cmd}"));
             }
         }
-        return Ok(None);
     }
-    // RAL-342: no explicit checks -- try this review's own declared
-    // `[[review.auto_build]]` step next, ahead of the project-wide default.
-    // Per Q5, a failure here is advisory only (a UI notice + Cartographer log)
-    // rather than a merge-failing `Err` -- unlike explicit `checks`, which the
-    // user wrote as a hard gate, an auto_build declaration is a convenience
-    // build step and should never block a review from reaching `InReview`.
-    if let Some(def) = auto_build {
-        if let Some(note) =
-            run_review_auto_build(store, runner, id, root, combined_str, &env, &def, cancel)
-        {
-            return Ok(Some(note));
-        }
-    }
-    // RAL-101: no explicit checks or review auto_build -- fall back to the
-    // project's default build/test command, if one is configured, so
-    // "in review" still means "testable" rather than "merged and never built".
-    // The config read is bound before the `match`: a scrutinee temporary
-    // would hold the store guard across the whole match body, and the
-    // `Some(cmd)` arm runs the project's build/test command (`cargo build`,
-    // `npm test`, ...) -- an unbounded-duration subprocess that must never
-    // run with the daemon's global store lock held.
-    let auto_build_cmd = store.lock().resolve_review_config(root.root()).auto_build;
-    match auto_build_cmd {
-        Some(cmd) => {
-            if !root
-                .at(combined_str)
-                .run_command_with_env(&cmd, &env, cancel)
-                .0
-            {
-                return Err(format!("auto-build failed: {cmd}"));
-            }
-            Ok(Some(format!("auto-built via project default: {cmd}")))
-        }
-        None => Ok(None),
-    }
+    prepare_action_hints(store, runner, id, root, combined_str, &env, cancel)?;
+    prepare_generated_manual_checks(store, runner, id, root, combined_str, &env, cancel)?;
+    Ok((!notes.is_empty()).then(|| notes.join("; ")))
 }
 
 /// Run this review's declared `[[review.auto_build]]` step (RAL-342) against the
@@ -9246,6 +9419,44 @@ fn final_checks(
 /// treats this tier as "handled" once it fires and falls through to `InReview`
 /// exactly as if this tier had been absent. `None` only when `def` describes
 /// no runnable step (defensive; `core::validate` should never allow this).
+/// Expand a direct worktree text marker into its declared branch text. The
+/// upstream is validation metadata; interpolation deliberately does not create
+/// or switch a worktree.
+fn expand_worktree_text(raw: &str) -> std::result::Result<String, String> {
+    ralphus_core::schema::replace_text_placeholders(raw, |body| {
+        let reference = ralphus_core::schema::parse_worktree_text_ref(body)
+            .map_err(|error| format!("invalid worktree text placeholder: {error:?}"))?;
+        Ok::<_, String>(reference.map(|reference| {
+            reference.text_fn.map_or_else(
+                || reference.branch.to_string(),
+                |function| function.apply(reference.branch),
+            )
+        }))
+    })
+}
+
+/// Resolve text-only worktree markers in the command and shared-artifact
+/// fields persisted for a manual action before its readiness is published.
+fn expand_check_worktree_text(
+    check: &mut crate::guardian::GuardianCheck,
+) -> std::result::Result<(), String> {
+    for value in [&mut check.command, &mut check.cleanup_command]
+        .into_iter()
+        .flatten()
+    {
+        *value = expand_worktree_text(value)?;
+    }
+    for artifact in &mut check.artifacts {
+        if let Some(path) = &mut artifact.shared_path {
+            *path = expand_worktree_text(path)?;
+        }
+        if let Some(command) = &mut artifact.readiness_command {
+            *command = expand_worktree_text(command)?;
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_review_auto_build(
     store: &crate::store_lock::StoreHandle,
@@ -9256,54 +9467,69 @@ fn run_review_auto_build(
     env: &std::collections::BTreeMap<String, String>,
     def: &crate::guardian::GuardianAutoBuild,
     cancel: &CancelToken,
-) -> Option<String> {
-    if let Some(cmd) = def.command.as_deref() {
-        let ok = root
-            .at(combined_str)
-            .run_command_with_env(cmd, env, cancel)
-            .0;
-        let _ = store
-            .lock()
-            .cartographer_log(crate::cartographer::CartographerEntry {
-                level: if ok {
-                    crate::logging::LogLevel::INFO
-                } else {
-                    crate::logging::LogLevel::WARNING
-                },
-                source: "guardian",
-                message: if ok {
-                    "review auto_build succeeded"
-                } else {
-                    "review auto_build failed"
-                },
-                scope: Some("guardian"),
-                squad_id: None,
-                guardian_id: Some(id),
-                cell_id: None,
-                task: None,
-                log_path: None,
-                payload: serde_json::json!({"command": cmd}),
-                admin_only: false,
-            });
-        if !ok {
-            let _ = store.lock().set_guardian_notice(
-                id,
-                "auto_build_failed",
-                &format!(
-                    "This review's declared auto_build command failed: {cmd}. The review has \
+) -> std::result::Result<String, String> {
+    let mut preparation_env = env.clone();
+    for (key, value) in &def.environment {
+        preparation_env.insert(key.clone(), expand_worktree_text(value)?);
+    }
+    let commands = if def.commands.is_empty() {
+        def.command.clone().into_iter().collect()
+    } else {
+        def.commands.clone()
+    };
+    if !commands.is_empty() {
+        for raw_command in commands {
+            let cmd = expand_worktree_text(&raw_command)?;
+            let ok = root
+                .at(combined_str)
+                .run_command_with_env(&cmd, &preparation_env, cancel)
+                .0;
+            let _ = store
+                .lock()
+                .cartographer_log(crate::cartographer::CartographerEntry {
+                    level: if ok {
+                        crate::logging::LogLevel::INFO
+                    } else {
+                        crate::logging::LogLevel::WARNING
+                    },
+                    source: "guardian",
+                    message: if ok {
+                        "review auto_build succeeded"
+                    } else {
+                        "review auto_build failed"
+                    },
+                    scope: Some("guardian"),
+                    squad_id: None,
+                    guardian_id: Some(id),
+                    cell_id: None,
+                    task: None,
+                    log_path: None,
+                    payload: serde_json::json!({"command": cmd}),
+                    admin_only: false,
+                });
+            if !ok {
+                let _ = store.lock().set_guardian_notice(
+                    id,
+                    "auto_build_failed",
+                    &format!(
+                        "This review's declared auto_build command failed: {cmd}. The review has \
                      still moved to In Review -- check the build output and re-run manually if \
                      needed."
-                ),
-            );
+                    ),
+                );
+            }
+            if !ok {
+                return Err(format!("preparation command failed: {cmd}"));
+            }
         }
-        return Some(format!(
-            "auto-built via review auto_build: {cmd}{}",
-            if ok { "" } else { " (failed)" }
-        ));
+        return Ok("prepared via declared command group".to_string());
     }
 
     // Agent-invocation shape: `def.prompt` (plus optional system prompt/agent/model).
-    let prompt = def.prompt.as_deref()?;
+    let prompt = def
+        .prompt
+        .as_deref()
+        .ok_or_else(|| "preparation step has neither command nor prompt".to_string())?;
     let cwd = combined_str.to_string();
     let (stored_agent, stored_model) = {
         let guard = store.lock();
@@ -9329,7 +9555,9 @@ fn run_review_auto_build(
                      The review has still moved to In Review."
                 ),
             );
-            return Some(format!("auto-build agent unresolvable: {message}"));
+            return Err(format!(
+                "preparation agent could not be resolved: {message}"
+            ));
         }
     };
     // RAL-517: resolve before `cwd,` moves the string below.
@@ -9359,7 +9587,7 @@ fn run_review_auto_build(
         assigned_agent_session_id: None,
         env_overrides: {
             let mut e = resolved.env.clone();
-            e.extend(env.clone());
+            e.extend(preparation_env);
             e
         },
         machine: root.machine().map(str::to_string),
@@ -9410,11 +9638,440 @@ fn run_review_auto_build(
             ),
         );
     }
-    Some(if ok {
-        "auto-built via review auto_build (agent)".to_string()
+    if ok {
+        Ok("prepared via declared agent step".to_string())
     } else {
-        "auto-build (agent) failed".to_string()
+        Err(format!(
+            "preparation agent failed: {}",
+            result.error.as_deref().unwrap_or("no summary produced")
+        ))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_action_hints(
+    store: &crate::store_lock::StoreHandle,
+    runner: &dyn Runner,
+    id: &str,
+    root: &Workspace,
+    combined_str: &str,
+    env: &std::collections::BTreeMap<String, String>,
+    cancel: &CancelToken,
+) -> std::result::Result<(), String> {
+    let mut hints = store
+        .lock()
+        .get_guardian(id)
+        .map_err(|e| e.to_string())?
+        .action_hints;
+    let mut failures = Vec::new();
+    let mut completed_groups = std::collections::HashSet::new();
+    for index in 0..hints.len() {
+        hints[index].preparation_state = Some("preparing".to_string());
+        hints[index].preparation_detail = None;
+        hints[index].prepared_at_ms = None;
+        store
+            .lock()
+            .set_guardian_action_hints(id, &hints)
+            .map_err(|e| e.to_string())?;
+
+        let result = (|| {
+            expand_check_worktree_text(&mut hints[index])?;
+            if hints[index].command.is_none() {
+                if let Some(prompt) = hints[index].prompt.as_deref() {
+                    hints[index].command = Some(expand_action_prompt(
+                        store,
+                        runner,
+                        id,
+                        root,
+                        combined_str,
+                        prompt,
+                        env,
+                        cancel,
+                    )?);
+                    store
+                        .lock()
+                        .set_guardian_action_hints(id, &hints)
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+            for step in &hints[index].prepare {
+                if cancel.is_cancelled() {
+                    return Err("preparation cancelled because the review changed".to_string());
+                }
+                let fingerprint = serde_json::to_string(step).map_err(|error| error.to_string())?;
+                if completed_groups.contains(&fingerprint) {
+                    continue;
+                }
+                run_review_auto_build(store, runner, id, root, combined_str, env, step, cancel)?;
+                completed_groups.insert(fingerprint);
+            }
+            if !hints[index].artifacts.is_empty() {
+                hints[index].preparation_state = Some("transferring".to_string());
+                store
+                    .lock()
+                    .set_guardian_action_hints(id, &hints)
+                    .map_err(|e| e.to_string())?;
+            }
+            materialize_action_artifacts(
+                id,
+                &format!("action-{index}"),
+                root,
+                combined_str,
+                &hints[index],
+                env,
+                cancel,
+            )
+        })();
+
+        if cancel.is_cancelled() {
+            return Err("preparation cancelled because the review changed".to_string());
+        }
+
+        match result {
+            Ok(prepared_cwd) => {
+                hints[index].preparation_state = Some("ready".to_string());
+                hints[index].preparation_detail = None;
+                hints[index].prepared_at_ms = Some(crate::store::now_ms());
+                hints[index].prepared_cwd = prepared_cwd.or_else(|| Some(combined_str.to_string()));
+            }
+            Err(error) => {
+                hints[index].preparation_state = Some("failed".to_string());
+                hints[index].preparation_detail = Some(error.clone());
+                failures.push(format!(
+                    "{}: {error}",
+                    hints[index].label.as_deref().unwrap_or("manual action")
+                ));
+            }
+        }
+        store
+            .lock()
+            .set_guardian_action_hints(id, &hints)
+            .map_err(|e| e.to_string())?;
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "manual preparation failed: {}",
+            failures.join("; ")
+        ))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_generated_manual_checks(
+    store: &crate::store_lock::StoreHandle,
+    runner: &dyn Runner,
+    id: &str,
+    root: &Workspace,
+    combined_str: &str,
+    env: &std::collections::BTreeMap<String, String>,
+    cancel: &CancelToken,
+) -> std::result::Result<(), String> {
+    let guardian = store.lock().get_guardian(id).map_err(|e| e.to_string())?;
+    let mut checks = guardian.manual_commands;
+    let agent = guardian.manual_commands_agent;
+    let model = guardian.manual_commands_model;
+    let mut failures = Vec::new();
+    for index in 0..checks.len() {
+        // RAL-521: a check already successfully prepared by an earlier pass
+        // and left untouched by generation above (generation skipped because
+        // the result is cached, or the diff basis simply hasn't changed)
+        // must not be re-run here -- that would redo the work for nothing and
+        // blow away its `prepared_at_ms` stamp on every later merge/rebase.
+        // Generation always hands back fresh commands with `prepared_at_ms`
+        // unset (see `parse_manual_commands_response`), so this only skips
+        // checks generation did not just (re)produce.
+        if checks[index].prepared_at_ms.is_some() {
+            continue;
+        }
+        checks[index].preparation_state = Some("preparing".to_string());
+        checks[index].preparation_detail = None;
+        checks[index].prepared_at_ms = None;
+        store
+            .lock()
+            .set_guardian_manual_commands(id, &checks, agent.as_deref(), model.as_deref())
+            .map_err(|e| e.to_string())?;
+
+        let result = (|| {
+            for step in &checks[index].prepare {
+                if cancel.is_cancelled() {
+                    return Err("preparation cancelled because the review changed".to_string());
+                }
+                run_review_auto_build(store, runner, id, root, combined_str, env, step, cancel)?;
+            }
+            if !checks[index].artifacts.is_empty() {
+                checks[index].preparation_state = Some("transferring".to_string());
+                store
+                    .lock()
+                    .set_guardian_manual_commands(id, &checks, agent.as_deref(), model.as_deref())
+                    .map_err(|e| e.to_string())?;
+            }
+            materialize_action_artifacts(
+                id,
+                &format!("manual-{index}"),
+                root,
+                combined_str,
+                &checks[index],
+                env,
+                cancel,
+            )
+        })();
+        if cancel.is_cancelled() {
+            return Err("preparation cancelled because the review changed".to_string());
+        }
+
+        match result {
+            Ok(prepared_cwd) => {
+                checks[index].preparation_state = Some("ready".to_string());
+                checks[index].preparation_detail = None;
+                checks[index].prepared_at_ms = Some(crate::store::now_ms());
+                checks[index].prepared_cwd =
+                    prepared_cwd.or_else(|| Some(combined_str.to_string()));
+            }
+            Err(error) => {
+                checks[index].preparation_state = Some("failed".to_string());
+                checks[index].preparation_detail = Some(error.clone());
+                failures.push(format!("manual check {}: {error}", index + 1));
+            }
+        }
+        store
+            .lock()
+            .set_guardian_manual_commands(id, &checks, agent.as_deref(), model.as_deref())
+            .map_err(|e| e.to_string())?;
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "manual preparation failed: {}",
+            failures.join("; ")
+        ))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expand_action_prompt(
+    store: &crate::store_lock::StoreHandle,
+    runner: &dyn Runner,
+    id: &str,
+    root: &Workspace,
+    combined_str: &str,
+    prompt: &str,
+    env: &std::collections::BTreeMap<String, String>,
+    cancel: &CancelToken,
+) -> std::result::Result<String, String> {
+    let (stored_agent, stored_model) = {
+        let guardian = store.lock().get_guardian(id).map_err(|e| e.to_string())?;
+        (guardian.resolver_agent, guardian.resolver_model)
+    };
+    let resolved = resolve_resolver_agent(
+        stored_agent.as_deref(),
+        stored_model.as_deref(),
+        store,
+        Path::new(combined_str),
+    )
+    .map_err(|e| format!("could not resolve prompt-action agent: {e}"))?;
+    let mut spec = RunnerSpec {
+        squad_id: format!("guardian-{id}"),
+        task: "expand-review-action".to_string(),
+        cell_id: "expand-review-action".to_string(),
+        cwd: combined_str.to_string(),
+        prompt: Some(format!(
+            "Turn this authored manual-test instruction into one runnable shell command. Do not run it. Return only JSON shaped {{\"manual_commands\":[\"command\"]}}. Instruction:\n\n{prompt}"
+        )),
+        command: None,
+        agent: resolved.backend.clone(),
+        executable: resolved.executable.clone(),
+        model: resolved.model.clone(),
+        system_prompt: None,
+        system_prompt_position: None,
+        timeout_sec: None,
+        budget_tokens: None,
+        maximum_budget_usd: None,
+        maximum_context: None,
+        auto_compact_threshold: None,
+        maximum_tool_output_tokens: None,
+        proof: false,
+        trace_context: None,
+        resume_agent_session_id: None,
+        assigned_agent_session_id: None,
+        env_overrides: {
+            let mut resolved_env = resolved.env;
+            resolved_env.extend(env.clone());
+            resolved_env
+        },
+        machine: root.machine().map(str::to_string),
+        tool_arg_truncate_chars: None,
+        thrash_max_compactions: None,
+        thrash_min_turn_gap: None,
+        allow_personal_settings: false,
+        allow_personal_memory: false,
+        retry_attempt: 0,
+        retry_after_unknown_default_seconds: crate::config::resolve(Path::new(combined_str))
+            .retry_after_unknown_default_seconds(),
+        maximum_timeout: None,
+    };
+    let result = run_agent_with_stall_recovery(store, &mut spec, runner, cancel, None);
+    if !result.is_done() {
+        return Err(format!(
+            "prompt action expansion failed: {}",
+            result.error.as_deref().unwrap_or("agent did not finish")
+        ));
+    }
+    parse_manual_commands_response(&result.summary)
+        .into_iter()
+        .find_map(|check| check.command)
+        .ok_or_else(|| "prompt action expansion returned no runnable command".to_string())
+}
+
+fn materialize_action_artifacts(
+    guardian_id: &str,
+    stage_key: &str,
+    root: &Workspace,
+    combined_str: &str,
+    action: &crate::guardian::GuardianCheck,
+    env: &std::collections::BTreeMap<String, String>,
+    cancel: &CancelToken,
+) -> std::result::Result<Option<String>, String> {
+    let workspace = root.at(combined_str);
+    let daemon_stage = std::env::temp_dir()
+        .join("ralphus")
+        .join("prepared")
+        .join(guardian_id)
+        .join(stage_key);
+    let mut uses_daemon_stage = false;
+    let action_platform = if action.run_on.as_deref() == Some("review_machine") {
+        workspace.target_platform()?
+    } else {
+        (
+            Some(std::env::consts::OS.to_string()),
+            Some(std::env::consts::ARCH.to_string()),
+        )
+    };
+    for artifact in &action.artifacts {
+        ensure_artifact_platform(artifact, &action_platform)?;
+        match artifact.placement.as_str() {
+            "retain" => {
+                if action.run_on.as_deref() == Some("daemon") && !workspace.is_local() {
+                    return Err(format!(
+                        "retained artifact {:?} is on the review machine but the action runs on the daemon",
+                        artifact.source
+                    ));
+                }
+                let probe = artifact_exists_command(&artifact.source);
+                if !workspace.run_command_with_env(&probe, env, cancel).0 {
+                    return Err(format!(
+                        "retained artifact {:?} does not exist",
+                        artifact.source
+                    ));
+                }
+            }
+            "copy" => {
+                let destination = artifact.destination.as_deref().ok_or_else(|| {
+                    format!("copy artifact {:?} has no destination", artifact.source)
+                })?;
+                let destination_root = if workspace.is_local() {
+                    PathBuf::from(combined_str)
+                } else {
+                    uses_daemon_stage = true;
+                    daemon_stage.clone()
+                };
+                workspace.materialize_to_daemon(
+                    &artifact.source,
+                    destination_root.join(destination),
+                    artifact.executable,
+                )?;
+            }
+            "shared" => {
+                let shared_path = artifact.shared_path.as_deref().ok_or_else(|| {
+                    format!("shared artifact {:?} has no shared_path", artifact.source)
+                })?;
+                let command = artifact.readiness_command.as_deref().ok_or_else(|| {
+                    format!("shared artifact {shared_path:?} has no readiness_command")
+                })?;
+                if !workspace.run_command_with_env(command, env, cancel).0 {
+                    return Err(format!(
+                        "shared artifact {shared_path:?} failed its readiness command: {command}"
+                    ));
+                }
+            }
+            other => return Err(format!("unknown artifact placement {other:?}")),
+        }
+    }
+    Ok(if uses_daemon_stage {
+        Some(daemon_stage.to_string_lossy().into_owned())
+    } else if workspace.is_local() {
+        Some(combined_str.to_string())
+    } else {
+        None
     })
+}
+
+fn ensure_artifact_platform(
+    artifact: &crate::guardian::GuardianArtifact,
+    action_platform: &(Option<String>, Option<String>),
+) -> Result<(), String> {
+    let declared = match (
+        artifact.target_os.as_deref(),
+        artifact.target_arch.as_deref(),
+    ) {
+        (Some(os), Some(arch)) => (normalize_target_os(os), normalize_target_arch(arch)),
+        _ if artifact.executable => {
+            return Err(format!(
+                "executable artifact {:?} does not declare target_os and target_arch",
+                artifact.source
+            ));
+        }
+        _ => return Ok(()),
+    };
+    let actual = match (action_platform.0.as_deref(), action_platform.1.as_deref()) {
+        (Some(os), Some(arch)) => (normalize_target_os(os), normalize_target_arch(arch)),
+        _ => {
+            return Err(format!(
+                "cannot prove artifact {:?} is compatible because the action machine did not report its platform",
+                artifact.source
+            ));
+        }
+    };
+    if declared == actual {
+        Ok(())
+    } else {
+        Err(format!(
+            "artifact {:?} targets {}-{} but the action host is {}-{}",
+            artifact.source, declared.0, declared.1, actual.0, actual.1
+        ))
+    }
+}
+
+fn normalize_target_os(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "darwin" | "mac" | "macos" => "macos".to_string(),
+        "win32" | "win64" | "windows" => "windows".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn normalize_target_arch(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "amd64" | "x64" | "x86_64" => "x86_64".to_string(),
+        "arm64" | "aarch64" => "aarch64".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn artifact_exists_command(relative: &str) -> String {
+    #[cfg(windows)]
+    {
+        format!(
+            "if exist \"{}\" (exit /b 0) else (exit /b 1)",
+            relative.replace('"', "\"\"")
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        format!("test -e '{}'", relative.replace('\'', "'\"'\"'"))
+    }
 }
 
 /// Fetch a branch produced on another machine into this repository, so the
@@ -11993,6 +12650,16 @@ enum ManualCheckItem {
     Structured {
         command: String,
         #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        success: Option<String>,
+        #[serde(default)]
+        run_on: Option<String>,
+        #[serde(default)]
+        prepare: Vec<crate::guardian::GuardianAutoBuild>,
+        #[serde(default)]
+        artifacts: Vec<crate::guardian::GuardianArtifact>,
+        #[serde(default)]
         cleanup_command: Option<String>,
         #[serde(default)]
         inputs: Vec<ManualCheckInputItem>,
@@ -12008,17 +12675,29 @@ impl From<ManualCheckItem> for GuardianCheck {
                 prompt: None,
                 cleanup_command: None,
                 inputs: Vec::new(),
+                ..Self::default()
             },
             ManualCheckItem::Structured {
                 command,
+                description,
+                success,
+                run_on,
+                prepare,
+                artifacts,
                 cleanup_command,
                 inputs,
             } => Self {
                 label: None,
                 command: Some(command),
                 prompt: None,
+                description,
+                success,
+                run_on: Some(run_on.unwrap_or_else(|| "daemon".to_string())),
+                prepare,
+                artifacts,
                 cleanup_command,
                 inputs: inputs.into_iter().map(CheckInput::from).collect(),
+                ..Self::default()
             },
         }
     }
@@ -12067,10 +12746,13 @@ fn parse_manual_commands_response(text: &str) -> Vec<GuardianCheck> {
 /// Shared prompt body for [`generate_manual_commands`].
 pub fn manual_commands_prompt(tail: &str, steering: Option<&str>) -> String {
     let focus = "You are preparing a code review. Based on the changed files and commit \
-         messages below, produce 1-5 shell command strings that a human reviewer should \
+         messages below, produce 1-5 shell commands that a human reviewer should \
          run to manually verify these changes. Focus on hands-on, observable steps: \
-         launching the app and inspecting it visually, running a build script, or \
-         exercising a CLI feature by hand. Do NOT suggest unit tests or automated checks \
+         launching the app and inspecting it visually or exercising a CLI feature by \
+         hand. Never put a build, dependency installation, download, or artifact copy in \
+         the manual \"command\". Put unattended setup in an object's ordered \"prepare\" \
+         array as {\"command\": \"...\"}; Ralphus runs it before enabling the command. \
+         Do NOT suggest unit tests or automated checks \
          that could be scripted — the goal is human eyes and hands on the actual result. \
          If a command depends on a value that could vary or collide between runs -- a \
          port number, a file path, a branch name, anything where running the same \
@@ -12081,7 +12763,9 @@ pub fn manual_commands_prompt(tail: &str, steering: Option<&str>) -> String {
          leaves something running that a rerun would collide with (e.g. a bound port, a \
          background process), also set \"cleanup_command\" on that same object to a \
          command that stops/frees it first. A command with nothing variable and nothing \
-         left running can stay a plain string.";
+         left running can stay a plain string. Structured objects may also include \
+         \"description\" and \"success\" guidance. Use \"run_on\": \"daemon\" unless the \
+         command explicitly needs the review machine.";
     let format = " Return ONLY a valid JSON array where each element is either a plain string or \
           the object shape described above — no markdown fences, no explanation, no \
           other text.";
@@ -12172,7 +12856,7 @@ fn generate_manual_commands(
     tip_ref: &str,
     worktree: Option<&Workspace>,
     cancel: &CancelToken,
-) {
+) -> std::result::Result<(), String> {
     // RAL-520: the reviewer's steering text from the board's regenerate
     // control, folded into the generation prompt so a regen can steer what
     // the checks cover.
@@ -12197,7 +12881,7 @@ fn generate_manual_commands(
                 ),
                 serde_json::json!({"phase": "manual_commands", "skipped": "no_changes"}),
             );
-            return;
+            return Ok(());
         }
         // RAL-201: was `git(root.root(), ...)`, a direct bypass of `root`'s
         // machine -- `root.git(...)` routes through the provider when `root`
@@ -12228,7 +12912,7 @@ fn generate_manual_commands(
                     ),
                     serde_json::json!({"phase": "manual_commands", "skipped": "no_changed_files"}),
                 );
-                return;
+                return Ok(());
             }
         };
         let log = root
@@ -12271,7 +12955,9 @@ fn generate_manual_commands(
                         ),
                         serde_json::json!({"error": message}),
                     );
-                return;
+                return Err(format!(
+                    "manual-check generation agent could not be resolved: {message}"
+                ));
             }
         }
     };
@@ -12404,7 +13090,13 @@ fn generate_manual_commands(
                 "cancelled": cancel.is_cancelled(),
             }),
         );
-        return;
+        return Err(format!(
+            "manual-check generation failed: {}",
+            result
+                .error
+                .as_deref()
+                .unwrap_or("agent produced no usable result")
+        ));
     }
 
     let commands = parse_manual_commands_response(result.summary.trim());
@@ -12445,7 +13137,7 @@ fn generate_manual_commands(
             format!("review {id} manual-commands generation superseded; result dropped"),
             serde_json::json!({ "phase": "manual_commands", "state": "superseded" }),
         );
-        return;
+        return Err("manual-check generation was superseded".to_string());
     }
 
     // RAL-88: record which resolved agent/model produced these commands. This
@@ -12492,6 +13184,7 @@ fn generate_manual_commands(
             "model": model,
         }),
     );
+    Ok(())
 }
 
 /// Prompt asked of the resolver agent for "set it for me" (RAL-164): propose
@@ -13917,6 +14610,31 @@ mod tests {
     }
 
     #[test]
+    fn generated_manual_command_can_carry_preparation_and_observation_guidance() {
+        let text = r#"{
+            "manual_commands": [{
+                "command": "target/debug/demo",
+                "description": "Open the window",
+                "success": "The greeting is visible",
+                "prepare": [{"command": "cargo build --bin demo"}]
+            }]
+        }"#;
+
+        let checks = parse_manual_commands_response(text);
+
+        assert_eq!(checks[0].run_on.as_deref(), Some("daemon"));
+        assert_eq!(checks[0].description.as_deref(), Some("Open the window"));
+        assert_eq!(
+            checks[0].success.as_deref(),
+            Some("The greeting is visible")
+        );
+        assert_eq!(
+            checks[0].prepare[0].command.as_deref(),
+            Some("cargo build --bin demo")
+        );
+    }
+
+    #[test]
     fn parse_manual_commands_tolerates_chatty_model_wrapping_json_in_prose() {
         let text = "Sure, here you go:\n```json\n{\"manual_commands\": [\"cargo test\"]}\n```\nHope that helps!";
         let checks = parse_manual_commands_response(text);
@@ -13977,6 +14695,7 @@ mod tests {
                         default: "7890".to_string(),
                         r#type: CheckInputType::Int,
                     }],
+                    ..GuardianCheck::default()
                 }],
                 None,
                 None,
@@ -13990,7 +14709,9 @@ mod tests {
         let store = Arc::new(crate::store_lock::StoreMutex::new(
             Store::open_in_memory().unwrap(),
         ));
-        let id = guardian_with_port_input(&store.lock());
+        let guard = store.lock();
+        let id = guardian_with_port_input(&guard);
+        drop(guard);
         let runner: Arc<dyn Runner> = Arc::new(FixedValueRunner("9001"));
         let sem = Arc::new(Semaphore::new(4));
 
@@ -14020,7 +14741,9 @@ mod tests {
         let store = Arc::new(crate::store_lock::StoreMutex::new(
             Store::open_in_memory().unwrap(),
         ));
-        let id = guardian_with_port_input(&store.lock());
+        let guard = store.lock();
+        let id = guardian_with_port_input(&guard);
+        drop(guard);
         let runner: Arc<dyn Runner> = Arc::new(FixedValueRunner("9001"));
         let sem = Arc::new(Semaphore::new(4));
 
@@ -14034,7 +14757,9 @@ mod tests {
         let store = Arc::new(crate::store_lock::StoreMutex::new(
             Store::open_in_memory().unwrap(),
         ));
-        let id = guardian_with_port_input(&store.lock());
+        let guard = store.lock();
+        let id = guardian_with_port_input(&guard);
+        drop(guard);
         // Pre-claim, simulating a resolution already in flight from a
         // concurrent request.
         store
@@ -15114,7 +15839,9 @@ mod tests {
         // while the retained unsafe one reads as claimed by the review that
         // still owns it.
         {
-            let view = worktree_retirement_view(&store.lock()).unwrap();
+            let guard = store.lock();
+            let view = worktree_retirement_view(&guard).unwrap();
+            drop(guard);
             let safe = view
                 .entries
                 .iter()
@@ -15260,7 +15987,9 @@ mod tests {
                 .unwrap();
         }
 
-        let view = worktree_retirement_view(&store.lock()).unwrap();
+        let guard = store.lock();
+        let view = worktree_retirement_view(&guard).unwrap();
+        drop(guard);
         assert_eq!(view.age_threshold_days, 30);
         let state_of = |id: &str, v: &WorktreeRetirementView| {
             v.entries
@@ -15294,7 +16023,9 @@ mod tests {
                 None,
             )
             .unwrap();
-        let view2 = worktree_retirement_view(&store.lock()).unwrap();
+        let guard = store.lock();
+        let view2 = worktree_retirement_view(&guard).unwrap();
+        drop(guard);
         let failed_entry = view2
             .entries
             .iter()
@@ -15321,7 +16052,9 @@ mod tests {
                 )
                 .unwrap();
         }
-        let view3 = worktree_retirement_view(&store.lock()).unwrap();
+        let guard = store.lock();
+        let view3 = worktree_retirement_view(&guard).unwrap();
+        drop(guard);
         let retired_entry = view3
             .entries
             .iter()
@@ -17403,11 +18136,8 @@ mod tests {
     // Remote build machines (RAL-175)
     // -----------------------------------------------------------------------
 
-    /// A guardian with an explicit `checks` command, in a repo whose
-    /// `.ralphus.toml` enables remote build against a fake endpoint --
-    /// `final_checks` only takes the remote path when it resolves a
     #[test]
-    fn final_checks_runs_local_checks_and_surfaces_a_failure() {
+    fn final_checks_runs_local_preparation_and_surfaces_a_failure() {
         let (base, repo, _fwt) = make_repo("finalchecks-remote-off");
         let store = Arc::new(crate::store_lock::StoreMutex::new(
             Store::open_in_memory().unwrap(),
@@ -17418,7 +18148,13 @@ mod tests {
                 .create_guardian("r", "main", &repo.to_string_lossy())
                 .unwrap();
             guard
-                .set_guardian_checks(&id, &["exit 1".to_string()])
+                .set_guardian_preparation(
+                    &id,
+                    vec![crate::guardian::GuardianAutoBuild {
+                        command: Some("exit 1".to_string()),
+                        ..crate::guardian::GuardianAutoBuild::default()
+                    }],
+                )
                 .unwrap();
             id
         };
@@ -17431,10 +18167,219 @@ mod tests {
             &repo.to_string_lossy(),
             &CancelToken::never(),
         );
-        // The configured `exit 1` check gate fails the review.
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("check failed"));
+        assert!(result.unwrap_err().contains("preparation command failed"));
 
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn preparation_builds_before_the_manual_action_becomes_ready() {
+        let (base, repo, _fwt) = make_repo("prepare-before-action");
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let build_command = if cfg!(windows) {
+            "echo built> prepared-hello.txt"
+        } else {
+            "printf built > prepared-hello.txt"
+        };
+        let test_command = if cfg!(windows) {
+            "if not exist prepared-hello.txt exit 1"
+        } else {
+            "test -f prepared-hello.txt"
+        };
+        let id = {
+            let guard = store.lock();
+            let id = guard
+                .create_guardian("r", "main", &repo.to_string_lossy())
+                .unwrap();
+            guard
+                .set_guardian_preparation(
+                    &id,
+                    vec![crate::guardian::GuardianAutoBuild {
+                        command: Some(build_command.to_string()),
+                        ..crate::guardian::GuardianAutoBuild::default()
+                    }],
+                )
+                .unwrap();
+            guard
+                .set_guardian_action_hints(
+                    &id,
+                    &[crate::guardian::GuardianCheck {
+                        label: Some("Hello world".to_string()),
+                        command: Some(test_command.to_string()),
+                        run_on: Some("daemon".to_string()),
+                        ..crate::guardian::GuardianCheck::default()
+                    }],
+                )
+                .unwrap();
+            id
+        };
+
+        final_checks(
+            &store,
+            &FixedValueRunner("unused"),
+            &id,
+            &Workspace::local(&repo),
+            &repo.to_string_lossy(),
+            &CancelToken::never(),
+        )
+        .expect("preparation succeeds");
+
+        let action = store
+            .lock()
+            .get_guardian(&id)
+            .unwrap()
+            .action_hints
+            .remove(0);
+        assert_eq!(action.preparation_state.as_deref(), Some("ready"));
+        assert!(repo.join("prepared-hello.txt").exists());
+        assert!(
+            Workspace::local(&repo)
+                .run_command(test_command, &CancelToken::never())
+                .0,
+            "the button command must find the already-built output without building"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn equal_action_preparation_groups_are_deduplicated_and_expand_worktree_text() {
+        let (base, repo, _fwt) = make_repo("deduplicate-action-preparation");
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let commands = if cfg!(windows) {
+            vec![
+                "echo %OUTPUT_NAME%>> group-count.txt".to_string(),
+                "echo second>> group-count.txt".to_string(),
+            ]
+        } else {
+            vec![
+                "printf '%s\\n' \"$OUTPUT_NAME\" >> group-count.txt".to_string(),
+                "printf 'second\\n' >> group-count.txt".to_string(),
+            ]
+        };
+        let group = crate::guardian::GuardianAutoBuild {
+            commands,
+            environment: std::collections::BTreeMap::from([(
+                "OUTPUT_NAME".to_string(),
+                "<<ralphus:new-worktree/RAL-999-add_widget?upstream=main&text=basename({})>>"
+                    .to_string(),
+            )]),
+            ..crate::guardian::GuardianAutoBuild::default()
+        };
+        let id = {
+            let guard = store.lock();
+            let id = guard
+                .create_guardian("r", "main", &repo.to_string_lossy())
+                .unwrap();
+            guard
+                .set_guardian_action_hints(
+                    &id,
+                    &[
+                        crate::guardian::GuardianCheck {
+                            label: Some("First".to_string()),
+                            command: Some("echo <<ralphus:new-worktree/RAL-999-add_widget?upstream=main&text=basename({})>>".to_string()),
+                            prepare: vec![group.clone()],
+                            ..crate::guardian::GuardianCheck::default()
+                        },
+                        crate::guardian::GuardianCheck {
+                            label: Some("Second".to_string()),
+                            command: Some("echo second".to_string()),
+                            prepare: vec![group],
+                            ..crate::guardian::GuardianCheck::default()
+                        },
+                    ],
+                )
+                .unwrap();
+            id
+        };
+
+        final_checks(
+            &store,
+            &FixedValueRunner("unused"),
+            &id,
+            &Workspace::local(&repo),
+            &repo.to_string_lossy(),
+            &CancelToken::never(),
+        )
+        .expect("deduplicated preparation succeeds");
+
+        let review = store.lock().get_guardian(&id).unwrap();
+        assert!(
+            review
+                .action_hints
+                .iter()
+                .all(|action| action.preparation_state.as_deref() == Some("ready"))
+        );
+        assert_eq!(
+            review.action_hints[0].command.as_deref(),
+            Some("echo RAL-999-add_widget")
+        );
+        let lines = std::fs::read_to_string(repo.join("group-count.txt")).unwrap();
+        assert_eq!(lines.lines().count(), 2, "the equal group must run once");
+        assert!(lines.contains("RAL-999-add_widget"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn generated_check_preparation_runs_before_the_check_becomes_ready() {
+        let (base, repo, _fwt) = make_repo("prepare-generated-check");
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let build_command = if cfg!(windows) {
+            "echo built> generated-ready.txt"
+        } else {
+            "printf built > generated-ready.txt"
+        };
+        let id = {
+            let guard = store.lock();
+            let id = guard
+                .create_guardian("r", "main", &repo.to_string_lossy())
+                .unwrap();
+            guard
+                .set_guardian_manual_commands(
+                    &id,
+                    &[crate::guardian::GuardianCheck {
+                        command: Some("generated-ready.txt".to_string()),
+                        prepare: vec![crate::guardian::GuardianAutoBuild {
+                            command: Some(build_command.to_string()),
+                            ..crate::guardian::GuardianAutoBuild::default()
+                        }],
+                        ..crate::guardian::GuardianCheck::default()
+                    }],
+                    None,
+                    None,
+                )
+                .unwrap();
+            id
+        };
+
+        final_checks(
+            &store,
+            &FixedValueRunner("unused"),
+            &id,
+            &Workspace::local(&repo),
+            &repo.to_string_lossy(),
+            &CancelToken::never(),
+        )
+        .expect("generated check preparation succeeds");
+
+        let check = store
+            .lock()
+            .get_guardian(&id)
+            .unwrap()
+            .manual_commands
+            .remove(0);
+        assert_eq!(check.preparation_state.as_deref(), Some("ready"));
+        assert_eq!(
+            check.prepared_cwd.as_deref(),
+            Some(repo.to_string_lossy().as_ref())
+        );
+        assert!(repo.join("generated-ready.txt").exists());
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -17443,7 +18388,7 @@ mod tests {
     /// `build_env` -- the check command below fails unless the overridden
     /// variable is actually present in its process environment.
     #[test]
-    fn final_checks_runs_check_gates_under_this_reviews_build_env_override() {
+    fn final_checks_runs_preparation_under_this_reviews_build_env_override() {
         let (base, repo, _fwt) = make_repo("finalchecks-buildenv");
         let store = Arc::new(crate::store_lock::StoreMutex::new(
             Store::open_in_memory().unwrap(),
@@ -17459,7 +18404,13 @@ mod tests {
                 .create_guardian("r", "main", &repo.to_string_lossy())
                 .unwrap();
             guard
-                .set_guardian_checks(&id, &[check_cmd.to_string()])
+                .set_guardian_preparation(
+                    &id,
+                    vec![crate::guardian::GuardianAutoBuild {
+                        command: Some(check_cmd.to_string()),
+                        ..crate::guardian::GuardianAutoBuild::default()
+                    }],
+                )
                 .unwrap();
             let mut set = std::collections::BTreeMap::new();
             set.insert("RAL203_BUILD_VAR".to_string(), "expected".to_string());
@@ -17479,7 +18430,7 @@ mod tests {
         );
         assert!(
             result.is_ok(),
-            "check gate must see the build-env override: {result:?}"
+            "preparation must see the build-env override: {result:?}"
         );
 
         let _ = std::fs::remove_dir_all(&base);
@@ -17530,12 +18481,10 @@ mod tests {
             result.is_ok(),
             "project auto_build must see the build-env override: {result:?}"
         );
+        let note = result.unwrap().unwrap();
         assert!(
-            result
-                .unwrap()
-                .unwrap()
-                .contains("auto-built via review auto_build"),
-            "expected the stamped review auto_build note"
+            note.contains("prepared via"),
+            "expected the preparation note: {note}"
         );
 
         let _ = std::fs::remove_dir_all(&base);
@@ -17553,7 +18502,7 @@ mod tests {
     /// above) -- the inferred build command below fails unless the
     /// overridden variable is actually present in its process environment.
     #[test]
-    fn final_checks_prefers_review_declared_auto_build_over_project_default() {
+    fn final_checks_prefers_review_preparation_over_project_default() {
         let (base, repo, _fwt) = make_repo("finalchecks-review-autobuild-precedence");
         std::fs::write(
             repo.join(".ralphus.toml"),
@@ -17573,11 +18522,13 @@ mod tests {
                     &id,
                     Some(&crate::guardian::GuardianAutoBuild {
                         command: Some("exit 0".to_string()),
+                        commands: Vec::new(),
                         prompt: None,
                         system_prompt: None,
                         system_prompt_position: None,
                         agent: None,
                         model: None,
+                        environment: std::collections::BTreeMap::new(),
                     }),
                 )
                 .unwrap();
@@ -17598,8 +18549,8 @@ mod tests {
         );
         let note = result.unwrap().unwrap();
         assert!(
-            note.contains("auto-built via review auto_build"),
-            "expected the review-declared auto_build note, got: {note}"
+            note.contains("prepared via declared command"),
+            "expected the review preparation note, got: {note}"
         );
 
         let _ = std::fs::remove_dir_all(&base);
@@ -17635,14 +18586,10 @@ mod tests {
         }
     }
 
-    /// RAL-342/Q5: a review-declared `[[review.auto_build]]` *agent* invocation
-    /// that fails must not fail the merge -- it surfaces as an advisory
-    /// notice plus a Cartographer log entry, and `final_checks` still returns
-    /// `Ok(Some(note))` (never `Err`) so the review reaches `InReview`. Cost
-    /// is still recorded via `record_guardian_call_cost` even though the call
-    /// failed.
+    /// A failed agent preparation is persisted as advisory post-merge failure
+    /// while its cost and diagnostic history remain available.
     #[test]
-    fn final_checks_review_auto_build_agent_failure_is_advisory_not_err() {
+    fn final_checks_preparation_agent_failure_is_recorded_as_failed() {
         let (base, repo, _fwt) = make_repo("finalchecks-review-autobuild-agent-fail");
         let store = Arc::new(crate::store_lock::StoreMutex::new(
             Store::open_in_memory().unwrap(),
@@ -17657,11 +18604,13 @@ mod tests {
                     &id,
                     Some(&crate::guardian::GuardianAutoBuild {
                         command: None,
+                        commands: Vec::new(),
                         prompt: Some("build the thing".to_string()),
                         system_prompt: None,
                         system_prompt_position: None,
                         agent: None,
                         model: None,
+                        environment: std::collections::BTreeMap::new(),
                     }),
                 )
                 .unwrap();
@@ -17676,15 +18625,8 @@ mod tests {
             &repo.to_string_lossy(),
             &CancelToken::never(),
         );
-        assert!(
-            result.is_ok(),
-            "an agent-form auto_build failure must be advisory, not an Err: {result:?}"
-        );
-        let note = result.unwrap().unwrap();
-        assert!(
-            note.contains("failed"),
-            "expected the failure to be reflected in the note: {note}"
-        );
+        assert!(result.is_err(), "failed preparation must not report ready");
+        assert!(result.unwrap_err().contains("agent exploded"));
 
         let guard = store.lock();
         let view = guard.get_guardian(&id).unwrap();
@@ -17718,5 +18660,65 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn feedback_cancels_in_flight_preparation_before_reading_review_state() {
+        struct FailIfCalledRunner;
+        impl Runner for FailIfCalledRunner {
+            fn run(&self, _spec: &RunnerSpec) -> RunnerResult {
+                panic!("feedback for a missing branch must not invoke the runner");
+            }
+        }
+
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = store
+            .lock()
+            .create_guardian("feedback-stale", "main", "/r")
+            .unwrap();
+        store
+            .lock()
+            .set_guardian_action_hints(
+                &id,
+                &[crate::guardian::GuardianCheck {
+                    label: Some("Run prepared scenario".to_string()),
+                    command: Some("prepared-test".to_string()),
+                    preparation_state: Some("ready".to_string()),
+                    prepared_at_ms: Some(crate::store::now_ms()),
+                    prepared_cwd: Some("/prepared/old".to_string()),
+                    ..crate::guardian::GuardianCheck::default()
+                }],
+            )
+            .unwrap();
+        let (_, preparation_cancel, _) = store.lock_free_memory().begin_guardian_preparation(&id);
+
+        let outcome = run_feedback(
+            &store,
+            &FailIfCalledRunner,
+            &id,
+            "missing-branch",
+            "apply this change",
+            None,
+            false,
+            &CancelToken::never(),
+        );
+
+        assert!(preparation_cancel.is_cancelled());
+        let action = store
+            .lock()
+            .get_guardian(&id)
+            .unwrap()
+            .action_hints
+            .remove(0);
+        assert_eq!(action.preparation_state.as_deref(), Some("stale"));
+        assert!(action.prepared_at_ms.is_none());
+        assert!(action.prepared_cwd.is_none());
+        assert!(!outcome.committed);
+        assert!(outcome.sha.is_none());
+        assert!(!outcome.pushed);
+        assert!(outcome.pushed_sha.is_none());
+        assert!(outcome.proof_passed.is_none());
     }
 }

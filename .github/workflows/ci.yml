@@ -347,7 +347,18 @@ jobs:
       # uses for the same class of shared-runner flake (see the Python
       # board cold-load perf step below); a genuine regression still fails
       # every attempt.
+      # RALPHUS_GUARD_HOLD_PANIC_MS: integration test binaries take the
+      # `cfg!(debug_assertions)` branch of `guard_hold_panic_ms()` (2,000 ms),
+      # not the more generous `cfg!(test)` branch (5,000 ms) meant for this
+      # kind of real-HTTP/real-SQLite load -- see that function's doc comment
+      # in daemon/src/store_lock.rs. Under the same noisy-shared-runner
+      # scheduling jitter --retries already exists to absorb (see above), a
+      # single store-guard hold can cross 2,000 ms without any blocking I/O
+      # under the lock -- the actual regression gates stay the p95/wait
+      # budgets this test asserts, not this debug watchdog.
       - name: Rust store contention budget
+        env:
+          RALPHUS_GUARD_HOLD_PANIC_MS: "8000"
         run: cargo nextest run -p ralphus-daemon --test board_contention --run-ignored only --test-threads 1 --retries 2
       # WS-B.5: the writer's sustained commit rate, batched and unbatched.
       - name: Rust store write-throughput floor

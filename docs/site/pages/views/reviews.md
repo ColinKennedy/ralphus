@@ -2,7 +2,7 @@
 
 A Guardian review takes the branches produced by a squad's tasks and stacks
 them into a single rebased review branch — resolving merge conflicts with an
-agent, running your declared check gates, and giving you a per-branch
+agent, preparing optional manual checks, and giving you a per-branch
 feedback thread to request changes before anything is marked merged. The Reviews
 tab is where you watch and steer that process.
 
@@ -30,8 +30,9 @@ once you click **Save**, which re-runs the stacked rebase in the new shape.
 
 ![The manual-checks section of a review, listing the agent's suggested commands with one expanded to show its full text](../screenshots/reviews-manual-checks.png)
 
-Alongside the automated check gates, an agent suggests shell commands worth
-running by hand to sanity-check the change. The suggestions are computed once,
+An agent suggests optional shell commands worth running by hand to sanity-check
+the change. Ralphus prepares their checkout and declared artifacts before any
+Run button enables. The suggestions are computed once,
 when the review's branches are first created, and then kept through later
 merges, rebases, and automated fix iterations — manual checks describe review
 work that doesn't change across an ordinary rebase, so ralphus doesn't spend
@@ -41,9 +42,10 @@ suggestions on every rebuild instead, turn the caching off: set
 cache_manual_checks = false` project default) and every later merge or rebase
 regenerates the commands from the freshly stacked diff.
 
-**▶ Run all** launches every suggested command at once in
-a new terminal in the repository root; the **▾** next to it opens the
-individual commands so you can run just one.
+**▶ Run all** launches every ready suggested command at once in its prepared
+checkout. It never performs a build or transfer. An action stays disabled and
+shows `preparing`, `transferring`, or an actionable failure until its setup is
+complete. These outcomes are useful history but never block approval.
 
 ## Feedback
 
