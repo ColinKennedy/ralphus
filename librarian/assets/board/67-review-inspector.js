@@ -153,6 +153,7 @@
       function renderReviewInspector() {
         const host = document.getElementById("review-inspector");
         if (!host) return;
+        const snap = snapshotInspectorUiState();
         const g = guardians.find((x) => x.id === selectedGuardian);
         if (!g || !g.branches) {
           host.innerHTML = `<div class="empty">Select a review.</div>`;
@@ -182,6 +183,57 @@
                 k === "feedback" && unread ? `<span class="insp-badge" data-tip="You left feedback the resolver has not answered yet.">1</span>` : ""}</button>`).join("")}</div>
           </div>
           <div class="insp-body">${inspectorTabBody(g, b)}</div>`;
+        restoreInspectorUiState(snap, `${g.id}:${b.id}:${inspectorTab}`);
+      }
+      /**
+       * @typedef {object} InspectorUiSnapshot
+       * @property {number} scrollTop - The body's scroll offset.
+       * @property {string|null} focusedId - Id of the focused draft textarea, if any.
+       * @property {number} selStart - Caret/selection start in that textarea.
+       * @property {number} selEnd - Selection end in that textarea.
+       * @property {string} layoutKey - Which branch/tab the snapshot was taken on.
+       */
+      /** @type {{[textareaId: string]: string}} Unsent feedback text per branch, surviving re-renders. */
+      const feedbackDrafts = {};
+      /** @type {string} The branch/tab last painted, so scroll is kept only across same-view refreshes. */
+      let inspectorLayoutKey = "";
+      /**
+       * Captures what a full inspector repaint would otherwise lose: the
+       * unsent feedback draft, textarea focus and caret, and the body's scroll.
+       * @returns {InspectorUiSnapshot}
+       */
+      function snapshotInspectorUiState() {
+        const body = document.querySelector("#review-inspector .insp-body");
+        const ta = /** @type {HTMLTextAreaElement|null} */ (
+          document.querySelector("#review-inspector textarea[id^='fb-input-']"));
+        if (ta) feedbackDrafts[ta.id] = ta.value;
+        const focused = !!ta && document.activeElement === ta;
+        return {
+          scrollTop: body ? body.scrollTop : 0,
+          focusedId: focused && ta ? ta.id : null,
+          selStart: ta ? ta.selectionStart : 0,
+          selEnd: ta ? ta.selectionEnd : 0,
+          layoutKey: inspectorLayoutKey,
+        };
+      }
+      /**
+       * Re-applies a snapshot to the freshly painted inspector.
+       * @param {InspectorUiSnapshot} snap - From {@link snapshotInspectorUiState}.
+       * @param {string} layoutKey - The branch/tab just painted.
+       * @returns {void}
+       */
+      function restoreInspectorUiState(snap, layoutKey) {
+        inspectorLayoutKey = layoutKey;
+        const ta = /** @type {HTMLTextAreaElement|null} */ (
+          document.querySelector("#review-inspector textarea[id^='fb-input-']"));
+        if (ta && feedbackDrafts[ta.id]) ta.value = feedbackDrafts[ta.id];
+        if (snap.layoutKey !== layoutKey) return;
+        const body = document.querySelector("#review-inspector .insp-body");
+        if (body) body.scrollTop = snap.scrollTop;
+        if (ta && snap.focusedId === ta.id && !ta.disabled) {
+          ta.focus({ preventScroll: true });
+          ta.setSelectionRange(snap.selStart, snap.selEnd);
+        }
       }
       /**
        * Body for whichever inspector tab is active. Only this one runs, so a
@@ -447,7 +499,10 @@
             notify("error", `Feedback was not sent: ${detail.slice(0, 200)}`);
             return;
           }
-          if (el) el.value = "";
+          // `el` was replaced by the "Sending…" repaint, so clear the live one.
+          const live = /** @type {HTMLTextAreaElement|null} */ (document.getElementById(`fb-input-${bid}`));
+          if (live) live.value = "";
+          delete feedbackDrafts[`fb-input-${bid}`];
           notify("success", "Feedback sent to the resolver agent.");
           // Re-read the thread so the message appears without a manual refresh.
           loadBranchMessages(gid, bid);
