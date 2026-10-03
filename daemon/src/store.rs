@@ -1794,6 +1794,62 @@ impl Store {
                 auto_watch            INTEGER NOT NULL DEFAULT 0,
                 default_notify_tiers  TEXT NOT NULL DEFAULT 'urgent,high,normal'
             );
+            -- A user may own several review clients (desktop, laptop, phone).
+            -- V1 uses a local shared store, but the durable client identity is
+            -- deliberately independent from the daemon host so later delivery
+            -- adapters do not need to rewrite review state.
+            CREATE TABLE IF NOT EXISTS review_clients (
+                id              TEXT PRIMARY KEY,
+                user_name       TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
+                label           TEXT NOT NULL,
+                enabled         INTEGER NOT NULL DEFAULT 1,
+                local           INTEGER NOT NULL DEFAULT 1,
+                created_at_ms   INTEGER NOT NULL,
+                updated_at_ms   INTEGER NOT NULL,
+                UNIQUE(user_name, label)
+            );
+            CREATE INDEX IF NOT EXISTS idx_review_clients_user ON review_clients(user_name, enabled);
+            -- Delivery policy belongs to a user, not task TOML. The trigger
+            -- columns use the closed values enforced by delivery.rs.
+            CREATE TABLE IF NOT EXISTS user_review_delivery_preferences (
+                user_name                   TEXT PRIMARY KEY REFERENCES users(name) ON DELETE CASCADE,
+                on_rebase                   TEXT NOT NULL DEFAULT 'ignore',
+                on_feedback                 TEXT NOT NULL DEFAULT 'prepare',
+                on_auto_pr_fix              TEXT NOT NULL DEFAULT 'prepare',
+                offline_delivery            TEXT NOT NULL DEFAULT 'retain_latest',
+                on_reconnect                TEXT NOT NULL DEFAULT 'deliver_latest',
+                auto_register_submitter     INTEGER NOT NULL DEFAULT 1,
+                updated_at_ms               INTEGER NOT NULL
+            );
+            -- A review recipient is an explicit user/client subscription. It
+            -- remains durable when the client goes temporarily offline.
+            CREATE TABLE IF NOT EXISTS guardian_recipients (
+                guardian_id     TEXT NOT NULL REFERENCES guardians(id) ON DELETE CASCADE,
+                client_id       TEXT NOT NULL REFERENCES review_clients(id) ON DELETE CASCADE,
+                subscribed_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (guardian_id, client_id)
+            );
+            -- One readiness record per review action, recipient, and source
+            -- generation. This is the single-flight ownership row for V1 and
+            -- becomes the transfer state machine in V2.
+            CREATE TABLE IF NOT EXISTS guardian_action_generations (
+                guardian_id       TEXT NOT NULL REFERENCES guardians(id) ON DELETE CASCADE,
+                action_key        TEXT NOT NULL,
+                client_id         TEXT NOT NULL REFERENCES review_clients(id) ON DELETE CASCADE,
+                generation        INTEGER NOT NULL,
+                state             TEXT NOT NULL,
+                definition_digest TEXT NOT NULL,
+                manifest_path     TEXT,
+                manifest_sha256   TEXT,
+                published_root    TEXT,
+                lease_expires_at_ms INTEGER,
+                detail            TEXT,
+                created_at_ms     INTEGER NOT NULL,
+                updated_at_ms     INTEGER NOT NULL,
+                PRIMARY KEY (guardian_id, action_key, client_id, generation)
+            );
+            CREATE INDEX IF NOT EXISTS idx_guardian_action_generations_current
+                ON guardian_action_generations(guardian_id, action_key, client_id, generation DESC);
             -- RAL-338: a project's writable fork, keyed by the user who pushes
             -- to it (`user = ''` is the project-wide fallback row). Rows
             -- deliberately do not cascade on user deletion -- an
