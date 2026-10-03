@@ -7535,7 +7535,7 @@ fn run_feedback_pass(
             // against the settled stack: hand them to the independent worker
             // instead of holding this feedback run (and the review's `merging`
             // state) while they run (RAL-520).
-            maybe_spawn_post_merge_for(store, id, rebuild_trigger);
+            maybe_spawn_post_merge_for(store, id, RebuildTrigger::Feedback);
         }
         Err(e) => set_status(GuardianStatus::MergeFailed, Some(&e)),
     }
