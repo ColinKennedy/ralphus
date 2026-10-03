@@ -819,9 +819,9 @@
       function branchStatusPill(b) {
         const status = b.merge_status || "";
         const tip = BRANCH_STATUS_TIPS[status];
-        const html = pill(status);
-        if (!tip) return html;
-        return html.replace(/ data-tip="[^"]*"/, "").replace("<span ", `<span data-tip="${esc(tip)}" `);
+        if (!tip) return pill(status);
+        const safe = safeState(status);
+        return `<span class="pill p-${safe}" data-tip="${esc(tip)}">${safe}</span>`;
       }
       /**
        * Renders a review branch's merge-status badge (ready / conflict / resolved).
