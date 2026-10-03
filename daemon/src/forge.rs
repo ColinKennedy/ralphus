@@ -3219,26 +3219,52 @@ fn configured_remote_names(root: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Whether remote `name`'s configured URL resolves to the same repository as
+/// `target` (an already-[`parse_remote_url`]-normalized `(host, path)` pair).
+/// Propagates a `git config` failure as `Err` rather than treating it as "no
+/// match" -- a probe that could not be answered is not the same claim as "this
+/// remote's URL differs", and callers must not invent a new remote on the
+/// strength of a failed probe they never actually completed.
+fn remote_url_is(root: &Path, name: &str, target: &(String, String)) -> Result<bool, String> {
+    let configured =
+        crate::guardian_merge::git(root, &["config", "--get", &format!("remote.{name}.url")])
+            .map_err(|e| format!("could not read remote.{name}.url: {e}"))?;
+    Ok(parse_remote_url(configured.trim()).as_ref() == Some(target))
+}
+
 /// Find, among `root`'s configured remotes (skipping `exclude`), one whose
 /// URL names the same repository as `url` (RAL-<new>) -- compared via
 /// [`parse_remote_url`]'s (host, path) normalization, so an `ssh://`/`git@`/
 /// `https://` form and a trailing `.git` all still match the same underlying
-/// repo. Reads `git config --get remote.<name>.url` rather than `git remote
-/// get-url`, for the same reason [`crate::project_forks::ensure_fork_remote`]
-/// documents: the latter applies any global `url.<x>.insteadOf` rewrite,
-/// which would make an already-correct remote misleadingly look different.
-fn find_remote_matching_url(root: &Path, url: &str, exclude: Option<&str>) -> Option<String> {
-    let target = parse_remote_url(url)?;
-    configured_remote_names(root).into_iter().find(|name| {
+/// repo. Reads `git config --get remote.<name>.url` (via [`remote_url_is`])
+/// rather than `git remote get-url`, for the same reason
+/// [`crate::project_forks::ensure_fork_remote`] documents: the latter applies
+/// any global `url.<x>.insteadOf` rewrite, which would make an already-correct
+/// remote misleadingly look different.
+///
+/// Returns `Ok(None)` when every configured remote was checked and none
+/// matched, but `Err` the moment one remote's probe itself fails -- those are
+/// not the same outcome, and a caller that cannot tell them apart risks
+/// creating a duplicate remote for one it merely failed to check. Remaining
+/// remotes after a failing one are not probed; the caller doesn't need a full
+/// scan once it can no longer trust the scan's completeness.
+fn find_remote_matching_url(
+    root: &Path,
+    url: &str,
+    exclude: Option<&str>,
+) -> Result<Option<String>, String> {
+    let Some(target) = parse_remote_url(url) else {
+        return Ok(None);
+    };
+    for name in configured_remote_names(root) {
         if Some(name.as_str()) == exclude {
-            return false;
+            continue;
         }
-        crate::guardian_merge::git(root, &["config", "--get", &format!("remote.{name}.url")])
-            .ok()
-            .and_then(|configured| parse_remote_url(configured.trim()))
-            .as_ref()
-            == Some(&target)
-    })
+        if remote_url_is(root, &name, &target)? {
+            return Ok(Some(name));
+        }
+    }
+    Ok(None)
 }
 
 /// Idempotently add a remote pointing at `url`, preferring `preferred_name`
@@ -3293,6 +3319,12 @@ fn ensure_remote_for_url(root: &Path, preferred_name: &str, url: &str) -> Result
 /// failure while creating a new remote also falls through to it, rather than
 /// failing the caller's whole PR/worktree operation over a remote-naming
 /// nicety.
+///
+/// A [`find_remote_matching_url`] probe failure (`Err`, as opposed to a clean
+/// `Ok(None)`) skips the create-a-remote step entirely and falls all the way
+/// through to [`resolve_remote_name_excluding`]'s heuristic -- inventing a
+/// new remote on the strength of a check that never actually completed would
+/// risk leaving a spurious duplicate behind.
 #[must_use]
 pub(crate) fn resolve_parent_remote_name(
     root: &Path,
@@ -3302,14 +3334,17 @@ pub(crate) fn resolve_parent_remote_name(
     exclude: Option<&str>,
 ) -> String {
     if let Some(url) = clone_url.map(str::trim).filter(|s| !s.is_empty()) {
-        if let Some(name) = find_remote_matching_url(root, url, exclude) {
-            return name;
-        }
-        let preferred = default_remote_name(cfg);
-        if Some(preferred.as_str()) != exclude {
-            if let Ok(name) = ensure_remote_for_url(root, &preferred, url) {
-                return name;
+        match find_remote_matching_url(root, url, exclude) {
+            Ok(Some(name)) => return name,
+            Ok(None) => {
+                let preferred = default_remote_name(cfg);
+                if Some(preferred.as_str()) != exclude {
+                    if let Ok(name) = ensure_remote_for_url(root, &preferred, url) {
+                        return name;
+                    }
+                }
             }
+            Err(_) => return resolve_remote_name_excluding(root, base_branch, cfg, exclude),
         }
     }
     resolve_remote_name_excluding(root, base_branch, cfg, exclude)
@@ -5756,6 +5791,48 @@ mod tests {
         assert_eq!(
             resolve_parent_remote_name(&root, "gitlab/main", &cfg, None, None),
             "gitlab"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_parent_remote_name_does_not_invent_a_remote_on_a_probe_failure() {
+        let root = tmp_dir("parent-remote-probe-failure");
+        g(&root, &["init", "--initial-branch", "main"]);
+        // "stub" shows up in `git remote`'s listing (it has a `fetch` key)
+        // but has no `url` key at all, so `git config --get remote.stub.url`
+        // -- the exact probe `remote_url_is` performs -- genuinely fails as
+        // a subprocess (non-zero exit), the same class of failure
+        // (anything other than a clean read) a timeout or corrupt config
+        // would also produce. This workspace forbids `unsafe_code`, so a
+        // test can't call the now-`unsafe` `std::env::set_var` to simulate
+        // the failure via `GIT_CONFIG` or similar; this construction gets a
+        // real git subprocess failure without it.
+        g(
+            &root,
+            &["remote", "add", "stub", "https://example.com/a/b.git"],
+        );
+        g(&root, &["config", "--unset", "remote.stub.url"]);
+
+        let cfg = ForgeConfig::default();
+        // No remote in this repo is named "origin" at all. If the "stub"
+        // probe failure above were ever mistaken for "no match" (the old,
+        // buggy collapse), `find_remote_matching_url` would report no match
+        // found and `resolve_parent_remote_name` would fall into
+        // `ensure_remote_for_url`, which -- finding no existing "origin" --
+        // would happily create a brand-new one pointing at `clone_url`.
+        let clone_url = "https://github.com/acme/widget.git";
+        let resolved =
+            resolve_parent_remote_name(&root, "feature-branch", &cfg, Some(clone_url), None);
+
+        assert_eq!(
+            resolved,
+            resolve_remote_name_excluding(&root, "feature-branch", &cfg, None),
+            "a failed probe must fall all the way through to the heuristic, not invent a remote"
+        );
+        assert!(
+            crate::guardian_merge::git(&root, &["config", "--get", "remote.origin.url"]).is_err(),
+            "must not have created a spurious \"origin\" remote off a probe it never completed"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
