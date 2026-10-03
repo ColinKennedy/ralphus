@@ -1055,6 +1055,32 @@ fn ensure_worktree_config_extension(worktree_dir: &Path) -> Result<(), String> {
     .map(|_| ())
 }
 
+/// Clear every existing `--worktree`-scoped value of `key` before writing a
+/// fresh one, safely handling the case where `key` already has 0, 1, or
+/// multiple values (RAL-<new>) -- worktrees are reused across many squads'
+/// cells over this function's own lifetime (see
+/// [`apply_worktree_credential_helper_best_effort`]'s doc comment), so a
+/// plain `git config --worktree <key> <value>` (single-value REPLACE
+/// semantics) fails outright with "cannot overwrite multiple values with a
+/// single value" the second time this runs against the same worktree, once
+/// a prior `--add` has left 2+ values stored.
+///
+/// `git config --unset-all` itself exits 5 both when `key` was never set at
+/// all AND on at least one real failure mode, so it cannot be called
+/// unconditionally and have its exit code tell those two cases apart. This
+/// guards it behind a `--get-all` existence probe first: if the probe fails
+/// (ordinarily because the key has no value yet -- the common case for a
+/// worktree going through this for the first time), there is nothing to
+/// unset and this returns `Ok(())` without ever invoking `--unset-all`.
+/// Only once presence is already confirmed does it call `--unset-all`, at
+/// which point any failure it reports is unambiguous.
+fn unset_all_worktree_config(worktree_dir: &Path, key: &str) -> Result<(), String> {
+    if git(worktree_dir, &["config", "--worktree", "--get-all", key]).is_err() {
+        return Ok(());
+    }
+    git(worktree_dir, &["config", "--worktree", "--unset-all", key]).map(|_| ())
+}
+
 /// The `credential.helper` value to install: the *absolute path* to the
 /// `ralphus` CLI binary sitting next to this daemon's own executable,
 /// POSIX-shell-quoted for the `!`-prefixed form git spawns via `sh -c`,
@@ -1142,9 +1168,10 @@ pub(crate) fn apply_worktree_credential_helper_best_effort(
             worktree_dir,
             &["config", "--worktree", "ralphus.worktree-grant", &grant],
         )?;
+        unset_all_worktree_config(worktree_dir, "credential.helper")?;
         git(
             worktree_dir,
-            &["config", "--worktree", "credential.helper", ""],
+            &["config", "--worktree", "--add", "credential.helper", ""],
         )?;
         git(
             worktree_dir,
@@ -3161,6 +3188,169 @@ mod tests {
              the credential helper wired up -- git's credential-helper protocol only ever fires \
              for HTTP(S) transport"
         );
+    }
+
+    #[test]
+    fn credential_helper_wiring_survives_a_reused_worktree_running_it_twice() {
+        // RAL-<pending>: worktrees are reused across many squads'/cells'
+        // lifetimes, so `apply_worktree_credential_helper_best_effort` can
+        // run more than once against the same worktree. The second call used
+        // to hit "cannot overwrite multiple values with a single value"
+        // because the first call's `--add credential.helper <command>` left
+        // two values stored, and the plain (no `--add`/`--unset-all`)
+        // `git config --worktree credential.helper ""` write on the second
+        // call used git's default single-value REPLACE semantics against a
+        // now-multi-valued key.
+        let repo = init_repo("submitter-fork-reused-worktree-cred-helper");
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        store
+            .lock()
+            .register_project("proj", "", &repo.to_string_lossy(), "git")
+            .unwrap();
+        store.lock().create_user("alice").unwrap();
+        store
+            .lock()
+            .set_user_forge_token("alice", "127.0.0.1:1", "glpat-test-secret")
+            .unwrap();
+        let wt = ensure_worktree(&repo, "feature-reused", "main").unwrap();
+
+        // First run: simulates the worktree's first squad/cell wiring up the
+        // credential helper.
+        apply_worktree_credential_helper_best_effort(
+            &store,
+            &wt,
+            "alice",
+            "https://127.0.0.1:1/owner/repo.git",
+        );
+        let helper_after_first = git(&wt, &["config", "--get", "credential.helper"])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert!(
+            helper_after_first.starts_with('!')
+                && helper_after_first.ends_with(" internal fork-credential-helper"),
+            "unexpected credential.helper value after first call: {helper_after_first:?}"
+        );
+
+        // Second run: simulates the same worktree being reused by a later
+        // squad/cell. This must not error, and must leave the credential
+        // helper correctly wired up for the fresh grant it just minted --
+        // not stuck on stale state from the first call.
+        apply_worktree_credential_helper_best_effort(
+            &store,
+            &wt,
+            "alice",
+            "https://127.0.0.1:1/owner/repo.git",
+        );
+
+        let worktree_id = git(&wt, &["config", "--get", "ralphus.worktree-id"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let grant = git(&wt, &["config", "--get", "ralphus.worktree-grant"])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert!(!worktree_id.is_empty());
+        assert!(!grant.is_empty());
+        // `git config --get` resolves to the LAST of a multi-valued key --
+        // proving this is still the real ralphus command (not the empty
+        // reset value, and not left over from the first call) proves the
+        // second call's writes actually landed.
+        let helper_after_second = git(&wt, &["config", "--get", "credential.helper"])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert!(
+            helper_after_second.starts_with('!')
+                && helper_after_second.ends_with(" internal fork-credential-helper"),
+            "unexpected credential.helper value after second call: {helper_after_second:?}"
+        );
+        assert_eq!(
+            store
+                .lock()
+                .resolve_worktree_credential(&worktree_id, &grant)
+                .unwrap(),
+            Some("glpat-test-secret".to_string())
+        );
+    }
+
+    #[test]
+    fn unset_all_worktree_config_reproduces_and_fixes_the_reused_worktree_replace_failure() {
+        // Directly exercises the raw git mechanism this bug is about,
+        // without going through `apply_worktree_credential_helper_best_effort`'s
+        // best-effort error-swallowing -- that wrapper hides the failure from
+        // a black-box test: `credential_helper_wiring_survives_a_reused_worktree_running_it_twice`
+        // above happens to pass even against the UNFIXED code, because both
+        // of its calls use the same fork_url, and the swallowed second-call
+        // failure just leaves the first call's already-correct value in
+        // place. This test proves the actual failure mode and the fix at
+        // the git-config layer directly.
+        let repo = init_repo("unset-all-worktree-config-repro");
+        let wt = ensure_worktree(&repo, "feature-cred-repro", "main").unwrap();
+        ensure_worktree_config_extension(&wt).unwrap();
+
+        // Simulate a worktree that has already been wired once: two
+        // accumulated `--add`ed values under the worktree-scoped key.
+        git(
+            &wt,
+            &["config", "--worktree", "--add", "credential.helper", ""],
+        )
+        .unwrap();
+        git(
+            &wt,
+            &["config", "--worktree", "--add", "credential.helper", "cmdA"],
+        )
+        .unwrap();
+
+        // THE BUG, reproduced directly: the old plain single-value REPLACE
+        // write fails outright against an already multi-valued key.
+        let old_style_write = git(&wt, &["config", "--worktree", "credential.helper", ""]);
+        assert!(
+            old_style_write.is_err(),
+            "expected the old plain-replace write to fail against an already \
+             multi-valued credential.helper -- if this starts passing, git's \
+             own single-value-replace semantics changed and this test (and \
+             the bug it documents) need re-examining"
+        );
+
+        // THE FIX: `unset_all_worktree_config` clears every existing value
+        // safely, after which a fresh `--add`-based write succeeds.
+        unset_all_worktree_config(&wt, "credential.helper").unwrap();
+        assert!(
+            git(
+                &wt,
+                &["config", "--worktree", "--get-all", "credential.helper"]
+            )
+            .is_err(),
+            "unset_all_worktree_config must leave no values behind"
+        );
+        git(
+            &wt,
+            &["config", "--worktree", "--add", "credential.helper", ""],
+        )
+        .unwrap();
+        git(
+            &wt,
+            &["config", "--worktree", "--add", "credential.helper", "cmdB"],
+        )
+        .unwrap();
+        assert_eq!(
+            git(&wt, &["config", "--get", "credential.helper"])
+                .unwrap()
+                .trim(),
+            "cmdB"
+        );
+    }
+
+    #[test]
+    fn unset_all_worktree_config_is_a_no_op_when_the_key_was_never_set() {
+        let repo = init_repo("unset-all-worktree-config-absent");
+        let wt = ensure_worktree(&repo, "feature-cred-absent", "main").unwrap();
+        ensure_worktree_config_extension(&wt).unwrap();
+        assert!(unset_all_worktree_config(&wt, "credential.helper").is_ok());
     }
 
     #[test]
