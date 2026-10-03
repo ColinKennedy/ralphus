@@ -3595,6 +3595,7 @@ impl Store {
             self.conn.execute(
                 "UPDATE guardians SET base_shift_rebuild_targets=?2, \
                  base_shift_rebuild_attempts_by_project=?3, \
+                 base_shift_rebuild_attempts=0, \
                  base_shift_exhausted_notified_at_ms=NULL, updated_at_ms=?4 WHERE id=?1",
                 params![id, targets_json, attempts_json, crate::store::now_ms()],
             )?
