@@ -493,6 +493,41 @@ pub(crate) fn allocate_review_upstream_branch(
         .ok_or_else(|| format!("could not find a free dual-root upstream branch for {guardian_id}"))
 }
 
+/// Sanitize an arbitrary string into a safe single path component for a
+/// disposable git ref component: keep ASCII alnum/`-`/`_`, replace everything
+/// else (including `/`) with `_`. Mirrors `pr.rs`'s `sync_fetch_ref`
+/// sanitization policy for the identical reason: `review_branch` here is
+/// itself daemon-generated ([`review_upstream_branch_base`]:
+/// `ralphus/review/<guardian-id>/upstream`), so this is defense-in-depth,
+/// not a load-bearing check.
+fn dual_root_fetch_ref_component(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// The disposable local ref [`sync_review_upstream_branch`] fetches the
+/// parent's base branch tip into, scoped per review-branch so concurrent
+/// syncs for different reviews never contend for the same ref -- or, before
+/// this fix, the repo-root-wide `FETCH_HEAD` file. See `pr.rs`'s
+/// `SYNC_FETCH_LOCKS` doc comment for the FETCH_HEAD-sharing hazard this
+/// mirrors the fix for: a concurrent fetch elsewhere in the same shared
+/// guardian-merge root could otherwise have this function's `rev-parse
+/// FETCH_HEAD` read the *other* fetch's result, silently force-pushing the
+/// wrong tip onto the fork.
+fn dual_root_fetch_ref(review_branch: &str) -> String {
+    format!(
+        "refs/ralphus/dual-root/{}",
+        dual_root_fetch_ref_component(review_branch)
+    )
+}
+
 /// Force-push the parent branch's current tip onto a review's transient
 /// fork-side upstream branch (RAL-<new>): the ref a `dual_root_pr` stack PR
 /// targets, kept exactly mirroring the parent's base so the stack PR always
@@ -501,16 +536,32 @@ pub(crate) fn allocate_review_upstream_branch(
 /// wired (see `pr::resolve_fork_routing`, which every caller of this function
 /// runs through first).
 ///
+/// The base tip is fetched into a dedicated, disposable ref
+/// ([`dual_root_fetch_ref`]) with an explicit refspec and
+/// `--no-write-fetch-head`, rather than relying on the repo-root-wide
+/// `FETCH_HEAD` file -- the same fix already applied to `pr.rs`'s
+/// `compute_sync_status`/`fetch_remote_pr_tip` for the analogous hazard (see
+/// that file's `SYNC_FETCH_LOCKS` doc comment).
+///
 /// The push is deliberately `--force`, unlike the fork's own base branch
 /// (which ralphus never touches): this ref is disposable and owned entirely
 /// by the review, so overwriting it can never lose anyone else's work.
+/// Before pushing, a defense-in-depth guard checks whether the PARENT remote
+/// already has a real branch literally named `review_branch` whose tip
+/// matches the just-fetched base tip -- the same symptom class as the
+/// FETCH_HEAD race (a base tip ending up identical to a review-branch head),
+/// which would make the fork's upstream ref collide with the review's own PR
+/// head branch content and produce a zero-diff PR. When that probe finds no
+/// such ref on the parent (the normal case), it does not block the sync.
+///
 /// Returns the pushed tip sha when a push was needed, `None` when the branch
 /// was already current -- an already-current branch skips the push entirely,
 /// so periodic refreshes stay cheap. RAL-510: the caller uses the returned
 /// sha as `cancel_superseded_ci`'s `keep_sha` for this force-push.
 ///
 /// # Errors
-/// Propagates the underlying `git fetch`/`git push` failure.
+/// Propagates the underlying `git fetch`/`git push` failure, and returns an
+/// `Err` when the collision guard above trips.
 pub(crate) fn sync_review_upstream_branch(
     root: &std::path::Path,
     parent_remote_name: &str,
@@ -518,9 +569,18 @@ pub(crate) fn sync_review_upstream_branch(
     base_branch_name: &str,
     review_branch: &str,
 ) -> std::result::Result<Option<String>, String> {
-    crate::guardian_merge::git(root, &["fetch", parent_remote_name, base_branch_name])
-        .map_err(|e| format!("could not fetch {parent_remote_name}/{base_branch_name}: {e}"))?;
-    let tip = crate::guardian_merge::git(root, &["rev-parse", "FETCH_HEAD"])
+    let dest_ref = dual_root_fetch_ref(review_branch);
+    crate::guardian_merge::git(
+        root,
+        &[
+            "fetch",
+            "--no-write-fetch-head",
+            parent_remote_name,
+            &format!("+{base_branch_name}:{dest_ref}"),
+        ],
+    )
+    .map_err(|e| format!("could not fetch {parent_remote_name}/{base_branch_name}: {e}"))?;
+    let tip = crate::guardian_merge::git(root, &["rev-parse", &dest_ref])
         .map(|s| s.trim().to_string())
         .map_err(|e| format!("could not resolve fetched tip: {e}"))?;
     let current = crate::guardian_merge::git(
@@ -538,6 +598,32 @@ pub(crate) fn sync_review_upstream_branch(
     .map(|(sha, _)| sha.trim().to_string());
     if current.as_deref() == Some(tip.as_str()) {
         return Ok(None);
+    }
+    // Defense-in-depth collision guard: see the function doc comment. A
+    // failed probe (most commonly: no such ref on the parent at all) is "no
+    // collision found", not an error -- it must never block a legitimate
+    // sync.
+    if let Ok(listing) = crate::guardian_merge::git(
+        root,
+        &[
+            "ls-remote",
+            parent_remote_name,
+            &format!("refs/heads/{review_branch}"),
+        ],
+    ) {
+        let parent_sha = listing
+            .lines()
+            .next()
+            .and_then(|line| line.split_once('\t'))
+            .map(|(sha, _)| sha.trim().to_string());
+        if parent_sha.as_deref() == Some(tip.as_str()) {
+            return Err(format!(
+                "refusing to force-push the review upstream branch {review_branch}: the \
+                 parent remote already has a branch named {review_branch} whose tip matches \
+                 the fetched base tip {tip}; this looks like the same symptom as the \
+                 FETCH_HEAD race this function guards against, not a legitimate sync"
+            ));
+        }
     }
     crate::guardian_merge::git(
         root,

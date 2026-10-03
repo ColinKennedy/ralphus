@@ -10289,6 +10289,128 @@ mod tests {
     }
 
     #[test]
+    fn sync_review_upstream_branch_never_writes_fetch_head() {
+        // RAL-<new>: the fetch must land in a dedicated, disposable ref
+        // (`refs/ralphus/dual-root/...`) with `--no-write-fetch-head`,
+        // never the repo-root-wide `FETCH_HEAD` file -- that file is shared
+        // by every other git fetch in the same (possibly concurrently used)
+        // root, and a race there is exactly the bug this function was fixed
+        // for.
+        let parent_bare = tmp_dir("fork-upstream-no-fetch-head-parent-bare");
+        g(&parent_bare, &["init", "--bare"]);
+        let fork_bare = tmp_dir("fork-upstream-no-fetch-head-fork-bare");
+        g(&fork_bare, &["init", "--bare"]);
+
+        let root_dir = tmp_dir("fork-upstream-no-fetch-head-work");
+        g(&root_dir, &["init", "--initial-branch", "release"]);
+        gwrite(&root_dir, "base.txt", "v1\n");
+        g(&root_dir, &["add", "."]);
+        g(&root_dir, &["commit", "--message", "v1"]);
+        g(
+            &root_dir,
+            &["remote", "add", "origin", parent_bare.to_str().unwrap()],
+        );
+        g(
+            &root_dir,
+            &["remote", "add", "fork", fork_bare.to_str().unwrap()],
+        );
+        g(&root_dir, &["push", "origin", "release:release"]);
+
+        let fetch_head_path = root_dir.join(".git").join("FETCH_HEAD");
+        let before = std::fs::read(&fetch_head_path).ok();
+
+        let pushed = crate::project_forks::sync_review_upstream_branch(
+            &root_dir,
+            "origin",
+            "fork",
+            "release",
+            "ralphus/review/g-fetch-head/upstream",
+        )
+        .unwrap();
+        assert!(pushed.is_some());
+
+        let after = std::fs::read(&fetch_head_path).ok();
+        assert_eq!(
+            before, after,
+            "sync_review_upstream_branch must not write FETCH_HEAD at all"
+        );
+
+        let _ = std::fs::remove_dir_all(&root_dir);
+        let _ = std::fs::remove_dir_all(&parent_bare);
+        let _ = std::fs::remove_dir_all(&fork_bare);
+    }
+
+    #[test]
+    fn sync_review_upstream_branch_refuses_to_push_when_the_parent_already_has_a_colliding_branch()
+    {
+        // RAL-<new>: defense-in-depth guard. If the PARENT remote already
+        // has a real branch literally named the same as the transient
+        // review-branch ref, with a tip matching the just-fetched base tip,
+        // that's the same symptom class as the FETCH_HEAD race (a "base
+        // tip" ending up identical to a "review branch head") -- refuse the
+        // push rather than risk producing a zero-diff PR.
+        let parent_bare = tmp_dir("fork-upstream-collision-parent-bare");
+        g(&parent_bare, &["init", "--bare"]);
+        let fork_bare = tmp_dir("fork-upstream-collision-fork-bare");
+        g(&fork_bare, &["init", "--bare"]);
+
+        let root_dir = tmp_dir("fork-upstream-collision-work");
+        g(&root_dir, &["init", "--initial-branch", "release"]);
+        gwrite(&root_dir, "base.txt", "v1\n");
+        g(&root_dir, &["add", "."]);
+        g(&root_dir, &["commit", "--message", "v1"]);
+        g(
+            &root_dir,
+            &["remote", "add", "origin", parent_bare.to_str().unwrap()],
+        );
+        g(
+            &root_dir,
+            &["remote", "add", "fork", fork_bare.to_str().unwrap()],
+        );
+        g(&root_dir, &["push", "origin", "release:release"]);
+        // The parent also already has a branch literally named the
+        // transient review-branch ref, pointed at the exact same tip as the
+        // base branch.
+        g(
+            &root_dir,
+            &[
+                "push",
+                "origin",
+                "release:refs/heads/ralphus/review/g-collide/upstream",
+            ],
+        );
+
+        let result = crate::project_forks::sync_review_upstream_branch(
+            &root_dir,
+            "origin",
+            "fork",
+            "release",
+            "ralphus/review/g-collide/upstream",
+        );
+        assert!(
+            result.is_err(),
+            "a colliding parent branch must refuse the push, not succeed"
+        );
+
+        let fork_listing = g(
+            &root_dir,
+            &[
+                "ls-remote",
+                "fork",
+                "refs/heads/ralphus/review/g-collide/upstream",
+            ],
+        );
+        assert!(
+            fork_listing.trim().is_empty(),
+            "the fork must never receive a push when the collision guard trips"
+        );
+
+        let _ = std::fs::remove_dir_all(&root_dir);
+        let _ = std::fs::remove_dir_all(&parent_bare);
+        let _ = std::fs::remove_dir_all(&fork_bare);
+    }
+
+    #[test]
     fn allocate_review_upstream_branch_walks_collisions_on_the_fork() {
         let fork_bare = tmp_dir("fork-upstream-allocate-fork-bare");
         g(&fork_bare, &["init", "--bare"]);
