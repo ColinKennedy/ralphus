@@ -1365,7 +1365,9 @@ impl Store {
             "UPDATE guardian_pull_requests
              SET auto_fix_attempted_at_ms=NULL, auto_fix_attempt_count=0,
                  auto_fix_next_attempt_at_ms=NULL, auto_fix_error=NULL,
-                 auto_fix_exhausted_notified_at_ms=NULL, updated_at_ms=? WHERE id=?",
+                 auto_fix_exhausted_notified_at_ms=NULL,
+                 auto_fix_last_outcome = CASE WHEN auto_fix_last_outcome='exhausted' THEN NULL ELSE auto_fix_last_outcome END,
+                 updated_at_ms=? WHERE id=?",
             params![now_ms(), id],
         )?;
         if n == 0 {
@@ -1387,8 +1389,12 @@ impl Store {
             "UPDATE guardian_pull_requests
              SET auto_fix_attempted_at_ms=NULL, auto_fix_attempt_count=0,
                  auto_fix_next_attempt_at_ms=NULL, auto_fix_error=NULL,
-                 auto_fix_exhausted_notified_at_ms=NULL, updated_at_ms=?
-             WHERE guardian_id=? AND state='open' AND auto_fix_attempted_at_ms IS NOT NULL",
+                 auto_fix_exhausted_notified_at_ms=NULL, auto_fix_last_outcome=NULL,
+                 updated_at_ms=?
+             WHERE guardian_id=? AND state='open'
+               AND (auto_fix_attempted_at_ms IS NOT NULL
+                    OR auto_fix_attempt_count > 0
+                    OR auto_fix_last_outcome IS NOT NULL)",
             params![now_ms(), guardian_id],
         )?)
     }
