@@ -415,9 +415,14 @@
       }
       /**
        * Deletes every selected review after one shared confirmation naming
-       * them all (RAL-508). Reports any review the daemon refused to delete
-       * via notify() -- one review failing does not block the rest of the
-       * batch; deleted reviews leave the selection either way.
+       * them all (RAL-508). Sends every id in one request to
+       * `POST /api/guardians/delete-batch` (RAL-549) rather than looping a
+       * per-review DELETE call -- worktree/branch cleanup for a review
+       * whose worktree is held by an in-progress merge can be slow, and a
+       * sequential per-id loop let one stuck review stall the whole batch.
+       * Reports any review the daemon refused to delete via notify() --
+       * one review failing does not block the rest of the batch; deleted
+       * reviews leave the selection either way.
        * @param {string[]} ids
        * @returns {Promise<void>}
        */
@@ -425,9 +430,17 @@
       async function bulkDeleteReviews(ids) {
         if (!ids.length) return;
         if (!confirm(`Delete ${ids.length} review(s)? This removes their review worktrees and cannot be undone.\n\n${bulkNameList(ids.map(reviewLabelOf))}`)) return;
-        const failed = await bulkActEach(ids, reviewLabelOf, (gid) => del(`/api/guardians/${gid}`), "delete review failed");
-        if (failed.length) notify("error", failed.join("; "));
-        else notify("success", `Deleted ${ids.length} review(s).`);
+        let resp;
+        try {
+          resp = await post("/api/guardians/delete-batch", { ids });
+        } catch (e) { notify("error", "daemon unreachable"); return; }
+        if (!resp.ok) { notify("error", await responseError(resp, "delete review failed")); return; }
+        /** @type {GuardianDeleteBatchResponse} */
+        const result = await resp.json();
+        const deleted = result.results.filter((r) => r.outcome === "deleted");
+        const failed = result.results.filter((r) => r.outcome === "failed");
+        if (failed.length) notify("error", failed.map((r) => `${reviewLabelOf(r.id)}: ${r.message}`).join("; "));
+        else notify("success", `Deleted ${deleted.length} review(s).`);
         for (const gid of ids) {
           if (selectedGuardian === gid) selectedGuardian = null;
           guardianMultiSel.delete(gid);

@@ -119,7 +119,8 @@ where one exists.
 | POST | `/api/guardians/{id}/settings` | Update opt-out settings (only present fields change) |
 | POST | `/api/guardians/{id}/details` | [Batched board-only update](#post-apiguardiansiddetails) — supersets rename/settings/base/squash/env endpoints, at most one rebase side effect |
 | POST | `/api/guardians/{id}/squash` | [Per-project commit squashing](#post-apiguardiansidsquash) |
-| DELETE | `/api/guardians/{id}` | Delete + purge worktrees/branches |
+| DELETE | `/api/guardians/{id}` | [Delete + purge worktrees/branches](#delete-apiguardiansid) |
+| POST | `/api/guardians/delete-batch` | [Delete many reviews in one request](#post-apiguardiansdelete-batch-ral-549) (RAL-549) |
 | POST | `/api/guardians/{id}/branches` | Add a branch |
 | POST | `/api/guardians/{id}/branches/reorder` | [Reorder branches](#post-apiguardiansidbranchesreorder) (does **not** rebase) |
 | POST | `/api/guardians/{id}/branches/arrange` | [Reorder + rebase atomically](#post-apiguardiansidbranchesarrange) |
@@ -2050,6 +2051,39 @@ HTTP status for the whole request:
 `/api/hidden/*/batch` endpoints, an unknown id is still reported per-review
 (`failed`, not a top-level `404`) since the batch as a whole always returns
 `200`.
+
+### `DELETE /api/guardians/{id}`
+Deletes the guardian row, then defers the worktree/branch/terminal-log
+cleanup (`purge_worktrees`, dual-root upstream branch retirement, durable
+terminal logs) to a background thread instead of running it synchronously
+before the response returns. The cleanup shells out to git with no timeout
+and delete has no eligibility gate (unlike Cancel/Reopen/Merge), so it can be
+invoked on a review whose worktree is actively held by an in-progress merge
+— running it inline used to block the response for as long as that merge
+held the worktree lease (RAL-549). Returns `200` with `{ "state": "deleted"
+}` as soon as the row itself is gone; the cleanup finishing is not
+observable through this response.
+
+### `POST /api/guardians/delete-batch` (RAL-549)
+Batch form of `DELETE /api/guardians/{id}` — the board's multi-select
+Reviews context menu sends every selected review id in one request instead
+of one round trip per review, so one id's worktree purge can never stall the
+rest of the batch the way a sequential per-id `DELETE` loop did:
+```json
+{ "ids": ["guardian-000000000001", "guardian-000000000002"] }
+```
+One id failing never stops the rest of the batch; the response reports a
+per-review outcome instead of one HTTP status for the whole request:
+```json
+{ "results": [
+  { "id": "guardian-000000000001", "outcome": "deleted", "message": "deleted" },
+  { "id": "guardian-000000000002", "outcome": "failed", "message": "not found" }
+] }
+```
+`outcome` is one of `deleted` or `failed` (`message` carries the reason for
+`failed`). `400 bad_request` if `ids` is empty or the body doesn't parse. As
+with `merge-batch`, an unknown id is reported per-review (`failed`), not a
+top-level `404` — the batch as a whole always returns `200`.
 
 ### `POST /api/guardians/{id}/manual-checks/regenerate` (RAL-520)
 Regenerate a review's manual checks on demand — the board's "↻ Regenerate"

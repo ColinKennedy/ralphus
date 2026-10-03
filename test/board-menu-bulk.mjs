@@ -156,6 +156,12 @@ export function makeBulkAction({
     if (action === "bulkCancelPreview" && path.endsWith("/cancel/preview")) {
       return Promise.resolve({ ok: postOk && !failIds.includes(id), json: async () => ({ squads: cancelPreviews[id] || [] }) });
     }
+    if (path === "/api/guardians/delete-batch") {
+      const results = (body?.ids || []).map((gid) => (failIds.includes(gid)
+        ? { id: gid, outcome: "failed", message: "daemon said no" }
+        : { id: gid, outcome: "deleted", message: "" }));
+      return Promise.resolve({ ok: postOk, json: async () => ({ results }) });
+    }
     return Promise.resolve(response(postOk && !failIds.includes(id), "daemon said no"));
   };
   const del = (path) => {

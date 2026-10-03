@@ -321,7 +321,7 @@ test("bulk review reopen names every review in its confirmation and reports succ
 
 // ---------- bulkDeleteReviews (shipped review-menu bulk action) ----------
 
-test("bulk review delete confirms naming every review, then deletes each once", async () => {
+test("bulk review delete confirms naming every review, then deletes all in one batch request", async () => {
   const h = makeBulkAction({
     action: "reviewDelete",
     guardians: { g1: { id: "g1", name: "R1" }, g2: { id: "g2", name: "R2" } },
@@ -331,7 +331,8 @@ test("bulk review delete confirms naming every review, then deletes each once", 
   assert.match(h.calls.confirmTexts[0], /Delete 2 review\(s\)/);
   assert.match(h.calls.confirmTexts[0], /R1/);
   assert.match(h.calls.confirmTexts[0], /R2/);
-  assert.deepEqual(h.calls.dels, ["/api/guardians/g1", "/api/guardians/g2"]);
+  assert.deepEqual(h.calls.posts, ["/api/guardians/delete-batch"]);
+  assert.deepEqual(h.calls.postBodies, [{ ids: ["g1", "g2"] }]);
   assert.deepEqual(h.calls.notifications, [{ kind: "success", msg: "Deleted 2 review(s)." }]);
   assert.equal(h.state().guardianMultiSelSize, 0);
 });
@@ -343,7 +344,8 @@ test("bulk review delete reports a per-item failure without blocking the others"
     failIds: ["g1"],
   });
   await h.bulkDeleteReviews(["g1", "g2"]);
-  assert.deepEqual(h.calls.dels, ["/api/guardians/g1", "/api/guardians/g2"]);
+  assert.deepEqual(h.calls.posts, ["/api/guardians/delete-batch"]);
+  assert.deepEqual(h.calls.postBodies, [{ ids: ["g1", "g2"] }]);
   assert.deepEqual(h.calls.notifications, [{ kind: "error", msg: "R1: daemon said no" }]);
   assert.equal(h.state().guardianMultiSelSize, 0);
 });
