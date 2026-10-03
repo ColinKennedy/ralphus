@@ -34,6 +34,7 @@ use ralphus_core::health_catalog::{
 use ralphus_core::process::which;
 use ralphus_runner::cli_agent_common::{self, BackendCommandHealth};
 use ralphus_runner::pi_backend;
+use ralphus_runner::version_probe::{self, VersionProbe};
 
 use crate::store::Store;
 use crate::store_lock::StoreHandle;
@@ -138,28 +139,61 @@ fn now_ms() -> u128 {
         .unwrap_or(0)
 }
 
+/// RAL-546: git PATH resolution plus `git --version`, via the shared
+/// [`version_probe`] helper. `fail`s on `NotFound` only -- git is
+/// load-bearing, same as the pre-RAL-546 PATH-only check -- but a resolved
+/// git whose version probe itself fails still `pass`es, since the binary is
+/// present and usable even if `--version` parsing broke.
 fn check_git() -> SweepCheck {
-    match which("git") {
-        Some(path) => SweepCheck {
-            id: ID_GIT,
-            status: PASS,
-            detail: path,
+    let probe = version_probe::probe_version("git", &["--version"], |out| {
+        version_probe::first_token_after_prefix(out, "git version ")
+    });
+    SweepCheck {
+        id: ID_GIT,
+        status: if matches!(probe, VersionProbe::NotFound) {
+            FAIL
+        } else {
+            PASS
         },
-        None => SweepCheck {
-            id: ID_GIT,
-            status: FAIL,
-            detail: "not found on PATH".to_string(),
-        },
+        detail: probe.detail("git"),
     }
 }
 
+/// RAL-546: resolves the tmux-compatible binary the same way a real cell
+/// dispatch would (`resolve_tmux_program_with_source`), then additionally
+/// probes its version with `-V` -- real tmux and the vendored psmux both
+/// self-report their first line as `"tmux <version>"`. Skips the version
+/// probe for a compound `RALPHUS_TMUX_CMD` override (shell syntax, not a
+/// directly-invokable program) the same way [`cli_agent_common::diagnose_command`]
+/// skips a compound agent command; the embedded-psmux and PATH cases are
+/// always a single invokable program.
 fn check_tmux() -> SweepCheck {
     match crate::tmux::resolve_tmux_program_with_source() {
-        Ok((program, source)) => SweepCheck {
-            id: ID_TMUX,
-            status: PASS,
-            detail: format!("{program} (source: {source})"),
-        },
+        Ok((program, source)) => {
+            if cli_agent_common::is_compound_command(&program) {
+                return SweepCheck {
+                    id: ID_TMUX,
+                    status: PASS,
+                    detail: format!("{program} (source: {source})"),
+                };
+            }
+            let probe = version_probe::probe_version_at(&program, &["-V"], |out| {
+                version_probe::first_token_after_prefix(out, "tmux ")
+            });
+            let detail = if let VersionProbe::Ok { version, .. } = &probe {
+                format!("{program} (source: {source}, version {version})")
+            } else {
+                format!(
+                    "{program} (source: {source}); version probe: {}",
+                    probe.detail(&program)
+                )
+            };
+            SweepCheck {
+                id: ID_TMUX,
+                status: PASS,
+                detail,
+            }
+        }
         Err(e) => SweepCheck {
             id: ID_TMUX,
             status: FAIL,
@@ -189,19 +223,31 @@ fn check_runner() -> SweepCheck {
     }
 }
 
+/// RAL-546: `gh` PATH resolution plus `gh --version`, via the shared
+/// [`version_probe`] helper. Always `pass`es, found or not -- `gh` is
+/// optional, the same "never a hard fail" rule ripgrep's checks follow.
 fn check_gh() -> SweepCheck {
+    let probe = version_probe::probe_version("gh", &["--version"], |out| {
+        version_probe::first_token_after_prefix(out, "gh version ")
+    });
     SweepCheck {
         id: ID_GH,
         status: PASS,
-        detail: which("gh").unwrap_or_else(|| "not found on PATH".to_string()),
+        detail: probe.detail("gh"),
     }
 }
 
+/// RAL-546: `glab` PATH resolution plus `glab --version`, via the shared
+/// [`version_probe`] helper. Always `pass`es, found or not -- `glab` is
+/// optional, the same "never a hard fail" rule ripgrep's checks follow.
 fn check_glab() -> SweepCheck {
+    let probe = version_probe::probe_version("glab", &["--version"], |out| {
+        version_probe::first_token_after_prefix(out, "glab ")
+    });
     SweepCheck {
         id: ID_GLAB,
         status: PASS,
-        detail: which("glab").unwrap_or_else(|| "not found on PATH".to_string()),
+        detail: probe.detail("glab"),
     }
 }
 
@@ -325,17 +371,32 @@ fn resolve_effective_command(
 /// (shell-routed) command is reported `skip` and displayed as-is, never
 /// executed; a direct command is checked for disk/PATH accessibility and
 /// executability, with Pi additionally version-checked against the
-/// supported minimum. `pub(crate)` and taking an already-resolved command
-/// (not a backend id/env var) so `agent_profiles::check_db_profiles_health`
-/// can reuse the identical evaluation for a database-stored backend command
-/// override -- previously a second, divergent implementation there took the
-/// first whitespace-delimited token of the command and resolved only that,
+/// supported minimum, and Claude Code/Codex additionally version-probed
+/// (RAL-546) via the shared [`version_probe`] helper. `pub(crate)` and
+/// taking an already-resolved command (not a backend id/env var) so
+/// `agent_profiles::check_db_profiles_health` can reuse the identical
+/// evaluation for a database-stored backend command override -- previously
+/// a second, divergent implementation there took the first
+/// whitespace-delimited token of the command and resolved only that,
 /// silently mis-evaluating any command with arguments.
 pub(crate) fn diagnose_backend_command(backend: &str, command: &str) -> BackendCommandHealth {
-    if backend == "pi" {
-        pi_backend::diagnose_pi_command(command)
-    } else {
-        cli_agent_common::diagnose_command(command)
+    match backend {
+        "pi" => pi_backend::diagnose_pi_command(command),
+        // Claude Code prints just "<version> (Claude Code)" on its first
+        // line -- no literal prefix to strip, so the version is simply the
+        // first line's first token.
+        "claude-code" => {
+            cli_agent_common::diagnose_command_with_version(command, &["--version"], |out| {
+                version_probe::first_token_after_prefix(out, "")
+            })
+        }
+        // Codex prints "codex-cli <version>" on its first line.
+        "codex" => {
+            cli_agent_common::diagnose_command_with_version(command, &["--version"], |out| {
+                version_probe::first_token_after_prefix(out, "codex-cli ")
+            })
+        }
+        _ => cli_agent_common::diagnose_command(command),
     }
 }
 
@@ -568,6 +629,82 @@ mod tests {
         } else {
             assert_eq!(version_check.status, WARN, "{version_check:?}");
         }
+    }
+
+    // ── RAL-546: version-probed git/tmux/gh/glab and claude-code/codex ─────
+
+    #[test]
+    fn git_check_never_fails_when_git_is_actually_on_path() {
+        // This test suite itself runs from a git worktree, so git must be on
+        // PATH -- if it weren't, the whole dev loop would already be broken.
+        let check = check_git();
+        assert_eq!(check.status, PASS, "{check:?}");
+        assert!(check.detail.contains("version"), "{check:?}");
+    }
+
+    #[test]
+    fn tmux_check_names_a_source_whatever_the_resolution_outcome() {
+        // Can't assume a real tmux/psmux is installed in every test
+        // environment. When resolution succeeds the detail must say which
+        // source it came from; when it fails (no tmux anywhere) the detail is
+        // the resolver's error, which has no single source to name.
+        let check = check_tmux();
+        if check.status == FAIL {
+            assert!(
+                check.detail.contains("tmux"),
+                "expected the resolver error, got {check:?}"
+            );
+        } else {
+            assert!(
+                check.detail.contains("source:"),
+                "expected a source label, got {check:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gh_and_glab_checks_never_fail_even_when_not_installed() {
+        // RAL-546: gh/glab are optional -- absence is a `pass` with a "not
+        // found" detail, never a `fail` that would sink the whole sweep.
+        let gh = check_gh();
+        assert_eq!(gh.status, PASS, "{gh:?}");
+        let glab = check_glab();
+        assert_eq!(glab.status, PASS, "{glab:?}");
+    }
+
+    #[test]
+    fn diagnose_backend_command_routes_claude_code_through_the_version_probe() {
+        // No real `claude` binary in a test env, but the dispatch must still
+        // reach `diagnose_command_with_version` (not the plain, version-less
+        // `diagnose_command`) for this backend id.
+        let health = diagnose_backend_command("claude-code", "definitely-not-a-real-claude-ral546");
+        assert_eq!(health.status, "fail");
+        assert_eq!(
+            health.effective_command,
+            "definitely-not-a-real-claude-ral546"
+        );
+        assert_eq!(health.version, None);
+    }
+
+    #[test]
+    fn diagnose_backend_command_routes_codex_through_the_version_probe() {
+        let health = diagnose_backend_command("codex", "definitely-not-a-real-codex-ral546");
+        assert_eq!(health.status, "fail");
+        assert_eq!(
+            health.effective_command,
+            "definitely-not-a-real-codex-ral546"
+        );
+        assert_eq!(health.version, None);
+    }
+
+    #[test]
+    fn diagnose_backend_command_still_skips_a_compound_claude_code_override_without_probing() {
+        // A compound (shell-routed) override must stay `skip`, not get
+        // routed into the version probe's direct `Command::new` invocation.
+        let health = diagnose_backend_command("claude-code", "rez-env foo -- claude");
+        assert_eq!(health.status, "skip");
+        assert_eq!(health.effective_command, "rez-env foo -- claude");
+        assert_eq!(health.version, None);
     }
 
     #[test]
