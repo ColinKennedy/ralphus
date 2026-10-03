@@ -276,6 +276,7 @@ the daemon's hourly Free-tier background sweep
 |---|---|
 | `cell show <selector>` | Cell detail (incl. tokens, cost, agent, model, cwd) |
 | `cell worktree <selector>` | The worktree/project a cell is using |
+| `cell diff <selector> [--summary]` | A running cell's live worktree diff (full diff only recomputed after the runner pushes a change) |
 | `cell reviews <selector>` | Reviews this cell's branch participates in |
 | `cell set-status <selector> <state>` | Override a cell's status |
 | `cell restart <selector>` | Restart a cell and its downstream |
@@ -662,6 +663,7 @@ use; see `READ_ONLY_NOTE`.
             - update name [str] --backend [name] --executable [cmd] --link [key=target...] --model [name] --set [key=value...] --thinking-capable/--no-thinking-capable  {Administrative (RAL-473): replace an existing agent profile's backend/executable/model/env. --thinking-capable/--no-thinking-capable (RAL-516) overrides whether a Live View pane running this profile shows the "Show Thinking" checkbox at all; omitted, it inherits the backend's own default.}
     - cartographer --ascending --cell [str] --entity [uri] --for [uri] --guardian [id] --level [str] --limit [integer] --offset [integer] --q [str] --scope [str] --source [str] --squad [id] --task [str]  {Query the structured Cartographer event log (RAL-98/RAL-155).}
     - cell  {Inspect and act on cells.}
+        - (read-only-safe) diff selector [uri] --summary  {Show a running cell's live worktree diff (full diff computed only when changes were pushed).}
         - edit selector [uri] --agent [name] --auto-compact-threshold [tokens] --command [cmd] --cwd [path] --maximum-context [tokens] --maximum-tool-output-tokens [tokens] --model [name] --prompt [text] --system-prompt [text]  {Edit a cell's fields.}
         - (read-only-safe) env selector [uri] --scope [cell|proof]  {List a cell's resolved environment variables, read-only (RAL-324); --scope proof shows what its own proof steps inherit.}
         - open-agent selector [uri]  {Open the real interactive agent in a new terminal -- while running, cleanly detaches the cell first (RAL-288); while finished, resumes it the old way.}

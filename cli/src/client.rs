@@ -929,6 +929,20 @@ impl DaemonClient {
         self.get("/api/resources")
     }
 
+    /// RAL-550: a cell's live worktree diff (`summary_only` skips the full diff).
+    pub fn cell_diff(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        cell_idx: i64,
+        summary_only: bool,
+    ) -> Result<Value, DaemonError> {
+        let summary = if summary_only { "&summary=1" } else { "" };
+        self.get(&format!(
+            "/api/squads/{squad_id}/diff?task={task_idx}&cell={cell_idx}{summary}"
+        ))
+    }
+
     pub fn squad_worktrees(&self, squad_id: &str) -> Result<Value, DaemonError> {
         self.get(&format!("/api/squads/{squad_id}/worktrees"))
     }

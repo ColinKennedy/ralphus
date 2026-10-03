@@ -19,6 +19,10 @@ pub enum CellCommand {
     Worktree {
         selector: String,
     },
+    Diff {
+        selector: String,
+        summary: bool,
+    },
     Reviews {
         selector: String,
     },
@@ -83,6 +87,10 @@ pub fn parse(args: &[String]) -> CellCommand {
             }
         }
         Some("worktree") => with_selector(scanner, |selector| CellCommand::Worktree { selector }),
+        Some("diff") => {
+            let summary = scanner.take_bool("--summary");
+            with_selector(scanner, |selector| CellCommand::Diff { selector, summary })
+        }
         Some("reviews") => with_selector(scanner, |selector| CellCommand::Reviews { selector }),
         Some("set-status") => {
             let rest = scanner.remaining();
@@ -280,6 +288,23 @@ pub fn dispatch(cmd: CellCommand, opts: &GlobalOpts) -> i32 {
                     ),
                     ("project", m["project"].as_str().unwrap_or("-").to_string()),
                 ]);
+            });
+            Ok(())
+        }),
+        CellCommand::Diff { selector, summary } => run_and_report(opts, None, || {
+            let resolved = resolve_scoped(&client, &selector, "cell")?;
+            let view = client.cell_diff(
+                &resolved.squad_id,
+                resolved.task_idx,
+                resolved.cell_idx,
+                summary,
+            )?;
+            emit(opts, &view, |v| match v["diff"].as_str() {
+                Some(diff) => print!("{diff}"),
+                None => crate::output::print_kv(&[
+                    ("version", v["version"].to_string()),
+                    ("summary", v["summary"].to_string()),
+                ]),
             });
             Ok(())
         }),
@@ -532,6 +557,21 @@ mod tests {
     fn parses_worktree() {
         match parse(&v(&["worktree", "squad-1/build/0"])) {
             CellCommand::Worktree { selector } => assert_eq!(selector, "squad-1/build/0"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_diff_with_optional_summary_flag() {
+        match parse(&v(&["diff", "squad-1/build/0"])) {
+            CellCommand::Diff { selector, summary } => {
+                assert_eq!(selector, "squad-1/build/0");
+                assert!(!summary);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        match parse(&v(&["diff", "--summary", "squad-1/build/0"])) {
+            CellCommand::Diff { summary, .. } => assert!(summary),
             other => panic!("unexpected: {other:?}"),
         }
     }
