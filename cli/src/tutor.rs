@@ -984,8 +984,11 @@ Guardian exists to surface, and is almost never what you want.
       command              = "cargo test --all-targets"
       remediation_attempts = 3
     `remediation_attempts` counts total command executions, including
-    the first. Use a `prompt` proof instead when the proof itself cannot
-    be expressed as a deterministic terminal command.
+    the first. Proof steps do not accept `system_prompt` or
+    `system_prompt_position`; remediating command proofs already give
+    their repair agent a fixed repair-only instruction. Use a `prompt`
+    proof instead when the proof itself cannot be expressed as a
+    deterministic terminal command.
 
  4. FINALIZE cell (depends on the proof steps passing): an AI cell
     that stages only the intended SOURCE files -- deliberately NOT
@@ -1109,7 +1112,7 @@ depends_on = ["setup"]            # waits for all of setup's cells + proof steps
 id       = "backend"
 upstream = "foo"
 
--- 4. Recommended per-branch shape (agent proof + finalize) --
+-- 4. Recommended per-branch shape (remediating proof + finalize) --
 
 # One shared review for the whole batch. `agent` here is the CONFLICT-RESOLVER
 # backend (see the [[review]] table above), a separate decision from the
@@ -1163,20 +1166,18 @@ project = "my-project"            # both cells' worktree materializes under this
   system_prompt_position = "append"
   prompt                 = "{<the RAL-2 ticket text, pasted verbatim>}"
 
-    # agent proof steps fix-and-retry, without committing. NOTE: unlike the
-    # work cell's system_prompt, this must NOT also forbid file changes --
-    # fixing a lint or a failing test requires editing files, which would
-    # contradict the fix-and-retry instruction in `prompt` above.
+    # Remediating command proof steps repair a failing deterministic command
+    # and then let the orchestrator re-run that exact command. They inherit
+    # the work cell's resolved agent/model; proof steps do not have
+    # system_prompt or system_prompt_position fields.
     [[task.cell.proof]]
     id                     = "fmt"
-    prompt                 = "Run cargo fmt --all; re-run up to 3x or fail. No commit/push."
-    system_prompt          = "Do NOT commit and do NOT push under any circumstances.\nYou are working in a dedicated git worktree of the ralphus repository. Implement the work exactly as-described and keep your changes only within the worktree."
-    system_prompt_position = "append"
+    command                = "cargo fmt --all -- --check"
+    remediation_attempts   = 3
     [[task.cell.proof]]
     id                     = "test"
-    prompt                 = "Run cargo test; fix and re-run up to 3x, else fail. No commit/push."
-    system_prompt          = "Do NOT commit and do NOT push under any circumstances.\nYou are working in a dedicated git worktree of the ralphus repository. Implement the work exactly as-described and keep your changes only within the worktree."
-    system_prompt_position = "append"
+    command                = "cargo test"
+    remediation_attempts   = 3
 
   # finalize: AI stages the relevant source files, commits, and pushes (depends on work).
   # Same placeholder string as "work" -- the daemon materializes it once and
@@ -1309,6 +1310,26 @@ mod tests {
         assert!(TASK_TUTOR.contains("[review.action.lifecycle]"));
         assert!(!TASK_TUTOR.contains("placement = \"copy\""));
         assert!(!TASK_TUTOR.contains("placement = \"shared\""));
+    }
+
+    #[test]
+    fn tutor_never_attaches_system_prompt_fields_to_proof_examples() {
+        let mut in_proof_table = false;
+        for line in TASK_TUTOR.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("[[") {
+                in_proof_table = matches!(trimmed, "[[task.proof]]" | "[[task.cell.proof]]");
+            }
+            assert!(
+                !in_proof_table
+                    || (!trimmed.starts_with("system_prompt")
+                        && !trimmed.starts_with("system_prompt_position")),
+                "proof examples must not contain unsupported system-prompt fields: {line}"
+            );
+        }
+        assert!(TASK_TUTOR.contains(
+            "Proof steps do not accept `system_prompt` or\n    `system_prompt_position`"
+        ));
     }
 
     #[test]
