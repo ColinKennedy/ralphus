@@ -659,11 +659,11 @@ use; see `READ_ONLY_NOTE`.
             - set backend [str] --command [argv]  {Administrative (RAL-473): set the global invoked command for a built-in backend (claude-code/codex/pi), e.g. a wrapper/compound command. Takes effect on the next cell/proof run, no daemon restart needed.}
         - (read-only-safe) list  {List supported agent backends and the models each is allowed to run.}
         - profile  {Administrative (RAL-473): manage DB-backed agent profiles. Most users only need `ralphus agent list`.}
-            - create name [str] --backend [name] --executable [cmd] --link [key=target...] --model [name] --set [key=value...]  {Administrative (RAL-473): create a new DB-backed agent profile. --set adds a literal env value, --link chains to another key in the same profile's env table (validated for cycles on save).}
+            - create name [str] --backend [name] --executable [cmd] --link [key=target...] --model [name] --set [key=value...] --thinking-capable/--no-thinking-capable  {Administrative (RAL-473): create a new DB-backed agent profile. --set adds a literal env value, --link chains to another key in the same profile's env table (validated for cycles on save). --thinking-capable/--no-thinking-capable (RAL-516) overrides whether a Live View pane running this profile shows the "Show Thinking" checkbox at all; omitted, it inherits the backend's own default.}
             - delete name [str] --force  {Administrative (RAL-473): delete an agent profile. Fails if it is still referenced by a stored squad/review unless --force is given.}
             - (read-only-safe) get name [str]  {Administrative (RAL-473): show one agent profile's stored backend/model/env rows.}
             - (read-only-safe) list  {Administrative (RAL-473): list all DB-backed agent profiles (built-in and custom).}
-            - update name [str] --backend [name] --executable [cmd] --link [key=target...] --model [name] --set [key=value...]  {Administrative (RAL-473): replace an existing agent profile's backend/executable/model/env.}
+            - update name [str] --backend [name] --executable [cmd] --link [key=target...] --model [name] --set [key=value...] --thinking-capable/--no-thinking-capable  {Administrative (RAL-473): replace an existing agent profile's backend/executable/model/env. --thinking-capable/--no-thinking-capable (RAL-516) overrides whether a Live View pane running this profile shows the "Show Thinking" checkbox at all; omitted, it inherits the backend's own default.}
     - cartographer --ascending --cell [str] --entity [uri] --for [uri] --guardian [id] --level [str] --limit [integer] --offset [integer] --q [str] --scope [str] --source [str] --squad [id] --task [str]  {Query the structured Cartographer event log (RAL-98/RAL-155).}
     - cell  {Inspect and act on cells.}
         - (read-only-safe) diff selector [uri] --summary  {Show a running cell's live worktree diff (full diff computed only when changes were pushed).}
@@ -702,6 +702,7 @@ use; see `READ_ONLY_NOTE`.
         - remove scheme [str]  {Remove a registered machine provider.}
     - mailbox  {Drain the escalation mailbox (RAL-241): failed/stalled work the daemon flagged for attention. Also personal watches and notification preferences layered over the same mailbox (RAL-320).}
         - check --priority [urgent|high|normal]  {Drain unread escalation mailbox messages and print them (RAL-241).}
+        - (read-only-safe) follow  {Push extension of `check` (RAL-241): opens the daemon's /api/events stream and prints one line per mailbox escalation as it arrives, instead of polling. Runs until killed.}
         - (read-only-safe) personal --priority [urgent|high|normal] --unread --user [name]  {List the acting user's personal mailbox messages, filtered through their watches (RAL-320).}
         - personal-drain --id [id...] --user [name]  {Mark personal mailbox messages read; omit --id to drain every unread message (RAL-320).}
         - personal-undrain --id [id...] --user [name]  {Mark personal mailbox messages unread (reverting a drain); omit --id to undrain every drained message (RAL-465).}
@@ -714,8 +715,10 @@ use; see `READ_ONLY_NOTE`.
     - mcp  {Configure agent hosts to use the ralphus MCP server.}
         - initialize host [claude|codex|pi] --dry-run --profile-file [path] --yes  {Preview and apply the local MCP setup required by an agent host.}
     - project  {Register and inspect projects known to the daemon.}
+        - (read-only-safe) check-destination name [str]  {Run a manual reachability check for a project's destination repository -- its registered clone URL, else the checkout's forge remote -- against the forge REST API. SSH-style clone URLs resolve through their host/path pair (no SSH connection is opened); a URL no REST identity can be resolved from is reported as a failed check with an actionable diagnostic.}
         - fork  {Manage per-project, per-user fork registrations for fork-based stacked PR routing.}
             - add project [str] --owner [owner] --remote-name [name] --url [url] --user [name]  {Register a fork for a project, optionally scoped to one user (defaults to the project-wide fallback row when --user is omitted).}
+            - (read-only-safe) check project [str] --url [url] --user [name]  {Run a manual reachability check for one fork URL against the forge REST API -- a URL about to be registered, or one already registered on a row. --user names whose stored forge token should authenticate the check (private forks); without it the daemon's own credential chain is used, and a public fork is checked unauthenticated.}
             - (read-only-safe) list project [str, optional] --short --user [name]  {List registered forks, optionally scoped to one project and/or filtered to one user.}
             - remove project [str] --user [name]  {Remove a fork registration (defaults to the project-wide fallback row when --user is omitted).}
             - set project [str] --owner [owner] --remote-name [name] --url [url] --user [name]  {Update fields on an existing fork registration (defaults to the project-wide fallback row when --user is omitted).}
@@ -725,7 +728,7 @@ use; see `READ_ONLY_NOTE`.
         - remove name [str]  {Unregister a project by exact name. Existing squads/tasks/reviews that reference it are unaffected; project-scoped settings (forks, Triage thresholds, review-settings defaults) are left in place as orphaned rows.}
         - review-settings  {Manage a project's database-backed DEFAULT review settings (RAL-408) -- resolver agent/model, machine, budget, proof scope, and the project-level equivalents of every `ralphus review settings` opt-out flag.}
             - (read-only-safe) get name [str]  {Show a project's current review-setting overrides plus the fully resolved effective value for each (file config + database).}
-            - set name [str] --auto-build [command] --auto-cancel-outdated-pr-pipelines/--no-auto-cancel-outdated-pr-pipelines --auto-fix-pr-errors/--no-auto-fix-pr-errors --auto-fix-prompt-template [str] --auto-submit-pr-stack/--no-auto-submit-pr-stack --base-shift-maximum-rebuilds [count] --clear-base-shift-maximum-rebuilds --clear-maximum-budget-usd --discourage-tests-during-auto-pr-fixes/--no-discourage-tests-during-auto-pr-fixes --dual-root-pr/--no-dual-root-pr --machine [scheme:uri] --match-pr-branch-name/--no-match-pr-branch-name --maximum-budget-usd [usd] --proof-scope [each_branch|final_branch|nothing] --resolver-agent [name] --resolver-model [name] --separate-pr-branch/--no-separate-pr-branch --skip-auto-clean/--no-skip-auto-clean --skip-base-updates/--no-skip-base-updates --skip-worktrees/--no-skip-worktrees  {Update a project's DEFAULT review settings, applied to future reviews only (an Arbiter-created review with no [[review]] block, or any review whose own block leaves a field unset) -- existing reviews are unaffected.}
+            - set name [str] --auto-build [command] --auto-cancel-outdated-pr-pipelines/--no-auto-cancel-outdated-pr-pipelines --auto-fix-pr-errors/--no-auto-fix-pr-errors --auto-fix-prompt-template [str] --auto-submit-pr-stack/--no-auto-submit-pr-stack --base-shift-maximum-rebuilds [count] --cache-manual-checks/--no-cache-manual-checks --clear-base-shift-maximum-rebuilds --clear-maximum-budget-usd --discourage-tests-during-auto-pr-fixes/--no-discourage-tests-during-auto-pr-fixes --dual-root-pr/--no-dual-root-pr --machine [scheme:uri] --match-pr-branch-name/--no-match-pr-branch-name --maximum-budget-usd [usd] --proof-scope [each_branch|final_branch|nothing] --resolver-agent [name] --resolver-model [name] --separate-pr-branch/--no-separate-pr-branch --skip-auto-clean/--no-skip-auto-clean --skip-base-updates/--no-skip-base-updates --skip-worktrees/--no-skip-worktrees  {Update a project's DEFAULT review settings, applied to future reviews only (an Arbiter-created review with no [[review]] block, or any review whose own block leaves a field unset) -- existing reviews are unaffected.}
     - proof  {Inspect and act on proof steps.}
         - edit selector [uri] --agent [name] --brain [text] --command [cmd] --maximum-tool-output-tokens [tokens] --model [name] --prompt [text]  {Edit a proof step's agent/model/command/prompt/brain overrides.}
         - (read-only-safe) env selector [uri]  {List a proof step's resolved environment variables, read-only (RAL-324); values of names registered in the Secrets tab are masked.}
@@ -773,7 +776,9 @@ use; see `READ_ONLY_NOTE`.
         - pr  {Submit/query pull requests for a review.}
             - (read-only-safe) comments pr_id [id]  {List a PR's comments/notes.}
             - (read-only-safe) find forge [github|gitlab] repo [str] pr_number [integer]  {Look up the ralphus PR row for a forge PR/MR number.}
+            - (read-only-safe) forge-cache  {List every PR's cached forge state (drift/comments/CI poll timestamps and statuses).}
             - (read-only-safe) list selector [uri]  {List PRs submitted for a review.}
+            - (read-only-safe) poll-status pr_id [id]  {Show when each poll (CI, branch drift, PR comments) last ran for a PR, how it went, when it is next due, and the last feedback applied.}
             - pull-feedback pr_id [id]  {Action a PR's un-actioned feedback into the owning review worktree.}
             - pull-from-pr pr_id [id]  {Pull a reviewer's commits pushed directly to the PR branch back into the owning review worktree, resolving conflicts and restacking downstream branches (RAL-190).}
             - (read-only-safe) show pr_id [id]  {Show one PR row.}
@@ -785,7 +790,7 @@ use; see `READ_ONLY_NOTE`.
         - reopen selector [uri]  {Reopen a cancelled or merged review and immediately stage in whatever branches are already ready, without waiting for the rest.}
         - reorder selector [uri] order [str] --disable [names] --enable [names]  {Set the branch order and kick off the rebase.}
         - restart-merge selector [uri]  {Cancel an in-progress rebase and start a fresh one.}
-        - settings selector [uri] --auto-cancel-outdated-pr-pipelines/--no-auto-cancel-outdated-pr-pipelines --auto-fix-pr-errors/--no-auto-fix-pr-errors --auto-fix-prompt-template [str] --auto-pr-feedback/--no-auto-pr-feedback --auto-submit-pr-stack/--no-auto-submit-pr-stack --base-branch [branch] --discourage-tests-during-auto-pr-fixes/--no-discourage-tests-during-auto-pr-fixes --dual-root-pr/--no-dual-root-pr --match-pr-branch-name/--no-match-pr-branch-name --proof-scope [each_branch|final_branch|nothing] --resolver-agent [name] --resolver-model [name] --separate-pr-branch/--no-separate-pr-branch --skip-auto-build/--no-skip-auto-build --skip-auto-clean/--no-skip-auto-clean --skip-base-updates/--no-skip-base-updates --skip-worktrees/--no-skip-worktrees  {Update per-review opt-out settings.}
+        - settings selector [uri] --auto-cancel-outdated-pr-pipelines/--no-auto-cancel-outdated-pr-pipelines --auto-fix-pr-errors/--no-auto-fix-pr-errors --auto-fix-prompt-template [str] --auto-pr-feedback/--no-auto-pr-feedback --auto-submit-pr-stack/--no-auto-submit-pr-stack --base-branch [branch] --cache-manual-checks/--no-cache-manual-checks --discourage-tests-during-auto-pr-fixes/--no-discourage-tests-during-auto-pr-fixes --dual-root-pr/--no-dual-root-pr --match-pr-branch-name/--no-match-pr-branch-name --proof-scope [each_branch|final_branch|nothing] --resolver-agent [name] --resolver-model [name] --separate-pr-branch/--no-separate-pr-branch --skip-auto-build/--no-skip-auto-build --skip-auto-clean/--no-skip-auto-clean --skip-base-updates/--no-skip-base-updates --skip-worktrees/--no-skip-worktrees  {Update per-review opt-out settings.}
         - (read-only-safe) show selector [uri]  {Show a single review's detail.}
         - squash selector [uri] project [str] --off --on  {Enable/disable squashing one git project's task branches to a single commit each in the review worktree.}
         - (read-only-safe) status selector [uri]  {Per-branch readiness + a summary verdict ('is this review ready?').}
@@ -831,9 +836,31 @@ use; see `READ_ONLY_NOTE`.
             - register name [str] --description [text] --label [text]  {Register (or update) a Triage type -- the categories the Arbiter classifies a Triage-opted-in cell into (RAL-318).}
     - (read-only-safe) tutor  {Print the Task TOML schema reference and worked examples. (Rust port hoists Python's `task show-tutor` to this top-level command.)}
     - user  {Manage a ralphus user's own forge personal access tokens (RAL-338 follow-up).}
+        - (read-only-safe) check-forge-token user [str] host [str]  {Run a manual connectivity check of a ralphus user's stored personal access token for one forge host: the daemon authenticates against the forge with it and reports whether the token works (and as whom) and whether the forge is reachable. Never returns the token.}
         - delete-forge-token user [str] host [str]  {Remove a ralphus user's personal access token for one forge host.}
         - (read-only-safe) list-forge-tokens user [str]  {List which forge hosts a ralphus user has a token configured for. Never returns the token value itself.}
         - set-forge-token user [str] --host [host] --token [token]  {Set or replace a ralphus user's personal access token for one forge host (e.g. gitlab.com), so their fork-routed worktrees can push over HTTPS without any SSH key setup.}
     - (read-only-safe) validate file [path...]  {Validate one or more task TOML files.}
+    - waypoint  {Coordinate cross-squad work: create waypoints, manage their roster and affected entries, and track bearings/deliveries (RAL-400).}
+        - affected  {Add/remove/change the mode of a waypoint's affected entries.}
+            - add waypoint_id [id] kind [review|squad] entry_id [id] --mode [block|advisory]  {Add (or upsert the mode of) one affected entry on a waypoint.}
+            - mode waypoint_id [id] entry_id [id] mode [block|advisory]  {Override the block/advisory mode of one existing affected entry.}
+            - remove waypoint_id [id] entry_id [id]  {Remove one affected entry from a waypoint.}
+        - bearing  {Append a completed-work bearing to a waypoint's delivery feed.}
+            - add waypoint_id [id] producer_kind [review|squad] producer_id [str] --commit-id [str] --commit-summary [text] --entity-uri [uri] --summary [text]  {Append a completed-work bearing to a waypoint's durable delivery feed.}
+        - (read-only-safe) bearings waypoint_id [id]  {List a waypoint's bearing feed.}
+        - close waypoint_id [id]  {Manually close an open waypoint.}
+        - create --affected [kind:entry_id[:mode]...] --agent [name] --allow-advisory --label [text] --model [name] --prompt [text] --roster [entry_id[:note]...]  {Create a cross-squad waypoint: --affected names the work it lands on, --roster the work whose          landing IS it being carried out. A waypoint with no roster is a broadcast -- nothing has to land,          so its affected work is never held, only asked to answer (RAL-400).}
+        - (read-only-safe) deliveries waypoint_id [id]  {Show a waypoint's delivery/event history.}
+        - edit waypoint_id [id] --agent [name] --allow-advisory/--no-allow-advisory --label [text] --model [name] --prompt [text] --resurvey  {Update a waypoint's settings: label, guidance prompt, survey agent/model, and whether advisory affected entries are allowed. Survey verdicts are kept unless --resurvey re-queues every daemon-enrolled entry for re-judging; preview that first with 'waypoint resurvey-preview'.}
+        - (read-only-safe) get waypoint_id [id]  {Show one waypoint's settings, roster, affected entries, tracked projects, and delivery summary.}
+        - (read-only-safe) list --project [name] --state [open|closed]  {List waypoints.}
+        - redo waypoint_id [id] entry_id [id]  {Re-run a squad whose finished work a closed waypoint flagged as stale, carrying its prior findings and the waypoint's bearings into the new run.}
+        - reopen waypoint_id [id]  {Reopen a closed waypoint.}
+        - resurvey-preview waypoint_id [id] (subagent)  {Show what 'waypoint edit --resurvey' would re-judge: which daemon-enrolled affected entries get their verdict cleared, and which human-declared entries are left alone.}
+        - roster  {Add/remove entries on a waypoint's completion list -- the work whose landing IS this 
+         waypoint being carried out.}
+            - add waypoint_id [id] entry_id [id] --note [text]  {Add a squad or review to a waypoint's completion list -- the work whose landing IS this waypoint being carried out. Distinct from the affected list, which is the work the waypoint lands on; nothing auto-enrolls here.}
+            - remove waypoint_id [id] entry_id [id]  {Drop a squad or review from a waypoint's completion list. Removing the last unfinished goal can complete the waypoint's first phase.}
 ```
 <!-- END GENERATED HELP-MAP (RAL-110) -->
