@@ -9806,10 +9806,12 @@ fn prepare_action_hints(
                 .map(|store| resolve_local_shared_store_root(Path::new(combined_str), store))
                 .transpose()?;
             let mut action_env = env.clone();
+            let workspace_identity = format!("{:x}", Sha256::digest(combined_str.as_bytes()));
             let build_root = std::env::temp_dir()
                 .join("ralphus")
                 .join("prepared-builds")
                 .join(id)
+                .join(&workspace_identity[..16])
                 .join(format!("action-{index}"));
             let lifecycle = hints[index].lifecycle.as_ref();
             let preserve_build_root = lifecycle
@@ -11280,8 +11282,10 @@ fn retire_terminal_action_publications(store: &crate::store_lock::StoreHandle) {
         let build_root = std::env::temp_dir()
             .join("ralphus")
             .join("prepared-builds")
-            .join(&row.guardian_id)
-            .join(&row.action_key);
+            .join(&row.guardian_id);
+        // Preparation roots are namespaced by worktree identity below this
+        // guardian directory. Terminal retirement can safely remove the full
+        // guardian directory because no later generation is permitted.
         if build_root.exists() {
             if let Err(error) = std::fs::remove_dir_all(&build_root) {
                 let message = format!("could not remove {}: {error}", build_root.display());
