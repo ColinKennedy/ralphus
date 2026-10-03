@@ -9229,46 +9229,20 @@ pub fn run_guardian_post_merge(
             .finish_guardian_post_merge(id, started_at, ok, detail)
     };
     if recorded.as_ref().is_ok_and(|recorded| *recorded) && !was_superseded {
-        let entity_uri = format!("guardian:{id}");
-        if ok {
-            let action_count = store
-                .lock()
-                .get_guardian(id)
-                .map(|guardian| guardian.action_hints.len() + guardian.manual_commands.len())
-                .unwrap_or(0);
-            let _ = store.lock().notify_watchers(
-                crate::monitor::NotifiableEventKind::ReviewManualChecksReady,
-                &entity_uri,
-                crate::mailbox::MailboxPriority::Normal,
-                &format!(
-                    "Review \"{}\" has {action_count} manual check{} prepared and ready to run.",
-                    guardian.name,
-                    if action_count == 1 { "" } else { "s" }
-                ),
-                guardian.squad_id.as_deref(),
-            );
-        } else {
-            let remediation = crate::mailbox::Remediation::ManualInterventionRequired {
-                guidance: format!(
-                    "open review {} and inspect its preparation detail; use Regenerate after correcting the command, machine, or artifact declaration",
-                    id
-                ),
-            };
-            let _ = store.lock().notify_watchers_with_remediation(
-                crate::monitor::NotifiableEventKind::ReviewManualChecksFailed,
-                &entity_uri,
-                crate::mailbox::MailboxPriority::High,
-                &format!(
-                    "Review \"{}\" finished manual preparation with a failure: {}",
-                    guardian.name,
-                    detail.unwrap_or("unknown preparation failure")
-                ),
-                &remediation,
-                guardian.squad_id.as_deref(),
-                None,
-                None,
-            );
-        }
+        let action_count = store
+            .lock()
+            .get_guardian(id)
+            .map(|current| current.action_hints.len() + current.manual_commands.len())
+            .unwrap_or(0);
+        notify_manual_preparation_outcome(
+            &store.lock(),
+            id,
+            &guardian.name,
+            guardian.squad_id.as_deref(),
+            action_count,
+            ok,
+            detail,
+        );
     }
     phase_note(
         store,
@@ -9303,6 +9277,57 @@ pub fn run_guardian_post_merge(
     );
     let _ = watcher.join();
     memory.finish_guardian_preparation(id, generation);
+}
+
+/// Send the terminal, watcher-visible outcome of one manual-preparation pass.
+/// The mailbox notifier broadcasts this row over SSE, so a watcher receives it
+/// immediately without the board or an agent polling for preparation state.
+fn notify_manual_preparation_outcome(
+    store: &crate::store::Store,
+    guardian_id: &str,
+    guardian_name: &str,
+    squad_id: Option<&str>,
+    action_count: usize,
+    ok: bool,
+    detail: Option<&str>,
+) {
+    // A review without any manual surface has nothing for a watcher to act
+    // on, so it must not produce a misleading "0 checks ready" notice.
+    if ok && action_count == 0 {
+        return;
+    }
+    let entity_uri = format!("guardian:{guardian_id}");
+    if ok {
+        let _ = store.notify_watchers(
+            crate::monitor::NotifiableEventKind::ReviewManualChecksReady,
+            &entity_uri,
+            crate::mailbox::MailboxPriority::Normal,
+            &format!(
+                "Review \"{guardian_name}\" has {action_count} manual check{} prepared and ready to run.",
+                if action_count == 1 { "" } else { "s" }
+            ),
+            squad_id,
+        );
+    } else {
+        let remediation = crate::mailbox::Remediation::ManualInterventionRequired {
+            guidance: format!(
+                "open review {guardian_id} and inspect its preparation detail; use Regenerate after correcting the command, machine, or artifact declaration"
+            ),
+        };
+        let _ = store.notify_watchers_with_remediation(
+            crate::monitor::NotifiableEventKind::ReviewManualChecksFailed,
+            &entity_uri,
+            crate::mailbox::MailboxPriority::High,
+            &format!(
+                "Review \"{guardian_name}\" finished manual preparation with a failure: {}",
+                detail.unwrap_or("unknown preparation failure")
+            ),
+            &remediation,
+            squad_id,
+            None,
+            None,
+        );
+    }
 }
 
 /// The worker's body: check out a scratch worktree at the combined review
@@ -9458,17 +9483,23 @@ fn post_merge_jobs_inner(
         let _ = pm_ws.git(&["clean", "-fdx"]);
     }
 
-    // Generated checks may declare their own setup, so generation must finish
-    // before the common preparation pass can decide any button is ready.
-    //
-    // Per `generate_manual_commands`'s own doc comment, its failures are
-    // silent -- a missing command list is better than failing the whole
-    // post-merge gate (and the checks/`final_checks` below) over an agent
-    // that produced nothing. Propagating it with `?` here would regress a
-    // review with no manual checks requested at all back to a hard failure
-    // whenever generation errors (e.g. no agent configured in a test/CI
-    // fixture).
-    if generate_manual {
+    // First prepare the author-declared action surface. It must not wait on
+    // optional AI discovery of additional manual checks: an unavailable model
+    // cannot be allowed to keep a declared, buildable action disabled.
+    let outcome = if cancel.is_cancelled() {
+        Err("preparation cancelled because the review changed".to_string())
+    } else if jobs.checks {
+        final_checks_without_generated(store, runner, id, &ws_root.at(&proj), &pm_str, cancel)
+    } else {
+        Ok(None)
+    };
+
+    // Generated checks may declare their own setup, so only their own
+    // preparation follows their optional discovery. Per
+    // `generate_manual_commands`'s doc comment, discovery failures are
+    // silent -- a missing generated command list is better than failing a
+    // declared manual action over an unavailable agent.
+    if generate_manual && !cancel.is_cancelled() {
         if let Err(e) = generate_manual_commands(
             store,
             runner,
@@ -9484,14 +9515,25 @@ fn post_merge_jobs_inner(
                 "ralphus [guardian] review {id} manual-commands generation failed: {e}"
             );
         }
+        if jobs.checks && outcome.is_ok() {
+            let env = store
+                .lock()
+                .get_guardian(id)
+                .map(|current| current.build_env)
+                .unwrap_or_default();
+            if let Err(error) = prepare_generated_manual_checks(
+                store,
+                runner,
+                id,
+                &ws_root.at(&proj),
+                &pm_str,
+                &env,
+                cancel,
+            ) {
+                return Err(error);
+            }
+        }
     }
-    let outcome = if cancel.is_cancelled() {
-        Err("preparation cancelled because the review changed".to_string())
-    } else if jobs.checks {
-        final_checks(store, runner, id, &ws_root.at(&proj), &pm_str, cancel)
-    } else {
-        Ok(None)
-    };
 
     // The prepared checkout is intentionally retained. Manual actions run in
     // this exact directory, so build output remains warm after the worker
@@ -9505,6 +9547,7 @@ fn post_merge_jobs_inner(
 /// Review-level steps run first, followed by each action's own steps and
 /// artifact placement. The project `auto_build` setting remains a compatibility
 /// fallback only when the review declares no preparation steps.
+#[cfg(test)]
 fn final_checks(
     store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
@@ -9512,6 +9555,31 @@ fn final_checks(
     root: &Workspace,
     combined_str: &str,
     cancel: &CancelToken,
+) -> std::result::Result<Option<String>, String> {
+    final_checks_inner(store, runner, id, root, combined_str, cancel, true)
+}
+
+/// Prepare explicit review/action work, deliberately leaving generated manual
+/// checks for after their independent optional discovery has completed.
+fn final_checks_without_generated(
+    store: &crate::store_lock::StoreHandle,
+    runner: &dyn Runner,
+    id: &str,
+    root: &Workspace,
+    combined_str: &str,
+    cancel: &CancelToken,
+) -> std::result::Result<Option<String>, String> {
+    final_checks_inner(store, runner, id, root, combined_str, cancel, false)
+}
+
+fn final_checks_inner(
+    store: &crate::store_lock::StoreHandle,
+    runner: &dyn Runner,
+    id: &str,
+    root: &Workspace,
+    combined_str: &str,
+    cancel: &CancelToken,
+    prepare_generated: bool,
 ) -> std::result::Result<Option<String>, String> {
     let (preparation, checks, env) = {
         let guard = store.lock();
@@ -9579,7 +9647,9 @@ fn final_checks(
         }
     }
     prepare_action_hints(store, runner, id, root, combined_str, &env, cancel)?;
-    prepare_generated_manual_checks(store, runner, id, root, combined_str, &env, cancel)?;
+    if prepare_generated {
+        prepare_generated_manual_checks(store, runner, id, root, combined_str, &env, cancel)?;
+    }
     Ok((!notes.is_empty()).then(|| notes.join("; ")))
 }
 
@@ -9846,6 +9916,10 @@ fn prepare_action_hints(
         .map_err(|e| e.to_string())?
         .action_hints;
     let mut failures = Vec::new();
+    // A preparation group is the complete ordered list plus its output and
+    // lifecycle context, not each individual build step. Thus [A, B] and
+    // [A, C] remain independent groups and both execute A; only an exactly
+    // equal group satisfies a second action.
     let mut completed_groups = std::collections::HashSet::new();
     for index in 0..hints.len() {
         let mut shared_store_cwd = None;
@@ -9874,12 +9948,14 @@ fn prepare_action_hints(
             let preserve_build_root = lifecycle
                 .and_then(|value| value.build_root_policy.as_deref())
                 == Some("prepare_managed");
+            let group_fingerprint = serde_json::to_string(&(
+                &hints[index].prepare,
+                &hints[index].shared_store,
+                &hints[index].lifecycle,
+            ))
+            .map_err(|error| error.to_string())?;
             let has_new_preparation =
-                hints[index].prepare.iter().try_fold(false, |found, step| {
-                    let fingerprint =
-                        serde_json::to_string(step).map_err(|error| error.to_string())?;
-                    Ok::<_, String>(found || !completed_groups.contains(&fingerprint))
-                })?;
+                !hints[index].prepare.is_empty() && !completed_groups.contains(&group_fingerprint);
             action_env.insert(
                 "RALPHUS_BUILD_ROOT".to_string(),
                 build_root.to_string_lossy().into_owned(),
@@ -9971,25 +10047,23 @@ fn prepare_action_hints(
                         .map_err(|e| e.to_string())?;
                 }
             }
-            for step in &hints[index].prepare {
-                if cancel.is_cancelled() {
-                    return Err("preparation cancelled because the review changed".to_string());
+            if has_new_preparation {
+                for step in &hints[index].prepare {
+                    if cancel.is_cancelled() {
+                        return Err("preparation cancelled because the review changed".to_string());
+                    }
+                    run_review_auto_build(
+                        store,
+                        runner,
+                        id,
+                        root,
+                        combined_str,
+                        &action_env,
+                        step,
+                        cancel,
+                    )?;
                 }
-                let fingerprint = serde_json::to_string(step).map_err(|error| error.to_string())?;
-                if completed_groups.contains(&fingerprint) {
-                    continue;
-                }
-                run_review_auto_build(
-                    store,
-                    runner,
-                    id,
-                    root,
-                    combined_str,
-                    &action_env,
-                    step,
-                    cancel,
-                )?;
-                completed_groups.insert(fingerprint);
+                completed_groups.insert(group_fingerprint);
             }
             if !hints[index].artifacts.is_empty() {
                 hints[index].preparation_state = Some("transferring".to_string());
@@ -10220,12 +10294,6 @@ fn resolve_local_shared_store_root(
     project_root: &Path,
     store: &crate::guardian::GuardianSharedStore,
 ) -> Result<PathBuf, String> {
-    let root = crate::config::shared_store_root(project_root, &store.store).unwrap_or_else(|| {
-        std::env::var_os("RALPHUS_SHARED_STORE_ROOT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| std::env::temp_dir().join("ralphus-shared-store"))
-            .join(&store.store)
-    });
     let store_name = Path::new(&store.store);
     let path = Path::new(&store.path);
     if store_name.components().count() != 1
@@ -10237,6 +10305,12 @@ fn resolve_local_shared_store_root(
     {
         return Err("invalid shared-store location after validation".to_string());
     }
+    let root = crate::config::shared_store_root(project_root, &store.store).ok_or_else(|| {
+        format!(
+            "shared store {:?} is not registered for this project; add a [[shared_store]] entry to .ralphus.toml",
+            store.store
+        )
+    })?;
     Ok(root.join(path))
 }
 
@@ -13736,14 +13810,67 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     #[test]
+    fn manual_preparation_ready_is_pushed_to_watchers() {
+        let store = Store::open_in_memory().unwrap();
+        let client_id = store.register_mailbox_client().unwrap();
+        let (_subscription, events) = store.event_bus().subscribe();
+
+        notify_manual_preparation_outcome(
+            &store,
+            "guardian-000000000123",
+            "Shared demo",
+            None,
+            2,
+            true,
+            None,
+        );
+
+        let event = events
+            .recv()
+            .expect("ready notification is pushed over SSE");
+        let crate::events::BusEvent::Mailbox(notice) = event else {
+            panic!("manual preparation should publish a mailbox event")
+        };
+        assert_eq!(notice.priority, "normal");
+        assert!(
+            notice
+                .message
+                .contains("2 manual checks prepared and ready")
+        );
+        assert_eq!(
+            notice.entity_uri.as_deref(),
+            Some("guardian:guardian-000000000123")
+        );
+
+        let messages = store
+            .mailbox_messages_for_client(&client_id, true, None)
+            .unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].event_kind.as_deref(),
+            Some("review_manual_checks_ready")
+        );
+    }
+
+    #[test]
     fn local_shared_store_root_is_namespaced_by_store_and_path() {
+        let project = std::env::temp_dir().join(format!(
+            "ralphus-shared-store-root-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join(".ralphus.toml"),
+            "[[shared_store]]\nname = 'review-artifacts'\nroot = 'C:/review-artifacts'\n",
+        )
+        .unwrap();
         let store = crate::guardian::GuardianSharedStore {
             store: "review-artifacts".to_string(),
             path: "reviews/RAL-999/demo".to_string(),
         };
-        let root =
-            resolve_local_shared_store_root(Path::new("."), &store).expect("valid store path");
+        let root = resolve_local_shared_store_root(&project, &store).expect("valid store path");
         assert!(root.ends_with(Path::new("review-artifacts").join("reviews/RAL-999/demo")));
+        let _ = std::fs::remove_dir_all(project);
     }
 
     #[test]
@@ -13753,6 +13880,17 @@ mod tests {
             path: "../escape".to_string(),
         };
         assert!(resolve_local_shared_store_root(Path::new("."), &store).is_err());
+    }
+
+    #[test]
+    fn local_shared_store_root_requires_registered_logical_store() {
+        let store = crate::guardian::GuardianSharedStore {
+            store: format!("unregistered-store-{}", std::process::id()),
+            path: "reviews/RAL-999/demo".to_string(),
+        };
+        let error = resolve_local_shared_store_root(Path::new("."), &store)
+            .expect_err("an undeclared logical store must not use an implicit local path");
+        assert!(error.contains("is not registered"));
     }
 
     #[test]
@@ -18700,6 +18838,15 @@ mod tests {
     #[test]
     fn shared_store_preparation_sets_action_cwd_before_manual_run() {
         let (base, repo, _fwt) = make_repo("shared-store-preparation");
+        let shared_root = base.join("shared-store");
+        std::fs::write(
+            repo.join(".ralphus.toml"),
+            format!(
+                "[[shared_store]]\nname = 'test-store'\nroot = {:?}\n",
+                shared_root.to_string_lossy()
+            ),
+        )
+        .unwrap();
         let store = Arc::new(crate::store_lock::StoreMutex::new(
             Store::open_in_memory().unwrap(),
         ));
@@ -18934,6 +19081,79 @@ mod tests {
         let lines = std::fs::read_to_string(repo.join("group-count.txt")).unwrap();
         assert_eq!(lines.lines().count(), 2, "the equal group must run once");
         assert!(lines.contains("RAL-999-add_widget"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn partially_overlapping_action_preparation_groups_are_not_deduplicated() {
+        let (base, repo, _fwt) = make_repo("partial-action-preparation");
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let write = |text: &str| {
+            if cfg!(windows) {
+                format!("echo {text}>> group-count.txt")
+            } else {
+                format!("printf '{text}\\n' >> group-count.txt")
+            }
+        };
+        let common = crate::guardian::GuardianAutoBuild {
+            command: Some(write("common")),
+            ..crate::guardian::GuardianAutoBuild::default()
+        };
+        let id = {
+            let guard = store.lock();
+            let id = guard
+                .create_guardian("r", "main", &repo.to_string_lossy())
+                .unwrap();
+            guard
+                .set_guardian_action_hints(
+                    &id,
+                    &[
+                        crate::guardian::GuardianCheck {
+                            label: Some("A plus B".to_string()),
+                            command: Some("echo first".to_string()),
+                            prepare: vec![
+                                common.clone(),
+                                crate::guardian::GuardianAutoBuild {
+                                    command: Some(write("b")),
+                                    ..crate::guardian::GuardianAutoBuild::default()
+                                },
+                            ],
+                            ..crate::guardian::GuardianCheck::default()
+                        },
+                        crate::guardian::GuardianCheck {
+                            label: Some("A plus C".to_string()),
+                            command: Some("echo second".to_string()),
+                            prepare: vec![
+                                common,
+                                crate::guardian::GuardianAutoBuild {
+                                    command: Some(write("c")),
+                                    ..crate::guardian::GuardianAutoBuild::default()
+                                },
+                            ],
+                            ..crate::guardian::GuardianCheck::default()
+                        },
+                    ],
+                )
+                .unwrap();
+            id
+        };
+
+        final_checks(
+            &store,
+            &FixedValueRunner("unused"),
+            &id,
+            &Workspace::local(&repo),
+            &repo.to_string_lossy(),
+            &CancelToken::never(),
+        )
+        .expect("independent preparation groups succeed");
+
+        let lines = std::fs::read_to_string(repo.join("group-count.txt")).unwrap();
+        assert_eq!(lines.lines().filter(|line| *line == "common").count(), 2);
+        assert!(lines.lines().any(|line| line == "b"));
+        assert!(lines.lines().any(|line| line == "c"));
         let _ = std::fs::remove_dir_all(&base);
     }
 

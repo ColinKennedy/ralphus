@@ -582,7 +582,15 @@ may embed <<ralphus:new-worktree/BRANCH?upstream=UPSTREAM
 
  [review.action.shared_store] is optional. It names a configured logical store
  and a nonempty relative path. The daemon/provider maps `store` to the actual
- absolute share root; task TOML never hardcodes that machine-specific root.
+ absolute share root; task TOML never hardcodes that machine-specific root. A
+ missing store name is an error, rather than a temporary-directory fallback.
+ Configure the local V1 mapping in the project `.ralphus.toml` (or global
+ daemon config):
+
+    [[shared_store]]
+    name = "review-artifacts"
+    root = "Z:/ralphus-review-artifacts"
+
  When present, preparation receives RALPHUS_SHARED_STORE_ROOT and the action
  runs with that published directory as its working directory.
 
