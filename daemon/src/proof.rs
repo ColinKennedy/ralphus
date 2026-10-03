@@ -157,6 +157,21 @@ pub fn run_command_proof_capture(
     env: &BTreeMap<String, String>,
     cancel: &CancelToken,
 ) -> (bool, String) {
+    run_command_proof_capture_with_timeout(cwd, command, parent, env, cancel, None)
+}
+
+/// Like [`run_command_proof_capture`] but fails and kills the command tree
+/// when `timeout` elapses. The caller-provided cancellation token still wins
+/// immediately, so a review supersession never waits for a hook timeout.
+#[must_use]
+pub fn run_command_proof_capture_with_timeout(
+    cwd: &str,
+    command: &str,
+    parent: &Context,
+    env: &BTreeMap<String, String>,
+    cancel: &CancelToken,
+    timeout: Option<Duration>,
+) -> (bool, String) {
     let span = crate::otel::start_span("proof.command", parent, SpanKind::Internal);
     span.set_attribute("proof.cwd", cwd.to_string());
     span.set_attribute("proof.command", command.to_string());
@@ -199,6 +214,8 @@ pub fn run_command_proof_capture(
                 }
                 buf
             });
+            let started = std::time::Instant::now();
+            let mut timed_out = false;
             let cancelled = loop {
                 match child.try_wait() {
                     Ok(Some(_)) => break false,
@@ -206,6 +223,11 @@ pub fn run_command_proof_capture(
                         if cancel.is_cancelled() {
                             tree.kill(&mut child);
                             break true;
+                        }
+                        if timeout.is_some_and(|limit| started.elapsed() >= limit) {
+                            timed_out = true;
+                            tree.kill(&mut child);
+                            break false;
                         }
                         std::thread::sleep(POLL_INTERVAL);
                     }
@@ -227,6 +249,9 @@ pub fn run_command_proof_capture(
             }
             if cancelled {
                 buf.push_str("\n(cancelled)");
+                (false, truncate_output(&buf))
+            } else if timed_out {
+                buf.push_str("\n(timed out)");
                 (false, truncate_output(&buf))
             } else {
                 let ok = status.map(|s| s.success()).unwrap_or(false);
@@ -310,6 +335,25 @@ mod tests {
             run_command_proof_capture(".", cmd, &Context::new(), &env, &CancelToken::never());
         assert!(ok);
         assert!(out.contains("hello-env-override"), "captured: {out:?}");
+    }
+
+    #[test]
+    fn capture_kills_command_and_reports_failure_when_timed_out() {
+        let cmd = if cfg!(windows) {
+            "ping -n 5 127.0.0.1 >NUL"
+        } else {
+            "sleep 5"
+        };
+        let (ok, out) = run_command_proof_capture_with_timeout(
+            ".",
+            cmd,
+            &Context::new(),
+            &BTreeMap::new(),
+            &CancelToken::never(),
+            Some(Duration::from_millis(100)),
+        );
+        assert!(!ok);
+        assert!(out.contains("timed out"), "captured: {out:?}");
     }
 
     #[test]

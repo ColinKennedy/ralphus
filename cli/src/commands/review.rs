@@ -2310,9 +2310,14 @@ fn dispatch_action_run(
             1,
         );
     }
-    let cwd = guardian["combined_worktree"]
+    let cwd = hint["prepared_cwd"]
         .as_str()
         .filter(|s| !s.is_empty())
+        .or_else(|| {
+            guardian["combined_worktree"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+        })
         .or_else(|| guardian["git_root"].as_str())
         .unwrap_or_default()
         .to_string();
