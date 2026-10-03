@@ -218,7 +218,7 @@
         // line per row costs a third of the list you can see at once.
         el.innerHTML = bulkBar + list.map((g) => `<div class="squad-item ${(g.id===selectedGuardian || guardianMultiSel.has(g.id))?"selected":""}" data-click="onReviewClick" data-ctx="openReviewMenu" data-guardian-id="${esc(g.id)}">
           <div class="squad-row">
-            <div class="rid">${hiddenGuardianIds.has(g.id) ? `<span data-tip="You've hidden this review from your own view.\nIt's shown now because \"show hidden\" is on, or you navigated to it directly.\nA personal preference — it does not affect what other users see.">🙈</span> ` : ""}${esc(g.name)} ${arbiterBadge(g)}</div>
+            ${gdot(g.status)}<div class="rid">${hiddenGuardianIds.has(g.id) ? `<span data-tip="You've hidden this review from your own view.\nIt's shown now because \"show hidden\" is on, or you navigated to it directly.\nA personal preference — it does not affect what other users see.">🙈</span> ` : ""}${esc(g.name)} ${arbiterBadge(g)}</div>
             <div class="squad-actions"><button class="btn squadbtn" data-click="openReviewMenu" data-guardian-id="${esc(g.id)}" data-tip="Review actions — rename, hide, cancel, or delete this review.">⋯</button></div>
           </div>
           <div class="meta">${pill(g.status)}${reviewSparkbar(g)}</div></div>`).join("");
