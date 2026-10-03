@@ -293,7 +293,36 @@ impl Store {
     /// gives push coverage for squad/task/cell/guardian/queue/cartographer
     /// events without a second, parallel set of instrumentation call sites.
     pub fn cartographer_log(&self, entry: CartographerEntry<'_>) -> Result<()> {
-        let at_ms = now_ms();
+        let row = self.insert_cartographer_row(now_ms(), entry)?;
+        self.publish_cartographer_row(row);
+        Ok(())
+    }
+
+    /// Persist several Cartographer records in one transaction, each stamped
+    /// with the caller-supplied `at_ms` (captured when the event happened, not
+    /// when the batch is written). Rows are broadcast to SSE subscribers only
+    /// after the commit, so a subscriber never sees a row that then rolls back.
+    pub fn cartographer_log_batch(&self, entries: Vec<(i64, CartographerEntry<'_>)>) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let mut rows = Vec::with_capacity(entries.len());
+        for (at_ms, entry) in entries {
+            rows.push(self.insert_cartographer_row(at_ms, entry)?);
+        }
+        tx.commit()?;
+        for row in rows {
+            self.publish_cartographer_row(row);
+        }
+        Ok(())
+    }
+
+    fn insert_cartographer_row(
+        &self,
+        at_ms: i64,
+        entry: CartographerEntry<'_>,
+    ) -> Result<CartographerRow> {
         self.conn.execute(
             "INSERT INTO cartographer_events(at_ms, level, source, message, scope, squad_id, guardian_id, cell_id, task, log_path, payload, admin_only)
              VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -312,15 +341,7 @@ impl Store {
                 entry.admin_only,
             ],
         )?;
-        // RAL-332: the SSE broadcast below is not viewer-scoped (`EventBus`
-        // has no per-connection identity), so an admin_only row's full
-        // payload still reaches every connected browser over the wire even
-        // though the Logs tab's own `GET /api/cartographer`/`GET
-        // /api/cartographer/{id}` calls filter it out of what's ever
-        // rendered. Acceptable for a UI-level convenience gate (see
-        // `crate::users`'s module doc comment) -- closing this would need a
-        // per-connection-aware `EventBus`, out of scope here.
-        self.event_bus().publish(CartographerRow {
+        Ok(CartographerRow {
             id: self.conn.last_insert_rowid(),
             at_ms,
             level: level_str(entry.level).to_string(),
@@ -334,8 +355,18 @@ impl Store {
             log_path: entry.log_path.map(str::to_string),
             payload: entry.payload,
             admin_only: entry.admin_only,
-        });
-        Ok(())
+        })
+    }
+
+    fn publish_cartographer_row(&self, row: CartographerRow) {
+        // RAL-332: the SSE broadcast is not viewer-scoped (`EventBus` has no
+        // per-connection identity), so an admin_only row's full payload still
+        // reaches every connected browser over the wire even though the Logs
+        // tab's own `GET /api/cartographer`/`GET /api/cartographer/{id}` calls
+        // filter it out of what's ever rendered. Acceptable for a UI-level
+        // convenience gate (see `crate::users`'s module doc comment) -- closing
+        // this would need a per-connection-aware `EventBus`, out of scope here.
+        self.event_bus().publish(row);
     }
 
     /// Query Cartographer with filters, sorting, and pagination.
