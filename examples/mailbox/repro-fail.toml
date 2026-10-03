@@ -1,9 +1,11 @@
 # RAL-241 manual-verification repro: a task engineered to fail outright.
 #
-# The cell below runs `exit 1` -- an immediate, deterministic nonzero exit --
-# so the daemon's scheduler (daemon/src/scheduler.rs::run_cell_worker) marks
-# the cell `Failed` right away and, per RAL-241, broadcasts an `urgent`
-# mailbox message referencing this squad/task/cell.
+# The cell below runs `exit 1`, then exercises the default remediating-command
+# loop. Because the command is unconditionally unsuccessful, all three command
+# executions fail even after the two repair passes. The daemon's scheduler
+# (daemon/src/scheduler.rs::run_cell_worker) then marks the cell `Failed` and,
+# per RAL-241, broadcasts an `urgent` mailbox message referencing this
+# squad/task/cell.
 #
 # Usage:
 #   ralphus submit examples/mailbox/repro-fail.toml
@@ -17,3 +19,4 @@ name = "mailbox-repro-fail"
 [[task.cell]]
 cwd = "."
 command = "exit 1"
+remediation_attempts = 3

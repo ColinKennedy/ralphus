@@ -36,4 +36,5 @@ name = "mailbox-repro-stall"
 [[task.cell]]
 cwd = "."
 command = 'powershell -NoProfile -Command "Start-Sleep -Seconds 600"'
+remediation_attempts = 3
 timeout_minutes = 3

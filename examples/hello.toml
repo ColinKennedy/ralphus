@@ -4,3 +4,4 @@ name = "hello"
 [[task.cell]]
 cwd = "__RALPHUS_BUNDLE_ROOT__"
 command = "cmd /c echo hello from ralphus> hello-from-ralphus.txt"
+remediation_attempts = 3

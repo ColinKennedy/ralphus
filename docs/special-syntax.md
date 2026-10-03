@@ -91,6 +91,7 @@ environment.LOG_DIR = "<<ralphus:linked-field/./cwd>>/logs"
 
 [[task.cell.proof]]
 command = "cargo test"
+remediation_attempts = 3
 environment.CELL_ID = "<<ralphus:linked-field/../id>>"
 ```
 

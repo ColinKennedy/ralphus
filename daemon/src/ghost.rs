@@ -64,8 +64,9 @@ pub struct GhostView {
     /// Free-form text a human typed into the restart popup (RAL-174), kept
     /// separate from `content` so it can be overwritten on every restart
     /// rather than folded/accumulated like the agent-authored notes above
-    /// (see [`Store::set_ghost_user_note`]). `None` when no one has ever
-    /// attached a restart note to this owner.
+    /// (see [`Store::set_ghost_user_note`]). The scheduler clears it when the
+    /// restarted cell is dispatched, so `None` also means the latest note was
+    /// already consumed.
     pub user_note: Option<String>,
     /// Opaque, VCS-agnostic revision marker captured when this ghost was last
     /// written (e.g. a git commit sha), for best-effort staleness reasoning.
@@ -324,6 +325,27 @@ impl Store {
             params![owner_uri, kind, squad_id, guardian_id, merged, revision, now, now],
         )?;
         self.get_ghost(owner_uri).map(|g| g.expect("just written"))
+    }
+
+    /// Remove and return the human-authored restart note for `owner_uri`.
+    /// Agent-authored ghost content remains available on later restarts.
+    pub fn take_ghost_user_note(&self, owner_uri: &str) -> Result<Option<String>> {
+        let note = self
+            .conn
+            .query_row(
+                "SELECT user_note FROM ghosts WHERE owner_uri=?",
+                params![owner_uri],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        if note.is_some() {
+            self.conn.execute(
+                "UPDATE ghosts SET user_note=NULL, updated_at_ms=? WHERE owner_uri=?",
+                params![now_ms(), owner_uri],
+            )?;
+        }
+        Ok(note)
     }
 
     /// Attach (or replace) a human-authored restart note (RAL-174) on the
@@ -719,6 +741,26 @@ mod tests {
             .unwrap();
         assert_eq!(g.user_note.as_deref(), Some("second restart note"));
         assert!(!g.user_note.unwrap().contains("first restart note"));
+    }
+
+    #[test]
+    fn take_ghost_user_note_consumes_only_the_human_note() {
+        let s = store();
+        seed_squad(&s, "squad-1");
+        let uri = cell_uri("squad-1", 0, 0);
+        s.upsert_ghost(&uri, KIND_CELL, Some("squad-1"), None, "agent note", None)
+            .unwrap();
+        s.set_ghost_user_note(&uri, KIND_CELL, Some("squad-1"), None, "restart once")
+            .unwrap();
+
+        assert_eq!(
+            s.take_ghost_user_note(&uri).unwrap().as_deref(),
+            Some("restart once")
+        );
+        assert_eq!(s.take_ghost_user_note(&uri).unwrap(), None);
+        let ghost = s.get_ghost(&uri).unwrap().unwrap();
+        assert_eq!(ghost.content, "agent note");
+        assert_eq!(ghost.user_note, None);
     }
 
     #[test]

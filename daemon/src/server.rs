@@ -9246,6 +9246,30 @@ fn apply_restart_note(
     }
 }
 
+/// Attach restart guidance to the exact proof selected by the user. When the
+/// request opts into children, downstream cells receive their own one-shot
+/// copy, but the owning cell does not retain a duplicate.
+#[allow(clippy::too_many_arguments)]
+fn apply_proof_restart_note(
+    daemon: &Daemon,
+    squad_id: &str,
+    task_idx: i64,
+    scope: &str,
+    cell_idx: i64,
+    proof_idx: i64,
+    roots: &[(i64, i64)],
+    req: &RestartNoteBody,
+) {
+    let Some(note) = req.trimmed_note() else {
+        return;
+    };
+    let guard = daemon.lock();
+    let _ = guard.set_proof_restart_note(squad_id, task_idx, scope, cell_idx, proof_idx, &note);
+    if req.apply_to_all {
+        let _ = guard.apply_restart_user_note_to_downstream(squad_id, roots, &note);
+    }
+}
+
 /// Block until `squad_id`'s in-flight worker (if any) has actually exited,
 /// bounded so a wedged worker can never hang the HTTP thread forever.
 ///
@@ -9642,7 +9666,16 @@ fn restart_cell_proof(
                 daemon.cancellations.cancel(dep_id);
             }
             wait_for_workers_stop(daemon, &dirtied);
-            apply_restart_note(daemon, id, &[(task_idx, cell_idx)], &note_req);
+            apply_proof_restart_note(
+                daemon,
+                id,
+                task_idx,
+                "cell",
+                cell_idx,
+                proof_from,
+                &[(task_idx, cell_idx)],
+                &note_req,
+            );
             json(
                 200,
                 &RestartResponse {
@@ -9708,7 +9741,9 @@ fn restart_task_proof(daemon: &Daemon, id: &str, ti: &str, vi: &str, body: &str)
                     .filter(|s| s.task_idx == task_idx)
                     .map(|s| (s.task_idx, s.idx))
                     .collect();
-                apply_restart_note(daemon, id, &roots, &note_req);
+                apply_proof_restart_note(
+                    daemon, id, task_idx, "task", -1, proof_from, &roots, &note_req,
+                );
             }
             json(
                 200,
@@ -26961,11 +26996,12 @@ remediation_attempts = 1
         assert!(r.body.contains("\"state\":\"pending\""));
     }
 
-    /// RAL-174 deadlock regression (see `restart_squad_route_with_note_attaches_ghost_without_hanging`).
+    /// Restart-note deadlock regression for the exact cell proof target.
     #[test]
-    fn restart_cell_proof_route_with_note_attaches_ghost_without_hanging() {
+    fn restart_cell_proof_route_with_note_targets_the_proof_without_hanging() {
         let d = daemon();
-        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        let task = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.cell.proof]]\ncommand=\"true\"\nremediation_attempts=1\n";
+        route(&d, "POST", "/api/squads", &submit_body(task));
         let body = serde_json::json!({"note": "proof was flaking on the last attempt"}).to_string();
         let r = route(
             &d,
@@ -26974,14 +27010,18 @@ remediation_attempts = 1
             &body,
         );
         assert_eq!(r.status, 200);
-        let ghost = d
-            .lock()
-            .get_ghost(&crate::ghost::cell_uri("squad-000000000001", 0, 0))
-            .unwrap()
-            .unwrap();
         assert_eq!(
-            ghost.user_note.as_deref(),
+            d.lock()
+                .take_proof_restart_note("squad-000000000001", 0, "cell", 0, 0)
+                .unwrap()
+                .as_deref(),
             Some("proof was flaking on the last attempt")
+        );
+        assert!(
+            d.lock()
+                .get_ghost(&crate::ghost::cell_uri("squad-000000000001", 0, 0))
+                .unwrap()
+                .is_none()
         );
     }
 
@@ -27011,15 +27051,12 @@ remediation_attempts = 1
         assert!(r.body.contains("\"state\":\"pending\""));
     }
 
-    /// RAL-174 deadlock regression (see `restart_squad_route_with_note_attaches_ghost_without_hanging`).
-    /// This is the endpoint that actually hung during development: unlike the
-    /// other four, its handler unconditionally re-locks the store (via
-    /// `cells_of`) inside the match arm to compute the task's owned
-    /// cells, so it deadlocked even before reaching `apply_restart_note`.
+    /// Restart-note deadlock regression for the exact task proof target.
     #[test]
-    fn restart_task_proof_route_with_note_attaches_ghost_without_hanging() {
+    fn restart_task_proof_route_with_note_targets_the_proof_without_hanging() {
         let d = daemon();
-        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        let task = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.proof]]\ncommand=\"true\"\nremediation_attempts=1\n";
+        route(&d, "POST", "/api/squads", &submit_body(task));
         let body = serde_json::json!({"note": "task proof needs a longer timeout"}).to_string();
         let r = route(
             &d,
@@ -27028,14 +27065,18 @@ remediation_attempts = 1
             &body,
         );
         assert_eq!(r.status, 200);
-        let ghost = d
-            .lock()
-            .get_ghost(&crate::ghost::cell_uri("squad-000000000001", 0, 0))
-            .unwrap()
-            .unwrap();
         assert_eq!(
-            ghost.user_note.as_deref(),
+            d.lock()
+                .take_proof_restart_note("squad-000000000001", 0, "task", -1, 0)
+                .unwrap()
+                .as_deref(),
             Some("task proof needs a longer timeout")
+        );
+        assert!(
+            d.lock()
+                .get_ghost(&crate::ghost::cell_uri("squad-000000000001", 0, 0))
+                .unwrap()
+                .is_none()
         );
     }
 
