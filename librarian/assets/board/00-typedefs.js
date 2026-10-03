@@ -919,6 +919,7 @@
        * panel reads it (WS-G.4). The endpoint also returns name/version/status/
        * db/warnings, which other call sites use.
        * @typedef {object} DaemonHealthView
+       * @property {string} [db] - result of the daemon's own database probe ("ok" or an error string). RAL-544: a non-"ok" value means the daemon is reachable but cannot reliably read its own store.
        * @property {StoreLockWaitView} [lock_wait] - store-lock acquisition wait over the daemon's lifetime (RAL-393).
        * @property {StoreGuardHoldView} [guard_hold] - how long the lock has been *held* at worst (WS-D.8/M5). Distinct from `lock_wait`: a long hold is the cause, a long wait is what every other thread feels.
        * @property {StoreWatchdogView} [watchdog] - store-lock liveness (WS-G.1/G.2, `daemon/src/watchdog.rs`).

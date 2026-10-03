@@ -180,6 +180,13 @@
             ? { color: "--warn", label: "recovered" }
             : { color: "--done", label: "reachable" };
         const rows = [];
+        // RAL-544: the database probe is a distinct failure mode from the
+        // watchdog above -- the store lock can be reachable while the
+        // database itself cannot be read, so this needs its own indicator
+        // rather than being folded into the watchdog's state.
+        if (daemon.db && daemon.db !== "ok") {
+          rows.push(`<span data-tip="The daemon's own database probe (GET /api/daemon's db field). A non-'ok' value means the daemon is reachable but cannot reliably read its own store -- task state, submissions, and this board may be stale or fail outright."><span class="dot" style="background:${cvar("--failed")}"></span> db: ${esc(daemon.db)}</span>`);
+        }
         rows.push(`<span data-tip="Whether the liveness watchdog could acquire the daemon's store lock on its last check (every ${esc(String(WATCHDOG_INTERVAL_SECS))}s). 'unreachable' means the daemon is wedged -- every request is queued behind whoever holds the lock."><span class="dot" style="background:${cvar(state.color)}"></span> ${esc(state.label)}</span>`);
         if (dog) {
           if (dog.last_ok_age_ms !== null && dog.last_ok_age_ms !== undefined) {
