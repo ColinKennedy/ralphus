@@ -5201,7 +5201,13 @@ fn refresh_pr_forge_cache_for_guardian(store: &crate::store_lock::StoreHandle, i
             .collect()
     };
 
-    // Comment pass -- no drift lock is held from here on.
+    // Comment pass -- no drift lock is held from here on. RAL-545: this
+    // cycle's forge reachability is also recorded once per guardian (not
+    // per PR) -- every PR under one guardian shares the same forge client
+    // and token, so a comment-fetch failure on any of them is the same
+    // root-cause signal, not an independent outage per PR.
+    let mut cycle_ok = true;
+    let mut cycle_error: Option<String> = None;
     for (pr, drift) in prs.iter().zip(drift_by_pr) {
         let number = pr.pr_number.expect("filtered to pr_number.is_some() above");
 
@@ -5270,6 +5276,12 @@ fn refresh_pr_forge_cache_for_guardian(store: &crate::store_lock::StoreHandle, i
         let _ = store
             .lock()
             .upsert_pr_forge_cache(&pr.id, drift_half, comments_half);
+        if !ok {
+            cycle_ok = false;
+            if cycle_error.is_none() {
+                cycle_error = comment_error.clone();
+            }
+        }
         let new_status = if ok { "ok" } else { "unknown" };
         if previous_status.as_deref() != Some(new_status) {
             // A genuine reachability transition (first poll, forge recovered,
@@ -5312,6 +5324,18 @@ fn refresh_pr_forge_cache_for_guardian(store: &crate::store_lock::StoreHandle, i
             );
         }
     }
+
+    let outcome = if cycle_ok {
+        crate::poller_health::PollOutcome::Healthy
+    } else {
+        crate::poller_health::PollOutcome::Unhealthy {
+            error: cycle_error.unwrap_or_else(|| "forge cache poll failed".to_string()),
+        }
+    };
+    let _ =
+        store
+            .lock()
+            .record_poll_outcome(crate::poller_health::PollerKind::PrForge, id, &outcome);
 }
 
 /// Poll every guardian with an open PR stack once (RAL-279's forge-side base

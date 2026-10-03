@@ -2040,6 +2040,26 @@ impl Store {
                 PRIMARY KEY (pr_id, endpoint, external_id)
             );
             CREATE INDEX IF NOT EXISTS idx_pr_forge_comments_pr ON guardian_pr_forge_comments(pr_id);
+            -- RAL-545: durable healthy/unhealthy state for one polling
+            -- target (`poller_kind` + `target_key`, today always a guardian
+            -- id) -- a boolean transition, not a retry counter, so a
+            -- restart never re-triggers the just-went-unhealthy mailbox
+            -- notification for an outage already known about. `streak`/
+            -- `next_log_at_streak` drive the exponential backoff on repeated
+            -- same-state Cartographer health logs; both reset to 1/2 on
+            -- every healthy<->unhealthy transition so the first poll in the
+            -- new state is always logged. `last_error` is the most recent
+            -- failure detail, cleared on recovery.
+            CREATE TABLE IF NOT EXISTS poller_health (
+                poller_kind        TEXT NOT NULL,
+                target_key         TEXT NOT NULL,
+                healthy            INTEGER NOT NULL,
+                streak             INTEGER NOT NULL DEFAULT 0,
+                next_log_at_streak INTEGER NOT NULL DEFAULT 1,
+                last_error         TEXT,
+                updated_at_ms      INTEGER NOT NULL,
+                PRIMARY KEY (poller_kind, target_key)
+            );
             -- RAL-164: tracks in-flight/completed 'set it for me' AI resolution
             -- of a named CheckInput, one row per (guardian_id, input_name).
             -- Existence of this table (rather than a JSON blob on `guardians`)
