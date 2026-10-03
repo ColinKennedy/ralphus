@@ -4460,12 +4460,11 @@ impl Store {
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         let satisfied = Self::dependency_satisfying_squads(&self.conn)?;
+        let gated = self.block_gated_squads()?;
         let mut ready = Vec::new();
         for (id, deps_json) in pending {
             let deps: Vec<String> = from_json(&deps_json);
-            if Self::deps_satisfied_in(&satisfied, &deps)
-                && self.squad_block_gating_waypoint(&id)?.is_none()
-            {
+            if Self::deps_satisfied_in(&satisfied, &deps) && !gated.contains(&id) {
                 ready.push(id);
             }
         }
@@ -16494,6 +16493,134 @@ command = "check-c"
         let q = store.queue().unwrap();
         let item = q.iter().find(|i| i.squad_id == squad).unwrap();
         assert_eq!(item.readiness, "ready");
+    }
+
+    thread_local! {
+        static STATEMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn count_statement(_sql: &str) {
+        STATEMENTS.with(|n| n.set(n.get() + 1));
+    }
+
+    /// Statements `Store::list_ready` issues on this thread.
+    #[allow(deprecated)]
+    fn list_ready_statements(store: &mut Store) -> (Vec<String>, usize) {
+        STATEMENTS.with(|n| n.set(0));
+        store.conn.trace(Some(count_statement));
+        let ready = store.list_ready().unwrap();
+        store.conn.trace(None);
+        (ready, STATEMENTS.with(std::cell::Cell::get))
+    }
+
+    /// `n` pending squads, oldest first, each gated by its own open block
+    /// waypoint whose roster entry (`roster_of(i)`) is given by the caller.
+    fn pending_squads_gated_by_waypoints(
+        store: &mut Store,
+        n: usize,
+        roster_of: impl Fn(usize) -> Option<(crate::waypoints::WaypointEntryKind, String)>,
+    ) -> Vec<String> {
+        use crate::waypoints::{AffectedMode, WaypointEntryKind};
+        let mut ids = Vec::new();
+        for i in 0..n {
+            let squad = store
+                .insert_squad(&parse(SAMPLE), Some("a"), false)
+                .unwrap();
+            let wp = format!("waypoint-{squad}");
+            store
+                .create_waypoint(&wp, Some("l"), "prompt", None, None, false)
+                .unwrap();
+            store
+                .add_affected_entry(&wp, WaypointEntryKind::Squad, &squad, AffectedMode::Block)
+                .unwrap();
+            if let Some((kind, entry)) = roster_of(i) {
+                store.add_roster_entry(&wp, kind, &entry, None).unwrap();
+            }
+            ids.push(squad);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        ids
+    }
+
+    #[test]
+    fn list_ready_statement_count_is_constant_in_pending_squads() {
+        use crate::waypoints::WaypointEntryKind;
+
+        let mut store = Store::open_in_memory().unwrap();
+        pending_squads_gated_by_waypoints(&mut store, 2, |i| {
+            Some((WaypointEntryKind::Squad, format!("squad-missing-{i}")))
+        });
+        let (_, few) = list_ready_statements(&mut store);
+        pending_squads_gated_by_waypoints(&mut store, 30, |i| {
+            Some((WaypointEntryKind::Squad, format!("squad-missing-{i}")))
+        });
+        let (_, many) = list_ready_statements(&mut store);
+        assert_eq!(few, many, "statements must not grow with pending squads");
+        assert!(many <= 4, "pending, deps, candidates, roster: got {many}");
+    }
+
+    #[test]
+    fn list_ready_mixes_blocked_unblocked_and_dependency_unsatisfied() {
+        use crate::waypoints::WaypointEntryKind;
+
+        let mut store = Store::open_in_memory().unwrap();
+        let landed = store
+            .insert_squad(&parse(SAMPLE), Some("landed"), false)
+            .unwrap();
+        store.set_squad_state(&landed, SquadState::Done).unwrap();
+        let review = store.create_guardian("g", "main", "/r").unwrap();
+        // 0: unlanded squad roster (held); 1: landed squad roster (free);
+        // 2: empty roster (free); 3: unlanded review roster (held);
+        // 4: landed review roster (free).
+        store
+            .set_guardian_status(&review, crate::guardian::GuardianStatus::Merged, None)
+            .unwrap();
+        let open_review = store.create_guardian("g2", "main", "/r").unwrap();
+        let ids = pending_squads_gated_by_waypoints(&mut store, 5, |i| match i {
+            0 => Some((WaypointEntryKind::Squad, "squad-missing".to_string())),
+            1 => Some((WaypointEntryKind::Squad, landed.clone())),
+            2 => None,
+            3 => Some((WaypointEntryKind::Review, open_review.clone())),
+            _ => Some((WaypointEntryKind::Review, review.clone())),
+        });
+        // A dependency-unsatisfied squad is excluded whatever its waypoints say.
+        let dep_toml = "[[default]]\ndepends_on = [\"squad-never\"]\n[[task]]\nname=\"d\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let dep = store
+            .insert_squad(&parse(dep_toml), Some("d"), false)
+            .unwrap();
+
+        let ready = store.list_ready().unwrap();
+        assert_eq!(
+            ready,
+            vec![ids[1].clone(), ids[2].clone(), ids[4].clone()],
+            "oldest-first order, held and dependency-blocked squads excluded"
+        );
+        assert!(!ready.contains(&dep));
+        for id in &ids {
+            assert_eq!(
+                ready.contains(id),
+                store.squad_block_gating_waypoint(id).unwrap().is_none(),
+                "batch gating agrees with the per-squad lookup for {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn list_ready_unblocks_when_roster_entry_lands() {
+        use crate::waypoints::WaypointEntryKind;
+
+        let mut store = Store::open_in_memory().unwrap();
+        let roster = store
+            .insert_squad(&parse(SAMPLE), Some("roster"), false)
+            .unwrap();
+        store.set_squad_state(&roster, SquadState::Running).unwrap();
+        let ids = pending_squads_gated_by_waypoints(&mut store, 2, |_| {
+            Some((WaypointEntryKind::Squad, roster.clone()))
+        });
+        assert!(store.list_ready().unwrap().is_empty());
+
+        store.set_squad_state(&roster, SquadState::Done).unwrap();
+        assert_eq!(store.list_ready().unwrap(), ids);
     }
 
     #[test]
