@@ -1637,6 +1637,16 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
             ${rows}
           </div>`;
       }
+      /** Tooltip shown on every run control while a review's build is still running. */
+      const REVIEW_BUILDING_TIP = "This review's auto-build and post-merge checks are still running.\nChecks and actions open once they finish, so they always run against a built worktree.";
+      /**
+       * Whether the review's auto-build / post-merge worker is still running.
+       * @param {GuardianView} g - The review.
+       * @returns {boolean}
+       */
+      function reviewBuilding(g) {
+        return g.post_merge_status === "running";
+      }
       /**
        * The split run control shared by the sections that can actually trigger
        * their commands. `kind` picks the run-all action; the ▾ half opens the
@@ -1649,6 +1659,13 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        * @returns {string}
        */
       function reviewRunControl(g, kind, enabled, label, tip) {
+        // A run launched mid-build would open a worktree that is not built yet,
+        // so every run-all button stands down until the build settles.
+        if (reviewBuilding(g)) {
+          enabled = false;
+          label = "▶ Building…";
+          tip = REVIEW_BUILDING_TIP;
+        }
         const action = kind === "manual" ? "runAllManualChecks" : "runAllActionHints";
         const btn = `<button class="btn primary rg-runbtn" ${enabled ? "" : "disabled"} `
           + `data-click="${action}" data-guardian-id="${esc(g.id)}"${enabled ? ` data-tip="${esc(tip)}"` : ""}>${esc(label)}</button>`;
@@ -1996,8 +2013,8 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
               }
               const cmdText = h.command || "";
               return `<div class="cmd-row selectable${isCommandRowSelected(key) ? " sel" : ""}" data-click="selectReviewCommandRow" data-dblclick="toggleReviewCommandFull" data-guardian-id="${esc(g.id)}" data-key="${esc(key)}" data-cmd="${esc(cmdText)}" data-tip="Select this action to scope the log drawer to it.\nDouble-click to open it in full.">
-                  <button class="cmd-run" data-click="runCheck" data-kind="action" data-guardian-id="${esc(g.id)}" data-i="${i}" data-runkey="${esc(key)}"
-                    data-tip="Run this action in the built review worktree.\nRun: ${esc(cmdText)}${needsInput ? `\nUses the values in + — its current ones, or this review's last ones if you have not opened it.` : ""}">▶</button>
+                  <button class="cmd-run"${reviewBuilding(g) ? " disabled" : ""} data-click="runCheck" data-kind="action" data-guardian-id="${esc(g.id)}" data-i="${i}" data-runkey="${esc(key)}"
+                    data-tip="${reviewBuilding(g) ? esc(REVIEW_BUILDING_TIP) + "\n" : ""}Run this action in the built review worktree.\nRun: ${esc(cmdText)}${needsInput ? `\nUses the values in + — its current ones, or this review's last ones if you have not opened it.` : ""}">▶</button>
                   <span class="cmd-label">${label}</span>
                   <span class="cmd-text mono" data-tip="${esc(cmdText)}">${esc(cmdText)}</span>
                   ${commandRunStatus(key)}
@@ -2056,8 +2073,8 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
                       const key = `${g.id}:manual:${i}`;
                       const needsInput = !!(cmd.inputs && cmd.inputs.length);
                       return `<div class="cmd-row selectable${isCommandRowSelected(key) ? " sel" : ""}" data-click="selectReviewCommandRow" data-dblclick="toggleReviewCommandFull" data-guardian-id="${esc(g.id)}" data-key="${esc(key)}" data-cmd="${esc(cmdText)}" data-tip="Select this check to scope the log drawer to it.\nDouble-click to open it in full.">
-                          <button class="cmd-run" data-click="runCheck" data-kind="manual" data-guardian-id="${esc(g.id)}" data-i="${i}" data-runkey="${esc(key)}"
-                            data-tip="Run this check in the built review worktree.\nRun: ${esc(cmdText)}${needsInput ? `\nUses the values in + — its current ones, or this review's last ones if you have not opened it.` : ""}">▶</button>
+                          <button class="cmd-run"${reviewBuilding(g) ? " disabled" : ""} data-click="runCheck" data-kind="manual" data-guardian-id="${esc(g.id)}" data-i="${i}" data-runkey="${esc(key)}"
+                            data-tip="${reviewBuilding(g) ? esc(REVIEW_BUILDING_TIP) + "\n" : ""}Run this check in the built review worktree.\nRun: ${esc(cmdText)}${needsInput ? `\nUses the values in + — its current ones, or this review's last ones if you have not opened it.` : ""}">▶</button>
                           <span class="cmd-text mono" data-tip="${esc(cmdText)}">${esc(cmdText)}</span>
                           ${commandRunStatus(key)}
                           <button class="cmd-expand" data-click="toggleReviewCommandFull" data-key="${esc(key)}" data-tip="${needsInput ? "Show this command in full, with its values filled in and editable beneath it." : "Show or hide this command in full beneath its row."}">${commandFullOpen[key] ? "−" : "+"}</button>

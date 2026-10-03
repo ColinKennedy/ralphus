@@ -9132,12 +9132,74 @@ fn post_merge_jobs_inner(
         checks
     });
 
+    // The build ran in the scratch checkout, but the reviewer's checks and
+    // actions run in the combined worktree. Hand the build's outputs over
+    // before the scratch is deleted, or the reviewer would open a tree that
+    // was never built.
+    if jobs.checks && outcome.is_ok() && !cancel.is_cancelled() && pm_ws.is_local() {
+        promote_build_outputs(&pm_dir, &combined_path, &pm_ws);
+    }
+
     // Remove the scratch worktree best-effort; a leftover directory is swept
     // by the next `worktree_add_or_reset` on this path, and a failed deletion
     // must never fail the (already recorded) post-merge outcome.
     let _ = combined_ws.git(&["worktree", "remove", "--force", &pm_str]);
     let _ = combined_ws.git(&["worktree", "prune"]);
     outcome
+}
+
+/// Move the gitignored files a successful build left in the scratch checkout
+/// (`dist/`, `target/`, ...) into the combined worktree at the same relative
+/// paths, replacing whatever a previous build left there.
+///
+/// Only ignored paths move: tracked files already match the tip in both
+/// checkouts, and ignored ones cannot dirty the combined worktree a later merge
+/// reuses. A path that cannot be moved or copied is skipped, since promotion is
+/// best-effort and must never fail the recorded post-merge outcome.
+fn promote_build_outputs(from: &Path, to: &Path, from_ws: &Workspace) {
+    let Ok(listing) = from_ws.git(&[
+        "ls-files",
+        "--others",
+        "--ignored",
+        "--exclude-standard",
+        "--directory",
+    ]) else {
+        return;
+    };
+    for rel in listing
+        .lines()
+        .map(|line| line.trim_end_matches('/'))
+        .filter(|line| !line.is_empty())
+    {
+        let (src, dst) = (from.join(rel), to.join(rel));
+        if let Some(parent) = dst.parent() {
+            if std::fs::create_dir_all(parent).is_err() {
+                continue;
+            }
+        }
+        let _ = if dst.is_dir() {
+            std::fs::remove_dir_all(&dst)
+        } else {
+            std::fs::remove_file(&dst).or(Ok(()))
+        };
+        if std::fs::rename(&src, &dst).is_err() {
+            let _ = copy_path_recursive(&src, &dst);
+        }
+    }
+}
+
+/// Copy a file or directory tree, creating `dst` and any missing parents.
+fn copy_path_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if src.is_dir() {
+        std::fs::create_dir_all(dst)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            copy_path_recursive(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+        Ok(())
+    } else {
+        std::fs::copy(src, dst).map(|_| ())
+    }
 }
 
 /// Run the review's check gates against the finished combined worktree.
@@ -14937,6 +14999,40 @@ mod tests {
             dir.join("nonexistent")
         )));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn promote_build_outputs_moves_only_ignored_files_and_replaces_stale_ones() {
+        let base = tmp_dir("promote");
+        let (scratch, combined) = (base.join("scratch"), base.join("combined"));
+        for dir in [&scratch, &combined] {
+            std::fs::create_dir_all(dir.join("dist")).unwrap();
+            g(dir, &["init", "-q"]);
+            std::fs::write(dir.join(".gitignore"), "dist/\n").unwrap();
+            std::fs::write(dir.join("tracked.txt"), "same").unwrap();
+        }
+        std::fs::write(scratch.join("dist").join("build.json"), "fresh").unwrap();
+        std::fs::write(combined.join("dist").join("stale.json"), "old").unwrap();
+
+        promote_build_outputs(&scratch, &combined, &Workspace::local(&scratch));
+
+        assert_eq!(
+            std::fs::read_to_string(combined.join("dist").join("build.json")).unwrap(),
+            "fresh"
+        );
+        assert!(
+            !combined.join("dist").join("stale.json").exists(),
+            "a previous build's leftovers must not survive next to the new output"
+        );
+        assert!(
+            !scratch.join("dist").exists(),
+            "outputs move rather than copy"
+        );
+        assert_eq!(
+            std::fs::read_to_string(combined.join("tracked.txt")).unwrap(),
+            "same"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

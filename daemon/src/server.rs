@@ -16777,6 +16777,32 @@ fn watch_check_run(
     });
 }
 
+/// Whether a review's post-merge worker (auto-build, check gates, manual-check
+/// generation) is genuinely running: a `running` phase older than
+/// [`crate::guardian_merge::POST_MERGE_STALE_AFTER_MS`] is an abandoned one
+/// (the daemon died mid-run) and does not count.
+fn post_merge_in_flight(guardian: &crate::guardian::GuardianView) -> bool {
+    guardian.post_merge_status.as_deref() == Some("running")
+        && guardian.post_merge_started_at_ms.is_some_and(|started| {
+            crate::store::now_ms().saturating_sub(started)
+                < crate::guardian_merge::POST_MERGE_STALE_AFTER_MS
+        })
+}
+
+/// The 409 a check/action launch gets while the review is still being built:
+/// launching then would run against a worktree whose build has not finished.
+fn reject_while_building(guardian: &crate::guardian::GuardianView) -> Option<Reply> {
+    post_merge_in_flight(guardian).then(|| {
+        error(
+            409,
+            "build_in_progress",
+            "this review's auto-build and post-merge checks are still running; \
+             checks and actions open once they finish",
+            vec![],
+        )
+    })
+}
+
 /// Run one or all LLM-generated manual review commands as fire-and-forget
 /// terminal subprocesses (RAL-27). Body `{ "index": N, "inputs": {...},
 /// "run_cleanup": bool }` runs command N only; no body (or `{}`) runs all
@@ -16802,6 +16828,9 @@ fn guardian_run_manual_commands(daemon: &Daemon, id: &str, body: &str) -> Reply 
         Ok(g) => g,
         Err(e) => return store_error(&e),
     };
+    if let Some(reply) = reject_while_building(&g) {
+        return reply;
+    }
 
     if g.manual_commands.is_empty() {
         return error(
@@ -16923,6 +16952,9 @@ fn guardian_run_action_hint(daemon: &Daemon, id: &str, body: &str) -> Reply {
         Ok(g) => g,
         Err(e) => return store_error(&e),
     };
+    if let Some(reply) = reject_while_building(&g) {
+        return reply;
+    }
 
     let hint = match g.action_hints.get(req.index) {
         Some(h) => h.clone(),
@@ -17428,12 +17460,7 @@ fn guardian_regenerate_manual_checks(daemon: &Daemon, id: &str, body: &str) -> R
     // running would have its session killed and its outcome overwritten by a
     // second one. This never gates merging -- a merge supersedes any running
     // post-merge job by design (RAL-520).
-    if guardian.post_merge_status.as_deref() == Some("running")
-        && guardian.post_merge_started_at_ms.is_some_and(|started| {
-            crate::store::now_ms().saturating_sub(started)
-                < crate::guardian_merge::POST_MERGE_STALE_AFTER_MS
-        })
-    {
+    if post_merge_in_flight(&guardian) {
         return error(
             409,
             "invalid_transition",
@@ -19334,6 +19361,48 @@ mod tests {
         // default for this input.
         let g = d.lock().get_guardian(&id).unwrap();
         assert!(g.input_values.is_empty());
+    }
+
+    #[test]
+    fn check_and_action_launches_are_refused_until_the_build_finishes() {
+        let d = daemon();
+        let id = d.lock().create_guardian("g", "main", "/r").unwrap();
+        let hint = crate::guardian::GuardianCheck {
+            label: Some("Launch".to_string()),
+            command: Some("true".to_string()),
+            prompt: None,
+            cleanup_command: None,
+            inputs: vec![],
+        };
+        d.lock()
+            .set_guardian_action_hints(&id, std::slice::from_ref(&hint))
+            .unwrap();
+        d.lock()
+            .set_guardian_manual_commands(&id, std::slice::from_ref(&hint), None, None)
+            .unwrap();
+        let started = d.lock().start_guardian_post_merge(&id).unwrap();
+
+        for (path, body) in [
+            ("run-action-hint", r#"{"index":0}"#),
+            ("run-manual-commands", r#"{"index":0}"#),
+        ] {
+            let r = route(&d, "POST", &format!("/api/guardians/{id}/{path}"), body);
+            assert_eq!(r.status, 409, "{path}: {}", r.body);
+            assert!(r.body.contains("build_in_progress"), "{path}: {}", r.body);
+        }
+
+        // Once the worker records an outcome the gate lifts (here a failed
+        // build is advisory and does not keep the review locked).
+        d.lock()
+            .finish_guardian_post_merge(&id, started, false, Some("build failed"))
+            .unwrap();
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/guardians/{id}/run-action-hint"),
+            r#"{"index":99}"#,
+        );
+        assert_eq!(r.status, 400, "{}", r.body);
     }
 
     #[test]
