@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::tools::ToolError;
+use crate::version_probe::{self, VersionProbe};
 use crate::{backend::BackendError, shellcmd};
 
 /// Whether `value` should be routed through a shell rather than exec'd
@@ -99,7 +100,8 @@ pub struct BackendCommandHealth {
     pub effective_command: String,
     pub detail: String,
     /// Populated only by a backend whose health probe also reports a
-    /// version (Pi) and only once a version was actually parsed.
+    /// version (Pi, and -- via [`diagnose_command_with_version`] -- Claude
+    /// Code and Codex) and only once a version was actually parsed.
     pub version: Option<String>,
 }
 
@@ -174,6 +176,45 @@ pub fn diagnose_command(command: &str) -> BackendCommandHealth {
         return BackendCommandHealth::fail(command, format!("{resolved} is not executable"));
     }
     BackendCommandHealth::pass(command, resolved)
+}
+
+/// Like [`diagnose_command`], but additionally probes
+/// `<resolved> <version_args>` and extracts a version from its output via
+/// `extract`, folding it into `detail` and `version` on success (RAL-546).
+///
+/// Reuses `diagnose_command`'s own skip/fail classification unchanged: a
+/// compound command is still skipped and an unresolvable one still fails
+/// without ever being invoked. Version probing only ever runs on an
+/// already-`pass`ed, already-resolved, already-executable path -- that
+/// path is exactly what `diagnose_command`'s `pass` variant puts in
+/// `detail` -- and is itself best-effort: a probe failure never downgrades
+/// an already-confirmed-resolvable command back to `fail`, it just leaves
+/// `version` unset and says so in `detail`.
+#[must_use]
+pub fn diagnose_command_with_version(
+    command: &str,
+    version_args: &[&str],
+    extract: impl Fn(&str) -> Option<String>,
+) -> BackendCommandHealth {
+    let health = diagnose_command(command);
+    if health.status != "pass" {
+        return health;
+    }
+    let resolved_path = health.detail;
+    match version_probe::probe_version_at(&resolved_path, version_args, extract) {
+        VersionProbe::Ok { path, version } => BackendCommandHealth {
+            status: "pass",
+            effective_command: command.to_string(),
+            detail: format!("{path} (version {version})"),
+            version: Some(version),
+        },
+        other => BackendCommandHealth {
+            status: "pass",
+            effective_command: command.to_string(),
+            detail: format!("{resolved_path}; version probe: {}", other.detail(command)),
+            version: None,
+        },
+    }
 }
 
 fn task_prompts_dir() -> PathBuf {
@@ -299,5 +340,46 @@ mod tests {
             health.effective_command,
             "\"definitely-not-a-real-program-ral485\""
         );
+    }
+
+    // ── diagnose_command_with_version (RAL-546) ────────────────────────────
+
+    #[test]
+    fn diagnose_command_with_version_skips_a_compound_command_without_probing() {
+        let health = diagnose_command_with_version("cd /foo && claude", &["--version"], |_| None);
+        assert_eq!(health.status, "skip");
+        assert_eq!(health.version, None);
+    }
+
+    #[test]
+    fn diagnose_command_with_version_fails_an_unresolvable_command_without_probing() {
+        let health = diagnose_command_with_version(
+            "definitely-not-a-real-program-ral546",
+            &["--version"],
+            |_| None,
+        );
+        assert_eq!(health.status, "fail");
+        assert_eq!(health.version, None);
+    }
+
+    #[test]
+    fn diagnose_command_with_version_parses_a_real_cargo_version() {
+        let health = diagnose_command_with_version("cargo", &["--version"], |out| {
+            crate::version_probe::first_token_after_prefix(out, "cargo ")
+        });
+        assert_eq!(health.status, "pass", "{health:?}");
+        assert!(health.version.is_some(), "{health:?}");
+        assert!(health.detail.contains("version"), "{health:?}");
+    }
+
+    #[test]
+    fn diagnose_command_with_version_still_passes_when_the_probe_cannot_parse_a_version() {
+        // `cargo` resolves and runs cleanly, but the extractor never matches --
+        // the command is still confirmed resolvable/executable, so this must
+        // stay a `pass` with `version` left unset, not degrade to `fail`.
+        let health = diagnose_command_with_version("cargo", &["--version"], |_| None);
+        assert_eq!(health.status, "pass", "{health:?}");
+        assert_eq!(health.version, None);
+        assert!(health.detail.contains("version probe"), "{health:?}");
     }
 }
