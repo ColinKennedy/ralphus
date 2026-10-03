@@ -1906,7 +1906,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         // render as the setup strip (reviewSetupStrip) directly under the
         // banner, where the display is also the edit affordance.
         el.innerHTML = `<div class="review-cmdbar">
-            <div class="cmd-row hc-anchor" data-card="gReviewId" data-guardian-id="${esc(g.id)}">
+            <div class="cmd-row hc-anchor" data-card="gReviewId" data-guardian-id="${esc(g.id)}" data-click="openReviewHeaderLogs" data-tip="Open this review's activity log.&#10;It includes review operations and, by default, every branch worktree's events in time order.">
               ${gdot(g.status)}<span class="rid">${esc(g.name)}</span> ${pill(g.status)} ${arbiterBadge(g)}
               ${reviewCostChip(g)}
               <div class="cmd-actions">
