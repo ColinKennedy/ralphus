@@ -47,8 +47,10 @@ METHODS = ("GET", "POST", "PUT", "DELETE", "PATCH")
 SPECIAL_ROUTES: dict[str, str] = {
     "GET /api/events": "SSE push stream requires a live, blocked connection \
 stream (matches EVENTS_PATH in serve(), bypassing route() so the connection gets \
-its own thread, RAL-167/RAL-222); the CLI has no SSE consumer -- the \
-librarian's board is its only client.",
+its own thread, RAL-167/RAL-222); has two clients -- the librarian's board, and \
+`ralphus mailbox follow` (RAL-241) -- neither reachable as a normal \
+ENDPOINT_TO_CLI mapping since the route itself is invisible to the route-arm \
+scanner.",
 }
 
 # One endpoint -> the CLI leaf paths that are its clients, verbatim-spelled

@@ -1,7 +1,13 @@
-//! `ralphus mailbox <subcommand>` (RAL-241, poll-only scope): the escalation
-//! mailbox client. `ralphus mailbox check` is the turn-boundary poll a
-//! `ralphus quick-start watcher ...` session's system prompt is instructed to
-//! run after every user turn -- see `crate::commands::quick_start`.
+//! `ralphus mailbox <subcommand>` (RAL-241): the escalation mailbox client.
+//! `ralphus mailbox check` is the turn-boundary poll a `ralphus quick-start
+//! watcher ...` session's system prompt instructs it to run (still the only
+//! mechanism for Codex/Pi); `ralphus mailbox follow` is the RAL-241 push
+//! extension -- it streams the daemon's `/api/events` SSE feed and prints
+//! one line per escalation as it arrives, with zero interval polling -- see
+//! `crate::commands::quick_start`'s Claude Code watcher instructions.
+
+use std::io::BufRead;
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -51,6 +57,12 @@ pub enum MailboxCommand {
     Undrain {
         message_ids: Option<Vec<String>>,
     },
+    /// RAL-241 push extension: open the daemon's `/api/events` SSE stream
+    /// (RAL-222) and print exactly one line per mailbox escalation as it
+    /// arrives, in place of `check`'s turn-boundary poll. See
+    /// `crate::commands::quick_start`'s Claude Code watcher instructions,
+    /// which run this under the `Monitor` tool.
+    Follow,
     UsageError(String),
 }
 
@@ -193,6 +205,7 @@ pub fn parse(args: &[String]) -> MailboxCommand {
                 ),
             }
         }
+        Some("follow") => MailboxCommand::Follow,
         Some(other) => MailboxCommand::UsageError(format!("unknown mailbox subcommand: {other}")),
     }
 }
@@ -306,7 +319,86 @@ pub fn dispatch(cmd: MailboxCommand, opts: &GlobalOpts) -> i32 {
             });
             Ok(())
         }),
+        MailboxCommand::Follow => run_and_report(opts, None, || {
+            ensure_client_id(&client)?;
+            cmd_follow(&client)
+        }),
     }
+}
+
+/// `ralphus mailbox follow` (RAL-241 push extension): reconnects to the
+/// daemon's `/api/events` SSE stream forever, with exponential backoff
+/// between reconnect attempts. Never returns under normal operation -- it's
+/// meant to run under a harness's own background/notification primitive
+/// (e.g. Claude Code's `Monitor` tool), where each stdout line becomes one
+/// nudge back into the agent. Only an actual mailbox notification is ever
+/// printed to stdout; connects/reconnects/errors go to stderr so they never
+/// look like a notification to whatever is watching stdout.
+fn cmd_follow(client: &DaemonClient) -> Result<(), CommandError> {
+    const MAX_BACKOFF: Duration = Duration::from_secs(30);
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        match follow_once(client) {
+            Ok(()) => backoff = Duration::from_secs(1),
+            Err(e) => {
+                eprintln!("mailbox follow: {e}, retrying in {}s", backoff.as_secs());
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+            }
+        }
+    }
+}
+
+/// Opens one `/api/events` connection with a freshly minted (single-use,
+/// RAL-222) ticket, and blocks reading it until the stream ends or errors.
+/// Each `event: mailbox\ndata: <json>\n\n` block becomes one printed line;
+/// every other event kind (`squad`/`guardian`/`other`, shared with the
+/// board) and the idle heartbeat comment are ignored.
+fn follow_once(client: &DaemonClient) -> Result<(), String> {
+    let ticket = client
+        .mint_events_ticket()
+        .map_err(|e| format!("could not mint events ticket: {e}"))?;
+    let url = format!(
+        "{}/api/events?ticket={ticket}",
+        client.base_url().trim_end_matches('/')
+    );
+    let resp = ureq::get(&url)
+        .call()
+        .map_err(|e| format!("could not open event stream: {e}"))?;
+    eprintln!("mailbox follow: connected");
+    let reader = std::io::BufReader::new(resp.into_reader());
+    let mut event_kind: Option<String> = None;
+    for line in reader.lines() {
+        let line = line.map_err(|e| format!("stream read error: {e}"))?;
+        if let Some(kind) = line.strip_prefix("event: ") {
+            event_kind = Some(kind.to_string());
+        } else if let Some(data) = line.strip_prefix("data: ") {
+            if event_kind.as_deref() == Some("mailbox") {
+                print_mailbox_notice(data);
+            }
+        } else if line.is_empty() {
+            event_kind = None;
+        }
+    }
+    Ok(())
+}
+
+/// Prints exactly one line for a `MailboxNotice` JSON payload (see
+/// `daemon/src/events.rs`), or silently drops it if it doesn't parse --
+/// malformed push data should never crash a session-length watcher.
+fn print_mailbox_notice(data: &str) {
+    let Ok(v) = serde_json::from_str::<Value>(data) else {
+        return;
+    };
+    let tag = match v["priority"].as_str().unwrap_or("normal") {
+        "urgent" => "URGENT",
+        "high" => "HIGH",
+        _ => "info",
+    };
+    println!(
+        "MAILBOX [{tag}] {}",
+        v["message"].as_str().unwrap_or_default()
+    );
 }
 
 /// Reads the locally persisted mailbox `client_id`
@@ -429,6 +521,11 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_follow() {
+        assert!(matches!(parse(&v(&["follow"])), MailboxCommand::Follow));
     }
 
     #[test]

@@ -1,10 +1,15 @@
 //! `ralphus quick-start <manager|reviewer|watcher> <claude-code|codex|pi>`.
 //! `manager`/`reviewer` are ported from `cli/src/ralphus/__main__.py`'s
-//! quick-start group; `watcher` is new (RAL-241) -- a mailbox-polling
-//! supervisor session that registers a `client_id` with the daemon on
-//! startup (see `crate::commands::mailbox::ensure_client_id`) and launches
-//! with a system prompt instructing the agent to run `ralphus mailbox check`
-//! after every user turn.
+//! quick-start group; `watcher` is new (RAL-241) -- a mailbox-supervisor
+//! session that registers a `client_id` with the daemon on startup (see
+//! `crate::commands::mailbox::ensure_client_id`) and launches with a system
+//! prompt instructing the agent to drain the escalation mailbox. How it's
+//! told to *notice* a new message is backend-specific
+//! ([`WatcherDeliveryMechanism`]): Claude Code gets real push -- its system
+//! prompt arms the `Monitor` tool on `ralphus mailbox follow`, which blocks
+//! on the daemon's SSE stream with zero polling and costs nothing while idle
+//! -- Codex and Pi still get the original "run `ralphus mailbox check` after
+//! every user turn" convention until they get their own push integration.
 //!
 //! Despite the "interactive" framing, this does **not** touch tmux/psmux at
 //! all -- that mechanism is for tracking a *scheduled task's* session, a
@@ -263,7 +268,11 @@ pub fn dispatch(cmd: QuickStartCommand, opts: &GlobalOpts) -> i32 {
             }
             launch_claude(
                 "quick-start-watcher-claude-code",
-                watcher_system_prompt_content(launch.read_only, CLAUDE_READ_ONLY_MECHANISM),
+                watcher_system_prompt_content(
+                    launch.read_only,
+                    CLAUDE_READ_ONLY_MECHANISM,
+                    WatcherDeliveryMechanism::ClaudeMonitor,
+                ),
                 &launch,
             )
         }
@@ -273,7 +282,11 @@ pub fn dispatch(cmd: QuickStartCommand, opts: &GlobalOpts) -> i32 {
             }
             launch_codex(
                 "quick-start-watcher-codex",
-                watcher_system_prompt_content(launch.read_only, CODEX_READ_ONLY_MECHANISM),
+                watcher_system_prompt_content(
+                    launch.read_only,
+                    CODEX_READ_ONLY_MECHANISM,
+                    WatcherDeliveryMechanism::PollEveryTurn,
+                ),
                 &launch,
             )
         }
@@ -283,7 +296,11 @@ pub fn dispatch(cmd: QuickStartCommand, opts: &GlobalOpts) -> i32 {
             }
             launch_pi(
                 "quick-start-watcher-pi",
-                watcher_system_prompt_content(launch.read_only, PI_READ_ONLY_MECHANISM),
+                watcher_system_prompt_content(
+                    launch.read_only,
+                    PI_READ_ONLY_MECHANISM,
+                    WatcherDeliveryMechanism::PollEveryTurn,
+                ),
                 &launch,
             )
         }
@@ -438,21 +455,55 @@ fn reviewer_system_prompt_content(
     ))
 }
 
-/// RAL-241: framing for the watcher quick-start harness -- a mailbox-polling
+/// RAL-241: framing for the watcher quick-start harness -- a mailbox
 /// supervisor rather than a fresh orchestration session or a review
-/// operator. The one hard requirement (drain after every user turn) is
-/// stated up front and repeated as "MANDATORY" since it's the entire reason
-/// this quick-start variant exists; everything else is the same full
-/// command surface `manager` gets, since a watcher may still need to
-/// inspect/act on the squad/task/review the escalation is about.
-const WATCHER_ROLE_NOTE: &str = "You are Ralphus operating in WATCHER mode (RAL-241). Your job is to supervise autonomous ralphus work by draining its escalation mailbox -- a queue of `urgent`/`high`/`normal` priority messages the daemon writes when something needs attention (a task/cell failed, a session appears to have stalled with no activity for several minutes, or a cross-squad waypoint is now holding or advising a piece of work).\n\nMANDATORY: after every user turn -- i.e. as the first thing you do once you finish responding to what the user just asked, before going idle waiting for their next message -- run `ralphus mailbox check` (no category filter -- you drain everything, including `review`-category PR/CI-watch notices from RAL-375, unlike QuickStart Reviewer which defaults to the `review` category only) and show its output to the user verbatim, even if it reports no unread messages. Do not silently swallow or summarize away a message.\n\nHow to react once you've shown a message:\n  - `urgent` -- stop and read it now. Treat it as more important than whatever else you were about to say; investigate it (e.g. `ralphus get <selector>`, `ralphus cell show <selector>`, `ralphus cartographer --squad-id <id>`) before continuing.\n  - `high` -- process it before you would otherwise go idle; it does not need to interrupt an in-progress response, but must not be left unaddressed.\n  - `normal` -- informational; mention it, no action required.\n\nWaypoint messages (RAL-400) need a different reaction from a failure, so recognise them by `event_kind`:
+/// operator. Everything else is the same full command surface `manager`
+/// gets, since a watcher may still need to inspect/act on the squad/task/
+/// review the escalation is about.
+const WATCHER_ROLE_INTRO: &str = "You are Ralphus operating in WATCHER mode (RAL-241). Your job is to supervise autonomous ralphus work by draining its escalation mailbox -- a queue of `urgent`/`high`/`normal` priority messages the daemon writes when something needs attention (a task/cell failed, a session appears to have stalled with no activity for several minutes, or a cross-squad waypoint is now holding or advising a piece of work).";
+
+/// Backend-agnostic half of the watcher's instructions: how to react once a
+/// message has been shown, regardless of how its arrival was detected.
+/// Includes the RAL-400 waypoint-specific reactions (distinct from an
+/// ordinary failure) since those apply the same way no matter how the
+/// message was noticed.
+const WATCHER_REACTION_NOTE: &str = "How to react once you've shown a message:\n  - `urgent` -- stop and read it now. Treat it as more important than whatever else you were about to say; investigate it (e.g. `ralphus get <selector>`, `ralphus cell show <selector>`, `ralphus cartographer --squad-id <id>`) before continuing.\n  - `high` -- process it before you would otherwise go idle; it does not need to interrupt an in-progress response, but must not be left unaddressed.\n  - `normal` -- informational; mention it, no action required.\n\nWaypoint messages (RAL-400) need a different reaction from a failure, so recognise them by `event_kind`:
   - `waypoint_blocked` -- this squad or review is held by an open waypoint and will not progress on its own. It is not broken and does not need fixing; it needs a decision. Report which waypoint holds it (`ralphus waypoint get <id>`) and what the affected entry says, then let the user choose: wait for the waypoint, set that entry to advisory to release it, or close the waypoint. Never restart or retry the held work to 'unstick' it -- the gate will simply hold it again.
   - `waypoint_advised` -- a waypoint published guidance that applies to still-running work without holding it. Informational: surface the guidance so the user knows it was issued, and note that the agent itself receives it on that cell's next dispatch rather than mid-turn.
   - `squad_waypoint_halted` -- narrower than `waypoint_blocked`: a cell that was already running was stopped mid-flight. It resumes automatically once the waypoint closes or de-escalates, so report it without intervening.
 
 `ralphus mailbox check` also marks whatever it returns as read (drained), so only genuinely new escalations appear on each subsequent check -- you do not need to deduplicate against earlier turns yourself.";
 
-fn watcher_system_prompt_content(read_only: bool, harness_mechanism: ReadOnlyMechanism) -> String {
+/// How a watcher session is told to notice a new mailbox message -- the one
+/// part of the watcher framing that genuinely varies per harness (RAL-241
+/// push extension). `PollEveryTurn` is the original, harness-agnostic
+/// convention every backend used before this extension; `ClaudeMonitor` is
+/// real push, built on Claude Code's `Monitor` tool and `ralphus mailbox
+/// follow` (see `crate::commands::mailbox`), and costs nothing while idle --
+/// no inference call happens until the daemon actually has something to say.
+#[derive(Debug, Clone, Copy)]
+enum WatcherDeliveryMechanism {
+    ClaudeMonitor,
+    PollEveryTurn,
+}
+
+const CLAUDE_WATCHER_DELIVERY_NOTE: &str = "MANDATORY, once, at the very start of this session: call the Monitor tool with command: `ralphus mailbox follow`, persistent: true, description: \"ralphus mailbox notifications\" (RAL-241 push extension). This opens the daemon's live `/api/events` stream and blocks with zero polling -- Monitor delivers a notification the moment that command prints a line, instead of you checking on a timer. Do not relaunch it every turn; once armed, it keeps running for the rest of this session.\n\nEach time a Monitor notification from this watch arrives, immediately run `ralphus mailbox check` (no category filter -- you drain everything, including `review`-category PR/CI-watch notices from RAL-375, unlike QuickStart Reviewer which defaults to the `review` category only) and show its output to the user verbatim. Do not silently swallow or summarize away a message. If the watch ever stops (Monitor reports it was auto-stopped, or you suspect it died), re-arm it with the same Monitor call rather than falling back to checking on a fixed schedule yourself.";
+
+const POLL_EVERY_TURN_DELIVERY_NOTE: &str = "MANDATORY: after every user turn -- i.e. as the first thing you do once you finish responding to what the user just asked, before going idle waiting for their next message -- run `ralphus mailbox check` (no category filter -- you drain everything, including `review`-category PR/CI-watch notices from RAL-375, unlike QuickStart Reviewer which defaults to the `review` category only) and show its output to the user verbatim, even if it reports no unread messages. Do not silently swallow or summarize away a message.";
+
+fn watcher_role_note(delivery: WatcherDeliveryMechanism) -> String {
+    let delivery_note = match delivery {
+        WatcherDeliveryMechanism::ClaudeMonitor => CLAUDE_WATCHER_DELIVERY_NOTE,
+        WatcherDeliveryMechanism::PollEveryTurn => POLL_EVERY_TURN_DELIVERY_NOTE,
+    };
+    format!("{WATCHER_ROLE_INTRO}\n\n{delivery_note}\n\n{WATCHER_REACTION_NOTE}")
+}
+
+fn watcher_system_prompt_content(
+    read_only: bool,
+    harness_mechanism: ReadOnlyMechanism,
+    delivery: WatcherDeliveryMechanism,
+) -> String {
     let read_only_block = if read_only {
         format!("\n\n{}", read_only_session_note(harness_mechanism))
     } else {
@@ -461,7 +512,8 @@ fn watcher_system_prompt_content(read_only: bool, harness_mechanism: ReadOnlyMec
     crate::program_name::substitute_backticked_invocations(&format!(
         "You are Ralphus. The complete `ralphus` CLI command surface -- every subcommand, flag, \
          and expected value type -- is documented below for reference. Use `ralphus <command> \
-         --help` for details on any specific command.\n\n{WATCHER_ROLE_NOTE}{WAYPOINT_AWARENESS_NOTE}\n\n{}{read_only_block}\n\n{}",
+         --help` for details on any specific command.\n\n{}{WAYPOINT_AWARENESS_NOTE}\n\n{}{read_only_block}\n\n{}",
+        watcher_role_note(delivery),
         crate::help_map::READ_ONLY_NOTE,
         help_map_tree(read_only),
     ))
@@ -1194,7 +1246,12 @@ mod tests {
 
     #[test]
     fn watcher_system_prompt_instructs_mailbox_check_after_every_turn() {
-        let content = watcher_system_prompt_content(false, CLAUDE_READ_ONLY_MECHANISM);
+        // Codex/Pi still get the original poll-every-turn convention.
+        let content = watcher_system_prompt_content(
+            false,
+            CODEX_READ_ONLY_MECHANISM,
+            WatcherDeliveryMechanism::PollEveryTurn,
+        );
         assert!(content.contains("WATCHER mode"));
         assert!(content.contains("MANDATORY"));
         let program = crate::program_name::resolve_program_name();
@@ -1206,17 +1263,42 @@ mod tests {
     }
 
     #[test]
+    fn watcher_system_prompt_arms_monitor_for_claude_code() {
+        // RAL-241 push extension: Claude Code gets real push via Monitor +
+        // `ralphus mailbox follow`, not the per-turn poll convention.
+        let content = watcher_system_prompt_content(
+            false,
+            CLAUDE_READ_ONLY_MECHANISM,
+            WatcherDeliveryMechanism::ClaudeMonitor,
+        );
+        assert!(content.contains("WATCHER mode"));
+        assert!(content.contains("Monitor"));
+        let program = crate::program_name::resolve_program_name();
+        assert!(content.contains(&format!("{program} mailbox follow")));
+        assert!(content.contains("persistent: true"));
+        assert!(content.contains(&format!("{program} mailbox check")));
+        // The whole point is not needing a per-turn ritual any more.
+        assert!(!content.contains("after every user turn"));
+    }
+
+    #[test]
     fn watcher_system_prompt_drains_review_category_messages_too() {
         // RAL-375: unlike Reviewer's `--category review` default, Watcher
         // must keep draining everything -- including review-category
-        // PR/CI-watch notices -- so its own MANDATORY instruction never adds
-        // a `--category` filter. Checked against WATCHER_ROLE_NOTE itself,
-        // not the full rendered prompt: that also carries the appended
-        // help-map reference listing, which legitimately documents
-        // `mailbox check`'s `--category` flag (RAL-375) without the watcher
-        // actually using it.
-        assert!(WATCHER_ROLE_NOTE.contains("review"));
-        assert!(!WATCHER_ROLE_NOTE.contains("--category"));
+        // PR/CI-watch notices -- so neither delivery mechanism's MANDATORY
+        // instruction ever adds a `--category` filter. Checked against
+        // `watcher_role_note` itself, not the full rendered prompt: that
+        // also carries the appended help-map reference listing, which
+        // legitimately documents `mailbox check`'s `--category` flag
+        // (RAL-375) without the watcher actually using it.
+        for delivery in [
+            WatcherDeliveryMechanism::ClaudeMonitor,
+            WatcherDeliveryMechanism::PollEveryTurn,
+        ] {
+            let note = watcher_role_note(delivery);
+            assert!(note.contains("review"));
+            assert!(!note.contains("--category"));
+        }
     }
 
     #[test]
@@ -1231,19 +1313,23 @@ mod tests {
             "squad_waypoint_halted",
         ] {
             assert!(
-                WATCHER_ROLE_NOTE.contains(kind),
+                WATCHER_REACTION_NOTE.contains(kind),
                 "the watcher must recognise {kind}"
             );
         }
         assert!(
-            WATCHER_ROLE_NOTE.contains("Never restart or retry the held work"),
+            WATCHER_REACTION_NOTE.contains("Never restart or retry the held work"),
             "a held squad must not be treated as a stuck one"
         );
     }
 
     #[test]
     fn watcher_system_prompt_adds_read_only_note_when_requested() {
-        let content = watcher_system_prompt_content(true, CODEX_READ_ONLY_MECHANISM);
+        let content = watcher_system_prompt_content(
+            true,
+            CODEX_READ_ONLY_MECHANISM,
+            WatcherDeliveryMechanism::PollEveryTurn,
+        );
         assert!(content.contains("READ-ONLY MODE"));
         assert!(content.contains("--sandbox read-only"));
     }

@@ -61,5 +61,8 @@ pub fn execute(cmd: MailboxCommand, client: &DaemonClient) -> ExecResult {
             let client_id = mailbox::ensure_client_id(client)?;
             Ok(client.mailbox_undrain(&client_id, message_ids.as_deref())?)
         }
+        MailboxCommand::Follow => Err(usage(
+            "mailbox follow is excluded from the MCP tool surface",
+        )),
     }
 }
