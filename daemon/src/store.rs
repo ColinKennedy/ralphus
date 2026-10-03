@@ -2332,7 +2332,6 @@ impl Store {
                 updated_at_ms  INTEGER NOT NULL,
                 closed_at_ms   INTEGER
             );
-            CREATE INDEX IF NOT EXISTS idx_waypoints_state ON waypoints(state);
             -- RAL-400: one review/squad this waypoint lands on -- work it
             -- affects rather than work it consists of. `kind` is
             -- `review`/`squad`; `entry_id` is that review's or squad's id.
@@ -2367,8 +2366,6 @@ impl Store {
                 updated_at_ms         INTEGER NOT NULL,
                 PRIMARY KEY (waypoint_id, kind, entry_id)
             );
-            CREATE INDEX IF NOT EXISTS idx_waypoint_affected_entry
-                ON waypoint_affected(kind, entry_id);
             -- RAL-400: the waypoint's own completion list -- the reviews and
             -- squads whose landing *is* this waypoint being carried out.
             -- Curated by hand: nothing auto-enrolls here, because what must
@@ -3443,6 +3440,14 @@ impl Store {
             // Only auto-enrolled entries are eligible to be surveyed, so an
             // explicit declaration is never second-guessed by the classifier
             // -- see `waypoints::Store::waypoint_survey_candidates`.
+            // RAL-400: `waypoint_affected`'s columns were originally named
+            // `entity_kind`/`entity_id` before settling on `kind`/`entry_id`
+            // -- renamed here (tolerantly: a no-op once already renamed, or
+            // on a database that created the table fresh with the new
+            // names) rather than re-adding the index that needs them.
+            "ALTER TABLE waypoint_affected RENAME COLUMN entity_kind TO kind",
+            "ALTER TABLE waypoint_affected RENAME COLUMN entity_id TO entry_id",
+            "ALTER TABLE waypoint_affected ADD COLUMN stand_down_at_ms INTEGER",
             "ALTER TABLE waypoint_affected ADD COLUMN auto_enrolled INTEGER NOT NULL DEFAULT 0",
             // RAL-400: when this entry's already-finished work was flagged as
             // possibly needing a redo, because its waypoint closed while the
@@ -3456,10 +3461,20 @@ impl Store {
             // which for a `block`-mode entry is what holds it.
             "ALTER TABLE waypoint_affected ADD COLUMN bearing_decision TEXT",
             "ALTER TABLE waypoint_affected ADD COLUMN bearing_decided_at_ms INTEGER",
+            "CREATE INDEX IF NOT EXISTS idx_waypoint_affected_entry ON waypoint_affected(kind, entry_id)",
             // RAL-400: which waypoint's guidance a queued injection carries,
             // so a delivered injection can be attributed back to it in that
             // waypoint's consolidated event feed.
             "ALTER TABLE pending_injections ADD COLUMN waypoint_id TEXT",
+            // RAL-400: `state` and `updated_at_ms` were added to the `waypoints`
+            // CREATE TABLE definition above after some local dev databases had
+            // already created that table without them -- `CREATE TABLE IF NOT
+            // EXISTS` is then a no-op against the old shape, so these two
+            // columns (and the index on `state`) are backfilled here instead,
+            // the same way every other retrofitted column in this list is.
+            "ALTER TABLE waypoints ADD COLUMN state TEXT NOT NULL DEFAULT 'open'",
+            "ALTER TABLE waypoints ADD COLUMN updated_at_ms INTEGER NOT NULL DEFAULT 0",
+            "CREATE INDEX IF NOT EXISTS idx_waypoints_state ON waypoints(state)",
             "CREATE INDEX IF NOT EXISTS idx_carto_scope_at ON cartographer_events(scope, at_ms)",
             // RAL-509: persist the transient fork-side upstream branch name for
             // dual_root_pr targets once allocated.
