@@ -29119,6 +29119,46 @@ remediation_attempts=1
             )
             .unwrap();
         d.lock().mark_pr_auto_fix_attempted(&pr_id).unwrap();
+        d.lock()
+            .set_pr_auto_fix_outcome(&pr_id, "exhausted")
+            .unwrap();
+
+        let reply = route(&d, "POST", &format!("/api/guardians/{gid}/merge"), "");
+        assert_eq!(reply.status, 400, "{}", reply.body);
+        let after = d.lock().get_pull_request(&pr_id).unwrap();
+        assert_eq!(
+            after.auto_fix_attempted_at_ms, None,
+            "an explicit Merge / rebase request resets the CI watcher's retry budget"
+        );
+        assert_eq!(
+            after.auto_fix_last_outcome, None,
+            "the board's 'auto-fix exhausted' badge reads auto_fix_last_outcome, so the reset must clear it too"
+        );
+    }
+
+    #[test]
+    fn manual_merge_clears_a_stale_exhausted_outcome_with_a_zero_attempt_count() {
+        let d = daemon();
+        let gid = make_guardian(&d);
+        let pr_id = d
+            .lock()
+            .create_pull_request(
+                &gid,
+                Some("branch-000000000001"),
+                "github",
+                "acme/widget",
+                "feature/foo",
+                "main",
+                "Add foo",
+                "",
+                Some(1),
+                None,
+            )
+            .unwrap();
+        // The state an earlier reset left behind: counters zeroed, outcome stuck.
+        d.lock()
+            .set_pr_auto_fix_outcome(&pr_id, "exhausted")
+            .unwrap();
 
         let reply = route(&d, "POST", &format!("/api/guardians/{gid}/merge"), "");
         assert_eq!(reply.status, 400, "{}", reply.body);
@@ -29126,9 +29166,8 @@ remediation_attempts=1
             d.lock()
                 .get_pull_request(&pr_id)
                 .unwrap()
-                .auto_fix_attempted_at_ms,
-            None,
-            "an explicit Merge / rebase request resets the CI watcher's retry budget"
+                .auto_fix_last_outcome,
+            None
         );
     }
 
