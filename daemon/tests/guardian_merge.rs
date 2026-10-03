@@ -2536,12 +2536,8 @@ fn stopped_review_s_pending_feedback_is_left_queued_by_restart_recovery() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// RAL-524: a feedback pass that was already in flight when the user stopped
-/// the review (the pass itself is not cancellable, so it runs to completion)
-/// still lands its edits on the branch, but must not move the review out of
-/// `merge_stopped` -- resuming the merge is the separate, explicit
-/// "Merge / rebase" action, and no background status write may revive the
-/// review the user stopped.
+/// RAL-558: feedback submitted after a review is stopped is rejected before
+/// the resolver runs, so it cannot publish edits or revive the review.
 #[test]
 fn feedback_pass_on_a_stopped_review_does_not_revive_it() {
     let root = temp_repo();
@@ -2575,7 +2571,7 @@ fn feedback_pass_on_a_stopped_review_does_not_revive_it() {
         .id
         .clone();
 
-    // The user stops the review while a feedback pass is about to run.
+    // The user stops the review before the feedback pass starts.
     store
         .lock()
         .set_guardian_status(&id, GuardianStatus::MergeStopped, None)
@@ -2591,25 +2587,19 @@ fn feedback_pass_on_a_stopped_review_does_not_revive_it() {
         &CancelToken::never(),
     );
 
-    // The pass completed its branch-level work...
+    // The safe checkpoint rejects the pass without changing the branch.
     let view = store.lock().get_guardian(&id).unwrap();
     assert_eq!(
         view.branches[0].merge_status,
         MergeStatus::Done.as_str(),
-        "the feedback pass itself still completes"
-    );
-    assert!(
-        view.branches[0]
-            .detail
-            .as_deref()
-            .unwrap_or("")
-            .starts_with("feedback applied"),
-        "expected the feedback outcome detail, got: {:?}",
-        view.branches[0].detail
+        "a rejected feedback pass must preserve the completed branch"
     );
     let rev0 = view.branches[0].review_branch.clone().unwrap();
     let files0 = git(&root, &["ls-tree", "-r", "--name-only", &rev0]);
-    assert!(files0.contains("note.txt"), "the edits land on the branch");
+    assert!(
+        !files0.contains("note.txt"),
+        "rejected feedback must not publish edits"
+    );
 
     // ...but the review the user stopped stays stopped.
     assert_eq!(
