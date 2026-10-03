@@ -315,9 +315,7 @@ const REVIEW_ACTION_KEYS: &[&str] = &[
     "command",
     "description",
     "success",
-    "run_on",
     "prepare",
-    "artifact",
     "cleanup_command",
     "input",
     "shared_store",
@@ -327,16 +325,6 @@ const REVIEW_ACTION_SHARED_STORE_KEYS: &[&str] = &["store", "path"];
 const REVIEW_ACTION_LIFECYCLE_KEYS: &[&str] =
     &["build_root_policy", "before_reset_command", "timeout"];
 const REVIEW_ACTION_INPUT_KEYS: &[&str] = &["name", "message", "default"];
-const REVIEW_ARTIFACT_KEYS: &[&str] = &[
-    "source",
-    "destination",
-    "placement",
-    "shared_path",
-    "readiness_command",
-    "executable",
-    "target_os",
-    "target_arch",
-];
 const AUTO_BUILD_KEYS: &[&str] = &[
     "command",
     "prompt",
@@ -2674,46 +2662,12 @@ fn validate_review_action_array(value: Option<&toml::Value>, path: &str, ctx: &m
         check_type(ctx, table, "cleanup_command", Ty::Str, &apath, None);
         check_type(ctx, table, "description", Ty::Str, &apath, None);
         check_type(ctx, table, "success", Ty::Str, &apath, None);
-        check_type(ctx, table, "run_on", Ty::Str, &apath, None);
         for key in ["command", "cleanup_command"] {
             if let Some(value) = table.get(key).and_then(toml::Value::as_str) {
                 check_worktree_text_placeholders(ctx, &format!("{apath}.{key}"), value);
             }
         }
-        if let Some(run_on) = table.get("run_on").and_then(toml::Value::as_str) {
-            if !matches!(run_on, "daemon" | "review_machine") {
-                ctx.error(
-                    &format!("{apath}.run_on"),
-                    ErrorKind::InvalidValue,
-                    "'run_on' must be \"daemon\" or \"review_machine\"",
-                    None,
-                );
-            }
-        }
-
         validate_preparation_array(table.get("prepare"), &format!("{apath}.prepare"), ctx);
-        validate_review_artifact_array(table.get("artifact"), &format!("{apath}.artifact"), ctx);
-        if table.get("run_on").and_then(toml::Value::as_str) == Some("review_machine")
-            && table
-                .get("artifact")
-                .and_then(toml::Value::as_array)
-                .is_some_and(|artifacts| {
-                    artifacts.iter().any(|artifact| {
-                        artifact
-                            .as_table()
-                            .and_then(|value| value.get("placement"))
-                            .and_then(toml::Value::as_str)
-                            == Some("copy")
-                    })
-                })
-        {
-            ctx.error(
-                &format!("{apath}.run_on"),
-                ErrorKind::ConflictingKeys,
-                "an action with copied artifacts runs on the daemon; use retain or shared for review_machine",
-                None,
-            );
-        }
 
         validate_review_action_input_array(table.get("input"), &format!("{apath}.input"), ctx);
         validate_review_action_shared_store(
@@ -2843,132 +2797,6 @@ fn safe_relative_artifact_path(value: &str) -> bool {
         && normalized
             .split('/')
             .all(|component| !matches!(component, "" | "." | ".."))
-}
-
-fn validate_review_artifact_array(value: Option<&toml::Value>, path: &str, ctx: &mut Ctx) {
-    let Some(value) = value else { return };
-    let Some(arr) = value.as_array() else {
-        ctx.error(
-            path,
-            ErrorKind::WrongType,
-            "[[review.action.artifact]] must be an array of tables",
-            None,
-        );
-        return;
-    };
-    for (idx, item) in arr.iter().enumerate() {
-        let artifact_path = format!("{path}[{idx}]");
-        let Some(table) = item.as_table() else {
-            ctx.error(
-                &artifact_path,
-                ErrorKind::WrongType,
-                "each [[review.action.artifact]] must be a table",
-                None,
-            );
-            continue;
-        };
-        unknown_keys(ctx, table, REVIEW_ARTIFACT_KEYS, &artifact_path, None);
-        for key in [
-            "source",
-            "destination",
-            "placement",
-            "shared_path",
-            "readiness_command",
-        ] {
-            check_type(ctx, table, key, Ty::Str, &artifact_path, None);
-        }
-        for key in ["shared_path", "readiness_command"] {
-            if let Some(value) = table.get(key).and_then(toml::Value::as_str) {
-                check_worktree_text_placeholders(ctx, &format!("{artifact_path}.{key}"), value);
-            }
-        }
-        check_type(ctx, table, "executable", Ty::Bool, &artifact_path, None);
-        check_type(ctx, table, "target_os", Ty::Str, &artifact_path, None);
-        check_type(ctx, table, "target_arch", Ty::Str, &artifact_path, None);
-        if table.get("executable").and_then(toml::Value::as_bool) == Some(true)
-            && (table.get("target_os").is_none() || table.get("target_arch").is_none())
-        {
-            ctx.error(
-                &artifact_path,
-                ErrorKind::MissingRequired,
-                "executable artifacts require 'target_os' and 'target_arch' so readiness cannot cross an incompatible platform",
-                None,
-            );
-        }
-        let source = table.get("source").and_then(toml::Value::as_str);
-        if source.is_none() {
-            ctx.error(
-                &artifact_path,
-                ErrorKind::MissingRequired,
-                "review action artifact requires 'source'",
-                None,
-            );
-        } else if !source.is_some_and(safe_relative_artifact_path) {
-            ctx.error(
-                &format!("{artifact_path}.source"),
-                ErrorKind::InvalidValue,
-                "artifact source must be a non-empty relative path without traversal",
-                None,
-            );
-        }
-        if let Some(destination) = table.get("destination").and_then(toml::Value::as_str) {
-            if !safe_relative_artifact_path(destination) {
-                ctx.error(
-                    &format!("{artifact_path}.destination"),
-                    ErrorKind::InvalidValue,
-                    "artifact destination must be a non-empty relative path without traversal",
-                    None,
-                );
-            }
-        }
-        let placement = table.get("placement").and_then(toml::Value::as_str);
-        if !matches!(placement, Some("copy" | "retain" | "shared")) {
-            ctx.error(
-                &format!("{artifact_path}.placement"),
-                ErrorKind::InvalidValue,
-                "artifact placement must be \"copy\", \"retain\", or \"shared\"",
-                None,
-            );
-        }
-        match placement {
-            Some("copy") if table.get("destination").is_none() => ctx.error(
-                &artifact_path,
-                ErrorKind::MissingRequired,
-                "copy artifact requires 'destination'",
-                None,
-            ),
-            Some("shared")
-                if table.get("shared_path").is_none()
-                    || table.get("readiness_command").is_none() =>
-            {
-                ctx.error(
-                    &artifact_path,
-                    ErrorKind::MissingRequired,
-                    "shared artifact requires 'shared_path' and 'readiness_command'",
-                    None,
-                )
-            }
-            Some("retain")
-                if table.get("destination").is_some() || table.get("shared_path").is_some() =>
-            {
-                ctx.error(
-                    &artifact_path,
-                    ErrorKind::ConflictingKeys,
-                    "retain artifact cannot set destination or shared_path",
-                    None,
-                )
-            }
-            _ => {}
-        }
-        if placement != Some("shared") && table.get("readiness_command").is_some() {
-            ctx.error(
-                &format!("{artifact_path}.readiness_command"),
-                ErrorKind::InvalidValue,
-                "readiness_command is only valid for shared artifacts",
-                None,
-            );
-        }
-    }
 }
 
 /// Validate `[[review.action.input]]` entries. Each entry must have `name`
@@ -5848,7 +5676,7 @@ project = "ralphus"
     }
 
     #[test]
-    fn review_preparation_and_copy_artifact_are_valid() {
+    fn review_action_copy_artifact_is_now_unknown() {
         let src = r#"
 [[task]]
 name = "t"
@@ -5874,7 +5702,14 @@ target_os = "windows"
 target_arch = "x86_64"
 "#;
         let report = validate_toml(src);
-        assert!(report.is_ok(), "{:?}", report.errors);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.kind == ErrorKind::UnknownKey),
+            "{:?}",
+            report.errors
+        );
     }
 
     #[test]
@@ -5980,7 +5815,7 @@ timeout = "soon"
     }
 
     #[test]
-    fn executable_artifact_requires_a_declared_platform() {
+    fn executable_artifact_is_now_unknown() {
         let src = r#"
 [[task]]
 name = "t"
@@ -5999,13 +5834,16 @@ destination = "staged/app"
 placement = "copy"
 executable = true
 "#;
-        assert!(validate_toml(src).errors.iter().any(|error| {
-            error.kind == ErrorKind::MissingRequired && error.message.contains("target_os")
-        }));
+        assert!(
+            validate_toml(src)
+                .errors
+                .iter()
+                .any(|error| error.kind == ErrorKind::UnknownKey)
+        );
     }
 
     #[test]
-    fn copied_artifact_cannot_run_on_the_review_machine() {
+    fn run_on_and_artifact_are_now_unknown() {
         let src = r#"
 [[task]]
 name = "t"
@@ -6028,7 +5866,7 @@ placement = "copy"
             validate_toml(src)
                 .errors
                 .iter()
-                .any(|error| error.kind == ErrorKind::ConflictingKeys)
+                .any(|error| error.kind == ErrorKind::UnknownKey)
         );
     }
 

@@ -29,6 +29,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 use crate::cancel::{CancelToken, Cancellations};
 use crate::guardian::{
@@ -9735,11 +9736,13 @@ fn prepare_action_hints(
     env: &std::collections::BTreeMap<String, String>,
     cancel: &CancelToken,
 ) -> std::result::Result<(), String> {
-    let mut hints = store
+    let guardian = store.lock().get_guardian(id).map_err(|e| e.to_string())?;
+    let generation = guardian.merge_attempt;
+    let recipients = store
         .lock()
-        .get_guardian(id)
-        .map_err(|e| e.to_string())?
-        .action_hints;
+        .guardian_recipients(id)
+        .map_err(|e| e.to_string())?;
+    let mut hints = guardian.action_hints;
     let mut failures = Vec::new();
     // A preparation group is the complete ordered list plus its output and
     // lifecycle context, not each individual build step. Thus [A, B] and
@@ -9748,6 +9751,45 @@ fn prepare_action_hints(
     let mut completed_groups = std::collections::HashSet::new();
     for index in 0..hints.len() {
         let mut shared_store_cwd = None;
+        let action_key = format!("action-{index}");
+        let definition_digest = format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&(
+                    &hints[index].prepare,
+                    &hints[index].shared_store,
+                    &hints[index].lifecycle,
+                    &hints[index].command,
+                    &hints[index].prompt,
+                ))
+                .map_err(|error| error.to_string())?
+            )
+        );
+        // The first caller owns this recipient/action/generation. Repeated
+        // clicks and overlapping post-merge work attach to the durable row
+        // instead of rebuilding the same publication.
+        let mut claimed_recipients = Vec::new();
+        for recipient in &recipients {
+            if store
+                .lock()
+                .claim_action_generation(
+                    id,
+                    &action_key,
+                    &recipient.id,
+                    generation,
+                    &definition_digest,
+                )
+                .map_err(|error| error.to_string())?
+            {
+                claimed_recipients.push(recipient.id.clone());
+            }
+        }
+        if !recipients.is_empty() && claimed_recipients.is_empty() {
+            // A ready or preparing record already owns this exact generation.
+            // Keep the visible action state unchanged so its existing worker
+            // remains the source of progress for every recipient.
+            continue;
+        }
         hints[index].preparation_state = Some("preparing".to_string());
         hints[index].preparation_detail = None;
         hints[index].prepared_at_ms = None;
@@ -9914,13 +9956,46 @@ fn prepare_action_hints(
 
         match result {
             Ok(prepared_cwd) => {
+                let mut published = None;
+                if let Some(shared_root) = &shared_store_cwd {
+                    let (manifest, digest) = write_shared_store_manifest(shared_root)?;
+                    hints[index].preparation_detail = Some(format!(
+                        "published manifest {} (sha256 {digest})",
+                        manifest.display()
+                    ));
+                    published = Some((manifest, digest, shared_root.clone()));
+                }
                 hints[index].preparation_state = Some("ready".to_string());
-                hints[index].preparation_detail = None;
                 hints[index].prepared_at_ms = Some(crate::store::now_ms());
                 hints[index].prepared_cwd = shared_store_cwd
                     .map(|path| path.to_string_lossy().into_owned())
                     .or(prepared_cwd)
                     .or_else(|| Some(combined_str.to_string()));
+                let lease = crate::store::now_ms() + 24 * 60 * 60 * 1000;
+                for client_id in claimed_recipients {
+                    let manifest_path = published
+                        .as_ref()
+                        .map(|(manifest, _, _)| manifest.to_string_lossy().into_owned());
+                    let manifest_digest = published.as_ref().map(|(_, digest, _)| digest.as_str());
+                    let published_root = published
+                        .as_ref()
+                        .map(|(_, _, root)| root.to_string_lossy().into_owned());
+                    store
+                        .lock()
+                        .finish_action_generation(
+                            id,
+                            &action_key,
+                            &client_id,
+                            generation,
+                            "ready",
+                            manifest_path.as_deref(),
+                            manifest_digest,
+                            published_root.as_deref(),
+                            Some(lease),
+                            hints[index].preparation_detail.as_deref(),
+                        )
+                        .map_err(|error| error.to_string())?;
+                }
             }
             Err(error) => {
                 hints[index].preparation_state = Some("failed".to_string());
@@ -9929,6 +10004,23 @@ fn prepare_action_hints(
                     "{}: {error}",
                     hints[index].label.as_deref().unwrap_or("manual action")
                 ));
+                for client_id in claimed_recipients {
+                    store
+                        .lock()
+                        .finish_action_generation(
+                            id,
+                            &action_key,
+                            &client_id,
+                            generation,
+                            "failed",
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some(&error),
+                        )
+                        .map_err(|store_error| store_error.to_string())?;
+                }
             }
         }
         store
@@ -10168,6 +10260,64 @@ fn parse_lifecycle_timeout(value: &str) -> Result<std::time::Duration, String> {
         _ => return Err("lifecycle timeout must end in s, m, or h".to_string()),
     };
     Ok(std::time::Duration::from_secs(seconds))
+}
+
+/// Atomically records the immutable V1 publication boundary. The digest covers
+/// every regular file below `root`; consumers can reject a partially replaced
+/// or modified shared-store generation before running its action.
+fn write_shared_store_manifest(root: &Path) -> Result<(PathBuf, String), String> {
+    fn visit(
+        root: &Path,
+        path: &Path,
+        rows: &mut Vec<(String, u64, String)>,
+    ) -> Result<(), String> {
+        for entry in std::fs::read_dir(path).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let ty = entry.file_type().map_err(|e| e.to_string())?;
+            if ty.is_dir() {
+                visit(root, &entry.path(), rows)?;
+            } else if ty.is_file() {
+                let name = entry.file_name();
+                if name == ".ralphus-manifest.json"
+                    || name == ".ralphus-manifest.json.tmp"
+                    || name == ".ralphus-ready"
+                    || name == ".ralphus-ready.tmp"
+                {
+                    continue;
+                }
+                let bytes = std::fs::read(entry.path()).map_err(|e| e.to_string())?;
+                let hash = format!("{:x}", Sha256::digest(&bytes));
+                let relative = entry
+                    .path()
+                    .strip_prefix(root)
+                    .map_err(|e| e.to_string())?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                rows.push((relative, bytes.len() as u64, hash));
+            }
+        }
+        Ok(())
+    }
+    let mut rows = Vec::new();
+    visit(root, root, &mut rows)?;
+    rows.sort();
+    let total_bytes = rows.iter().map(|(_, bytes, _)| *bytes).sum::<u64>();
+    let body = serde_json::to_vec_pretty(&serde_json::json!({
+        "version": 1,
+        "total_bytes": total_bytes,
+        "files": rows,
+    }))
+    .map_err(|e| e.to_string())?;
+    let digest = format!("{:x}", Sha256::digest(&body));
+    let manifest = root.join(".ralphus-manifest.json");
+    let temporary = root.join(".ralphus-manifest.json.tmp");
+    std::fs::write(&temporary, body).map_err(|e| e.to_string())?;
+    std::fs::rename(&temporary, &manifest).map_err(|e| e.to_string())?;
+    let ready = root.join(".ralphus-ready");
+    let ready_temporary = root.join(".ralphus-ready.tmp");
+    std::fs::write(&ready_temporary, format!("sha256:{digest}\n")).map_err(|e| e.to_string())?;
+    std::fs::rename(&ready_temporary, &ready).map_err(|e| e.to_string())?;
+    Ok((manifest, digest))
 }
 
 fn materialize_action_artifacts(
@@ -10765,6 +10915,7 @@ fn terminal_worktree_claim(kind: &str, state: &str) -> bool {
 /// Called only from the scheduler's daily interval. Git and filesystem work
 /// happen without holding the store mutex; each short snapshot/update does.
 pub fn retire_stale_worktrees(store: &crate::store_lock::StoreHandle) {
+    retire_terminal_action_publications(store);
     // RAL-386: loaded once per sweep, not per worktree -- an operator's
     // static opt-out is a config file read, not a store round trip, and the
     // set of configured machines cannot change mid-sweep.
@@ -11098,6 +11249,62 @@ pub fn retire_stale_worktrees(store: &crate::store_lock::StoreHandle) {
                     );
             }
         }
+    }
+}
+
+/// Retire V1 local shared-store publications after their review ends. The
+/// database lease is claimed before touching disk, so another sweep cannot
+/// race this one. Missing paths are a successful no-op: an author-managed
+/// cleanup hook is allowed to have removed them already.
+fn retire_terminal_action_publications(store: &crate::store_lock::StoreHandle) {
+    let rows = match store.lock().claim_expired_terminal_action_generations() {
+        Ok(rows) => rows,
+        Err(error) => {
+            crate::rlog!(
+                WARNING,
+                "ralphus [guardian] could not claim retired action publications: {error}"
+            );
+            return;
+        }
+    };
+    for row in rows {
+        let mut detail = None;
+        if let Some(root) = row.published_root.as_deref() {
+            let path = Path::new(root);
+            if path.exists() {
+                if let Err(error) = std::fs::remove_dir_all(path) {
+                    detail = Some(format!("could not remove {}: {error}", path.display()));
+                }
+            }
+        }
+        let build_root = std::env::temp_dir()
+            .join("ralphus")
+            .join("prepared-builds")
+            .join(&row.guardian_id)
+            .join(&row.action_key);
+        if build_root.exists() {
+            if let Err(error) = std::fs::remove_dir_all(&build_root) {
+                let message = format!("could not remove {}: {error}", build_root.display());
+                detail =
+                    Some(detail.map_or(message.clone(), |prior| format!("{prior}; {message}")));
+            }
+        }
+        let guard = store.lock();
+        let _ = guard.finish_action_generation_retirement(&row, detail.as_deref());
+        crate::cartographer::Note::new("guardian")
+            .guardian(&row.guardian_id)
+            .scope("guardian")
+            .emit(
+                &guard,
+                "retired terminal manual-action publication",
+                serde_json::json!({
+                    "action": row.action_key,
+                    "client": row.client_id,
+                    "generation": row.generation,
+                    "published_root": row.published_root,
+                    "detail": detail,
+                }),
+            );
     }
 }
 
@@ -13667,6 +13874,27 @@ mod tests {
         let error = resolve_local_shared_store_root(Path::new("."), &store)
             .expect_err("an undeclared logical store must not use an implicit local path");
         assert!(error.contains("is not registered"));
+    }
+
+    #[test]
+    fn shared_store_publication_has_manifest_digest_size_and_ready_marker() {
+        let root = std::env::temp_dir().join(format!(
+            "ralphus-shared-manifest-test-{}-{}",
+            std::process::id(),
+            crate::store::now_ms()
+        ));
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::write(root.join("bin/demo"), b"hello").unwrap();
+        let (manifest, digest) = write_shared_store_manifest(&root).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        assert_eq!(value["total_bytes"], 5);
+        assert_eq!(value["files"][0][0], "bin/demo");
+        assert_eq!(
+            std::fs::read_to_string(root.join(".ralphus-ready")).unwrap(),
+            format!("sha256:{digest}\n")
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

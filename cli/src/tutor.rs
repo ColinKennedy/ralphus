@@ -1120,7 +1120,6 @@ label   = "Run tests"
 command = "target/debug/my-test-runner"
 description = "Run the already-built focused test executable."
 success = "The focused scenario completes and prints PASS."
-run_on = "daemon"
 
 [[review.action]]
 label  = "Frontend smoke test"

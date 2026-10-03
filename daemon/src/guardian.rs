@@ -2714,6 +2714,14 @@ impl Store {
                 );
             }
             if GuardianStatus::is_terminal_status(status.as_str()) {
+                // A review cannot retain a manual-action execution lease once
+                // it is terminal. The next retirement sweep owns deleting its
+                // shared publication and private build root.
+                let _ = self.conn.execute(
+                    "UPDATE guardian_action_generations SET lease_expires_at_ms=?1, updated_at_ms=?1
+                     WHERE guardian_id=?2 AND state='ready'",
+                    params![crate::store::now_ms(), id],
+                );
                 // RAL-400 Phase 6: a review reaching `merged`/`cancelled`/
                 // `deployed` may be the last non-terminal affected entry on one
                 // or more open waypoints. `is_terminal_status` already
