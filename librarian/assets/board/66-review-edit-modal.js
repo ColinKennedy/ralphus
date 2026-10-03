@@ -67,10 +67,13 @@
        * @property {string} originalAutoFixPromptTemplate
        * @property {boolean} discourageTests
        * @property {boolean} originalDiscourageTests
+       * @property {RebuildOnDraft} rebuildOn - When this review's prepared build is rebuilt; `inherit` means the project default applies.
+       * @property {RebuildOnDraft} originalRebuildOn
+       * @property {string[]} rebuildOnEffective - The resolved triggers shown while inheriting.
        * @property {{[project: string]: boolean}} squash
        * @property {string[]} originalSquashOn
        * @property {string[]} projects
-       * @property {string} focus - Which setup-strip chip opened this modal ("onto", "resolver", "proof", "squash", "worktrees"), or "" when opened from the editor button. The matching group is highlighted and scrolled to.
+       * @property {string} focus - Which setup-strip chip opened this modal ("onto", "resolver", "proof", "squash", "rebuild", "worktrees"), or "" when opened from the editor button. The matching group is highlighted and scrolled to.
        */
 
       /**
@@ -99,6 +102,191 @@
       const REVIEW_EDIT_TEXTAREA_STYLE = "width:100%;box-sizing:border-box;resize:vertical;font-family:inherit;font-size:12px;padding:6px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px";
       const AUTO_FIX_PROMPT_TEMPLATE_TIP = "Prompt handed to the resolver agent when 'auto-fix PR errors' fires, with the literal <<prompt>> placeholder replaced by the failing branch's own Cell prompts. Must contain <<prompt>> or Save is rejected. Leave blank to inherit the project default. Applies on Save.";
       const DISCOURAGE_TESTS_TIP = "When on, the resolver agent dispatched to fix this review's pull request -- whether from 'auto-fix PR errors' or a manual PR-fix request -- is told to prefer automatic formatters, linters, and static-analysis tools and to avoid running a broad or expensive test suite. Comprehensive validation still happens separately, through the pull request's own checks. Applies on Save.";
+
+      // RALPHUS-REBUILD-ON:BEGIN
+      // When a review's prepared build is torn down and rebuilt. The draft
+      // logic is pure; the two render helpers need only `esc` and `document`.
+      // node --test slices this region and exercises it (test/board-rebuild-on.test.mjs).
+      // The review Setup modal and the project Review Settings modal share it.
+
+      /**
+       * One modal's draft of the `rebuild_on` setting.
+       * @typedef {object} RebuildOnDraft
+       * @property {boolean} inherit - True = no explicit value; the project/global default applies.
+       * @property {string[]} triggers - The explicit triggers (canonical order). Ignored while `inherit` is true.
+       */
+
+      /** Every event that can rebuild a review's prepared build, in display order. */
+      const REBUILD_TRIGGERS = ["rebase", "feedback", "auto_fix"];
+      /** Reader-facing names for each trigger. */
+      const REBUILD_TRIGGER_LABELS = { rebase: "rebase", feedback: "reviewer feedback", auto_fix: "auto PR fix" };
+
+      /**
+       * Reduces any list to the canonical form the daemon stores: only known
+       * triggers, deduplicated, in display order.
+       * @param {string[]|null|undefined} list
+       * @returns {string[]}
+       */
+      function normalizeRebuildOn(list) {
+        const wanted = new Set(Array.isArray(list) ? list : []);
+        return REBUILD_TRIGGERS.filter((t) => wanted.has(t));
+      }
+
+      /**
+       * Seeds a draft from a review/project's explicit value and its resolved
+       * default. A null/absent explicit value means "inherit".
+       * @param {string[]|null|undefined} explicit
+       * @param {string[]|null|undefined} effective
+       * @returns {RebuildOnDraft}
+       */
+      function buildRebuildOnDraft(explicit, effective) {
+        const inherit = explicit === null || explicit === undefined;
+        const seed = inherit ? (effective === null || effective === undefined ? REBUILD_TRIGGERS : effective) : explicit;
+        return { inherit, triggers: normalizeRebuildOn(seed) };
+      }
+
+      /**
+       * The triggers a draft currently displays: the resolved default while
+       * inheriting, its own explicit set otherwise.
+       * @param {RebuildOnDraft} draft
+       * @param {string[]|null|undefined} effective
+       * @returns {string[]}
+       */
+      function rebuildOnShown(draft, effective) {
+        if (draft.inherit) return normalizeRebuildOn(effective === null || effective === undefined ? REBUILD_TRIGGERS : effective);
+        return normalizeRebuildOn(draft.triggers);
+      }
+
+      /**
+       * Switches a draft between inheriting and explicit. Leaving inherit
+       * seeds the explicit set from what was being inherited, so unticking the
+       * box pins today's behavior instead of silently changing it.
+       * @param {RebuildOnDraft} draft
+       * @param {boolean} inherit
+       * @param {string[]|null|undefined} effective
+       * @returns {void}
+       */
+      function setRebuildInherit(draft, inherit, effective) {
+        if (!inherit && draft.inherit) draft.triggers = rebuildOnShown(draft, effective);
+        draft.inherit = inherit;
+      }
+
+      /**
+       * Turns one trigger on or off in an explicit draft. Unknown triggers are ignored.
+       * @param {RebuildOnDraft} draft
+       * @param {string} trigger
+       * @param {boolean} on
+       * @returns {void}
+       */
+      function setRebuildTrigger(draft, trigger, on) {
+        if (!REBUILD_TRIGGERS.includes(trigger)) return;
+        const set = new Set(draft.triggers);
+        if (on) set.add(trigger); else set.delete(trigger);
+        draft.triggers = normalizeRebuildOn(Array.from(set));
+      }
+
+      /**
+       * One-line, human-readable policy for a draft.
+       * @param {RebuildOnDraft} draft
+       * @param {string[]|null|undefined} effective
+       * @returns {string}
+       */
+      function rebuildOnSummary(draft, effective) {
+        const shown = rebuildOnShown(draft, effective);
+        const prefix = draft.inherit ? "inherited: " : "";
+        if (shown.length === 0) return `${prefix}never — rebuild manually`;
+        if (shown.length === REBUILD_TRIGGERS.length) return `${prefix}every rebase, feedback, and auto PR fix`;
+        return `${prefix}${shown.map((t) => REBUILD_TRIGGER_LABELS[/** @type {keyof typeof REBUILD_TRIGGER_LABELS} */ (t)]).join(" + ")}`;
+      }
+
+      /**
+       * Short value for the setup-strip chip.
+       * @param {string[]|null|undefined} effective - The review's resolved triggers.
+       * @returns {string}
+       */
+      function rebuildOnChipText(effective) {
+        const shown = normalizeRebuildOn(effective === null || effective === undefined ? REBUILD_TRIGGERS : effective);
+        if (shown.length === 0) return "manual only";
+        if (shown.length === REBUILD_TRIGGERS.length) return "on every change";
+        return shown.map((t) => t.replace("_", " ")).join(" + ");
+      }
+
+      /**
+       * Whether a draft differs from the state it was seeded with. Two
+       * inheriting drafts are equal whatever their (ignored) triggers hold.
+       * @param {RebuildOnDraft} draft
+       * @param {RebuildOnDraft} original
+       * @returns {boolean}
+       */
+      function rebuildOnChanged(draft, original) {
+        if (draft.inherit || original.inherit) return draft.inherit !== original.inherit;
+        return JSON.stringify(normalizeRebuildOn(draft.triggers)) !== JSON.stringify(normalizeRebuildOn(original.triggers));
+      }
+
+      /**
+       * The request-body value for a draft: `null` clears back to inherit, a
+       * list (possibly empty = manual only) sets an explicit policy.
+       * @param {RebuildOnDraft} draft
+       * @returns {string[]|null}
+       */
+      function rebuildOnBodyValue(draft) {
+        return draft.inherit ? null : normalizeRebuildOn(draft.triggers);
+      }
+
+      const REBUILD_ON_TIP = "When this review's prepared build is torn down and built again. A rebuild first runs each action's [review.action.lifecycle] before_reset_command teardown hooks (if declared), resets its build root, then re-runs its preparation. Tick the events that should trigger one; untick all of them to build once and only rebuild when you press 'Rebuild now'. Applies on Save.";
+      /** Tooltip for each trigger checkbox. */
+      const REBUILD_TRIGGER_TIPS = {
+        rebase: "Rebuild after every merge / rebase of this review's stack (including automatic base-branch rebases). Untick if the build is slow and the rebased code rarely changes what you test.",
+        feedback: "Rebuild after reviewer feedback has been applied to a branch and the stack restacked. Untick to keep testing the previous build while feedback lands.",
+        auto_fix: "Rebuild after an automatic PR-error fix has been applied and the stack restacked. Untick so unattended fix loops never trigger a rebuild.",
+      };
+
+      /**
+       * Renders the "rebuild preparation when" control shared by the review
+       * Setup modal and the project Review Settings modal: a use-the-default
+       * checkbox, one checkbox per trigger, and a one-line summary.
+       * @param {string} prefix - Element-id prefix, unique per modal ("review" | "project").
+       * @param {RebuildOnDraft} draft
+       * @param {string[]|null|undefined} effective - The default shown while inheriting.
+       * @param {string} inheritLabel - Label for the use-the-default checkbox.
+       * @param {string} inheritTip - Tooltip for it.
+       * @param {string} onInherit - Global handler name called with the checked state.
+       * @param {string} onTrigger - Global handler name called with (trigger, checked).
+       * @returns {string}
+       */
+      function renderRebuildOnFieldsHtml(prefix, draft, effective, inheritLabel, inheritTip, onInherit, onTrigger) {
+        const shown = rebuildOnShown(draft, effective);
+        const boxes = REBUILD_TRIGGERS.map((t) => `<label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px;margin-left:18px" data-tip="${esc(REBUILD_TRIGGER_TIPS[/** @type {keyof typeof REBUILD_TRIGGER_TIPS} */ (t)])}">
+            <input type="checkbox" id="${prefix}-rebuild-${t}" ${shown.includes(t) ? "checked" : ""} ${draft.inherit ? "disabled" : ""} onchange="${onTrigger}('${t}',this.checked)">${esc(REBUILD_TRIGGER_LABELS[/** @type {keyof typeof REBUILD_TRIGGER_LABELS} */ (t)])}</label>`).join("");
+        return `<div id="${prefix}-rebuild-on" data-tip="${esc(REBUILD_ON_TIP)}">
+            <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="${esc(inheritTip)}">
+              <input type="checkbox" id="${prefix}-rebuild-inherit" ${draft.inherit ? "checked" : ""} onchange="${onInherit}(this.checked)">${esc(inheritLabel)}</label>
+            ${boxes}
+            <div class="hint" id="${prefix}-rebuild-summary" data-tip="${esc(REBUILD_ON_TIP)}">${esc(rebuildOnSummary(draft, effective))}</div>
+          </div>`;
+      }
+
+      /**
+       * Updates an already-rendered rebuild-on control in place after a
+       * checkbox change, so the modal does not re-render (a full re-render
+       * would reset its scroll position).
+       * @param {string} prefix - The same prefix passed to `renderRebuildOnFieldsHtml`.
+       * @param {RebuildOnDraft} draft
+       * @param {string[]|null|undefined} effective
+       * @returns {void}
+       */
+      function refreshRebuildOnFields(prefix, draft, effective) {
+        const shown = rebuildOnShown(draft, effective);
+        for (const t of REBUILD_TRIGGERS) {
+          const box = /** @type {HTMLInputElement|null} */ (document.getElementById(`${prefix}-rebuild-${t}`));
+          if (!box) continue;
+          box.checked = shown.includes(t);
+          box.disabled = draft.inherit;
+        }
+        const summary = document.getElementById(`${prefix}-rebuild-summary`);
+        if (summary) summary.textContent = rebuildOnSummary(draft, effective);
+      }
+      // RALPHUS-REBUILD-ON:END
 
       /**
        * Builds an env-override scope's draft rows from its currently-saved
@@ -138,6 +326,7 @@
         const autoFixPrErrors = !!g.auto_fix_pr_errors;
         const autoFixPromptTemplate = g.auto_fix_prompt_template || "";
         const discourageTests = !!g.discourage_tests_during_auto_pull_request_fixes;
+        const rebuildOnEffective = normalizeRebuildOn(g.effective_rebuild_on === undefined ? REBUILD_TRIGGERS : g.effective_rebuild_on);
         return {
           gid: g.id,
           name: g.name,
@@ -160,6 +349,9 @@
           autoFixPrErrors, originalAutoFixPrErrors: autoFixPrErrors,
           autoFixPromptTemplate, originalAutoFixPromptTemplate: autoFixPromptTemplate,
           discourageTests, originalDiscourageTests: discourageTests,
+          rebuildOn: buildRebuildOnDraft(g.rebuild_on, rebuildOnEffective),
+          originalRebuildOn: buildRebuildOnDraft(g.rebuild_on, rebuildOnEffective),
+          rebuildOnEffective,
           squash,
           originalSquashOn: squashOn.slice(),
           projects,
@@ -328,6 +520,30 @@
        * @returns {void}
        */
       function onEditDiscourageTests(checked) { if (reviewEditDraft) reviewEditDraft.discourageTests = checked; }
+      /**
+       * Stages "use the project default" for when this review rebuilds its
+       * prepared build.
+       * @param {boolean} checked
+       * @returns {void}
+       */
+      function onEditRebuildOnInherit(checked) {
+        const d = reviewEditDraft;
+        if (!d) return;
+        setRebuildInherit(d.rebuildOn, checked, d.rebuildOnEffective);
+        refreshRebuildOnFields("review", d.rebuildOn, d.rebuildOnEffective);
+      }
+      /**
+       * Stages one rebuild trigger on or off for this review.
+       * @param {string} trigger - "rebase" | "feedback" | "auto_fix"
+       * @param {boolean} checked
+       * @returns {void}
+       */
+      function onEditRebuildOnTrigger(trigger, checked) {
+        const d = reviewEditDraft;
+        if (!d) return;
+        setRebuildTrigger(d.rebuildOn, trigger, checked);
+        refreshRebuildOnFields("review", d.rebuildOn, d.rebuildOnEffective);
+      }
       /**
        * Stages one git project's squash toggle.
        * @param {string} project
@@ -682,6 +898,8 @@
               <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Overrides the project default for this review only: when its upstream branch moves, don't automatically rebuild/rebase this review's stack onto the new tip. Use for a review whose auto-rebase keeps getting in the way (e.g. one under heavy manual conflict resolution). You can still start a merge/rebase manually at any time, individually or via the review list's bulk Merge/Rebase action, regardless of this setting. Applies on Save.">
                 <input type="checkbox" ${draft.skipBaseUpdates ? "checked" : ""} onchange="onEditSkipBaseUpdates(this.checked)">skip automatic base-branch rebasing</label>
               <div class="hint">Manual-check preparation is declared in task TOML and runs automatically before its controls unlock.</div></div>
+            <div ${grp("rebuild")}><h3 class="section" data-tip="${esc(REBUILD_ON_TIP)}">rebuild preparation when</h3>
+              ${renderRebuildOnFieldsHtml("review", draft.rebuildOn, draft.rebuildOnEffective, "use the project default", "Follow the project's default for when preparation is rebuilt (set in the project's Review Settings; every trigger when nothing sets one). Untick to give this review its own policy. Applies on Save.", "onEditRebuildOnInherit", "onEditRebuildOnTrigger")}</div>
             <div ${grp("worktrees")}><h3 class="section">worktrees</h3>
               <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:6px" data-tip="Build the entire branch stack in one shared worktree instead of isolated per-branch worktrees. Applies on Save.">
                 <input type="checkbox" ${draft.skipWorktrees ? "checked" : ""} onchange="onEditSkipWorktrees(this.checked)">skip per-branch worktrees</label></div>
@@ -764,6 +982,7 @@
         if (draft.autoFixPrErrors !== draft.originalAutoFixPrErrors) body.auto_fix_pr_errors = draft.autoFixPrErrors;
         if (draft.autoFixPromptTemplate !== draft.originalAutoFixPromptTemplate) body.auto_fix_prompt_template = draft.autoFixPromptTemplate;
         if (draft.discourageTests !== draft.originalDiscourageTests) body.discourage_tests_during_auto_pull_request_fixes = draft.discourageTests;
+        if (rebuildOnChanged(draft.rebuildOn, draft.originalRebuildOn)) body.rebuild_on = rebuildOnBodyValue(draft.rebuildOn);
         const squashOn = draft.projects.filter((p) => draft.squash[p]).sort();
         if (JSON.stringify(squashOn) !== JSON.stringify(draft.originalSquashOn.slice().sort())) {
           body.squash_projects = squashOn;
@@ -798,4 +1017,4 @@
         }
       }
 
-      void [onEditResolverAgent, onEditResolverModel, onEditProofScope, onEditProofSkipAutoClean, onEditSeparatePrBranch, onEditMatchPrBranchName, onEditAutoSubmitPrStack, onEditDualRootPr, onEditAutoFixPrErrors, onEditAutoFixPromptTemplate, onEditDiscourageTests];
+      void [onEditResolverAgent, onEditResolverModel, onEditProofScope, onEditProofSkipAutoClean, onEditSeparatePrBranch, onEditMatchPrBranchName, onEditAutoSubmitPrStack, onEditDualRootPr, onEditAutoFixPrErrors, onEditAutoFixPromptTemplate, onEditDiscourageTests, onEditRebuildOnInherit, onEditRebuildOnTrigger];

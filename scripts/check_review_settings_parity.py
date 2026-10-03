@@ -34,6 +34,7 @@ MAPPING = {
     "discourage_tests_during_auto_pull_request_fixes": "discourage_tests_during_auto_pull_request_fixes",
     "auto_cancel_outdated_pr_pipelines": "auto_cancel_outdated_pr_pipelines",
     "cache_manual_checks": "cache_manual_checks",
+    "rebuild_on": "rebuild_on",
 }
 EXEMPT = {
     "base_branch": (

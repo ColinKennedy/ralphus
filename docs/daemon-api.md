@@ -146,6 +146,7 @@ where one exists.
 | GET | `/api/guardians/{id}/manual-checks/debug-events` | Same, for the manual-checks generation pass |
 | POST | `/api/guardians/{id}/merge` | Start/continue the stacked rebase |
 | POST | `/api/guardians/{id}/manual-checks/regenerate` | [Regenerate the review's manual checks on demand, with optional steering text](#post-apiguardiansidmanual-checksregenerate-ral-520) (RAL-520) |
+| POST | `/api/guardians/{id}/rebuild` | [Tear down and rebuild the review's prepared build now](#post-apiguardiansidrebuild), whatever its `rebuild_on` setting says |
 | POST | `/api/guardians/merge-batch` | [Start/continue the stacked rebase for many reviews in one request](#post-apiguardiansmerge-batch-ral-514) (RAL-514) |
 | POST | `/api/guardians/{id}/cancel_and_merge` | Cancel an in-progress rebase, start fresh |
 | POST | `/api/guardians/{id}/stop` | [Stop a mid-rebase at the next checkpoint](#post-apiguardiansidstop) (RAL-249), leaving it resumable |
@@ -1887,6 +1888,32 @@ submissions via a `ralphus:new-review/<key>` link is one review, so its first
 generation (from whichever submission built its branches first) is what
 sticks.
 
+`rebuild_on` (array of strings, default every event) controls which events tear
+down and rebuild a review's prepared build — the preparation that makes its
+test actions and generated manual checks runnable. Each entry is one of
+`"rebase"` (a merge or restack of the stack settled), `"feedback"` (reviewer
+feedback was applied to a branch), or `"auto_fix"` (an unattended PR/MR fix
+pass was applied); each may appear at most once, anything else is rejected
+with `400 invalid_rebuild_on`. The default list is all three, which rebuilds on
+every one of them. A list that leaves an event out keeps the existing ready
+build untouched when that event happens: its actions stay `ready`, the
+retained checkout is neither reset nor removed, and no preparation or teardown
+command runs. An empty list never rebuilds automatically; the build is then
+rebuilt only by [`POST /api/guardians/{id}/rebuild`](#post-apiguardiansidrebuild).
+A review that has no ready build yet (its first build, or after a failed one)
+builds regardless of the list. It is declared as `[[review]] rebuild_on` or
+`[review] rebuild_on` in `.ralphus.toml`, written through `POST
+.../settings` or `POST .../details` (a JSON array sets it, an empty array means
+"never automatically", and an explicit `null` clears it back to inheriting),
+and shown on the review as `rebuild_on` (this review's own value, `null` when
+inheriting) and `effective_rebuild_on` (the resolved list). Precedence: the
+review's own value wins over the project's review-settings default, which wins
+over `.ralphus.toml`, which wins over the global config, which wins over every
+event; the nearest layer that sets it replaces the list outright. `POST
+/api/projects/{name}/review-settings` takes the same field (absent leaves it
+as-is, a JSON array sets it, `null` clears it) and reports the resolved list
+under `effective.rebuild_on`.
+
 `base_shift_maximum_rebuilds` (RAL-507, optional positive integer, default 3)
 caps how many times the automatic base-branch-update rebuild may retry one
 unresolved base shift -- a rebuild that keeps failing on the same new base (a
@@ -2076,6 +2103,35 @@ Advisory by construction, like every post-merge job: it never gates
   a post-merge job is already running (one generation at a time; retry when
   it finishes).
 - `400 bad_request` — the body doesn't parse.
+
+### `POST /api/guardians/{id}/rebuild`
+Tear down and rebuild a settled review's prepared build now, whatever the
+review's `rebuild_on` list says — the board's rebuild control and
+`ralphus review rebuild`. No body. Returns `202 {"ok": true}` once the
+post-merge worker is scheduled; the rebuild itself is asynchronous, so the
+caller watches `post_merge_status` and each action's `preparation_state`.
+
+The worker starts its own preparation generation (a rebuild is never mistaken
+for a duplicate of the build it replaces) and then runs the same teardown a
+rebase-triggered generation does, per test action:
+
+1. the action's `[review.action.lifecycle] before_reset_command` list runs in
+   order (each command bounded by the optional `timeout`; a failing or timed-out
+   command blocks the rebuild and leaves the action `failed`);
+2. the action's build root is reset according to `build_root_policy`
+   (`reset_before_prepare`, the default, clears it first; `prepare_managed`
+   keeps it for the commands to manage);
+3. the retained checkout is refreshed at the current review tip; and
+4. every action's `prepare` steps run again — a group shared by several
+   actions runs once. Generated manual checks keep their commands; only their
+   own `prepare` steps rerun.
+
+While it runs, each action reports `preparing` and its run endpoints return
+`409` until it is `ready` again.
+
+- `409 invalid_transition` — the review is not `in_review` with a built stack,
+  or a post-merge job is already running (retry when it finishes).
+- `404` — no such review.
 
 #### The post-merge phase (RAL-520)
 Once a merge/rebase settles a stack, the review moves to `in_review`

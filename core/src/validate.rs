@@ -283,6 +283,7 @@ pub const REVIEW_KEYS: &[&str] = &[
     "auto_cancel_outdated_pr_pipelines",
     "summary_format",
     "cache_manual_checks",
+    "rebuild_on",
 ];
 /// The full set of top-level `[[waypoint]]` keys (RAL-400).
 pub const WAYPOINT_KEYS: &[&str] = &[
@@ -1999,6 +2000,7 @@ fn validate_review_blocks(value: Option<&toml::Value>, ctx: &mut Ctx) {
             header,
         );
         check_type(ctx, table, "cache_manual_checks", Ty::Bool, &rpath, header);
+        validate_rebuild_on(table, &rpath, ctx, header);
         check_type(
             ctx,
             table,
@@ -2242,6 +2244,39 @@ fn validate_waypoint_blocks(root: &toml::Table, value: Option<&toml::Value>, ctx
 /// instead, so `ralphus validate`/`submit` can flag the common case (no
 /// project-level default configured either) without false-positiving on a
 /// submission that a project default genuinely covers.
+fn validate_rebuild_on(table: &toml::Table, rpath: &str, ctx: &mut Ctx, header: Option<u32>) {
+    let Some(value) = table.get("rebuild_on") else {
+        return;
+    };
+    let path = format!("{rpath}.rebuild_on");
+    let line = ctx.key_line(header, "rebuild_on");
+    let Some(array) = value.as_array() else {
+        ctx.error(
+            &path,
+            ErrorKind::WrongType,
+            "'rebuild_on' must be an array of strings",
+            line,
+        );
+        return;
+    };
+    let mut entries = Vec::with_capacity(array.len());
+    for item in array {
+        let Some(text) = item.as_str() else {
+            ctx.error(
+                &path,
+                ErrorKind::WrongType,
+                "'rebuild_on' must be an array of strings",
+                line,
+            );
+            return;
+        };
+        entries.push(text.to_string());
+    }
+    if let Err(message) = crate::schema::check_rebuild_on(&entries) {
+        ctx.error(&path, ErrorKind::InvalidValue, message, line);
+    }
+}
+
 fn validate_auto_build_table(table: &toml::Table, rpath: &str, ctx: &mut Ctx, header: Option<u32>) {
     let skip_auto_build = table
         .get("skip_auto_build")
@@ -4148,6 +4183,88 @@ prompt = "gate on review"
             "{:?}",
             r.errors
         );
+    }
+
+    // ── [[review]] rebuild_on ──
+
+    fn rebuild_on_src(value: &str) -> String {
+        format!(
+            "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nrebuild_on={value}\n"
+        )
+    }
+
+    #[test]
+    fn review_rebuild_on_accepts_every_subset_including_empty() {
+        for value in [
+            "[]",
+            "[\"rebase\"]",
+            "[\"feedback\"]",
+            "[\"auto_fix\"]",
+            "[\"rebase\", \"feedback\", \"auto_fix\"]",
+            "[\"auto_fix\", \"rebase\"]",
+        ] {
+            let r = validate_toml(&rebuild_on_src(value));
+            assert!(r.is_ok(), "{value}: {:?}", r.errors);
+        }
+    }
+
+    #[test]
+    fn review_rebuild_on_rejects_unknown_value_and_lists_the_allowed_ones() {
+        let r = validate_toml(&rebuild_on_src("[\"rebase\", \"nightly\"]"));
+        let error = r
+            .errors
+            .iter()
+            .find(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("rebuild_on"))
+            .unwrap_or_else(|| panic!("{:?}", r.errors));
+        assert!(error.message.contains("\"nightly\""), "{}", error.message);
+        for allowed in ["rebase", "feedback", "auto_fix"] {
+            assert!(error.message.contains(allowed), "{}", error.message);
+        }
+    }
+
+    #[test]
+    fn review_rebuild_on_rejects_duplicates() {
+        let r = validate_toml(&rebuild_on_src("[\"feedback\", \"rebase\", \"feedback\"]"));
+        assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::InvalidValue
+                && e.message.contains("more than once")
+                && e.message.contains("\"feedback\"")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn review_rebuild_on_rejects_non_array_and_non_string_entries() {
+        for value in [
+            "\"rebase\"",
+            "true",
+            "[1]",
+            "[\"rebase\", 2]",
+            "[[\"rebase\"]]",
+        ] {
+            let r = validate_toml(&rebuild_on_src(value));
+            assert!(
+                r.errors
+                    .iter()
+                    .any(|e| e.kind == ErrorKind::WrongType && e.message.contains("rebuild_on")),
+                "{value}: {:?}",
+                r.errors
+            );
+        }
+    }
+
+    #[test]
+    fn check_rebuild_on_reports_the_first_problem() {
+        assert!(check_rebuild_on_strs(&[]).is_ok());
+        assert!(check_rebuild_on_strs(&["rebase", "feedback", "auto_fix"]).is_ok());
+        assert!(check_rebuild_on_strs(&["Rebase"]).is_err());
+        assert!(check_rebuild_on_strs(&["rebase", "rebase"]).is_err());
+    }
+
+    fn check_rebuild_on_strs(values: &[&str]) -> Result<(), String> {
+        let owned: Vec<String> = values.iter().map(|value| (*value).to_string()).collect();
+        crate::schema::check_rebuild_on(&owned)
     }
 
     #[test]

@@ -247,6 +247,7 @@ ENDPOINT_TO_CLI: dict[str, list[str]] = {
     "POST /api/guardians/{id}/approve": ["review approve"],
     "POST /api/guardians/{id}/cancel": ["review cancel"],
     "POST /api/guardians/{id}/reopen": ["review reopen"],
+    "POST /api/guardians/{id}/rebuild": ["review rebuild"],
     "POST /api/guardians/{id}/pull-requests": ["review pr submit"],
     "GET /api/guardians/{id}/pull-requests": ["review pr list"],
     "POST /api/guardians/{id}/pull-requests/unlink": ["review pr unlink"],

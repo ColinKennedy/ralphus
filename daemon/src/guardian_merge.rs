@@ -4207,13 +4207,16 @@ pub(crate) fn kickoff_merge(
     }
     // The settled tip is no longer authoritative. Stop its advisory build
     // before this merge worker starts changing the stack; the next settled
-    // tip will enqueue a fresh generation.
-    store.lock_free_memory().cancel_guardian_preparation(id);
-    invalidate_guardian_preparation(
-        &store,
-        id,
-        "review is rebasing; preparation will refresh after the new stack settles",
-    );
+    // tip will enqueue a fresh generation. A review whose `rebuild_on` list
+    // leaves out `rebase` keeps its prepared build untouched instead.
+    if should_rebuild_for(&store, id, RebuildTrigger::Rebase) {
+        store.lock_free_memory().cancel_guardian_preparation(id);
+        invalidate_guardian_preparation(
+            &store,
+            id,
+            "review is rebasing; preparation will refresh after the new stack settles",
+        );
+    }
     crate::rlog!(
         INFO,
         "ralphus [guardian] review {id} merge starting branches={} (kickoff {}ms)",
@@ -6333,14 +6336,24 @@ pub fn run_feedback(
     require_proof: bool,
     cancel: &CancelToken,
 ) -> FeedbackOutcome {
-    // Feedback and unattended PR fixes both flow through this function. Their
-    // edits supersede any preparation based on the previous review tip.
-    store.lock_free_memory().cancel_guardian_preparation(id);
-    invalidate_guardian_preparation(
-        store,
-        id,
-        "review feedback is changing the stack; preparation will refresh afterward",
-    );
+    // Feedback and unattended PR fixes both flow through this function; the
+    // unattended auto-fix dispatcher is the caller that requires a proof
+    // verdict. Their edits supersede any preparation based on the previous
+    // review tip -- unless the review's `rebuild_on` list leaves this trigger
+    // out, in which case its prepared build is kept untouched.
+    let rebuild_trigger = if require_proof {
+        RebuildTrigger::AutoFix
+    } else {
+        RebuildTrigger::Feedback
+    };
+    if should_rebuild_for(store, id, rebuild_trigger) {
+        store.lock_free_memory().cancel_guardian_preparation(id);
+        invalidate_guardian_preparation(
+            store,
+            id,
+            "review feedback is changing the stack; preparation will refresh afterward",
+        );
+    }
     // RAL-380: mark the reviewer message this call was invoked for as
     // `Failed` -- used on every early-exit path below that bails out before
     // the resolver agent (and therefore the main completion block further
@@ -7298,7 +7311,7 @@ pub fn run_feedback(
             // against the settled stack: hand them to the independent worker
             // instead of holding this feedback run (and the review's `merging`
             // state) while they run (RAL-520).
-            maybe_spawn_post_merge(store, id);
+            maybe_spawn_post_merge_for(store, id, rebuild_trigger);
         }
         Err(e) => set_status(GuardianStatus::MergeFailed, Some(&e)),
     }
@@ -8802,6 +8815,94 @@ impl PostMergeJobs {
     };
 }
 
+/// What caused a review's post-merge preparation to be requested. Compared
+/// against the review's effective `rebuild_on` list to decide whether the
+/// prepared build is torn down and rebuilt (see [`should_rebuild`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RebuildTrigger {
+    /// A merge or restack of the review's stack settled.
+    Rebase,
+    /// Reviewer feedback was applied to a branch.
+    Feedback,
+    /// An unattended PR/MR auto-fix pass was applied to a branch.
+    AutoFix,
+    /// An explicit rebuild request. Always rebuilds, whatever `rebuild_on` says.
+    Manual,
+}
+
+impl RebuildTrigger {
+    /// The `rebuild_on` entry that names this trigger, or `None` for
+    /// [`Self::Manual`], which no list can exclude.
+    #[must_use]
+    pub fn rebuild_on_value(self) -> Option<&'static str> {
+        match self {
+            Self::Rebase => Some("rebase"),
+            Self::Feedback => Some("feedback"),
+            Self::AutoFix => Some("auto_fix"),
+            Self::Manual => None,
+        }
+    }
+
+    /// Human-readable name for logs and notes.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        self.rebuild_on_value().unwrap_or("manual")
+    }
+}
+
+/// Whether a post-merge run caused by `trigger` tears down and rebuilds the
+/// prepared build. A review with no prepared build yet always builds, and an
+/// explicit rebuild request always rebuilds; otherwise the trigger must be in
+/// the review's effective `rebuild_on` list.
+#[must_use]
+pub fn should_rebuild(
+    effective_rebuild_on: &[String],
+    trigger: RebuildTrigger,
+    has_prepared_build: bool,
+) -> bool {
+    if !has_prepared_build {
+        return true;
+    }
+    match trigger.rebuild_on_value() {
+        None => true,
+        Some(value) => effective_rebuild_on.iter().any(|entry| entry == value),
+    }
+}
+
+/// Whether the review currently has a build that finished preparing: any test
+/// action or generated manual check in the `ready` state with its prepared
+/// working directory recorded.
+#[must_use]
+pub fn has_prepared_build(guardian: &crate::guardian::GuardianView) -> bool {
+    let ready = |state: Option<&str>, cwd: Option<&str>| state == Some("ready") && cwd.is_some();
+    guardian.action_hints.iter().any(|check| {
+        ready(
+            check.preparation_state.as_deref(),
+            check.prepared_cwd.as_deref(),
+        )
+    }) || guardian.manual_commands.iter().any(|check| {
+        ready(
+            check.preparation_state.as_deref(),
+            check.prepared_cwd.as_deref(),
+        )
+    })
+}
+
+/// [`should_rebuild`] for a review loaded from the store: `true` when the
+/// review cannot be loaded, so a read failure never silently keeps a stale
+/// build.
+fn should_rebuild_for(
+    store: &crate::store_lock::StoreHandle,
+    id: &str,
+    trigger: RebuildTrigger,
+) -> bool {
+    let guardian = store.lock().get_guardian(id);
+    match guardian {
+        Ok(g) => should_rebuild(&g.effective_rebuild_on, trigger, has_prepared_build(&g)),
+        Err(_) => true,
+    }
+}
+
 /// Spawn the independent post-merge worker for a settled review (RAL-520).
 ///
 /// No-op unless spawning is enabled (production `serve()`) or the review is
@@ -8811,7 +8912,17 @@ impl PostMergeJobs {
 /// the rebase is free immediately and the review never looks busy behind
 /// post-merge work.
 pub(crate) fn maybe_spawn_post_merge(store: &crate::store_lock::StoreHandle, id: &str) {
-    spawn_guardian_post_merge(store, id, PostMergeJobs::ALL);
+    maybe_spawn_post_merge_for(store, id, RebuildTrigger::Rebase);
+}
+
+/// [`maybe_spawn_post_merge`] for a settled review whose preparation was
+/// requested by `trigger`.
+pub(crate) fn maybe_spawn_post_merge_for(
+    store: &crate::store_lock::StoreHandle,
+    id: &str,
+    trigger: RebuildTrigger,
+) {
+    spawn_guardian_post_merge(store, id, PostMergeJobs::ALL, trigger);
 }
 
 /// Revoke every manual surface tied to the previous settled tip.
@@ -8868,6 +8979,7 @@ pub(crate) fn spawn_guardian_post_merge(
     store: &crate::store_lock::StoreHandle,
     id: &str,
     jobs: PostMergeJobs,
+    trigger: RebuildTrigger,
 ) {
     if !POST_MERGE_SPAWNING.load(Ordering::Relaxed) {
         return;
@@ -8889,7 +9001,7 @@ pub(crate) fn spawn_guardian_post_merge(
             let runner: std::sync::Arc<dyn Runner> = std::sync::Arc::new(
                 crate::runner::SubprocessRunner::from_env().with_cartographer(store.clone()),
             );
-            run_guardian_post_merge(&store, runner.as_ref(), &id, jobs);
+            run_guardian_post_merge_for(&store, runner.as_ref(), &id, jobs, trigger);
         })
         .ok();
 }
@@ -8914,11 +9026,32 @@ pub(crate) fn spawn_guardian_post_merge(
 /// jobs poll) when the review leaves `in_review`, or when a newer post-merge
 /// run starts for the same review -- the newer run owns the outcome slot.
 /// Only the run whose `started_at` stamp still matches records an outcome.
+///
+/// This entry point is the run a settled merge or rebase hands off
+/// ([`RebuildTrigger::Rebase`]); use [`run_guardian_post_merge_for`] for any
+/// other cause.
 pub fn run_guardian_post_merge(
     store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     id: &str,
     jobs: PostMergeJobs,
+) {
+    run_guardian_post_merge_for(store, runner, id, jobs, RebuildTrigger::Rebase);
+}
+
+/// [`run_guardian_post_merge`] for a run requested by `trigger`.
+///
+/// When the review already has a prepared build and `trigger` is not in its
+/// effective `rebuild_on` list (see [`should_rebuild`]), the worker stands down
+/// before touching anything: the prepared state stays `ready`, the retained
+/// checkout is neither reset nor removed, and no preparation or teardown
+/// command runs. [`RebuildTrigger::Manual`] always runs.
+pub fn run_guardian_post_merge_for(
+    store: &crate::store_lock::StoreHandle,
+    runner: &dyn Runner,
+    id: &str,
+    jobs: PostMergeJobs,
+    trigger: RebuildTrigger,
 ) {
     let guardian = match store.lock().get_guardian(id) {
         Ok(g) => g,
@@ -8941,6 +9074,43 @@ pub fn run_guardian_post_merge(
     let Some(combined_str) = guardian.combined_worktree.clone() else {
         return;
     };
+
+    // The review's `rebuild_on` list can exclude this trigger. Decided before
+    // beginning a preparation generation, because beginning one cancels any
+    // preparation still running -- a kept build must leave everything alone.
+    if !should_rebuild(
+        &guardian.effective_rebuild_on,
+        trigger,
+        has_prepared_build(&guardian),
+    ) {
+        phase_note(
+            store,
+            id,
+            crate::logging::LogLevel::INFO,
+            format!(
+                "review {id} prepared build kept: {} is not in rebuild_on",
+                trigger.label()
+            ),
+            serde_json::json!({
+                "phase": "post_merge",
+                "state": "kept",
+                "trigger": trigger.label(),
+            }),
+        );
+        return;
+    }
+
+    // Preparation is recorded per generation (the review's merge-attempt
+    // counter), and a generation that already holds a ready record is never
+    // built twice. A merge or restack advances the counter itself, so only the
+    // other triggers -- applied feedback, an auto-fix pass, an explicit rebuild
+    // -- start their own generation here; without it their rebuild would be
+    // taken for a duplicate of the one it is meant to replace. A run that
+    // skips the check gates (manual-check regeneration only) prepares no
+    // action, so it has no generation to advance.
+    if trigger != RebuildTrigger::Rebase && jobs.checks {
+        let _ = store.lock().bump_guardian_merge_attempt(id);
+    }
 
     // A newer generation cancels this one immediately, then waits for this
     // review's preparation gate before reusing its retained checkout. This
@@ -9027,7 +9197,16 @@ pub fn run_guardian_post_merge(
         }
     });
 
-    let outcome = post_merge_jobs_inner(store, runner, id, &guardian, &combined_str, jobs, &cancel);
+    let outcome = post_merge_jobs_inner(
+        store,
+        runner,
+        id,
+        &guardian,
+        &combined_str,
+        jobs,
+        trigger,
+        &cancel,
+    );
 
     // Stop the supersede watcher: the run is over, one way or the other. The
     // superseded flag was sampled by the watcher before this cancel.
@@ -9158,6 +9337,7 @@ fn notify_manual_preparation_outcome(
 
 /// The worker's body: check out a scratch worktree at the combined review
 /// branch's tip and run the requested jobs there concurrently.
+#[allow(clippy::too_many_arguments)]
 fn post_merge_jobs_inner(
     store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
@@ -9165,6 +9345,7 @@ fn post_merge_jobs_inner(
     guardian: &crate::guardian::GuardianView,
     combined_str: &str,
     jobs: PostMergeJobs,
+    trigger: RebuildTrigger,
     cancel: &CancelToken,
 ) -> std::result::Result<Option<String>, String> {
     let combined_path = PathBuf::from(combined_str);
@@ -9238,6 +9419,12 @@ fn post_merge_jobs_inner(
         g.effective_cache_manual_checks && g.manual_checks_cached && g.manual_checks_basis.is_some()
     });
     let generate_manual = jobs.manual_checks && !cached && (!commands_present || basis_changed);
+    // An explicit rebuild also re-prepares the already generated checks, which
+    // a cached review would otherwise leave marked ready while this run resets
+    // the checkout their build output lives in. Their commands are kept as-is
+    // (no rediscovery); only their own preparation reruns.
+    let reprepare_generated =
+        trigger == RebuildTrigger::Manual && !generate_manual && commands_present && jobs.checks;
 
     // Scratch checkout of the tip. Sibling of the combined worktree, with its
     // own branch, so the jobs' byproducts land here instead of dirtying the
@@ -9263,7 +9450,7 @@ fn post_merge_jobs_inner(
     // Bind the read result before updating either collection. An `if let`
     // scrutinee temporary would otherwise retain the non-reentrant store lock
     // for the entire body and deadlock on the first update.
-    if generate_manual {
+    if generate_manual || reprepare_generated {
         let current_result = store.lock().get_guardian(id);
         if let Ok(current) = current_result {
             let mut commands = current.manual_commands;
@@ -9347,7 +9534,7 @@ fn post_merge_jobs_inner(
                 .get_guardian(id)
                 .map(|current| current.build_env)
                 .unwrap_or_default();
-            if let Err(error) = prepare_generated_manual_checks(
+            prepare_generated_manual_checks(
                 store,
                 runner,
                 id,
@@ -9355,10 +9542,23 @@ fn post_merge_jobs_inner(
                 &pm_str,
                 &env,
                 cancel,
-            ) {
-                return Err(error);
-            }
+            )?;
         }
+    } else if reprepare_generated && !cancel.is_cancelled() && outcome.is_ok() {
+        let env = store
+            .lock()
+            .get_guardian(id)
+            .map(|current| current.build_env)
+            .unwrap_or_default();
+        prepare_generated_manual_checks(
+            store,
+            runner,
+            id,
+            &ws_root.at(&proj),
+            &pm_str,
+            &env,
+            cancel,
+        )?;
     }
 
     // The prepared checkout is intentionally retained. Manual actions run in
@@ -16254,6 +16454,103 @@ mod tests {
             dir.join("nonexistent")
         )));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn rebuild_on_list(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn should_rebuild_truth_table() {
+        let all = rebuild_on_list(&["rebase", "feedback", "auto_fix"]);
+        let none: Vec<String> = Vec::new();
+        let only_feedback = rebuild_on_list(&["feedback"]);
+        let triggers = [
+            RebuildTrigger::Rebase,
+            RebuildTrigger::Feedback,
+            RebuildTrigger::AutoFix,
+            RebuildTrigger::Manual,
+        ];
+
+        // Without a prepared build every combination builds: the first
+        // generation can never be skipped.
+        for list in [&all, &none, &only_feedback] {
+            for trigger in triggers {
+                assert!(should_rebuild(list, trigger, false), "{trigger:?} {list:?}");
+            }
+        }
+
+        // With a prepared build the list decides, except that an explicit
+        // rebuild always runs.
+        for trigger in triggers {
+            assert!(
+                should_rebuild(&all, trigger, true),
+                "default keeps today's behavior: {trigger:?}"
+            );
+            assert_eq!(
+                should_rebuild(&none, trigger, true),
+                trigger == RebuildTrigger::Manual,
+                "empty list: {trigger:?}"
+            );
+            assert_eq!(
+                should_rebuild(&only_feedback, trigger, true),
+                matches!(trigger, RebuildTrigger::Feedback | RebuildTrigger::Manual),
+                "feedback only: {trigger:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rebuild_trigger_names_match_the_rebuild_on_vocabulary() {
+        let named: Vec<&str> = [
+            RebuildTrigger::Rebase,
+            RebuildTrigger::Feedback,
+            RebuildTrigger::AutoFix,
+        ]
+        .iter()
+        .filter_map(|trigger| trigger.rebuild_on_value())
+        .collect();
+        assert_eq!(named, ralphus_core::schema::REBUILD_ON_VALUES);
+        assert_eq!(RebuildTrigger::Manual.rebuild_on_value(), None);
+        assert_eq!(RebuildTrigger::Manual.label(), "manual");
+    }
+
+    #[test]
+    fn has_prepared_build_needs_a_ready_check_with_a_recorded_directory() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        let check = |state: Option<&str>, cwd: Option<&str>| crate::guardian::GuardianCheck {
+            command: Some("true".to_string()),
+            preparation_state: state.map(str::to_string),
+            prepared_cwd: cwd.map(str::to_string),
+            ..crate::guardian::GuardianCheck::default()
+        };
+        assert!(!has_prepared_build(&store.get_guardian(&id).unwrap()));
+
+        for (state, cwd, expected) in [
+            (Some("ready"), Some("/built"), true),
+            (Some("ready"), None, false),
+            (Some("preparing"), Some("/built"), false),
+            (Some("stale"), Some("/built"), false),
+            (Some("failed"), Some("/built"), false),
+            (None, None, false),
+        ] {
+            store
+                .set_guardian_action_hints(&id, &[check(state, cwd)])
+                .unwrap();
+            assert_eq!(
+                has_prepared_build(&store.get_guardian(&id).unwrap()),
+                expected,
+                "{state:?} {cwd:?}"
+            );
+        }
+
+        // A ready generated manual check counts the same as a ready action.
+        store.set_guardian_action_hints(&id, &[]).unwrap();
+        store
+            .set_guardian_manual_commands(&id, &[check(Some("ready"), Some("/built"))], None, None)
+            .unwrap();
+        assert!(has_prepared_build(&store.get_guardian(&id).unwrap()));
     }
 
     #[test]

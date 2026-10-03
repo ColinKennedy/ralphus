@@ -133,6 +133,15 @@ pub enum ReviewCommand {
         /// and then reused through later merges, rebases, and automated fix
         /// iterations. Defaults to `true` (on by default) when unset.
         cache_manual_checks: Option<bool>,
+        /// This review's own list of events that tear down and rebuild its
+        /// prepared build. Outer `None` leaves it alone, `Some(None)` clears
+        /// it back to inherit, `Some(Some(list))` sets it (an empty list never
+        /// rebuilds automatically).
+        rebuild_on: Option<Option<Vec<String>>>,
+    },
+    /// Tear down and rebuild a settled review's prepared build now.
+    Rebuild {
+        selector: String,
     },
     BuildEnv(GuardianEnvArgs),
     ManualChecksEnv(GuardianEnvArgs),
@@ -423,6 +432,10 @@ pub fn parse(args: &[String]) -> ReviewCommand {
             let auto_cancel_outdated_pr_pipelines =
                 take_tri_bool(&mut scanner, "--auto-cancel-outdated-pr-pipelines");
             let cache_manual_checks = take_tri_bool(&mut scanner, "--cache-manual-checks");
+            let rebuild_on = match take_rebuild_on(&mut scanner) {
+                Ok(value) => value,
+                Err(UsageError(message)) => return ReviewCommand::UsageError(message),
+            };
             with_selector(scanner, |selector| ReviewCommand::Settings {
                 selector,
                 skip_auto_build,
@@ -443,8 +456,10 @@ pub fn parse(args: &[String]) -> ReviewCommand {
                 discourage_tests_during_auto_pull_request_fixes,
                 auto_cancel_outdated_pr_pipelines,
                 cache_manual_checks,
+                rebuild_on,
             })
         }
+        Some("rebuild") => with_selector(scanner, |selector| ReviewCommand::Rebuild { selector }),
         Some("env") => {
             let scope = scanner.take_value("--scope").ok().flatten();
             match scope.as_deref() {
@@ -581,6 +596,51 @@ fn with_selector(scanner: Scanner, make: impl FnOnce(String) -> ReviewCommand) -
         Some(selector) => make(selector),
         None => ReviewCommand::UsageError("missing required <selector> argument".to_string()),
     }
+}
+
+/// Parse the values of a repeatable `--rebuild-on`: events (`rebase`,
+/// `feedback`, `auto_fix`, in any subset, repeated or comma-separated), or the
+/// single keyword `none` for an empty list (never rebuild automatically) or
+/// `inherit` to clear the override. Returns `None` for `inherit` and
+/// `Some(list)` otherwise.
+///
+/// # Errors
+/// An entry outside the allowed events, a repeated one, or a keyword combined
+/// with other values.
+pub(crate) fn parse_rebuild_on(values: &[String]) -> Result<Option<Vec<String>>, UsageError> {
+    let tokens: Vec<String> = values
+        .iter()
+        .flat_map(|value| value.split(','))
+        .map(|token| token.trim().to_string())
+        .collect();
+    let keyword = |token: &String, word: &str| token.eq_ignore_ascii_case(word);
+    if tokens
+        .iter()
+        .any(|token| keyword(token, "inherit") || keyword(token, "none"))
+    {
+        return match tokens.as_slice() {
+            [only] if keyword(only, "inherit") => Ok(None),
+            [only] if keyword(only, "none") => Ok(Some(Vec::new())),
+            _ => Err(UsageError(
+                "--rebuild-on: `none` and `inherit` must be the only value".to_string(),
+            )),
+        };
+    }
+    ralphus_core::schema::check_rebuild_on(&tokens)
+        .map_err(|message| UsageError(format!("--rebuild-on: {message}")))?;
+    Ok(Some(tokens))
+}
+
+/// Take every `--rebuild-on <event|none|inherit>` from the scanner (repeatable;
+/// each value may itself be a comma list). `None` when the flag is absent.
+pub(crate) fn take_rebuild_on(
+    scanner: &mut Scanner,
+) -> Result<Option<Option<Vec<String>>>, UsageError> {
+    let values = scanner.take_repeated("--rebuild-on").unwrap_or_default();
+    if values.is_empty() {
+        return Ok(None);
+    }
+    parse_rebuild_on(&values).map(Some)
 }
 
 /// `--flag`/`--no-flag` tri-state, mirroring Python's
@@ -1346,6 +1406,7 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
             discourage_tests_during_auto_pull_request_fixes,
             auto_cancel_outdated_pr_pipelines,
             cache_manual_checks,
+            rebuild_on,
         } => run_and_report(opts, None, || {
             let resolved = resolve_guardian_selector(&client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
             let settings = GuardianSettings {
@@ -1367,9 +1428,18 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
                 discourage_tests_during_auto_pull_request_fixes,
                 auto_cancel_outdated_pr_pipelines,
                 cache_manual_checks,
+                rebuild_on,
             };
             let result = client.guardian_settings(&resolved.guardian_id, &settings)?;
             emit(opts, &result, |_| println!("{selector} settings updated"));
+            Ok(())
+        }),
+        ReviewCommand::Rebuild { selector } => run_and_report(opts, None, || {
+            let resolved = resolve_guardian_selector(&client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
+            let result = client.guardian_rebuild(&resolved.guardian_id)?;
+            emit(opts, &result, |_| {
+                println!("{selector} rebuild started");
+            });
             Ok(())
         }),
         ReviewCommand::Env { selector, scope } => run_and_report(opts, None, || {
@@ -3016,6 +3086,115 @@ mod tests {
             } => assert_eq!(cache_manual_checks, None),
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    fn rebuild_on_of(args: &[&str]) -> Option<Option<Vec<String>>> {
+        match parse(&v(args)) {
+            ReviewCommand::Settings { rebuild_on, .. } => rebuild_on,
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_settings_rebuild_on_csv_none_and_inherit() {
+        assert_eq!(
+            rebuild_on_of(&["settings", "g1"]),
+            None,
+            "absent leaves it alone"
+        );
+        assert_eq!(
+            rebuild_on_of(&["settings", "g1", "--rebuild-on", "feedback,auto_fix"]),
+            Some(Some(vec!["feedback".to_string(), "auto_fix".to_string()]))
+        );
+        assert_eq!(
+            rebuild_on_of(&[
+                "settings",
+                "g1",
+                "--rebuild-on",
+                "rebase, feedback ,auto_fix"
+            ]),
+            Some(Some(vec![
+                "rebase".to_string(),
+                "feedback".to_string(),
+                "auto_fix".to_string()
+            ])),
+            "whitespace around entries is ignored"
+        );
+        assert_eq!(
+            rebuild_on_of(&["settings", "g1", "--rebuild-on", "none"]),
+            Some(Some(Vec::new())),
+            "`none` is an empty list: never rebuild automatically"
+        );
+        assert_eq!(
+            rebuild_on_of(&["settings", "g1", "--rebuild-on", "inherit"]),
+            Some(None),
+            "`inherit` clears the override"
+        );
+    }
+
+    #[test]
+    fn settings_rebuild_on_accepts_the_flag_repeated() {
+        assert_eq!(
+            rebuild_on_of(&[
+                "settings",
+                "g1",
+                "--rebuild-on",
+                "feedback",
+                "--rebuild-on",
+                "auto_fix",
+            ]),
+            Some(Some(vec!["feedback".to_string(), "auto_fix".to_string()]))
+        );
+    }
+
+    #[test]
+    fn settings_rebuild_on_keywords_must_stand_alone() {
+        for bad in [
+            &["--rebuild-on", "none", "--rebuild-on", "rebase"][..],
+            &["--rebuild-on", "inherit,feedback"][..],
+            &["--rebuild-on", "none", "--rebuild-on", "inherit"][..],
+        ] {
+            let mut args = vec!["settings", "g1"];
+            args.extend_from_slice(bad);
+            match parse(&v(&args)) {
+                ReviewCommand::UsageError(message) => {
+                    assert!(message.contains("only value"), "{bad:?}: {message}");
+                }
+                other => panic!("{bad:?} should be a usage error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn settings_rebuild_on_rejects_unknown_and_repeated_entries() {
+        for bad in ["nightly", "rebase,rebase", "rebase,,feedback", ""] {
+            match parse(&v(&["settings", "g1", "--rebuild-on", bad])) {
+                ReviewCommand::UsageError(message) => {
+                    assert!(message.contains("--rebuild-on"), "{bad:?}: {message}");
+                }
+                other => panic!("{bad:?} should be a usage error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parses_rebuild_with_a_selector() {
+        match parse(&v(&["rebuild", "my-review"])) {
+            ReviewCommand::Rebuild { selector } => assert_eq!(selector, "my-review"),
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(matches!(
+            parse(&v(&["rebuild"])),
+            ReviewCommand::UsageError(_)
+        ));
+    }
+
+    #[test]
+    fn parse_rebuild_on_is_case_insensitive_for_the_keywords_only() {
+        let one = |value: &str| parse_rebuild_on(&[value.to_string()]);
+        assert_eq!(one("NONE").unwrap(), Some(Vec::new()));
+        assert_eq!(one("Inherit").unwrap(), None);
+        assert!(one("Rebase").is_err(), "event names are exact");
     }
 
     #[test]

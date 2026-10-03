@@ -42,6 +42,31 @@ suggestions on every rebuild instead, turn the caching off: set
 cache_manual_checks = false` project default) and every later merge or rebase
 regenerates the commands from the freshly stacked diff.
 
+### When the prepared build is rebuilt
+
+By default every rebase, every applied piece of reviewer feedback, and every
+unattended auto-fix pass tears the prepared build down and builds it again, so
+a ready action always matches the current stack. If that is more rebuilding than
+you want, set `[[review]] rebuild_on` (or a `[review] rebuild_on` project
+default) to just the events that should rebuild:
+
+```toml
+[[review]]
+id = "ralphus:new-review/my-review"
+rebuild_on = ["rebase"]   # rebuild on a rebase; keep the build through feedback and auto-fix
+```
+
+The allowed entries are `"rebase"`, `"feedback"` and `"auto_fix"`. An event left
+out keeps the ready build exactly as it is — its actions stay ready and nothing
+is torn down or rebuilt. An empty list, `rebuild_on = []`, never rebuilds
+automatically, so you rebuild only when you ask: `ralphus review rebuild
+<selector>` tears the build down (running each action's
+`[review.action.lifecycle] before_reset_command` teardown commands first) and
+builds it again whatever `rebuild_on` says. A review with no ready build yet
+always builds, so the first build is never skipped. The same list is editable
+per review with `ralphus review settings <selector> --rebuild-on ...` and per
+project with `ralphus project review-settings set <project> --rebuild-on ...`.
+
 **▶ Run all** launches every ready suggested command at once in its prepared
 checkout. It never performs a build or transfer. An action stays disabled and
 shows `preparing`, `transferring`, or an actionable failure until its setup is

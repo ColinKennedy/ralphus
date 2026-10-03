@@ -474,6 +474,89 @@ fn cache_manual_checks_precedence_review_over_project_over_default() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+// `rebuild_on` precedence from authored TOML -- the review's own
+// `[[review]] rebuild_on` (an empty list included) wins over the project's
+// `.ralphus.toml [review] rebuild_on` default, which wins over the built-in
+// default of every event.
+#[test]
+fn rebuild_on_precedence_review_over_project_over_default() {
+    let every_event = vec!["rebase", "feedback", "auto_fix"];
+
+    // The review's own list wins over the project file default.
+    let base = temp_base("rebuild-on-precedence-override");
+    let cwd = repo_with_worktree(&base, "feature/rebuild-override");
+    std::fs::write(
+        base.join("repo").join(".ralphus.toml"),
+        "[review]\nrebuild_on = [\"rebase\"]\n",
+    )
+    .unwrap();
+    let toml = session_toml(
+        &cwd,
+        "override",
+        "skip_auto_build=true\nrebuild_on=[\"feedback\", \"auto_fix\"]",
+    );
+    let file: TaskFile = toml::from_str(&toml).unwrap();
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    let squad_id = store.lock().insert_squad(&file, None, false).unwrap();
+    let guardian_id = derive_reviews(&store, &squad_id, &file).unwrap().remove(0);
+    let guardian = store.lock().get_guardian(&guardian_id).unwrap();
+    assert_eq!(
+        guardian.rebuild_on,
+        Some(vec!["feedback".to_string(), "auto_fix".to_string()])
+    );
+    assert_eq!(guardian.effective_rebuild_on, vec!["feedback", "auto_fix"]);
+    let _ = std::fs::remove_dir_all(&base);
+
+    // An empty review list means "never automatically" and still wins.
+    let base = temp_base("rebuild-on-precedence-empty");
+    let cwd = repo_with_worktree(&base, "feature/rebuild-empty");
+    std::fs::write(
+        base.join("repo").join(".ralphus.toml"),
+        "[review]\nrebuild_on = [\"rebase\"]\n",
+    )
+    .unwrap();
+    let toml = session_toml(&cwd, "empty", "skip_auto_build=true\nrebuild_on=[]");
+    let file: TaskFile = toml::from_str(&toml).unwrap();
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    let squad_id = store.lock().insert_squad(&file, None, false).unwrap();
+    let guardian_id = derive_reviews(&store, &squad_id, &file).unwrap().remove(0);
+    let guardian = store.lock().get_guardian(&guardian_id).unwrap();
+    assert_eq!(guardian.rebuild_on, Some(Vec::new()));
+    assert!(guardian.effective_rebuild_on.is_empty());
+    let _ = std::fs::remove_dir_all(&base);
+
+    // The project file default applies when the review leaves it unset.
+    let base = temp_base("rebuild-on-precedence-project");
+    let cwd = repo_with_worktree(&base, "feature/rebuild-project");
+    std::fs::write(
+        base.join("repo").join(".ralphus.toml"),
+        "[review]\nrebuild_on = [\"auto_fix\"]\n",
+    )
+    .unwrap();
+    let toml = session_toml(&cwd, "project", "skip_auto_build=true");
+    let file: TaskFile = toml::from_str(&toml).unwrap();
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    let squad_id = store.lock().insert_squad(&file, None, false).unwrap();
+    let guardian_id = derive_reviews(&store, &squad_id, &file).unwrap().remove(0);
+    let guardian = store.lock().get_guardian(&guardian_id).unwrap();
+    assert_eq!(guardian.rebuild_on, None);
+    assert_eq!(guardian.effective_rebuild_on, vec!["auto_fix"]);
+    let _ = std::fs::remove_dir_all(&base);
+
+    // Everything unset resolves to the built-in default: every event.
+    let base = temp_base("rebuild-on-precedence-default");
+    let cwd = repo_with_worktree(&base, "feature/rebuild-default");
+    let toml = session_toml(&cwd, "default", "skip_auto_build=true");
+    let file: TaskFile = toml::from_str(&toml).unwrap();
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    let squad_id = store.lock().insert_squad(&file, None, false).unwrap();
+    let guardian_id = derive_reviews(&store, &squad_id, &file).unwrap().remove(0);
+    let guardian = store.lock().get_guardian(&guardian_id).unwrap();
+    assert_eq!(guardian.rebuild_on, None);
+    assert_eq!(guardian.effective_rebuild_on, every_event);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 #[test]
 fn two_projects_make_two_disambiguated_reviews() {
     let base_a = temp_base("projA");
