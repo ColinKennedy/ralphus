@@ -4580,17 +4580,27 @@ impl Store {
     /// Also clears the cell's `error` (e.g. a stale "blocked by a failed
     /// dependency" message) — it no longer applies once the cell is forced
     /// done.
+    ///
+    /// Also closes any still-open active-duration interval on the proofs it
+    /// force-finishes, the same way [`Self::set_proof_state`] would — this
+    /// bypasses that function with a raw bulk `UPDATE`, so it must close the
+    /// interval itself or the board keeps ticking a forced-done proof's
+    /// "active duration" up forever.
     pub fn force_cell_done(&self, squad_id: &str, task_idx: i64, idx: i64) -> Result<()> {
         self.set_cell_state(squad_id, task_idx, idx, NodeState::Done)?;
         self.conn.execute(
             "UPDATE cells SET error=NULL WHERE squad_id=? AND task_idx=? AND idx=?",
             params![squad_id, task_idx, idx],
         )?;
+        let now = now_ms();
         self.conn.execute(
-            "UPDATE proofs SET state='done', env_out_of_date=0
+            "UPDATE proofs SET state='done', env_out_of_date=0,
+                 completed_active_duration_ms = completed_active_duration_ms +
+                    CASE WHEN active_started_at_ms IS NULL THEN 0 ELSE MAX(0, ? - active_started_at_ms) END,
+                 active_started_at_ms = NULL
              WHERE squad_id=? AND task_idx=? AND scope='cell' AND cell_idx=?
              AND state NOT IN ('done','failed','cancelled')",
-            params![squad_id, task_idx, idx],
+            params![now, squad_id, task_idx, idx],
         )?;
         Ok(())
     }
@@ -7785,6 +7795,12 @@ impl Store {
     /// reason as [`Self::record_cell_result`] — a manual `set-status`
     /// override on this proof step while it's still mid-flight must not be
     /// clobbered once the scheduler's own runner call for it unblocks.
+    ///
+    /// Also closes any still-open active-duration interval when `state` is
+    /// terminal — see [`Self::record_cell_result`]'s matching comment; this
+    /// is the proof-step twin of the same bug (the board's "active duration"
+    /// never stopped ticking for a proof that finished through its normal
+    /// completion path).
     #[allow(clippy::too_many_arguments)]
     pub fn set_proof_result(
         &self,
@@ -7811,8 +7827,13 @@ impl Store {
             .ok()
             .flatten()
             .unwrap_or_else(|| ("unknown".to_string(), None));
+        let entering_terminal = i64::from(state.is_terminal());
+        let now = now_ms();
         self.conn.execute(
-            "UPDATE proofs SET state=?, output=?, agent_session_id=?, tokens_in=?, tokens_out=?, cache_creation_tokens=?, cache_read_tokens=?, compaction_input_tokens=?, compaction_count=?, turns=?, cost_usd=?, cost_is_estimated=?
+            "UPDATE proofs SET state=?, output=?, agent_session_id=?, tokens_in=?, tokens_out=?, cache_creation_tokens=?, cache_read_tokens=?, compaction_input_tokens=?, compaction_count=?, turns=?, cost_usd=?, cost_is_estimated=?,
+                 completed_active_duration_ms = completed_active_duration_ms +
+                    CASE WHEN ?=1 AND active_started_at_ms IS NOT NULL THEN MAX(0, ? - active_started_at_ms) ELSE 0 END,
+                 active_started_at_ms = CASE WHEN ?=1 THEN NULL ELSE active_started_at_ms END
              WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=? AND state IN ('pending', 'running', ?)",
             params![
                 state.as_str(),
@@ -7827,6 +7848,9 @@ impl Store {
                 usage.turns,
                 usage.cost_usd,
                 usage.cost_is_estimated,
+                entering_terminal,
+                now,
+                entering_terminal,
                 squad_id,
                 task_idx,
                 scope,
@@ -9868,6 +9892,14 @@ impl Store {
     /// [`Store::set_squad_state`]'s doc comment for the shared timestamp
     /// semantics); `started_at_ms` is not touched here since a cell only
     /// ever reaches this function after already having been marked `running`.
+    ///
+    /// Also closes any still-open active-duration interval when
+    /// `outcome.state` is terminal, the same way [`Store::set_cell_state`]
+    /// does on any other transition out of `running` — this is the *only*
+    /// place a normally-completing cell (success or failure, not a manual
+    /// override or cancellation) ever reaches a terminal state, and before
+    /// this it left `active_started_at_ms` set forever, so the board kept
+    /// ticking the "active duration" clock up past completion.
     pub fn record_cell_result(
         &self,
         squad_id: &str,
@@ -9876,9 +9908,13 @@ impl Store {
         outcome: &CellOutcome,
     ) -> Result<()> {
         let entering_terminal = i64::from(outcome.state.is_terminal());
+        let now = now_ms();
         self.conn.execute(
             "UPDATE cells SET state=?, tokens_in=?, tokens_out=?, cache_creation_tokens=?, cache_read_tokens=?, compaction_input_tokens=?, compaction_count=?, turns=?, cost_usd=?, cost_is_estimated=?, error=?, agent_session_id=COALESCE(?, agent_session_id),
-                 finished_at_ms = CASE WHEN ?=1 THEN ? ELSE finished_at_ms END
+                 finished_at_ms = CASE WHEN ?=1 THEN ? ELSE finished_at_ms END,
+                 completed_active_duration_ms = completed_active_duration_ms +
+                    CASE WHEN ?=1 AND active_started_at_ms IS NOT NULL THEN MAX(0, ? - active_started_at_ms) ELSE 0 END,
+                 active_started_at_ms = CASE WHEN ?=1 THEN NULL ELSE active_started_at_ms END
              WHERE squad_id=? AND task_idx=? AND idx=? AND state IN ('pending', 'running', ?)",
             params![
                 outcome.state.as_str(),
@@ -9894,7 +9930,10 @@ impl Store {
                 outcome.error.as_deref(),
                 outcome.agent_session_id.as_deref(),
                 entering_terminal,
-                now_ms(),
+                now,
+                entering_terminal,
+                now,
+                entering_terminal,
                 squad_id,
                 task_idx,
                 idx,
@@ -15591,6 +15630,113 @@ command = "cargo test"
         let squad = store.get_squad(&id).unwrap();
         assert!(squad.tasks[0].cells[0].started_at_ms.is_some());
         assert!(squad.tasks[0].cells[0].finished_at_ms.is_some());
+    }
+
+    #[test]
+    fn record_cell_result_closes_the_active_duration_interval() {
+        // Regression test: a cell completing through its normal path (not a
+        // manual override, not a cancellation) used to leave
+        // `active_started_at_ms` set forever, so the board's "active
+        // duration" kept ticking up even after the cell reached `done`.
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+        store.set_cell_state(&id, 0, 0, NodeState::Running).unwrap();
+
+        store
+            .record_cell_result(
+                &id,
+                0,
+                0,
+                &CellOutcome {
+                    state: NodeState::Done,
+                    usage: RecordedUsage::default(),
+                    error: None,
+                    agent_session_id: None,
+                },
+            )
+            .unwrap();
+        // SAMPLE's cell has its own "fmt" proof — mark it done too so the
+        // displayed cell state (which folds proof progress back in) reads
+        // as fully done, same as `cell_and_task_state_transitions` above.
+        store
+            .set_proof_state(&id, 0, "cell", 0, 0, NodeState::Done)
+            .unwrap();
+
+        let squad = store.get_squad(&id).unwrap();
+        assert_eq!(squad.tasks[0].cells[0].state, "done");
+        assert_eq!(squad.tasks[0].cells[0].active_duration_intervals, 0);
+    }
+
+    #[test]
+    fn record_cell_result_closes_the_active_duration_interval_on_failure() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+        store.set_cell_state(&id, 0, 0, NodeState::Running).unwrap();
+
+        store
+            .record_cell_result(
+                &id,
+                0,
+                0,
+                &CellOutcome {
+                    state: NodeState::Failed,
+                    usage: RecordedUsage::default(),
+                    error: Some("boom".to_string()),
+                    agent_session_id: None,
+                },
+            )
+            .unwrap();
+
+        let squad = store.get_squad(&id).unwrap();
+        assert_eq!(squad.tasks[0].cells[0].state, "failed");
+        assert_eq!(squad.tasks[0].cells[0].active_duration_intervals, 0);
+    }
+
+    #[test]
+    fn set_proof_result_closes_the_active_duration_interval() {
+        // Proof-step twin of `record_cell_result_closes_the_active_duration_interval`.
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+        store.set_cell_state(&id, 0, 0, NodeState::Running).unwrap();
+        store
+            .set_proof_state(&id, 0, "cell", 0, 0, NodeState::Running)
+            .unwrap();
+
+        store
+            .set_proof_result(
+                &id,
+                0,
+                "cell",
+                0,
+                0,
+                NodeState::Done,
+                "ok",
+                None,
+                RecordedUsage::default(),
+            )
+            .unwrap();
+
+        let squad = store.get_squad(&id).unwrap();
+        let proof = &squad.tasks[0].cells[0].proof[0];
+        assert_eq!(proof.state, "done");
+        assert_eq!(proof.active_duration_intervals, 0);
+    }
+
+    #[test]
+    fn force_cell_done_closes_proof_active_duration_intervals() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+        store.set_cell_state(&id, 0, 0, NodeState::Running).unwrap();
+        store
+            .set_proof_state(&id, 0, "cell", 0, 0, NodeState::Running)
+            .unwrap();
+
+        store.force_cell_done(&id, 0, 0).unwrap();
+
+        let squad = store.get_squad(&id).unwrap();
+        let proof = &squad.tasks[0].cells[0].proof[0];
+        assert_eq!(proof.state, "done");
+        assert_eq!(proof.active_duration_intervals, 0);
     }
 
     #[test]
