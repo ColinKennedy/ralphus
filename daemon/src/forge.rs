@@ -3325,6 +3325,17 @@ fn ensure_remote_for_url(root: &Path, preferred_name: &str, url: &str) -> Result
 /// through to [`resolve_remote_name_excluding`]'s heuristic -- inventing a
 /// new remote on the strength of a check that never actually completed would
 /// risk leaving a spurious duplicate behind.
+///
+/// Before scanning for *any* same-URL remote, `base_branch`'s own leading
+/// `<remote>/` segment (RAL-<new>) gets first refusal when that named remote
+/// is not `exclude` and genuinely points at `clone_url`: two remotes can
+/// legitimately share one clone URL (e.g. a project registered under both
+/// "origin" and "source"), and when `base_branch` was already written as
+/// `"source/beta"` the caller means "source" specifically, not whichever
+/// same-URL remote [`find_remote_matching_url`]'s listing order happens to
+/// return first. This early check is a pure shortcut over the same URL
+/// comparison the full scan does; a failed or inconclusive probe here just
+/// falls through to it rather than being treated as a confirmed non-match.
 #[must_use]
 pub(crate) fn resolve_parent_remote_name(
     root: &Path,
@@ -3334,6 +3345,15 @@ pub(crate) fn resolve_parent_remote_name(
     exclude: Option<&str>,
 ) -> String {
     if let Some(url) = clone_url.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(named) = remote_from_base_branch(root, base_branch) {
+            if Some(named.as_str()) != exclude {
+                if let Some(target) = parse_remote_url(url) {
+                    if remote_url_is(root, &named, &target).unwrap_or(false) {
+                        return named;
+                    }
+                }
+            }
+        }
         match find_remote_matching_url(root, url, exclude) {
             Ok(Some(name)) => return name,
             Ok(None) => {
@@ -5833,6 +5853,56 @@ mod tests {
         assert!(
             crate::guardian_merge::git(&root, &["config", "--get", "remote.origin.url"]).is_err(),
             "must not have created a spurious \"origin\" remote off a probe it never completed"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_parent_remote_name_prefers_the_remote_named_in_base_branch_over_listing_order() {
+        let root = tmp_dir("parent-remote-same-url-base-branch-names-one");
+        g(&root, &["init", "--initial-branch", "main"]);
+        // "origin" and "source" are both clones of the SAME repo -- a real,
+        // not-uncommon setup. `find_remote_matching_url`'s listing order has
+        // no idea `base_branch` already named "source" specifically, so
+        // without the base_branch-first check this test guards, it could
+        // just as easily return "origin" depending on `git remote`'s
+        // arbitrary ordering.
+        g(
+            &root,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/widget.git",
+            ],
+        );
+        g(
+            &root,
+            &[
+                "remote",
+                "add",
+                "source",
+                "https://github.com/acme/widget.git",
+            ],
+        );
+        let cfg = ForgeConfig::default();
+        let resolved = resolve_parent_remote_name(
+            &root,
+            "source/beta",
+            &cfg,
+            Some("https://github.com/acme/widget.git"),
+            None,
+        );
+        assert_eq!(
+            resolved, "source",
+            "base_branch's own \"source/\" prefix must win over an arbitrary same-URL match, \
+             so a caller stripping \"source/beta\" down to \"beta\" strips the right remote"
+        );
+        // And no synthetic remote was invented in the process.
+        assert!(
+            crate::guardian_merge::git(&root, &["config", "--get", "remote.origin-project.url"])
+                .is_err(),
+            "must not have created a spurious duplicate remote"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
