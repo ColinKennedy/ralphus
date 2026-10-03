@@ -1604,6 +1604,7 @@ const MAILBOX_CHILDREN: &[HelpNode] = &[
         false, // mutates read state.
         &[],
     ),
+    // ralphus[ignore-endpoint-cli]: client of GET /api/events, a SPECIAL_ROUTES exclusion in check_endpoint_cli_parity.py (bypasses route_for_user for its own blocking SSE thread, RAL-167/RAL-222) -- never a normal ENDPOINT_TO_CLI mapping value
     node(
         "follow",
         &[],

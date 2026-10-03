@@ -697,6 +697,7 @@ use; see `READ_ONLY_NOTE`.
         - remove scheme [str]  {Remove a registered machine provider.}
     - mailbox  {Drain the escalation mailbox (RAL-241): failed/stalled work the daemon flagged for attention. Also personal watches and notification preferences layered over the same mailbox (RAL-320).}
         - check --priority [urgent|high|normal]  {Drain unread escalation mailbox messages and print them (RAL-241).}
+        - (read-only-safe) follow  {Push extension of `check` (RAL-241): opens the daemon's /api/events stream and prints one line per mailbox escalation as it arrives, instead of polling. Runs until killed.}
         - (read-only-safe) personal --priority [urgent|high|normal] --unread --user [name]  {List the acting user's personal mailbox messages, filtered through their watches (RAL-320).}
         - personal-drain --id [id...] --user [name]  {Mark personal mailbox messages read; omit --id to drain every unread message (RAL-320).}
         - personal-undrain --id [id...] --user [name]  {Mark personal mailbox messages unread (reverting a drain); omit --id to undrain every drained message (RAL-465).}
