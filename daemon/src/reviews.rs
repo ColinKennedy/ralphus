@@ -389,14 +389,8 @@ struct Membership {
     summary_format: Option<String>,
     match_pr_branch_name: Option<bool>,
     separate_pr_branch: Option<bool>,
-    /// Compatibility payload decoded from stored task files that predate
-    /// `[[review.prepare]]`; validation rejects this key in new submissions.
-    auto_build: Vec<ralphus_core::schema::AutoBuildDef>,
     /// Preparation declarations authored with `[[review.prepare]]`.
     prepare: Vec<ralphus_core::schema::PreparationStepDef>,
-    /// Compatibility value decoded from stored task files; preparation is
-    /// optional without an explicit opt-out in new submissions.
-    skip_auto_build: bool,
     /// RAL-395: optional auto-fix-PR-errors override declared on the review
     /// (`[[review]] auto_fix_pr_errors`).
     auto_fix_pr_errors: Option<bool>,
@@ -1054,9 +1048,7 @@ pub fn derive_reviews_with_full_prefetch(
             summary_format: rv.and_then(|r| r.summary_format.clone()),
             match_pr_branch_name: rv.and_then(|r| r.match_pr_branch_name),
             separate_pr_branch: rv.and_then(|r| r.separate_pr_branch),
-            auto_build: rv.map(|r| r.auto_build.clone()).unwrap_or_default(),
             prepare: rv.map(|r| r.prepare.clone()).unwrap_or_default(),
-            skip_auto_build: rv.is_some_and(|r| r.skip_auto_build),
             auto_fix_pr_errors: rv.and_then(|r| r.auto_fix_pr_errors),
             auto_fix_prompt_template: rv
                 .and_then(|r| r.auto_fix_prompt_template.clone())
@@ -1201,7 +1193,7 @@ pub fn derive_reviews_with_full_prefetch(
             .map_err(|e| ReviewError::new(e.to_string()))?;
         apply_resolver(store, &gid, &members)?;
         apply_project_review_defaults(store, &gid, project)?;
-        apply_auto_build(store, &gid, &members)?;
+        apply_preparation(store, &gid, &members)?;
         apply_action_hints(store, &gid, &members, &hints_by_id)?;
         // Single-project: no need to tag branches with a project (they share git_root).
         add_new_branches(store, &gid, &[], &members, false)?;
@@ -1260,7 +1252,7 @@ pub fn derive_reviews_with_full_prefetch(
             apply_project_review_defaults(store, &gid, proj)?;
         }
         apply_resolver(store, &gid, &members)?;
-        apply_auto_build(store, &gid, &members)?;
+        apply_preparation(store, &gid, &members)?;
         apply_action_hints(store, &gid, &members, &hints_by_id)?;
         // Freshly minted guardian: no branches attached yet. Tag each branch with
         // its project root (multi-project link group).
@@ -1547,22 +1539,6 @@ fn apply_resolver(
     Ok(())
 }
 
-/// Convert the shared preparation-step payload to its persisted runtime shape.
-fn into_guardian_auto_build(
-    def: &ralphus_core::schema::AutoBuildDef,
-) -> crate::guardian::GuardianAutoBuild {
-    crate::guardian::GuardianAutoBuild {
-        command: def.command.clone(),
-        commands: Vec::new(),
-        prompt: def.prompt.clone(),
-        system_prompt: def.system_prompt.clone(),
-        system_prompt_position: def.system_prompt_position.clone(),
-        agent: def.agent.clone(),
-        model: def.model.clone(),
-        environment: std::collections::BTreeMap::new(),
-    }
-}
-
 /// Convert a declared preparation group, preserving its ordered command list
 /// and per-group environment overrides.
 fn into_guardian_preparation(
@@ -1584,28 +1560,20 @@ fn into_guardian_preparation(
 }
 
 /// Persist every declared preparation step from the first member that defines
-/// them. Stored compatibility values are folded into the same runtime list.
-fn apply_auto_build(
+/// them.
+fn apply_preparation(
     store: &Store,
     gid: &str,
     members: &[&Membership],
 ) -> std::result::Result<(), ReviewError> {
-    if let Some(member) = members
-        .iter()
-        .find(|m| !m.prepare.is_empty() || !m.auto_build.is_empty())
-    {
+    if let Some(member) = members.iter().find(|m| !m.prepare.is_empty()) {
         let steps = member
             .prepare
             .iter()
             .map(into_guardian_preparation)
-            .chain(member.auto_build.iter().map(into_guardian_auto_build))
             .collect();
         store
             .set_guardian_preparation(gid, steps)
-            .map_err(|e| ReviewError::new(e.to_string()))?;
-    } else if members.iter().any(|m| m.skip_auto_build) {
-        store
-            .set_guardian_skip_auto_build(gid, true)
             .map_err(|e| ReviewError::new(e.to_string()))?;
     }
     Ok(())
@@ -2662,7 +2630,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::{
-        Membership, any_workspace_ahead_of_upstream, apply_arbiter_pool_order, apply_auto_build,
+        Membership, any_workspace_ahead_of_upstream, apply_arbiter_pool_order,
         apply_project_review_defaults, apply_resolver, create_review_from_triage_pool,
         derive_reviews_with_prefetch, derive_triage_pools, fire_ready_triage_thresholds, plan,
         rebase_onto, repair_arbiter_review_project_roots, repair_review_project_identities,
@@ -3111,8 +3079,6 @@ mod tests {
             summary_format: None,
             match_pr_branch_name: None,
             separate_pr_branch: None,
-            auto_build: Vec::new(),
-            skip_auto_build: false,
             auto_fix_pr_errors: None,
             auto_fix_prompt_template: None,
             discourage_tests_during_auto_pull_request_fixes: None,
@@ -3223,52 +3189,6 @@ mod tests {
         assert_eq!(guardian.match_pr_branch_name, Some(true));
         assert_eq!(guardian.separate_pr_branch, Some(true));
         assert_eq!(guardian.cache_manual_checks, Some(false));
-    }
-
-    // ── [[review]] auto_build wiring / required-declaration (RAL-342) ────
-
-    #[test]
-    fn apply_auto_build_sets_auto_build_from_declaring_member() {
-        let store = Store::open_in_memory().unwrap();
-        let gid = store.create_guardian("r", "main", "/repo").unwrap();
-        let def = ralphus_core::schema::AutoBuildDef {
-            command: Some("make build".to_string()),
-            ..Default::default()
-        };
-        let m = Membership {
-            auto_build: vec![def],
-            ..membership(None)
-        };
-        apply_auto_build(&store, &gid, &[&m]).unwrap();
-        let stored = store.guardian_auto_build(&gid).unwrap();
-        assert_eq!(
-            stored.and_then(|b| b.command),
-            Some("make build".to_string())
-        );
-        assert!(!store.guardian_skip_auto_build(&gid).unwrap());
-    }
-
-    #[test]
-    fn apply_auto_build_sets_skip_auto_build_when_declared_and_no_auto_build_present() {
-        let store = Store::open_in_memory().unwrap();
-        let gid = store.create_guardian("r", "main", "/repo").unwrap();
-        let m = Membership {
-            skip_auto_build: true,
-            ..membership(None)
-        };
-        apply_auto_build(&store, &gid, &[&m]).unwrap();
-        assert!(store.guardian_skip_auto_build(&gid).unwrap());
-        assert_eq!(store.guardian_auto_build(&gid).unwrap(), None);
-    }
-
-    #[test]
-    fn apply_auto_build_leaves_unset_when_no_member_declares_either() {
-        let store = Store::open_in_memory().unwrap();
-        let gid = store.create_guardian("r", "main", "/repo").unwrap();
-        let m = membership(None);
-        apply_auto_build(&store, &gid, &[&m]).unwrap();
-        assert_eq!(store.guardian_auto_build(&gid).unwrap(), None);
-        assert!(!store.guardian_skip_auto_build(&gid).unwrap());
     }
 
     /// A one-task, one-cell, one-link-review TOML referencing project `"proj"`
