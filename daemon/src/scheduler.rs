@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use opentelemetry::trace::SpanKind;
 
@@ -718,25 +718,40 @@ fn claim_ready(
     store: &crate::store_lock::StoreHandle,
     cancellations: &Cancellations,
 ) -> Vec<(String, CancelToken)> {
+    let held_from = Instant::now();
+    let mut timings = ClaimTimings::default();
     let guard = store.lock();
+    let phase = Instant::now();
     let ready = guard.list_ready().unwrap_or_default();
+    timings.list_ready = phase.elapsed();
+    timings.pending = ready.len();
     let mut claimed = Vec::new();
     for squad_id in ready {
+        let phase = Instant::now();
         if cancellations.is_active(&squad_id) {
+            timings.cancellations += phase.elapsed();
             continue;
         }
         // Register up front, under the same store lock the readiness check
         // ran under, so no other tick can observe this squad as both
         // `Pending` and not-yet-active and claim it a second time.
         let token = cancellations.register(&squad_id);
+        timings.cancellations += phase.elapsed();
         // A short-lived span for the claim itself (RAL-96) — continues the
         // trace persisted at submit time, if any. Cell/proof execution
         // get their own spans later, once the worker thread starts.
+        let phase = Instant::now();
         let trace_context = guard.squad_trace_context(&squad_id).unwrap_or_default();
+        timings.trace_context += phase.elapsed();
+        let phase = Instant::now();
         let cx = otel::context_from_traceparent(trace_context.as_deref());
         let _span = otel::start_span("scheduler.claim_ready", &cx, SpanKind::Internal);
         _span.set_attribute("squad_id", squad_id.clone());
+        timings.otel += phase.elapsed();
+        let phase = Instant::now();
         crate::rlog!(INFO, "ralphus [scheduler] squad {squad_id} claimed");
+        timings.rlog += phase.elapsed();
+        let phase = Instant::now();
         let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
             level: crate::logging::LogLevel::INFO,
             source: "scheduler",
@@ -750,9 +765,84 @@ fn claim_ready(
             payload: serde_json::json!({}),
             admin_only: false,
         });
+        timings.cartographer_log += phase.elapsed();
         claimed.push((squad_id, token));
     }
+    drop(guard);
+    timings.total = held_from.elapsed();
+    // Reported only after the guard is released, so the breakdown adds no I/O
+    // to the hold it describes.
+    if timings.total >= CLAIM_HOLD_REPORT_THRESHOLD {
+        timings.report(store);
+    }
     claimed
+}
+
+/// Hold time at or above which `claim_ready` reports its phase breakdown; the
+/// same value as the store-guard watchdog's warning threshold.
+const CLAIM_HOLD_REPORT_THRESHOLD: Duration = Duration::from_millis(100);
+
+/// Where one `claim_ready` hold of the store guard went. Phases are
+/// accumulated across the per-squad loop; `total` also covers the lock wait.
+#[derive(Debug, Default)]
+struct ClaimTimings {
+    total: Duration,
+    pending: usize,
+    list_ready: Duration,
+    cancellations: Duration,
+    trace_context: Duration,
+    otel: Duration,
+    rlog: Duration,
+    cartographer_log: Duration,
+}
+
+impl ClaimTimings {
+    fn summary(&self) -> String {
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        format!(
+            "claim_ready held the store lock {:.1}ms for {} pending squad(s): \
+             list_ready={:.1}ms, loop={:.1}ms (cancellations={:.1}ms, \
+             trace_context={:.1}ms, otel={:.1}ms, rlog={:.1}ms, \
+             cartographer_log={:.1}ms)",
+            ms(self.total),
+            self.pending,
+            ms(self.list_ready),
+            ms(self.loop_total()),
+            ms(self.cancellations),
+            ms(self.trace_context),
+            ms(self.otel),
+            ms(self.rlog),
+            ms(self.cartographer_log),
+        )
+    }
+
+    fn loop_total(&self) -> Duration {
+        self.cancellations + self.trace_context + self.otel + self.rlog + self.cartographer_log
+    }
+
+    fn report(&self, store: &crate::store_lock::StoreHandle) {
+        let summary = self.summary();
+        crate::rlog!(WARNING, "ralphus [scheduler] {summary}");
+        let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+        let guard = store.lock();
+        crate::cartographer::Note::new("scheduler")
+            .level(crate::logging::LogLevel::WARNING)
+            .emit(
+                &guard,
+                "claim_ready lock hold breakdown",
+                serde_json::json!({
+                    "held_ms": ms(self.total),
+                    "pending_squads": self.pending,
+                    "list_ready_ms": ms(self.list_ready),
+                    "loop_ms": ms(self.loop_total()),
+                    "cancellations_ms": ms(self.cancellations),
+                    "trace_context_ms": ms(self.trace_context),
+                    "otel_ms": ms(self.otel),
+                    "rlog_ms": ms(self.rlog),
+                    "cartographer_log_ms": ms(self.cartographer_log),
+                }),
+            );
+    }
 }
 
 /// Run `f` against a private, single-worker [`crate::summary_worker::SummaryQueue`]
@@ -7165,6 +7255,32 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
             waited += 1;
+        }
+    }
+
+    #[test]
+    fn claim_timings_summary_names_every_phase() {
+        let t = ClaimTimings {
+            total: Duration::from_millis(250),
+            pending: 7,
+            list_ready: Duration::from_millis(100),
+            cancellations: Duration::from_millis(1),
+            trace_context: Duration::from_millis(2),
+            otel: Duration::from_millis(3),
+            rlog: Duration::from_millis(40),
+            cartographer_log: Duration::from_millis(50),
+        };
+        let s = t.summary();
+        for needle in [
+            "250.0ms",
+            "7 pending",
+            "list_ready=100.0ms",
+            "loop=96.0ms",
+            "trace_context=2.0ms",
+            "rlog=40.0ms",
+            "cartographer_log=50.0ms",
+        ] {
+            assert!(s.contains(needle), "{needle} missing from {s}");
         }
     }
 
