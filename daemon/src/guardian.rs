@@ -6592,6 +6592,161 @@ mod tests {
         assert!(g.manual_checks_env_overrides.is_empty());
     }
 
+    // ── RAL-547: last-branch env inheritance across branch-stack changes ──
+
+    /// A guardian with one branch per entry in `names`, in order; branch `n`
+    /// carries `WHO=<n>` plus `ONLY_<n>=1` as its own env layer. Returns the
+    /// guardian id.
+    fn guardian_with_env_branches(store: &Store, names: &[&str]) -> String {
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        for name in names {
+            store.add_guardian_branch(&id, name).unwrap();
+        }
+        let g = store.get_guardian(&id).unwrap();
+        for b in &g.branches {
+            let mut set = BTreeMap::new();
+            set.insert("WHO".to_string(), b.branch.clone());
+            set.insert(format!("ONLY_{}", b.branch), "1".to_string());
+            store
+                .set_guardian_branch_env_overrides(&id, &b.id, &set, &[], &[])
+                .unwrap();
+        }
+        id
+    }
+
+    /// Assert `build_env`, `manual_checks_env` and `combined_env` all carry
+    /// `WHO=<who>` and only `who`'s `ONLY_*` key. Check gates, manual checks
+    /// and the post-merge phase all read these same views.
+    fn assert_all_sections_inherit(store: &Store, id: &str, who: &str) {
+        let g = store.get_guardian(id).unwrap();
+        for (label, env) in [
+            ("combined", &g.combined_env),
+            ("build", &g.build_env),
+            ("manual", &g.manual_checks_env),
+        ] {
+            assert_eq!(env.get("WHO").map(String::as_str), Some(who), "{label}");
+            let only: Vec<&String> = env.keys().filter(|k| k.starts_with("ONLY_")).collect();
+            assert_eq!(only, vec![&format!("ONLY_{who}")], "{label}: {env:?}");
+        }
+    }
+
+    #[test]
+    fn single_branch_is_both_first_and_last_for_env_inheritance() {
+        let store = Store::open_in_memory().unwrap();
+        let id = guardian_with_env_branches(&store, &["only"]);
+        assert_all_sections_inherit(&store, &id, "only");
+    }
+
+    #[test]
+    fn last_branch_in_the_stack_supplies_the_env_and_earlier_ones_do_not_leak() {
+        let store = Store::open_in_memory().unwrap();
+        let id = guardian_with_env_branches(&store, &["a", "b", "c"]);
+        assert_all_sections_inherit(&store, &id, "c");
+    }
+
+    #[test]
+    fn section_overrides_win_over_the_last_branch_env_for_each_section() {
+        let store = Store::open_in_memory().unwrap();
+        let id = guardian_with_env_branches(&store, &["a", "b"]);
+
+        let mut build = BTreeMap::new();
+        build.insert("WHO".to_string(), "build-override".to_string());
+        store
+            .set_guardian_build_env_overrides(&id, &build, &[], &[])
+            .unwrap();
+        let mut manual = BTreeMap::new();
+        manual.insert("WHO".to_string(), "manual-override".to_string());
+        store
+            .set_guardian_manual_checks_env_overrides(&id, &manual, &["ONLY_b".to_string()], &[])
+            .unwrap();
+
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(
+            g.build_env.get("WHO").map(String::as_str),
+            Some("build-override")
+        );
+        assert_eq!(g.build_env.get("ONLY_b").map(String::as_str), Some("1"));
+        assert_eq!(
+            g.manual_checks_env.get("WHO").map(String::as_str),
+            Some("manual-override")
+        );
+        assert!(!g.manual_checks_env.contains_key("ONLY_b"));
+        assert_eq!(g.combined_env.get("WHO").map(String::as_str), Some("b"));
+    }
+
+    #[test]
+    fn reordering_the_stack_changes_which_branch_the_sections_inherit_from() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = guardian_with_env_branches(&store, &["a", "b", "c"]);
+        assert_all_sections_inherit(&store, &id, "c");
+
+        let order = ["c", "a", "b"].map(String::from);
+        store.reorder_guardian_branches(&id, &order).unwrap();
+        assert_all_sections_inherit(&store, &id, "b");
+
+        // An override set before the reorder keeps winning over the new base.
+        let mut build = BTreeMap::new();
+        build.insert("WHO".to_string(), "pinned".to_string());
+        store
+            .set_guardian_build_env_overrides(&id, &build, &[], &[])
+            .unwrap();
+        store
+            .reorder_guardian_branches(&id, &["b", "c", "a"].map(String::from))
+            .unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.build_env.get("WHO").map(String::as_str), Some("pinned"));
+        assert_eq!(g.build_env.get("ONLY_a").map(String::as_str), Some("1"));
+        assert_eq!(
+            g.manual_checks_env.get("WHO").map(String::as_str),
+            Some("a")
+        );
+    }
+
+    #[test]
+    fn adding_a_branch_moves_the_inherited_env_to_the_new_last_branch() {
+        let store = Store::open_in_memory().unwrap();
+        let id = guardian_with_env_branches(&store, &["a"]);
+        assert_all_sections_inherit(&store, &id, "a");
+
+        store.add_guardian_branch(&id, "z").unwrap();
+        let z = store
+            .get_guardian(&id)
+            .unwrap()
+            .branches
+            .into_iter()
+            .find(|b| b.branch == "z")
+            .unwrap();
+        let mut set = BTreeMap::new();
+        set.insert("WHO".to_string(), "z".to_string());
+        set.insert("ONLY_z".to_string(), "1".to_string());
+        store
+            .set_guardian_branch_env_overrides(&id, &z.id, &set, &[], &[])
+            .unwrap();
+        assert_all_sections_inherit(&store, &id, "z");
+    }
+
+    #[test]
+    fn disabling_the_last_branch_falls_back_to_the_previous_enabled_one() {
+        let store = Store::open_in_memory().unwrap();
+        let id = guardian_with_env_branches(&store, &["a", "b", "c"]);
+
+        store.set_branch_enabled_by_name(&id, "c", false).unwrap();
+        assert_all_sections_inherit(&store, &id, "b");
+
+        store.set_branch_enabled_by_name(&id, "b", false).unwrap();
+        assert_all_sections_inherit(&store, &id, "a");
+
+        store.set_branch_enabled_by_name(&id, "c", true).unwrap();
+        assert_all_sections_inherit(&store, &id, "c");
+
+        // With every branch disabled there is nothing to inherit.
+        for n in ["a", "b", "c"] {
+            store.set_branch_enabled_by_name(&id, n, false).unwrap();
+        }
+        let g = store.get_guardian(&id).unwrap();
+        assert!(g.build_env.is_empty() && g.manual_checks_env.is_empty());
+    }
+
     #[test]
     fn a_build_only_override_does_not_leak_into_manual_checks_or_combined_env() {
         let mut store = Store::open_in_memory().unwrap();
