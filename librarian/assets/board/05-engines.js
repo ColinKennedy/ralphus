@@ -260,6 +260,7 @@
       CLICK_HANDLERS.inspectBranchFromMenu = (e, ds) => inspectBranchFromMenu(ds.branchId || "", ds.tab || "overview");
       CLICK_HANDLERS.scopeReviewDockToBranch = (e, ds) => scopeReviewDockToBranch(ds.guardianId || "", ds.branchId || "");
       CLICK_HANDLERS.runAllActionHints = (e, ds) => runAllActionHints(ds.guardianId || "");
+      CLICK_HANDLERS.rebuildPreparationNow = (e, ds) => rebuildPreparationNow(ds.guardianId || "");
       CLICK_HANDLERS.selectReviewCommandRow = (e, ds) => selectReviewCommandRow(ds.guardianId || "", ds.key || "", ds.cmd || "");
       CLICK_HANDLERS.scopeReviewDockToCommand = (e, ds) => scopeReviewDockToCommand(ds.guardianId || "", ds.key || "", ds.cmd || "");
       CLICK_HANDLERS.toggleReviewCommandFull = (e, ds) => toggleReviewCommandFull(ds.key || "");

@@ -601,6 +601,17 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
         &[],
     ),
     node(
+        "rebuild",
+        &["selector [str]"],
+        &[],
+        "Tear down and rebuild a settled review's prepared build now, whatever its rebuild_on \
+setting says: each action's [review.action.lifecycle] teardown commands run, then its build \
+root is reset and its prepare steps run again.",
+        false,
+        false,
+        &[],
+    ),
+    node(
         "stop-merge",
         &["selector [str]"],
         &[],
@@ -631,6 +642,7 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
             "--skip-base-updates/--no-skip-base-updates",
             "--skip-worktrees/--no-skip-worktrees",
             "--proof-scope [each_branch|final_branch|nothing]",
+            "--rebuild-on [none|inherit|rebase|feedback|auto_fix...]",
         ],
         "Update per-review opt-out settings.",
         false,
@@ -1125,6 +1137,7 @@ value for each (file config + database).",
             "--match-pr-branch-name/--no-match-pr-branch-name",
             "--maximum-budget-usd [usd]",
             "--proof-scope [each_branch|final_branch|nothing]",
+            "--rebuild-on [none|inherit|rebase|feedback|auto_fix...]",
             "--resolver-agent [name]",
             "--resolver-model [name]",
             "--separate-pr-branch/--no-separate-pr-branch",

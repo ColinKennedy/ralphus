@@ -507,6 +507,87 @@ pub fn parse_worktree_placeholder_upstream(cwd: &str) -> Option<&str> {
     Some(value)
 }
 
+/// A worktree placeholder embedded as text in a review preparation/action
+/// field. It identifies the declared branch and can optionally transform that
+/// branch for a deterministic output path; it never materializes a worktree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorktreeTextRef<'a> {
+    /// Branch text declared by the placeholder.
+    pub branch: &'a str,
+    /// Tracking upstream declared by the placeholder.
+    pub upstream: &'a str,
+    /// Optional transform applied to [`Self::branch`] during interpolation.
+    pub text_fn: Option<TextFn>,
+}
+
+/// Why a text-embedded worktree placeholder is invalid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorktreeTextRefError<'a> {
+    /// The placeholder omitted its required worktree upstream.
+    MissingUpstream,
+    /// One query parameter occurred more than once.
+    DuplicateParameter(&'a str),
+    /// The placeholder named a query parameter other than `upstream` or `text`.
+    UnknownParameter(&'a str),
+    /// The `text` query could not be parsed as a registered text transform.
+    InvalidTextQuery(LinkedFieldQueryError<'a>),
+}
+
+/// Parse a `ralphus:new-worktree/<branch>?upstream=<upstream>[&text=<fn>({})]`
+/// marker used as text interpolation in review preparation/action fields.
+///
+/// A non-worktree marker returns `Ok(None)`. The `upstream` parameter remains
+/// mandatory so the marker has the same unambiguous branch declaration as a
+/// cell worktree placeholder. `text` defaults to the declared branch itself.
+pub fn parse_worktree_text_ref(
+    marker: &str,
+) -> Result<Option<WorktreeTextRef<'_>>, WorktreeTextRefError<'_>> {
+    let Some(rest) = marker.strip_prefix(WORKTREE_PLACEHOLDER_PREFIX) else {
+        return Ok(None);
+    };
+    let Some((branch, query)) = rest.split_once('?') else {
+        return Err(WorktreeTextRefError::MissingUpstream);
+    };
+    if branch.is_empty() {
+        return Err(WorktreeTextRefError::MissingUpstream);
+    }
+    let mut upstream = None;
+    let mut text_fn = None;
+    for parameter in query.split('&') {
+        let Some((name, value)) = parameter.split_once('=') else {
+            return Err(WorktreeTextRefError::UnknownParameter(parameter));
+        };
+        match name {
+            "upstream" => {
+                if upstream.replace(value).is_some() {
+                    return Err(WorktreeTextRefError::DuplicateParameter("upstream"));
+                }
+                if value.is_empty() {
+                    return Err(WorktreeTextRefError::MissingUpstream);
+                }
+            }
+            "text" => {
+                if text_fn.is_some() {
+                    return Err(WorktreeTextRefError::DuplicateParameter("text"));
+                }
+                text_fn = Some(
+                    parse_text_fn_expression(value)
+                        .map_err(WorktreeTextRefError::InvalidTextQuery)?,
+                );
+            }
+            _ => return Err(WorktreeTextRefError::UnknownParameter(name)),
+        }
+    }
+    let Some(upstream) = upstream else {
+        return Err(WorktreeTextRefError::MissingUpstream);
+    };
+    Ok(Some(WorktreeTextRef {
+        branch,
+        upstream,
+        text_fn,
+    }))
+}
+
 /// Byte offset of the `>>` that closes the `<<` whose body starts at
 /// `body_start`, or `None` when the run is unterminated.
 ///
@@ -568,6 +649,37 @@ pub fn text_placeholders(text: &str) -> Vec<&str> {
         offset = close + 2;
     }
     out
+}
+
+/// Replace selected wrapped text placeholders while preserving every marker
+/// the caller does not recognize. Nested sentinels use the same closing-rule
+/// as [`text_placeholders`].
+pub fn replace_text_placeholders<E>(
+    text: &str,
+    mut replace: impl FnMut(&str) -> Result<Option<String>, E>,
+) -> Result<String, E> {
+    let mut out = String::with_capacity(text.len());
+    let mut offset = 0usize;
+    while let Some(open_rel) = text[offset..].find("<<") {
+        let open = offset + open_rel;
+        out.push_str(&text[offset..open]);
+        let body_start = open + 2;
+        let Some(close) = placeholder_close(text, body_start) else {
+            out.push_str(&text[open..]);
+            return Ok(out);
+        };
+        let body = &text[body_start..close];
+        if let Some(value) = replace(body)? {
+            out.push_str(&value);
+        } else {
+            out.push_str("<<");
+            out.push_str(body);
+            out.push_str(">>");
+        }
+        offset = close + 2;
+    }
+    out.push_str(&text[offset..]);
+    Ok(out)
 }
 
 /// The first worktree placeholder found in `text`, either as the whole string
@@ -886,6 +998,11 @@ pub fn parse_linked_field_query(query: &str) -> Result<TextFn, LinkedFieldQueryE
     let expr = query
         .strip_prefix("text=")
         .ok_or(LinkedFieldQueryError::UnknownParam)?;
+    parse_text_fn_expression(expr)
+}
+
+/// Parse the expression portion of a `text=<function>({})` query.
+pub fn parse_text_fn_expression(expr: &str) -> Result<TextFn, LinkedFieldQueryError<'_>> {
     if expr.is_empty() {
         return Err(LinkedFieldQueryError::EmptyExpression);
     }
@@ -956,6 +1073,36 @@ pub const PROOF_SCOPE_VALUES: &[&str] = &[
 
 /// Every accepted `summary_format` literal for a review change summary.
 pub const SUMMARY_FORMAT_VALUES: &[&str] = &["bullet", "prose"];
+
+/// Every accepted `rebuild_on` entry: the events that tear down and rebuild a
+/// review's prepared build. Also the value a review resolves to when neither
+/// it nor its project sets `rebuild_on` (all three, in this order).
+pub const REBUILD_ON_VALUES: &[&str] = &["rebase", "feedback", "auto_fix"];
+
+/// Check a `rebuild_on` list: every entry must be one of
+/// [`REBUILD_ON_VALUES`] and none may repeat. An empty list is valid (it means
+/// "never rebuild automatically"). The error is a complete sentence naming the
+/// offending entry and the allowed values.
+pub fn check_rebuild_on(values: &[String]) -> Result<(), String> {
+    let allowed = REBUILD_ON_VALUES
+        .iter()
+        .map(|value| format!("\"{value}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    for (index, value) in values.iter().enumerate() {
+        if !REBUILD_ON_VALUES.contains(&value.as_str()) {
+            return Err(format!(
+                "'rebuild_on' entries must be one of {allowed} -- got \"{value}\""
+            ));
+        }
+        if values[..index].contains(value) {
+            return Err(format!(
+                "'rebuild_on' lists \"{value}\" more than once; each of {allowed} may appear at most once"
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// Valid values for `[[task.cell]] mode` / `[[task.proof]]` (and
 /// `[[task.cell.proof]]`) `mode`: how a `command` cell/proof step behaves on
@@ -1367,9 +1514,6 @@ pub struct ReviewDef {
     /// the convention-derived alias.
     #[serde(default)]
     pub match_pr_branch_name: Option<bool>,
-    /// Commands that gate this review before it becomes ready.
-    #[serde(default)]
-    pub checks: Vec<String>,
     /// Rendering format for the generated change summary.
     #[serde(default)]
     pub summary_format: Option<String>,
@@ -1390,24 +1534,11 @@ pub struct ReviewDef {
     /// User-declared test actions shown as labelled buttons in the board UI.
     #[serde(default)]
     pub action: Vec<ReviewActionDef>,
-    /// This review's own declared build steps (RAL-342), run at merge/finalize
-    /// time ahead of the project-level `.ralphus.toml [review] auto_build`
-    /// default. Mutually exclusive with `skip_auto_build`. When multiple
-    /// entries are present, they run in order.
-    ///
-    /// Submitting a task TOML that creates a `[[review]]` must set exactly one
-    /// of `auto_build`, `skip_auto_build`, or rely on a project-level
-    /// `.ralphus.toml [review] auto_build` default covering every project the
-    /// review spans -- the daemon enforces this at submit time (`core`
-    /// validation only checks this table's own shape; see
-    /// [`AutoBuildDef`]).
+    /// Ordered unattended work that makes this review's manual surfaces ready.
+    /// These steps run after the stack is rebuilt and before any manual action
+    /// is advertised as ready.
     #[serde(default)]
-    pub auto_build: Vec<AutoBuildDef>,
-    /// Declares that this review deliberately has no build step. Mutually
-    /// exclusive with `auto_build`; satisfies the submit-time requirement
-    /// that every review say something about how (or whether) it builds.
-    #[serde(default)]
-    pub skip_auto_build: bool,
+    pub prepare: Vec<PreparationStepDef>,
     /// RAL-395: whether this review automatically dispatches its agent to
     /// fix a failing PR/MR CI status, instead of leaving the failure for a
     /// human to notice and action manually. Unset inherits the
@@ -1438,6 +1569,17 @@ pub struct ReviewDef {
     /// block to read it from.
     #[serde(default)]
     pub cache_manual_checks: Option<bool>,
+    /// Which events tear down and rebuild this review's prepared build: any
+    /// of [`REBUILD_ON_VALUES`] (`"rebase"` -- a merge or restack of the
+    /// stack, `"feedback"` -- applied reviewer feedback, `"auto_fix"` -- an
+    /// unattended PR-fix pass). Unset inherits the project-level
+    /// `.ralphus.toml [review] rebuild_on` default, then all three values.
+    /// An empty list never rebuilds automatically; the review is then rebuilt
+    /// only by an explicit rebuild request. The first build of a review
+    /// always runs regardless. Auto-created reviews (Arbiter/Triage) always
+    /// use the project default and never set this directly.
+    #[serde(default)]
+    pub rebuild_on: Option<Vec<String>>,
     /// RAL-395: this review's own override of the prompt template handed to
     /// the resolver agent when `auto_fix_pr_errors` fires. Must contain the
     /// literal `<<prompt>>` placeholder, which is replaced with the
@@ -1466,44 +1608,54 @@ pub struct ReviewDef {
     pub discourage_tests_during_auto_pull_request_fixes: Option<bool>,
 }
 
-/// This review's own declared build step (RAL-342): either a static
-/// `command` (run verbatim), or an agent-invocation shape (`prompt` plus
-/// optionally `system_prompt`/`system_prompt_position`/`agent`/`model`) for
-/// build shapes not knowable up front -- e.g. novel work where "what does
-/// building this even mean" must be figured out by inspecting the worktree.
-/// Exactly one of `command` or `prompt` must be set; the agent-invocation
-/// fields are only meaningful alongside `prompt`. Unlike the old AI-guessed
-/// build tier this replaces (RAL-110), a declared `auto_build` is
-/// user-authored: it must be provided (or explicitly skipped via
-/// [`ReviewDef::skip_auto_build`]) at submit time rather than inferred at
-/// merge time.
+/// One or several ordered shell commands in a preparation group.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum PreparationCommandDef {
+    /// One shell command.
+    One(String),
+    /// Several shell commands which share one environment and fail as a group.
+    Many(Vec<String>),
+}
+
+impl PreparationCommandDef {
+    /// Return this group's commands in declaration order.
+    #[must_use]
+    pub fn commands(&self) -> Vec<String> {
+        match self {
+            Self::One(command) => vec![command.clone()],
+            Self::Many(commands) => commands.clone(),
+        }
+    }
+}
+
+/// One ordered unattended preparation group for a review or manual action.
+/// Exactly one of `command` or `prompt` is set. Command groups can carry a
+/// single string or an ordered string array and may override their environment.
 #[derive(Debug, Clone, Default, Deserialize)]
-pub struct AutoBuildDef {
-    /// Verbatim shell command run directly, no LLM involvement. Mutually
+pub struct PreparationStepDef {
+    /// One shell command or an ordered list of shell commands, mutually
     /// exclusive with `prompt`.
     #[serde(default)]
-    pub command: Option<String>,
-    /// Prompt forwarded to a headless agent call to figure out and perform
-    /// the build. Mutually exclusive with `command`.
+    pub command: Option<PreparationCommandDef>,
+    /// Prompt forwarded to a headless agent, mutually exclusive with `command`.
     #[serde(default)]
     pub prompt: Option<String>,
-    /// Appended system prompt for the agent call (only valid alongside
-    /// `prompt`); see [`ReviewDef`]'s neighbors for the same convention.
+    /// Appended system prompt for an agent preparation group.
     #[serde(default)]
     pub system_prompt: Option<String>,
-    /// Must be [`SYSTEM_PROMPT_POSITION_APPEND`] when set (only valid
-    /// alongside `prompt`).
+    /// Position of `system_prompt` in the agent's system instruction.
     #[serde(default)]
     pub system_prompt_position: Option<String>,
-    /// Backend for the agent call, e.g. `"claude"` (only valid alongside
-    /// `prompt`). Unset falls back to this step's parent [`ReviewDef`]'s agent,
-    /// then the daemon's default resolver agent.
+    /// Agent backend override for a prompt preparation group.
     #[serde(default)]
     pub agent: Option<String>,
-    /// Model the agent call runs (only valid alongside `prompt`). Unset falls
-    /// back to this step's parent [`ReviewDef`]'s model, then the daemon's default.
+    /// Agent model override for a prompt preparation group.
     #[serde(default)]
     pub model: Option<String>,
+    /// Environment overrides applied only while this group prepares.
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
 }
 
 /// A user-declared manual-test action shown as a labelled button in the review UI.
@@ -1523,6 +1675,15 @@ pub struct ReviewActionDef {
     /// Mutually exclusive with `prompt`.
     #[serde(default)]
     pub command: Option<String>,
+    /// What the reviewer should inspect while the action runs.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// A concise statement of what a successful observation looks like.
+    #[serde(default)]
+    pub success: Option<String>,
+    /// Ordered unattended steps specific to this action.
+    #[serde(default)]
+    pub prepare: Vec<PreparationStepDef>,
     /// Optional command run before `command`/the expanded `prompt`, e.g. to stop
     /// a stale process from a previous run. Opt-in at run time via a UI
     /// checkbox (RAL-164) -- coexists with either `prompt` or `command`, no
@@ -1534,6 +1695,36 @@ pub struct ReviewActionDef {
     /// otherwise be hardcoded and collide across concurrent reviews.
     #[serde(default)]
     pub input: Vec<ReviewActionInputDef>,
+    /// Optional shared-network publication for this action. The provider owns
+    /// the absolute store root; `path` is a review-relative namespace.
+    #[serde(default)]
+    pub shared_store: Option<ReviewActionSharedStoreDef>,
+    /// Preparation workspace lifecycle policy and optional teardown commands.
+    #[serde(default)]
+    pub lifecycle: Option<ReviewActionLifecycleDef>,
+}
+
+/// A logical network store and a relative path within the provider-owned root.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReviewActionSharedStoreDef {
+    /// Registered logical store name, resolved by the daemon/provider.
+    pub store: String,
+    /// Relative namespace below the provider's absolute store root.
+    pub path: String,
+}
+
+/// Optional cleanup policy for a prepared action generation.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReviewActionLifecycleDef {
+    /// `reset_before_prepare` (default) or `prepare_managed`.
+    #[serde(default)]
+    pub build_root_policy: Option<String>,
+    /// Commands run before an owned build root is reset.
+    #[serde(default)]
+    pub before_reset_command: Vec<String>,
+    /// Optional maximum hook duration in the existing duration-string format.
+    #[serde(default)]
+    pub timeout: Option<String>,
 }
 
 /// A named, defaulted input referenced by a [`ReviewActionDef`]'s
@@ -2301,99 +2492,6 @@ mod tests {
     }
 
     #[test]
-    fn review_auto_build_command_form_deserializes() {
-        let toml = r#"
-            [[task]]
-            name = "t"
-            [[task.cell]]
-            cwd = "/repo/.wt/feat"
-            prompt = "do work"
-            review = "<<review:backend>>"
-
-            [[review]]
-            id = "backend"
-            [[review.auto_build]]
-            command = "cargo build"
-        "#;
-        let parsed: TaskFile = toml::from_str(toml).expect("should deserialize");
-        let def = parsed.review[0]
-            .auto_build
-            .first()
-            .expect("auto_build should be set");
-        assert_eq!(def.command.as_deref(), Some("cargo build"));
-        assert!(def.prompt.is_none());
-        assert!(!parsed.review[0].skip_auto_build);
-    }
-
-    #[test]
-    fn review_auto_build_agent_form_deserializes() {
-        let toml = r#"
-            [[task]]
-            name = "t"
-            [[task.cell]]
-            cwd = "/repo/.wt/feat"
-            prompt = "do work"
-            review = "<<review:backend>>"
-
-            [[review]]
-            id = "backend"
-            [[review.auto_build]]
-            prompt = "figure out how to build this and do it"
-            system_prompt = "be thorough"
-            system_prompt_position = "append"
-            agent = "claude"
-            model = "claude-opus-4-8"
-        "#;
-        let parsed: TaskFile = toml::from_str(toml).expect("should deserialize");
-        let def = parsed.review[0]
-            .auto_build
-            .first()
-            .expect("auto_build should be set");
-        assert!(def.command.is_none());
-        assert_eq!(
-            def.prompt.as_deref(),
-            Some("figure out how to build this and do it")
-        );
-        assert_eq!(def.system_prompt.as_deref(), Some("be thorough"));
-        assert_eq!(def.system_prompt_position.as_deref(), Some("append"));
-        assert_eq!(def.agent.as_deref(), Some("claude"));
-        assert_eq!(def.model.as_deref(), Some("claude-opus-4-8"));
-    }
-
-    #[test]
-    fn review_skip_auto_build_defaults_to_false() {
-        let toml = r#"
-            [[task]]
-            name = "t"
-            [[task.cell]]
-            cwd = "/repo/.wt/feat"
-            prompt = "do work"
-            review = "<<review:backend>>"
-
-            [[review]]
-            id = "backend"
-        "#;
-        let parsed: TaskFile = toml::from_str(toml).expect("should deserialize");
-        assert!(!parsed.review[0].skip_auto_build);
-        assert!(parsed.review[0].auto_build.is_empty());
-
-        let toml_skip = r#"
-            [[task]]
-            name = "t"
-            [[task.cell]]
-            cwd = "/repo/.wt/feat"
-            prompt = "do work"
-            review = "<<review:backend>>"
-
-            [[review]]
-            id = "backend"
-            skip_auto_build = true
-        "#;
-        let parsed_skip: TaskFile = toml::from_str(toml_skip).expect("should deserialize");
-        assert!(parsed_skip.review[0].skip_auto_build);
-    }
-
-    #[test]
     fn review_action_cleanup_command_and_input_deserialize() {
         let toml = r#"
             [[task]]
@@ -2811,6 +2909,41 @@ mod tests {
         );
         assert_eq!(text_placeholders("<<one>><<two>>"), vec!["one", "two"]);
         assert!(text_placeholders("<<unterminated").is_empty());
+    }
+
+    #[test]
+    fn worktree_text_ref_supports_branch_basename_interpolation() {
+        let reference = parse_worktree_text_ref(
+            "ralphus:new-worktree/RAL-999-add_widget?upstream=main&text=basename({})",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(reference.branch, "RAL-999-add_widget");
+        assert_eq!(reference.upstream, "main");
+        assert_eq!(
+            reference.text_fn.unwrap().apply(reference.branch),
+            "RAL-999-add_widget"
+        );
+        assert!(matches!(
+            parse_worktree_text_ref("ralphus:new-worktree/a?upstream=main&bad=value"),
+            Err(WorktreeTextRefError::UnknownParameter("bad"))
+        ));
+    }
+
+    #[test]
+    fn replace_text_placeholders_preserves_unknown_markers() {
+        let replaced = replace_text_placeholders(
+            "a <<ralphus:new-worktree/feature?upstream=main>> b <<other>>",
+            |body| {
+                Ok::<_, ()>(
+                    parse_worktree_text_ref(body)
+                        .unwrap()
+                        .map(|reference| reference.branch.to_string()),
+                )
+            },
+        )
+        .unwrap();
+        assert_eq!(replaced, "a feature b <<other>>");
     }
 
     #[test]

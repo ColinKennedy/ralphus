@@ -28,6 +28,8 @@ pub enum NotifiableEventKind {
     SquadAttributesChanged,
     ReviewSettingsChanged,
     ReviewStatusChanged,
+    ReviewManualChecksReady,
+    ReviewManualChecksFailed,
     SquadFailed,
     ReviewFailed,
     /// RAL-400 Phase 3: a squad's in-flight cell was halted because its
@@ -65,6 +67,8 @@ impl NotifiableEventKind {
             Self::SquadAttributesChanged => "squad_attributes_changed",
             Self::ReviewSettingsChanged => "review_settings_changed",
             Self::ReviewStatusChanged => "review_status_changed",
+            Self::ReviewManualChecksReady => "review_manual_checks_ready",
+            Self::ReviewManualChecksFailed => "review_manual_checks_failed",
             Self::SquadFailed => "squad_failed",
             Self::ReviewFailed => "review_failed",
             Self::SquadWaypointHalted => "squad_waypoint_halted",
@@ -156,6 +160,7 @@ impl Store {
                     | NotifiableEventKind::ReviewFailed
                     | NotifiableEventKind::SquadWaypointHalted
                     | NotifiableEventKind::WaypointBlocked
+                    | NotifiableEventKind::ReviewManualChecksFailed
             ),
             "notify_watchers_with_remediation is for failure/blocked events only; use notify_watchers_with_context for ordinary status changes"
         );

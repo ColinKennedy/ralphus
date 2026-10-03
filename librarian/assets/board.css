@@ -839,7 +839,7 @@
       }
       .filters-more:hover { color: var(--accent); }
 
-      /* ---- Command lists (check gates, and the shape manual checks share) ---- */
+      /* ---- Command lists for prepared manual checks ---- */
       /* A command is something you read in full and whose outcome you want to
          see, so it gets a row rather than a wrapping chip. Long commands elide
          rather than reflowing the section; the row's ⋯ shows the whole thing. */
@@ -883,9 +883,7 @@
       .rg-head.rg-run { display: flex; align-items: center; gap: 10px; }
       .rg-head.rg-run .rg-note { flex: 1; min-width: 0; }
       .rg-runbtn { flex: none; padding: 4px 12px; font-size: 12px; font-weight: 600; }
-      /* Check gates have no manual trigger — the daemon runs them after each
-         merge commit — so their slot carries when-it-runs rather than a button
-         that would do nothing. Same position, same rhythm, no false affordance. */
+      /* Non-interactive command rows use this slot for timing information. */
       .rg-when {
         flex: none; font-size: 10.5px; text-transform: uppercase; letter-spacing: .5px;
         font-weight: 700; color: var(--cancelled); background: var(--bg);

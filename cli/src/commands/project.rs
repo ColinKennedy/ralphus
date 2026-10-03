@@ -61,6 +61,9 @@ pub enum ProjectCommand {
 /// `ralphus review settings` opt-out flag. Applied to FUTURE reviews only
 /// (an Arbiter-created review with no `[[review]]` block, or any review
 /// whose own block leaves a field unset); existing reviews are unaffected.
+// `Set` carries one optional field per review setting and is built once per
+// invocation, so the size gap to the small variants costs nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum ProjectReviewSettingsCommand {
     Help,
@@ -90,6 +93,11 @@ pub enum ProjectReviewSettingsCommand {
         discourage_tests_during_auto_pull_request_fixes: Option<bool>,
         auto_cancel_outdated_pr_pipelines: Option<bool>,
         cache_manual_checks: Option<bool>,
+        /// The project's default list of events that rebuild a review's
+        /// prepared build. Outer `None` leaves it alone, `Some(None)` clears
+        /// it back to inherit, `Some(Some(list))` sets it (an empty list never
+        /// rebuilds automatically).
+        rebuild_on: Option<Option<Vec<String>>>,
     },
     UsageError(String),
 }
@@ -360,6 +368,7 @@ fn parse_review_settings_set(
         crate::commands::review::take_tri_bool(scanner, "--auto-cancel-outdated-pr-pipelines");
     let cache_manual_checks =
         crate::commands::review::take_tri_bool(scanner, "--cache-manual-checks");
+    let rebuild_on = crate::commands::review::take_rebuild_on(scanner)?;
     if clear_maximum_budget_usd && maximum_budget_usd_raw.is_some() {
         return Err(UsageError(
             "review-settings set: --clear-maximum-budget-usd cannot be combined with \
@@ -419,6 +428,7 @@ fn parse_review_settings_set(
         discourage_tests_during_auto_pull_request_fixes,
         auto_cancel_outdated_pr_pipelines,
         cache_manual_checks,
+        rebuild_on,
     })
 }
 
@@ -570,6 +580,7 @@ fn dispatch_review_settings(cmd: ProjectReviewSettingsCommand, opts: &GlobalOpts
             discourage_tests_during_auto_pull_request_fixes,
             auto_cancel_outdated_pr_pipelines,
             cache_manual_checks,
+            rebuild_on,
         } => {
             let patch = crate::client::ProjectReviewSettingsPatch {
                 default_resolver_agent: resolver_agent.as_deref(),
@@ -593,6 +604,7 @@ fn dispatch_review_settings(cmd: ProjectReviewSettingsCommand, opts: &GlobalOpts
                 discourage_tests_during_auto_pull_request_fixes,
                 auto_cancel_outdated_pr_pipelines,
                 cache_manual_checks,
+                rebuild_on,
             };
             match client.set_project_review_settings(&name, &patch) {
                 Ok(payload) => {
@@ -678,6 +690,25 @@ fn render_review_settings(payload: &Value) {
         "auto_cancel_outdated_pr_pipelines",
     );
     row_bool("cache manual checks:", "cache_manual_checks");
+    let list = |value: &serde_json::Value| -> Option<String> {
+        value.as_array().map(|entries| {
+            if entries.is_empty() {
+                "(none)".to_string()
+            } else {
+                entries
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            }
+        })
+    };
+    println!(
+        "  {:<26} {:<24} (effective: {})",
+        "rebuild on:",
+        list(&settings["rebuild_on"]).unwrap_or_else(|| "(inherited)".to_string()),
+        list(&effective["rebuild_on"]).unwrap_or_else(|| "(all)".to_string())
+    );
 }
 
 #[must_use]
@@ -1383,6 +1414,45 @@ mod tests {
                 assert_eq!(auto_submit_pr_stack, Some(false));
             }
             other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    fn project_rebuild_on_of(extra: &[&str]) -> ProjectCommand {
+        let mut args = vec!["review-settings", "set", "proj"];
+        args.extend_from_slice(extra);
+        parse(&v(&args))
+    }
+
+    #[test]
+    fn parses_review_settings_set_rebuild_on_csv_none_and_inherit() {
+        let rebuild_on = |extra: &[&str]| match project_rebuild_on_of(extra) {
+            ProjectCommand::ReviewSettings(ProjectReviewSettingsCommand::Set {
+                rebuild_on,
+                ..
+            }) => rebuild_on,
+            other => panic!("unexpected: {other:?}"),
+        };
+        assert_eq!(rebuild_on(&[]), None, "absent leaves it alone");
+        assert_eq!(
+            rebuild_on(&["--rebuild-on", "rebase,auto_fix"]),
+            Some(Some(vec!["rebase".to_string(), "auto_fix".to_string()]))
+        );
+        assert_eq!(
+            rebuild_on(&["--rebuild-on", "none"]),
+            Some(Some(Vec::new()))
+        );
+        assert_eq!(rebuild_on(&["--rebuild-on", "inherit"]), Some(None));
+    }
+
+    #[test]
+    fn review_settings_set_rejects_an_invalid_rebuild_on() {
+        for bad in ["nightly", "feedback,feedback"] {
+            match project_rebuild_on_of(&["--rebuild-on", bad]) {
+                ProjectCommand::ReviewSettings(ProjectReviewSettingsCommand::UsageError(
+                    message,
+                )) => assert!(message.contains("--rebuild-on"), "{bad}: {message}"),
+                other => panic!("{bad}: expected a usage error, got {other:?}"),
+            }
         }
     }
 

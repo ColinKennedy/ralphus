@@ -86,15 +86,6 @@ impl ValidationReport {
             line,
         });
     }
-
-    fn warning(&mut self, path: &str, kind: ErrorKind, msg: impl Into<String>, line: Option<u32>) {
-        self.warnings.push(ValidationError {
-            path: path.to_string(),
-            kind,
-            message: msg.into(),
-            line,
-        });
-    }
 }
 
 /// Shared validation context: the raw source, the line index, and the report
@@ -109,10 +100,6 @@ struct Ctx<'a> {
 impl Ctx<'_> {
     fn error(&mut self, path: &str, kind: ErrorKind, msg: impl Into<String>, line: Option<u32>) {
         self.report.error(path, kind, msg, line);
-    }
-
-    fn warning(&mut self, path: &str, kind: ErrorKind, msg: impl Into<String>, line: Option<u32>) {
-        self.report.warning(path, kind, msg, line);
     }
 
     fn key_line(&self, header: Option<u32>, key: &str) -> Option<u32> {
@@ -277,6 +264,7 @@ pub const REVIEW_KEYS: &[&str] = &[
     "machine",
     "upstream",
     "action",
+    "prepare",
     "maximum_budget_usd",
     "proof_scope",
     "auto_submit_pr_stack",
@@ -289,15 +277,13 @@ pub const REVIEW_KEYS: &[&str] = &[
     "match_pr_branch_name",
     "separate_pr_branch",
     "dual_root_pr",
-    "auto_build",
-    "skip_auto_build",
     "auto_fix_pr_errors",
     "auto_fix_prompt_template",
     "discourage_tests_during_auto_pull_request_fixes",
     "auto_cancel_outdated_pr_pipelines",
-    "checks",
     "summary_format",
     "cache_manual_checks",
+    "rebuild_on",
 ];
 /// The full set of top-level `[[waypoint]]` keys (RAL-400).
 pub const WAYPOINT_KEYS: &[&str] = &[
@@ -324,7 +310,21 @@ pub fn auto_fix_template_has_placeholder(template: &str) -> bool {
     template.contains(AUTO_FIX_PROMPT_PLACEHOLDER)
 }
 
-const REVIEW_ACTION_KEYS: &[&str] = &["label", "prompt", "command", "cleanup_command", "input"];
+const REVIEW_ACTION_KEYS: &[&str] = &[
+    "label",
+    "prompt",
+    "command",
+    "description",
+    "success",
+    "prepare",
+    "cleanup_command",
+    "input",
+    "shared_store",
+    "lifecycle",
+];
+const REVIEW_ACTION_SHARED_STORE_KEYS: &[&str] = &["store", "path"];
+const REVIEW_ACTION_LIFECYCLE_KEYS: &[&str] =
+    &["build_root_policy", "before_reset_command", "timeout"];
 const REVIEW_ACTION_INPUT_KEYS: &[&str] = &["name", "message", "default"];
 const AUTO_BUILD_KEYS: &[&str] = &[
     "command",
@@ -333,6 +333,15 @@ const AUTO_BUILD_KEYS: &[&str] = &[
     "system_prompt_position",
     "agent",
     "model",
+];
+const PREPARATION_KEYS: &[&str] = &[
+    "command",
+    "prompt",
+    "system_prompt",
+    "system_prompt_position",
+    "agent",
+    "model",
+    "environment",
 ];
 const PROOF_KEYS: &[&str] = &[
     "id",
@@ -1961,7 +1970,6 @@ fn validate_review_blocks(value: Option<&toml::Value>, ctx: &mut Ctx) {
                 ctx.key_line(header, "skip_auto_clean"),
             );
         }
-        check_type(ctx, table, "checks", Ty::StrArray, &rpath, header);
         check_type(ctx, table, "summary_format", Ty::Str, &rpath, header);
         if let Some(format) = table.get("summary_format").and_then(toml::Value::as_str) {
             if !crate::schema::SUMMARY_FORMAT_VALUES.contains(&format) {
@@ -1980,8 +1988,8 @@ fn validate_review_blocks(value: Option<&toml::Value>, ctx: &mut Ctx) {
                 );
             }
         }
-        check_type(ctx, table, "skip_auto_build", Ty::Bool, &rpath, header);
         validate_auto_build_table(table, &rpath, ctx, header);
+        validate_preparation_array(table.get("prepare"), &format!("{rpath}.prepare"), ctx);
         check_type(ctx, table, "auto_fix_pr_errors", Ty::Bool, &rpath, header);
         check_type(
             ctx,
@@ -1992,6 +2000,7 @@ fn validate_review_blocks(value: Option<&toml::Value>, ctx: &mut Ctx) {
             header,
         );
         check_type(ctx, table, "cache_manual_checks", Ty::Bool, &rpath, header);
+        validate_rebuild_on(table, &rpath, ctx, header);
         check_type(
             ctx,
             table,
@@ -2235,6 +2244,39 @@ fn validate_waypoint_blocks(root: &toml::Table, value: Option<&toml::Value>, ctx
 /// instead, so `ralphus validate`/`submit` can flag the common case (no
 /// project-level default configured either) without false-positiving on a
 /// submission that a project default genuinely covers.
+fn validate_rebuild_on(table: &toml::Table, rpath: &str, ctx: &mut Ctx, header: Option<u32>) {
+    let Some(value) = table.get("rebuild_on") else {
+        return;
+    };
+    let path = format!("{rpath}.rebuild_on");
+    let line = ctx.key_line(header, "rebuild_on");
+    let Some(array) = value.as_array() else {
+        ctx.error(
+            &path,
+            ErrorKind::WrongType,
+            "'rebuild_on' must be an array of strings",
+            line,
+        );
+        return;
+    };
+    let mut entries = Vec::with_capacity(array.len());
+    for item in array {
+        let Some(text) = item.as_str() else {
+            ctx.error(
+                &path,
+                ErrorKind::WrongType,
+                "'rebuild_on' must be an array of strings",
+                line,
+            );
+            return;
+        };
+        entries.push(text.to_string());
+    }
+    if let Err(message) = crate::schema::check_rebuild_on(&entries) {
+        ctx.error(&path, ErrorKind::InvalidValue, message, line);
+    }
+}
+
 fn validate_auto_build_table(table: &toml::Table, rpath: &str, ctx: &mut Ctx, header: Option<u32>) {
     let skip_auto_build = table
         .get("skip_auto_build")
@@ -2242,17 +2284,6 @@ fn validate_auto_build_table(table: &toml::Table, rpath: &str, ctx: &mut Ctx, he
         .unwrap_or(false);
 
     let Some(value) = table.get("auto_build") else {
-        if !skip_auto_build {
-            ctx.warning(
-                rpath,
-                ErrorKind::MissingRequired,
-                "neither [[review.auto_build]] nor skip_auto_build = true is set -- the \
-                 daemon will reject this submission at materialization time unless every \
-                 project involved has a project-level `.ralphus.toml [review] auto_build` \
-                 default configured",
-                header,
-            );
-        }
         return;
     };
     let Some(arr) = value.as_array() else {
@@ -2366,6 +2397,235 @@ fn validate_auto_build_table(table: &toml::Table, rpath: &str, ctx: &mut Ctx, he
     }
 }
 
+/// Validate ordered preparation steps. The entry shape intentionally matches
+/// the legacy `auto_build` declaration so old declarations can be translated
+/// without changing their command/agent semantics.
+fn validate_preparation_array(value: Option<&toml::Value>, path: &str, ctx: &mut Ctx) {
+    let Some(value) = value else { return };
+    let Some(entries) = value.as_array() else {
+        ctx.error(
+            path,
+            ErrorKind::WrongType,
+            "preparation must be an array of tables",
+            None,
+        );
+        return;
+    };
+    for (idx, entry) in entries.iter().enumerate() {
+        let Some(step) = entry.as_table() else {
+            ctx.error(
+                &format!("{path}[{idx}]"),
+                ErrorKind::WrongType,
+                "preparation step must be a table",
+                None,
+            );
+            continue;
+        };
+        validate_preparation_step(step, &format!("{path}[{idx}]"), ctx);
+    }
+}
+
+fn validate_preparation_step(step: &toml::Table, path: &str, ctx: &mut Ctx) {
+    unknown_keys(ctx, step, PREPARATION_KEYS, path, None);
+    let command = step.contains_key("command");
+    let prompt = step.contains_key("prompt");
+    if command == prompt {
+        ctx.error(
+            path,
+            if command {
+                ErrorKind::ConflictingKeys
+            } else {
+                ErrorKind::MissingRequired
+            },
+            "preparation step requires exactly one of 'command' or 'prompt'",
+            None,
+        );
+    }
+    check_preparation_command(ctx, step, path);
+    check_type(ctx, step, "prompt", Ty::Str, path, None);
+    check_type(ctx, step, "system_prompt", Ty::Str, path, None);
+    check_type(ctx, step, "system_prompt_position", Ty::Str, path, None);
+    check_type(ctx, step, "agent", Ty::Str, path, None);
+    check_type(ctx, step, "model", Ty::Str, path, None);
+    check_preparation_environment(ctx, step, path);
+    if command {
+        for key in ["system_prompt", "system_prompt_position", "agent", "model"] {
+            if step.contains_key(key) {
+                ctx.error(
+                    &format!("{path}.{key}"),
+                    ErrorKind::InvalidValue,
+                    format!("'{key}' is only valid with a prompt preparation step"),
+                    None,
+                );
+            }
+        }
+    }
+    if let Some(position) = step
+        .get("system_prompt_position")
+        .and_then(toml::Value::as_str)
+    {
+        if position != crate::schema::SYSTEM_PROMPT_POSITION_APPEND {
+            ctx.error(
+                &format!("{path}.system_prompt_position"),
+                ErrorKind::InvalidValue,
+                "'system_prompt_position' must be \"append\"",
+                None,
+            );
+        }
+    }
+}
+
+/// Validate a preparation command group: one non-empty string or a non-empty
+/// array of non-empty strings.
+fn check_preparation_command(ctx: &mut Ctx, step: &toml::Table, path: &str) {
+    let Some(value) = step.get("command") else {
+        return;
+    };
+    match value {
+        toml::Value::String(command) => {
+            if command.trim().is_empty() {
+                ctx.error(
+                    &format!("{path}.command"),
+                    ErrorKind::InvalidValue,
+                    "preparation command must not be empty",
+                    None,
+                );
+            }
+            check_worktree_text_placeholders(ctx, &format!("{path}.command"), command);
+        }
+        toml::Value::Array(commands) => {
+            if commands.is_empty() {
+                ctx.error(
+                    &format!("{path}.command"),
+                    ErrorKind::InvalidValue,
+                    "preparation command array must not be empty",
+                    None,
+                );
+            }
+            for (index, command) in commands.iter().enumerate() {
+                let command_path = format!("{path}.command[{index}]");
+                let Some(command) = command.as_str() else {
+                    ctx.error(
+                        &command_path,
+                        ErrorKind::WrongType,
+                        "every preparation command must be a string",
+                        None,
+                    );
+                    continue;
+                };
+                if command.trim().is_empty() {
+                    ctx.error(
+                        &command_path,
+                        ErrorKind::InvalidValue,
+                        "preparation command must not be empty",
+                        None,
+                    );
+                }
+                check_worktree_text_placeholders(ctx, &command_path, command);
+            }
+        }
+        _ => ctx.error(
+            &format!("{path}.command"),
+            ErrorKind::WrongType,
+            "preparation command must be a string or an array of strings",
+            None,
+        ),
+    }
+}
+
+/// Validate preparation-group environment overrides. They have the same safe
+/// key and string-value contract as other execution environments.
+fn check_preparation_environment(ctx: &mut Ctx, step: &toml::Table, path: &str) {
+    let Some(value) = step.get("environment") else {
+        return;
+    };
+    let Some(environment) = value.as_table() else {
+        ctx.error(
+            &format!("{path}.environment"),
+            ErrorKind::WrongType,
+            "preparation environment must be a table of string values",
+            None,
+        );
+        return;
+    };
+    for (key, value) in environment {
+        let value_path = format!("{path}.environment.{key}");
+        if !is_valid_env_key(key) {
+            ctx.error(
+                &value_path,
+                ErrorKind::InvalidValue,
+                format!(
+                    "environment key \"{key}\" is not a valid identifier \
+                     (must match [A-Za-z_][A-Za-z0-9_]*)"
+                ),
+                None,
+            );
+        }
+        let Some(value) = value.as_str() else {
+            ctx.error(
+                &value_path,
+                ErrorKind::WrongType,
+                "preparation environment values must be strings",
+                None,
+            );
+            continue;
+        };
+        check_worktree_text_placeholders(ctx, &value_path, value);
+    }
+}
+
+/// Reject malformed worktree text placeholders in review preparation/action
+/// fields before a build can reach a shell with an unintended literal path.
+fn check_worktree_text_placeholders(ctx: &mut Ctx, path: &str, raw: &str) {
+    for body in crate::schema::text_placeholders(raw) {
+        let parsed = crate::schema::parse_worktree_text_ref(body);
+        let Err(error) = parsed else { continue };
+        use crate::schema::{LinkedFieldQueryError as QueryError, WorktreeTextRefError};
+        let detail = match error {
+            WorktreeTextRefError::MissingUpstream => {
+                "worktree text placeholders require '?upstream=<upstream>'"
+            }
+            WorktreeTextRefError::DuplicateParameter(name) => {
+                return ctx.error(
+                    path,
+                    ErrorKind::InvalidValue,
+                    format!("worktree text placeholder repeats query parameter \"{name}\""),
+                    None,
+                );
+            }
+            WorktreeTextRefError::UnknownParameter(name) => {
+                return ctx.error(
+                    path,
+                    ErrorKind::InvalidValue,
+                    format!(
+                        "worktree text placeholder has unknown query parameter \"{name}\"; \
+                         use 'upstream' and optional 'text=basename({{}})'"
+                    ),
+                    None,
+                );
+            }
+            WorktreeTextRefError::InvalidTextQuery(QueryError::EmptyExpression) => {
+                "worktree text placeholder has an empty text transform"
+            }
+            WorktreeTextRefError::InvalidTextQuery(QueryError::MalformedExpression) => {
+                "worktree text transform must be '<function>({})', e.g. 'basename({})'"
+            }
+            WorktreeTextRefError::InvalidTextQuery(QueryError::UnknownFunction(name)) => {
+                return ctx.error(
+                    path,
+                    ErrorKind::InvalidValue,
+                    format!("worktree text placeholder has unknown text function \"{name}\""),
+                    None,
+                );
+            }
+            WorktreeTextRefError::InvalidTextQuery(QueryError::UnknownParam) => {
+                "worktree text transform is invalid"
+            }
+        };
+        ctx.error(path, ErrorKind::InvalidValue, detail, None);
+    }
+}
+
 /// Validate `[[review.action]]` entries. Each entry must have `label` plus exactly
 /// one of `prompt` or `command`.
 fn validate_review_action_array(value: Option<&toml::Value>, path: &str, ctx: &mut Ctx) {
@@ -2435,9 +2695,143 @@ fn validate_review_action_array(value: Option<&toml::Value>, path: &str, ctx: &m
         // `cleanup_command` is optional and independent of the prompt/command
         // XOR above -- it coexists with either.
         check_type(ctx, table, "cleanup_command", Ty::Str, &apath, None);
+        check_type(ctx, table, "description", Ty::Str, &apath, None);
+        check_type(ctx, table, "success", Ty::Str, &apath, None);
+        for key in ["command", "cleanup_command"] {
+            if let Some(value) = table.get(key).and_then(toml::Value::as_str) {
+                check_worktree_text_placeholders(ctx, &format!("{apath}.{key}"), value);
+            }
+        }
+        validate_preparation_array(table.get("prepare"), &format!("{apath}.prepare"), ctx);
 
         validate_review_action_input_array(table.get("input"), &format!("{apath}.input"), ctx);
+        validate_review_action_shared_store(
+            table.get("shared_store"),
+            &format!("{apath}.shared_store"),
+            ctx,
+        );
+        validate_review_action_lifecycle(
+            table.get("lifecycle"),
+            &format!("{apath}.lifecycle"),
+            ctx,
+        );
     }
+}
+
+fn validate_review_action_shared_store(value: Option<&toml::Value>, path: &str, ctx: &mut Ctx) {
+    let Some(value) = value else { return };
+    let Some(table) = value.as_table() else {
+        ctx.error(
+            path,
+            ErrorKind::WrongType,
+            "shared_store must be a table",
+            None,
+        );
+        return;
+    };
+    unknown_keys(ctx, table, REVIEW_ACTION_SHARED_STORE_KEYS, path, None);
+    for key in ["store", "path"] {
+        check_type(ctx, table, key, Ty::Str, path, None);
+        if table.get(key).is_none() {
+            ctx.error(
+                path,
+                ErrorKind::MissingRequired,
+                format!("shared_store requires '{key}'"),
+                None,
+            );
+        }
+    }
+    if let Some(path_value) = table.get("path").and_then(toml::Value::as_str) {
+        check_worktree_text_placeholders(ctx, &format!("{path}.path"), path_value);
+        let path_for_safety = crate::schema::replace_text_placeholders(path_value, |_| {
+            Ok::<_, ()>(Some("worktree-placeholder".to_string()))
+        })
+        .unwrap_or_else(|_| path_value.to_string());
+        if !safe_relative_artifact_path(&path_for_safety) {
+            ctx.error(
+                &format!("{path}.path"),
+                ErrorKind::InvalidValue,
+                "shared_store path must be a non-empty relative path without traversal",
+                None,
+            );
+        }
+    }
+}
+
+fn validate_review_action_lifecycle(value: Option<&toml::Value>, path: &str, ctx: &mut Ctx) {
+    let Some(value) = value else { return };
+    let Some(table) = value.as_table() else {
+        ctx.error(
+            path,
+            ErrorKind::WrongType,
+            "lifecycle must be a table",
+            None,
+        );
+        return;
+    };
+    unknown_keys(ctx, table, REVIEW_ACTION_LIFECYCLE_KEYS, path, None);
+    check_type(ctx, table, "build_root_policy", Ty::Str, path, None);
+    check_type(ctx, table, "timeout", Ty::Str, path, None);
+    if let Some(policy) = table.get("build_root_policy").and_then(toml::Value::as_str) {
+        if !matches!(policy, "reset_before_prepare" | "prepare_managed") {
+            ctx.error(
+                &format!("{path}.build_root_policy"),
+                ErrorKind::InvalidValue,
+                "build_root_policy must be \"reset_before_prepare\" or \"prepare_managed\"",
+                None,
+            );
+        }
+    }
+    if let Some(timeout) = table.get("timeout").and_then(toml::Value::as_str) {
+        if !valid_lifecycle_timeout(timeout) {
+            ctx.error(
+                &format!("{path}.timeout"),
+                ErrorKind::InvalidValue,
+                "timeout must be a positive whole number followed by s, m, or h",
+                None,
+            );
+        }
+    }
+    if let Some(commands) = table.get("before_reset_command") {
+        let Some(commands) = commands.as_array() else {
+            ctx.error(
+                &format!("{path}.before_reset_command"),
+                ErrorKind::WrongType,
+                "before_reset_command must be an array of strings",
+                None,
+            );
+            return;
+        };
+        for (index, command) in commands.iter().enumerate() {
+            if !command.is_str() {
+                ctx.error(
+                    &format!("{path}.before_reset_command[{index}]"),
+                    ErrorKind::WrongType,
+                    "before_reset_command entries must be strings",
+                    None,
+                );
+            }
+        }
+    }
+}
+
+fn valid_lifecycle_timeout(value: &str) -> bool {
+    let value = value.trim();
+    if value.len() < 2 {
+        return false;
+    }
+    let (number, unit) = value.split_at(value.len() - 1);
+    matches!(unit, "s" | "m" | "h") && number.parse::<u64>().is_ok_and(|n| n > 0)
+}
+
+fn safe_relative_artifact_path(value: &str) -> bool {
+    let normalized = value.replace('\\', "/");
+    !normalized.is_empty()
+        && !normalized.starts_with('/')
+        && !normalized.contains(':')
+        && normalized
+            .split('/')
+            .all(|component| !matches!(component, "" | "." | ".."))
 }
 
 /// Validate `[[review.action.input]]` entries. Each entry must have `name`
@@ -3789,6 +4183,88 @@ prompt = "gate on review"
             "{:?}",
             r.errors
         );
+    }
+
+    // ── [[review]] rebuild_on ──
+
+    fn rebuild_on_src(value: &str) -> String {
+        format!(
+            "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nrebuild_on={value}\n"
+        )
+    }
+
+    #[test]
+    fn review_rebuild_on_accepts_every_subset_including_empty() {
+        for value in [
+            "[]",
+            "[\"rebase\"]",
+            "[\"feedback\"]",
+            "[\"auto_fix\"]",
+            "[\"rebase\", \"feedback\", \"auto_fix\"]",
+            "[\"auto_fix\", \"rebase\"]",
+        ] {
+            let r = validate_toml(&rebuild_on_src(value));
+            assert!(r.is_ok(), "{value}: {:?}", r.errors);
+        }
+    }
+
+    #[test]
+    fn review_rebuild_on_rejects_unknown_value_and_lists_the_allowed_ones() {
+        let r = validate_toml(&rebuild_on_src("[\"rebase\", \"nightly\"]"));
+        let error = r
+            .errors
+            .iter()
+            .find(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("rebuild_on"))
+            .unwrap_or_else(|| panic!("{:?}", r.errors));
+        assert!(error.message.contains("\"nightly\""), "{}", error.message);
+        for allowed in ["rebase", "feedback", "auto_fix"] {
+            assert!(error.message.contains(allowed), "{}", error.message);
+        }
+    }
+
+    #[test]
+    fn review_rebuild_on_rejects_duplicates() {
+        let r = validate_toml(&rebuild_on_src("[\"feedback\", \"rebase\", \"feedback\"]"));
+        assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::InvalidValue
+                && e.message.contains("more than once")
+                && e.message.contains("\"feedback\"")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn review_rebuild_on_rejects_non_array_and_non_string_entries() {
+        for value in [
+            "\"rebase\"",
+            "true",
+            "[1]",
+            "[\"rebase\", 2]",
+            "[[\"rebase\"]]",
+        ] {
+            let r = validate_toml(&rebuild_on_src(value));
+            assert!(
+                r.errors
+                    .iter()
+                    .any(|e| e.kind == ErrorKind::WrongType && e.message.contains("rebuild_on")),
+                "{value}: {:?}",
+                r.errors
+            );
+        }
+    }
+
+    #[test]
+    fn check_rebuild_on_reports_the_first_problem() {
+        assert!(check_rebuild_on_strs(&[]).is_ok());
+        assert!(check_rebuild_on_strs(&["rebase", "feedback", "auto_fix"]).is_ok());
+        assert!(check_rebuild_on_strs(&["Rebase"]).is_err());
+        assert!(check_rebuild_on_strs(&["rebase", "rebase"]).is_err());
+    }
+
+    fn check_rebuild_on_strs(values: &[&str]) -> Result<(), String> {
+        let owned: Vec<String> = values.iter().map(|value| (*value).to_string()).collect();
+        crate::schema::check_rebuild_on(&owned)
     }
 
     #[test]
@@ -5284,32 +5760,230 @@ project = "ralphus"
     }
 
     #[test]
-    fn review_auto_build_command_form_is_valid() {
+    fn review_auto_build_command_form_is_now_unknown() {
         let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\n[[review.auto_build]]\ncommand=\"cargo build\"\n";
         assert!(
-            validate_toml(src).is_ok(),
-            "{:?}",
-            validate_toml(src).errors
+            validate_toml(src)
+                .errors
+                .iter()
+                .any(|error| error.kind == ErrorKind::UnknownKey)
         );
     }
 
     #[test]
-    fn review_auto_build_agent_form_is_valid() {
+    fn review_auto_build_agent_form_is_now_unknown() {
         let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\n[[review.auto_build]]\nprompt=\"build it\"\nsystem_prompt=\"be terse\"\nsystem_prompt_position=\"append\"\nagent=\"claude-code\"\nmodel=\"sonnet\"\n";
         assert!(
-            validate_toml(src).is_ok(),
-            "{:?}",
-            validate_toml(src).errors
+            validate_toml(src)
+                .errors
+                .iter()
+                .any(|error| error.kind == ErrorKind::UnknownKey)
         );
     }
 
     #[test]
-    fn review_skip_auto_build_alone_is_valid() {
+    fn review_skip_auto_build_is_now_unknown() {
         let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nskip_auto_build=true\n";
         assert!(
-            validate_toml(src).is_ok(),
+            validate_toml(src)
+                .errors
+                .iter()
+                .any(|error| error.kind == ErrorKind::UnknownKey)
+        );
+    }
+
+    #[test]
+    fn review_action_copy_artifact_is_now_unknown() {
+        let src = r#"
+[[task]]
+name = "t"
+[[task.cell]]
+cwd = "/r"
+prompt = "p"
+review = "<<review:r>>"
+[[review]]
+id = "r"
+[[review.prepare]]
+command = "cargo build"
+[[review.action]]
+label = "Run build"
+command = "staged/app"
+description = "Exercise the prepared binary"
+success = "It prints PASS"
+[[review.action.artifact]]
+source = "target/debug/app"
+destination = "staged/app"
+placement = "copy"
+executable = true
+target_os = "windows"
+target_arch = "x86_64"
+"#;
+        let report = validate_toml(src);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.kind == ErrorKind::UnknownKey),
             "{:?}",
-            validate_toml(src).errors
+            report.errors
+        );
+    }
+
+    #[test]
+    fn review_action_preparation_command_group_environment_and_worktree_text_are_valid() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Run\"\ncommand=\"/share/<<ralphus:new-worktree/RAL-999-add_widget?upstream=main&text=basename({})>>/demo\"\n[[review.action.prepare]]\ncommand=[\"cmake -S . -B build\",\"cmake --build build\"]\nenvironment={ BUILD_ROOT=\"/share/<<ralphus:new-worktree/RAL-999-add_widget?upstream=main&text=basename({})>>\" }\n";
+        let result = validate_toml(src);
+        assert!(result.is_ok(), "{:?}", result.errors);
+    }
+
+    #[test]
+    fn review_action_shared_store_and_lifecycle_are_valid() {
+        let src = r#"
+[[task]]
+name = "t"
+[[task.cell]]
+cwd = "/r"
+prompt = "p"
+review = "<<review:r>>"
+[[review]]
+id = "r"
+[[review.action]]
+label = "Run shared build"
+command = "run"
+[review.action.shared_store]
+store = "review-artifacts"
+path = "reviews/<<ralphus:new-worktree/RAL-999-add_widget?upstream=main&text=basename({})>>/demo"
+[review.action.lifecycle]
+build_root_policy = "prepare_managed"
+before_reset_command = ["./stop-demo"]
+timeout = "2m"
+"#;
+        let result = validate_toml(src);
+        assert!(result.is_ok(), "{:?}", result.errors);
+    }
+
+    #[test]
+    fn review_action_shared_store_path_rejects_traversal() {
+        let src = r#"
+[[task]]
+name = "t"
+[[task.cell]]
+cwd = "/r"
+prompt = "p"
+review = "<<review:r>>"
+[[review]]
+id = "r"
+[[review.action]]
+label = "Run shared build"
+command = "run"
+[review.action.shared_store]
+store = "review-artifacts"
+path = "../escape"
+"#;
+        let result = validate_toml(src);
+        assert!(
+            result.errors.iter().any(|error| error
+                .message
+                .contains("shared_store path must be a non-empty relative path")),
+            "{:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn review_action_lifecycle_rejects_malformed_timeout() {
+        let src = r#"
+[[task]]
+name = "t"
+[[task.cell]]
+cwd = "/r"
+prompt = "p"
+review = "<<review:r>>"
+[[review]]
+id = "r"
+[[review.action]]
+label = "Run"
+command = "run"
+[review.action.lifecycle]
+timeout = "soon"
+"#;
+        let result = validate_toml(src);
+        assert!(
+            result.errors.iter().any(|error| error
+                .message
+                .contains("timeout must be a positive whole number")),
+            "{:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn review_action_preparation_rejects_malformed_worktree_text() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Run\"\ncommand=\"run\"\n[[review.action.prepare]]\ncommand=\"build <<ralphus:new-worktree/x?text=basename({})>>\"\n";
+        let result = validate_toml(src);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|error| error.message.contains("require '?upstream")),
+            "{:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn executable_artifact_is_now_unknown() {
+        let src = r#"
+[[task]]
+name = "t"
+[[task.cell]]
+cwd = "/r"
+prompt = "p"
+review = "<<review:r>>"
+[[review]]
+id = "r"
+[[review.action]]
+label = "Run build"
+command = "staged/app"
+[[review.action.artifact]]
+source = "target/debug/app"
+destination = "staged/app"
+placement = "copy"
+executable = true
+"#;
+        assert!(
+            validate_toml(src)
+                .errors
+                .iter()
+                .any(|error| error.kind == ErrorKind::UnknownKey)
+        );
+    }
+
+    #[test]
+    fn run_on_and_artifact_are_now_unknown() {
+        let src = r#"
+[[task]]
+name = "t"
+[[task.cell]]
+cwd = "/r"
+prompt = "p"
+review = "<<review:r>>"
+[[review]]
+id = "r"
+[[review.action]]
+label = "Run build"
+command = "staged/app"
+run_on = "review_machine"
+[[review.action.artifact]]
+source = "target/debug/app"
+destination = "staged/app"
+placement = "copy"
+"#;
+        assert!(
+            validate_toml(src)
+                .errors
+                .iter()
+                .any(|error| error.kind == ErrorKind::UnknownKey)
         );
     }
 

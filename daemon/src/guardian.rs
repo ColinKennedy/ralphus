@@ -96,7 +96,7 @@ pub struct InputResolutionView {
 /// can carry an optional `cleanup_command` and named, defaulted `inputs`.
 /// Exactly one of `command` (verbatim shell) or `prompt` (forwarded to LLM)
 /// is set.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GuardianCheck {
     /// Button label shown in the UI. `None` for AI-synthesized manual checks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -107,6 +107,34 @@ pub struct GuardianCheck {
     /// Prompt forwarded to the LLM to expand into a command (mutually exclusive with `command`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
+    /// What the reviewer should observe while this action runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Human-facing success criteria. This is guidance, never an approval gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub success: Option<String>,
+    /// `daemon` or `review_machine`; unset selects the review machine for a
+    /// remote review and the daemon for a local review.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_on: Option<String>,
+    /// Ordered unattended work specific to this action.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prepare: Vec<GuardianAutoBuild>,
+    /// Outputs this action consumes after preparation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<GuardianArtifact>,
+    /// `waiting`, `preparing`, `transferring`, `ready`, `failed`, or `stale`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation_state: Option<String>,
+    /// Actionable preparation or transfer detail, especially on failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation_detail: Option<String>,
+    /// Epoch milliseconds when this action most recently became ready.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_at_ms: Option<i64>,
+    /// Daemon-host working directory for a copied remote artifact set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_cwd: Option<String>,
     /// Optional command run before `command`/the expanded `prompt`, e.g. to
     /// stop a stale process from a previous run. Opt-in at run time via a UI
     /// checkbox.
@@ -116,6 +144,50 @@ pub struct GuardianCheck {
     /// `{name}` placeholders.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<CheckInput>,
+    /// Optional logical shared-store publication for this action generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_store: Option<GuardianSharedStore>,
+    /// Preparation workspace lifecycle policy and optional teardown commands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<GuardianActionLifecycle>,
+}
+
+/// Persisted logical shared-store declaration. The provider resolves the
+/// concrete absolute root at preparation time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuardianSharedStore {
+    pub store: String,
+    pub path: String,
+}
+
+/// Persisted action-generation lifecycle declaration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuardianActionLifecycle {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_root_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub before_reset_command: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<String>,
+}
+
+/// One prepared output and how it becomes visible to a manual action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuardianArtifact {
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<String>,
+    pub placement: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness_command: Option<String>,
+    #[serde(default)]
+    pub executable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_os: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_arch: Option<String>,
 }
 
 /// This review's own declared build step (RAL-342), authored via
@@ -125,12 +197,16 @@ pub struct GuardianCheck {
 /// a static shell `command`, or an agent invocation described by the
 /// remaining fields -- exactly one of the two shapes is populated, enforced
 /// by `core::validate` at parse time.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct GuardianAutoBuild {
     /// Verbatim shell command to run against the combined worktree (mutually
     /// exclusive with the agent-invocation fields below).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
+    /// Ordered shell commands belonging to one preparation group. All must
+    /// finish before the group is ready.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<String>,
     /// Prompt forwarded to the build agent (mutually exclusive with `command`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
@@ -148,6 +224,10 @@ pub struct GuardianAutoBuild {
     /// Model override for the build agent invocation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Environment overrides applied to every command or agent invocation in
+    /// this preparation group.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub environment: std::collections::BTreeMap<String, String>,
 }
 
 /// Lifecycle state of a guardian/review.
@@ -755,6 +835,16 @@ pub struct GuardianView {
     /// unset. The merge engine gates manual-checks regeneration on this
     /// plus [`Self::manual_checks_cached`].
     pub effective_cache_manual_checks: bool,
+    /// This review's own list of events (`rebase`, `feedback`, `auto_fix`)
+    /// that tear down and rebuild its prepared build. `None` means "inherit the
+    /// project/global default" (resolved into [`Self::effective_rebuild_on`]
+    /// at hydration time); an empty list means "never rebuild automatically".
+    pub rebuild_on: Option<Vec<String>>,
+    /// [`Self::rebuild_on`] resolved against the database-backed project
+    /// setting, the project-level `.ralphus.toml [review] rebuild_on` default,
+    /// and the live global config -- always a concrete list, every event when
+    /// every layer is unset.
+    pub effective_rebuild_on: Vec<String>,
     /// RAL-521: `true` once manual-checks generation has completed for this
     /// review, including an intentionally empty command result. Under an
     /// enabled [`Self::effective_cache_manual_checks`] the merge engine treats
@@ -1123,16 +1213,11 @@ pub struct GuardianView {
     /// When [`Self::notice_kind`] was recorded (epoch ms). `None` alongside
     /// `notice_kind: None`.
     pub notice_at_ms: Option<i64>,
-    /// This review's declared build step (RAL-342), from `[[review.auto_build]]`.
-    /// `None` means the review declared `skip_auto_build = true` instead --
-    /// unlike [`Self::resolver_agent`]-style overrides, `None` here is never
-    /// "inherit the project config default": every guardian created after
-    /// the RAL-342 migration has exactly one of this field or
-    /// [`Self::skip_auto_build`] set, enforced at submit time
-    /// (`reviews::require_auto_build_declaration`). A guardian created
-    /// before that migration shipped simply has no auto_build tier at
-    /// finalize time (see `guardian_merge::final_checks`).
-    pub auto_build: Option<GuardianAutoBuild>,
+    /// Preparation steps persisted for this review. The serialized field name
+    /// keeps existing database rows readable; an empty list is a valid review
+    /// that needs no preparation command.
+    #[serde(rename = "preparation")]
+    pub auto_build: Vec<GuardianAutoBuild>,
     /// The summary format stamped when this review was created.
     pub summary_format: Option<String>,
     /// The summary format used by the merge engine.
@@ -1431,11 +1516,13 @@ impl Store {
             .map(|command| {
                 serde_json::to_string(&GuardianAutoBuild {
                     command: Some(command.to_string()),
+                    commands: Vec::new(),
                     prompt: None,
                     system_prompt: None,
                     system_prompt_position: None,
                     agent: None,
                     model: None,
+                    environment: std::collections::BTreeMap::new(),
                 })
             })
             .transpose()
@@ -1446,6 +1533,7 @@ impl Store {
             "UPDATE guardians SET auto_build_json=? WHERE id=?",
             params![auto_build_json, id],
         )?;
+        self.auto_subscribe_review_submitter(&id, owner.as_deref())?;
         // RAL-<new>: a new review coming into existence is the single most
         // consequential event in this file, and every route into it
         // (`create_guardian_for_squad`/`_for_project`/`_keyed` directly) went
@@ -2659,6 +2747,14 @@ impl Store {
                 );
             }
             if GuardianStatus::is_terminal_status(status.as_str()) {
+                // A review cannot retain a manual-action execution lease once
+                // it is terminal. The next retirement sweep owns deleting its
+                // shared publication and private build root.
+                let _ = self.conn.execute(
+                    "UPDATE guardian_action_generations SET lease_expires_at_ms=?1, updated_at_ms=?1
+                     WHERE guardian_id=?2 AND state='ready'",
+                    params![crate::store::now_ms(), id],
+                );
                 // RAL-400 Phase 6: a review reaching `merged`/`cancelled`/
                 // `deployed` may be the last non-terminal affected entry on one
                 // or more open waypoints. `is_terminal_status` already
@@ -3030,8 +3126,19 @@ impl Store {
         id: &str,
         auto_build: Option<&GuardianAutoBuild>,
     ) -> Result<()> {
-        let json =
-            auto_build.map(|b| serde_json::to_string(b).unwrap_or_else(|_| "{}".to_string()));
+        self.set_guardian_preparation(id, auto_build.into_iter().cloned().collect())
+    }
+
+    /// Store all ordered preparation steps. The existing JSON column is kept
+    /// so databases migrate without copying payloads; readers accept both the
+    /// former single-object representation and the current array.
+    pub fn set_guardian_preparation(
+        &self,
+        id: &str,
+        preparation: Vec<GuardianAutoBuild>,
+    ) -> Result<()> {
+        let json = (!preparation.is_empty())
+            .then(|| serde_json::to_string(&preparation).unwrap_or_else(|_| "[]".to_string()));
         let n = self.conn.execute(
             "UPDATE guardians SET auto_build_json=?, updated_at_ms=? WHERE id=?",
             params![json, crate::store::now_ms(), id],
@@ -3045,6 +3152,11 @@ impl Store {
 
     /// This review's declared build step -- see [`GuardianView::auto_build`].
     pub fn guardian_auto_build(&self, id: &str) -> Result<Option<GuardianAutoBuild>> {
+        Ok(self.guardian_preparation(id)?.into_iter().next())
+    }
+
+    /// This review's ordered preparation steps.
+    pub fn guardian_preparation(&self, id: &str) -> Result<Vec<GuardianAutoBuild>> {
         let json: Option<String> = self
             .conn
             .query_row(
@@ -3054,7 +3166,16 @@ impl Store {
             )
             .optional()?
             .ok_or(StoreError::NotFound)?;
-        Ok(json.as_deref().and_then(|s| serde_json::from_str(s).ok()))
+        let Some(json) = json else {
+            return Ok(Vec::new());
+        };
+        if let Ok(steps) = serde_json::from_str::<Vec<GuardianAutoBuild>>(&json) {
+            return Ok(steps);
+        }
+        Ok(serde_json::from_str::<GuardianAutoBuild>(&json)
+            .ok()
+            .into_iter()
+            .collect())
     }
 
     /// Set the summary rendering format stored for this review.
@@ -3242,6 +3363,27 @@ impl Store {
         let n = self.conn.execute(
             "UPDATE guardians SET cache_manual_checks=?, updated_at_ms=? WHERE id=?",
             params![enabled.map(i64::from), crate::store::now_ms(), id],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Set this review's own `rebuild_on` override: the events (`rebase`,
+    /// `feedback`, `auto_fix`) that tear down and rebuild its prepared build.
+    /// `None` inherits the project/global default; `Some(&[])` never rebuilds
+    /// automatically. The caller validates the entries with
+    /// `ralphus_core::schema::check_rebuild_on`.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] when no such guardian exists.
+    pub fn set_guardian_rebuild_on(&self, id: &str, events: Option<&[String]>) -> Result<()> {
+        let json = events.map(|list| serde_json::to_string(list).unwrap_or_else(|_| "[]".into()));
+        let n = self.conn.execute(
+            "UPDATE guardians SET rebuild_on=?, updated_at_ms=? WHERE id=?",
+            params![json, crate::store::now_ms(), id],
         )?;
         if n == 0 {
             Err(StoreError::NotFound)
@@ -4490,11 +4632,17 @@ impl Store {
     /// `in_review`. The two jobs it covers run concurrently against a scratch
     /// checkout of the finished stack; see [`GuardianView::post_merge_status`].
     pub fn start_guardian_post_merge(&self, id: &str) -> Result<i64> {
-        let started = crate::store::now_ms();
+        let now = crate::store::now_ms();
         self.conn.execute(
             "UPDATE guardians SET post_merge_status='running', post_merge_detail=NULL, \
-             post_merge_started_at_ms=?, post_merge_finished_at_ms=NULL WHERE id=?",
-            params![started, id],
+             post_merge_started_at_ms=MAX(?, COALESCE(post_merge_started_at_ms + 1, ?)), \
+             post_merge_finished_at_ms=NULL WHERE id=?",
+            params![now, now, id],
+        )?;
+        let started = self.conn.query_row(
+            "SELECT post_merge_started_at_ms FROM guardians WHERE id=?",
+            params![id],
+            |row| row.get(0),
         )?;
         Ok(started)
     }
@@ -5031,7 +5179,7 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus, summary_format, base_shift_rebuild_attempts_by_project
+                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus, summary_format, base_shift_rebuild_attempts_by_project, rebuild_on
                   FROM guardians WHERE id=?", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
                 /*
                 "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus
@@ -5177,7 +5325,7 @@ impl Store {
     /// (`crate::store_pool`) can serve it without the writer lock.
     pub(crate) fn list_guardians_conn(conn: &Connection) -> Result<Vec<GuardianView>> {
         let mut stmt = conn.prepare(
-            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus, summary_format, base_shift_rebuild_attempts_by_project
+            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus, summary_format, base_shift_rebuild_attempts_by_project, rebuild_on
               FROM guardians ORDER BY created_at_ms DESC", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
         )?;
         let rows = stmt
@@ -5317,6 +5465,7 @@ impl Store {
             manual_checks_focus: r.get(71)?,
             summary_format: r.get(72)?,
             base_shift_rebuild_attempts_by_project: r.get(73)?,
+            rebuild_on: r.get(74)?,
         })
     }
 
@@ -5540,7 +5689,13 @@ impl Store {
             .iter()
             .filter(|b| b.merge_status == "failed")
             .count();
-        let checks_state: &'static str = if !manual_commands.is_empty() {
+        let checks_state: &'static str = if row.post_merge_status.as_deref() == Some("ok") {
+            "ready"
+        } else if row.post_merge_status.as_deref() == Some("failed") {
+            "failed"
+        } else if row.post_merge_status.as_deref() == Some("running") {
+            "generating"
+        } else if !manual_commands.is_empty() {
             "ready"
         } else if row.status == "merging"
             && !enabled_branches.is_empty()
@@ -5572,7 +5727,15 @@ impl Store {
         let auto_build = row
             .auto_build_json
             .as_deref()
-            .and_then(|json| serde_json::from_str::<GuardianAutoBuild>(json).ok());
+            .map(|json| {
+                serde_json::from_str::<Vec<GuardianAutoBuild>>(json).unwrap_or_else(|_| {
+                    serde_json::from_str::<GuardianAutoBuild>(json)
+                        .ok()
+                        .into_iter()
+                        .collect()
+                })
+            })
+            .unwrap_or_default();
 
         // RAL-168: resolve this review's own Proof-scope override (if any)
         // against the project-level `.ralphus.toml [review] default_proof_scope`
@@ -5724,6 +5887,25 @@ impl Store {
             .or(live_global.cache_manual_checks)
             .unwrap_or(true);
 
+        // Which events rebuild the prepared build, layered the same way:
+        // per-review override > database-backed project default > explicit
+        // `.ralphus.toml [review]` value > the live global config > every
+        // event. The whole list is replaced by the nearest layer that sets
+        // it, never unioned.
+        let rebuild_on: Option<Vec<String>> = row
+            .rebuild_on
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).ok());
+        let effective_rebuild_on = crate::config::ReviewConfig {
+            rebuild_on: rebuild_on
+                .clone()
+                .or_else(|| db_settings.rebuild_on.clone())
+                .or_else(|| explicit_project.rebuild_on.clone())
+                .or_else(|| live_global.rebuild_on.clone()),
+            ..crate::config::ReviewConfig::default()
+        }
+        .rebuild_on();
+
         // RAL-193: this review's own agent cost -- conflict resolution and
         // prover calls made by the guardian merge machinery -- scoped to
         // the current merge attempt and cumulatively across every
@@ -5826,6 +6008,8 @@ impl Store {
             auto_cancel_outdated_pr_pipelines: row.auto_cancel_outdated_pr_pipelines,
             cache_manual_checks: row.cache_manual_checks,
             effective_cache_manual_checks,
+            rebuild_on,
+            effective_rebuild_on,
             manual_checks_cached: row.manual_checks_cached != 0,
             match_pr_branch_name: row.match_pr_branch_name,
             effective_match_pr_branch_name,
@@ -6351,6 +6535,9 @@ struct GuardianRow {
     /// commands for this review (the one-time-computed marker the merge
     /// engine consults when `effective_cache_manual_checks` is on).
     manual_checks_cached: i64,
+    /// This review's own `rebuild_on` override, as stored: a JSON array of
+    /// strings, or `None` to inherit the project/global default.
+    rebuild_on: Option<String>,
 }
 
 #[cfg(test)]
@@ -7154,6 +7341,7 @@ mod tests {
                     prompt: None,
                     cleanup_command: None,
                     inputs: vec![],
+                    ..GuardianCheck::default()
                 }],
                 None,
                 None,
@@ -7176,6 +7364,7 @@ mod tests {
                 prompt: None,
                 cleanup_command: None,
                 inputs: vec![],
+                ..GuardianCheck::default()
             },
             GuardianCheck {
                 label: None,
@@ -7188,6 +7377,7 @@ mod tests {
                     default: "7890".to_string(),
                     r#type: CheckInputType::Int,
                 }],
+                ..GuardianCheck::default()
             },
         ];
         store
@@ -7220,6 +7410,7 @@ mod tests {
                 default: "7890".to_string(),
                 r#type: CheckInputType::Int,
             }],
+            ..GuardianCheck::default()
         }];
         store.set_guardian_action_hints(&id, &hints).unwrap();
         let g = store.get_guardian(&id).unwrap();
@@ -8084,47 +8275,51 @@ mod tests {
     }
 
     #[test]
-    fn auto_build_defaults_none_and_round_trips_both_shapes() {
+    fn preparation_defaults_empty_and_accepts_legacy_single_step_writes() {
         let store = Store::open_in_memory().unwrap();
         let id = store.create_guardian("r", "main", "/repo").unwrap();
-        assert!(store.get_guardian(&id).unwrap().auto_build.is_none());
+        assert!(store.get_guardian(&id).unwrap().auto_build.is_empty());
         assert!(store.guardian_auto_build(&id).unwrap().is_none());
 
         let command_build = GuardianAutoBuild {
             command: Some("make build".to_string()),
+            commands: Vec::new(),
             prompt: None,
             system_prompt: None,
             system_prompt_position: None,
             agent: None,
             model: None,
+            environment: std::collections::BTreeMap::new(),
         };
         store
             .set_guardian_auto_build(&id, Some(&command_build))
             .unwrap();
         assert_eq!(
             store.get_guardian(&id).unwrap().auto_build,
-            Some(command_build.clone())
+            vec![command_build.clone()]
         );
         assert_eq!(store.guardian_auto_build(&id).unwrap(), Some(command_build));
 
         let agent_build = GuardianAutoBuild {
             command: None,
+            commands: Vec::new(),
             prompt: Some("build the project".to_string()),
             system_prompt: Some("you are a build agent".to_string()),
             system_prompt_position: Some("append".to_string()),
             agent: Some("claude".to_string()),
             model: Some("sonnet".to_string()),
+            environment: std::collections::BTreeMap::new(),
         };
         store
             .set_guardian_auto_build(&id, Some(&agent_build))
             .unwrap();
         assert_eq!(
             store.get_guardian(&id).unwrap().auto_build,
-            Some(agent_build)
+            vec![agent_build]
         );
 
         store.set_guardian_auto_build(&id, None).unwrap();
-        assert!(store.get_guardian(&id).unwrap().auto_build.is_none());
+        assert!(store.get_guardian(&id).unwrap().auto_build.is_empty());
 
         assert!(store.set_guardian_auto_build("nope", None).is_err());
     }
@@ -8236,6 +8431,112 @@ mod tests {
             store
                 .set_guardian_cache_manual_checks("nope", Some(false))
                 .is_err()
+        );
+    }
+
+    fn events(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn rebuild_on_defaults_to_every_event_and_round_trips() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.rebuild_on, None);
+        assert_eq!(
+            g.effective_rebuild_on,
+            events(&["rebase", "feedback", "auto_fix"])
+        );
+
+        store
+            .set_guardian_rebuild_on(&id, Some(&events(&["feedback", "auto_fix"])))
+            .unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.rebuild_on, Some(events(&["feedback", "auto_fix"])));
+        assert_eq!(g.effective_rebuild_on, events(&["feedback", "auto_fix"]));
+
+        // An empty list is a real value ("never automatically"), not "unset".
+        store.set_guardian_rebuild_on(&id, Some(&[])).unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.rebuild_on, Some(Vec::new()));
+        assert!(g.effective_rebuild_on.is_empty());
+
+        // Clearing restores inheritance.
+        store.set_guardian_rebuild_on(&id, None).unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.rebuild_on, None);
+        assert_eq!(
+            g.effective_rebuild_on,
+            events(&["rebase", "feedback", "auto_fix"])
+        );
+
+        assert!(store.set_guardian_rebuild_on("nope", Some(&[])).is_err());
+    }
+
+    #[test]
+    fn rebuild_on_serializes_both_the_override_and_the_effective_list() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store
+            .set_guardian_rebuild_on(&id, Some(&events(&["rebase"])))
+            .unwrap();
+        let json = serde_json::to_value(store.get_guardian(&id).unwrap()).unwrap();
+        assert_eq!(json["rebuild_on"], serde_json::json!(["rebase"]));
+        assert_eq!(json["effective_rebuild_on"], serde_json::json!(["rebase"]));
+        store.set_guardian_rebuild_on(&id, None).unwrap();
+        let json = serde_json::to_value(store.get_guardian(&id).unwrap()).unwrap();
+        assert!(json["rebuild_on"].is_null());
+        assert_eq!(
+            json["effective_rebuild_on"],
+            serde_json::json!(["rebase", "feedback", "auto_fix"])
+        );
+    }
+
+    #[test]
+    fn rebuild_on_resolves_review_over_project_over_default() {
+        let store = Store::open_in_memory().unwrap();
+        store.register_project("proj", "", "/repo", "git").unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+
+        // The project's database-backed default applies when the review sets none.
+        store
+            .set_project_review_settings(
+                "proj",
+                &crate::store::ProjectReviewSettings {
+                    rebuild_on: Some(events(&["auto_fix"])),
+                    ..crate::store::ProjectReviewSettings::default()
+                },
+            )
+            .unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.rebuild_on, None);
+        assert_eq!(g.effective_rebuild_on, events(&["auto_fix"]));
+
+        // The review's own value replaces it outright, never unioned.
+        store
+            .set_guardian_rebuild_on(&id, Some(&events(&["rebase"])))
+            .unwrap();
+        assert_eq!(
+            store.get_guardian(&id).unwrap().effective_rebuild_on,
+            events(&["rebase"])
+        );
+
+        // An explicitly empty review list beats a non-empty project list.
+        store.set_guardian_rebuild_on(&id, Some(&[])).unwrap();
+        assert!(
+            store
+                .get_guardian(&id)
+                .unwrap()
+                .effective_rebuild_on
+                .is_empty()
+        );
+
+        // Clearing the review value falls back to the project value again.
+        store.set_guardian_rebuild_on(&id, None).unwrap();
+        assert_eq!(
+            store.get_guardian(&id).unwrap().effective_rebuild_on,
+            events(&["auto_fix"])
         );
     }
 
@@ -10115,5 +10416,26 @@ mod tests {
             store.link_review_cell(&gid, &branch_id, &squad, 9, 9),
             Err(StoreError::NotFound)
         ));
+    }
+
+    #[test]
+    fn post_merge_start_stamps_are_strictly_monotonic() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("R", "main", "/repo").unwrap();
+
+        let first = store.start_guardian_post_merge(&id).unwrap();
+        let second = store.start_guardian_post_merge(&id).unwrap();
+
+        assert!(second > first);
+        assert!(
+            !store
+                .finish_guardian_post_merge(&id, first, true, None)
+                .unwrap()
+        );
+        assert!(
+            store
+                .finish_guardian_post_merge(&id, second, true, None)
+                .unwrap()
+        );
     }
 }

@@ -227,12 +227,40 @@ impl Workspace {
                     cwd: self.root.to_string_lossy().into_owned(),
                     program: String::new(),
                     args: vec![command.to_string()],
+                    env: env.clone(),
                 };
                 match self.with_provider(|p, spec| p.run_vcs(&req, spec)) {
                     Ok(out) => (true, out),
                     Err(e) => (false, e),
                 }
             }
+        }
+    }
+
+    /// Run a local command with both review cancellation and a bounded wall
+    /// clock duration. Remote providers do not yet expose a cancellation-aware
+    /// timeout contract, so V1 rejects that combination at the caller.
+    #[must_use]
+    pub fn run_command_with_env_timeout(
+        &self,
+        command: &str,
+        env: &std::collections::BTreeMap<String, String>,
+        cancel: &crate::cancel::CancelToken,
+        timeout: std::time::Duration,
+    ) -> (bool, String) {
+        match &self.machine {
+            None => crate::proof::run_command_proof_capture_with_timeout(
+                &self.root.to_string_lossy(),
+                command,
+                &opentelemetry::Context::new(),
+                env,
+                cancel,
+                Some(timeout),
+            ),
+            Some(_) => (
+                false,
+                "lifecycle timeout is not supported by a remote provider yet".to_string(),
+            ),
         }
     }
 
@@ -333,6 +361,90 @@ impl Workspace {
             None => self.resolve(path).exists(),
             Some(_) => self.read_file(path).is_some(),
         }
+    }
+
+    /// Copy one selected file or directory from this workspace into an exact
+    /// absolute destination on the daemon host.
+    pub fn materialize_to_daemon(
+        &self,
+        source: impl AsRef<Path>,
+        destination: impl AsRef<Path>,
+        executable: bool,
+    ) -> Result<(), String> {
+        let source = self.resolve(source);
+        let destination = destination.as_ref();
+        if !destination.is_absolute() {
+            return Err(format!(
+                "artifact destination must be absolute on the daemon host: {}",
+                destination.display()
+            ));
+        }
+        match &self.machine {
+            None => {
+                let allowed_root = self
+                    .root
+                    .canonicalize()
+                    .map_err(|e| format!("could not resolve workspace root: {e}"))?;
+                let source_resolved = source
+                    .canonicalize()
+                    .map_err(|e| format!("could not resolve artifact {}: {e}", source.display()))?;
+                if destination.starts_with(&source_resolved) {
+                    return Err("artifact destination cannot be inside its source".to_string());
+                }
+                let parent = destination.parent().ok_or_else(|| {
+                    format!(
+                        "artifact destination has no parent: {}",
+                        destination.display()
+                    )
+                })?;
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                let mut nonce = [0_u8; 8];
+                getrandom::getrandom(&mut nonce)
+                    .map_err(|e| format!("could not create artifact transfer id: {e}"))?;
+                let staging = parent.join(format!(
+                    ".ralphus-artifact-{}",
+                    nonce
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>()
+                ));
+                let publish = (|| {
+                    copy_local_artifact(&source, &staging, executable, &allowed_root)?;
+                    remove_local_destination(destination)?;
+                    std::fs::rename(&staging, destination).map_err(|e| {
+                        format!("could not publish artifact {}: {e}", destination.display())
+                    })
+                })();
+                if publish.is_err() {
+                    let _ = remove_local_destination(&staging);
+                }
+                publish
+            }
+            Some(_) => self.with_provider(|provider, spec| {
+                provider.materialize(
+                    &source.to_string_lossy(),
+                    &destination.to_string_lossy(),
+                    executable,
+                    spec,
+                )
+            }),
+        }
+    }
+
+    /// Platform reported by the machine that owns this workspace.
+    pub fn target_platform(&self) -> Result<(Option<String>, Option<String>), String> {
+        if self.machine.is_none() {
+            return Ok((
+                Some(std::env::consts::OS.to_string()),
+                Some(std::env::consts::ARCH.to_string()),
+            ));
+        }
+        self.with_provider(|provider, spec| {
+            let capabilities = provider
+                .capabilities(spec)?
+                .ok_or_else(|| "machine provider did not report a target platform".to_string())?;
+            Ok((capabilities.os, capabilities.arch))
+        })
     }
 
     /// Resolve `path` against this workspace's root when relative, or take it
@@ -436,9 +548,88 @@ impl Workspace {
             cwd: self.root.to_string_lossy().into_owned(),
             program: "git".to_string(),
             args: args.iter().map(|a| (*a).to_string()).collect(),
+            env: std::collections::BTreeMap::new(),
         };
         self.with_provider(|p, spec| p.run_vcs(&req, spec))
     }
+}
+
+fn remove_local_destination(path: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            std::fs::remove_dir_all(path).map_err(|e| e.to_string())
+        }
+        Ok(_) => std::fs::remove_file(path).map_err(|e| e.to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn copy_local_artifact(
+    source: &Path,
+    destination: &Path,
+    executable: bool,
+    allowed_root: &Path,
+) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(source)
+        .map_err(|e| format!("could not inspect artifact {}: {e}", source.display()))?;
+    if metadata.file_type().is_symlink() {
+        let resolved = source.canonicalize().map_err(|e| {
+            format!(
+                "could not resolve artifact symlink {}: {e}",
+                source.display()
+            )
+        })?;
+        if !resolved.starts_with(allowed_root) {
+            return Err(format!(
+                "artifact symlink escapes its declared root: {}",
+                source.display()
+            ));
+        }
+        return copy_local_artifact(&resolved, destination, executable, allowed_root);
+    }
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "could not create artifact destination {}: {e}",
+                parent.display()
+            )
+        })?;
+    }
+    if metadata.is_dir() {
+        std::fs::create_dir_all(destination).map_err(|e| {
+            format!(
+                "could not create artifact directory {}: {e}",
+                destination.display()
+            )
+        })?;
+        for entry in std::fs::read_dir(source).map_err(|e| {
+            format!(
+                "could not read artifact directory {}: {e}",
+                source.display()
+            )
+        })? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            copy_local_artifact(
+                &entry.path(),
+                &destination.join(entry.file_name()),
+                executable,
+                allowed_root,
+            )?;
+        }
+    } else {
+        std::fs::copy(source, destination).map_err(|e| {
+            format!(
+                "could not copy artifact {} to {}: {e}",
+                source.display(),
+                destination.display()
+            )
+        })?;
+        if executable {
+            set_executable(destination)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -465,6 +656,45 @@ fn set_executable(_path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_artifact_materialization_publishes_an_exact_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "ralphus-artifact-copy-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let source = root.join("out");
+        let destination = root.join("prepared").join("app");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("new.txt"), "new").unwrap();
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(destination.join("stale.txt"), "stale").unwrap();
+
+        Workspace::local(&root)
+            .materialize_to_daemon("out", &destination, false)
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(destination.join("new.txt")).unwrap(),
+            "new"
+        );
+        assert!(!destination.join("stale.txt").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn local_workspace_reports_the_action_platform() {
+        assert_eq!(
+            Workspace::local(std::env::temp_dir())
+                .target_platform()
+                .unwrap(),
+            (
+                Some(std::env::consts::OS.to_string()),
+                Some(std::env::consts::ARCH.to_string())
+            )
+        );
+    }
 
     #[test]
     fn an_unset_or_local_machine_yields_a_local_workspace() {

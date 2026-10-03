@@ -18,12 +18,12 @@ provider's business.
 > **Status:** implemented — registry, `machine` syntax, validation, remote
 > cell/proof execution, and every documented verb (`provision`, `exec`,
 > `status`, `stream`, `cancel`, `run`, `read-file`, `write-file`,
-> `remove-path`, `ping`, `capabilities`, `channel`, `cleanup`, `retire`), each
+> `remove-path`, `materialize`, `ping`, `capabilities`, `channel`, `cleanup`, `retire`), each
 > dispatched genericly through the same registry with no daemon-side
 > branching on scheme. Guardian
 > reviews now dispatch to a remote review's assigned machine too (RAL-185
 > Phase 3/RAL-201) — the merge worktree, stacked rebase, conflict-resolution
-> agent, chat/feedback/summary agent invocations, and check gates all route
+> agent, chat/feedback/summary agent invocations, and manual preparation all route
 > through the review's machine. See `REMOTE.local.md` for the full phase
 > history and its "Known limitations" section for what still runs local-only
 > even on a remote review (build-config resolution, the empty-branch VCS
@@ -157,6 +157,7 @@ or `#[derive(Deserialize)]` matching the direction it's used in).
 | `run` | `--uri` | [`RunRequest`](../daemon/src/remote_runner.rs) (`cwd: String`, `program: String`, `args: Vec<String>`) | Run one VCS command in a workspace. Reply `{"exit_code": 0, "stdout": "..."}`. |
 | `read-file` | `--uri` | [`FileRequest`](../daemon/src/remote_runner.rs) (`path: String`, `content: null`, `recursive: false`) | Return a file's contents. Reply `{"stdout": "<file content>"}`. A missing/unreadable file is **not** an error at the daemon layer — callers treat it as "absent" — but the provider still replies however it normally would (`ok: false` is fine; the daemon maps any failure to "absent"). |
 | `write-file` | `--uri` | [`FileRequest`](../daemon/src/remote_runner.rs) (`path: String`, `content: "<text to write>"`, `recursive: false`, optional `executable`) | Write `content` to `path`, creating parent directories as needed. When `executable` is true, give the written file executable permissions. Reply is the standard envelope. |
+| `materialize` | `--uri` | [`MaterializeRequest`](../daemon/src/remote_runner.rs) (`source`: absolute path on the provider, `destination`: absolute path on the daemon, optional `executable`) | Stream one explicitly selected file or directory from the provider to an exact daemon-host destination. Transfers are binary-safe and staged before publication; there is deliberately no size limit or implicit whole-worktree copy. |
 | `remove-path` | `--uri` | [`FileRequest`](../daemon/src/remote_runner.rs) (`path: String`, `content: null`, `recursive: bool`) | Delete a file, or a directory tree when `recursive` is `true`. A path that does not exist is success, not an error. |
 | `ping` | `--uri` | none | Confirm the machine is reachable and ready, doing no work. Reply `{"ok": true, "detail": "..."}`. Called on demand from the board's Machines tab, never polled. |
 | `capabilities` | `--uri` | none | **Optional.** Report what this provider/machine pairing supports. Reply `{"capabilities": {...}}` — see [`Capabilities`](../daemon/src/remote_runner.rs) (`os?`, `arch?`, `supported_ops: [String]`, `async_exec: bool`, `terminal: bool`, `runner_version?`). Every field is best-effort (`None`/omitted means "unknown", never "no"). A provider that does not implement this verb is not a failure — the daemon reads that the same way as "no capability information available", not an error. Must never have side effects (no runner upload, no workspace mutation) even when answering `runner_version` or `async_exec` would otherwise tempt one. |

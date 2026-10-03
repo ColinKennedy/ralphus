@@ -846,6 +846,11 @@ pub struct ProjectReviewSettings {
     /// iterations. Defaults to `true` (on by default) when unset.
     #[serde(default)]
     pub cache_manual_checks: Option<bool>,
+    /// Project-level default for which events (`rebase`, `feedback`,
+    /// `auto_fix`) tear down and rebuild a review's prepared build. Unset
+    /// resolves to all three; an empty list never rebuilds automatically.
+    #[serde(default)]
+    pub rebuild_on: Option<Vec<String>>,
     /// RAL-507: the project's default cap on unattended base-shift rebuild
     /// attempts per retry campaign, for a future review whose `[[review]]`
     /// block (and whose own per-review override) leaves the cap unset.
@@ -899,6 +904,7 @@ impl ProjectReviewSettings {
                 .discourage_tests_during_auto_pull_request_fixes,
             auto_cancel_outdated_pr_pipelines: self.auto_cancel_outdated_pr_pipelines,
             cache_manual_checks: self.cache_manual_checks,
+            rebuild_on: self.rebuild_on,
             auto_fix_max_attempts: None,
             auto_fix_retry_base_seconds: None,
             // Database-backed project settings don't cover this setting --
@@ -1794,6 +1800,62 @@ impl Store {
                 auto_watch            INTEGER NOT NULL DEFAULT 0,
                 default_notify_tiers  TEXT NOT NULL DEFAULT 'urgent,high,normal'
             );
+            -- A user may own several review clients (desktop, laptop, phone).
+            -- V1 uses a local shared store, but the durable client identity is
+            -- deliberately independent from the daemon host so later delivery
+            -- adapters do not need to rewrite review state.
+            CREATE TABLE IF NOT EXISTS review_clients (
+                id              TEXT PRIMARY KEY,
+                user_name       TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
+                label           TEXT NOT NULL,
+                enabled         INTEGER NOT NULL DEFAULT 1,
+                local           INTEGER NOT NULL DEFAULT 1,
+                created_at_ms   INTEGER NOT NULL,
+                updated_at_ms   INTEGER NOT NULL,
+                UNIQUE(user_name, label)
+            );
+            CREATE INDEX IF NOT EXISTS idx_review_clients_user ON review_clients(user_name, enabled);
+            -- Delivery policy belongs to a user, not task TOML. The trigger
+            -- columns use the closed values enforced by delivery.rs.
+            CREATE TABLE IF NOT EXISTS user_review_delivery_preferences (
+                user_name                   TEXT PRIMARY KEY REFERENCES users(name) ON DELETE CASCADE,
+                on_rebase                   TEXT NOT NULL DEFAULT 'ignore',
+                on_feedback                 TEXT NOT NULL DEFAULT 'prepare',
+                on_auto_pr_fix              TEXT NOT NULL DEFAULT 'prepare',
+                offline_delivery            TEXT NOT NULL DEFAULT 'retain_latest',
+                on_reconnect                TEXT NOT NULL DEFAULT 'deliver_latest',
+                auto_register_submitter     INTEGER NOT NULL DEFAULT 1,
+                updated_at_ms               INTEGER NOT NULL
+            );
+            -- A review recipient is an explicit user/client subscription. It
+            -- remains durable when the client goes temporarily offline.
+            CREATE TABLE IF NOT EXISTS guardian_recipients (
+                guardian_id     TEXT NOT NULL REFERENCES guardians(id) ON DELETE CASCADE,
+                client_id       TEXT NOT NULL REFERENCES review_clients(id) ON DELETE CASCADE,
+                subscribed_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (guardian_id, client_id)
+            );
+            -- One readiness record per review action, recipient, and source
+            -- generation. This is the single-flight ownership row for V1 and
+            -- becomes the transfer state machine in V2.
+            CREATE TABLE IF NOT EXISTS guardian_action_generations (
+                guardian_id       TEXT NOT NULL REFERENCES guardians(id) ON DELETE CASCADE,
+                action_key        TEXT NOT NULL,
+                client_id         TEXT NOT NULL REFERENCES review_clients(id) ON DELETE CASCADE,
+                generation        INTEGER NOT NULL,
+                state             TEXT NOT NULL,
+                definition_digest TEXT NOT NULL,
+                manifest_path     TEXT,
+                manifest_sha256   TEXT,
+                published_root    TEXT,
+                lease_expires_at_ms INTEGER,
+                detail            TEXT,
+                created_at_ms     INTEGER NOT NULL,
+                updated_at_ms     INTEGER NOT NULL,
+                PRIMARY KEY (guardian_id, action_key, client_id, generation)
+            );
+            CREATE INDEX IF NOT EXISTS idx_guardian_action_generations_current
+                ON guardian_action_generations(guardian_id, action_key, client_id, generation DESC);
             -- RAL-338: a project's writable fork, keyed by the user who pushes
             -- to it (`user = ''` is the project-wide fallback row). Rows
             -- deliberately do not cascade on user deletion -- an
@@ -3127,19 +3189,9 @@ impl Store {
             "ALTER TABLE cells ADD COLUMN compaction_count INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE proofs ADD COLUMN compaction_input_tokens INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE proofs ADD COLUMN compaction_count INTEGER NOT NULL DEFAULT 0",
-            // RAL-342: this review's own declared build step, authored via
-            // `[[review.auto_build]]` and resolved once at submit time
-            // (`reviews::derive_reviews`) into a JSON-serialized
-            // `GuardianAutoBuild`. NULL means the review declared
-            // `skip_auto_build = true` instead -- unlike the
-            // nullable-override columns above (`resolver_agent`,
-            // `proof_scope`, ...), NULL here never means "inherit the
-            // project config default": every guardian created after this
-            // migration has one of `auto_build_json` or `skip_auto_build`
-            // set, enforced by `reviews::require_auto_build_declaration` at
-            // submit time. A guardian created before this shipped (neither
-            // column meaningfully set) simply gets no auto_build tier at
-            // finalize time (see `guardian_merge::final_checks`).
+            // JSON-serialized review preparation steps. The column retains
+            // its storage name so existing databases remain readable; NULL
+            // or an empty list means the review needs no preparation command.
             "ALTER TABLE guardians ADD COLUMN auto_build_json TEXT",
             // Registered-project creation identity. NULL preserves the
             // distinct raw-directory creation route for existing rows.
@@ -3412,6 +3464,11 @@ impl Store {
             // merge/rebase/fix may regenerate.
             "ALTER TABLE guardians ADD COLUMN cache_manual_checks INTEGER",
             "ALTER TABLE guardians ADD COLUMN manual_checks_cached INTEGER NOT NULL DEFAULT 0",
+            // Per-review override of which events (`rebase`, `feedback`,
+            // `auto_fix`) tear down and rebuild the prepared build, stored as
+            // a JSON array of strings. NULL inherits the project/global
+            // default, which resolves to all three events.
+            "ALTER TABLE guardians ADD COLUMN rebuild_on TEXT",
             // RAL-<pending>: coarse-grained progress reporting for a squad
             // sitting in `materializing` (`run_submit_followup`'s named
             // phases -- fetching upstream refs, creating worktrees,
@@ -12593,6 +12650,46 @@ prompt = "legacy cell, no review_guardian_id"
     }
 
     #[test]
+    fn migration_adds_nullable_rebuild_on_column_to_existing_guardians() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("legacy", "main", "/repo").unwrap();
+        // Put the table back into its pre-`rebuild_on` shape, with a review row
+        // already in it, then run the migration over it.
+        store
+            .conn
+            .execute("ALTER TABLE guardians DROP COLUMN rebuild_on", [])
+            .expect("drop the column to simulate an older database");
+        store
+            .init_schema()
+            .expect("migration must add the nullable rebuild_on column");
+
+        let stored: Option<String> = store
+            .conn
+            .query_row("SELECT rebuild_on FROM guardians WHERE id=?", [&id], |r| {
+                r.get(0)
+            })
+            .expect("the pre-existing review row survives with the new column");
+        assert!(stored.is_none());
+
+        let guardian = store.get_guardian(&id).unwrap();
+        assert_eq!(guardian.rebuild_on, None);
+        assert_eq!(
+            guardian.effective_rebuild_on,
+            vec!["rebase", "feedback", "auto_fix"]
+        );
+        store
+            .set_guardian_rebuild_on(&id, Some(&["feedback".to_string()]))
+            .unwrap();
+        assert_eq!(
+            store.get_guardian(&id).unwrap().rebuild_on,
+            Some(vec!["feedback".to_string()])
+        );
+
+        // Running the migration again on an up-to-date table is a no-op.
+        store.init_schema().expect("migration is idempotent");
+    }
+
+    #[test]
     fn migration_broadens_hidden_items_kind_to_include_task() {
         let conn = Connection::open_in_memory().expect("open sqlite");
         conn.execute_batch(
@@ -17215,6 +17312,7 @@ command = "e"
             discourage_tests_during_auto_pull_request_fixes: Some(true),
             auto_cancel_outdated_pr_pipelines: Some(false),
             cache_manual_checks: Some(false),
+            rebuild_on: Some(vec!["feedback".to_string(), "auto_fix".to_string()]),
             base_shift_maximum_rebuilds: Some(5),
             default_pr_user: Some("alice".to_string()),
             forks_only: Some(true),

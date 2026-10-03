@@ -16,11 +16,26 @@ const PAIRS: &[(&str, &str)] = &[
     ("skip_worktrees", "skip_worktrees"),
     ("skip_base_updates", "skip_base_updates"),
     ("proof_skip_auto_clean", "proof_skip_auto_clean"),
-    ("checks", "checks"),
-    ("auto_build", "auto_build"),
     ("summary_format", "summary_format"),
     ("cache_manual_checks", "cache_manual_checks"),
+    ("rebuild_on", "rebuild_on"),
+    // The preparation redesign replaced the directly-authored
+    // `[[review.auto_build]]` with `[[review.prepare]]`; the project-level
+    // `.ralphus.toml [review] auto_build` default is still exactly what
+    // `final_checks` falls back to when a review declares no preparation
+    // steps of its own, so the pairing follows the renamed authored side.
+    ("prepare", "auto_build"),
 ];
+
+/// Project-default (`REVIEW_CONFIG_KEYS`) entries with no `[[review]]`
+/// TOML counterpart to pair with -- the reverse of
+/// [`REVIEW_DEF_ONLY_EXCLUSIONS`] below.
+const CONFIG_DEF_ONLY_EXCLUSIONS: &[(&str, &str)] = &[(
+    "checks",
+    "no longer an authored [[review]] key since the preparation redesign; the \
+     project default still seeds a review's check gates when none are set \
+     via the daemon API",
+)];
 
 const REVIEW_DEF_ONLY_EXCLUSIONS: &[(&str, &str)] = &[
     ("id", "identity is assigned for each individual review"),
@@ -52,10 +67,6 @@ const REVIEW_DEF_ONLY_EXCLUSIONS: &[(&str, &str)] = &[
     (
         "dual_root_pr",
         "outside this review-default parity contract",
-    ),
-    (
-        "skip_auto_build",
-        "an opt-out has no project default counterpart",
     ),
     (
         "auto_fix_pr_errors",
@@ -134,8 +145,32 @@ fn every_project_default_key_is_covered_by_exactly_one_pair() {
         "these REVIEW_CONFIG_KEYS names appear more than once as a PAIRS right-hand side: \\
          {duplicate_pairs:?}"
     );
+
+    let mut excluded = BTreeSet::new();
+    let mut duplicate_exclusions = Vec::new();
+    for (config_key, _) in CONFIG_DEF_ONLY_EXCLUSIONS {
+        if !excluded.insert(*config_key) {
+            duplicate_exclusions.push(*config_key);
+        }
+    }
+    assert!(
+        duplicate_exclusions.is_empty(),
+        "these REVIEW_CONFIG_KEYS names appear more than once in CONFIG_DEF_ONLY_EXCLUSIONS: \\
+         {duplicate_exclusions:?}"
+    );
+    assert!(
+        paired.is_disjoint(&excluded),
+        "a key cannot be paired and excluded"
+    );
+    assert!(
+        CONFIG_DEF_ONLY_EXCLUSIONS
+            .iter()
+            .all(|(_, reason)| reason.trim().len() >= 15)
+    );
+
+    let covered: BTreeSet<_> = paired.union(&excluded).copied().collect();
     assert_eq!(
-        config_keys, paired,
-        "every project default must have one authored counterpart"
+        config_keys, covered,
+        "every project default must have one authored counterpart or a deliberate exclusion"
     );
 }

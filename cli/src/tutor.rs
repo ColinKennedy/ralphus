@@ -524,14 +524,32 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                 cache_manual_checks default, then true (on by default).
                 Set false to have every later merge or rebase regenerate
                 the checks from the freshly stacked diff.
+ rebuild_on
+        string[] Which events tear down and rebuild this review's prepared
+                build (its preparation, then its actions): any of "rebase"
+                (a merge or restack settled), "feedback" (reviewer feedback
+                was applied), "auto_fix" (an unattended PR/MR fix was
+                applied). Each at most once; anything else is an error.
+                Unset inherits the project-level .ralphus.toml [review]
+                rebuild_on default, then all three (today's behavior). An
+                event left out keeps the existing ready build untouched
+                (its actions stay ready; nothing is torn down or rebuilt).
+                [] never rebuilds automatically -- use `ralphus review
+                rebuild <selector>` (or the board) to rebuild on demand; that
+                runs each action's [review.action.lifecycle]
+                before_reset_command teardown first. A review with no ready
+                build yet always builds.
 
- [[review.auto_build]]  (zero or more per [[review]])
- Declare the build steps that run at merge/finalize time (RAL-342).
+ [[review.prepare]]  (zero or more per [[review]])
+ Declare ordered unattended work that makes manual actions ready before a
+ reviewer presses Run.
  Each entry is run in order. Exactly ONE of `prompt` or `command`
  is required per entry.
 
  Key                     Type           Notes
- command                 string  ONE-OF Verbatim shell command run directly.
+ command                 string|string[] ONE-OF One command, or an ordered
+                                       command group run directly. Every command
+                                       completes before the group is ready.
  prompt                  string  ONE-OF Agent prompt to figure out and run the
                                        build. The agent is inferred from the
                                        review's `agent` field (or the
@@ -548,16 +566,92 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                                        step (only valid with `prompt`). Unset falls
                                        back to the review's `model`, then the
                                        project-level default.
+ environment             table          String environment overrides applied to
+                                       every command or agent call in this group.
 
  [[review.action]]  (zero or more per [[review]])
- User-declared labelled buttons shown in the review pane.
+ User-declared labelled buttons shown in the review pane. Every action is
+ optional to run and never blocks approval.
  Exactly ONE of `prompt` or `command` is required per entry.
 
  Key     Type    Notes
  label   string  REQUIRED. Text shown on the UI button.
  command string  ONE-OF Verbatim shell command run in a terminal.
  prompt  string  ONE-OF Hint text forwarded to the resolver LLM
-                 to expand into a runnable command before running.
+                 to expand into a runnable command during preparation.
+ description string     What the reviewer should inspect.
+ success string         Optional guidance on what to inspect. Omit it for the
+                        normal "exit code 0" manual action.
+
+[[review.action.prepare]] belongs to the immediately preceding
+[[review.action]] and uses the same command/prompt shape as [[review.prepare]]
+for action-specific setup. Its command may be one string or an ordered
+string array; environment overrides apply to that whole group. Equal action
+preparation groups are run once per preparation generation and satisfy every
+action that declares them.
+
+Preparation/action commands, group environment values, and shared-store paths
+may embed <<ralphus:new-worktree/BRANCH?upstream=UPSTREAM
+&text=basename({})>>. This is text interpolation only: it expands to BRANCH
+(or its requested text transform) and does not create another worktree.
+
+ [review.action.shared_store] is optional. It names a configured logical store
+ and a nonempty relative path. The daemon/provider maps `store` to the actual
+ absolute share root; task TOML never hardcodes that machine-specific root. A
+ missing store name is an error, rather than a temporary-directory fallback.
+ Configure the local V1 mapping in the project `.ralphus.toml` (or global
+ daemon config):
+
+    [[shared_store]]
+    name = "review-artifacts"
+    root = "Z:/ralphus-review-artifacts"
+
+ When present, preparation receives RALPHUS_SHARED_STORE_ROOT and the action
+ runs with that published directory as its working directory.
+
+ [review.action.lifecycle] is optional. `build_root_policy` is
+ "reset_before_prepare" (the default) or "prepare_managed". An ordered
+ `before_reset_command` array runs before the default build-root reset; its
+ optional `timeout` is a positive duration such as "30s" or "2m". A failing
+ or timed-out hook blocks the replacement generation.
+
+ Placement recipes (V1 supports the first two on the same machine; remote
+ delivery is deliberately introduced later):
+
+ 1. Local build and local test: preparation and Run use the retained review
+    checkout; no transfer is needed.
+
+    [[review.prepare]]
+    command = ["cargo build --bin demo", "cargo test --bin demo"]
+    environment = { RUST_LOG = "demo=debug" }
+
+    [[review.action]]
+    label = "Run local demo"
+    command = "target/debug/demo"
+
+ 2. Shared/network placement: preparation writes directly to the configured
+    mounted share. The action runs there; Ralphus does not copy it through the
+    daemon.
+
+    [[review.action]]
+    label = "Exercise shared build"
+    command = "./demo"
+
+      [review.action.shared_store]
+      store = "review-artifacts"
+      path = "reviews/<<ralphus:new-worktree/RAL-999-add_widget?upstream=main&text=basename({})>>/demo"
+
+      [[review.action.prepare]]
+      command = [
+        "cmake -S . -B \"$RALPHUS_SHARED_STORE_ROOT/build\"",
+        "cmake --build \"$RALPHUS_SHARED_STORE_ROOT/build\" --target demo",
+        "install -D -m 755 \"$RALPHUS_SHARED_STORE_ROOT/build/bin/demo\" \"$RALPHUS_SHARED_STORE_ROOT/demo\""
+      ]
+      environment = { BUILD_FLAVOR = "release" }
+
+      [review.action.lifecycle]
+      build_root_policy = "reset_before_prepare"
+      before_reset_command = ["./scripts/stop-demo-if-running"]
 
 ---------------------------------------------------------------
  Triage (RAL-318) -- auto-review opt-in, alternative to [[review]]
@@ -584,8 +678,8 @@ Tip: validate before submitting -- `ralphus validate file.toml`
  skip_base_updates, match_pr_branch_name, separate_pr_branch,
  dual_root_pr, auto_build, auto_submit_pr_stack, auto_fix_pr_errors,
  auto_fix_prompt_template, discourage_tests_during_auto_pull_request_fixes,
- auto_cancel_outdated_pr_pipelines, cache_manual_checks, and
- skip_auto_clean) can also be set from
+ auto_cancel_outdated_pr_pipelines, cache_manual_checks, rebuild_on,
+ and skip_auto_clean) can also be set from
  the database, via `ralphus project review-settings set <name>
  [flags]` or the board's Projects tab (the ... menu -> Review
  Settings), instead of hand-editing .ralphus.toml. A database
@@ -1024,21 +1118,24 @@ agent              = "{<insert recommended agent here>}"  # claude-code, codex-c
 auto_fix_pr_errors = true  # dispatch the resolver agent to fix a failing PR/MR CI status automatically
 auto_cancel_outdated_pr_pipelines = true  # on by default; cancel stale CI runs when a newer commit is force-pushed
 cache_manual_checks = true  # on by default; compute manual checks once at first branch creation (RAL-521)
+rebuild_on = ["rebase", "feedback", "auto_fix"]  # default: every event rebuilds the prepared build; [] = only `ralphus review rebuild`
 
-# Build step 1: static command (run verbatim in shell).
-[[review.auto_build]]
+# Shared preparation runs before any manual action is enabled.
+[[review.prepare]]
 command = "cargo build --release"
 
-# Build step 2: agent-driven command (agent figures out the build).
+# Agent-driven preparation is also supported and runs in declaration order.
 # If agent/model are unset here, they inherit from the review's agent/model above.
-[[review.auto_build]]
+[[review.prepare]]
 prompt  = "Build this Rust project. Figure out what build tool to use and run it."
 agent   = "{<insert recommended agent here>}"  # optional: uses review's agent if unset
 
 # Optional: user-declared test buttons shown in the review pane.
 [[review.action]]
 label   = "Run tests"
-command = "cargo test --all-targets"
+command = "target/debug/my-test-runner"
+description = "Run the already-built focused test executable."
+success = "The focused scenario completes and prints PASS."
 
 [[review.action]]
 label  = "Frontend smoke test"
@@ -1171,6 +1268,18 @@ mod tests {
     }
 
     #[test]
+    fn tutor_documents_rebuild_on_and_every_allowed_event() {
+        assert!(TASK_TUTOR.contains(" rebuild_on\n"));
+        assert!(TASK_TUTOR.contains("ralphus review\n                rebuild <selector>"));
+        for event in ralphus_core::schema::REBUILD_ON_VALUES {
+            assert!(
+                TASK_TUTOR.contains(&format!("\"{event}\"")),
+                "tutor must name the {event:?} event"
+            );
+        }
+    }
+
+    #[test]
     fn task_tutor_preserves_protocol_markers() {
         let text = task_tutor();
         assert!(text.contains("<<ralphus:new-worktree/hello?upstream=main>>"));
@@ -1182,6 +1291,18 @@ mod tests {
         assert!(TASK_TUTOR.contains("[[task]]"));
         assert!(TASK_TUTOR.contains("[[task.cell]]"));
         assert!(TASK_TUTOR.contains("[[review]]"));
+    }
+
+    #[test]
+    fn tutor_teaches_manual_preparation_and_shared_store_v1() {
+        assert!(TASK_TUTOR.contains("[[review.prepare]]"));
+        assert!(TASK_TUTOR.contains("1. Local build and local test"));
+        assert!(TASK_TUTOR.contains("2. Shared/network placement"));
+        assert!(TASK_TUTOR.contains("[review.action.shared_store]"));
+        assert!(TASK_TUTOR.contains("RALPHUS_SHARED_STORE_ROOT"));
+        assert!(TASK_TUTOR.contains("[review.action.lifecycle]"));
+        assert!(!TASK_TUTOR.contains("placement = \"copy\""));
+        assert!(!TASK_TUTOR.contains("placement = \"shared\""));
     }
 
     #[test]

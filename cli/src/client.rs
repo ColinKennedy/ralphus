@@ -283,6 +283,17 @@ fn set_if_some<T: Into<Value>>(obj: &mut Value, key: &str, value: Option<T>) {
     }
 }
 
+/// Insert a tri-state `rebuild_on`: outer `None` omits the key (leave as-is),
+/// `Some(None)` sends JSON `null` (clear back to inherit), `Some(Some(list))`
+/// sends the list.
+fn set_rebuild_on(obj: &mut Value, value: Option<Option<Vec<String>>>) {
+    match value {
+        None => {}
+        Some(None) => obj["rebuild_on"] = Value::Null,
+        Some(Some(list)) => obj["rebuild_on"] = json!(list),
+    }
+}
+
 impl DaemonClient {
     // ---- health / validate / submit ------------------------------------
 
@@ -497,6 +508,7 @@ impl DaemonClient {
             patch.auto_cancel_outdated_pr_pipelines,
         );
         set_if_some(&mut body, "cache_manual_checks", patch.cache_manual_checks);
+        set_rebuild_on(&mut body, patch.rebuild_on.clone());
         self.post(&format!("/api/projects/{name}/review-settings"), Some(body))
     }
 
@@ -1745,10 +1757,17 @@ impl DaemonClient {
             "cache_manual_checks",
             settings.cache_manual_checks,
         );
+        set_rebuild_on(&mut body, settings.rebuild_on.clone());
         self.post(
             &format!("/api/guardians/{guardian_id}/settings"),
             Some(body),
         )
+    }
+
+    /// `POST /api/guardians/{id}/rebuild`: tear down and rebuild a settled
+    /// review's prepared build now, whatever its `rebuild_on` list says.
+    pub fn guardian_rebuild(&self, guardian_id: &str) -> Result<Value, DaemonError> {
+        self.post(&format!("/api/guardians/{guardian_id}/rebuild"), None)
     }
 
     pub fn guardian_delete(&self, guardian_id: &str) -> Result<Value, DaemonError> {
@@ -2258,6 +2277,11 @@ pub struct GuardianSettings<'a> {
     /// merges, rebases, and automated fix iterations. Defaults to `true`
     /// (on by default) when unset.
     pub cache_manual_checks: Option<bool>,
+    /// Which events tear down and rebuild this review's prepared build.
+    /// Outer `None` leaves it alone, `Some(None)` clears the override back to
+    /// inherit (sent as JSON `null`), `Some(Some(list))` sets it (an empty list
+    /// never rebuilds automatically).
+    pub rebuild_on: Option<Option<Vec<String>>>,
 }
 
 /// RAL-408: bundled optional fields for
@@ -2306,6 +2330,11 @@ pub struct ProjectReviewSettingsPatch<'a> {
     /// then reused through later merges, rebases, and automated fix
     /// iterations. Defaults to `true` (on by default) when unset.
     pub cache_manual_checks: Option<bool>,
+    /// The project's default list of events that tear down and rebuild a
+    /// review's prepared build. Outer `None` leaves it alone, `Some(None)`
+    /// clears it back to inherit (sent as JSON `null`), `Some(Some(list))`
+    /// sets it (an empty list never rebuilds automatically).
+    pub rebuild_on: Option<Option<Vec<String>>>,
 }
 
 #[cfg(test)]
@@ -2381,6 +2410,40 @@ mod tests {
         let client = DaemonClient::new(server.url());
         let result = client.guardian_squash("g1", "proj", true).unwrap();
         assert_eq!(result["id"], "g1");
+    }
+
+    #[test]
+    fn guardian_rebuild_posts_to_the_rebuild_endpoint() {
+        let server = TestServer::start(|req| {
+            assert_eq!(req.url(), "/api/guardians/g1/rebuild");
+            assert_eq!(req.method(), &tiny_http::Method::Post);
+            (202, r#"{"ok":true}"#.to_string())
+        });
+        let client = DaemonClient::new(server.url());
+        let result = client.guardian_rebuild("g1").unwrap();
+        assert_eq!(result["ok"], true);
+    }
+
+    #[test]
+    fn rebuild_on_is_omitted_nulled_or_listed_in_the_request_body() {
+        let body_for = |value: Option<Option<Vec<String>>>| {
+            let mut body = json!({});
+            set_rebuild_on(&mut body, value);
+            body
+        };
+        // Absent: the key is not sent, so the daemon leaves the setting alone.
+        assert_eq!(body_for(None), json!({}));
+        // Inherit: an explicit JSON null clears the override.
+        assert_eq!(body_for(Some(None)), json!({"rebuild_on": null}));
+        // A list, including the empty "never automatically" list.
+        assert_eq!(
+            body_for(Some(Some(vec![
+                "rebase".to_string(),
+                "auto_fix".to_string()
+            ]))),
+            json!({"rebuild_on": ["rebase", "auto_fix"]})
+        );
+        assert_eq!(body_for(Some(Some(Vec::new()))), json!({"rebuild_on": []}));
     }
 
     #[test]

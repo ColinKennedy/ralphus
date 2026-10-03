@@ -58,6 +58,9 @@ pub const VERB_WRITE_FILE: &str = "write-file";
 
 /// The `remove-path` verb: delete a file or directory tree in a workspace.
 pub const VERB_REMOVE_PATH: &str = "remove-path";
+/// The `materialize` verb: copy one selected file or directory from the
+/// provider machine onto the daemon host.
+pub const VERB_MATERIALIZE: &str = "materialize";
 
 /// The `ping` verb: confirm the machine is reachable and ready, without doing
 /// any work. Cheap by contract — it is called to surface reachability in the
@@ -165,6 +168,18 @@ pub struct FileRequest {
     pub executable: bool,
 }
 
+/// A binary-safe provider-to-daemon artifact transfer.
+#[derive(Debug, Clone, Serialize)]
+pub struct MaterializeRequest {
+    /// Absolute source path on the provider machine.
+    pub source: String,
+    /// Absolute destination path on the daemon host.
+    pub destination: String,
+    /// Make a materialized file executable when the destination platform
+    /// supports executable mode bits.
+    pub executable: bool,
+}
+
 /// The payload sent to a provider's `run` verb.
 #[derive(Debug, Clone, Serialize)]
 pub struct RunRequest {
@@ -176,6 +191,9 @@ pub struct RunRequest {
     /// Arguments, already split — never a shell string, so nothing has to be
     /// quoted or escaped correctly on the far side.
     pub args: Vec<String>,
+    /// Environment overrides applied by the provider before execution.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
 }
 
 /// The payload sent to a provider's `provision` verb.
@@ -435,6 +453,29 @@ pub struct ProviderRunner {
 }
 
 impl ProviderRunner {
+    /// Program and argv for opening this provider's interactive terminal verb
+    /// in a daemon-host terminal window.
+    #[must_use]
+    pub fn terminal_invocation(
+        &self,
+        command: &str,
+        cols: u16,
+        lines: u16,
+    ) -> (String, Vec<String>) {
+        let mut args = self.args.clone();
+        args.extend([
+            "terminal".to_string(),
+            "--uri".to_string(),
+            self.uri.clone(),
+            "--command".to_string(),
+            command.to_string(),
+            "--cols".to_string(),
+            cols.to_string(),
+            "--lines".to_string(),
+            lines.to_string(),
+        ]);
+        (self.program.clone(), args)
+    }
     /// Build a runner for one registered provider + machine uri.
     #[must_use]
     pub fn new(
@@ -1299,6 +1340,23 @@ impl ProviderRunner {
         let payload = serde_json::to_string(&req)
             .map_err(|e| format!("could not serialize remove-path request: {e}"))?;
         self.invoke(VERB_REMOVE_PATH, &payload, spec).map(|_| ())
+    }
+
+    /// Materialize one selected remote file or directory on the daemon host.
+    pub fn materialize(
+        &self,
+        source: &str,
+        destination: &str,
+        executable: bool,
+        spec: &RunnerSpec,
+    ) -> Result<(), String> {
+        let payload = serde_json::to_string(&MaterializeRequest {
+            source: source.to_string(),
+            destination: destination.to_string(),
+            executable,
+        })
+        .map_err(|e| format!("could not serialize materialize request: {e}"))?;
+        self.invoke(VERB_MATERIALIZE, &payload, spec).map(|_| ())
     }
 
     /// Prove `remote_root` is actually usable on the machine: create a small
@@ -2588,6 +2646,7 @@ else:
             cwd: ".".to_string(),
             program: "git".to_string(),
             args: vec!["status".to_string()],
+            env: BTreeMap::new(),
         };
         let sp = spec(Some("chantest:A"));
         let a = provider.run_vcs(&req, &sp).expect("first");
@@ -2636,6 +2695,7 @@ else:
             cwd: ".".to_string(),
             program: "git".to_string(),
             args: vec!["status".to_string()],
+            env: BTreeMap::new(),
         };
         let out = provider
             .run_vcs(&req, &spec(Some("falltest:A")))

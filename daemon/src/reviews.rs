@@ -386,17 +386,11 @@ struct Membership {
     /// (`[[review]] base_shift_maximum_rebuilds`).
     base_shift_maximum_rebuilds: Option<u32>,
     proof_skip_auto_clean: Option<bool>,
-    checks: Vec<String>,
     summary_format: Option<String>,
     match_pr_branch_name: Option<bool>,
     separate_pr_branch: Option<bool>,
-    /// Declared `[[review.auto_build]]` steps (RAL-342): zero or more build
-    /// steps, each either a static `command` or an agent-invocation shape,
-    /// mutually exclusive with `skip_auto_build`.
-    auto_build: Vec<ralphus_core::schema::AutoBuildDef>,
-    /// Explicit opt-out of the auto_build requirement (`[[review]]
-    /// skip_auto_build = true`, RAL-342), mutually exclusive with `auto_build`.
-    skip_auto_build: bool,
+    /// Preparation declarations authored with `[[review.prepare]]`.
+    prepare: Vec<ralphus_core::schema::PreparationStepDef>,
     /// RAL-395: optional auto-fix-PR-errors override declared on the review
     /// (`[[review]] auto_fix_pr_errors`).
     auto_fix_pr_errors: Option<bool>,
@@ -420,6 +414,10 @@ struct Membership {
     /// computed once, when its review branches are first created, and then
     /// reused through later merges, rebases, and automated fix iterations.
     cache_manual_checks: Option<bool>,
+    /// Optional override declared on the review (`[[review]] rebuild_on`) for
+    /// which events tear down and rebuild its prepared build. `Some(vec![])`
+    /// is a declared "never automatically"; `None` inherits.
+    rebuild_on: Option<Vec<String>>,
 }
 
 /// Build the planner's cell/task rows straight from the task file (same order
@@ -501,7 +499,23 @@ fn actions_to_hints(actions: &[ReviewActionDef]) -> Vec<GuardianCheck> {
             label: Some(a.label.clone()),
             command: a.command.clone(),
             prompt: a.prompt.clone(),
+            description: a.description.clone(),
+            success: a.success.clone(),
+            prepare: a.prepare.iter().map(into_guardian_preparation).collect(),
             cleanup_command: a.cleanup_command.clone(),
+            shared_store: a.shared_store.as_ref().map(|store| {
+                crate::guardian::GuardianSharedStore {
+                    store: store.store.clone(),
+                    path: store.path.clone(),
+                }
+            }),
+            lifecycle: a.lifecycle.as_ref().map(|lifecycle| {
+                crate::guardian::GuardianActionLifecycle {
+                    build_root_policy: lifecycle.build_root_policy.clone(),
+                    before_reset_command: lifecycle.before_reset_command.clone(),
+                    timeout: lifecycle.timeout.clone(),
+                }
+            }),
             inputs: a
                 .input
                 .iter()
@@ -515,6 +529,7 @@ fn actions_to_hints(actions: &[ReviewActionDef]) -> Vec<GuardianCheck> {
                     r#type: crate::guardian::CheckInputType::String,
                 })
                 .collect(),
+            ..GuardianCheck::default()
         })
         .collect()
 }
@@ -830,16 +845,6 @@ pub fn derive_reviews_with_full_prefetch(
         return Ok(Vec::new());
     }
 
-    // RAL-<pending>: a cheap, best-effort pass for `require_auto_build_declaration`
-    // (below) BEFORE paying for `resolve_placeholders_with_prefetch`'s real `git
-    // worktree add` calls -- a missing `[[review.auto_build]]`/`skip_auto_build`
-    // is a purely syntactic mistake and shouldn't cost a whole batch's worth of
-    // worktree creation to discover. See its own doc comment for why this only
-    // covers link-key reviews and is advisory (the real check below still runs
-    // regardless, so an imprecise answer here only costs time, never correctness).
-    // allow-lock-io: local config/DB reads only, no subprocess or network.
-    require_auto_build_declaration_early(&store.lock(), file, &tasks, &cells, &cell_info)?;
-
     // A review-opted-in cell's `cwd` may still be an unmaterialized
     // `ralphus:new-worktree/<branch>` placeholder (RAL-100): normally the
     // scheduler only resolves those when the squad is claimed to execute, but
@@ -1044,12 +1049,10 @@ pub fn derive_reviews_with_full_prefetch(
             skip_base_updates: rv.and_then(|r| r.skip_base_updates),
             base_shift_maximum_rebuilds: rv.and_then(|r| r.base_shift_maximum_rebuilds),
             proof_skip_auto_clean: rv.and_then(|r| r.proof_skip_auto_clean),
-            checks: rv.map(|r| r.checks.clone()).unwrap_or_default(),
             summary_format: rv.and_then(|r| r.summary_format.clone()),
             match_pr_branch_name: rv.and_then(|r| r.match_pr_branch_name),
             separate_pr_branch: rv.and_then(|r| r.separate_pr_branch),
-            auto_build: rv.map(|r| r.auto_build.clone()).unwrap_or_default(),
-            skip_auto_build: rv.is_some_and(|r| r.skip_auto_build),
+            prepare: rv.map(|r| r.prepare.clone()).unwrap_or_default(),
             auto_fix_pr_errors: rv.and_then(|r| r.auto_fix_pr_errors),
             auto_fix_prompt_template: rv
                 .and_then(|r| r.auto_fix_prompt_template.clone())
@@ -1058,6 +1061,7 @@ pub fn derive_reviews_with_full_prefetch(
                 .and_then(|r| r.discourage_tests_during_auto_pull_request_fixes),
             auto_cancel_outdated_pr_pipelines: rv.and_then(|r| r.auto_cancel_outdated_pr_pipelines),
             cache_manual_checks: rv.and_then(|r| r.cache_manual_checks),
+            rebuild_on: rv.and_then(|r| r.rebuild_on.clone()),
         });
     }
 
@@ -1181,7 +1185,6 @@ pub fn derive_reviews_with_full_prefetch(
         } else {
             suggested
         };
-        require_auto_build_declaration(store, &members, std::slice::from_ref(project), &name)?;
         let registered_project = single_registered_project(&members);
         let gid = store
             .create_guardian_keyed(
@@ -1195,7 +1198,7 @@ pub fn derive_reviews_with_full_prefetch(
             .map_err(|e| ReviewError::new(e.to_string()))?;
         apply_resolver(store, &gid, &members)?;
         apply_project_review_defaults(store, &gid, project)?;
-        apply_auto_build(store, &gid, &members)?;
+        apply_preparation(store, &gid, &members)?;
         apply_action_hints(store, &gid, &members, &hints_by_id)?;
         // Single-project: no need to tag branches with a project (they share git_root).
         add_new_branches(store, &gid, &[], &members, false)?;
@@ -1228,8 +1231,8 @@ pub fn derive_reviews_with_full_prefetch(
             .iter()
             .find(|m| !m.name.is_empty())
             .map_or_else(|| key.clone(), |m| m.name.clone());
-        // Computed before the guardian is created: every distinct project in
-        // the group, and the required-declaration check both need this.
+        // Preserve every distinct project in the linked review so each
+        // project's defaults can be applied to the shared guardian.
         let distinct_projects: Vec<String> = {
             let mut seen = std::collections::HashSet::new();
             members
@@ -1238,8 +1241,6 @@ pub fn derive_reviews_with_full_prefetch(
                 .filter(|p| seen.insert(p.clone()))
                 .collect()
         };
-        let review_ref = format!("{}{key}", ralphus_core::schema::REVIEW_LINK_PREFIX);
-        require_auto_build_declaration(store, &members, &distinct_projects, &review_ref)?;
         let registered_project = single_registered_project(&members);
         let gid = store
             .create_guardian_keyed(
@@ -1256,7 +1257,7 @@ pub fn derive_reviews_with_full_prefetch(
             apply_project_review_defaults(store, &gid, proj)?;
         }
         apply_resolver(store, &gid, &members)?;
-        apply_auto_build(store, &gid, &members)?;
+        apply_preparation(store, &gid, &members)?;
         apply_action_hints(store, &gid, &members, &hints_by_id)?;
         // Freshly minted guardian: no branches attached yet. Tag each branch with
         // its project root (multi-project link group).
@@ -1489,17 +1490,6 @@ fn apply_resolver(
             .set_guardian_summary_format(gid, Some(&format))
             .map_err(|e| ReviewError::new(e.to_string()))?;
     }
-    let mut checks = store
-        .guardian_checks(gid)
-        .map_err(|e| ReviewError::new(e.to_string()))?;
-    for check in members.iter().flat_map(|member| &member.checks) {
-        if !checks.contains(check) {
-            checks.push(check.clone());
-        }
-    }
-    store
-        .set_guardian_checks(gid, &checks)
-        .map_err(|e| ReviewError::new(e.to_string()))?;
     if let Some(enabled) = members.iter().find_map(|m| m.separate_pr_branch) {
         store
             .set_guardian_separate_pr_branch(gid, Some(enabled))
@@ -1551,174 +1541,54 @@ fn apply_resolver(
             .set_guardian_cache_manual_checks(gid, Some(enabled))
             .map_err(|e| ReviewError::new(e.to_string()))?;
     }
+    // This review's own list of rebuild events, authored via
+    // `[[review]] rebuild_on` (an empty list is a real value, not "unset").
+    if let Some(events) = members.iter().find_map(|m| m.rebuild_on.as_ref()) {
+        store
+            .set_guardian_rebuild_on(gid, Some(events))
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+    }
     Ok(())
 }
 
-/// Field-for-field conversion from the offline `core::schema` shape (as parsed
-/// from `[[review.auto_build]]`) to the runtime `guardian::GuardianAutoBuild`
-/// shape persisted in the store.
-fn into_guardian_auto_build(
-    def: &ralphus_core::schema::AutoBuildDef,
+/// Convert a declared preparation group, preserving its ordered command list
+/// and per-group environment overrides.
+fn into_guardian_preparation(
+    def: &ralphus_core::schema::PreparationStepDef,
 ) -> crate::guardian::GuardianAutoBuild {
     crate::guardian::GuardianAutoBuild {
-        command: def.command.clone(),
+        command: None,
+        commands: def
+            .command
+            .as_ref()
+            .map_or_else(Vec::new, |command| command.commands()),
         prompt: def.prompt.clone(),
         system_prompt: def.system_prompt.clone(),
         system_prompt_position: def.system_prompt_position.clone(),
         agent: def.agent.clone(),
         model: def.model.clone(),
+        environment: def.environment.clone(),
     }
 }
 
-/// Persist this review's declared build steps (RAL-342), from the first member
-/// that sets `[[review.auto_build]]` entries, or -- failing that -- the first
-/// member that sets `skip_auto_build = true`. Currently only the first step
-/// is persisted; multiple steps will be supported in the future. A no-op when
-/// no member declares either, leaving the guardian to fall back to the
-/// project-config default at merge time.
-fn apply_auto_build(
+/// Persist every declared preparation step from the first member that defines
+/// them.
+fn apply_preparation(
     store: &Store,
     gid: &str,
     members: &[&Membership],
 ) -> std::result::Result<(), ReviewError> {
-    if let Some(def) = members.iter().find_map(|m| m.auto_build.first()) {
+    if let Some(member) = members.iter().find(|m| !m.prepare.is_empty()) {
+        let steps = member
+            .prepare
+            .iter()
+            .map(into_guardian_preparation)
+            .collect();
         store
-            .set_guardian_auto_build(gid, Some(&into_guardian_auto_build(def)))
-            .map_err(|e| ReviewError::new(e.to_string()))?;
-    } else if members.iter().any(|m| m.skip_auto_build) {
-        store
-            .set_guardian_skip_auto_build(gid, true)
+            .set_guardian_preparation(gid, steps)
             .map_err(|e| ReviewError::new(e.to_string()))?;
     }
     Ok(())
-}
-
-/// Preflight review build declarations before squad insertion, using only
-/// registered project configuration. It covers LINK-KEY reviews
-/// (`ralphus:new-review/<key>`, `id` starting with
-/// [`ralphus_core::schema::REVIEW_LINK_PREFIX`]) — a
-/// plain-name review's membership can still be SPLIT into multiple guardians
-/// by *resolved git root* once worktrees exist (see the "project groups" loop
-/// in [`derive_reviews_with_prefetch`]), so this function cannot safely
-/// predict its final per-guardian project set and leaves those to the late
-/// check exactly as before. A link-key review is never split that way — every
-/// cell sharing a `<key>` always folds into one guardian — so its full
-/// project set is already knowable from each referencing cell's *owning
-/// task's declared `project` name*, no worktree resolution required.
-///
-/// That declared name is then proxied through the project's *registered*
-/// root path (`Store::resolve_project`), not the eventual per-branch
-/// worktree path the late check uses, when asking
-/// `crate::config::resolve` whether a project-level `auto_build` default
-/// covers it — the two paths can differ (a worktree is a subdirectory
-/// alongside the main checkout), but `.ralphus.toml` config is layered
-/// upward from wherever you start, so both normally resolve the same files.
-/// The materialization path repeats the check against resolved worktree paths
-/// before creating a guardian.
-pub(crate) fn preflight_auto_build_declarations(
-    store: &Store,
-    file: &TaskFile,
-) -> std::result::Result<(), ReviewError> {
-    let (cells, tasks, cell_info) = rows_from_file(file);
-    require_auto_build_declaration_early(store, file, &tasks, &cells, &cell_info)
-}
-
-fn require_auto_build_declaration_early(
-    store: &Store,
-    file: &TaskFile,
-    tasks: &[TaskRow],
-    cells: &[CellRow],
-    cell_info: &CellReviewInfo,
-) -> std::result::Result<(), ReviewError> {
-    let review_map: std::collections::HashMap<&str, &ReviewDef> = file
-        .review
-        .iter()
-        .filter_map(|rv| rv.id.as_deref().map(|id| (id, rv)))
-        .collect();
-    let tasks_by_idx: BTreeMap<i64, &TaskRow> = tasks.iter().map(|t| (t.idx, t)).collect();
-
-    let mut projects_by_review: BTreeMap<&str, HashSet<String>> = BTreeMap::new();
-    for (pos, (_, rev_id_opt)) in cell_info.iter().enumerate() {
-        let Some(rev_id) = rev_id_opt else { continue };
-        if !rev_id.starts_with(ralphus_core::schema::REVIEW_LINK_PREFIX) {
-            continue; // Plain-name reviews may still split by git root later.
-        }
-        let Some(project_name) = tasks_by_idx
-            .get(&cells[pos].task_idx)
-            .and_then(|t| t.project.as_deref())
-        else {
-            continue;
-        };
-        projects_by_review
-            .entry(rev_id)
-            .or_default()
-            .insert(project_name.to_string());
-    }
-
-    for (rev_id, project_names) in projects_by_review {
-        let Some(rv) = review_map.get(rev_id) else {
-            continue;
-        };
-        if !rv.auto_build.is_empty() || rv.skip_auto_build {
-            continue;
-        }
-        let covered = !project_names.is_empty()
-            && project_names.iter().all(|name| {
-                store.resolve_project(name).ok().flatten().is_some_and(|p| {
-                    crate::config::resolve(Path::new(&p.path))
-                        .auto_build
-                        .is_some()
-                })
-            });
-        if covered {
-            continue;
-        }
-        return Err(ReviewError::new(format!(
-            "{rev_id} must declare [[review.auto_build]] or skip_auto_build = true \
-             (or configure a project-level auto_build default in .ralphus.toml)"
-        )));
-    }
-    Ok(())
-}
-
-/// RAL-342: every review must explicitly declare its finalize-time build step
-/// -- `[[review.auto_build]]` or `skip_auto_build = true` -- unless every
-/// distinct project in the group already has a project-level `auto_build`
-/// default configured (`.ralphus.toml [review] auto_build`). Runs before the
-/// guardian is created, so a rejection here never leaves behind a partial
-/// guardian (mirrors the whole-squad rollback-on-`Err` at the submit call
-/// site). Submit-time only -- reopen/restart-merge do not re-check this.
-///
-/// `review_ref` identifies the pending review in the error message: for a
-/// link group this is its `ralphus:new-review/<key>` placeholder URI (no
-/// guardian id exists yet to reference instead); for a project group it is
-/// the review's resolved name.
-fn require_auto_build_declaration(
-    store: &Store,
-    members: &[&Membership],
-    distinct_projects: &[String],
-    review_ref: &str,
-) -> std::result::Result<(), ReviewError> {
-    let declared = members
-        .iter()
-        .any(|m| !m.auto_build.is_empty() || m.skip_auto_build);
-    if declared {
-        return Ok(());
-    }
-    let covered_by_config = !distinct_projects.is_empty()
-        && distinct_projects.iter().all(|p| {
-            store
-                .resolve_review_config(Path::new(p))
-                .auto_build
-                .is_some()
-        });
-    if covered_by_config {
-        return Ok(());
-    }
-    Err(ReviewError::new(format!(
-        "{review_ref} must declare [[review.auto_build]] or skip_auto_build = true \
-         (or configure a project-level auto_build default in .ralphus.toml)"
-    )))
 }
 
 /// Persist user-declared action hints from the top-level `[[review.action]]`
@@ -2772,13 +2642,12 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::{
-        Membership, any_workspace_ahead_of_upstream, apply_arbiter_pool_order, apply_auto_build,
+        Membership, any_workspace_ahead_of_upstream, apply_arbiter_pool_order,
         apply_project_review_defaults, apply_resolver, create_review_from_triage_pool,
         derive_reviews_with_prefetch, derive_triage_pools, fire_ready_triage_thresholds, plan,
         rebase_onto, repair_arbiter_review_project_roots, repair_review_project_identities,
-        repair_triage_pool_keys, require_auto_build_declaration,
-        require_auto_build_declaration_early, review_branch_order, rows_from_file,
-        set_worktree_commit_baseline, workspace_has_commits_ahead_of_upstream,
+        repair_triage_pool_keys, review_branch_order, set_worktree_commit_baseline,
+        workspace_has_commits_ahead_of_upstream,
     };
     use crate::store::{Store, TaskRow};
     use crate::workspace::Workspace;
@@ -3218,17 +3087,16 @@ mod tests {
             skip_base_updates: None,
             base_shift_maximum_rebuilds: None,
             proof_skip_auto_clean: None,
-            checks: Vec::new(),
+            prepare: Vec::new(),
             summary_format: None,
             match_pr_branch_name: None,
             separate_pr_branch: None,
-            auto_build: Vec::new(),
-            skip_auto_build: false,
             auto_fix_pr_errors: None,
             auto_fix_prompt_template: None,
             discourage_tests_during_auto_pull_request_fixes: None,
             auto_cancel_outdated_pr_pipelines: None,
             cache_manual_checks: None,
+            rebuild_on: None,
         }
     }
 
@@ -3318,7 +3186,7 @@ mod tests {
             auto_pr_feedback: Some(true),
             skip_base_updates: Some(true),
             proof_skip_auto_clean: Some(true),
-            checks: Vec::new(),
+            prepare: Vec::new(),
             summary_format: None,
             match_pr_branch_name: Some(true),
             separate_pr_branch: Some(true),
@@ -3336,146 +3204,41 @@ mod tests {
         assert_eq!(guardian.cache_manual_checks, Some(false));
     }
 
-    // ── [[review]] auto_build wiring / required-declaration (RAL-342) ────
+    #[test]
+    fn apply_resolver_stamps_the_declared_rebuild_on_including_an_empty_list() {
+        for declared in [
+            vec!["feedback".to_string()],
+            Vec::new(),
+            vec!["rebase".to_string(), "auto_fix".to_string()],
+        ] {
+            let store = Store::open_in_memory().unwrap();
+            let gid = store.create_guardian("r", "main", "/repo").unwrap();
+            let m = Membership {
+                rebuild_on: Some(declared.clone()),
+                ..membership(None)
+            };
+            apply_resolver(&store, &gid, &[&m]).unwrap();
+            let guardian = store.get_guardian(&gid).unwrap();
+            assert_eq!(guardian.rebuild_on, Some(declared.clone()));
+            assert_eq!(guardian.effective_rebuild_on, declared);
+        }
+    }
 
     #[test]
-    fn apply_auto_build_sets_auto_build_from_declaring_member() {
+    fn apply_resolver_leaves_rebuild_on_unset_when_not_declared() {
         let store = Store::open_in_memory().unwrap();
         let gid = store.create_guardian("r", "main", "/repo").unwrap();
-        let def = ralphus_core::schema::AutoBuildDef {
-            command: Some("make build".to_string()),
-            ..Default::default()
-        };
-        let m = Membership {
-            auto_build: vec![def],
-            ..membership(None)
-        };
-        apply_auto_build(&store, &gid, &[&m]).unwrap();
-        let stored = store.guardian_auto_build(&gid).unwrap();
+        apply_resolver(&store, &gid, &[&membership(None)]).unwrap();
+        let guardian = store.get_guardian(&gid).unwrap();
+        assert_eq!(guardian.rebuild_on, None);
         assert_eq!(
-            stored.and_then(|b| b.command),
-            Some("make build".to_string())
+            guardian.effective_rebuild_on,
+            vec!["rebase", "feedback", "auto_fix"]
         );
-        assert!(!store.guardian_skip_auto_build(&gid).unwrap());
     }
-
-    #[test]
-    fn apply_auto_build_sets_skip_auto_build_when_declared_and_no_auto_build_present() {
-        let store = Store::open_in_memory().unwrap();
-        let gid = store.create_guardian("r", "main", "/repo").unwrap();
-        let m = Membership {
-            skip_auto_build: true,
-            ..membership(None)
-        };
-        apply_auto_build(&store, &gid, &[&m]).unwrap();
-        assert!(store.guardian_skip_auto_build(&gid).unwrap());
-        assert_eq!(store.guardian_auto_build(&gid).unwrap(), None);
-    }
-
-    #[test]
-    fn apply_auto_build_leaves_unset_when_no_member_declares_either() {
-        let store = Store::open_in_memory().unwrap();
-        let gid = store.create_guardian("r", "main", "/repo").unwrap();
-        let m = membership(None);
-        apply_auto_build(&store, &gid, &[&m]).unwrap();
-        assert_eq!(store.guardian_auto_build(&gid).unwrap(), None);
-        assert!(!store.guardian_skip_auto_build(&gid).unwrap());
-    }
-
-    #[test]
-    fn require_auto_build_declaration_ok_when_member_declares_auto_build() {
-        let def = ralphus_core::schema::AutoBuildDef {
-            command: Some("make build".to_string()),
-            ..Default::default()
-        };
-        let m = Membership {
-            auto_build: vec![def],
-            ..membership(None)
-        };
-        let root = temp_repo();
-        let project = root.to_string_lossy().into_owned();
-        let store = Store::open_in_memory().unwrap();
-        assert!(require_auto_build_declaration(&store, &[&m], &[project], "r").is_ok());
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn require_auto_build_declaration_ok_when_member_declares_skip() {
-        let m = Membership {
-            skip_auto_build: true,
-            ..membership(None)
-        };
-        let root = temp_repo();
-        let project = root.to_string_lossy().into_owned();
-        let store = Store::open_in_memory().unwrap();
-        assert!(require_auto_build_declaration(&store, &[&m], &[project], "r").is_ok());
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn require_auto_build_declaration_ok_when_project_config_declares_default() {
-        let root = temp_repo();
-        std::fs::write(
-            root.join(".ralphus.toml"),
-            "[review]\nauto_build = \"make build\"\n",
-        )
-        .unwrap();
-        let m = membership(None);
-        let project = root.to_string_lossy().into_owned();
-        let store = Store::open_in_memory().unwrap();
-        assert!(require_auto_build_declaration(&store, &[&m], &[project], "r").is_ok());
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn require_auto_build_declaration_err_when_nothing_declared_and_no_config_fallback() {
-        let root = temp_repo();
-        let m = membership(None);
-        let project = root.to_string_lossy().into_owned();
-        let store = Store::open_in_memory().unwrap();
-        let err =
-            require_auto_build_declaration(&store, &[&m], &[project], "ralphus:new-review/abc123")
-                .unwrap_err();
-        assert!(
-            err.to_string().contains("ralphus:new-review/abc123"),
-            "error must identify the pending review: {err}"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn require_auto_build_declaration_err_when_link_group_only_partially_covered_by_config() {
-        // Two distinct projects in a link group; only one has a project-level
-        // `auto_build` default. A partial fallback doesn't count for the whole
-        // group -- the merge could silently pick up the covered project's
-        // default while running with none for the other.
-        let covered = temp_repo();
-        std::fs::write(
-            covered.join(".ralphus.toml"),
-            "[review]\nauto_build = \"make build\"\n",
-        )
-        .unwrap();
-        let uncovered = temp_repo();
-        let m = membership(None);
-        let projects = [
-            covered.to_string_lossy().into_owned(),
-            uncovered.to_string_lossy().into_owned(),
-        ];
-        let store = Store::open_in_memory().unwrap();
-        assert!(require_auto_build_declaration(&store, &[&m], &projects, "r").is_err());
-        let _ = std::fs::remove_dir_all(&covered);
-        let _ = std::fs::remove_dir_all(&uncovered);
-    }
-
-    // ── RAL-<pending>: `require_auto_build_declaration_early` ────────────
-    // (the pre-`resolve_placeholders_with_prefetch` fast-fail pass) and the
-    // end-to-end proof that `derive_reviews_with_prefetch` actually runs it
-    // before paying for worktree materialization.
 
     /// A one-task, one-cell, one-link-review TOML referencing project `"proj"`
-    /// (must already be registered on `store` by the caller), with `review_toml`
-    /// spliced verbatim into the `[[review]]` block (e.g. `"skip_auto_build = true"`,
-    /// or `""` for neither declared).
+    /// (which the caller registers before materialization).
     fn link_review_toml(review_toml: &str) -> String {
         format!(
             "[[task]]\nname=\"t\"\nproject=\"proj\"\n\n  [[task.cell]]\n  \
@@ -3485,93 +3248,7 @@ mod tests {
     }
 
     #[test]
-    fn require_auto_build_declaration_early_ok_when_auto_build_declared() {
-        let file: ralphus_core::schema::TaskFile = toml::from_str(&link_review_toml(
-            "[[review.auto_build]]\ncommand=\"make build\"\n",
-        ))
-        .unwrap();
-        let (cells, tasks, cell_info) = rows_from_file(&file);
-        let store = Store::open_in_memory().unwrap();
-        assert!(
-            require_auto_build_declaration_early(&store, &file, &tasks, &cells, &cell_info).is_ok()
-        );
-    }
-
-    #[test]
-    fn require_auto_build_declaration_early_ok_when_skip_auto_build_declared() {
-        let file: ralphus_core::schema::TaskFile =
-            toml::from_str(&link_review_toml("skip_auto_build = true")).unwrap();
-        let (cells, tasks, cell_info) = rows_from_file(&file);
-        let store = Store::open_in_memory().unwrap();
-        assert!(
-            require_auto_build_declaration_early(&store, &file, &tasks, &cells, &cell_info).is_ok()
-        );
-    }
-
-    #[test]
-    fn require_auto_build_declaration_early_err_when_neither_declared_and_no_config_fallback() {
-        let root = temp_repo();
-        let file: ralphus_core::schema::TaskFile = toml::from_str(&link_review_toml("")).unwrap();
-        let (cells, tasks, cell_info) = rows_from_file(&file);
-        let store = Store::open_in_memory().unwrap();
-        store
-            .register_project("proj", "", &root.to_string_lossy(), "git")
-            .unwrap();
-        let err = require_auto_build_declaration_early(&store, &file, &tasks, &cells, &cell_info)
-            .unwrap_err();
-        assert!(
-            err.message.contains("ralphus:new-review/k"),
-            "error must identify the pending review: {}",
-            err.message
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn require_auto_build_declaration_early_ok_when_project_config_covers_it() {
-        let root = temp_repo();
-        std::fs::write(
-            root.join(".ralphus.toml"),
-            "[review]\nauto_build = \"make build\"\n",
-        )
-        .unwrap();
-        let file: ralphus_core::schema::TaskFile = toml::from_str(&link_review_toml("")).unwrap();
-        let (cells, tasks, cell_info) = rows_from_file(&file);
-        let store = Store::open_in_memory().unwrap();
-        store
-            .register_project("proj", "", &root.to_string_lossy(), "git")
-            .unwrap();
-        assert!(
-            require_auto_build_declaration_early(&store, &file, &tasks, &cells, &cell_info).is_ok()
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn require_auto_build_declaration_early_skips_plain_name_reviews() {
-        // A plain (non-link) review's final membership can still be SPLIT by
-        // *resolved* git root once worktrees exist -- this function must not
-        // guess at that early and risk a false-positive rejection; it defers
-        // entirely to the late `require_auto_build_declaration` check.
-        let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\n\n  [[task.cell]]\n  \
-                    cwd=\"<<ralphus:new-worktree/feat-x?upstream=main>>\"\n  prompt=\"p\"\n  \
-                    review=\"<<review:backend>>\"\n\n[[review]]\nid=\"backend\"\n";
-        let file: ralphus_core::schema::TaskFile = toml::from_str(toml).unwrap();
-        let (cells, tasks, cell_info) = rows_from_file(&file);
-        let root = temp_repo();
-        let store = Store::open_in_memory().unwrap();
-        store
-            .register_project("proj", "", &root.to_string_lossy(), "git")
-            .unwrap();
-        assert!(
-            require_auto_build_declaration_early(&store, &file, &tasks, &cells, &cell_info).is_ok(),
-            "a plain-name review must be left to the late check, never rejected early"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn derive_reviews_with_prefetch_rejects_missing_auto_build_before_materializing_any_worktree() {
+    fn derive_reviews_with_prefetch_allows_no_preparation_and_materializes_worktree() {
         let root = temp_repo();
         git(&root, &["init", "--initial-branch", "main"]);
         std::fs::write(root.join("base.txt"), "base\n").unwrap();
@@ -3587,23 +3264,11 @@ mod tests {
             .unwrap();
         let file: ralphus_core::schema::TaskFile = toml::from_str(&link_review_toml("")).unwrap();
 
-        let err =
-            derive_reviews_with_prefetch(&store, "squad-1", &file, &HashMap::new()).unwrap_err();
-        assert!(
-            err.message.contains("ralphus:new-review/k"),
-            "must fail on the missing auto_build declaration, not something else: {}",
-            err.message
-        );
-        // The real proof this runs BEFORE `resolve_placeholders_with_prefetch`:
-        // no worktree/branch was ever created for the rejected review's cell.
-        assert!(
-            !crate::worktrees::worktree_dir(&root, "feat-x").exists(),
-            "the early auto_build check must reject before any worktree is materialized"
-        );
-        assert!(
-            git(&root, &["branch", "--list", "feat-x"]).is_empty(),
-            "no branch should have been created either"
-        );
+        let guardians =
+            derive_reviews_with_prefetch(&store, "squad-1", &file, &HashMap::new()).unwrap();
+        assert_eq!(guardians.len(), 1);
+        assert!(crate::worktrees::worktree_dir(&root, "feat-x").exists());
+        assert!(!git(&root, &["branch", "--list", "feat-x"]).is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 

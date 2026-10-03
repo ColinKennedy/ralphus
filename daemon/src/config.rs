@@ -32,6 +32,14 @@ pub struct ArkConfig {
     pub max_worktrees: usize,
 }
 
+/// One locally mounted shared store. The name is referenced by a review action;
+/// the absolute root stays daemon/provider configuration rather than task TOML.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SharedStoreConfig {
+    pub name: String,
+    pub root: String,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 struct ArkConfigLayer {
     sweep_interval_days: Option<u64>,
@@ -260,6 +268,14 @@ pub struct ReviewConfig {
     /// (see `Guardian::cache_manual_checks` in `guardian.rs`) wins over this.
     #[serde(default)]
     pub cache_manual_checks: Option<bool>,
+    /// Which events tear down and rebuild a review's prepared build (any of
+    /// `ralphus_core::schema::REBUILD_ON_VALUES`). `None` means unset, which
+    /// resolves to all three values (see [`Self::rebuild_on`]); the project
+    /// layer replaces the global one outright rather than unioning with it. A
+    /// per-review override (see `Guardian::rebuild_on` in `guardian.rs`) wins
+    /// over this.
+    #[serde(default)]
+    pub rebuild_on: Option<Vec<String>>,
     /// RAL-395: the prompt template handed to the resolver agent when
     /// `auto_fix_pr_errors` fires, with `<<prompt>>` replaced by the
     /// concatenated prompts of the failing branch's attached Cells. `None`
@@ -411,6 +427,7 @@ pub const REVIEW_CONFIG_KEYS: &[&str] = &[
     "auto_build",
     "summary_format",
     "cache_manual_checks",
+    "rebuild_on",
 ];
 
 impl ReviewConfig {
@@ -541,6 +558,31 @@ impl ReviewConfig {
     #[must_use]
     pub fn cache_manual_checks(&self) -> bool {
         self.cache_manual_checks.unwrap_or(true)
+    }
+
+    /// The events that rebuild a review's prepared build when neither the
+    /// review nor this config narrows them: the configured list, or every
+    /// `REBUILD_ON_VALUES` entry when unset. An entry outside that set (a
+    /// hand-edited config) is dropped rather than failing the whole file.
+    #[must_use]
+    pub fn rebuild_on(&self) -> Vec<String> {
+        match &self.rebuild_on {
+            Some(values) => {
+                let mut resolved: Vec<String> = Vec::new();
+                for value in values {
+                    if ralphus_core::schema::REBUILD_ON_VALUES.contains(&value.as_str())
+                        && !resolved.contains(value)
+                    {
+                        resolved.push(value.clone());
+                    }
+                }
+                resolved
+            }
+            None => ralphus_core::schema::REBUILD_ON_VALUES
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+        }
     }
 
     /// The configured default auto-fix prompt template, unset resolves to
@@ -677,6 +719,7 @@ impl ReviewConfig {
                 .auto_cancel_outdated_pr_pipelines
                 .or(self.auto_cancel_outdated_pr_pipelines),
             cache_manual_checks: over.cache_manual_checks.or(self.cache_manual_checks),
+            rebuild_on: over.rebuild_on.or(self.rebuild_on),
             auto_fix_prompt_template: over
                 .auto_fix_prompt_template
                 .or(self.auto_fix_prompt_template),
@@ -826,11 +869,8 @@ pub const REVIEW_FIELD_PARITY: &[(&str, ReviewFieldDefault)] = &[
     (
         "skip_auto_build",
         ReviewFieldDefault::NotApplicable(
-            "skip_auto_build is an explicit per-review opt-out of build gating; there is no \
-             project-level 'never build' default to inherit -- the project's own `auto_build` \
-             default (or its absence) already governs a declaration-less review, and a \
-             project-wide skip would silently disable build gating for every auto-review \
-             the project ever creates (see `reviews::require_auto_build_declaration`).",
+            "skip_auto_build is retained only for stored compatibility settings; preparation \
+             is optional and new task files use `[[review.prepare]]` when work is needed.",
         ),
     ),
     (
@@ -844,6 +884,10 @@ pub const REVIEW_FIELD_PARITY: &[(&str, ReviewFieldDefault)] = &[
     (
         "cache_manual_checks",
         ReviewFieldDefault::ProjectDefault(|c| c.cache_manual_checks.is_some()),
+    ),
+    (
+        "rebuild_on",
+        ReviewFieldDefault::ProjectDefault(|c| c.rebuild_on.is_some()),
     ),
     (
         "auto_fix_prompt_template",
@@ -2365,6 +2409,8 @@ struct ConfigFile {
     #[serde(default)]
     ark: Option<ArkConfigLayer>,
     #[serde(default)]
+    shared_store: Vec<SharedStoreConfig>,
+    #[serde(default)]
     arbiter: Option<ArbiterConfig>,
     #[serde(default)]
     pr_cache: Option<PrCacheConfig>,
@@ -2412,6 +2458,31 @@ struct ConfigFile {
     templates: Vec<TemplateDef>,
     #[serde(default)]
     ui: Option<UiConfig>,
+}
+
+/// Resolve a V1 same-machine shared-store root. A project entry with the same
+/// name replaces the global entry; the task file never carries this absolute
+/// path because a later provider may map the logical store differently.
+#[must_use]
+pub fn shared_store_root(project_root: &Path, name: &str) -> Option<PathBuf> {
+    let mut stores = global_config_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| toml::from_str::<ConfigFile>(&text).ok())
+        .map_or_else(Vec::new, |file| file.shared_store);
+    if let Some(project_stores) = find_project_config(project_root)
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| toml::from_str::<ConfigFile>(&text).ok())
+        .map(|file| file.shared_store)
+    {
+        for store in project_stores {
+            stores.retain(|existing| existing.name != store.name);
+            stores.push(store);
+        }
+    }
+    stores
+        .into_iter()
+        .find(|store| store.name == name)
+        .map(|store| PathBuf::from(store.root))
 }
 
 #[must_use]
@@ -2964,6 +3035,32 @@ pub(crate) fn reset_cors_cache_for_test() {
 mod tests {
     use super::*;
     use crate::forge::ForgeKind;
+
+    #[test]
+    fn project_shared_store_root_uses_logical_name() {
+        let project = std::env::temp_dir().join(format!(
+            "ralphus-shared-store-config-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join(".ralphus.toml"),
+            "[[shared_store]]\nname = 'review-artifacts'\nroot = 'Z:/review-artifacts'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            shared_store_root(&project, "review-artifacts"),
+            Some(PathBuf::from("Z:/review-artifacts"))
+        );
+        assert_eq!(
+            shared_store_root(
+                &project,
+                &format!("missing-test-store-{}", std::process::id())
+            ),
+            None
+        );
+        let _ = std::fs::remove_dir_all(project);
+    }
 
     #[test]
     fn ark_defaults_and_validation_are_safe() {
@@ -4705,6 +4802,73 @@ mod tests {
         assert!(!global.clone().merge(project).cache_manual_checks());
         // Project unset falls back to the global value.
         assert!(global.merge(ReviewConfig::default()).cache_manual_checks());
+    }
+
+    // ── rebuild_on ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn rebuild_on_defaults_to_every_trigger_when_unset() {
+        let all = vec![
+            "rebase".to_string(),
+            "feedback".to_string(),
+            "auto_fix".to_string(),
+        ];
+        assert_eq!(ReviewConfig::default().rebuild_on, None);
+        assert_eq!(ReviewConfig::default().rebuild_on(), all);
+        assert_eq!(
+            from_toml_str("[review]\nskip_worktrees = true\n").rebuild_on(),
+            all
+        );
+    }
+
+    #[test]
+    fn rebuild_on_parses_explicit_lists_including_empty() {
+        let c = from_toml_str("[review]\nrebuild_on = [\"feedback\"]\n");
+        assert_eq!(c.rebuild_on, Some(vec!["feedback".to_string()]));
+        assert_eq!(c.rebuild_on(), vec!["feedback".to_string()]);
+        let c = from_toml_str("[review]\nrebuild_on = []\n");
+        assert_eq!(c.rebuild_on, Some(Vec::new()));
+        assert!(c.rebuild_on().is_empty());
+    }
+
+    #[test]
+    fn rebuild_on_drops_unknown_and_repeated_entries_when_resolving() {
+        let c = ReviewConfig {
+            rebuild_on: Some(vec![
+                "rebase".to_string(),
+                "nightly".to_string(),
+                "rebase".to_string(),
+            ]),
+            ..ReviewConfig::default()
+        };
+        assert_eq!(c.rebuild_on(), vec!["rebase".to_string()]);
+    }
+
+    #[test]
+    fn merge_rebuild_on_project_replaces_global_without_unioning() {
+        let global = ReviewConfig {
+            rebuild_on: Some(vec!["rebase".to_string(), "feedback".to_string()]),
+            ..ReviewConfig::default()
+        };
+        let project = ReviewConfig {
+            rebuild_on: Some(vec!["auto_fix".to_string()]),
+            ..ReviewConfig::default()
+        };
+        assert_eq!(
+            global.clone().merge(project).rebuild_on(),
+            vec!["auto_fix".to_string()]
+        );
+        // An explicitly empty project list still wins over a non-empty global.
+        let empty = ReviewConfig {
+            rebuild_on: Some(Vec::new()),
+            ..ReviewConfig::default()
+        };
+        assert!(global.clone().merge(empty).rebuild_on().is_empty());
+        // Project unset falls back to the global value.
+        assert_eq!(
+            global.merge(ReviewConfig::default()).rebuild_on(),
+            vec!["rebase".to_string(), "feedback".to_string()]
+        );
     }
 
     // ── auto_submit_pr_stack (RAL-317) ──────────────────────────────────────
