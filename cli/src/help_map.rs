@@ -1604,6 +1604,17 @@ const MAILBOX_CHILDREN: &[HelpNode] = &[
         false, // mutates read state.
         &[],
     ),
+    // ralphus[ignore-endpoint-cli]: client of GET /api/events, a SPECIAL_ROUTES exclusion in check_endpoint_cli_parity.py (bypasses route_for_user for its own blocking SSE thread, RAL-167/RAL-222) -- never a normal ENDPOINT_TO_CLI mapping value
+    node(
+        "follow",
+        &[],
+        &[],
+        "Push extension of `check` (RAL-241): opens the daemon's /api/events stream and prints \
+         one line per mailbox escalation as it arrives, instead of polling. Runs until killed.",
+        false,
+        true, // read-only: only ever reads the event stream, never drains/mutates.
+        &[],
+    ),
 ];
 
 const QUEUE_CHILDREN: &[HelpNode] = &[

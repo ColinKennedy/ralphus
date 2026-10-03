@@ -80,6 +80,13 @@ pub const EXCLUDED: &[(&[&str], &str)] = &[
          choice for the same non-portable launch.",
     ),
     (
+        &["mailbox", "follow"],
+        "Opens the daemon's /api/events SSE stream and blocks forever, printing one line per \
+         mailbox escalation as it arrives (RAL-241 push extension) -- it never returns a value, \
+         so it has no single-request/response MCP shape; meant to run under a harness's own \
+         background-process primitive (e.g. Claude Code's Monitor tool), not as a tool call.",
+    ),
+    (
         &["internal", "fork-credential-helper"],
         "Implements git's credential-helper protocol (RAL-338 follow-up): git invokes it with a \
          request on stdin and expects a plain-text response on stdout, from within the specific \
