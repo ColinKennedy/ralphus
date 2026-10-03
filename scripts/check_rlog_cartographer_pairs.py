@@ -26,7 +26,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DAEMON_SRC = REPO_ROOT / "daemon" / "src"
 RLOG = re.compile(r"\b(?:crate\s*::\s*)?rlog\s*!")
-STRUCTURED_LOG = re.compile(r"\b(?:cartographer_log|log_event(?:_with_task)?)\s*\(")
+STRUCTURED_LOG = re.compile(r"\b(?:cartographer_log(?:_batch)?|log_event(?:_with_task)?)\s*\(")
 NOTE = re.compile(r"\bNote\s*::\s*new\s*\(")
 EMIT = re.compile(r"\.\s*emit\s*\(")
 EXEMPTION = re.compile(r"//\s*ralphus\[ignore-rlog-pair\]\s*:\s*(.*?)\s*$")
