@@ -318,6 +318,26 @@
        * @property {GuardianMergeBatchResult[]} results
        */
       /**
+       * One review's classification within a `GuardianDeleteBatchResponse`
+       * (RAL-549).
+       * @typedef {"deleted"|"failed"} GuardianDeleteBatchOutcome
+       */
+      /**
+       * @typedef {object} GuardianDeleteBatchResult
+       * @property {string} id
+       * @property {GuardianDeleteBatchOutcome} outcome
+       * @property {string} message
+       */
+      /**
+       * Response from `POST /api/guardians/delete-batch` (RAL-549) -- the
+       * board's multi-select Delete context-menu action; always attempts
+       * every requested id in one request (rather than a sequential
+       * per-review DELETE loop) and reports a per-review outcome rather
+       * than stopping at the first failure.
+       * @typedef {object} GuardianDeleteBatchResponse
+       * @property {GuardianDeleteBatchResult[]} results
+       */
+      /**
        * @typedef {object} GuardianView
        * @property {string} id
        * @property {string} name

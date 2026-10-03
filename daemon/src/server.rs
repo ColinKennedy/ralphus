@@ -2120,6 +2120,8 @@ fn route_for_user(
         }
         // ralphus[ignore-endpoint-cli]: board multi-select Merge/Rebase context-menu action (RAL-514); the CLI already has per-review `review merge`
         ("POST", ["api", "guardians", "merge-batch"]) => guardian_merge_batch(daemon, body),
+        // ralphus[ignore-endpoint-cli]: board multi-select Delete context-menu action (RAL-549); the CLI already has per-review `review delete`
+        ("POST", ["api", "guardians", "delete-batch"]) => guardian_delete_batch(daemon, body),
         ("POST", ["api", "guardians", id, "stop"]) => guardian_stop(daemon, id),
         ("POST", ["api", "guardians", id, "cancel_and_merge"]) => {
             guardian_cancel_and_merge(daemon, id)
@@ -13595,6 +13597,36 @@ struct GuardianMergeBatchResponse {
     results: Vec<GuardianMergeBatchResult>,
 }
 
+/// `POST /api/guardians/delete-batch` body (RAL-549) -- the board's
+/// multi-select Delete context-menu action sends every selected review id in
+/// one request instead of one HTTP round trip per review, so a single slow
+/// worktree purge can't stall the rest of the batch the way a sequential
+/// per-id `DELETE` loop did.
+#[derive(Deserialize)]
+struct GuardianDeleteBatchBody {
+    ids: Vec<String>,
+}
+
+/// One review's classification in a [`GuardianDeleteBatchResult`] (RAL-549).
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum GuardianDeleteBatchOutcome {
+    Deleted,
+    Failed,
+}
+
+#[derive(Serialize)]
+struct GuardianDeleteBatchResult {
+    id: String,
+    outcome: GuardianDeleteBatchOutcome,
+    message: String,
+}
+
+#[derive(Serialize)]
+struct GuardianDeleteBatchResponse {
+    results: Vec<GuardianDeleteBatchResult>,
+}
+
 #[derive(Serialize)]
 struct IdResponse {
     id: String,
@@ -15961,8 +15993,19 @@ fn guardian_squash(daemon: &Daemon, id: &str, body: &str) -> Reply {
     }
 }
 
-/// Delete a review and purge its review worktrees/branches from every project.
-fn guardian_delete(daemon: &Daemon, id: &str) -> Reply {
+/// Deletes the guardian row, then defers the worktree/branch/terminal-log
+/// cleanup to a background thread (RAL-549) instead of running it
+/// synchronously before the HTTP response returns. `purge_worktrees` shells
+/// out to git with no timeout, and delete has no eligibility gate (unlike
+/// Cancel/Reopen/Merge) — so it can be invoked on a review whose worktree is
+/// actively held by an in-progress merge, and used to hang the request for as
+/// long as that merge kept the lease. The board's multi-select delete used to
+/// issue one `DELETE` per id sequentially, so a single stuck review stalled
+/// every id queued behind it; both the single-id and batch handlers go
+/// through this helper so neither can block on cleanup. Shares
+/// `daemon.background()`'s `Immediate` mode in tests, so existing synchronous
+/// assertions about cleanup still see it happen before `route()` returns.
+fn delete_guardian_and_defer_cleanup(daemon: &Daemon, id: &str) -> Result<(), StoreError> {
     let store = daemon.lock();
     // Snapshot everything needed for cleanup before the row is gone
     // (multi-project guardians span >1 root).
@@ -15971,33 +16014,40 @@ fn guardian_delete(daemon: &Daemon, id: &str) -> Reply {
     // while the row -- and the fork routing it is resolved from -- still
     // exists.
     let dual_root_branch = store.guardian_dual_root_stack_branch(id).ok().flatten();
-    match store.delete_guardian(id) {
-        Ok(()) => {
-            drop(store);
-            let store_handle = daemon.store_handle();
-            if let Some(g) = snapshot {
-                if let Some(branch) = dual_root_branch {
-                    crate::pr::retire_dual_root_upstream_branch(
-                        &store_handle,
-                        &crate::store::DualRootUpstreamSnapshot {
-                            guardian_id: id.to_string(),
-                            git_root: g.git_root.clone(),
-                            owner: g.owner.clone(),
-                            branch,
-                        },
-                        "review deleted",
-                    );
-                }
-                for root in &g.projects {
-                    crate::guardian_merge::purge_worktrees(&store_handle, root, id);
-                }
+    store.delete_guardian(id)?;
+    drop(store);
+    let store_handle = daemon.store_handle();
+    let id = id.to_string();
+    daemon.background().spawn(move || {
+        if let Some(g) = snapshot {
+            if let Some(branch) = dual_root_branch {
+                crate::pr::retire_dual_root_upstream_branch(
+                    &store_handle,
+                    &crate::store::DualRootUpstreamSnapshot {
+                        guardian_id: id.clone(),
+                        git_root: g.git_root.clone(),
+                        owner: g.owner.clone(),
+                        branch,
+                    },
+                    "review deleted",
+                );
             }
-            // RAL-154: same scoping as `kill_guardian_tmux_sessions` — a
-            // deleted guardian's durable terminal logs (resolver/manual-checks
-            // cells) must not outlive it.
-            crate::terminal_log::delete_with_prefix(&format!("ralphus_guardian-{id}_"));
-            json(200, &StateResponse { state: "deleted" })
+            for root in &g.projects {
+                crate::guardian_merge::purge_worktrees(&store_handle, root, &id);
+            }
         }
+        // RAL-154: same scoping as `kill_guardian_tmux_sessions` — a
+        // deleted guardian's durable terminal logs (resolver/manual-checks
+        // cells) must not outlive it.
+        crate::terminal_log::delete_with_prefix(&format!("ralphus_guardian-{id}_"));
+    });
+    Ok(())
+}
+
+/// Delete a review and purge its review worktrees/branches from every project.
+fn guardian_delete(daemon: &Daemon, id: &str) -> Reply {
+    match delete_guardian_and_defer_cleanup(daemon, id) {
+        Ok(()) => json(200, &StateResponse { state: "deleted" }),
         Err(e) => store_error(&e),
     }
 }
@@ -17481,6 +17531,40 @@ fn guardian_merge_batch(daemon: &Daemon, body: &str) -> Reply {
         })
         .collect();
     json(200, &GuardianMergeBatchResponse { results })
+}
+
+/// Batch form of [`guardian_delete`] (RAL-549) -- the board's multi-select
+/// Delete context-menu action applies to every selected review in one
+/// request. Goes through [`delete_guardian_and_defer_cleanup`], the same
+/// helper the single-id endpoint uses, so each id's worktree purge runs on a
+/// background thread rather than inline — a stuck cleanup for one id can
+/// never block the rest of the ids in this loop, unlike the board's previous
+/// sequential per-id `DELETE` calls. Always keeps going through every id even
+/// after an earlier one fails -- the response reports a full per-review
+/// summary rather than the batch stopping at the first failure.
+fn guardian_delete_batch(daemon: &Daemon, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<GuardianDeleteBatchBody>(body) else {
+        return error(400, "bad_request", "invalid body", vec![]);
+    };
+    if req.ids.is_empty() {
+        return error(400, "bad_request", "ids must not be empty", vec![]);
+    }
+    let results: Vec<GuardianDeleteBatchResult> = req
+        .ids
+        .iter()
+        .map(|id| {
+            let (outcome, message) = match delete_guardian_and_defer_cleanup(daemon, id) {
+                Ok(()) => (GuardianDeleteBatchOutcome::Deleted, "deleted".to_string()),
+                Err(e) => (GuardianDeleteBatchOutcome::Failed, e.to_string()),
+            };
+            GuardianDeleteBatchResult {
+                id: id.clone(),
+                outcome,
+                message,
+            }
+        })
+        .collect();
+    json(200, &GuardianDeleteBatchResponse { results })
 }
 
 /// An explicit rebase request gives the CI watcher another chance to fix an
@@ -26792,6 +26876,66 @@ remediation_attempts = 1
             route(&d, "GET", &format!("/api/guardians/{gid}"), "").status,
             404
         );
+    }
+
+    #[test]
+    fn guardian_delete_batch_deletes_all_and_reports_unknown_id_as_failed() {
+        let d = daemon();
+        let body =
+            serde_json::json!({"name":"r1","base_branch":"main","git_root":"/repo"}).to_string();
+        route(&d, "POST", "/api/guardians", &body);
+        let body2 =
+            serde_json::json!({"name":"r2","base_branch":"main","git_root":"/repo"}).to_string();
+        route(&d, "POST", "/api/guardians", &body2);
+        let gid1 = "guardian-000000000001";
+        let gid2 = "guardian-000000000002";
+        let missing = "guardian-000000000099";
+
+        let resp = route(
+            &d,
+            "POST",
+            "/api/guardians/delete-batch",
+            &serde_json::json!({"ids": [gid1, gid2, missing]}).to_string(),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let parsed: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        let results = parsed["results"].as_array().unwrap();
+        assert_eq!(results.len(), 3);
+        let outcome_for = |id: &str| {
+            results
+                .iter()
+                .find(|r| r["id"] == id)
+                .unwrap_or_else(|| panic!("missing result for {id}"))["outcome"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(outcome_for(gid1), "deleted");
+        assert_eq!(outcome_for(gid2), "deleted");
+        assert_eq!(outcome_for(missing), "failed");
+
+        // Both real ids are actually gone -- a batch delete must not stop
+        // partway through, unlike the sequential per-id loop this replaces.
+        assert_eq!(
+            route(&d, "GET", &format!("/api/guardians/{gid1}"), "").status,
+            404
+        );
+        assert_eq!(
+            route(&d, "GET", &format!("/api/guardians/{gid2}"), "").status,
+            404
+        );
+    }
+
+    #[test]
+    fn guardian_delete_batch_rejects_empty_ids() {
+        let d = daemon();
+        let resp = route(
+            &d,
+            "POST",
+            "/api/guardians/delete-batch",
+            &serde_json::json!({"ids": []}).to_string(),
+        );
+        assert_eq!(resp.status, 400);
     }
 
     #[test]
