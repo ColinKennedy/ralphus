@@ -200,6 +200,25 @@ const REVIEW_PR_CHILDREN: &[HelpNode] = &[
         &[],
     ),
     node(
+        "forge-cache",
+        &[],
+        &[],
+        "List every PR's cached forge state (drift/comments/CI poll timestamps and statuses).",
+        false,
+        true, // ("review", "pr", "forge-cache")
+        &[],
+    ),
+    node(
+        "poll-status",
+        &["pr_id [str]"],
+        &[],
+        "Show when each poll (CI, branch drift, PR comments) last ran for a PR, how it went, \
+when it is next due, and the last feedback applied.",
+        false,
+        true, // ("review", "pr", "poll-status")
+        &[],
+    ),
+    node(
         "pull-feedback",
         &["pr_id [str]"],
         &[],

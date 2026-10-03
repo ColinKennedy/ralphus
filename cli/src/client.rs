@@ -1964,6 +1964,14 @@ impl DaemonClient {
         self.get(&format!("/api/pull-requests/{pr_id}/comments"))
     }
 
+    pub fn pr_forge_cache_index(&self) -> Result<Value, DaemonError> {
+        self.get("/api/pull-requests/forge-cache-index")
+    }
+
+    pub fn pr_poll_status(&self, pr_id: &str) -> Result<Value, DaemonError> {
+        self.get(&format!("/api/pull-requests/{pr_id}/poll-status"))
+    }
+
     pub fn pr_action_feedback(&self, pr_id: &str) -> Result<Value, DaemonError> {
         self.post(&format!("/api/pull-requests/{pr_id}/action-feedback"), None)
     }

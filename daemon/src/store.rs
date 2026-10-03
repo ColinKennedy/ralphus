@@ -2014,7 +2014,14 @@ impl Store {
                 drift_error            TEXT,
                 comments_checked_at_ms INTEGER,
                 comments_status        TEXT,
-                comments_error         TEXT
+                comments_error         TEXT,
+                -- RAL-553: the CI-status half (standing poll, CI watch and
+                -- `pr_refresh_ci`) and the last review-feedback outcome.
+                ci_checked_at_ms       INTEGER,
+                ci_check_status        TEXT,
+                ci_check_error         TEXT,
+                feedback_applied_at_ms INTEGER,
+                feedback_outcome       TEXT
             );
             -- RAL-366: the set of PR comments/notes last fetched by the
             -- background poller -- id/author/timestamp only, deliberately
@@ -3264,6 +3271,13 @@ impl Store {
             "ALTER TABLE guardian_pr_forge_cache ADD COLUMN comments_checked_at_ms INTEGER",
             "ALTER TABLE guardian_pr_forge_cache ADD COLUMN comments_status TEXT",
             "ALTER TABLE guardian_pr_forge_cache ADD COLUMN comments_error TEXT",
+            // RAL-553: last-attempted CI check (time, `ok`/`unknown`, error)
+            // and the last feedback application (time, outcome) per PR.
+            "ALTER TABLE guardian_pr_forge_cache ADD COLUMN ci_checked_at_ms INTEGER",
+            "ALTER TABLE guardian_pr_forge_cache ADD COLUMN ci_check_status TEXT",
+            "ALTER TABLE guardian_pr_forge_cache ADD COLUMN ci_check_error TEXT",
+            "ALTER TABLE guardian_pr_forge_cache ADD COLUMN feedback_applied_at_ms INTEGER",
+            "ALTER TABLE guardian_pr_forge_cache ADD COLUMN feedback_outcome TEXT",
             "ALTER TABLE guardians ADD COLUMN post_merge_status TEXT",
             "ALTER TABLE guardians ADD COLUMN post_merge_detail TEXT",
             "ALTER TABLE guardians ADD COLUMN post_merge_started_at_ms INTEGER",
