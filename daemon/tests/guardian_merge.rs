@@ -5154,6 +5154,165 @@ fn successful_base_shift_rebuild_closes_the_campaign() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A runner whose preflight check succeeds (the `Runner` trait default,
+/// since this struct does not override it) but whose agent dispatch always
+/// fails. `FailingAgentRunner` above fails `preflight_agent` too, which
+/// aborts a whole merge pass before any project's branches are touched --
+/// useless for a test that needs exactly one project's conflict resolution
+/// to be invoked (and fail) while a sibling project's clean rebase never
+/// calls the runner at all.
+struct FailingResolveRunner;
+impl Runner for FailingResolveRunner {
+    fn run(&self, _spec: &RunnerSpec) -> RunnerResult {
+        RunnerResult::failure("agent could not resolve conflict (test)")
+    }
+}
+
+// RAL-542: the base-shift rebuild retry budget must be bounded per worktree,
+// not pooled across the whole review -- joining a chronically conflicting
+// project with an unrelated, always-clean one in the same review must not
+// let the conflicting project's exhausted budget stop the clean project from
+// rebasing, and must not let the clean project's successes top up or reset
+// the conflicting project's own count.
+#[test]
+fn base_shift_rebuild_budget_is_tracked_per_project_not_pooled_across_the_review() {
+    // Project A: edits `shared.txt`, so every future upstream advance to
+    // that same file conflicts on rebase -- chronically failing.
+    let root_a = temp_repo();
+    init_repo(&root_a);
+    write(&root_a, "shared.txt", "original\n");
+    git(&root_a, &["add", "."]);
+    git(&root_a, &["commit", "-m", "base"]);
+    git(&root_a, &["checkout", "-b", "feature/a"]);
+    write(&root_a, "shared.txt", "feature\n");
+    git(&root_a, &["add", "."]);
+    git(&root_a, &["commit", "-m", "feature"]);
+    git(&root_a, &["checkout", "main"]);
+
+    // Project B: an unrelated file, so every upstream advance here rebases
+    // cleanly -- healthy, and never calls the runner at all.
+    let root_b = temp_repo();
+    init_repo(&root_b);
+    write(&root_b, "base.txt", "base\n");
+    git(&root_b, &["add", "."]);
+    git(&root_b, &["commit", "-m", "base"]);
+    git(&root_b, &["checkout", "-b", "feature/b"]);
+    write(&root_b, "b.txt", "from b\n");
+    git(&root_b, &["add", "."]);
+    git(&root_b, &["commit", "-m", "add b"]);
+    git(&root_b, &["checkout", "main"]);
+
+    let a_str = root_a.to_str().unwrap().to_string();
+    let b_str = root_b.to_str().unwrap().to_string();
+
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock();
+        let id = g.create_guardian("multi", "main", &a_str).unwrap();
+        g.add_guardian_branch_with_project(&id, "feature/a", Some(&a_str))
+            .unwrap();
+        g.add_guardian_branch_with_project(&id, "feature/b", Some(&b_str))
+            .unwrap();
+        id
+    };
+    run_merge(&store, &NoopRunner, &id);
+    assert_eq!(store.lock().get_guardian(&id).unwrap().status, "in_review");
+    store
+        .lock()
+        .set_guardian_base_shift_maximum_rebuilds(&id, Some(2))
+        .unwrap();
+    let sem = Semaphore::new(4);
+
+    // Both projects' bases shift together in every pass below: B rebases
+    // cleanly every time, A conflicts every time.
+    advance_main(
+        &root_a,
+        "shared.txt",
+        "moved on 1\n",
+        "conflicting advance 1",
+    );
+    advance_main(&root_b, "extra.txt", "more upstream 1\n", "clean advance 1");
+
+    assert!(rebuild_on_base_shift(
+        &store,
+        &FailingResolveRunner,
+        &id,
+        &sem,
+        &CancelToken::never()
+    ));
+    let g = store.lock().get_guardian(&id).unwrap();
+    assert_eq!(
+        g.status, "merge_failed",
+        "project A's conflict leaves the review awaiting human action"
+    );
+    let attempts = g
+        .base_shift_rebuild_attempts_by_project
+        .clone()
+        .unwrap_or_default();
+    assert_eq!(attempts.get(&a_str).copied().unwrap_or(0), 1);
+    assert_eq!(
+        attempts.get(&b_str).copied().unwrap_or(0),
+        0,
+        "project B must not spend any of its own budget for A's failure"
+    );
+    assert!(
+        !g.base_shift_rebuild_targets
+            .as_ref()
+            .map(|t| t.contains_key(&b_str))
+            .unwrap_or(false),
+        "project B's successful rebuild must close its own sub-campaign"
+    );
+
+    // Second pass against the SAME still-conflicting target: by now only A
+    // is detected shifted (B already caught up last pass), and A must still
+    // be eligible -- this is attempt 2 of A's budget of 2.
+    assert!(
+        rebuild_on_base_shift(
+            &store,
+            &FailingResolveRunner,
+            &id,
+            &sem,
+            &CancelToken::never()
+        ),
+        "project A alone being shifted must still dispatch while its own budget remains"
+    );
+    let g = store.lock().get_guardian(&id).unwrap();
+    let attempts = g
+        .base_shift_rebuild_attempts_by_project
+        .clone()
+        .unwrap_or_default();
+    assert_eq!(attempts.get(&a_str).copied().unwrap_or(0), 2);
+    assert_eq!(attempts.get(&b_str).copied().unwrap_or(0), 0);
+
+    // A's budget (2) is now spent against this target: a further pass must
+    // not dispatch at all, and the mailbox notice must name project A only.
+    assert!(
+        !rebuild_on_base_shift(
+            &store,
+            &FailingResolveRunner,
+            &id,
+            &sem,
+            &CancelToken::never()
+        ),
+        "project A's exhausted budget must stop dispatching once it is the only shifted project left"
+    );
+    let notices = exhaustion_notices(&store);
+    assert_eq!(notices.len(), 1, "exactly one exhaustion notice");
+    assert!(
+        notices[0].message.contains(&a_str),
+        "the notice must name the exhausted project: {}",
+        notices[0].message
+    );
+    assert!(
+        !notices[0].message.contains(&b_str),
+        "the healthy project must not be named as exhausted: {}",
+        notices[0].message
+    );
+
+    let _ = std::fs::remove_dir_all(&root_a);
+    let _ = std::fs::remove_dir_all(&root_b);
+}
+
 // Pressing Merge / rebase manually resets the review's base-shift
 // automatic-rebuild budget BEFORE the user-requested rebase starts: a
 // human-directed retry earns a fresh automatic budget.

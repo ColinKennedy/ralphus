@@ -3479,6 +3479,11 @@ impl Store {
             // RAL-509: persist the transient fork-side upstream branch name for
             // dual_root_pr targets once allocated.
             "ALTER TABLE guardians ADD COLUMN dual_root_stack_branch TEXT",
+            // RAL-542: each worktree's own slice of the base-shift retry
+            // budget, keyed by project root, so one chronically-conflicting
+            // worktree exhausting its attempts can no longer stop automatic
+            // rebuild for the review's other worktrees.
+            "ALTER TABLE guardians ADD COLUMN base_shift_rebuild_attempts_by_project TEXT",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
