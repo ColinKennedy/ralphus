@@ -63,6 +63,8 @@
       let reviewDockCommand = "";
       /** @type {boolean} When true the dock ignores selection changes. */
       let reviewDockSticky = false;
+      /** @type {boolean} When true the whole-review drawer includes branch-worktree activity. */
+      let reviewDockIncludeBranchWorktrees = true;
 
       /**
        * The branch the inspector is showing, or null when nothing is selected
@@ -144,6 +146,26 @@
       function toggleReviewDockSticky() {
         reviewDockSticky = !reviewDockSticky;
         renderReviewDock();
+      }
+      /** Toggles branch-worktree activity in the whole-review log drawer. @returns {void} */
+      function toggleReviewDockBranchWorktrees() {
+        reviewDockIncludeBranchWorktrees = !reviewDockIncludeBranchWorktrees;
+        renderReviewDock();
+      }
+      /**
+       * Opens the whole-review log drawer from the review header.
+       * @param {string} gid - The review id.
+       * @returns {void}
+       */
+      function openReviewHeaderLogs(gid) {
+        reviewDockScope = "review";
+        reviewDockCommand = "";
+        if (!reviewDockOpen) {
+          toggleReviewDock();
+        } else {
+          renderReviewDock();
+          if (reviewDockEvents[gid] === undefined) loadReviewDockEvents(gid);
+        }
       }
 
       /**
@@ -861,6 +883,10 @@
           sticky.className = `tgl${reviewDockSticky ? " on" : ""}`;
           sticky.setAttribute("aria-pressed", reviewDockSticky ? "true" : "false");
         }
+        const branchWorktrees = /** @type {HTMLInputElement|null} */ (
+          document.getElementById("review-dock-branch-worktrees")
+        );
+        if (branchWorktrees) branchWorktrees.checked = reviewDockIncludeBranchWorktrees;
         const g = guardians.find((x) => x.id === selectedGuardian);
         const b = (g && g.branches ? g.branches.find((x) => x.id === reviewDockScope) : null) || null;
         const scopeEl = document.getElementById("review-dock-scope");
@@ -911,7 +937,11 @@
           kind: dockKindFor(r.level || ""),
           message: r.message || "",
         });
-        if (!b) return raw.map(shape);
+        if (!b) {
+          return raw
+            .filter((r) => reviewDockIncludeBranchWorktrees || r.guardian_id === g.id)
+            .map(shape);
+        }
         // Most of a review's events name the review, not the branch, so a
         // branch scope legitimately matches nothing. Showing an empty drawer
         // over 38 unshown rows reads as "no logs"; fall back to the whole
@@ -1624,7 +1654,7 @@
        */
       async function loadReviewDockEvents(gid) {
         try {
-          const r = await fetch(`/api/cartographer?guardian_id=${encodeURIComponent(gid)}&limit=200`);
+          const r = await fetch(`/api/guardians/${encodeURIComponent(gid)}/cartographer?limit=200&sort=asc`);
           if (!r.ok) { reviewDockEvents[gid] = []; afterReviewDockEvents(); return; }
           /** @type {{rows: CartographerRow[], total: number}} */
           const data = await r.json();

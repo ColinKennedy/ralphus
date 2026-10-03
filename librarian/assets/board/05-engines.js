@@ -250,7 +250,9 @@
       CLICK_HANDLERS.selectBranchRow = (e, ds) => selectBranchRow(e, ds.guardianId || "", ds.branch || "", ds.branchId || "");
       CLICK_HANDLERS.setInspectorTab = (e, ds) => setInspectorTab(ds.tab || "overview");
       CLICK_HANDLERS.toggleReviewDock = () => toggleReviewDock();
+      CLICK_HANDLERS.openReviewHeaderLogs = (e, ds) => openReviewHeaderLogs(ds.guardianId || "");
       CLICK_HANDLERS.toggleReviewDockSticky = (e) => { e.stopPropagation(); toggleReviewDockSticky(); };
+      CLICK_HANDLERS.toggleReviewDockBranchWorktrees = (e) => { e.preventDefault(); e.stopPropagation(); toggleReviewDockBranchWorktrees(); };
       CLICK_HANDLERS.openReviewSectionMenu = (e, ds) => openReviewSectionMenu(e, ds.guardianId || "", ds.kind || "");
       CLICK_HANDLERS.scopeReviewDockToSection = (e, ds) => scopeReviewDockToSection(ds.guardianId || "");
       CLICK_HANDLERS.openReviewCommandMenu = (e, ds) => openReviewCommandMenu(e, ds.guardianId || "", ds.cmd || "", ds.key || "");
