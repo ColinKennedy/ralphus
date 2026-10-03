@@ -9430,12 +9430,10 @@ fn post_merge_jobs_inner(
     // own branch, so the jobs' byproducts land here instead of dirtying the
     // combined worktree a future merge reuses -- and so a failed deletion can
     // never wedge the combined worktree itself.
-    let pm_dir = combined_path
+    let pm_parent = combined_path
         .parent()
-        .map(|p| p.join(POST_MERGE_WORKTREE_DIR))
-        .ok_or_else(|| "combined worktree path has no parent".to_string())?;
-    let pm_ws = ws_root.at(&pm_dir);
-    let pm_str = pm_dir.to_string_lossy().to_string();
+        .ok_or_else(|| "combined worktree path has no parent".to_string())?
+        .to_path_buf();
     // Invalidate the prior prepared generation before touching its retained
     // checkout. The board must never offer a Run button while the directory
     // behind it is being reset for a newer review tip.
@@ -9479,22 +9477,9 @@ fn post_merge_jobs_inner(
             let _ = store.lock().set_guardian_action_hints(id, &actions);
         }
     }
-    // A detached checkout retained for manual use after preparation. It has no
-    // named branch and is refreshed in place when Windows file locks prevent a
-    // remove/add cycle.
-    if pm_ws.root().exists() {
-        let _ = combined_ws.git(&["worktree", "remove", "--force", &pm_str]);
-    }
-    if !pm_ws.root().exists() {
-        combined_ws
-            .git(&["worktree", "add", "--detach", &pm_str, &tip])
-            .map_err(|e| format!("post-merge scratch checkout failed: {e}"))?;
-    } else {
-        pm_ws
-            .git(&["checkout", "-f", "--detach", &tip])
-            .map_err(|e| format!("post-merge scratch reset failed: {e}"))?;
-        let _ = pm_ws.git(&["clean", "-fdx"]);
-    }
+    let pm_dir = claim_post_merge_checkout(&ws_root, &combined_ws, &pm_parent, &tip)?;
+    let pm_ws = ws_root.at(&pm_dir);
+    let pm_str = pm_dir.to_string_lossy().to_string();
 
     // First prepare the author-declared action surface. It must not wait on
     // optional AI discovery of additional manual checks: an unavailable model
@@ -9926,6 +9911,93 @@ fn run_review_auto_build(
     }
 }
 
+/// How many sibling directories [`claim_post_merge_checkout`] will try before
+/// giving up on finding one it can use.
+const POST_MERGE_CHECKOUT_ATTEMPTS: usize = 8;
+
+/// Produce a detached checkout of `tip` for the post-merge worker to prepare in,
+/// and return its directory. It is retained after preparation so manual actions
+/// run against the build output left in it.
+///
+/// The usual directory is `<parent>/review-postmerge`. It is refreshed in place
+/// when it is still a valid worktree that could not be removed (a Windows file
+/// lock). A reviewer's action can leave a terminal open inside it, and a failed
+/// `worktree remove` can then delete the worktree's `.git` link while leaving the
+/// directory behind. Such a directory is no longer a worktree, so it is pruned and
+/// cleared where possible, and when it still cannot be reused the next sibling
+/// (`review-postmerge-1`, ...) is claimed instead. Actions record the directory
+/// they were prepared in, so they follow whichever one this returns.
+fn claim_post_merge_checkout(
+    ws_root: &Workspace,
+    combined_ws: &Workspace,
+    parent: &Path,
+    tip: &str,
+) -> std::result::Result<PathBuf, String> {
+    let mut last_error = String::new();
+    for attempt in 0..POST_MERGE_CHECKOUT_ATTEMPTS {
+        let dir = if attempt == 0 {
+            parent.join(POST_MERGE_WORKTREE_DIR)
+        } else {
+            parent.join(format!("{POST_MERGE_WORKTREE_DIR}-{attempt}"))
+        };
+        let ws = ws_root.at(&dir);
+        let dir_str = dir.to_string_lossy().to_string();
+        if ws.root().exists() {
+            let _ = combined_ws.git(&["worktree", "remove", "--force", &dir_str]);
+        }
+        if ws.root().exists() && !is_valid_linked_worktree(&ws) {
+            let _ = combined_ws.git(&["worktree", "prune"]);
+            if ws.is_local() {
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+        if !ws.root().exists() {
+            match combined_ws.git(&["worktree", "add", "--detach", &dir_str, tip]) {
+                Ok(_) => return Ok(dir),
+                Err(error) => {
+                    last_error = format!("post-merge scratch checkout failed: {error}");
+                    continue;
+                }
+            }
+        }
+        if is_valid_linked_worktree(&ws) {
+            match ws.git(&["checkout", "-f", "--detach", tip]) {
+                Ok(_) => {
+                    let _ = ws.git(&["clean", "-fdx"]);
+                    return Ok(dir);
+                }
+                Err(error) => {
+                    last_error = format!("post-merge scratch reset failed: {error}");
+                    continue;
+                }
+            }
+        }
+        last_error = format!(
+            "post-merge scratch directory {dir_str} is not a worktree and could not be cleared"
+        );
+    }
+    Err(last_error)
+}
+
+/// Whether an action needs no preparation at all: it declares a verbatim
+/// command and nothing to build, transfer or publish, so it is runnable as soon
+/// as the checkout exists.
+fn action_needs_no_preparation(hint: &crate::guardian::GuardianCheck) -> bool {
+    hint.command.is_some()
+        && hint.prepare.is_empty()
+        && hint.artifacts.is_empty()
+        && hint.shared_store.is_none()
+}
+
+/// The order actions are prepared in: those that need no preparation first, so
+/// a quick action is never held behind another action's slow build, then the
+/// rest in declaration order. Indices refer to positions in `hints`.
+fn preparation_order(hints: &[crate::guardian::GuardianCheck]) -> Vec<usize> {
+    let (immediate, built): (Vec<usize>, Vec<usize>) =
+        (0..hints.len()).partition(|&index| action_needs_no_preparation(&hints[index]));
+    immediate.into_iter().chain(built).collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_action_hints(
     store: &crate::store_lock::StoreHandle,
@@ -9949,7 +10021,7 @@ fn prepare_action_hints(
     // [A, C] remain independent groups and both execute A; only an exactly
     // equal group satisfies a second action.
     let mut completed_groups = std::collections::HashSet::new();
-    for index in 0..hints.len() {
+    for index in preparation_order(&hints) {
         let mut shared_store_cwd = None;
         let action_key = format!("action-{index}");
         let definition_digest = format!(
@@ -19301,6 +19373,224 @@ mod tests {
         )
         .expect("replacement preparation succeeds after lifecycle hook");
         assert!(repo.join("lifecycle-hook.txt").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    fn plain_action(label: &str) -> crate::guardian::GuardianCheck {
+        crate::guardian::GuardianCheck {
+            label: Some(label.to_string()),
+            command: Some("echo run".to_string()),
+            ..crate::guardian::GuardianCheck::default()
+        }
+    }
+
+    fn built_action(label: &str, build: &str) -> crate::guardian::GuardianCheck {
+        crate::guardian::GuardianCheck {
+            prepare: vec![crate::guardian::GuardianAutoBuild {
+                command: Some(build.to_string()),
+                ..crate::guardian::GuardianAutoBuild::default()
+            }],
+            ..plain_action(label)
+        }
+    }
+
+    fn head_of(repo: &Path) -> String {
+        Workspace::local(repo)
+            .git(&["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    #[test]
+    fn claiming_the_post_merge_checkout_refreshes_a_valid_one_in_place() {
+        let (base, repo, _fwt) = make_repo("claim-valid");
+        let root = Workspace::local(&repo);
+        let parent = base.join("pm-parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        let tip = head_of(&repo);
+
+        let first = claim_post_merge_checkout(&root, &root, &parent, &tip).unwrap();
+        assert_eq!(first, parent.join(POST_MERGE_WORKTREE_DIR));
+        assert!(is_valid_linked_worktree(&Workspace::local(&first)));
+        let second = claim_post_merge_checkout(&root, &root, &parent, &tip).unwrap();
+        assert_eq!(second, first, "an intact checkout is reused, not replaced");
+        assert!(is_valid_linked_worktree(&Workspace::local(&second)));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn claiming_the_post_merge_checkout_recovers_a_half_removed_one() {
+        let (base, repo, _fwt) = make_repo("claim-half-removed");
+        let root = Workspace::local(&repo);
+        let parent = base.join("pm-parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        let tip = head_of(&repo);
+        let dir = claim_post_merge_checkout(&root, &root, &parent, &tip).unwrap();
+        // What a failed `worktree remove` leaves behind when a terminal holds the
+        // directory open: the worktree link is gone, the directory and its build
+        // output are not.
+        std::fs::remove_file(dir.join(".git")).unwrap();
+        std::fs::write(dir.join("stale-build-output.txt"), "old").unwrap();
+        assert!(!is_valid_linked_worktree(&Workspace::local(&dir)));
+
+        let again = claim_post_merge_checkout(&root, &root, &parent, &tip)
+            .expect("a directory that is no longer a worktree must not wedge the refresh");
+        assert!(is_valid_linked_worktree(&Workspace::local(&again)));
+        assert_eq!(head_of(&again), tip);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn claiming_the_post_merge_checkout_falls_back_to_a_sibling_when_the_path_cannot_be_cleared() {
+        let (base, repo, _fwt) = make_repo("claim-sibling");
+        let root = Workspace::local(&repo);
+        let parent = base.join("pm-parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        let tip = head_of(&repo);
+        // A plain file squatting on the usual path is something neither
+        // `worktree remove` nor a directory delete can clear.
+        std::fs::write(parent.join(POST_MERGE_WORKTREE_DIR), "squatter").unwrap();
+
+        let dir = claim_post_merge_checkout(&root, &root, &parent, &tip).unwrap();
+        assert_eq!(dir, parent.join(format!("{POST_MERGE_WORKTREE_DIR}-1")));
+        assert!(is_valid_linked_worktree(&Workspace::local(&dir)));
+        assert_eq!(head_of(&dir), tip);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn preparation_order_puts_actions_needing_no_preparation_first() {
+        let mut prompt_only = plain_action("prompt");
+        prompt_only.command = None;
+        prompt_only.prompt = Some("expand me".to_string());
+        let hints = vec![
+            built_action("build-a", "make a"),
+            plain_action("quick-1"),
+            built_action("build-b", "make b"),
+            prompt_only,
+            plain_action("quick-2"),
+        ];
+        // Quick actions keep their relative order and lead; everything that
+        // needs work (a build, or a prompt to expand) follows in declaration order.
+        assert_eq!(preparation_order(&hints), vec![1, 4, 0, 2, 3]);
+        assert_eq!(preparation_order(&[]), Vec::<usize>::new());
+        assert_eq!(preparation_order(&hints[1..2]), vec![0]);
+    }
+
+    #[test]
+    fn an_action_needing_no_preparation_is_ready_before_a_slower_build_finishes() {
+        let (base, repo, _fwt) = make_repo("quick-action-first");
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let slow_build = if cfg!(windows) {
+            "ping -n 3 127.0.0.1 >nul"
+        } else {
+            "sleep 2"
+        };
+        let id = {
+            let guard = store.lock();
+            let id = guard
+                .create_guardian("r", "main", &repo.to_string_lossy())
+                .unwrap();
+            // The slow build is declared FIRST: without reordering it would
+            // hold the quick action behind it.
+            guard
+                .set_guardian_action_hints(
+                    &id,
+                    &[built_action("slow", slow_build), plain_action("quick")],
+                )
+                .unwrap();
+            id
+        };
+        final_checks(
+            &store,
+            &FixedValueRunner("unused"),
+            &id,
+            &Workspace::local(&repo),
+            &repo.to_string_lossy(),
+            &CancelToken::never(),
+        )
+        .expect("preparation succeeds");
+        let hints = store.lock().get_guardian(&id).unwrap().action_hints;
+        assert!(
+            hints
+                .iter()
+                .all(|hint| hint.preparation_state.as_deref() == Some("ready")),
+            "every action ends ready"
+        );
+        let (slow, quick) = (
+            hints[0].prepared_at_ms.expect("slow action is stamped"),
+            hints[1].prepared_at_ms.expect("quick action is stamped"),
+        );
+        assert!(
+            slow - quick >= 1_000,
+            "the quick action must be ready at least a second before the slow build finishes \
+             (quick={quick}, slow={slow})"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn each_distinct_build_runs_once_and_actions_without_one_run_none() {
+        let (base, repo, _fwt) = make_repo("per-action-builds");
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let log = |name: &str| format!("echo x>> {name}.log");
+        let id = {
+            let guard = store.lock();
+            let id = guard
+                .create_guardian("r", "main", &repo.to_string_lossy())
+                .unwrap();
+            // Three actions share build A, one has its own build B, one needs
+            // no build at all.
+            guard
+                .set_guardian_action_hints(
+                    &id,
+                    &[
+                        built_action("a1", &log("build-a")),
+                        built_action("a2", &log("build-a")),
+                        built_action("b", &log("build-b")),
+                        built_action("a3", &log("build-a")),
+                        plain_action("quick"),
+                    ],
+                )
+                .unwrap();
+            id
+        };
+        final_checks(
+            &store,
+            &FixedValueRunner("unused"),
+            &id,
+            &Workspace::local(&repo),
+            &repo.to_string_lossy(),
+            &CancelToken::never(),
+        )
+        .expect("preparation succeeds");
+        let runs = |name: &str| {
+            std::fs::read_to_string(repo.join(format!("{name}.log")))
+                .map(|text| text.lines().count())
+                .unwrap_or(0)
+        };
+        assert_eq!(
+            runs("build-a"),
+            1,
+            "three actions sharing a build run it once"
+        );
+        assert_eq!(
+            runs("build-b"),
+            1,
+            "a distinct build runs for its own action"
+        );
+        let hints = store.lock().get_guardian(&id).unwrap().action_hints;
+        assert!(
+            hints
+                .iter()
+                .all(|hint| hint.preparation_state.as_deref() == Some("ready")),
+            "every action, built or not, ends ready"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
