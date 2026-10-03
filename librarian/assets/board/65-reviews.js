@@ -799,27 +799,29 @@
             : "starts automatically when its squad finishes — or start it now below"}</span></div>`;
       }
       /**
-       * Renders the RAL-480 "already merged upstream" badge shared by
-       * `branchBadge` (the branch row) and the review-worktree detail row --
-       * kept as one function so both spots show identical wording.
-       * @returns {string}
+       * Tooltips for the branch statuses whose own pill carries the whole
+       * status (no separate badge repeats it): the pill shows the status word
+       * once and this text explains it.
+       * @type {{[status: string]: string}}
        */
-      function mergedBranchBadge() {
-        return `<span class="badge done" data-tip="This branch's commits are already integrated upstream.\nWho/when: a partial or serial stack merge landed this branch's PR/MR (or its base already absorbed its commits) before the rest of the review finished.\nRalphus will not create, update, or otherwise touch this branch's PR/MR again -- it stays enabled and keeps rebasing normally with the rest of the stack.">✓ merged</span>`;
-      }
+      const BRANCH_STATUS_TIPS = {
+        merged: "This branch's commits are already integrated upstream.\nWho/when: a partial or serial stack merge landed this branch's PR/MR (or its base already absorbed its commits) before the rest of the review finished.\nRalphus will not create, update, or otherwise touch this branch's PR/MR again -- it stays enabled and keeps rebasing normally with the rest of the stack.",
+        closed: "This branch's linked PR/MR was closed on the forge without merging -- most likely a human closed it directly on GitHub/GitLab.\nWho/when: you expected auto-submit or a 'submit PR stack' click to keep this branch's PR open, but it stays closed instead.\nRalphus will not create, update, or otherwise resubmit a PR for this branch again -- it stays enabled and keeps rebasing normally with the rest of the stack. Submit this one branch again manually (its own 'submit PR' action) to open a fresh PR.",
+        ready: "All tasks are done — this branch is queued for the automatic rebase.\nThe scheduler will start rebasing it into the review stack shortly.",
+        actioning: "Reviewer feedback is being applied — the resolver agent is revising this branch now.\nWho/when: you submitted feedback and want confirmation it's actually being worked.\nClears automatically once the revision is committed (and pushed, if applicable).",
+      };
       /**
-       * Renders the "PR closed externally" badge for a branch whose linked
-       * PR/MR was observed closed on the forge without merging -- a human's
-       * deliberate rejection, made directly on GitHub/GitLab rather than
-       * through ralphus. Mirrors `mergedBranchBadge()`'s placement and
-       * "ralphus will not touch this again" wording, but in the existing
-       * `--cancelled` PR-lifecycle color (already used for a closed PR's own
-       * chip, `PR_STATE_COLORS.closed`) rather than `--done`, since the
-       * outcome here is a rejection, not a success.
+       * Renders a review branch's status as the single pill-shaped badge,
+       * carrying the branch-specific tooltip when one exists.
+       * @param {GuardianBranch} b
        * @returns {string}
        */
-      function closedExternallyBadge() {
-        return `<span class="badge cancelled" data-tip="This branch's linked PR/MR was closed on the forge without merging -- most likely a human closed it directly on GitHub/GitLab.\nWho/when: you expected auto-submit or a 'submit PR stack' click to keep this branch's PR open, but it stays closed instead.\nRalphus will not create, update, or otherwise resubmit a PR for this branch again -- it stays enabled and keeps rebasing normally with the rest of the stack. Submit this one branch again manually (its own 'submit PR' action) to open a fresh PR and clear this badge.">✕ closed</span>`;
+      function branchStatusPill(b) {
+        const status = b.merge_status || "";
+        const tip = BRANCH_STATUS_TIPS[status];
+        if (!tip) return pill(status);
+        const safe = safeState(status);
+        return `<span class="pill p-${safe}" data-tip="${esc(tip)}">${safe}</span>`;
       }
       /**
        * Renders a review branch's merge-status badge (ready / conflict / resolved).
@@ -852,7 +854,6 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         // either clear or replace.
         if (b.pr_submission_pending) return `<span class="badge live" data-tip="Auto-submitting this branch's pull request is in progress on its own background worker.\nWho/when: you enabled auto-submit for this review's PR stack and this branch just reached a terminal state.\nClears automatically once the attempt completes (success clears it silently; failure leaves the ⚠ auto-submit failed badge instead).">⏳ submitting PR</span>`;
         if (b.auto_submit_error) return `<span class="badge bad" data-full="${esc(b.auto_submit_error)}" onclick="event.stopPropagation();openErrPopup(event)" data-tip="Auto-submitting this branch's pull request failed: ${esc(b.auto_submit_error)}\nWho/when: you enabled auto-submit for this review's PR stack and this branch's PR wasn't opened/updated as a result.\nCheck forge credentials/connectivity, then resubmit manually (review pr submit) or wait for the next auto-submit attempt.\nClick to open the full failure text in a copyable popup.">⚠ auto-submit failed</span>`;
-        if (b.merge_status === "ready") return `<span class="badge ready" data-tip="All tasks are done — this branch is queued for the automatic rebase.\nThe scheduler will start rebasing it into the review stack shortly.">⚡ ready</span>`;
         if (b.merge_status === "failed") {
           const failDetail = b.detail || "conflict during rebase";
           return `<span class="badge bad" data-tip="Merge failed — ${esc(failDetail)}">⚠ conflict</span> ${detailSummary(failDetail, "Failure log", "fail")}`;
@@ -867,23 +868,9 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         // response to `review feedback` (and, once it finishes, a proof pass
         // and a commit/push may follow). Clears automatically to "done" or a
         // conflict/failure badge once the whole feedback pass finishes.
-        if (b.merge_status === "actioning") return `<span class="badge live" data-tip="Reviewer feedback is being applied — the resolver agent is revising this branch now.\nWho/when: you submitted feedback and want confirmation it's actually being worked.\nClears automatically once the revision is committed (and pushed, if applicable).">✎ actioning</span>`;
         if (b.merge_status === "conflict_resolved") return `<span class="badge warn2" data-tip="Conflict was resolved by the guardian agent — ${esc(b.detail || "resolved")}">✓ resolved</span>`;
-        // RAL-480: this branch's own commits are already integrated upstream
-        // (detected by git ancestry during a rebase, or by the forge
-        // reporting its linked PR/MR as merged) -- shown in place of the
-        // ordinary "done" pill so a reviewer can tell at a glance that this
-        // branch's PR/MR is frozen: ralphus will never create, update, or
-        // otherwise touch it again, even though the branch stays enabled and
-        // keeps participating in the stack's rebases. One review can carry a
-        // mix of `merged` and not-yet-merged branches (a partial stack
-        // merge) without the review itself leaving `in_review`.
-        if (b.merge_status === "merged") return mergedBranchBadge();
-        // RAL-<new>: mirrors the `merged` check just above -- a `closed`
-        // branch is just as terminal for PR/MR automation, but the outcome
-        // is the opposite one, so it gets its own badge/color rather than
-        // reusing `mergedBranchBadge()`'s "success" wording and green.
-        if (b.merge_status === "closed") return closedExternallyBadge();
+        // `merged` / `closed` (and `ready` / `actioning` above) are conveyed
+        // solely by the status pill -- see `branchStatusPill`.
         return "";
       }
       // RAL-146: per-branch live progress bars (rebase position + conflict
@@ -1804,7 +1791,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
             : `<span class="br-toggle placeholder">▸</span>`;
           const detail = hasDetail ? `<div class="branch-detail ${open ? "" : "hidden"}">
               ${b.detail ? `<div class="kv-row" style="margin:0 0 4px"><span class="k" style="text-transform:none;letter-spacing:0">status</span><span class="v" style="font-size:12px">${detailSummary(b.detail, "Branch detail")}</span></div>` : ""}
-              ${b.worktree ? `<div class="kv-row" style="margin:0"><span class="k" style="text-transform:none;letter-spacing:0">review worktree</span><span class="v mono hc-anchor" style="font-size:11px" data-card="gBranchWorktree" data-guardian-id="${esc(g.id)}" data-branch-id="${esc(b.id)}">${esc(b.worktree)}</span>${b.merge_status === "merged" ? ` ${mergedBranchBadge()}` : ""}</div>` : ""}
+              ${b.worktree ? `<div class="kv-row" style="margin:0"><span class="k" style="text-transform:none;letter-spacing:0">review worktree</span><span class="v mono hc-anchor" style="font-size:11px" data-card="gBranchWorktree" data-guardian-id="${esc(g.id)}" data-branch-id="${esc(b.id)}">${esc(b.worktree)}</span>${b.merge_status === "merged" ? ` ${branchStatusPill(b)}` : ""}</div>` : ""}
               ${(b.worktree || b.source_squad_id != null) ? `<div class="row" style="margin:2px 0 4px">${worktreeCellBtn(b, `${g.id}:${b.id}`)}</div>` : ""}
               ${branchPrSection(g, b)}
             </div>` : "";
@@ -1840,7 +1827,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
               ${toggle}
               <span>${gdot(b.merge_status || "")}</span>
               <span class="mono" style="flex:1${isEnabled ? "" : ";color:var(--muted)"}" data-tip="${esc(b.branch)}\nSelect it to read its position, source and status in the inspector.">${esc(b.branch)}</span>
-              ${isEnabled ? `${branchBadge(b)} ${autoFixExhaustedBadge(pullRequests[g.id] || [], b)} ${pill(b.merge_status || "")} ${branchPrLink(g, b)}` : '<span class="badge" style="color:var(--muted);border-color:var(--border);font-size:11px">disabled</span>'}
+              ${isEnabled ? `${branchBadge(b)} ${autoFixExhaustedBadge(pullRequests[g.id] || [], b)} ${branchStatusPill(b)} ${branchPrLink(g, b)}` : '<span class="badge" style="color:var(--muted);border-color:var(--border);font-size:11px">disabled</span>'}
               ${enableToggle}${reEnableIcon}${branchMenuBtn}
             </div>
             ${branchConflictBar(b)}
