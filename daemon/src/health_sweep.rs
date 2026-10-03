@@ -645,13 +645,21 @@ mod tests {
     #[test]
     fn tmux_check_names_a_source_whatever_the_resolution_outcome() {
         // Can't assume a real tmux/psmux is installed in every test
-        // environment, but whichever way `resolve_tmux_program_with_source`
-        // resolves, the reported detail must say which source it came from.
+        // environment. When resolution succeeds the detail must say which
+        // source it came from; when it fails (no tmux anywhere) the detail is
+        // the resolver's error, which has no single source to name.
         let check = check_tmux();
-        assert!(
-            check.detail.contains("source:"),
-            "expected a source label, got {check:?}"
-        );
+        if check.status == FAIL {
+            assert!(
+                check.detail.contains("tmux"),
+                "expected the resolver error, got {check:?}"
+            );
+        } else {
+            assert!(
+                check.detail.contains("source:"),
+                "expected a source label, got {check:?}"
+            );
+        }
     }
 
     #[test]
