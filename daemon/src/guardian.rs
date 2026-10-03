@@ -896,6 +896,19 @@ pub struct GuardianView {
     /// rebase-generated review SHAs, which churn on every unrelated
     /// rebase. `None` when no campaign is open.
     pub base_shift_rebuild_targets: Option<std::collections::BTreeMap<String, String>>,
+    /// RAL-542: failed unattended base-shift rebuild attempts consumed by
+    /// each worktree's own slice of the current retry campaign, keyed by
+    /// project root. A worktree absent from this map has spent none of its
+    /// budget. This is the map the automatic-rebuild gate and exhaustion
+    /// check actually read, so one chronically-conflicting worktree's
+    /// exhausted budget can no longer silently stop automatic rebuild for
+    /// the review's other, unrelated worktrees. Kept alongside the older,
+    /// whole-campaign [`Self::base_shift_rebuild_attempts`] scalar, which
+    /// continues to count failed passes exactly as it always has (one
+    /// shared counter, unaware of per-worktree budgets) purely for the
+    /// consumers that still read it as a whole-review summary. `None` when
+    /// no campaign is open.
+    pub base_shift_rebuild_attempts_by_project: Option<std::collections::BTreeMap<String, u32>>,
     /// RAL-507: when the notification mailbox was told that this campaign's
     /// automatic-rebuild budget is exhausted. One message per exhausted
     /// campaign; reset together with the campaign.
@@ -3534,6 +3547,190 @@ impl Store {
         Ok(())
     }
 
+    /// RAL-542: open (or continue) each shifted project's own slice of the
+    /// base-shift retry campaign against `targets`. A project whose stored
+    /// target SHA differs from `targets` (or has none yet) starts a fresh
+    /// sub-campaign with a full budget for that worktree alone; a project
+    /// whose target is unchanged continues its existing sub-campaign's
+    /// attempt count untouched -- so one worktree's exhausted budget is
+    /// never reset just because a different worktree's shift triggered this
+    /// same dispatch. Clears the whole-guardian exhaustion-notified marker
+    /// whenever any project's target changes, so new upstream work landing
+    /// on a previously-exhausted worktree earns a fresh notice once (if) it
+    /// exhausts again.
+    pub fn update_guardian_base_shift_campaign_per_project(
+        &self,
+        id: &str,
+        targets: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        let (targets_json, attempts_json): (Option<String>, Option<String>) = self.conn.query_row(
+            "SELECT base_shift_rebuild_targets, base_shift_rebuild_attempts_by_project \
+             FROM guardians WHERE id=?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let mut stored_targets: BTreeMap<String, String> = targets_json
+            .as_deref()
+            .and_then(|j| serde_json::from_str(j).ok())
+            .unwrap_or_default();
+        let mut attempts_by_project: BTreeMap<String, u32> = attempts_json
+            .as_deref()
+            .and_then(|j| serde_json::from_str(j).ok())
+            .unwrap_or_default();
+        let mut any_new = false;
+        for (proj, target) in targets {
+            if stored_targets.get(proj) != Some(target) {
+                any_new = true;
+                attempts_by_project.insert(proj.clone(), 0);
+            }
+            stored_targets.insert(proj.clone(), target.clone());
+        }
+        let targets_json = serde_json::to_string(&stored_targets).map_err(|e| {
+            StoreError::InvalidTransition(format!("serialize campaign targets: {e}"))
+        })?;
+        let attempts_json = serde_json::to_string(&attempts_by_project).map_err(|e| {
+            StoreError::InvalidTransition(format!("serialize per-worktree attempts: {e}"))
+        })?;
+        let n = if any_new {
+            self.conn.execute(
+                "UPDATE guardians SET base_shift_rebuild_targets=?2, \
+                 base_shift_rebuild_attempts_by_project=?3, \
+                 base_shift_rebuild_attempts=0, \
+                 base_shift_exhausted_notified_at_ms=NULL, updated_at_ms=?4 WHERE id=?1",
+                params![id, targets_json, attempts_json, crate::store::now_ms()],
+            )?
+        } else {
+            self.conn.execute(
+                "UPDATE guardians SET base_shift_rebuild_targets=?2, \
+                 base_shift_rebuild_attempts_by_project=?3, updated_at_ms=?4 WHERE id=?1",
+                params![id, targets_json, attempts_json, crate::store::now_ms()],
+            )?
+        };
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// RAL-542: record one failed unattended base-shift rebuild for each of
+    /// `projects` -- the worktrees whose branches didn't make it through
+    /// this pass -- bumping only their own slice of the retry budget, never
+    /// a worktree absent from `projects`. Returns the updated per-worktree
+    /// attempts map so the caller can check each failed worktree against
+    /// the cap independently, instead of one shared counter letting a
+    /// single chronically-conflicting worktree exhaust the whole review's
+    /// budget.
+    pub fn increment_guardian_base_shift_rebuild_attempts_for_projects(
+        &self,
+        id: &str,
+        projects: &[&str],
+    ) -> Result<BTreeMap<String, u32>> {
+        let attempts_json: Option<String> = self.conn.query_row(
+            "SELECT base_shift_rebuild_attempts_by_project FROM guardians WHERE id=?1",
+            params![id],
+            |r| r.get(0),
+        )?;
+        let mut attempts_by_project: BTreeMap<String, u32> = attempts_json
+            .as_deref()
+            .and_then(|j| serde_json::from_str(j).ok())
+            .unwrap_or_default();
+        for proj in projects {
+            let entry = attempts_by_project.entry((*proj).to_string()).or_insert(0);
+            *entry = entry.saturating_add(1);
+        }
+        let json = serde_json::to_string(&attempts_by_project).map_err(|e| {
+            StoreError::InvalidTransition(format!("serialize per-worktree attempts: {e}"))
+        })?;
+        let n = self.conn.execute(
+            "UPDATE guardians SET base_shift_rebuild_attempts_by_project=?2, updated_at_ms=?3 \
+             WHERE id=?1",
+            params![id, json, crate::store::now_ms()],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(attempts_by_project)
+        }
+    }
+
+    /// RAL-542: close out just `project`'s own slice of the base-shift
+    /// retry campaign -- its target SHA and attempt count -- leaving any
+    /// other project's still-open sub-campaign untouched. Called after that
+    /// project's branches rebuild successfully. When every project's slice
+    /// ends up empty, this also folds the legacy whole-guardian scalars
+    /// (`base_shift_rebuild_attempts`, the exhaustion-notified marker)
+    /// closed via [`Self::clear_guardian_base_shift_campaign`], so a fully
+    /// closed campaign looks the same regardless of which project closed it
+    /// last.
+    pub fn clear_guardian_base_shift_campaign_for_project(
+        &self,
+        id: &str,
+        project: &str,
+    ) -> Result<()> {
+        let (targets_json, attempts_json): (Option<String>, Option<String>) = self.conn.query_row(
+            "SELECT base_shift_rebuild_targets, base_shift_rebuild_attempts_by_project \
+             FROM guardians WHERE id=?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let mut stored_targets: BTreeMap<String, String> = targets_json
+            .as_deref()
+            .and_then(|j| serde_json::from_str(j).ok())
+            .unwrap_or_default();
+        let mut attempts_by_project: BTreeMap<String, u32> = attempts_json
+            .as_deref()
+            .and_then(|j| serde_json::from_str(j).ok())
+            .unwrap_or_default();
+        stored_targets.remove(project);
+        attempts_by_project.remove(project);
+        if stored_targets.is_empty() {
+            return self.clear_guardian_base_shift_campaign(id);
+        }
+        let targets_json = serde_json::to_string(&stored_targets).map_err(|e| {
+            StoreError::InvalidTransition(format!("serialize campaign targets: {e}"))
+        })?;
+        let attempts_json = serde_json::to_string(&attempts_by_project).map_err(|e| {
+            StoreError::InvalidTransition(format!("serialize per-worktree attempts: {e}"))
+        })?;
+        let n = self.conn.execute(
+            "UPDATE guardians SET base_shift_rebuild_targets=?2, \
+             base_shift_rebuild_attempts_by_project=?3, updated_at_ms=?4 WHERE id=?1",
+            params![id, targets_json, attempts_json, crate::store::now_ms()],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// RAL-542: bump only the legacy whole-campaign `base_shift_rebuild_attempts`
+    /// scalar by one, without touching `base_shift_rebuild_targets` or the
+    /// per-worktree attempts map. Used instead of
+    /// [`Self::record_guardian_base_shift_rebuild_failure`] once a campaign can
+    /// span several worktrees, since that method's rewrite of the targets
+    /// column would overwrite -- not merge -- any other worktree's still-open
+    /// sub-campaign entry with whatever subset of projects shifted in this one
+    /// dispatch. Kept only so the handful of consumers that still read the
+    /// scalar as a whole-review failed-pass count (e.g. the RAL-537 badge)
+    /// keep seeing it increment; the per-worktree gate and exhaustion check
+    /// read [`Self::increment_guardian_base_shift_rebuild_attempts_for_projects`]
+    /// instead.
+    pub fn bump_guardian_base_shift_rebuild_attempts(&self, id: &str) -> Result<u32> {
+        self.conn.execute(
+            "UPDATE guardians SET base_shift_rebuild_attempts=base_shift_rebuild_attempts+1, \
+             updated_at_ms=?2 WHERE id=?1",
+            params![id, crate::store::now_ms()],
+        )?;
+        let attempts: i64 = self.conn.query_row(
+            "SELECT base_shift_rebuild_attempts FROM guardians WHERE id=?1",
+            params![id],
+            |r| r.get(0),
+        )?;
+        Ok(u32::try_from(attempts).unwrap_or(u32::MAX))
+    }
+
     /// Set this review's own override for whether a newly submitted PR's
     /// branch defaults to the exact worktree/feature branch name instead of
     /// the convention-derived alias (RAL-307). `None` resets it to "inherit
@@ -4834,7 +5031,7 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus, summary_format
+                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus, summary_format, base_shift_rebuild_attempts_by_project
                   FROM guardians WHERE id=?", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
                 /*
                 "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus
@@ -4980,7 +5177,7 @@ impl Store {
     /// (`crate::store_pool`) can serve it without the writer lock.
     pub(crate) fn list_guardians_conn(conn: &Connection) -> Result<Vec<GuardianView>> {
         let mut stmt = conn.prepare(
-            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus, summary_format
+            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus, summary_format, base_shift_rebuild_attempts_by_project
               FROM guardians ORDER BY created_at_ms DESC", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
         )?;
         let rows = stmt
@@ -5119,6 +5316,7 @@ impl Store {
             manual_checks_basis: r.get(70)?,
             manual_checks_focus: r.get(71)?,
             summary_format: r.get(72)?,
+            base_shift_rebuild_attempts_by_project: r.get(73)?,
         })
     }
 
@@ -5461,6 +5659,13 @@ impl Store {
             .base_shift_rebuild_targets
             .as_deref()
             .and_then(|json| serde_json::from_str::<BTreeMap<String, String>>(json).ok());
+        // RAL-542: each worktree's own slice of the retry budget, parsed the
+        // same way -- a malformed/empty value degrades to "no per-worktree
+        // attempts recorded yet", not a hard error.
+        let base_shift_rebuild_attempts_by_project = row
+            .base_shift_rebuild_attempts_by_project
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<BTreeMap<String, u32>>(json).ok());
 
         // RAL-307: same layering as `effective_skip_base_updates` above, for
         // whether a newly submitted PR's branch defaults to the exact
@@ -5616,6 +5821,7 @@ impl Store {
                 .base_shift_rebuild_attempts
                 .clamp(0, i64::from(u32::MAX)) as u32,
             base_shift_rebuild_targets,
+            base_shift_rebuild_attempts_by_project,
             base_shift_exhausted_notified_at_ms: row.base_shift_exhausted_notified_at_ms,
             auto_cancel_outdated_pr_pipelines: row.auto_cancel_outdated_pr_pipelines,
             cache_manual_checks: row.cache_manual_checks,
@@ -6127,6 +6333,10 @@ struct GuardianRow {
     /// RAL-507: when the mailbox was told this campaign's budget is
     /// exhausted (one-time, dedup marker).
     base_shift_exhausted_notified_at_ms: Option<i64>,
+    /// RAL-542: JSON map of `{project_root: attempts}`, each worktree's own
+    /// slice of the current campaign's retry budget. `None` when no campaign
+    /// is open.
+    base_shift_rebuild_attempts_by_project: Option<String>,
     /// RAL-510: per-review override for whether this review cancels a
     /// PR/MR's still-running CI pipelines whenever a newer commit is
     /// force-pushed onto the same branch. `None` inherits the
