@@ -9454,6 +9454,9 @@ fn expand_check_worktree_text(
             *command = expand_worktree_text(command)?;
         }
     }
+    if let Some(shared_store) = &mut check.shared_store {
+        shared_store.path = expand_worktree_text(&shared_store.path)?;
+    }
     Ok(())
 }
 
@@ -9480,10 +9483,9 @@ fn run_review_auto_build(
     if !commands.is_empty() {
         for raw_command in commands {
             let cmd = expand_worktree_text(&raw_command)?;
-            let ok = root
-                .at(combined_str)
-                .run_command_with_env(&cmd, &preparation_env, cancel)
-                .0;
+            let (ok, output) =
+                root.at(combined_str)
+                    .run_command_with_env(&cmd, &preparation_env, cancel);
             let _ = store
                 .lock()
                 .cartographer_log(crate::cartographer::CartographerEntry {
@@ -9519,7 +9521,12 @@ fn run_review_auto_build(
                 );
             }
             if !ok {
-                return Err(format!("preparation command failed: {cmd}"));
+                let output = output.trim();
+                return Err(if output.is_empty() {
+                    format!("preparation command failed: {cmd}")
+                } else {
+                    format!("preparation command failed: {cmd}\n{output}")
+                });
             }
         }
         return Ok("prepared via declared command group".to_string());
@@ -9666,6 +9673,7 @@ fn prepare_action_hints(
     let mut failures = Vec::new();
     let mut completed_groups = std::collections::HashSet::new();
     for index in 0..hints.len() {
+        let mut shared_store_cwd = None;
         hints[index].preparation_state = Some("preparing".to_string());
         hints[index].preparation_detail = None;
         hints[index].prepared_at_ms = None;
@@ -9676,6 +9684,100 @@ fn prepare_action_hints(
 
         let result = (|| {
             expand_check_worktree_text(&mut hints[index])?;
+            shared_store_cwd = hints[index]
+                .shared_store
+                .as_ref()
+                .map(|store| resolve_local_shared_store_root(Path::new(combined_str), store))
+                .transpose()?;
+            let mut action_env = env.clone();
+            let build_root = std::env::temp_dir()
+                .join("ralphus")
+                .join("prepared-builds")
+                .join(id)
+                .join(format!("action-{index}"));
+            let lifecycle = hints[index].lifecycle.as_ref();
+            let preserve_build_root = lifecycle
+                .and_then(|value| value.build_root_policy.as_deref())
+                == Some("prepare_managed");
+            let has_new_preparation =
+                hints[index].prepare.iter().try_fold(false, |found, step| {
+                    let fingerprint =
+                        serde_json::to_string(step).map_err(|error| error.to_string())?;
+                    Ok::<_, String>(found || !completed_groups.contains(&fingerprint))
+                })?;
+            action_env.insert(
+                "RALPHUS_BUILD_ROOT".to_string(),
+                build_root.to_string_lossy().into_owned(),
+            );
+            if let Some(shared_root) = &shared_store_cwd {
+                action_env.insert(
+                    "RALPHUS_SHARED_STORE_ROOT".to_string(),
+                    native_command_path(shared_root),
+                );
+            }
+            if has_new_preparation {
+                if let Some(lifecycle) = lifecycle {
+                    let workspace = root.at(combined_str);
+                    let timeout = lifecycle
+                        .timeout
+                        .as_deref()
+                        .map(parse_lifecycle_timeout)
+                        .transpose()?;
+                    for command in &lifecycle.before_reset_command {
+                        let (ok, output) = match timeout {
+                            Some(timeout) => workspace.run_command_with_env_timeout(
+                                command,
+                                &action_env,
+                                cancel,
+                                timeout,
+                            ),
+                            None => workspace.run_command_with_env(command, &action_env, cancel),
+                        };
+                        if !ok {
+                            let output = output.trim();
+                            return Err(if output.is_empty() {
+                                format!("before_reset_command failed: {command}")
+                            } else {
+                                format!("before_reset_command failed: {command}\n{output}")
+                            });
+                        }
+                    }
+                }
+                if !preserve_build_root && build_root.exists() {
+                    std::fs::remove_dir_all(&build_root).map_err(|error| {
+                        format!(
+                            "failed to reset build root {}: {error}",
+                            build_root.display()
+                        )
+                    })?;
+                }
+                std::fs::create_dir_all(&build_root).map_err(|error| {
+                    format!(
+                        "failed to create build root {}: {error}",
+                        build_root.display()
+                    )
+                })?;
+                if !preserve_build_root {
+                    if let Some(shared_root) = &shared_store_cwd {
+                        if shared_root.exists() {
+                            std::fs::remove_dir_all(shared_root).map_err(|error| {
+                                format!(
+                                    "failed to reset shared-store root {}: {error}",
+                                    shared_root.display()
+                                )
+                            })?;
+                        }
+                    }
+                }
+            }
+            if let Some(shared_root) = &shared_store_cwd {
+                std::fs::create_dir_all(shared_root).map_err(|error| {
+                    format!(
+                        "failed to create shared-store root {}: {error}",
+                        shared_root.display()
+                    )
+                })?;
+            }
             if hints[index].command.is_none() {
                 if let Some(prompt) = hints[index].prompt.as_deref() {
                     hints[index].command = Some(expand_action_prompt(
@@ -9685,7 +9787,7 @@ fn prepare_action_hints(
                         root,
                         combined_str,
                         prompt,
-                        env,
+                        &action_env,
                         cancel,
                     )?);
                     store
@@ -9702,7 +9804,16 @@ fn prepare_action_hints(
                 if completed_groups.contains(&fingerprint) {
                     continue;
                 }
-                run_review_auto_build(store, runner, id, root, combined_str, env, step, cancel)?;
+                run_review_auto_build(
+                    store,
+                    runner,
+                    id,
+                    root,
+                    combined_str,
+                    &action_env,
+                    step,
+                    cancel,
+                )?;
                 completed_groups.insert(fingerprint);
             }
             if !hints[index].artifacts.is_empty() {
@@ -9718,7 +9829,7 @@ fn prepare_action_hints(
                 root,
                 combined_str,
                 &hints[index],
-                env,
+                &action_env,
                 cancel,
             )
         })();
@@ -9732,7 +9843,10 @@ fn prepare_action_hints(
                 hints[index].preparation_state = Some("ready".to_string());
                 hints[index].preparation_detail = None;
                 hints[index].prepared_at_ms = Some(crate::store::now_ms());
-                hints[index].prepared_cwd = prepared_cwd.or_else(|| Some(combined_str.to_string()));
+                hints[index].prepared_cwd = shared_store_cwd
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .or(prepared_cwd)
+                    .or_else(|| Some(combined_str.to_string()));
             }
             Err(error) => {
                 hints[index].preparation_state = Some("failed".to_string());
@@ -9923,6 +10037,63 @@ fn expand_action_prompt(
         .into_iter()
         .find_map(|check| check.command)
         .ok_or_else(|| "prompt action expansion returned no runnable command".to_string())
+}
+
+/// Resolve a V1 shared-store namespace on this machine. Remote providers will
+/// replace this local fallback with their own configured store mapping.
+fn resolve_local_shared_store_root(
+    project_root: &Path,
+    store: &crate::guardian::GuardianSharedStore,
+) -> Result<PathBuf, String> {
+    let root = crate::config::shared_store_root(project_root, &store.store).unwrap_or_else(|| {
+        std::env::var_os("RALPHUS_SHARED_STORE_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::temp_dir().join("ralphus-shared-store"))
+            .join(&store.store)
+    });
+    let store_name = Path::new(&store.store);
+    let path = Path::new(&store.path);
+    if store_name.components().count() != 1
+        || store_name.as_os_str().is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err("invalid shared-store location after validation".to_string());
+    }
+    Ok(root.join(path))
+}
+
+fn native_command_path(path: &Path) -> String {
+    let value = path.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    {
+        value.replace('/', "\\")
+    }
+    #[cfg(not(windows))]
+    {
+        value
+    }
+}
+
+fn parse_lifecycle_timeout(value: &str) -> Result<std::time::Duration, String> {
+    let value = value.trim();
+    let Some(unit) = value.chars().last() else {
+        return Err("lifecycle timeout is empty".to_string());
+    };
+    let number = value
+        .strip_suffix(unit)
+        .and_then(|number| number.parse::<u64>().ok())
+        .filter(|number| *number > 0)
+        .ok_or_else(|| "lifecycle timeout must be a positive number".to_string())?;
+    let seconds = match unit {
+        's' => number,
+        'm' => number.saturating_mul(60),
+        'h' => number.saturating_mul(60 * 60),
+        _ => return Err("lifecycle timeout must end in s, m, or h".to_string()),
+    };
+    Ok(std::time::Duration::from_secs(seconds))
 }
 
 fn materialize_action_artifacts(
@@ -13339,6 +13510,57 @@ mod tests {
     use super::*;
     use crate::runner::RunnerResult;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[test]
+    fn local_shared_store_root_is_namespaced_by_store_and_path() {
+        let store = crate::guardian::GuardianSharedStore {
+            store: "review-artifacts".to_string(),
+            path: "reviews/RAL-999/demo".to_string(),
+        };
+        let root =
+            resolve_local_shared_store_root(Path::new("."), &store).expect("valid store path");
+        assert!(root.ends_with(Path::new("review-artifacts").join("reviews/RAL-999/demo")));
+    }
+
+    #[test]
+    fn local_shared_store_root_refuses_parent_path() {
+        let store = crate::guardian::GuardianSharedStore {
+            store: "review-artifacts".to_string(),
+            path: "../escape".to_string(),
+        };
+        assert!(resolve_local_shared_store_root(Path::new("."), &store).is_err());
+    }
+
+    #[test]
+    fn shared_store_path_expands_existing_worktree_text_placeholder() {
+        let mut check = crate::guardian::GuardianCheck {
+            shared_store: Some(crate::guardian::GuardianSharedStore {
+                store: "review-artifacts".to_string(),
+                path: "reviews/<<ralphus:new-worktree/RAL-999-add_widget?upstream=main&text=basename({})>>/demo"
+                    .to_string(),
+            }),
+            ..crate::guardian::GuardianCheck::default()
+        };
+        expand_check_worktree_text(&mut check).expect("valid text placeholder");
+        assert_eq!(
+            check.shared_store.as_ref().map(|store| store.path.as_str()),
+            Some("reviews/RAL-999-add_widget/demo")
+        );
+    }
+
+    #[test]
+    fn lifecycle_timeout_parser_accepts_supported_units_only() {
+        assert_eq!(
+            parse_lifecycle_timeout("2m").expect("minutes parse"),
+            std::time::Duration::from_secs(120)
+        );
+        assert_eq!(
+            parse_lifecycle_timeout("3h").expect("hours parse"),
+            std::time::Duration::from_secs(10_800)
+        );
+        assert!(parse_lifecycle_timeout("0s").is_err());
+        assert!(parse_lifecycle_timeout("30ms").is_err());
+    }
 
     /// The worktree-lease poll must not write a row per iteration.
     ///
@@ -18241,6 +18463,166 @@ mod tests {
                 .0,
             "the button command must find the already-built output without building"
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn shared_store_preparation_sets_action_cwd_before_manual_run() {
+        let (base, repo, _fwt) = make_repo("shared-store-preparation");
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let path = format!("tests/{}", std::process::id());
+        let build_command = if cfg!(windows) {
+            "echo ready> %RALPHUS_SHARED_STORE_ROOT%\\demo.txt"
+        } else {
+            "printf ready > \"$RALPHUS_SHARED_STORE_ROOT/demo.txt\""
+        };
+        let id = {
+            let guard = store.lock();
+            let id = guard
+                .create_guardian("r", "main", &repo.to_string_lossy())
+                .unwrap();
+            guard
+                .set_guardian_action_hints(
+                    &id,
+                    &[crate::guardian::GuardianCheck {
+                        label: Some("Shared demo".to_string()),
+                        command: Some("demo.txt".to_string()),
+                        prepare: vec![crate::guardian::GuardianAutoBuild {
+                            command: Some(build_command.to_string()),
+                            ..crate::guardian::GuardianAutoBuild::default()
+                        }],
+                        shared_store: Some(crate::guardian::GuardianSharedStore {
+                            store: "test-store".to_string(),
+                            path: path.clone(),
+                        }),
+                        ..crate::guardian::GuardianCheck::default()
+                    }],
+                )
+                .unwrap();
+            id
+        };
+
+        final_checks(
+            &store,
+            &FixedValueRunner("unused"),
+            &id,
+            &Workspace::local(&repo),
+            &repo.to_string_lossy(),
+            &CancelToken::never(),
+        )
+        .expect("shared-store preparation succeeds");
+
+        let action = store
+            .lock()
+            .get_guardian(&id)
+            .unwrap()
+            .action_hints
+            .remove(0);
+        let cwd = PathBuf::from(action.prepared_cwd.expect("shared-store cwd"));
+        assert_eq!(action.preparation_state.as_deref(), Some("ready"));
+        assert!(
+            cwd.join("demo.txt").exists(),
+            "preparation published to shared store"
+        );
+        let run_command = if cfg!(windows) {
+            "if exist demo.txt (exit /b 0) else (exit /b 1)"
+        } else {
+            "test -f demo.txt"
+        };
+        assert!(
+            Workspace::local(&cwd)
+                .run_command(run_command, &CancelToken::never())
+                .0,
+            "the manual action runs directly from the shared store"
+        );
+        std::fs::write(cwd.join("stale-from-prior-generation.txt"), "stale").unwrap();
+        final_checks(
+            &store,
+            &FixedValueRunner("unused"),
+            &id,
+            &Workspace::local(&repo),
+            &repo.to_string_lossy(),
+            &CancelToken::never(),
+        )
+        .expect("replacement preparation succeeds");
+        assert!(
+            !cwd.join("stale-from-prior-generation.txt").exists(),
+            "default lifecycle clears the prior shared publication before rebuilding"
+        );
+        assert!(cwd.join("demo.txt").exists());
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn lifecycle_hook_runs_before_default_build_root_reset() {
+        let (base, repo, _fwt) = make_repo("lifecycle-before-reset");
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let write_marker = if cfg!(windows) {
+            "echo built> %RALPHUS_BUILD_ROOT%\\marker.txt"
+        } else {
+            "printf built > \"$RALPHUS_BUILD_ROOT/marker.txt\""
+        };
+        let id = {
+            let guard = store.lock();
+            let id = guard
+                .create_guardian("r", "main", &repo.to_string_lossy())
+                .unwrap();
+            guard
+                .set_guardian_action_hints(
+                    &id,
+                    &[crate::guardian::GuardianCheck {
+                        label: Some("Lifecycle".to_string()),
+                        command: Some("echo ready".to_string()),
+                        prepare: vec![crate::guardian::GuardianAutoBuild {
+                            command: Some(write_marker.to_string()),
+                            ..crate::guardian::GuardianAutoBuild::default()
+                        }],
+                        ..crate::guardian::GuardianCheck::default()
+                    }],
+                )
+                .unwrap();
+            id
+        };
+        let root = Workspace::local(&repo);
+        final_checks(
+            &store,
+            &FixedValueRunner("unused"),
+            &id,
+            &root,
+            &repo.to_string_lossy(),
+            &CancelToken::never(),
+        )
+        .expect("first preparation succeeds");
+
+        let hook = if cfg!(windows) {
+            "if exist %RALPHUS_BUILD_ROOT%\\marker.txt (echo stopped> lifecycle-hook.txt) else (exit /b 1)"
+        } else {
+            "test -f \"$RALPHUS_BUILD_ROOT/marker.txt\" && printf stopped > lifecycle-hook.txt"
+        };
+        {
+            let guard = store.lock();
+            let mut action = guard.get_guardian(&id).unwrap().action_hints.remove(0);
+            action.lifecycle = Some(crate::guardian::GuardianActionLifecycle {
+                before_reset_command: vec![hook.to_string()],
+                ..crate::guardian::GuardianActionLifecycle::default()
+            });
+            guard.set_guardian_action_hints(&id, &[action]).unwrap();
+        }
+        final_checks(
+            &store,
+            &FixedValueRunner("unused"),
+            &id,
+            &root,
+            &repo.to_string_lossy(),
+            &CancelToken::never(),
+        )
+        .expect("replacement preparation succeeds after lifecycle hook");
+        assert!(repo.join("lifecycle-hook.txt").exists());
         let _ = std::fs::remove_dir_all(&base);
     }
 

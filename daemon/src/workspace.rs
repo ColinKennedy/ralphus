@@ -237,6 +237,33 @@ impl Workspace {
         }
     }
 
+    /// Run a local command with both review cancellation and a bounded wall
+    /// clock duration. Remote providers do not yet expose a cancellation-aware
+    /// timeout contract, so V1 rejects that combination at the caller.
+    #[must_use]
+    pub fn run_command_with_env_timeout(
+        &self,
+        command: &str,
+        env: &std::collections::BTreeMap<String, String>,
+        cancel: &crate::cancel::CancelToken,
+        timeout: std::time::Duration,
+    ) -> (bool, String) {
+        match &self.machine {
+            None => crate::proof::run_command_proof_capture_with_timeout(
+                &self.root.to_string_lossy(),
+                command,
+                &opentelemetry::Context::new(),
+                env,
+                cancel,
+                Some(timeout),
+            ),
+            Some(_) => (
+                false,
+                "lifecycle timeout is not supported by a remote provider yet".to_string(),
+            ),
+        }
+    }
+
     /// Read a file at `path`, which may be absolute or relative to this
     /// workspace's root.
     ///

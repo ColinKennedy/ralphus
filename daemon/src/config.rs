@@ -32,6 +32,14 @@ pub struct ArkConfig {
     pub max_worktrees: usize,
 }
 
+/// One locally mounted shared store. The name is referenced by a review action;
+/// the absolute root stays daemon/provider configuration rather than task TOML.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SharedStoreConfig {
+    pub name: String,
+    pub root: String,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 struct ArkConfigLayer {
     sweep_interval_days: Option<u64>,
@@ -2362,6 +2370,8 @@ struct ConfigFile {
     #[serde(default)]
     ark: Option<ArkConfigLayer>,
     #[serde(default)]
+    shared_store: Vec<SharedStoreConfig>,
+    #[serde(default)]
     arbiter: Option<ArbiterConfig>,
     #[serde(default)]
     pr_cache: Option<PrCacheConfig>,
@@ -2409,6 +2419,31 @@ struct ConfigFile {
     templates: Vec<TemplateDef>,
     #[serde(default)]
     ui: Option<UiConfig>,
+}
+
+/// Resolve a V1 same-machine shared-store root. A project entry with the same
+/// name replaces the global entry; the task file never carries this absolute
+/// path because a later provider may map the logical store differently.
+#[must_use]
+pub fn shared_store_root(project_root: &Path, name: &str) -> Option<PathBuf> {
+    let mut stores = global_config_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| toml::from_str::<ConfigFile>(&text).ok())
+        .map_or_else(Vec::new, |file| file.shared_store);
+    if let Some(project_stores) = find_project_config(project_root)
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| toml::from_str::<ConfigFile>(&text).ok())
+        .map(|file| file.shared_store)
+    {
+        for store in project_stores {
+            stores.retain(|existing| existing.name != store.name);
+            stores.push(store);
+        }
+    }
+    stores
+        .into_iter()
+        .find(|store| store.name == name)
+        .map(|store| PathBuf::from(store.root))
 }
 
 #[must_use]
@@ -2961,6 +2996,32 @@ pub(crate) fn reset_cors_cache_for_test() {
 mod tests {
     use super::*;
     use crate::forge::ForgeKind;
+
+    #[test]
+    fn project_shared_store_root_uses_logical_name() {
+        let project = std::env::temp_dir().join(format!(
+            "ralphus-shared-store-config-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join(".ralphus.toml"),
+            "[[shared_store]]\nname = 'review-artifacts'\nroot = 'Z:/review-artifacts'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            shared_store_root(&project, "review-artifacts"),
+            Some(PathBuf::from("Z:/review-artifacts"))
+        );
+        assert_eq!(
+            shared_store_root(
+                &project,
+                &format!("missing-test-store-{}", std::process::id())
+            ),
+            None
+        );
+        let _ = std::fs::remove_dir_all(project);
+    }
 
     #[test]
     fn ark_defaults_and_validation_are_safe() {

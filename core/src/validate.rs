@@ -320,7 +320,12 @@ const REVIEW_ACTION_KEYS: &[&str] = &[
     "artifact",
     "cleanup_command",
     "input",
+    "shared_store",
+    "lifecycle",
 ];
+const REVIEW_ACTION_SHARED_STORE_KEYS: &[&str] = &["store", "path"];
+const REVIEW_ACTION_LIFECYCLE_KEYS: &[&str] =
+    &["build_root_policy", "before_reset_command", "timeout"];
 const REVIEW_ACTION_INPUT_KEYS: &[&str] = &["name", "message", "default"];
 const REVIEW_ARTIFACT_KEYS: &[&str] = &[
     "source",
@@ -2711,7 +2716,123 @@ fn validate_review_action_array(value: Option<&toml::Value>, path: &str, ctx: &m
         }
 
         validate_review_action_input_array(table.get("input"), &format!("{apath}.input"), ctx);
+        validate_review_action_shared_store(
+            table.get("shared_store"),
+            &format!("{apath}.shared_store"),
+            ctx,
+        );
+        validate_review_action_lifecycle(
+            table.get("lifecycle"),
+            &format!("{apath}.lifecycle"),
+            ctx,
+        );
     }
+}
+
+fn validate_review_action_shared_store(value: Option<&toml::Value>, path: &str, ctx: &mut Ctx) {
+    let Some(value) = value else { return };
+    let Some(table) = value.as_table() else {
+        ctx.error(
+            path,
+            ErrorKind::WrongType,
+            "shared_store must be a table",
+            None,
+        );
+        return;
+    };
+    unknown_keys(ctx, table, REVIEW_ACTION_SHARED_STORE_KEYS, path, None);
+    for key in ["store", "path"] {
+        check_type(ctx, table, key, Ty::Str, path, None);
+        if table.get(key).is_none() {
+            ctx.error(
+                path,
+                ErrorKind::MissingRequired,
+                format!("shared_store requires '{key}'"),
+                None,
+            );
+        }
+    }
+    if let Some(path_value) = table.get("path").and_then(toml::Value::as_str) {
+        check_worktree_text_placeholders(ctx, &format!("{path}.path"), path_value);
+        let path_for_safety = crate::schema::replace_text_placeholders(path_value, |_| {
+            Ok::<_, ()>(Some("worktree-placeholder".to_string()))
+        })
+        .unwrap_or_else(|_| path_value.to_string());
+        if !safe_relative_artifact_path(&path_for_safety) {
+            ctx.error(
+                &format!("{path}.path"),
+                ErrorKind::InvalidValue,
+                "shared_store path must be a non-empty relative path without traversal",
+                None,
+            );
+        }
+    }
+}
+
+fn validate_review_action_lifecycle(value: Option<&toml::Value>, path: &str, ctx: &mut Ctx) {
+    let Some(value) = value else { return };
+    let Some(table) = value.as_table() else {
+        ctx.error(
+            path,
+            ErrorKind::WrongType,
+            "lifecycle must be a table",
+            None,
+        );
+        return;
+    };
+    unknown_keys(ctx, table, REVIEW_ACTION_LIFECYCLE_KEYS, path, None);
+    check_type(ctx, table, "build_root_policy", Ty::Str, path, None);
+    check_type(ctx, table, "timeout", Ty::Str, path, None);
+    if let Some(policy) = table.get("build_root_policy").and_then(toml::Value::as_str) {
+        if !matches!(policy, "reset_before_prepare" | "prepare_managed") {
+            ctx.error(
+                &format!("{path}.build_root_policy"),
+                ErrorKind::InvalidValue,
+                "build_root_policy must be \"reset_before_prepare\" or \"prepare_managed\"",
+                None,
+            );
+        }
+    }
+    if let Some(timeout) = table.get("timeout").and_then(toml::Value::as_str) {
+        if !valid_lifecycle_timeout(timeout) {
+            ctx.error(
+                &format!("{path}.timeout"),
+                ErrorKind::InvalidValue,
+                "timeout must be a positive whole number followed by s, m, or h",
+                None,
+            );
+        }
+    }
+    if let Some(commands) = table.get("before_reset_command") {
+        let Some(commands) = commands.as_array() else {
+            ctx.error(
+                &format!("{path}.before_reset_command"),
+                ErrorKind::WrongType,
+                "before_reset_command must be an array of strings",
+                None,
+            );
+            return;
+        };
+        for (index, command) in commands.iter().enumerate() {
+            if !command.is_str() {
+                ctx.error(
+                    &format!("{path}.before_reset_command[{index}]"),
+                    ErrorKind::WrongType,
+                    "before_reset_command entries must be strings",
+                    None,
+                );
+            }
+        }
+    }
+}
+
+fn valid_lifecycle_timeout(value: &str) -> bool {
+    let value = value.trim();
+    if value.len() < 2 {
+        return false;
+    }
+    let (number, unit) = value.split_at(value.len() - 1);
+    matches!(unit, "s" | "m" | "h") && number.parse::<u64>().is_ok_and(|n| n > 0)
 }
 
 fn safe_relative_artifact_path(value: &str) -> bool {
@@ -5761,6 +5882,87 @@ target_arch = "x86_64"
         let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Run\"\ncommand=\"/share/<<ralphus:new-worktree/RAL-999-add_widget?upstream=main&text=basename({})>>/demo\"\n[[review.action.prepare]]\ncommand=[\"cmake -S . -B build\",\"cmake --build build\"]\nenvironment={ BUILD_ROOT=\"/share/<<ralphus:new-worktree/RAL-999-add_widget?upstream=main&text=basename({})>>\" }\n";
         let result = validate_toml(src);
         assert!(result.is_ok(), "{:?}", result.errors);
+    }
+
+    #[test]
+    fn review_action_shared_store_and_lifecycle_are_valid() {
+        let src = r#"
+[[task]]
+name = "t"
+[[task.cell]]
+cwd = "/r"
+prompt = "p"
+review = "<<review:r>>"
+[[review]]
+id = "r"
+[[review.action]]
+label = "Run shared build"
+command = "run"
+[review.action.shared_store]
+store = "review-artifacts"
+path = "reviews/<<ralphus:new-worktree/RAL-999-add_widget?upstream=main&text=basename({})>>/demo"
+[review.action.lifecycle]
+build_root_policy = "prepare_managed"
+before_reset_command = ["./stop-demo"]
+timeout = "2m"
+"#;
+        let result = validate_toml(src);
+        assert!(result.is_ok(), "{:?}", result.errors);
+    }
+
+    #[test]
+    fn review_action_shared_store_path_rejects_traversal() {
+        let src = r#"
+[[task]]
+name = "t"
+[[task.cell]]
+cwd = "/r"
+prompt = "p"
+review = "<<review:r>>"
+[[review]]
+id = "r"
+[[review.action]]
+label = "Run shared build"
+command = "run"
+[review.action.shared_store]
+store = "review-artifacts"
+path = "../escape"
+"#;
+        let result = validate_toml(src);
+        assert!(
+            result.errors.iter().any(|error| error
+                .message
+                .contains("shared_store path must be a non-empty relative path")),
+            "{:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn review_action_lifecycle_rejects_malformed_timeout() {
+        let src = r#"
+[[task]]
+name = "t"
+[[task.cell]]
+cwd = "/r"
+prompt = "p"
+review = "<<review:r>>"
+[[review]]
+id = "r"
+[[review.action]]
+label = "Run"
+command = "run"
+[review.action.lifecycle]
+timeout = "soon"
+"#;
+        let result = validate_toml(src);
+        assert!(
+            result.errors.iter().any(|error| error
+                .message
+                .contains("timeout must be a positive whole number")),
+            "{:?}",
+            result.errors
+        );
     }
 
     #[test]

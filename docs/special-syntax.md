@@ -61,7 +61,7 @@ Rules and risks:
   always knows what the created branch tracks instead of guessing from HEAD.
 - **Review preparation text interpolation.** In `[[review.prepare]]`,
   `[[review.action.prepare]]`, action `command`/`cleanup_command`, and shared
-  artifact `shared_path`/`readiness_command`, a wrapped
+  store `path`, a wrapped
   `<<ralphus:new-worktree/<branch>?upstream=<upstream>&text=basename({})>>`
   marker expands to the declared branch text (or its registered `text`
   transform). It is a deterministic naming aid for output/share paths; it

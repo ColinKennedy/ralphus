@@ -564,7 +564,6 @@ Tip: validate before submitting -- `ralphus validate file.toml`
  command string  ONE-OF Verbatim shell command run in a terminal.
  prompt  string  ONE-OF Hint text forwarded to the resolver LLM
                  to expand into a runnable command during preparation.
- run_on  string         "daemon" (default) or "review_machine".
  description string     What the reviewer should inspect.
  success string         Optional guidance on what to inspect. Omit it for the
                         normal "exit code 0" manual action.
@@ -576,25 +575,28 @@ string array; environment overrides apply to that whole group. Equal action
 preparation groups are run once per preparation generation and satisfy every
 action that declares them.
 
-Preparation/action commands, group environment values, shared_path, and
-readiness_command may embed <<ralphus:new-worktree/BRANCH?upstream=UPSTREAM
+Preparation/action commands, group environment values, and shared-store paths
+may embed <<ralphus:new-worktree/BRANCH?upstream=UPSTREAM
 &text=basename({})>>. This is text interpolation only: it expands to BRANCH
 (or its requested text transform) and does not create another worktree.
 
- [[review.action.artifact]] declares selected prepared outputs:
- source             relative path produced in the review checkout
- placement          "copy", "retain", or "shared"
- destination        relative daemon-side path (required for "copy")
- shared_path        network path/URI (required for "shared")
- readiness_command  proves shared output is usable (required for "shared")
- executable         preserve/add executable mode where supported
- target_os          required for executable artifacts (windows/linux/macos)
- target_arch        required for executable artifacts (x86_64/aarch64/etc.)
+ [review.action.shared_store] is optional. It names a configured logical store
+ and a nonempty relative path. The daemon/provider maps `store` to the actual
+ absolute share root; task TOML never hardcodes that machine-specific root.
+ When present, preparation receives RALPHUS_SHARED_STORE_ROOT and the action
+ runs with that published directory as its working directory.
 
- Placement recipes:
+ [review.action.lifecycle] is optional. `build_root_policy` is
+ "reset_before_prepare" (the default) or "prepare_managed". An ordered
+ `before_reset_command` array runs before the default build-root reset; its
+ optional `timeout` is a positive duration such as "30s" or "2m". A failing
+ or timed-out hook blocks the replacement generation.
 
- 1. Local build and local test: review has no remote machine. Prepare and Run
-    both use the retained local review checkout; no transfer is needed.
+ Placement recipes (V1 supports the first two on the same machine; remote
+ delivery is deliberately introduced later):
+
+ 1. Local build and local test: preparation and Run use the retained review
+    checkout; no transfer is needed.
 
     [[review.prepare]]
     command = ["cargo build --bin demo", "cargo test --bin demo"]
@@ -603,44 +605,30 @@ readiness_command may embed <<ralphus:new-worktree/BRANCH?upstream=UPSTREAM
     [[review.action]]
     label = "Run local demo"
     command = "target/debug/demo"
-    run_on = "daemon"
 
- 2. Remote build, local test: assign [[review]] machine, build there, and
-    copy only the selected executable/resources back before Run enables.
-
-    [[review.action]]
-    label = "Run copied desktop build"
-    command = "staged/demo"
-    run_on = "daemon"
-
-      [[review.action.artifact]]
-      source = "target/release/demo"
-      destination = "staged/demo"
-      placement = "copy"
-      executable = true
-      target_os = "windows"
-      target_arch = "x86_64"
-
- 3. Shared/network placement: preparation publishes to a mounted share or
-    artifact store. Ralphus verifies readiness but does not relay the payload.
+ 2. Shared/network placement: preparation writes directly to the configured
+    mounted share. The action runs there; Ralphus does not copy it through the
+    daemon.
 
     [[review.action]]
     label = "Exercise shared build"
-    command = "//build-share/demo/<<ralphus:new-worktree/RAL-999-add_widget?upstream=main&text=basename({})>>/demo"
-    run_on = "daemon"
+    command = "./demo"
+
+      [review.action.shared_store]
+      store = "review-artifacts"
+      path = "reviews/<<ralphus:new-worktree/RAL-999-add_widget?upstream=main&text=basename({})>>/demo"
 
       [[review.action.prepare]]
       command = [
-        "cmake -S . -B /mnt/build-share/<<ralphus:new-worktree/RAL-999-add_widget?upstream=main&text=basename({})>>/build",
-        "cmake --build /mnt/build-share/<<ralphus:new-worktree/RAL-999-add_widget?upstream=main&text=basename({})>>/build --target demo"
+        "cmake -S . -B \"$RALPHUS_SHARED_STORE_ROOT/build\"",
+        "cmake --build \"$RALPHUS_SHARED_STORE_ROOT/build\" --target demo",
+        "install -D -m 755 \"$RALPHUS_SHARED_STORE_ROOT/build/bin/demo\" \"$RALPHUS_SHARED_STORE_ROOT/demo\""
       ]
       environment = { BUILD_FLAVOR = "release" }
 
-      [[review.action.artifact]]
-      source = "target/release/demo"
-      placement = "shared"
-      shared_path = "//build-share/demo/<<ralphus:new-worktree/RAL-999-add_widget?upstream=main&text=basename({})>>/demo"
-      readiness_command = "test -x /mnt/build-share/demo/<<ralphus:new-worktree/RAL-999-add_widget?upstream=main&text=basename({})>>/demo"
+      [review.action.lifecycle]
+      build_root_policy = "reset_before_prepare"
+      before_reset_command = ["./scripts/stop-demo-if-running"]
 
 ---------------------------------------------------------------
  Triage (RAL-318) -- auto-review opt-in, alternative to [[review]]
@@ -1271,14 +1259,15 @@ mod tests {
     }
 
     #[test]
-    fn tutor_teaches_all_manual_preparation_placements() {
+    fn tutor_teaches_manual_preparation_and_shared_store_v1() {
         assert!(TASK_TUTOR.contains("[[review.prepare]]"));
         assert!(TASK_TUTOR.contains("1. Local build and local test"));
-        assert!(TASK_TUTOR.contains("2. Remote build, local test"));
-        assert!(TASK_TUTOR.contains("3. Shared/network placement"));
-        assert!(TASK_TUTOR.contains("placement = \"copy\""));
-        assert!(TASK_TUTOR.contains("placement = \"shared\""));
-        assert!(TASK_TUTOR.contains("run_on = \"daemon\""));
+        assert!(TASK_TUTOR.contains("2. Shared/network placement"));
+        assert!(TASK_TUTOR.contains("[review.action.shared_store]"));
+        assert!(TASK_TUTOR.contains("RALPHUS_SHARED_STORE_ROOT"));
+        assert!(TASK_TUTOR.contains("[review.action.lifecycle]"));
+        assert!(!TASK_TUTOR.contains("placement = \"copy\""));
+        assert!(!TASK_TUTOR.contains("placement = \"shared\""));
     }
 
     #[test]

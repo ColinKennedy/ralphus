@@ -525,6 +525,19 @@ fn actions_to_hints(actions: &[ReviewActionDef]) -> Vec<GuardianCheck> {
                 })
                 .collect(),
             cleanup_command: a.cleanup_command.clone(),
+            shared_store: a.shared_store.as_ref().map(|store| {
+                crate::guardian::GuardianSharedStore {
+                    store: store.store.clone(),
+                    path: store.path.clone(),
+                }
+            }),
+            lifecycle: a.lifecycle.as_ref().map(|lifecycle| {
+                crate::guardian::GuardianActionLifecycle {
+                    build_root_policy: lifecycle.build_root_policy.clone(),
+                    before_reset_command: lifecycle.before_reset_command.clone(),
+                    timeout: lifecycle.timeout.clone(),
+                }
+            }),
             inputs: a
                 .input
                 .iter()

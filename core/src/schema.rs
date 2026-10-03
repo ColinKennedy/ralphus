@@ -1760,6 +1760,36 @@ pub struct ReviewActionDef {
     /// otherwise be hardcoded and collide across concurrent reviews.
     #[serde(default)]
     pub input: Vec<ReviewActionInputDef>,
+    /// Optional shared-network publication for this action. The provider owns
+    /// the absolute store root; `path` is a review-relative namespace.
+    #[serde(default)]
+    pub shared_store: Option<ReviewActionSharedStoreDef>,
+    /// Preparation workspace lifecycle policy and optional teardown commands.
+    #[serde(default)]
+    pub lifecycle: Option<ReviewActionLifecycleDef>,
+}
+
+/// A logical network store and a relative path within the provider-owned root.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReviewActionSharedStoreDef {
+    /// Registered logical store name, resolved by the daemon/provider.
+    pub store: String,
+    /// Relative namespace below the provider's absolute store root.
+    pub path: String,
+}
+
+/// Optional cleanup policy for a prepared action generation.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReviewActionLifecycleDef {
+    /// `reset_before_prepare` (default) or `prepare_managed`.
+    #[serde(default)]
+    pub build_root_policy: Option<String>,
+    /// Commands run before an owned build root is reset.
+    #[serde(default)]
+    pub before_reset_command: Vec<String>,
+    /// Optional maximum hook duration in the existing duration-string format.
+    #[serde(default)]
+    pub timeout: Option<String>,
 }
 
 /// A named, defaulted input referenced by a [`ReviewActionDef`]'s

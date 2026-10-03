@@ -144,6 +144,31 @@ pub struct GuardianCheck {
     /// `{name}` placeholders.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<CheckInput>,
+    /// Optional logical shared-store publication for this action generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_store: Option<GuardianSharedStore>,
+    /// Preparation workspace lifecycle policy and optional teardown commands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<GuardianActionLifecycle>,
+}
+
+/// Persisted logical shared-store declaration. The provider resolves the
+/// concrete absolute root at preparation time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuardianSharedStore {
+    pub store: String,
+    pub path: String,
+}
+
+/// Persisted action-generation lifecycle declaration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuardianActionLifecycle {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_root_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub before_reset_command: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<String>,
 }
 
 /// One prepared output and how it becomes visible to a manual action.
