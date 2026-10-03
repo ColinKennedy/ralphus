@@ -5165,8 +5165,15 @@ fn staged_merge_pass(
     )
     .map(str::to_string);
 
+    // A failure in one project's branches must not stop the pass from
+    // attempting the other projects -- each worktree's rebuild budget and
+    // up-to-date status are per-worktree, not shared across the whole
+    // review (RAL-542). `failed_projects` accumulates which projects hit an
+    // error this pass; everything else in `project_order` still gets a full
+    // attempt.
+    let mut failed_projects: Vec<String> = Vec::new();
     let mut built_any = false;
-    for proj in &project_order {
+    'projects: for proj in &project_order {
         if cancel.is_cancelled() {
             return StagedPassOutcome::Cancelled;
         }
@@ -5175,7 +5182,8 @@ fn staged_merge_pass(
         let base_sha = base_shas.get(proj).cloned().unwrap_or_default();
         if let Err(e) = preflight_worktree_budget(&root, &wt_base, &base_sha) {
             set_status(GuardianStatus::MergeFailed, Some(&e));
-            return StagedPassOutcome::Failed;
+            failed_projects.push(proj.clone());
+            continue 'projects;
         }
         // For resume, reuse the maximal `Done` prefix's last tip as the seed;
         // otherwise seed from the base (full rebuild of the ready prefix).
@@ -5231,7 +5239,8 @@ fn staged_merge_pass(
                 .set_branch_status(id, &bv.id, MergeStatus::InProgress, None);
             if let Err(e) = fetch_branch_for_remote_cell(store, id, bv) {
                 fail_branch(store, id, &bv.id, &bv.branch, &e, &set_status);
-                return StagedPassOutcome::Failed;
+                failed_projects.push(proj.clone());
+                continue 'projects;
             }
             let rev = match claim_branch_review_ref(
                 store,
@@ -5246,7 +5255,8 @@ fn staged_merge_pass(
                 Ok(rev) => rev,
                 Err(e) => {
                     fail_branch(store, id, &bv.id, &bv.branch, &e, &set_status);
-                    return StagedPassOutcome::Failed;
+                    failed_projects.push(proj.clone());
+                    continue 'projects;
                 }
             };
             let wt = branch_wt_dir(&wt_base, &short_names, &bv.branch);
@@ -5260,7 +5270,8 @@ fn staged_merge_pass(
                 );
             if let Err(e) = worktree_add_or_reset(&root, &rev, &wt, source_ref) {
                 fail_branch(store, id, &bv.id, &bv.branch, &e, &set_status);
-                return StagedPassOutcome::Failed;
+                failed_projects.push(proj.clone());
+                continue 'projects;
             }
             let _ = store.lock().set_branch_review(id, &bv.id, &rev, &wt_str);
             let gate = ProofGate::resolve(store, id, Some(&bv.id) == final_id.as_ref());
@@ -5278,14 +5289,16 @@ fn staged_merge_pass(
             .is_err()
             {
                 // stack_pick already set this branch + guardian failed.
-                return StagedPassOutcome::Failed;
+                failed_projects.push(proj.clone());
+                continue 'projects;
             }
             if cancel.is_cancelled() {
                 return StagedPassOutcome::Cancelled;
             }
             if let Err(e) = run_commit_checks(store, id, &bv.id, &wt, &bv.branch, cancel) {
                 fail_branch(store, id, &bv.id, &bv.branch, &e, &set_status);
-                return StagedPassOutcome::Failed;
+                failed_projects.push(proj.clone());
+                continue 'projects;
             }
             if note_if_branch_is_empty(store, id, &bv.id, &bv.branch, &root, upstream) {
                 fail_branch(
@@ -5296,32 +5309,54 @@ fn staged_merge_pass(
                     EMPTY_BRANCH_DETAIL,
                     &set_status,
                 );
-                return StagedPassOutcome::Failed;
+                failed_projects.push(proj.clone());
+                continue 'projects;
             }
             prev_ref = rev;
             built_any = true;
         }
     }
 
-    // Commit the base/signature baseline only after the pass succeeds. If a
-    // conflict resolver or check fails, the worktrees are rolled back to the
-    // prior review state; recording the attempted base before that point would
-    // make the maintenance sweep believe the rolled-back review was current
-    // and suppress a later retry.
+    // Commit the base/signature baseline for every project that actually
+    // succeeded this pass, even if a different project failed (RAL-542) --
+    // an unrelated worktree's conflict must not stop a healthy worktree's
+    // branches from advancing or being recognized as up to date. If a
+    // conflict resolver or check fails for project P, P's own worktrees are
+    // rolled back to the prior review state; recording P's attempted base
+    // before that point would make the maintenance sweep believe the
+    // rolled-back review was current and suppress a later retry for P -- but
+    // that risk only applies to P, not to projects that finished cleanly.
+    let succeeded_projects: Vec<&String> = project_order
+        .iter()
+        .filter(|p| !failed_projects.contains(p))
+        .collect();
     {
         let guard = store.lock();
-        for (proj, sha) in &base_shas {
-            let _ = guard.set_guardian_project_base_commit(id, proj, sha);
+        for proj in &succeeded_projects {
+            if let Some(sha) = base_shas.get(*proj) {
+                let _ = guard.set_guardian_project_base_commit(id, proj, sha);
+            }
+            // RAL-542: this project's own base-shift retry campaign entry
+            // (if any) has done its job -- close out just this project's
+            // target/attempts, leaving any other still-open project alone.
+            let _ = guard.clear_guardian_base_shift_campaign_for_project(id, proj);
         }
-        let _ = guard.set_guardian_build_signature(id, &current_sig);
-        // RAL-507: the pass succeeded, so any open base-shift retry campaign
-        // has done its job -- close it (counter, target SHAs, and the
-        // exhaustion-notified marker reset together) so a future shift gets
-        // a full budget instead of resuming a spent one.
-        let _ = guard.clear_guardian_base_shift_campaign(id);
+        if failed_projects.is_empty() {
+            let _ = guard.set_guardian_build_signature(id, &current_sig);
+            // RAL-507: the whole pass succeeded, so any open base-shift retry
+            // campaign has done its job everywhere -- close it (counter,
+            // target SHAs, and the exhaustion-notified marker reset
+            // together) so a future shift gets a full budget instead of
+            // resuming a spent one.
+            let _ = guard.clear_guardian_base_shift_campaign(id);
+        }
     }
 
-    StagedPassOutcome::Ok { built_any }
+    if failed_projects.is_empty() {
+        StagedPassOutcome::Ok { built_any }
+    } else {
+        StagedPassOutcome::Failed
+    }
 }
 
 /// For one project's ordered branches, find the maximal contiguous prefix that
@@ -8510,17 +8545,37 @@ pub fn rebuild_on_base_shift_with_debounce(
     {
         return true;
     }
-    // RAL-507: bound the unattended retry campaign. When the same target base
-    // SHAs have already consumed the full rebuild budget, stop dispatching:
-    // a persistent conflict, failed proof, provider outage, or worktree
-    // problem must not consume merge capacity and agent spend forever. A
-    // different target SHA (meaningful new upstream work) starts a fresh
-    // campaign with a full budget; a manual Merge / rebase resets the budget
-    // the same way, and a successful rebuild closes the campaign outright.
+    // RAL-542: bound each shifted worktree's own slice of the unattended
+    // retry campaign independently -- a persistent conflict, failed proof,
+    // provider outage, or worktree problem in one project must not consume
+    // merge capacity and agent spend forever, but it also must not stop
+    // automatic rebuild for the review's other, unrelated worktrees. Only
+    // skip this dispatch outright when EVERY shifted worktree has already
+    // spent its budget against this exact target; otherwise dispatch so the
+    // still-eligible worktrees keep rebasing. (An already-exhausted worktree
+    // riding along in the same dispatch may pick up one more attempt as a
+    // side effect of a sibling's legitimate shift -- a narrow, accepted edge
+    // case, not a new budget leak: that worktree was already stuck either
+    // way.)
     let maximum_rebuilds = guardian.effective_base_shift_maximum_rebuilds;
-    let same_campaign = guardian.base_shift_rebuild_targets.as_ref() == Some(&shift_targets);
-    if same_campaign && guardian.base_shift_rebuild_attempts >= maximum_rebuilds {
-        notify_base_shift_budget_exhausted(store, &guardian, maximum_rebuilds);
+    let stored_targets = guardian
+        .base_shift_rebuild_targets
+        .clone()
+        .unwrap_or_default();
+    let attempts_by_project = guardian
+        .base_shift_rebuild_attempts_by_project
+        .clone()
+        .unwrap_or_default();
+    let exhausted_projects: Vec<String> = shift_targets
+        .iter()
+        .filter(|(proj, target)| {
+            stored_targets.get(*proj) == Some(*target)
+                && attempts_by_project.get(*proj).copied().unwrap_or(0) >= maximum_rebuilds
+        })
+        .map(|(proj, _)| proj.clone())
+        .collect();
+    if exhausted_projects.len() == shift_targets.len() {
+        notify_base_shift_budget_exhausted(store, &guardian, maximum_rebuilds, &exhausted_projects);
         return false;
     }
     // Claim the review under one lock (flip to Merging) so a concurrent
@@ -8536,17 +8591,17 @@ pub fn rebuild_on_base_shift_with_debounce(
                 .is_ok()
     };
     if claimed {
-        // RAL-507: a shift to a *different* target SHA opens a new campaign
-        // with a full budget. A shift to the same target continues the open
-        // campaign's counter untouched. Consuming the budget (recording a
-        // failed attempt) happens only after this dispatch actually ran and
-        // failed -- inside the claim window this branch owns, so a lost race
-        // can never burn budget without dispatching.
-        if !same_campaign {
-            let _ = store
-                .lock()
-                .start_guardian_base_shift_campaign(id, &shift_targets);
-        }
+        // RAL-542: open (or continue) each shifted worktree's own
+        // sub-campaign. A worktree whose target is unchanged keeps its
+        // existing attempt count; a worktree shifting to a new target starts
+        // fresh -- decided per-worktree inside this call, so one worktree's
+        // exhausted budget is never reset just because a different
+        // worktree's shift triggered this dispatch. Consuming budget
+        // (recording a failed attempt) happens only after this dispatch
+        // actually ran and failed, inside the claim window this branch owns.
+        let _ = store
+            .lock()
+            .update_guardian_base_shift_campaign_per_project(id, &shift_targets);
         let _permit = sem.acquire();
         run_merge_staged(store, runner, id, cancel);
         record_base_shift_rebuild_outcome(store, id, &shift_targets, maximum_rebuilds);
@@ -8556,14 +8611,22 @@ pub fn rebuild_on_base_shift_with_debounce(
     }
 }
 
-/// RAL-507: after an automatic base-shift rebuild dispatched by
-/// [`rebuild_on_base_shift`] has finished, classify its outcome. A rebuild
-/// that left the review `merge_failed` consumed one attempt of the campaign
-/// whose target SHAs it attempted; when that reaches the configured cap the
-/// one-time mailbox notification fires. Any other outcome needs no recording
-/// here: a successful pass already closed the campaign (see
-/// `staged_merge_pass`'s post-success baseline commit), and a cancelled or
-/// still-`collecting` rebuild consumed nothing.
+/// RAL-542: after an automatic base-shift rebuild dispatched by
+/// [`rebuild_on_base_shift`] has finished, classify its outcome per shifted
+/// worktree. A rebuild that left the review `merge_failed` consumed one
+/// attempt of each shifted project that is still present in the refreshed
+/// `base_shift_rebuild_targets` map -- `staged_merge_pass` only clears a
+/// project's entry there once that project's own branches succeed, so a
+/// project still present there afterward is exactly one that failed this
+/// pass. Each worktree whose own attempt count reaches the cap fires the
+/// mailbox notice naming it; a worktree that isn't part of this dispatch's
+/// shift, or that already succeeded, consumes nothing. Also bumps the
+/// legacy whole-campaign `base_shift_rebuild_attempts` scalar by one for the
+/// handful of consumers that still read it as a whole-review summary rather
+/// than per worktree. Any other outcome needs no recording here: a
+/// successful pass already closed every succeeding worktree's sub-campaign
+/// (see `staged_merge_pass`'s post-success per-worktree clear), and a
+/// cancelled or still-`collecting` rebuild consumed nothing.
 fn record_base_shift_rebuild_outcome(
     store: &crate::store_lock::StoreHandle,
     id: &str,
@@ -8580,30 +8643,62 @@ fn record_base_shift_rebuild_outcome(
     if !failed {
         return;
     }
-    let attempts = store
-        .lock()
-        .record_guardian_base_shift_rebuild_failure(id, shift_targets)
-        .unwrap_or(0);
-    if attempts >= maximum_rebuilds {
-        let guardian = match store.lock().get_guardian(id) {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        notify_base_shift_budget_exhausted(store, &guardian, maximum_rebuilds);
+    let _ = store.lock().bump_guardian_base_shift_rebuild_attempts(id);
+
+    let still_open = match store.lock().get_guardian(id) {
+        Ok(g) => g.base_shift_rebuild_targets.unwrap_or_default(),
+        Err(_) => return,
+    };
+    let failed_projects: Vec<&str> = shift_targets
+        .keys()
+        .filter(|proj| still_open.contains_key(proj.as_str()))
+        .map(|s| s.as_str())
+        .collect();
+    if failed_projects.is_empty() {
+        return;
     }
+    let updated_attempts = match store
+        .lock()
+        .increment_guardian_base_shift_rebuild_attempts_for_projects(id, &failed_projects)
+    {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    let newly_exhausted: Vec<String> = failed_projects
+        .iter()
+        .filter(|proj| updated_attempts.get(**proj).copied().unwrap_or(0) >= maximum_rebuilds)
+        .map(|s| s.to_string())
+        .collect();
+    if newly_exhausted.is_empty() {
+        return;
+    }
+    let guardian = match store.lock().get_guardian(id) {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    notify_base_shift_budget_exhausted(store, &guardian, maximum_rebuilds, &newly_exhausted);
 }
 
-/// RAL-507: tell a human that this review's unattended base-shift rebuild
-/// campaign is exhausted -- automatic rebasing stopped because its retry
-/// budget was used up, and a person must intervene. Fires at most once per
-/// exhausted campaign: the durable `base_shift_exhausted_notified_at_ms`
-/// marker is claimed atomically before the mailbox enqueue, so concurrent
-/// maintenance passes and daemon-restart recovery cannot duplicate the
-/// message, and a failed enqueue releases the claim so a later pass retries.
+/// RAL-507/RAL-542: tell a human that one or more of this review's
+/// worktrees have exhausted their unattended base-shift rebuild budget --
+/// automatic rebasing stopped for those worktrees because their retry
+/// budget was used up, and a person must intervene. `exhausted_projects`
+/// names exactly which worktrees are stuck (by project root, resolved to a
+/// display name per RAL-396); the review-level dedup marker still fires at
+/// most once per claim -- RAL-542 kept the single whole-guardian marker
+/// rather than one per worktree, so the mailbox doesn't page once per
+/// conflicting worktree -- but the message text always lists the specific
+/// worktree(s), so a reader is never left guessing which one needs
+/// attention. Fires at most once per claim of the durable
+/// `base_shift_exhausted_notified_at_ms` marker, claimed atomically before
+/// the mailbox enqueue, so concurrent maintenance passes and daemon-restart
+/// recovery cannot duplicate the message, and a failed enqueue releases the
+/// claim so a later pass retries.
 fn notify_base_shift_budget_exhausted(
     store: &crate::store_lock::StoreHandle,
     guardian: &crate::guardian::GuardianView,
     maximum_rebuilds: u32,
+    exhausted_projects: &[String],
 ) {
     let id = &guardian.id;
     let claimed = store
@@ -8613,22 +8708,37 @@ fn notify_base_shift_budget_exhausted(
     if !claimed {
         return;
     }
+    let project_names: Vec<String> = {
+        let guard = store.lock();
+        exhausted_projects
+            .iter()
+            .map(|p| guard.project_name_for_path(p).unwrap_or_else(|| p.clone()))
+            .collect()
+    };
     let attempts = guardian.base_shift_rebuild_attempts;
     let text = format!(
         "Base-shift rebuild budget exhausted for review '{name}' ({id})\n\n\
-         The base branch moved, and automatic rebasing stopped after {attempts} failed \
-         rebuild attempt(s) against the same new base (cap: {maximum_rebuilds}). The review is \
-         left as-is awaiting human action.\n\n\
-         To retry: press Merge / rebase (or run `ralphus review merge`) after intervening -- \
-         that resets this budget and starts a fresh automatic campaign.\n",
+         The base branch moved, and automatic rebasing stopped for {project_list} after \
+         reaching the retry cap (cap: {maximum_rebuilds} attempt(s) against the same new base). \
+         The affected worktree(s) are left as-is awaiting human action; any other worktree in \
+         this review keeps rebasing normally.",
         name = guardian.name,
+        project_list = project_names.join(", "),
     );
+    let remediation = crate::mailbox::Remediation::ManualInterventionRequired {
+        guidance: format!(
+            "find and fix what keeps the rebuild failing, then press Merge / rebase (or run \
+             `ralphus review merge {id}`) -- that resets every worktree's budget and starts a \
+             fresh automatic campaign"
+        ),
+    };
     let entity_uri = format!("guardian:{id}");
     let enqueued = {
         let guard = store.lock();
-        guard.enqueue_mailbox_message_ex(
+        guard.enqueue_error_mailbox_message(
             crate::mailbox::MailboxPriority::High,
             &text,
+            &remediation,
             None,
             None,
             None,
@@ -8640,7 +8750,8 @@ fn notify_base_shift_budget_exhausted(
         Ok(_) => {
             crate::rlog!(
                 WARNING,
-                "ralphus [guardian] review {id} base-shift rebuild budget exhausted: notified mailbox"
+                "ralphus [guardian] review {id} base-shift rebuild budget exhausted for {}: notified mailbox",
+                project_names.join(", ")
             );
             crate::cartographer::Note::new("guardian")
                 .level(crate::logging::LogLevel::WARNING)
@@ -8648,7 +8759,11 @@ fn notify_base_shift_budget_exhausted(
                 .emit(
                     &store.lock(),
                     "base-shift rebuild budget exhausted: notified mailbox",
-                    serde_json::json!({"attempts": attempts, "cap": maximum_rebuilds}),
+                    serde_json::json!({
+                        "attempts": attempts,
+                        "cap": maximum_rebuilds,
+                        "projects": project_names,
+                    }),
                 );
         }
         Err(e) => {

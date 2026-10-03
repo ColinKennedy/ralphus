@@ -118,7 +118,6 @@ test("notice appears once attempts reach the cap, using --muted and a data-tip",
   assert.doesNotMatch(html, /#[0-9a-fA-F]{3,6}/, "no hardcoded hex color");
   assert.match(html, />⚠ Automatic rebasing stopped after 3\/3 failed attempt\(s\)/);
   assert.match(html, /data-tip="[^"]*cap: 3[^"]*"/);
-  assert.match(html, /data-tip="[^"]*whole review[^"]*"/);
   assert.match(html, /data-tip="[^"]*Merge \/ rebase[^"]*"/);
 });
 
@@ -127,4 +126,36 @@ test("notice remains once attempts exceed the cap", () => {
   const g = { base_shift_rebuild_attempts: 4, effective_base_shift_maximum_rebuilds: 3 };
   const html = rebaseExhaustedNotice(g, true);
   assert.match(html, />⚠ Automatic rebasing stopped after 4\/3 failed attempt\(s\)/);
+});
+
+test("per-worktree map: notice names only the exhausted worktree and ignores the pass counter", () => {
+  const { rebaseExhaustedNotice } = makeExhaustedBadges();
+  const g = {
+    base_shift_rebuild_attempts: 3,
+    effective_base_shift_maximum_rebuilds: 3,
+    base_shift_rebuild_attempts_by_project: { "/repo/alpha": 3, "/repo/beta": 1 },
+  };
+  const html = rebaseExhaustedNotice(g, true);
+  assert.match(html, />⚠ Automatic rebasing stopped for alpha after 3\/3 failed attempt\(s\)/);
+  assert.doesNotMatch(html, /beta/);
+  assert.match(html, /data-tip="[^"]*other worktree[^"]*keeps rebasing[^"]*"/);
+});
+
+test("per-worktree map: no notice while every worktree still has budget, even if the pass counter hit the cap", () => {
+  const { rebaseExhaustedNotice } = makeExhaustedBadges();
+  const g = {
+    base_shift_rebuild_attempts: 4,
+    effective_base_shift_maximum_rebuilds: 3,
+    base_shift_rebuild_attempts_by_project: { "/repo/alpha": 2, "/repo/beta": 1 },
+  };
+  assert.equal(rebaseExhaustedNotice(g, true), "");
+});
+
+test("per-worktree map: Windows-style roots show their last path segment", () => {
+  const { rebaseExhaustedNotice } = makeExhaustedBadges();
+  const g = {
+    effective_base_shift_maximum_rebuilds: 2,
+    base_shift_rebuild_attempts_by_project: { "C:\\repo\\alpha": 2 },
+  };
+  assert.match(rebaseExhaustedNotice(g, true), /stopped for alpha after 2\/2/);
 });
