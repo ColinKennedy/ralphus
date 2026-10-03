@@ -584,18 +584,28 @@ pub fn branch_log_label(guardian: &GuardianView, branch_id: &str) -> String {
 }
 
 /// [`branch_log_label`] for a call site that hasn't already loaded this
-/// guardian -- looks it up first. Falls back to the raw `branch_id` if the
-/// guardian itself can't be found (e.g. it was deleted between the event and
-/// this log call).
+/// guardian -- looks up just the two columns the label needs
+/// (`review_branch_name`, `branch`) via [`Store::branch_log_label_row`],
+/// rather than paying for a full [`Store::get_guardian`] hydration (the wide
+/// column SELECT plus per-branch `BranchView` hydration, agent-profile
+/// resolution, and `.ralphus.toml` filesystem walk). This matters because
+/// this function is called from hot paths -- including a lease-wait poll
+/// loop in `guardian_merge.rs` -- while holding the daemon's single global
+/// store lock, where a full hydration would make logging about lock
+/// contention itself worsen that contention (RAL-523).
+///
+/// Falls back to the raw `branch_id` if no matching branch row is found
+/// (e.g. the branch or guardian was deleted between the event and this log
+/// call) or the lookup otherwise errors.
 #[must_use]
 pub fn branch_log_label_for(
     store: &crate::store_lock::StoreHandle,
     guardian_id: &str,
     branch_id: &str,
 ) -> String {
-    match store.lock().get_guardian(guardian_id) {
-        Ok(guardian) => branch_log_label(&guardian, branch_id),
-        Err(_) => branch_id.to_string(),
+    match store.lock().branch_log_label_row(guardian_id, branch_id) {
+        Ok(Some((review_branch_name, branch))) => review_branch_name.unwrap_or(branch),
+        Ok(None) | Err(_) => branch_id.to_string(),
     }
 }
 
@@ -4837,6 +4847,27 @@ impl Store {
         self.hydrate_guardian(row, &ctx)
     }
 
+    /// [`branch_log_label_for`]'s minimal lookup (RAL-523): just the two
+    /// columns needed to render a branch's log label, no per-branch
+    /// `BranchView` hydration, agent-profile resolution, or `.ralphus.toml`
+    /// filesystem walk -- see `branch_log_label_for`'s doc comment for why
+    /// `get_guardian` was too expensive to call from inside a tight
+    /// lease-wait poll loop.
+    pub(crate) fn branch_log_label_row(
+        &self,
+        guardian_id: &str,
+        branch_id: &str,
+    ) -> Result<Option<(Option<String>, String)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT review_branch_name, branch FROM guardian_branches WHERE guardian_id=? AND id=?",
+                params![guardian_id, branch_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
     /// List all guardians, newest first.
     pub fn list_guardians(&self) -> Result<Vec<GuardianView>> {
         Self::list_guardians_conn(&self.conn)
@@ -6264,6 +6295,97 @@ mod tests {
             .unwrap();
         let g = store.get_guardian(&id).unwrap();
         assert!(g.ready);
+    }
+
+    // ── RAL-523: branch_log_label_row / branch_log_label_for ────────────────
+
+    #[test]
+    fn branch_log_label_row_prefers_review_branch_name() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "feat").unwrap();
+        let bid = store.get_guardian(&id).unwrap().branches[0].id.clone();
+        store
+            .set_branch_review_branch_name(&id, &bid, "ral-1-feat-review")
+            .unwrap();
+
+        let row = store.branch_log_label_row(&id, &bid).unwrap();
+        assert_eq!(
+            row,
+            Some((Some("ral-1-feat-review".to_string()), "feat".to_string()))
+        );
+    }
+
+    #[test]
+    fn branch_log_label_row_falls_back_to_branch_when_no_review_name() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "feat").unwrap();
+        let bid = store.get_guardian(&id).unwrap().branches[0].id.clone();
+
+        let row = store.branch_log_label_row(&id, &bid).unwrap();
+        assert_eq!(row, Some((None, "feat".to_string())));
+    }
+
+    #[test]
+    fn branch_log_label_row_is_none_for_unknown_branch() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "feat").unwrap();
+
+        let row = store
+            .branch_log_label_row(&id, "branch-does-not-exist")
+            .unwrap();
+        assert_eq!(row, None);
+    }
+
+    #[test]
+    fn branch_log_label_for_prefers_review_branch_name_over_raw_branch() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "feat").unwrap();
+        let bid = store.get_guardian(&id).unwrap().branches[0].id.clone();
+        store
+            .set_branch_review_branch_name(&id, &bid, "ral-1-feat-review")
+            .unwrap();
+
+        let handle: crate::store_lock::StoreHandle =
+            std::sync::Arc::new(crate::store_lock::StoreMutex::new(store));
+        assert_eq!(
+            branch_log_label_for(&handle, &id, &bid),
+            "ral-1-feat-review"
+        );
+    }
+
+    #[test]
+    fn branch_log_label_for_falls_back_to_branch_when_no_review_name() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "feat").unwrap();
+        let bid = store.get_guardian(&id).unwrap().branches[0].id.clone();
+
+        let handle: crate::store_lock::StoreHandle =
+            std::sync::Arc::new(crate::store_lock::StoreMutex::new(store));
+        assert_eq!(branch_log_label_for(&handle, &id, &bid), "feat");
+    }
+
+    #[test]
+    fn branch_log_label_for_falls_back_to_raw_branch_id_when_row_missing() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "feat").unwrap();
+
+        let handle: crate::store_lock::StoreHandle =
+            std::sync::Arc::new(crate::store_lock::StoreMutex::new(store));
+        assert_eq!(
+            branch_log_label_for(&handle, &id, "branch-does-not-exist"),
+            "branch-does-not-exist"
+        );
+        // Unknown guardian id altogether also falls back to the raw branch_id.
+        assert_eq!(
+            branch_log_label_for(&handle, "guardian-does-not-exist", "branch-does-not-exist"),
+            "branch-does-not-exist"
+        );
     }
 
     // ── RAL-191: review-worktree environment inheritance + per-branch overrides ──
