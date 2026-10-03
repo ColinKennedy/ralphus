@@ -19148,6 +19148,7 @@ mod tests {
             "the manual action runs directly from the shared store"
         );
         std::fs::write(cwd.join("stale-from-prior-generation.txt"), "stale").unwrap();
+        store.lock().bump_guardian_merge_attempt(&id).unwrap();
         final_checks(
             &store,
             &FixedValueRunner("unused"),
@@ -19223,6 +19224,7 @@ mod tests {
             });
             guard.set_guardian_action_hints(&id, &[action]).unwrap();
         }
+        store.lock().bump_guardian_merge_attempt(&id).unwrap();
         final_checks(
             &store,
             &FixedValueRunner("unused"),
