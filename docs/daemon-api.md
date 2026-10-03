@@ -214,6 +214,7 @@ produced no pane output.
 | GET | `/api/pull-requests/{pr_id}` | One PR row |
 | POST | `/api/pull-requests/{pr_id}` | [Mutate the PR mapping](#post-apipull-requestspr_id) (number/url/alias/state) |
 | GET | `/api/pull-requests/{pr_id}/comments` | [Live-query the forge](#get-apipull-requestspr_idcomments) for this PR's comments |
+| GET | `/api/pull-requests/{pr_id}/poll-status` | [On-demand poll status](#get-apipull-requestspr_idpoll-status) for one PR: when the CI / drift / comments polls last ran, how they went, when each is next due, and the last feedback applied (RAL-553) |
 | POST | `/api/pull-requests/{pr_id}/action-feedback` | [Pull un-actioned feedback](#post-apipull-requestspr_idaction-feedback) into the worktree |
 | GET | `/api/pull-requests/{pr_id}/sync-status` | [Drift check](#get-apipull-requestspr_idsync-status) between the PR branch and the review worktree (RAL-190) |
 | POST | `/api/pull-requests/{pr_id}/pull-from-pr` | [Pull PR-branch commits](#post-apipull-requestspr_idpull-from-pr) into the review worktree (RAL-190) |
@@ -3009,6 +3010,35 @@ place (its own branch became the stack's new root after the prior root
 merged). The superseded row is kept, not deleted, so its discussion stays
 visible in `GET .../pull-request-stacks` history.
 
+### `GET /api/pull-requests/{pr_id}/poll-status`
+RAL-553: when each background poll last ran for one PR and how it went, read
+entirely from the stored forge-cache row (it never touches the forge, so it is
+cheap to call on selection). The board requests it only once a branch with a
+PR is selected. `polls` has one entry per poll (`ci`, `drift`, `comments`):
+```json
+{
+  "pr_id": "pr-abc123", "branch_id": "br-1", "pr_state": "open", "pr_number": 42,
+  "now_ms": 1700000100000,
+  "feedback": {"outcome": "applied", "applied_at_ms": 1700000050000},
+  "polls": [
+    {"kind": "ci", "state": "ok", "last_checked_at_ms": 1700000090000,
+     "status": "ok", "error": null, "interval_ms": 120000,
+     "next_due_at_ms": 1700000210000, "reason": null}
+  ]
+}
+```
+`state` is `ok`, `error`, `never` (not polled yet), `inactive` (PR no longer
+open) or `disabled` (poller disabled in config); `inactive`/`disabled` carry a
+`reason` and no `next_due_at_ms`. `next_due_at_ms` is the stored last-attempt
+plus `interval_ms`, so it survives a daemon restart. The flat fields
+(`ci_check_status`, `ci_checked_at_ms`, `drift_*`, `comments_*`,
+`feedback_outcome`, `feedback_applied_at_ms`) mirror the
+[forge-cache-index](#get-apipull-requestsforge-cache-index) row, which also
+gains `ci_checked_at_ms`/`ci_check_status`/`ci_check_error` and
+`feedback_applied_at_ms`/`feedback_outcome`. `feedback.outcome` is `applied`,
+`failed` or `no_changes`. CLI: `ralphus review pr poll-status <pr_id>`
+(`review pr forge-cache` for the index).
+
 ### `GET /api/pull-requests/{pr_id}/comments`
 Live-queries the forge for this PR's comments/notes (GitHub issue comments;
 GitLab MR notes, with system-generated notes filtered out) and returns them
@@ -3631,6 +3661,7 @@ per-squad "events" sub-tab that used to be backed by `GET /api/squads/{id}/logs`
 
 Query params (all optional): `source`, `scope`, `level`, `squad_id`,
 `guardian_id`, `cell_id`, `task` (exact match on task name, RAL-155),
+`branch_id` (RAL-553: rows whose `payload.branch_id` or `payload.ref` equals it; pair with `guardian_id`),
 `q` (substring match on message), `since_ms`, `until_ms`, `limit` (default
 100, max 1000), `offset`, `sort` (`asc`/`desc`, default `desc` — newest
 first) — plus `entity` (RAL-155): a single-string [entity URI](#entity-uris-ral-155)

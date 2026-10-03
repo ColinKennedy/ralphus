@@ -478,6 +478,8 @@ fn exec_pr(cmd: ReviewPrCommand, client: &DaemonClient) -> ExecResult {
             state.as_deref(),
         )?),
         ReviewPrCommand::Comments { pr_id } => Ok(client.pr_comments(&pr_id)?),
+        ReviewPrCommand::ForgeCache => Ok(client.pr_forge_cache_index()?),
+        ReviewPrCommand::PollStatus { pr_id } => Ok(client.pr_poll_status(&pr_id)?),
         ReviewPrCommand::PullFeedback { pr_id } => Ok(client.pr_action_feedback(&pr_id)?),
         ReviewPrCommand::PullFromPr { pr_id } => Ok(client.pr_pull_from_pr(&pr_id)?),
         ReviewPrCommand::Unlink { selector } => {

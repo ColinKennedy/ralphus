@@ -1285,7 +1285,9 @@ const PR_FORGE_CACHE_SELECT: &str = "
         (SELECT cm.created_at FROM guardian_pr_forge_comments cm
           WHERE cm.pr_id = c.pr_id ORDER BY cm.created_at DESC, cm.external_id DESC LIMIT 1),
         c.drift_checked_at_ms, c.drift_status, c.drift_error,
-        c.comments_checked_at_ms, c.comments_status, c.comments_error
+        c.comments_checked_at_ms, c.comments_status, c.comments_error,
+        c.ci_checked_at_ms, c.ci_check_status, c.ci_check_error,
+        c.feedback_applied_at_ms, c.feedback_outcome
     FROM guardian_pr_forge_cache c";
 
 fn map_pr_forge_cache_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PrForgeCacheView> {
@@ -1309,6 +1311,11 @@ fn map_pr_forge_cache_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PrForgeCach
         comments_checked_at_ms: r.get(16)?,
         comments_status: r.get(17)?,
         comments_error: r.get(18)?,
+        ci_checked_at_ms: r.get(19)?,
+        ci_check_status: r.get(20)?,
+        ci_check_error: r.get(21)?,
+        feedback_applied_at_ms: r.get(22)?,
+        feedback_outcome: r.get(23)?,
     })
 }
 
@@ -1350,9 +1357,55 @@ pub struct PrForgeCacheView {
     pub comments_checked_at_ms: Option<i64>,
     pub comments_status: Option<String>,
     pub comments_error: Option<String>,
+    /// When the CI-status check (standing poll, CI watch or `pr_refresh_ci`)
+    /// was last *attempted*, and how it went (`ok` / `unknown`).
+    pub ci_checked_at_ms: Option<i64>,
+    pub ci_check_status: Option<String>,
+    pub ci_check_error: Option<String>,
+    /// When review feedback was last applied to this PR's branch, and the
+    /// outcome (`applied` / `failed` / `nothing_to_do`).
+    pub feedback_applied_at_ms: Option<i64>,
+    pub feedback_outcome: Option<String>,
 }
 
 impl Store {
+    /// Record the last-attempted CI-status check for a PR (RAL-553). `error`
+    /// `None` is a success. Inserts a row if the poller has not reached the
+    /// PR yet; never touches the drift/comments halves or the rolled-up
+    /// columns of an existing row.
+    pub(crate) fn record_pr_ci_check(&self, pr_id: &str, error: Option<&str>) -> Result<()> {
+        let status = if error.is_none() { "ok" } else { "unknown" };
+        let now = now_ms();
+        self.conn.execute(
+            "INSERT INTO guardian_pr_forge_cache(
+                pr_id, last_checked_at_ms, status,
+                ci_checked_at_ms, ci_check_status, ci_check_error
+             ) VALUES(?,?,'unknown',?,?,?)
+             ON CONFLICT(pr_id) DO UPDATE SET
+                ci_checked_at_ms = excluded.ci_checked_at_ms,
+                ci_check_status  = excluded.ci_check_status,
+                ci_check_error   = excluded.ci_check_error",
+            params![pr_id, now, now, status, error],
+        )?;
+        Ok(())
+    }
+
+    /// Record the outcome of the last feedback application on a PR (RAL-553).
+    pub(crate) fn record_pr_feedback_outcome(&self, pr_id: &str, outcome: &str) -> Result<()> {
+        let now = now_ms();
+        self.conn.execute(
+            "INSERT INTO guardian_pr_forge_cache(
+                pr_id, last_checked_at_ms, status,
+                feedback_applied_at_ms, feedback_outcome
+             ) VALUES(?,?,'unknown',?,?)
+             ON CONFLICT(pr_id) DO UPDATE SET
+                feedback_applied_at_ms = excluded.feedback_applied_at_ms,
+                feedback_outcome       = excluded.feedback_outcome",
+            params![pr_id, now, now, outcome],
+        )?;
+        Ok(())
+    }
+
     /// Undo [`Self::mark_pr_auto_fix_attempted`] (RAL-395 follow-up): called
     /// when [`crate::guardian_merge::run_feedback`] bailed out before the
     /// resolver agent ever ran (e.g. the branch's review worktree was
@@ -5219,6 +5272,9 @@ fn refresh_pr_forge_cache_for_guardian(store: &crate::store_lock::StoreHandle, i
             .get_pr_forge_cache(&pr.id)
             .ok()
             .flatten()
+            // A row created only by a CI/feedback record has never been
+            // polled for drift/comments, so it is not a prior poll status.
+            .filter(|c| c.drift_checked_at_ms.is_some() || c.comments_checked_at_ms.is_some())
             .map(|c| c.status);
 
         let (ok, comment_error, new_conversation_etag, new_review_etag) =
@@ -9250,7 +9306,11 @@ fn action_pr_feedback_inner(
     // attempt-per-failure cap (a person retrying by hand is exactly the case
     // that cap must not block). Best-effort: a transient forge error here
     // must not undo the comment-feedback work already applied above.
-    if let Ok(state) = client.check_pr_ci_status(pr_number) {
+    let ci_checked = client.check_pr_ci_status(pr_number);
+    let _ = store
+        .lock()
+        .record_pr_ci_check(pr_id, ci_checked.as_ref().err().map(String::as_str));
+    if let Ok(state) = ci_checked {
         let job_url = match &state {
             crate::forge::PrCiState::Failing(f) => f.job_url.clone(),
             _ => None,
@@ -18818,6 +18878,49 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             )
             .unwrap();
         (gid, pr_id)
+    }
+
+    #[test]
+    fn record_pr_ci_check_persists_success_and_failure_without_touching_other_halves() {
+        let s = store();
+        let (_gid, pr_id) = make_pr(&s);
+        s.record_pr_ci_check(&pr_id, None).unwrap();
+        let c = s.get_pr_forge_cache(&pr_id).unwrap().unwrap();
+        assert_eq!(c.ci_check_status.as_deref(), Some("ok"));
+        assert!(c.ci_checked_at_ms.is_some());
+        assert!(c.ci_check_error.is_none());
+        assert!(c.drift_checked_at_ms.is_none());
+        assert!(c.comments_checked_at_ms.is_none());
+
+        s.record_pr_ci_check(&pr_id, Some("forge down")).unwrap();
+        let c = s.get_pr_forge_cache(&pr_id).unwrap().unwrap();
+        assert_eq!(c.ci_check_status.as_deref(), Some("unknown"));
+        assert_eq!(c.ci_check_error.as_deref(), Some("forge down"));
+
+        s.record_pr_ci_check(&pr_id, None).unwrap();
+        let c = s.get_pr_forge_cache(&pr_id).unwrap().unwrap();
+        assert!(c.ci_check_error.is_none());
+    }
+
+    #[test]
+    fn record_pr_feedback_outcome_survives_a_later_poll_upsert() {
+        let s = store();
+        let (_gid, pr_id) = make_pr(&s);
+        s.record_pr_feedback_outcome(&pr_id, "applied").unwrap();
+        s.upsert_pr_forge_cache(
+            &pr_id,
+            None,
+            Some(Ok(CommentsObservation {
+                etag_conversation: None,
+                etag_review: None,
+            })),
+        )
+        .unwrap();
+        s.record_pr_ci_check(&pr_id, None).unwrap();
+        let c = s.get_pr_forge_cache(&pr_id).unwrap().unwrap();
+        assert_eq!(c.feedback_outcome.as_deref(), Some("applied"));
+        assert!(c.feedback_applied_at_ms.is_some());
+        assert_eq!(c.comments_status.as_deref(), Some("ok"));
     }
 
     #[test]

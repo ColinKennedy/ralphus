@@ -251,6 +251,7 @@
       CLICK_HANDLERS.setInspectorTab = (e, ds) => setInspectorTab(ds.tab || "overview");
       CLICK_HANDLERS.toggleReviewDock = () => toggleReviewDock();
       CLICK_HANDLERS.toggleReviewDockSticky = (e) => { e.stopPropagation(); toggleReviewDockSticky(); };
+      CLICK_HANDLERS.toggleReviewDockDebug = (e) => { e.stopPropagation(); toggleReviewDockDebug(); };
       CLICK_HANDLERS.openReviewSectionMenu = (e, ds) => openReviewSectionMenu(e, ds.guardianId || "", ds.kind || "");
       CLICK_HANDLERS.scopeReviewDockToSection = (e, ds) => scopeReviewDockToSection(ds.guardianId || "");
       CLICK_HANDLERS.openReviewCommandMenu = (e, ds) => openReviewCommandMenu(e, ds.guardianId || "", ds.cmd || "", ds.key || "");

@@ -186,6 +186,56 @@ fn log_ci_watch(
         );
 }
 
+/// Minimum interval between "poll succeeded" heartbeat rows for one
+/// `(branch, kind)` (RAL-553). A successful poll is otherwise silent, so the
+/// log dock could not show that a branch was being polled at all; the
+/// interval keeps that from becoming one row per 2-minute poll per branch.
+const POLL_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+static POLL_HEARTBEAT_LAST: LazyLock<Mutex<HashMap<(String, String), Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Whether a heartbeat for `(branch_id, kind)` is due, stamping it if so.
+fn poll_heartbeat_due(branch_id: &str, kind: &str) -> bool {
+    let mut last = POLL_HEARTBEAT_LAST.lock().expect("poisoned");
+    let now = Instant::now();
+    let key = (branch_id.to_string(), kind.to_string());
+    if last
+        .get(&key)
+        .is_some_and(|prev| now.duration_since(*prev) < POLL_HEARTBEAT_INTERVAL)
+    {
+        return false;
+    }
+    last.insert(key, now);
+    true
+}
+
+/// Emit a rate-limited Cartographer row recording a successful poll of
+/// `branch_id`'s PR (RAL-553), attributable to the branch via
+/// `payload.branch_id`.
+fn log_poll_success(
+    store: &crate::store_lock::StoreHandle,
+    guardian_id: &str,
+    branch_id: &str,
+    kind: &str,
+    number: i64,
+    state: &str,
+) {
+    if !poll_heartbeat_due(branch_id, kind) {
+        return;
+    }
+    log_ci_watch(
+        store,
+        guardian_id,
+        branch_id,
+        LogLevel::INFO,
+        format!(
+            "ralphus [ci-watch] review {guardian_id} branch {branch_id} pr #{number} {kind} poll ok: {state}"
+        ),
+        serde_json::json!({"pr_number": number, "outcome": "poll_ok", "kind": kind, "state": state}),
+    );
+}
+
 /// Start watching `branch_id`'s open PR (RAL-375, extended by RAL-<new> to
 /// also fire right after a PR is first submitted, not only after a
 /// review-feedback push). No-op if the branch has no open, forge-numbered
@@ -298,7 +348,21 @@ fn run_watch(store: &crate::store_lock::StoreHandle, guardian_id: &str, branch_i
             );
             return;
         }
-        match client.check_pr_ci_status(number) {
+        let checked = client.check_pr_ci_status(number);
+        let _ = store
+            .lock()
+            .record_pr_ci_check(&pr.id, checked.as_ref().err().map(String::as_str));
+        if let Ok(state) = &checked {
+            log_poll_success(
+                store,
+                guardian_id,
+                branch_id,
+                "ci-watch",
+                number,
+                state.as_str(),
+            );
+        }
+        match checked {
             Ok(PrCiState::Passing) => {
                 if elapsed < SUCCESS_SETTLE_DURATION {
                     log_ci_watch(
@@ -591,7 +655,7 @@ fn enqueue_auto_fix_exhausted_notice(
 /// is cheap to call on every `review_maintenance` pass (a 5s cadence), so it
 /// needs its own, much coarser throttle to stay within forge rate-limit
 /// expectations (`.agent/forge-design-principles.md`).
-const STANDING_POLL_INTERVAL: Duration = Duration::from_secs(2 * 60);
+pub(crate) const STANDING_POLL_INTERVAL: Duration = Duration::from_secs(2 * 60);
 
 /// Last standing-poll time per guardian id (RAL-395) -- mirrors
 /// `guardian_merge::IDLE_MAINT_LAST`'s shape, but keyed and intervaled
@@ -685,6 +749,10 @@ pub fn poll_open_pr_ci_status(
                 ),
                 serde_json::json!({"pr_number": number, "outcome": "unavailable"}),
             );
+            let _ = store.lock().record_pr_ci_check(
+                &pr.id,
+                Some("no forge client could be resolved for this PR's repo"),
+            );
             continue;
         };
         let probe = match client.check_pr_ci_status_probe(number) {
@@ -700,9 +768,19 @@ pub fn poll_open_pr_ci_status(
                     ),
                     serde_json::json!({"pr_number": number, "outcome": "poll_error", "error": e}),
                 );
+                let _ = store.lock().record_pr_ci_check(&pr.id, Some(e.as_str()));
                 continue;
             }
         };
+        let _ = store.lock().record_pr_ci_check(&pr.id, None);
+        log_poll_success(
+            store,
+            guardian_id,
+            pr.branch_id.as_deref().unwrap_or(""),
+            "standing",
+            number,
+            probe.ci.as_str(),
+        );
         let state = probe.ci;
         let job_url = match &state {
             PrCiState::Failing(f) => f.job_url.clone(),
