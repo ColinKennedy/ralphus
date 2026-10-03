@@ -465,6 +465,15 @@ fn run_with_backend(
         );
     }
 
+    // RAL-550: pushes live worktree-change summaries for as long as the
+    // backend runs; its `Drop` stops and joins the thread on every exit path.
+    let _worktree_watcher = crate::worktree_diff::WorktreeWatcher::start(
+        workspace.root(),
+        &spec.squad_id,
+        &spec.cell_id,
+        &spec.task,
+    );
+
     let mut prompt = original_prompt.to_string();
     let mut resume_id = spec.resume_agent_session_id.clone();
     let mut total_tokens_in = 0i64;

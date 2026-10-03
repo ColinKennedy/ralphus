@@ -46,6 +46,15 @@ pub fn execute(cmd: CellCommand, client: &DaemonClient) -> ExecResult {
                     )))
                 })
         }
+        CellCommand::Diff { selector, summary } => {
+            let resolved = cell::resolve_scoped(client, &selector, "cell")?;
+            Ok(client.cell_diff(
+                &resolved.squad_id,
+                resolved.task_idx,
+                resolved.cell_idx,
+                summary,
+            )?)
+        }
         CellCommand::Reviews { selector } => {
             let resolved = cell::resolve_scoped(client, &selector, "cell")?;
             let squad = client.squad(&resolved.squad_id)?;

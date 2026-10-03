@@ -165,6 +165,7 @@ ENDPOINT_TO_CLI: dict[str, list[str]] = {
         "status",
     ],
     "GET /api/squads/{id}/worktrees": ["cell worktree"],
+    "GET /api/squads/{id}/diff": ["cell diff"],
     "GET /api/squads/{id}/logs": ["squad logs"],
     "GET /api/squads/{id}/timeline": ["squad timeline"],
     "GET /api/squads/{id}/graph": ["graph"],

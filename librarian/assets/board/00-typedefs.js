@@ -106,6 +106,16 @@
        * @property {string|null} upstream
        */
       /**
+       * RAL-550: the runner-pushed numstat summary of a cell's worktree
+       * changes, from `GET /api/squads/{id}/diff?summary=1`.
+       * @typedef {object} CellDiffSummary
+       * @property {number} [files_changed]
+       * @property {number} [files_added]
+       * @property {number} [files_removed]
+       * @property {number} [lines_added]
+       * @property {number} [lines_removed]
+       */
+      /**
        * One durably-persisted terminal-log attempt's metadata (RAL-154), from
        * `GET .../terminal-log-attempts` — `attempt` `0` is the initial run,
        * `1..` each subsequent tmux reattach.
