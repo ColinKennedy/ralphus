@@ -1246,6 +1246,34 @@ fn route_for_user(
                 list_user_forge_tokens(daemon, &target_user)
             })
         }
+        // ralphus[ignore-endpoint-cli]: the initial V1 companion-registration surface backs the board's personal settings; a dedicated CLI/MCP command is added with remote companions in V2.
+        ("GET", ["api", "users", user, "review-clients"]) => {
+            let target_user = url_decode(user);
+            self_or_admin_gated(daemon, user_header, &target_user, || {
+                review_clients_for_user(daemon, &target_user)
+            })
+        }
+        // ralphus[ignore-endpoint-cli]: the initial V1 companion-registration surface backs the board's personal settings; a dedicated CLI/MCP command is added with remote companions in V2.
+        ("POST", ["api", "users", user, "review-clients"]) => {
+            let target_user = url_decode(user);
+            self_or_admin_gated(daemon, user_header, &target_user, || {
+                upsert_review_client(daemon, &target_user, body)
+            })
+        }
+        // ralphus[ignore-endpoint-cli]: personal delivery preferences are V1 board settings and deliberately retain their future companion-neutral API shape.
+        ("GET", ["api", "users", user, "review-delivery-preferences"]) => {
+            let target_user = url_decode(user);
+            self_or_admin_gated(daemon, user_header, &target_user, || {
+                review_delivery_preferences(daemon, &target_user)
+            })
+        }
+        // ralphus[ignore-endpoint-cli]: personal delivery preferences are V1 board settings and deliberately retain their future companion-neutral API shape.
+        ("PUT", ["api", "users", user, "review-delivery-preferences"]) => {
+            let target_user = url_decode(user);
+            self_or_admin_gated(daemon, user_header, &target_user, || {
+                set_review_delivery_preferences(daemon, &target_user, body)
+            })
+        }
         ("POST", ["api", "users", user, "forge-tokens"]) => {
             let target_user = url_decode(user);
             self_or_admin_gated(daemon, user_header, &target_user, || {
@@ -2137,6 +2165,14 @@ fn route_for_user(
         // ralphus[ignore-endpoint-cli]: daemon-host GUI execution of a hint action; CLI `review action run` is deliberately headless
         ("POST", ["api", "guardians", id, "run-action-hint"]) => {
             guardian_run_action_hint(daemon, id, body)
+        }
+        // ralphus[ignore-endpoint-cli]: board readiness detail for the V1 shared-store action panel.
+        ("GET", ["api", "guardians", id, "action-generations"]) => {
+            guardian_action_generations(daemon, id)
+        }
+        // ralphus[ignore-endpoint-cli]: board subscription control; V1 clients are local and the remote-companion CLI/MCP surface is deferred to V2.
+        ("POST", ["api", "guardians", id, "recipients"]) => {
+            guardian_subscribe_recipient(daemon, id, body)
         }
         // ralphus[ignore-endpoint-cli]: lazily expands output captured by the board's own daemon-host check launcher; the headless CLI `review checks run` already streams its command's output to the caller
         ("GET", ["api", "guardians", id, "check-runs", kind, index, "output"]) => {
@@ -13438,6 +13474,88 @@ fn clear_all(daemon: &Daemon, body: &str) -> Reply {
 // ── guardian endpoints ─────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+struct ReviewClientBody {
+    label: String,
+    #[serde(default = "default_true")]
+    enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn review_clients_for_user(daemon: &Daemon, user: &str) -> Reply {
+    match daemon.lock().review_clients_for_user(user) {
+        Ok(clients) => json(200, &serde_json::json!({"clients": clients})),
+        Err(error) => store_error(&error),
+    }
+}
+
+fn upsert_review_client(daemon: &Daemon, user: &str, body: &str) -> Reply {
+    let Ok(request) = serde_json::from_str::<ReviewClientBody>(body) else {
+        return error(400, "bad_request", "body must be {label, enabled?}", vec![]);
+    };
+    match daemon
+        .lock()
+        .upsert_review_client(user, &request.label, request.enabled)
+    {
+        Ok(client) => json(200, &client),
+        Err(error) => store_error(&error),
+    }
+}
+
+fn review_delivery_preferences(daemon: &Daemon, user: &str) -> Reply {
+    match daemon.lock().review_delivery_preferences(user) {
+        Ok(preferences) => json(200, &preferences),
+        Err(error) => store_error(&error),
+    }
+}
+
+fn set_review_delivery_preferences(daemon: &Daemon, user: &str, body: &str) -> Reply {
+    let Ok(preferences) = serde_json::from_str::<crate::delivery::ReviewDeliveryPreferences>(body)
+    else {
+        return error(
+            400,
+            "bad_request",
+            "body must be a review delivery preference record",
+            vec![],
+        );
+    };
+    match daemon
+        .lock()
+        .set_review_delivery_preferences(user, &preferences)
+    {
+        Ok(()) => json(200, &preferences),
+        Err(error) => store_error(&error),
+    }
+}
+
+fn guardian_action_generations(daemon: &Daemon, id: &str) -> Reply {
+    match daemon.lock().action_generations(id) {
+        Ok(generations) => json(200, &serde_json::json!({"generations": generations})),
+        Err(error) => store_error(&error),
+    }
+}
+
+#[derive(Deserialize)]
+struct RecipientBody {
+    client_id: String,
+}
+
+fn guardian_subscribe_recipient(daemon: &Daemon, id: &str, body: &str) -> Reply {
+    let Ok(request) = serde_json::from_str::<RecipientBody>(body) else {
+        return error(400, "bad_request", "body must be {client_id}", vec![]);
+    };
+    match daemon
+        .lock()
+        .subscribe_review_client(id, &request.client_id)
+    {
+        Ok(()) => json(200, &OpenTerminalResponse { ok: true }),
+        Err(error) => store_error(&error),
+    }
+}
+
+#[derive(Deserialize)]
 struct CreateGuardianBody {
     name: String,
     base_branch: String,
@@ -17080,6 +17198,15 @@ fn guardian_run_action_hint(daemon: &Daemon, id: &str, body: &str) -> Reply {
         Err(e) => return store_error(&e),
     };
 
+    if crate::guardian::GuardianStatus::is_terminal_status(&g.status) {
+        return error(
+            409,
+            "review_terminal",
+            "this review is terminal and its prepared manual actions have been retired",
+            vec![],
+        );
+    }
+
     let hint = match g.action_hints.get(req.index) {
         Some(h) => h.clone(),
         None => {
@@ -19570,6 +19697,23 @@ mod tests {
         assert!(r.body.contains("port"));
         let g = d.lock().get_guardian(&id).unwrap();
         assert!(g.input_values.is_empty());
+    }
+
+    #[test]
+    fn guardian_run_action_hint_rejects_a_terminal_review() {
+        let d = daemon();
+        let id = d.lock().create_guardian("g", "main", "/r").unwrap();
+        d.lock()
+            .set_guardian_status(&id, crate::guardian::GuardianStatus::Cancelled, None)
+            .unwrap();
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/guardians/{id}/run-action-hint"),
+            r#"{"index":0}"#,
+        );
+        assert_eq!(r.status, 409);
+        assert!(r.body.contains("review_terminal"));
     }
 
     // ── RAL-312: board.html's request field is `run_cleanup`, matching what

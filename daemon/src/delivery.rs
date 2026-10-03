@@ -5,7 +5,7 @@
 //! remote execution without changing recipient or generation identity.
 
 use rusqlite::OptionalExtension as _;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::store::{Result as StoreResult, Store, StoreError, now_ms};
 
@@ -29,7 +29,7 @@ pub struct ReviewClientView {
 }
 
 /// User-controlled automatic delivery policy.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReviewDeliveryPreferences {
     pub on_rebase: String,
     pub on_feedback: String,
@@ -37,6 +37,22 @@ pub struct ReviewDeliveryPreferences {
     pub offline_delivery: String,
     pub on_reconnect: String,
     pub auto_register_submitter: bool,
+}
+
+/// Recipient-scoped readiness for one prepared action generation.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ActionGenerationView {
+    pub guardian_id: String,
+    pub action_key: String,
+    pub client_id: String,
+    pub generation: i64,
+    pub state: String,
+    pub definition_digest: String,
+    pub manifest_path: Option<String>,
+    pub manifest_sha256: Option<String>,
+    pub published_root: Option<String>,
+    pub lease_expires_at_ms: Option<i64>,
+    pub detail: Option<String>,
 }
 
 impl Default for ReviewDeliveryPreferences {
@@ -79,6 +95,146 @@ fn row_to_client(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewClientView> 
 }
 
 impl Store {
+    /// Enabled recipients for a review, including their current local client
+    /// identity. A disabled/offline client deliberately receives no new V1
+    /// preparation claim; its prior generation remains durable for retirement.
+    pub fn guardian_recipients(&self, guardian_id: &str) -> StoreResult<Vec<ReviewClientView>> {
+        let mut statement = self.conn.prepare(
+            "SELECT c.id, c.user_name, c.label, c.enabled, c.local, c.created_at_ms, c.updated_at_ms
+             FROM guardian_recipients r JOIN review_clients c ON c.id=r.client_id
+             WHERE r.guardian_id=? ORDER BY r.subscribed_at_ms, c.id",
+        )?;
+        statement
+            .query_map(rusqlite::params![guardian_id], row_to_client)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Atomically acquire the one V1 build slot for a recipient/action/generation.
+    /// A duplicate click or a concurrent post-merge worker gets `false` and
+    /// must attach to the existing progress rather than starting a second build.
+    pub fn claim_action_generation(
+        &self,
+        guardian_id: &str,
+        action_key: &str,
+        client_id: &str,
+        generation: i64,
+        definition_digest: &str,
+    ) -> StoreResult<bool> {
+        let now = now_ms();
+        let changed = self.conn.execute(
+            "INSERT INTO guardian_action_generations(guardian_id, action_key, client_id, generation, state, definition_digest, created_at_ms, updated_at_ms)
+             VALUES(?1, ?2, ?3, ?4, 'preparing', ?5, ?6, ?6)
+             ON CONFLICT(guardian_id, action_key, client_id, generation) DO UPDATE SET
+                state='preparing', definition_digest=excluded.definition_digest, detail=NULL, updated_at_ms=excluded.updated_at_ms
+             WHERE guardian_action_generations.state NOT IN ('preparing', 'ready')",
+            rusqlite::params![guardian_id, action_key, client_id, generation, definition_digest, now],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Publish terminal recipient readiness and the immutable manifest data.
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_action_generation(
+        &self,
+        guardian_id: &str,
+        action_key: &str,
+        client_id: &str,
+        generation: i64,
+        state: &str,
+        manifest_path: Option<&str>,
+        manifest_sha256: Option<&str>,
+        published_root: Option<&str>,
+        lease_expires_at_ms: Option<i64>,
+        detail: Option<&str>,
+    ) -> StoreResult<()> {
+        self.conn.execute(
+            "UPDATE guardian_action_generations SET state=?1, manifest_path=?2, manifest_sha256=?3, published_root=?4, lease_expires_at_ms=?5, detail=?6, updated_at_ms=?7
+             WHERE guardian_id=?8 AND action_key=?9 AND client_id=?10 AND generation=?11",
+            rusqlite::params![state, manifest_path, manifest_sha256, published_root, lease_expires_at_ms, detail, now_ms(), guardian_id, action_key, client_id, generation],
+        )?;
+        Ok(())
+    }
+
+    /// Recipient-facing state, newest generation first.
+    pub fn action_generations(&self, guardian_id: &str) -> StoreResult<Vec<ActionGenerationView>> {
+        let mut statement = self.conn.prepare(
+            "SELECT guardian_id, action_key, client_id, generation, state, definition_digest, manifest_path, manifest_sha256, published_root, lease_expires_at_ms, detail
+             FROM guardian_action_generations WHERE guardian_id=? ORDER BY generation DESC, action_key, client_id",
+        )?;
+        statement
+            .query_map(rusqlite::params![guardian_id], |row| {
+                Ok(ActionGenerationView {
+                    guardian_id: row.get(0)?,
+                    action_key: row.get(1)?,
+                    client_id: row.get(2)?,
+                    generation: row.get(3)?,
+                    state: row.get(4)?,
+                    definition_digest: row.get(5)?,
+                    manifest_path: row.get(6)?,
+                    manifest_sha256: row.get(7)?,
+                    published_root: row.get(8)?,
+                    lease_expires_at_ms: row.get(9)?,
+                    detail: row.get(10)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Claim publications whose review is terminal and whose execution lease
+    /// has elapsed. Marking them first makes cleanup idempotent across the
+    /// daily sweep and a concurrent daemon restart.
+    pub fn claim_expired_terminal_action_generations(
+        &self,
+    ) -> StoreResult<Vec<ActionGenerationView>> {
+        let now = now_ms();
+        let mut statement = self.conn.prepare(
+            "SELECT g.guardian_id, g.action_key, g.client_id, g.generation, g.state, g.definition_digest, g.manifest_path, g.manifest_sha256, g.published_root, g.lease_expires_at_ms, g.detail
+             FROM guardian_action_generations g JOIN guardians r ON r.id=g.guardian_id
+             WHERE r.status IN ('merged', 'approved', 'cancelled', 'deployed')
+               AND g.state='ready' AND (g.lease_expires_at_ms IS NULL OR g.lease_expires_at_ms<=?1)",
+        )?;
+        let rows = statement
+            .query_map(rusqlite::params![now], |row| {
+                Ok(ActionGenerationView {
+                    guardian_id: row.get(0)?,
+                    action_key: row.get(1)?,
+                    client_id: row.get(2)?,
+                    generation: row.get(3)?,
+                    state: row.get(4)?,
+                    definition_digest: row.get(5)?,
+                    manifest_path: row.get(6)?,
+                    manifest_sha256: row.get(7)?,
+                    published_root: row.get(8)?,
+                    lease_expires_at_ms: row.get(9)?,
+                    detail: row.get(10)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for row in &rows {
+            self.conn.execute(
+                "UPDATE guardian_action_generations SET state='retiring', updated_at_ms=?1
+                 WHERE guardian_id=?2 AND action_key=?3 AND client_id=?4 AND generation=?5 AND state='ready'",
+                rusqlite::params![now, row.guardian_id, row.action_key, row.client_id, row.generation],
+            )?;
+        }
+        Ok(rows)
+    }
+
+    /// Complete the filesystem-retirement state after a sweep attempt.
+    pub fn finish_action_generation_retirement(
+        &self,
+        row: &ActionGenerationView,
+        detail: Option<&str>,
+    ) -> StoreResult<()> {
+        self.conn.execute(
+            "UPDATE guardian_action_generations SET state='retired', detail=?1, updated_at_ms=?2
+             WHERE guardian_id=?3 AND action_key=?4 AND client_id=?5 AND generation=?6 AND state='retiring'",
+            rusqlite::params![detail, now_ms(), row.guardian_id, row.action_key, row.client_id, row.generation],
+        )?;
+        Ok(())
+    }
     /// Subscribe a registered client to a review. Repeating the same request is
     /// intentionally idempotent, which is important when a submit/retry races
     /// the default submitter enrollment.
@@ -217,6 +373,54 @@ mod tests {
         assert_eq!(
             store.review_delivery_preferences("korin").unwrap(),
             ReviewDeliveryPreferences::default()
+        );
+    }
+
+    #[test]
+    fn identical_generation_claims_are_single_flight_and_terminal_rows_retire() {
+        let store = Store::open_in_memory().unwrap();
+        let guardian = store.create_guardian("delivery", "main", "/repo").unwrap();
+        let client = store
+            .upsert_review_client("korin", "Desktop", true)
+            .unwrap();
+        store
+            .subscribe_review_client(&guardian, &client.id)
+            .unwrap();
+        assert!(
+            store
+                .claim_action_generation(&guardian, "action-0", &client.id, 1, "abc")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .claim_action_generation(&guardian, "action-0", &client.id, 1, "abc")
+                .unwrap()
+        );
+        store
+            .finish_action_generation(
+                &guardian,
+                "action-0",
+                &client.id,
+                1,
+                "ready",
+                Some("C:/shared/.ralphus-manifest.json"),
+                Some("digest"),
+                Some("C:/shared"),
+                Some(0),
+                None,
+            )
+            .unwrap();
+        store
+            .set_guardian_status(&guardian, crate::guardian::GuardianStatus::Cancelled, None)
+            .unwrap();
+        let rows = store.claim_expired_terminal_action_generations().unwrap();
+        assert_eq!(rows.len(), 1);
+        store
+            .finish_action_generation_retirement(&rows[0], None)
+            .unwrap();
+        assert_eq!(
+            store.action_generations(&guardian).unwrap()[0].state,
+            "retired"
         );
     }
 }
