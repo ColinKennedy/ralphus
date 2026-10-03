@@ -10946,8 +10946,9 @@ pub fn poll_base_branch_freshness_once(store: &crate::store_lock::StoreHandle) {
                         }),
                     );
             }
+            drop(guard);
             for guardian_id in &guardian_ids {
-                let _ = guard.record_poll_outcome(
+                let _ = store.lock().record_poll_outcome(
                     crate::poller_health::PollerKind::BaseBranchFetch,
                     guardian_id,
                     &outcome,
