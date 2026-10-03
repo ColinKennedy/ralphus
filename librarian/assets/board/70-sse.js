@@ -29,6 +29,9 @@
           const n = typeof ref === "string" ? document.getElementById(ref) : ref;
           if (n) n.scrollTop = top;
         }
+        // The raw offsets above are stale for live-terminal panes (bottom-pinned
+        // ones must follow new output); their atBottom-aware restore has the last word.
+        if (typeof restorePeekScrollPositions === "function") restorePeekScrollPositions();
         if (fId) {
           const n = /** @type {HTMLInputElement|HTMLTextAreaElement|null} */ (document.getElementById(fId));
           if (n) {

@@ -270,6 +270,7 @@
           // atBottom flag from before the box closed instead (RAL-471).
           const freshLoad = peekContent[key] === undefined;
           const saved = peekScrollState[key];
+          const priorTop = before.scrollTop;
           const atBottom = forceBottom || (freshLoad && saved
             ? saved.atBottom
             : before.scrollTop + before.clientHeight >= before.scrollHeight - 4);
@@ -371,6 +372,10 @@
             // instead of their saved mid-log position.
             const target = peekScrollRestoreTarget(saved, pre.scrollHeight);
             if (target !== null) pre.scrollTop = target;
+          } else if (before === pre) {
+            // Scrolled up and the same node: the text swap must not move the
+            // reader, so re-assert the offset they had before it.
+            pre.scrollTop = priorTop;
           }
           savePeekScrollState(key, pre);
           updatePeekJumpVisibility(key);
@@ -553,7 +558,7 @@
        * @returns {void}
        */
       function restorePeekScrollPositions() {
-        document.querySelectorAll(".peek-pre[data-key]").forEach((el) => {
+        document.querySelectorAll(".peek-pre[data-key], .runterm[data-key]").forEach((el) => {
           const pre = /** @type {HTMLElement} */ (el);
           const key = pre.dataset.key;
           if (!key) return;
