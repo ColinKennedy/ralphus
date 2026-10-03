@@ -846,6 +846,11 @@ pub struct ProjectReviewSettings {
     /// iterations. Defaults to `true` (on by default) when unset.
     #[serde(default)]
     pub cache_manual_checks: Option<bool>,
+    /// Project-level default for which events (`rebase`, `feedback`,
+    /// `auto_fix`) tear down and rebuild a review's prepared build. Unset
+    /// resolves to all three; an empty list never rebuilds automatically.
+    #[serde(default)]
+    pub rebuild_on: Option<Vec<String>>,
     /// RAL-507: the project's default cap on unattended base-shift rebuild
     /// attempts per retry campaign, for a future review whose `[[review]]`
     /// block (and whose own per-review override) leaves the cap unset.
@@ -899,6 +904,7 @@ impl ProjectReviewSettings {
                 .discourage_tests_during_auto_pull_request_fixes,
             auto_cancel_outdated_pr_pipelines: self.auto_cancel_outdated_pr_pipelines,
             cache_manual_checks: self.cache_manual_checks,
+            rebuild_on: self.rebuild_on,
             auto_fix_max_attempts: None,
             auto_fix_retry_base_seconds: None,
             // Database-backed project settings don't cover this setting --
@@ -3458,6 +3464,11 @@ impl Store {
             // merge/rebase/fix may regenerate.
             "ALTER TABLE guardians ADD COLUMN cache_manual_checks INTEGER",
             "ALTER TABLE guardians ADD COLUMN manual_checks_cached INTEGER NOT NULL DEFAULT 0",
+            // Per-review override of which events (`rebase`, `feedback`,
+            // `auto_fix`) tear down and rebuild the prepared build, stored as
+            // a JSON array of strings. NULL inherits the project/global
+            // default, which resolves to all three events.
+            "ALTER TABLE guardians ADD COLUMN rebuild_on TEXT",
             // RAL-<pending>: coarse-grained progress reporting for a squad
             // sitting in `materializing` (`run_submit_followup`'s named
             // phases -- fetching upstream refs, creating worktrees,
@@ -12639,6 +12650,46 @@ prompt = "legacy cell, no review_guardian_id"
     }
 
     #[test]
+    fn migration_adds_nullable_rebuild_on_column_to_existing_guardians() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("legacy", "main", "/repo").unwrap();
+        // Put the table back into its pre-`rebuild_on` shape, with a review row
+        // already in it, then run the migration over it.
+        store
+            .conn
+            .execute("ALTER TABLE guardians DROP COLUMN rebuild_on", [])
+            .expect("drop the column to simulate an older database");
+        store
+            .init_schema()
+            .expect("migration must add the nullable rebuild_on column");
+
+        let stored: Option<String> = store
+            .conn
+            .query_row("SELECT rebuild_on FROM guardians WHERE id=?", [&id], |r| {
+                r.get(0)
+            })
+            .expect("the pre-existing review row survives with the new column");
+        assert!(stored.is_none());
+
+        let guardian = store.get_guardian(&id).unwrap();
+        assert_eq!(guardian.rebuild_on, None);
+        assert_eq!(
+            guardian.effective_rebuild_on,
+            vec!["rebase", "feedback", "auto_fix"]
+        );
+        store
+            .set_guardian_rebuild_on(&id, Some(&["feedback".to_string()]))
+            .unwrap();
+        assert_eq!(
+            store.get_guardian(&id).unwrap().rebuild_on,
+            Some(vec!["feedback".to_string()])
+        );
+
+        // Running the migration again on an up-to-date table is a no-op.
+        store.init_schema().expect("migration is idempotent");
+    }
+
+    #[test]
     fn migration_broadens_hidden_items_kind_to_include_task() {
         let conn = Connection::open_in_memory().expect("open sqlite");
         conn.execute_batch(
@@ -17261,6 +17312,7 @@ command = "e"
             discourage_tests_during_auto_pull_request_fixes: Some(true),
             auto_cancel_outdated_pr_pipelines: Some(false),
             cache_manual_checks: Some(false),
+            rebuild_on: Some(vec!["feedback".to_string(), "auto_fix".to_string()]),
             base_shift_maximum_rebuilds: Some(5),
             default_pr_user: Some("alice".to_string()),
             forks_only: Some(true),

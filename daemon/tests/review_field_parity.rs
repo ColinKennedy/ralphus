@@ -18,6 +18,7 @@ const PAIRS: &[(&str, &str)] = &[
     ("proof_skip_auto_clean", "proof_skip_auto_clean"),
     ("summary_format", "summary_format"),
     ("cache_manual_checks", "cache_manual_checks"),
+    ("rebuild_on", "rebuild_on"),
     // The preparation redesign replaced the directly-authored
     // `[[review.auto_build]]` with `[[review.prepare]]`; the project-level
     // `.ralphus.toml [review] auto_build` default is still exactly what

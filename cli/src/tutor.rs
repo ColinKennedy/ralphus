@@ -524,6 +524,21 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                 cache_manual_checks default, then true (on by default).
                 Set false to have every later merge or rebase regenerate
                 the checks from the freshly stacked diff.
+ rebuild_on
+        string[] Which events tear down and rebuild this review's prepared
+                build (its preparation, then its actions): any of "rebase"
+                (a merge or restack settled), "feedback" (reviewer feedback
+                was applied), "auto_fix" (an unattended PR/MR fix was
+                applied). Each at most once; anything else is an error.
+                Unset inherits the project-level .ralphus.toml [review]
+                rebuild_on default, then all three (today's behavior). An
+                event left out keeps the existing ready build untouched
+                (its actions stay ready; nothing is torn down or rebuilt).
+                [] never rebuilds automatically -- use `ralphus review
+                rebuild <selector>` (or the board) to rebuild on demand; that
+                runs each action's [review.action.lifecycle]
+                before_reset_command teardown first. A review with no ready
+                build yet always builds.
 
  [[review.prepare]]  (zero or more per [[review]])
  Declare ordered unattended work that makes manual actions ready before a
@@ -663,8 +678,8 @@ may embed <<ralphus:new-worktree/BRANCH?upstream=UPSTREAM
  skip_base_updates, match_pr_branch_name, separate_pr_branch,
  dual_root_pr, auto_build, auto_submit_pr_stack, auto_fix_pr_errors,
  auto_fix_prompt_template, discourage_tests_during_auto_pull_request_fixes,
- auto_cancel_outdated_pr_pipelines, cache_manual_checks, and
- skip_auto_clean) can also be set from
+ auto_cancel_outdated_pr_pipelines, cache_manual_checks, rebuild_on,
+ and skip_auto_clean) can also be set from
  the database, via `ralphus project review-settings set <name>
  [flags]` or the board's Projects tab (the ... menu -> Review
  Settings), instead of hand-editing .ralphus.toml. A database
@@ -1103,6 +1118,7 @@ agent              = "{<insert recommended agent here>}"  # claude-code, codex-c
 auto_fix_pr_errors = true  # dispatch the resolver agent to fix a failing PR/MR CI status automatically
 auto_cancel_outdated_pr_pipelines = true  # on by default; cancel stale CI runs when a newer commit is force-pushed
 cache_manual_checks = true  # on by default; compute manual checks once at first branch creation (RAL-521)
+rebuild_on = ["rebase", "feedback", "auto_fix"]  # default: every event rebuilds the prepared build; [] = only `ralphus review rebuild`
 
 # Shared preparation runs before any manual action is enabled.
 [[review.prepare]]
@@ -1249,6 +1265,18 @@ mod tests {
             TASK_TUTOR.is_ascii(),
             "tutor text must stay ASCII-only for legacy Windows consoles"
         );
+    }
+
+    #[test]
+    fn tutor_documents_rebuild_on_and_every_allowed_event() {
+        assert!(TASK_TUTOR.contains(" rebuild_on\n"));
+        assert!(TASK_TUTOR.contains("ralphus review\n                rebuild <selector>"));
+        for event in ralphus_core::schema::REBUILD_ON_VALUES {
+            assert!(
+                TASK_TUTOR.contains(&format!("\"{event}\"")),
+                "tutor must name the {event:?} event"
+            );
+        }
     }
 
     #[test]

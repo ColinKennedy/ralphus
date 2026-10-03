@@ -2147,6 +2147,7 @@ fn route_for_user(
         ("POST", ["api", "guardians", id, "manual-checks", "regenerate"]) => {
             guardian_regenerate_manual_checks(daemon, id, body)
         }
+        ("POST", ["api", "guardians", id, "rebuild"]) => guardian_rebuild(daemon, id),
         // ralphus[ignore-endpoint-cli]: board multi-select Merge/Rebase context-menu action (RAL-514); the CLI already has per-review `review merge`
         ("POST", ["api", "guardians", "merge-batch"]) => guardian_merge_batch(daemon, body),
         // ralphus[ignore-endpoint-cli]: board multi-select Delete context-menu action (RAL-549); the CLI already has per-review `review delete`
@@ -2970,6 +2971,10 @@ struct EffectiveReviewDefaults {
     /// RAL-521: the resolved manual-check caching default (per-review
     /// override > database default > `.ralphus.toml`/global > `true`).
     cache_manual_checks: bool,
+    /// The resolved list of events that rebuild a review's prepared build
+    /// (per-review override > database default > `.ralphus.toml`/global >
+    /// every event).
+    rebuild_on: Vec<String>,
 }
 
 impl EffectiveReviewDefaults {
@@ -2995,6 +3000,7 @@ impl EffectiveReviewDefaults {
                 .discourage_tests_during_auto_pull_request_fixes(),
             auto_cancel_outdated_pr_pipelines: cfg.auto_cancel_outdated_pr_pipelines(),
             cache_manual_checks: cfg.cache_manual_checks(),
+            rebuild_on: cfg.rebuild_on(),
         }
     }
 }
@@ -3103,6 +3109,13 @@ struct ProjectReviewSettingsBody {
     /// to `true` when unset.
     #[serde(default)]
     cache_manual_checks: Option<bool>,
+    /// Project-level default for which events (`rebase`, `feedback`,
+    /// `auto_fix`) tear down and rebuild a review's prepared build -- see
+    /// [`crate::store::ProjectReviewSettings`]. Absent leaves the setting
+    /// as-is, a list sets it (`[]` never rebuilds automatically), and an
+    /// explicit JSON `null` clears it back to inherit (no `clear_*` flag).
+    #[serde(default, deserialize_with = "deserialize_present")]
+    rebuild_on: Option<Option<Vec<String>>>,
     /// RAL-507: the project's default cap on unattended base-shift rebuild
     /// attempts per retry campaign. Zero is itself invalid (the cap must be
     /// at least 1), so clearing uses an explicit flag -- same convention as
@@ -3128,6 +3141,9 @@ fn set_project_review_settings(daemon: &Daemon, name: &str, body: &str) -> Reply
     let Ok(req) = serde_json::from_str::<ProjectReviewSettingsBody>(body) else {
         return error(400, "bad_request", "invalid review-settings body", vec![]);
     };
+    if let Some(reply) = reject_invalid_rebuild_on(&req.rebuild_on) {
+        return reply;
+    }
     if req.clear_maximum_budget_usd && req.default_maximum_budget_usd.is_some() {
         return error(
             400,
@@ -3294,6 +3310,9 @@ fn set_project_review_settings(daemon: &Daemon, name: &str, body: &str) -> Reply
     }
     if let Some(v) = req.cache_manual_checks {
         settings.cache_manual_checks = Some(v);
+    }
+    if let Some(v) = req.rebuild_on {
+        settings.rebuild_on = v;
     }
     if let Some(v) = req.default_pr_user {
         settings.default_pr_user = clear_if_empty(v);
@@ -13664,6 +13683,37 @@ struct GuardianSettingsBody {
     /// default", which resolves to `true` (caching on by default).
     #[serde(default)]
     cache_manual_checks: Option<bool>,
+    /// Which events (`rebase`, `feedback`, `auto_fix`) tear down and rebuild
+    /// this review's prepared build. Absent leaves it untouched, a list sets
+    /// it (an empty list never rebuilds automatically), and an explicit
+    /// `null` clears the override so the review inherits the project/global
+    /// default again.
+    #[serde(default, deserialize_with = "deserialize_present")]
+    rebuild_on: Option<Option<Vec<String>>>,
+}
+
+/// Deserialize a field that distinguishes "absent" (`None`, via
+/// `#[serde(default)]`) from "present as `null`" (`Some(None)`) and "present
+/// with a value" (`Some(Some(v))`).
+fn deserialize_present<'de, D, T>(
+    deserializer: D,
+) -> std::result::Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+/// The 400 for a `rebuild_on` list outside the closed set, or `None` when the
+/// request carries no list or a valid one.
+fn reject_invalid_rebuild_on(value: &Option<Option<Vec<String>>>) -> Option<Reply> {
+    let Some(Some(events)) = value else {
+        return None;
+    };
+    ralphus_core::schema::check_rebuild_on(events)
+        .err()
+        .map(|message| error(400, "invalid_rebuild_on", &message, vec![]))
 }
 
 /// Body for `POST /api/guardians/{id}/details` -- the board's single
@@ -13719,6 +13769,9 @@ struct GuardianDetailsBody {
     /// RAL-521: see [`GuardianSettingsBody::cache_manual_checks`].
     #[serde(default)]
     cache_manual_checks: Option<bool>,
+    /// See [`GuardianSettingsBody::rebuild_on`].
+    #[serde(default, deserialize_with = "deserialize_present")]
+    rebuild_on: Option<Option<Vec<String>>>,
     /// Full desired squash membership: every project in this list gets
     /// squash turned ON, every other project in the review's
     /// [`crate::guardian::GuardianView::projects`] gets it turned OFF.
@@ -14073,6 +14126,9 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
             vec![],
         );
     };
+    if let Some(reply) = reject_invalid_rebuild_on(&req.rebuild_on) {
+        return reply;
+    }
     let store = daemon.lock();
     if let Some(skip) = req.skip_auto_build {
         if let Err(e) = store.set_guardian_skip_auto_build(id, skip) {
@@ -14178,6 +14234,11 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
     }
     if let Some(enabled) = req.cache_manual_checks {
         if let Err(e) = store.set_guardian_cache_manual_checks(id, Some(enabled)) {
+            return store_error(&e);
+        }
+    }
+    if let Some(events) = &req.rebuild_on {
+        if let Err(e) = store.set_guardian_rebuild_on(id, events.as_deref()) {
             return store_error(&e);
         }
     }
@@ -14331,6 +14392,9 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
     let Ok(req) = serde_json::from_str::<GuardianDetailsBody>(body) else {
         return error(400, "bad_request", "invalid body", vec![]);
     };
+    if let Some(reply) = reject_invalid_rebuild_on(&req.rebuild_on) {
+        return reply;
+    }
 
     let store = daemon.lock();
     let guardian = match store.get_guardian(id) {
@@ -14493,6 +14557,11 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
     }
     if let Some(enabled) = req.cache_manual_checks {
         if let Err(e) = store.set_guardian_cache_manual_checks(id, Some(enabled)) {
+            return store_error(&e);
+        }
+    }
+    if let Some(events) = &req.rebuild_on {
+        if let Err(e) = store.set_guardian_rebuild_on(id, events.as_deref()) {
             return store_error(&e);
         }
     }
@@ -17767,11 +17836,74 @@ fn guardian_regenerate_manual_checks(daemon: &Daemon, id: &str, body: &str) -> R
         &daemon.store_handle(),
         id,
         crate::guardian_merge::PostMergeJobs::MANUAL_CHECKS_ONLY,
+        crate::guardian_merge::RebuildTrigger::Manual,
     );
     match daemon.lock().get_guardian(id) {
         Ok(g) => json(202, &g),
         Err(e) => store_error(&e),
     }
+}
+
+/// Whether a review's post-merge worker is genuinely running: a `running`
+/// phase older than [`crate::guardian_merge::POST_MERGE_STALE_AFTER_MS`] is an
+/// abandoned one (the daemon died mid-run) and does not count.
+fn post_merge_in_flight(guardian: &crate::guardian::GuardianView) -> bool {
+    guardian.post_merge_status.as_deref() == Some("running")
+        && guardian.post_merge_started_at_ms.is_some_and(|started| {
+            crate::store::now_ms().saturating_sub(started)
+                < crate::guardian_merge::POST_MERGE_STALE_AFTER_MS
+        })
+}
+
+/// `POST /api/guardians/{id}/rebuild`: tear down and rebuild a settled
+/// review's prepared build now, whatever its `rebuild_on` list says.
+///
+/// Schedules the full post-merge worker with the manual trigger. The worker
+/// starts its own preparation generation (advancing the merge-attempt counter
+/// that keys the generation a build is recorded under, so the previous
+/// generation's "already ready" record cannot satisfy it) and runs the same
+/// teardown a rebase-triggered generation does: each action's
+/// `[review.action.lifecycle]` `before_reset_command` list runs first, the
+/// action's build root is reset per its `build_root_policy`, the retained
+/// checkout is refreshed at the current tip, and every action's and generated
+/// check's `prepare` steps run again. Generated manual checks keep their
+/// commands; only their preparation reruns.
+///
+/// Returns `202 {"ok": true}` once scheduled. 409 when the review is not
+/// settled (only an `in_review` review with a built stack has a build to
+/// refresh) or a post-merge job is already running.
+fn guardian_rebuild(daemon: &Daemon, id: &str) -> Reply {
+    let store = daemon.lock();
+    let guardian = match store.get_guardian(id) {
+        Ok(g) => g,
+        Err(e) => return store_error(&e),
+    };
+    if guardian.status.as_str() != crate::guardian::GuardianStatus::InReview.as_str()
+        || guardian.combined_worktree.is_none()
+    {
+        return error(
+            409,
+            "invalid_transition",
+            "only an in-review review with a built stack can be rebuilt",
+            vec![],
+        );
+    }
+    if post_merge_in_flight(&guardian) {
+        return error(
+            409,
+            "invalid_transition",
+            "a post-merge job is already running; try again when it finishes",
+            vec![],
+        );
+    }
+    drop(store);
+    crate::guardian_merge::spawn_guardian_post_merge(
+        &daemon.store_handle(),
+        id,
+        crate::guardian_merge::PostMergeJobs::ALL,
+        crate::guardian_merge::RebuildTrigger::Manual,
+    );
+    json(202, &OpenTerminalResponse { ok: true })
 }
 
 /// Batch form of [`guardian_merge`] (RAL-514) -- the board's multi-select
@@ -21257,6 +21389,110 @@ mod tests {
         );
         assert!(body["effective"]["skip_worktrees"].as_bool().unwrap());
         assert_eq!(body["effective"]["maximum_budget_usd"], 5.0);
+    }
+
+    #[test]
+    fn project_review_settings_route_rebuild_on_distinguishes_null_from_absent() {
+        let d = daemon();
+        let repo = tmp_git_repo("rs-rebuild-on");
+        std::fs::write(
+            repo.join(".ralphus.toml"),
+            "[review]\nrebuild_on = [\"rebase\", \"feedback\"]\n",
+        )
+        .unwrap();
+        route(
+            &d,
+            "POST",
+            "/api/projects",
+            &register_body("proj", &repo.to_string_lossy(), ""),
+        );
+        let url = "/api/projects/proj/review-settings";
+        let get = || -> serde_json::Value {
+            serde_json::from_str(&route(&d, "GET", url, "").body).unwrap()
+        };
+
+        // Nothing stored: the file config's list is the effective one.
+        let body = get();
+        assert!(body["settings"]["rebuild_on"].is_null());
+        assert_eq!(
+            body["effective"]["rebuild_on"],
+            serde_json::json!(["rebase", "feedback"])
+        );
+
+        // A list is stored and wins over the file config.
+        let r = route(&d, "POST", url, r#"{"rebuild_on":["auto_fix"]}"#);
+        assert_eq!(r.status, 200, "{}", r.body);
+        let body = get();
+        assert_eq!(
+            body["settings"]["rebuild_on"],
+            serde_json::json!(["auto_fix"])
+        );
+        assert_eq!(
+            body["effective"]["rebuild_on"],
+            serde_json::json!(["auto_fix"])
+        );
+
+        // An absent field leaves the stored list untouched.
+        let r = route(&d, "POST", url, r#"{"skip_worktrees":true}"#);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert_eq!(
+            get()["settings"]["rebuild_on"],
+            serde_json::json!(["auto_fix"])
+        );
+
+        // An empty list is a real value: never rebuild automatically.
+        let r = route(&d, "POST", url, r#"{"rebuild_on":[]}"#);
+        assert_eq!(r.status, 200, "{}", r.body);
+        let body = get();
+        assert_eq!(body["settings"]["rebuild_on"], serde_json::json!([]));
+        assert_eq!(body["effective"]["rebuild_on"], serde_json::json!([]));
+
+        // An explicit null clears it, falling back to the file config.
+        let r = route(&d, "POST", url, r#"{"rebuild_on":null}"#);
+        assert_eq!(r.status, 200, "{}", r.body);
+        let body = get();
+        assert!(body["settings"]["rebuild_on"].is_null());
+        assert_eq!(
+            body["effective"]["rebuild_on"],
+            serde_json::json!(["rebase", "feedback"])
+        );
+    }
+
+    #[test]
+    fn project_review_settings_route_rejects_invalid_rebuild_on() {
+        let d = daemon();
+        let repo = tmp_git_repo("rs-rebuild-on-bad");
+        route(
+            &d,
+            "POST",
+            "/api/projects",
+            &register_body("proj", &repo.to_string_lossy(), ""),
+        );
+        let url = "/api/projects/proj/review-settings";
+        for bad in [
+            r#"{"rebuild_on":["nightly"]}"#,
+            r#"{"rebuild_on":["rebase","rebase"]}"#,
+            r#"{"rebuild_on":"rebase"}"#,
+            r#"{"rebuild_on":[3]}"#,
+        ] {
+            let r = route(&d, "POST", url, bad);
+            assert_eq!(r.status, 400, "{bad}: {}", r.body);
+        }
+        let r = route(
+            &d,
+            "POST",
+            url,
+            r#"{"rebuild_on":["nightly"],"skip_worktrees":true}"#,
+        );
+        assert_eq!(r.status, 400);
+        assert!(r.body.contains("invalid_rebuild_on"), "{}", r.body);
+        let body: serde_json::Value =
+            serde_json::from_str(&route(&d, "GET", url, "").body).unwrap();
+        assert!(body["settings"]["rebuild_on"].is_null());
+        assert!(
+            body["settings"]["skip_worktrees"].is_null(),
+            "a rejected request stores none of its fields"
+        );
     }
 
     #[test]
@@ -29975,6 +30211,242 @@ remediation_attempts=1
         assert_eq!(r.status, 200);
         assert!(r.body.contains("\"cache_manual_checks\":true"));
         assert!(r.body.contains("\"effective_cache_manual_checks\":true"));
+    }
+
+    fn view_of(d: &Daemon, gid: &str) -> serde_json::Value {
+        let r = route(d, "GET", &format!("/api/guardians/{gid}"), "");
+        serde_json::from_str(&r.body).unwrap()
+    }
+
+    const EVERY_REBUILD_EVENT: [&str; 3] = ["rebase", "feedback", "auto_fix"];
+
+    #[test]
+    fn guardian_settings_sets_clears_and_validates_rebuild_on() {
+        let d = daemon();
+        let gid = make_guardian(&d);
+        let post = |body: serde_json::Value| {
+            route(
+                &d,
+                "POST",
+                &format!("/api/guardians/{gid}/settings"),
+                &body.to_string(),
+            )
+        };
+
+        let v = view_of(&d, &gid);
+        assert!(v["rebuild_on"].is_null());
+        assert_eq!(
+            v["effective_rebuild_on"],
+            serde_json::json!(EVERY_REBUILD_EVENT)
+        );
+
+        let r = post(serde_json::json!({"rebuild_on": ["feedback"]}));
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v = view_of(&d, &gid);
+        assert_eq!(v["rebuild_on"], serde_json::json!(["feedback"]));
+        assert_eq!(v["effective_rebuild_on"], serde_json::json!(["feedback"]));
+
+        // A request that does not mention the field leaves it alone.
+        let r = post(serde_json::json!({"cache_manual_checks": true}));
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert_eq!(
+            view_of(&d, &gid)["rebuild_on"],
+            serde_json::json!(["feedback"])
+        );
+
+        // An empty list is a real value: never rebuild automatically.
+        let r = post(serde_json::json!({"rebuild_on": []}));
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v = view_of(&d, &gid);
+        assert_eq!(v["rebuild_on"], serde_json::json!([]));
+        assert_eq!(v["effective_rebuild_on"], serde_json::json!([]));
+
+        // An explicit null clears the override back to inherit.
+        let r = post(serde_json::json!({"rebuild_on": null}));
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v = view_of(&d, &gid);
+        assert!(v["rebuild_on"].is_null());
+        assert_eq!(
+            v["effective_rebuild_on"],
+            serde_json::json!(EVERY_REBUILD_EVENT)
+        );
+    }
+
+    #[test]
+    fn guardian_settings_rejects_invalid_rebuild_on_without_changing_anything() {
+        let d = daemon();
+        let gid = make_guardian(&d);
+        let url = format!("/api/guardians/{gid}/settings");
+        for bad in [
+            serde_json::json!({"rebuild_on": ["nightly"]}),
+            serde_json::json!({"rebuild_on": ["rebase", "rebase"]}),
+            serde_json::json!({"rebuild_on": ["Rebase"]}),
+            serde_json::json!({"rebuild_on": "rebase"}),
+            serde_json::json!({"rebuild_on": [1]}),
+        ] {
+            let r = route(&d, "POST", &url, &bad.to_string());
+            assert_eq!(r.status, 400, "{bad}: {}", r.body);
+        }
+        let body = serde_json::json!({"rebuild_on": ["nightly"], "cache_manual_checks": false})
+            .to_string();
+        let r = route(&d, "POST", &url, &body);
+        assert_eq!(r.status, 400);
+        assert!(r.body.contains("invalid_rebuild_on"), "{}", r.body);
+        assert!(
+            r.body.contains("auto_fix"),
+            "names the allowed values: {}",
+            r.body
+        );
+        let v = view_of(&d, &gid);
+        assert!(v["rebuild_on"].is_null());
+        assert!(
+            v["cache_manual_checks"].is_null(),
+            "a rejected request applies none of its fields"
+        );
+    }
+
+    #[test]
+    fn guardian_details_sets_clears_and_validates_rebuild_on() {
+        let d = daemon();
+        let gid = make_guardian(&d);
+        let post = |body: serde_json::Value| {
+            route(
+                &d,
+                "POST",
+                &format!("/api/guardians/{gid}/details"),
+                &body.to_string(),
+            )
+        };
+
+        let r = post(serde_json::json!({"rebuild_on": ["rebase", "auto_fix"]}));
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v = view_of(&d, &gid);
+        assert_eq!(v["rebuild_on"], serde_json::json!(["rebase", "auto_fix"]));
+        assert_eq!(
+            v["effective_rebuild_on"],
+            serde_json::json!(["rebase", "auto_fix"])
+        );
+
+        // Batched with other fields in the same request.
+        let r = post(serde_json::json!({"rebuild_on": [], "cache_manual_checks": false}));
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v = view_of(&d, &gid);
+        assert_eq!(v["rebuild_on"], serde_json::json!([]));
+        assert_eq!(v["cache_manual_checks"], serde_json::json!(false));
+
+        // Absent leaves it alone; null clears it.
+        let r = post(serde_json::json!({"cache_manual_checks": true}));
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert_eq!(view_of(&d, &gid)["rebuild_on"], serde_json::json!([]));
+        let r = post(serde_json::json!({"rebuild_on": null}));
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v = view_of(&d, &gid);
+        assert!(v["rebuild_on"].is_null());
+        assert_eq!(
+            v["effective_rebuild_on"],
+            serde_json::json!(EVERY_REBUILD_EVENT)
+        );
+
+        // Invalid values are a 400 that applies nothing else from the request.
+        post(serde_json::json!({"rebuild_on": ["feedback"]}));
+        for bad in [
+            serde_json::json!({"rebuild_on": ["weekly"]}),
+            serde_json::json!({"rebuild_on": ["feedback", "feedback"]}),
+            serde_json::json!({"rebuild_on": {"rebase": true}}),
+        ] {
+            let r = post(bad.clone());
+            assert_eq!(r.status, 400, "{bad}: {}", r.body);
+        }
+        let r = post(serde_json::json!({"rebuild_on": ["weekly"], "cache_manual_checks": false}));
+        assert_eq!(r.status, 400);
+        assert!(r.body.contains("invalid_rebuild_on"), "{}", r.body);
+        let v = view_of(&d, &gid);
+        assert_eq!(v["rebuild_on"], serde_json::json!(["feedback"]));
+        assert_eq!(v["cache_manual_checks"], serde_json::json!(true));
+    }
+
+    fn make_in_review_guardian(d: &Daemon, with_worktree: bool) -> String {
+        let gid = make_guardian(d);
+        let store = d.lock();
+        store
+            .set_guardian_status(&gid, crate::guardian::GuardianStatus::InReview, None)
+            .unwrap();
+        if with_worktree {
+            store
+                .set_guardian_combined_worktree(&gid, "/repo/.git/.ralphus/g/g1/review")
+                .unwrap();
+        }
+        gid
+    }
+
+    #[test]
+    fn rebuild_is_accepted_for_a_settled_review_even_when_it_never_rebuilds_automatically() {
+        let d = daemon();
+        let gid = make_in_review_guardian(&d, true);
+        d.lock().set_guardian_rebuild_on(&gid, Some(&[])).unwrap();
+        let r = route(&d, "POST", &format!("/api/guardians/{gid}/rebuild"), "");
+        assert_eq!(r.status, 202, "{}", r.body);
+        assert_eq!(r.body, r#"{"ok":true}"#);
+        // A second request while nothing is running is accepted again.
+        let r = route(&d, "POST", &format!("/api/guardians/{gid}/rebuild"), "");
+        assert_eq!(r.status, 202, "{}", r.body);
+    }
+
+    #[test]
+    fn rebuild_is_refused_unless_the_review_is_settled_with_a_built_stack() {
+        let d = daemon();
+        let collecting = make_guardian(&d);
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/guardians/{collecting}/rebuild"),
+            "",
+        );
+        assert_eq!(r.status, 409, "{}", r.body);
+        assert!(r.body.contains("invalid_transition"), "{}", r.body);
+
+        let unbuilt = make_in_review_guardian(&d, false);
+        let before = d.lock().get_guardian(&unbuilt).unwrap().merge_attempt;
+        let r = route(&d, "POST", &format!("/api/guardians/{unbuilt}/rebuild"), "");
+        assert_eq!(r.status, 409, "{}", r.body);
+        assert_eq!(
+            d.lock().get_guardian(&unbuilt).unwrap().merge_attempt,
+            before,
+            "a refused rebuild changes nothing"
+        );
+
+        let r = route(
+            &d,
+            "POST",
+            "/api/guardians/guardian-999999999999/rebuild",
+            "",
+        );
+        assert_eq!(r.status, 404, "{}", r.body);
+    }
+
+    #[test]
+    fn rebuild_is_refused_while_a_post_merge_job_is_genuinely_running() {
+        let d = daemon();
+        let gid = make_in_review_guardian(&d, true);
+        d.lock().start_guardian_post_merge(&gid).unwrap();
+        let before = d.lock().get_guardian(&gid).unwrap().merge_attempt;
+        let r = route(&d, "POST", &format!("/api/guardians/{gid}/rebuild"), "");
+        assert_eq!(r.status, 409, "{}", r.body);
+        assert!(r.body.contains("already running"), "{}", r.body);
+        assert_eq!(d.lock().get_guardian(&gid).unwrap().merge_attempt, before);
+
+        // Once the worker records an outcome the rebuild is accepted.
+        let started = d
+            .lock()
+            .get_guardian(&gid)
+            .unwrap()
+            .post_merge_started_at_ms
+            .unwrap();
+        d.lock()
+            .finish_guardian_post_merge(&gid, started, true, None)
+            .unwrap();
+        let r = route(&d, "POST", &format!("/api/guardians/{gid}/rebuild"), "");
+        assert_eq!(r.status, 202, "{}", r.body);
     }
 
     #[test]

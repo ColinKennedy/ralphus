@@ -414,6 +414,10 @@ struct Membership {
     /// computed once, when its review branches are first created, and then
     /// reused through later merges, rebases, and automated fix iterations.
     cache_manual_checks: Option<bool>,
+    /// Optional override declared on the review (`[[review]] rebuild_on`) for
+    /// which events tear down and rebuild its prepared build. `Some(vec![])`
+    /// is a declared "never automatically"; `None` inherits.
+    rebuild_on: Option<Vec<String>>,
 }
 
 /// Build the planner's cell/task rows straight from the task file (same order
@@ -1057,6 +1061,7 @@ pub fn derive_reviews_with_full_prefetch(
                 .and_then(|r| r.discourage_tests_during_auto_pull_request_fixes),
             auto_cancel_outdated_pr_pipelines: rv.and_then(|r| r.auto_cancel_outdated_pr_pipelines),
             cache_manual_checks: rv.and_then(|r| r.cache_manual_checks),
+            rebuild_on: rv.and_then(|r| r.rebuild_on.clone()),
         });
     }
 
@@ -1534,6 +1539,13 @@ fn apply_resolver(
     if let Some(enabled) = members.iter().find_map(|m| m.cache_manual_checks) {
         store
             .set_guardian_cache_manual_checks(gid, Some(enabled))
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+    }
+    // This review's own list of rebuild events, authored via
+    // `[[review]] rebuild_on` (an empty list is a real value, not "unset").
+    if let Some(events) = members.iter().find_map(|m| m.rebuild_on.as_ref()) {
+        store
+            .set_guardian_rebuild_on(gid, Some(events))
             .map_err(|e| ReviewError::new(e.to_string()))?;
     }
     Ok(())
@@ -3084,6 +3096,7 @@ mod tests {
             discourage_tests_during_auto_pull_request_fixes: None,
             auto_cancel_outdated_pr_pipelines: None,
             cache_manual_checks: None,
+            rebuild_on: None,
         }
     }
 
@@ -3189,6 +3202,39 @@ mod tests {
         assert_eq!(guardian.match_pr_branch_name, Some(true));
         assert_eq!(guardian.separate_pr_branch, Some(true));
         assert_eq!(guardian.cache_manual_checks, Some(false));
+    }
+
+    #[test]
+    fn apply_resolver_stamps_the_declared_rebuild_on_including_an_empty_list() {
+        for declared in [
+            vec!["feedback".to_string()],
+            Vec::new(),
+            vec!["rebase".to_string(), "auto_fix".to_string()],
+        ] {
+            let store = Store::open_in_memory().unwrap();
+            let gid = store.create_guardian("r", "main", "/repo").unwrap();
+            let m = Membership {
+                rebuild_on: Some(declared.clone()),
+                ..membership(None)
+            };
+            apply_resolver(&store, &gid, &[&m]).unwrap();
+            let guardian = store.get_guardian(&gid).unwrap();
+            assert_eq!(guardian.rebuild_on, Some(declared.clone()));
+            assert_eq!(guardian.effective_rebuild_on, declared);
+        }
+    }
+
+    #[test]
+    fn apply_resolver_leaves_rebuild_on_unset_when_not_declared() {
+        let store = Store::open_in_memory().unwrap();
+        let gid = store.create_guardian("r", "main", "/repo").unwrap();
+        apply_resolver(&store, &gid, &[&membership(None)]).unwrap();
+        let guardian = store.get_guardian(&gid).unwrap();
+        assert_eq!(guardian.rebuild_on, None);
+        assert_eq!(
+            guardian.effective_rebuild_on,
+            vec!["rebase", "feedback", "auto_fix"]
+        );
     }
 
     /// A one-task, one-cell, one-link-review TOML referencing project `"proj"`

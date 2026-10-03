@@ -65,6 +65,8 @@
        * @property {boolean} originalAutoCancelOutdatedPrPipelines
        * @property {boolean} cacheManualChecks
        * @property {boolean} originalCacheManualChecks
+       * @property {RebuildOnDraft} rebuildOn - Default for when a future review rebuilds its prepared build; `inherit` means the file-config/global value applies.
+       * @property {RebuildOnDraft} originalRebuildOn
        */
 
       /** @type {ProjectReviewSettingsDraft|null} */
@@ -141,6 +143,8 @@
           discourageTests, originalDiscourageTests: discourageTests,
           autoCancelOutdatedPrPipelines, originalAutoCancelOutdatedPrPipelines: autoCancelOutdatedPrPipelines,
           cacheManualChecks, originalCacheManualChecks: cacheManualChecks,
+          rebuildOn: buildRebuildOnDraft(s.rebuild_on, effective.rebuild_on),
+          originalRebuildOn: buildRebuildOnDraft(s.rebuild_on, effective.rebuild_on),
         };
       }
 
@@ -319,6 +323,29 @@
        * @returns {void}
        */
       function onProjectEditCacheManualChecks(checked) { if (projectReviewSettingsDraft) projectReviewSettingsDraft.cacheManualChecks = checked; }
+      /**
+       * Stages "inherit the file-config/global default" for the rebuild-on setting.
+       * @param {boolean} checked
+       * @returns {void}
+       */
+      function onProjectEditRebuildOnInherit(checked) {
+        const d = projectReviewSettingsDraft;
+        if (!d) return;
+        setRebuildInherit(d.rebuildOn, checked, d.effective.rebuild_on);
+        refreshRebuildOnFields("project", d.rebuildOn, d.effective.rebuild_on);
+      }
+      /**
+       * Stages one rebuild trigger on or off as the project default.
+       * @param {string} trigger - "rebase" | "feedback" | "auto_fix"
+       * @param {boolean} checked
+       * @returns {void}
+       */
+      function onProjectEditRebuildOnTrigger(trigger, checked) {
+        const d = projectReviewSettingsDraft;
+        if (!d) return;
+        setRebuildTrigger(d.rebuildOn, trigger, checked);
+        refreshRebuildOnFields("project", d.rebuildOn, d.effective.rebuild_on);
+      }
 
       const PROJECT_REVIEW_SETTINGS_BASE_SHIFT_CAP_TIP = "Maximum unattended rebuild attempts per base-shift retry campaign (a persistent conflict, failed proof, or outage stops automatic rebasing once spent, and the mailbox says so). Blank inherits the file-config/global value shown below; manual Merge/rebase resets the budget.";
       const PROJECT_REVIEW_SETTINGS_BUDGET_TIP = "USD spend cap applied to a future review's own resolver/prover cost when neither its [[review]] block nor the Arbiter sets one. Blank means unbounded (inherits the file-config/global value shown below).";
@@ -361,6 +388,8 @@
               <input type="checkbox" ${draft.autoCancelOutdatedPrPipelines ? "checked" : ""} onchange="onProjectEditAutoCancelOutdatedPrPipelines(this.checked)">auto-cancel outdated CI pipelines</label>
             <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Compute a future review's manual checks once, when its review branches are first created, and reuse that result through later merges, rebases, and automated fix iterations, for a future review that declares no explicit cache_manual_checks setting of its own. Manual checks describe review work that does not change across ordinary rebases, so caching avoids re-running the manual-checks agent for nothing.">
               <input type="checkbox" ${draft.cacheManualChecks ? "checked" : ""} onchange="onProjectEditCacheManualChecks(this.checked)">cache manual checks across rebases</label>
+            <h3 class="section" data-tip="${esc(REBUILD_ON_TIP)}">rebuild preparation when</h3>
+            ${renderRebuildOnFieldsHtml("project", draft.rebuildOn, draft.effective.rebuild_on, "inherit the file-config/global default", "Follow the file-config/global default for when a future review rebuilds its prepared build (every trigger when nothing sets one), for a future review that declares no explicit rebuild_on of its own. Untick to set this project's own default. Applies on Save.", "onProjectEditRebuildOnInherit", "onProjectEditRebuildOnTrigger")}
             ${err}
             <div class="btn-row" style="margin-top:12px"><button class="btn" onclick="closeProjectReviewSettingsModal()">Cancel</button><button class="btn primary" onclick="saveProjectReviewSettings()" data-tip="Apply every change made in this modal in a single request. Only fields you actually touched are sent -- an untouched field keeps inheriting from the file-config/global default.">Save</button></div>
           </div></div>`;
@@ -410,6 +439,7 @@
         if (draft.discourageTests !== draft.originalDiscourageTests) body.discourage_tests_during_auto_pull_request_fixes = draft.discourageTests;
         if (draft.autoCancelOutdatedPrPipelines !== draft.originalAutoCancelOutdatedPrPipelines) body.auto_cancel_outdated_pr_pipelines = draft.autoCancelOutdatedPrPipelines;
         if (draft.cacheManualChecks !== draft.originalCacheManualChecks) body.cache_manual_checks = draft.cacheManualChecks;
+        if (rebuildOnChanged(draft.rebuildOn, draft.originalRebuildOn)) body.rebuild_on = rebuildOnBodyValue(draft.rebuildOn);
         if (Object.keys(body).length === 0) { closeProjectReviewSettingsModal(); return; }
         try {
           const r = await fetch(`/api/projects/${encodeURIComponent(draft.project)}/review-settings`, {
@@ -430,4 +460,4 @@
         closeProjectReviewSettingsModal();
       }
 
-      void [onProjectEditResolverAgent, onProjectEditResolverModel, onProjectEditMachine, onProjectEditMaximumBudgetUsd, onProjectEditProofScope, onProjectEditProofSkipAutoClean, onProjectEditSkipWorktrees, onProjectEditSkipBaseUpdates, onProjectEditBaseShiftMaximumRebuilds, onProjectEditSeparatePrBranch, onProjectEditDualRootPr, onProjectEditMatchPrBranchName, onProjectEditAutoBuild, onProjectEditAutoSubmitPrStack, onProjectEditAutoFixPrErrors, onProjectEditAutoFixPromptTemplate, onProjectEditDiscourageTests, onProjectEditAutoCancelOutdatedPrPipelines];
+      void [onProjectEditResolverAgent, onProjectEditResolverModel, onProjectEditMachine, onProjectEditMaximumBudgetUsd, onProjectEditProofScope, onProjectEditProofSkipAutoClean, onProjectEditSkipWorktrees, onProjectEditSkipBaseUpdates, onProjectEditBaseShiftMaximumRebuilds, onProjectEditSeparatePrBranch, onProjectEditDualRootPr, onProjectEditMatchPrBranchName, onProjectEditAutoBuild, onProjectEditAutoSubmitPrStack, onProjectEditAutoFixPrErrors, onProjectEditAutoFixPromptTemplate, onProjectEditDiscourageTests, onProjectEditAutoCancelOutdatedPrPipelines, onProjectEditRebuildOnInherit, onProjectEditRebuildOnTrigger];

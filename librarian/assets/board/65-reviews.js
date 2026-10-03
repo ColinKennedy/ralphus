@@ -1657,6 +1657,41 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
       }
 
       /**
+       * The "Rebuild now" button shown beside a review's run controls: tears
+       * down the previous prepared build and prepares again, whatever the
+       * review's rebuild-on policy says. Empty unless the review is
+       * `in_review`; disabled (with the reason) while preparation is running.
+       * @param {GuardianView} g - The review.
+       * @returns {string}
+       */
+      function rebuildNowControl(g) {
+        if (g.status !== "in_review") return "";
+        const running = g.post_merge_status === "running";
+        const tip = running
+          ? "Preparation is already running for this review.\nRebuild now unlocks once it finishes."
+          : "Tear down this review's previous build and prepare it again, whatever its rebuild policy says.\nRuns each action's before_reset_command teardown hooks, resets its build root, then re-runs preparation; the run buttons lock until it is ready.\nUse after you change something the build depends on. This cannot be undone.";
+        const btn = `<button class="btn rg-rebuildbtn" ${running ? "disabled" : ""} data-click="rebuildPreparationNow" data-guardian-id="${esc(g.id)}"${running ? "" : ` data-tip="${esc(tip)}"`}>↻ Rebuild now</button>`;
+        return running ? `<span data-tip="${esc(tip)}">${btn}</span>` : btn;
+      }
+
+      /**
+       * Asks the daemon to rebuild a review's prepared build now: teardown,
+       * reset, then preparation again. Confirms first because the previous
+       * build is discarded.
+       * @param {string} id - The review id.
+       * @returns {Promise<void>}
+       */
+      async function rebuildPreparationNow(id) {
+        const g = guardians.find((x) => x.id === id);
+        if (!confirm(`Rebuild "${g ? g.name : id}" now? This tears down the previous build (running any before_reset_command hooks and resetting the build root) and prepares it again; its run buttons stay locked until that finishes. This cannot be undone.`)) return;
+        const resp = await guardianAction(`/api/guardians/${id}/rebuild`);
+        if (resp && resp.ok) {
+          notify("info", "Rebuild started — the run buttons unlock when preparation is ready.");
+          tick();
+        }
+      }
+
+      /**
        * Builds one chip for the setup strip.
        * @param {string} gid - The review this chip edits.
        * @param {string} label - Short uppercase key, e.g. "onto".
@@ -1708,6 +1743,8 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
             `How often the dedicated LLM proof pass runs${g.proof_scope ? "" : " — currently the project default"}.`)
           + setupChip(g.id, "squash", esc(squashText),
             "Whether each task branch collapses to a single commit in the review worktree.\nScope is per git project, so a multi-project review sets it independently.")
+          + (g.effective_rebuild_on === undefined ? "" : setupChip(g.id, "rebuild", esc(rebuildOnChipText(g.effective_rebuild_on)),
+            `When this review's prepared build is torn down and built again${g.rebuild_on === null || g.rebuild_on === undefined ? " — currently the project default" : ""}.\nA rebuild runs each action's teardown hooks, resets its build root, then re-runs its preparation.`))
           + `<span class="setup-chip ident" data-tip="Manual-check preparation status. Preparation is advisory and never blocks approval.">`
           + `<span class="sc-k">preparation</span><b>${esc(preparationText)}</b></span>`
           + setupChip(g.id, "worktrees", g.skip_worktrees ? "shared" : "per-branch",
@@ -1943,7 +1980,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
             return `<h3 class="section" data-tip="User-declared test actions from the task TOML [[review.action]] blocks.\nAuthored by the task author, not generated — each runs in the built review worktree.\nLabelled buttons give reviewers one-click access to targeted manual checks.">test actions${sectionMenuBtn(g.id, "actions")}</h3>
               ${reviewRunGroup(
                 reviewRunControl(g, "actions", hints.some((h) => h.preparation_state === "ready" && h.command && !(h.inputs && h.inputs.length)), "▶ Run all",
-                  "Run every ready action, each from its already-prepared location.\nActions needing input are skipped — run those from their own row."),
+                  "Run every ready action, each from its already-prepared location.\nActions needing input are skipped — run those from their own row.") + rebuildNowControl(g),
                 "",
                 rows)}`;
           })()}
@@ -1988,7 +2025,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
             return `<h3 class="section" data-tip="Shell commands suggested by the resolver agent to manually verify these changes.\nSuggested against this stack's changes and advisory — they never block Approve or Merge / rebase.\nGenerated once when the review branch is rebuilt (or when the rebuilt stack's changes change), and re-generated on demand from this section's ⋯ menu.">manual checks${sectionMenuBtn(g.id, "manual")}</h3>
               ${isReady && cmds.length
                 ? reviewRunGroup(
-                  runControl,
+                  runControl + rebuildNowControl(g),
                   "",
                   cmds.map((cmd, i) => {
                       const cmdText = cmd.command || "";

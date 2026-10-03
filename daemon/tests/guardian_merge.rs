@@ -15,14 +15,16 @@ use ralphus_core::schema::TaskFile;
 use ralphus_daemon::cancel::{CancelToken, Cancellations};
 use ralphus_daemon::cartographer::CartographerFilter;
 use ralphus_daemon::guardian::{
-    FeedbackActionStatus, GuardianAutoBuild, GuardianCheck, GuardianStatus, MergeStatus,
+    FeedbackActionStatus, GuardianActionLifecycle, GuardianAutoBuild, GuardianCheck,
+    GuardianStatus, MergeStatus,
 };
 use ralphus_daemon::guardian_merge::{
-    PostMergeJobs, poll_base_branch_freshness_once, pull_pr_commits, purge_worktrees,
-    rebase_command_progress, rebase_on_manual_push, rebuild_on_base_shift,
+    PostMergeJobs, RebuildTrigger, poll_base_branch_freshness_once, pull_pr_commits,
+    purge_worktrees, rebase_command_progress, rebase_on_manual_push, rebuild_on_base_shift,
     rebuild_on_base_shift_with_debounce, reopen_guardian_merge, reopen_straggler,
-    restart_guardian_merge, run_feedback, run_guardian_post_merge, run_merge, run_merge_staged,
-    start_feedback, start_merge, stop_guardian_merge, stop_merge_worker_for_cancel,
+    restart_guardian_merge, run_feedback, run_guardian_post_merge, run_guardian_post_merge_for,
+    run_merge, run_merge_staged, start_feedback, start_merge, stop_guardian_merge,
+    stop_merge_worker_for_cancel,
 };
 use ralphus_daemon::pr::sync_remote_pr_commits;
 use ralphus_daemon::reviews::derive_reviews;
@@ -9680,5 +9682,345 @@ fn stopping_a_mid_rebase_leaves_the_review_resumable_not_cancelled() {
         );
     }
 
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ── rebuild_on: which events rebuild the prepared build ──────────────────
+
+/// A review with one test action whose preparation appends a line to
+/// `<root>/prep-runs.log` and whose teardown hook appends one to
+/// `<root>/teardown-runs.log`, so each test counts how many times a build
+/// (and its teardown) really ran. The logs live outside the scratch checkout,
+/// which every rebuild deletes.
+fn rebuild_on_fixture() -> (PathBuf, Arc<StoreMutex>, String) {
+    let (root, store, id) = single_feature_repo();
+    // Native separators: the commands run under `cmd` on Windows, which does
+    // not accept forward slashes in a redirect target.
+    let native = |name: &str| root.join(name).to_string_lossy().into_owned();
+    let prep_log = native("prep-runs.log");
+    let teardown_log = native("teardown-runs.log");
+    store
+        .lock()
+        .set_guardian_action_hints(
+            &id,
+            &[GuardianCheck {
+                label: Some("Launch".to_string()),
+                command: Some("true".to_string()),
+                prepare: vec![GuardianAutoBuild {
+                    command: Some(format!("echo built >> {prep_log}")),
+                    ..GuardianAutoBuild::default()
+                }],
+                lifecycle: Some(GuardianActionLifecycle {
+                    build_root_policy: None,
+                    before_reset_command: vec![format!("echo torn-down >> {teardown_log}")],
+                    timeout: None,
+                }),
+                ..GuardianCheck::default()
+            }],
+        )
+        .unwrap();
+    run_merge(&store, &NoopRunner, &id);
+    assert_eq!(store.lock().get_guardian(&id).unwrap().status, "in_review");
+    (root, store, id)
+}
+
+fn count_lines(root: &Path, name: &str) -> usize {
+    std::fs::read_to_string(root.join(name))
+        .map(|text| text.lines().count())
+        .unwrap_or(0)
+}
+
+fn action_state(store: &Arc<StoreMutex>, id: &str) -> (Option<String>, Option<i64>) {
+    let g = store.lock().get_guardian(id).unwrap();
+    (
+        g.action_hints[0].preparation_state.clone(),
+        g.action_hints[0].prepared_at_ms,
+    )
+}
+
+fn post_merge_for(store: &Arc<StoreMutex>, id: &str, trigger: RebuildTrigger) {
+    run_guardian_post_merge_for(store, &NoopRunner, id, PostMergeJobs::ALL, trigger);
+}
+
+#[test]
+fn empty_rebuild_on_keeps_a_ready_build_for_every_automatic_trigger_but_still_builds_first() {
+    let (root, store, id) = rebuild_on_fixture();
+    store
+        .lock()
+        .set_guardian_rebuild_on(&id, Some(&[]))
+        .unwrap();
+
+    // No prepared build yet: the very first generation always builds.
+    post_merge_for(&store, &id, RebuildTrigger::Rebase);
+    assert_eq!(count_lines(&root, "prep-runs.log"), 1);
+    let ready = action_state(&store, &id);
+    assert_eq!(ready.0.as_deref(), Some("ready"));
+    let prepared_at = ready.1.expect("stamped when ready");
+
+    // Every automatic trigger now leaves the build, its state and its stamp
+    // alone and runs neither the build nor the teardown.
+    let teardowns_so_far = count_lines(&root, "teardown-runs.log");
+    for trigger in [
+        RebuildTrigger::Rebase,
+        RebuildTrigger::Feedback,
+        RebuildTrigger::AutoFix,
+    ] {
+        post_merge_for(&store, &id, trigger);
+        assert_eq!(
+            count_lines(&root, "prep-runs.log"),
+            1,
+            "{trigger:?} must not rebuild"
+        );
+        assert_eq!(
+            count_lines(&root, "teardown-runs.log"),
+            teardowns_so_far,
+            "{trigger:?} must not tear down"
+        );
+        assert_eq!(
+            action_state(&store, &id),
+            (Some("ready".to_string()), Some(prepared_at)),
+            "{trigger:?} must leave the ready build untouched"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn manual_trigger_rebuilds_and_tears_down_even_when_rebuild_on_is_empty() {
+    let (root, store, id) = rebuild_on_fixture();
+    store
+        .lock()
+        .set_guardian_rebuild_on(&id, Some(&[]))
+        .unwrap();
+    post_merge_for(&store, &id, RebuildTrigger::Rebase);
+    assert_eq!(count_lines(&root, "prep-runs.log"), 1);
+    let teardowns_after_first = count_lines(&root, "teardown-runs.log");
+
+    post_merge_for(&store, &id, RebuildTrigger::Manual);
+    assert_eq!(
+        count_lines(&root, "prep-runs.log"),
+        2,
+        "an explicit rebuild rebuilds"
+    );
+    assert_eq!(
+        count_lines(&root, "teardown-runs.log"),
+        teardowns_after_first + 1,
+        "and runs the declared teardown again"
+    );
+    assert_eq!(action_state(&store, &id).0.as_deref(), Some("ready"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn default_rebuild_on_rebuilds_for_every_trigger() {
+    let (root, store, id) = rebuild_on_fixture();
+    assert_eq!(store.lock().get_guardian(&id).unwrap().rebuild_on, None);
+    let mut expected = 0;
+    for trigger in [
+        RebuildTrigger::Rebase,
+        RebuildTrigger::Feedback,
+        RebuildTrigger::AutoFix,
+        RebuildTrigger::Manual,
+    ] {
+        post_merge_for(&store, &id, trigger);
+        expected += 1;
+        assert_eq!(
+            count_lines(&root, "prep-runs.log"),
+            expected,
+            "{trigger:?} rebuilds under the default setting"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn rebuild_on_subset_rebuilds_only_for_the_listed_triggers() {
+    let (root, store, id) = rebuild_on_fixture();
+    store
+        .lock()
+        .set_guardian_rebuild_on(&id, Some(&["feedback".to_string()]))
+        .unwrap();
+    post_merge_for(&store, &id, RebuildTrigger::Rebase);
+    assert_eq!(count_lines(&root, "prep-runs.log"), 1, "first build");
+
+    post_merge_for(&store, &id, RebuildTrigger::Rebase);
+    post_merge_for(&store, &id, RebuildTrigger::AutoFix);
+    assert_eq!(
+        count_lines(&root, "prep-runs.log"),
+        1,
+        "unlisted triggers keep the build"
+    );
+
+    post_merge_for(&store, &id, RebuildTrigger::Feedback);
+    assert_eq!(
+        count_lines(&root, "prep-runs.log"),
+        2,
+        "the listed trigger rebuilds"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_failed_build_is_not_a_prepared_build_so_the_next_trigger_retries() {
+    let (root, store, id) = single_feature_repo();
+    let action = |command: &str| GuardianCheck {
+        label: Some("Launch".to_string()),
+        command: Some("true".to_string()),
+        prepare: vec![GuardianAutoBuild {
+            command: Some(command.to_string()),
+            ..GuardianAutoBuild::default()
+        }],
+        ..GuardianCheck::default()
+    };
+    store
+        .lock()
+        .set_guardian_action_hints(&id, &[action("exit 1")])
+        .unwrap();
+    store
+        .lock()
+        .set_guardian_rebuild_on(&id, Some(&[]))
+        .unwrap();
+    run_merge(&store, &NoopRunner, &id);
+    post_merge_for(&store, &id, RebuildTrigger::Rebase);
+    assert_eq!(action_state(&store, &id).0.as_deref(), Some("failed"));
+
+    // Nothing is ready, so even an empty `rebuild_on` lets a later rebase run
+    // the build again instead of keeping the failure forever.
+    store
+        .lock()
+        .set_guardian_action_hints(&id, &[action("true")])
+        .unwrap();
+    post_merge_for(&store, &id, RebuildTrigger::Rebase);
+    assert_eq!(action_state(&store, &id).0.as_deref(), Some("ready"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+fn start_rebase_and_wait(store: &Arc<StoreMutex>, id: &str) {
+    let reply = start_merge(
+        Arc::clone(store),
+        Arc::new(NoopRunner),
+        id,
+        Arc::new(Semaphore::new(4)),
+        Cancellations::new(),
+    );
+    assert_eq!(reply.status, 202, "{}", reply.body);
+    for _ in 0..4000 {
+        if store.lock().get_guardian(id).unwrap().status == "in_review" {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("the rebase never settled");
+}
+
+#[test]
+fn a_rebase_request_keeps_the_ready_build_when_rebase_is_not_in_rebuild_on() {
+    let (root, store, id) = rebuild_on_fixture();
+    post_merge_for(&store, &id, RebuildTrigger::Rebase);
+    let ready = action_state(&store, &id);
+    assert_eq!(ready.0.as_deref(), Some("ready"));
+
+    // Rebase is left out: the claimed rebase must not revoke the build the
+    // reviewer is about to keep using.
+    store
+        .lock()
+        .set_guardian_rebuild_on(&id, Some(&["feedback".to_string()]))
+        .unwrap();
+    start_rebase_and_wait(&store, &id);
+    assert_eq!(
+        action_state(&store, &id),
+        ready,
+        "the prepared build stays ready through a rebase that is not in rebuild_on"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_rebase_request_revokes_the_ready_build_by_default() {
+    let (root, store, id) = rebuild_on_fixture();
+    post_merge_for(&store, &id, RebuildTrigger::Rebase);
+    assert_eq!(action_state(&store, &id).0.as_deref(), Some("ready"));
+
+    start_rebase_and_wait(&store, &id);
+    assert_eq!(
+        action_state(&store, &id).0.as_deref(),
+        Some("stale"),
+        "under the default setting a rebase invalidates the build until it is rebuilt"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_explicit_rebuild_reprepares_cached_generated_checks_without_regenerating_them() {
+    let (root, store, id) = single_feature_repo();
+    let runner = ManualCommandsCountingRunner::new();
+    run_merge(&store, &runner, &id);
+    let post_merge = |trigger| {
+        run_guardian_post_merge_for(&store, &runner, &id, PostMergeJobs::ALL, trigger);
+    };
+    let stamp = || {
+        let g = store.lock().get_guardian(&id).unwrap();
+        (
+            g.manual_commands[0].preparation_state.clone(),
+            g.manual_commands[0].prepared_at_ms,
+        )
+    };
+
+    post_merge(RebuildTrigger::Rebase);
+    assert_eq!(runner.calls(), 1, "the first run generates the checks");
+    let (state, first) = stamp();
+    assert_eq!(state.as_deref(), Some("ready"));
+    let first = first.expect("generated checks are stamped when prepared");
+
+    // An ordinary rebase reuses the cached checks untouched.
+    std::thread::sleep(Duration::from_millis(5));
+    post_merge(RebuildTrigger::Rebase);
+    assert_eq!(runner.calls(), 1);
+    assert_eq!(stamp(), (Some("ready".to_string()), Some(first)));
+
+    // An explicit rebuild prepares them again, but keeps their commands: the
+    // agent is not asked to rediscover them.
+    std::thread::sleep(Duration::from_millis(5));
+    post_merge(RebuildTrigger::Manual);
+    assert_eq!(
+        runner.calls(),
+        1,
+        "a rebuild never regenerates the commands"
+    );
+    let (state, second) = stamp();
+    assert_eq!(state.as_deref(), Some("ready"));
+    assert!(
+        second.expect("stamped again") > first,
+        "the generated check was prepared again"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn manual_checks_regeneration_alone_does_not_start_a_new_generation() {
+    let (root, store, id) = rebuild_on_fixture();
+    post_merge_for(&store, &id, RebuildTrigger::Rebase);
+    let before = store.lock().get_guardian(&id).unwrap().merge_attempt;
+
+    // The board's "Regenerate" control runs the manual-checks job alone: it
+    // prepares no action, so it must not advance the preparation generation.
+    run_guardian_post_merge_for(
+        &store,
+        &NoopRunner,
+        &id,
+        PostMergeJobs::MANUAL_CHECKS_ONLY,
+        RebuildTrigger::Manual,
+    );
+    assert_eq!(
+        store.lock().get_guardian(&id).unwrap().merge_attempt,
+        before
+    );
+
+    // A full rebuild does.
+    post_merge_for(&store, &id, RebuildTrigger::Manual);
+    assert_eq!(
+        store.lock().get_guardian(&id).unwrap().merge_attempt,
+        before + 1
+    );
     let _ = std::fs::remove_dir_all(&root);
 }

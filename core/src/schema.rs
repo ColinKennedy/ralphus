@@ -1074,6 +1074,36 @@ pub const PROOF_SCOPE_VALUES: &[&str] = &[
 /// Every accepted `summary_format` literal for a review change summary.
 pub const SUMMARY_FORMAT_VALUES: &[&str] = &["bullet", "prose"];
 
+/// Every accepted `rebuild_on` entry: the events that tear down and rebuild a
+/// review's prepared build. Also the value a review resolves to when neither
+/// it nor its project sets `rebuild_on` (all three, in this order).
+pub const REBUILD_ON_VALUES: &[&str] = &["rebase", "feedback", "auto_fix"];
+
+/// Check a `rebuild_on` list: every entry must be one of
+/// [`REBUILD_ON_VALUES`] and none may repeat. An empty list is valid (it means
+/// "never rebuild automatically"). The error is a complete sentence naming the
+/// offending entry and the allowed values.
+pub fn check_rebuild_on(values: &[String]) -> Result<(), String> {
+    let allowed = REBUILD_ON_VALUES
+        .iter()
+        .map(|value| format!("\"{value}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    for (index, value) in values.iter().enumerate() {
+        if !REBUILD_ON_VALUES.contains(&value.as_str()) {
+            return Err(format!(
+                "'rebuild_on' entries must be one of {allowed} -- got \"{value}\""
+            ));
+        }
+        if values[..index].contains(value) {
+            return Err(format!(
+                "'rebuild_on' lists \"{value}\" more than once; each of {allowed} may appear at most once"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Valid values for `[[task.cell]] mode` / `[[task.proof]]` (and
 /// `[[task.cell.proof]]`) `mode`: how a `command` cell/proof step behaves on
 /// failure. See [`CellDef::mode`]/[`ProofStep::mode`].
@@ -1539,6 +1569,17 @@ pub struct ReviewDef {
     /// block to read it from.
     #[serde(default)]
     pub cache_manual_checks: Option<bool>,
+    /// Which events tear down and rebuild this review's prepared build: any
+    /// of [`REBUILD_ON_VALUES`] (`"rebase"` -- a merge or restack of the
+    /// stack, `"feedback"` -- applied reviewer feedback, `"auto_fix"` -- an
+    /// unattended PR-fix pass). Unset inherits the project-level
+    /// `.ralphus.toml [review] rebuild_on` default, then all three values.
+    /// An empty list never rebuilds automatically; the review is then rebuilt
+    /// only by an explicit rebuild request. The first build of a review
+    /// always runs regardless. Auto-created reviews (Arbiter/Triage) always
+    /// use the project default and never set this directly.
+    #[serde(default)]
+    pub rebuild_on: Option<Vec<String>>,
     /// RAL-395: this review's own override of the prompt template handed to
     /// the resolver agent when `auto_fix_pr_errors` fires. Must contain the
     /// literal `<<prompt>>` placeholder, which is replaced with the
