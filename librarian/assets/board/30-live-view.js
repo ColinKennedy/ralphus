@@ -230,7 +230,11 @@
         const [kind, ...rest] = key.split("|");
         if (kind === "cell") { const [squadId, ti, si] = rest; return `/api/squads/${squadId}/cells/${ti}/${si}/pane-transcript`; }
         if (kind === "proof") { const [squadId, ti, scope, si, vi] = rest; return `/api/squads/${squadId}/proofs/${ti}/${scope}/${si}/${vi}/pane-transcript`; }
-        if (kind === "guardian") { const [gid, branchId] = rest; return `/api/guardians/${gid}/branches/${branchId}/pane-transcript`; }
+        if (kind === "guardian") {
+          const [gid, branchId, task, cellId] = rest;
+          const run = task && cellId ? `?task=${encodeURIComponent(task)}&cell_id=${encodeURIComponent(cellId)}` : "";
+          return `/api/guardians/${gid}/branches/${branchId}/pane-transcript${run}`;
+        }
         if (kind === "guardian-manual") { const [gid] = rest; return `/api/guardians/${gid}/manual-checks/pane-transcript`; }
         return null;
       }
