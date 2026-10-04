@@ -175,6 +175,29 @@ Ask concretely: name the candidate value shapes (an enum's literal list, a
 numeric bound, "no validation") rather than asking "should this be
 validated?" in the abstract.
 
+## Keep `initialize server` interactive and one-shot setup in parity
+
+`ralphus initialize server` serves both a first-time user at a terminal and a
+scripted first-time installation. Treat its prompts and its flags as two
+interfaces to the same setup choices:
+
+- Every new interactive question needs an explicit flag that can provide the
+  exact answer non-interactively. A bare `--yes` only accepts the default; it
+  does not replace a flag for a non-default value.
+- Every new initialization flag needs an equivalent prompt in the interactive
+  flow. Do not create script-only configuration that a terminal user cannot
+  choose.
+- Keep conditions and defaults aligned: if an answer controls whether a later
+  question is relevant, both interfaces must take the same branch for the
+  same answer. Route both through the same setup option rather than keeping
+  separate prompt-only and flag-only state.
+- Add parser coverage for the full non-interactive invocation and for invalid
+  constrained flag values whenever a setting is added or changed.
+
+This rule applies to every value, including optional hosts, empty/disabled
+thresholds, and credentials. Sensitive values must never appear in CLI debug
+output or normal command rendering.
+
 ## Mailbox errors carry remediation guidance (RAL-502)
 
 Any new mailbox message that reports a failure, a blocked state, or another

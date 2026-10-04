@@ -219,10 +219,9 @@ pub enum Command {
     /// installation walkthrough -- deliberately absent from
     /// `help_map.rs`/generated help/the MCP tool surface (see
     /// `initialize_server.rs`'s module doc), reached only via the
-    /// `resolved_path` exception in `help_map.rs`. `--yes` accepts every
-    /// stage's default answer instead of prompting (non-interactive runs).
+    /// `resolved_path` exception in `help_map.rs`.
     InitializeServer {
-        yes: bool,
+        setup: initialize_server::InitializeServerOptions,
     },
     Project(project::ProjectCommand),
     Machine(machine::MachineCommand),
@@ -305,8 +304,15 @@ pub fn parse_args(args: &[String]) -> Command {
                 }
                 Some("server") => {
                     let mut inner = Scanner::new(&tail[1..]);
-                    let yes = inner.take_bool("--yes");
-                    Command::InitializeServer { yes }
+                    match parse_initialize_server(&mut inner) {
+                        Ok(setup) if inner.remaining().is_empty() => {
+                            Command::InitializeServer { setup }
+                        }
+                        Ok(_) => Command::UsageError(
+                            "initialize server: unexpected argument".to_string(),
+                        ),
+                        Err(error) => Command::UsageError(error.0),
+                    }
                 }
                 _ => Command::UsageError(
                     "initialize: expected 'git' or 'server' subcommand".to_string(),
@@ -333,6 +339,46 @@ pub fn parse_args(args: &[String]) -> Command {
         Some("internal") => Command::Internal(internal::parse(&scanner.remaining())),
         Some(other) => Command::UsageError(format!("unknown command: {other}")),
     }
+}
+
+fn parse_initialize_bool(scanner: &mut Scanner, name: &str) -> Result<Option<bool>, UsageError> {
+    scanner
+        .take_value(name)?
+        .map_or(Ok(None), |value| match value.as_str() {
+            "yes" | "true" => Ok(Some(true)),
+            "no" | "false" => Ok(Some(false)),
+            _ => Err(UsageError(format!(
+                "{name}: expected yes or no, got '{value}'"
+            ))),
+        })
+}
+
+fn parse_initialize_server(
+    scanner: &mut Scanner,
+) -> Result<initialize_server::InitializeServerOptions, UsageError> {
+    Ok(initialize_server::InitializeServerOptions {
+        yes: scanner.take_bool("--yes"),
+        install_tmux: parse_initialize_bool(scanner, "--install-tmux")?,
+        tmux_program: scanner.take_value("--tmux-program")?,
+        setup_mcp: parse_initialize_bool(scanner, "--setup-mcp")?,
+        mcp_hosts: scanner.take_repeated("--mcp-host")?,
+        register_project: parse_initialize_bool(scanner, "--register-project")?,
+        project_name: scanner.take_value("--project-name")?,
+        project_description: scanner.take_value("--project-description")?,
+        bug_threshold: scanner.take_value("--bug-threshold")?,
+        feature_threshold: scanner.take_value("--feature-threshold")?,
+        investigation_threshold: scanner.take_value("--investigation-threshold")?,
+        unclassified_threshold: scanner.take_value("--unclassified-threshold")?,
+        require_forks: parse_initialize_bool(scanner, "--require-forks")?,
+        fork_user: scanner.take_value("--fork-user")?,
+        fork_url: scanner.take_value("--fork-url")?,
+        forge_host: scanner.take_value("--forge-host")?,
+        forge_token: scanner.take_value("--forge-token")?,
+        create_admin: parse_initialize_bool(scanner, "--create-admin")?,
+        admin_name: scanner.take_value("--admin-name")?,
+        submit_sample: parse_initialize_bool(scanner, "--submit-sample")?,
+        sample_agent: scanner.take_value("--sample-agent")?,
+    })
 }
 
 fn with_positional_arg(
@@ -399,7 +445,7 @@ pub fn dispatch(cmd: Command, opts: &GlobalOpts) -> i32 {
         Command::Queue(c) => queue::dispatch(c, opts),
         Command::Mcp(c) => mcp::dispatch(c),
         Command::InitializeGit { path } => misc::cmd_initialize_git(path),
-        Command::InitializeServer { yes } => initialize_server::dispatch(opts, yes),
+        Command::InitializeServer { setup } => initialize_server::dispatch(opts, setup),
         Command::Project(c) => project::dispatch(c, opts),
         Command::Machine(c) => machine::dispatch(c, opts),
         Command::Agent(c) => agent::dispatch(c, opts),
@@ -474,6 +520,71 @@ mod tests {
                 assert_eq!(selector, "squad-1/task/0/cell/0");
                 assert_eq!(type_filter, "read glob");
             }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn initialize_server_parses_every_non_interactive_answer() {
+        match parse_args(&v(&[
+            "initialize",
+            "server",
+            "--install-tmux",
+            "no",
+            "--tmux-program",
+            "",
+            "--setup-mcp",
+            "yes",
+            "--mcp-host",
+            "claude",
+            "--register-project",
+            "yes",
+            "--project-name",
+            "ralphus",
+            "--project-description",
+            "self-hosting",
+            "--bug-threshold",
+            "",
+            "--feature-threshold",
+            "5",
+            "--investigation-threshold",
+            "3",
+            "--unclassified-threshold",
+            "5",
+            "--require-forks",
+            "yes",
+            "--fork-user",
+            "Ada",
+            "--fork-url",
+            "git@example.test:ada/ralphus.git",
+            "--forge-host",
+            "github.com",
+            "--forge-token",
+            "token",
+            "--create-admin",
+            "yes",
+            "--admin-name",
+            "Ada",
+            "--submit-sample",
+            "yes",
+            "--sample-agent",
+            "claude-code",
+        ])) {
+            Command::InitializeServer { setup } => {
+                assert_eq!(setup.install_tmux, Some(false));
+                assert_eq!(setup.mcp_hosts, ["claude"]);
+                assert_eq!(setup.project_name.as_deref(), Some("ralphus"));
+                assert_eq!(setup.forge_token.as_deref(), Some("token"));
+                assert_eq!(setup.sample_agent.as_deref(), Some("claude-code"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn initialize_server_rejects_invalid_boolean_answer() {
+        match parse_args(&v(&["initialize", "server", "--create-admin", "perhaps"])) {
+            Command::UsageError(message) => assert!(message.contains("expected yes or no")),
             other => panic!("unexpected: {other:?}"),
         }
     }
