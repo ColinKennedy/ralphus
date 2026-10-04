@@ -692,8 +692,9 @@ pub fn tick(
 /// their tokens. Readiness — Pending with cross-squad deps Done — is decided
 /// by [`Store::list_ready`]; the concurrency cap is enforced later, per cell,
 /// by the shared [`Semaphore`]. Only the readiness check and registration run
-/// in that first hold; the "squad claimed" logging happens in a second, short
-/// hold ([`log_claims`]), batched into one Cartographer transaction.
+/// in that first hold; the "squad claimed" Cartographer rows are written in a
+/// second, short hold ([`log_claims`]) as one transaction, and the stderr line
+/// and otel span after it, with no lock held ([`trace_claims`]).
 ///
 /// RAL-405: claiming no longer flips the squad to `Running` — that would make
 /// it visibly "running" while its worker is still doing setup (worktree
@@ -731,17 +732,19 @@ fn claim_ready(
         timings.report_if_slow(store);
         return claimed;
     }
-    // Second, short hold: trace-context lookup, span, stderr line and one
-    // batched Cartographer transaction. Nothing here affects claim atomicity —
+    // Second, short hold: trace-context lookup and one batched Cartographer
+    // transaction; the span and stderr line follow once the guard is dropped.
+    // Nothing here affects claim atomicity —
     // the tokens are already registered. A squad cancelled or deleted since the
     // first hold just has no trace context; its claim row is still written.
     let claim_times: Vec<i64> = claimed.iter().map(|_| crate::store::now_ms()).collect();
     let logging_from = Instant::now();
-    {
+    let trace_contexts = {
         let guard = store.lock();
-        log_claims(&guard, &claimed, &claim_times, &mut timings);
-    }
+        log_claims(&guard, &claimed, &claim_times, &mut timings)
+    };
     timings.logging_hold = logging_from.elapsed();
+    trace_claims(&claimed, &trace_contexts, &mut timings);
     timings.report_if_slow(store);
     claimed
 }
@@ -774,32 +777,24 @@ fn claim_under_lock(
     claimed
 }
 
-/// The second hold: one "squad claimed" stderr line and Cartographer row per
-/// claimed squad, the rows written as a single transaction stamped with the
-/// time each squad was claimed.
+/// The second hold: the claimed squads' persisted trace contexts and one
+/// "squad claimed" Cartographer row per squad, the rows written as a single
+/// transaction stamped with the time each squad was claimed. Returns the trace
+/// contexts, in `claimed` order, for [`trace_claims`] to use once the guard is
+/// dropped -- the stderr line and otel span need no store, so they stay out of
+/// this hold.
 fn log_claims(
     guard: &crate::store::Store,
     claimed: &[(String, CancelToken)],
     claim_times: &[i64],
     timings: &mut ClaimTimings,
-) {
+) -> Vec<Option<String>> {
+    let mut trace_contexts = Vec::with_capacity(claimed.len());
     let mut entries = Vec::with_capacity(claimed.len());
     for ((squad_id, _), at_ms) in claimed.iter().zip(claim_times) {
-        // A short-lived span for the claim itself (RAL-96) — continues the
-        // trace persisted at submit time, if any. Cell/proof execution
-        // get their own spans later, once the worker thread starts.
         let phase = Instant::now();
-        let trace_context = guard.squad_trace_context(squad_id).unwrap_or_default();
+        trace_contexts.push(guard.squad_trace_context(squad_id).unwrap_or_default());
         timings.trace_context += phase.elapsed();
-        let phase = Instant::now();
-        let cx = otel::context_from_traceparent(trace_context.as_deref());
-        let _span = otel::start_span("scheduler.claim_ready", &cx, SpanKind::Internal);
-        _span.set_attribute("squad_id", squad_id.clone());
-        timings.otel += phase.elapsed();
-        let phase = Instant::now();
-        // ralphus[ignore-rlog-pair]: CartographerEntry struct pushed to batched vec, emitted later
-        crate::rlog!(INFO, "ralphus [scheduler] squad {squad_id} claimed");
-        timings.rlog += phase.elapsed();
         entries.push((
             *at_ms,
             crate::cartographer::CartographerEntry {
@@ -820,6 +815,29 @@ fn log_claims(
     let phase = Instant::now();
     let _ = guard.cartographer_log_batch(entries);
     timings.cartographer_log = phase.elapsed();
+    trace_contexts
+}
+
+/// Per claimed squad, outside the store lock: a short-lived span for the claim
+/// itself (RAL-96), continuing the trace persisted at submit time if any, and
+/// the "squad claimed" stderr line. Cell/proof execution get their own spans
+/// later, once the worker thread starts.
+fn trace_claims(
+    claimed: &[(String, CancelToken)],
+    trace_contexts: &[Option<String>],
+    timings: &mut ClaimTimings,
+) {
+    for ((squad_id, _), trace_context) in claimed.iter().zip(trace_contexts) {
+        let phase = Instant::now();
+        let cx = otel::context_from_traceparent(trace_context.as_deref());
+        let _span = otel::start_span("scheduler.claim_ready", &cx, SpanKind::Internal);
+        _span.set_attribute("squad_id", squad_id.clone());
+        timings.otel += phase.elapsed();
+        let phase = Instant::now();
+        // ralphus[ignore-rlog-pair]: its Cartographer row was already written in log_claims' batched transaction, under the lock this runs outside of
+        crate::rlog!(INFO, "ralphus [scheduler] squad {squad_id} claimed");
+        timings.rlog += phase.elapsed();
+    }
 }
 
 /// Hold time at or above which `claim_ready` reports its phase breakdown; the
@@ -7412,8 +7430,9 @@ mod tests {
         store.lock().delete_squad(&id).ok();
         let mut timings = ClaimTimings::default();
         let guard = store.lock();
-        log_claims(&guard, &claimed, &[crate::store::now_ms()], &mut timings);
+        let trace_contexts = log_claims(&guard, &claimed, &[crate::store::now_ms()], &mut timings);
         drop(guard);
+        assert_eq!(trace_contexts, vec![None]);
         assert_eq!(claim_rows(&store).len(), 1);
     }
 
