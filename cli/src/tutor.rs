@@ -1346,7 +1346,7 @@ mod tests {
         assert!(!TASK_TUTOR.contains("hint.include_when"));
         assert!(TASK_TUTOR.contains("SAME input name"));
         assert!(TASK_TUTOR.contains("The nearest .ralphus.toml wins"));
-        assert!(TASK_TUTOR.contains("\"Run all\" must work with"));
+        assert!(TASK_TUTOR.contains("\"Run all\" must work"));
     }
 
     #[test]
