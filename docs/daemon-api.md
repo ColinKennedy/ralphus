@@ -1963,15 +1963,17 @@ caveat), the review's `auto_run`, the project's `auto_run` (`.ralphus.toml`
 `[review] auto_run`, or the database default written through `POST
 /api/projects/{name}/review-settings`), then `false`. A submission that defines
 its own checks is authoritative: the project file's
-`[[review.action.hint]]` suggestions are not layered on top of it, because a
+suggested `[[review.action]]` checks (with their `[[review.action.hint]]`
+rules) are not layered on top of it, because a
 submission and its project that differ even slightly would otherwise leave "Run
 all" with more checks than the submitter chose, and a minimal set of checks must
 stay possible. The review reports `auto_run` (its own value, `null` when
 inheriting) and `effective_auto_run`; the project endpoint reports the resolved
 default under `effective.auto_run`. A non-boolean value is a `400`.
 
-The project file's `[[review.action.hint]]` tables are advisory: the daemon never
-reads or runs them. They inform whoever writes the submission -- the auto-review
+The project file's suggested `[[review.action]]` tables and their
+`[[review.action.hint]]` rules are advisory: the daemon never reads or runs
+them. They inform whoever writes the submission -- the auto-review
 agent, `ralphus tutor`, a person -- and are described in
 [`docs/special-syntax.md`](special-syntax.md).
 

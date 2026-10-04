@@ -67,8 +67,9 @@ the review as it was; its result is badged **auto** so you can tell it from a
 run you started.
 
 When a submission defines its own checks they are used as written. A project's
-`.ralphus.toml` can suggest checks with `[[review.action.hint]]`, but those only
-inform whoever writes the submission and are never layered on top of it: if they
+`.ralphus.toml` can suggest checks with `[[review.action]]` and say when each
+applies with `[[review.action.hint]]`, but those only inform whoever writes the
+submission and are never layered on top of it: if they
 were, a submission and its project that differ even slightly would stop **Run
 all** from running just the small set of checks you chose.
 

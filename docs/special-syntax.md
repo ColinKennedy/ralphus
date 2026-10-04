@@ -371,47 +371,65 @@ bearing and a waypoint's roster are built from, and
 [`.agent/waypoints-phase0-decisions.md`](../.agent/waypoints-phase0-decisions.md)
 for the design rationale.
 
-### `[[review.action.hint]]` (project `.ralphus.toml`, RAL-565)
+### Suggested checks and `[[review.action.hint]]` (project `.ralphus.toml`, RAL-565)
 
-A project's `.ralphus.toml` is **not** a task submission. Its
-`[[review.action.hint]]` tables are parsed (`ralphus-core`'s
-`project_hints`), but only to *inform* whoever writes a real `[[review]]`: the
-auto-review agent, `ralphus tutor` (which prints the hints for the current
-directory), and the manual-check generator, which is told to prefer them. The
-daemon never runs a hint, never merges one into a submission, and never reads
-one when it schedules or runs a check.
+A project's `.ralphus.toml` is **not** a task submission. Its `[[review.action]]`
+tables are *suggested* manual checks, in the same shape as a submitted
+`[[review.action]]`, and each can carry `[[review.action.hint]]` tables saying
+when it applies. They are parsed (`ralphus-core`'s `project_hints`), but only to
+*inform* whoever writes a real `[[review]]`: the auto-review agent, `ralphus
+tutor` (which prints the suggestions for the current directory), and the
+manual-check generator, which is told to prefer them. The daemon never runs one,
+never merges one into a submission, and never reads one when it schedules or
+runs a check.
 
 ```toml
-[[review.action.hint]]
-label = "GUI smoke test"             # identity of the hint
-command = "npm test"                 # suggested command (or `prompt`, not both)
-auto_run = true                      # suggested; false = do not auto-run it
-hint.include_when = "Any change under librarian/assets/ should include this check."
-hint.paths = ["librarian/assets/**"] # optional globs against the diff
+[[review.action]]
+label = "Board in an isolated dev stack"
+command = "bash scripts/build-debug.sh --daemon-port {daemon_port} --librarian-port {librarian_port}"
+auto_run = false                     # suggested; false = do not auto-run it
 
-[[review.action.hint.prepare]]       # suggested build steps, same shape as [[review.action.prepare]]
+[[review.action.input]]              # a parameter with a default, editable in the UI before the run
+name = "daemon_port"
+message = "Port for the second daemon"
+default = "7891"
+
+[[review.action.input]]
+name = "librarian_port"
+message = "Port for the second board"
+default = "7475"
+
+[[review.action.prepare]]            # suggested build step, same shape as a submitted one
 command = "npm ci"
+
+[[review.action.hint]]               # when to include this check; several may be given, any one matching applies
+include_when = "Any change to the web board should include this check."
+paths = ["librarian/**"]             # optional globs against the diff
 ```
 
 | Key | Meaning |
 |---|---|
 | `label` | Required, unique within a file. For one label, the nearest `.ralphus.toml` wins and a parent directory's file only fills labels the nearer files left out. |
-| `command` / `prompt` | The suggested check; at most one. |
-| `auto_run` | Whether the project judges the check safe to start unattended. A submitter must not set `auto_run = true` on a check whose hint says `false`. |
-| `hint.include_when` | Plain-language rule for when the check belongs in a review. |
-| `hint.paths` | Optional globs (`*` within a path segment, `**` across segments) that make the rule checkable against a diff. |
-| `prepare` | Suggested build steps. |
+| `command` / `prompt` | The suggested check; at most one. `{name}` placeholders must each have a matching `input`. |
+| `input` | Named, defaulted values (`name`, `message`, `default`). Parameterize anything that could collide or vary -- ports, paths, branch names -- so the reviewer can change it just before running the check. |
+| `auto_run` | Whether the project judges the check safe to start unattended. A submitter must not set `auto_run = true` on a check whose suggestion says `false`. |
+| `prepare` | Suggested build steps. A `[[review.action.prepare.hint]]` may say when one step is needed, but a check that applies almost always needs all of its steps, so it is rarely worth writing. |
+| `hint` (`include_when`, `paths`) | When the check applies: a plain-language rule, and optional globs (`*` within a path segment, `**` across segments) that make it checkable against a diff. |
 
 Rules and risks:
 
 - **A submission that defines its own `[[review.action]]` checks is
-  authoritative.** Hints are never layered on top of it. A submission and its
-  project that differ even slightly would otherwise leave **Run all** with more
-  checks than the submitter chose, and running only a minimal set of checks must
-  stay possible. Leave a hint out when it does not apply.
-- **Unknown keys are an error** in a hint, so a typo (`comand`) is reported by
-  `ralphus tutor` rather than silently dropped. A broken file is reported and
-  does not hide the files above it.
+  authoritative.** Suggestions are never layered on top of it. A submission and
+  its project that differ even slightly would otherwise leave **Run all** with
+  more checks than the submitter chose, and running only a minimal set of checks
+  must stay possible. Leave a suggestion out when it does not apply.
+- **Consistent parameters across checks.** The agent writing a review's checks
+  sees all of them at once and is told to look for checks that share a parameter
+  (the same port, path, branch name) and to give that input the same name and the
+  same default in each, so one value holds across the whole review.
+- **Unknown keys are an error** in a suggested action, so a typo (`comand`) is
+  reported by `ralphus tutor` rather than silently dropped. A broken file is
+  reported and does not hide the files above it.
 - **Not to be confused** with `GuardianView.action_hints` in the code, which is
   the stored list of a review's declared `[[review.action]]` checks.
 

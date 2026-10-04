@@ -1248,34 +1248,48 @@ folds into ONE guardian. Submitting the files one at a time instead
 Unless the user explicitly asks for a different split, recommend the
 former shape: one submit call, one Guardian review.
 
-Project manual-check hints (.ralphus.toml)
-------------------------------------------
-A project's .ralphus.toml is NOT a task file. Its [[review.action.hint]]
-tables are recommendations about which manual checks suit the project and
-when. They inform the [[review.action]] entries you write; they are never
-run, merged into a submission, or read by the scheduler. Before writing a
-[[review]], read the hints for the directories the change touches and
-include the checks whose rule applies:
+Project manual-check suggestions (.ralphus.toml)
+------------------------------------------------
+A project's .ralphus.toml is NOT a task file. Its [[review.action]] tables are
+the manual checks the project recommends, and each carries [[review.action.hint]]
+tables saying when it applies. They inform the [[review.action]] entries you
+write; they are never run, merged into a submission, or read by the scheduler.
+Before writing a [[review]], read the suggestions for the directories the
+change touches and include the checks whose hint applies:
 
-  [[review.action.hint]]
-  label = "GUI smoke test"           # identity of the hint
-  command = "npm test"               # suggested command (or `prompt`)
-  auto_run = true                    # suggested; false = do not auto-run it
-  hint.include_when = "Any change under librarian/assets/ should include this check."
-  hint.paths = ["librarian/assets/**"]   # optional globs against the diff
-  [[review.action.hint.prepare]]
+  [[review.action]]
+  label = "Board in an isolated dev stack"
+  command = "bash scripts/build-debug.sh --daemon-port {daemon_port}"
+  auto_run = false                   # suggested; false = do not auto-run it
+  [[review.action.input]]            # parameter with a default, editable in the UI
+  name = "daemon_port"
+  message = "Port for the second daemon"
+  default = "7891"
+  [[review.action.prepare]]
   command = "npm ci"                 # suggested build step
+  [[review.action.hint]]             # when to include this check (any one may match)
+  include_when = "Any change to the web board should include this check."
+  paths = ["librarian/**"]           # optional globs against the diff
+
+A [[review.action.prepare.hint]] may say when one build step is needed, but a
+check that applies almost always needs all of its steps, so it is rarely used.
 
 Rules:
 - The nearest .ralphus.toml wins for a given label; a parent directory's
   file only fills labels the nearer files did not mention.
-- Copy a hint into a real [[review.action]] (command, prepare, description,
-  success). Do not set auto_run = true on a check whose hint says
-  auto_run = false.
+- Copy a suggestion into a real [[review.action]] (command, input, prepare,
+  description, success). Do not set auto_run = true on a check whose
+  suggestion says auto_run = false.
+- Parameterize anything that could collide or vary (ports, paths, branch
+  names) as an input with a default, never a hardcoded value.
+- Write all of a review's checks together. When two or more share a parameter
+  (the same port, path, branch name), declare it with the SAME input name and
+  the SAME default in each, so one value is consistent across every check and
+  is changed once.
 - If your [[review]] defines any [[review.action]], those checks are the
-  whole set. Hints are NOT layered on top of them: "Run all" must work with
-  a minimal set of checks even when a submission and its project differ.
-  Leave a hint out when it does not apply.
+  whole set. Suggestions are NOT layered on top of them: "Run all" must work
+  with a minimal set of checks even when a submission and its project differ.
+  Leave a suggestion out when it does not apply.
 "#;
 
 /// Returns the Task TOML tutorial text with CLI examples using the running
@@ -1311,7 +1325,7 @@ pub fn task_tutor_in(dir: &std::path::Path) -> String {
     let rendered = ralphus_core::project_hints::render_hints(&hints);
     if !rendered.is_empty() {
         text.push_str(&format!(
-            "\nThis project's manual-check hints (from {}):\n\n{rendered}\n",
+            "\nThis project's manual-check suggestions (from {}):\n\n{rendered}\n",
             dir.display()
         ));
     }
@@ -1328,7 +1342,9 @@ mod tests {
     #[test]
     fn tutor_documents_project_hints_and_why_they_are_not_layered() {
         assert!(TASK_TUTOR.contains("[[review.action.hint]]"));
-        assert!(TASK_TUTOR.contains("hint.include_when"));
+        assert!(TASK_TUTOR.contains("include_when = "));
+        assert!(!TASK_TUTOR.contains("hint.include_when"));
+        assert!(TASK_TUTOR.contains("SAME input name"));
         assert!(TASK_TUTOR.contains("The nearest .ralphus.toml wins"));
         assert!(TASK_TUTOR.contains("\"Run all\" must work with"));
     }
@@ -1340,11 +1356,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join(".ralphus.toml"),
-            "[[review.action.hint]]\nlabel = \"Smoke\"\ncommand = \"echo hi\"\nhint.include_when = \"always\"\n",
+            "[[review.action]]\nlabel = \"Smoke\"\ncommand = \"echo hi\"\n[[review.action.hint]]\ninclude_when = \"always\"\n",
         )
         .unwrap();
         let text = task_tutor_in(&dir);
-        assert!(text.contains("This project's manual-check hints"));
+        assert!(text.contains("This project's manual-check suggestions"));
         assert!(text.contains("- Smoke"));
         assert!(text.contains("include when: always"));
         let _ = std::fs::remove_dir_all(&dir);

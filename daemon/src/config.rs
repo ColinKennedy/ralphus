@@ -3830,18 +3830,20 @@ mod tests {
 
     #[test]
     fn project_hints_are_ignored_by_the_review_config() {
-        // RAL-565: [[review.action.hint]] informs whoever writes a submission;
-        // the daemon's own reading of [review] must not change because of it.
+        // RAL-565: a project's suggested [[review.action]] checks inform
+        // whoever writes a submission; the daemon's own reading of [review]
+        // must not change because of them.
         let with_hints = from_toml_str(
-            "[review]\nauto_run = true\n\n[[review.action.hint]]\nlabel = \"Smoke\"\n\
-             command = \"echo hi\"\nauto_run = false\nhint.include_when = \"always\"\n",
+            "[review]\nauto_run = true\n\n[[review.action]]\nlabel = \"Smoke\"\n\
+             command = \"echo hi\"\nauto_run = false\n[[review.action.hint]]\n\
+             include_when = \"always\"\n",
         );
         assert!(
             with_hints.auto_run(),
             "the review-level default still applies"
         );
         let only_hints = from_toml_str(
-            "[[review.action.hint]]\nlabel = \"Smoke\"\ncommand = \"echo hi\"\nauto_run = true\n",
+            "[[review.action]]\nlabel = \"Smoke\"\ncommand = \"echo hi\"\nauto_run = true\n",
         );
         assert!(
             !only_hints.auto_run(),
