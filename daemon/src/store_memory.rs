@@ -87,6 +87,8 @@ pub struct CellDiffState {
     pub version: u64,
     /// The latest pushed numstat summary (`files_changed`, `lines_added`, ...).
     pub summary: serde_json::Value,
+    /// Last pushed version claimed by the large-diff Arbiter inspection.
+    reviewed_version: u64,
     /// The full diff last pulled on demand, and the `version` it was computed at.
     cached: Option<(u64, String)>,
     /// Recency tick, so the map can be bounded by evicting the stalest cell.
@@ -539,6 +541,19 @@ impl StoreMemory {
     /// newer push landed while it was being computed.
     pub fn store_cell_diff(&self, key: &str, version: u64, diff: String) {
         self.with_cell_diff(key, |s| s.cached = Some((version, diff)));
+    }
+
+    /// Claim one changed diff version for Arbiter inspection. A second event
+    /// for the same version cannot spend another Arbiter call.
+    pub fn claim_cell_diff_inspection(&self, key: &str) -> Option<(u64, serde_json::Value)> {
+        self.with_cell_diff(key, |s| {
+            if s.version == 0 || s.reviewed_version == s.version {
+                None
+            } else {
+                s.reviewed_version = s.version;
+                Some((s.version, s.summary.clone()))
+            }
+        })
     }
 }
 
