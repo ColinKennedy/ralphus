@@ -3395,6 +3395,28 @@ fn run_cell_worker(
     // detach, no human interactive session takes over: the periodic
     // resume-sweep in `waypoints.rs` automatically hands the cell back to
     // `pending` once the blocking waypoint closes or de-escalates.
+    if result.is_arbiter_stopped() {
+        let outcome = CellOutcome {
+            state: NodeState::Cancelled,
+            usage: (&result).into(),
+            error: result.error.clone(),
+            agent_session_id: result.agent_session_id.clone(),
+        };
+        let guard = store.lock();
+        let _ = guard.record_cell_result(squad_id, row.task_idx, row.idx, &outcome);
+        crate::cartographer::Note::new("arbiter")
+            .squad(squad_id)
+            .cell(&row.cell_id)
+            .task(&row.task_name)
+            .admin_only()
+            .emit(
+                &guard,
+                "Cell cancelled by Arbiter after suspicious large diff",
+                serde_json::json!({"reason": result.error}),
+            );
+        progress.lock().expect("progress mutex poisoned").status[i] = CellState::Cancelled;
+        return;
+    }
     if result.is_waypoint_halted() {
         crate::rlog!(
             INFO,
