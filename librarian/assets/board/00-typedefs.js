@@ -370,6 +370,7 @@
        * @property {string[]} [projects]
        * @property {string[]} [squash_projects]
        * @property {GuardianBranch[]} branches
+       * @property {boolean} [ever_ready] - see `GuardianIndexEntry.ever_ready`.
        * @property {boolean} [needs_attention] - see `GuardianIndexEntry.needs_attention`; carried by the lean index entry the full view is merged onto.
        * @property {number} [branch_count] - not a real `GuardianView` field -- present only on a `guardians[]` entry that's still lean (came from `/api/guardian-index` and hasn't had this review's full detail merged in yet, see the `guardians` declaration in `05-engines.js`). `branches` is the authoritative count once available.
        * @property {string} [squad_id]
@@ -470,6 +471,7 @@
        * @property {string} origin
        * @property {number} branch_count
        * @property {boolean} needs_attention - daemon-derived (RAL-559): the review is at a human decision point -- a settled stack (every enabled branch rebased, no PR still processing), or a stalled merge. The "Needs you" filter keys on this.
+       * @property {boolean} ever_ready - daemon-side write-once marker (RAL-562): every enabled branch was settled in review at least once. The "review is ready" banner shows only for reviews with this set.
        * @property {string|null} resolver_agent
        * @property {string} git_root
        * @property {string[]} projects

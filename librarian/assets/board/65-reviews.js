@@ -3243,14 +3243,29 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
       // A guardian in `in_review` has its stack built; preparation remains advisory —
       // the "ready to act on" signal. Show a dismissible banner that jumps to it.
       /**
-       * Renders the dismissible "review is ready" banner for every in_review guardian.
+       * Reviews that get the "review is ready" banner: those the daemon marked
+       * `ever_ready` (RAL-562, write-once) that the user has not dismissed.
+       * Review status never dismisses or re-shows a banner.
+       * @template {{id: string, ever_ready?: boolean}} T
+       * @param {T[]} items
+       * @param {Set<string>} dismissed
+       * @returns {T[]}
+       */
+      function readyBannerItems(items, dismissed) {
+        return items.filter((g) => g.ever_ready && !dismissed.has(g.id));
+      }
+      /**
+       * Renders the dismissible "review is ready" banner for every review that first became ready and was not dismissed.
        * @param {GuardianView[]|GuardianIndexEntry[]} [items]
        * @returns {void}
        */
       function renderReadyBanner(items = guardians) {
         const el = document.getElementById("ready-banner");
         if (!el) return;
-        const ready = items.filter((g) => g.status === "in_review" && !dismissedReady.has(g.id));
+        const ready = readyBannerItems(
+          /** @type {Array<GuardianView|GuardianIndexEntry>} */ (items),
+          dismissedReady,
+        );
         el.innerHTML = ready.map((g) => `<div class="ready-banner">
             <span>✅ Review <b>${esc(g.name)}</b> is ready.</span>
             <a href="#" data-click="gotoReview" data-guardian-id="${esc(g.id)}" data-tip="Open this review on the Reviews tab to approve or inspect it.">Open review →</a>

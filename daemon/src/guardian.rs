@@ -2736,6 +2736,9 @@ impl Store {
                 None => format!("review → {}", status.as_str()),
             };
             let _ = self.log_event(None, Some(id), "guardian", None, &msg);
+            if status == GuardianStatus::InReview {
+                let _ = self.mark_first_ready(id);
+            }
             let failed = matches!(status, GuardianStatus::MergeFailed);
             if failed {
                 // RAL-504: a MergeFailed transition caused by
@@ -3725,6 +3728,31 @@ impl Store {
         } else {
             Ok(())
         }
+    }
+
+    /// RAL-562: stamp `first_ready_at_ms` the first time every enabled branch
+    /// of `id` is settled (`done`, `conflict_resolved`, `merged`, `closed`).
+    /// Write-once (`IS NULL` guard): returning to `in_review` after a
+    /// conflict-fix re-merge, feedback round, or reopen never re-arms it.
+    /// Returns whether this call set the marker.
+    pub fn mark_first_ready(&self, id: &str) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE guardians SET first_ready_at_ms=?2              WHERE id=?1 AND first_ready_at_ms IS NULL              AND EXISTS (SELECT 1 FROM guardian_branches WHERE guardian_id=?1 AND enabled=1)              AND NOT EXISTS (SELECT 1 FROM guardian_branches WHERE guardian_id=?1 AND enabled=1                  AND merge_status NOT IN ('done','conflict_resolved','merged','closed'))",
+            params![id, crate::store::now_ms()],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// RAL-562: ids of reviews whose `first_ready_at_ms` marker is set.
+    pub(crate) fn first_ready_ids_conn(
+        conn: &Connection,
+    ) -> Result<std::collections::HashSet<String>> {
+        let mut stmt =
+            conn.prepare("SELECT id FROM guardians WHERE first_ready_at_ms IS NOT NULL")?;
+        let ids = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(ids)
     }
 
     /// RAL-507: atomically claim the right to enqueue the one-time
@@ -6744,6 +6772,54 @@ mod tests {
             auto_submit_error: None,
             finished_at_ms: None,
         }
+    }
+
+    #[test]
+    fn first_ready_marker_is_write_once_across_conflict_fix_remerge() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "a").unwrap();
+        let bid = store.get_guardian(&id).unwrap().branches[0].id.clone();
+        let ready = |store: &Store| {
+            Store::first_ready_ids_conn(&store.conn)
+                .unwrap()
+                .contains(&id)
+        };
+
+        // In review with the branch still unsettled -> not ready yet.
+        store
+            .set_guardian_status(&id, GuardianStatus::Merging, None)
+            .unwrap();
+        store
+            .set_branch_status(&id, &bid, MergeStatus::InProgress, None)
+            .unwrap();
+        store
+            .set_guardian_status(&id, GuardianStatus::InReview, None)
+            .unwrap();
+        assert!(!ready(&store));
+
+        // Conflict fixed, back in review -> first ready.
+        store
+            .set_guardian_status(&id, GuardianStatus::Merging, None)
+            .unwrap();
+        store
+            .set_branch_status(&id, &bid, MergeStatus::ConflictResolved, None)
+            .unwrap();
+        store
+            .set_guardian_status(&id, GuardianStatus::InReview, None)
+            .unwrap();
+        assert!(ready(&store));
+        assert!(!store.mark_first_ready(&id).unwrap());
+
+        // Re-merge -> in_review again: the marker stays set and is not re-stamped.
+        store
+            .set_guardian_status(&id, GuardianStatus::Merging, None)
+            .unwrap();
+        assert!(ready(&store));
+        store
+            .set_guardian_status(&id, GuardianStatus::InReview, None)
+            .unwrap();
+        assert!(ready(&store));
     }
 
     #[test]
