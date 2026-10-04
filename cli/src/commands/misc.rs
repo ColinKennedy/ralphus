@@ -1314,7 +1314,18 @@ pub fn cmd_check(opts: &GlobalOpts, args: CheckArgs) -> i32 {
         args.all_remotes,
         args.enable_live_agent_check,
     );
-    let file_issues = crate::config::validate_config_files(&cwd, true);
+    report_health(opts, &cwd, &results)
+}
+
+/// Prints already-run health `results` (plus the config-file issues under
+/// `cwd`) as `check health` does and returns its exit code. Split from
+/// [`cmd_check`] so a caller that also needs the results runs the checks once.
+pub(crate) fn report_health(
+    opts: &GlobalOpts,
+    cwd: &std::path::Path,
+    results: &[crate::health::CheckResult],
+) -> i32 {
+    let file_issues = crate::config::validate_config_files(cwd, true);
     let failed = results.iter().filter(|r| r.is_fail()).count() + file_issues.len();
 
     // `opts.json`, not a per-subcommand flag: `args::extract_global_opts`
@@ -1323,9 +1334,9 @@ pub fn cmd_check(opts: &GlobalOpts, args: CheckArgs) -> i32 {
     // uses), so branching on anything else here would make `ralphus check
     // health --json` silently fall through to human output.
     if opts.json {
-        println!("{}", render_health_json(&results, &file_issues, failed));
+        println!("{}", render_health_json(results, &file_issues, failed));
     } else {
-        print!("{}", render_health_human(&results, &file_issues, failed));
+        print!("{}", render_health_human(results, &file_issues, failed));
     }
 
     if failed > 0 { 1 } else { 0 }

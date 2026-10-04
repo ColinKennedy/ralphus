@@ -163,6 +163,33 @@ list of candidates.
 | `task show-tutor` | Print the Task TOML schema reference |
 | `queue list [--all]` / `reorder <paths...>` / `set-position <paths...> --to N [--relative]` / `set-status <path> <state>` | Inspect/reorder the squad queue by priority |
 | `initialize git [--path]` | Enable git rerere in a repository |
+| `initialize server [--yes] [--agent-logins claude,codex\|all\|none] ...` | Guided first-run server setup. See [Initialize server](#initialize-server) below |
+
+### Initialize server
+
+`ralphus initialize server` walks a fresh machine through ten steps (each
+printed as `Step N of 10`), ending with a health run and a sample squad. Every
+interactive answer has a matching flag, and `--yes` accepts defaults without
+prompting.
+
+The **Agent logins** step probes the Claude Code and Codex CLIs with the same
+login probes as `ralphus check health`:
+
+- A logged-in backend reports OK and is never prompted about.
+- A backend whose CLI is not installed is skipped with an info line.
+- A logged-out backend gets an explanation of the impact (its cells fail until
+  it is logged in) and the config directory the login would write to. You choose
+  which backends to log in to (`claude`, `codex`, a comma list, `all` or
+  `none`); `--agent-logins` supplies the same answer without a prompt. After a
+  login the backend is re-probed once.
+- Codex logs in with `codex login`, or `codex login --device-auth` over SSH.
+  Claude Code's `claude auth login` needs a local browser, so over SSH the
+  command is printed and the step waits for Enter (or `s` to skip the re-check).
+- Non-interactive runs, and `--yes` without `--agent-logins`, never block and
+  never spawn a login: the command is printed for you to run later.
+
+The sample-squad step defaults to a logged-in backend and warns if you pick a
+logged-out one. The final health run includes both login checks.
 
 ### Submit
 
