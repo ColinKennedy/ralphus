@@ -1019,7 +1019,6 @@
           sticky.className = `tgl${reviewDockSticky ? " on" : ""}`;
           sticky.setAttribute("aria-pressed", reviewDockSticky ? "true" : "false");
         }
-<<<<<<< HEAD
         const branchWorktrees = /** @type {HTMLInputElement|null} */ (
           document.getElementById("review-dock-branch-worktrees")
         );
