@@ -63,6 +63,51 @@ use crate::runner::Runner;
 use crate::store::{Result as StoreResult, Store, StoreError, now_ms};
 use crate::triage::SubprojectResolution;
 
+/// One `waypoint_roster` row with the state of the squad or review it names,
+/// as read by [`Store::block_gated_squads`]. The state of an entry that does
+/// not exist (or of the other kind) is `None`.
+#[derive(Debug, Clone)]
+struct RosterRow {
+    waypoint_id: String,
+    kind: String,
+    squad_state: Option<String>,
+    review_status: Option<String>,
+}
+
+impl RosterRow {
+    /// Same reading as `Store::entry_work_is_terminal`: a missing squad or
+    /// review is non-terminal, and an unknown kind is not a roster entry.
+    fn terminal(&self) -> Option<bool> {
+        Some(match WaypointEntryKind::parse(&self.kind)? {
+            WaypointEntryKind::Squad => self
+                .squad_state
+                .as_deref()
+                .and_then(crate::store::SquadState::parse)
+                .is_some_and(crate::store::SquadState::is_terminal_for_waypoint),
+            WaypointEntryKind::Review => self
+                .review_status
+                .as_deref()
+                .is_some_and(GuardianStatus::is_terminal_status),
+        })
+    }
+}
+
+/// The squads held by at least one candidate waypoint whose roster is not
+/// fully terminal. `candidates` are `(squad_id, waypoint_id)` pairs; a
+/// waypoint with an empty roster never holds anything.
+fn gated_squads_in(candidates: &[(String, String)], roster: &[RosterRow]) -> BTreeSet<String> {
+    let unfinished: BTreeSet<&str> = roster
+        .iter()
+        .filter(|row| row.terminal() == Some(false))
+        .map(|row| row.waypoint_id.as_str())
+        .collect();
+    candidates
+        .iter()
+        .filter(|(_, waypoint_id)| unfinished.contains(waypoint_id.as_str()))
+        .map(|(squad_id, _)| squad_id.clone())
+        .collect()
+}
+
 /// A waypoint/review/squad's aggregate monorepo-subproject footprint (the
 /// Phase 0 actionable-notification matching model, see
 /// `.agent/waypoints-phase0-decisions.md`). Consumed by
@@ -2041,6 +2086,57 @@ impl Store {
     /// Propagates any SQLite failure.
     pub fn squad_block_gating_waypoint(&self, squad_id: &str) -> StoreResult<Option<String>> {
         self.first_gating_waypoint(squad_id)
+    }
+
+    /// Every squad currently held by an open `block`-mode waypoint, in two
+    /// queries -- the set-based form of calling
+    /// [`Self::squad_block_gating_waypoint`] once per squad.
+    ///
+    /// The first query reads the `(squad, waypoint)` candidate pairs, the
+    /// second the roster of just those waypoints with each roster entry's
+    /// squad state / review status joined in. Which of those states count as
+    /// terminal is still decided in Rust, by [`gated_squads_in`].
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub(crate) fn block_gated_squads(&self) -> StoreResult<BTreeSet<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT wr.entry_id, wr.waypoint_id FROM waypoint_affected wr
+             JOIN waypoints w ON w.id = wr.waypoint_id
+             WHERE wr.kind = 'squad' AND wr.mode = 'block'
+               AND (wr.survey_verdict IS NULL OR wr.survey_verdict = 'impacted')
+               AND w.state = 'open'",
+        )?;
+        let candidates: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+        if candidates.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+
+        let mut stmt = self.conn.prepare(
+            "SELECT r.waypoint_id, r.kind, s.state, g.status FROM waypoint_roster r
+             LEFT JOIN squads s ON r.kind = 'squad' AND s.id = r.entry_id
+             LEFT JOIN guardians g ON r.kind = 'review' AND g.id = r.entry_id
+             WHERE r.waypoint_id IN (
+                 SELECT wr.waypoint_id FROM waypoint_affected wr
+                 JOIN waypoints w ON w.id = wr.waypoint_id
+                 WHERE wr.kind = 'squad' AND wr.mode = 'block'
+                   AND (wr.survey_verdict IS NULL OR wr.survey_verdict = 'impacted')
+                   AND w.state = 'open')",
+        )?;
+        let roster: Vec<RosterRow> = stmt
+            .query_map([], |r| {
+                Ok(RosterRow {
+                    waypoint_id: r.get(0)?,
+                    kind: r.get(1)?,
+                    squad_state: r.get(2)?,
+                    review_status: r.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(gated_squads_in(&candidates, &roster))
     }
 
     /// The first open waypoint holding this squad back from being scheduled.

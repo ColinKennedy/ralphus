@@ -51,6 +51,8 @@ sha2.workspace = true
 [dev-dependencies]
 ureq = { workspace = true }
 git2 = { workspace = true }
+# `Connection::trace`, used to count the statements a store call issues.
+rusqlite = { workspace = true, features = ["trace"] }
 
 [target."cfg(windows)".dependencies]
 sysinfo = { version = "0.36.1", default-features = false, features = ["system"] }
