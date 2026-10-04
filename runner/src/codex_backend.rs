@@ -708,7 +708,6 @@ fn script_label(script: &str) -> Option<String> {
                         first.contains('=') || rest.first().is_some_and(|n| n.starts_with('='));
                     if assign {
                         // PowerShell assignment: the whole statement is setup.
-                        words = &[];
                         break;
                     }
                     return None;
