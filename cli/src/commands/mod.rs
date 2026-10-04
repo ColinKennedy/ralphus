@@ -14,7 +14,13 @@
 pub mod agent;
 pub mod cell;
 pub mod env;
+pub mod initialize_exercise;
+pub mod initialize_machine;
+pub mod initialize_mailbox;
+pub mod initialize_review;
 pub mod initialize_server;
+pub mod initialize_triage;
+pub mod initialize_waypoint;
 pub mod internal;
 pub mod machine;
 pub mod mailbox;
@@ -223,6 +229,22 @@ pub enum Command {
     InitializeServer {
         setup: Box<initialize_server::InitializeServerOptions>,
     },
+    /// Set up an isolated daemon and submit a waypoint exercise suite.
+    InitializeWaypoint {
+        state_dir: Option<String>,
+    },
+    InitializeMailbox {
+        state_dir: Option<String>,
+    },
+    InitializeMachine {
+        state_dir: Option<String>,
+    },
+    InitializeTriage {
+        state_dir: Option<String>,
+    },
+    InitializeReview {
+        state_dir: Option<String>,
+    },
     Project(project::ProjectCommand),
     Machine(machine::MachineCommand),
     Agent(agent::AgentCommand),
@@ -314,8 +336,28 @@ pub fn parse_args(args: &[String]) -> Command {
                         Err(error) => Command::UsageError(error.0),
                     }
                 }
+                Some("waypoint") => {
+                    let mut inner = Scanner::new(&tail[1..]);
+                    let state_dir = inner.take_value("--state-dir").ok().flatten();
+                    Command::InitializeWaypoint { state_dir }
+                }
+                Some("mailbox") => {
+                    let mut inner = Scanner::new(&tail[1..]);
+                    Command::InitializeMailbox {
+                        state_dir: inner.take_value("--state-dir").ok().flatten(),
+                    }
+                }
+                Some("machine") => {
+                    let mut inner = Scanner::new(&tail[1..]);
+                    Command::InitializeMachine {
+                        state_dir: inner.take_value("--state-dir").ok().flatten(),
+                    }
+                }
+                Some("triage") => { let mut inner = Scanner::new(&tail[1..]); Command::InitializeTriage { state_dir: inner.take_value("--state-dir").ok().flatten() } }
+                Some("review") => { let mut inner = Scanner::new(&tail[1..]); Command::InitializeReview { state_dir: inner.take_value("--state-dir").ok().flatten() } }
                 _ => Command::UsageError(
-                    "initialize: expected 'git' or 'server' subcommand".to_string(),
+                    "initialize: expected 'git', 'server', 'waypoint', 'mailbox', 'machine', 'triage', or 'review' subcommand"
+                        .to_string(),
                 ),
             }
         }
@@ -504,6 +546,11 @@ pub fn dispatch(cmd: Command, opts: &GlobalOpts) -> i32 {
         Command::Mcp(c) => mcp::dispatch(c),
         Command::InitializeGit { path } => misc::cmd_initialize_git(path),
         Command::InitializeServer { setup } => initialize_server::dispatch(opts, *setup),
+        Command::InitializeWaypoint { state_dir } => initialize_waypoint::dispatch(state_dir),
+        Command::InitializeMailbox { state_dir } => initialize_mailbox::dispatch(state_dir),
+        Command::InitializeMachine { state_dir } => initialize_machine::dispatch(state_dir),
+        Command::InitializeTriage { state_dir } => initialize_triage::dispatch(state_dir),
+        Command::InitializeReview { state_dir } => initialize_review::dispatch(state_dir),
         Command::Project(c) => project::dispatch(c, opts),
         Command::Machine(c) => machine::dispatch(c, opts),
         Command::Agent(c) => agent::dispatch(c, opts),
