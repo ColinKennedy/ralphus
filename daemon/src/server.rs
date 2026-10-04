@@ -1568,7 +1568,7 @@ fn route_for_user(
             visit_user_profile(daemon, user_header, &url_decode(name))
         }
         // ralphus[ignore-endpoint-cli]: board Hidden-items management (hide/show without deleting)
-        ("GET", ["api", "hidden"]) => list_hidden(daemon, user_header),
+        ("GET", ["api", "hidden"]) => list_hidden(daemon, query, user_header),
         // ralphus[ignore-endpoint-cli]: board Hidden-items management (hide/show without deleting)
         ("POST", ["api", "hidden", "squads", "batch"]) => {
             set_squads_hidden_batch(daemon, user_header, body)
@@ -4790,7 +4790,15 @@ fn list_agents(daemon: &Daemon, query: &str, user_header: Option<&str>) -> Reply
     }
 }
 
-fn list_hidden(daemon: &Daemon, user_header: Option<&str>) -> Reply {
+fn list_hidden(daemon: &Daemon, query: &str, user_header: Option<&str>) -> Reply {
+    if query_param(query, "user").is_some() {
+        return error(
+            400,
+            "identity_in_url_not_accepted",
+            "Identity in the URL is deliberately no longer accepted; use X-Ralphus-User header instead",
+            vec![],
+        );
+    }
     let user_name = match require_current_user(daemon, user_header) {
         Ok(name) => name,
         Err(reply) => return reply,
