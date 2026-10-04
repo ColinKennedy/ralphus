@@ -213,12 +213,12 @@ breaking anything. Nothing in the compiled binaries invokes `rg` itself.
 `ralphus check health`'s Harness section (`cli/src/health.rs`'s
 `check_ripgrep`, RAL-522) and the daemon's hourly Free-tier health sweep
 (`daemon/src/health_sweep.rs`, which backs the board's Health tab) both run
-the same shared probe (`runner/src/ripgrep.rs`), as two separate
-diagnostics: PATH resolution (catalog id `ripgrep-path`) and actually
-invoking `rg --version` on the resolved executable (catalog id `ripgrep-version`).
-Both findings are `warn`s, never `fail`s, and each
-failure shape (not on PATH; resolved but not executable; ran but reported
-no ripgrep version) carries its own actionable detail.
+the same shared probe (`runner/src/ripgrep.rs`) as a single diagnostic
+(catalog id `ripgrep`): it resolves `rg` on PATH, invokes `rg --version` on
+the resolved executable, and on success reports `<path> (<version>)`. The
+finding is a `warn`, never a `fail`, and each failure shape (not on PATH;
+resolved but not executable; ran but reported no ripgrep version) carries
+its own actionable detail.
 
 Check your version:
 

@@ -67,8 +67,20 @@ jobs:
       # has none that execute today (everything under `/// ```...``` ` is
       # `text`/`ignore`-fenced), so it's cheap insurance against a future one
       # going unchecked rather than covering a present gap.
+      #
+      # RALPHUS_GUARD_HOLD_PANIC_MS: integration test binaries take the
+      # `cfg!(debug_assertions)` branch of `guard_hold_panic_ms()` (2,000 ms),
+      # not the `cfg!(test)` branch (5,000 ms) -- see that function's doc
+      # comment in daemon/src/store_lock.rs. On a busy shared runner (notably
+      # windows-latest, with several real-git guardian_merge tests running at
+      # once) a guard covering nothing but two SQLite UPDATEs has crossed
+      # 2,000 ms with no blocking I/O under the lock. Same value and reasoning
+      # as the perf job's store-contention step; genuine blocking I/O under
+      # the lock (a subprocess, a sleep, a network call) still blows past it.
       - name: Test
         if: matrix.suite == 'full'
+        env:
+          RALPHUS_GUARD_HOLD_PANIC_MS: "8000"
         run: cargo "+${{ matrix.toolchain }}" nextest run --workspace --all-targets
       - name: Doctests
         if: matrix.suite == 'full'

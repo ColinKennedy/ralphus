@@ -201,7 +201,12 @@ pub fn diagnose_command_with_version(
         return health;
     }
     let resolved_path = health.detail;
-    match version_probe::probe_version_at(&resolved_path, version_args, extract) {
+    match version_probe::probe_version_at(
+        &resolved_path,
+        version_args,
+        version_probe::DEFAULT_VERSION_PROBE_TIMEOUT,
+        extract,
+    ) {
         VersionProbe::Ok { path, version } => BackendCommandHealth {
             status: "pass",
             effective_command: command.to_string(),
