@@ -301,19 +301,35 @@
           // `usingTape` stays false when there is no `.raw` — then the `/pane`
           // snapshot above is rendered as the fallback.
           const prevTape = peekTape[key];
-          const prevTotal = prevTape ? prevTape.total : 0;
+          let prevTotal = prevTape ? prevTape.total : 0;
           let win = prevTape;
           let usingTape = true;
-          if (!win) {
+          /**
+           * Seeds the window from the tail of the tape at `tapeUrl`.
+           * @returns {Promise<void>}
+           */
+          const seedWindow = async () => {
             const probe = await fetchTapeRange(tapeUrl, TAPE_PROBE_OFFSET, 1);
             const seed = probe === null
               ? null
               : await fetchTapeRange(tapeUrl, Math.max(0, probe.total - TAPE_CHUNK_BYTES), TAPE_CHUNK_BYTES);
             if (seed === null) usingTape = false;
             else win = tapeAppend(emptyTapeWindow(), { start: seed.start, content: seed.content, total: seed.total, requested: TAPE_CHUNK_BYTES });
+          };
+          if (!win) {
+            await seedWindow();
           } else {
             const chunk = await fetchTapeRange(tapeUrl, win.loadedEnd, TAPE_CHUNK_BYTES);
-            if (chunk !== null) {
+            if (chunk !== null && chunk.total < win.loadedEnd) {
+              // The tape is smaller than what was already loaded: the daemon
+              // now resolves this key to a different session (a branch moving
+              // from its feedback agent to its commit agent), so the loaded
+              // window belongs to a transcript that is no longer served.
+              // Following its tail would read past the new file's end and
+              // never load what the new session has already written.
+              prevTotal = 0;
+              await seedWindow();
+            } else if (chunk !== null) {
               win = tapeAppend(win, { start: chunk.start, content: chunk.content, total: chunk.total, requested: TAPE_CHUNK_BYTES });
               // Don't drop the front while the user is actively paging older
               // history in (that fetch is mid-flight and about to prepend).

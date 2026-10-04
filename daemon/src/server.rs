@@ -11265,10 +11265,7 @@ fn resolver_task_and_cell_id(
     // agent's own session is the live one to show -- distinct from (and not
     // reachable through) the merge/rebase resolver below.
     if b.merge_status == "actioning" {
-        return Ok((
-            crate::guardian_merge::FEEDBACK_TASK,
-            crate::guardian_merge::feedback_cell_id(&b.id),
-        ));
+        return Ok(actioning_session(id, &b.id));
     }
     if b.merge_status == "proof_pending" {
         return Ok((
@@ -11292,6 +11289,36 @@ fn resolver_task_and_cell_id(
     // merge/rebase log the way it did before this resolved feedback's own
     // session at all.
     Ok(freshest_resolver_or_feedback(id, &b.id))
+}
+
+/// The session to show while a branch is `actioning`. Feedback actioning runs
+/// two agents back to back under the same status: the feedback resolver
+/// (`reviewer-{branch}`) and then the commit step (`reviewer-{branch}-commit`,
+/// see `guardian_merge::run_commit_step`). Pointing at the first one only
+/// leaves Live View on its finished transcript while the commit agent works.
+fn actioning_session(id: &str, branch_id: &str) -> (&'static str, String) {
+    let squad = format!("guardian-{id}");
+    let feedback_cell = crate::guardian_merge::feedback_cell_id(branch_id);
+    let commit_cell = format!("{feedback_cell}-commit");
+    let task = crate::guardian_merge::FEEDBACK_TASK;
+    let commit_live = crate::tmux::Tmux::resolve()
+        .map(|t| t.has_session(&crate::tmux::session_name(&squad, task, &commit_cell)))
+        .unwrap_or(false);
+    (
+        task,
+        pick_actioning_cell(commit_live, feedback_cell, commit_cell),
+    )
+}
+
+/// Pure decision behind [`actioning_session`]: the commit session while it is
+/// live, otherwise the feedback session (running, or the finished record in
+/// the gap before the commit step starts).
+fn pick_actioning_cell(commit_live: bool, feedback_cell: String, commit_cell: String) -> String {
+    if commit_live {
+        commit_cell
+    } else {
+        feedback_cell
+    }
 }
 
 /// Picks whichever of the merge/rebase resolver's or a feedback-actioning
@@ -24005,6 +24032,22 @@ remediation_attempts=1
         let (task, cell_id) = resolver_task_and_cell_id(&d, &id, &branch_id).unwrap();
         assert_eq!(task, crate::guardian_merge::FEEDBACK_TASK);
         assert_eq!(cell_id, crate::guardian_merge::feedback_cell_id(&branch_id));
+    }
+
+    #[test]
+    fn pick_actioning_cell_follows_the_live_commit_session() {
+        let feedback = "reviewer-b".to_string();
+        let commit = "reviewer-b-commit".to_string();
+        // The commit agent is running after the feedback agent finished.
+        assert_eq!(
+            pick_actioning_cell(true, feedback.clone(), commit.clone()),
+            commit
+        );
+        // Otherwise the feedback session is the one to show.
+        assert_eq!(
+            pick_actioning_cell(false, feedback.clone(), commit),
+            feedback
+        );
     }
 
     #[test]
