@@ -12,7 +12,7 @@
 //! `--setup-mcp`, `--register-project`, `--review-auto-submit-pr-stack`,
 //! `--require-forks`, `--create-admin`, `--setup-forge-token`, `--submit-sample`.
 //! The value flags are `--tmux-program`, repeatable
-//! `--mcp-host`, `--project-name`, `--project-description`, `--project-is-fork`,
+//! `--mcp-host`, `--agent-logins` (`claude,codex`, `all`, or `none`), `--project-name`, `--project-description`, `--project-is-fork`,
 //! `--project-fork-url`, `--project-url`,
 //! `--bug-threshold`, `--feature-threshold`, `--investigation-threshold`,
 //! `--unclassified-threshold`, `--fork-user`, `--fork-url`, `--forge-provider`,
@@ -24,10 +24,10 @@ use std::path::PathBuf;
 
 use crate::args::GlobalOpts;
 use crate::client::ProjectReviewSettingsPatch;
-use crate::commands::misc::CheckArgs;
 use crate::health::CheckResult;
+use ralphus_runner::login_probe::{LoginProbe, LoginState, LoginStatus, StatusRun, login_probes};
 
-const TOTAL_STEPS: u32 = 9;
+const TOTAL_STEPS: u32 = 10;
 const WINDOWS_MINIMUM_TMUX_VERSION: (u32, u32, u32) = (3, 3, 8);
 const SAMPLE_LABEL_PREFIX: &str = "ralphus initialize server: hello world";
 
@@ -90,6 +90,10 @@ const SETUP_MCP: InitializeSetting = InitializeSetting {
 const MCP_HOST: InitializeSetting = InitializeSetting {
     prompt: "MCP host",
     flag: "--mcp-host",
+};
+const AGENT_LOGINS: InitializeSetting = InitializeSetting {
+    prompt: "agent logins",
+    flag: "--agent-logins",
 };
 const REGISTER_PROJECT: InitializeSetting = InitializeSetting {
     prompt: "register project",
@@ -193,6 +197,7 @@ const INTERACTIVE_SETTINGS: &[&InitializeSetting] = &[
     &TMUX_PROGRAM,
     &SETUP_MCP,
     &MCP_HOST,
+    &AGENT_LOGINS,
     &REGISTER_PROJECT,
     &PROJECT_NAME,
     &PROJECT_IS_FORK,
@@ -239,6 +244,9 @@ pub struct InitializeServerOptions {
     pub tmux_program: Option<String>,
     pub setup_mcp: Option<bool>,
     pub mcp_hosts: Vec<String>,
+    /// Backends to log in to (`claude,codex`, `all`, `none`); pre-answers the
+    /// agent-logins prompt.
+    pub agent_logins: Option<String>,
     pub register_project: Option<bool>,
     pub project_name: Option<String>,
     pub project_is_fork: Option<bool>,
@@ -274,6 +282,7 @@ impl std::fmt::Debug for InitializeServerOptions {
             .field("tmux_program", &self.tmux_program)
             .field("setup_mcp", &self.setup_mcp)
             .field("mcp_hosts", &self.mcp_hosts)
+            .field("agent_logins", &self.agent_logins)
             .field("register_project", &self.register_project)
             .field("project_name", &self.project_name)
             .field("project_is_fork", &self.project_is_fork)
@@ -315,6 +324,7 @@ impl InitializeServerOptions {
             || self.tmux_program.is_some()
             || self.setup_mcp.is_some()
             || !self.mcp_hosts.is_empty()
+            || self.agent_logins.is_some()
             || self.register_project.is_some()
             || self.project_name.is_some()
             || self.project_is_fork.is_some()
@@ -361,6 +371,9 @@ pub fn dispatch(opts: &GlobalOpts, setup: InitializeServerOptions) -> i32 {
     step.begin("Set up MCP hosts (optional)");
     step_mcp(&setup);
 
+    step.begin("Check agent logins (Claude Code, Codex)");
+    let logins = step_agent_logins(opts, &setup);
+
     step.begin("Register this repository as a project (optional)");
     let project = step_project(opts, &setup);
 
@@ -386,7 +399,7 @@ pub fn dispatch(opts: &GlobalOpts, setup: InitializeServerOptions) -> i32 {
     let health_results = step_health(opts);
 
     step.begin("Submit a sample hello-world task (optional)");
-    step_sample(opts, project.as_deref(), &health_results, &setup);
+    step_sample(opts, project.as_deref(), &health_results, &logins, &setup);
 
     println!();
     println!("setup complete.");
@@ -668,6 +681,356 @@ fn command_available(program: &str) -> bool {
         .arg("--version")
         .output()
         .is_ok_and(|output| output.status.success())
+}
+
+// ---- agent logins ---------------------------------------------------------------
+
+/// Where one backend's login stands after the step ran; the sample step uses
+/// it to pick (and sanity-check) the sample's agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentLoginReport {
+    backend: &'static str,
+    /// Names the backend answers to in `--agent-logins` / `--sample-agent`.
+    aliases: Vec<&'static str>,
+    /// `None` when the backend is not installed or was not probed.
+    state: Option<LoginState>,
+}
+
+impl AgentLoginReport {
+    fn answers_to(&self, name: &str) -> bool {
+        self.backend == name || self.aliases.contains(&name)
+    }
+}
+
+/// The outcome of probing one backend's login.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProbeOutcome {
+    /// The CLI could not be found; carries the reason.
+    NotInstalled(String),
+    /// The command cannot be probed or logged into (e.g. a compound command).
+    Skipped(String),
+    Checked {
+        /// The resolved program a login would be spawned with.
+        program: String,
+        status: LoginStatus,
+    },
+}
+
+/// Everything the login step does to the outside world, so tests can mock the
+/// probes, the spawned login, and the prompts.
+trait LoginHost {
+    fn probe(&self, probe: &dyn LoginProbe) -> ProbeOutcome;
+    /// Runs `<program> <args>` with the terminal attached; returns its exit code.
+    fn spawn_login(&self, program: &str, args: &[&str]) -> std::io::Result<i32>;
+    /// Whether a login flow can be handed the terminal.
+    fn is_interactive(&self) -> bool;
+    fn is_ssh_session(&self) -> bool;
+    /// Prompts with `question` and returns the trimmed answer (empty on EOF).
+    fn read_line(&self, question: &str) -> String;
+}
+
+/// The real host: resolves each backend's command in the daemon's order
+/// (database override, environment variable, default) and runs it locally.
+struct RealLoginHost {
+    overrides: Vec<(String, String)>,
+}
+
+impl RealLoginHost {
+    fn load(opts: &GlobalOpts) -> Self {
+        let overrides = opts
+            .client()
+            .list_agent_backend_commands()
+            .ok()
+            .and_then(|payload| payload["commands"].as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|entry| {
+                Some((
+                    entry["backend"].as_str()?.to_string(),
+                    entry["command"].as_str()?.to_string(),
+                ))
+            })
+            .collect();
+        Self { overrides }
+    }
+}
+
+impl LoginHost for RealLoginHost {
+    fn probe(&self, probe: &dyn LoginProbe) -> ProbeOutcome {
+        let command = self
+            .overrides
+            .iter()
+            .find(|(backend, _)| backend == probe.backend_name())
+            .map(|(_, command)| command.clone())
+            .or_else(|| std::env::var(probe.command_env_var()).ok())
+            .unwrap_or_else(|| probe.default_program().to_string());
+        if ralphus_core::shellcmd::is_compound_command(&command) {
+            return ProbeOutcome::Skipped(format!("{command} is a compound command"));
+        }
+        let path = if std::path::Path::new(&command).exists() {
+            Some(command.clone())
+        } else {
+            ralphus_core::process::which(&command)
+        };
+        let Some(program) = path else {
+            return ProbeOutcome::NotInstalled(format!("{command} not found"));
+        };
+        let status = match ralphus_runner::login_probe::run_status_command(
+            &program,
+            probe.status_args(),
+            ralphus_runner::version_probe::DEFAULT_VERSION_PROBE_TIMEOUT,
+        ) {
+            StatusRun::SpawnFailed(error) => LoginStatus {
+                state: LoginState::Unknown,
+                summary: error,
+            },
+            StatusRun::TimedOut => LoginStatus {
+                state: LoginState::Unknown,
+                summary: "status probe timed out".to_string(),
+            },
+            StatusRun::Finished { exit_ok, output } => {
+                let env_present =
+                    |name: &str| std::env::var_os(name).is_some_and(|value| !value.is_empty());
+                probe.parse(&output, exit_ok, &env_present)
+            }
+        };
+        ProbeOutcome::Checked { program, status }
+    }
+
+    fn spawn_login(&self, program: &str, args: &[&str]) -> std::io::Result<i32> {
+        let status = std::process::Command::new(program).args(args).status()?;
+        Ok(status.code().unwrap_or(-1))
+    }
+
+    fn is_interactive(&self) -> bool {
+        std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+    }
+
+    fn is_ssh_session(&self) -> bool {
+        ["SSH_CONNECTION", "SSH_TTY"]
+            .iter()
+            .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+    }
+
+    fn read_line(&self, question: &str) -> String {
+        print!("{question} ");
+        let _ = std::io::stdout().flush();
+        let mut answer = String::new();
+        let _ = std::io::stdin().read_line(&mut answer);
+        answer.trim().to_string()
+    }
+}
+
+fn step_agent_logins(opts: &GlobalOpts, setup: &InitializeServerOptions) -> Vec<AgentLoginReport> {
+    run_agent_logins(
+        &RealLoginHost::load(opts),
+        &login_probes(),
+        setup.agent_logins.as_deref(),
+        setup.yes,
+    )
+}
+
+fn probe_names(probe: &dyn LoginProbe) -> Vec<&'static str> {
+    vec![probe.backend_name(), probe.default_program()]
+}
+
+fn config_dir_text(probe: &dyn LoginProbe) -> String {
+    probe
+        .config_dir()
+        .map_or_else(|| "unknown".to_string(), |dir| dir.display().to_string())
+}
+
+/// Probes every backend once, then lets the user pick which logged-out ones to
+/// log in to. `selection` is the `--agent-logins` answer; with `--yes` and no
+/// answer the step only reports, and it never spawns without a terminal.
+fn run_agent_logins(
+    host: &dyn LoginHost,
+    probes: &[&dyn LoginProbe],
+    selection: Option<&str>,
+    yes: bool,
+) -> Vec<AgentLoginReport> {
+    let mut reports = Vec::new();
+    let mut candidates: Vec<(&dyn LoginProbe, String)> = Vec::new();
+    for &probe in probes {
+        let name = probe.display_name();
+        let state = match host.probe(probe) {
+            ProbeOutcome::NotInstalled(reason) => {
+                println!("  {name}: not installed ({reason}); skipping");
+                None
+            }
+            ProbeOutcome::Skipped(reason) => {
+                println!("  {name}: not probed ({reason})");
+                None
+            }
+            ProbeOutcome::Checked { program, status } => {
+                match status.state {
+                    LoginState::LoggedIn => {
+                        println!("  {name}: OK, logged in ({})", status.summary)
+                    }
+                    LoginState::LoggedOut => {
+                        println!(
+                            "  {name}: not logged in (config dir: {}); {name} cells and proofs will fail to authenticate until you log in",
+                            config_dir_text(probe)
+                        );
+                        candidates.push((probe, program));
+                    }
+                    LoginState::Unknown => {
+                        println!("  {name}: login state unknown ({})", status.summary);
+                    }
+                }
+                Some(status.state)
+            }
+        };
+        reports.push(AgentLoginReport {
+            backend: probe.backend_name(),
+            aliases: probe_names(probe),
+            state,
+        });
+    }
+    if candidates.is_empty() {
+        return reports;
+    }
+
+    let answer = match selection {
+        Some(answer) => answer.to_string(),
+        None if yes => {
+            println!(
+                "  skipping logins (--yes); run the commands above yourself, or pass --agent-logins <claude,codex|all|none>"
+            );
+            for (probe, _) in &candidates {
+                println!("    {}: {}", probe.display_name(), probe.login_command());
+            }
+            return reports;
+        }
+        None => {
+            let names: Vec<&str> = candidates
+                .iter()
+                .map(|(probe, _)| probe.default_program())
+                .collect();
+            host.read_line(&format!(
+                "  log in to which? ({}, all, or none) [none]:",
+                names.join(", ")
+            ))
+        }
+    };
+    let chosen = select_logins(&answer, &candidates);
+    if chosen.is_empty() {
+        println!("  skipped: no agent logins selected");
+        return reports;
+    }
+
+    for index in chosen {
+        let (probe, program) = &candidates[index];
+        let outcome = log_in(host, *probe, program, yes);
+        if let (Some(state), Some(report)) = (
+            outcome,
+            reports
+                .iter_mut()
+                .find(|report| report.backend == probe.backend_name()),
+        ) {
+            report.state = Some(state);
+        }
+    }
+    reports
+}
+
+/// Indices into `candidates` named by a comma-separated `answer` (`all`,
+/// `none`, or backend names); unknown names are reported and ignored.
+fn select_logins(answer: &str, candidates: &[(&dyn LoginProbe, String)]) -> Vec<usize> {
+    let mut chosen = Vec::new();
+    for token in answer
+        .split(',')
+        .map(|token| token.trim().to_ascii_lowercase())
+        .filter(|token| !token.is_empty())
+    {
+        match token.as_str() {
+            "none" => return Vec::new(),
+            "all" => return (0..candidates.len()).collect(),
+            _ => match candidates
+                .iter()
+                .position(|(probe, _)| probe_names(*probe).contains(&token.as_str()))
+            {
+                Some(index) => {
+                    if !chosen.contains(&index) {
+                        chosen.push(index);
+                    }
+                }
+                None => println!("  ignoring \"{token}\": not a logged-out agent backend here"),
+            },
+        }
+    }
+    chosen
+}
+
+/// Starts (or tells the user how to start) one backend's login, then probes
+/// once more. Returns the backend's state afterwards, `None` if nothing ran
+/// that could have changed it.
+fn log_in(
+    host: &dyn LoginHost,
+    probe: &dyn LoginProbe,
+    program: &str,
+    yes: bool,
+) -> Option<LoginState> {
+    let name = probe.display_name();
+    let ssh = host.is_ssh_session();
+    let args = probe.login_args(ssh);
+    let command = match args {
+        Some(args) => format!("{} {}", probe.default_program(), args.join(" ")),
+        None => probe.login_command().to_string(),
+    };
+    println!(
+        "  {name}: logging in with `{command}` (config dir: {})",
+        config_dir_text(probe)
+    );
+    let mut ran = false;
+    match args {
+        Some(args) if host.is_interactive() => match host.spawn_login(program, args) {
+            Ok(code) => {
+                println!("  `{command}` exited with code {code}");
+                ran = true;
+            }
+            Err(error) => println!("  could not run `{command}`: {error}"),
+        },
+        _ => {
+            if ssh && args.is_none() {
+                println!(
+                    "  this is an SSH session, so run it where you can finish the browser sign-in"
+                );
+            }
+            println!("  run this yourself: {command}");
+        }
+    }
+    if !ran {
+        if yes || !host.is_interactive() {
+            return None;
+        }
+        let answer =
+            host.read_line("  press Enter once you have logged in to re-check (or s to skip):");
+        if answer.to_ascii_lowercase().starts_with('s') {
+            println!("  skipped re-check for {name}");
+            return None;
+        }
+    }
+    match host.probe(probe) {
+        ProbeOutcome::Checked { status, .. } => {
+            match status.state {
+                LoginState::LoggedIn => {
+                    println!("  {name}: OK, now logged in ({})", status.summary)
+                }
+                LoginState::LoggedOut => {
+                    println!("  {name}: still not logged in; run `{command}` when you are ready");
+                }
+                LoginState::Unknown => {
+                    println!("  {name}: login state unknown ({})", status.summary);
+                }
+            }
+            Some(status.state)
+        }
+        ProbeOutcome::NotInstalled(reason) | ProbeOutcome::Skipped(reason) => {
+            println!("  {name}: could not re-check ({reason})");
+            None
+        }
+    }
 }
 
 // ---- project registration --------------------------------------------------
@@ -1168,15 +1531,9 @@ fn persist_default_admin(name: &str) -> Result<(PathBuf, bool), String> {
 fn step_health(opts: &GlobalOpts) -> Vec<CheckResult> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     println!("  a passing `ralphus check health` is required before ralphus can run real work.");
-    let _ = crate::commands::misc::cmd_check(
-        opts,
-        CheckArgs {
-            enable_developer_checks: false,
-            all_remotes: false,
-            enable_live_agent_check: false,
-        },
-    );
-    crate::health::run_checks(&opts.daemon_url, &cwd, false, false, false)
+    let results = crate::health::run_checks(&opts.daemon_url, &cwd, false, false, false);
+    let _ = crate::commands::misc::report_health(opts, &cwd, &results);
+    results
 }
 
 fn health_ok_for_sample(results: &[CheckResult], requires_agent: bool) -> bool {
@@ -1228,6 +1585,7 @@ fn step_sample(
     opts: &GlobalOpts,
     project: Option<&str>,
     health_results: &[CheckResult],
+    logins: &[AgentLoginReport],
     setup: &InitializeServerOptions,
 ) {
     let Some(project) = project else {
@@ -1257,13 +1615,19 @@ fn step_sample(
         return;
     }
     let agent = (mode == "agent").then(|| {
-        prompt(
+        let agent = prompt(
             &SAMPLE_AGENT,
             "  agent backend for the hello-world prompts",
-            "claude-code",
+            default_sample_agent(logins),
             setup.sample_agent.as_ref(),
             setup.yes,
-        )
+        );
+        if logged_out(logins, &agent) {
+            println!(
+                "  warning: {agent} is not logged in, so the sample cells will likely fail to authenticate"
+            );
+        }
+        agent
     });
     let toml_text = sample_task_toml(project, &mode, agent.as_deref());
     let client = opts.client();
@@ -1289,6 +1653,20 @@ fn step_sample(
     }
     println!("  saved the submitted TOML to {}", path.display());
     println!("  equivalent command: ralphus submit {}", path.display());
+}
+
+/// The first backend confirmed logged in, else `claude-code`.
+fn default_sample_agent(logins: &[AgentLoginReport]) -> &'static str {
+    logins
+        .iter()
+        .find(|report| report.state == Some(LoginState::LoggedIn))
+        .map_or("claude-code", |report| report.backend)
+}
+
+fn logged_out(logins: &[AgentLoginReport], agent: &str) -> bool {
+    logins
+        .iter()
+        .any(|report| report.answers_to(agent) && report.state == Some(LoginState::LoggedOut))
 }
 
 fn sample_label(mode: &str) -> String {
@@ -1318,7 +1696,7 @@ mod tests {
     #[test]
     fn interactive_settings_have_unique_prompt_and_flag_contracts() {
         assert!(interactive_settings_are_valid());
-        assert_eq!(INTERACTIVE_SETTINGS.len(), 28);
+        assert_eq!(INTERACTIVE_SETTINGS.len(), 29);
     }
 
     #[test]
@@ -1342,6 +1720,295 @@ mod tests {
             ralphus_core::validate::validate_toml(&toml).is_ok(),
             "{toml}"
         );
+    }
+
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    /// Scripted [`LoginHost`]: each backend's probes pop from a queue (the
+    /// last entry repeats); spawns and prompts are recorded.
+    struct MockHost {
+        probes: RefCell<HashMap<&'static str, Vec<ProbeOutcome>>>,
+        interactive: bool,
+        ssh: bool,
+        answers: RefCell<Vec<String>>,
+        questions: RefCell<Vec<String>>,
+        spawns: RefCell<Vec<(String, Vec<String>)>>,
+        probe_calls: RefCell<Vec<&'static str>>,
+        /// Logs the backend in as a side effect of a spawn.
+        spawn_fixes: bool,
+    }
+
+    fn checked(state: LoginState) -> ProbeOutcome {
+        ProbeOutcome::Checked {
+            program: "prog".to_string(),
+            status: LoginStatus {
+                state,
+                summary: "summary".to_string(),
+            },
+        }
+    }
+
+    fn host(claude: Vec<ProbeOutcome>, codex: Vec<ProbeOutcome>) -> MockHost {
+        MockHost {
+            probes: RefCell::new(HashMap::from([("claude-code", claude), ("codex", codex)])),
+            interactive: true,
+            ssh: false,
+            answers: RefCell::new(Vec::new()),
+            questions: RefCell::new(Vec::new()),
+            spawns: RefCell::new(Vec::new()),
+            probe_calls: RefCell::new(Vec::new()),
+            spawn_fixes: false,
+        }
+    }
+
+    impl LoginHost for MockHost {
+        fn probe(&self, probe: &dyn LoginProbe) -> ProbeOutcome {
+            self.probe_calls.borrow_mut().push(probe.backend_name());
+            let mut probes = self.probes.borrow_mut();
+            let queue = probes.get_mut(probe.backend_name()).expect("scripted");
+            if queue.len() > 1 {
+                queue.remove(0)
+            } else {
+                queue[0].clone()
+            }
+        }
+        fn spawn_login(&self, program: &str, args: &[&str]) -> std::io::Result<i32> {
+            self.spawns.borrow_mut().push((
+                program.to_string(),
+                args.iter().map(ToString::to_string).collect(),
+            ));
+            if self.spawn_fixes {
+                for queue in self.probes.borrow_mut().values_mut() {
+                    if queue.first() == Some(&checked(LoginState::LoggedOut)) {
+                        *queue = vec![checked(LoginState::LoggedIn)];
+                    }
+                }
+            }
+            Ok(0)
+        }
+        fn is_interactive(&self) -> bool {
+            self.interactive
+        }
+        fn is_ssh_session(&self) -> bool {
+            self.ssh
+        }
+        fn read_line(&self, question: &str) -> String {
+            self.questions.borrow_mut().push(question.to_string());
+            let mut answers = self.answers.borrow_mut();
+            if answers.is_empty() {
+                String::new()
+            } else {
+                answers.remove(0)
+            }
+        }
+    }
+
+    fn run(host: &MockHost, selection: Option<&str>, yes: bool) -> Vec<AgentLoginReport> {
+        run_agent_logins(host, &login_probes(), selection, yes)
+    }
+
+    fn states(reports: &[AgentLoginReport]) -> Vec<Option<LoginState>> {
+        reports.iter().map(|report| report.state).collect()
+    }
+
+    #[test]
+    fn logged_in_backends_report_ok_without_prompting() {
+        let host = host(
+            vec![checked(LoginState::LoggedIn)],
+            vec![checked(LoginState::LoggedIn)],
+        );
+        let reports = run(&host, None, false);
+        assert!(host.questions.borrow().is_empty());
+        assert!(host.spawns.borrow().is_empty());
+        assert_eq!(
+            states(&reports),
+            [Some(LoginState::LoggedIn), Some(LoginState::LoggedIn)]
+        );
+    }
+
+    #[test]
+    fn uninstalled_backends_are_skipped_without_prompting() {
+        let missing = ProbeOutcome::NotInstalled("nope not found".to_string());
+        let host = host(vec![missing.clone()], vec![missing]);
+        let reports = run(&host, None, false);
+        assert!(host.questions.borrow().is_empty());
+        assert_eq!(states(&reports), [None, None]);
+    }
+
+    #[test]
+    fn logged_out_then_fixed_by_spawning_each_backends_login() {
+        for (answer, backend, args) in [
+            ("claude", "claude-code", vec!["auth", "login"]),
+            ("codex", "codex", vec!["login"]),
+        ] {
+            let mut host = host(
+                vec![checked(LoginState::LoggedOut)],
+                vec![checked(LoginState::LoggedOut)],
+            );
+            host.spawn_fixes = true;
+            let reports = run(&host, Some(answer), false);
+            assert_eq!(
+                *host.spawns.borrow(),
+                [(
+                    "prog".to_string(),
+                    args.iter().map(ToString::to_string).collect::<Vec<_>>()
+                )]
+            );
+            let report = reports.iter().find(|r| r.backend == backend).unwrap();
+            assert_eq!(report.state, Some(LoginState::LoggedIn), "{backend}");
+            // The other backend was skipped and stays logged out.
+            let other = reports.iter().find(|r| r.backend != backend).unwrap();
+            assert_eq!(other.state, Some(LoginState::LoggedOut));
+        }
+    }
+
+    #[test]
+    fn both_logged_out_are_chosen_from_one_prompt_and_both_fixed() {
+        let mut host = host(
+            vec![checked(LoginState::LoggedOut)],
+            vec![checked(LoginState::LoggedOut)],
+        );
+        host.spawn_fixes = true;
+        host.answers.borrow_mut().push("claude, codex".to_string());
+        let reports = run(&host, None, false);
+        assert_eq!(host.questions.borrow().len(), 1);
+        assert_eq!(host.spawns.borrow().len(), 2);
+        assert_eq!(
+            states(&reports),
+            [Some(LoginState::LoggedIn), Some(LoginState::LoggedIn)]
+        );
+    }
+
+    #[test]
+    fn all_selects_every_logged_out_backend() {
+        let host = host(
+            vec![checked(LoginState::LoggedOut)],
+            vec![checked(LoginState::LoggedOut)],
+        );
+        host.answers.borrow_mut().push("all".to_string());
+        run(&host, None, false);
+        assert_eq!(host.spawns.borrow().len(), 2);
+    }
+
+    #[test]
+    fn skipping_spawns_nothing_and_leaves_state_logged_out() {
+        for answer in ["none", ""] {
+            let host = host(
+                vec![checked(LoginState::LoggedOut)],
+                vec![checked(LoginState::LoggedOut)],
+            );
+            host.answers.borrow_mut().push(answer.to_string());
+            let reports = run(&host, None, false);
+            assert!(host.spawns.borrow().is_empty());
+            assert_eq!(
+                states(&reports),
+                [Some(LoginState::LoggedOut), Some(LoginState::LoggedOut)]
+            );
+        }
+    }
+
+    #[test]
+    fn logged_out_but_still_logged_out_after_the_login_reports_it() {
+        let host = host(
+            vec![checked(LoginState::LoggedOut)],
+            vec![checked(LoginState::LoggedIn)],
+        );
+        let reports = run(&host, Some("claude"), false);
+        assert_eq!(host.spawns.borrow().len(), 1);
+        assert_eq!(reports[0].state, Some(LoginState::LoggedOut));
+    }
+
+    #[test]
+    fn yes_without_a_selection_reports_only() {
+        let host = host(
+            vec![checked(LoginState::LoggedOut)],
+            vec![checked(LoginState::LoggedOut)],
+        );
+        let reports = run(&host, None, true);
+        assert!(host.questions.borrow().is_empty());
+        assert!(host.spawns.borrow().is_empty());
+        assert_eq!(host.probe_calls.borrow().len(), 2, "probed once each");
+        assert_eq!(reports[0].state, Some(LoginState::LoggedOut));
+    }
+
+    #[test]
+    fn without_a_terminal_the_command_is_printed_not_spawned_or_waited_on() {
+        let mut host = host(
+            vec![checked(LoginState::LoggedOut)],
+            vec![checked(LoginState::LoggedIn)],
+        );
+        host.interactive = false;
+        let reports = run(&host, Some("all"), false);
+        assert!(host.spawns.borrow().is_empty());
+        assert!(host.questions.borrow().is_empty());
+        assert_eq!(reports[0].state, Some(LoginState::LoggedOut));
+    }
+
+    #[test]
+    fn claude_over_ssh_prints_the_command_and_rechecks_after_enter() {
+        let mut host = host(
+            vec![
+                checked(LoginState::LoggedOut),
+                checked(LoginState::LoggedIn),
+            ],
+            vec![checked(LoginState::LoggedIn)],
+        );
+        host.ssh = true;
+        host.answers.borrow_mut().push(String::new());
+        let reports = run(&host, Some("claude"), false);
+        assert!(host.spawns.borrow().is_empty());
+        assert_eq!(host.questions.borrow().len(), 1);
+        assert_eq!(reports[0].state, Some(LoginState::LoggedIn));
+    }
+
+    #[test]
+    fn claude_over_ssh_can_skip_the_recheck() {
+        let mut host = host(
+            vec![checked(LoginState::LoggedOut)],
+            vec![checked(LoginState::LoggedIn)],
+        );
+        host.ssh = true;
+        host.answers.borrow_mut().push("s".to_string());
+        let reports = run(&host, Some("claude"), false);
+        assert_eq!(host.probe_calls.borrow().len(), 2, "no re-probe");
+        assert_eq!(reports[0].state, Some(LoginState::LoggedOut));
+    }
+
+    #[test]
+    fn codex_uses_device_auth_over_ssh() {
+        let mut host = host(
+            vec![checked(LoginState::LoggedIn)],
+            vec![checked(LoginState::LoggedOut)],
+        );
+        host.ssh = true;
+        run(&host, Some("codex"), false);
+        assert_eq!(
+            host.spawns.borrow()[0].1,
+            ["login".to_string(), "--device-auth".to_string()]
+        );
+    }
+
+    #[test]
+    fn sample_agent_defaults_to_a_logged_in_backend_and_warns_on_logged_out() {
+        let reports = vec![
+            AgentLoginReport {
+                backend: "claude-code",
+                aliases: vec!["claude-code", "claude"],
+                state: Some(LoginState::LoggedOut),
+            },
+            AgentLoginReport {
+                backend: "codex",
+                aliases: vec!["codex"],
+                state: Some(LoginState::LoggedIn),
+            },
+        ];
+        assert_eq!(default_sample_agent(&reports), "codex");
+        assert!(logged_out(&reports, "claude-code"));
+        assert!(logged_out(&reports, "claude"));
+        assert!(!logged_out(&reports, "codex"));
+        assert!(!logged_out(&reports, "ollama"));
+        assert_eq!(default_sample_agent(&[]), "claude-code");
     }
 
     #[test]

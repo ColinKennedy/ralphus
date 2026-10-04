@@ -74,6 +74,11 @@ pub trait LoginProbe: Sync {
     fn default_config_dirname(&self) -> &'static str;
     /// The command a human runs to log in.
     fn login_command(&self) -> &'static str;
+    /// Arguments an interactive setup flow passes to the backend program to
+    /// start its login. `None` when the flow cannot run inline in this kind of
+    /// session (`ssh_session`: the browser OAuth callback is unreachable), so
+    /// the caller should print [`Self::login_command`] for the user instead.
+    fn login_args(&self, ssh_session: bool) -> Option<&'static [&'static str]>;
     /// Pure interpretation of a finished status command. `env_present`
     /// reports whether an env var is set to a non-empty value.
     fn parse(&self, output: &str, exit_ok: bool, env_present: &dyn Fn(&str) -> bool)
@@ -136,6 +141,9 @@ impl LoginProbe for ClaudeCodeBackend {
     }
     fn login_command(&self) -> &'static str {
         "claude auth login"
+    }
+    fn login_args(&self, ssh_session: bool) -> Option<&'static [&'static str]> {
+        (!ssh_session).then_some(&["auth", "login"])
     }
     fn platform_caveat(&self) -> Option<&'static str> {
         cfg!(target_os = "macos").then_some(
@@ -217,6 +225,13 @@ impl LoginProbe for CodexBackend {
     }
     fn login_command(&self) -> &'static str {
         "codex login"
+    }
+    fn login_args(&self, ssh_session: bool) -> Option<&'static [&'static str]> {
+        Some(if ssh_session {
+            &["login", "--device-auth"]
+        } else {
+            &["login"]
+        })
     }
 
     fn parse(
