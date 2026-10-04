@@ -9586,6 +9586,11 @@ pub fn run_guardian_post_merge_for(
             ok,
             detail,
         );
+        // RAL-565: a pass that finished with every build command succeeded
+        // (or had none) starts its auto-run checks. A failed pass never does.
+        if ok {
+            crate::server::auto_run_ready_checks(store, id);
+        }
     }
     phase_note(
         store,
@@ -13782,6 +13787,8 @@ enum ManualCheckItem {
         cleanup_command: Option<String>,
         #[serde(default)]
         inputs: Vec<ManualCheckInputItem>,
+        #[serde(default)]
+        auto_run: Option<bool>,
     },
 }
 
@@ -13805,6 +13812,7 @@ impl From<ManualCheckItem> for GuardianCheck {
                 artifacts,
                 cleanup_command,
                 inputs,
+                auto_run,
             } => Self {
                 label: None,
                 command: Some(command),
@@ -13816,6 +13824,7 @@ impl From<ManualCheckItem> for GuardianCheck {
                 artifacts,
                 cleanup_command,
                 inputs: inputs.into_iter().map(CheckInput::from).collect(),
+                auto_run,
                 ..Self::default()
             },
         }
@@ -13954,7 +13963,10 @@ pub fn manual_commands_prompt(tail: &str, steering: Option<&str>) -> String {
          a blanket kill by image name such as `taskkill /IM python.exe` or `pkill python`, \
          which would take down unrelated work on the machine. A command with nothing variable and nothing \
          left running can stay a plain string. Structured objects may also include \
-         \"description\" and \"success\" guidance. Use \"run_on\": \"daemon\" unless the \
+         \"description\" and \"success\" guidance. Set \"auto_run\": true on an object only \
+         when you are very confident the command is safe to start unattended -- idempotent, \
+         non-destructive, non-interactive, and every input has a safe \"default\"; omit it \
+         otherwise. Use \"run_on\": \"daemon\" unless the \
          command explicitly needs the review machine.";
     let format = " Return ONLY a valid JSON array where each element is either a plain string or \
           the object shape described above — no markdown fences, no explanation, no \

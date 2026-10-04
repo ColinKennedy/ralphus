@@ -1920,6 +1920,25 @@ which wins over the global `[review]` value, which wins over `false`. A
 non-boolean value is a `400`. The project endpoint also reports the resolved
 default under `effective.skip_manual_checks`.
 
+`auto_run` (boolean, default `false`) makes the daemon run a review's ready
+manual checks itself once their build succeeds: after a rebuild settles, each
+check whose `preparation_state` is `ready` and whose inputs all have defaults is
+launched in a visible terminal on the daemon's own machine (never a remote
+one), with its `cleanup_command` and `lifecycle.before_reset_command` respected
+exactly as a manual click would. A check with no build commands runs as soon as
+it is ready. Each check is claimed once per machine and per prepared generation
+(`prepared_at_ms`), so a manual click is never blocked and a rebuild re-arms the
+run. A failed auto-run only produces an informational notice. Precedence, first
+set wins: the check's own `auto_run` (a `[[review.action]]` field, or emitted by
+the check generator with a confidence caveat), the review's `auto_run`, the
+project's `auto_run` (`.ralphus.toml` `[review] auto_run`, or the database
+default written through `POST /api/projects/{name}/review-settings`), then
+`false`. A submission that defines its own checks is authoritative: project
+hint definitions are not layered on top of it. The review reports `auto_run`
+(its own value, `null` when inheriting) and `effective_auto_run`; the project
+endpoint reports the resolved default under `effective.auto_run`. A non-boolean
+value is a `400`.
+
 `rebuild_on` (array of strings, default every event) controls which events tear
 down and rebuild a review's prepared build — the preparation that makes its
 test actions and generated manual checks runnable. Each entry is one of

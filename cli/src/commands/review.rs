@@ -136,6 +136,7 @@ pub enum ReviewCommand {
         /// This review's own override for whether manual-check generation is
         /// skipped. Defaults to `false` (generation runs) when unset.
         skip_manual_checks: Option<bool>,
+        auto_run: Option<bool>,
         /// This review's own list of events that tear down and rebuild its
         /// prepared build. Outer `None` leaves it alone, `Some(None)` clears
         /// it back to inherit, `Some(Some(list))` sets it (an empty list never
@@ -440,6 +441,7 @@ pub fn parse(args: &[String]) -> ReviewCommand {
                 take_tri_bool(&mut scanner, "--auto-cancel-outdated-pr-pipelines");
             let cache_manual_checks = take_tri_bool(&mut scanner, "--cache-manual-checks");
             let skip_manual_checks = take_tri_bool(&mut scanner, "--skip-manual-checks");
+            let auto_run = take_tri_bool(&mut scanner, "--auto-run");
             let rebuild_on = match take_rebuild_on(&mut scanner) {
                 Ok(value) => value,
                 Err(UsageError(message)) => return ReviewCommand::UsageError(message),
@@ -465,6 +467,7 @@ pub fn parse(args: &[String]) -> ReviewCommand {
                 auto_cancel_outdated_pr_pipelines,
                 cache_manual_checks,
                 skip_manual_checks,
+                auto_run,
                 rebuild_on,
             })
         }
@@ -1421,6 +1424,7 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
             auto_cancel_outdated_pr_pipelines,
             cache_manual_checks,
             skip_manual_checks,
+            auto_run,
             rebuild_on,
         } => run_and_report(opts, None, || {
             let resolved = resolve_guardian_selector(&client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
@@ -1444,6 +1448,7 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
                 auto_cancel_outdated_pr_pipelines,
                 cache_manual_checks,
                 skip_manual_checks,
+                auto_run,
                 rebuild_on,
             };
             let result = client.guardian_settings(&resolved.guardian_id, &settings)?;
@@ -3192,6 +3197,22 @@ mod tests {
                 skip_manual_checks, ..
             } => assert_eq!(skip_manual_checks, None),
             other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_settings_auto_run_tri_state() {
+        for (flag, want) in [
+            (Some("--auto-run"), Some(true)),
+            (Some("--no-auto-run"), Some(false)),
+            (None, None),
+        ] {
+            let mut args = vec!["settings", "g1"];
+            args.extend(flag);
+            match parse(&v(&args)) {
+                ReviewCommand::Settings { auto_run, .. } => assert_eq!(auto_run, want),
+                other => panic!("unexpected: {other:?}"),
+            }
         }
     }
 

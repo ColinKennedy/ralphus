@@ -850,6 +850,10 @@ pub struct ProjectReviewSettings {
     /// for a review. Defaults to `false` when unset.
     #[serde(default)]
     pub skip_manual_checks: Option<bool>,
+    /// RAL-565: project-level default for whether manual checks auto-run once
+    /// ready. Defaults to `false` when unset.
+    #[serde(default)]
+    pub auto_run: Option<bool>,
     /// Project-level default for which events (`rebase`, `feedback`,
     /// `auto_fix`) tear down and rebuild a review's prepared build. Unset
     /// resolves to all three; an empty list never rebuilds automatically.
@@ -909,6 +913,7 @@ impl ProjectReviewSettings {
             auto_cancel_outdated_pr_pipelines: self.auto_cancel_outdated_pr_pipelines,
             cache_manual_checks: self.cache_manual_checks,
             skip_manual_checks: self.skip_manual_checks,
+            auto_run: self.auto_run,
             rebuild_on: self.rebuild_on,
             auto_fix_max_attempts: None,
             auto_fix_retry_base_seconds: None,
@@ -3492,6 +3497,9 @@ impl Store {
             // skipped. NULL inherits the project/global default, which
             // resolves to `false` (generation runs).
             "ALTER TABLE guardians ADD COLUMN skip_manual_checks INTEGER",
+            // RAL-565: per-review default for auto-running manual checks. NULL
+            // inherits the project/global default, which resolves to `false`.
+            "ALTER TABLE guardians ADD COLUMN auto_run INTEGER",
             // RAL-562: write-once marker (epoch ms) of the first moment every
             // enabled branch was settled while the review was `in_review` --
             // the "review is ready" banner shows only for reviews carrying it.
@@ -17487,6 +17495,7 @@ command = "e"
             auto_cancel_outdated_pr_pipelines: Some(false),
             cache_manual_checks: Some(false),
             skip_manual_checks: Some(true),
+            auto_run: Some(true),
             rebuild_on: Some(vec!["feedback".to_string(), "auto_fix".to_string()]),
             base_shift_maximum_rebuilds: Some(5),
             default_pr_user: Some("alice".to_string()),
