@@ -1,5 +1,35 @@
-//! Best-effort per-command labels for shell command lines, shared by the
-//! agent backends that surface shell tool calls.
+//! Best-effort per-command labels for shell command lines, and the generic
+//! tool-argument renderer, shared by the agent backends that surface tool
+//! calls.
+
+use serde_json::Value;
+
+/// Renders a tool call's arguments compactly for the live tmux pane
+/// (RAL-102), mirroring the old `claude_code_backend.py`'s
+/// `_format_tool_input`. `truncate_chars` (RAL-303) is the per-value
+/// character budget before a trailing `…` is appended -- configurable via
+/// `[live_view] tool_arg_truncate_chars`.
+pub fn format_tool_input(input: &Value, truncate_chars: usize) -> String {
+    let Some(obj) = input.as_object() else {
+        return String::new();
+    };
+    obj.iter()
+        .map(|(key, value)| {
+            let text = match value {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            let text = if text.chars().count() > truncate_chars {
+                let truncated: String = text.chars().take(truncate_chars).collect();
+                format!("{truncated}…")
+            } else {
+                text
+            };
+            format!("{key}={text:?}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 /// One lexed piece of a shell command line.
 enum ShellTok {

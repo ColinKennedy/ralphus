@@ -1,0 +1,15 @@
+{"type":"message_update","assistantMessageEvent":{"type":"toolcall_start","contentIndex":0,"id":"call_dfb89ecf271a483799e8900f","toolName":"bash"}}
+{"type":"message_update","assistantMessageEvent":{"type":"toolcall_delta","contentIndex":0,"delta":""}}
+{"type":"message_update","assistantMessageEvent":{"type":"toolcall_delta","contentIndex":0,"delta":""}}
+{"type":"message_update","assistantMessageEvent":{"type":"toolcall_delta","contentIndex":0,"delta":"{\"command\": "}}
+{"type":"message_update","assistantMessageEvent":{"type":"toolcall_delta","contentIndex":0,"delta":"\"echo hi\""}}
+{"type":"message_update","assistantMessageEvent":{"type":"toolcall_delta","contentIndex":0,"delta":"}"}}
+{"type":"message_update","assistantMessageEvent":{"type":"toolcall_start","contentIndex":1,"id":"call_7861ad4d96e049bf89f673c5","toolName":"read"}}
+{"type":"message_update","assistantMessageEvent":{"type":"toolcall_delta","contentIndex":1,"delta":""}}
+{"type":"message_update","assistantMessageEvent":{"type":"toolcall_delta","contentIndex":1,"delta":""}}
+{"type":"message_update","assistantMessageEvent":{"type":"toolcall_delta","contentIndex":1,"delta":"{\"path\": \"a"}}
+{"type":"message_update","assistantMessageEvent":{"type":"toolcall_delta","contentIndex":1,"delta":".txt\""}}
+{"type":"message_update","assistantMessageEvent":{"type":"toolcall_delta","contentIndex":1,"delta":"}"}}
+{"type":"message_update","assistantMessageEvent":{"type":"toolcall_end","contentIndex":0,"toolCall":{"type":"toolCall","id":"call_dfb89ecf271a483799e8900f","name":"bash","arguments":{"command":"echo hi"}}}}
+{"type":"message_update","assistantMessageEvent":{"type":"toolcall_end","contentIndex":1,"toolCall":{"type":"toolCall","id":"call_7861ad4d96e049bf89f673c5","name":"read","arguments":{"path":"a.txt"}}}}
+{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"done {github,gitlab}"}}
