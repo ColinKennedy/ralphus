@@ -3622,6 +3622,15 @@ impl Store {
             "CREATE INDEX IF NOT EXISTS idx_cells_review_branch ON cells(review_branch)",
             [],
         );
+        // `list_ready` runs under the store lock on every scheduler tick: this
+        // turns its `state='pending' ORDER BY created_at_ms` lookup into an
+        // index seek, and lets `dependency_satisfying_squads` read
+        // `(id, state)` from the index alone instead of scanning `squads`
+        // rows, which is what made a cold-cache first tick slow.
+        let _ = self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_squads_state_created ON squads(state, created_at_ms, id)",
+            [],
+        );
         // RAL-314: same reasoning as `idx_cells_review_branch` above, for the
         // direct guardian-id join `reviews_by_branch`/`collecting_guardians_for_cells`
         // now prefer over the branch-string join.
@@ -4486,12 +4495,22 @@ impl Store {
         let pending = stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        if pending.is_empty() {
+            return Ok(Vec::new());
+        }
 
-        let satisfied = Self::dependency_satisfying_squads(&self.conn)?;
+        let deps_by_squad: Vec<(String, Vec<String>)> = pending
+            .into_iter()
+            .map(|(id, deps_json)| (id, from_json(&deps_json)))
+            .collect();
+        let satisfied = if deps_by_squad.iter().any(|(_, deps)| !deps.is_empty()) {
+            Self::dependency_satisfying_squads(&self.conn)?
+        } else {
+            HashSet::new()
+        };
         let gated = self.block_gated_squads()?;
         let mut ready = Vec::new();
-        for (id, deps_json) in pending {
-            let deps: Vec<String> = from_json(&deps_json);
+        for (id, deps) in deps_by_squad {
             if Self::deps_satisfied_in(&satisfied, &deps) && !gated.contains(&id) {
                 ready.push(id);
             }
