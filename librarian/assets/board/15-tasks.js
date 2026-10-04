@@ -89,6 +89,7 @@
       function ttBuildRows() {
         /** @type {TtRow[]} */
         const rows = [];
+        const attentionReviewIds = new Set(guardians.filter((g) => reviewMatchesQuickFilter("needs", g)).map((g) => g.id));
         for (const squad of squads) {
           const tasks = squad.tasks || [];
           for (let taskIdx = 0; taskIdx < tasks.length; taskIdx++) {
@@ -100,7 +101,7 @@
             const explicitWatch = taskTabWatches.find((w) => w.entity_uri === ttTaskEntityUri(squad.id, taskIdx));
             const squadWatch = taskTabWatches.find((w) => w.entity_uri === ttSquadEntityUri(squad.id));
             const notifyTiers = (explicitWatch || squadWatch || {}).notify_tiers || [];
-            const needs = ttTaskNeedsMe(task, watch, notifyTiers, reviews, prs.length);
+            const needs = ttTaskNeedsMe(task, watch, notifyTiers, reviews, prs.length, attentionReviewIds);
             const startedAtMs = task.started_at_ms ?? null;
             const finishedAtMs = task.finished_at_ms ?? null;
             const durationMs = task.duration_ms ?? 0;

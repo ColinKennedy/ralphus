@@ -269,10 +269,17 @@ test("ttTaskNeedsMe fires for a watched, failed task", () => {
 
 test("ttTaskNeedsMe fires for a watched task with a review in_review", () => {
   const task = { state: "running" };
-  const reviews = [{ name: "R1", status: "in_review" }];
-  const r = ttTaskNeedsMe(task, { watched: true }, [], reviews, 0);
+  const reviews = [{ id: "g1", name: "R1", status: "in_review" }];
+  const r = ttTaskNeedsMe(task, { watched: true }, [], reviews, 0, new Set(["g1"]));
   assert.equal(r.needs, true);
   assert.match(r.reason, /in_review/);
+});
+
+test("ttTaskNeedsMe ignores an in_review review the daemon has not marked as needing attention", () => {
+  const task = { state: "running" };
+  const reviews = [{ id: "g1", name: "R1", status: "in_review" }];
+  assert.equal(ttTaskNeedsMe(task, { watched: true }, [], reviews, 0).needs, false);
+  assert.equal(ttTaskNeedsMe(task, { watched: true }, [], reviews, 0, new Set(["other"])).needs, false);
 });
 
 test("ttTaskNeedsMe fires for a merged review with no PR, but not once a PR exists", () => {
