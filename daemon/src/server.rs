@@ -17488,6 +17488,106 @@ pub(crate) fn run_check_unattended(
     )
 }
 
+/// RAL-565: which checks of `g` should start on their own right now, as
+/// `(kind, index)` pairs where `kind` is `"action"` (declared) or `"manual"`
+/// (generated). A check qualifies when it is ready, local, runnable, has every
+/// input defaulted, and its own `auto_run` -- falling back to the review's
+/// resolved default -- is on.
+fn auto_run_candidates(g: &crate::guardian::GuardianView) -> Vec<(&'static str, usize)> {
+    let eligible = |check: &crate::guardian::GuardianCheck| {
+        check.auto_run.unwrap_or(g.effective_auto_run)
+            && check.preparation_state.as_deref() == Some("ready")
+            && check.command.is_some()
+            && check.run_on.as_deref() != Some("review_machine")
+            && !(check.run_on.is_none() && g.machine.is_some())
+            && check
+                .inputs
+                .iter()
+                .all(|input| !input.default.is_empty() || g.input_values.contains_key(&input.name))
+    };
+    let mut out = Vec::new();
+    if !crate::guardian::GuardianStatus::is_terminal_status(&g.status) {
+        for (i, check) in g.action_hints.iter().enumerate() {
+            if eligible(check) {
+                out.push(("action", i));
+            }
+        }
+        for (i, check) in g.manual_commands.iter().enumerate() {
+            if eligible(check) {
+                out.push(("manual", i));
+            }
+        }
+    }
+    out
+}
+
+/// Claim one auto-run of a check generation on this daemon host. The key
+/// includes the generation's `prepared_at_ms`, so a rebuild that re-prepares
+/// the check opens a new claim while a repeat pass over the same generation
+/// cannot start it twice. Manual clicks never consult the claim.
+fn claim_auto_run(key: String) -> bool {
+    static CLAIMED: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+        std::sync::Mutex::new(None);
+    let mut guard = CLAIMED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard
+        .get_or_insert_with(std::collections::HashSet::new)
+        .insert(key)
+}
+
+/// RAL-565: start every ready, opted-in check of review `id` in a visible
+/// terminal, once per prepared generation. The check's `cleanup_command`
+/// (teardown of a previous run) runs first. Launching happens on its own
+/// thread so the preparation worker that calls this is never held up.
+pub(crate) fn auto_run_ready_checks(store: &crate::store_lock::StoreHandle, id: &str) {
+    let Ok(g) = store.lock().get_guardian(id) else {
+        return;
+    };
+    for (kind, index) in auto_run_candidates(&g) {
+        let check = if kind == "action" {
+            &g.action_hints[index]
+        } else {
+            &g.manual_commands[index]
+        };
+        let key = format!("{id}|{kind}|{index}|{}", check.prepared_at_ms.unwrap_or(0));
+        if !claim_auto_run(key) {
+            continue;
+        }
+        let check = check.clone();
+        let g = g.clone();
+        let store = store.clone();
+        let id = id.to_string();
+        std::thread::spawn(move || {
+            let cwd = check
+                .prepared_cwd
+                .clone()
+                .or_else(|| g.combined_worktree.clone())
+                .unwrap_or_else(|| g.git_root.clone());
+            let marker = new_check_run_marker(&id, kind, index);
+            let log = check_run_log_path(&id, kind, index);
+            let Some(prepared) = build_check_command_line(
+                &cwd,
+                &check,
+                &std::collections::HashMap::new(),
+                &g.input_values,
+                true,
+                &marker,
+                &log,
+            ) else {
+                return;
+            };
+            match spawn_in_terminal(None, "cmd", &prepared.args, &g.manual_checks_env) {
+                Ok(()) => watch_check_run(store, &id, kind, index, &prepared),
+                Err(e) => crate::rlog!(
+                    WARNING,
+                    "ralphus [guardian] review {id} auto-run of {kind} check {index} could not open a terminal: {e}"
+                ),
+            }
+        });
+    }
+}
+
 /// Run one or all LLM-generated manual review commands as fire-and-forget
 /// terminal subprocesses (RAL-27). Body `{ "index": N, "inputs": {...},
 /// "run_cleanup": bool }` runs command N only; no body (or `{}`) runs all
