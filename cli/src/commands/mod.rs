@@ -364,6 +364,17 @@ fn parse_sample_mode(scanner: &mut Scanner) -> Result<Option<String>, UsageError
         })
 }
 
+fn parse_forge_provider(scanner: &mut Scanner) -> Result<Option<String>, UsageError> {
+    scanner
+        .take_value("--forge-provider")?
+        .map_or(Ok(None), |value| match value.as_str() {
+            "github" | "gitlab" => Ok(Some(value)),
+            _ => Err(UsageError(format!(
+                "--forge-provider: expected github or gitlab, got '{value}'"
+            ))),
+        })
+}
+
 fn parse_initialize_server(
     scanner: &mut Scanner,
 ) -> Result<initialize_server::InitializeServerOptions, UsageError> {
@@ -392,6 +403,8 @@ fn parse_initialize_server(
         forge_token: scanner.take_value("--forge-token")?,
         create_admin: parse_initialize_bool(scanner, "--create-admin")?,
         admin_name: scanner.take_value("--admin-name")?,
+        setup_forge_token: parse_initialize_bool(scanner, "--setup-forge-token")?,
+        forge_provider: parse_forge_provider(scanner)?,
         submit_sample: parse_initialize_bool(scanner, "--submit-sample")?,
         sample_mode: parse_sample_mode(scanner)?,
         sample_agent: scanner.take_value("--sample-agent")?,
@@ -586,6 +599,10 @@ mod tests {
             "yes",
             "--admin-name",
             "Ada",
+            "--setup-forge-token",
+            "yes",
+            "--forge-provider",
+            "gitlab",
             "--submit-sample",
             "yes",
             "--sample-mode",
@@ -598,6 +615,8 @@ mod tests {
                 assert_eq!(setup.mcp_hosts, ["claude"]);
                 assert_eq!(setup.project_name.as_deref(), Some("ralphus"));
                 assert_eq!(setup.forge_token.as_deref(), Some("token"));
+                assert_eq!(setup.setup_forge_token, Some(true));
+                assert_eq!(setup.forge_provider.as_deref(), Some("gitlab"));
                 assert_eq!(setup.review_auto_submit_pr_stack, Some(true));
                 assert_eq!(setup.review_resolver_agent.as_deref(), Some("claude-code"));
                 assert_eq!(setup.sample_mode.as_deref(), Some("agent"));
@@ -619,6 +638,19 @@ mod tests {
     fn initialize_server_rejects_invalid_sample_mode() {
         match parse_args(&v(&["initialize", "server", "--sample-mode", "shell"])) {
             Command::UsageError(message) => assert!(message.contains("expected agent or raw")),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn initialize_server_rejects_invalid_forge_provider() {
+        match parse_args(&v(&[
+            "initialize",
+            "server",
+            "--forge-provider",
+            "bitbucket",
+        ])) {
+            Command::UsageError(message) => assert!(message.contains("expected github or gitlab")),
             other => panic!("unexpected: {other:?}"),
         }
     }

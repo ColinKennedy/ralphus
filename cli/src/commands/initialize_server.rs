@@ -10,11 +10,13 @@
 //! the same way `ralphus mcp initialize` rejects one (see `mcp.rs`).
 //! Boolean answer flags take `yes` or `no`: `--install-tmux`,
 //! `--setup-mcp`, `--register-project`, `--review-auto-submit-pr-stack`,
-//! `--require-forks`, `--create-admin`, `--submit-sample`. The value flags are `--tmux-program`, repeatable
+//! `--require-forks`, `--create-admin`, `--setup-forge-token`, `--submit-sample`.
+//! The value flags are `--tmux-program`, repeatable
 //! `--mcp-host`, `--project-name`, `--project-description`,
 //! `--bug-threshold`, `--feature-threshold`, `--investigation-threshold`,
-//! `--unclassified-threshold`, `--fork-user`, `--fork-url`, `--forge-host`,
-//! `--forge-token`, `--admin-name`, `--review-resolver-agent`, `--sample-mode`, and `--sample-agent`.
+//! `--unclassified-threshold`, `--fork-user`, `--fork-url`, `--forge-provider`,
+//! `--forge-host`, `--forge-token`, `--admin-name`,
+//! `--review-resolver-agent`, `--sample-mode`, and `--sample-agent`.
 
 use std::io::{IsTerminal as _, Write as _};
 use std::path::PathBuf;
@@ -24,7 +26,7 @@ use crate::client::ProjectReviewSettingsPatch;
 use crate::commands::misc::CheckArgs;
 use crate::health::CheckResult;
 
-const TOTAL_STEPS: u32 = 8;
+const TOTAL_STEPS: u32 = 9;
 const WINDOWS_MINIMUM_TMUX_VERSION: (u32, u32, u32) = (3, 3, 8);
 const SAMPLE_LABEL_PREFIX: &str = "ralphus initialize server: hello world";
 
@@ -116,6 +118,14 @@ const ADMIN_NAME: InitializeSetting = InitializeSetting {
     prompt: "admin name",
     flag: "--admin-name",
 };
+const SETUP_FORGE_TOKEN: InitializeSetting = InitializeSetting {
+    prompt: "set up forge token",
+    flag: "--setup-forge-token",
+};
+const FORGE_PROVIDER: InitializeSetting = InitializeSetting {
+    prompt: "forge provider",
+    flag: "--forge-provider",
+};
 const SUBMIT_SAMPLE: InitializeSetting = InitializeSetting {
     prompt: "submit sample",
     flag: "--submit-sample",
@@ -146,10 +156,12 @@ const INTERACTIVE_SETTINGS: &[&InitializeSetting] = &[
     &REQUIRE_FORKS,
     &FORK_USER,
     &FORK_URL,
-    &FORGE_HOST,
-    &FORGE_TOKEN,
     &CREATE_ADMIN,
     &ADMIN_NAME,
+    &SETUP_FORGE_TOKEN,
+    &FORGE_PROVIDER,
+    &FORGE_HOST,
+    &FORGE_TOKEN,
     &SUBMIT_SAMPLE,
     &SAMPLE_MODE,
     &SAMPLE_AGENT,
@@ -191,6 +203,8 @@ pub struct InitializeServerOptions {
     pub forge_token: Option<String>,
     pub create_admin: Option<bool>,
     pub admin_name: Option<String>,
+    pub setup_forge_token: Option<bool>,
+    pub forge_provider: Option<String>,
     pub submit_sample: Option<bool>,
     pub sample_mode: Option<String>,
     pub sample_agent: Option<String>,
@@ -227,6 +241,8 @@ impl std::fmt::Debug for InitializeServerOptions {
             )
             .field("create_admin", &self.create_admin)
             .field("admin_name", &self.admin_name)
+            .field("setup_forge_token", &self.setup_forge_token)
+            .field("forge_provider", &self.forge_provider)
             .field("submit_sample", &self.submit_sample)
             .field("sample_mode", &self.sample_mode)
             .field("sample_agent", &self.sample_agent)
@@ -257,6 +273,8 @@ impl InitializeServerOptions {
             || self.forge_token.is_some()
             || self.create_admin.is_some()
             || self.admin_name.is_some()
+            || self.setup_forge_token.is_some()
+            || self.forge_provider.is_some()
             || self.submit_sample.is_some()
             || self.sample_mode.is_some()
             || self.sample_agent.is_some()
@@ -298,7 +316,10 @@ pub fn dispatch(opts: &GlobalOpts, setup: InitializeServerOptions) -> i32 {
     }
 
     step.begin("Create an optional default admin user");
-    step_admin(opts, &setup);
+    let admin_user = step_admin(opts, &setup);
+
+    step.begin("Configure a forge token for the default admin user");
+    step_forge_token(opts, admin_user.as_deref(), &setup);
 
     step.begin("Run ralphus check health");
     let health_results = step_health(opts);
@@ -836,51 +857,11 @@ fn step_forks(opts: &GlobalOpts, project: &str, setup: &InitializeServerOptions)
             Err(error) => println!("  error registering fork: {error}"),
         },
     }
-    if setup.yes && setup.forge_host.is_none() && setup.forge_token.is_none() {
-        println!(
-            "  skipping personal access token prompt (--yes); set one later with `ralphus user set-forge-token`"
-        );
-        return;
-    }
-    let host = prompt(
-        &FORGE_HOST,
-        "  forge host for the personal access token (e.g. github.com)",
-        "github.com",
-        setup.forge_host.as_ref(),
-        setup.yes,
-    );
-    let token = setup.forge_token.clone().unwrap_or_else(|| {
-        prompt_secret(
-            &FORGE_TOKEN,
-            "  personal access token for that host (never echoed back or logged by ralphus)",
-        )
-    });
-    if token.is_empty() {
-        println!("  no token given; skipping (use `ralphus user set-forge-token` later)");
-        return;
-    }
-    let token_already_configured = client
-        .list_user_forge_tokens(&user)
-        .ok()
-        .and_then(|payload| payload["tokens"].as_array().cloned())
-        .is_some_and(|tokens| {
-            tokens
-                .iter()
-                .any(|entry| entry["host"].as_str() == Some(&host))
-        });
-    if token_already_configured {
-        println!("  a forge token is already configured for {user}@{host}; skipping");
-        return;
-    }
-    match client.set_user_forge_token(&user, &host, &token) {
-        Ok(_) => println!("  stored a forge token for {user}@{host}"),
-        Err(error) => println!("  error storing forge token: {error}"),
-    }
 }
 
 // ---- default admin user ------------------------------------------------------
 
-fn step_admin(opts: &GlobalOpts, setup: &InitializeServerOptions) {
+fn step_admin(opts: &GlobalOpts, setup: &InitializeServerOptions) -> Option<String> {
     if !prompt_yes_no(
         &CREATE_ADMIN,
         "  create a default admin user?",
@@ -889,7 +870,7 @@ fn step_admin(opts: &GlobalOpts, setup: &InitializeServerOptions) {
         setup.yes,
     ) {
         println!("  skipped");
-        return;
+        return None;
     }
     let name = prompt(
         &ADMIN_NAME,
@@ -914,7 +895,7 @@ fn step_admin(opts: &GlobalOpts, setup: &InitializeServerOptions) {
     } else if existing_admin.is_none() {
         if let Err(error) = client.create_user(&name) {
             println!("  error: could not create user {name}: {error}");
-            return;
+            return None;
         }
     }
     if existing_admin != Some(true) {
@@ -922,7 +903,7 @@ fn step_admin(opts: &GlobalOpts, setup: &InitializeServerOptions) {
             Ok(_) => println!("  {name} is now an admin"),
             Err(error) => {
                 println!("  error: could not grant admin to {name}: {error}");
-                return;
+                return None;
             }
         }
     }
@@ -938,6 +919,77 @@ fn step_admin(opts: &GlobalOpts, setup: &InitializeServerOptions) {
         Err(error) => {
             println!("  warning: could not persist the default admin to the global config: {error}")
         }
+    }
+    Some(name)
+}
+
+// ---- forge token ------------------------------------------------------------
+
+fn step_forge_token(opts: &GlobalOpts, user: Option<&str>, setup: &InitializeServerOptions) {
+    let Some(user) = user else {
+        println!("  skipped: no default admin user was created");
+        return;
+    };
+    let supplied_token_requests_setup = setup.forge_token.as_ref().map(|_| true);
+    if !prompt_yes_no(
+        &SETUP_FORGE_TOKEN,
+        &format!("  configure a GitHub or GitLab personal access token for {user}?"),
+        true,
+        setup.setup_forge_token.or(supplied_token_requests_setup),
+        setup.yes,
+    ) {
+        println!("  skipped");
+        return;
+    }
+    let provider = prompt(
+        &FORGE_PROVIDER,
+        "  forge provider (github or gitlab)",
+        "github",
+        setup.forge_provider.as_ref(),
+        setup.yes,
+    );
+    let default_host = match provider.as_str() {
+        "github" => "github.com",
+        "gitlab" => "gitlab.com",
+        _ => {
+            println!("  invalid forge provider {provider:?}; expected github or gitlab");
+            return;
+        }
+    };
+    let host = prompt(
+        &FORGE_HOST,
+        "  forge host for the personal access token",
+        default_host,
+        setup.forge_host.as_ref(),
+        setup.yes,
+    );
+    let token = setup.forge_token.clone().unwrap_or_else(|| {
+        prompt_secret(
+            &FORGE_TOKEN,
+            "  personal access token (never echoed back or logged by ralphus)",
+        )
+    });
+    if token.is_empty() {
+        println!("  no token given; skipping (use `ralphus user set-forge-token` later)");
+        return;
+    }
+    let client = opts.client();
+    let token_already_configured = client
+        .list_user_forge_tokens(user)
+        .ok()
+        .and_then(|payload| payload["tokens"].as_array().cloned())
+        .is_some_and(|tokens| {
+            tokens
+                .iter()
+                .any(|entry| entry["host"].as_str() == Some(&host))
+        });
+    if token_already_configured {
+        println!("  a forge token is already configured for {user}@{host}; skipping");
+        return;
+    }
+    match client.set_user_forge_token(user, &host, &token) {
+        Ok(_) => println!("  stored a {provider} forge token for {user}@{host}"),
+        Err(error) => println!("  error storing forge token: {error}"),
     }
 }
 
@@ -1141,7 +1193,7 @@ mod tests {
     #[test]
     fn interactive_settings_have_unique_prompt_and_flag_contracts() {
         assert!(interactive_settings_are_valid());
-        assert_eq!(INTERACTIVE_SETTINGS.len(), 23);
+        assert_eq!(INTERACTIVE_SETTINGS.len(), 25);
     }
 
     #[test]
