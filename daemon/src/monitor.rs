@@ -30,6 +30,15 @@ pub enum NotifiableEventKind {
     ReviewStatusChanged,
     ReviewManualChecksReady,
     ReviewManualChecksFailed,
+    /// RAL-565: an auto-run manual check finished with a non-zero exit or
+    /// timed out. The check's own result, not a system fault, so it is an
+    /// informational notice without remediation and leaves the review's state
+    /// alone.
+    ReviewAutoRunCheckFailed,
+    /// RAL-565: a rebase, feedback pass or auto-PR fix arrived while an
+    /// auto-run manual check was running, so its environment may be out of
+    /// date. Informational; the run is never killed.
+    ReviewAutoRunSuperseded,
     SquadFailed,
     ReviewFailed,
     /// RAL-400 Phase 3: a squad's in-flight cell was halted because its
@@ -69,6 +78,8 @@ impl NotifiableEventKind {
             Self::ReviewStatusChanged => "review_status_changed",
             Self::ReviewManualChecksReady => "review_manual_checks_ready",
             Self::ReviewManualChecksFailed => "review_manual_checks_failed",
+            Self::ReviewAutoRunCheckFailed => "review_auto_run_check_failed",
+            Self::ReviewAutoRunSuperseded => "review_auto_run_superseded",
             Self::SquadFailed => "squad_failed",
             Self::ReviewFailed => "review_failed",
             Self::SquadWaypointHalted => "squad_waypoint_halted",

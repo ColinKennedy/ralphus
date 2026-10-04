@@ -1972,7 +1972,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
                     data-tip="Run this action in the built review worktree.\nRun: ${esc(cmdText)}${needsInput ? `\nUses the values in + — its current ones, or this review's last ones if you have not opened it.` : ""}">▶</button>
                   <span class="cmd-label">${label}</span>
                   <span class="cmd-text mono" data-tip="${esc(cmdText)}">${esc(cmdText)}</span>
-                  ${commandRunStatus(key)}
+                  ${autoRunNoteBadge(h)}${commandRunStatus(key)}
                   <button class="cmd-expand" data-click="toggleReviewCommandFull" data-key="${esc(key)}" data-tip="${needsInput ? "Show this command in full, with its values filled in and editable beneath it." : "Show or hide this command in full beneath its row."}">${commandFullOpen[key] ? "−" : "+"}</button>
                   <button class="section-menu" data-click="openReviewCommandMenu" data-guardian-id="${esc(g.id)}" data-key="${esc(key)}" data-cmd="${esc(cmdText)}" data-tip="Actions for this check — its logs, its environment, copy it.">⋯</button>
                 </div>${commandFullBlock(key, cmdText, { g, check: h, kind: "action", i })}`;
@@ -2035,7 +2035,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
                           <button class="cmd-run" data-click="runCheck" data-kind="manual" data-guardian-id="${esc(g.id)}" data-i="${i}" data-runkey="${esc(key)}"
                             data-tip="Run this check in the built review worktree.\nRun: ${esc(cmdText)}${needsInput ? `\nUses the values in + — its current ones, or this review's last ones if you have not opened it.` : ""}">▶</button>
                           <span class="cmd-text mono" data-tip="${esc(cmdText)}">${esc(cmdText)}</span>
-                          ${commandRunStatus(key)}
+                          ${autoRunNoteBadge(cmd)}${commandRunStatus(key)}
                           <button class="cmd-expand" data-click="toggleReviewCommandFull" data-key="${esc(key)}" data-tip="${needsInput ? "Show this command in full, with its values filled in and editable beneath it." : "Show or hide this command in full beneath its row."}">${commandFullOpen[key] ? "−" : "+"}</button>
                           <button class="section-menu" data-click="openReviewCommandMenu" data-guardian-id="${esc(g.id)}" data-key="${esc(key)}" data-cmd="${esc(cmdText)}" data-tip="Actions for this check — its logs, its environment, copy it.">⋯</button>
                         </div>${commandFullBlock(key, cmdText, { g, check: cmd, kind: "manual", i })}`;

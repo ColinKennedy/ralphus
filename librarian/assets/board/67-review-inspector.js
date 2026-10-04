@@ -1444,6 +1444,7 @@
        * @property {boolean} done - Whether the finish event has arrived.
        * @property {boolean} timedOut - Set when the daemon gave up waiting rather than observing an exit.
        * @property {boolean} hasOutput - Whether the daemon captured any output for this run.
+       * @property {boolean} [auto] - RAL-565: auto-run started this run rather than a click.
        */
       /** @type {{[key: string]: CommandRun}} */
       const commandRuns = {};
@@ -1570,7 +1571,7 @@
           ? `<span class="rg-sub" data-tip="How many lines this run printed.">${lineCount} lines</span>`
           : "";
         return `<div class="run-result">
-            <div class="run-result-head">${verdict}<span class="rg-sub">ran for ${esc(fmtRunTime(r.elapsedMs))}</span>${count}
+            <div class="run-result-head">${verdict}${r.auto ? `<span class="cmd-status idle" data-tip="Auto-run started this run when the check's build finished; nobody clicked it.\nIts terminal window opened on the daemon host. Turn auto-run off for this check with auto_run = false in the task file, or for the whole review from its edit dialog.">auto</span>` : ""}<span class="rg-sub">ran for ${esc(fmtRunTime(r.elapsedMs))}</span>${count}
               <span style="margin-left:auto;display:flex;align-items:center;gap:6px">${sizer}
                 <button class="copy-btn" data-copy="${esc(commandRunMarkdown(key, cmd))}" onclick="copyText(event)"
                   data-tip="Copy this run as Markdown — the command, how it ended, and its output in a fenced block.\nCopies the whole output, not just the part shown.">⧉</button>
@@ -1668,6 +1669,7 @@
               run.exitCode = Number(p.exit_code) || 0;
               run.timedOut = !!p.timed_out;
               run.hasOutput = !!p.has_output;
+              run.auto = !!p.auto;
               // A result nobody can see is not a result: finishing opens the
               // row's panel so what happened is on screen, rather than behind a
               // click you have to know to make.
@@ -1677,6 +1679,16 @@
             if (settled) renderReviewDetail();
           } catch { /* a missed poll settles on the next tick */ }
         }
+      }
+      /**
+       * The warning shown on a check's row when auto-run skipped it or a newer
+       * rebase, feedback pass or auto-PR fix arrived during its auto-run.
+       * @param {GuardianCheck} check - The check the row is for.
+       * @returns {string} Badge markup, or "" when the check carries no note.
+       */
+      function autoRunNoteBadge(check) {
+        if (!check.auto_run_note) return "";
+        return `<span class="cmd-status idle" data-tip="${esc(check.auto_run_note)}\nThis warning clears the next time the check is prepared.">⚠ auto-run</span>`;
       }
       /**
        * One command row's elapsed time and outcome.

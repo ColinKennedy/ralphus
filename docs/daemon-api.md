@@ -1921,23 +1921,61 @@ non-boolean value is a `400`. The project endpoint also reports the resolved
 default under `effective.skip_manual_checks`.
 
 `auto_run` (boolean, default `false`) makes the daemon run a review's ready
-manual checks itself once their build succeeds: after a rebuild settles, each
-check whose `preparation_state` is `ready` and whose inputs all have defaults is
-launched in a visible terminal on the daemon's own machine (never a remote
-one), with its `cleanup_command` and `lifecycle.before_reset_command` respected
-exactly as a manual click would. A check with no build commands runs as soon as
-it is ready. Each check is claimed once per machine and per prepared generation
-(`prepared_at_ms`), so a manual click is never blocked and a rebuild re-arms the
-run. A failed auto-run only produces an informational notice. Precedence, first
-set wins: the check's own `auto_run` (a `[[review.action]]` field, or emitted by
-the check generator with a confidence caveat), the review's `auto_run`, the
-project's `auto_run` (`.ralphus.toml` `[review] auto_run`, or the database
-default written through `POST /api/projects/{name}/review-settings`), then
-`false`. A submission that defines its own checks is authoritative: project
-hint definitions are not layered on top of it. The review reports `auto_run`
-(its own value, `null` when inheriting) and `effective_auto_run`; the project
-endpoint reports the resolved default under `effective.auto_run`. A non-boolean
-value is a `400`.
+manual checks itself the moment each one's build succeeds. The instant a check's
+`preparation_state` becomes `ready` -- its own `prepare` steps succeeded, or it
+had none -- it is launched, without waiting for the rest of the pass, in a
+visible terminal on the daemon's own machine (never a remote one) if its inputs
+all have defaults. A check with an unfilled input is skipped and carries an
+`auto_run_note` saying which input needs a value. Only a rebuild re-prepares a
+check, so only the events in the review's `rebuild_on` list (a rebase, applied
+reviewer feedback, an unattended PR/MR fix) cause a new run; an event that
+keeps the existing build never re-runs it.
+
+*Teardown.* The check's `cleanup_command` runs ahead of every auto-run, as if its
+checkbox were ticked, because nobody is there to tick it. The
+`lifecycle.before_reset_command` teardown of the previous build already ran when
+the build this run follows was prepared, so a rebuilt check is torn down before
+it is rebuilt and run again.
+
+*Once per client and generation.* A claim is stored per review, check, client
+and prepared generation (`prepared_at_ms`) in `guardian_auto_runs`. One client's
+claim never blocks another's, a daemon restart cannot launch a generation a
+second time, a manual click is never blocked, and a rebuild opens a new claim.
+
+*A newer event never kills a run.* If a rebase, feedback pass or auto-PR fix
+arrives while an auto-run is in flight, the check's `auto_run_note` is set to
+"New {rebase|feedback|auto-PR fix} arrived while you were running the '<label>'
+Manual Check. Your check environment may be out of date. Consider closing and
+re-running.", the board shows it as a warning on the row, and watchers get a
+`review_auto_run_superseded` notice. The run is left alone; the note clears when
+the check is prepared again.
+
+*Failures.* A failing auto-run (non-zero exit, or timed out) sends an
+informational `review_auto_run_check_failed` notice. It carries no remediation
+and does not change the review's state: a check failing is that check's result,
+not a fault in ralphus. The run's recorded result carries `auto: true`, which the
+board shows as an "auto" badge, and `GET
+/api/guardians/{id}/check-runs/{kind}/{index}/output` reports it.
+
+*Precedence,* most specific first: the check's own `auto_run` (a
+`[[review.action]]` field, or emitted by the check generator with a confidence
+caveat), the review's `auto_run`, the project's `auto_run` (`.ralphus.toml`
+`[review] auto_run`, or the database default written through `POST
+/api/projects/{name}/review-settings`), then `false`. A submission that defines
+its own checks is authoritative: the project file's
+suggested `[[review.action]]` checks (with their `[[review.action.hint]]`
+rules) are not layered on top of it, because a
+submission and its project that differ even slightly would otherwise leave "Run
+all" with more checks than the submitter chose, and a minimal set of checks must
+stay possible. The review reports `auto_run` (its own value, `null` when
+inheriting) and `effective_auto_run`; the project endpoint reports the resolved
+default under `effective.auto_run`. A non-boolean value is a `400`.
+
+The project file's suggested `[[review.action]]` tables and their
+`[[review.action.hint]]` rules are advisory: the daemon never reads or runs
+them. They inform whoever writes the submission -- the auto-review
+agent, `ralphus tutor`, a person -- and are described in
+[`docs/special-syntax.md`](special-syntax.md).
 
 `rebuild_on` (array of strings, default every event) controls which events tear
 down and rebuild a review's prepared build — the preparation that makes its

@@ -52,12 +52,26 @@ To have ready manual checks run by themselves, set `auto_run = true` on a
 check (`[[review.action]]`), on the review (`[[review]] auto_run = true`), or as
 a project default (`[review] auto_run = true` in `.ralphus.toml`, or the
 "auto-run manual checks after build" control in the Setup / Review Settings
-modals). The first of those that is set wins; nothing set means off. A check
-runs once its build commands succeed (immediately if it has none), once per
-machine per build, in a terminal you can watch on the daemon's machine. Only
-checks whose inputs all have defaults run, and a failure shows only an
-informational notice. When a submission defines its own checks they are used as
-written; project-level hints are not layered on top.
+modals). The most specific setting wins (the check, then the review, then the
+project); nothing set means off. A check runs the moment its build commands
+succeed (immediately if it has none), once per machine per build, in a terminal
+you can watch on the daemon's machine, and its `cleanup_command` runs first. Only
+checks whose inputs all have defaults run; one that needs a value shows a
+warning on its row instead.
+
+If a rebase, reviewer feedback or an auto-PR fix arrives while an auto-run is
+still going, nothing is killed. The row shows a warning ("Your check environment
+may be out of date. Consider closing and re-running.") and you get a
+notification. A failing auto-run sends an informational notification and leaves
+the review as it was; its result is badged **auto** so you can tell it from a
+run you started.
+
+When a submission defines its own checks they are used as written. A project's
+`.ralphus.toml` can suggest checks with `[[review.action]]` and say when each
+applies with `[[review.action.hint]]`, but those only inform whoever writes the
+submission and are never layered on top of it: if they
+were, a submission and its project that differ even slightly would stop **Run
+all** from running just the small set of checks you chose.
 
 ### When the prepared build is rebuilt
 

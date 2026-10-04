@@ -4275,6 +4275,7 @@ pub(crate) fn kickoff_merge(
             id,
             "review is rebasing; preparation will refresh after the new stack settles",
         );
+        crate::auto_run::note_superseded(&store, id, "rebase");
     }
     crate::rlog!(
         INFO,
@@ -6483,6 +6484,14 @@ pub fn run_feedback(
             store,
             id,
             "review feedback is changing the stack; preparation will refresh afterward",
+        );
+        crate::auto_run::note_superseded(
+            store,
+            id,
+            match rebuild_trigger {
+                RebuildTrigger::AutoFix => "auto-PR fix",
+                _ => "feedback",
+            },
         );
     }
 
@@ -9586,11 +9595,6 @@ pub fn run_guardian_post_merge_for(
             ok,
             detail,
         );
-        // RAL-565: a pass that finished with every build command succeeded
-        // (or had none) starts its auto-run checks. A failed pass never does.
-        if ok {
-            crate::server::auto_run_ready_checks(store, id);
-        }
     }
     phase_note(
         store,
@@ -10412,6 +10416,7 @@ fn prepare_action_hints(
         hints[index].preparation_state = Some("preparing".to_string());
         hints[index].preparation_detail = None;
         hints[index].prepared_at_ms = None;
+        hints[index].auto_run_note = None;
         store
             .lock()
             .set_guardian_action_hints(id, &hints)
@@ -10648,6 +10653,12 @@ fn prepare_action_hints(
             .lock()
             .set_guardian_action_hints(id, &hints)
             .map_err(|e| e.to_string())?;
+        // RAL-565: this action just finished preparing (its build commands
+        // succeeded, or it had none), so an opted-in one starts now rather
+        // than waiting for the rest of the pass.
+        if hints[index].preparation_state.as_deref() == Some("ready") {
+            crate::auto_run::run_ready_checks(store, id);
+        }
     }
     if failures.is_empty() {
         Ok(())
@@ -10689,6 +10700,7 @@ fn prepare_generated_manual_checks(
         checks[index].preparation_state = Some("preparing".to_string());
         checks[index].preparation_detail = None;
         checks[index].prepared_at_ms = None;
+        checks[index].auto_run_note = None;
         store
             .lock()
             .set_guardian_manual_commands(id, &checks, agent.as_deref(), model.as_deref())
@@ -10740,6 +10752,11 @@ fn prepare_generated_manual_checks(
             .lock()
             .set_guardian_manual_commands(id, &checks, agent.as_deref(), model.as_deref())
             .map_err(|e| e.to_string())?;
+        // RAL-565: this check just finished preparing, so an opted-in one
+        // starts now rather than waiting for the rest of the pass.
+        if checks[index].preparation_state.as_deref() == Some("ready") {
+            crate::auto_run::run_ready_checks(store, id);
+        }
     }
     if failures.is_empty() {
         Ok(())
@@ -13876,6 +13893,11 @@ fn parse_manual_commands_response(text: &str) -> Vec<GuardianCheck> {
 /// command-line limits in harness backends.
 const GUIDANCE_FILE_LIMIT: usize = 6000;
 
+/// The project file gets more room than the other guidance because its
+/// suggested checks are only useful whole: a cut-off one is a half-written
+/// command.
+const GUIDANCE_TOML_LIMIT: usize = 16000;
+
 /// Repository files that tell a generator how this project is run and
 /// verified. The first of AGENTS.md / CLAUDE.md that exists is used (CLAUDE.md
 /// files conventionally just import AGENTS.md); the Ralphus project TOML is
@@ -13908,10 +13930,17 @@ fn render_repository_guidance(agents: Option<(&str, &str)>, ralphus_toml: Option
     }
     if let Some(body) = ralphus_toml.filter(|b| !b.trim().is_empty()) {
         sections.push(format!(
-            "--- {GUIDANCE_TOML_FILE} (Ralphus project configuration: any [[review.action]] / \
-             [[review.action.prepare]] entries show the commands and conventions reviewers \
-             already use) ---\n{}",
-            truncate_guidance(body, GUIDANCE_FILE_LIMIT)
+            "--- {GUIDANCE_TOML_FILE} (Ralphus project configuration: each [[review.action]] here is \
+             one of the project's recommended manual checks, with the same shape as a check you \
+             emit (label, command, prepare, input, cleanup_command) plus [[review.action.hint]] \
+             tables whose include_when and paths say when it applies -- include a check when one \
+             of its hints fits these changes, reusing its command, inputs and prepare steps. A \
+             check's auto_run = false means the project judges it unsuitable to start unattended, \
+             so never set \"auto_run\": true on a check built from it. A .ralphus.toml in a \
+             directory nearer the changed files overrides this one for the same label, and a \
+             parent directory's file fills in labels it leaves out: look for nested ones beside \
+             the changed files and prefer the nearest) ---\n{}",
+            truncate_guidance(body, GUIDANCE_TOML_LIMIT)
         ));
     }
     if sections.is_empty() {
@@ -13966,7 +13995,11 @@ pub fn manual_commands_prompt(tail: &str, steering: Option<&str>) -> String {
          \"description\" and \"success\" guidance. Set \"auto_run\": true on an object only \
          when you are very confident the command is safe to start unattended -- idempotent, \
          non-destructive, non-interactive, and every input has a safe \"default\"; omit it \
-         otherwise. Use \"run_on\": \"daemon\" unless the \
+         otherwise. You are writing every check of this review in this one answer, so look at \
+         them together: when two or more checks share a parameter -- the same port, path, \
+         branch name, database file -- give that input the SAME \"name\" and the SAME \
+         \"default\" in every check that uses it, so one value is consistent across all of the \
+         review's checks and a reviewer changes it once. Use \"run_on\": \"daemon\" unless the \
          command explicitly needs the review machine.";
     let format = " Return ONLY a valid JSON array where each element is either a plain string or \
           the object shape described above — no markdown fences, no explanation, no \

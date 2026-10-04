@@ -88,7 +88,10 @@ pub fn execute(cmd: Command, client: &DaemonClient) -> ExecResult {
         })),
         Command::Configuration => Ok(exec_configuration()),
         Command::Task(c) => task::execute(c, client),
-        Command::TutorShow => Ok(json!({"tutor": ralphus_cli::tutor::task_tutor()})),
+        Command::TutorShow => {
+            let dir = std::env::current_dir().unwrap_or_default();
+            Ok(json!({"tutor": ralphus_cli::tutor::task_tutor_in(&dir)}))
+        }
         Command::Cell(c) => cell::execute(c, client),
         Command::Proof(c) => proof::execute(c, client),
         Command::Prophecy(c) => prophecy::execute(c, client),
