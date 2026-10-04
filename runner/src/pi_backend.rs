@@ -14,6 +14,7 @@ use crate::cli_agent_common::{BackendCommandHealth, live_session_path, write_liv
 use crate::mcp_init::{
     self, McpFileEdit, McpFileEditMode, McpInitializationPlan, McpInitializer, McpThirdPartyInstall,
 };
+use crate::shell_label::format_tool_input;
 use crate::shellcmd::{self, Env};
 use crate::tools::Workspace;
 
@@ -1088,22 +1089,11 @@ struct ParseState {
     /// this after every event and stops (kills the child) rather than
     /// waiting for stdout EOF.
     compaction_thrash: Option<crate::thrash::ThrashDetail>,
-    /// True while [`feed_assistant_text`] is buffering a candidate top-level
-    /// JSON object out of the streamed text (see its doc comment) rather
-    /// than printing characters straight through.
-    capturing_json: bool,
-    /// The candidate JSON object accumulated so far, including its opening
-    /// `{`. Only meaningful while `capturing_json` is set.
-    json_buffer: String,
-    /// Brace nesting depth of `json_buffer`, starting at 1 for the opening
-    /// `{` that began capture; capture ends the moment this reaches 0.
-    json_depth: i32,
-    /// Whether the scanner is currently inside a JSON string literal (so a
-    /// `{`/`}` there doesn't count toward `json_depth`).
-    json_in_string: bool,
-    /// Whether the next character in `json_buffer` is escaped (follows an
-    /// unescaped `\` inside a string) and must not be interpreted specially.
-    json_escape: bool,
+    /// Tool calls whose `toolcall_start`/`toolcall_delta` events have arrived
+    /// but whose `toolcall_end` has not, keyed by Pi's `contentIndex`. The
+    /// streamed argument text is kept as a safety net so a call that never
+    /// completes is still printed (see [`finish_pi_text_stream`]).
+    pending_tool_calls: std::collections::BTreeMap<i64, PendingToolCall>,
     /// RAL-434: model thinking/reasoning text received but not yet
     /// terminated by a newline. Thinking is emitted one whole
     /// [`THINKING_MARKER`]-prefixed line at a time -- a prefix only stays
@@ -1118,127 +1108,106 @@ struct ParseState {
     in_thinking_block: bool,
 }
 
-/// Pi's `--mode json` `message_update` events stream the model's own raw
-/// text verbatim (RAL-380) -- unlike claude-code/codex, which get a distinct
-/// `tool_use`/`command_execution` event, Pi (at least fronting an
-/// OpenRouter/DeepSeek model with no native function-calling) emits its tool
-/// calls as bare JSON objects embedded directly in that text. Left alone
-/// they land in the terminal pane as raw, unreadable multi-hundred-character
-/// blobs (`{"command": "..."}`, `{"edits": [...], "path": "..."}`, ...).
-///
-/// This scans incoming deltas character-by-character, using `ParseState`'s
-/// `json_*` fields to track brace depth across delta boundaries (a blob can
-/// span many small deltas), so a candidate object starting at a top-level
-/// `{` is captured whole and, once balanced, replaced with a
-/// [`format_pi_tool_call`] summary line instead of being printed raw.
-/// Anything that isn't recognized JSON falls back to the old raw-passthrough
-/// behavior, so no content is ever silently dropped.
-fn feed_assistant_text(state: &mut ParseState, delta: &str, tool_arg_truncate_chars: usize) {
-    let mut plain_run = String::new();
-    for c in delta.chars() {
-        if !state.capturing_json {
-            if c == '{' {
-                if !plain_run.is_empty() {
-                    print_delta(&plain_run);
-                    state.printed_text_delta = true;
-                    plain_run.clear();
-                }
-                state.capturing_json = true;
-                state.json_buffer.clear();
-                state.json_buffer.push(c);
-                state.json_depth = 1;
-                state.json_in_string = false;
-                state.json_escape = false;
-            } else {
-                plain_run.push(c);
-            }
-            continue;
-        }
-
-        state.json_buffer.push(c);
-        if state.json_escape {
-            state.json_escape = false;
-        } else if state.json_in_string {
-            match c {
-                '\\' => state.json_escape = true,
-                '"' => state.json_in_string = false,
-                _ => {}
-            }
-        } else {
-            match c {
-                '"' => state.json_in_string = true,
-                '{' => state.json_depth += 1,
-                '}' => {
-                    state.json_depth -= 1;
-                    if state.json_depth == 0 {
-                        flush_json_buffer(state, tool_arg_truncate_chars);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    if !plain_run.is_empty() {
-        print_delta(&plain_run);
-        state.printed_text_delta = true;
-    }
+/// A tool call Pi has begun streaming but not yet completed.
+#[derive(Debug, Default)]
+struct PendingToolCall {
+    name: Option<String>,
+    /// The raw `toolcall_delta` argument text received so far.
+    raw: String,
 }
 
-/// Ends capture started by [`feed_assistant_text`], printing either a
-/// formatted `[tool]` summary (recognized shape) or the raw buffered text
-/// unchanged (anything else -- preserves the pre-RAL-380 behavior as a
-/// fallback rather than ever discarding content).
-fn flush_json_buffer(state: &mut ParseState, tool_arg_truncate_chars: usize) {
-    let raw = std::mem::take(&mut state.json_buffer);
-    state.capturing_json = false;
-    match serde_json::from_str::<Value>(&raw) {
-        Ok(value) => {
-            if state.printed_text_delta {
-                finish_delta_line();
-                state.printed_text_delta = false;
+/// Prints one streamed ordinary-text delta, tracking that a plain-text line
+/// is open so the next tool/thinking line can close it first.
+fn feed_assistant_text(state: &mut ParseState, delta: &str) {
+    print_delta(delta);
+    state.printed_text_delta = true;
+}
+
+/// Prints one finished tool-call line to the pane, closing any open
+/// plain-text line first so the tool line starts at a line start.
+fn print_tool_line(state: &mut ParseState, line: &str) {
+    if state.printed_text_delta {
+        finish_delta_line();
+        state.printed_text_delta = false;
+    }
+    eprintln!("{line}");
+}
+
+/// Handles one `toolcall_start`/`toolcall_delta`/`toolcall_end`
+/// `assistantMessageEvent`. Pi reports each call's real name and parsed
+/// arguments on `toolcall_end` (`toolCall: {id, name, arguments}`); the
+/// start/delta events only feed the raw-text safety net used when Pi could
+/// not parse the arguments or the message ended before `toolcall_end`.
+/// Returns the line to print when the call completed.
+fn handle_tool_call_event(
+    state: &mut ParseState,
+    event_type: &str,
+    event: &Value,
+    tool_arg_truncate_chars: usize,
+) -> Option<String> {
+    let index = event["contentIndex"].as_i64().unwrap_or(0);
+    match event_type {
+        "toolcall_start" => {
+            let pending = state.pending_tool_calls.entry(index).or_default();
+            if let Some(name) = event["toolName"]
+                .as_str()
+                .or_else(|| event["toolCall"]["name"].as_str())
+            {
+                pending.name = Some(name.to_string());
             }
-            // A complete JSON object is a tool-call candidate. Keep an
-            // unrecognized shape discoverable without changing its raw text.
-            let line = format_pi_tool_event(&value, &raw, tool_arg_truncate_chars);
-            eprintln!("{line}");
         }
-        Err(_) => {
-            // A balanced JSON candidate that still fails to parse is a tool
-            // entry we cannot classify. Keep the complete raw entry verbatim
-            // after the generic parse-failure tag.
-            eprintln!("{}", format_unknown_tool_event(&raw));
+        "toolcall_delta" => {
+            if let Some(delta) = event["delta"].as_str() {
+                state
+                    .pending_tool_calls
+                    .entry(index)
+                    .or_default()
+                    .raw
+                    .push_str(delta);
+            }
         }
+        "toolcall_end" => {
+            let pending = state.pending_tool_calls.remove(&index).unwrap_or_default();
+            let tool_call = &event["toolCall"];
+            let name = tool_call["name"].as_str().or(pending.name.as_deref());
+            return Some(format_pi_tool_line(
+                name,
+                &tool_call["arguments"],
+                &pending.raw,
+                tool_arg_truncate_chars,
+            ));
+        }
+        _ => {}
     }
+    None
 }
 
-fn format_pi_tool_event(value: &Value, raw: &str, truncate_chars: usize) -> String {
-    format_pi_tool_call(value, truncate_chars).unwrap_or_else(|| format!("[tool.unknown] {raw}"))
-}
-
-fn format_unknown_tool_event(raw: &str) -> String {
-    format!("[tool.unknown] {raw}")
-}
-
-/// Flushes any JSON capture left incomplete when a message/turn ends (the
-/// closing `}` never arrived, e.g. the candidate was ordinary prose
-/// containing a stray `{`) as plain raw text, so nothing is lost. Called at
-/// `message_end`/`agent_end` before their existing "finish the delta line"
-/// handling.
-fn finish_pi_text_stream(state: &mut ParseState) {
-    if state.capturing_json {
-        let raw = std::mem::take(&mut state.json_buffer);
-        state.capturing_json = false;
-        if !raw.is_empty() {
-            print_delta(&raw);
-            state.printed_text_delta = true;
-        }
-    }
-    // RAL-434: a turn ending mid-thinking -- an error, an abort, or simply a
-    // provider that never sends `thinking_end` -- still has to emit the
-    // partial line it buffered rather than drop it.
+/// Flushes state left open when a message/turn ends. Tool calls that never
+/// received a `toolcall_end` are printed from their raw argument text so
+/// nothing is lost; a thinking block left open (RAL-434 -- an error, an
+/// abort, or a provider that never sends `thinking_end`) emits the partial
+/// line it buffered. Called at `message_end`/`agent_end` before their
+/// existing "finish the delta line" handling.
+fn finish_pi_text_stream(state: &mut ParseState, tool_arg_truncate_chars: usize) {
     if state.in_thinking_block {
         finish_thinking_block(state);
     }
+    for line in unfinished_tool_lines(state, tool_arg_truncate_chars) {
+        print_tool_line(state, &line);
+    }
+}
+
+/// Drains the tool calls that never received a `toolcall_end` into
+/// `[tool.<name>] <raw argument text>` lines.
+fn unfinished_tool_lines(state: &mut ParseState, tool_arg_truncate_chars: usize) -> Vec<String> {
+    std::mem::take(&mut state.pending_tool_calls)
+        .into_values()
+        .map(|pending| {
+            let tag = tool_type_code(pending.name.as_deref());
+            let raw = truncate_display(&pending.raw, tool_arg_truncate_chars);
+            format!("[{tag}] {raw}")
+        })
+        .collect()
 }
 
 /// RAL-434: handles one `thinking_start`/`thinking_delta`/`thinking_end`
@@ -1247,10 +1216,8 @@ fn finish_pi_text_stream(state: &mut ParseState) {
 /// render time. Called only for those three types (see [`process_event`]'s
 /// `message_update` arm).
 ///
-/// Thinking text deliberately bypasses [`feed_assistant_text`]: that scanner
-/// treats a top-level `{` as the opening of one of Pi's bare tool-call blobs,
-/// and reasoning prose routinely contains braces it would swallow and then
-/// mislabel as a `[tool]` line.
+/// Thinking text is printed as tagged lines rather than through
+/// [`feed_assistant_text`], so it never joins a plain-text line.
 fn handle_thinking_event(state: &mut ParseState, assistant_message_event_type: &str, delta: &str) {
     if assistant_message_event_type == "thinking_end" {
         if state.in_thinking_block {
@@ -1308,63 +1275,97 @@ fn finish_thinking_block(state: &mut ParseState) {
     state.in_thinking_block = false;
 }
 
-/// Best-effort classification of one of Pi's bare tool-call JSON objects
-/// (see [`feed_assistant_text`]) into a `[tool] name(args)` line matching
-/// claude-code's/codex's `[tool]` convention. Pi's own tool names aren't
-/// observable from this JSON (there is no wrapping `{"name": ..., "args":
-/// ...}` -- just the bare argument object), so the names used here
-/// (`bash`/`edit`/`read`) are inferred from the argument shape, not read
-/// from Pi. Returns `None` for any object shape not recognized, so the
-/// caller falls back to printing it raw rather than mislabeling it.
-fn format_pi_tool_call(value: &Value, truncate_chars: usize) -> Option<String> {
-    let obj = value.as_object()?;
-    if let Some(command) = obj.get("command").and_then(Value::as_str) {
-        let mut args = vec![format!(
-            "command={:?}",
-            truncate_display(command, truncate_chars)
-        )];
-        if let Some(timeout) = obj.get("timeout") {
-            args.push(format!("timeout={timeout}"));
-        }
-        return Some(format!("[tool.bash] bash({})", args.join(", ")));
+/// `tool.<name>` type tag for a Pi tool call, or `tool.unknown` when the
+/// event carried no name. Every name Pi reports (the eight built-ins and any
+/// extension-registered tool) renders under itself.
+fn tool_type_code(name: Option<&str>) -> String {
+    match name {
+        Some(name) if !name.is_empty() => format!("tool.{name}"),
+        _ => "tool.unknown".to_string(),
     }
-    if let (Some(edits), Some(path)) = (
-        obj.get("edits").and_then(Value::as_array),
-        obj.get("path").and_then(Value::as_str),
-    ) {
-        let edits_str = edits
-            .iter()
-            .enumerate()
-            .map(|(i, edit)| {
-                let old = truncate_display(
-                    edit.get("oldText").and_then(Value::as_str).unwrap_or(""),
-                    truncate_chars,
-                );
-                let new = truncate_display(
-                    edit.get("newText").and_then(Value::as_str).unwrap_or(""),
-                    truncate_chars,
-                );
-                format!("#{}: old_text={old:?}, new_text={new:?}", i + 1)
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Some(format!(
-            "[tool.edit] edit(path={path:?}, edits=[{edits_str}])"
-        ));
+}
+
+/// Renders a completed Pi tool call as `[tool.<name>] name(args)`.
+///
+/// `arguments` is Pi's parsed `toolCall.arguments`; `raw` is the streamed
+/// argument text. Pi quietly replaces unparseable arguments with `{}`, so an
+/// empty object alongside non-empty raw text prints the raw text instead of
+/// losing it.
+fn format_pi_tool_line(
+    name: Option<&str>,
+    arguments: &Value,
+    raw: &str,
+    truncate_chars: usize,
+) -> String {
+    let tag = tool_type_code(name);
+    let display_name = name.filter(|n| !n.is_empty()).unwrap_or("unknown");
+    let empty = arguments.as_object().is_none_or(|o| o.is_empty());
+    let args = if empty && !raw.trim().is_empty() {
+        truncate_display(raw, truncate_chars)
+    } else {
+        format_pi_tool_args(display_name, arguments, truncate_chars)
+    };
+    format!("[{tag}] {display_name}({args})")
+}
+
+/// Renders arguments with a readable custom layout for `bash`/`powershell`,
+/// `edit` and `read`, falling back to the generic `key="value"` rendering for
+/// every other tool (and for a built-in name whose arguments don't have the
+/// expected shape, e.g. a plugin that replaced it).
+fn format_pi_tool_args(name: &str, arguments: &Value, truncate_chars: usize) -> String {
+    let custom = match name {
+        "bash" | "powershell" => format_shell_args(arguments, truncate_chars),
+        "edit" => format_edit_args(arguments, truncate_chars),
+        "read" => format_read_args(arguments),
+        _ => None,
+    };
+    custom.unwrap_or_else(|| format_tool_input(arguments, truncate_chars))
+}
+
+fn format_shell_args(arguments: &Value, truncate_chars: usize) -> Option<String> {
+    let command = arguments.get("command")?.as_str()?;
+    let mut args = vec![format!(
+        "command={:?}",
+        truncate_display(command, truncate_chars)
+    )];
+    if let Some(timeout) = arguments.get("timeout") {
+        args.push(format!("timeout={timeout}"));
     }
-    if let Some(path) = obj.get("path").and_then(Value::as_str) {
-        if obj.contains_key("offset") || obj.contains_key("limit") {
-            let mut args = vec![format!("path={path:?}")];
-            if let Some(offset) = obj.get("offset") {
-                args.push(format!("offset={offset}"));
-            }
-            if let Some(limit) = obj.get("limit") {
-                args.push(format!("limit={limit}"));
-            }
-            return Some(format!("[tool.read] read({})", args.join(", ")));
-        }
+    Some(args.join(", "))
+}
+
+fn format_edit_args(arguments: &Value, truncate_chars: usize) -> Option<String> {
+    let path = arguments.get("path")?.as_str()?;
+    let edits = arguments.get("edits")?.as_array()?;
+    let edits_str = edits
+        .iter()
+        .enumerate()
+        .map(|(i, edit)| {
+            let old = truncate_display(
+                edit.get("oldText").and_then(Value::as_str).unwrap_or(""),
+                truncate_chars,
+            );
+            let new = truncate_display(
+                edit.get("newText").and_then(Value::as_str).unwrap_or(""),
+                truncate_chars,
+            );
+            format!("#{}: old_text={old:?}, new_text={new:?}", i + 1)
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(format!("path={path:?}, edits=[{edits_str}]"))
+}
+
+fn format_read_args(arguments: &Value) -> Option<String> {
+    let path = arguments.get("path")?.as_str()?;
+    let mut args = vec![format!("path={path:?}")];
+    if let Some(offset) = arguments.get("offset") {
+        args.push(format!("offset={offset}"));
     }
-    None
+    if let Some(limit) = arguments.get("limit") {
+        args.push(format!("limit={limit}"));
+    }
+    Some(args.join(", "))
 }
 
 /// Truncates `text` to `truncate_chars` characters with a trailing `…`,
@@ -1466,9 +1467,18 @@ fn process_event(
                         .as_str()
                         .unwrap_or(""),
                 );
+            } else if assistant_message_event_type.starts_with("toolcall_") {
+                if let Some(line) = handle_tool_call_event(
+                    state,
+                    assistant_message_event_type,
+                    &event["assistantMessageEvent"],
+                    tool_arg_truncate_chars,
+                ) {
+                    print_tool_line(state, &line);
+                }
             } else if let Some(delta) = event["assistantMessageEvent"]["delta"].as_str() {
                 if !delta.is_empty() {
-                    feed_assistant_text(state, delta, tool_arg_truncate_chars);
+                    feed_assistant_text(state, delta);
                 }
             }
         }
@@ -1486,7 +1496,7 @@ fn process_event(
                 }
                 record_assistant_terminal(state, &event["message"]);
             }
-            finish_pi_text_stream(state);
+            finish_pi_text_stream(state, tool_arg_truncate_chars);
             if state.printed_text_delta {
                 finish_delta_line();
                 state.printed_text_delta = false;
@@ -1505,7 +1515,7 @@ fn process_event(
                 }
                 record_assistant_terminal(state, last);
             }
-            finish_pi_text_stream(state);
+            finish_pi_text_stream(state, tool_arg_truncate_chars);
             if state.printed_text_delta {
                 finish_delta_line();
                 state.printed_text_delta = false;
@@ -2302,16 +2312,14 @@ mod tests {
     fn finish_pi_text_stream_flushes_a_block_left_open() {
         let mut state = ParseState::default();
         handle_thinking_event(&mut state, "thinking_delta", "interrupted");
-        finish_pi_text_stream(&mut state);
+        finish_pi_text_stream(&mut state, DEFAULT_TOOL_ARG_TRUNCATE_CHARS);
         assert!(!state.in_thinking_block);
         assert!(state.thinking_line.is_empty());
     }
 
-    /// Thinking must not reach `feed_assistant_text`: reasoning prose
-    /// containing a top-level `{` would otherwise be captured as one of Pi's
-    /// bare tool-call blobs and mislabeled as a `[tool]` line.
+    /// Thinking is buffered as tagged lines, braces and all.
     #[test]
-    fn process_event_routes_thinking_away_from_the_tool_call_scanner() {
+    fn process_event_keeps_braced_thinking_as_thinking() {
         let mut state = ParseState::default();
         let root = Path::new(".");
         process_event(
@@ -2326,10 +2334,6 @@ mod tests {
             &mut state,
             root,
             DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
-        );
-        assert!(
-            !state.capturing_json,
-            "a brace inside reasoning must not open a tool-call capture"
         );
         assert!(state.in_thinking_block);
         assert_eq!(
@@ -3226,152 +3230,204 @@ mod tests {
         assert_eq!(state.compaction_thrash, None);
     }
 
-    /// RAL-380: the exact shape observed in a real `pi-openrouter-deepseek`
-    /// terminal log -- a bare shell-command call with no wrapping tool name.
-    #[test]
-    fn format_pi_tool_call_recognizes_a_bash_style_command() {
-        let line = format_pi_tool_call(
-            &serde_json::json!({"command": "cargo check -p ralphus-daemon", "timeout": 900}),
-            200,
+    fn tool_end(index: i64, name: &str, arguments: Value) -> Value {
+        serde_json::json!({
+            "type": "toolcall_end",
+            "contentIndex": index,
+            "toolCall": {"type": "toolCall", "id": "call_1", "name": name, "arguments": arguments},
+        })
+    }
+
+    fn tool_line(name: &str, arguments: Value, truncate: usize) -> String {
+        let mut state = ParseState::default();
+        handle_tool_call_event(
+            &mut state,
+            "toolcall_end",
+            &tool_end(0, name, arguments),
+            truncate,
         )
-        .expect("a command+timeout object should be recognized as a bash call");
+        .expect("toolcall_end yields a line")
+    }
+
+    #[test]
+    fn tool_line_renders_bash_and_powershell_under_their_own_names() {
+        let args = serde_json::json!({"command": "cargo check", "timeout": 900});
         assert_eq!(
-            line,
-            r#"[tool.bash] bash(command="cargo check -p ralphus-daemon", timeout=900)"#
+            tool_line("bash", args.clone(), 200),
+            r#"[tool.bash] bash(command="cargo check", timeout=900)"#
+        );
+        assert_eq!(
+            tool_line("powershell", args, 200),
+            r#"[tool.powershell] powershell(command="cargo check", timeout=900)"#
         );
     }
 
     #[test]
-    fn format_pi_tool_call_truncates_a_long_command() {
-        let line = format_pi_tool_call(&serde_json::json!({"command": "a".repeat(250)}), 10)
-            .expect("recognized as a bash call");
+    fn tool_line_truncates_a_long_command() {
         assert_eq!(
-            line,
+            tool_line("bash", serde_json::json!({"command": "a".repeat(250)}), 10),
             format!(r#"[tool.bash] bash(command="{}…")"#, "a".repeat(10))
         );
     }
 
-    /// RAL-380: an edit call with multiple find/replace pairs in one object,
-    /// as seen for `daemon/src/store.rs` edits in the real log.
     #[test]
-    fn format_pi_tool_call_recognizes_a_multi_edit_call() {
-        let line = format_pi_tool_call(
-            &serde_json::json!({
+    fn tool_line_renders_a_multi_edit_call() {
+        let line = tool_line(
+            "edit",
+            serde_json::json!({
                 "path": "daemon/src/runner.rs",
                 "edits": [
                     {"oldText": "turns: None,", "newText": "turns: Some(2),"},
-                    {"oldText": "foo", "newText": "bar"},
+                    {"oldText": "fn f() { 1 }", "newText": "bar"},
                 ]
             }),
             200,
-        )
-        .expect("an edits+path object should be recognized as an edit call");
+        );
         assert_eq!(
             line,
-            r#"[tool.edit] edit(path="daemon/src/runner.rs", edits=[#1: old_text="turns: None,", new_text="turns: Some(2),"; #2: old_text="foo", new_text="bar"])"#
+            r#"[tool.edit] edit(path="daemon/src/runner.rs", edits=[#1: old_text="turns: None,", new_text="turns: Some(2),"; #2: old_text="fn f() { 1 }", new_text="bar"])"#
         );
     }
 
     #[test]
-    fn format_pi_tool_call_recognizes_a_read_call() {
-        let line = format_pi_tool_call(
-            &serde_json::json!({"limit": 75, "offset": 12200, "path": "daemon/src/store.rs"}),
-            200,
-        )
-        .expect("a path+offset/limit object should be recognized as a read call");
+    fn tool_line_renders_read_with_and_without_a_range() {
         assert_eq!(
-            line,
-            r#"[tool.read] read(path="daemon/src/store.rs", offset=12200, limit=75)"#
-        );
-    }
-
-    /// A `path`-only object with neither `offset`/`limit` nor `edits` isn't a
-    /// shape this classifier has evidence for -- it must fall back to `None`
-    /// (raw passthrough) rather than guess.
-    #[test]
-    fn format_pi_tool_call_does_not_classify_an_unrecognized_shape() {
-        assert_eq!(
-            format_pi_tool_call(&serde_json::json!({"path": "some/file.rs"}), 200),
-            None
-        );
-        assert_eq!(
-            format_pi_tool_call(&serde_json::json!({"foo": "bar"}), 200),
-            None
-        );
-    }
-
-    #[test]
-    fn format_pi_tool_event_marks_an_unrecognized_json_object_unknown() {
-        assert_eq!(
-            format_pi_tool_event(
-                &serde_json::json!({"unexpected": true}),
-                r#"{"unexpected":true}"#,
-                200,
+            tool_line(
+                "read",
+                serde_json::json!({"limit": 75, "offset": 12200, "path": "a.rs"}),
+                200
             ),
-            r#"[tool.unknown] {"unexpected":true}"#
+            r#"[tool.read] read(path="a.rs", offset=12200, limit=75)"#
         );
-    }
-
-    #[test]
-    fn complete_unparseable_tool_candidate_uses_unknown_tag() {
-        let raw = r#"{\"unterminated\":}"#;
-        assert!(serde_json::from_str::<Value>(raw).is_err());
         assert_eq!(
-            format_unknown_tool_event(raw),
-            r#"[tool.unknown] {\"unterminated\":}"#
+            tool_line("read", serde_json::json!({"path": "a.rs"}), 200),
+            r#"[tool.read] read(path="a.rs")"#
         );
     }
 
-    /// RAL-380: `feed_assistant_text` must capture a top-level JSON object
-    /// spanning many small deltas (Pi streams token-by-token, not whole
-    /// blobs) and clear its buffer once the object balances.
     #[test]
-    fn feed_assistant_text_captures_a_json_blob_split_across_many_deltas() {
-        let mut state = ParseState::default();
-        for ch in r#"{"command": "echo hi"}"#.chars() {
-            feed_assistant_text(&mut state, &ch.to_string(), DEFAULT_TOOL_ARG_TRUNCATE_CHARS);
+    fn tool_line_renders_every_other_builtin_generically() {
+        assert_eq!(
+            tool_line(
+                "write",
+                serde_json::json!({"path": "a.rs", "content": "x".repeat(20)}),
+                5
+            ),
+            r#"[tool.write] write(content="xxxxx…", path="a.rs")"#
+        );
+        for name in ["grep", "find", "ls"] {
+            let line = tool_line(name, serde_json::json!({"path": "src"}), 200);
+            assert_eq!(line, format!(r#"[tool.{name}] {name}(path="src")"#));
         }
-        assert!(
-            !state.capturing_json,
-            "the object closed and should be flushed"
+        assert_eq!(
+            tool_line("my_plugin", serde_json::json!({"q": 1}), 200),
+            r#"[tool.my_plugin] my_plugin(q="1")"#
         );
-        assert!(state.json_buffer.is_empty());
     }
 
-    /// A `{` that never closes (ordinary prose, not a tool call) must not
-    /// leave the parser stuck waiting forever -- `finish_pi_text_stream`
-    /// (called at `message_end`/`agent_end`) flushes it as plain text.
+    /// A plugin that replaced a built-in with different arguments falls back
+    /// to the generic renderer rather than hiding them.
     #[test]
-    fn finish_pi_text_stream_flushes_an_unterminated_json_looking_prefix() {
+    fn tool_line_falls_back_when_a_builtin_has_unexpected_arguments() {
+        assert_eq!(
+            tool_line("bash", serde_json::json!({"script": "ls"}), 200),
+            r#"[tool.bash] bash(script="ls")"#
+        );
+    }
+
+    #[test]
+    fn tool_line_without_a_name_is_unknown() {
         let mut state = ParseState::default();
-        feed_assistant_text(
+        let line = handle_tool_call_event(
             &mut state,
-            "here's a map {like this, unterminated",
-            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
-        );
-        assert!(
-            state.capturing_json,
-            "the stray open brace should still be buffering"
-        );
-        finish_pi_text_stream(&mut state);
-        assert!(!state.capturing_json);
-        assert!(state.json_buffer.is_empty());
-    }
-
-    /// Braces inside a string value (very common in Rust source edits) must
-    /// not be mistaken for structural JSON nesting.
-    #[test]
-    fn format_pi_tool_call_edit_survives_braces_inside_the_edited_text() {
-        let line = format_pi_tool_call(
-            &serde_json::json!({
-                "path": "src/lib.rs",
-                "edits": [{"oldText": "fn f() { 1 }", "newText": "fn f() { 2 }"}]
-            }),
+            "toolcall_end",
+            &serde_json::json!({"type": "toolcall_end", "toolCall": {"arguments": {"a": 1}}}),
             200,
         )
-        .expect("braces inside oldText/newText must not break parsing");
-        assert!(line.contains(r#"old_text="fn f() { 1 }""#));
-        assert!(line.contains(r#"new_text="fn f() { 2 }""#));
+        .unwrap();
+        assert_eq!(line, r#"[tool.unknown] unknown(a="1")"#);
+    }
+
+    /// Pi replaces unparseable arguments with `{}`; the streamed text is the
+    /// only surviving copy and must be printed.
+    #[test]
+    fn tool_line_prints_raw_text_when_pi_emptied_the_arguments() {
+        let mut state = ParseState::default();
+        let start =
+            serde_json::json!({"type": "toolcall_start", "contentIndex": 0, "toolName": "bash"});
+        let delta = serde_json::json!({"type": "toolcall_delta", "contentIndex": 0, "delta": "{\"command\": oops"});
+        handle_tool_call_event(&mut state, "toolcall_start", &start, 200);
+        handle_tool_call_event(&mut state, "toolcall_delta", &delta, 200);
+        let line = handle_tool_call_event(
+            &mut state,
+            "toolcall_end",
+            &tool_end(0, "bash", serde_json::json!({})),
+            200,
+        )
+        .unwrap();
+        assert_eq!(line, r#"[tool.bash] bash({"command": oops)"#);
+        assert!(state.pending_tool_calls.is_empty());
+    }
+
+    #[test]
+    fn unfinished_tool_calls_are_printed_from_their_raw_text() {
+        let mut state = ParseState::default();
+        handle_tool_call_event(
+            &mut state,
+            "toolcall_start",
+            &serde_json::json!({"contentIndex": 2, "toolName": "grep"}),
+            200,
+        );
+        handle_tool_call_event(
+            &mut state,
+            "toolcall_delta",
+            &serde_json::json!({"contentIndex": 2, "delta": "{\"pattern\": \"x"}),
+            200,
+        );
+        assert_eq!(
+            unfinished_tool_lines(&mut state, 200),
+            vec![r#"[tool.grep] {"pattern": "x"#.to_string()]
+        );
+        assert!(state.pending_tool_calls.is_empty());
+    }
+
+    /// Replays a trimmed real `pi --mode json` capture (pi-coding-agent
+    /// 0.85.1, `openrouter/z-ai/glm-5.3-flash`; the final text delta is
+    /// replaced with prose containing literal braces).
+    #[test]
+    fn live_glm_capture_yields_structured_tool_lines_and_plain_prose() {
+        let fixture = include_str!("../tests/fixtures/pi_toolcall_glm_5_3_flash.jsonl");
+        let mut state = ParseState::default();
+        let mut lines = Vec::new();
+        let mut text = String::new();
+        for raw in fixture.lines() {
+            let event: Value = serde_json::from_str(raw).unwrap();
+            let inner = &event["assistantMessageEvent"];
+            let kind = inner["type"].as_str().unwrap();
+            if kind.starts_with("toolcall_") {
+                lines.extend(handle_tool_call_event(&mut state, kind, inner, 200));
+            } else if let Some(delta) = inner["delta"].as_str() {
+                text.push_str(delta);
+            }
+        }
+        assert_eq!(
+            lines,
+            vec![
+                r#"[tool.bash] bash(command="echo hi")"#.to_string(),
+                r#"[tool.read] read(path="a.txt")"#.to_string(),
+            ]
+        );
+        assert_eq!(text, "done {github,gitlab}");
+        assert!(state.pending_tool_calls.is_empty());
+    }
+
+    /// Prose containing braces is plain text, never a tool line.
+    #[test]
+    fn feed_assistant_text_prints_braces_as_plain_text() {
+        let mut state = ParseState::default();
+        feed_assistant_text(&mut state, "failures in {github,gitlab}");
+        assert!(state.printed_text_delta);
+        assert!(state.pending_tool_calls.is_empty());
     }
 
     #[test]

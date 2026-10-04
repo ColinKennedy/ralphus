@@ -16,7 +16,7 @@ use crate::backend::{
 };
 use crate::cli_agent_common::{live_session_path, write_live_session_id, write_prompt_file};
 use crate::mcp_init::{self, McpInitializationPlan, McpInitializer, McpSetupCommand};
-use crate::shell_label::exec_command_label;
+use crate::shell_label::{exec_command_label, format_tool_input};
 use crate::shellcmd::{self, Env};
 use crate::tools::Workspace;
 
@@ -1133,35 +1133,6 @@ fn print_delta(delta: &str) {
 #[allow(clippy::print_stdout)] // intentional: see `print_header`
 fn finish_delta_line() {
     println!();
-}
-
-/// Renders a `tool_use` block's input compactly for the live tmux pane
-/// (RAL-102), mirroring the old `claude_code_backend.py`'s
-/// `_format_tool_input`. `truncate_chars` (RAL-303) is the per-value
-/// character budget before a trailing `…` is appended -- configurable via
-/// `[live_view] tool_arg_truncate_chars`, since the fixed 80-char cutoff this
-/// used to hardcode made exactly the tool calls an operator most needs to
-/// read (file edits, shell commands, diffs) illegible.
-fn format_tool_input(input: &Value, truncate_chars: usize) -> String {
-    let Some(obj) = input.as_object() else {
-        return String::new();
-    };
-    obj.iter()
-        .map(|(key, value)| {
-            let text = match value {
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
-            };
-            let text = if text.chars().count() > truncate_chars {
-                let truncated: String = text.chars().take(truncate_chars).collect();
-                format!("{truncated}…")
-            } else {
-                text
-            };
-            format!("{key}={text:?}")
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 /// Extracts human-readable text from a `tool_result` block's content
