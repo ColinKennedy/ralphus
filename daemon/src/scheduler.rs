@@ -797,6 +797,7 @@ fn log_claims(
         _span.set_attribute("squad_id", squad_id.clone());
         timings.otel += phase.elapsed();
         let phase = Instant::now();
+        // ralphus[ignore-rlog-pair]: CartographerEntry struct pushed to batched vec, emitted later
         crate::rlog!(INFO, "ralphus [scheduler] squad {squad_id} claimed");
         timings.rlog += phase.elapsed();
         entries.push((
