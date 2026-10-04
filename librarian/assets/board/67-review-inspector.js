@@ -49,6 +49,9 @@
        * @property {string} outcome - resolved / passed / failed / committed …
        * @property {string} who - The agent that ran it.
        * @property {number} elapsedMs - Measured duration, or 0 when the emitter reports none. Never estimated.
+       * @property {string} [task] - The daemon task that owns this pass's transcript.
+       * @property {string} [cellId] - The unique resolver cell that owns this pass.
+       * @property {string} [prompt] - The dispatched instruction, when retained by the daemon.
        */
       /** @type {boolean} True while the log dock is expanded. */
       let reviewDockOpen = false;
@@ -454,7 +457,7 @@
         if (branchMessages[key] === undefined) loadBranchMessages(g.id, b.id);
         const msgs = branchMessages[key] || [];
         if (!msgs.length) {
-          return `<div class="absent-run" style="margin-bottom:12px"><span class="ai">○</span>
+          return `<div class="absent-run" style="margin-bottom:12px">
               <div class="abody"><div class="at">No change requests yet</div>
                 <div class="as">Ask for a change below and it is routed straight into this branch's worktree.
                   The same thread is reachable from the CLI:
@@ -686,7 +689,9 @@
               id: `rebase-${r.id}`, kind: "rebase",
               label: `rebase onto ${g.base_branch || "upstream"}${found}`,
               atMs: r.at_ms, outcome: "running", elapsedMs: 0,
-              who: String(p.agent || resolver),
+              who: String(p.agent || resolver), task: String(r.task || p.task || "resolver"),
+              cellId: typeof r.cell_id === "string" ? r.cell_id : (typeof p.cell_id === "string" ? p.cell_id : undefined),
+              prompt: typeof p.prompt === "string" ? p.prompt : undefined,
             });
           } else if (msg.startsWith("conflicts resolved")) {
             close("rebase", p.committed ? "resolved" : "resolved, nothing to commit");
@@ -696,6 +701,9 @@
             runs.push({
               id: `proof-${r.id}`, kind: "proof", label: "final proof",
               atMs: r.at_ms, outcome: "running", elapsedMs: 0, who: resolver,
+              task: String(r.task || p.task || "resolver-proof"),
+              cellId: typeof r.cell_id === "string" ? r.cell_id : (typeof p.cell_id === "string" ? p.cell_id : undefined),
+              prompt: typeof p.prompt === "string" ? p.prompt : undefined,
             });
           } else if (msg.startsWith("final proof done")) {
             close("proof", p.passed ? "passed" : "failed");
@@ -703,6 +711,9 @@
             runs.push({
               id: `fb-${r.id}`, kind: "feedback", label: "feedback revision",
               atMs: r.at_ms, outcome: "running", elapsedMs: 0, who: resolver,
+              task: String(r.task || p.task || "feedback"),
+              cellId: typeof r.cell_id === "string" ? r.cell_id : (typeof p.cell_id === "string" ? p.cell_id : undefined),
+              prompt: typeof p.prompt === "string" ? p.prompt : undefined,
             });
           } else if (msg.startsWith("feedback done")) {
             close("feedback", p.committed ? "committed" : "no change committed");
@@ -804,7 +815,6 @@
         if (!b.worktree) {
           return `<div class="empty">No worktree yet — a resolver session starts when this branch begins rebasing.</div>`;
         }
-        const key = `guardian|${g.id}|${b.id}`;
         // The run list is derived from the review's event rows, which the log
         // drawer also reads -- one fetch per review, on the first thing that
         // needs it, rather than one per tab.
@@ -812,6 +822,7 @@
         const runs = branchRuns(g, b);
         const ri = curRunIdx(runs, b.id);
         const run = ri >= 0 ? runs[ri] : null;
+        const key = `guardian|${g.id}|${b.id}${run && run.task && run.cellId ? `|${run.task}|${run.cellId}` : ""}`;
         const isLatest = ri === runs.length - 1;
         const sub = liveSub[b.id] || "terminal";
         const ended = !!peekEnded[key];
@@ -916,15 +927,6 @@
               data-tip="Open this branch's log drawer alongside the transcript.">Logs</button>
             <span class="rg-sub">${run ? esc(run.who) : ""}</span>
           </div>`;
-        if (!isLatest) {
-          return `<div class="absent-run"><span class="ai">○</span>
-              <div class="abody"><div class="at">This run's terminal text is no longer reachable</div>
-                <div class="as">The persisted attempt log covers the branch's current pass and its reattaches;
-                  an earlier pass — a previous rebase, a proof, a feedback revision — wrote to the same pane and
-                  is not addressable on its own. What the run did, when, and how it ended is above and in the
-                  logs drawer; only its raw output is gone.</div></div>
-            </div>${foot}`;
-        }
         const shown = peekContent[key];
         return `<div style="position:relative"><div class="runterm" id="peek-pre-${peekCssKey(key)}" style="height:${peekPaneHeight}px" tabindex="0" data-key="${esc(key)}"
             onscroll="onPeekScroll(this.dataset.key)" onkeydown="handlePeekKeydown(event,this.dataset.key)"
@@ -936,17 +938,19 @@
       /**
        * The Live tab's Prompt view: the instruction this run's agent was given.
        *
-       * The daemon composes a resolver's prompt at dispatch and never persists
-       * it, so for most runs there is nothing to show and this says so rather
-       * than showing the system prompt again under a second label. A feedback
-       * revision is the exception -- the reviewer's own text is stored, and it
-       * is the substantive half of what that run was told to do.
+       * The daemon retains each newly dispatched resolver prompt with its run.
+       * Older runs created before that record was available fall back to the
+       * stored reviewer feedback when applicable, then explain the limitation.
        * @param {GuardianView} g - The review.
        * @param {GuardianBranch} b - The branch.
        * @param {BranchRun|null} run - The run being shown.
        * @returns {string}
        */
       function livePromptView(g, b, run) {
+        if (run && run.prompt) {
+          return `<div class="promptbox">${esc(run.prompt)}</div>
+            <div class="hint">The instruction dispatched to this run.</div>`;
+        }
         if (run && run.kind === "feedback") {
           const msgs = branchMessages[`${g.id}:${b.id}`];
           if (msgs === undefined) { loadBranchMessages(g.id, b.id); return `<div class="promptbox">Loading…</div>`; }
@@ -959,12 +963,11 @@
               standing instructions before sending; only the authored half is retained, and this is it.</div>`;
           }
         }
-        return `<div class="absent-run"><span class="ai">○</span>
+        return `<div class="absent-run">
             <div class="abody"><div class="at">This run's prompt was not retained</div>
-              <div class="as">A resolver's instruction is composed when the run is dispatched — naming the branch
-                and the exact conflicted files — and is not written to the store, so there is nothing to replay.
-                The standing half of what it was told is on the System Prompt tab; a feedback revision shows the
-                reviewer's own text here.</div></div>
+              <div class="as">This historical run has no retained dispatch record. The standing half of what it
+                was told is on the System Prompt tab; a feedback revision may still show the reviewer's own text
+                here.</div></div>
           </div>`;
       }
       /**
@@ -975,7 +978,7 @@
        */
       function liveSystemPromptView(g, key) {
         if (!currentUserIsAdmin) {
-          return `<div class="absent-run"><span class="ai">○</span>
+          return `<div class="absent-run">
               <div class="abody"><div class="at">Admin-only view</div>
                 <div class="as">The effective system prompt is shown to administrators only.</div></div>
             </div>`;
