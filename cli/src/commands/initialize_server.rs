@@ -9,12 +9,12 @@
 //! non-interactive/scripted runs; without it, a non-TTY stdin is rejected
 //! the same way `ralphus mcp initialize` rejects one (see `mcp.rs`).
 //! Boolean answer flags take `yes` or `no`: `--install-tmux`,
-//! `--setup-mcp`, `--register-project`, `--require-forks`, `--create-admin`,
-//! `--submit-sample`. The value flags are `--tmux-program`, repeatable
+//! `--setup-mcp`, `--register-project`, `--review-auto-submit-pr-stack`,
+//! `--require-forks`, `--create-admin`, `--submit-sample`. The value flags are `--tmux-program`, repeatable
 //! `--mcp-host`, `--project-name`, `--project-description`,
 //! `--bug-threshold`, `--feature-threshold`, `--investigation-threshold`,
 //! `--unclassified-threshold`, `--fork-user`, `--fork-url`, `--forge-host`,
-//! `--forge-token`, `--admin-name`, `--sample-mode`, and `--sample-agent`.
+//! `--forge-token`, `--admin-name`, `--review-resolver-agent`, `--sample-mode`, and `--sample-agent`.
 
 use std::io::{IsTerminal as _, Write as _};
 use std::path::PathBuf;
@@ -80,6 +80,14 @@ const UNCLASSIFIED_THRESHOLD: InitializeSetting = InitializeSetting {
     prompt: "unclassified threshold",
     flag: "--unclassified-threshold",
 };
+const REVIEW_AUTO_SUBMIT_PR_STACK: InitializeSetting = InitializeSetting {
+    prompt: "review auto-submit PR stack",
+    flag: "--review-auto-submit-pr-stack",
+};
+const REVIEW_RESOLVER_AGENT: InitializeSetting = InitializeSetting {
+    prompt: "review resolver agent",
+    flag: "--review-resolver-agent",
+};
 const REQUIRE_FORKS: InitializeSetting = InitializeSetting {
     prompt: "require forks",
     flag: "--require-forks",
@@ -133,6 +141,8 @@ const INTERACTIVE_SETTINGS: &[&InitializeSetting] = &[
     &FEATURE_THRESHOLD,
     &INVESTIGATION_THRESHOLD,
     &UNCLASSIFIED_THRESHOLD,
+    &REVIEW_AUTO_SUBMIT_PR_STACK,
+    &REVIEW_RESOLVER_AGENT,
     &REQUIRE_FORKS,
     &FORK_USER,
     &FORK_URL,
@@ -172,6 +182,8 @@ pub struct InitializeServerOptions {
     pub feature_threshold: Option<String>,
     pub investigation_threshold: Option<String>,
     pub unclassified_threshold: Option<String>,
+    pub review_auto_submit_pr_stack: Option<bool>,
+    pub review_resolver_agent: Option<String>,
     pub require_forks: Option<bool>,
     pub fork_user: Option<String>,
     pub fork_url: Option<String>,
@@ -200,6 +212,11 @@ impl std::fmt::Debug for InitializeServerOptions {
             .field("feature_threshold", &self.feature_threshold)
             .field("investigation_threshold", &self.investigation_threshold)
             .field("unclassified_threshold", &self.unclassified_threshold)
+            .field(
+                "review_auto_submit_pr_stack",
+                &self.review_auto_submit_pr_stack,
+            )
+            .field("review_resolver_agent", &self.review_resolver_agent)
             .field("require_forks", &self.require_forks)
             .field("fork_user", &self.fork_user)
             .field("fork_url", &self.fork_url)
@@ -231,6 +248,8 @@ impl InitializeServerOptions {
             || self.feature_threshold.is_some()
             || self.investigation_threshold.is_some()
             || self.unclassified_threshold.is_some()
+            || self.review_auto_submit_pr_stack.is_some()
+            || self.review_resolver_agent.is_some()
             || self.require_forks.is_some()
             || self.fork_user.is_some()
             || self.fork_url.is_some()
@@ -716,6 +735,31 @@ fn step_review_settings(opts: &GlobalOpts, project: &str, setup: &InitializeServ
             Err(error) => println!("    {triage_type}: error setting threshold: {error}"),
         }
     }
+    let auto_submit_pr_stack = prompt_yes_no(
+        &REVIEW_AUTO_SUBMIT_PR_STACK,
+        "  automatically submit this project's review PR stacks?",
+        true,
+        setup.review_auto_submit_pr_stack,
+        setup.yes,
+    );
+    let resolver_agent = prompt(
+        &REVIEW_RESOLVER_AGENT,
+        "  resolver agent for this project's reviews",
+        "claude-code",
+        setup.review_resolver_agent.as_ref(),
+        setup.yes,
+    );
+    let patch = ProjectReviewSettingsPatch {
+        auto_submit_pr_stack: Some(auto_submit_pr_stack),
+        default_resolver_agent: Some(&resolver_agent),
+        ..Default::default()
+    };
+    match client.set_project_review_settings(project, &patch) {
+        Ok(_) => println!(
+            "  review defaults: auto-submit PR stacks = {auto_submit_pr_stack}; resolver agent = {resolver_agent}"
+        ),
+        Err(error) => println!("  error setting review defaults: {error}"),
+    }
 }
 
 // ---- forks ------------------------------------------------------------------
@@ -1097,7 +1141,7 @@ mod tests {
     #[test]
     fn interactive_settings_have_unique_prompt_and_flag_contracts() {
         assert!(interactive_settings_are_valid());
-        assert_eq!(INTERACTIVE_SETTINGS.len(), 21);
+        assert_eq!(INTERACTIVE_SETTINGS.len(), 23);
     }
 
     #[test]

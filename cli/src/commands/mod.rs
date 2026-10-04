@@ -380,6 +380,11 @@ fn parse_initialize_server(
         feature_threshold: scanner.take_value("--feature-threshold")?,
         investigation_threshold: scanner.take_value("--investigation-threshold")?,
         unclassified_threshold: scanner.take_value("--unclassified-threshold")?,
+        review_auto_submit_pr_stack: parse_initialize_bool(
+            scanner,
+            "--review-auto-submit-pr-stack",
+        )?,
+        review_resolver_agent: scanner.take_value("--review-resolver-agent")?,
         require_forks: parse_initialize_bool(scanner, "--require-forks")?,
         fork_user: scanner.take_value("--fork-user")?,
         fork_url: scanner.take_value("--fork-url")?,
@@ -563,6 +568,10 @@ mod tests {
             "3",
             "--unclassified-threshold",
             "5",
+            "--review-auto-submit-pr-stack",
+            "yes",
+            "--review-resolver-agent",
+            "claude-code",
             "--require-forks",
             "yes",
             "--fork-user",
@@ -589,6 +598,8 @@ mod tests {
                 assert_eq!(setup.mcp_hosts, ["claude"]);
                 assert_eq!(setup.project_name.as_deref(), Some("ralphus"));
                 assert_eq!(setup.forge_token.as_deref(), Some("token"));
+                assert_eq!(setup.review_auto_submit_pr_stack, Some(true));
+                assert_eq!(setup.review_resolver_agent.as_deref(), Some("claude-code"));
                 assert_eq!(setup.sample_mode.as_deref(), Some("agent"));
                 assert_eq!(setup.sample_agent.as_deref(), Some("claude-code"));
             }
