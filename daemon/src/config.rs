@@ -277,6 +277,12 @@ pub struct ReviewConfig {
     /// Manual checks declared explicitly are unaffected.
     #[serde(default)]
     pub skip_manual_checks: Option<bool>,
+    /// RAL-565: project default for whether a review's manual checks start
+    /// automatically once ready. `None` resolves to `false` (see
+    /// [`Self::auto_run`]). A review's `[review] auto_run` and a check's own
+    /// `auto_run` both win over this.
+    #[serde(default)]
+    pub auto_run: Option<bool>,
     /// Which events tear down and rebuild a review's prepared build (any of
     /// `ralphus_core::schema::REBUILD_ON_VALUES`). `None` means unset, which
     /// resolves to all three values (see [`Self::rebuild_on`]); the project
@@ -437,6 +443,7 @@ pub const REVIEW_CONFIG_KEYS: &[&str] = &[
     "summary_format",
     "cache_manual_checks",
     "skip_manual_checks",
+    "auto_run",
     "rebuild_on",
 ];
 
@@ -575,6 +582,12 @@ impl ReviewConfig {
     #[must_use]
     pub fn skip_manual_checks(&self) -> bool {
         self.skip_manual_checks.unwrap_or(false)
+    }
+
+    /// Whether manual checks auto-run when no layer sets it (`false`).
+    #[must_use]
+    pub fn auto_run(&self) -> bool {
+        self.auto_run.unwrap_or(false)
     }
 
     /// The events that rebuild a review's prepared build when neither the
@@ -737,6 +750,7 @@ impl ReviewConfig {
                 .or(self.auto_cancel_outdated_pr_pipelines),
             cache_manual_checks: over.cache_manual_checks.or(self.cache_manual_checks),
             skip_manual_checks: over.skip_manual_checks.or(self.skip_manual_checks),
+            auto_run: over.auto_run.or(self.auto_run),
             rebuild_on: over.rebuild_on.or(self.rebuild_on),
             auto_fix_prompt_template: over
                 .auto_fix_prompt_template
@@ -906,6 +920,10 @@ pub const REVIEW_FIELD_PARITY: &[(&str, ReviewFieldDefault)] = &[
     (
         "skip_manual_checks",
         ReviewFieldDefault::ProjectDefault(|c| c.skip_manual_checks.is_some()),
+    ),
+    (
+        "auto_run",
+        ReviewFieldDefault::ProjectDefault(|c| c.auto_run.is_some()),
     ),
     (
         "rebuild_on",
@@ -4847,6 +4865,25 @@ mod tests {
         assert!(!global.clone().merge(project).cache_manual_checks());
         // Project unset falls back to the global value.
         assert!(global.merge(ReviewConfig::default()).cache_manual_checks());
+    }
+
+    // ── auto_run (RAL-565) ──────────────────────────────────────────────────
+
+    #[test]
+    fn auto_run_defaults_off_parses_and_merges() {
+        assert!(!ReviewConfig::default().auto_run());
+        let c = from_toml_str(
+            "[review]
+auto_run = true
+",
+        );
+        assert_eq!(c.auto_run, Some(true));
+        let project = ReviewConfig {
+            auto_run: Some(false),
+            ..ReviewConfig::default()
+        };
+        assert!(c.clone().merge(project).auto_run == Some(false));
+        assert!(c.merge(ReviewConfig::default()).auto_run());
     }
 
     // ── skip_manual_checks ──────────────────────────────────────────────────

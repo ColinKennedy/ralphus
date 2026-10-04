@@ -2985,6 +2985,9 @@ struct EffectiveReviewDefaults {
     /// The resolved manual-check generation skip default (per-review
     /// override > database default > `.ralphus.toml`/global > `false`).
     skip_manual_checks: bool,
+    /// RAL-565: the resolved manual-check auto-run default (per-review >
+    /// database default > `.ralphus.toml`/global > `false`).
+    auto_run: bool,
     /// The resolved list of events that rebuild a review's prepared build
     /// (per-review override > database default > `.ralphus.toml`/global >
     /// every event).
@@ -3015,6 +3018,7 @@ impl EffectiveReviewDefaults {
             auto_cancel_outdated_pr_pipelines: cfg.auto_cancel_outdated_pr_pipelines(),
             cache_manual_checks: cfg.cache_manual_checks(),
             skip_manual_checks: cfg.skip_manual_checks(),
+            auto_run: cfg.auto_run(),
             rebuild_on: cfg.rebuild_on(),
         }
     }
@@ -3129,6 +3133,10 @@ struct ProjectReviewSettingsBody {
     /// when unset.
     #[serde(default)]
     skip_manual_checks: Option<bool>,
+    /// RAL-565: project-level default for whether manual checks auto-run once
+    /// ready -- see [`crate::store::ProjectReviewSettings`].
+    #[serde(default)]
+    auto_run: Option<bool>,
     /// Project-level default for which events (`rebase`, `feedback`,
     /// `auto_fix`) tear down and rebuild a review's prepared build -- see
     /// [`crate::store::ProjectReviewSettings`]. Absent leaves the setting
@@ -3333,6 +3341,9 @@ fn set_project_review_settings(daemon: &Daemon, name: &str, body: &str) -> Reply
     }
     if let Some(v) = req.skip_manual_checks {
         settings.skip_manual_checks = Some(v);
+    }
+    if let Some(v) = req.auto_run {
+        settings.auto_run = Some(v);
     }
     if let Some(v) = req.rebuild_on {
         settings.rebuild_on = v;
@@ -13805,6 +13816,10 @@ struct GuardianSettingsBody {
     /// project/global default", which resolves to `false` (generation runs).
     #[serde(default)]
     skip_manual_checks: Option<bool>,
+    /// RAL-565: this review's own default for whether its manual checks
+    /// auto-run once ready. `None` inherits the project/global default.
+    #[serde(default)]
+    auto_run: Option<bool>,
     /// Which events (`rebase`, `feedback`, `auto_fix`) tear down and rebuild
     /// this review's prepared build. Absent leaves it untouched, a list sets
     /// it (an empty list never rebuilds automatically), and an explicit
@@ -13894,6 +13909,9 @@ struct GuardianDetailsBody {
     /// See [`GuardianSettingsBody::skip_manual_checks`].
     #[serde(default)]
     skip_manual_checks: Option<bool>,
+    /// See [`GuardianSettingsBody::auto_run`].
+    #[serde(default)]
+    auto_run: Option<bool>,
     /// See [`GuardianSettingsBody::rebuild_on`].
     #[serde(default, deserialize_with = "deserialize_present")]
     rebuild_on: Option<Option<Vec<String>>>,
@@ -14408,6 +14426,11 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
             return store_error(&e);
         }
     }
+    if let Some(enabled) = req.auto_run {
+        if let Err(e) = store.set_guardian_auto_run(id, Some(enabled)) {
+            return store_error(&e);
+        }
+    }
     if let Some(events) = &req.rebuild_on {
         if let Err(e) = store.set_guardian_rebuild_on(id, events.as_deref()) {
             return store_error(&e);
@@ -14736,6 +14759,11 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
     }
     if let Some(enabled) = req.skip_manual_checks {
         if let Err(e) = store.set_guardian_skip_manual_checks(id, Some(enabled)) {
+            return store_error(&e);
+        }
+    }
+    if let Some(enabled) = req.auto_run {
+        if let Err(e) = store.set_guardian_auto_run(id, Some(enabled)) {
             return store_error(&e);
         }
     }
@@ -17399,6 +17427,106 @@ fn watch_check_run(
     });
 }
 
+/// RAL-565: which checks of `g` should start on their own right now, as
+/// `(kind, index)` pairs where `kind` is `"action"` (declared) or `"manual"`
+/// (generated). A check qualifies when it is ready, local, runnable, has every
+/// input defaulted, and its own `auto_run` -- falling back to the review's
+/// resolved default -- is on.
+fn auto_run_candidates(g: &crate::guardian::GuardianView) -> Vec<(&'static str, usize)> {
+    let eligible = |check: &crate::guardian::GuardianCheck| {
+        check.auto_run.unwrap_or(g.effective_auto_run)
+            && check.preparation_state.as_deref() == Some("ready")
+            && check.command.is_some()
+            && check.run_on.as_deref() != Some("review_machine")
+            && !(check.run_on.is_none() && g.machine.is_some())
+            && check
+                .inputs
+                .iter()
+                .all(|input| !input.default.is_empty() || g.input_values.contains_key(&input.name))
+    };
+    let mut out = Vec::new();
+    if !crate::guardian::GuardianStatus::is_terminal_status(&g.status) {
+        for (i, check) in g.action_hints.iter().enumerate() {
+            if eligible(check) {
+                out.push(("action", i));
+            }
+        }
+        for (i, check) in g.manual_commands.iter().enumerate() {
+            if eligible(check) {
+                out.push(("manual", i));
+            }
+        }
+    }
+    out
+}
+
+/// Claim one auto-run of a check generation on this daemon host. The key
+/// includes the generation's `prepared_at_ms`, so a rebuild that re-prepares
+/// the check opens a new claim while a repeat pass over the same generation
+/// cannot start it twice. Manual clicks never consult the claim.
+fn claim_auto_run(key: String) -> bool {
+    static CLAIMED: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+        std::sync::Mutex::new(None);
+    let mut guard = CLAIMED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard
+        .get_or_insert_with(std::collections::HashSet::new)
+        .insert(key)
+}
+
+/// RAL-565: start every ready, opted-in check of review `id` in a visible
+/// terminal, once per prepared generation. The check's `cleanup_command`
+/// (teardown of a previous run) runs first. Launching happens on its own
+/// thread so the preparation worker that calls this is never held up.
+pub(crate) fn auto_run_ready_checks(store: &crate::store_lock::StoreHandle, id: &str) {
+    let Ok(g) = store.lock().get_guardian(id) else {
+        return;
+    };
+    for (kind, index) in auto_run_candidates(&g) {
+        let check = if kind == "action" {
+            &g.action_hints[index]
+        } else {
+            &g.manual_commands[index]
+        };
+        let key = format!("{id}|{kind}|{index}|{}", check.prepared_at_ms.unwrap_or(0));
+        if !claim_auto_run(key) {
+            continue;
+        }
+        let check = check.clone();
+        let g = g.clone();
+        let store = store.clone();
+        let id = id.to_string();
+        std::thread::spawn(move || {
+            let cwd = check
+                .prepared_cwd
+                .clone()
+                .or_else(|| g.combined_worktree.clone())
+                .unwrap_or_else(|| g.git_root.clone());
+            let marker = new_check_run_marker(&id, kind, index);
+            let log = check_run_log_path(&id, kind, index);
+            let Some(prepared) = build_check_command_line(
+                &cwd,
+                &check,
+                &std::collections::HashMap::new(),
+                &g.input_values,
+                true,
+                &marker,
+                &log,
+            ) else {
+                return;
+            };
+            match spawn_in_terminal(None, "cmd", &prepared.args, &g.manual_checks_env) {
+                Ok(()) => watch_check_run(store, &id, kind, index, &prepared),
+                Err(e) => crate::rlog!(
+                    WARNING,
+                    "ralphus [guardian] review {id} auto-run of {kind} check {index} could not open a terminal: {e}"
+                ),
+            }
+        });
+    }
+}
+
 /// Run one or all LLM-generated manual review commands as fire-and-forget
 /// terminal subprocesses (RAL-27). Body `{ "index": N, "inputs": {...},
 /// "run_cleanup": bool }` runs command N only; no body (or `{}`) runs all
@@ -19668,6 +19796,104 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create check-run scratch dir");
         dir
+    }
+
+    // ── auto-run (RAL-565) ──
+
+    fn auto_run_check(
+        label: &str,
+        auto_run: Option<bool>,
+        state: &str,
+    ) -> crate::guardian::GuardianCheck {
+        crate::guardian::GuardianCheck {
+            label: Some(label.to_string()),
+            command: Some("echo hi".to_string()),
+            auto_run,
+            preparation_state: Some(state.to_string()),
+            ..crate::guardian::GuardianCheck::default()
+        }
+    }
+
+    fn auto_run_guardian(
+        review_default: Option<bool>,
+        hints: &[crate::guardian::GuardianCheck],
+    ) -> crate::guardian::GuardianView {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.set_guardian_auto_run(&id, review_default).unwrap();
+        store.set_guardian_action_hints(&id, hints).unwrap();
+        store.get_guardian(&id).unwrap()
+    }
+
+    #[test]
+    fn auto_run_is_off_by_default_and_check_setting_beats_review_default() {
+        let hints = [
+            auto_run_check("inherit", None, "ready"),
+            auto_run_check("on", Some(true), "ready"),
+            auto_run_check("off", Some(false), "ready"),
+        ];
+        assert_eq!(
+            auto_run_candidates(&auto_run_guardian(None, &hints)),
+            vec![("action", 1)],
+            "unset everywhere is off; only the explicit opt-in runs"
+        );
+        assert_eq!(
+            auto_run_candidates(&auto_run_guardian(Some(true), &hints)),
+            vec![("action", 0), ("action", 1)],
+            "a review default turns inheriting checks on; an opted-out check stays manual"
+        );
+        assert!(auto_run_candidates(&auto_run_guardian(Some(false), &hints[..1])).is_empty());
+    }
+
+    #[test]
+    fn auto_run_waits_for_ready_and_for_defaulted_inputs() {
+        let mut needs_input = auto_run_check("input", Some(true), "ready");
+        needs_input.inputs = vec![crate::guardian::CheckInput {
+            name: "port".to_string(),
+            message: String::new(),
+            default: String::new(),
+            r#type: crate::guardian::CheckInputType::String,
+        }];
+        let mut defaulted = needs_input.clone();
+        defaulted.inputs[0].default = "8080".to_string();
+        let hints = [
+            auto_run_check("preparing", Some(true), "preparing"),
+            auto_run_check("failed", Some(true), "failed"),
+            needs_input,
+            defaulted,
+        ];
+        assert_eq!(
+            auto_run_candidates(&auto_run_guardian(None, &hints)),
+            vec![("action", 3)]
+        );
+    }
+
+    #[test]
+    fn auto_run_claim_is_once_per_prepared_generation() {
+        assert!(claim_auto_run("g-claim|action|0|100".to_string()));
+        assert!(!claim_auto_run("g-claim|action|0|100".to_string()));
+        assert!(
+            claim_auto_run("g-claim|action|0|200".to_string()),
+            "a re-prepared generation is a new claim"
+        );
+    }
+
+    #[test]
+    fn auto_run_command_line_runs_teardown_before_the_check() {
+        let mut check = auto_run_check("c", Some(true), "ready");
+        check.cleanup_command = Some("stop-it".to_string());
+        let dir = check_run_scratch("auto-run-teardown");
+        let prepared = build_check_command_line(
+            "C:\repo",
+            &check,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            true,
+            &dir.join("m.exit"),
+            &dir.join("o.log"),
+        )
+        .unwrap();
+        assert!(prepared.args[2].contains("(stop-it) & echo hi"));
     }
 
     #[test]

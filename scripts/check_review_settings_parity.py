@@ -35,6 +35,7 @@ MAPPING = {
     "auto_cancel_outdated_pr_pipelines": "auto_cancel_outdated_pr_pipelines",
     "cache_manual_checks": "cache_manual_checks",
     "skip_manual_checks": "skip_manual_checks",
+    "auto_run": "auto_run",
     "rebuild_on": "rebuild_on",
 }
 EXEMPT = {
