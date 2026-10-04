@@ -38,6 +38,8 @@ pub mod logging;
 pub mod machine_targets;
 pub mod machines;
 pub mod mailbox;
+#[cfg(test)]
+pub(crate) mod mock_forge;
 pub mod monitor;
 pub mod otel;
 pub mod perf_timing;

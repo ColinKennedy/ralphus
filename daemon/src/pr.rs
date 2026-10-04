@@ -9613,6 +9613,7 @@ mod tests {
     use super::*;
     use crate::guardian::GuardianStatus;
     use crate::guardian::MergeStatus;
+    use crate::mock_forge::{MockForge, MockForgeServer};
     use crate::store::Store;
     use git2::build::CheckoutBuilder;
     use std::process::Command;
@@ -9895,8 +9896,8 @@ mod tests {
     /// call this test cares about. Answer "none" so the mock server's
     /// expected request sequence can move straight on to what the test is
     /// actually about.
-    fn expect_cancel_check(server: &tiny_http::Server, repo: &str) {
-        let req = server.recv().unwrap();
+    fn expect_cancel_check(server: &MockForgeServer, repo: &str) {
+        let req = server.recv();
         assert_eq!(req.method(), &tiny_http::Method::Get);
         assert!(
             req.url()
@@ -10984,19 +10985,12 @@ mod tests {
     /// test if it is ever asked to unstack or to register a new stack.
     #[test]
     fn reconcile_native_pr_stack_ignores_a_mid_restack_branch() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
+        let mock = MockForge::start(move |server| {
             let mut writes: Vec<String> = Vec::new();
-            loop {
-                let req = server.recv().unwrap();
+            for req in server.requests() {
                 let method = req.method().clone();
                 let url = req.url().to_string();
-                if url == "/done" {
-                    req.respond(tiny_http::Response::empty(204)).unwrap();
-                    break;
-                } else if method == tiny_http::Method::Get
-                    && url.starts_with("/repos/acme/widget/pulls/")
+                if method == tiny_http::Method::Get && url.starts_with("/repos/acme/widget/pulls/")
                 {
                     req.respond(
                         tiny_http::Response::from_string(
@@ -11083,12 +11077,7 @@ mod tests {
         }
 
         let store = Arc::new(crate::store_lock::StoreMutex::new(s));
-        let client = crate::forge::ForgeClient::new(
-            crate::forge::ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(crate::forge::ForgeKind::GitHub, "acme/widget");
 
         reconcile_native_pr_stack(&store, &client, &gid, None, 0).unwrap();
 
@@ -11097,13 +11086,8 @@ mod tests {
             Some(42),
             "a mid-restack reconcile must leave the registered stack in place"
         );
-        // Retire the server thread: it serves reads until this sentinel and
-        // reports whatever writes it was asked for along the way.
-        let _ = ureq::get(&format!("http://{addr}/done"))
-            .timeout(std::time::Duration::from_secs(5))
-            .call();
         assert!(
-            handle.join().unwrap().is_empty(),
+            mock.finish().is_empty(),
             "reconciling a correct stack must not write to the forge"
         );
 
@@ -11877,13 +11861,11 @@ mod tests {
     /// it never closes or recreates a pull request.
     #[test]
     fn repoint_stacked_prs_dissolves_retries_the_base_then_re_registers() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
+        let mock = MockForge::start(move |server| {
             let mut seen: Vec<(String, String)> = Vec::new();
             let mut created_payload = serde_json::Value::Null;
             for request_index in 0..3 {
-                let mut req = server.recv().unwrap();
+                let mut req = server.recv();
                 let method = req.method().as_str().to_string();
                 let url = req.url().to_string();
                 let mut body = String::new();
@@ -11908,12 +11890,7 @@ mod tests {
         let gid = s.create_guardian("demo", "main", "/tmp/root").unwrap();
         s.set_guardian_forge_stack_number(&gid, 42).unwrap();
         let store = Arc::new(crate::store_lock::StoreMutex::new(s));
-        let client = crate::forge::ForgeClient::new(
-            crate::forge::ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(crate::forge::ForgeKind::GitHub, "acme/widget");
 
         repoint_stacked_prs(
             &store,
@@ -11924,7 +11901,7 @@ mod tests {
         )
         .unwrap();
 
-        let (seen, created_payload) = handle.join().unwrap();
+        let (seen, created_payload) = mock.finish();
         assert_eq!(
             seen,
             vec![
@@ -11950,11 +11927,9 @@ mod tests {
 
     #[test]
     fn repoint_stacked_prs_does_not_retain_a_dissolved_stack_number() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
+        let mock = MockForge::start(move |server| {
             for request_index in 0..3 {
-                let req = server.recv().unwrap();
+                let req = server.recv();
                 match request_index {
                     0 => req.respond(tiny_http::Response::empty(204)).unwrap(),
                     1 => req.respond(tiny_http::Response::from_string("{}")).unwrap(),
@@ -11971,12 +11946,7 @@ mod tests {
         let gid = s.create_guardian("demo", "main", "/tmp/root").unwrap();
         s.set_guardian_forge_stack_number(&gid, 42).unwrap();
         let store = Arc::new(crate::store_lock::StoreMutex::new(s));
-        let client = crate::forge::ForgeClient::new(
-            crate::forge::ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(crate::forge::ForgeKind::GitHub, "acme/widget");
 
         let result = repoint_stacked_prs(
             &store,
@@ -11991,7 +11961,7 @@ mod tests {
             None,
             "a dissolved stack must not remain recorded when rebuilding it fails"
         );
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
@@ -12666,17 +12636,15 @@ mod tests {
     }
 
     fn synchronous_multi_branch_base_sync(forge: &str, already_synced: bool) {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
         let forge_name = forge.to_string();
-        let handle = std::thread::spawn(move || {
+        let mock = MockForge::start(move |server| {
             let mut bases = Vec::new();
             for (number, forge_base) in (1..=3).zip(if already_synced {
                 ["release", "a-alias", "b-alias"]
             } else {
                 ["main", "a-alias", "b-alias"]
             }) {
-                let req = server.recv().unwrap();
+                let req = server.recv();
                 assert_eq!(req.method(), &tiny_http::Method::Get);
                 let expected_get_path = if forge_name == "github" {
                     format!("/repos/acme/widget/pulls/{number}")
@@ -12704,7 +12672,7 @@ mod tests {
                     continue;
                 }
 
-                let mut req = server.recv().unwrap();
+                let mut req = server.recv();
                 let expected_method = if forge_name == "github" {
                     tiny_http::Method::Patch
                 } else {
@@ -12736,6 +12704,7 @@ mod tests {
             }
             bases
         });
+        let addr = mock.addr();
 
         let root = tmp_dir(&format!("sync-base-{forge}"));
         g(&root, &["init"]);
@@ -12802,7 +12771,7 @@ mod tests {
             if already_synced { 0 } else { 1 }
         );
         assert_eq!(
-            handle.join().unwrap(),
+            mock.finish(),
             if already_synced {
                 Vec::new()
             } else {
@@ -13037,9 +13006,7 @@ mod tests {
     #[test]
     fn detect_forge_reorder_converges_after_one_apply_when_the_registered_fork_remote_matches_base_branchs_own_remote()
      {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
+        let mock = MockForge::start(move |server| {
             // Two full rounds: one for the initial (correctly reported)
             // detection, one for the re-check after applying the fix, which
             // must come back clean. `detect_forge_reorder` fetches each
@@ -13048,7 +13015,7 @@ mod tests {
             // on the PR number in the URL rather than assuming request order.
             for _round in 0..2 {
                 for _ in 0..2 {
-                    let req = server.recv().unwrap();
+                    let req = server.recv();
                     let forge_base = if req.url() == "/repos/acme/widget/pulls/1" {
                         "main"
                     } else if req.url() == "/repos/acme/widget/pulls/2" {
@@ -13072,6 +13039,7 @@ mod tests {
                 }
             }
         });
+        let addr = mock.addr();
 
         let root_dir = tmp_dir("fork-remote-collision");
         g(&root_dir, &["init"]);
@@ -13182,7 +13150,7 @@ mod tests {
             "applying the reported drift once must make the next detection pass agree \
              nothing is left to fix, instead of looping forever"
         );
-        handle.join().unwrap();
+        mock.finish();
         let _ = std::fs::remove_dir_all(root_dir);
     }
 
@@ -13645,10 +13613,8 @@ mod tests {
 
     #[test]
     fn refresh_open_prs_drops_a_pr_closed_externally_and_persists_the_new_state() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             req.respond(
                 tiny_http::Response::from_string(r#"{"state": "closed", "merged": false}"#)
                     .with_status_code(200),
@@ -13677,12 +13643,7 @@ mod tests {
             )
             .unwrap();
 
-        let client = crate::forge::ForgeClient::new(
-            crate::forge::ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(crate::forge::ForgeKind::GitHub, "acme/widget");
         let prs = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
         let by_branch = open_prs_by_branch(&prs);
         assert_eq!(
@@ -13702,15 +13663,13 @@ mod tests {
             updated.state, "closed",
             "the local row must be corrected to match forge reality"
         );
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
     fn refresh_open_prs_uses_the_parent_client_for_a_fork_mode_root_gitlab_mr() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             assert_eq!(
                 req.url(),
                 "/projects/parent%2Fwidget/merge_requests/10",
@@ -13742,18 +13701,8 @@ mod tests {
                 None,
             )
             .unwrap();
-        let parent_client = crate::forge::ForgeClient::new(
-            crate::forge::ForgeKind::GitLab,
-            format!("http://{addr}"),
-            "parent%2Fwidget".to_string(),
-            Some("tok".to_string()),
-        );
-        let fork_client = crate::forge::ForgeClient::new(
-            crate::forge::ForgeKind::GitLab,
-            format!("http://{addr}"),
-            "fork%2Fwidget".to_string(),
-            Some("tok".to_string()),
-        );
+        let parent_client = mock.client(crate::forge::ForgeKind::GitLab, "parent%2Fwidget");
+        let fork_client = mock.client(crate::forge::ForgeKind::GitLab, "fork%2Fwidget");
         let routing = ForkRouting {
             fork: crate::project_forks::ForkRecord {
                 project: "demo".to_string(),
@@ -13781,7 +13730,7 @@ mod tests {
 
         assert_eq!(refreshed.len(), 1, "the open parent MR remains live");
         assert_eq!(store.lock().get_pull_request(&pr_id).unwrap().state, "open");
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
@@ -13792,10 +13741,8 @@ mod tests {
         // submission call, including the auto-submit-PR-stack sweep) would,
         // in that same call, treat the branch as "never submitted" and open
         // a brand-new PR for it -- undoing the human's close immediately.
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             assert_eq!(req.url(), "/repos/acme/w/pulls/99");
             req.respond(
                 tiny_http::Response::from_string(r#"{"state": "closed", "merged": false}"#)
@@ -13859,12 +13806,7 @@ mod tests {
             )
             .unwrap();
 
-        let client = crate::forge::ForgeClient::new(
-            crate::forge::ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/w".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(crate::forge::ForgeKind::GitHub, "acme/w");
         let runner = NoopRunner;
         let guardian = store.lock().get_guardian(&gid).unwrap();
         let ordered_enabled: Vec<&BranchView> = guardian.branches.iter().collect();
@@ -13906,7 +13848,7 @@ mod tests {
             "the branch must be marked closed, not silently left done"
         );
 
-        handle.join().unwrap();
+        mock.finish();
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&remote_dir);
     }
@@ -14063,10 +14005,8 @@ mod tests {
 
     #[test]
     fn check_pr_merges_approves_when_every_linked_pr_has_merged() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             req.respond(
                 tiny_http::Response::from_string(r#"{"state": "closed", "merged": true}"#)
                     .with_status_code(200),
@@ -14099,12 +14039,7 @@ mod tests {
             )
             .unwrap();
 
-        let client = crate::forge::ForgeClient::new(
-            crate::forge::ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(crate::forge::ForgeKind::GitHub, "acme/widget");
         let prs = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
 
         let changed = apply_pr_merge_check(&store, &gid, &prs, &client);
@@ -14115,7 +14050,7 @@ mod tests {
         let updated_pr = store.lock().get_pull_request(&pr_id).unwrap();
         assert_eq!(updated_pr.state, "merged");
 
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
@@ -14125,11 +14060,9 @@ mod tests {
         // `maybe_promote_fork_root`), not merged itself. The "every linked
         // PR has merged" completion gate must ignore it entirely, the same
         // way it already ignores a dropped or superseded row.
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
+        let mock = MockForge::start(move |server| {
             // The parent PR (#7) merged for real.
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(req.url(), "/repos/acme/widget/pulls/7");
             req.respond(
                 tiny_http::Response::from_string(r#"{"state": "closed", "merged": true}"#)
@@ -14138,7 +14071,7 @@ mod tests {
             .unwrap();
             // The stack PR (#8) is still open -- and must stay that way
             // without blocking the review's completion.
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(req.url(), "/repos/acme/widget/pulls/8");
             req.respond(
                 tiny_http::Response::from_string(r#"{"state": "open", "merged": false}"#)
@@ -14190,12 +14123,7 @@ mod tests {
             )
             .unwrap();
 
-        let client = crate::forge::ForgeClient::new(
-            crate::forge::ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(crate::forge::ForgeKind::GitHub, "acme/widget");
         let prs = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
 
         let changed = apply_pr_merge_check(&store, &gid, &prs, &client);
@@ -14214,7 +14142,7 @@ mod tests {
              explicitly by promotion, never expected to merge"
         );
 
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
@@ -14283,18 +14211,16 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         // `merged`), while the merged branch's own `merge_status` becomes
         // independently visible right away rather than waiting for every
         // sibling to merge too.
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
+        let mock = MockForge::start(move |server| {
             // Branch A's pr: merged.
-            let req = server.recv().unwrap();
+            let req = server.recv();
             req.respond(
                 tiny_http::Response::from_string(r#"{"state": "closed", "merged": true}"#)
                     .with_status_code(200),
             )
             .unwrap();
             // Branch B's pr: still open.
-            let req = server.recv().unwrap();
+            let req = server.recv();
             req.respond(
                 tiny_http::Response::from_string(r#"{"state": "open", "merged": false}"#)
                     .with_status_code(200),
@@ -14356,12 +14282,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             )
             .unwrap();
 
-        let client = crate::forge::ForgeClient::new(
-            crate::forge::ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(crate::forge::ForgeKind::GitHub, "acme/widget");
         let prs = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
 
         let changed = apply_pr_merge_check(&store, &gid, &prs, &client);
@@ -14389,15 +14310,13 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         let pr_a_row = store.lock().get_pull_request(&pr_a).unwrap();
         assert_eq!(pr_a_row.state, "merged");
 
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
     fn check_pr_merges_drops_a_pr_merged_out_of_band_while_mid_flight() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             req.respond(
                 tiny_http::Response::from_string(r#"{"state": "closed", "merged": true}"#)
                     .with_status_code(200),
@@ -14431,12 +14350,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             )
             .unwrap();
 
-        let client = crate::forge::ForgeClient::new(
-            crate::forge::ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(crate::forge::ForgeKind::GitHub, "acme/widget");
         let prs = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
 
         let changed = apply_pr_merge_check(&store, &gid, &prs, &client);
@@ -14472,7 +14386,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         );
         assert!(messages[0].message.contains("dropped from the review"));
 
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
@@ -14648,13 +14562,11 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
 
     #[test]
     fn promotion_closes_the_fork_pr_and_reopens_against_the_parent_when_the_root_merges() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
+        let mock = MockForge::start(move |server| {
             // Answered in whichever order the concurrent fan-out delivers them.
             // 1+2. Root PR (at the parent, merged) and successor (at the fork, open).
             answer_merge_probes(
-                &server,
+                server,
                 &[
                     (
                         "/repos/acme/widget/pulls/10",
@@ -14668,7 +14580,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             );
 
             // 3. Promotion: create the new cross-repo PR at the parent.
-            let mut req = server.recv().unwrap();
+            let mut req = server.recv();
             assert_eq!(req.method(), &tiny_http::Method::Post);
             assert_eq!(req.url(), "/repos/acme/widget/pulls");
             let mut body = String::new();
@@ -14683,7 +14595,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             .unwrap();
 
             // 4. Close the now-superseded fork-internal PR.
-            let mut req = server.recv().unwrap();
+            let mut req = server.recv();
             assert_eq!(req.method(), &tiny_http::Method::Patch);
             assert_eq!(req.url(), "/repos/alice/widget/pulls/20");
             let mut body = String::new();
@@ -14696,14 +14608,15 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
                 .unwrap();
 
             // 5. Pointer comment left on the closed PR.
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(req.method(), &tiny_http::Method::Post);
             assert_eq!(req.url(), "/repos/alice/widget/issues/20/comments");
             req.respond(tiny_http::Response::from_string("{}").with_status_code(201))
                 .unwrap();
         });
+        let addr = mock.addr();
 
-        let (store, gid, root_dir) = fork_promotion_fixture(&addr);
+        let (store, gid, root_dir) = fork_promotion_fixture(addr);
         check_pr_merges(&store, &gid);
 
         let rows = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
@@ -14725,20 +14638,18 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         let updated_guardian = store.lock().get_guardian(&gid).unwrap();
         assert_eq!(updated_guardian.status.as_str(), "in_review");
 
-        handle.join().unwrap();
+        mock.finish();
         let _ = std::fs::remove_dir_all(root_dir);
     }
 
     #[test]
     fn promotion_is_a_noop_when_the_forge_already_retargeted_the_successor_at_the_parent() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
+        let mock = MockForge::start(move |server| {
             // Answered in whichever order the concurrent fan-out delivers them.
             // Reconcile-first reads both before touching anything; no further
             // requests should follow, since the successor is already filed at the parent.
             answer_merge_probes(
-                &server,
+                server,
                 &[
                     (
                         "/repos/acme/widget/pulls/10",
@@ -14751,8 +14662,9 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
                 ],
             );
         });
+        let addr = mock.addr();
 
-        let (store, gid, root_dir) = fork_promotion_fixture(&addr);
+        let (store, gid, root_dir) = fork_promotion_fixture(addr);
         // Simulate the successor already having been reconciled (by a human,
         // or a forge feature this ticket doesn't yet trust) directly against
         // the parent, still under its own original PR number.
@@ -14784,7 +14696,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         assert_eq!(successor.state, "open");
         assert!(successor.superseded_by.is_none());
 
-        handle.join().unwrap();
+        mock.finish();
         let _ = std::fs::remove_dir_all(root_dir);
     }
 
@@ -14798,15 +14710,13 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
     /// URL passes only while the machine is quiet enough for the threads to
     /// finish in spawn order; under load it flips and the test fails.
     ///
-    /// Worse, it *hangs* rather than fails: the assertion panics on the server
-    /// thread, so every later request finds nobody left to answer it and the
-    /// client blocks forever. Hence the deliberate non-panicking 500 below --
-    /// an unexpected request must still get a response, and the caller asserts
-    /// on the returned list once every probe has been answered.
-    fn answer_merge_probes(server: &tiny_http::Server, routes: &[(&str, &str)]) -> Vec<String> {
+    /// So an unexpected request gets a deliberate non-panicking 500 below
+    /// rather than an assertion, every probe is still answered, and the caller
+    /// asserts on the returned list once all of them are in.
+    fn answer_merge_probes(server: &MockForgeServer, routes: &[(&str, &str)]) -> Vec<String> {
         let mut seen = Vec::new();
         for _ in 0..routes.len() {
-            let req = server.recv().unwrap();
+            let req = server.recv();
             let url = req.url().to_string();
             let response = match routes.iter().find(|(route, _)| *route == url) {
                 Some((_, body)) => {
@@ -14824,11 +14734,9 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
 
     #[test]
     fn a_non_fork_review_is_untouched_by_promotion() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
+        let mock = MockForge::start(move |server| {
             answer_merge_probes(
-                &server,
+                server,
                 &[
                     (
                         "/repos/acme/widget/pulls/10",
@@ -14841,6 +14749,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
                 ],
             )
         });
+        let addr = mock.addr();
 
         // Same two-branch shape as the fork fixture, but no project/fork is
         // registered at all -- both PRs live in the same (parent-only) repo,
@@ -14932,7 +14841,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         assert!(successor.superseded_by.is_none());
 
         assert_eq!(
-            handle.join().unwrap(),
+            mock.finish(),
             vec![
                 "/repos/acme/widget/pulls/10".to_string(),
                 "/repos/acme/widget/pulls/20".to_string(),
@@ -14947,12 +14856,10 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         // Three branches: a (root, parent) and b both merge in the same poll;
         // c is the only one still open. Promotion must skip b (it also just
         // merged -- nothing to promote there) and promote exactly c, not b.
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
+        let mock = MockForge::start(move |server| {
             // Answered in whichever order the concurrent fan-out delivers them.
             answer_merge_probes(
-                &server,
+                server,
                 &[
                     (
                         "/repos/acme/widget/pulls/10",
@@ -14969,7 +14876,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
                 ],
             );
 
-            let mut req = server.recv().unwrap();
+            let mut req = server.recv();
             assert_eq!(req.method(), &tiny_http::Method::Post);
             assert_eq!(req.url(), "/repos/acme/widget/pulls");
             let mut body = String::new();
@@ -14986,20 +14893,21 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             )
             .unwrap();
 
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(req.method(), &tiny_http::Method::Patch);
             assert_eq!(req.url(), "/repos/alice/widget/pulls/30");
             req.respond(tiny_http::Response::from_string("{}").with_status_code(200))
                 .unwrap();
 
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(req.method(), &tiny_http::Method::Post);
             assert_eq!(req.url(), "/repos/alice/widget/issues/30/comments");
             req.respond(tiny_http::Response::from_string("{}").with_status_code(201))
                 .unwrap();
         });
+        let addr = mock.addr();
 
-        let (store, gid, root_dir) = fork_promotion_fixture(&addr);
+        let (store, gid, root_dir) = fork_promotion_fixture(addr);
         store.lock().add_guardian_branch(&gid, "c").unwrap();
         let ids: Vec<_> = store
             .lock()
@@ -15048,7 +14956,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             "exactly one promotion happened (b was skipped, not itself promoted)"
         );
 
-        handle.join().unwrap();
+        mock.finish();
         let _ = std::fs::remove_dir_all(root_dir);
     }
 
@@ -15062,13 +14970,11 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         // detection keys off `base_ref`, not `repo`, so it also tolerates
         // rows recorded before that correction (the fork-labeled root row
         // seeded below).
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
+        let mock = MockForge::start(move |server| {
             // Answered in whichever order the concurrent fan-out delivers them.
             // 1+2. Root MR and successor MR, both filed on the fork.
             answer_merge_probes(
-                &server,
+                server,
                 &[
                     (
                         "/projects/alice%2Fwidget/merge_requests/10",
@@ -15082,14 +14988,14 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             );
 
             // 3. Promotion resolves the parent's numeric GitLab project id.
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(req.url(), "/projects/acme%2Fwidget");
             req.respond(tiny_http::Response::from_string(r#"{"id":999}"#).with_status_code(200))
                 .unwrap();
 
             // 4. Create the new cross-project MR -- on the FORK client, not
             //    the parent's, with `target_project_id` set.
-            let mut req = server.recv().unwrap();
+            let mut req = server.recv();
             assert_eq!(req.method(), &tiny_http::Method::Post);
             assert_eq!(req.url(), "/projects/alice%2Fwidget/merge_requests");
             let mut body = String::new();
@@ -15105,14 +15011,14 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             .unwrap();
 
             // 5. Close the now-superseded fork-internal MR.
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(req.method(), &tiny_http::Method::Put);
             assert_eq!(req.url(), "/projects/alice%2Fwidget/merge_requests/20");
             req.respond(tiny_http::Response::from_string("{}").with_status_code(200))
                 .unwrap();
 
             // 6. Pointer note on the closed MR.
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(req.method(), &tiny_http::Method::Post);
             assert_eq!(
                 req.url(),
@@ -15121,6 +15027,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             req.respond(tiny_http::Response::from_string("{}").with_status_code(201))
                 .unwrap();
         });
+        let addr = mock.addr();
 
         let root_dir = tmp_dir("gitlab-promotion");
         g(&root_dir, &["init"]);
@@ -15250,7 +15157,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         assert_eq!(new_b.base_ref, "release");
         assert_eq!(old_b.superseded_by.as_deref(), Some(new_b.id.as_str()));
 
-        handle.join().unwrap();
+        mock.finish();
         let _ = std::fs::remove_dir_all(root_dir);
     }
 
@@ -15274,14 +15181,12 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         let fork_bare = tmp_dir("fork-it-fork-bare");
         g(&fork_bare, &["init", "--bare"]);
 
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
         // Every `submit_stacked_branch_pr` call now checks "does an open
         // PR/MR already exist for this head?" via a GET before it POSTs a
         // new one (RAL-<new>) -- expect and answer "no" for each branch.
         let expect_none_then_create =
-            |server: &tiny_http::Server, repo: &str, number: i64, url: &str| {
-                let req = server.recv().unwrap();
+            |server: &MockForgeServer, repo: &str, number: i64, url: &str| {
+                let req = server.recv();
                 assert_eq!(req.method(), &tiny_http::Method::Get);
                 assert!(
                     req.url().starts_with(&format!("/repos/{repo}/pulls?")),
@@ -15291,7 +15196,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
                 req.respond(tiny_http::Response::from_string("[]").with_status_code(200))
                     .unwrap();
 
-                let mut req = server.recv().unwrap();
+                let mut req = server.recv();
                 assert_eq!(req.url(), format!("/repos/{repo}/pulls"));
                 let mut body = String::new();
                 req.as_reader().read_to_string(&mut body).unwrap();
@@ -15305,11 +15210,11 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
                 .unwrap();
                 payload
             };
-        let handle = std::thread::spawn(move || {
+        let mock = MockForge::start(move |server| {
             // Root branch: cross-repository PR filed at the parent, head is
             // `<fork_owner>:<alias>`.
-            expect_cancel_check(&server, "alice/widget");
-            let payload = expect_none_then_create(&server, "acme/widget", 1, "http://x/1");
+            expect_cancel_check(server, "alice/widget");
+            let payload = expect_none_then_create(server, "acme/widget", 1, "http://x/1");
             assert_eq!(payload["head"], serde_json::json!("alice:a-alias"));
             assert_eq!(payload["base"], serde_json::json!("release"));
 
@@ -15318,14 +15223,14 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             // silently ignores a bare branch name (see
             // `ForgeClient::same_repo_head`), so even a fork-internal head
             // must carry the fork's own `owner:` prefix.
-            expect_cancel_check(&server, "alice/widget");
-            let payload = expect_none_then_create(&server, "alice/widget", 2, "http://x/2");
+            expect_cancel_check(server, "alice/widget");
+            let payload = expect_none_then_create(server, "alice/widget", 2, "http://x/2");
             assert_eq!(payload["head"], serde_json::json!("alice:b-alias"));
             assert_eq!(payload["base"], serde_json::json!("a-alias"));
 
             // Branch c: fork-internal PR based on b's own alias.
-            expect_cancel_check(&server, "alice/widget");
-            let payload = expect_none_then_create(&server, "alice/widget", 3, "http://x/3");
+            expect_cancel_check(server, "alice/widget");
+            let payload = expect_none_then_create(server, "alice/widget", 3, "http://x/3");
             assert_eq!(payload["head"], serde_json::json!("alice:c-alias"));
             assert_eq!(payload["base"], serde_json::json!("b-alias"));
         });
@@ -15383,18 +15288,8 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             created_at_ms: 0,
             updated_at_ms: 0,
         };
-        let parent_client = crate::forge::ForgeClient::new(
-            crate::forge::ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
-        let fork_client = crate::forge::ForgeClient::new(
-            crate::forge::ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "alice/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let parent_client = mock.client(crate::forge::ForgeKind::GitHub, "acme/widget");
+        let fork_client = mock.client(crate::forge::ForgeKind::GitHub, "alice/widget");
         let routing = ForkRouting {
             fork,
             parent_client,
@@ -15487,7 +15382,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         assert_eq!(repo_of("b-alias"), "alice/widget");
         assert_eq!(repo_of("c-alias"), "alice/widget");
 
-        handle.join().unwrap();
+        mock.finish();
         let _ = std::fs::remove_dir_all(&root_dir);
         let _ = std::fs::remove_dir_all(&parent_bare);
         let _ = std::fs::remove_dir_all(&fork_bare);
@@ -15507,12 +15402,10 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         let fork_bare = tmp_dir("gitlab-fork-it-fork-bare");
         g(&fork_bare, &["init", "--bare"]);
 
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
+        let mock = MockForge::start(move |server| {
             // RAL-510: each branch's push now triggers a "cancel superseded
             // ci" sweep against the pushing (fork) client's project first.
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(req.method(), &tiny_http::Method::Get);
             assert!(
                 req.url().starts_with("/projects/alice%2Fwidget/pipelines?"),
@@ -15524,7 +15417,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
 
             // Root branch: the adoption probe asks the PARENT project (the
             // IID owner), never the fork.
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(req.method(), &tiny_http::Method::Get);
             assert_eq!(
                 req.url(),
@@ -15535,7 +15428,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
 
             // ... and the create POST still goes through the FORK, with
             // `target_project_id` naming the parent.
-            let mut req = server.recv().unwrap();
+            let mut req = server.recv();
             assert_eq!(req.method(), &tiny_http::Method::Post);
             assert_eq!(req.url(), "/projects/alice%2Fwidget/merge_requests");
             let mut body = String::new();
@@ -15552,7 +15445,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
 
             // Branch b: cancel-check first, then probe and create both stay
             // on the fork, and no `target_project_id` is sent.
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert!(
                 req.url().starts_with("/projects/alice%2Fwidget/pipelines?"),
                 "{}",
@@ -15560,14 +15453,14 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             );
             req.respond(tiny_http::Response::from_string("[]").with_status_code(200))
                 .unwrap();
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(
                 req.url(),
                 "/projects/alice%2Fwidget/merge_requests?source_branch=b-alias&state=opened"
             );
             req.respond(tiny_http::Response::from_string("[]").with_status_code(200))
                 .unwrap();
-            let mut req = server.recv().unwrap();
+            let mut req = server.recv();
             assert_eq!(req.url(), "/projects/alice%2Fwidget/merge_requests");
             let mut body = String::new();
             req.as_reader().read_to_string(&mut body).unwrap();
@@ -15580,6 +15473,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             )
             .unwrap();
         });
+        let addr = mock.addr();
 
         let root_dir = tmp_dir("gitlab-fork-it-work");
         g(&root_dir, &["init", "--initial-branch", "release"]);
@@ -15627,12 +15521,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
                 .unwrap();
         }
 
-        let fork_client = crate::forge::ForgeClient::new(
-            crate::forge::ForgeKind::GitLab,
-            format!("http://{addr}"),
-            "alice%2Fwidget".to_string(),
-            Some("tok".to_string()),
-        );
+        let fork_client = mock.client(crate::forge::ForgeKind::GitLab, "alice%2Fwidget");
         let routing = ForkRouting {
             fork: crate::project_forks::ForkRecord {
                 project: "demo".to_string(),
@@ -15645,12 +15534,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
                 created_at_ms: 0,
                 updated_at_ms: 0,
             },
-            parent_client: crate::forge::ForgeClient::new(
-                crate::forge::ForgeKind::GitLab,
-                format!("http://{addr}"),
-                "acme%2Fwidget".to_string(),
-                Some("tok".to_string()),
-            ),
+            parent_client: mock.client(crate::forge::ForgeKind::GitLab, "acme%2Fwidget"),
             fork_client: fork_client.clone(),
             parent_project_id: Some(999),
         };
@@ -15708,7 +15592,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         assert_eq!(fork_row.repo, "alice%2Fwidget");
         assert_eq!(fork_row.pr_number, Some(11));
 
-        handle.join().unwrap();
+        mock.finish();
         let _ = std::fs::remove_dir_all(&root_dir);
         let _ = std::fs::remove_dir_all(&fork_bare);
     }
@@ -15723,16 +15607,14 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         let fork_bare = tmp_dir("gitlab-adopt-fork-bare");
         g(&fork_bare, &["init", "--bare"]);
 
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
         let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let handle = {
+        let mock = {
             let requests = requests.clone();
-            std::thread::spawn(move || {
+            MockForge::start(move |server| {
                 // RAL-510: the push that precedes the adoption probe now
                 // triggers a "cancel superseded ci" sweep against the
                 // pushing (fork) client's project first.
-                let req = server.recv().unwrap();
+                let req = server.recv();
                 requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 assert_eq!(req.method(), &tiny_http::Method::Get);
                 assert!(
@@ -15744,7 +15626,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
                     .unwrap();
 
                 // The adoption probe hits the PARENT project.
-                let req = server.recv().unwrap();
+                let req = server.recv();
                 requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 assert_eq!(req.method(), &tiny_http::Method::Get);
                 assert_eq!(
@@ -15762,7 +15644,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
 
                 // The submission asked for a non-draft PR, the existing MR is
                 // a draft -- the adoption toggle goes to the PARENT too.
-                let mut req = server.recv().unwrap();
+                let mut req = server.recv();
                 requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 assert_eq!(req.method(), &tiny_http::Method::Put);
                 assert_eq!(req.url(), "/projects/acme%2Fwidget/merge_requests/7");
@@ -15777,6 +15659,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
                 assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 3);
             })
         };
+        let addr = mock.addr();
 
         let root_dir = tmp_dir("gitlab-adopt-work");
         g(&root_dir, &["init", "--initial-branch", "release"]);
@@ -15815,7 +15698,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
 
         let fork_client = crate::forge::ForgeClient::new(
             crate::forge::ForgeKind::GitLab,
-            format!("http://{addr}"),
+            mock.base_url(),
             "alice%2Fwidget".to_string(),
             Some("tok".to_string()),
         );
@@ -15833,7 +15716,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             },
             parent_client: crate::forge::ForgeClient::new(
                 crate::forge::ForgeKind::GitLab,
-                format!("http://{addr}"),
+                mock.base_url(),
                 "acme%2Fwidget".to_string(),
                 Some("tok".to_string()),
             ),
@@ -15882,7 +15765,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         // The adoption recorded the forge's actual (toggled) draft state.
         assert_eq!(rows[0].draft, Some(false));
 
-        handle.join().unwrap();
+        mock.finish();
         let _ = std::fs::remove_dir_all(&root_dir);
         let _ = std::fs::remove_dir_all(&fork_bare);
     }
@@ -15892,9 +15775,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
     /// cross-project root row, the fork for fork-internal stack rows.
     #[test]
     fn gitlab_fork_base_resync_targets_each_mr_through_the_project_that_owns_its_iid() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
+        let mock = MockForge::start(move |server| {
             // Both rows are drifted (forge says "main", the stack wants
             // "release"/"a-alias"): one GET + one PUT per row, in row
             // order. The root's MR lives at the parent project; the
@@ -15903,7 +15784,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
                 ("acme%2Fwidget", 10, "main", "release"),
                 ("alice%2Fwidget", 11, "main", "a-alias"),
             ] {
-                let req = server.recv().unwrap();
+                let req = server.recv();
                 assert_eq!(req.method(), &tiny_http::Method::Get);
                 assert_eq!(
                     req.url(),
@@ -15921,7 +15802,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
                 )
                 .unwrap();
 
-                let mut req = server.recv().unwrap();
+                let mut req = server.recv();
                 assert_eq!(req.method(), &tiny_http::Method::Put);
                 assert_eq!(
                     req.url(),
@@ -15935,6 +15816,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
                     .unwrap();
             }
         });
+        let addr = mock.addr();
 
         let root_dir = tmp_dir("gitlab-resync-fork");
         g(&root_dir, &["init"]);
@@ -16045,7 +15927,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             "a-alias"
         );
 
-        handle.join().unwrap();
+        mock.finish();
         let _ = std::fs::remove_dir_all(&root_dir);
     }
 
@@ -16079,11 +15961,9 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         let parent_bare = tmp_dir("dual-root-parent-bare");
         g(&parent_bare, &["init", "--bare"]);
 
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
         let expect_none_then_create =
-            |server: &tiny_http::Server, repo: &str, number: i64, url: &str| {
-                let req = server.recv().unwrap();
+            |server: &MockForgeServer, repo: &str, number: i64, url: &str| {
+                let req = server.recv();
                 assert_eq!(req.method(), &tiny_http::Method::Get);
                 assert!(
                     req.url().starts_with(&format!("/repos/{repo}/pulls?")),
@@ -16093,7 +15973,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
                 req.respond(tiny_http::Response::from_string("[]").with_status_code(200))
                     .unwrap();
 
-                let mut req = server.recv().unwrap();
+                let mut req = server.recv();
                 assert_eq!(req.url(), format!("/repos/{repo}/pulls"));
                 let mut body = String::new();
                 req.as_reader().read_to_string(&mut body).unwrap();
@@ -16111,8 +15991,8 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         // triggers a "cancel superseded ci" sweep against the pushing
         // client's repo first -- once per push, not once per PR filed off
         // that push (a dual-root branch files two PRs from one push).
-        let expect_cancel_check = |server: &tiny_http::Server, repo: &str| {
-            let req = server.recv().unwrap();
+        let expect_cancel_check = |server: &MockForgeServer, repo: &str| {
+            let req = server.recv();
             assert_eq!(req.method(), &tiny_http::Method::Get);
             assert!(
                 req.url()
@@ -16185,11 +16065,11 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             .unwrap();
         let expected_stack_base = transient_branch.clone();
 
-        let handle = std::thread::spawn(move || {
+        let mock = MockForge::start(move |server| {
             // The existing "parent" PR: cross-repository, filed at the
             // parent, unchanged from today's single-PR behavior.
-            expect_cancel_check(&server, "alice/widget");
-            let payload = expect_none_then_create(&server, "acme/widget", 1, "http://x/1");
+            expect_cancel_check(server, "alice/widget");
+            let payload = expect_none_then_create(server, "acme/widget", 1, "http://x/1");
             assert_eq!(payload["head"], serde_json::json!("alice:a-alias"));
             assert_eq!(payload["base"], serde_json::json!("release"));
 
@@ -16197,7 +16077,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             // review's transient fork-side upstream branch -- never the
             // fork's own real base branch. Same push as above, so no second
             // cancel-check in between.
-            let payload = expect_none_then_create(&server, "alice/widget", 2, "http://x/2");
+            let payload = expect_none_then_create(server, "alice/widget", 2, "http://x/2");
             assert_eq!(payload["head"], serde_json::json!("alice:a-alias"));
             assert_eq!(
                 payload["base"],
@@ -16207,8 +16087,8 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
 
             // The following branch remains based on the root's alias, not
             // on the transient branch used by the visual root PR.
-            expect_cancel_check(&server, "alice/widget");
-            let payload = expect_none_then_create(&server, "alice/widget", 3, "http://x/3");
+            expect_cancel_check(server, "alice/widget");
+            let payload = expect_none_then_create(server, "alice/widget", 3, "http://x/3");
             assert_eq!(payload["head"], serde_json::json!("alice:b-alias"));
             assert_eq!(payload["base"], serde_json::json!("a-alias"));
         });
@@ -16224,18 +16104,8 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             created_at_ms: 0,
             updated_at_ms: 0,
         };
-        let parent_client = crate::forge::ForgeClient::new(
-            crate::forge::ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
-        let fork_client = crate::forge::ForgeClient::new(
-            crate::forge::ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "alice/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let parent_client = mock.client(crate::forge::ForgeKind::GitHub, "acme/widget");
+        let fork_client = mock.client(crate::forge::ForgeKind::GitHub, "alice/widget");
         let routing = ForkRouting {
             fork,
             parent_client,
@@ -16339,7 +16209,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         assert_eq!(successor_row.base_ref, "a-alias");
         assert_eq!(successor_row.pr_number, Some(3));
 
-        handle.join().unwrap();
+        mock.finish();
         // The fork's own real base branch must be untouched: no PR targets
         // it and no sync moves it.
         assert_eq!(
@@ -16370,12 +16240,10 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         let parent_bare = tmp_dir("dual-root-no-fork-parent-bare");
         g(&parent_bare, &["init", "--bare"]);
 
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
+        let mock = MockForge::start(move |server| {
             // RAL-510: the push that precedes this PR check now triggers a
             // "cancel superseded ci" sweep first.
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(req.method(), &tiny_http::Method::Get);
             assert!(
                 req.url().starts_with("/repos/acme/widget/actions/runs?"),
@@ -16390,7 +16258,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             // The single branch's one and only PR: filed at the parent,
             // plain same-repo alias head, parent base branch -- no second
             // "stack" PR of any kind is ever requested.
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(req.method(), &tiny_http::Method::Get);
             assert!(
                 req.url().starts_with("/repos/acme/widget/pulls?"),
@@ -16399,7 +16267,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             );
             req.respond(tiny_http::Response::from_string("[]").with_status_code(200))
                 .unwrap();
-            let mut req = server.recv().unwrap();
+            let mut req = server.recv();
             assert_eq!(req.url(), "/repos/acme/widget/pulls");
             let mut body = String::new();
             req.as_reader().read_to_string(&mut body).unwrap();
@@ -16412,6 +16280,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             )
             .unwrap();
         });
+        let addr = mock.addr();
 
         let root_dir = tmp_dir("dual-root-no-fork-work");
         g(&root_dir, &["init", "--initial-branch", "release"]);
@@ -16536,7 +16405,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         );
         assert!(parent_refs.contains("a-review"), "{parent_refs}");
 
-        handle.join().unwrap();
+        mock.finish();
         let _ = std::fs::remove_dir_all(&root_dir);
         let _ = std::fs::remove_dir_all(&parent_bare);
     }
@@ -16627,9 +16496,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
     /// invocations rather than one "submit the whole stack" request.
     #[test]
     fn per_branch_submission_still_registers_the_native_github_stack() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
+        let mock = MockForge::start(move |server| {
             // Requests arrive in a mix of fixed (PR creation, stack
             // registration) and non-deterministic (per-PR live-state checks,
             // iterated from a `HashMap`) order, so this dispatches by
@@ -16641,7 +16508,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             let mut next_pr_number = 10_i64;
             let mut stack_payload = serde_json::Value::Null;
             for _ in 0..10 {
-                let mut req = server.recv().unwrap();
+                let mut req = server.recv();
                 let method = req.method().clone();
                 let url = req.url().to_string();
                 if method == tiny_http::Method::Get
@@ -16737,12 +16604,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
                 .unwrap();
         }
 
-        let client = crate::forge::ForgeClient::new(
-            crate::forge::ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(crate::forge::ForgeKind::GitHub, "acme/widget");
         let runner = NoopRunner;
 
         let guardian = store.lock().get_guardian(&gid).unwrap();
@@ -16796,7 +16658,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             "the second per-branch submission must have registered the native stack"
         );
 
-        let stack_payload = handle.join().unwrap();
+        let stack_payload = mock.finish();
         assert_eq!(stack_payload["pull_requests"], serde_json::json!([10, 11]));
 
         let _ = std::fs::remove_dir_all(&root_dir);
@@ -16818,17 +16680,10 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
     /// `submit_pull_requests_inner` freshly resolves from the guardian's
     /// `base_branch` on every call.
     fn resubmit_after_upstream_change_targets_the_new_remote(forge: &str) {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
         let forge_name = forge.to_string();
-        let handle = std::thread::spawn(move || {
+        let mock = MockForge::start(move |server| {
             let mut next_number = 101_i64;
-            loop {
-                let timeout = std::time::Duration::from_secs(30);
-                let req = match server.recv_timeout(timeout) {
-                    Ok(Some(r)) => r,
-                    Ok(None) | Err(_) => break,
-                };
+            for req in server.requests() {
                 let method = req.method().clone();
                 let url = req.url().to_string();
                 let path = url.split('?').next().unwrap_or(&url).to_string();
@@ -16963,13 +16818,13 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         };
         let client_origin = crate::forge::ForgeClient::new(
             kind,
-            format!("http://{addr}"),
+            mock.base_url(),
             origin_repo.clone(),
             Some("tok".to_string()),
         );
         let client_alt = crate::forge::ForgeClient::new(
             kind,
-            format!("http://{addr}"),
+            mock.base_url(),
             alt_repo.clone(),
             Some("tok".to_string()),
         );
@@ -17089,7 +16944,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         assert_eq!(old_pr.state, "open");
         assert_eq!(old_pr.repo, origin_repo);
 
-        handle.join().unwrap();
+        mock.finish();
         let _ = std::fs::remove_dir_all(&root_dir);
         let _ = std::fs::remove_dir_all(&origin_bare);
         let _ = std::fs::remove_dir_all(&alt_bare);
@@ -17114,14 +16969,12 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         // the whole PR creation would fail. Now `submit_stacked_branch_pr`
         // must reconcile (pull the remote's extra commit into the worktree)
         // and complete the submission instead.
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            expect_cancel_check(&server, "acme/w");
+        let mock = MockForge::start(move |server| {
+            expect_cancel_check(server, "acme/w");
 
             // `submit_stacked_branch_pr` checks "does an open PR already
             // exist for this head?" before creating (RAL-<new>) -- answer no.
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(req.method(), &tiny_http::Method::Get);
             assert!(
                 req.url().starts_with("/repos/acme/w/pulls?"),
@@ -17131,7 +16984,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             req.respond(tiny_http::Response::from_string("[]").with_status_code(200))
                 .unwrap();
 
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(req.method(), &tiny_http::Method::Post);
             assert_eq!(req.url(), "/repos/acme/w/pulls");
             req.respond(
@@ -17200,12 +17053,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             .set_guardian_status(&gid, GuardianStatus::InReview, None)
             .unwrap();
 
-        let client = crate::forge::ForgeClient::new(
-            crate::forge::ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/w".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(crate::forge::ForgeKind::GitHub, "acme/w");
         let runner = NoopRunner;
         let guardian = store.lock().get_guardian(&gid).unwrap();
         let ordered_enabled: Vec<&BranchView> = guardian.branches.iter().collect();
@@ -17260,7 +17108,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             g(&root, &["rev-parse", "review-branch"]).trim()
         );
 
-        handle.join().unwrap();
+        mock.finish();
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&remote_dir);
         let _ = std::fs::remove_dir_all(&clone_dir);
@@ -17277,28 +17125,13 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         // attempted, and the batch's single error had nowhere to go but
         // whichever branch its caller happened to be stamping, so a failure
         // landed on branches that had not produced it.
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
         // A lenient dispatcher (rather than a hand-counted request sequence)
         // so this test doesn't have to track every incidental call
         // `submit_stacked_branch_pr` makes along the way (e.g. probing for a
         // PR template) -- only the two calls this test actually cares about:
         // branch A's create 422s, branch B's create succeeds.
-        let handle = std::thread::spawn(move || {
-            loop {
-                // Under a full parallel `nextest` run this thread can be waiting
-                // behind real git2/filesystem setup work in the main thread while
-                // dozens of other tests contend for CPU. Even after the first
-                // request, a slow/loaded machine can take >5 seconds between
-                // handling one response and starting the next -- see
-                // submit_stack_for_guardian's per-branch error handling adding
-                // latency. Windows CI particularly sees delays >10s under full
-                // parallelism, so use a generous 30s timeout throughout.
-                let timeout = std::time::Duration::from_secs(30);
-                let mut req = match server.recv_timeout(timeout) {
-                    Ok(Some(r)) => r,
-                    _ => break,
-                };
+        let mock = MockForge::start(move |server| {
+            for mut req in server.requests() {
                 let method = req.method().clone();
                 let url = req.url().to_string();
                 if method == tiny_http::Method::Get && url.starts_with("/repos/acme/w/pulls?") {
@@ -17405,7 +17238,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
 
         let client = crate::forge::ForgeClient::new(
             crate::forge::ForgeKind::GitHub,
-            format!("http://{addr}"),
+            mock.base_url(),
             "acme/w".to_string(),
             Some("tok".to_string()),
         );
@@ -17446,7 +17279,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         assert_eq!(failed[0].0, branch_a_id);
         assert!(failed[0].1.contains("422"), "{}", failed[0].1);
 
-        handle.join().unwrap();
+        mock.finish();
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&remote_dir);
     }
@@ -17460,12 +17293,10 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         // already exists for ..."). `submit_stacked_branch_pr` must discover
         // it via the documented head-filter query and adopt it, never by
         // parsing that creation error's free-text message.
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            expect_cancel_check(&server, "acme/w");
+        let mock = MockForge::start(move |server| {
+            expect_cancel_check(server, "acme/w");
 
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(req.method(), &tiny_http::Method::Get);
             assert!(
                 req.url().starts_with("/repos/acme/w/pulls?"),
@@ -17520,12 +17351,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             .set_branch_review(&gid, &branch_id, "review-branch", root.to_str().unwrap())
             .unwrap();
 
-        let client = crate::forge::ForgeClient::new(
-            crate::forge::ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/w".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(crate::forge::ForgeKind::GitHub, "acme/w");
         let runner = NoopRunner;
         let guardian = store.lock().get_guardian(&gid).unwrap();
         let ordered_enabled: Vec<&BranchView> = guardian.branches.iter().collect();
@@ -17571,7 +17397,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         assert_eq!(pr.title, "Existing title");
         assert_eq!(pr.description, "Existing body");
 
-        handle.join().unwrap();
+        mock.finish();
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&remote_dir);
     }
@@ -17876,12 +17702,10 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         // find response), the request asks for a draft, so the submission
         // must PATCH it to draft and record that -- and must not create a
         // duplicate.
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            expect_cancel_check(&server, "acme/w");
+        let mock = MockForge::start(move |server| {
+            expect_cancel_check(server, "acme/w");
 
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(req.method(), &tiny_http::Method::Get);
             assert!(req.url().starts_with("/repos/acme/w/pulls?"));
             req.respond(
@@ -17891,7 +17715,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
                 .with_status_code(200),
             )
             .unwrap();
-            let mut req = server.recv().unwrap();
+            let mut req = server.recv();
             assert_eq!(req.method(), &tiny_http::Method::Patch);
             assert_eq!(req.url(), "/repos/acme/w/pulls/21");
             let mut body = String::new();
@@ -17940,12 +17764,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             .set_branch_review(&gid, &branch_id, "review-branch", root.to_str().unwrap())
             .unwrap();
 
-        let client = crate::forge::ForgeClient::new(
-            crate::forge::ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/w".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(crate::forge::ForgeKind::GitHub, "acme/w");
         let runner = NoopRunner;
         let guardian = store.lock().get_guardian(&gid).unwrap();
         let ordered_enabled: Vec<&BranchView> = guardian.branches.iter().collect();
@@ -17987,7 +17806,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         // ready-for-review state the find query reported.
         assert_eq!(pr.draft, Some(true));
 
-        handle.join().unwrap();
+        mock.finish();
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&remote_dir);
     }
@@ -18000,18 +17819,16 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         // project default would open it ready-for-review, so the creation
         // POST must carry `"draft": true` and the populated row must record
         // the forge's own draft state back.
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            expect_cancel_check(&server, "acme/w");
+        let mock = MockForge::start(move |server| {
+            expect_cancel_check(server, "acme/w");
 
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(req.method(), &tiny_http::Method::Get);
             assert!(req.url().starts_with("/repos/acme/w/pulls?"));
             // No pre-existing PR/MR for this head -- the create path runs.
             req.respond(tiny_http::Response::from_string("[]").with_status_code(200))
                 .unwrap();
-            let mut req = server.recv().unwrap();
+            let mut req = server.recv();
             assert_eq!(req.method(), &tiny_http::Method::Post);
             assert_eq!(req.url(), "/repos/acme/w/pulls");
             let mut body = String::new();
@@ -18062,12 +17879,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             .set_branch_review(&gid, &branch_id, "review-branch", root.to_str().unwrap())
             .unwrap();
 
-        let client = crate::forge::ForgeClient::new(
-            crate::forge::ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/w".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(crate::forge::ForgeKind::GitHub, "acme/w");
         let runner = NoopRunner;
         let guardian = store.lock().get_guardian(&gid).unwrap();
         let ordered_enabled: Vec<&BranchView> = guardian.branches.iter().collect();
@@ -18114,7 +17926,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         assert_eq!(pr.pr_number, Some(41));
         assert_eq!(pr.draft, Some(true));
 
-        handle.join().unwrap();
+        mock.finish();
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&remote_dir);
     }
@@ -18128,16 +17940,14 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         // clear the branch's own stale marker itself, or the board keeps
         // showing "auto-submit failed" forever after the real problem is
         // already fixed.
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            expect_cancel_check(&server, "acme/w");
+        let mock = MockForge::start(move |server| {
+            expect_cancel_check(server, "acme/w");
 
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(req.method(), &tiny_http::Method::Get);
             req.respond(tiny_http::Response::from_string("[]").with_status_code(200))
                 .unwrap();
-            let mut req = server.recv().unwrap();
+            let mut req = server.recv();
             let mut body = String::new();
             req.as_reader().read_to_string(&mut body).unwrap();
             req.respond(
@@ -18188,12 +17998,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             .set_branch_auto_submit_error(&gid, &branch_id, Some("earlier failure"))
             .unwrap();
 
-        let client = crate::forge::ForgeClient::new(
-            crate::forge::ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/w".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(crate::forge::ForgeKind::GitHub, "acme/w");
         let runner = NoopRunner;
         let guardian = store.lock().get_guardian(&gid).unwrap();
         let ordered_enabled: Vec<&BranchView> = guardian.branches.iter().collect();
@@ -18236,7 +18041,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
              not just leave a real failure's badge stuck forever"
         );
 
-        handle.join().unwrap();
+        mock.finish();
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&remote_dir);
     }

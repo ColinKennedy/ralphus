@@ -19573,6 +19573,7 @@ mod tests {
     #![allow(clippy::print_stdout)]
 
     use super::*;
+    use crate::mock_forge::MockForge;
 
     /// WS-D.5: the ETag helpers, which decide whether a board poll can be
     /// answered `304 Not Modified`.
@@ -30403,14 +30404,13 @@ remediation_attempts=1
             .expect("git remote add");
         assert!(status.success());
 
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             assert_eq!(req.method(), &tiny_http::Method::Post);
             assert_eq!(req.url(), "/repos/acme/widget/stacks/42/unstack");
             req.respond(tiny_http::Response::empty(204)).unwrap();
         });
+        let addr = mock.addr();
         std::fs::write(
             repo.join(".ralphus.toml"),
             format!(
@@ -30454,9 +30454,7 @@ remediation_attempts=1
         assert_eq!(r.status, 200, "{}", r.body);
         assert_eq!(r.body, "{\"dropped\":1}");
 
-        handle
-            .join()
-            .expect("unstack request never reached the mock forge server");
+        mock.finish();
         assert_eq!(d.lock().get_pull_request(&pr_id).unwrap().state, "dropped");
         assert_eq!(
             d.lock().get_guardian_forge_stack_number(&gid).unwrap(),

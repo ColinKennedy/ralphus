@@ -3926,13 +3926,12 @@ fn resolve_remote_for_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mock_forge::MockForge;
 
     #[test]
     fn fetch_pr_template_reads_the_github_default_template() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             assert_eq!(
                 req.url(),
                 "/repos/acme/widget/contents/.github/PULL_REQUEST_TEMPLATE.md"
@@ -3943,23 +3942,16 @@ mod tests {
             )
             .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
 
         assert_eq!(client.fetch_pr_template().as_deref(), Some("## Summary\n"));
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
     fn fetch_pr_template_reads_the_gitlab_default_template() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             assert_eq!(req.url(), "/projects/acme%2Fwidget");
             req.respond(
                 tiny_http::Response::from_string(r#"{"default_branch":"main"}"#)
@@ -3967,7 +3959,7 @@ mod tests {
             )
             .unwrap();
 
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(
                 req.url(),
                 "/projects/acme%2Fwidget/repository/files/.gitlab%2Fmerge_request_templates%2FDefault.md/raw?ref=main"
@@ -3975,23 +3967,16 @@ mod tests {
             req.respond(tiny_http::Response::from_string("## Summary\n").with_status_code(200))
                 .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitLab,
-            format!("http://{addr}"),
-            "acme%2Fwidget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitLab, "acme%2Fwidget");
 
         assert_eq!(client.fetch_pr_template().as_deref(), Some("## Summary\n"));
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
     fn cancel_superseded_ci_github_skips_keep_sha_and_treats_409_as_benign() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             assert_eq!(req.method(), &tiny_http::Method::Get);
             let (path, query) = req.url().split_once('?').unwrap();
             assert_eq!(path, "/repos/acme/widget/actions/runs");
@@ -4009,37 +3994,30 @@ mod tests {
             )
             .unwrap();
 
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(req.method(), &tiny_http::Method::Post);
             assert_eq!(req.url(), "/repos/acme/widget/actions/runs/2/force-cancel");
             req.respond(tiny_http::Response::from_string("").with_status_code(202))
                 .unwrap();
 
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(req.url(), "/repos/acme/widget/actions/runs/3/force-cancel");
             // Already terminal by the time this call landed -- benign, not
             // surfaced as an error.
             req.respond(tiny_http::Response::from_string("").with_status_code(409))
                 .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
 
         let summary = client.cancel_superseded_ci("feature", "keep").unwrap();
         assert_eq!(summary.cancelled, vec![2]);
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
     fn cancel_superseded_ci_gitlab_skips_keep_sha_and_non_active_pipelines() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             assert_eq!(req.method(), &tiny_http::Method::Get);
             let (path, query) = req.url().split_once('?').unwrap();
             assert_eq!(path, "/projects/acme%2Fwidget/pipelines");
@@ -4056,7 +4034,7 @@ mod tests {
             )
             .unwrap();
 
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(req.method(), &tiny_http::Method::Post);
             assert_eq!(req.url(), "/projects/acme%2Fwidget/pipelines/11/cancel");
             req.respond(
@@ -4065,16 +4043,11 @@ mod tests {
             )
             .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitLab,
-            format!("http://{addr}"),
-            "acme%2Fwidget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitLab, "acme%2Fwidget");
 
         let summary = client.cancel_superseded_ci("feature", "keep").unwrap();
         assert_eq!(summary.cancelled, vec![11]);
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
@@ -4087,10 +4060,8 @@ mod tests {
         // auto-fix dispatch only fires from this call's `Failing` arm, so
         // proving the head still comes back `Passing` here also proves
         // cancellation can't trigger an unwanted `auto_fix_pr_errors` round.
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             let (path, query) = req.url().split_once('?').unwrap();
             assert_eq!(path, "/repos/acme/widget/actions/runs");
             assert!(query.contains("branch=feature"), "{query}");
@@ -4105,7 +4076,7 @@ mod tests {
             )
             .unwrap();
 
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(req.url(), "/repos/acme/widget/actions/runs/2/force-cancel");
             req.respond(tiny_http::Response::from_string("").with_status_code(202))
                 .unwrap();
@@ -4113,7 +4084,7 @@ mod tests {
             // The classification call that follows never asks about run 2 or
             // its sha at all -- only about "keep", the head that was never
             // cancelled.
-            let req = server.recv().unwrap();
+            let req = server.recv();
             req.respond(
                 tiny_http::Response::from_string(
                     r#"{"mergeable_state": "clean", "head": {"sha": "keep"}}"#,
@@ -4121,7 +4092,7 @@ mod tests {
                 .with_status_code(200),
             )
             .unwrap();
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(req.url(), "/repos/acme/widget/commits/keep/check-runs");
             req.respond(
                 tiny_http::Response::from_string(
@@ -4130,24 +4101,19 @@ mod tests {
                 .with_status_code(200),
             )
             .unwrap();
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(req.url(), "/repos/acme/widget/commits/keep/status");
             req.respond(
                 tiny_http::Response::from_string(r#"{"state": "success"}"#).with_status_code(200),
             )
             .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
 
         let summary = client.cancel_superseded_ci("feature", "keep").unwrap();
         assert_eq!(summary.cancelled, vec![2]);
         assert_eq!(client.check_pr_ci_status(4).unwrap(), PrCiState::Passing);
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
@@ -4158,10 +4124,8 @@ mod tests {
         // current head (RAL-462). A pipeline this feature cancels always
         // belongs to a non-`keep_sha` commit, so it can never be the
         // pipeline this classification reads for the surviving head.
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             let (path, query) = req.url().split_once('?').unwrap();
             assert_eq!(path, "/projects/acme%2Fwidget/pipelines");
             assert!(query.contains("ref=feature"), "{query}");
@@ -4176,7 +4140,7 @@ mod tests {
             )
             .unwrap();
 
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(req.url(), "/projects/acme%2Fwidget/pipelines/11/cancel");
             req.respond(
                 tiny_http::Response::from_string(r#"{"id":11,"status":"canceled"}"#)
@@ -4184,7 +4148,7 @@ mod tests {
             )
             .unwrap();
 
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(req.url(), "/projects/acme%2Fwidget/merge_requests/7");
             req.respond(
                 tiny_http::Response::from_string(
@@ -4195,17 +4159,12 @@ mod tests {
             )
             .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitLab,
-            format!("http://{addr}"),
-            "acme%2Fwidget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitLab, "acme%2Fwidget");
 
         let summary = client.cancel_superseded_ci("feature", "keep").unwrap();
         assert_eq!(summary.cancelled, vec![11]);
         assert_eq!(client.check_pr_ci_status(7).unwrap(), PrCiState::Passing);
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
@@ -4360,10 +4319,8 @@ mod tests {
 
     #[test]
     fn create_pull_request_routed_sends_gitlab_target_project_id_only_when_given() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let mut req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let mut req = server.recv();
             let mut body = String::new();
             req.as_reader().read_to_string(&mut body).unwrap();
             let json: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -4374,24 +4331,17 @@ mod tests {
             )
             .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitLab,
-            format!("http://{addr}"),
-            "alice%2Fwidget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitLab, "alice%2Fwidget");
         client
             .create_pull_request_routed("t", "b", "alias", "main", Some(42), false)
             .unwrap();
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
     fn create_pull_request_without_target_project_id_omits_the_field() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let mut req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let mut req = server.recv();
             let mut body = String::new();
             req.as_reader().read_to_string(&mut body).unwrap();
             let json: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -4402,16 +4352,11 @@ mod tests {
             )
             .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitLab,
-            format!("http://{addr}"),
-            "alice%2Fwidget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitLab, "alice%2Fwidget");
         client
             .create_pull_request("t", "b", "alias", "main", false)
             .unwrap();
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
@@ -4419,10 +4364,8 @@ mod tests {
         // RAL-196: GitHub drafts are the REST `draft` field -- the same flag a
         // human's "convert to draft" GUI toggle sets, so the created PR is
         // indistinguishable from one marked draft by hand.
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let mut req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let mut req = server.recv();
             assert_eq!(req.method(), &tiny_http::Method::Post);
             let mut body = String::new();
             req.as_reader().read_to_string(&mut body).unwrap();
@@ -4437,26 +4380,19 @@ mod tests {
             )
             .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
         let created = client
             .create_pull_request("t", "b", "alias", "main", true)
             .unwrap();
         assert!(created.draft);
         assert_eq!(created.number, 7);
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
     fn create_pull_request_github_sends_draft_false_when_ready_for_review() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let mut req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let mut req = server.recv();
             let mut body = String::new();
             req.as_reader().read_to_string(&mut body).unwrap();
             let json: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -4467,17 +4403,12 @@ mod tests {
             )
             .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
         let created = client
             .create_pull_request("t", "b", "alias", "main", false)
             .unwrap();
         assert!(!created.draft);
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
@@ -4485,10 +4416,8 @@ mod tests {
         // RAL-196: GitLab drafts are purely a `Draft: ` title prefix (there is
         // no draft body field on the create API) -- the created MR is a real
         // draft, the same thing the "Mark as draft" GUI action produces.
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let mut req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let mut req = server.recv();
             let mut body = String::new();
             req.as_reader().read_to_string(&mut body).unwrap();
             let json: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -4502,25 +4431,18 @@ mod tests {
             )
             .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitLab,
-            format!("http://{addr}"),
-            "alice%2Fwidget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitLab, "alice%2Fwidget");
         let created = client
             .create_pull_request("t", "b", "alias", "main", true)
             .unwrap();
         assert!(created.draft);
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
     fn create_pull_request_gitlab_ready_for_review_leaves_title_unprefixed() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let mut req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let mut req = server.recv();
             let mut body = String::new();
             req.as_reader().read_to_string(&mut body).unwrap();
             let json: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -4531,17 +4453,12 @@ mod tests {
             )
             .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitLab,
-            format!("http://{addr}"),
-            "alice%2Fwidget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitLab, "alice%2Fwidget");
         let created = client
             .create_pull_request("t", "b", "alias", "main", false)
             .unwrap();
         assert!(!created.draft);
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
@@ -4549,10 +4466,8 @@ mod tests {
         // A title that already opens with the draft prefix (e.g. one pulled
         // back out of a prior draft MR and re-submitted) must not be
         // double-prefixed into `Draft: Draft: ...`.
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let mut req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let mut req = server.recv();
             let mut body = String::new();
             req.as_reader().read_to_string(&mut body).unwrap();
             let json: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -4565,17 +4480,12 @@ mod tests {
             )
             .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitLab,
-            format!("http://{addr}"),
-            "alice%2Fwidget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitLab, "alice%2Fwidget");
         let created = client
             .create_pull_request("Draft: t", "b", "alias", "main", true)
             .unwrap();
         assert!(created.draft);
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
@@ -4585,10 +4495,8 @@ mod tests {
         // to the real branch names before the create request goes out, while
         // leaving an unsupported/unknown template token (`%{closes_issue}`)
         // untouched rather than guessing at it.
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let mut req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let mut req = server.recv();
             let mut body = String::new();
             req.as_reader().read_to_string(&mut body).unwrap();
             let json: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -4602,12 +4510,7 @@ mod tests {
             )
             .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitLab,
-            format!("http://{addr}"),
-            "alice%2Fwidget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitLab, "alice%2Fwidget");
         client
             .create_pull_request(
                 "t",
@@ -4617,15 +4520,13 @@ mod tests {
                 false,
             )
             .unwrap();
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
     fn update_pull_request_draft_github_patches_the_draft_field() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let mut req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let mut req = server.recv();
             assert_eq!(req.method(), &tiny_http::Method::Patch);
             assert_eq!(req.url(), "/repos/acme/widget/pulls/42");
             let mut body = String::new();
@@ -4637,24 +4538,17 @@ mod tests {
             )
             .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
         client.update_pull_request_draft(42, true).unwrap();
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
     fn update_pull_request_draft_gitlab_sends_wip_event_toggle() {
         // GitLab toggles drafts through the `wip_event` update parameter, which
         // adds/removes the `Draft: ` title prefix its drafts are built on.
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let mut req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let mut req = server.recv();
             assert_eq!(req.method(), &tiny_http::Method::Put);
             let mut body = String::new();
             req.as_reader().read_to_string(&mut body).unwrap();
@@ -4663,22 +4557,15 @@ mod tests {
             req.respond(tiny_http::Response::from_string(r#"{}"#).with_status_code(200))
                 .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitLab,
-            format!("http://{addr}"),
-            "alice%2Fwidget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitLab, "alice%2Fwidget");
         client.update_pull_request_draft(42, false).unwrap();
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
     fn find_open_pull_request_queries_githubs_documented_head_filter() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             assert_eq!(req.method(), &tiny_http::Method::Get);
             let (path, query) = req.url().split_once('?').unwrap();
             assert_eq!(path, "/repos/acme/widget/pulls");
@@ -4695,12 +4582,7 @@ mod tests {
             )
             .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
         let found = client
             .find_open_pull_request("acme:alias")
             .unwrap()
@@ -4710,39 +4592,30 @@ mod tests {
         assert_eq!(found.base, "main");
         assert_eq!(found.title, "T");
         assert_eq!(found.description, "D");
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
     fn find_open_pull_request_is_none_when_githubs_list_is_empty() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             req.respond(tiny_http::Response::from_string("[]").with_status_code(200))
                 .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
         assert!(
             client
                 .find_open_pull_request("acme:alias")
                 .unwrap()
                 .is_none()
         );
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
     fn find_open_pull_request_queries_gitlabs_documented_source_branch_filter() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             assert_eq!(req.method(), &tiny_http::Method::Get);
             let (path, query) = req.url().split_once('?').unwrap();
             assert_eq!(path, "/projects/alice%2Fwidget/merge_requests");
@@ -4756,19 +4629,14 @@ mod tests {
             )
             .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitLab,
-            format!("http://{addr}"),
-            "alice%2Fwidget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitLab, "alice%2Fwidget");
         let found = client
             .find_open_pull_request("alias")
             .unwrap()
             .expect("must find the open MR the mock server reports");
         assert_eq!(found.number, 9);
         assert_eq!(found.base, "main");
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
@@ -4805,10 +4673,8 @@ mod tests {
         // unrelated open PR. This test pins that raw (buggy-if-relied-on)
         // server behavior so a regression in `same_repo_head`'s callers is
         // caught even though this call site itself is intentionally bare.
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             let (path, query) = req.url().split_once('?').unwrap();
             assert_eq!(path, "/repos/acme/widget/pulls");
             assert!(query.contains("head=totally-unrelated-branch"), "{query}");
@@ -4820,18 +4686,13 @@ mod tests {
             )
             .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
         let found = client
             .find_open_pull_request("totally-unrelated-branch")
             .unwrap()
             .expect("bare head is ignored server-side and returns the unfiltered list");
         assert_eq!(found.number, 2);
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
@@ -4889,44 +4750,30 @@ mod tests {
 
     #[test]
     fn update_pull_request_base_sends_github_patch() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             assert_eq!(req.method(), &tiny_http::Method::Patch);
             assert_eq!(req.url(), "/repos/acme/widget/pulls/7");
             req.respond(tiny_http::Response::from_string("{}").with_status_code(200))
                 .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
         client.update_pull_request_base(7, "main").unwrap();
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
     fn update_pull_request_base_sends_gitlab_put() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             assert_eq!(req.method(), &tiny_http::Method::Put);
             assert_eq!(req.url(), "/projects/group%2Fproj/merge_requests/9");
             req.respond(tiny_http::Response::from_string("{}").with_status_code(200))
                 .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitLab,
-            format!("http://{addr}"),
-            "group%2Fproj".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitLab, "group%2Fproj");
         client.update_pull_request_base(9, "main").unwrap();
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
@@ -4969,10 +4816,8 @@ mod tests {
 
     #[test]
     fn get_pull_request_base_reads_github_base_ref() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             assert_eq!(req.method(), &tiny_http::Method::Get);
             assert_eq!(req.url(), "/repos/acme/widget/pulls/5");
             req.respond(
@@ -4983,12 +4828,7 @@ mod tests {
             )
             .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
         let state = client.get_pull_request_base_state(5).unwrap();
         assert_eq!(state.base, "feature-a");
         assert_eq!(
@@ -4997,15 +4837,13 @@ mod tests {
                 .unwrap()
                 .timestamp_millis()
         );
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
     fn get_pull_request_base_reads_gitlab_target_branch() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             assert_eq!(req.method(), &tiny_http::Method::Get);
             assert_eq!(req.url(), "/projects/group%2Fproj/merge_requests/6");
             req.respond(
@@ -5016,34 +4854,22 @@ mod tests {
             )
             .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitLab,
-            format!("http://{addr}"),
-            "group%2Fproj".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitLab, "group%2Fproj");
         assert_eq!(client.get_pull_request_base(6).unwrap(), "feature-a");
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
     fn get_pull_request_base_errors_when_the_forge_response_omits_it() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             req.respond(tiny_http::Response::from_string("{}").with_status_code(200))
                 .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
         let err = client.get_pull_request_base(7).unwrap_err();
         assert!(err.contains("base.ref"), "{err}");
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
@@ -5060,10 +4886,8 @@ mod tests {
 
     #[test]
     fn get_pull_request_state_reports_closed() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             assert_eq!(req.method(), &tiny_http::Method::Get);
             assert_eq!(req.url(), "/repos/acme/widget/pulls/3");
             req.respond(
@@ -5072,58 +4896,39 @@ mod tests {
             )
             .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
         assert_eq!(client.get_pull_request_state(3).unwrap(), "closed");
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
     fn get_pull_request_state_reports_merged_over_closed() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             req.respond(
                 tiny_http::Response::from_string(r#"{"state": "closed", "merged": true}"#)
                     .with_status_code(200),
             )
             .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
         assert_eq!(client.get_pull_request_state(3).unwrap(), "merged");
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
     fn get_pull_request_state_normalizes_gitlab_opened() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             assert_eq!(req.url(), "/projects/group%2Fproj/merge_requests/9");
             req.respond(
                 tiny_http::Response::from_string(r#"{"state": "opened"}"#).with_status_code(200),
             )
             .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitLab,
-            format!("http://{addr}"),
-            "group%2Fproj".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitLab, "group%2Fproj");
         assert_eq!(client.get_pull_request_state(9).unwrap(), "open");
-        handle.join().unwrap();
+        mock.finish();
     }
 
     /// RAL-478: GitHub distinguishes closed-without-merge from merged via a
@@ -5134,54 +4939,38 @@ mod tests {
     /// closed/merged distinction stays covered at parity.
     #[test]
     fn get_pull_request_state_reports_gitlab_closed_without_merging() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             assert_eq!(req.url(), "/projects/group%2Fproj/merge_requests/9");
             req.respond(
                 tiny_http::Response::from_string(r#"{"state": "closed"}"#).with_status_code(200),
             )
             .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitLab,
-            format!("http://{addr}"),
-            "group%2Fproj".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitLab, "group%2Fproj");
         assert_eq!(client.get_pull_request_state(9).unwrap(), "closed");
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
     fn get_pull_request_state_reports_gitlab_merged() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             assert_eq!(req.url(), "/projects/group%2Fproj/merge_requests/9");
             req.respond(
                 tiny_http::Response::from_string(r#"{"state": "merged"}"#).with_status_code(200),
             )
             .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitLab,
-            format!("http://{addr}"),
-            "group%2Fproj".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitLab, "group%2Fproj");
         assert_eq!(client.get_pull_request_state(9).unwrap(), "merged");
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
     fn create_stack_sends_ordered_pull_request_numbers() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let mut req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let mut req = server.recv();
             assert_eq!(req.method(), &tiny_http::Method::Post);
             assert_eq!(req.url(), "/repos/acme/widget/stacks");
             let mut body = String::new();
@@ -5193,15 +4982,10 @@ mod tests {
             )
             .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
         let stack = client.create_stack(&[3, 6, 7]).unwrap().unwrap();
         assert_eq!(stack.number, 42);
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
@@ -5217,10 +5001,8 @@ mod tests {
 
     #[test]
     fn add_to_stack_sends_new_pull_request_numbers() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let mut req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let mut req = server.recv();
             assert_eq!(req.method(), &tiny_http::Method::Post);
             assert_eq!(req.url(), "/repos/acme/widget/stacks/42/add");
             let mut body = String::new();
@@ -5230,14 +5012,9 @@ mod tests {
             req.respond(tiny_http::Response::from_string("{}").with_status_code(200))
                 .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
         client.add_to_stack(42, &[9]).unwrap();
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
@@ -5253,63 +5030,42 @@ mod tests {
 
     #[test]
     fn unstack_posts_to_the_stacks_unstack_endpoint() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             assert_eq!(req.method(), &tiny_http::Method::Post);
             assert_eq!(req.url(), "/repos/acme/widget/stacks/42/unstack");
             req.respond(tiny_http::Response::empty(204)).unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
         client.unstack(42).unwrap();
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
     fn stack_exists_treats_not_found_as_absent() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             assert_eq!(req.method(), &tiny_http::Method::Get);
             assert_eq!(req.url(), "/repos/acme/widget/stacks/42");
             req.respond(tiny_http::Response::from_string("not found").with_status_code(404))
                 .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
         assert!(!client.stack_exists(42).unwrap());
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
     fn stack_exists_accepts_a_live_stack_response() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             assert_eq!(req.url(), "/repos/acme/widget/stacks/42");
             req.respond(tiny_http::Response::from_string(r#"{"number":42}"#))
                 .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
         assert!(client.stack_exists(42).unwrap());
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
@@ -5335,22 +5091,20 @@ mod tests {
         // A 404 (e.g. `stack_exists`'s not-found case above) must NOT evict --
         // it's a normal negative result, not evidence the token itself is bad.
         seed_cache("still-good");
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             req.respond(tiny_http::Response::from_string("not found").with_status_code(404))
                 .unwrap();
         });
         let client = ForgeClient::new(
             ForgeKind::GitHub,
-            format!("http://{addr}"),
+            mock.base_url(),
             "acme/widget".to_string(),
             Some("still-good".to_string()),
         )
         .with_cli_token_host(host);
         assert!(!client.stack_exists(42).unwrap());
-        handle.join().unwrap();
+        mock.finish();
         assert_eq!(
             cached_token().as_deref(),
             Some("still-good"),
@@ -5361,22 +5115,20 @@ mod tests {
         // re-checks the CLI live instead of serving this token for the rest
         // of CLI_TOKEN_TTL.
         seed_cache("now-revoked");
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             req.respond(tiny_http::Response::from_string("bad credentials").with_status_code(401))
                 .unwrap();
         });
         let client = ForgeClient::new(
             ForgeKind::GitHub,
-            format!("http://{addr}"),
+            mock.base_url(),
             "acme/widget".to_string(),
             Some("now-revoked".to_string()),
         )
         .with_cli_token_host(host);
         let _ = client.get_pull_request_state(1);
-        handle.join().unwrap();
+        mock.finish();
         assert_eq!(
             cached_token(),
             None,
@@ -5386,10 +5138,8 @@ mod tests {
 
     #[test]
     fn get_stack_pull_requests_returns_members_in_forge_order() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             assert_eq!(req.method(), &tiny_http::Method::Get);
             assert_eq!(req.url(), "/repos/acme/widget/stacks/42");
             req.respond(tiny_http::Response::from_string(
@@ -5397,37 +5147,25 @@ mod tests {
             ))
             .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
         assert_eq!(
             client.get_stack_pull_requests(42).unwrap(),
             Some(vec![3, 6])
         );
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
     fn get_stack_pull_requests_treats_not_found_as_absent() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             assert_eq!(req.url(), "/repos/acme/widget/stacks/42");
             req.respond(tiny_http::Response::from_string("not found").with_status_code(404))
                 .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
         assert_eq!(client.get_stack_pull_requests(42).unwrap(), None);
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
@@ -5450,49 +5188,42 @@ mod tests {
     /// merely succeed, they must never reach the forge at all.
     #[test]
     fn gitlab_moves_a_base_without_ever_calling_a_stack_endpoint() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let client = ForgeClient::new(
-            ForgeKind::GitLab,
-            format!("http://{addr}"),
-            "group%2Fproj".to_string(),
-            Some("tok".to_string()),
-        );
-        let caller = std::thread::spawn(move || {
-            let base = client.update_pull_request_base(7, "new-target");
-            // Everything the GitHub recovery path would issue.
-            let unstacked = client.unstack(42);
-            let created = client.create_stack(&[7, 8]);
-            let added = client.add_to_stack(42, &[9]);
-            (base, unstacked, created, added)
+        // Records every request so the assertion covers all traffic, not just
+        // the calls the test expects.
+        let mock = MockForge::start(move |server| {
+            let mut seen = Vec::new();
+            for mut req in server.requests() {
+                let mut body = String::new();
+                req.as_reader().read_to_string(&mut body).unwrap();
+                seen.push((req.method().clone(), req.url().to_string(), body));
+                req.respond(tiny_http::Response::from_string("{}").with_status_code(200))
+                    .unwrap();
+            }
+            seen
         });
+        let client = mock.client(ForgeKind::GitLab, "group%2Fproj");
 
-        let mut req = server
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .unwrap()
-            .expect("the base move should reach the forge");
-        assert_eq!(req.method(), &tiny_http::Method::Put);
-        assert_eq!(req.url(), "/projects/group%2Fproj/merge_requests/7");
-        let mut body = String::new();
-        req.as_reader().read_to_string(&mut body).unwrap();
-        let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(payload["target_branch"], "new-target");
-        req.respond(tiny_http::Response::from_string("{}").with_status_code(200))
-            .unwrap();
-
-        let (base, unstacked, created, added) = caller.join().unwrap();
-        base.unwrap();
-        unstacked.unwrap();
-        assert_eq!(created.unwrap(), None, "no stack is registered on GitLab");
-        added.unwrap();
-
-        assert!(
-            server
-                .recv_timeout(std::time::Duration::from_millis(500))
-                .unwrap()
-                .is_none(),
-            "no stack endpoint may be called on GitLab"
+        client.update_pull_request_base(7, "new-target").unwrap();
+        // Everything the GitHub recovery path would issue.
+        client.unstack(42).unwrap();
+        assert_eq!(
+            client.create_stack(&[7, 8]).unwrap(),
+            None,
+            "no stack is registered on GitLab"
         );
+        client.add_to_stack(42, &[9]).unwrap();
+
+        let seen = mock.finish();
+        assert_eq!(
+            seen.len(),
+            1,
+            "no stack endpoint may be called on GitLab: {seen:?}"
+        );
+        let (method, url, body) = &seen[0];
+        assert_eq!(method, &tiny_http::Method::Put);
+        assert_eq!(url, "/projects/group%2Fproj/merge_requests/7");
+        let payload: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(payload["target_branch"], "new-target");
     }
 
     fn tmp_dir(tag: &str) -> std::path::PathBuf {
@@ -6147,10 +5878,8 @@ mod tests {
 
     #[test]
     fn check_pr_ci_status_reports_github_conflict_before_any_check_call() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             assert_eq!(req.url(), "/repos/acme/widget/pulls/4");
             req.respond(
                 tiny_http::Response::from_string(r#"{"mergeable_state": "dirty"}"#)
@@ -6158,19 +5887,13 @@ mod tests {
             )
             .unwrap();
             // A conflict verdict is terminal -- no check-runs call should follow.
+            let extra: Vec<String> = server.requests().map(|r| r.url().to_string()).collect();
             assert!(
-                server
-                    .recv_timeout(std::time::Duration::from_millis(200))
-                    .unwrap()
-                    .is_none()
+                extra.is_empty(),
+                "unexpected requests after the conflict: {extra:?}"
             );
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
         let state = client.check_pr_ci_status(4).unwrap();
         assert_eq!(
             state,
@@ -6181,15 +5904,13 @@ mod tests {
                 checks: vec![],
             })
         );
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
     fn check_pr_ci_status_reports_a_failing_github_check_run() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             assert_eq!(req.url(), "/repos/acme/widget/pulls/4");
             req.respond(
                 tiny_http::Response::from_string(
@@ -6198,7 +5919,7 @@ mod tests {
                 .with_status_code(200),
             )
             .unwrap();
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(req.url(), "/repos/acme/widget/commits/deadbeef/check-runs");
             req.respond(
                 tiny_http::Response::from_string(
@@ -6208,12 +5929,7 @@ mod tests {
             )
             .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
         let state = client.check_pr_ci_status(4).unwrap();
         assert_eq!(
             state,
@@ -6229,15 +5945,13 @@ mod tests {
                 }],
             })
         );
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
     fn check_pr_ci_status_reports_every_failing_github_check_run_not_just_the_first() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             assert_eq!(req.url(), "/repos/acme/widget/pulls/4");
             req.respond(
                 tiny_http::Response::from_string(
@@ -6246,7 +5960,7 @@ mod tests {
                 .with_status_code(200),
             )
             .unwrap();
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(req.url(), "/repos/acme/widget/commits/deadbeef/check-runs");
             req.respond(
                 tiny_http::Response::from_string(
@@ -6260,12 +5974,7 @@ mod tests {
             )
             .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
         let state = client.check_pr_ci_status(4).unwrap();
         assert_eq!(
             state,
@@ -6291,15 +6000,13 @@ mod tests {
             "the passing 'lint' run must be excluded, and both failing runs -- not just the first -- \
              must be captured"
         );
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
     fn check_pr_ci_status_reports_github_pending_while_a_check_is_still_running() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             req.respond(
                 tiny_http::Response::from_string(
                     r#"{"mergeable_state": "unstable", "head": {"sha": "deadbeef"}}"#,
@@ -6307,7 +6014,7 @@ mod tests {
                 .with_status_code(200),
             )
             .unwrap();
-            let req = server.recv().unwrap();
+            let req = server.recv();
             req.respond(
                 tiny_http::Response::from_string(
                     r#"{"check_runs": [{"name": "build", "status": "in_progress", "conclusion": null}]}"#,
@@ -6316,14 +6023,9 @@ mod tests {
             )
             .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
         assert_eq!(client.check_pr_ci_status(4).unwrap(), PrCiState::Pending);
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
@@ -6336,10 +6038,8 @@ mod tests {
         // has a check-run in flight. Only the PR-object fetch should happen;
         // reaching the check-runs/status endpoints at all would mean the
         // short-circuit added for "unknown"/"blocked"/"behind" didn't fire.
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             req.respond(
                 tiny_http::Response::from_string(
                     r#"{"mergeable_state": "unknown", "head": {"sha": "deadbeef"}}"#,
@@ -6348,14 +6048,9 @@ mod tests {
             )
             .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
         assert_eq!(client.check_pr_ci_status(4).unwrap(), PrCiState::Pending);
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
@@ -6368,16 +6063,8 @@ mod tests {
         // check-run for "oldsha" must never be consulted for "newsha" -- the
         // poll must report the new head's own (in this case still pending)
         // state instead of resurfacing the old failure.
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let client = ForgeClient::new(
-            ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             req.respond(
                 tiny_http::Response::from_string(
                     r#"{"mergeable_state": "unstable", "head": {"sha": "oldsha"}}"#,
@@ -6385,7 +6072,7 @@ mod tests {
                 .with_status_code(200),
             )
             .unwrap();
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(req.url(), "/repos/acme/widget/commits/oldsha/check-runs");
             req.respond(
                 tiny_http::Response::from_string(
@@ -6395,7 +6082,7 @@ mod tests {
             )
             .unwrap();
 
-            let req = server.recv().unwrap();
+            let req = server.recv();
             req.respond(
                 tiny_http::Response::from_string(
                     r#"{"mergeable_state": "unstable", "head": {"sha": "newsha"}}"#,
@@ -6403,7 +6090,7 @@ mod tests {
                 .with_status_code(200),
             )
             .unwrap();
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(req.url(), "/repos/acme/widget/commits/newsha/check-runs");
             req.respond(
                 tiny_http::Response::from_string(
@@ -6413,6 +6100,7 @@ mod tests {
             )
             .unwrap();
         });
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
         assert!(matches!(
             client.check_pr_ci_status(4).unwrap(),
             PrCiState::Failing(_)
@@ -6423,15 +6111,13 @@ mod tests {
             "polling again after the head sha moved must reflect the new commit's own state, \
              not the previous commit's failure"
         );
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
     fn check_pr_ci_status_reports_github_passing_when_everything_is_green() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             req.respond(
                 tiny_http::Response::from_string(
                     r#"{"mergeable_state": "clean", "head": {"sha": "deadbeef"}}"#,
@@ -6439,7 +6125,7 @@ mod tests {
                 .with_status_code(200),
             )
             .unwrap();
-            let req = server.recv().unwrap();
+            let req = server.recv();
             req.respond(
                 tiny_http::Response::from_string(
                     r#"{"check_runs": [{"name": "build", "status": "completed", "conclusion": "success"}]}"#,
@@ -6447,21 +6133,16 @@ mod tests {
                 .with_status_code(200),
             )
             .unwrap();
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(req.url(), "/repos/acme/widget/commits/deadbeef/status");
             req.respond(
                 tiny_http::Response::from_string(r#"{"state": "success"}"#).with_status_code(200),
             )
             .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
         assert_eq!(client.check_pr_ci_status(4).unwrap(), PrCiState::Passing);
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
@@ -6472,10 +6153,8 @@ mod tests {
         // 0}` from the combined-status endpoint forever, even after every
         // check-run has completed successfully. That default must not be
         // mistaken for a real in-flight legacy status.
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             req.respond(
                 tiny_http::Response::from_string(
                     r#"{"mergeable_state": "clean", "head": {"sha": "deadbeef"}}"#,
@@ -6483,7 +6162,7 @@ mod tests {
                 .with_status_code(200),
             )
             .unwrap();
-            let req = server.recv().unwrap();
+            let req = server.recv();
             req.respond(
                 tiny_http::Response::from_string(
                     r#"{"check_runs": [{"name": "build", "status": "completed", "conclusion": "success"}]}"#,
@@ -6491,7 +6170,7 @@ mod tests {
                 .with_status_code(200),
             )
             .unwrap();
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(req.url(), "/repos/acme/widget/commits/deadbeef/status");
             req.respond(
                 tiny_http::Response::from_string(
@@ -6501,22 +6180,15 @@ mod tests {
             )
             .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
         assert_eq!(client.check_pr_ci_status(4).unwrap(), PrCiState::Passing);
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
     fn check_pr_ci_status_reports_github_pending_when_a_legacy_status_is_actually_pending() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             req.respond(
                 tiny_http::Response::from_string(
                     r#"{"mergeable_state": "clean", "head": {"sha": "deadbeef"}}"#,
@@ -6524,12 +6196,12 @@ mod tests {
                 .with_status_code(200),
             )
             .unwrap();
-            let req = server.recv().unwrap();
+            let req = server.recv();
             req.respond(
                 tiny_http::Response::from_string(r#"{"check_runs": []}"#).with_status_code(200),
             )
             .unwrap();
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(req.url(), "/repos/acme/widget/commits/deadbeef/status");
             req.respond(
                 tiny_http::Response::from_string(
@@ -6539,22 +6211,15 @@ mod tests {
             )
             .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
         assert_eq!(client.check_pr_ci_status(4).unwrap(), PrCiState::Pending);
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
     fn check_pr_ci_status_reports_gitlab_conflict_before_any_pipeline_call() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             assert_eq!(req.url(), "/projects/group%2Fproj/merge_requests/9");
             req.respond(
                 tiny_http::Response::from_string(r#"{"merge_status": "cannot_be_merged"}"#)
@@ -6562,12 +6227,7 @@ mod tests {
             )
             .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitLab,
-            format!("http://{addr}"),
-            "group%2Fproj".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitLab, "group%2Fproj");
         let state = client.check_pr_ci_status(9).unwrap();
         assert_eq!(
             state,
@@ -6578,7 +6238,7 @@ mod tests {
                 checks: vec![],
             })
         );
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
@@ -6588,10 +6248,8 @@ mod tests {
         // *previous* head ("oldsha") and reports it as failed -- a fresh
         // pipeline for "newsha" simply hasn't been created yet. The stale
         // pipeline's own verdict must not resurface as this PR's status.
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             assert_eq!(req.url(), "/projects/group%2Fproj/merge_requests/9");
             req.respond(
                 tiny_http::Response::from_string(
@@ -6601,12 +6259,7 @@ mod tests {
             )
             .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitLab,
-            format!("http://{addr}"),
-            "group%2Fproj".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitLab, "group%2Fproj");
         let state = client.check_pr_ci_status(9).unwrap();
         assert_eq!(
             state,
@@ -6614,7 +6267,7 @@ mod tests {
             "a pipeline belonging to a commit that's no longer the MR's head must not be reported \
              as the current status -- badge must read pending, not a stale failure/success"
         );
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
@@ -6623,10 +6276,8 @@ mod tests {
         // matches the MR's current head -- its "failed" verdict is genuine
         // and must still surface (the sha check must not swallow real
         // failures for the commit it's actually meant to report on).
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             assert_eq!(req.url(), "/projects/group%2Fproj/merge_requests/9");
             req.respond(
                 tiny_http::Response::from_string(
@@ -6636,15 +6287,10 @@ mod tests {
             )
             .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitLab,
-            format!("http://{addr}"),
-            "group%2Fproj".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitLab, "group%2Fproj");
         let state = client.check_pr_ci_status(9).unwrap();
         assert_eq!(state, PrCiState::Passing);
-        handle.join().unwrap();
+        mock.finish();
     }
 
     // These tiny_http responses mock GitLab's documented MR and merge-ref
@@ -6653,10 +6299,8 @@ mod tests {
     // live GitLab differs from https://docs.gitlab.com/api/merge_requests/.
     #[test]
     fn check_pr_ci_status_reports_a_current_gitlab_merged_results_pipeline_as_passing() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             assert_eq!(req.url(), "/projects/group%2Fproj/merge_requests/9");
             req.respond(
                 tiny_http::Response::from_string(
@@ -6665,7 +6309,7 @@ mod tests {
                 .with_status_code(200),
             )
             .unwrap();
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(
                 req.url(),
                 "/projects/group%2Fproj/merge_requests/9/merge_ref"
@@ -6676,22 +6320,15 @@ mod tests {
             )
             .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitLab,
-            format!("http://{addr}"),
-            "group%2Fproj".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitLab, "group%2Fproj");
         assert_eq!(client.check_pr_ci_status(9).unwrap(), PrCiState::Passing);
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
     fn check_pr_ci_status_reports_gitlab_pending_for_a_stale_merged_results_pipeline() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             req.respond(
                 tiny_http::Response::from_string(
                     r#"{"merge_status": "can_be_merged", "sha": "source-sha", "pipeline": {"id": 55, "ref": "refs/merge-requests/9/merge", "sha": "old-merge-sha", "status": "failed"}}"#,
@@ -6699,7 +6336,7 @@ mod tests {
                 .with_status_code(200),
             )
             .unwrap();
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(
                 req.url(),
                 "/projects/group%2Fproj/merge_requests/9/merge_ref"
@@ -6710,22 +6347,15 @@ mod tests {
             )
             .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitLab,
-            format!("http://{addr}"),
-            "group%2Fproj".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitLab, "group%2Fproj");
         assert_eq!(client.check_pr_ci_status(9).unwrap(), PrCiState::Pending);
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
     fn check_pr_ci_status_reports_gitlab_pending_when_the_merge_ref_is_unavailable() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             req.respond(
                 tiny_http::Response::from_string(
                     r#"{"merge_status": "can_be_merged", "sha": "source-sha", "pipeline": {"id": 55, "ref": "refs/merge-requests/9/merge", "sha": "merge-sha", "status": "success"}}"#,
@@ -6733,7 +6363,7 @@ mod tests {
                 .with_status_code(200),
             )
             .unwrap();
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(
                 req.url(),
                 "/projects/group%2Fproj/merge_requests/9/merge_ref"
@@ -6743,22 +6373,15 @@ mod tests {
             )
             .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitLab,
-            format!("http://{addr}"),
-            "group%2Fproj".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitLab, "group%2Fproj");
         assert_eq!(client.check_pr_ci_status(9).unwrap(), PrCiState::Pending);
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
     fn check_pr_ci_status_reports_failing_gitlab_merged_results_job_trace() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             assert_eq!(req.url(), "/projects/group%2Fproj/merge_requests/9");
             req.respond(
                 tiny_http::Response::from_string(
@@ -6767,7 +6390,7 @@ mod tests {
                 .with_status_code(200),
             )
             .unwrap();
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(
                 req.url(),
                 "/projects/group%2Fproj/merge_requests/9/merge_ref"
@@ -6777,7 +6400,7 @@ mod tests {
                     .with_status_code(200),
             )
             .unwrap();
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(
                 req.url(),
                 "/projects/group%2Fproj/pipelines/55/jobs?scope[]=failed"
@@ -6789,19 +6412,14 @@ mod tests {
                 .with_status_code(200),
             )
             .unwrap();
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(req.url(), "/projects/group%2Fproj/jobs/77/trace");
             req.respond(
                 tiny_http::Response::from_string("FAIL: assertion failed\n").with_status_code(200),
             )
             .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitLab,
-            format!("http://{addr}"),
-            "group%2Fproj".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitLab, "group%2Fproj");
         let state = client.check_pr_ci_status(9).unwrap();
         assert_eq!(
             state,
@@ -6817,15 +6435,13 @@ mod tests {
                 }],
             })
         );
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
     fn check_pr_ci_status_reports_every_failing_gitlab_pipeline_job_not_just_the_first() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             assert_eq!(req.url(), "/projects/group%2Fproj/merge_requests/9");
             req.respond(
                 tiny_http::Response::from_string(
@@ -6834,7 +6450,7 @@ mod tests {
                 .with_status_code(200),
             )
             .unwrap();
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(
                 req.url(),
                 "/projects/group%2Fproj/pipelines/55/jobs?scope[]=failed"
@@ -6849,23 +6465,18 @@ mod tests {
                 .with_status_code(200),
             )
             .unwrap();
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(req.url(), "/projects/group%2Fproj/jobs/77/trace");
             req.respond(
                 tiny_http::Response::from_string("FAIL: assertion failed\n").with_status_code(200),
             )
             .unwrap();
-            let req = server.recv().unwrap();
+            let req = server.recv();
             assert_eq!(req.url(), "/projects/group%2Fproj/jobs/78/trace");
             req.respond(tiny_http::Response::from_string("lint error\n").with_status_code(200))
                 .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitLab,
-            format!("http://{addr}"),
-            "group%2Fproj".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitLab, "group%2Fproj");
         let state = client.check_pr_ci_status(9).unwrap();
         assert_eq!(
             state,
@@ -6890,29 +6501,22 @@ mod tests {
             }),
             "both failed jobs -- not just the first -- must be captured, each with its own trace"
         );
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
     fn check_pr_ci_status_reports_gitlab_pending_with_no_pipeline_yet() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             req.respond(
                 tiny_http::Response::from_string(r#"{"merge_status": "unchecked"}"#)
                     .with_status_code(200),
             )
             .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitLab,
-            format!("http://{addr}"),
-            "group%2Fproj".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitLab, "group%2Fproj");
         assert_eq!(client.check_pr_ci_status(9).unwrap(), PrCiState::Pending);
-        handle.join().unwrap();
+        mock.finish();
     }
 
     // -----------------------------------------------------------------
@@ -6967,10 +6571,8 @@ mod tests {
 
     #[test]
     fn describe_error_captures_status_and_integer_retry_after() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             req.respond(
                 tiny_http::Response::from_string("rate limited")
                     .with_status_code(429)
@@ -6980,49 +6582,36 @@ mod tests {
             )
             .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
         let err = client
             .list_pr_comments_conditional(1, PrCommentEndpoint::Conversation, None)
             .unwrap_err();
         assert_eq!(err.status, Some(429));
         assert_eq!(err.retry_after, Some(Duration::from_secs(30)));
         assert!(err.is_rate_limited());
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
     fn get_conditional_sends_if_none_match_and_reports_not_modified_on_304() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             assert_eq!(req_header(&req, "If-None-Match").as_deref(), Some("\"v1\""));
             req.respond(tiny_http::Response::from_string("").with_status_code(304))
                 .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let addr = mock.addr();
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
         let req = http_agent().get(&format!("http://{addr}/x"));
         let result = client.get_conditional(req, Some("\"v1\"")).unwrap();
         assert!(matches!(result, ConditionalGet::NotModified));
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
     fn list_pr_comments_conditional_github_fetches_both_endpoints_with_fresh_etags() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let conv = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let conv = server.recv();
             assert_eq!(
                 conv.url(),
                 "/repos/acme/widget/issues/7/comments?per_page=100"
@@ -7037,7 +6626,7 @@ mod tests {
             )
             .unwrap();
 
-            let review = server.recv().unwrap();
+            let review = server.recv();
             assert_eq!(
                 review.url(),
                 "/repos/acme/widget/pulls/7/comments?per_page=100"
@@ -7054,12 +6643,7 @@ mod tests {
                 )
                 .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
         let conv = client
             .list_pr_comments_conditional(7, PrCommentEndpoint::Conversation, None)
             .unwrap();
@@ -7085,38 +6669,29 @@ mod tests {
         };
         assert_eq!(comments[0].author, "bob");
         assert_eq!(etag.as_deref(), Some("\"r1\""));
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
     fn list_pr_comments_conditional_reports_not_modified_and_costs_no_reparse() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             assert_eq!(req_header(&req, "If-None-Match").as_deref(), Some("\"c1\""));
             req.respond(tiny_http::Response::from_string("").with_status_code(304))
                 .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
         let result = client
             .list_pr_comments_conditional(7, PrCommentEndpoint::Conversation, Some("\"c1\""))
             .unwrap();
         assert!(matches!(result, CommentsPoll::NotModified));
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
     fn list_pr_comments_conditional_gitlab_uses_the_single_notes_endpoint_for_either_source() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             assert_eq!(
                 req.url(),
                 "/projects/group%2Fproj/merge_requests/3/notes?per_page=100"
@@ -7129,12 +6704,7 @@ mod tests {
             )
             .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitLab,
-            format!("http://{addr}"),
-            "group%2Fproj".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitLab, "group%2Fproj");
         // `Review` is meaningless for GitLab -- must route to the exact same
         // single notes endpoint as `Conversation`, not error or 404.
         let result = client
@@ -7144,7 +6714,7 @@ mod tests {
             panic!("expected a fresh body");
         };
         assert_eq!(comments[0].author, "carol");
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
@@ -7155,10 +6725,8 @@ mod tests {
 
     #[test]
     fn verify_forge_token_reports_valid_on_a_2xx_response() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             assert_eq!(req.url(), "/user");
             assert_eq!(
                 req_header(&req, "Authorization").as_deref(),
@@ -7167,18 +6735,15 @@ mod tests {
             req.respond(tiny_http::Response::from_string(r#"{"login":"alice"}"#))
                 .unwrap();
         });
-        let outcome =
-            verify_forge_token(ForgeKind::GitHub, &format!("http://{addr}"), "good-token");
+        let outcome = verify_forge_token(ForgeKind::GitHub, &mock.base_url(), "good-token");
         assert_eq!(outcome, TokenVerifyOutcome::Valid);
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
     fn verify_forge_token_reports_invalid_on_401_and_sends_the_gitlab_header() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             assert_eq!(
                 req_header(&req, "PRIVATE-TOKEN").as_deref(),
                 Some("bad-token")
@@ -7186,9 +6751,9 @@ mod tests {
             req.respond(tiny_http::Response::from_string("unauthorized").with_status_code(401))
                 .unwrap();
         });
-        let outcome = verify_forge_token(ForgeKind::GitLab, &format!("http://{addr}"), "bad-token");
+        let outcome = verify_forge_token(ForgeKind::GitLab, &mock.base_url(), "bad-token");
         assert_eq!(outcome, TokenVerifyOutcome::Invalid);
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
@@ -7207,10 +6772,8 @@ mod tests {
 
     #[test]
     fn check_token_github_ok_reports_identity_and_sends_the_bearer_header() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             assert_eq!(req.url(), "/user");
             assert_eq!(
                 req_header(&req, "Authorization").as_deref(),
@@ -7223,7 +6786,7 @@ mod tests {
         });
         let client = ForgeClient::new(
             ForgeKind::GitHub,
-            format!("http://{addr}"),
+            mock.base_url(),
             String::new(),
             Some("sekrit-523".to_string()),
         );
@@ -7235,15 +6798,13 @@ mod tests {
             !outcome.detail.contains("sekrit-523"),
             "the token must never appear in the detail"
         );
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
     fn check_token_gitlab_ok_uses_the_private_token_header_and_username_identity() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             assert_eq!(req.url(), "/user");
             assert_eq!(req_header(&req, "PRIVATE-TOKEN").as_deref(), Some("tok"));
             req.respond(
@@ -7253,22 +6814,20 @@ mod tests {
         });
         let client = ForgeClient::new(
             ForgeKind::GitLab,
-            format!("http://{addr}"),
+            mock.base_url(),
             String::new(),
             Some("tok".to_string()),
         );
         let outcome = client.check_token();
         assert!(outcome.ok);
         assert_eq!(outcome.identity.as_deref(), Some("bob"));
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
     fn check_token_reports_unauthorized_and_folds_in_the_forges_own_message() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             req.respond(
                 tiny_http::Response::from_string(r#"{"message":"401 Unauthorized"}"#)
                     .with_status_code(401),
@@ -7277,7 +6836,7 @@ mod tests {
         });
         let client = ForgeClient::new(
             ForgeKind::GitHub,
-            format!("http://{addr}"),
+            mock.base_url(),
             String::new(),
             Some("bad".to_string()),
         );
@@ -7293,7 +6852,7 @@ mod tests {
             !outcome.detail.contains("bad"),
             "the token must never appear in the detail"
         );
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
@@ -7324,10 +6883,8 @@ mod tests {
 
     #[test]
     fn check_repo_github_ok_reports_the_full_name() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             assert_eq!(req.url(), "/repos/acme/widget");
             req.respond(
                 tiny_http::Response::from_string(r#"{"full_name":"acme/widget"}"#)
@@ -7335,24 +6892,17 @@ mod tests {
             )
             .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/widget".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
         let outcome = client.check_repo();
         assert!(outcome.ok);
         assert_eq!(outcome.identity.as_deref(), Some("acme/widget"));
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
     fn check_repo_gitlab_ok_addresses_the_percent_encoded_project_path() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             assert_eq!(req.url(), "/projects/acme%2Fwidget%2Fsub");
             req.respond(
                 tiny_http::Response::from_string(r#"{"path_with_namespace":"acme/widget/sub"}"#)
@@ -7362,7 +6912,7 @@ mod tests {
         });
         let client = ForgeClient::new(
             ForgeKind::GitLab,
-            format!("http://{addr}"),
+            mock.base_url(),
             "acme%2Fwidget%2Fsub".to_string(),
             None,
         );
@@ -7372,27 +6922,20 @@ mod tests {
             "a public repo must be reachable unauthenticated too"
         );
         assert_eq!(outcome.identity.as_deref(), Some("acme/widget/sub"));
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
     fn check_repo_reports_not_found_on_404_and_forbidden_on_403() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             req.respond(tiny_http::Response::from_string("{}").with_status_code(404))
                 .unwrap();
-            let req = server.recv().unwrap();
+            let req = server.recv();
             req.respond(tiny_http::Response::from_string("{}").with_status_code(403))
                 .unwrap();
         });
-        let client = ForgeClient::new(
-            ForgeKind::GitHub,
-            format!("http://{addr}"),
-            "acme/private".to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(ForgeKind::GitHub, "acme/private");
         let not_found = client.check_repo();
         assert_eq!(check_outcome_status(&not_found), "not_found");
         assert!(
@@ -7401,7 +6944,7 @@ mod tests {
         );
         let forbidden = client.check_repo();
         assert_eq!(check_outcome_status(&forbidden), "forbidden");
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
@@ -7473,10 +7016,8 @@ mod tests {
 
     #[test]
     fn check_repository_url_uses_the_callers_token_override() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_string();
-        let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
             assert_eq!(req.url(), "/repos/acme/widget");
             assert_eq!(
                 req_header(&req, "Authorization").as_deref(),
@@ -7489,7 +7030,7 @@ mod tests {
             .unwrap();
         });
         let cfg = ForgeConfig {
-            api_base: Some(format!("http://{addr}")),
+            api_base: Some(mock.base_url()),
             ..ForgeConfig::default()
         };
         let outcome =
@@ -7497,7 +7038,7 @@ mod tests {
                 .unwrap();
         assert!(outcome.ok);
         assert_eq!(outcome.identity.as_deref(), Some("acme/widget"));
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]

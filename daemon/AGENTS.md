@@ -83,6 +83,18 @@ two of the groupings are load-bearing (the restack/worktree-lease interlock in
 particular, where separate locks would let a restack and a lease both be held
 for one guardian).
 
+## Testing — mocking a forge
+
+Unit tests that need a fake GitHub/GitLab REST API use
+[`mock_forge::MockForge`](src/mock_forge.rs) rather than hand-rolling a
+`tiny_http` server + thread: `MockForge::start(move |server| ...)` runs the
+handler (a `server.recv()` script or a `for req in server.requests()`
+dispatcher), `mock.client(kind, repo)` builds the `ForgeClient`, and
+`mock.finish()` shuts it down and returns the handler's value. Shutdown is
+drop-based, so a handler waiting on a request that never comes fails the test
+instead of hanging it, and requests after the handler has exited get a prompt
+`500` -- no `recv_timeout` loops or `/done` sentinels needed.
+
 ## Testing — Rust integration tests
 
 `cargo nextest run --all-targets` runs everything. Key integration test files in `daemon/tests/`:
