@@ -29,7 +29,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ralphus_core::health_catalog::{
     ID_CLAUDE_COMMAND, ID_CODEX_COMMAND, ID_GH, ID_GIT, ID_GLAB, ID_NVIDIA_SMI, ID_OLLAMA,
-    ID_PI_COMMAND, ID_RG_PATH, ID_RG_VERSION, ID_RUNNER, ID_TMUX,
+    ID_PI_COMMAND, ID_RG, ID_RUNNER, ID_TMUX,
 };
 use ralphus_core::process::which;
 use ralphus_runner::cli_agent_common::{self, BackendCommandHealth};
@@ -52,8 +52,7 @@ const SWEEP_CATALOG_IDS: &[&str] = &[
     ID_RUNNER,
     ID_GH,
     ID_GLAB,
-    ID_RG_PATH,
-    ID_RG_VERSION,
+    ID_RG,
     ID_NVIDIA_SMI,
     ID_OLLAMA,
     ID_CLAUDE_COMMAND,
@@ -263,42 +262,35 @@ fn check_glab() -> SweepCheck {
     }
 }
 
-/// RAL-522: ripgrep PATH resolution, via the same shared probe the CLI's
-/// `check health` runs (`ralphus_runner::ripgrep`) so the two surfaces can
-/// never disagree. A `warn`, never a `fail`: agents fall back to `grep`.
-fn check_rg_path() -> SweepCheck {
-    let probe = ralphus_runner::ripgrep::probe_path();
-    SweepCheck {
-        id: ID_RG_PATH,
-        status: probe.status(),
-        detail: probe.detail(),
-    }
-}
-
-/// RAL-522: ripgrep version invocation (`rg --version` on the resolved
-/// executable), the second half of the same shared probe. A `warn`, never a
-/// `fail`, with a distinct detail per failure shape.
-fn check_rg_version() -> SweepCheck {
+/// RAL-522: ripgrep PATH resolution plus `rg --version` on the resolved
+/// executable, via the same shared probe the CLI's `check health` runs
+/// (`ralphus_runner::ripgrep`) so the two surfaces can never disagree. A
+/// `warn`, never a `fail` (agents fall back to `grep`), with a distinct
+/// detail per failure shape.
+fn check_rg() -> SweepCheck {
     let probe = ralphus_runner::ripgrep::probe_version();
     SweepCheck {
-        id: ID_RG_VERSION,
+        id: ID_RG,
         status: probe.status(),
         detail: probe.detail(),
     }
 }
 
+/// RAL-546: `nvidia-smi` PATH resolution plus `nvidia-smi --version`, via
+/// the shared [`version_probe`] helper, so the detail carries the
+/// NVIDIA-SMI, driver, and CUDA versions. A `warn` when it's missing or
+/// broken, never a `fail`: only the resource view's GPU column needs it.
 fn check_nvidia_smi() -> SweepCheck {
-    match which("nvidia-smi") {
-        Some(path) => SweepCheck {
-            id: ID_NVIDIA_SMI,
-            status: PASS,
-            detail: path,
-        },
-        None => SweepCheck {
-            id: ID_NVIDIA_SMI,
-            status: WARN,
-            detail: "not found on PATH".to_string(),
-        },
+    let probe = version_probe::probe_version(
+        "nvidia-smi",
+        &["--version"],
+        version_probe::DEFAULT_VERSION_PROBE_TIMEOUT,
+        version_probe::nvidia_smi_version,
+    );
+    SweepCheck {
+        id: ID_NVIDIA_SMI,
+        status: probe.status(),
+        detail: probe.detail("nvidia-smi"),
     }
 }
 
@@ -447,8 +439,7 @@ pub fn run_sweep(store: &StoreHandle) -> SweepReport {
         check_runner(),
         check_gh(),
         check_glab(),
-        check_rg_path(),
-        check_rg_version(),
+        check_rg(),
         check_nvidia_smi(),
         check_ollama(),
         check_backend_command(
@@ -622,24 +613,19 @@ mod tests {
     }
 
     #[test]
-    fn ripgrep_checks_are_warns_at_worst_and_agree_on_the_resolved_path() {
-        // RAL-522: neither ripgrep half is ever a hard fail (agents fall
-        // back to grep), and when PATH resolution finds an rg, the version
-        // probe must have invoked that same resolved executable -- its
-        // detail names the path whatever the invocation outcome was.
-        let path_check = check_rg_path();
-        let version_check = check_rg_version();
-        assert_ne!(path_check.status, FAIL, "{path_check:?}");
-        assert_ne!(version_check.status, FAIL, "{version_check:?}");
-        if path_check.status == PASS {
-            assert!(
-                version_check.detail.contains(&path_check.detail),
-                "version detail {:?} should name the resolved path {:?}",
-                version_check.detail,
-                path_check.detail
-            );
-        } else {
-            assert_eq!(version_check.status, WARN, "{version_check:?}");
+    fn ripgrep_check_is_a_warn_at_worst_and_names_the_resolved_path() {
+        // RAL-522: the ripgrep check is never a hard fail (agents fall back
+        // to grep), and when PATH resolution finds an rg, the detail names
+        // that resolved executable whatever the invocation outcome was.
+        let check = check_rg();
+        assert_ne!(check.status, FAIL, "{check:?}");
+        match which("rg") {
+            Some(path) => assert!(
+                check.detail.contains(&path),
+                "detail {:?} should name the resolved path {path:?}",
+                check.detail
+            ),
+            None => assert_eq!(check.status, WARN, "{check:?}"),
         }
     }
 
