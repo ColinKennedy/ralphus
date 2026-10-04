@@ -16,6 +16,7 @@ use crate::backend::{
 };
 use crate::cli_agent_common::{live_session_path, write_live_session_id, write_prompt_file};
 use crate::mcp_init::{self, McpInitializationPlan, McpInitializer, McpSetupCommand};
+use crate::shell_label::exec_command_label;
 use crate::shellcmd::{self, Env};
 use crate::tools::Workspace;
 
@@ -849,7 +850,7 @@ fn process_event(
                         Some("tool_use") => {
                             let name = block["name"].as_str().filter(|name| !name.is_empty());
                             let args = format_tool_input(&block["input"], tool_arg_truncate_chars);
-                            let tag = tool_type_code(name);
+                            let tag = tool_type_code(name, block["input"]["command"].as_str());
                             let name = name.unwrap_or("tool");
                             eprintln!("[{tag}] {name}({args})");
                             if name == "Bash"
@@ -1015,8 +1016,23 @@ fn process_event(
     }
 }
 
-fn tool_type_code(name: Option<&str>) -> String {
-    name.map_or_else(|| "tool.unknown".to_string(), |name| format!("tool.{name}"))
+/// Type tag for a `tool_use` block: `tool.<Name>`, refined to
+/// `tool.<Name>.<cmd>` for shell tools and split into dotted segments for
+/// `mcp__<server>__<tool>` names.
+fn tool_type_code(name: Option<&str>, command: Option<&str>) -> String {
+    let Some(name) = name else {
+        return "tool.unknown".to_string();
+    };
+    if let Some(rest) = name.strip_prefix("mcp__") {
+        let dotted = rest.split("__").collect::<Vec<_>>().join(".");
+        return format!("tool.mcp.{dotted}");
+    }
+    if matches!(name, "Bash" | "PowerShell" | "Monitor") {
+        if let Some(cmd) = command.and_then(exec_command_label) {
+            return format!("tool.{name}.{cmd}");
+        }
+    }
+    format!("tool.{name}")
 }
 
 /// Builds the error for a claude-code exit with no terminal `result` event.
@@ -2052,9 +2068,62 @@ mod tests {
 
     #[test]
     fn tool_type_code_keeps_real_names_and_marks_missing_names_unknown() {
-        assert_eq!(tool_type_code(Some("Bash")), "tool.Bash");
-        assert_eq!(tool_type_code(Some("Read")), "tool.Read");
-        assert_eq!(tool_type_code(None), "tool.unknown");
+        assert_eq!(tool_type_code(Some("Bash"), None), "tool.Bash");
+        assert_eq!(tool_type_code(Some("Read"), None), "tool.Read");
+        assert_eq!(tool_type_code(None, None), "tool.unknown");
+    }
+
+    #[test]
+    fn tool_type_code_labels_shell_commands() {
+        let cases = [
+            (
+                "Bash",
+                "cargo build -p ralphus-runner 2>&1 | tail -150",
+                "tool.Bash.cargo",
+            ),
+            (
+                "Bash",
+                "for i in $(seq 1 20); do\n  echo $i\ndone",
+                "tool.Bash",
+            ),
+            (
+                "Bash",
+                r#"grep -rn "a\|b" cli/tests/*.rs 2>/dev/null | head -50"#,
+                "tool.Bash.grep",
+            ),
+            ("Bash", "cd \"$PWD\" && git status --short", "tool.Bash.git"),
+            (
+                "PowerShell",
+                r#"cd "C:\x\wt-ral-488" && git status"#,
+                "tool.PowerShell.git",
+            ),
+            (
+                "PowerShell",
+                "Get-Content a.txt",
+                "tool.PowerShell.Get-Content",
+            ),
+            (
+                "Monitor",
+                r#"until ! pgrep -f "cargo.*test" > /dev/null; do sleep 2; done; echo done"#,
+                "tool.Monitor",
+            ),
+        ];
+        for (name, cmd, want) in cases {
+            assert_eq!(tool_type_code(Some(name), Some(cmd)), want, "{cmd}");
+        }
+        assert_eq!(tool_type_code(Some("Monitor"), None), "tool.Monitor");
+        assert_eq!(
+            tool_type_code(Some("Read"), Some("git status")),
+            "tool.Read"
+        );
+    }
+
+    #[test]
+    fn tool_type_code_splits_mcp_names() {
+        assert_eq!(
+            tool_type_code(Some("mcp__ralphus__squad_list"), None),
+            "tool.mcp.ralphus.squad_list"
+        );
     }
 
     #[test]
