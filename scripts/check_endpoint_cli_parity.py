@@ -256,6 +256,8 @@ ENDPOINT_TO_CLI: dict[str, list[str]] = {
     "GET /api/pull-requests/{pr_id}": ["review pr show"],
     "POST /api/pull-requests/{pr_id}": ["review pr update"],
     "GET /api/pull-requests/{pr_id}/comments": ["review pr comments"],
+    "GET /api/pull-requests/forge-cache-index": ["review pr forge-cache"],
+    "GET /api/pull-requests/{pr_id}/poll-status": ["review pr poll-status"],
     "POST /api/pull-requests/{pr_id}/action-feedback": ["review pr pull-feedback"],
     "POST /api/pull-requests/{pr_id}/pull-from-pr": ["review pr pull-from-pr"],
 }

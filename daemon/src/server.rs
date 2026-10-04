@@ -2212,11 +2212,11 @@ fn route_for_user(
         ("GET", ["api", "pull-requests", "index"]) => pr_index_list(daemon),
         // RAL-366: must precede the generic `pr_id` arm below, same reasoning
         // as `"index"` above.
-        // ralphus[ignore-endpoint-cli]: board debug listing of the forge cache
         ("GET", ["api", "pull-requests", "forge-cache-index"]) => pr_forge_cache_index(daemon),
         ("GET", ["api", "pull-requests", pr_id]) => pr_get(daemon, pr_id),
         ("POST", ["api", "pull-requests", pr_id]) => pr_update(daemon, pr_id, body),
         ("GET", ["api", "pull-requests", pr_id, "comments"]) => pr_comments(daemon, pr_id),
+        ("GET", ["api", "pull-requests", pr_id, "poll-status"]) => pr_poll_status(daemon, pr_id),
         ("POST", ["api", "pull-requests", pr_id, "action-feedback"]) => {
             pr_action_feedback(daemon, user_header, pr_id)
         }
@@ -7642,6 +7642,7 @@ fn cartographer_query(daemon: &Daemon, query: &str, user_header: Option<&str>) -
         review_worktrees_for_guardian: None,
         cell_id: query_filter(query, "cell_id"),
         task: query_filter(query, "task"),
+        branch_id: query_filter(query, "branch_id"),
         q: query_filter(query, "q"),
         since_ms: query_param(query, "since_ms").and_then(|s| s.parse::<i64>().ok()),
         until_ms: query_param(query, "until_ms").and_then(|s| s.parse::<i64>().ok()),
@@ -14925,6 +14926,122 @@ fn pr_forge_cache_index(daemon: &Daemon) -> Reply {
     }
 }
 
+/// One poll's entry in [`pr_poll_status`]'s `polls` array: when it last ran,
+/// how it went, and when the next scheduled run is due.
+fn poll_status_entry(
+    kind: &str,
+    pr_open: bool,
+    enabled: bool,
+    interval: std::time::Duration,
+    checked_at_ms: Option<i64>,
+    status: Option<&str>,
+    error: Option<&str>,
+) -> serde_json::Value {
+    let interval_ms = i64::try_from(interval.as_millis()).unwrap_or(i64::MAX);
+    let (state, reason, next_due) = if !pr_open {
+        ("inactive", Some("PR is no longer open"), None)
+    } else if !enabled {
+        ("disabled", Some("disabled in config"), None)
+    } else {
+        let state = match (checked_at_ms, status) {
+            (None, _) => "never",
+            (Some(_), Some("ok")) => "ok",
+            (Some(_), _) => "error",
+        };
+        let next = checked_at_ms.map(|t| t.saturating_add(interval_ms));
+        (state, None, next)
+    };
+    serde_json::json!({
+        "kind": kind,
+        "state": state,
+        "last_checked_at_ms": checked_at_ms,
+        "status": status,
+        "error": error,
+        "interval_ms": interval_ms,
+        "next_due_at_ms": next_due,
+        "reason": reason,
+    })
+}
+
+/// On-demand poll status for one PR (RAL-553): when the CI, drift and
+/// comments polls last ran, their outcome, the next scheduled run, and the
+/// last review-feedback application -- all read from the stored
+/// [`crate::pr::PrForgeCacheView`], so it never touches the forge.
+fn pr_poll_status(daemon: &Daemon, pr_id: &str) -> Reply {
+    let (pr, cache) = {
+        let store = daemon.lock();
+        let pr = match store.get_pull_request(pr_id) {
+            Ok(pr) => pr,
+            Err(e) => return store_error(&e),
+        };
+        let cache = match store.get_pr_forge_cache(pr_id) {
+            Ok(c) => c,
+            Err(e) => return store_error(&e),
+        };
+        (pr, cache)
+    };
+    let pr_open = pr.state == "open";
+    let pr_cache_cfg = crate::config::load_pr_cache_config();
+    let forge_interval = pr_cache_cfg.poll_interval();
+    let forge_enabled = pr_cache_cfg.enabled();
+    let c = cache.as_ref();
+    let polls = vec![
+        poll_status_entry(
+            "ci",
+            pr_open,
+            true,
+            crate::ci_watch::STANDING_POLL_INTERVAL,
+            c.and_then(|c| c.ci_checked_at_ms),
+            c.and_then(|c| c.ci_check_status.as_deref()),
+            c.and_then(|c| c.ci_check_error.as_deref()),
+        ),
+        poll_status_entry(
+            "drift",
+            pr_open,
+            forge_enabled,
+            forge_interval,
+            c.and_then(|c| c.drift_checked_at_ms),
+            c.and_then(|c| c.drift_status.as_deref()),
+            c.and_then(|c| c.drift_error.as_deref()),
+        ),
+        poll_status_entry(
+            "comments",
+            pr_open,
+            forge_enabled,
+            forge_interval,
+            c.and_then(|c| c.comments_checked_at_ms),
+            c.and_then(|c| c.comments_status.as_deref()),
+            c.and_then(|c| c.comments_error.as_deref()),
+        ),
+    ];
+    json(
+        200,
+        &serde_json::json!({
+            "pr_id": pr.id,
+            "branch_id": pr.branch_id,
+            "pr_state": pr.state,
+            "pr_number": pr.pr_number,
+            "now_ms": crate::store::now_ms(),
+            "ci_check_status": c.and_then(|c| c.ci_check_status.clone()),
+            "ci_checked_at_ms": c.and_then(|c| c.ci_checked_at_ms),
+            "ci_check_error": c.and_then(|c| c.ci_check_error.clone()),
+            "drift_status": c.and_then(|c| c.drift_status.clone()),
+            "drift_checked_at_ms": c.and_then(|c| c.drift_checked_at_ms),
+            "drift_error": c.and_then(|c| c.drift_error.clone()),
+            "comments_status": c.and_then(|c| c.comments_status.clone()),
+            "comments_checked_at_ms": c.and_then(|c| c.comments_checked_at_ms),
+            "comments_error": c.and_then(|c| c.comments_error.clone()),
+            "feedback_outcome": c.and_then(|c| c.feedback_outcome.clone()),
+            "feedback_applied_at_ms": c.and_then(|c| c.feedback_applied_at_ms),
+            "feedback": {
+                "outcome": c.and_then(|c| c.feedback_outcome.clone()),
+                "applied_at_ms": c.and_then(|c| c.feedback_applied_at_ms),
+            },
+            "polls": polls,
+        }),
+    )
+}
+
 /// Look up the ralphus PR row for a given forge PR/MR (PR → worktree
 /// direction): `GET /api/pull-requests?forge=github&repo=acme%2Fwidget&pr_number=42`.
 fn pr_find(daemon: &Daemon, query: &str) -> Reply {
@@ -15201,13 +15318,17 @@ fn pr_refresh_ci(daemon: &Daemon, pr_id: &str) -> Reply {
     };
     let state = match client.check_pr_ci_status(pr_number) {
         Ok(s) => s,
-        Err(e) => return error(502, "forge_error", &e, vec![]),
+        Err(e) => {
+            let _ = daemon.lock().record_pr_ci_check(pr_id, Some(e.as_str()));
+            return error(502, "forge_error", &e, vec![]);
+        }
     };
     let job_url = match &state {
         crate::forge::PrCiState::Failing(f) => f.job_url.clone(),
         _ => None,
     };
     let store = daemon.lock();
+    let _ = store.record_pr_ci_check(pr_id, None);
     if let Err(e) = store.set_pr_ci_status(pr_id, state.as_str(), job_url.as_deref()) {
         return store_error(&e);
     }

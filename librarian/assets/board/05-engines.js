@@ -253,6 +253,7 @@
       CLICK_HANDLERS.openReviewHeaderLogs = (e, ds) => openReviewHeaderLogs(ds.guardianId || "");
       CLICK_HANDLERS.toggleReviewDockSticky = (e) => { e.stopPropagation(); toggleReviewDockSticky(); };
       CLICK_HANDLERS.toggleReviewDockBranchWorktrees = (e) => { e.preventDefault(); e.stopPropagation(); toggleReviewDockBranchWorktrees(); };
+      CLICK_HANDLERS.toggleReviewDockDebug = (e) => { e.stopPropagation(); toggleReviewDockDebug(); };
       CLICK_HANDLERS.openReviewSectionMenu = (e, ds) => openReviewSectionMenu(e, ds.guardianId || "", ds.kind || "");
       CLICK_HANDLERS.scopeReviewDockToSection = (e, ds) => scopeReviewDockToSection(ds.guardianId || "");
       CLICK_HANDLERS.openReviewCommandMenu = (e, ds) => openReviewCommandMenu(e, ds.guardianId || "", ds.cmd || "", ds.key || "");
