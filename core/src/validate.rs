@@ -284,6 +284,7 @@ pub const REVIEW_KEYS: &[&str] = &[
     "summary_format",
     "cache_manual_checks",
     "skip_manual_checks",
+    "auto_run",
     "rebuild_on",
 ];
 /// The full set of top-level `[[waypoint]]` keys (RAL-400).
@@ -322,6 +323,7 @@ const REVIEW_ACTION_KEYS: &[&str] = &[
     "input",
     "shared_store",
     "lifecycle",
+    "auto_run",
 ];
 const REVIEW_ACTION_SHARED_STORE_KEYS: &[&str] = &["store", "path"];
 const REVIEW_ACTION_LIFECYCLE_KEYS: &[&str] =
@@ -2002,6 +2004,7 @@ fn validate_review_blocks(value: Option<&toml::Value>, ctx: &mut Ctx) {
         );
         check_type(ctx, table, "cache_manual_checks", Ty::Bool, &rpath, header);
         check_type(ctx, table, "skip_manual_checks", Ty::Bool, &rpath, header);
+        check_type(ctx, table, "auto_run", Ty::Bool, &rpath, header);
         validate_rebuild_on(table, &rpath, ctx, header);
         check_type(
             ctx,
@@ -2697,6 +2700,7 @@ fn validate_review_action_array(value: Option<&toml::Value>, path: &str, ctx: &m
         // `cleanup_command` is optional and independent of the prompt/command
         // XOR above -- it coexists with either.
         check_type(ctx, table, "cleanup_command", Ty::Str, &apath, None);
+        check_type(ctx, table, "auto_run", Ty::Bool, &apath, None);
         check_type(ctx, table, "description", Ty::Str, &apath, None);
         check_type(ctx, table, "success", Ty::Str, &apath, None);
         for key in ["command", "cleanup_command"] {
@@ -4185,6 +4189,41 @@ prompt = "gate on review"
             "{:?}",
             r.errors
         );
+    }
+
+    // ── auto_run (RAL-565) ──
+
+    #[test]
+    fn review_and_action_auto_run_accepted_and_typed() {
+        let ok = "[[task]]
+name=\"t\"
+[[task.cell]]
+cwd=\"/r\"
+prompt=\"p\"
+review=\"<<review:r>>\"
+[[review]]
+id=\"r\"
+auto_run=true
+[[review.action]]
+label=\"a\"
+command=\"c\"
+auto_run=false
+";
+        let r = validate_toml(ok);
+        assert!(r.is_ok(), "{:?}", r.errors);
+        for bad in [
+            ok.replace("auto_run=true", "auto_run=\"y\""),
+            ok.replace("auto_run=false", "auto_run=1"),
+        ] {
+            let r = validate_toml(&bad);
+            assert!(
+                r.errors
+                    .iter()
+                    .any(|e| e.kind == ErrorKind::WrongType && e.message.contains("auto_run")),
+                "{:?}",
+                r.errors
+            );
+        }
     }
 
     // ── [[review]] cache_manual_checks (RAL-521) ──

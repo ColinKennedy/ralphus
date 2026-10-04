@@ -417,6 +417,9 @@ struct Membership {
     /// Optional override declared on the review (`[[review]]
     /// skip_manual_checks`) for whether manual-check generation is skipped.
     skip_manual_checks: Option<bool>,
+    /// Optional review-wide default (`[[review]] auto_run`) for auto-running
+    /// manual checks.
+    auto_run: Option<bool>,
     /// Optional override declared on the review (`[[review]] rebuild_on`) for
     /// which events tear down and rebuild its prepared build. `Some(vec![])`
     /// is a declared "never automatically"; `None` inherits.
@@ -532,6 +535,7 @@ fn actions_to_hints(actions: &[ReviewActionDef]) -> Vec<GuardianCheck> {
                     r#type: crate::guardian::CheckInputType::String,
                 })
                 .collect(),
+            auto_run: a.auto_run,
             ..GuardianCheck::default()
         })
         .collect()
@@ -1065,6 +1069,7 @@ pub fn derive_reviews_with_full_prefetch(
             auto_cancel_outdated_pr_pipelines: rv.and_then(|r| r.auto_cancel_outdated_pr_pipelines),
             cache_manual_checks: rv.and_then(|r| r.cache_manual_checks),
             skip_manual_checks: rv.and_then(|r| r.skip_manual_checks),
+            auto_run: rv.and_then(|r| r.auto_run),
             rebuild_on: rv.and_then(|r| r.rebuild_on.clone()),
         });
     }
@@ -1550,6 +1555,13 @@ fn apply_resolver(
     if let Some(enabled) = members.iter().find_map(|m| m.skip_manual_checks) {
         store
             .set_guardian_skip_manual_checks(gid, Some(enabled))
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+    }
+    // This review's own manual-check auto-run default, authored via
+    // `[[review]] auto_run`.
+    if let Some(enabled) = members.iter().find_map(|m| m.auto_run) {
+        store
+            .set_guardian_auto_run(gid, Some(enabled))
             .map_err(|e| ReviewError::new(e.to_string()))?;
     }
     // This review's own list of rebuild events, authored via
@@ -3108,6 +3120,7 @@ mod tests {
             auto_cancel_outdated_pr_pipelines: None,
             cache_manual_checks: None,
             skip_manual_checks: None,
+            auto_run: None,
             rebuild_on: None,
         }
     }

@@ -19,6 +19,7 @@ const PAIRS: &[(&str, &str)] = &[
     ("summary_format", "summary_format"),
     ("cache_manual_checks", "cache_manual_checks"),
     ("skip_manual_checks", "skip_manual_checks"),
+    ("auto_run", "auto_run"),
     ("rebuild_on", "rebuild_on"),
     // The preparation redesign replaced the directly-authored
     // `[[review.auto_build]]` with `[[review.prepare]]`; the project-level
