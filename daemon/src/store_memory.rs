@@ -486,10 +486,12 @@ impl StoreMemory {
 
     // ---- live cell diff (RAL-550) ----
 
-    /// The key for one cell's diff state.
+    /// The key for one cell's diff state. Cell ids are only unique within a
+    /// task (every task in a squad may have a `work` cell), so the task name
+    /// is part of the key.
     #[must_use]
-    pub fn cell_diff_key(squad_id: &str, cell_id: &str) -> String {
-        format!("{squad_id}/{cell_id}")
+    pub fn cell_diff_key(squad_id: &str, task: &str, cell_id: &str) -> String {
+        format!("{squad_id}/{task}/{cell_id}")
     }
 
     fn with_cell_diff<R>(&self, key: &str, f: impl FnOnce(&mut CellDiffState) -> R) -> R {
@@ -564,7 +566,7 @@ mod tests {
     #[test]
     fn a_pushed_change_marks_the_cell_diff_dirty_until_it_is_pulled() {
         let m = StoreMemory::default();
-        let key = StoreMemory::cell_diff_key("squad-1", "c0");
+        let key = StoreMemory::cell_diff_key("squad-1", "t0", "c0");
         assert!(m.fresh_cell_diff(&key).is_none());
         m.note_cell_diff_changed(&key, serde_json::json!({"files_changed": 1}));
         let state = m.cell_diff_state(&key).unwrap();
