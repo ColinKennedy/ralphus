@@ -3829,6 +3829,34 @@ mod tests {
     }
 
     #[test]
+    fn project_hints_are_ignored_by_the_review_config() {
+        // RAL-565: [[review.action.hint]] informs whoever writes a submission;
+        // the daemon's own reading of [review] must not change because of it.
+        let with_hints = from_toml_str(
+            "[review]\nauto_run = true\n\n[[review.action.hint]]\nlabel = \"Smoke\"\n\
+             command = \"echo hi\"\nauto_run = false\nhint.include_when = \"always\"\n",
+        );
+        assert!(
+            with_hints.auto_run(),
+            "the review-level default still applies"
+        );
+        let only_hints = from_toml_str(
+            "[[review.action.hint]]\nlabel = \"Smoke\"\ncommand = \"echo hi\"\nauto_run = true\n",
+        );
+        assert!(
+            !only_hints.auto_run(),
+            "a hint never turns auto-run on by itself"
+        );
+    }
+
+    #[test]
+    fn ralphus_own_project_file_leaves_review_defaults_alone() {
+        let own = from_toml_str(include_str!("../../.ralphus.toml"));
+        assert!(!own.auto_run());
+        assert!(own.checks.is_empty());
+    }
+
+    #[test]
     fn find_project_config_walks_up() {
         let base = std::env::temp_dir().join(format!("ralphus-cfg-{}", std::process::id()));
         let nested = base.join("a").join("b").join("c");

@@ -1247,6 +1247,35 @@ folds into ONE guardian. Submitting the files one at a time instead
 (three separate `ralphus submit` calls) mints three separate guardians.
 Unless the user explicitly asks for a different split, recommend the
 former shape: one submit call, one Guardian review.
+
+Project manual-check hints (.ralphus.toml)
+------------------------------------------
+A project's .ralphus.toml is NOT a task file. Its [[review.action.hint]]
+tables are recommendations about which manual checks suit the project and
+when. They inform the [[review.action]] entries you write; they are never
+run, merged into a submission, or read by the scheduler. Before writing a
+[[review]], read the hints for the directories the change touches and
+include the checks whose rule applies:
+
+  [[review.action.hint]]
+  label = "GUI smoke test"           # identity of the hint
+  command = "npm test"               # suggested command (or `prompt`)
+  auto_run = true                    # suggested; false = do not auto-run it
+  hint.include_when = "Any change under librarian/assets/ should include this check."
+  hint.paths = ["librarian/assets/**"]   # optional globs against the diff
+  [[review.action.hint.prepare]]
+  command = "npm ci"                 # suggested build step
+
+Rules:
+- The nearest .ralphus.toml wins for a given label; a parent directory's
+  file only fills labels the nearer files did not mention.
+- Copy a hint into a real [[review.action]] (command, prepare, description,
+  success). Do not set auto_run = true on a check whose hint says
+  auto_run = false.
+- If your [[review]] defines any [[review.action]], those checks are the
+  whole set. Hints are NOT layered on top of them: "Run all" must work with
+  a minimal set of checks even when a submission and its project differ.
+  Leave a hint out when it does not apply.
 "#;
 
 /// Returns the Task TOML tutorial text with CLI examples using the running
@@ -1271,9 +1300,55 @@ pub fn task_tutor() -> String {
     )
 }
 
+/// The tutorial plus the manual-check hints found in the `.ralphus.toml` files
+/// at or above `dir`, nearest first, so whoever reads the tutorial sees the
+/// project's own guidance for the directory they are working in. A file that
+/// cannot be read or parsed is reported rather than hidden.
+#[must_use]
+pub fn task_tutor_in(dir: &std::path::Path) -> String {
+    let mut text = task_tutor();
+    let (hints, warnings) = ralphus_core::project_hints::collect_project_hints(dir);
+    let rendered = ralphus_core::project_hints::render_hints(&hints);
+    if !rendered.is_empty() {
+        text.push_str(&format!(
+            "\nThis project's manual-check hints (from {}):\n\n{rendered}\n",
+            dir.display()
+        ));
+    }
+    for warning in warnings {
+        text.push_str(&format!("\nIgnored a project file: {warning}\n"));
+    }
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tutor_documents_project_hints_and_why_they_are_not_layered() {
+        assert!(TASK_TUTOR.contains("[[review.action.hint]]"));
+        assert!(TASK_TUTOR.contains("hint.include_when"));
+        assert!(TASK_TUTOR.contains("The nearest .ralphus.toml wins"));
+        assert!(TASK_TUTOR.contains("\"Run all\" must work with"));
+    }
+
+    #[test]
+    fn task_tutor_in_appends_the_projects_hints() {
+        let dir = std::env::temp_dir().join(format!("ralphus-tutor-hints-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(".ralphus.toml"),
+            "[[review.action.hint]]\nlabel = \"Smoke\"\ncommand = \"echo hi\"\nhint.include_when = \"always\"\n",
+        )
+        .unwrap();
+        let text = task_tutor_in(&dir);
+        assert!(text.contains("This project's manual-check hints"));
+        assert!(text.contains("- Smoke"));
+        assert!(text.contains("include when: always"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn tutor_is_ascii_only() {

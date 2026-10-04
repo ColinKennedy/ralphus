@@ -133,6 +133,25 @@ impl Store {
         Ok(changed > 0)
     }
 
+    /// RAL-565: atomically take the auto-run slot of one check generation for
+    /// one client. Each client owns its own slot, so one client's claim never
+    /// blocks another's; a repeat claim by the same client for the same
+    /// generation (a second pass, a daemon restart) gets `false`.
+    pub fn claim_auto_run(
+        &self,
+        guardian_id: &str,
+        check_key: &str,
+        client_id: &str,
+        generation: i64,
+    ) -> StoreResult<bool> {
+        let changed = self.conn.execute(
+            "INSERT OR IGNORE INTO guardian_auto_runs(guardian_id, check_key, client_id, generation, claimed_at_ms)
+             VALUES(?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![guardian_id, check_key, client_id, generation, now_ms()],
+        )?;
+        Ok(changed > 0)
+    }
+
     /// Publish terminal recipient readiness and the immutable manifest data.
     #[allow(clippy::too_many_arguments)]
     pub fn finish_action_generation(

@@ -205,6 +205,14 @@ Prefer naming the exact entity affected (an `EntityUri`, a selector, an id)
 in the guidance text over a generic pointer, so the recipient doesn't have to
 go hunting for which squad/review/cell the message is about.
 
+**One deliberate exception (RAL-565):** the outcome of a manual check a person
+or auto-run started -- `NotifiableEventKind::ReviewAutoRunCheckFailed` -- is
+that check's own *result*, not a fault in ralphus or a blocked state. A check
+failing usually needs no remediation and never changes the review's state, so
+it goes through plain `notify_watchers`. Do not extend this to anything that
+reports ralphus itself failing to run something (a preparation failure, a
+terminal that would not open): those still carry remediation.
+
 ## Every retry loop must notify on exhaustion, once (RAL-504)
 
 Any mechanism in this codebase that retries an operation a bounded number of

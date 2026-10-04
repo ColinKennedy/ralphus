@@ -371,6 +371,50 @@ bearing and a waypoint's roster are built from, and
 [`.agent/waypoints-phase0-decisions.md`](../.agent/waypoints-phase0-decisions.md)
 for the design rationale.
 
+### `[[review.action.hint]]` (project `.ralphus.toml`, RAL-565)
+
+A project's `.ralphus.toml` is **not** a task submission. Its
+`[[review.action.hint]]` tables are parsed (`ralphus-core`'s
+`project_hints`), but only to *inform* whoever writes a real `[[review]]`: the
+auto-review agent, `ralphus tutor` (which prints the hints for the current
+directory), and the manual-check generator, which is told to prefer them. The
+daemon never runs a hint, never merges one into a submission, and never reads
+one when it schedules or runs a check.
+
+```toml
+[[review.action.hint]]
+label = "GUI smoke test"             # identity of the hint
+command = "npm test"                 # suggested command (or `prompt`, not both)
+auto_run = true                      # suggested; false = do not auto-run it
+hint.include_when = "Any change under librarian/assets/ should include this check."
+hint.paths = ["librarian/assets/**"] # optional globs against the diff
+
+[[review.action.hint.prepare]]       # suggested build steps, same shape as [[review.action.prepare]]
+command = "npm ci"
+```
+
+| Key | Meaning |
+|---|---|
+| `label` | Required, unique within a file. For one label, the nearest `.ralphus.toml` wins and a parent directory's file only fills labels the nearer files left out. |
+| `command` / `prompt` | The suggested check; at most one. |
+| `auto_run` | Whether the project judges the check safe to start unattended. A submitter must not set `auto_run = true` on a check whose hint says `false`. |
+| `hint.include_when` | Plain-language rule for when the check belongs in a review. |
+| `hint.paths` | Optional globs (`*` within a path segment, `**` across segments) that make the rule checkable against a diff. |
+| `prepare` | Suggested build steps. |
+
+Rules and risks:
+
+- **A submission that defines its own `[[review.action]]` checks is
+  authoritative.** Hints are never layered on top of it. A submission and its
+  project that differ even slightly would otherwise leave **Run all** with more
+  checks than the submitter chose, and running only a minimal set of checks must
+  stay possible. Leave a hint out when it does not apply.
+- **Unknown keys are an error** in a hint, so a typo (`comand`) is reported by
+  `ralphus tutor` rather than silently dropped. A broken file is reported and
+  does not hide the files above it.
+- **Not to be confused** with `GuardianView.action_hints` in the code, which is
+  the stored list of a review's declared `[[review.action]]` checks.
+
 ### Process-side sentinels (agent authors, not cell authors)
 
 Three sentinels exist for code that *hosts* a ralphus runner, not for task

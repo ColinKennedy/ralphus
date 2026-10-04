@@ -1,0 +1,73 @@
+# ralphus's own project file.
+#
+# This is NOT a task submission. The [[review.action.hint]] tables below are the
+# manual checks the ralphus maintainers recommend for reviewing a change to this
+# repository, plus the rule for when each one applies. The auto-review agent and
+# `ralphus tutor` read them when someone writes a `[[review]]`; they copy the
+# checks that fit into real `[[review.action]]` entries. The daemon never runs a
+# hint and never merges one into a submission (docs/special-syntax.md).
+#
+# `auto_run = true` marks a check that is safe to start unattended: idempotent,
+# non-destructive, non-interactive, no ports or long-lived processes. Anything
+# that boots a stack or opens a browser is `auto_run = false`.
+#
+# Per AGENTS.md, a check must never start, stop or restart the maintainer's own
+# dev daemon or librarian. The stack checks below use their own ports (7891 /
+# 7475) and their own database so they leave a running stack alone.
+
+[[review.action.hint]]
+label = "Tutor shows this project's hints"
+command = "cargo run -q -p ralphus-cli -- tutor"
+auto_run = true
+description = "Prints the task tutorial followed by this file's hints, nearest .ralphus.toml first."
+success = "The output ends with 'This project's manual-check hints' and lists every label in this file."
+hint.include_when = "Any change to the tutor text, the project-hint parser, or this file's [[review.action.hint]] schema."
+hint.paths = ["cli/src/tutor.rs", "core/src/project_hints.rs", ".ralphus.toml"]
+
+[[review.action.hint]]
+label = "Board in an isolated dev stack"
+command = "bash scripts/build-debug.sh --daemon-port 7891 --librarian-port 7475 --db-path ~/.ralphus/tasks-review-7891.db"
+auto_run = false
+description = "Boots a second daemon (7891) and board (7475) on their own database, then open http://127.0.0.1:7475. Ctrl-C stops both. Stop a leftover daemon with `ralphus-daemon stop --port 7891`."
+success = "The Reviews tab renders the changed UI in both themes, tooltips read correctly, and the browser console is clean."
+hint.include_when = "Any change to the web board: librarian/assets/, board chunks, board.css, or a color documented in docs/colors.md. Look at it in the browser; unit tests cannot judge layout, theme or tooltips."
+hint.paths = ["librarian/**", "docs/colors.md"]
+
+[[review.action.hint.prepare]]
+command = "npm ci --no-audit --no-fund"
+
+[[review.action.hint]]
+label = "Daemon API in an isolated dev stack"
+command = "bash scripts/build-debug.sh --daemon-port 7891 --librarian-port 7475 --db-path ~/.ralphus/tasks-review-7891.db"
+auto_run = false
+description = "Boots the isolated stack, then exercise the changed route, e.g. `curl http://127.0.0.1:7891/api/daemon`, or the CLI with `ralphus --daemon-url http://127.0.0.1:7891 ...`."
+success = "The changed endpoint answers with the documented shape, an existing database is migrated without errors in the daemon log, and the board still loads."
+hint.include_when = "Any change to daemon routes, the store schema (new tables or columns), the scheduler, or the guardian merge pipeline."
+hint.paths = ["daemon/src/server.rs", "daemon/src/store.rs", "daemon/src/scheduler.rs", "daemon/src/guardian*.rs", "daemon/src/delivery.rs"]
+
+[[review.action.hint]]
+label = "Auto-run of a manual check"
+prompt = "Using the isolated dev stack on ports 7891/7475, submit a task file with a [[review]] whose [[review.action]] sets auto_run = true and has no prepare steps. Confirm its terminal opens by itself when the review settles, runs once, and the board row shows an 'auto' badge. Then start a rebase or feedback pass while the check is still running and confirm the row shows the out-of-date warning and the run is not killed."
+auto_run = false
+description = "End-to-end check of RAL-565 behavior, which no unit test can see: a real terminal opening unattended."
+success = "One terminal, one run, an 'auto' badge, and a warning (not a kill) when a newer rebase, feedback pass or auto-PR fix arrives mid-run."
+hint.include_when = "Any change to auto-run: daemon/src/auto_run.rs, the manual-check preparation hooks in guardian_merge.rs, or the auto_run setting."
+hint.paths = ["daemon/src/auto_run.rs", "daemon/src/guardian_merge.rs", "librarian/assets/board/65-reviews.js", "librarian/assets/board/67-review-inspector.js"]
+
+[[review.action.hint]]
+label = "CLI and MCP surface"
+prompt = "Build the CLI and MCP server, then run `ralphus <group> --help` for each command group you changed and confirm the help text, flags and defaults read correctly. List the MCP tools and confirm every new CLI command or flag has a matching tool."
+auto_run = false
+description = "Reads the changed help text the way a user would; mcp/tests/parity.rs only proves a tool exists, not that its description is right."
+success = "Help text is accurate, flags are documented with their defaults, and each new CLI command has an MCP tool."
+hint.include_when = "Any change to the CLI command tree (cli/src/help_map.rs, cli/src/commands/) or the MCP server."
+hint.paths = ["cli/src/**", "mcp/src/**"]
+
+[[review.action.hint]]
+label = "Documentation site"
+command = "bash scripts/docs-build.sh"
+auto_run = true
+description = "Renders docs/site/pages into docs/site/_site with MkDocs (git-ignored). Read the changed pages in the output."
+success = "The build finishes without warnings about broken links or missing pages."
+hint.include_when = "Any change under docs/ or to a command or board surface the docs describe."
+hint.paths = ["docs/**"]

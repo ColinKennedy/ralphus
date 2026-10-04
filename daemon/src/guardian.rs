@@ -154,6 +154,12 @@ pub struct GuardianCheck {
     /// review's [`GuardianView::effective_auto_run`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_run: Option<bool>,
+    /// RAL-565: why auto-run did not (or may no longer) reflect this check --
+    /// it was skipped for a missing input value, or a newer rebase, feedback
+    /// or auto-PR fix arrived while it ran. Shown as a warning on the board;
+    /// cleared when the check is prepared again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_run_note: Option<String>,
 }
 
 /// Persisted logical shared-store declaration. The provider resolves the
@@ -4451,6 +4457,59 @@ impl Store {
             params![id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?)
+    }
+
+    /// RAL-565: set or clear [`GuardianCheck::auto_run_note`] on one check,
+    /// leaving every other field -- which the preparation worker may be
+    /// updating -- as it is stored. `kind` is `"action"` or `"manual"`. A
+    /// missing check, or one already carrying `note`, is a no-op.
+    pub fn set_check_auto_run_note(
+        &self,
+        id: &str,
+        kind: &str,
+        index: usize,
+        note: Option<&str>,
+    ) -> Result<()> {
+        let column = if kind == "action" {
+            "action_hints"
+        } else {
+            "manual_commands"
+        };
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                &format!("SELECT {column} FROM guardians WHERE id=?"),
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(raw) = raw else {
+            return Ok(());
+        };
+        let Ok(mut checks) = serde_json::from_str::<Vec<GuardianCheck>>(&raw) else {
+            return Ok(());
+        };
+        let Some(check) = checks.get_mut(index) else {
+            return Ok(());
+        };
+        if check.auto_run_note.as_deref() == note {
+            return Ok(());
+        }
+        check.auto_run_note = note.map(str::to_string);
+        let json = serde_json::to_string(&checks).unwrap_or_else(|_| "[]".to_string());
+        self.conn.execute(
+            &format!("UPDATE guardians SET {column}=?, updated_at_ms=? WHERE id=?"),
+            params![json, crate::store::now_ms(), id],
+        )?;
+        let _ = self.notify_watchers(
+            crate::monitor::NotifiableEventKind::ReviewSettingsChanged,
+            &format!("guardian:{id}"),
+            crate::mailbox::MailboxPriority::Normal,
+            "review manual checks changed",
+            None,
+        );
+        Ok(())
     }
 
     /// Persist user-declared action hints from `[[review.action]]` (RAL-77).

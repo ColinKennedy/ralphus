@@ -4275,6 +4275,7 @@ pub(crate) fn kickoff_merge(
             id,
             "review is rebasing; preparation will refresh after the new stack settles",
         );
+        crate::auto_run::note_superseded(&store, id, "rebase");
     }
     crate::rlog!(
         INFO,
@@ -6483,6 +6484,14 @@ pub fn run_feedback(
             store,
             id,
             "review feedback is changing the stack; preparation will refresh afterward",
+        );
+        crate::auto_run::note_superseded(
+            store,
+            id,
+            match rebuild_trigger {
+                RebuildTrigger::AutoFix => "auto-PR fix",
+                _ => "feedback",
+            },
         );
     }
 
@@ -9586,11 +9595,6 @@ pub fn run_guardian_post_merge_for(
             ok,
             detail,
         );
-        // RAL-565: a pass that finished with every build command succeeded
-        // (or had none) starts its auto-run checks. A failed pass never does.
-        if ok {
-            crate::server::auto_run_ready_checks(store, id);
-        }
     }
     phase_note(
         store,
@@ -10412,6 +10416,7 @@ fn prepare_action_hints(
         hints[index].preparation_state = Some("preparing".to_string());
         hints[index].preparation_detail = None;
         hints[index].prepared_at_ms = None;
+        hints[index].auto_run_note = None;
         store
             .lock()
             .set_guardian_action_hints(id, &hints)
@@ -10648,6 +10653,12 @@ fn prepare_action_hints(
             .lock()
             .set_guardian_action_hints(id, &hints)
             .map_err(|e| e.to_string())?;
+        // RAL-565: this action just finished preparing (its build commands
+        // succeeded, or it had none), so an opted-in one starts now rather
+        // than waiting for the rest of the pass.
+        if hints[index].preparation_state.as_deref() == Some("ready") {
+            crate::auto_run::run_ready_checks(store, id);
+        }
     }
     if failures.is_empty() {
         Ok(())
@@ -10689,6 +10700,7 @@ fn prepare_generated_manual_checks(
         checks[index].preparation_state = Some("preparing".to_string());
         checks[index].preparation_detail = None;
         checks[index].prepared_at_ms = None;
+        checks[index].auto_run_note = None;
         store
             .lock()
             .set_guardian_manual_commands(id, &checks, agent.as_deref(), model.as_deref())
@@ -10740,6 +10752,11 @@ fn prepare_generated_manual_checks(
             .lock()
             .set_guardian_manual_commands(id, &checks, agent.as_deref(), model.as_deref())
             .map_err(|e| e.to_string())?;
+        // RAL-565: this check just finished preparing, so an opted-in one
+        // starts now rather than waiting for the rest of the pass.
+        if checks[index].preparation_state.as_deref() == Some("ready") {
+            crate::auto_run::run_ready_checks(store, id);
+        }
     }
     if failures.is_empty() {
         Ok(())
@@ -13908,9 +13925,17 @@ fn render_repository_guidance(agents: Option<(&str, &str)>, ralphus_toml: Option
     }
     if let Some(body) = ralphus_toml.filter(|b| !b.trim().is_empty()) {
         sections.push(format!(
-            "--- {GUIDANCE_TOML_FILE} (Ralphus project configuration: any [[review.action]] / \
-             [[review.action.prepare]] entries show the commands and conventions reviewers \
-             already use) ---\n{}",
+            "--- {GUIDANCE_TOML_FILE} (Ralphus project configuration: [[review.action.hint]] \
+             entries are the project's recommended manual checks, each with a hint.include_when \
+             rule and optional hint.paths globs saying when it applies -- include a check whose \
+             rule fits these changes, reusing its command and [[review.action.hint.prepare]] \
+             steps. A hint's auto_run = false means the project judges it unsuitable to start \
+             unattended, so never set \"auto_run\": true on a check built from it. A \
+             .ralphus.toml in a directory nearer the changed files overrides this one for the \
+             same label, and a parent directory's file fills in labels it leaves out: look for \
+             nested ones beside the changed files and prefer the nearest. Any \
+             [[review.action]] / [[review.action.prepare]] entries show the commands and \
+             conventions reviewers already use) ---\n{}",
             truncate_guidance(body, GUIDANCE_FILE_LIMIT)
         ));
     }

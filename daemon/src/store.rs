@@ -1866,6 +1866,18 @@ impl Store {
             );
             CREATE INDEX IF NOT EXISTS idx_guardian_action_generations_current
                 ON guardian_action_generations(guardian_id, action_key, client_id, generation DESC);
+            -- RAL-565: one auto-run ownership row per review check, client and
+            -- prepared generation. `client_id = ''` stands for a review with no
+            -- registered recipient. Rows survive a daemon restart so a restart
+            -- cannot launch a check a second time for the same generation.
+            CREATE TABLE IF NOT EXISTS guardian_auto_runs (
+                guardian_id   TEXT NOT NULL REFERENCES guardians(id) ON DELETE CASCADE,
+                check_key     TEXT NOT NULL,
+                client_id     TEXT NOT NULL,
+                generation    INTEGER NOT NULL,
+                claimed_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (guardian_id, check_key, client_id, generation)
+            );
             -- RAL-338: a project's writable fork, keyed by the user who pushes
             -- to it (`user = ''` is the project-wide fallback row). Rows
             -- deliberately do not cascade on user deletion -- an

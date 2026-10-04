@@ -388,7 +388,8 @@ pub fn dispatch(cmd: Command, opts: &GlobalOpts) -> i32 {
         Command::Configuration => misc::cmd_configuration(opts),
         Command::CheckCatalog => misc::cmd_check_catalog(opts),
         Command::TutorShow => {
-            println!("{}", crate::tutor::task_tutor());
+            let dir = std::env::current_dir().unwrap_or_default();
+            println!("{}", crate::tutor::task_tutor_in(&dir));
             0
         }
         Command::Task(c) => task::dispatch(c, opts),

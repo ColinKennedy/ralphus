@@ -17218,6 +17218,9 @@ struct CheckRunResult {
     elapsed_ms: u64,
     /// The watcher hit [`CHECK_RUN_MARKER_TIMEOUT`] without seeing a marker.
     timed_out: bool,
+    /// RAL-565: the run was started by auto-run rather than a click.
+    #[serde(default)]
+    auto: bool,
 }
 
 /// Reply for `GET /api/guardians/{id}/check-runs/{kind}/{index}/output`.
@@ -17235,6 +17238,8 @@ struct CheckRunOutputReply {
     truncated: bool,
     /// The run never reported an exit code — see [`CheckRunResult::timed_out`].
     timed_out: bool,
+    /// RAL-565: auto-run started this run; the board badges it "auto".
+    auto: bool,
 }
 
 /// The tail of a check's captured output, with whether anything was dropped to
@@ -17295,6 +17300,7 @@ fn check_run_output_reply(result_path: &std::path::Path, log_path: &std::path::P
                 elapsed_ms: None,
                 truncated: false,
                 timed_out: false,
+                auto: false,
             },
         );
     };
@@ -17316,6 +17322,7 @@ fn check_run_output_reply(result_path: &std::path::Path, log_path: &std::path::P
             elapsed_ms: Some(result.elapsed_ms),
             truncated,
             timed_out: result.timed_out,
+            auto: result.auto,
         },
     )
 }
@@ -17350,7 +17357,9 @@ fn check_run_note(
 /// "started" row.
 ///
 /// On completion it also persists a [`CheckRunResult`] beside the captured
-/// output, which is what [`guardian_check_run_output`] serves.
+/// output, which is what [`guardian_check_run_output`] serves. The returned
+/// handle yields the exit code (`None` on timeout); a click ignores it, while
+/// auto-run joins it. `auto` records that auto-run started the run.
 ///
 /// `kind` is `"manual"` for a generated manual check and `"action"` for a
 /// `[[review.action]]` hint; `index` is the check's position in that list.
@@ -17360,7 +17369,8 @@ fn watch_check_run(
     kind: &'static str,
     index: usize,
     prepared: &PreparedCheck,
-) {
+    auto: bool,
+) -> std::thread::JoinHandle<Option<i32>> {
     let result_path = check_run_result_path(guardian_id, kind, index);
     // The previous run's recorded result would otherwise be served as this
     // one's while this one is still going.
@@ -17375,6 +17385,7 @@ fn watch_check_run(
             "kind": kind,
             "index": index,
             "command": prepared.resolved_command,
+            "auto": auto,
         }),
     );
 
@@ -17399,6 +17410,7 @@ fn watch_check_run(
             exit_code,
             elapsed_ms,
             timed_out: exit_code.is_none(),
+            auto,
         };
         if let Ok(encoded) = serde_json::to_string(&result) {
             let _ = std::fs::write(&result_path, encoded);
@@ -17408,6 +17420,7 @@ fn watch_check_run(
             "index": index,
             "elapsed_ms": elapsed_ms,
             "has_output": has_output,
+            "auto": auto,
         });
         let level = match exit_code {
             Some(code) => {
@@ -17424,107 +17437,55 @@ fn watch_check_run(
             }
         };
         check_run_note(&store, &guardian_id, level, "check run finished", payload);
-    });
+        exit_code
+    })
 }
 
-/// RAL-565: which checks of `g` should start on their own right now, as
-/// `(kind, index)` pairs where `kind` is `"action"` (declared) or `"manual"`
-/// (generated). A check qualifies when it is ready, local, runnable, has every
-/// input defaulted, and its own `auto_run` -- falling back to the review's
-/// resolved default -- is on.
-fn auto_run_candidates(g: &crate::guardian::GuardianView) -> Vec<(&'static str, usize)> {
-    let eligible = |check: &crate::guardian::GuardianCheck| {
-        check.auto_run.unwrap_or(g.effective_auto_run)
-            && check.preparation_state.as_deref() == Some("ready")
-            && check.command.is_some()
-            && check.run_on.as_deref() != Some("review_machine")
-            && !(check.run_on.is_none() && g.machine.is_some())
-            && check
-                .inputs
-                .iter()
-                .all(|input| !input.default.is_empty() || g.input_values.contains_key(&input.name))
-    };
-    let mut out = Vec::new();
-    if !crate::guardian::GuardianStatus::is_terminal_status(&g.status) {
-        for (i, check) in g.action_hints.iter().enumerate() {
-            if eligible(check) {
-                out.push(("action", i));
-            }
-        }
-        for (i, check) in g.manual_commands.iter().enumerate() {
-            if eligible(check) {
-                out.push(("manual", i));
-            }
-        }
+/// RAL-565: run one ready check unattended, in the same visible terminal a
+/// click would open, and wait for it. Returns the check's exit code, `Some(None)`
+/// when the watcher gave up waiting for one, or `None` when no terminal could be
+/// opened. The check's `cleanup_command` (teardown of a previous run) runs
+/// first, with no checkbox to tick; the `lifecycle.before_reset_command`
+/// teardown already ran when the build this run follows was prepared.
+///
+/// The caller ([`crate::auto_run`]) owns the claim and the notices; this owns
+/// only the terminal and the recorded result.
+pub(crate) fn run_check_unattended(
+    store: &crate::store_lock::StoreHandle,
+    g: &crate::guardian::GuardianView,
+    check: &crate::guardian::GuardianCheck,
+    kind: &'static str,
+    index: usize,
+) -> Option<Option<i32>> {
+    let id = g.id.as_str();
+    let cwd = check
+        .prepared_cwd
+        .clone()
+        .or_else(|| g.combined_worktree.clone())
+        .unwrap_or_else(|| g.git_root.clone());
+    let marker = new_check_run_marker(id, kind, index);
+    let log = check_run_log_path(id, kind, index);
+    let prepared = build_check_command_line(
+        &cwd,
+        check,
+        &std::collections::HashMap::new(),
+        &g.input_values,
+        true,
+        &marker,
+        &log,
+    )?;
+    if let Err(e) = spawn_in_terminal(None, "cmd", &prepared.args, &g.manual_checks_env) {
+        crate::rlog!(
+            WARNING,
+            "ralphus [guardian] review {id} auto-run of {kind} check {index} could not open a terminal: {e}"
+        );
+        return None;
     }
-    out
-}
-
-/// Claim one auto-run of a check generation on this daemon host. The key
-/// includes the generation's `prepared_at_ms`, so a rebuild that re-prepares
-/// the check opens a new claim while a repeat pass over the same generation
-/// cannot start it twice. Manual clicks never consult the claim.
-fn claim_auto_run(key: String) -> bool {
-    static CLAIMED: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
-        std::sync::Mutex::new(None);
-    let mut guard = CLAIMED
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    guard
-        .get_or_insert_with(std::collections::HashSet::new)
-        .insert(key)
-}
-
-/// RAL-565: start every ready, opted-in check of review `id` in a visible
-/// terminal, once per prepared generation. The check's `cleanup_command`
-/// (teardown of a previous run) runs first. Launching happens on its own
-/// thread so the preparation worker that calls this is never held up.
-pub(crate) fn auto_run_ready_checks(store: &crate::store_lock::StoreHandle, id: &str) {
-    let Ok(g) = store.lock().get_guardian(id) else {
-        return;
-    };
-    for (kind, index) in auto_run_candidates(&g) {
-        let check = if kind == "action" {
-            &g.action_hints[index]
-        } else {
-            &g.manual_commands[index]
-        };
-        let key = format!("{id}|{kind}|{index}|{}", check.prepared_at_ms.unwrap_or(0));
-        if !claim_auto_run(key) {
-            continue;
-        }
-        let check = check.clone();
-        let g = g.clone();
-        let store = store.clone();
-        let id = id.to_string();
-        std::thread::spawn(move || {
-            let cwd = check
-                .prepared_cwd
-                .clone()
-                .or_else(|| g.combined_worktree.clone())
-                .unwrap_or_else(|| g.git_root.clone());
-            let marker = new_check_run_marker(&id, kind, index);
-            let log = check_run_log_path(&id, kind, index);
-            let Some(prepared) = build_check_command_line(
-                &cwd,
-                &check,
-                &std::collections::HashMap::new(),
-                &g.input_values,
-                true,
-                &marker,
-                &log,
-            ) else {
-                return;
-            };
-            match spawn_in_terminal(None, "cmd", &prepared.args, &g.manual_checks_env) {
-                Ok(()) => watch_check_run(store, &id, kind, index, &prepared),
-                Err(e) => crate::rlog!(
-                    WARNING,
-                    "ralphus [guardian] review {id} auto-run of {kind} check {index} could not open a terminal: {e}"
-                ),
-            }
-        });
-    }
+    Some(
+        watch_check_run(store.clone(), id, kind, index, &prepared, true)
+            .join()
+            .unwrap_or(None),
+    )
 }
 
 /// Run one or all LLM-generated manual review commands as fire-and-forget
@@ -17631,7 +17592,16 @@ fn guardian_run_manual_commands(daemon: &Daemon, id: &str, body: &str) -> Reply 
             prepared
         };
         match spawn_in_terminal(None, "cmd", &prepared.args, &g.manual_checks_env) {
-            Ok(()) => watch_check_run(daemon.store_handle(), id, "manual", *index, &prepared),
+            Ok(()) => {
+                watch_check_run(
+                    daemon.store_handle(),
+                    id,
+                    "manual",
+                    *index,
+                    &prepared,
+                    false,
+                );
+            }
             Err(e) => errors.push(e),
         }
     }
@@ -17789,7 +17759,14 @@ fn guardian_run_action_hint(daemon: &Daemon, id: &str, body: &str) -> Reply {
         }
         match result {
             Ok(()) => {
-                watch_check_run(daemon.store_handle(), id, "action", req.index, &prepared);
+                watch_check_run(
+                    daemon.store_handle(),
+                    id,
+                    "action",
+                    req.index,
+                    &prepared,
+                    false,
+                );
                 json(200, &OpenTerminalResponse { ok: true })
             }
             Err(e) => error(500, "terminal_error", &e, vec![]),
@@ -19812,70 +19789,6 @@ mod tests {
             preparation_state: Some(state.to_string()),
             ..crate::guardian::GuardianCheck::default()
         }
-    }
-
-    fn auto_run_guardian(
-        review_default: Option<bool>,
-        hints: &[crate::guardian::GuardianCheck],
-    ) -> crate::guardian::GuardianView {
-        let store = Store::open_in_memory().unwrap();
-        let id = store.create_guardian("r", "main", "/repo").unwrap();
-        store.set_guardian_auto_run(&id, review_default).unwrap();
-        store.set_guardian_action_hints(&id, hints).unwrap();
-        store.get_guardian(&id).unwrap()
-    }
-
-    #[test]
-    fn auto_run_is_off_by_default_and_check_setting_beats_review_default() {
-        let hints = [
-            auto_run_check("inherit", None, "ready"),
-            auto_run_check("on", Some(true), "ready"),
-            auto_run_check("off", Some(false), "ready"),
-        ];
-        assert_eq!(
-            auto_run_candidates(&auto_run_guardian(None, &hints)),
-            vec![("action", 1)],
-            "unset everywhere is off; only the explicit opt-in runs"
-        );
-        assert_eq!(
-            auto_run_candidates(&auto_run_guardian(Some(true), &hints)),
-            vec![("action", 0), ("action", 1)],
-            "a review default turns inheriting checks on; an opted-out check stays manual"
-        );
-        assert!(auto_run_candidates(&auto_run_guardian(Some(false), &hints[..1])).is_empty());
-    }
-
-    #[test]
-    fn auto_run_waits_for_ready_and_for_defaulted_inputs() {
-        let mut needs_input = auto_run_check("input", Some(true), "ready");
-        needs_input.inputs = vec![crate::guardian::CheckInput {
-            name: "port".to_string(),
-            message: String::new(),
-            default: String::new(),
-            r#type: crate::guardian::CheckInputType::String,
-        }];
-        let mut defaulted = needs_input.clone();
-        defaulted.inputs[0].default = "8080".to_string();
-        let hints = [
-            auto_run_check("preparing", Some(true), "preparing"),
-            auto_run_check("failed", Some(true), "failed"),
-            needs_input,
-            defaulted,
-        ];
-        assert_eq!(
-            auto_run_candidates(&auto_run_guardian(None, &hints)),
-            vec![("action", 3)]
-        );
-    }
-
-    #[test]
-    fn auto_run_claim_is_once_per_prepared_generation() {
-        assert!(claim_auto_run("g-claim|action|0|100".to_string()));
-        assert!(!claim_auto_run("g-claim|action|0|100".to_string()));
-        assert!(
-            claim_auto_run("g-claim|action|0|200".to_string()),
-            "a re-prepared generation is a new claim"
-        );
     }
 
     #[test]
