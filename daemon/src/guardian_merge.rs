@@ -9595,11 +9595,6 @@ pub fn run_guardian_post_merge_for(
             ok,
             detail,
         );
-        // RAL-565: a pass that finished with every build command succeeded
-        // (or had none) starts its auto-run checks. A failed pass never does.
-        if ok {
-            crate::server::auto_run_ready_checks(store, id);
-        }
     }
     phase_note(
         store,
