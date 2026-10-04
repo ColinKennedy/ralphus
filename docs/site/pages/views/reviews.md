@@ -42,6 +42,12 @@ suggestions on every rebuild instead, turn the caching off: set
 cache_manual_checks = false` project default) and every later merge or rebase
 regenerates the commands from the freshly stacked diff.
 
+To turn the agent-suggested commands off entirely, set `[[review]]
+skip_manual_checks = true` on the review (or a `[review] skip_manual_checks =
+true` project default, or the matching control in the review's Setup modal).
+No agent is asked to propose commands for that review; manual checks you
+declared yourself in the task file are unaffected.
+
 ### When the prepared build is rebuilt
 
 By default every rebase, every applied piece of reviewer feedback, and every

@@ -72,6 +72,7 @@ fn exec_review_settings(cmd: ProjectReviewSettingsCommand, client: &DaemonClient
             discourage_tests_during_auto_pull_request_fixes,
             auto_cancel_outdated_pr_pipelines,
             cache_manual_checks,
+            skip_manual_checks,
             rebuild_on,
         } => {
             let patch = ProjectReviewSettingsPatch {
@@ -96,6 +97,7 @@ fn exec_review_settings(cmd: ProjectReviewSettingsCommand, client: &DaemonClient
                 discourage_tests_during_auto_pull_request_fixes,
                 auto_cancel_outdated_pr_pipelines,
                 cache_manual_checks,
+                skip_manual_checks,
                 rebuild_on,
             };
             Ok(client.set_project_review_settings(&name, &patch)?)

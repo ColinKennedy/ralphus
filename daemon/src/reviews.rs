@@ -414,6 +414,9 @@ struct Membership {
     /// computed once, when its review branches are first created, and then
     /// reused through later merges, rebases, and automated fix iterations.
     cache_manual_checks: Option<bool>,
+    /// Optional override declared on the review (`[[review]]
+    /// skip_manual_checks`) for whether manual-check generation is skipped.
+    skip_manual_checks: Option<bool>,
     /// Optional override declared on the review (`[[review]] rebuild_on`) for
     /// which events tear down and rebuild its prepared build. `Some(vec![])`
     /// is a declared "never automatically"; `None` inherits.
@@ -1061,6 +1064,7 @@ pub fn derive_reviews_with_full_prefetch(
                 .and_then(|r| r.discourage_tests_during_auto_pull_request_fixes),
             auto_cancel_outdated_pr_pipelines: rv.and_then(|r| r.auto_cancel_outdated_pr_pipelines),
             cache_manual_checks: rv.and_then(|r| r.cache_manual_checks),
+            skip_manual_checks: rv.and_then(|r| r.skip_manual_checks),
             rebuild_on: rv.and_then(|r| r.rebuild_on.clone()),
         });
     }
@@ -1539,6 +1543,13 @@ fn apply_resolver(
     if let Some(enabled) = members.iter().find_map(|m| m.cache_manual_checks) {
         store
             .set_guardian_cache_manual_checks(gid, Some(enabled))
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+    }
+    // This review's own manual-check generation skip override, authored via
+    // `[[review]] skip_manual_checks`.
+    if let Some(enabled) = members.iter().find_map(|m| m.skip_manual_checks) {
+        store
+            .set_guardian_skip_manual_checks(gid, Some(enabled))
             .map_err(|e| ReviewError::new(e.to_string()))?;
     }
     // This review's own list of rebuild events, authored via
@@ -3096,6 +3107,7 @@ mod tests {
             discourage_tests_during_auto_pull_request_fixes: None,
             auto_cancel_outdated_pr_pipelines: None,
             cache_manual_checks: None,
+            skip_manual_checks: None,
             rebuild_on: None,
         }
     }
@@ -3191,6 +3203,7 @@ mod tests {
             match_pr_branch_name: Some(true),
             separate_pr_branch: Some(true),
             cache_manual_checks: Some(false),
+            skip_manual_checks: Some(true),
             ..membership(None)
         };
         apply_resolver(&store, &gid, &[&m]).unwrap();
@@ -3202,6 +3215,7 @@ mod tests {
         assert_eq!(guardian.match_pr_branch_name, Some(true));
         assert_eq!(guardian.separate_pr_branch, Some(true));
         assert_eq!(guardian.cache_manual_checks, Some(false));
+        assert_eq!(guardian.skip_manual_checks, Some(true));
     }
 
     #[test]

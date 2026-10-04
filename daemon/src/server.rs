@@ -2971,6 +2971,9 @@ struct EffectiveReviewDefaults {
     /// RAL-521: the resolved manual-check caching default (per-review
     /// override > database default > `.ralphus.toml`/global > `true`).
     cache_manual_checks: bool,
+    /// The resolved manual-check generation skip default (per-review
+    /// override > database default > `.ralphus.toml`/global > `false`).
+    skip_manual_checks: bool,
     /// The resolved list of events that rebuild a review's prepared build
     /// (per-review override > database default > `.ralphus.toml`/global >
     /// every event).
@@ -3000,6 +3003,7 @@ impl EffectiveReviewDefaults {
                 .discourage_tests_during_auto_pull_request_fixes(),
             auto_cancel_outdated_pr_pipelines: cfg.auto_cancel_outdated_pr_pipelines(),
             cache_manual_checks: cfg.cache_manual_checks(),
+            skip_manual_checks: cfg.skip_manual_checks(),
             rebuild_on: cfg.rebuild_on(),
         }
     }
@@ -3109,6 +3113,11 @@ struct ProjectReviewSettingsBody {
     /// to `true` when unset.
     #[serde(default)]
     cache_manual_checks: Option<bool>,
+    /// Project-level default for whether manual-check generation is skipped
+    /// -- see [`crate::store::ProjectReviewSettings`]. Defaults to `false`
+    /// when unset.
+    #[serde(default)]
+    skip_manual_checks: Option<bool>,
     /// Project-level default for which events (`rebase`, `feedback`,
     /// `auto_fix`) tear down and rebuild a review's prepared build -- see
     /// [`crate::store::ProjectReviewSettings`]. Absent leaves the setting
@@ -3310,6 +3319,9 @@ fn set_project_review_settings(daemon: &Daemon, name: &str, body: &str) -> Reply
     }
     if let Some(v) = req.cache_manual_checks {
         settings.cache_manual_checks = Some(v);
+    }
+    if let Some(v) = req.skip_manual_checks {
+        settings.skip_manual_checks = Some(v);
     }
     if let Some(v) = req.rebuild_on {
         settings.rebuild_on = v;
@@ -13683,6 +13695,11 @@ struct GuardianSettingsBody {
     /// default", which resolves to `true` (caching on by default).
     #[serde(default)]
     cache_manual_checks: Option<bool>,
+    /// This review's own override for whether manual-check generation is
+    /// skipped. `None` (or the field being absent) means "inherit the
+    /// project/global default", which resolves to `false` (generation runs).
+    #[serde(default)]
+    skip_manual_checks: Option<bool>,
     /// Which events (`rebase`, `feedback`, `auto_fix`) tear down and rebuild
     /// this review's prepared build. Absent leaves it untouched, a list sets
     /// it (an empty list never rebuilds automatically), and an explicit
@@ -13769,6 +13786,9 @@ struct GuardianDetailsBody {
     /// RAL-521: see [`GuardianSettingsBody::cache_manual_checks`].
     #[serde(default)]
     cache_manual_checks: Option<bool>,
+    /// See [`GuardianSettingsBody::skip_manual_checks`].
+    #[serde(default)]
+    skip_manual_checks: Option<bool>,
     /// See [`GuardianSettingsBody::rebuild_on`].
     #[serde(default, deserialize_with = "deserialize_present")]
     rebuild_on: Option<Option<Vec<String>>>,
@@ -14237,6 +14257,11 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
             return store_error(&e);
         }
     }
+    if let Some(enabled) = req.skip_manual_checks {
+        if let Err(e) = store.set_guardian_skip_manual_checks(id, Some(enabled)) {
+            return store_error(&e);
+        }
+    }
     if let Some(events) = &req.rebuild_on {
         if let Err(e) = store.set_guardian_rebuild_on(id, events.as_deref()) {
             return store_error(&e);
@@ -14282,6 +14307,9 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
                 restarted.body
             );
         }
+    }
+    if req.skip_manual_checks.is_some() {
+        crate::guardian_merge::maybe_generate_manual_checks_for_settled(&daemon.store_handle(), id);
     }
     match daemon.lock().get_guardian(id) {
         Ok(g) => json(200, &g),
@@ -14560,6 +14588,11 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
             return store_error(&e);
         }
     }
+    if let Some(enabled) = req.skip_manual_checks {
+        if let Err(e) = store.set_guardian_skip_manual_checks(id, Some(enabled)) {
+            return store_error(&e);
+        }
+    }
     if let Some(events) = &req.rebuild_on {
         if let Err(e) = store.set_guardian_rebuild_on(id, events.as_deref()) {
             return store_error(&e);
@@ -14709,6 +14742,9 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
         }
     }
 
+    if req.skip_manual_checks.is_some() {
+        crate::guardian_merge::maybe_generate_manual_checks_for_settled(&daemon.store_handle(), id);
+    }
     match daemon.lock().get_guardian(id) {
         Ok(g) => json(
             200,
@@ -21582,6 +21618,38 @@ mod tests {
         );
         assert_eq!(r.status, 400, "{}", r.body);
         assert!(r.body.contains("invalid_value"));
+    }
+
+    #[test]
+    fn project_review_settings_route_round_trips_skip_manual_checks() {
+        let d = daemon();
+        let repo = tmp_git_repo("rs-skip-manual");
+        route(
+            &d,
+            "POST",
+            "/api/projects",
+            &register_body("proj", &repo.to_string_lossy(), ""),
+        );
+        let url = "/api/projects/proj/review-settings";
+        let r = route(&d, "GET", url, "");
+        let body: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert!(body["settings"]["skip_manual_checks"].is_null());
+        assert_eq!(body["effective"]["skip_manual_checks"], false);
+
+        let r = route(&d, "POST", url, r#"{"skip_manual_checks":true}"#);
+        assert_eq!(r.status, 200, "{}", r.body);
+        let body: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(body["settings"]["skip_manual_checks"], true);
+        assert_eq!(body["effective"]["skip_manual_checks"], true);
+
+        // A patch that omits the field leaves it as-is.
+        let r = route(&d, "POST", url, r#"{"cache_manual_checks":false}"#);
+        assert_eq!(r.status, 200, "{}", r.body);
+        let body: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(body["settings"]["skip_manual_checks"], true);
+
+        let r = route(&d, "POST", url, r#"{"skip_manual_checks":"yes"}"#);
+        assert_eq!(r.status, 400, "{}", r.body);
     }
 
     #[test]
@@ -30211,6 +30279,31 @@ remediation_attempts=1
         assert_eq!(r.status, 200);
         assert!(r.body.contains("\"cache_manual_checks\":true"));
         assert!(r.body.contains("\"effective_cache_manual_checks\":true"));
+    }
+
+    // The review settings endpoint accepts `skip_manual_checks` (default off),
+    // the view reports both the raw override and the effective value, and a
+    // non-boolean value is a 400.
+    #[test]
+    fn guardian_settings_sets_resets_and_validates_skip_manual_checks() {
+        let d = daemon();
+        let gid = make_guardian(&d);
+        let url = format!("/api/guardians/{gid}/settings");
+        let r = route(&d, "GET", &format!("/api/guardians/{gid}"), "");
+        assert!(r.body.contains("\"skip_manual_checks\":null"));
+        assert!(r.body.contains("\"effective_skip_manual_checks\":false"));
+        let body = serde_json::json!({"skip_manual_checks": true}).to_string();
+        let r = route(&d, "POST", &url, &body);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("\"skip_manual_checks\":true"));
+        assert!(r.body.contains("\"effective_skip_manual_checks\":true"));
+        let body = serde_json::json!({"skip_manual_checks": false}).to_string();
+        let r = route(&d, "POST", &url, &body);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("\"skip_manual_checks\":false"));
+        assert!(r.body.contains("\"effective_skip_manual_checks\":false"));
+        let r = route(&d, "POST", &url, r#"{"skip_manual_checks":"yes"}"#);
+        assert_eq!(r.status, 400, "{}", r.body);
     }
 
     fn view_of(d: &Daemon, gid: &str) -> serde_json::Value {

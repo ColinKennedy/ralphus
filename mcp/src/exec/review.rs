@@ -161,6 +161,7 @@ pub fn execute(cmd: ReviewCommand, client: &DaemonClient) -> ExecResult {
             discourage_tests_during_auto_pull_request_fixes,
             auto_cancel_outdated_pr_pipelines,
             cache_manual_checks,
+            skip_manual_checks,
             rebuild_on,
         } => {
             let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
@@ -183,6 +184,7 @@ pub fn execute(cmd: ReviewCommand, client: &DaemonClient) -> ExecResult {
                 discourage_tests_during_auto_pull_request_fixes,
                 auto_cancel_outdated_pr_pipelines,
                 cache_manual_checks,
+                skip_manual_checks,
                 rebuild_on,
             };
             Ok(client.guardian_settings(&resolved.guardian_id, &settings)?)

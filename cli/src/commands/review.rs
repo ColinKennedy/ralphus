@@ -133,6 +133,9 @@ pub enum ReviewCommand {
         /// and then reused through later merges, rebases, and automated fix
         /// iterations. Defaults to `true` (on by default) when unset.
         cache_manual_checks: Option<bool>,
+        /// This review's own override for whether manual-check generation is
+        /// skipped. Defaults to `false` (generation runs) when unset.
+        skip_manual_checks: Option<bool>,
         /// This review's own list of events that tear down and rebuild its
         /// prepared build. Outer `None` leaves it alone, `Some(None)` clears
         /// it back to inherit, `Some(Some(list))` sets it (an empty list never
@@ -432,6 +435,7 @@ pub fn parse(args: &[String]) -> ReviewCommand {
             let auto_cancel_outdated_pr_pipelines =
                 take_tri_bool(&mut scanner, "--auto-cancel-outdated-pr-pipelines");
             let cache_manual_checks = take_tri_bool(&mut scanner, "--cache-manual-checks");
+            let skip_manual_checks = take_tri_bool(&mut scanner, "--skip-manual-checks");
             let rebuild_on = match take_rebuild_on(&mut scanner) {
                 Ok(value) => value,
                 Err(UsageError(message)) => return ReviewCommand::UsageError(message),
@@ -456,6 +460,7 @@ pub fn parse(args: &[String]) -> ReviewCommand {
                 discourage_tests_during_auto_pull_request_fixes,
                 auto_cancel_outdated_pr_pipelines,
                 cache_manual_checks,
+                skip_manual_checks,
                 rebuild_on,
             })
         }
@@ -1406,6 +1411,7 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
             discourage_tests_during_auto_pull_request_fixes,
             auto_cancel_outdated_pr_pipelines,
             cache_manual_checks,
+            skip_manual_checks,
             rebuild_on,
         } => run_and_report(opts, None, || {
             let resolved = resolve_guardian_selector(&client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
@@ -1428,6 +1434,7 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
                 discourage_tests_during_auto_pull_request_fixes,
                 auto_cancel_outdated_pr_pipelines,
                 cache_manual_checks,
+                skip_manual_checks,
                 rebuild_on,
             };
             let result = client.guardian_settings(&resolved.guardian_id, &settings)?;
@@ -3084,6 +3091,28 @@ mod tests {
                 cache_manual_checks,
                 ..
             } => assert_eq!(cache_manual_checks, None),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_settings_skip_manual_checks_tri_state() {
+        match parse(&v(&["settings", "g1", "--skip-manual-checks"])) {
+            ReviewCommand::Settings {
+                skip_manual_checks, ..
+            } => assert_eq!(skip_manual_checks, Some(true)),
+            other => panic!("unexpected: {other:?}"),
+        }
+        match parse(&v(&["settings", "g1", "--no-skip-manual-checks"])) {
+            ReviewCommand::Settings {
+                skip_manual_checks, ..
+            } => assert_eq!(skip_manual_checks, Some(false)),
+            other => panic!("unexpected: {other:?}"),
+        }
+        match parse(&v(&["settings", "g1"])) {
+            ReviewCommand::Settings {
+                skip_manual_checks, ..
+            } => assert_eq!(skip_manual_checks, None),
             other => panic!("unexpected: {other:?}"),
         }
     }

@@ -8057,6 +8057,58 @@ fn cache_manual_checks_false_recomputes_on_merges_and_rebases() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+// With `skip_manual_checks` on, the post-merge worker never invokes the
+// manual-checks generation agent -- not on the initial merge, a rebase, or a
+// later full merge -- and no one-time cached marker is recorded.
+#[test]
+fn skip_manual_checks_never_invokes_the_generation_agent() {
+    let (root, store, id) = single_feature_repo();
+    store
+        .lock()
+        .set_guardian_skip_manual_checks(&id, Some(true))
+        .unwrap();
+    let runner = ManualCommandsCountingRunner::new();
+    run_merge(&store, &runner, &id);
+    run_guardian_post_merge(&store, &runner, &id, PostMergeJobs::ALL);
+    let first = store.lock().get_guardian(&id).unwrap();
+    assert_eq!(first.status, "in_review");
+    assert_eq!(runner.calls(), 0, "the initial merge skips generation");
+    assert!(first.manual_commands.is_empty());
+    assert!(!first.manual_checks_cached);
+
+    let wt0 = PathBuf::from(first.branches[0].worktree.as_deref().expect("worktree"));
+    write(&wt0, "manual.txt", "reviewer fix\n");
+    git(&wt0, &["add", "-A"]);
+    git(&wt0, &["commit", "-m", "manual reviewer fix"]);
+    let sem = Semaphore::new(4);
+    assert!(rebase_on_manual_push(&store, &runner, &id, &sem));
+    run_guardian_post_merge(&store, &runner, &id, PostMergeJobs::ALL);
+    assert_eq!(runner.calls(), 0, "a rebase skips generation");
+
+    run_merge(&store, &runner, &id);
+    run_guardian_post_merge(&store, &runner, &id, PostMergeJobs::ALL);
+    assert_eq!(runner.calls(), 0, "a later merge skips generation");
+
+    // Clearing the override restores generation.
+    store
+        .lock()
+        .set_guardian_skip_manual_checks(&id, Some(false))
+        .unwrap();
+    run_merge(&store, &runner, &id);
+    run_guardian_post_merge(&store, &runner, &id, PostMergeJobs::ALL);
+    assert_eq!(runner.calls(), 1, "generation runs once skip is off");
+    assert!(
+        !store
+            .lock()
+            .get_guardian(&id)
+            .unwrap()
+            .manual_commands
+            .is_empty()
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 // RAL-521: same as `FeedbackRunner` -- answers the feedback/auto-fix agent
 // call with a `note.txt` edit -- but counts `manual_commands` invocations like
 // [`ManualCommandsCountingRunner`], so a feedback pass's manual-checks
