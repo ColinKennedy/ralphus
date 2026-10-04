@@ -303,6 +303,9 @@
         <div style="margin-bottom:8px" data-tip="Switch between the light and dark board theme. Saved to this browser only.">Theme</div>
         <button class="icon-btn" onclick="toggleTheme()" id="prefs-theme-btn" aria-label="Toggle theme" data-tip="Toggle the board theme — the flashbang icon is the bright light theme, the night-vision goggles are the dark theme.\nUse it if the current theme is hard on your eyes or to match your surroundings."></button>
       </div>
+      <div style="margin-bottom:20px;padding-bottom:16px;border-bottom:1px solid var(--border)">
+        <label data-tip="Color each bracket-tagged transcript entry (usage, tool, tool.Bash, ...) by its type in Live View and log views, so mixed output is easy to scan.\nColors are generated per type and always keep at least 4.5:1 contrast against the board background. Saved to this browser only."><input id="turn-colors" type="checkbox" onchange="setTurnColorsEnabled(this.checked)"> Color turn types in transcripts</label>
+      </div>
       <div class="row" style="justify-content:space-between;margin-bottom:12px;align-items:baseline">
         <b data-tip="Hidden squads, reviews, and tasks (RAL-328/RAL-365) — items you've chosen to omit from your normal views.\nA hidden item is removed from this list the moment its underlying squad/review/task is deleted, so everything shown here is always live.">Hidden items</b>
       </div>
@@ -392,6 +395,7 @@
     <script src="/board/22-hovercards.js"></script>
     <script src="/board/25-chrome.js"></script>
     <script src="/board/30-live-view.js"></script>
+    <script src="/board/31-turn-colors.js"></script>
     <script src="/board/35-terminal-logs.js"></script>
     <script src="/board/40-dialogs.js"></script>
     <script src="/board/45-details-pane.js"></script>
