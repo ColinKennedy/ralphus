@@ -12,7 +12,8 @@
 //! `--setup-mcp`, `--register-project`, `--review-auto-submit-pr-stack`,
 //! `--require-forks`, `--create-admin`, `--setup-forge-token`, `--submit-sample`.
 //! The value flags are `--tmux-program`, repeatable
-//! `--mcp-host`, `--project-name`, `--project-description`,
+//! `--mcp-host`, `--project-name`, `--project-description`, `--project-is-fork`,
+//! `--project-fork-url`, `--project-url`,
 //! `--bug-threshold`, `--feature-threshold`, `--investigation-threshold`,
 //! `--unclassified-threshold`, `--fork-user`, `--fork-url`, `--forge-provider`,
 //! `--forge-host`, `--forge-token`, `--admin-name`,
@@ -56,6 +57,16 @@ pub(crate) fn validate_forge_host(host: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_project_fork_url(url: &str) -> Result<(), String> {
+    if !url.starts_with("https://") {
+        return Err(
+            "fork clone URLs must use HTTPS (for example https://github.com/owner/repo.git)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// One answer exposed through both the terminal walkthrough and the
 /// non-interactive command line. Keep this list complete: the parity test
 /// makes omissions fail CI.
@@ -91,6 +102,18 @@ const PROJECT_NAME: InitializeSetting = InitializeSetting {
 const PROJECT_DESCRIPTION: InitializeSetting = InitializeSetting {
     prompt: "project description",
     flag: "--project-description",
+};
+const PROJECT_IS_FORK: InitializeSetting = InitializeSetting {
+    prompt: "project is a fork",
+    flag: "--project-is-fork",
+};
+const PROJECT_FORK_URL: InitializeSetting = InitializeSetting {
+    prompt: "project fork URL",
+    flag: "--project-fork-url",
+};
+const PROJECT_URL: InitializeSetting = InitializeSetting {
+    prompt: "project URL",
+    flag: "--project-url",
 };
 const BUG_THRESHOLD: InitializeSetting = InitializeSetting {
     prompt: "bug threshold",
@@ -172,6 +195,9 @@ const INTERACTIVE_SETTINGS: &[&InitializeSetting] = &[
     &MCP_HOST,
     &REGISTER_PROJECT,
     &PROJECT_NAME,
+    &PROJECT_IS_FORK,
+    &PROJECT_FORK_URL,
+    &PROJECT_URL,
     &PROJECT_DESCRIPTION,
     &BUG_THRESHOLD,
     &FEATURE_THRESHOLD,
@@ -215,6 +241,9 @@ pub struct InitializeServerOptions {
     pub mcp_hosts: Vec<String>,
     pub register_project: Option<bool>,
     pub project_name: Option<String>,
+    pub project_is_fork: Option<bool>,
+    pub project_fork_url: Option<String>,
+    pub project_url: Option<String>,
     pub project_description: Option<String>,
     pub bug_threshold: Option<String>,
     pub feature_threshold: Option<String>,
@@ -247,6 +276,9 @@ impl std::fmt::Debug for InitializeServerOptions {
             .field("mcp_hosts", &self.mcp_hosts)
             .field("register_project", &self.register_project)
             .field("project_name", &self.project_name)
+            .field("project_is_fork", &self.project_is_fork)
+            .field("project_fork_url", &self.project_fork_url)
+            .field("project_url", &self.project_url)
             .field("project_description", &self.project_description)
             .field("bug_threshold", &self.bug_threshold)
             .field("feature_threshold", &self.feature_threshold)
@@ -285,6 +317,9 @@ impl InitializeServerOptions {
             || !self.mcp_hosts.is_empty()
             || self.register_project.is_some()
             || self.project_name.is_some()
+            || self.project_is_fork.is_some()
+            || self.project_fork_url.is_some()
+            || self.project_url.is_some()
             || self.project_description.is_some()
             || self.bug_threshold.is_some()
             || self.feature_threshold.is_some()
@@ -655,16 +690,6 @@ fn step_project(opts: &GlobalOpts, setup: &InitializeServerOptions) -> Option<St
         );
         return None;
     }
-    if !prompt_yes_no(
-        &REGISTER_PROJECT,
-        "  register this repository as a ralphus project?",
-        true,
-        setup.register_project,
-        setup.yes,
-    ) {
-        println!("  skipped");
-        return None;
-    }
     let default_name = cwd
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
@@ -676,6 +701,41 @@ fn step_project(opts: &GlobalOpts, setup: &InitializeServerOptions) -> Option<St
         setup.project_name.as_ref(),
         setup.yes,
     );
+    let is_fork = prompt_yes_no(
+        &PROJECT_IS_FORK,
+        "  you are about to register this project: is it a fork of another project?",
+        false,
+        setup.project_is_fork,
+        setup.yes,
+    );
+    let fork_url = if is_fork {
+        let fork_url = prompt(
+            &PROJECT_FORK_URL,
+            "  fork clone URL (HTTPS required)",
+            "",
+            setup.project_fork_url.as_ref(),
+            setup.yes,
+        );
+        if let Err(error) = validate_project_fork_url(&fork_url) {
+            println!("  invalid fork URL: {error}");
+            return None;
+        }
+        Some(fork_url)
+    } else {
+        None
+    };
+    let origin_url = git_remote_url(&cwd, "origin");
+    let project_url = prompt(
+        &PROJECT_URL,
+        if is_fork {
+            "  upstream/origin clone URL for the non-fork project (SSH recommended)"
+        } else {
+            "  project clone URL (SSH recommended)"
+        },
+        &origin_url,
+        setup.project_url.as_ref(),
+        setup.yes,
+    );
     let description = prompt(
         &PROJECT_DESCRIPTION,
         "  one-line project description",
@@ -683,6 +743,16 @@ fn step_project(opts: &GlobalOpts, setup: &InitializeServerOptions) -> Option<St
         setup.project_description.as_ref(),
         setup.yes,
     );
+    if !prompt_yes_no(
+        &REGISTER_PROJECT,
+        "  register this project with these settings?",
+        true,
+        setup.register_project,
+        setup.yes,
+    ) {
+        println!("  skipped");
+        return None;
+    }
     let target =
         ralphus_core::strip_verbatim_prefix(cwd.canonicalize().unwrap_or_else(|_| cwd.clone()));
     let target_str = target.to_string_lossy().to_string();
@@ -705,12 +775,27 @@ fn step_project(opts: &GlobalOpts, setup: &InitializeServerOptions) -> Option<St
         }
         Err(_) => {}
     }
-    match client.register_project(&name, &target_str, &description, "git", None, false, None) {
+    let clone_url = (!project_url.is_empty()).then_some(project_url.as_str());
+    match client.register_project(
+        &name,
+        &target_str,
+        &description,
+        "git",
+        clone_url,
+        false,
+        None,
+    ) {
         Ok(payload) => {
             println!("  registered project \"{name}\" -> {target_str}");
             for warning in payload["warnings"].as_array().into_iter().flatten() {
                 if let Some(warning) = warning.as_str() {
                     println!("  warning: {warning}");
+                }
+            }
+            if let Some(fork_url) = fork_url {
+                match client.add_project_fork(&name, "", &fork_url, None, None) {
+                    Ok(_) => println!("  registered the project-wide fork URL"),
+                    Err(error) => println!("  error registering the project fork URL: {error}"),
                 }
             }
             Some(name)
@@ -720,6 +805,16 @@ fn step_project(opts: &GlobalOpts, setup: &InitializeServerOptions) -> Option<St
             None
         }
     }
+}
+
+fn git_remote_url(cwd: &std::path::Path, remote: &str) -> String {
+    std::process::Command::new("git")
+        .args(["-C", &cwd.to_string_lossy(), "remote", "get-url", remote])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .unwrap_or_default()
 }
 
 // ---- review settings / auto-review thresholds ------------------------------
@@ -1223,7 +1318,7 @@ mod tests {
     #[test]
     fn interactive_settings_have_unique_prompt_and_flag_contracts() {
         assert!(interactive_settings_are_valid());
-        assert_eq!(INTERACTIVE_SETTINGS.len(), 25);
+        assert_eq!(INTERACTIVE_SETTINGS.len(), 28);
     }
 
     #[test]

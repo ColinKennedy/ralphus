@@ -221,7 +221,7 @@ pub enum Command {
     /// `initialize_server.rs`'s module doc), reached only via the
     /// `resolved_path` exception in `help_map.rs`.
     InitializeServer {
-        setup: initialize_server::InitializeServerOptions,
+        setup: Box<initialize_server::InitializeServerOptions>,
     },
     Project(project::ProjectCommand),
     Machine(machine::MachineCommand),
@@ -305,9 +305,9 @@ pub fn parse_args(args: &[String]) -> Command {
                 Some("server") => {
                     let mut inner = Scanner::new(&tail[1..]);
                     match parse_initialize_server(&mut inner) {
-                        Ok(setup) if inner.remaining().is_empty() => {
-                            Command::InitializeServer { setup }
-                        }
+                        Ok(setup) if inner.remaining().is_empty() => Command::InitializeServer {
+                            setup: Box::new(setup),
+                        },
                         Ok(_) => Command::UsageError(
                             "initialize server: unexpected argument".to_string(),
                         ),
@@ -385,6 +385,19 @@ fn parse_forge_host(scanner: &mut Scanner) -> Result<Option<String>, UsageError>
         })
 }
 
+fn parse_project_fork_url(scanner: &mut Scanner) -> Result<Option<String>, UsageError> {
+    scanner
+        .take_value("--project-fork-url")?
+        .map_or(Ok(None), |url| {
+            url.starts_with("https://").then_some(url).ok_or_else(|| {
+                UsageError(
+                    "--project-fork-url: fork clone URLs must use HTTPS (for example https://github.com/owner/repo.git)"
+                        .to_string(),
+                )
+            }).map(Some)
+        })
+}
+
 fn parse_initialize_server(
     scanner: &mut Scanner,
 ) -> Result<initialize_server::InitializeServerOptions, UsageError> {
@@ -396,6 +409,9 @@ fn parse_initialize_server(
         mcp_hosts: scanner.take_repeated("--mcp-host")?,
         register_project: parse_initialize_bool(scanner, "--register-project")?,
         project_name: scanner.take_value("--project-name")?,
+        project_is_fork: parse_initialize_bool(scanner, "--project-is-fork")?,
+        project_fork_url: parse_project_fork_url(scanner)?,
+        project_url: scanner.take_value("--project-url")?,
         project_description: scanner.take_value("--project-description")?,
         bug_threshold: scanner.take_value("--bug-threshold")?,
         feature_threshold: scanner.take_value("--feature-threshold")?,
@@ -485,7 +501,7 @@ pub fn dispatch(cmd: Command, opts: &GlobalOpts) -> i32 {
         Command::Queue(c) => queue::dispatch(c, opts),
         Command::Mcp(c) => mcp::dispatch(c),
         Command::InitializeGit { path } => misc::cmd_initialize_git(path),
-        Command::InitializeServer { setup } => initialize_server::dispatch(opts, setup),
+        Command::InitializeServer { setup } => initialize_server::dispatch(opts, *setup),
         Command::Project(c) => project::dispatch(c, opts),
         Command::Machine(c) => machine::dispatch(c, opts),
         Command::Agent(c) => agent::dispatch(c, opts),
@@ -581,6 +597,12 @@ mod tests {
             "yes",
             "--project-name",
             "ralphus",
+            "--project-is-fork",
+            "yes",
+            "--project-fork-url",
+            "https://github.com/ColinKennedy/ralphus.git",
+            "--project-url",
+            "git@github.com:upstream/ralphus.git",
             "--project-description",
             "self-hosting",
             "--bug-threshold",
@@ -624,6 +646,15 @@ mod tests {
                 assert_eq!(setup.install_tmux, Some(false));
                 assert_eq!(setup.mcp_hosts, ["claude"]);
                 assert_eq!(setup.project_name.as_deref(), Some("ralphus"));
+                assert_eq!(setup.project_is_fork, Some(true));
+                assert_eq!(
+                    setup.project_fork_url.as_deref(),
+                    Some("https://github.com/ColinKennedy/ralphus.git")
+                );
+                assert_eq!(
+                    setup.project_url.as_deref(),
+                    Some("git@github.com:upstream/ralphus.git")
+                );
                 assert_eq!(setup.forge_token.as_deref(), Some("token"));
                 assert_eq!(setup.setup_forge_token, Some(true));
                 assert_eq!(setup.forge_provider.as_deref(), Some("gitlab"));
@@ -682,6 +713,19 @@ mod tests {
                 Command::UsageError(message) => assert!(message.contains("bare hostname")),
                 other => panic!("unexpected: {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn initialize_server_rejects_non_https_project_fork_url() {
+        match parse_args(&v(&[
+            "initialize",
+            "server",
+            "--project-fork-url",
+            "git@github.com:owner/repo.git",
+        ])) {
+            Command::UsageError(message) => assert!(message.contains("must use HTTPS")),
+            other => panic!("unexpected: {other:?}"),
         }
     }
 }
