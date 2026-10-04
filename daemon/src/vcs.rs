@@ -240,7 +240,7 @@ impl Vcs for GitVcs {
         // `+` forces the update, so a force-push on the producing machine is
         // honoured rather than rejected as a non-fast-forward.
         let refspec = format!("+refs/heads/{branch}:refs/heads/{branch}");
-        let out = Self::exec_raw(root, &["fetch", remote, &refspec])?;
+        let out = Self::exec_raw(root, &["fetch", "--no-write-fetch-head", remote, &refspec])?;
         if out.status.success() {
             return Ok(());
         }

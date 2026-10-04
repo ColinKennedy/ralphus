@@ -605,7 +605,7 @@ pub(crate) fn resolve_registered_remote_upstream(
         return Ok(upstream.to_string());
     }
     let refspec = format!("+refs/heads/{upstream}:refs/remotes/{remote}/{upstream}");
-    git(root, &["fetch", &remote, &refspec]).map_err(|e| {
+    git(root, &["fetch", "--no-write-fetch-head", &remote, &refspec]).map_err(|e| {
         format!(
             "project \"{}\" is registered with a remote, but \"?upstream={upstream}\" could not \
              be fetched from \"{remote}\": {e}",
@@ -897,7 +897,7 @@ fn resync_remote_tracking_branch(wt: &Path) -> Result<(), String> {
         return Ok(());
     };
     let refspec = format!("{remote_branch}:{upstream}");
-    git(wt, &["fetch", remote, &refspec]).map_err(|e| {
+    git(wt, &["fetch", "--no-write-fetch-head", remote, &refspec]).map_err(|e| {
         format!(
             "could not fetch \"{remote}\" branch \"{remote_branch}\" to resync {}: {e}",
             wt.display()

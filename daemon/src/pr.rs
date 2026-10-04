@@ -1715,12 +1715,20 @@ fn guard_against_clobber(
     local_ref: &str,
     last_pushed: Option<&str>,
 ) -> std::result::Result<(), String> {
-    if git(root, &["fetch", remote, alias]).is_err() {
+    let fetched = guardian_merge::with_private_fetch(
+        alias,
+        &["clobber", remote, alias],
+        |refspec| git(root, &["fetch", "--no-write-fetch-head", remote, refspec]),
+        |dest| git(root, &["rev-parse", dest]),
+    );
+    let remote_sha = match fetched {
         // No remote branch yet (or it's unreachable) -- nothing to clobber.
-        return Ok(());
-    }
-    let Ok(remote_sha) = git(root, &["rev-parse", "FETCH_HEAD"]) else {
-        return Ok(());
+        Err(_) => return Ok(()),
+        // The fetch succeeded, so a ref that won't resolve is an error, not
+        // proof there is nothing to clobber.
+        Ok(resolved) => resolved.map_err(|e| {
+            format!("could not resolve fetched remote branch '{alias}' before pushing: {e}")
+        })?,
     };
     let remote_sha = remote_sha.trim();
     if last_pushed == Some(remote_sha) {
@@ -5219,7 +5227,7 @@ fn refresh_pr_forge_cache_for_guardian(store: &crate::store_lock::StoreHandle, i
         let fetch_error: Option<String> = if refspecs.is_empty() {
             None
         } else {
-            let mut args: Vec<&str> = vec!["fetch", &remote_name];
+            let mut args: Vec<&str> = vec!["fetch", "--no-write-fetch-head", &remote_name];
             args.extend(refspecs.iter().map(String::as_str));
             git(&root, &args).err()
         };
@@ -8528,10 +8536,13 @@ fn fetch_remote_pr_tip(
     // non-fast-forward from whatever this ref last pointed at, which a
     // plain refspec would otherwise refuse to write.
     let refspec = format!("+{}:{dest_ref}", pr.branch_alias);
-    Ok(git(&root, &["fetch", &remote_name, &refspec])
-        .ok()
-        .and_then(|_| git(&root, &["rev-parse", &dest_ref]).ok())
-        .map(|s| s.trim().to_string()))
+    Ok(git(
+        &root,
+        &["fetch", "--no-write-fetch-head", &remote_name, &refspec],
+    )
+    .ok()
+    .and_then(|_| git(&root, &["rev-parse", &dest_ref]).ok())
+    .map(|s| s.trim().to_string()))
 }
 
 /// The comparison logic shared by [`compute_sync_status`] and
@@ -11123,6 +11134,91 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&remote_dir);
         let _ = std::fs::remove_dir_all(&clone_dir);
+    }
+
+    /// Two branches of one repo reconcile against a shared `.git`: a sibling
+    /// fetch (and a foreign write to `FETCH_HEAD`) landing between this branch's
+    /// fetch and its resolve must not change the SHA it reads, and none of the
+    /// reconcile paths may write `FETCH_HEAD` themselves.
+    #[test]
+    fn private_fetch_ref_is_immune_to_fetch_head_interleaving() {
+        let root = tmp_dir("pf-root");
+        g(&root, &["init", "--initial-branch", "main"]);
+        gwrite(&root, "base.txt", "base\n");
+        g(&root, &["add", "."]);
+        g(&root, &["commit", "--message", "base"]);
+        let remote_dir = tmp_dir("pf-remote");
+        g(&remote_dir, &["init", "--bare"]);
+        let remote = remote_dir.to_str().unwrap();
+        g(&root, &["push", remote, "main:refs/heads/branch-a"]);
+        gwrite(&root, "other.txt", "other\n");
+        g(&root, &["add", "."]);
+        g(&root, &["commit", "--message", "other"]);
+        g(&root, &["push", remote, "main:refs/heads/branch-b"]);
+        let sha_a = git(&root, &["rev-parse", "main~1"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let sha_b = git(&root, &["rev-parse", "main"])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_ne!(sha_a, sha_b);
+
+        let fetch_head = root.join(".git").join("FETCH_HEAD");
+        let _ = std::fs::remove_file(&fetch_head);
+        let resolved_a = guardian_merge::with_private_fetch(
+            "branch-a",
+            &["clobber", remote, "branch-a"],
+            |refspec| git(&root, &["fetch", "--no-write-fetch-head", remote, refspec]),
+            |dest| {
+                // The sibling branch fetches and a foreign fetch clobbers
+                // FETCH_HEAD between this branch's fetch and its resolve.
+                let b = guardian_merge::with_private_fetch(
+                    "branch-b",
+                    &["clobber", remote, "branch-b"],
+                    |refspec| git(&root, &["fetch", "--no-write-fetch-head", remote, refspec]),
+                    |dest_b| git(&root, &["rev-parse", dest_b]),
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(b.trim(), sha_b);
+                std::fs::write(&fetch_head, format!("{sha_b}\t\tbranch 'branch-b'\n")).unwrap();
+                git(&root, &["rev-parse", dest])
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(resolved_a.trim(), sha_a);
+
+        // The real guard writes no FETCH_HEAD either.
+        let _ = std::fs::remove_file(&fetch_head);
+        assert!(guard_against_clobber(&root, remote, "branch-a", "main", None).is_ok());
+        assert!(
+            !fetch_head.exists(),
+            "guard_against_clobber must not write FETCH_HEAD"
+        );
+
+        // Concurrent reconciles of both branches each succeed.
+        std::thread::scope(|s| {
+            let handles: Vec<_> = ["branch-a", "branch-b"]
+                .iter()
+                .map(|alias| {
+                    let root = &root;
+                    s.spawn(move || {
+                        for _ in 0..10 {
+                            guard_against_clobber(root, remote, alias, "main", None).unwrap();
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+        });
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote_dir);
     }
 
     /// A restack leaves the remote tip un-ancestored even though nobody else

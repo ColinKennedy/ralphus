@@ -494,6 +494,64 @@ pub(crate) fn git(root: &Path, args: &[&str]) -> std::result::Result<String, Str
     GitVcs.run(root, args)
 }
 
+type PrivateFetchLocks = HashMap<String, Arc<Mutex<()>>>;
+static PRIVATE_FETCH_LOCKS: Mutex<Option<PrivateFetchLocks>> = Mutex::new(None);
+
+/// Fetch `remote_branch` from `remote` into a private ref unique to `key`, then
+/// hand `resolve` the ref name so it can read the fetched tip.
+///
+/// A bare `git fetch <remote> <branch>` writes `FETCH_HEAD`, one file shared by
+/// every fetch in the repository, so a concurrent fetch can leave
+/// `rev-parse FETCH_HEAD` missing or pointing at another branch's tip. The
+/// `fetch` closure receives the refspec and must pass `--no-write-fetch-head`.
+/// The ref lives under `refs/ralphus/push/`, in the shared refs namespace, so a
+/// fetch run through the repo root and a rebase in a worktree both resolve it.
+/// It is overwritten in place (`+`) under a stable name, so it needs no
+/// cleanup, and a per-ref lock is held until `resolve` returns so two
+/// operations that map to the same `key` can't overwrite each other's read.
+///
+/// Returns the fetch error if the fetch fails; `resolve` runs only after a
+/// successful fetch.
+pub(crate) fn with_private_fetch<R>(
+    remote_branch: &str,
+    key: &[&str],
+    fetch: impl FnOnce(&str) -> std::result::Result<String, String>,
+    resolve: impl FnOnce(&str) -> R,
+) -> std::result::Result<R, String> {
+    let joined = key.join("\u{1f}");
+    let digest = Sha256::digest(joined.as_bytes());
+    let short: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
+    let readable: String = joined
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(80)
+        .collect();
+    let dest = format!("refs/ralphus/push/{readable}-{short}");
+    let lock = {
+        let mut locks = PRIVATE_FETCH_LOCKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(
+            locks
+                .get_or_insert_with(HashMap::new)
+                .entry(dest.clone())
+                .or_default(),
+        )
+    };
+    let _held = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let refspec = format!("+refs/heads/{remote_branch}:{dest}");
+    fetch(&refspec)?;
+    Ok(resolve(&dest))
+}
+
 /// RAL-550: the full diff of a cell's worktree since `baseline` (the commit
 /// the runner's watcher started from; `HEAD` when unknown): committed and
 /// uncommitted changes from `git diff`, plus each untracked file rendered as an
@@ -695,20 +753,24 @@ fn guard_against_clobber(
     if advertised.trim().is_empty() {
         return Ok(None);
     }
-    wt.git(&["fetch", remote, remote_branch]).map_err(|e| {
+    let remote_sha = with_private_fetch(
+        remote_branch,
+        &["feedback", remote, remote_branch],
+        |refspec| wt.git(&["fetch", "--no-write-fetch-head", remote, refspec]),
+        |dest| wt.git(&["rev-parse", dest]),
+    )
+    .map_err(|e| {
         FeedbackPushError::Other(format!(
             "could not fetch {remote}/{remote_branch} before push: {e}"
         ))
-    })?;
-    let remote_sha = wt
-        .git(&["rev-parse", "FETCH_HEAD"])
-        .map_err(|e| {
-            FeedbackPushError::Other(format!(
-                "could not resolve fetched {remote}/{remote_branch}: {e}"
-            ))
-        })?
-        .trim()
-        .to_string();
+    })?
+    .map_err(|e| {
+        FeedbackPushError::Other(format!(
+            "could not resolve fetched {remote}/{remote_branch}: {e}"
+        ))
+    })?
+    .trim()
+    .to_string();
     if wt
         .git(&["merge-base", "--is-ancestor", &remote_sha, local_branch])
         .is_ok()
@@ -747,13 +809,16 @@ fn reconcile_remote_feedback_commits(
     is_final_branch: bool,
     cancel: &CancelToken,
 ) -> std::result::Result<(), String> {
-    wt.git(&["fetch", remote, remote_branch])
-        .map_err(|e| format!("fetch {remote}/{remote_branch} failed: {e}"))?;
-    let remote_sha = wt
-        .git(&["rev-parse", "FETCH_HEAD"])
-        .map_err(|e| format!("rev-parse FETCH_HEAD failed: {e}"))?
-        .trim()
-        .to_string();
+    let remote_sha = with_private_fetch(
+        remote_branch,
+        &["feedback", remote, remote_branch],
+        |refspec| wt.git(&["fetch", "--no-write-fetch-head", remote, refspec]),
+        |dest| wt.git(&["rev-parse", dest]),
+    )
+    .map_err(|e| format!("fetch {remote}/{remote_branch} failed: {e}"))?
+    .map_err(|e| format!("could not resolve fetched {remote}/{remote_branch}: {e}"))?
+    .trim()
+    .to_string();
     let base_sha = wt
         .git(&["merge-base", "HEAD", &remote_sha])
         .map_err(|e| format!("could not find common history with {remote_branch}: {e}"))?
@@ -7576,7 +7641,7 @@ fn run_feedback_pass(
 /// checked-out branch) is always the distinct, guardian-id-prefixed local
 /// ref `submit_stacked_branch_pr` pushed to it -- they can never collide by
 /// name. Reconciliation below is already purely SHA-based (fetch into the
-/// anonymous `FETCH_HEAD`, `merge-base --is-ancestor` for the no-op check,
+/// private per-branch ref, `merge-base --is-ancestor` for the no-op check,
 /// then a normal rebase), never a same-named self-rebase.
 pub fn pull_pr_commits(
     store: &crate::store_lock::StoreHandle,
@@ -7608,13 +7673,16 @@ pub fn pull_pr_commits(
     };
     let wt = root.at(PathBuf::from(&wt_str));
 
-    root.git(&["fetch", remote, alias])
-        .map_err(|e| format!("fetch {remote}/{alias} failed: {e}"))?;
-    let fetched = root
-        .git(&["rev-parse", "FETCH_HEAD"])
-        .map_err(|e| e.to_string())?
-        .trim()
-        .to_string();
+    let fetched = with_private_fetch(
+        alias,
+        &["pull", id, branch_id, remote, alias],
+        |refspec| root.git(&["fetch", "--no-write-fetch-head", remote, refspec]),
+        |dest| root.git(&["rev-parse", dest]),
+    )
+    .map_err(|e| format!("fetch {remote}/{alias} failed: {e}"))?
+    .map_err(|e| format!("could not resolve fetched {remote}/{alias}: {e}"))?
+    .trim()
+    .to_string();
     let current_tip = wt
         .git(&["rev-parse", "HEAD"])
         .map_err(|e| e.to_string())?
@@ -12611,14 +12679,18 @@ fn fetch_base_branch(
     if let Some((remote, branch)) = base.split_once('/') {
         if ws.git(&["remote", "get-url", remote]).is_ok() {
             let refspec = format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}");
-            return ws.git(&["fetch", remote, &refspec]).map(|_| ());
+            return ws
+                .git(&["fetch", "--no-write-fetch-head", remote, &refspec])
+                .map(|_| ());
         }
     }
     if let Ok(upstream) = ws.git(&["rev-parse", "--abbrev-ref", &format!("{base}@{{upstream}}")]) {
         let upstream = upstream.trim();
         if let Some((remote, branch)) = upstream.split_once('/') {
             let refspec = format!("+refs/heads/{branch}:refs/heads/{base}");
-            return ws.git(&["fetch", remote, &refspec]).map(|_| ());
+            return ws
+                .git(&["fetch", "--no-write-fetch-head", remote, &refspec])
+                .map(|_| ());
         }
     }
     Ok(())
