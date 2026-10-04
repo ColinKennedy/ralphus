@@ -20,10 +20,10 @@ use std::time::{Duration, Instant};
 
 use ralphus_core::process::which;
 
-/// How long `<program> <version-args>` may run before the child is killed
-/// and the probe reported as a timeout failure. Bounds a broken or shimmed
-/// binary so the hourly health sweep can never hang on it.
-const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Normal upper bound for a version command. Callers may choose a tighter
+/// bound when their health-check budget requires it; the probe kills a broken
+/// or shimmed binary when that bound elapses.
+pub const DEFAULT_VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Outcome of probing a program's version. Every non-[`VersionProbe::Ok`]
 /// shape carries its own distinct detail so an operator can tell "not
@@ -79,28 +79,31 @@ impl VersionProbe {
 }
 
 /// Resolves `program` on PATH and, when found, invokes it with
-/// `version_args`, extracting a version from its output via `extract`.
+/// `version_args`, bounded by `timeout`, extracting a version from its output
+/// via `extract`.
 #[must_use]
 pub fn probe_version(
     program: &str,
     version_args: &[&str],
+    timeout: Duration,
     extract: impl Fn(&str) -> Option<String>,
 ) -> VersionProbe {
     match which(program) {
-        Some(path) => probe_version_at(&path, version_args, extract),
+        Some(path) => probe_version_at(&path, version_args, timeout, extract),
         None => VersionProbe::NotFound,
     }
 }
 
-/// Runs `<resolved_path> <version_args>` and classifies the result via
-/// `extract`. Split out from [`probe_version`] so tests and callers that
-/// already have a resolved path (e.g. a backend's configured command, or
+/// Runs `<resolved_path> <version_args>` with `timeout` and classifies the
+/// result via `extract`. Split out from [`probe_version`] so tests and callers
+/// that already have a resolved path (e.g. a backend's configured command, or
 /// tmux's env-override/embedded-psmux path) can exercise every failure shape
 /// without going through a second PATH resolution.
 #[must_use]
 pub fn probe_version_at(
     resolved_path: &str,
     version_args: &[&str],
+    timeout: Duration,
     extract: impl Fn(&str) -> Option<String>,
 ) -> VersionProbe {
     let args_display = version_args.join(" ");
@@ -153,14 +156,12 @@ pub fn probe_version_at(
                 };
             }
         }
-        if start.elapsed() >= VERSION_PROBE_TIMEOUT {
+        if start.elapsed() >= timeout {
             let _ = child.kill();
             let _ = child.wait();
             return VersionProbe::BadOutput {
                 path: resolved_path.to_string(),
-                detail: format!(
-                    "{resolved_path} {args_display} did not exit within {VERSION_PROBE_TIMEOUT:?}"
-                ),
+                detail: format!("{resolved_path} {args_display} did not exit within {timeout:?}"),
             };
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -221,6 +222,10 @@ mod tests {
     #[test]
     fn first_token_after_prefix_strips_a_literal_prefix() {
         assert_eq!(
+            first_token_after_prefix("ripgrep 14.1.1\n", "ripgrep "),
+            Some("14.1.1".to_string())
+        );
+        assert_eq!(
             first_token_after_prefix("git version 2.44.0.windows.1\n", "git version "),
             Some("2.44.0.windows.1".to_string())
         );
@@ -272,6 +277,7 @@ mod tests {
         let probe = probe_version_at(
             "definitely-not-a-real-program-ral546",
             &["--version"],
+            DEFAULT_VERSION_PROBE_TIMEOUT,
             |_| None,
         );
         match &probe {
@@ -292,7 +298,12 @@ mod tests {
     fn probe_version_at_reports_bad_output_when_extract_finds_nothing() {
         // `cargo` is on PATH for this test itself to have run, and its
         // `--version` exits cleanly, but the extractor is rigged to never match.
-        let probe = probe_version_at("cargo", &["--version"], |_| None);
+        let probe = probe_version_at(
+            "cargo",
+            &["--version"],
+            DEFAULT_VERSION_PROBE_TIMEOUT,
+            |_| None,
+        );
         match &probe {
             VersionProbe::BadOutput { path, detail } => {
                 assert_eq!(path, "cargo");
@@ -308,9 +319,12 @@ mod tests {
 
     #[test]
     fn probe_version_at_extracts_a_real_cargo_version() {
-        let probe = probe_version_at("cargo", &["--version"], |out| {
-            first_token_after_prefix(out, "cargo ")
-        });
+        let probe = probe_version_at(
+            "cargo",
+            &["--version"],
+            DEFAULT_VERSION_PROBE_TIMEOUT,
+            |out| first_token_after_prefix(out, "cargo "),
+        );
         match &probe {
             VersionProbe::Ok { path, version } => {
                 assert_eq!(path, "cargo");
@@ -333,6 +347,7 @@ mod tests {
         let probe = probe_version(
             "definitely-not-a-real-program-ral546",
             &["--version"],
+            DEFAULT_VERSION_PROBE_TIMEOUT,
             |_| None,
         );
         assert_eq!(probe, VersionProbe::NotFound);

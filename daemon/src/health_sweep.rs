@@ -145,9 +145,12 @@ fn now_ms() -> u128 {
 /// git whose version probe itself fails still `pass`es, since the binary is
 /// present and usable even if `--version` parsing broke.
 fn check_git() -> SweepCheck {
-    let probe = version_probe::probe_version("git", &["--version"], |out| {
-        version_probe::first_token_after_prefix(out, "git version ")
-    });
+    let probe = version_probe::probe_version(
+        "git",
+        &["--version"],
+        version_probe::DEFAULT_VERSION_PROBE_TIMEOUT,
+        |out| version_probe::first_token_after_prefix(out, "git version "),
+    );
     SweepCheck {
         id: ID_GIT,
         status: if matches!(probe, VersionProbe::NotFound) {
@@ -177,9 +180,12 @@ fn check_tmux() -> SweepCheck {
                     detail: format!("{program} (source: {source})"),
                 };
             }
-            let probe = version_probe::probe_version_at(&program, &["-V"], |out| {
-                version_probe::first_token_after_prefix(out, "tmux ")
-            });
+            let probe = version_probe::probe_version_at(
+                &program,
+                &["-V"],
+                version_probe::DEFAULT_VERSION_PROBE_TIMEOUT,
+                |out| version_probe::first_token_after_prefix(out, "tmux "),
+            );
             let detail = if let VersionProbe::Ok { version, .. } = &probe {
                 format!("{program} (source: {source}, version {version})")
             } else {
@@ -227,9 +233,12 @@ fn check_runner() -> SweepCheck {
 /// [`version_probe`] helper. Always `pass`es, found or not -- `gh` is
 /// optional, the same "never a hard fail" rule ripgrep's checks follow.
 fn check_gh() -> SweepCheck {
-    let probe = version_probe::probe_version("gh", &["--version"], |out| {
-        version_probe::first_token_after_prefix(out, "gh version ")
-    });
+    let probe = version_probe::probe_version(
+        "gh",
+        &["--version"],
+        version_probe::DEFAULT_VERSION_PROBE_TIMEOUT,
+        |out| version_probe::first_token_after_prefix(out, "gh version "),
+    );
     SweepCheck {
         id: ID_GH,
         status: PASS,
@@ -241,9 +250,12 @@ fn check_gh() -> SweepCheck {
 /// [`version_probe`] helper. Always `pass`es, found or not -- `glab` is
 /// optional, the same "never a hard fail" rule ripgrep's checks follow.
 fn check_glab() -> SweepCheck {
-    let probe = version_probe::probe_version("glab", &["--version"], |out| {
-        version_probe::first_token_after_prefix(out, "glab ")
-    });
+    let probe = version_probe::probe_version(
+        "glab",
+        &["--version"],
+        version_probe::DEFAULT_VERSION_PROBE_TIMEOUT,
+        |out| version_probe::first_token_after_prefix(out, "glab "),
+    );
     SweepCheck {
         id: ID_GLAB,
         status: PASS,
