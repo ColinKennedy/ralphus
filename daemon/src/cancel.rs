@@ -162,6 +162,11 @@ pub type WaypointHalts = Cancellations;
 /// See [`WaypointHalts`].
 pub type WaypointHaltToken = CancelToken;
 
+/// Per-cell stop signal owned by live Arbiter oversight. Unlike a waypoint
+/// halt, this is terminal: the scheduler records the affected Cell cancelled.
+pub type ArbiterStops = Cancellations;
+pub type ArbiterStopToken = CancelToken;
+
 #[cfg(test)]
 mod tests {
     use super::*;

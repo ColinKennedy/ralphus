@@ -1267,6 +1267,31 @@ impl RunnerResult {
         }
     }
 
+    #[must_use]
+    pub fn arbiter_stopped(usage: LiveUsage, reason: String) -> Self {
+        Self {
+            status: "arbiter_stopped".to_string(),
+            tokens_in: usage.tokens_in,
+            tokens_out: usage.tokens_out,
+            cache_creation_tokens: usage.cache_creation_tokens,
+            cache_read_tokens: usage.cache_read_tokens,
+            compaction_input_tokens: 0,
+            compaction_count: 0,
+            cost_usd: usage.cost_usd,
+            cost_is_estimated: true,
+            summary: String::new(),
+            error: Some(reason),
+            proofed: None,
+            agent_session_id: None,
+            turns: Some(usage.turns),
+            ghost: None,
+            retry_after_secs: None,
+            prophecies: Vec::new(),
+            thinking_stall_last_line: None,
+            bearing: None,
+        }
+    }
+
     /// RAL-435: a recognized, retryable Pi rate limit with a suggested
     /// delay -- neither success nor failure, mirroring [`Self::detached`]'s
     /// "don't regress the board's numbers" reasoning. `run_cell_worker`
@@ -1395,6 +1420,11 @@ impl RunnerResult {
         self.status == "waypoint_halted"
     }
 
+    #[must_use]
+    pub fn is_arbiter_stopped(&self) -> bool {
+        self.status == "arbiter_stopped"
+    }
+
     /// RAL-435: a recognized, retryable Pi rate limit -- see
     /// [`Self::rate_limited`]. `run_cell_worker`'s retry loop checks this on
     /// every attempt and never lets it reach the rest of the normal
@@ -1424,6 +1454,8 @@ impl RunnerResult {
             || self.is_thinking_stalled()
         {
             NodeState::Running
+        } else if self.is_arbiter_stopped() {
+            NodeState::Cancelled
         } else {
             NodeState::Failed
         }
@@ -1516,6 +1548,7 @@ pub struct SubprocessRunner {
     /// one of its currently-running cells halted at once, without marking
     /// them terminally cancelled.
     waypoint_halts: Option<crate::cancel::WaypointHalts>,
+    arbiter_stops: Option<crate::cancel::ArbiterStops>,
 }
 
 impl SubprocessRunner {
@@ -1531,6 +1564,7 @@ impl SubprocessRunner {
             cartographer: None,
             detachments: None,
             waypoint_halts: None,
+            arbiter_stops: None,
         }
     }
 
@@ -1577,6 +1611,12 @@ impl SubprocessRunner {
         self.waypoint_halts = Some(waypoint_halts);
         self
     }
+
+    #[must_use]
+    pub fn with_arbiter_stops(mut self, arbiter_stops: crate::cancel::ArbiterStops) -> Self {
+        self.arbiter_stops = Some(arbiter_stops);
+        self
+    }
 }
 
 /// Registers a cell's subprocess PID on construction and unregisters it on
@@ -1621,6 +1661,16 @@ impl Drop for DetachGuard<'_> {
 struct WaypointHaltGuard<'a> {
     waypoint_halts: &'a crate::cancel::WaypointHalts,
     squad_id: &'a str,
+}
+
+struct ArbiterStopGuard<'a> {
+    stops: &'a crate::cancel::ArbiterStops,
+    key: &'a str,
+}
+impl Drop for ArbiterStopGuard<'_> {
+    fn drop(&mut self) {
+        self.stops.remove(self.key);
+    }
 }
 
 impl Drop for WaypointHaltGuard<'_> {
@@ -1868,6 +1918,20 @@ struct TranscriptEventTarget<'a> {
     squad_id: &'a str,
     cell_id: &'a str,
     task: &'a str,
+    cwd: &'a str,
+    context: &'a str,
+    arbiter_stops: Option<&'a crate::cancel::ArbiterStops>,
+}
+
+fn stop_suspicious_large_diff(
+    stops: &crate::cancel::ArbiterStops,
+    key: &str,
+    stopping_enabled: bool,
+    verdict: Option<crate::arbiter::LargeDiffVerdict>,
+) {
+    if stopping_enabled && verdict == Some(crate::arbiter::LargeDiffVerdict::Suspicious) {
+        stops.cancel(key);
+    }
 }
 
 fn consume_transcript_lines(
@@ -1907,6 +1971,26 @@ fn consume_transcript_lines(
                 target.task,
                 json,
             );
+            if let Some(stops) = target.arbiter_stops {
+                let verdict = crate::arbiter::inspect_large_diff(
+                    target.cartographer.expect("Arbiter stops require a store"),
+                    target.squad_id,
+                    target.cell_id,
+                    target.task,
+                    target.cwd,
+                    target.context,
+                );
+                let key = crate::store_memory::StoreMemory::cell_diff_key(
+                    target.squad_id,
+                    target.cell_id,
+                );
+                stop_suspicious_large_diff(
+                    stops,
+                    &key,
+                    crate::config::load_arbiter_config().allow_cell_stopping,
+                    verdict,
+                );
+            }
             // A tool call or any other genuine event resets the streak --
             // the periodic `LIVE_USAGE_MESSAGE` heartbeat does not
             // (`is_activity_signal` is `false` for it), since it fires every
@@ -2150,6 +2234,16 @@ impl SubprocessRunner {
             waypoint_halts: w,
             squad_id: &spec.squad_id,
         });
+        let arbiter_key =
+            crate::store_memory::StoreMemory::cell_diff_key(&spec.squad_id, &spec.cell_id);
+        let arbiter_stop_token = self
+            .arbiter_stops
+            .as_ref()
+            .map(|s| s.register(&arbiter_key));
+        let _arbiter_stop_guard = self.arbiter_stops.as_ref().map(|s| ArbiterStopGuard {
+            stops: s,
+            key: &arbiter_key,
+        });
 
         loop {
             let attempt_spec: std::borrow::Cow<'_, RunnerSpec> = if attempt == 0 {
@@ -2187,6 +2281,7 @@ impl SubprocessRunner {
                 cancel,
                 detach_token.as_ref(),
                 waypoint_halt_token.as_ref(),
+                arbiter_stop_token.as_ref(),
                 &tmux,
                 &session_name,
                 &spec_path,
@@ -2320,6 +2415,7 @@ impl SubprocessRunner {
         cancel: &CancelToken,
         detach: Option<&crate::cancel::DetachToken>,
         waypoint_halt: Option<&crate::cancel::WaypointHaltToken>,
+        arbiter_stop: Option<&crate::cancel::ArbiterStopToken>,
         tmux: &Tmux,
         session_name: &str,
         spec_path: &std::path::Path,
@@ -2585,6 +2681,30 @@ impl SubprocessRunner {
                     resumable_agent_session_id.clone(),
                 );
             }
+            if arbiter_stop.is_some_and(crate::cancel::ArbiterStopToken::is_cancelled) {
+                let _ = tmux.kill_session(session_name);
+                let arbiter_key = crate::store_memory::StoreMemory::cell_diff_key(
+                    &attempt_spec.squad_id,
+                    &attempt_spec.cell_id,
+                );
+                let numstat = self
+                    .cartographer
+                    .as_ref()
+                    .and_then(|store| {
+                        store
+                            .lock()
+                            .memory()
+                            .cell_diff_state(&arbiter_key)
+                            .map(|state| state.summary)
+                    })
+                    .unwrap_or_default();
+                break RunnerResult::arbiter_stopped(
+                    current_usage,
+                    format!(
+                        "terminated by Arbiter after suspicious large diff; numstat: {numstat}"
+                    ),
+                );
+            }
             if timed_out(started.elapsed(), deadline) {
                 let _ = tmux.kill_session(session_name);
                 let secs = deadline.map(|d| d.as_secs()).unwrap_or(0);
@@ -2666,6 +2786,12 @@ impl SubprocessRunner {
                     squad_id: &attempt_spec.squad_id,
                     cell_id: &attempt_spec.cell_id,
                     task: &attempt_spec.task,
+                    cwd: &attempt_spec.cwd,
+                    context: attempt_spec
+                        .prompt
+                        .as_deref()
+                        .unwrap_or(attempt_spec.command.as_deref().unwrap_or("")),
+                    arbiter_stops: self.arbiter_stops.as_ref(),
                 };
                 let (mut done, stall_sample) = consume_transcript_lines(
                     &drained.lines,
@@ -2767,6 +2893,32 @@ impl SubprocessRunner {
                                             &attempt_spec.task,
                                             json,
                                         );
+                                        if let Some(stops) = self.arbiter_stops.as_ref() {
+                                            let verdict = crate::arbiter::inspect_large_diff(
+                                                self.cartographer
+                                                    .as_ref()
+                                                    .expect("Arbiter stops require a store"),
+                                                &attempt_spec.squad_id,
+                                                &attempt_spec.cell_id,
+                                                &attempt_spec.task,
+                                                &attempt_spec.cwd,
+                                                attempt_spec.prompt.as_deref().unwrap_or(
+                                                    attempt_spec.command.as_deref().unwrap_or(""),
+                                                ),
+                                            );
+                                            let key =
+                                                crate::store_memory::StoreMemory::cell_diff_key(
+                                                    &attempt_spec.squad_id,
+                                                    &attempt_spec.cell_id,
+                                                );
+                                            stop_suspicious_large_diff(
+                                                stops,
+                                                &key,
+                                                crate::config::load_arbiter_config()
+                                                    .allow_cell_stopping,
+                                                verdict,
+                                            );
+                                        }
                                         if let Some(sid) = fwd.agent_session_id {
                                             *resumable_agent_session_id = Some(sid);
                                         }
@@ -2814,6 +2966,12 @@ impl SubprocessRunner {
             squad_id: &attempt_spec.squad_id,
             cell_id: &attempt_spec.cell_id,
             task: &attempt_spec.task,
+            cwd: &attempt_spec.cwd,
+            context: attempt_spec
+                .prompt
+                .as_deref()
+                .unwrap_or(attempt_spec.command.as_deref().unwrap_or("")),
+            arbiter_stops: self.arbiter_stops.as_ref(),
         };
         drain_transcript_to_current_end(
             &mut tailer,
@@ -3529,6 +3687,33 @@ mod tests {
     #![allow(clippy::print_stdout)]
 
     use super::*;
+
+    #[test]
+    fn arbiter_stop_is_terminally_cancelled() {
+        let result = RunnerResult::arbiter_stopped(LiveUsage::default(), "reason".to_string());
+        assert!(result.is_arbiter_stopped());
+        assert_eq!(result.node_state(), NodeState::Cancelled);
+    }
+
+    #[test]
+    fn suspicious_large_diff_does_not_stop_a_cell_without_permission() {
+        let stops = crate::cancel::ArbiterStops::new();
+        let token = stops.register("squad-1/cell-1");
+        stop_suspicious_large_diff(
+            &stops,
+            "squad-1/cell-1",
+            false,
+            Some(crate::arbiter::LargeDiffVerdict::Suspicious),
+        );
+        assert!(!token.is_cancelled());
+        stop_suspicious_large_diff(
+            &stops,
+            "squad-1/cell-1",
+            true,
+            Some(crate::arbiter::LargeDiffVerdict::Suspicious),
+        );
+        assert!(token.is_cancelled());
+    }
 
     #[test]
     fn rate_limited_clamps_an_absurd_retry_after_to_ten_minutes() {
@@ -5126,6 +5311,7 @@ prompt = "make it build"
             cartographer: None,
             detachments: None,
             waypoint_halts: None,
+            arbiter_stops: None,
         };
         #[cfg(not(target_os = "windows"))]
         let runner = SubprocessRunner {
@@ -5135,6 +5321,7 @@ prompt = "make it build"
             cartographer: None,
             detachments: None,
             waypoint_halts: None,
+            arbiter_stops: None,
         };
         let row = CellRow {
             task_idx: 0,
@@ -5416,6 +5603,7 @@ prompt = "make it build"
             cartographer: None,
             detachments: None,
             waypoint_halts: None,
+            arbiter_stops: None,
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         let spec = RunnerSpec::for_proof(
@@ -5470,6 +5658,7 @@ prompt = "make it build"
             cartographer: None,
             detachments: None,
             waypoint_halts: None,
+            arbiter_stops: None,
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         let spec = RunnerSpec::for_command_proof(
@@ -5521,6 +5710,7 @@ prompt = "make it build"
             cartographer: None,
             detachments: None,
             waypoint_halts: None,
+            arbiter_stops: None,
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         // Backstop only — see the identical note on
@@ -5639,6 +5829,7 @@ prompt = "make it build"
             cartographer: None,
             detachments: None,
             waypoint_halts: None,
+            arbiter_stops: None,
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         let spec = RunnerSpec::for_proof(
@@ -5695,6 +5886,7 @@ prompt = "make it build"
             cartographer: None,
             detachments: None,
             waypoint_halts: None,
+            arbiter_stops: None,
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         let spec = RunnerSpec::for_proof(
@@ -5757,6 +5949,7 @@ prompt = "make it build"
             cartographer: None,
             detachments: None,
             waypoint_halts: None,
+            arbiter_stops: None,
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         let spec = RunnerSpec::for_proof(
@@ -5844,6 +6037,7 @@ prompt = "make it build"
             cartographer: None,
             detachments: Some(detachments.clone()),
             waypoint_halts: None,
+            arbiter_stops: None,
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         let spec = RunnerSpec::for_proof(
@@ -5937,6 +6131,7 @@ prompt = "make it build"
             cartographer: Some(Arc::new(crate::store_lock::StoreMutex::new(store))),
             detachments: None,
             waypoint_halts: None,
+            arbiter_stops: None,
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         let spec = RunnerSpec {
@@ -6079,6 +6274,7 @@ prompt = "make it build"
             cartographer: Some(Arc::new(crate::store_lock::StoreMutex::new(store))),
             detachments: None,
             waypoint_halts: None,
+            arbiter_stops: None,
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         let spec = RunnerSpec {
@@ -6182,6 +6378,7 @@ prompt = "make it build"
             cartographer: None,
             detachments: None,
             waypoint_halts: None,
+            arbiter_stops: None,
         };
         runner
             .preflight_runner_executable(None)
@@ -6279,6 +6476,9 @@ prompt = "make it build"
             squad_id: &squad_id,
             cell_id: "worker",
             task: "build",
+            cwd: ".",
+            context: "test",
+            arbiter_stops: None,
         };
         consume_transcript_lines(&initial.lines, &target, &mut session_id, &mut usage, None);
         drain_transcript_to_current_end(&mut tailer, &target, &mut session_id, &mut usage);

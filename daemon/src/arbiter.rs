@@ -47,6 +47,284 @@ use crate::config::ArbiterConfig;
 use crate::store::Store;
 use crate::triage::{TriageTypeView, UNCLASSIFIED_TYPE};
 
+/// Result of one live large-diff inspection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LargeDiffVerdict {
+    Suspicious,
+    Legitimate,
+}
+
+const LARGE_DIFF_LINES: i64 = 1_000;
+const LARGE_DIFF_FILES: i64 = 20;
+const MAX_DIFF_CHARS: usize = 40_000;
+const MAX_DIFF_CHARS_PER_FILE: usize = 8_000;
+
+fn truncate_utf8(value: &str, limit: usize) -> &str {
+    if value.len() <= limit {
+        return value;
+    }
+    let end = value
+        .char_indices()
+        .take_while(|(idx, _)| *idx <= limit)
+        .map(|(idx, _)| idx)
+        .last()
+        .unwrap_or(0);
+    &value[..end]
+}
+
+/// Limit the Arbiter's second-pass evidence both across the whole diff and
+/// per file, so one generated file cannot consume the review context.
+fn bounded_diff(diff: &str) -> String {
+    let mut bounded = String::new();
+    for (index, part) in diff.split("diff --git ").enumerate() {
+        let file_diff = if index == 0 {
+            part.to_string()
+        } else {
+            format!("diff --git {part}")
+        };
+        if bounded.len() >= MAX_DIFF_CHARS {
+            break;
+        }
+        let remaining = MAX_DIFF_CHARS - bounded.len();
+        bounded.push_str(truncate_utf8(
+            &file_diff,
+            remaining.min(MAX_DIFF_CHARS_PER_FILE),
+        ));
+    }
+    bounded
+}
+
+fn large_diff(summary: &serde_json::Value) -> bool {
+    let n = |name| {
+        summary
+            .get(name)
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0)
+    };
+    n("files_changed") >= LARGE_DIFF_FILES
+        || n("lines_added").saturating_add(n("lines_removed")) >= LARGE_DIFF_LINES
+}
+
+fn parse_large_diff_reply(reply: &str) -> Option<LargeDiffVerdict> {
+    match reply.trim().to_ascii_uppercase().as_str() {
+        "SUSPICIOUS" => Some(LargeDiffVerdict::Suspicious),
+        "LEGITIMATE" => Some(LargeDiffVerdict::Legitimate),
+        _ => None,
+    }
+}
+
+fn wants_full_diff(reply: &str) -> bool {
+    reply.trim().eq_ignore_ascii_case("INSPECT")
+}
+
+struct LargeDiffInspection<'a> {
+    store: &'a Store,
+    cfg: &'a ArbiterConfig,
+    squad_id: &'a str,
+    cell_id: &'a str,
+    task: &'a str,
+    summary: &'a serde_json::Value,
+    version: u64,
+}
+
+fn record_large_diff_verdict(
+    inspection: LargeDiffInspection<'_>,
+    reply: &str,
+) -> Option<LargeDiffVerdict> {
+    let verdict = parse_large_diff_reply(reply);
+    match verdict {
+        Some(LargeDiffVerdict::Legitimate) => {
+            crate::cartographer::Note::new("arbiter")
+                .squad(inspection.squad_id)
+                .cell(inspection.cell_id)
+                .task(inspection.task)
+                .admin_only()
+                .emit(
+                    inspection.store,
+                    "Arbiter recommends an advisory waypoint for legitimate oversized change",
+                    serde_json::json!({"summary": inspection.summary, "version": inspection.version}),
+                );
+            if inspection.cfg.allow_waypoint_creation {
+                if let Ok(id) = inspection.store.next_id("waypoint_seq", "waypoint") {
+                    let prompt = format!(
+                        "Review the legitimate oversized change reported by Arbiter for {}/{}: {}",
+                        inspection.squad_id, inspection.cell_id, inspection.summary
+                    );
+                    if inspection
+                        .store
+                        .create_waypoint(
+                            &id,
+                            Some("Arbiter large-diff review"),
+                            &prompt,
+                            None,
+                            None,
+                            true,
+                        )
+                        .is_ok()
+                    {
+                        let _ = inspection.store.add_affected_entry(
+                            &id,
+                            crate::waypoints::WaypointEntryKind::Squad,
+                            inspection.squad_id,
+                            crate::waypoints::AffectedMode::Advisory,
+                        );
+                    }
+                }
+            }
+        }
+        Some(LargeDiffVerdict::Suspicious) => crate::cartographer::Note::new("arbiter")
+            .squad(inspection.squad_id)
+            .cell(inspection.cell_id)
+            .task(inspection.task)
+            .admin_only()
+            .emit(
+                inspection.store,
+                "Arbiter marked oversized change suspicious",
+                serde_json::json!({"summary": inspection.summary, "version": inspection.version, "stopping_enabled": inspection.cfg.allow_cell_stopping}),
+            ),
+        None => crate::cartographer::Note::new("arbiter")
+            .squad(inspection.squad_id)
+            .cell(inspection.cell_id)
+            .task(inspection.task)
+            .admin_only()
+            .emit(
+                inspection.store,
+                format!("Arbiter large-diff inspection returned unrecognized reply {reply:?}"),
+                serde_json::json!({"summary": inspection.summary, "version": inspection.version}),
+            ),
+    }
+    verdict
+}
+
+/// Inspect a newly pushed large live diff. This deliberately claims a version
+/// before its network call, so repeated transcript delivery cannot duplicate
+/// the inspection. The git read and chat call happen with no store lock held.
+pub fn inspect_large_diff(
+    store: &crate::store_lock::StoreHandle,
+    squad_id: &str,
+    cell_id: &str,
+    task: &str,
+    cwd: &str,
+    context: &str,
+) -> Option<LargeDiffVerdict> {
+    let cfg = crate::config::load_arbiter_config();
+    if !cfg.large_diff_oversight_enabled() {
+        return None;
+    }
+    let key = crate::store_memory::StoreMemory::cell_diff_key(squad_id, cell_id);
+    let (version, summary) = store.lock().memory().claim_cell_diff_inspection(&key)?;
+    if !large_diff(&summary) {
+        return None;
+    }
+    let arbiter = Arbiter::from_config(&cfg);
+    {
+        let guard = store.lock();
+        if over_budget(&guard, &arbiter) {
+            crate::cartographer::Note::new("arbiter")
+                .squad(squad_id)
+                .cell(cell_id)
+                .task(task)
+                .admin_only()
+                .emit(
+                    &guard,
+                    "Arbiter large-diff inspection skipped: maximum_budget_usd cap already reached",
+                    serde_json::json!({"summary": summary, "version": version}),
+                );
+            return None;
+        }
+    }
+    let numstat_system = "You are the Arbiter overseeing a running coding task. Compare task context and numstat only. Reply exactly INSPECT when the amount of change is unexpectedly large relative to the task and needs a bounded diff review; otherwise reply exactly IGNORE.";
+    let numstat_message = format!("Task context:\n{context}\n\nNumstat:\n{summary}");
+    let (numstat_reply, numstat_usage) = match chat_client::call_direct_with_usage(
+        &arbiter.agent,
+        arbiter.model.as_deref(),
+        numstat_system,
+        &[ChatMessage {
+            role: "user",
+            content: numstat_message,
+            image: None,
+        }],
+    ) {
+        Ok(v) => v,
+        Err(_) => return None,
+    };
+    let numstat_cost = estimate_cost_usd(
+        &arbiter.agent,
+        arbiter.model.as_deref().unwrap_or_default(),
+        numstat_usage,
+    );
+    let guard = store.lock();
+    let _ = guard.record_arbiter_cost(
+        "large_diff_numstat",
+        numstat_usage.tokens_in as i64,
+        numstat_usage.tokens_out as i64,
+        numstat_cost,
+    );
+    drop(guard);
+    if !wants_full_diff(&numstat_reply) {
+        return None;
+    }
+    let diff = crate::guardian_merge::cell_diff(
+        std::path::Path::new(cwd),
+        summary.get("baseline").and_then(serde_json::Value::as_str),
+    )
+    .unwrap_or_default();
+    let diff = bounded_diff(&diff);
+    let system = "You are the Arbiter overseeing a running coding task. A large diff alone is not suspicious. Compare the task context, numstat, and bounded diff. Reply with exactly LEGITIMATE if it remains in the task's spirit, otherwise exactly SUSPICIOUS for runaway, unhealthy, or out-of-scope work.";
+    let message =
+        format!("Task context:\n{context}\n\nNumstat:\n{summary}\n\nBounded diff:\n{diff}");
+    let (reply, usage) = match chat_client::call_direct_with_usage(
+        &arbiter.agent,
+        arbiter.model.as_deref(),
+        system,
+        &[ChatMessage {
+            role: "user",
+            content: message,
+            image: None,
+        }],
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            let guard = store.lock();
+            crate::cartographer::Note::new("arbiter")
+                .squad(squad_id)
+                .cell(cell_id)
+                .task(task)
+                .admin_only()
+                .emit(
+                    &guard,
+                    format!("Arbiter large-diff inspection call failed: {e}"),
+                    serde_json::json!({"summary": summary, "version": version}),
+                );
+            return None;
+        }
+    };
+    let cost = estimate_cost_usd(
+        &arbiter.agent,
+        arbiter.model.as_deref().unwrap_or_default(),
+        usage,
+    );
+    let guard = store.lock();
+    let _ = guard.record_arbiter_cost(
+        "large_diff_inspection",
+        usage.tokens_in as i64,
+        usage.tokens_out as i64,
+        cost,
+    );
+    record_large_diff_verdict(
+        LargeDiffInspection {
+            store: &guard,
+            cfg: &cfg,
+            squad_id,
+            cell_id,
+            task,
+            summary: &summary,
+            version,
+        },
+        &reply,
+    )
+}
+
 /// The resolved, daemon-singleton Arbiter -- computed fresh from
 /// `crate::config::load_arbiter_config()` at each call site rather than held
 /// as long-lived process state; see that function's doc comment for why this
@@ -1021,6 +1299,89 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn large_diff_reply_is_a_closed_verdict() {
+        assert_eq!(
+            parse_large_diff_reply("LEGITIMATE\n"),
+            Some(LargeDiffVerdict::Legitimate)
+        );
+        assert_eq!(
+            parse_large_diff_reply("suspicious"),
+            Some(LargeDiffVerdict::Suspicious)
+        );
+        assert_eq!(parse_large_diff_reply("probably legitimate"), None);
+    }
+
+    #[test]
+    fn large_diff_condition_needs_many_lines_or_files() {
+        assert!(!large_diff(
+            &serde_json::json!({"files_changed": 1, "lines_added": 999, "lines_removed": 0})
+        ));
+        assert!(large_diff(&serde_json::json!({"files_changed": 20})));
+        assert!(large_diff(
+            &serde_json::json!({"lines_added": 600, "lines_removed": 400})
+        ));
+    }
+
+    #[test]
+    fn bounded_diff_limits_each_file_and_the_total() {
+        let diff = format!(
+            "diff --git a/a b/a\n{}diff --git a/b b/b\n{}",
+            "a".repeat(MAX_DIFF_CHARS_PER_FILE * 2),
+            "b".repeat(MAX_DIFF_CHARS_PER_FILE * 2),
+        );
+        let bounded = bounded_diff(&diff);
+        assert!(bounded.len() <= MAX_DIFF_CHARS);
+        assert!(bounded.len() <= MAX_DIFF_CHARS_PER_FILE * 2);
+    }
+
+    #[test]
+    fn legitimate_large_diff_recommends_without_creating_waypoint_by_default() {
+        let store = store();
+        let summary = serde_json::json!({"files_changed": 21});
+        let cfg = ArbiterConfig::default();
+        let verdict = record_large_diff_verdict(
+            LargeDiffInspection {
+                store: &store,
+                cfg: &cfg,
+                squad_id: "squad-1",
+                cell_id: "cell-1",
+                task: "task",
+                summary: &summary,
+                version: 1,
+            },
+            "LEGITIMATE",
+        );
+        assert_eq!(verdict, Some(LargeDiffVerdict::Legitimate));
+        assert!(store.get_waypoint("waypoint-000000000001").is_err());
+    }
+
+    #[test]
+    fn enabled_waypoint_creation_creates_an_advisory_waypoint() {
+        let store = store();
+        let cfg = ArbiterConfig {
+            allow_waypoint_creation: true,
+            ..ArbiterConfig::default()
+        };
+        let summary = serde_json::json!({"files_changed": 21});
+        record_large_diff_verdict(
+            LargeDiffInspection {
+                store: &store,
+                cfg: &cfg,
+                squad_id: "squad-1",
+                cell_id: "cell-1",
+                task: "task",
+                summary: &summary,
+                version: 1,
+            },
+            "LEGITIMATE",
+        );
+        let waypoint = store
+            .get_waypoint("waypoint-000000000001")
+            .expect("Arbiter-created waypoint");
+        assert!(waypoint.allow_advisory);
+    }
     use crate::triage::TriageTypeView;
 
     fn store() -> Store {
