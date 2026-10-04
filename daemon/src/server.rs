@@ -52,7 +52,6 @@ pub struct Daemon {
     /// transitioning to `mode=block` can stop every currently-running cell
     /// in that squad immediately, without marking them terminally cancelled.
     waypoint_halts: crate::cancel::WaypointHalts,
-    arbiter_stops: crate::cancel::ArbiterStops,
     /// Live registry of cell subprocess PIDs, shared with the runner so the
     /// resource-usage endpoint can attribute OS metrics to running tasks (RAL-11).
     procs: ProcRegistry,
@@ -236,7 +235,6 @@ impl Daemon {
             cancellations: Cancellations::new(),
             detachments: crate::cancel::Detachments::new(),
             waypoint_halts: crate::cancel::WaypointHalts::new(),
-            arbiter_stops: crate::cancel::ArbiterStops::new(),
             procs: ProcRegistry::new(),
             sem: Arc::new(Semaphore::new(max_concurrent)),
             summary_queue: SummaryQueue::new(),
@@ -397,11 +395,6 @@ impl Daemon {
     #[must_use]
     pub fn waypoint_halts_handle(&self) -> crate::cancel::WaypointHalts {
         self.waypoint_halts.clone()
-    }
-
-    #[must_use]
-    pub fn arbiter_stops_handle(&self) -> crate::cancel::ArbiterStops {
-        self.arbiter_stops.clone()
     }
 
     /// A cloned handle to the subprocess PID registry (for the cell runner).
@@ -18706,8 +18699,7 @@ pub fn serve<A: ToSocketAddrs>(
             .with_registry(daemon.procs_handle())
             .with_cartographer(daemon.store_handle())
             .with_detachments(daemon.detachments_handle())
-            .with_waypoint_halts(daemon.waypoint_halts_handle())
-            .with_arbiter_stops(daemon.arbiter_stops_handle()),
+            .with_waypoint_halts(daemon.waypoint_halts_handle()),
     );
     // RAL-185: the scheduler holds a router rather than the local runner
     // directly, so a cell carrying a `machine` is dispatched to its provider

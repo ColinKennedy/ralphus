@@ -1689,7 +1689,17 @@ fn execute_squad_inner(
                                 )
                             })
                     });
-                    if all_terminal {
+                    // A task whose cell was cancelled mid-run (an Arbiter stop)
+                    // never completed its work, so it must not finalize as
+                    // Done -- same reasoning as the cascade above. A real
+                    // failure still wins and goes through the finalizer.
+                    let has_cancelled_cell = task_cells.get(&t).is_some_and(|idxs| {
+                        idxs.iter().any(|&i| prog.status[i] == CellState::Cancelled)
+                    });
+                    if all_terminal && has_cancelled_cell && !prog.failed.contains(&t) {
+                        cancelled_tasks.insert(t);
+                        finalized.insert(t);
+                    } else if all_terminal {
                         to_finalize.push(t);
                     }
                 }
@@ -3404,6 +3414,7 @@ fn run_cell_worker(
         };
         let guard = store.lock();
         let _ = guard.record_cell_result(squad_id, row.task_idx, row.idx, &outcome);
+        let _ = guard.set_task_state(squad_id, row.task_idx, NodeState::Cancelled);
         crate::cartographer::Note::new("arbiter")
             .squad(squad_id)
             .cell(&row.cell_id)
@@ -5956,6 +5967,46 @@ mod tests {
         assert_eq!(squad.tasks[0].state, "running");
         assert_ne!(guard.squad_state(&id).unwrap(), SquadState::Done);
         assert_ne!(guard.squad_state(&id).unwrap(), SquadState::Failed);
+    }
+
+    /// RAL-561: reports an Arbiter large-diff stop.
+    struct ArbiterStopRunner;
+
+    impl Runner for ArbiterStopRunner {
+        fn run(&self, _spec: &RunnerSpec) -> RunnerResult {
+            RunnerResult::arbiter_stopped(
+                crate::runner::LiveUsage {
+                    tokens_in: 4,
+                    tokens_out: 6,
+                    cache_creation_tokens: 0,
+                    cache_read_tokens: 0,
+                    cost_usd: 0.75,
+                    turns: 2,
+                },
+                "terminated by Arbiter after suspicious large diff".to_string(),
+            )
+        }
+    }
+
+    /// RAL-561: an Arbiter-stopped cell is terminally cancelled -- it keeps
+    /// the usage it spent and the reason, and never reaches proof or the
+    /// task finalizer as a success.
+    #[test]
+    fn an_arbiter_stopped_cell_is_recorded_cancelled_with_its_usage_and_reason() {
+        let (store, id) = store_with(ONE_CELL);
+        execute_squad(&store, &ArbiterStopRunner, &id);
+
+        let guard = store.lock();
+        let squad = guard.get_squad(&id).unwrap();
+        let cell = &squad.tasks[0].cells[0];
+        assert_eq!(cell.state, "cancelled");
+        assert_eq!(cell.tokens_in, 4);
+        assert_eq!(cell.tokens_out, 6);
+        assert_eq!(
+            cell.error.as_deref(),
+            Some("terminated by Arbiter after suspicious large diff")
+        );
+        assert_ne!(guard.squad_state(&id).unwrap(), SquadState::Done);
     }
 
     /// RAL-400 Phase 3: reports a waypoint halt, mirroring [`DetachRunner`].
