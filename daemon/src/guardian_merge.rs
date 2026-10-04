@@ -9854,7 +9854,7 @@ fn post_merge_jobs_inner(
                 "ralphus [guardian] review {id} manual-commands generation failed: {e}"
             );
         }
-        if jobs.checks && outcome.is_ok() {
+        if outcome.is_ok() {
             let env = store
                 .lock()
                 .get_guardian(id)
