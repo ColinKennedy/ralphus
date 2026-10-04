@@ -420,8 +420,45 @@ impl Store {
         draft: bool,
         pr_kind: &str,
     ) -> Result<String> {
-        let id = self.next_id("guardian_pr_seq", "pr")?;
         let now = now_ms();
+        // RAL-568: recording the same forge PR/MR twice (an adopted PR a
+        // concurrent submission already recorded) reuses the open row rather
+        // than inserting a second one.
+        if let Some(number) = pr_number {
+            let existing: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT id FROM guardian_pull_requests
+                     WHERE guardian_id=? AND forge=? AND repo=? AND pr_number=? AND pr_kind=?
+                       AND state='open'
+                     ORDER BY created_at_ms DESC, id DESC LIMIT 1",
+                    params![guardian_id, forge, repo, number, pr_kind],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(existing_id) = existing {
+                self.conn.execute(
+                    "UPDATE guardian_pull_requests
+                     SET branch_id=?, branch_alias=?, base_ref=?, title=?, description=?,
+                         pr_url=?, stack_id=?, draft=?, updated_at_ms=?
+                     WHERE id=?",
+                    params![
+                        branch_id,
+                        branch_alias,
+                        base_ref,
+                        title,
+                        description,
+                        pr_url,
+                        stack_id,
+                        draft,
+                        now,
+                        existing_id
+                    ],
+                )?;
+                return Ok(existing_id);
+            }
+        }
+        let id = self.next_id("guardian_pr_seq", "pr")?;
         self.conn.execute(
             "INSERT INTO guardian_pull_requests(
                 id, guardian_id, branch_id, forge, repo, branch_alias, base_ref,
@@ -448,6 +485,34 @@ impl Store {
             ],
         )?;
         Ok(id)
+    }
+
+    /// RAL-568: two concurrent whole-stack submissions of one review each
+    /// recorded their own row for the same forge PR/MR. Soft-drops every open
+    /// duplicate of a `(guardian, forge, repo, pr_number, pr_kind)` except the
+    /// most recently created one, returning how many rows it dropped.
+    /// Idempotent -- once a group is collapsed nothing matches it -- so the
+    /// migration can run it on every startup.
+    pub(crate) fn collapse_duplicate_open_pull_requests(&self) -> Result<usize> {
+        Ok(self.conn.execute(
+            "UPDATE guardian_pull_requests
+             SET state='dropped', dropped_reason='duplicate row for the same forge PR/MR (RAL-568)',
+                 updated_at_ms=?
+             WHERE state='open' AND pr_number IS NOT NULL
+               AND EXISTS (
+                   SELECT 1 FROM guardian_pull_requests newer
+                   WHERE newer.state='open'
+                     AND newer.guardian_id = guardian_pull_requests.guardian_id
+                     AND newer.forge = guardian_pull_requests.forge
+                     AND newer.repo = guardian_pull_requests.repo
+                     AND newer.pr_number = guardian_pull_requests.pr_number
+                     AND newer.pr_kind = guardian_pull_requests.pr_kind
+                     AND (newer.created_at_ms > guardian_pull_requests.created_at_ms
+                          OR (newer.created_at_ms = guardian_pull_requests.created_at_ms
+                              AND newer.id > guardian_pull_requests.id))
+               )",
+            params![now_ms()],
+        )?)
     }
 
     /// Fetch one PR row by its ralphus-internal id (worktree → PR direction).
@@ -6491,10 +6556,8 @@ fn submit_stacked_branch_pr(
         .lock()
         .list_unpublished_prophecies_for_guardian(id)
         .unwrap_or_default();
-    let (created_pr, base, title, description, adopted) = match route
-        .find_existing_pull_request()?
-    {
-        Some(existing) => {
+    let adopt = |existing: crate::forge::ExistingPr| {
+        {
             crate::rlog!(
                 INFO,
                 "ralphus [pr] review {id} branch {branch_id} alias {alias} adopting \
@@ -6533,6 +6596,11 @@ fn submit_stacked_branch_pr(
                 true,
             )
         }
+    };
+    let (created_pr, base, title, description, adopted) = match route
+        .find_existing_pull_request()?
+    {
+        Some(existing) => adopt(existing),
         None => {
             let (title, description, reviewer_relevant_prophecies) = resolve_title_description(
                 runner,
@@ -6578,8 +6646,19 @@ fn submit_stacked_branch_pr(
                      the review commit history: {e}"
                 ),
             }
-            let created = route.create_pull_request(&title, &description, draft)?;
-            (created, base, title, description, false)
+            match route.create_pull_request(&title, &description, draft) {
+                Ok(created) => (created, base, title, description, false),
+                // RAL-568: a concurrent create can win the race between the
+                // lookup above and this create. Re-ask the forge by head and
+                // adopt that PR/MR; any other failure stays a branch error.
+                Err(create_error) => match route.find_pull_request_after_failed_create(
+                    &create_error,
+                    DUPLICATE_CREATE_BACKOFF,
+                )? {
+                    Some(existing) => adopt(existing),
+                    None => return Err(create_error),
+                },
+            }
         }
     };
     let row_id = store
@@ -8000,8 +8079,27 @@ pub(crate) fn schedule_auto_submit_branch(
     }
 }
 
-/// Guardian ids currently being processed by the asynchronous auto-submit
-/// sweep. The claim prevents later ticks from racing a slow forge operation.
+/// Delays between the head re-queries that follow a duplicate-shaped create
+/// failure (RAL-568), covering a forge whose PR list lags a just-created PR.
+#[cfg(not(test))]
+const DUPLICATE_CREATE_BACKOFF: &[std::time::Duration] = &[
+    std::time::Duration::from_secs(1),
+    std::time::Duration::from_secs(2),
+    std::time::Duration::from_secs(4),
+];
+#[cfg(test)]
+const DUPLICATE_CREATE_BACKOFF: &[std::time::Duration] = &[
+    std::time::Duration::from_millis(5),
+    std::time::Duration::from_millis(5),
+];
+
+/// Guardian ids with a PR/MR submission in flight -- the auto-submit sweep
+/// and manual submits ([`start_submit_pull_requests`]) share this one claim.
+/// A per-branch claim would still let two whole-stack submissions of one
+/// review interleave branch by branch, each computing its bases from the
+/// other's half-written state (the incident's conflicting `staging` vs
+/// `prophecy-00-...` base); claiming per review keeps the stack intact. It
+/// also stops later sweep ticks from racing a slow forge operation.
 static AUTO_SUBMIT_IN_FLIGHT: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
@@ -9378,8 +9476,16 @@ pub fn start_submit_pull_requests(
     if let Err(e) = guardian {
         return error_reply(404, "not_found", &e.to_string());
     }
+    let Some(claim) = guardian_merge::InFlightClaim::acquire(&AUTO_SUBMIT_IN_FLIGHT, id) else {
+        return error_reply(
+            409,
+            "conflict",
+            "a submission is already running for this review; wait for it to finish",
+        );
+    };
     let sid = id.to_string();
     std::thread::spawn(move || {
+        let _claim = claim;
         match submit_pull_requests(
             &store,
             runner.as_ref(),
@@ -17372,6 +17478,297 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         handle.join().unwrap();
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&remote_dir);
+    }
+
+    /// RAL-568: submit one branch against a mock forge whose create call
+    /// fails with `create_status`. The head lookup returns nothing on its
+    /// first call (the check-then-create race) and `existing_json` on every
+    /// later call -- or always nothing when `existing_json` is empty.
+    /// Returns the submission result, how many create POSTs the forge saw, and
+    /// the number of local PR rows recorded.
+    fn submit_one_branch_against_failing_create(
+        kind: crate::forge::ForgeKind,
+        create_status: u16,
+        create_body: &'static str,
+        existing_json: &'static str,
+    ) -> (std::result::Result<PullRequestView, String>, usize, usize) {
+        let (repo_path, list_prefix, create_path) = match kind {
+            crate::forge::ForgeKind::GitHub => {
+                ("acme/w", "/repos/acme/w/pulls?", "/repos/acme/w/pulls")
+            }
+            crate::forge::ForgeKind::GitLab => (
+                "123",
+                "/projects/123/merge_requests?",
+                "/projects/123/merge_requests",
+            ),
+        };
+        let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").unwrap());
+        let addr = server.server_addr().to_string();
+        let server_for_thread = Arc::clone(&server);
+        let handle = std::thread::spawn(move || {
+            let server = server_for_thread;
+            let mut list_calls = 0;
+            let mut creates = 0;
+            while let Ok(mut req) = server.recv() {
+                let method = req.method().clone();
+                let url = req.url().to_string();
+                if method == tiny_http::Method::Get && url.starts_with(list_prefix) {
+                    list_calls += 1;
+                    let body = if list_calls == 1 || existing_json.is_empty() {
+                        "[]"
+                    } else {
+                        existing_json
+                    };
+                    req.respond(tiny_http::Response::from_string(body).with_status_code(200))
+                        .unwrap();
+                } else if method == tiny_http::Method::Post && url == create_path {
+                    creates += 1;
+                    let mut body = String::new();
+                    req.as_reader().read_to_string(&mut body).unwrap();
+                    req.respond(
+                        tiny_http::Response::from_string(create_body)
+                            .with_status_code(create_status),
+                    )
+                    .unwrap();
+                } else if url.contains("/actions/runs") {
+                    req.respond(
+                        tiny_http::Response::from_string(r#"{"workflow_runs":[]}"#)
+                            .with_status_code(200),
+                    )
+                    .unwrap();
+                } else {
+                    req.respond(tiny_http::Response::from_string("[]").with_status_code(404))
+                        .unwrap();
+                }
+            }
+            creates
+        });
+
+        let root = tmp_dir("dup-create-root");
+        let remote_dir = tmp_dir("dup-create-remote");
+        let mut init_opts = git2::RepositoryInitOptions::new();
+        init_opts.initial_head("main");
+        let repo = git2::Repository::init_opts(&root, &init_opts).unwrap();
+        let sig = git2::Signature::now("t", "t@t").unwrap();
+        gwrite(&root, "base.txt", "base\n");
+        let base_oid = git2_commit_all(&repo, &sig, "base", &[]);
+        let base_commit = repo.find_commit(base_oid).unwrap();
+        repo.branch("review-branch", &base_commit, false).unwrap();
+        git2_checkout(&repo, "review-branch");
+        gwrite(&root, "feat.txt", "feat\n");
+        git2_commit_all(&repo, &sig, "feat", &[&base_commit]);
+        git2::Repository::init_bare(&remote_dir).unwrap();
+        repo.remote("origin", remote_dir.to_str().unwrap()).unwrap();
+
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let gid = store
+            .lock()
+            .create_guardian("demo", "main", root.to_str().unwrap())
+            .unwrap();
+        store
+            .lock()
+            .add_guardian_branch(&gid, "review-branch")
+            .unwrap();
+        let branch_id = store.lock().get_guardian(&gid).unwrap().branches[0]
+            .id
+            .clone();
+        store
+            .lock()
+            .set_branch_review(&gid, &branch_id, "review-branch", root.to_str().unwrap())
+            .unwrap();
+        let client = crate::forge::ForgeClient::new(
+            kind,
+            format!("http://{addr}"),
+            repo_path.to_string(),
+            Some("tok".to_string()),
+        );
+        let guardian = store.lock().get_guardian(&gid).unwrap();
+        let ordered_enabled: Vec<&BranchView> = guardian.branches.iter().collect();
+        let mut alias_by_branch = HashMap::new();
+        let req = PrRequest {
+            branch_id: Some(branch_id.clone()),
+            branch_alias: Some("pr-y".to_string()),
+            title: Some("T".to_string()),
+            description: Some("D".to_string()),
+            use_worktree_branch_name: None,
+            draft: None,
+        };
+        let result = submit_stacked_branch_pr(
+            &store,
+            &NoopRunner,
+            &client,
+            &gid,
+            &root,
+            "origin",
+            &guardian,
+            &ordered_enabled,
+            &mut alias_by_branch,
+            "main",
+            ordered_enabled[0],
+            &req,
+            "{name}-alias",
+            None,
+            "stack-1",
+            None,
+            false,
+        );
+        // Two submissions racing to record the same adopted PR must collapse
+        // into one local row.
+        if let Ok(pr) = &result {
+            let second = store
+                .lock()
+                .create_pull_request_ex(
+                    &gid,
+                    Some(&branch_id),
+                    pr.forge.as_str(),
+                    &pr.repo,
+                    &pr.branch_alias,
+                    &pr.base_ref,
+                    &pr.title,
+                    &pr.description,
+                    pr.pr_number,
+                    pr.pr_url.as_deref(),
+                    Some("stack-2"),
+                    false,
+                    "parent",
+                )
+                .unwrap();
+            assert_eq!(second, pr.id, "the same PR must reuse its open row");
+        }
+        let rows = store
+            .lock()
+            .list_pull_requests_for_guardian(&gid)
+            .unwrap()
+            .len();
+        server.unblock();
+        let creates = handle.join().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote_dir);
+        (result, creates, rows)
+    }
+
+    #[test]
+    fn submit_stacked_branch_pr_adopts_the_pr_a_racing_create_already_opened_on_github() {
+        let (result, creates, rows) = submit_one_branch_against_failing_create(
+            crate::forge::ForgeKind::GitHub,
+            422,
+            r#"{"message":"Validation Failed","errors":[{"resource":"PullRequest","code":"custom","message":"A pull request already exists for acme:pr-y."}]}"#,
+            r#"[{"number":21,"html_url":"http://x/21","base":{"ref":"main"},"title":"Theirs","body":"Their body"}]"#,
+        );
+        let pr = result.expect("a duplicate-create 422 must adopt the existing PR");
+        assert_eq!(pr.pr_number, Some(21));
+        // The adopted PR keeps the base the forge reports, so the review's
+        // linear stack is unchanged.
+        assert_eq!(pr.base_ref, "main");
+        assert_eq!(pr.title, "Theirs");
+        assert_eq!(creates, 1, "exactly one forge create was attempted");
+        assert_eq!(rows, 1, "one local row for the one forge PR");
+    }
+
+    #[test]
+    fn submit_stacked_branch_pr_adopts_the_mr_a_racing_create_already_opened_on_gitlab() {
+        for status in [409, 422] {
+            let (result, creates, rows) = submit_one_branch_against_failing_create(
+                crate::forge::ForgeKind::GitLab,
+                status,
+                r#"{"message":["Another open merge request already exists for this source branch: !21"]}"#,
+                r#"[{"iid":21,"web_url":"http://x/21","target_branch":"main","title":"Theirs","description":"Their body"}]"#,
+            );
+            let pr = result.expect("a duplicate-create conflict must adopt the existing MR");
+            assert_eq!(pr.pr_number, Some(21));
+            assert_eq!(pr.base_ref, "main");
+            assert_eq!(creates, 1);
+            assert_eq!(rows, 1);
+        }
+    }
+
+    #[test]
+    fn submit_stacked_branch_pr_surfaces_an_unrelated_422_as_a_branch_error() {
+        // A missing base is also a 422, but no PR exists for the head, so the
+        // original error must reach the caller (which attaches remediation).
+        let (result, _creates, rows) = submit_one_branch_against_failing_create(
+            crate::forge::ForgeKind::GitHub,
+            422,
+            r#"{"message":"Validation Failed","errors":[{"resource":"PullRequest","field":"base","code":"invalid"}]}"#,
+            "",
+        );
+        let err = result.expect_err("an unrelated 422 must still fail the branch");
+        assert!(err.contains("422"), "{err}");
+        assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn collapse_duplicate_open_pull_requests_keeps_only_the_newest_row() {
+        let store = store();
+        let gid = store.create_guardian("demo", "main", "/tmp/x").unwrap();
+        let mk = |kind: &str, number: i64| {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO guardian_pull_requests(
+                        id, guardian_id, forge, repo, branch_alias, base_ref, title,
+                        description, pr_number, state, created_at_ms, updated_at_ms, pr_kind
+                     ) VALUES(?,?,?,?,?,?,?,?,?,'open',?,?,?)",
+                    params![
+                        format!(
+                            "pr-{kind}-{number}-{}",
+                            store.next_id("guardian_pr_seq", "pr").unwrap()
+                        ),
+                        gid,
+                        "github",
+                        "acme/w",
+                        "a",
+                        "main",
+                        "t",
+                        "d",
+                        number,
+                        1,
+                        1,
+                        kind
+                    ],
+                )
+                .unwrap();
+        };
+        mk("parent", 5);
+        mk("parent", 5);
+        mk("parent", 6);
+        mk("stack", 5);
+        assert_eq!(store.collapse_duplicate_open_pull_requests().unwrap(), 1);
+        assert_eq!(store.collapse_duplicate_open_pull_requests().unwrap(), 0);
+        let open = store
+            .list_pull_requests_for_guardian(&gid)
+            .unwrap()
+            .into_iter()
+            .filter(|p| p.state == "open")
+            .count();
+        assert_eq!(open, 3);
+    }
+
+    #[test]
+    fn manual_submit_is_rejected_while_the_review_already_has_a_submission_running() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let gid = store
+            .lock()
+            .create_guardian("demo", "main", "/tmp/x")
+            .unwrap();
+        let _held = guardian_merge::InFlightClaim::acquire(&AUTO_SUBMIT_IN_FLIGHT, &gid)
+            .expect("claim is free");
+        let reply = start_submit_pull_requests(
+            store,
+            Arc::new(NoopRunner),
+            &gid,
+            vec![PrRequest {
+                branch_id: None,
+                branch_alias: None,
+                title: None,
+                description: None,
+                use_worktree_branch_name: None,
+                draft: None,
+            }],
+            "u".to_string(),
+            false,
+        );
+        assert_eq!(reply.status, 409, "{}", reply.body);
     }
 
     #[test]
