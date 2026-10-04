@@ -950,6 +950,18 @@ pub struct ArbiterConfig {
     /// unbounded.
     #[serde(default)]
     pub maximum_budget_usd: Option<f64>,
+    /// Enables live large-diff inspection and administrator recommendations.
+    /// Unset defaults to enabled.
+    #[serde(default)]
+    pub large_diff_oversight: Option<bool>,
+    /// Permits the Arbiter to stop a Cell it has classified as runaway.
+    /// Experimental and disabled unless explicitly enabled.
+    #[serde(default)]
+    pub allow_cell_stopping: bool,
+    /// Permits the Arbiter to create advisory waypoints for legitimate large
+    /// changes. Disabled unless explicitly enabled.
+    #[serde(default)]
+    pub allow_waypoint_creation: bool,
 }
 
 impl ArbiterConfig {
@@ -958,6 +970,11 @@ impl ArbiterConfig {
     #[must_use]
     pub fn agent(&self) -> &str {
         self.agent.as_deref().unwrap_or("ollama")
+    }
+
+    #[must_use]
+    pub fn large_diff_oversight_enabled(&self) -> bool {
+        self.large_diff_oversight.unwrap_or(true)
     }
 }
 
@@ -3282,16 +3299,22 @@ mod tests {
         assert_eq!(c.agent(), "ollama");
         assert_eq!(c.model, None);
         assert_eq!(c.maximum_budget_usd, None);
+        assert!(c.large_diff_oversight_enabled());
+        assert!(!c.allow_cell_stopping);
+        assert!(!c.allow_waypoint_creation);
     }
 
     #[test]
     fn parse_arbiter_config() {
         let c = arbiter_from_toml_str(
-            "[arbiter]\nagent = \"claude\"\nmodel = \"claude-haiku-4-5\"\nmaximum_budget_usd = 2.5\n",
+            "[arbiter]\nagent = \"claude\"\nmodel = \"claude-haiku-4-5\"\nmaximum_budget_usd = 2.5\nlarge_diff_oversight = false\nallow_cell_stopping = true\nallow_waypoint_creation = true\n",
         );
         assert_eq!(c.agent(), "claude");
         assert_eq!(c.model.as_deref(), Some("claude-haiku-4-5"));
         assert_eq!(c.maximum_budget_usd, Some(2.5));
+        assert!(!c.large_diff_oversight_enabled());
+        assert!(c.allow_cell_stopping);
+        assert!(c.allow_waypoint_creation);
     }
 
     #[test]
