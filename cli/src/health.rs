@@ -226,6 +226,13 @@ fn check_agent_command_via_daemon(
             "The command is a shell pipeline/multi-word invocation, so only a live run can confirm it actually works.",
             "No action needed; verify by running a task with this backend.",
         ),
+        Some("warn") => CheckResult::harness(
+            display_name,
+            WARN,
+            detail,
+            "Tasks using this backend may not start cleanly.",
+            "See the detail above and fix the effective command (a database override, an env-var override, or the compiled default).",
+        ),
         _ => CheckResult::harness(
             display_name,
             FAIL,
@@ -234,6 +241,48 @@ fn check_agent_command_via_daemon(
             "See the detail above and fix the effective command (a database override, an env-var override, or the compiled default).",
         ),
     }
+}
+
+/// RAL-571: a backend's login row, read from the daemon's cached sweep
+/// (`GET /api/health/report`). The daemon owns the probe (it resolves the
+/// command and config dir its cells use), so this only maps the status:
+/// `pass` -> PASS, `skip` -> SKIP (binary missing or compound command),
+/// `warn` -> WARN (logged out / undeterminable), anything else -> FAIL.
+fn check_login_via_daemon(daemon_url: &str, id: &'static str, display_name: &str) -> CheckResult {
+    let entry = ralphus_core::health_catalog::get(id);
+    let impact = entry.map_or("", |e| e.impact);
+    let remediation = entry.map_or("", |e| e.remediation);
+    let client = DaemonClient::new(daemon_url);
+    let response = match client.health_report() {
+        Ok(response) => response,
+        Err(e) => {
+            return CheckResult::harness(
+                display_name,
+                FAIL,
+                format!("could not reach daemon to check {display_name}: {e}"),
+                impact,
+                "Ensure the daemon is reachable, then re-run this check.",
+            );
+        }
+    };
+    let checks = response["checks"].as_array().cloned().unwrap_or_default();
+    let Some(check) = checks.iter().find(|c| c["id"].as_str() == Some(id)) else {
+        return CheckResult::harness(
+            display_name,
+            SKIP,
+            "the daemon has not reported this check yet (its sweep has not completed, or it predates this check)",
+            impact,
+            "Wait for the daemon's hourly sweep (or POST /api/health/report/refresh), then re-run this check.",
+        );
+    };
+    let detail = check["detail"].as_str().unwrap_or_default().to_string();
+    let (status, remediation) = match check["status"].as_str() {
+        Some("pass") => (PASS, "No action needed."),
+        Some("skip") => (SKIP, "No action needed unless you use this backend."),
+        Some("warn") => (WARN, remediation),
+        _ => (FAIL, remediation),
+    };
+    CheckResult::harness(display_name, status, detail, impact, remediation)
 }
 
 fn is_executable(path: &Path) -> bool {
@@ -1952,6 +2001,13 @@ pub fn run_checks(
         check_agent_command_via_daemon(daemon_url, ID_PI_COMMAND, "pi-command")
             .with_id(ID_PI_COMMAND),
     );
+    results.push(
+        check_login_via_daemon(daemon_url, ID_CLAUDE_CODE_LOGIN, "claude-code-login")
+            .with_id(ID_CLAUDE_CODE_LOGIN),
+    );
+    results.push(
+        check_login_via_daemon(daemon_url, ID_CODEX_LOGIN, "codex-login").with_id(ID_CODEX_LOGIN),
+    );
 
     results.push(check_config(cwd).with_id(ID_CONFIG));
     results.push(check_max_concurrent(cwd).with_id(ID_DAEMON_MAX_CONCURRENT));
@@ -2064,6 +2120,18 @@ mod tests {
             "{}",
             result.detail
         );
+    }
+
+    #[test]
+    fn check_login_via_daemon_fails_when_the_daemon_is_unreachable() {
+        let result = check_login_via_daemon(
+            "http://127.0.0.1:1",
+            ralphus_core::health_catalog::ID_CODEX_LOGIN,
+            "codex-login",
+        );
+        assert_eq!(result.status, FAIL);
+        assert_eq!(result.section, HARNESS);
+        assert!(!result.impact.is_empty());
     }
 
     #[test]

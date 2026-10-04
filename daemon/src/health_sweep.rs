@@ -28,11 +28,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ralphus_core::health_catalog::{
-    ID_CLAUDE_COMMAND, ID_CODEX_COMMAND, ID_GH, ID_GIT, ID_GLAB, ID_NVIDIA_SMI, ID_OLLAMA,
-    ID_PI_COMMAND, ID_RG, ID_RUNNER, ID_TMUX,
+    ID_CLAUDE_CODE_LOGIN, ID_CLAUDE_COMMAND, ID_CODEX_COMMAND, ID_CODEX_LOGIN, ID_GH, ID_GIT,
+    ID_GLAB, ID_NVIDIA_SMI, ID_OLLAMA, ID_PI_COMMAND, ID_RG, ID_RUNNER, ID_TMUX,
 };
 use ralphus_core::process::which;
 use ralphus_runner::cli_agent_common::{self, BackendCommandHealth};
+use ralphus_runner::login_probe::{self, LoginProbe, LoginState, StatusRun, login_probes};
 use ralphus_runner::pi_backend;
 use ralphus_runner::version_probe::{self, VersionProbe};
 
@@ -58,6 +59,8 @@ const SWEEP_CATALOG_IDS: &[&str] = &[
     ID_CLAUDE_COMMAND,
     ID_CODEX_COMMAND,
     ID_PI_COMMAND,
+    ID_CLAUDE_CODE_LOGIN,
+    ID_CODEX_LOGIN,
 ];
 
 /// One check's cached outcome. Deliberately smaller than
@@ -339,11 +342,17 @@ struct AgentCommandOverrides {
     claude_code: Option<String>,
     codex: Option<String>,
     pi: Option<String>,
+    /// One entry per [`login_probes`] backend, in the same order.
+    login: Vec<Option<String>>,
 }
 
 impl AgentCommandOverrides {
     fn load(store: &Store) -> Self {
         Self {
+            login: login_probes()
+                .iter()
+                .map(|probe| backend_command_override(store, probe.backend_name()))
+                .collect(),
             claude_code: backend_command_override(store, "claude-code"),
             codex: backend_command_override(store, "codex"),
             pi: backend_command_override(store, "pi"),
@@ -419,6 +428,93 @@ fn check_backend_command(
     }
 }
 
+const SKIP: &str = "skip";
+
+/// RAL-571: is the backend's CLI logged in? Resolves the command exactly as
+/// [`check_backend_command`] does (database override, env var, default) and
+/// runs the backend's own status subcommand against the config dir the
+/// runner copies credentials from. A missing binary or a compound command is
+/// `skip` (the command check owns reporting those); logged out, an
+/// unrecognized status output, or a timeout is `warn`.
+fn check_login(probe: &dyn LoginProbe, db_override: Option<&str>) -> SweepCheck {
+    let id = probe.health_id();
+    let (command, source) = resolve_effective_command(
+        db_override,
+        probe.command_env_var(),
+        probe.default_program(),
+    );
+    let name = probe.display_name();
+    let skip = |detail: String| SweepCheck {
+        id,
+        status: SKIP,
+        detail,
+    };
+    if cli_agent_common::is_compound_command(&command) {
+        return skip(format!(
+            "{name} command is a compound command ({command}); login not probed"
+        ));
+    }
+    let path = if std::path::Path::new(&command).exists() {
+        Some(command.clone())
+    } else {
+        which(&command)
+    };
+    let Some(path) = path else {
+        return skip(format!(
+            "{command} not found (source: {source}); {name} is not installed"
+        ));
+    };
+    let run = login_probe::run_status_command(
+        &path,
+        probe.status_args(),
+        version_probe::DEFAULT_VERSION_PROBE_TIMEOUT,
+    );
+    let config = probe
+        .config_dir()
+        .map_or_else(|| "unknown".to_string(), |dir| dir.display().to_string());
+    let provenance = format!("config {config} · via {path} (source: {source})");
+    let remedy = probe.login_command();
+    match run {
+        StatusRun::SpawnFailed(error) => SweepCheck {
+            id,
+            status: WARN,
+            detail: format!("cannot determine login: {error}; {provenance}"),
+        },
+        StatusRun::TimedOut => SweepCheck {
+            id,
+            status: WARN,
+            detail: format!("status probe timed out; {provenance}"),
+        },
+        StatusRun::Finished { exit_ok, output } => {
+            let env_present =
+                |name: &str| std::env::var_os(name).is_some_and(|value| !value.is_empty());
+            let status = probe.parse(&output, exit_ok, &env_present);
+            match status.state {
+                LoginState::LoggedIn => {
+                    let caveat = probe
+                        .platform_caveat()
+                        .map_or_else(String::new, |c| format!(" · {c}"));
+                    SweepCheck {
+                        id,
+                        status: PASS,
+                        detail: format!("{} · {provenance}{caveat}", status.summary),
+                    }
+                }
+                LoginState::LoggedOut => SweepCheck {
+                    id,
+                    status: WARN,
+                    detail: format!("{name} is not logged in (run `{remedy}`); {provenance}"),
+                },
+                LoginState::Unknown => SweepCheck {
+                    id,
+                    status: WARN,
+                    detail: format!("cannot determine login: {}; {provenance}", status.summary),
+                },
+            }
+        }
+    }
+}
+
 /// Runs every check in [`SWEEP_CATALOG_IDS`] and returns the resulting
 /// report. Takes a [`StoreHandle`] only to snapshot the current
 /// `agent_backend_commands` overrides under one short lock
@@ -432,7 +528,7 @@ pub fn run_sweep(store: &StoreHandle) -> SweepReport {
     // allow-lock-io: see the doc comment above -- one short DB read, released
     // before any of the slower external probing below.
     let overrides = AgentCommandOverrides::load(&store.lock());
-    let checks = vec![
+    let mut checks = vec![
         check_git(),
         check_tmux(),
         check_runner(),
@@ -463,6 +559,12 @@ pub fn run_sweep(store: &StoreHandle) -> SweepReport {
             "pi",
         ),
     ];
+    checks.extend(
+        login_probes()
+            .into_iter()
+            .zip(&overrides.login)
+            .map(|(probe, db_override)| check_login(probe, db_override.as_deref())),
+    );
     debug_assert_eq!(
         checks.len(),
         SWEEP_CATALOG_IDS.len(),
@@ -548,6 +650,22 @@ mod tests {
         );
         assert_eq!(result.status, "skip");
         assert!(result.detail.contains("wrapper claude"), "{result:?}");
+    }
+
+    #[test]
+    fn login_check_skips_when_the_binary_is_missing() {
+        for probe in login_probes() {
+            let result = check_login(probe, Some("ralphus-no-such-binary-ral571"));
+            assert_eq!(result.status, "skip", "{result:?}");
+            assert_eq!(result.id, probe.health_id());
+        }
+    }
+
+    #[test]
+    fn login_check_skips_compound_commands_without_running_them() {
+        let probe = login_probes()[0];
+        let result = check_login(probe, Some("wrapper claude"));
+        assert_eq!(result.status, "skip", "{result:?}");
     }
 
     #[test]

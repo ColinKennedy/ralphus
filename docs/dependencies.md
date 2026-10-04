@@ -289,3 +289,25 @@ documented in full at its own doc, not duplicated here:
 | `--features secure-dist` build | A signed `ralphus.lic` file (or `$RALPHUS_LICENSE` path override) | [`docs/secure-dist.md`](secure-dist.md), `auth/AGENTS.md` |
 | Container execution mode | Docker Engine / Docker Desktop | [`docs/container-mode.md`](container-mode.md) |
 | SSH machine providers | `ssh`/`rsync`/`tar` on the *daemon host*, an SSH-reachable remote — see the runtime section above | [`docs/machine-providers.md`](machine-providers.md) |
+
+## Agent CLI login checks (`claude-code-login`, `codex-login`)
+
+The daemon's health sweep asks each agent CLI whether it is logged in, using
+the same command the runner would spawn (database override, then
+`RALPHUS_CLAUDE_COMMAND`/`RALPHUS_CODEX_COMMAND`, then `claude`/`codex`) and the
+same config dir the runner copies credentials from (`CLAUDE_CONFIG_DIR`/`CODEX_HOME`,
+else `~/.claude`/`~/.codex`). Only the daemon host's login is checked.
+
+| Backend | Probe | Logged in | Logged out |
+|---|---|---|---|
+| Claude Code | `claude auth status` (JSON; `loggedIn`, `authMethod`) | `pass`; `ANTHROPIC_API_KEY` counts (reported "unverified") | `warn`, run `claude auth login` |
+| Codex | `codex login status` (text) | `pass`; `CODEX_API_KEY`/`OPENAI_API_KEY` counts when status says logged out (reported "unverified") | `warn`, run `codex login` |
+
+Both probes are offline: they detect never-logged-in, not an expired or revoked
+token. A missing binary or compound command is `skip`; a timeout (5s) or an
+older CLI without the status subcommand is `warn`. The account email is never
+included, only auth method and organization. Same behavior on Windows, Linux
+and macOS, with one gap: on macOS Claude Code keeps credentials in the Keychain,
+which `claude auth status` reads but per-cell isolation (`.credentials.json`
+copy) does not, so a pass can overstate what an isolated cell sees; the detail
+carries a macOS caveat.
