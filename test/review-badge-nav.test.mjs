@@ -16,7 +16,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { boardSource, makeBadgeRenderer, makeGotoReview, makePollReviews, makeRefreshBanner, resolveJson } from "./board-review-badge-nav.mjs";
+import { boardSource, makeBadgeRenderer, makeGotoReview, makePollReviews, makeReadyBannerItems, makeRefreshBanner, resolveJson } from "./board-review-badge-nav.mjs";
 
 // ---------- badge lane markup (sliced real source) ----------
 
@@ -321,4 +321,17 @@ test("a poll abandoned by a newer one (RAL-382 guard) never stamps a time it did
   resolveJson(fetchA, [{ id: "review-a", name: "a", status: "collecting" }]);
   await promiseA;
   assert.equal(poll.calls.markUpdated, 1, "the abandoned older poll must not stamp a second time");
+});
+
+test("RAL-562: ready banner keys on the daemon's ever_ready marker, not review status", () => {
+  const readyBannerItems = makeReadyBannerItems();
+  const items = [
+    { id: "a", status: "in_review", ever_ready: false },
+    { id: "b", status: "merging", ever_ready: true },
+    { id: "c", status: "in_review", ever_ready: true },
+    { id: "d", status: "in_review", ever_ready: true },
+  ];
+  const shown = readyBannerItems(items, new Set(["d"])).map((g) => g.id);
+  // `a` has not first-readied yet; `b` stays (status never dismisses); `d` was dismissed.
+  assert.deepEqual(shown, ["b", "c"]);
 });

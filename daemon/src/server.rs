@@ -13998,6 +13998,11 @@ struct GuardianIndexEntry {
     /// daemon-derived flag (see [`crate::guardian::review_needs_attention`])
     /// because the branch and PR detail it needs is not in the lean index.
     needs_attention: bool,
+    /// RAL-562: the daemon-side write-once marker that every enabled branch
+    /// was settled while in review at least once. The board's "review is
+    /// ready" banner shows only for reviews carrying it, so a later
+    /// re-merge back to `in_review` can never re-announce the review.
+    ever_ready: bool,
     resolver_agent: Option<String>,
     git_root: String,
     projects: Vec<String>,
@@ -14007,7 +14012,11 @@ struct GuardianIndexEntry {
 }
 
 impl GuardianIndexEntry {
-    fn new(value: crate::guardian::GuardianView, prs: &[crate::pr::PrIndexRow]) -> Self {
+    fn new(
+        value: crate::guardian::GuardianView,
+        prs: &[crate::pr::PrIndexRow],
+        ever_ready: bool,
+    ) -> Self {
         let branches: Vec<(bool, &str)> = value
             .branches
             .iter()
@@ -14022,6 +14031,7 @@ impl GuardianIndexEntry {
             crate::guardian::review_needs_attention(&value.status, &branches, &pr_states);
         Self {
             needs_attention,
+            ever_ready,
             id: value.id,
             name: value.name,
             status: value.status,
@@ -14047,10 +14057,11 @@ fn guardian_index(daemon: &Daemon) -> Reply {
         Ok((
             Store::list_guardians_conn(conn)?,
             Store::list_pull_requests_index_conn(conn)?,
+            Store::first_ready_ids_conn(conn)?,
         ))
     });
     match read {
-        Ok((gs, prs)) => {
+        Ok((gs, prs, ready_ids)) => {
             let queue = daemon.summary_queue_handle();
             for g in &gs {
                 if g.status == "collecting" {
@@ -14059,7 +14070,10 @@ fn guardian_index(daemon: &Daemon) -> Reply {
             }
             let entries: Vec<GuardianIndexEntry> = gs
                 .into_iter()
-                .map(|g| GuardianIndexEntry::new(g, &prs))
+                .map(|g| {
+                    let ever_ready = ready_ids.contains(&g.id);
+                    GuardianIndexEntry::new(g, &prs, ever_ready)
+                })
                 .collect();
             json(200, &entries)
         }

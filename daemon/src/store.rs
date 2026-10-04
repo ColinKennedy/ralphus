@@ -3492,6 +3492,11 @@ impl Store {
             // skipped. NULL inherits the project/global default, which
             // resolves to `false` (generation runs).
             "ALTER TABLE guardians ADD COLUMN skip_manual_checks INTEGER",
+            // RAL-562: write-once marker (epoch ms) of the first moment every
+            // enabled branch was settled while the review was `in_review` --
+            // the "review is ready" banner shows only for reviews carrying it.
+            // Never cleared, so a re-merge or feedback round cannot re-arm it.
+            "ALTER TABLE guardians ADD COLUMN first_ready_at_ms INTEGER",
             // RAL-<pending>: coarse-grained progress reporting for a squad
             // sitting in `materializing` (`run_submit_followup`'s named
             // phases -- fetching upstream refs, creating worktrees,

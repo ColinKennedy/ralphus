@@ -1790,15 +1790,29 @@ Compact review list for the Reviews tab's sidebar, its status/origin/agent
 filters, and cross-review notice toasts. It carries `id`, `name`, `status`,
 `origin`, `branch_count` (just the count — the sidebar list shows "N
 branches", never a per-branch breakdown), `resolver_agent`, `git_root`,
-`projects`, and `notice_kind`/`notice_message`/`notice_at_ms`, and omits
-everything else `GET /api/guardians` returns per review — env overrides,
-build/manual-checks environments, resolver session ids, token/cost
-accounting, per-branch detail, and more. This keeps a review list with a lot
-of history from repeatedly transferring detail that's only ever read once a
-specific review is opened (via `GET /api/guardians/{id}`). It is read-only
-and has no query parameters. `GET /api/guardians` is unaffected by this
-endpoint's existence and keeps returning full detail for every consumer that
-already depends on it (the CLI, the MCP server, docs generation).
+`projects`, `needs_attention` (RAL-559), `ever_ready` (RAL-562), and
+`notice_kind`/`notice_message`/`notice_at_ms`, and omits everything else
+`GET /api/guardians` returns per review — env overrides, build/manual-checks
+environments, resolver session ids, token/cost accounting, per-branch detail,
+and more. This keeps a review list with a lot of history from repeatedly
+transferring detail that's only ever read once a specific review is opened
+(via `GET /api/guardians/{id}`). It is read-only and has no query parameters.
+`GET /api/guardians` is unaffected by this endpoint's existence and keeps
+returning full detail for every consumer that already depends on it (the CLI,
+the MCP server, docs generation).
+
+**`needs_attention` (RAL-559, `bool`):** daemon-derived flag set when the
+review is at a human decision point — a settled stack (every enabled branch
+rebased, no PR still processing), or a stalled merge. The "Needs you" filter
+keys on this. The flag transitions automatically with merge status changes
+and is never user-controlled.
+
+**`ever_ready` (RAL-562, `bool`):** daemon-side write-once marker set the
+first time every enabled branch was settled (done, conflict_resolved, merged,
+or closed) while the review was in the `in_review` state. The "review is
+ready" dismissible banner shows only for reviews carrying this marker, so a
+later re-merge or feedback cycle returning to `in_review` can never
+re-announce the review. Once set, it is never cleared.
 
 ### `GET /api/guardians/{id}`
 A single review's full detail, including its ordered `branches` list.

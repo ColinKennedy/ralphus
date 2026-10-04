@@ -200,3 +200,9 @@ export function makeRefreshBanner({ initialTab = "squads", initialGuardians = []
 export function resolveJson(entry, data) {
   entry.resolve({ ok: true, json: async () => data });
 }
+
+/** The real `readyBannerItems` predicate (RAL-562), a pure function. */
+export function makeReadyBannerItems() {
+  // eslint-disable-next-line no-new-func -- evaluating the real shipped source is the point; see the header.
+  return new Function(`${funcSourceOf("readyBannerItems")}\n return readyBannerItems;`)();
+}
