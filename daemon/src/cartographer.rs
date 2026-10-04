@@ -75,6 +75,9 @@ pub struct CartographerFilter {
     pub squad_id: Option<String>,
     /// Exact-match guardian id.
     pub guardian_id: Option<String>,
+    /// A review's complete activity: rows owned directly by this guardian plus
+    /// rows emitted from its branch-worktree squad.
+    pub review_worktrees_for_guardian: Option<String>,
     /// Exact-match cell id.
     pub cell_id: Option<String>,
     /// Exact-match task name (RAL-155 Q2). Populated on rows whose emitter
@@ -353,6 +356,11 @@ impl Store {
         eq_clause!("level", filter.level);
         eq_clause!("squad_id", filter.squad_id);
         eq_clause!("guardian_id", filter.guardian_id);
+        if let Some(guardian_id) = filter.review_worktrees_for_guardian.as_ref() {
+            clauses.push("(guardian_id = ? OR squad_id = ?)".to_string());
+            values.push(Box::new(guardian_id.clone()));
+            values.push(Box::new(format!("guardian-{guardian_id}")));
+        }
         eq_clause!("cell_id", filter.cell_id);
         eq_clause!("task", filter.task);
         if !filter.include_admin_only {

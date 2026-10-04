@@ -1950,6 +1950,10 @@ fn route_for_user(
         ("POST", ["api", "guardians"]) => guardian_create(daemon, user_header, body),
         ("GET", ["api", "guardians", id]) => guardian_get(daemon, id),
         ("GET", ["api", "guardians", id, "logs"]) => guardian_logs(daemon, id),
+        // ralphus[ignore-endpoint-cli]: board review log drawer's structured review/worktree timeline
+        ("GET", ["api", "guardians", id, "cartographer"]) => {
+            guardian_cartographer(daemon, id, query, user_header)
+        }
         ("POST", ["api", "guardians", id, "rename"]) => guardian_rename(daemon, id, body),
         ("POST", ["api", "guardians", id, "settings"]) => guardian_settings(daemon, id, body),
         // ralphus[ignore-endpoint-cli]: board batched save of guardian settings fields; the CLI edits via `review settings`
@@ -7551,6 +7555,39 @@ fn guardian_logs(daemon: &Daemon, id: &str) -> Reply {
     }
 }
 
+/// Cartographer activity for a review and every branch worktree that belongs
+/// to it. Branch resolver rows carry the review's synthetic squad id rather
+/// than its guardian id, so this is deliberately distinct from the generic
+/// `guardian_id` Cartographer filter.
+fn guardian_cartographer(
+    daemon: &Daemon,
+    id: &str,
+    query: &str,
+    user_header: Option<&str>,
+) -> Reply {
+    let include_admin_only = caller_is_admin(daemon, user_header);
+    let guard = daemon.lock();
+    if guard.get_guardian(id).is_err() {
+        return error(404, "not_found", "no such guardian", vec![]);
+    }
+    let filter = crate::cartographer::CartographerFilter {
+        review_worktrees_for_guardian: Some(id.to_string()),
+        limit: query_param(query, "limit")
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(100),
+        offset: query_param(query, "offset")
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0),
+        ascending: query_param(query, "sort") == Some("asc"),
+        include_admin_only,
+        ..crate::cartographer::CartographerFilter::default()
+    };
+    match guard.cartographer_query(&filter) {
+        Ok(page) => json(200, &page),
+        Err(e) => store_error(&e),
+    }
+}
+
 /// The global Cartographer log (RAL-98): a filtered, paginated, sorted view
 /// over every structured event in the system. The same endpoint serves both
 /// "show me everything" (no filters) and "show me this one squad/cell/
@@ -7594,6 +7631,7 @@ fn cartographer_query(daemon: &Daemon, query: &str, user_header: Option<&str>) -
         level: query_filter(query, "level"),
         squad_id: query_filter(query, "squad_id"),
         guardian_id: query_filter(query, "guardian_id"),
+        review_worktrees_for_guardian: None,
         cell_id: query_filter(query, "cell_id"),
         task: query_filter(query, "task"),
         q: query_filter(query, "q"),
@@ -23847,6 +23885,59 @@ remediation_attempts=1
         let r_missing = route(&d, "GET", "/api/cartographer?squad_id=squad-nope", "");
         assert_eq!(r_missing.status, 200);
         assert!(r_missing.body.contains("\"total\":0"));
+    }
+
+    #[test]
+    fn guardian_cartographer_merges_review_and_branch_worktree_events_in_order() {
+        let d = daemon();
+        let id = d.lock().create_guardian("g", "main", "/r").unwrap();
+        {
+            let store = d.lock();
+            for (message, guardian_id, squad_id) in [
+                ("review started", Some(id.as_str()), None),
+                ("branch resolver ran", None, Some(format!("guardian-{id}"))),
+                ("unrelated", None, Some("squad-unrelated".to_string())),
+                ("review completed", Some(id.as_str()), None),
+            ] {
+                let _ = store.cartographer_log(crate::cartographer::CartographerEntry {
+                    level: crate::logging::LogLevel::INFO,
+                    source: "test",
+                    message,
+                    scope: Some("guardian"),
+                    squad_id: squad_id.as_deref(),
+                    guardian_id,
+                    cell_id: None,
+                    task: None,
+                    log_path: None,
+                    payload: serde_json::json!({}),
+                    admin_only: false,
+                });
+            }
+        }
+
+        let reply = route(
+            &d,
+            "GET",
+            &format!("/api/guardians/{id}/cartographer?sort=asc"),
+            "",
+        );
+        assert_eq!(reply.status, 200, "{}", reply.body);
+        let body = serde_json::from_str::<serde_json::Value>(&reply.body).unwrap();
+        let rows = body["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["message"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            [
+                format!("review {id} ('g') created, base=main"),
+                "review started".to_string(),
+                "branch resolver ran".to_string(),
+                "review completed".to_string(),
+            ]
+        );
     }
 
     #[test]
