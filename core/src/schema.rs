@@ -1577,6 +1577,13 @@ pub struct ReviewDef {
     /// and never set this directly.
     #[serde(default)]
     pub skip_manual_checks: Option<bool>,
+    /// RAL-565: default for whether this review's manual checks start
+    /// automatically once they are ready (build commands succeeded, or no
+    /// build commands). A check's own `auto_run` wins over this; unset
+    /// inherits the project-level `.ralphus.toml [review] auto_run` default,
+    /// then `false`.
+    #[serde(default)]
+    pub auto_run: Option<bool>,
     /// Which events tear down and rebuild this review's prepared build: any
     /// of [`REBUILD_ON_VALUES`] (`"rebase"` -- a merge or restack of the
     /// stack, `"feedback"` -- applied reviewer feedback, `"auto_fix"` -- an
@@ -1710,6 +1717,12 @@ pub struct ReviewActionDef {
     /// Preparation workspace lifecycle policy and optional teardown commands.
     #[serde(default)]
     pub lifecycle: Option<ReviewActionLifecycleDef>,
+    /// RAL-565: whether this check starts automatically once it is ready.
+    /// Unset inherits the review's `auto_run`, then the project default,
+    /// then `false`. Checks with an `input` lacking a `default` never
+    /// auto-run.
+    #[serde(default)]
+    pub auto_run: Option<bool>,
 }
 
 /// A logical network store and a relative path within the provider-owned root.

@@ -67,6 +67,8 @@
        * @property {boolean} originalCacheManualChecks
        * @property {boolean} skipManualChecks
        * @property {boolean} originalSkipManualChecks
+       * @property {boolean} autoRun
+       * @property {boolean} originalAutoRun
        * @property {RebuildOnDraft} rebuildOn - Default for when a future review rebuilds its prepared build; `inherit` means the file-config/global value applies.
        * @property {RebuildOnDraft} originalRebuildOn
        */
@@ -123,6 +125,7 @@
         const autoCancelOutdatedPrPipelines = boolOr(s.auto_cancel_outdated_pr_pipelines, effective.auto_cancel_outdated_pr_pipelines);
         const cacheManualChecks = boolOr(s.cache_manual_checks, effective.cache_manual_checks);
         const skipManualChecks = boolOr(s.skip_manual_checks, effective.skip_manual_checks);
+        const autoRun = boolOr(s.auto_run, effective.auto_run);
         return {
           project,
           cwd: proj ? proj.path : "",
@@ -147,6 +150,7 @@
           autoCancelOutdatedPrPipelines, originalAutoCancelOutdatedPrPipelines: autoCancelOutdatedPrPipelines,
           cacheManualChecks, originalCacheManualChecks: cacheManualChecks,
           skipManualChecks, originalSkipManualChecks: skipManualChecks,
+          autoRun, originalAutoRun: autoRun,
           rebuildOn: buildRebuildOnDraft(s.rebuild_on, effective.rebuild_on),
           originalRebuildOn: buildRebuildOnDraft(s.rebuild_on, effective.rebuild_on),
         };
@@ -334,6 +338,12 @@
        */
       function onProjectEditSkipManualChecks(checked) { if (projectReviewSettingsDraft) projectReviewSettingsDraft.skipManualChecks = checked; }
       /**
+       * Stages the auto-run default.
+       * @param {boolean} checked
+       * @returns {void}
+       */
+      function onProjectEditAutoRun(checked) { if (projectReviewSettingsDraft) projectReviewSettingsDraft.autoRun = checked; }
+      /**
        * Stages "inherit the file-config/global default" for the rebuild-on setting.
        * @param {boolean} checked
        * @returns {void}
@@ -400,6 +410,8 @@
               <input type="checkbox" ${draft.cacheManualChecks ? "checked" : ""} onchange="onProjectEditCacheManualChecks(this.checked)">cache manual checks across rebases</label>
             <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Skip manual-check generation entirely, for a future review that declares no explicit skip_manual_checks setting of its own: no agent is asked to propose commands from the diff. Manual checks declared in a task file are unaffected.">
               <input type="checkbox" ${draft.skipManualChecks ? "checked" : ""} onchange="onProjectEditSkipManualChecks(this.checked)">skip manual-check generation</label>
+            <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Run each manual check automatically once its build commands succeed (a check with no build commands runs as soon as it is ready), for a future review that declares no explicit auto_run setting of its own. Only checks whose inputs all have defaults run; each runs once per machine per build, in a visible terminal. A check's own auto_run wins over this.">
+              <input type="checkbox" ${draft.autoRun ? "checked" : ""} onchange="onProjectEditAutoRun(this.checked)">auto-run manual checks after build</label>
             <h3 class="section" data-tip="${esc(REBUILD_ON_TIP)}">rebuild preparation when</h3>
             ${renderRebuildOnFieldsHtml("project", draft.rebuildOn, draft.effective.rebuild_on, "inherit the file-config/global default", "Follow the file-config/global default for when a future review rebuilds its prepared build (every trigger when nothing sets one), for a future review that declares no explicit rebuild_on of its own. Untick to set this project's own default. Applies on Save.", "onProjectEditRebuildOnInherit", "onProjectEditRebuildOnTrigger")}
             ${err}
@@ -452,6 +464,7 @@
         if (draft.autoCancelOutdatedPrPipelines !== draft.originalAutoCancelOutdatedPrPipelines) body.auto_cancel_outdated_pr_pipelines = draft.autoCancelOutdatedPrPipelines;
         if (draft.cacheManualChecks !== draft.originalCacheManualChecks) body.cache_manual_checks = draft.cacheManualChecks;
         if (draft.skipManualChecks !== draft.originalSkipManualChecks) body.skip_manual_checks = draft.skipManualChecks;
+        if (draft.autoRun !== draft.originalAutoRun) body.auto_run = draft.autoRun;
         if (rebuildOnChanged(draft.rebuildOn, draft.originalRebuildOn)) body.rebuild_on = rebuildOnBodyValue(draft.rebuildOn);
         if (Object.keys(body).length === 0) { closeProjectReviewSettingsModal(); return; }
         try {
