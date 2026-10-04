@@ -1570,6 +1570,15 @@
         renderReviewDetail();
       }
       /**
+       * Drops a launch the daemon refused, returning the row to idle.
+       * @param {string} key - The command's key, `<gid>:<kind>:<index>`.
+       * @returns {void}
+       */
+      function forgetCommandLaunch(key) {
+        delete commandRuns[key];
+        renderReviewDetail();
+      }
+      /**
        * Formats a run duration the way the command rows show it.
        * @param {number} ms - Milliseconds.
        * @returns {string}

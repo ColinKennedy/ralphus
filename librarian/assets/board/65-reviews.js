@@ -3087,13 +3087,36 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         manualMenuOpen[id] = !manualMenuOpen[id];
         renderReviewDetail();
       }
+      // RALPHUS-RUN-ALL:BEGIN
       /**
-       * Runs every suggested manual-check command in a new terminal.
-       * @param {string} id
+       * The positions of the checks a section's "Run all" launches: the ones
+       * whose preparation is ready and that have a command to run. Anything
+       * else would only be refused by the daemon.
+       * @param {GuardianCheck[]} checks - A section's checks, in order.
+       * @returns {number[]}
+       */
+      function runnableCheckIndexes(checks) {
+        return checks
+          .map((c, i) => (c.preparation_state === "ready" && !!c.command ? i : -1))
+          .filter((i) => i >= 0);
+      }
+      // RALPHUS-RUN-ALL:END
+      /**
+       * Runs every ready manual check, each through the same path a row's ▶
+       * uses, so every row it launches tracks its own status, duration and
+       * output exactly as running them one by one would.
+       * @param {string} id - The review id.
        * @returns {Promise<void>}
        */
       async function runAllManualChecks(id) {
-        await guardianAction(`/api/guardians/${id}/run-manual-commands`, {});
+        const g = guardians.find((x) => x.id === id);
+        if (!g) return;
+        const runnable = runnableCheckIndexes(g.manual_commands || []);
+        if (!runnable.length) {
+          notify("info", "No manual checks are ready to run.");
+          return;
+        }
+        for (const i of runnable) await runCheck("manual", id, i);
       }
       // RAL-520: regenerate the manual checks on demand, with optional focus.
       /**
@@ -3139,12 +3162,9 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         if (resp && resp.ok) notify("info", "Summary regeneration requested — it runs in the background.");
       }
       /**
-       * Runs every command-based test action for a review, in declaration
-       * order. There is no run-all route for action hints the way there is for
-       * manual checks (`/run-manual-commands`), so this fans out over the
-       * per-index one. Prompt-based hints are skipped: they expand through the
-       * resolver LLM before running and that path is not wired up, so firing
-       * them would fail server-side rather than do nothing.
+       * Runs every ready test action for a review, in declaration order. A
+       * prompt-based action is runnable once preparation has expanded it into
+       * a command; until then it is skipped rather than refused server-side.
        *
        * Each one goes through the same path a row's ▶ uses, so every row it
        * launches marks itself launched too -- running them all should leave the
@@ -3155,14 +3175,12 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
       async function runAllActionHints(id) {
         const g = guardians.find((x) => x.id === id);
         if (!g) return;
-        const runnable = (g.action_hints || [])
-          .map((h, i) => ({ h: h, i: i }))
-          .filter((x) => !!x.h.command);
+        const runnable = runnableCheckIndexes(g.action_hints || []);
         if (!runnable.length) {
-          notify("info", "No test actions declare a command to run.");
+          notify("info", "No test actions are ready to run.");
           return;
         }
-        for (const x of runnable) await runCheck("action", id, x.i);
+        for (const i of runnable) await runCheck("action", id, i);
       }
 
       // ---------- structured check inputs (RAL-164) ----------
@@ -3188,7 +3206,10 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         const run_cleanup = !!(cleanupEl && cleanupEl.checked);
         markCommandLaunched(key);
         const url = `/api/guardians/${id}/${kind === "manual" ? "run-manual-commands" : "run-action-hint"}`;
-        await guardianAction(url, { index, inputs, run_cleanup });
+        const resp = await guardianAction(url, { index, inputs, run_cleanup });
+        // A refused launch never reports finishing, so it would otherwise sit
+        // at "running" for good; the error toast already says why.
+        if (!resp || !resp.ok) forgetCommandLaunch(key);
         tick();
       }
       /**
