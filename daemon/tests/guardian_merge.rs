@@ -3433,6 +3433,35 @@ impl Runner for ManualCommandsRunner {
     }
 }
 
+// A generation-only run (the board's regenerate control, and the run started
+// when a settled review stops skipping generation) must still prepare what it
+// generated -- otherwise the checks exist but are never built or unlocked.
+#[test]
+fn generation_only_run_prepares_the_checks_it_generated() {
+    let (root, store, id) = single_feature_repo();
+    run_merge(&store, &NoopRunner, &id);
+
+    run_guardian_post_merge(
+        &store,
+        &ManualCommandsRunner,
+        &id,
+        PostMergeJobs::MANUAL_CHECKS_ONLY,
+    );
+    let g = store.lock().get_guardian(&id).unwrap();
+    assert!(
+        !g.manual_commands.is_empty(),
+        "generation must produce commands"
+    );
+    for check in &g.manual_commands {
+        assert_eq!(
+            check.preparation_state.as_deref(),
+            Some("ready"),
+            "a generated check with nothing to build is ready once generation finishes: {check:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 // RAL-520: the post-merge worker records what generation ran against (the
 // basis), and a later run on the same settled stack skips regeneration; a
 // cleared basis (the board's regenerate control) forces it again.
