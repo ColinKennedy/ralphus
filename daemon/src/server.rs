@@ -15093,7 +15093,13 @@ fn pr_action_feedback(daemon: &Daemon, user_header: Option<&str>, pr_id: &str) -
     let submitted_by = current_user(daemon, user_header).ok().flatten();
     let runner: Arc<dyn Runner> =
         Arc::new(SubprocessRunner::from_env().with_cartographer(daemon.store_handle()));
-    crate::pr::start_action_pr_feedback(daemon.store_handle(), runner, pr_id, submitted_by)
+    crate::pr::start_action_pr_feedback(
+        daemon.store_handle(),
+        runner,
+        daemon.cancellations_handle(),
+        pr_id,
+        submitted_by,
+    )
 }
 
 /// Live drift check between this PR's remote branch and its owning review

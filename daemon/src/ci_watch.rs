@@ -46,7 +46,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::cancel::CancelToken;
 use crate::forge::{FailedCheck, PrCiState, PrFailure};
 use crate::guardian::{BranchView, GuardianView};
 use crate::logging::LogLevel;
@@ -612,6 +611,7 @@ static STANDING_POLL_LAST: LazyLock<Mutex<HashMap<String, Instant>>> =
 pub fn poll_open_pr_ci_status(
     store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
+    cancellations: &crate::cancel::Cancellations,
     guardian_id: &str,
 ) {
     {
@@ -754,9 +754,10 @@ pub fn poll_open_pr_ci_status(
             ) else {
                 continue;
             };
-            dispatch_pr_auto_fix(
+            dispatch_pr_auto_fix_cancellable(
                 store,
                 runner,
+                cancellations,
                 &guardian,
                 decision.pr,
                 decision.failure,
@@ -1130,9 +1131,32 @@ fn pr_fix_branch_id(guardian: &GuardianView, pr: &PullRequestView) -> Option<Str
     }
 }
 
+/// Dispatch an auto-fix without a review lifecycle owner. Kept for callers
+/// outside the daemon's review workers; daemon-owned paths use
+/// [`dispatch_pr_auto_fix_cancellable`] so Stop shares their registration.
 pub fn dispatch_pr_auto_fix(
     store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
+    guardian: &GuardianView,
+    pr: &PullRequestView,
+    failure: &PrFailure,
+    client: &crate::forge::ForgeClient,
+) {
+    dispatch_pr_auto_fix_cancellable(
+        store,
+        runner,
+        &crate::cancel::Cancellations::new(),
+        guardian,
+        pr,
+        failure,
+        client,
+    );
+}
+
+pub fn dispatch_pr_auto_fix_cancellable(
+    store: &crate::store_lock::StoreHandle,
+    runner: &dyn Runner,
+    cancellations: &crate::cancel::Cancellations,
     guardian: &GuardianView,
     pr: &PullRequestView,
     failure: &PrFailure,
@@ -1256,6 +1280,7 @@ pub fn dispatch_pr_auto_fix(
     run_pr_fix(
         store,
         runner,
+        cancellations,
         guardian,
         pr,
         &branch_id,
@@ -1290,6 +1315,7 @@ pub fn dispatch_pr_auto_fix(
 pub fn dispatch_pr_fix_manual(
     store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
+    cancellations: &crate::cancel::Cancellations,
     guardian: &GuardianView,
     pr: &PullRequestView,
     branch_id: &str,
@@ -1306,6 +1332,7 @@ pub fn dispatch_pr_fix_manual(
     run_pr_fix(
         store,
         runner,
+        cancellations,
         guardian,
         pr,
         branch_id,
@@ -1326,6 +1353,7 @@ pub fn dispatch_pr_fix_manual(
 fn run_pr_fix(
     store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
+    cancellations: &crate::cancel::Cancellations,
     guardian: &GuardianView,
     pr: &PullRequestView,
     branch_id: &str,
@@ -1485,15 +1513,15 @@ fn run_pr_fix(
     let _ = store
         .lock()
         .set_pr_auto_fix_outcome(&pr.id, "auto_fix_dispatching");
-    let outcome = crate::guardian_merge::run_feedback(
+    let outcome = crate::guardian_merge::run_feedback_registered(
         store,
         runner,
+        cancellations,
         &guardian.id,
         branch_id,
         &feedback,
         message_seq,
         true,
-        &CancelToken::never(),
     );
     if let Some(sha) = outcome.pushed_sha.as_deref().filter(|_| outcome.pushed) {
         let _ = store.lock().update_pull_request_ex(

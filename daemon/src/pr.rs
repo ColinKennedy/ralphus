@@ -9002,6 +9002,7 @@ const MANUAL_PR_FEEDBACK_AUTHOR: &str = "Manual (PR feedback)";
 pub fn action_pr_feedback(
     store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
+    cancellations: &crate::cancel::Cancellations,
     pr_id: &str,
     submitted_by: Option<&str>,
 ) -> std::result::Result<usize, String> {
@@ -9011,7 +9012,7 @@ pub fn action_pr_feedback(
 
     // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
     crate::rlog!(INFO, "ralphus [pr] pr {pr_id} actioning feedback");
-    let result = action_pr_feedback_inner(store, runner, pr_id, submitted_by);
+    let result = action_pr_feedback_inner(store, runner, cancellations, pr_id, submitted_by);
     match &result {
         Ok(n) => {
             span.set_status(Status::Ok);
@@ -9030,6 +9031,7 @@ pub fn action_pr_feedback(
 fn action_pr_feedback_inner(
     store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
+    cancellations: &crate::cancel::Cancellations,
     pr_id: &str,
     submitted_by: Option<&str>,
 ) -> std::result::Result<usize, String> {
@@ -9161,15 +9163,15 @@ fn action_pr_feedback_inner(
             fresh.len(),
             pr.guardian_id
         );
-        let outcome = guardian_merge::run_feedback(
+        let outcome = guardian_merge::run_feedback_registered(
             store,
             runner,
+            cancellations,
             &pr.guardian_id,
             &branch_id,
             &feedback,
             message_seq,
             false,
-            &crate::cancel::CancelToken::never(),
         );
 
         if pr.branch_id.is_some() {
@@ -9262,6 +9264,7 @@ fn action_pr_feedback_inner(
             crate::ci_watch::dispatch_pr_fix_manual(
                 store,
                 runner,
+                cancellations,
                 &guardian,
                 &pr,
                 &branch_id,
@@ -9369,6 +9372,7 @@ pub fn start_submit_pull_requests(
 pub fn start_action_pr_feedback(
     store: crate::store_lock::StoreHandle,
     runner: Arc<dyn Runner>,
+    cancellations: crate::cancel::Cancellations,
     pr_id: &str,
     submitted_by: Option<String>,
 ) -> Reply {
@@ -9382,7 +9386,13 @@ pub fn start_action_pr_feedback(
     };
     let pid = pr_id.to_string();
     std::thread::spawn(move || {
-        match action_pr_feedback(&store, runner.as_ref(), &pid, submitted_by.as_deref()) {
+        match action_pr_feedback(
+            &store,
+            runner.as_ref(),
+            &cancellations,
+            &pid,
+            submitted_by.as_deref(),
+        ) {
             Ok(n) => {
                 let guard = store.lock();
                 let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {

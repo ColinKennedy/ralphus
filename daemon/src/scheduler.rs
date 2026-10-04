@@ -4248,22 +4248,20 @@ fn resume_feedback(
             local,
             Arc::clone(&store),
         ));
-        let token = cancellations.register(&format!("guardian:{gid}"));
         let message_seq = store
             .lock()
             .latest_received_feedback_message_seq(&gid, &branch_id)
             .unwrap_or_default();
-        crate::guardian_merge::run_feedback(
+        crate::guardian_merge::run_feedback_registered(
             &store,
             runner.as_ref(),
+            &cancellations,
             &gid,
             &branch_id,
             &feedback,
             message_seq,
             false,
-            &token,
         );
-        cancellations.remove(&format!("guardian:{gid}"));
     });
 }
 
