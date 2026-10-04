@@ -375,6 +375,16 @@ fn parse_forge_provider(scanner: &mut Scanner) -> Result<Option<String>, UsageEr
         })
 }
 
+fn parse_forge_host(scanner: &mut Scanner) -> Result<Option<String>, UsageError> {
+    scanner
+        .take_value("--forge-host")?
+        .map_or(Ok(None), |host| {
+            initialize_server::validate_forge_host(&host)
+                .map(|()| Some(host))
+                .map_err(|error| UsageError(format!("--forge-host: {error}")))
+        })
+}
+
 fn parse_initialize_server(
     scanner: &mut Scanner,
 ) -> Result<initialize_server::InitializeServerOptions, UsageError> {
@@ -399,7 +409,7 @@ fn parse_initialize_server(
         require_forks: parse_initialize_bool(scanner, "--require-forks")?,
         fork_user: scanner.take_value("--fork-user")?,
         fork_url: scanner.take_value("--fork-url")?,
-        forge_host: scanner.take_value("--forge-host")?,
+        forge_host: parse_forge_host(scanner)?,
         forge_token: scanner.take_value("--forge-token")?,
         create_admin: parse_initialize_bool(scanner, "--create-admin")?,
         admin_name: scanner.take_value("--admin-name")?,
@@ -652,6 +662,26 @@ mod tests {
         ])) {
             Command::UsageError(message) => assert!(message.contains("expected github or gitlab")),
             other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn initialize_server_accepts_a_bare_forge_host() {
+        match parse_args(&v(&["initialize", "server", "--forge-host", "gitlab.com"])) {
+            Command::InitializeServer { setup } => {
+                assert_eq!(setup.forge_host.as_deref(), Some("gitlab.com"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn initialize_server_rejects_forge_host_urls_and_www_prefixes() {
+        for host in ["https://gitlab.com", "http://gitlab.com", "www.gitlab.com"] {
+            match parse_args(&v(&["initialize", "server", "--forge-host", host])) {
+                Command::UsageError(message) => assert!(message.contains("bare hostname")),
+                other => panic!("unexpected: {other:?}"),
+            }
         }
     }
 }

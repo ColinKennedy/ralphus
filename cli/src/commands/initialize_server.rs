@@ -30,6 +30,32 @@ const TOTAL_STEPS: u32 = 9;
 const WINDOWS_MINIMUM_TMUX_VERSION: (u32, u32, u32) = (3, 3, 8);
 const SAMPLE_LABEL_PREFIX: &str = "ralphus initialize server: hello world";
 
+pub(crate) fn validate_forge_host(host: &str) -> Result<(), String> {
+    let lower = host.to_ascii_lowercase();
+    if host.is_empty()
+        || lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("www.")
+        || host.contains(['/', ':', '?', '#', '@'])
+        || host.chars().any(char::is_whitespace)
+    {
+        return Err(
+            "expected a bare hostname such as gitlab.com (without http(s):// or www.)".to_string(),
+        );
+    }
+    if host.split('.').any(|label| {
+        label.is_empty()
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '-')
+    }) {
+        return Err("expected a valid bare hostname such as gitlab.com".to_string());
+    }
+    Ok(())
+}
+
 /// One answer exposed through both the terminal walkthrough and the
 /// non-interactive command line. Keep this list complete: the parity test
 /// makes omissions fail CI.
@@ -963,6 +989,10 @@ fn step_forge_token(opts: &GlobalOpts, user: Option<&str>, setup: &InitializeSer
         setup.forge_host.as_ref(),
         setup.yes,
     );
+    if let Err(error) = validate_forge_host(&host) {
+        println!("  invalid forge host {host:?}: {error}");
+        return;
+    }
     let token = setup.forge_token.clone().unwrap_or_else(|| {
         prompt_secret(
             &FORGE_TOKEN,
