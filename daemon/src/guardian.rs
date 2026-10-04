@@ -2327,6 +2327,14 @@ impl Store {
                 branch_id
             ],
         )?;
+        crate::cartographer::Note::new("guardian")
+            .scope("branch")
+            .guardian(guardian_id)
+            .emit(
+                self,
+                format!("branch {branch_id} ('{branch}') added to review {guardian_id} at position {next}"),
+                serde_json::json!({"branch_id": branch_id, "branch": branch, "position": next, "project": project}),
+            );
         Ok(next)
     }
 
@@ -2465,6 +2473,22 @@ impl Store {
             ],
         )?;
         tx.commit()?;
+        crate::cartographer::Note::new("guardian")
+            .scope("branch")
+            .guardian(to_guardian_id)
+            .emit(
+                self,
+                format!(
+                    "branch {branch_id} ('{branch}') moved from review {from_guardian_id} to review {to_guardian_id} at position {new_position}"
+                ),
+                serde_json::json!({
+                    "branch_id": branch_id,
+                    "branch": branch,
+                    "from_guardian_id": from_guardian_id,
+                    "to_guardian_id": to_guardian_id,
+                    "position": new_position,
+                }),
+            );
         Ok(new_position)
     }
 
@@ -2487,6 +2511,14 @@ impl Store {
         if n == 0 {
             Err(StoreError::NotFound)
         } else {
+            crate::cartographer::Note::new("guardian")
+                .scope("guardian")
+                .guardian(id)
+                .emit(
+                    self,
+                    format!("review {id} renamed to '{name}'"),
+                    serde_json::json!({"name": name}),
+                );
             Ok(())
         }
     }
@@ -2539,6 +2571,10 @@ impl Store {
         if n == 0 {
             Err(StoreError::NotFound)
         } else {
+            crate::cartographer::Note::new("guardian")
+                .scope("guardian")
+                .guardian(id)
+                .emit(self, format!("review {id} deleted"), serde_json::json!({}));
             Ok(())
         }
     }
@@ -2753,7 +2789,9 @@ impl Store {
             };
             let _ = self.log_event(None, Some(id), "guardian", None, &msg);
             if status == GuardianStatus::InReview {
-                let _ = self.mark_first_ready(id);
+                if let Err(e) = self.mark_first_ready(id) {
+                    self.warn_status_side_effect(id, status, "mark first-ready", &e);
+                }
             }
             let failed = matches!(status, GuardianStatus::MergeFailed);
             if failed {
@@ -2792,7 +2830,7 @@ impl Store {
                         },
                     )
                 };
-                let _ = self.notify_watchers_with_remediation(
+                if let Err(e) = self.notify_watchers_with_remediation(
                     crate::monitor::NotifiableEventKind::ReviewFailed,
                     &format!("guardian:{id}"),
                     priority,
@@ -2801,37 +2839,72 @@ impl Store {
                     None,
                     None,
                     None,
-                );
-            } else {
-                let _ = self.notify_watchers(
-                    crate::monitor::NotifiableEventKind::ReviewStatusChanged,
-                    &format!("guardian:{id}"),
-                    crate::mailbox::MailboxPriority::Normal,
-                    &msg,
-                    None,
-                );
+                ) {
+                    self.warn_status_side_effect(id, status, "notify watchers", &e);
+                }
+            } else if let Err(e) = self.notify_watchers(
+                crate::monitor::NotifiableEventKind::ReviewStatusChanged,
+                &format!("guardian:{id}"),
+                crate::mailbox::MailboxPriority::Normal,
+                &msg,
+                None,
+            ) {
+                self.warn_status_side_effect(id, status, "notify watchers", &e);
             }
             if GuardianStatus::is_terminal_status(status.as_str()) {
                 // A review cannot retain a manual-action execution lease once
                 // it is terminal. The next retirement sweep owns deleting its
                 // shared publication and private build root.
-                let _ = self.conn.execute(
+                if let Err(e) = self.conn.execute(
                     "UPDATE guardian_action_generations SET lease_expires_at_ms=?1, updated_at_ms=?1
                      WHERE guardian_id=?2 AND state='ready'",
                     params![crate::store::now_ms(), id],
-                );
+                ) {
+                    self.warn_status_side_effect(
+                        id,
+                        status,
+                        "expire manual-action leases",
+                        &StoreError::from(e),
+                    );
+                }
                 // RAL-400 Phase 6: a review reaching `merged`/`cancelled`/
                 // `deployed` may be the last non-terminal affected entry on one
                 // or more open waypoints. `is_terminal_status` already
                 // excludes `merge_failed`, since a failed merge may still be
                 // retried and so is not "finished" for this purpose.
-                let _ = self.maybe_auto_close_waypoints_for_affected_entry(
+                if let Err(e) = self.maybe_auto_close_waypoints_for_affected_entry(
                     crate::waypoints::WaypointEntryKind::Review,
                     id,
-                );
+                ) {
+                    self.warn_status_side_effect(id, status, "auto-close waypoints", &e);
+                }
             }
             Ok(())
         }
+    }
+
+    /// Record a best-effort follow-up of [`Self::set_guardian_status`] that
+    /// failed after the status itself was written. The transition stands;
+    /// the WARNING row is what makes the missing side effect traceable.
+    fn warn_status_side_effect(
+        &self,
+        id: &str,
+        status: GuardianStatus,
+        step: &str,
+        error: &dyn std::fmt::Display,
+    ) {
+        crate::cartographer::Note::new("guardian")
+            .level(crate::logging::LogLevel::WARNING)
+            .scope("guardian")
+            .guardian(id)
+            .emit(
+                self,
+                format!(
+                    "review {id} → {}: {step} failed: {error}",
+                    status.as_str()
+                ),
+                serde_json::json!({"status": status.as_str(), "step": step, "error": error.to_string()}),
+            );
     }
 
     /// Record a one-shot, GUI-facing notice for this guardian (RAL-273) --
@@ -4985,6 +5058,14 @@ impl Store {
             next += 1;
         }
         tx.commit()?;
+        crate::cartographer::Note::new("guardian")
+            .scope("guardian")
+            .guardian(guardian_id)
+            .emit(
+                self,
+                format!("review {guardian_id} branches reordered"),
+                serde_json::json!({"order": order}),
+            );
         Ok(())
     }
 
@@ -6379,6 +6460,14 @@ impl Store {
     /// `advisory` or closing the waypoint release it too.
     pub fn approve_guardian(&self, id: &str) -> Result<GuardianStatus> {
         if let Some(waypoint_id) = self.review_block_gating_waypoint(id)? {
+            crate::cartographer::Note::new("guardian")
+                .scope("guardian")
+                .guardian(id)
+                .emit(
+                    self,
+                    format!("review {id} approval rejected: held by open waypoint {waypoint_id}"),
+                    serde_json::json!({"waypoint_id": waypoint_id}),
+                );
             return Err(StoreError::InvalidTransition(format!(
                 "review {id} is held by open waypoint {waypoint_id}; its resolver releases it by \
                  answering with a RALPHUS_BEARING line. To release it without an answer, set its \
@@ -6442,6 +6531,10 @@ impl Store {
                 "can only reset a guardian that is merging, in_review, or merge_failed".into(),
             ))
         } else {
+            crate::rlog!(
+                INFO,
+                "ralphus [state] guardian {id} → collecting (reset for restart)"
+            );
             let _ = self.log_event(
                 None,
                 Some(id),
@@ -6476,6 +6569,10 @@ impl Store {
                 "can only reopen a guardian that is cancelled, merged, or approved, it is {status}"
             )));
         }
+        crate::rlog!(
+            INFO,
+            "ralphus [state] guardian {id} → collecting (reopened)"
+        );
         let _ = self.log_event(
             None,
             Some(id),
@@ -6504,6 +6601,10 @@ impl Store {
                 "can only stop a guardian that is currently merging".into(),
             ));
         }
+        crate::rlog!(
+            INFO,
+            "ralphus [state] guardian {id} merging → merge_stopped (stopped mid-rebase)"
+        );
         let _ = self.log_event(
             None,
             Some(id),

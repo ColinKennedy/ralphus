@@ -160,8 +160,11 @@ impl ReadConnPool {
             match open_reader(location) {
                 Ok(conn) => free.push(conn),
                 Err(e) => {
-                    eprintln!(
-                        "ralphus [store] failed to open a pooled read connection: {e} -- reads needing the pool will fall back to the writer lock"
+                    // ralphus[ignore-rlog-pair]: the pool is built before its owning Store exists, so no Cartographer row can be written yet
+                    crate::rlog!(
+                        ERROR,
+                        "ralphus [store] failed to open a pooled read connection ({} of {POOL_SIZE} open): {e} -- reads needing the pool will fall back to the writer lock",
+                        free.len()
                     );
                     break;
                 }

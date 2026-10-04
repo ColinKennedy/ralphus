@@ -210,7 +210,28 @@ impl ModelBackend for ClaudeCodeBackend {
             options.maximum_tool_output_tokens,
             claude_config_dir.as_deref(),
         )
-        .map_err(|e| BackendError(format!("could not spawn {program}: {e}")))?;
+        .map_err(|e| {
+            crate::cli_agent_common::emit_child_lifecycle(
+                "claude-code",
+                "agent process spawn failed",
+                "error",
+                serde_json::json!({"compound": compound, "error": e.to_string()}),
+            );
+            BackendError(format!("could not spawn {program}: {e}"))
+        })?;
+        crate::cli_agent_common::emit_child_lifecycle(
+            "claude-code",
+            "agent process spawned",
+            "info",
+            serde_json::json!({
+                "pid": child.id(),
+                "model": options.model,
+                "compound": compound,
+                "resume": options.resume_agent_session_id.is_some(),
+                "isolated_config_dir": claude_config_dir.is_some(),
+                "timeout_sec": options.timeout_sec,
+            }),
+        );
 
         // Human-readable header for the live tmux pane (RAL-102) -- everything
         // below this is Claude's own text/tool-call activity, not runner logging.
@@ -221,15 +242,17 @@ impl ModelBackend for ClaudeCodeBackend {
         // seen), so it's held behind an `Arc<Mutex<_>>` rather than owned
         // outright by either side.
         let Some(stdin) = child.stdin.take() else {
-            let _ = child.kill();
-            let _ = child.wait();
+            crate::cli_agent_common::kill_child("claude-code", &mut child, "no stdin pipe");
             return Err(BackendError("claude-code: no stdin pipe".to_string()));
         };
         let stdin = Arc::new(Mutex::new(stdin));
 
         if let Err(e) = write_initial_turn(&stdin, prompt) {
-            let _ = child.kill();
-            let _ = child.wait();
+            crate::cli_agent_common::kill_child(
+                "claude-code",
+                &mut child,
+                "failed to write initial prompt to stdin",
+            );
             return Err(BackendError(format!(
                 "claude-code: failed to write initial prompt to stdin: {e}"
             )));
@@ -280,9 +303,12 @@ impl ModelBackend for ClaudeCodeBackend {
 
         if !self.keep_temporary_files {
             if let Some(p) = &prompt_file_for_system {
-                let _ = std::fs::remove_file(p);
+                crate::cli_agent_common::remove_temp_file("claude-code", p);
             }
-            let _ = std::fs::remove_file(live_session_path(workspace.root()));
+            crate::cli_agent_common::remove_temp_file(
+                "claude-code",
+                &live_session_path(workspace.root()),
+            );
         }
 
         outcome
@@ -596,8 +622,7 @@ fn drive_stream_json(
         // RAL-339: the run is thrashing -- kill the child now rather than let
         // `wait_for_child` wait for a natural exit that may be arbitrarily far
         // off, then fail the cell with whatever was captured live so far.
-        let _ = child.kill();
-        let _ = child.wait();
+        crate::cli_agent_common::kill_child("claude-code", child, "compaction thrash");
         if let Some(t) = stderr_thread {
             let _ = t.join();
         }
@@ -624,8 +649,17 @@ fn drive_stream_json(
     // shared stdin handle, once it and the closer thread (RAL-288 Stage 2,
     // `spawn_stdin_closer`) both agree this call returning means the same
     // thing.
-    let status = wait_for_child(child, timeout_sec)
-        .map_err(|e| BackendError(format!("claude-code: {e}")))?;
+    let pid = child.id();
+    let status = wait_for_child(child, timeout_sec).map_err(|e| {
+        crate::cli_agent_common::emit_child_lifecycle(
+            "claude-code",
+            "agent process wait failed",
+            "error",
+            serde_json::json!({"pid": pid, "error": e.to_string()}),
+        );
+        BackendError(format!("claude-code: {e}"))
+    })?;
+    crate::cli_agent_common::emit_child_exited("claude-code", pid, &status);
     if let Some(t) = stderr_thread {
         let _ = t.join();
     }
@@ -1065,7 +1099,20 @@ fn wait_for_child(
             return Ok(status);
         }
         if start.elapsed() >= deadline {
-            let _ = child.kill();
+            crate::cli_agent_common::emit_child_lifecycle(
+                "claude-code",
+                "agent process timed out; killing",
+                "warning",
+                serde_json::json!({"pid": child.id(), "timeout_sec": secs}),
+            );
+            if let Err(e) = child.kill() {
+                crate::cli_agent_common::emit_child_lifecycle(
+                    "claude-code",
+                    "agent process kill failed",
+                    "warning",
+                    serde_json::json!({"pid": child.id(), "error": e.to_string()}),
+                );
+            }
             return child.wait();
         }
         std::thread::sleep(Duration::from_millis(100));

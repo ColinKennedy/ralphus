@@ -163,6 +163,11 @@ pub fn request(
             None => {
                 let opened = Arc::new(Mutex::new(Channel::open(program, args, uri)?));
                 guard.insert(key.clone(), Arc::clone(&opened));
+                // ralphus[ignore-rlog-pair]: the process-wide channel pool has no Store; remote_runner records the structured outcome
+                crate::rlog!(
+                    INFO,
+                    "ralphus [channel] opened provider channel key={key} program={program}"
+                );
                 opened
             }
         }
@@ -188,7 +193,11 @@ pub fn request(
 /// is done with a machine.
 pub fn close(scheme: &str, uri: &str) {
     let key = format!("{scheme}:{uri}");
-    let _ = pool().lock().expect("channel pool poisoned").remove(&key);
+    let removed = pool().lock().expect("channel pool poisoned").remove(&key);
+    if removed.is_some() {
+        // ralphus[ignore-rlog-pair]: the process-wide channel pool has no Store; remote_runner records the structured outcome
+        crate::rlog!(INFO, "ralphus [channel] closed provider channel key={key}");
+    }
 }
 
 /// Whether a channel is currently open for `scheme:uri`.

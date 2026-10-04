@@ -65,7 +65,17 @@ pub fn agent_catalog(store: &Store) -> Vec<CatalogAgent> {
     let user = crate::agent_access::UserContext::default();
     let agents = crate::agent_access::DefaultAgentAccess
         .available_agents(&user, &cwd, store)
-        .unwrap_or_default();
+        .unwrap_or_else(|e| {
+            crate::cartographer::Note::new("agent-catalog")
+                .level(crate::logging::LogLevel::WARNING)
+                .scope("agent-profile")
+                .emit(
+                    store,
+                    format!("loading the agent catalog failed; it lists no agents: {e}"),
+                    serde_json::json!({ "error": e.to_string() }),
+                );
+            Vec::new()
+        });
     agents
         .into_iter()
         .map(|a| CatalogAgent {

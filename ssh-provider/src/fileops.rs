@@ -147,7 +147,17 @@ pub fn remove_path(uri: &str, payload_json: &str, config: &EffectiveConfig) -> R
     require_under_configured_root(&req.path, config)?;
     let flag = if req.recursive { "-rf" } else { "-f" };
     let script = format!("rm {flag} {}", shell_quote_single(&req.path));
-    ssh_command(&target, &script, config, None).map(|_| ())
+    ssh_command(&target, &script, config, None)?;
+    crate::emit_event(
+        "removed remote path",
+        "info",
+        serde_json::json!({
+            "target": target.to_string(),
+            "path": req.path,
+            "recursive": req.recursive,
+        }),
+    );
+    Ok(())
 }
 
 /// Run one VCS command (`program` is always `"git"` today) in a workspace and

@@ -140,10 +140,29 @@ fn sync_source(
     let excludes = transport::merge_excludes(transport::DEFAULT_EXCLUDES, &config.extra_excludes);
     let host_os = transport::local_os();
     let rsync_available = host_os == HostOs::Unix && program_on_path("rsync");
-    match transport::choose_transport(host_os, rsync_available) {
-        Transport::Rsync => sync_via_rsync(target, local_dir, remote_dir, &excludes, config),
-        Transport::TarSsh => sync_via_tar_ssh(target, local_dir, remote_dir, &excludes, config),
+    let transport = transport::choose_transport(host_os, rsync_available);
+    let started = std::time::Instant::now();
+    let (name, result) = match transport {
+        Transport::Rsync => (
+            "rsync",
+            sync_via_rsync(target, local_dir, remote_dir, &excludes, config),
+        ),
+        Transport::TarSsh => (
+            "tar-ssh",
+            sync_via_tar_ssh(target, local_dir, remote_dir, &excludes, config),
+        ),
+    };
+    let payload = serde_json::json!({
+        "target": target.to_string(),
+        "remote_dir": remote_dir,
+        "transport": name,
+        "elapsed_s": started.elapsed().as_secs_f64(),
+    });
+    match &result {
+        Ok(()) => crate::emit_event("synced workspace to remote", "info", payload),
+        Err(_) => crate::emit_event("workspace sync to remote failed", "warning", payload),
     }
+    result
 }
 
 /// Whether `program` can be spawned at all -- used only to decide whether
@@ -302,7 +321,13 @@ fn run_remote_cell(
         // on a full pipe; treat the write failing as non-fatal and let the
         // exit status/stdout decide, mirroring the daemon's own
         // `ProviderRunner::invoke_with`.
-        let _ = stdin.write_all(remote_spec_json.as_bytes());
+        if let Err(e) = stdin.write_all(remote_spec_json.as_bytes()) {
+            crate::emit_event(
+                "could not write cell spec to remote runner stdin",
+                "warning",
+                serde_json::json!({"target": target.to_string(), "error": e.to_string()}),
+            );
+        }
     }
 
     // Forward `RALPHUS_EVENT:` lines to our own stderr as they arrive -- see
@@ -325,6 +350,19 @@ fn run_remote_cell(
     let out = child
         .wait_with_output()
         .map_err(|e| format!("could not wait on ssh: {e}"))?;
+    crate::emit_event(
+        "remote runner exited",
+        if out.status.success() {
+            "info"
+        } else {
+            "warning"
+        },
+        serde_json::json!({
+            "target": target.to_string(),
+            "remote_dir": remote_dir,
+            "exit_code": out.status.code(),
+        }),
+    );
     let stderr_tail = stderr_handle
         .and_then(|h| h.join().ok())
         .unwrap_or_default();

@@ -118,13 +118,14 @@ impl Store {
         task: Option<&str>,
         cell_id: Option<&str>,
     ) -> Result<String> {
-        let id = self.enqueue_mailbox_message(
+        let id = self.enqueue_mailbox_message_unlogged(
             priority,
             message,
             squad_id,
             task,
             cell_id,
             Some(entity_uri),
+            None,
         )?;
         self.conn.execute(
             "UPDATE mailbox_messages SET event_kind=?1 WHERE id=?2",
@@ -140,6 +141,7 @@ impl Store {
             entity_uri: Some(entity_uri.to_string()),
             category: None,
         });
+        self.log_mailbox_enqueued(&id, Some(event.as_str()));
         Ok(id)
     }
 
@@ -149,9 +151,11 @@ impl Store {
     /// [`NotifiableEventKind::SquadWaypointHalted`], the variants that
     /// represent an error/failure/block rather than an ordinary status
     /// change. `remediation` is mandatory: its rendered text is appended to
-    /// `message` via [`crate::mailbox::Store::enqueue_error_mailbox_message`],
-    /// so every such notification a watcher receives carries actionable
-    /// guidance.
+    /// `message` via `enqueue_error_mailbox_message_unlogged` (the same
+    /// folding [`crate::mailbox::Store::enqueue_error_mailbox_message`]
+    /// applies), so every such notification a watcher receives carries
+    /// actionable guidance. The enqueue is logged after the bus push, so SSE
+    /// subscribers see the message before its log row.
     #[allow(clippy::too_many_arguments)]
     pub fn notify_watchers_with_remediation(
         &self,
@@ -175,7 +179,7 @@ impl Store {
             ),
             "notify_watchers_with_remediation is for failure/blocked events only; use notify_watchers_with_context for ordinary status changes"
         );
-        let id = self.enqueue_error_mailbox_message(
+        let id = self.enqueue_error_mailbox_message_unlogged(
             priority,
             message,
             remediation,
@@ -199,6 +203,7 @@ impl Store {
             entity_uri: Some(entity_uri.to_string()),
             category: None,
         });
+        self.log_mailbox_enqueued(&id, Some(event.as_str()));
         Ok(id)
     }
 

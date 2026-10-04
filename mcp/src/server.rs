@@ -72,21 +72,41 @@ impl Server {
             .unwrap_or(&empty);
 
         let Some(tool) = self.visible_tools().find(|t| t.name == name) else {
+            eprintln!(
+                "ralphus-mcp [tool] unknown tool name={name} read_only={}",
+                self.read_only
+            );
             return Err((-32602, format!("unknown tool: {name}")));
         };
 
         let argv = match tool.build_argv(arguments) {
             Ok(argv) => argv,
-            Err(message) => return Ok(tool_error(message)),
+            Err(message) => {
+                eprintln!("ralphus-mcp [tool] invalid arguments name={name} error={message}");
+                return Ok(tool_error(message));
+            }
         };
         let cmd = commands::parse_args(&argv);
         let client = DaemonClient::new(self.daemon_url.clone());
-        match exec::execute(cmd, &client) {
-            Ok(value) => Ok(json!({
-                "content": [{"type": "text", "text": render(&value)}],
-                "isError": false,
-            })),
-            Err(e) => Ok(tool_error(exec::message(&e))),
+        let started = std::time::Instant::now();
+        let outcome = exec::execute(cmd, &client);
+        let elapsed_ms = started.elapsed().as_millis();
+        // Arguments are never logged: they can carry prompts and task text.
+        match outcome {
+            Ok(value) => {
+                eprintln!("ralphus-mcp [tool] call ok name={name} elapsed_ms={elapsed_ms}");
+                Ok(json!({
+                    "content": [{"type": "text", "text": render(&value)}],
+                    "isError": false,
+                }))
+            }
+            Err(e) => {
+                let message = exec::message(&e);
+                eprintln!(
+                    "ralphus-mcp [tool] call failed name={name} elapsed_ms={elapsed_ms} error={message}"
+                );
+                Ok(tool_error(message))
+            }
         }
     }
 }

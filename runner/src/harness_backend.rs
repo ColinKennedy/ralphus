@@ -44,11 +44,39 @@ impl ModelBackend for HarnessBackend {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
-            .map_err(|e| BackendError(format!("could not spawn {}: {e}", self.program)))?;
+            .map_err(|e| {
+                crate::cli_agent_common::emit_child_lifecycle(
+                    "harness",
+                    "agent process spawn failed",
+                    "error",
+                    serde_json::json!({"program": self.program, "error": e.to_string()}),
+                );
+                BackendError(format!("could not spawn {}: {e}", self.program))
+            })?;
+        let pid = child.id();
+        crate::cli_agent_common::emit_child_lifecycle(
+            "harness",
+            "agent process spawned",
+            "info",
+            serde_json::json!({
+                "program": self.program,
+                "pid": pid,
+                "model": options.model,
+                "prompt_len": prompt.len(),
+            }),
+        );
 
         let timeout = Duration::from_secs(options.timeout_sec.unwrap_or(DEFAULT_TIMEOUT_SECS));
-        let output = wait_with_timeout(child, timeout)
-            .map_err(|e| BackendError(format!("{} failed: {e}", self.program)))?;
+        let output = wait_with_timeout(child, timeout).map_err(|e| {
+            crate::cli_agent_common::emit_child_lifecycle(
+                "harness",
+                "agent process failed",
+                "warning",
+                serde_json::json!({"program": self.program, "pid": pid, "error": e.to_string()}),
+            );
+            BackendError(format!("{} failed: {e}", self.program))
+        })?;
+        crate::cli_agent_common::emit_child_exited("harness", pid, &output.status);
 
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -120,8 +148,11 @@ fn wait_with_timeout(
             return child.wait_with_output();
         }
         if start.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
+            crate::cli_agent_common::kill_child(
+                "harness",
+                &mut child,
+                &format!("timed out after {}s", timeout.as_secs()),
+            );
             return Err(std::io::Error::other(format!(
                 "timed out after {}s",
                 timeout.as_secs()

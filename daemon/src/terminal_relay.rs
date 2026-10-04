@@ -116,7 +116,24 @@ fn handle_connection(stream: TcpStream, daemon: &Arc<Daemon>) {
     };
     let query = captured_query.unwrap_or_default();
     if let Err(reason) = run_session(&mut ws, &query, daemon) {
-        crate::rlog!(WARNING, "ralphus [terminal] session refused: {reason}");
+        let squad_id = query_param(&query, "squad_id").unwrap_or("");
+        let guard = daemon.lock();
+        let mut note = Note::new("terminal")
+            .level(crate::logging::LogLevel::WARNING)
+            .scope("cell");
+        if !squad_id.is_empty() {
+            note = note.squad(squad_id);
+        }
+        note.emit(
+            &guard,
+            format!("session refused: {reason}"),
+            serde_json::json!({
+                "reason": reason,
+                "task_idx": query_param(&query, "task_idx"),
+                "cell_idx": query_param(&query, "cell_idx"),
+            }),
+        );
+        drop(guard);
         let _ = ws.send(Message::Text(format!("ralphus: {reason}\r\n")));
     }
     let _ = ws.close(None);
@@ -256,11 +273,14 @@ fn run_session(
     if let Some(parent) = log_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let mut log_file = std::fs::OpenOptions::new()
+    let (mut log_file, transcript_error) = match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&log_path)
-        .ok();
+    {
+        Ok(file) => (Some(file), None),
+        Err(e) => (None, Some(e.to_string())),
+    };
 
     log_open_event(
         daemon,
@@ -268,6 +288,7 @@ fn run_session(
         &machine,
         &cwd,
         log_path.to_string_lossy().as_ref(),
+        transcript_error.as_deref(),
     );
 
     let mut child = provider.spawn_terminal(&command, params.cols, params.lines)?;
@@ -380,22 +401,39 @@ fn log_open_event(
     machine: &str,
     cwd: &str,
     log_path: &str,
+    transcript_error: Option<&str>,
 ) {
     let guard = daemon.lock();
     let cell_id = format!("{}/{}", params.task_idx, params.cell_idx);
+    // An unopenable transcript file means the session still relays but
+    // leaves no durable record, so it is surfaced at WARNING.
+    let (level, message) = match transcript_error {
+        None => (
+            crate::logging::LogLevel::INFO,
+            "remote terminal session opened".to_string(),
+        ),
+        Some(e) => (
+            crate::logging::LogLevel::WARNING,
+            format!(
+                "remote terminal session opened without a transcript (could not open {log_path}: {e})"
+            ),
+        ),
+    };
     Note::new("terminal")
+        .level(level)
         .scope("cell")
         .squad(&params.squad_id)
         .cell(&cell_id)
         .log_path(log_path)
         .emit(
             &guard,
-            "remote terminal session opened",
+            message,
             serde_json::json!({
                 "task_idx": params.task_idx,
                 "cell_idx": params.cell_idx,
                 "machine": machine,
                 "cwd": cwd,
+                "transcript_error": transcript_error,
             }),
         );
 }

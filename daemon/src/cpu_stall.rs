@@ -142,7 +142,7 @@ impl CpuStallTracker {
                 entry.flat_samples,
             );
             let entity_uri = guard.cell_entity_uri_by_sid(&run_id, &session_id);
-            if let Ok(message_id) = guard.enqueue_error_mailbox_message(
+            match guard.enqueue_error_mailbox_message(
                 crate::mailbox::MailboxPriority::High,
                 &text,
                 &crate::mailbox::Remediation::ManualInterventionRequired {
@@ -158,22 +158,44 @@ impl CpuStallTracker {
                 entity_uri.as_deref(),
                 None,
             ) {
-                crate::cartographer::Note::new("cpu_stall")
-                    .level(crate::logging::LogLevel::WARNING)
-                    .squad(&run_id)
-                    .cell(&session_id)
-                    .scope("mailbox")
-                    .emit(
-                        &guard,
-                        format!("mailbox message enqueued for CPU-flat session ({session_id})"),
-                        serde_json::json!({
-                            "message_id": message_id,
-                            "priority": "high",
-                            "pid": pid,
-                            "flat_span_secs": span_ms / 1000,
-                            "flat_samples": entry.flat_samples,
-                        }),
-                    );
+                Ok(message_id) => {
+                    crate::cartographer::Note::new("cpu_stall")
+                        .level(crate::logging::LogLevel::WARNING)
+                        .squad(&run_id)
+                        .cell(&session_id)
+                        .scope("mailbox")
+                        .emit(
+                            &guard,
+                            format!("mailbox message enqueued for CPU-flat session ({session_id})"),
+                            serde_json::json!({
+                                "message_id": message_id,
+                                "priority": "high",
+                                "pid": pid,
+                                "flat_span_secs": span_ms / 1000,
+                                "flat_samples": entry.flat_samples,
+                            }),
+                        );
+                }
+                Err(e) => {
+                    crate::cartographer::Note::new("cpu_stall")
+                        .level(crate::logging::LogLevel::WARNING)
+                        .squad(&run_id)
+                        .cell(&session_id)
+                        .scope("mailbox")
+                        .emit(
+                            &guard,
+                            format!(
+                                "session {session_id} (pid {pid}) CPU-flat for {}s; could not \
+                                 enqueue its mailbox message: {e}",
+                                span_ms / 1000
+                            ),
+                            serde_json::json!({
+                                "pid": pid,
+                                "flat_span_secs": span_ms / 1000,
+                                "error": e.to_string(),
+                            }),
+                        );
+                }
             }
             entry.escalated_onset_ms = Some(entry.flat_since_ms);
         }

@@ -257,6 +257,13 @@ impl Store {
             "INSERT INTO mailbox_clients(id, registered_at_ms) VALUES(?1, ?2)",
             params![client_id, now_ms()],
         )?;
+        crate::cartographer::Note::new("mailbox")
+            .scope("mailbox")
+            .emit(
+                self,
+                format!("mailbox client registered client_id={client_id}"),
+                serde_json::json!({ "client_id": client_id }),
+            );
         Ok(client_id)
     }
 
@@ -308,6 +315,29 @@ impl Store {
         entity_uri: Option<&str>,
         category: Option<&str>,
     ) -> Result<String> {
+        let id = self.enqueue_mailbox_message_unlogged(
+            priority, message, squad_id, task, cell_id, entity_uri, category,
+        )?;
+        self.log_mailbox_enqueued(&id, None);
+        Ok(id)
+    }
+
+    /// [`Self::enqueue_mailbox_message_ex`] without its Cartographer row, for
+    /// a caller that pushes the message over the event bus itself and so
+    /// logs it with [`Self::log_mailbox_enqueued`] only after that push --
+    /// otherwise the log row would reach SSE subscribers ahead of the
+    /// message it describes.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn enqueue_mailbox_message_unlogged(
+        &self,
+        priority: MailboxPriority,
+        message: &str,
+        squad_id: Option<&str>,
+        task: Option<&str>,
+        cell_id: Option<&str>,
+        entity_uri: Option<&str>,
+        category: Option<&str>,
+    ) -> Result<String> {
         let id = self.next_id("mailbox_message_seq", "mailbox")?;
         self.conn.execute(
             "INSERT INTO mailbox_messages(id, priority, message, squad_id, task, cell_id, created_at_ms, entity_uri, category)
@@ -315,6 +345,79 @@ impl Store {
             params![id, priority.as_str(), message, squad_id, task, cell_id, now_ms(), entity_uri, category],
         )?;
         Ok(id)
+    }
+
+    /// Record that mailbox message `id` was enqueued: one INFO `mailbox`
+    /// Cartographer row carrying its priority, entity, category, Monitor
+    /// `event_kind` (when the caller has one) and body length -- not the body
+    /// itself, which can quote arbitrary command output.
+    pub(crate) fn log_mailbox_enqueued(&self, id: &str, event_kind: Option<&str>) {
+        type Row = (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i64,
+        );
+        let row: rusqlite::Result<Row> = self.conn.query_row(
+            "SELECT priority, squad_id, task, cell_id, entity_uri, category, length(message)
+             FROM mailbox_messages WHERE id=?1",
+            params![id],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                ))
+            },
+        );
+        let (priority, squad_id, task, cell_id, entity_uri, category, message_len) = match row {
+            Ok(row) => row,
+            Err(e) => {
+                crate::cartographer::Note::new("mailbox")
+                    .level(crate::logging::LogLevel::WARNING)
+                    .scope("mailbox")
+                    .emit(
+                        self,
+                        format!("mailbox message {id} enqueued but could not be re-read for logging: {e}"),
+                        serde_json::json!({ "message_id": id, "error": e.to_string() }),
+                    );
+                return;
+            }
+        };
+        let mut note = crate::cartographer::Note::new("mailbox").scope("mailbox");
+        if let Some(squad_id) = squad_id.as_deref() {
+            note = note.squad(squad_id);
+        }
+        if let Some(task) = task.as_deref() {
+            note = note.task(task);
+        }
+        if let Some(cell_id) = cell_id.as_deref() {
+            note = note.cell(cell_id);
+        }
+        note.emit(
+            self,
+            format!(
+                "mailbox message enqueued id={id} priority={priority} event_kind={} entity_uri={} category={} len={message_len}",
+                event_kind.unwrap_or("-"),
+                entity_uri.as_deref().unwrap_or("-"),
+                category.as_deref().unwrap_or("-"),
+            ),
+            serde_json::json!({
+                "message_id": id,
+                "priority": priority,
+                "event_kind": event_kind,
+                "entity_uri": entity_uri,
+                "category": category,
+                "message_len": message_len,
+            }),
+        );
     }
 
     /// Enqueue an error/failure mailbox message (RAL-502). Identical to
@@ -337,8 +440,38 @@ impl Store {
         entity_uri: Option<&str>,
         category: Option<&str>,
     ) -> Result<String> {
+        let id = self.enqueue_error_mailbox_message_unlogged(
+            priority,
+            message,
+            remediation,
+            squad_id,
+            task,
+            cell_id,
+            entity_uri,
+            category,
+        )?;
+        self.log_mailbox_enqueued(&id, None);
+        Ok(id)
+    }
+
+    /// [`Self::enqueue_error_mailbox_message`] (remediation still mandatory)
+    /// without its Cartographer row -- see
+    /// [`Self::enqueue_mailbox_message_unlogged`] for when a caller logs it
+    /// itself.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn enqueue_error_mailbox_message_unlogged(
+        &self,
+        priority: MailboxPriority,
+        message: &str,
+        remediation: &Remediation,
+        squad_id: Option<&str>,
+        task: Option<&str>,
+        cell_id: Option<&str>,
+        entity_uri: Option<&str>,
+        category: Option<&str>,
+    ) -> Result<String> {
         let full_message = format!("{message} {}", remediation.render());
-        self.enqueue_mailbox_message_ex(
+        self.enqueue_mailbox_message_unlogged(
             priority,
             &full_message,
             squad_id,
@@ -500,6 +633,7 @@ impl Store {
             )?;
             drained += n;
         }
+        self.log_mailbox_read_state("drained", "user", user_name, drained);
         Ok(drained)
     }
 
@@ -516,7 +650,7 @@ impl Store {
         user_name: &str,
         message_ids: Option<&[String]>,
     ) -> Result<usize> {
-        match message_ids {
+        let undrained = match message_ids {
             Some(ids) if !ids.is_empty() => {
                 let placeholders = std::iter::repeat_n("?", ids.len())
                     .collect::<Vec<_>>()
@@ -526,14 +660,16 @@ impl Store {
                 );
                 let mut bound: Vec<&dyn rusqlite::ToSql> = vec![&user_name];
                 bound.extend(ids.iter().map(|s| s as &dyn rusqlite::ToSql));
-                Ok(self.conn.execute(&sql, bound.as_slice())?)
+                self.conn.execute(&sql, bound.as_slice())?
             }
-            Some(_) => Ok(0),
-            None => Ok(self.conn.execute(
+            Some(_) => 0,
+            None => self.conn.execute(
                 "DELETE FROM user_mailbox_drains WHERE user_name = ?1",
                 params![user_name],
-            )?),
-        }
+            )?,
+        };
+        self.log_mailbox_read_state("undrained", "user", user_name, undrained);
+        Ok(undrained)
     }
 
     /// Revert previously-drained messages back to unread for `client_id`
@@ -549,7 +685,7 @@ impl Store {
         client_id: &str,
         message_ids: Option<&[String]>,
     ) -> Result<usize> {
-        match message_ids {
+        let undrained = match message_ids {
             Some(ids) if !ids.is_empty() => {
                 let placeholders = std::iter::repeat_n("?", ids.len())
                     .collect::<Vec<_>>()
@@ -559,14 +695,16 @@ impl Store {
                 );
                 let mut bound: Vec<&dyn rusqlite::ToSql> = vec![&client_id];
                 bound.extend(ids.iter().map(|s| s as &dyn rusqlite::ToSql));
-                Ok(self.conn.execute(&sql, bound.as_slice())?)
+                self.conn.execute(&sql, bound.as_slice())?
             }
-            Some(_) => Ok(0),
-            None => Ok(self.conn.execute(
+            Some(_) => 0,
+            None => self.conn.execute(
                 "DELETE FROM mailbox_drains WHERE client_id = ?1",
                 params![client_id],
-            )?),
-        }
+            )?,
+        };
+        self.log_mailbox_read_state("undrained", "client", client_id, undrained);
+        Ok(undrained)
     }
 
     /// Mark messages as drained (read) for `client_id`. `message_ids: None`
@@ -618,7 +756,28 @@ impl Store {
             )?;
             drained += n;
         }
+        self.log_mailbox_read_state("drained", "client", client_id, drained);
         Ok(drained)
+    }
+
+    /// Records a drain/undrain that changed at least one message's read
+    /// state for one broadcast client or personal-mailbox user.
+    fn log_mailbox_read_state(&self, action: &str, reader_kind: &str, reader: &str, count: usize) {
+        if count == 0 {
+            return;
+        }
+        crate::cartographer::Note::new("mailbox")
+            .scope("mailbox")
+            .emit(
+                self,
+                format!("mailbox messages {action} {reader_kind}={reader} count={count}"),
+                serde_json::json!({
+                    "action": action,
+                    "reader_kind": reader_kind,
+                    "reader": reader,
+                    "count": count,
+                }),
+            );
     }
 }
 

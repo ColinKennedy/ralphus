@@ -75,6 +75,13 @@ pub fn sync_commit_metadata_hook(workspace: &Workspace, add_coauthor: bool) -> R
     let dir = hooks_dir(workspace)?;
     let hook_path = dir.join("prepare-commit-msg");
     if workspace.read_file(&hook_path).is_some() && !is_ralphus_managed(workspace, &hook_path) {
+        // ralphus[ignore-rlog-pair]: hook installer has no Store and runs once per worktree resolution; caller owns structured outcomes
+        crate::rlog!(
+            DEBUG,
+            "ralphus [worktrees] leaving hand-authored prepare-commit-msg hook at {} untouched; \
+             commits there will not get the {CELL_TRAILER} trailer",
+            hook_path.display()
+        );
         return Ok(());
     }
     workspace.write_executable_file(&hook_path, &hook_script(add_coauthor))

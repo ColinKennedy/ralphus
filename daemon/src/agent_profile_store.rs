@@ -158,6 +158,41 @@ impl From<rusqlite::Error> for AgentProfileSaveError {
     }
 }
 
+/// Which env-var *names* a profile save adds, removes, or changes the
+/// kind/value of -- logged on save in place of the values themselves.
+struct EnvNameDiff {
+    added: Vec<String>,
+    removed: Vec<String>,
+    changed: Vec<String>,
+}
+
+impl EnvNameDiff {
+    fn between(previous: Option<&[AgentEnvEntry]>, next: &[AgentEnvEntry]) -> Self {
+        let previous = previous.unwrap_or_default();
+        let find =
+            |entries: &[AgentEnvEntry], key: &str| entries.iter().find(|e| e.key == key).cloned();
+        let mut added = Vec::new();
+        let mut changed = Vec::new();
+        for entry in next {
+            match find(previous, &entry.key) {
+                None => added.push(entry.key.clone()),
+                Some(old) if old != *entry => changed.push(entry.key.clone()),
+                Some(_) => {}
+            }
+        }
+        let removed = previous
+            .iter()
+            .filter(|e| find(next, &e.key).is_none())
+            .map(|e| e.key.clone())
+            .collect();
+        Self {
+            added,
+            removed,
+            changed,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn row_to_profile(
     name: String,
@@ -169,7 +204,14 @@ fn row_to_profile(
     created_at_ms: i64,
     updated_at_ms: i64,
 ) -> AgentProfileView {
-    let env: Vec<AgentEnvEntry> = serde_json::from_str(&env_json).unwrap_or_default();
+    let env: Vec<AgentEnvEntry> = serde_json::from_str(&env_json).unwrap_or_else(|e| {
+        // ralphus[ignore-rlog-pair]: row mapper runs inside a rusqlite query closure with no Store handle in scope
+        crate::rlog!(
+            WARNING,
+            "ralphus [store] agent profile {name:?} has an unreadable env_json ({e}); treating its env as empty"
+        );
+        Vec::new()
+    });
     AgentProfileView {
         name,
         backend,
@@ -320,6 +362,13 @@ impl Store {
             return Err(AgentProfileSaveError::Cycle(cycle));
         }
         let env_json = serde_json::to_string(&env).unwrap_or_else(|_| "[]".to_string());
+        let previous = self.get_agent_profile(name).ok().flatten();
+        let env_diff = EnvNameDiff::between(previous.as_ref().map(|p| p.env.as_slice()), &env);
+        let action = if previous.is_some() {
+            "updated"
+        } else {
+            "created"
+        };
         let now = now_ms();
         self.conn.execute(
             "INSERT INTO agent_profiles(name, backend, executable, model, env_json, thinking_capable, created_at_ms, updated_at_ms)
@@ -335,8 +384,12 @@ impl Store {
         )?;
         crate::rlog!(
             INFO,
-            "ralphus [store] agent profile {name:?} saved (backend={backend:?})"
+            "ralphus [store] agent profile {name:?} saved ({action}, backend={backend:?}) env_added={:?} env_removed={:?} env_changed={:?}",
+            env_diff.added,
+            env_diff.removed,
+            env_diff.changed
         );
+        // Env *names* only -- values may be literal secrets.
         let _ = self.cartographer_log(crate::cartographer::CartographerEntry {
             level: crate::logging::LogLevel::INFO,
             source: "store",
@@ -347,7 +400,15 @@ impl Store {
             cell_id: None,
             task: None,
             log_path: None,
-            payload: serde_json::json!({ "name": name, "backend": backend }),
+            payload: serde_json::json!({
+                "name": name,
+                "backend": backend,
+                "action": action,
+                "model": model,
+                "env_added": env_diff.added,
+                "env_removed": env_diff.removed,
+                "env_changed": env_diff.changed,
+            }),
             admin_only: true,
         });
         Ok(())

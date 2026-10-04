@@ -41,7 +41,15 @@ pub fn init(service_name: &'static str) -> Option<SdkTracerProvider> {
 
 pub fn shutdown(provider: Option<SdkTracerProvider>) {
     if let Some(provider) = provider {
-        let _ = provider.shutdown();
+        if let Err(e) = provider.shutdown() {
+            crate::cartographer::emit(
+                "runner",
+                "OpenTelemetry tracer shutdown failed",
+                "warning",
+                crate::cartographer::EventContext::default(),
+                serde_json::json!({"error": e.to_string()}),
+            );
+        }
     }
 }
 

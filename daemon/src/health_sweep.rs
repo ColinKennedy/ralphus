@@ -111,11 +111,24 @@ impl HealthSweepState {
             .clone()
     }
 
-    fn set(&self, report: SweepReport) {
+    /// Caches `report` as the latest sweep, returning the one it replaced.
+    fn set(&self, report: SweepReport) -> Option<SweepReport> {
         self.0
             .lock()
             .expect("health sweep state mutex poisoned")
-            .last = Some(report);
+            .last
+            .replace(report)
+    }
+
+    /// Caches `report` and logs every check whose status changed since the
+    /// previous sweep (or, on the first sweep, every non-passing check), so a
+    /// degraded or recovered dependency is recorded once on the transition
+    /// rather than on every hourly pass. Takes the store lock only for the
+    /// logging itself, after the probing in [`run_sweep`] has finished.
+    fn record(&self, store: &StoreHandle, report: SweepReport, trigger: &str) {
+        let previous = self.set(report.clone());
+        let store = store.lock();
+        log_transitions(&store, previous.as_ref(), &report, trigger);
     }
 
     /// Runs [`run_sweep`] immediately (rather than waiting for the next
@@ -129,9 +142,73 @@ impl HealthSweepState {
     /// check-now API shape" -- see RAL-416's own report).
     pub fn refresh_now(&self, store: &StoreHandle) -> SweepReport {
         let report = run_sweep(store);
-        self.set(report.clone());
+        self.record(store, report.clone(), "on-demand");
         report
     }
+}
+
+/// Emits one Cartographer row per check whose status differs from
+/// `previous` (a check absent from `previous` counts as changed only when it
+/// is not passing), plus a DEBUG summary of the whole pass.
+fn log_transitions(
+    store: &Store,
+    previous: Option<&SweepReport>,
+    report: &SweepReport,
+    trigger: &str,
+) {
+    for check in &report.checks {
+        let before = previous.and_then(|p| p.checks.iter().find(|c| c.id == check.id));
+        let old_status = before.map(|c| c.status);
+        if old_status == Some(check.status) || (old_status.is_none() && check.status == PASS) {
+            continue;
+        }
+        let level = match check.status {
+            FAIL => crate::logging::LogLevel::ERROR,
+            WARN => crate::logging::LogLevel::WARNING,
+            _ => crate::logging::LogLevel::INFO,
+        };
+        let from = old_status.unwrap_or("unknown");
+        crate::cartographer::Note::new("health")
+            .level(level)
+            .scope("daemon")
+            .emit(
+                store,
+                format!(
+                    "health check {} {from} → {} detail={}",
+                    check.id, check.status, check.detail
+                ),
+                serde_json::json!({
+                    "check": check.id,
+                    "old_status": from,
+                    "new_status": check.status,
+                    "detail": check.detail,
+                    "trigger": trigger,
+                }),
+            );
+    }
+    let count = |status: &str| report.checks.iter().filter(|c| c.status == status).count();
+    crate::cartographer::Note::new("health")
+        .level(crate::logging::LogLevel::DEBUG)
+        .scope("daemon")
+        .emit(
+            store,
+            format!(
+                "health sweep complete trigger={trigger} checks={} pass={} warn={} fail={} skip={}",
+                report.checks.len(),
+                count(PASS),
+                count(WARN),
+                count(FAIL),
+                count(SKIP)
+            ),
+            serde_json::json!({
+                "trigger": trigger,
+                "checks": report.checks.len(),
+                "pass": count(PASS),
+                "warn": count(WARN),
+                "fail": count(FAIL),
+                "skip": count(SKIP),
+            }),
+        );
 }
 
 fn now_ms() -> u128 {
@@ -325,9 +402,23 @@ fn check_ollama() -> SweepCheck {
 /// default. A short, read-only store access -- callers hold the lock only
 /// long enough to read this, never across the slower probing below.
 fn backend_command_override(store: &Store, backend: &str) -> Option<String> {
-    store
-        .list_agent_backend_commands()
-        .unwrap_or_default()
+    let commands = match store.list_agent_backend_commands() {
+        Ok(commands) => commands,
+        Err(e) => {
+            crate::cartographer::Note::new("health")
+                .level(crate::logging::LogLevel::WARNING)
+                .scope("daemon")
+                .emit(
+                    store,
+                    format!(
+                        "health sweep could not read agent backend command overrides backend={backend} error={e}; probing env/default command instead"
+                    ),
+                    serde_json::json!({ "backend": backend, "error": e.to_string() }),
+                );
+            Vec::new()
+        }
+    };
+    commands
         .into_iter()
         .find(|c| c.backend == backend)
         .map(|c| c.command)
@@ -586,7 +677,7 @@ pub fn run_sweep(store: &StoreHandle) -> SweepReport {
 /// `crate::scheduler`), so a freshly (re)started daemon has a report
 /// available immediately rather than waiting a full interval.
 pub fn spawn_health_sweep(state: HealthSweepState, store: StoreHandle) {
-    state.set(run_sweep(&store));
+    state.record(&store, run_sweep(&store), "startup");
     std::thread::spawn(move || {
         loop {
             let cfg = crate::config::load_health_sweep_config();
@@ -594,7 +685,8 @@ pub fn spawn_health_sweep(state: HealthSweepState, store: StoreHandle) {
             if !cfg.enabled() {
                 continue;
             }
-            state.set(run_sweep(&store));
+            let report = run_sweep(&store);
+            state.record(&store, report, "scheduled");
         }
     });
 }

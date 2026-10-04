@@ -214,7 +214,7 @@ impl Store {
                          automatically on the next poll"
                     ),
                 };
-                let _ = self.notify_watchers_with_remediation(
+                if let Err(e) = self.notify_watchers_with_remediation(
                     crate::monitor::NotifiableEventKind::ReviewFailed,
                     &format!("guardian:{target_key}"),
                     crate::mailbox::MailboxPriority::High,
@@ -223,7 +223,23 @@ impl Store {
                     None,
                     None,
                     None,
-                );
+                ) {
+                    crate::cartographer::Note::new("poller_health")
+                        .scope(kind.as_str())
+                        .guardian(target_key)
+                        .level(crate::logging::LogLevel::WARNING)
+                        .emit(
+                            self,
+                            format!(
+                                "failed to notify watchers that {} poll started failing for review {target_key}: {e}",
+                                kind.label()
+                            ),
+                            serde_json::json!({
+                                "poller_kind": kind.as_str(),
+                                "error": e.to_string(),
+                            }),
+                        );
+                }
             }
         }
         Ok(())
@@ -292,11 +308,53 @@ impl Store {
     /// # Errors
     /// Propagates any SQLite failure.
     pub fn clear_poller_health_for_guardian(&self, guardian_id: &str) -> Result<()> {
-        self.conn.execute(
+        let result = self.conn.execute(
             "DELETE FROM poller_health WHERE target_key=?1",
             rusqlite::params![guardian_id],
-        )?;
-        Ok(())
+        );
+        self.log_poller_health_clear(Some(guardian_id), result)
+    }
+
+    /// Logs the outcome of a poller-health reset: an INFO row with the count
+    /// when rows were cleared, a WARNING when the delete failed (several
+    /// callers discard the returned error, so this is where it is recorded).
+    fn log_poller_health_clear(
+        &self,
+        guardian_id: Option<&str>,
+        result: rusqlite::Result<usize>,
+    ) -> Result<()> {
+        let target = guardian_id.unwrap_or("all");
+        match result {
+            Ok(0) => Ok(()),
+            Ok(cleared) => {
+                let note = crate::cartographer::Note::new("poller_health").scope("poller_health");
+                let note = match guardian_id {
+                    Some(id) => note.guardian(id),
+                    None => note,
+                };
+                note.emit(
+                    self,
+                    format!("poller health reset target={target} cleared={cleared}"),
+                    serde_json::json!({ "target": target, "cleared": cleared }),
+                );
+                Ok(())
+            }
+            Err(e) => {
+                let note = crate::cartographer::Note::new("poller_health")
+                    .scope("poller_health")
+                    .level(crate::logging::LogLevel::WARNING);
+                let note = match guardian_id {
+                    Some(id) => note.guardian(id),
+                    None => note,
+                };
+                note.emit(
+                    self,
+                    format!("poller health reset failed target={target}: {e}"),
+                    serde_json::json!({ "target": target, "error": e.to_string() }),
+                );
+                Err(e.into())
+            }
+        }
     }
 
     /// Clear every poller-health row across every review (RAL-545) --
@@ -311,8 +369,8 @@ impl Store {
     /// # Errors
     /// Propagates any SQLite failure.
     pub fn clear_all_poller_health(&self) -> Result<()> {
-        self.conn.execute("DELETE FROM poller_health", [])?;
-        Ok(())
+        let result = self.conn.execute("DELETE FROM poller_health", []);
+        self.log_poller_health_clear(None, result)
     }
 }
 

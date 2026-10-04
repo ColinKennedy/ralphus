@@ -424,6 +424,15 @@ pub fn periodic_sweep(
     sweep_inner(store, cancellations, sem, SweepMode::DetectOnly, true)
 }
 
+/// A WARNING-level `ark` Cartographer row for a sweep step that failed and
+/// was skipped or defaulted rather than aborting the sweep.
+fn ark_warn(store: &Store, message: String, payload: serde_json::Value) {
+    crate::cartographer::Note::new("ark")
+        .level(crate::logging::LogLevel::WARNING)
+        .scope("ark")
+        .emit(store, message, payload);
+}
+
 fn sweep_inner(
     store: &crate::store_lock::StoreHandle,
     cancellations: &Cancellations,
@@ -431,19 +440,40 @@ fn sweep_inner(
     mode: SweepMode,
     only_due: bool,
 ) -> SweepReport {
-    let projects = store.lock().list_projects().unwrap_or_default();
+    let projects = {
+        let guard = store.lock();
+        match guard.list_projects() {
+            Ok(projects) => projects,
+            Err(e) => {
+                ark_warn(
+                    &guard,
+                    format!("Ark sweep could not list projects; sweeping none: {e}"),
+                    serde_json::json!({ "error": e.to_string() }),
+                );
+                Vec::new()
+            }
+        }
+    };
     let mut report = SweepReport::default();
     for project in projects.into_iter().filter(|p| p.vcs == "git") {
         let root = PathBuf::from(&project.path);
         let cfg = crate::config::load_ark_config(&root);
         if let Err(error) = cfg.validate() {
+            ark_warn(
+                &store.lock(),
+                format!(
+                    "Ark skipped project {} due to invalid [ark] config: {error}",
+                    project.name
+                ),
+                serde_json::json!({ "project": project.name, "error": error.to_string() }),
+            );
             report.skipped.push(format!("{}: {error}", project.name));
             continue;
         }
         if only_due {
             let due = {
                 let guard = store.lock();
-                let last: Option<i64> = guard
+                let last: Option<i64> = match guard
                     .conn
                     .query_row(
                         "SELECT swept_at_ms FROM ark_sweeps WHERE project_path=?1",
@@ -451,7 +481,20 @@ fn sweep_inner(
                         |row| row.get(0),
                     )
                     .optional()
-                    .unwrap_or(None);
+                {
+                    Ok(last) => last,
+                    Err(e) => {
+                        ark_warn(
+                            &guard,
+                            format!(
+                                "Ark could not read last sweep time for project {}; treating it as due: {e}",
+                                project.name
+                            ),
+                            serde_json::json!({ "project": project.name, "error": e.to_string() }),
+                        );
+                        None
+                    }
+                };
                 let interval_ms =
                     i64::try_from(cfg.sweep_interval().as_millis()).unwrap_or(i64::MAX);
                 last.is_none_or(|at| now_ms().saturating_sub(at) >= interval_ms)
@@ -462,36 +505,116 @@ fn sweep_inner(
         }
         let (snapshot, notified) = {
             let guard = store.lock();
-            (
-                store_snapshot(&guard, &root).ok(),
-                notify_old_reviews(&guard, &root, &cfg).unwrap_or(0),
-            )
+            let snapshot = match store_snapshot(&guard, &root) {
+                Ok(snapshot) => Some(snapshot),
+                Err(e) => {
+                    ark_warn(
+                        &guard,
+                        format!(
+                            "Ark could not snapshot reviews/squads for project {}; no stale worktrees detected this pass: {e}",
+                            project.name
+                        ),
+                        serde_json::json!({ "project": project.name, "error": e.to_string() }),
+                    );
+                    None
+                }
+            };
+            let notified = match notify_old_reviews(&guard, &root, &cfg) {
+                Ok(notified) => notified,
+                Err(e) => {
+                    ark_warn(
+                        &guard,
+                        format!(
+                            "Ark old-review notification failed for project {}: {e}",
+                            project.name
+                        ),
+                        serde_json::json!({ "project": project.name, "error": e.to_string() }),
+                    );
+                    0
+                }
+            };
+            (snapshot, notified)
         };
         // Git registry scans and remote probes can be slow. They deliberately
         // run after releasing the daemon's store mutex.
         let candidates = snapshot
             .map(|snapshot| detect_snapshot(snapshot, &root, &cfg))
             .unwrap_or_default();
-        let registered = registered_count(&root).unwrap_or(0);
+        let registered = match registered_count(&root) {
+            Ok(count) => count,
+            Err(e) => {
+                ark_warn(
+                    &store.lock(),
+                    format!(
+                        "Ark could not count registered worktrees for project {}; assuming 0: {e}",
+                        project.name
+                    ),
+                    serde_json::json!({ "project": project.name, "error": e }),
+                );
+                0
+            }
+        };
         report.registered += registered;
         report.stale += candidates.len();
         report.notified += notified;
         if only_due {
             let guard = store.lock();
-            let _ = guard.conn.execute(
+            if let Err(e) = guard.conn.execute(
                 "INSERT INTO ark_sweeps(project_path, swept_at_ms) VALUES(?1, ?2)
                  ON CONFLICT(project_path) DO UPDATE SET swept_at_ms=excluded.swept_at_ms",
                 params![project.path, now_ms()],
-            );
+            ) {
+                ark_warn(
+                    &guard,
+                    format!(
+                        "Ark could not record sweep time for project {}; it will be re-swept early: {e}",
+                        project.name
+                    ),
+                    serde_json::json!({ "project": project.name, "error": e.to_string() }),
+                );
+            }
         }
         if mode == SweepMode::Reap && registered > cfg.max_worktrees {
             let needed = registered - cfg.max_worktrees;
             for candidate in candidates.iter().take(needed) {
                 match reap(candidate, cancellations, sem) {
-                    Ok(_) => report.reaped += 1,
-                    Err(error) => report
-                        .skipped
-                        .push(format!("{}: {error}", candidate.worktree.display())),
+                    Ok(reaped) => {
+                        crate::cartographer::Note::new("ark").scope("ark").emit(
+                            &store.lock(),
+                            format!(
+                                "Ark reaped worktree {} owner={}:{} preserved_ref={}",
+                                candidate.worktree.display(),
+                                candidate.owner.kind(),
+                                candidate.owner.id(),
+                                reaped.preserved_ref
+                            ),
+                            serde_json::json!({
+                                "project": project.name,
+                                "worktree": candidate.worktree.display().to_string(),
+                                "owner_kind": candidate.owner.kind(),
+                                "owner_id": candidate.owner.id(),
+                                "preserved_ref": reaped.preserved_ref,
+                            }),
+                        );
+                        report.reaped += 1;
+                    }
+                    Err(error) => {
+                        ark_warn(
+                            &store.lock(),
+                            format!(
+                                "Ark skipped reaping worktree {}: {error}",
+                                candidate.worktree.display()
+                            ),
+                            serde_json::json!({
+                                "project": project.name,
+                                "worktree": candidate.worktree.display().to_string(),
+                                "error": error,
+                            }),
+                        );
+                        report
+                            .skipped
+                            .push(format!("{}: {error}", candidate.worktree.display()));
+                    }
                 }
             }
         }
@@ -509,6 +632,7 @@ fn sweep_inner(
                 "stale": report.stale,
                 "notified": report.notified,
                 "reaped": report.reaped,
+                "skipped": report.skipped.len(),
                 "mode": format!("{mode:?}"),
             }),
         );

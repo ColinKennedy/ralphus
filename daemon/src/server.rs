@@ -2320,7 +2320,20 @@ fn route_with_trace_for_user(
             extract_squad_id(&reply.body),
             crate::otel::traceparent_from_context(&span.cx),
         ) {
-            let _ = daemon.lock().set_squad_trace_context(&squad_id, &tp);
+            let guard = daemon.lock();
+            if let Err(e) = guard.set_squad_trace_context(&squad_id, &tp) {
+                crate::cartographer::Note::new("http")
+                    .level(crate::logging::LogLevel::WARNING)
+                    .scope("squad")
+                    .squad(&squad_id)
+                    .emit(
+                        &guard,
+                        format!(
+                            "could not persist trace context onto squad {squad_id}; its scheduled execution will start a new trace: {e}"
+                        ),
+                        serde_json::json!({ "error": e.to_string() }),
+                    );
+            }
         }
     }
 
@@ -12568,14 +12581,23 @@ fn shutdown(daemon: &Daemon, body: &str) -> Reply {
 
     daemon.cancellations.cancel_all();
 
-    let squads = daemon.lock().list_squads().unwrap_or_default();
+    // Store failures here never block the shutdown itself; they are collected
+    // so the shutdown record says which squads/reviews were left untouched.
+    let mut failures: Vec<String> = Vec::new();
+    let squads = daemon.lock().list_squads().unwrap_or_else(|e| {
+        failures.push(format!("list squads: {e}"));
+        Vec::new()
+    });
     // Shutdown only needs guardian ids here. The full view hydrates project
     // configuration and walks each git root; an unavailable/stale root must
     // not prevent an otherwise valid auto-cancel from reaching that review.
     let guardians = daemon
         .lock()
         .list_guardian_status_pairs()
-        .unwrap_or_default();
+        .unwrap_or_else(|e| {
+            failures.push(format!("list reviews: {e}"));
+            Vec::new()
+        });
     let tmux_killed: usize = squads
         .iter()
         .map(|r| kill_squad_tmux_sessions(&r.id))
@@ -12594,17 +12616,26 @@ fn shutdown(daemon: &Daemon, body: &str) -> Reply {
             .map(|r| r.id)
             .collect();
         for id in active_squad_ids {
-            if let Ok(impact) = daemon.lock().cancel_squad(&id, false) {
-                for r in &impact.squads {
-                    daemon.cancellations.cancel(&r.id);
+            let cancelled = daemon.lock().cancel_squad(&id, false);
+            match cancelled {
+                Ok(impact) => {
+                    for r in &impact.squads {
+                        daemon.cancellations.cancel(&r.id);
+                    }
+                    cancelled_squads.extend(impact.squads.into_iter().map(|r| r.id));
                 }
-                cancelled_squads.extend(impact.squads.into_iter().map(|r| r.id));
+                Err(e) => failures.push(format!("cancel squad {id}: {e}")),
             }
         }
 
-        for (id, _status) in guardians {
-            if daemon.lock().cancel_guardian(&id).is_ok() {
-                cancelled_guardians.push(id);
+        for (id, status) in guardians {
+            let cancelled = daemon.lock().cancel_guardian(&id);
+            match cancelled {
+                Ok(_) => cancelled_guardians.push(id),
+                // A review already in a terminal status is expected to refuse
+                // cancellation; only other failures are worth reporting.
+                Err(StoreError::InvalidTransition(_)) => {}
+                Err(e) => failures.push(format!("cancel review {id} ({status}): {e}")),
             }
         }
     }
@@ -12626,17 +12657,22 @@ fn shutdown(daemon: &Daemon, body: &str) -> Reply {
                 "tmux_killed": tmux_killed,
                 "cancelled_squads": cancelled_squads.len(),
                 "cancelled_guardians": cancelled_guardians.len(),
+                "failures": failures,
             }),
             admin_only: false,
         });
     crate::rlog!(
         WARNING,
         "ralphus [daemon] shutdown requested: auto_cancel={} tmux_killed={tmux_killed} \
-         cancelled_squads={} cancelled_guardians={}",
+         cancelled_squads={} cancelled_guardians={} failures={}",
         req.auto_cancel,
         cancelled_squads.len(),
-        cancelled_guardians.len()
+        cancelled_guardians.len(),
+        failures.len()
     );
+    for failure in &failures {
+        crate::rlog!(WARNING, "ralphus [daemon] shutdown: {failure}");
+    }
 
     daemon.request_shutdown();
     json(
@@ -18619,8 +18655,27 @@ pub fn serve<A: ToSocketAddrs>(
     // manual-checks generation) to the independent worker; in-process tests
     // keep synchronous merges so their assertions stay hermetic.
     crate::guardian_merge::enable_post_merge_spawning();
-    let store = Store::open(db_path).map_err(|e| std::io::Error::other(e.to_string()))?;
+    let store = Store::open(db_path).map_err(|e| {
+        // ralphus[ignore-rlog-pair]: the store failed to open, so there is no database to record this in
+        crate::rlog!(
+            ERROR,
+            "ralphus [daemon] could not open the store at {}: {e}",
+            db_path.display()
+        );
+        std::io::Error::other(e.to_string())
+    })?;
     let schema_open_ms = startup_started.elapsed().as_millis();
+    crate::cartographer::Note::new("daemon").emit(
+        &store,
+        format!(
+            "store opened at {} (schema ready in {schema_open_ms}ms)",
+            db_path.display()
+        ),
+        serde_json::json!({
+            "db_path": db_path.display().to_string(),
+            "schema_open_ms": schema_open_ms,
+        }),
+    );
     // RAL-332: apply `[daemon].default_user_is_admin` before serving any
     // request, so `GET /api/whoami` reflects it on the very first poll.
     bootstrap_default_user_admin(&store);
@@ -18632,7 +18687,24 @@ pub fn serve<A: ToSocketAddrs>(
     // stomp the live daemon's in-flight `running` rows to `pending` before
     // failing here on the bind, corrupting state without ever serving a
     // request. Binding first makes that race fail closed instead.
-    let server = tiny_http::Server::http(addr).map_err(|e| std::io::Error::other(e.to_string()))?;
+    let server = match tiny_http::Server::http(addr) {
+        Ok(server) => server,
+        Err(e) => {
+            crate::cartographer::Note::new("daemon")
+                .level(crate::logging::LogLevel::ERROR)
+                .emit(
+                    &store,
+                    format!("could not bind the HTTP listener: {e}"),
+                    serde_json::json!({ "error": e.to_string() }),
+                );
+            return Err(std::io::Error::other(e.to_string()));
+        }
+    };
+    crate::cartographer::Note::new("daemon").emit(
+        &store,
+        format!("HTTP listener bound on {}", server.server_addr()),
+        serde_json::json!({ "addr": server.server_addr().to_string() }),
+    );
     // Crash recovery before anything schedules: a previous unclean shutdown may
     // have left squads `Running` with no worker. Reset them to `Pending` so the
     // scheduler resumes them; finished cells are preserved and skipped, so
@@ -18892,17 +18964,47 @@ pub fn serve<A: ToSocketAddrs>(
     // `crate::watchdog`'s module doc comment for what the unwatched failure
     // looked like.
     crate::watchdog::spawn(daemon.store_handle(), daemon.watchdog_handle());
+    let scheduler_store = daemon.store_handle();
     std::thread::spawn(move || {
-        crate::scheduler::run_loop(
-            handle,
-            runner,
-            cancellations,
-            waypoint_halts,
-            sem,
-            summary_queue,
-            procs,
-        );
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::scheduler::run_loop(
+                handle,
+                runner,
+                cancellations,
+                waypoint_halts,
+                sem,
+                summary_queue,
+                procs,
+            );
+        }));
+        // `run_loop` never returns while the daemon is healthy, so either way
+        // out means no further squads will be scheduled by this process.
+        let reason = match &outcome {
+            Ok(()) => "returned".to_string(),
+            Err(payload) => format!("panicked: {}", panic_payload_message(payload.as_ref())),
+        };
+        crate::cartographer::Note::new("scheduler")
+            .level(crate::logging::LogLevel::ERROR)
+            .emit(
+                &scheduler_store.lock(),
+                format!("scheduler thread {reason}; no further squads will be scheduled until the daemon restarts"),
+                serde_json::json!({ "reason": reason }),
+            );
+        if let Err(payload) = outcome {
+            std::panic::resume_unwind(payload);
+        }
     });
+    crate::cartographer::Note::new("daemon").emit(
+        &daemon.lock(),
+        format!(
+            "background workers and scheduler thread started (max_concurrent={max_concurrent}, read_workers={READ_WORKERS}, write_workers={WRITE_WORKERS})"
+        ),
+        serde_json::json!({
+            "max_concurrent": max_concurrent,
+            "read_workers": READ_WORKERS,
+            "write_workers": WRITE_WORKERS,
+        }),
+    );
 
     // tiny_http 0.12 treats any accept() error as fatal: its accept thread
     // reports the error via the `log` crate (no logger is installed here, so
@@ -18947,7 +19049,24 @@ pub fn serve<A: ToSocketAddrs>(
             }
         }
     }
+    crate::cartographer::Note::new("daemon").emit(
+        &daemon.lock(),
+        format!(
+            "HTTP loop stopped after shutdown request; daemon exiting after {}s",
+            startup_started.elapsed().as_secs()
+        ),
+        serde_json::json!({ "uptime_secs": startup_started.elapsed().as_secs() }),
+    );
     Ok(())
+}
+
+/// The message a panic was raised with, when it is a string.
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_string())
 }
 
 /// Re-create the HTTP listener after tiny_http's accept thread died (see the
@@ -19153,6 +19272,8 @@ struct PendingRequest {
     traceparent: Option<String>,
     auth_header: Option<String>,
     user_header: Option<String>,
+    /// The peer's socket address, kept only for logging auth failures.
+    remote_addr: Option<String>,
     /// WS-D.5: the board's conditional-GET validator, if it sent one — see
     /// [`body_etag`].
     if_none_match: Option<String>,
@@ -19197,15 +19318,30 @@ impl ReadPool {
             let rx = Arc::clone(&rx);
             let daemon = Arc::clone(daemon);
             std::thread::spawn(move || {
-                loop {
-                    // The guard is dropped as this `let` statement ends, so
-                    // exactly one idle worker blocks in `recv()` at a time
-                    // and the rest are free the instant it takes a job.
-                    let job = rx.lock().expect("read pool mutex poisoned").recv();
-                    match job {
-                        Ok(pending) => answer_request(&daemon, pending),
-                        Err(_) => break,
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    loop {
+                        // The guard is dropped as this `let` statement ends, so
+                        // exactly one idle worker blocks in `recv()` at a time
+                        // and the rest are free the instant it takes a job.
+                        let job = rx.lock().expect("read pool mutex poisoned").recv();
+                        match job {
+                            Ok(pending) => answer_request(&daemon, pending),
+                            Err(_) => break,
+                        }
                     }
+                }));
+                // A panicking handler takes its worker thread with it; the
+                // pool keeps serving on the rest (and inline once none remain).
+                if let Err(payload) = outcome {
+                    let message = panic_payload_message(payload.as_ref());
+                    crate::cartographer::Note::new("http")
+                        .level(crate::logging::LogLevel::ERROR)
+                        .emit(
+                            &daemon.lock(),
+                            format!("HTTP worker thread panicked and exited: {message}"),
+                            serde_json::json!({ "panic": message }),
+                        );
+                    std::panic::resume_unwind(payload);
                 }
             });
         }
@@ -19234,6 +19370,7 @@ fn answer_request(daemon: &Daemon, pending: PendingRequest) {
         traceparent,
         auth_header,
         user_header,
+        remote_addr,
         if_none_match,
         cors,
         accepted_at,
@@ -19268,6 +19405,10 @@ fn answer_request(daemon: &Daemon, pending: PendingRequest) {
     };
     let handler_ms = handler_started.elapsed().as_millis();
     let lock_wait_ms = crate::store_lock::take_request_lock_wait_ms();
+    let handler_status = reply.status;
+    // Only a failure's body is kept past the response: it carries the
+    // `{error:{code,message}}` reason `log_request_outcome` records below.
+    let failure_body = (handler_status >= 400).then(|| reply.body.clone());
     let mut status = reply.status;
     let server_timing = reply.server_timing;
     // WS-D.5: conditional GET. Only for a successful read -- a mutation's
@@ -19300,7 +19441,24 @@ fn answer_request(daemon: &Daemon, pending: PendingRequest) {
             response = response.with_header(h);
         }
     }
-    let _ = request.respond(response);
+    if let Err(e) = request.respond(response) {
+        // ralphus[ignore-rlog-pair]: client disconnects are transport noise; the handler already recorded any state change
+        crate::rlog!(
+            DEBUG,
+            "ralphus [http] {method} {url} -> {status}: response not delivered ({e})"
+        );
+    }
+    log_request_outcome(
+        daemon,
+        &RequestOutcome {
+            method: &method,
+            url: &url,
+            user: user_header.as_deref(),
+            remote_addr: remote_addr.as_deref(),
+            status: handler_status,
+            failure_body: failure_body.as_deref(),
+        },
+    );
     // Logged after responding so the measurement never adds to the latency it
     // measures. Deliberately `rlog!`-only rather than a Cartographer row:
     // every Cartographer write publishes an SSE event, the board refreshes on
@@ -19311,12 +19469,318 @@ fn answer_request(daemon: &Daemon, pending: PendingRequest) {
             WARNING,
             "ralphus [http] {method} {url} -> {status} SLOW: handler {handler_ms}ms (queued {queued_ms}ms, lock_wait {lock_wait_ms}ms)"
         );
-    } else {
+    } else if method == "GET" {
         crate::rlog!(
             DEBUG,
             "ralphus [http] {method} {url} -> {status} ({handler_ms}ms, queued {queued_ms}ms, lock_wait {lock_wait_ms}ms)"
         );
+    } else {
+        // A mutating request is a user or client action, so it is kept at the
+        // default log level; reads stay at DEBUG because the board polls them.
+        crate::rlog!(
+            INFO,
+            "ralphus [http] {method} {url} -> {status} ({handler_ms}ms, queued {queued_ms}ms, lock_wait {lock_wait_ms}ms)"
+        );
     }
+}
+
+/// Minimum gap between two log lines for the same failing request shape --
+/// see [`failure_log_permit`].
+const FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Upper bound on the distinct keys [`failure_log_permit`] remembers, so a
+/// caller cycling through unique paths cannot grow the map without limit.
+const FAILURE_LOG_MAX_KEYS: usize = 1024;
+
+/// Longest error message copied into a failure log line or row.
+const FAILURE_LOG_MAX_MESSAGE_CHARS: usize = 500;
+
+/// Rate-limits request-failure logging per `key`: returns `Some(suppressed)`
+/// when a line may be written now (`suppressed` counts the repeats dropped
+/// since the previous one) and `None` while `key` is still inside
+/// [`FAILURE_LOG_INTERVAL`].
+///
+/// A board poll that keeps failing, or a client retrying with a stale token,
+/// would otherwise write one line per attempt; and a Cartographer row
+/// publishes an SSE event that makes the board refresh, so an unbounded row
+/// per failed request could feed itself.
+fn failure_log_permit(key: &str) -> Option<u64> {
+    static LAST: std::sync::OnceLock<Mutex<std::collections::HashMap<String, (Instant, u64)>>> =
+        std::sync::OnceLock::new();
+    let mut seen = LAST
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let now = Instant::now();
+    if let Some((last, suppressed)) = seen.get_mut(key) {
+        if now.duration_since(*last) < FAILURE_LOG_INTERVAL {
+            *suppressed += 1;
+            return None;
+        }
+        let dropped = *suppressed;
+        *last = now;
+        *suppressed = 0;
+        return Some(dropped);
+    }
+    if seen.len() >= FAILURE_LOG_MAX_KEYS {
+        seen.retain(|_, (last, _)| now.duration_since(*last) < FAILURE_LOG_INTERVAL);
+        if seen.len() >= FAILURE_LOG_MAX_KEYS {
+            seen.clear();
+        }
+    }
+    seen.insert(key.to_string(), (now, 0));
+    Some(0)
+}
+
+/// `" (N similar suppressed)"` when [`failure_log_permit`] dropped repeats.
+fn suppressed_suffix(suppressed: u64) -> String {
+    if suppressed == 0 {
+        String::new()
+    } else {
+        format!(" ({suppressed} similar suppressed)")
+    }
+}
+
+/// The `code`, redacted and length-capped `message`, and validation-detail
+/// summaries from an [`ErrorEnvelope`] body. A body that is not an error
+/// envelope yields an empty code and message.
+fn error_reason(body: &str) -> (String, String, Vec<String>) {
+    let parsed: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+    let err = &parsed["error"];
+    let code = err["code"].as_str().unwrap_or_default().to_string();
+    let message = crate::redact::redact_all(err["message"].as_str().unwrap_or_default());
+    let message: String = message
+        .chars()
+        .take(FAILURE_LOG_MAX_MESSAGE_CHARS)
+        .collect();
+    let details = err["details"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .take(5)
+                .map(|d| {
+                    let line = d["line"]
+                        .as_u64()
+                        .map_or_else(String::new, |l| format!(" (line {l})"));
+                    let text = crate::redact::redact_all(d["message"].as_str().unwrap_or_default());
+                    let text: String = text.chars().take(200).collect();
+                    format!("{}{line}: {text}", d["path"].as_str().unwrap_or_default())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    (code, message, details)
+}
+
+/// The squad or guardian a request path addresses, for attaching a log row to
+/// it: `/api/squads/{id}/...` and `/api/guardians/{id}/...` (excluding the
+/// guardian batch endpoints, whose third segment is not an id).
+fn path_entity<'a>(segs: &[&'a str]) -> (Option<&'a str>, Option<&'a str>) {
+    match segs {
+        ["api", "squads", id, ..] if id.starts_with("squad-") => (Some(id), None),
+        ["api", "guardians", id, ..] if !matches!(*id, "merge-batch" | "delete-batch") => {
+            (None, Some(id))
+        }
+        _ => (None, None),
+    }
+}
+
+/// Names the manual action a successful mutating request performed, for the
+/// user-facing routes whose handlers record no Cartographer row of their own,
+/// or whose downstream state rows do not say a person asked for the change.
+/// `None` for every other route -- in particular high-frequency client
+/// traffic (mailbox drains, SSE/terminal tickets, previews, checks), which is
+/// already in the text log via `answer_request`'s per-request line.
+fn manual_action_label(method: &str, segs: &[&str]) -> Option<&'static str> {
+    let label = match (method, segs) {
+        ("DELETE", ["api", "squads", _]) => "delete squad",
+        ("POST", ["api", "squads", _, "cancel"]) => "cancel squad",
+        ("POST", ["api", "squads", _, "retry"]) => "retry squad",
+        ("POST", ["api", "squads", _, "restart"]) => "restart squad",
+        ("POST", ["api", "squads", _, "activate"]) => "activate squad",
+        ("POST", ["api", "squads", _, "set-status"]) => "set squad status",
+        ("POST", ["api", "squads", _, "edit"]) => "edit squad",
+        ("POST", ["api", "squads", _, "tasks", _, "restart"]) => "restart task",
+        ("POST", ["api", "squads", _, "cells", _, _, "restart"]) => "restart cell",
+        ("POST", ["api", "squads", _, "cells", _, _, "proof", _, "restart"])
+        | ("POST", ["api", "squads", _, "tasks", _, "proof", _, "restart"]) => "restart proof",
+        ("POST", ["api", "clear"]) => "clear squads and reviews",
+        ("DELETE", ["api", "guardians", _]) => "delete review",
+        ("POST", ["api", "guardians", "delete-batch"]) => "delete reviews (batch)",
+        ("POST", ["api", "guardians", "merge-batch"]) => "merge reviews (batch)",
+        ("POST", ["api", "guardians", _, action]) => match *action {
+            "rename" => "rename review",
+            "approve" => "approve review",
+            "cancel" => "cancel review",
+            "stop" => "stop review merge",
+            "reopen" => "reopen review",
+            "merge" => "merge review",
+            "rebuild" => "rebuild review",
+            "force_start" => "force-start review",
+            "cancel_and_merge" => "cancel and re-merge review",
+            _ => return None,
+        },
+        ("POST" | "PATCH", ["api", "agent-profiles", ..]) => "save agent profile",
+        ("DELETE", ["api", "agent-profiles", _]) => "delete agent profile",
+        ("POST", ["api", "agent-backend-commands", _]) => "set agent backend command",
+        ("DELETE", ["api", "agent-backend-commands", _]) => "reset agent backend command",
+        ("POST", ["api", "users", _, "forge-tokens"]) => "save forge token",
+        ("DELETE", ["api", "users", _, "forge-tokens", _]) => "remove forge token",
+        ("POST", ["api", "projects"]) => "register project",
+        ("POST", ["api", "machines"]) => "register machine",
+        ("DELETE", ["api", "machines", _]) => "deregister machine",
+        ("POST", ["api", "triage", "types"]) => "register triage type",
+        ("DELETE", ["api", "triage", "types", _]) => "deregister triage type",
+        ("POST", ["api", "triage", "schedules"]) => "add triage schedule",
+        ("DELETE", ["api", "triage", "schedules", _]) => "remove triage schedule",
+        _ => return None,
+    };
+    Some(label)
+}
+
+/// What [`log_request_outcome`] needs to know about one answered request.
+struct RequestOutcome<'a> {
+    method: &'a str,
+    /// The request URL; only its path (never the query string) is logged.
+    url: &'a str,
+    /// The caller-claimed `X-Ralphus-User`, if any.
+    user: Option<&'a str>,
+    remote_addr: Option<&'a str>,
+    /// The handler's status, before any `304 Not Modified` substitution.
+    status: u16,
+    /// The reply body when `status >= 400`.
+    failure_body: Option<&'a str>,
+}
+
+/// Records why a request failed, and which manual action a successful one
+/// performed, after `answer_request` has responded. Never logs the request
+/// body, query string, or headers.
+///
+/// - Failed mutating requests write a Cartographer row (WARNING for 4xx,
+///   ERROR for 5xx), rate-limited by [`failure_log_permit`]; a `401` is keyed
+///   by remote address.
+/// - Failed `GET`s (`401`s included) are text-only: a row publishes an SSE
+///   event and the board answers events by re-polling, so a row per failing
+///   poll would feed itself; and `GET`s are served by read-pool workers,
+///   which must never wait on the store lock (see
+///   `read_resolve_worktree_credential`).
+/// - Successful requests matching [`manual_action_label`] write one INFO row.
+///
+/// Must be called with no store guard held -- it takes the store lock itself.
+fn log_request_outcome(daemon: &Daemon, outcome: &RequestOutcome<'_>) {
+    let RequestOutcome {
+        method,
+        url,
+        user,
+        remote_addr,
+        status,
+        failure_body,
+    } = *outcome;
+    let path = url.split('?').next().unwrap_or(url);
+    let segs: Vec<&str> = path.trim_matches('/').split('/').collect();
+    let (squad, guardian) = path_entity(&segs);
+    // Rows naming a user's own settings, or another user's account, stay
+    // admin-only for the same reason RAL-332's hide/visit rows do.
+    let admin_only = matches!(
+        segs.as_slice(),
+        ["api", "users", ..] | ["api", "hidden", ..]
+    );
+    let remote = remote_addr.unwrap_or("unknown");
+    let user_label = user.unwrap_or("-");
+
+    if status < 400 {
+        let Some(action) = manual_action_label(method, &segs) else {
+            return;
+        };
+        let mut note = crate::cartographer::Note::new("http");
+        if let Some(id) = squad {
+            note = note.scope("squad").squad(id);
+        } else if let Some(id) = guardian {
+            note = note.scope("guardian").guardian(id);
+        }
+        if admin_only {
+            note = note.admin_only();
+        }
+        note.emit(
+            &daemon.lock(),
+            format!("user action: {action} ({method} {path} -> {status}, user {user_label})"),
+            serde_json::json!({
+                "action": action,
+                "method": method,
+                "path": path,
+                "status": status,
+                "user": user,
+            }),
+        );
+        return;
+    }
+
+    let (code, message, details) = error_reason(failure_body.unwrap_or_default());
+    let key = if status == 401 {
+        format!("401 {remote}")
+    } else {
+        format!("{method} {path} {status}")
+    };
+    let Some(suppressed) = failure_log_permit(&key) else {
+        return;
+    };
+    let details_suffix = if details.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", details.join("; "))
+    };
+    let auth_suffix = if matches!(status, 401 | 403) {
+        format!(" (remote {remote}, user {user_label})")
+    } else {
+        String::new()
+    };
+    let line = format!(
+        "{method} {path} rejected {status} {code}: {message}{details_suffix}{auth_suffix}{}",
+        suppressed_suffix(suppressed)
+    );
+    if method == "GET" {
+        if status >= 500 {
+            // ralphus[ignore-rlog-pair]: a row per failing poll would publish an SSE event that triggers the next poll
+            crate::rlog!(ERROR, "ralphus [http] {line}");
+        } else if matches!(status, 401 | 403) {
+            // ralphus[ignore-rlog-pair]: read-pool workers must never wait on the store lock to write a row
+            crate::rlog!(WARNING, "ralphus [http] {line}");
+        } else {
+            // ralphus[ignore-rlog-pair]: a row per failing poll would publish an SSE event that triggers the next poll
+            crate::rlog!(INFO, "ralphus [http] {line}");
+        }
+        return;
+    }
+    let level = if status >= 500 {
+        crate::logging::LogLevel::ERROR
+    } else {
+        crate::logging::LogLevel::WARNING
+    };
+    let mut note = crate::cartographer::Note::new("http").level(level);
+    if let Some(id) = squad {
+        note = note.scope("squad").squad(id);
+    } else if let Some(id) = guardian {
+        note = note.scope("guardian").guardian(id);
+    }
+    if admin_only {
+        note = note.admin_only();
+    }
+    note.emit(
+        &daemon.lock(),
+        line,
+        serde_json::json!({
+            "method": method,
+            "path": path,
+            "status": status,
+            "code": code,
+            "message": message,
+            "details": details,
+            "user": user,
+            "remote_addr": remote_addr,
+            "suppressed": suppressed,
+        }),
+    );
 }
 
 /// Why [`run_http_loop`] stopped serving.
@@ -19400,6 +19864,17 @@ fn run_http_loop(server: tiny_http::Server, daemon: &Arc<Daemon>) -> HttpLoopEnd
             let query = url.split_once('?').map_or("", |(_, q)| q);
             let ticket = query_param(query, "ticket").map(url_decode);
             if !daemon.consume_events_ticket(ticket.as_deref()) {
+                let remote = request
+                    .remote_addr()
+                    .map_or_else(|| "unknown".to_string(), ToString::to_string);
+                if let Some(suppressed) = failure_log_permit(&format!("events-ticket {remote}")) {
+                    // ralphus[ignore-rlog-pair]: the accept loop must never wait on the store lock, so this auth rejection stays text-only
+                    crate::rlog!(
+                        WARNING,
+                        "ralphus [http] GET {EVENTS_PATH} rejected 401: missing or invalid events ticket (remote {remote}){}",
+                        suppressed_suffix(suppressed)
+                    );
+                }
                 let header =
                     tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
                         .expect("valid header");
@@ -19436,9 +19911,18 @@ fn run_http_loop(server: tiny_http::Server, daemon: &Arc<Daemon>) -> HttpLoopEnd
         let auth_header = header_value(&request, "Authorization");
         let user_header = header_value(&request, "X-Ralphus-User");
         let if_none_match = header_value(&request, "If-None-Match");
+        let remote_addr = request.remote_addr().map(ToString::to_string);
 
         let mut body = String::new();
-        let _ = request.as_reader().read_to_string(&mut body);
+        if let Err(e) = request.as_reader().read_to_string(&mut body) {
+            // ralphus[ignore-rlog-pair]: the accept loop must never wait on the store lock; the handler's own rejection of the truncated body is recorded downstream
+            crate::rlog!(
+                WARNING,
+                "ralphus [http] {method} {} request body could not be read in full ({e}); handling what was read ({} bytes)",
+                url.split('?').next().unwrap_or(&url),
+                body.len()
+            );
+        }
 
         let pending = PendingRequest {
             request,
@@ -19448,6 +19932,7 @@ fn run_http_loop(server: tiny_http::Server, daemon: &Arc<Daemon>) -> HttpLoopEnd
             traceparent,
             auth_header,
             user_header,
+            remote_addr,
             if_none_match,
             cors,
             accepted_at: Instant::now(),
@@ -20526,6 +21011,104 @@ mod tests {
         // No squad exists at all, so looking one up is a NotFound error rather
         // than a panic — this just confirms the non-submit path is a no-op.
         assert!(d.lock().squad_trace_context("squad-000000000001").is_err());
+    }
+
+    // ── request outcome logging ─────────────────────────────────────────────
+
+    fn http_rows(d: &Daemon) -> Vec<crate::cartographer::CartographerRow> {
+        d.lock()
+            .cartographer_query(&crate::cartographer::CartographerFilter {
+                source: Some("http".to_string()),
+                limit: 50,
+                ..crate::cartographer::CartographerFilter::default()
+            })
+            .unwrap()
+            .rows
+    }
+
+    #[test]
+    fn failure_log_permit_suppresses_repeats_within_the_interval() {
+        let key = "test-key-failure-log-permit";
+        assert_eq!(failure_log_permit(key), Some(0));
+        assert_eq!(failure_log_permit(key), None);
+        assert_eq!(failure_log_permit(key), None);
+    }
+
+    #[test]
+    fn rejected_mutation_records_its_reason_without_the_body() {
+        let d = daemon();
+        let reply = route(&d, "POST", "/api/squads/squad-logtest000001/cancel", "");
+        assert_eq!(reply.status, 404);
+        log_request_outcome(
+            &d,
+            &RequestOutcome {
+                method: "POST",
+                url: "/api/squads/squad-logtest000001/cancel?user=alice",
+                user: Some("alice"),
+                remote_addr: Some("127.0.0.1:5000"),
+                status: reply.status,
+                failure_body: Some(&reply.body),
+            },
+        );
+        let rows = http_rows(&d);
+        let row = rows
+            .iter()
+            .find(|r| r.message.contains("rejected 404"))
+            .expect("a rejection row");
+        assert_eq!(row.level, "warning");
+        assert_eq!(row.squad_id.as_deref(), Some("squad-logtest000001"));
+        assert!(row.message.contains("not_found"), "{}", row.message);
+        assert!(!row.message.contains("user=alice"), "query string leaked");
+    }
+
+    #[test]
+    fn failed_get_writes_no_row() {
+        let d = daemon();
+        log_request_outcome(
+            &d,
+            &RequestOutcome {
+                method: "GET",
+                url: "/api/squads/squad-logtest000002",
+                user: None,
+                remote_addr: None,
+                status: 404,
+                failure_body: Some(r#"{"error":{"code":"not_found","message":"x"}}"#),
+            },
+        );
+        assert!(http_rows(&d).is_empty());
+    }
+
+    #[test]
+    fn successful_manual_action_records_who_asked() {
+        let d = daemon();
+        log_request_outcome(
+            &d,
+            &RequestOutcome {
+                method: "DELETE",
+                url: "/api/squads/squad-logtest000003",
+                user: Some("bob"),
+                remote_addr: None,
+                status: 200,
+                failure_body: None,
+            },
+        );
+        let rows = http_rows(&d);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].message.contains("user action: delete squad"));
+        assert!(rows[0].message.contains("user bob"));
+        // A non-allowlisted mutation (e.g. a mailbox drain) writes nothing.
+        log_request_outcome(
+            &d,
+            &RequestOutcome {
+                method: "POST",
+                url: "/api/mailbox/personal/drain",
+                user: Some("bob"),
+                remote_addr: None,
+                status: 200,
+                failure_body: None,
+            },
+        );
+        assert_eq!(http_rows(&d).len(), 1);
     }
 
     // ── RAL-219: bearer-token auth ──────────────────────────────────────────

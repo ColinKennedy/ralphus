@@ -146,6 +146,27 @@ pub fn run_command_with_remediation(
             result.error = Some(combine_exhaustion_diagnostics(&result, repair));
         }
     }
+    if attempt > 1 {
+        let outcome = if result.is_done() {
+            "recovered"
+        } else if cancel.is_cancelled() {
+            "cancelled"
+        } else {
+            "exhausted"
+        };
+        let line = format!(
+            "ralphus [remediation] squad={} task={} cell={} retry loop {outcome} after \
+             {attempt}/{total_attempts} command attempt(s)",
+            command_spec.squad_id, command_spec.task, command_spec.cell_id,
+        );
+        if result.is_done() {
+            // ralphus[ignore-rlog-pair]: low-level retry-loop helper with no Store; scheduler records structured cell state
+            crate::rlog!(INFO, "{line}");
+        } else {
+            // ralphus[ignore-rlog-pair]: low-level retry-loop helper with no Store; scheduler records structured cell state
+            crate::rlog!(WARNING, "{line}");
+        }
+    }
     result
 }
 
@@ -252,7 +273,18 @@ pub(crate) fn restore_worktree_before_repair(
 /// leftover snapshot directory is disk-space clutter, never a correctness
 /// problem, so its removal failing is not worth surfacing.
 pub(crate) fn cleanup_worktree_snapshot(snapshot_dir: &Path) {
-    let _ = std::fs::remove_dir_all(snapshot_dir);
+    match std::fs::remove_dir_all(snapshot_dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            // ralphus[ignore-rlog-pair]: low-level VCS helper has no Store; best-effort graceful degradation
+            crate::rlog!(
+                WARNING,
+                "ralphus [remediation] could not remove worktree snapshot dir={} error={e}; leaving it on disk",
+                snapshot_dir.display()
+            );
+        }
+    }
 }
 
 /// RAII guard around an optional [`snapshot_worktree_before_retries`]
@@ -369,11 +401,22 @@ pub(crate) fn run_repair_pass(
                     path.display(),
                     format_size(meta.len()),
                 ),
-                Err(e) => format!(
-                    "The failed command's output should have been captured to {}, but it \
-                     could not be read ({e}). Proceed from whatever context you already have.",
-                    path.display(),
-                ),
+                Err(e) => {
+                    // ralphus[ignore-rlog-pair]: low-level retry-loop helper with no Store; scheduler records structured cell state
+                    crate::rlog!(
+                        WARNING,
+                        "ralphus [remediation] squad={} task={} cell={} captured output log unreadable path={} error={e}",
+                        command_spec.squad_id,
+                        command_spec.task,
+                        command_spec.cell_id,
+                        path.display()
+                    );
+                    format!(
+                        "The failed command's output should have been captured to {}, but it \
+                         could not be read ({e}). Proceed from whatever context you already have.",
+                        path.display(),
+                    )
+                }
             }
         }
         None => "The failed command's output was not captured (no terminal log found for this \

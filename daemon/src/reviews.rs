@@ -140,10 +140,24 @@ pub(crate) fn rebase_onto(cwd: &Path, target_branch: &str) -> std::result::Resul
 
     if let Err(e) = git(cwd, &["rebase", target_branch]) {
         // Abort the incomplete rebase so the worktree stays usable.
-        let _ = git(cwd, &["rebase", "--abort"]);
+        if let Err(abort_err) = git(cwd, &["rebase", "--abort"]) {
+            // ralphus[ignore-rlog-pair]: git helper has no Store; its caller records the structured rebase failure
+            crate::rlog!(
+                WARNING,
+                "ralphus [guardian] rebase abort failed after failed rebase onto {target_branch} in {}: {abort_err}",
+                cwd.display()
+            );
+        }
         // Restore stashed work so nothing is lost.
         if let Some(name) = &stash_name {
-            let _ = crate::stash::pop_named(|args| git(cwd, args), name);
+            if let Err(pop_err) = crate::stash::pop_named(|args| git(cwd, args), name) {
+                // ralphus[ignore-rlog-pair]: git helper has no Store; its caller records the structured rebase failure
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [guardian] could not restore stash {name} in {} after failed rebase (stash preserved): {pop_err}",
+                    cwd.display()
+                );
+            }
         }
         return Err(format!("git rebase {target_branch} failed: {e}"));
     }
@@ -2569,7 +2583,21 @@ pub fn repair_triage_pool_keys(store_handle: &crate::store_lock::StoreHandle) {
         touched_keys.insert((new_project.clone(), triage_type.clone()));
         for (old_project, _) in &old_rows {
             if *old_project != new_project {
-                let _ = store.set_triage_pool_threshold(old_project, &triage_type, None);
+                if let Err(e) = store.set_triage_pool_threshold(old_project, &triage_type, None) {
+                    crate::cartographer::Note::new("triage")
+                        .level(crate::logging::LogLevel::WARNING)
+                        .emit(
+                            &store,
+                            format!(
+                                "pool-key repair: failed to clear threshold under old key ({old_project}, {triage_type}): {e}"
+                            ),
+                            serde_json::json!({
+                                "old_project": old_project,
+                                "project": new_project,
+                                "triage_type": triage_type,
+                            }),
+                        );
+                }
             }
         }
         let mut distinct_values: Vec<i64> = old_rows.iter().map(|(_, v)| *v).collect();
@@ -2608,18 +2636,28 @@ pub fn repair_triage_pool_keys(store_handle: &crate::store_lock::StoreHandle) {
         }
     }
 
-    if let Ok(schedules) = store.list_triage_schedules(None) {
-        for sched in schedules {
-            let new_project = crate::triage::pool_key_for_path(&store, Path::new(&sched.project));
-            if new_project != sched.project {
-                touched_keys.insert((new_project.clone(), sched.triage_type.clone()));
-                if let Err(e) = store.rekey_triage_schedule(sched.id, &new_project) {
-                    crate::rlog!(
-                        ERROR,
-                        "ralphus [triage] pool-key repair: failed to rekey schedule {}: {e}",
-                        sched.id
-                    );
-                }
+    let schedules = store.list_triage_schedules(None).unwrap_or_else(|e| {
+        crate::cartographer::Note::new("triage")
+            .level(crate::logging::LogLevel::WARNING)
+            .emit(
+                &store,
+                format!(
+                    "pool-key repair: failed to list triage schedules; skipping their rekey: {e}"
+                ),
+                serde_json::json!({}),
+            );
+        Vec::new()
+    });
+    for sched in schedules {
+        let new_project = crate::triage::pool_key_for_path(&store, Path::new(&sched.project));
+        if new_project != sched.project {
+            touched_keys.insert((new_project.clone(), sched.triage_type.clone()));
+            if let Err(e) = store.rekey_triage_schedule(sched.id, &new_project) {
+                crate::rlog!(
+                    ERROR,
+                    "ralphus [triage] pool-key repair: failed to rekey schedule {}: {e}",
+                    sched.id
+                );
             }
         }
     }

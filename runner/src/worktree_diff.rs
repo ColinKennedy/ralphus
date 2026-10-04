@@ -98,16 +98,30 @@ impl Backoff {
 }
 
 fn git(root: &Path, args: &[&str]) -> Option<String> {
+    git_detailed(root, args).ok()
+}
+
+/// As [`git`], but keeps why the command failed (spawn error, or the exit
+/// status plus the head of its stderr) for the watcher's failure event.
+fn git_detailed(root: &Path, args: &[&str]) -> Result<String, String> {
     let out = Command::new("git")
         .args(args)
         .current_dir(root)
         // A background poll must never wait on, or hold, the repo's index lock.
         .env("GIT_OPTIONAL_LOCKS", "0")
         .output()
-        .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+        .map_err(|e| format!("could not run git {}: {e}", args.join(" ")))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let first = stderr.lines().next().unwrap_or("").trim();
+        Err(format!(
+            "git {} exited {}: {first}",
+            args.join(" "),
+            out.status
+        ))
+    }
 }
 
 /// The commit `HEAD` points at, or `None` when `root` is not a git worktree.
@@ -137,9 +151,14 @@ fn count_lines(path: &Path) -> u64 {
 /// uncommitted and untracked. `None` if git could not be queried.
 #[must_use]
 pub fn summarize(root: &Path, baseline: &str) -> Option<DiffSummary> {
-    let numstat = git(root, &["diff", "--numstat", "--no-renames", baseline])?;
-    let status = git(root, &["diff", "--name-status", "--no-renames", baseline])?;
-    let untracked = git(root, &["ls-files", "--others", "--exclude-standard", "-z"])?;
+    summarize_detailed(root, baseline).ok()
+}
+
+/// As [`summarize`], but keeps the failing git command's error.
+fn summarize_detailed(root: &Path, baseline: &str) -> Result<DiffSummary, String> {
+    let numstat = git_detailed(root, &["diff", "--numstat", "--no-renames", baseline])?;
+    let status = git_detailed(root, &["diff", "--name-status", "--no-renames", baseline])?;
+    let untracked = git_detailed(root, &["ls-files", "--others", "--exclude-standard", "-z"])?;
 
     let mut summary = DiffSummary::default();
     for line in numstat.lines() {
@@ -167,7 +186,7 @@ pub fn summarize(root: &Path, baseline: &str) -> Option<DiffSummary> {
         summary.files_added += 1;
         summary.lines_added += count_lines(&root.join(rel));
     }
-    Some(summary)
+    Ok(summary)
 }
 
 /// A watcher thread scoped to one backend run. Dropping it (success, error,
@@ -212,20 +231,61 @@ impl WorktreeWatcher {
         max: Duration,
         emit: impl Fn(&str, &DiffSummary) + Send + 'static,
     ) -> Option<Self> {
-        let baseline = head_commit(root)?;
+        let baseline = match git_detailed(root, &["rev-parse", "--verify", "HEAD"]) {
+            Ok(head) => head.trim().to_string(),
+            Err(error) => {
+                cartographer::emit(
+                    WORKTREE_DIFF_SOURCE,
+                    "live diff watcher not started: no HEAD commit",
+                    "debug",
+                    EventContext::default(),
+                    json!({"root": root.display().to_string(), "error": error}),
+                );
+                return None;
+            }
+        };
         let root: PathBuf = root.to_path_buf();
         let (stop, rx) = mpsc::channel::<()>();
         let handle = std::thread::spawn(move || {
             let mut last = DiffSummary::default();
             let mut backoff = Backoff::new(min, max);
-            let poll = |last: &mut DiffSummary| -> bool {
-                match summarize(&root, &baseline) {
-                    Some(now) if now != *last => {
+            // Polls repeat every few seconds, so a persistent failure is
+            // reported once when it starts and once when it clears, not per
+            // poll.
+            let mut failing = false;
+            let mut poll = |last: &mut DiffSummary| -> bool {
+                match summarize_detailed(&root, &baseline) {
+                    Ok(now) => {
+                        if failing {
+                            failing = false;
+                            cartographer::emit(
+                                WORKTREE_DIFF_SOURCE,
+                                "live diff summary recovered",
+                                "info",
+                                EventContext::default(),
+                                json!({"root": root.display().to_string()}),
+                            );
+                        }
+                        if now == *last {
+                            return false;
+                        }
                         *last = now;
                         emit(&baseline, &now);
                         true
                     }
-                    _ => false,
+                    Err(error) => {
+                        if !failing {
+                            failing = true;
+                            cartographer::emit(
+                                WORKTREE_DIFF_SOURCE,
+                                "live diff summary failed",
+                                "warning",
+                                EventContext::default(),
+                                json!({"root": root.display().to_string(), "error": error}),
+                            );
+                        }
+                        false
+                    }
                 }
             };
             loop {
@@ -256,7 +316,15 @@ impl Drop for WorktreeWatcher {
             let _ = stop.send(());
         }
         if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+            if handle.join().is_err() {
+                cartographer::emit(
+                    WORKTREE_DIFF_SOURCE,
+                    "live diff watcher thread panicked",
+                    "warning",
+                    EventContext::default(),
+                    serde_json::Value::Null,
+                );
+            }
         }
     }
 }

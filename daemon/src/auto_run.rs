@@ -64,6 +64,22 @@ fn running() -> std::sync::MutexGuard<'static, Vec<RunningCheck>> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Emit one `auto_run` Cartographer row (and its stderr line) for review `id`
+/// through the already-held `store` guard.
+fn note(
+    store: &crate::store::Store,
+    id: &str,
+    level: crate::logging::LogLevel,
+    message: String,
+    payload: serde_json::Value,
+) {
+    crate::cartographer::Note::new("auto_run")
+        .level(level)
+        .scope("guardian")
+        .guardian(id)
+        .emit(store, message, payload);
+}
+
 fn checks_of<'a>(g: &'a GuardianView, kind: &str) -> &'a [GuardianCheck] {
     if kind == "action" {
         &g.action_hints
@@ -137,9 +153,17 @@ fn generation_of(check: &GuardianCheck) -> i64 {
 /// recipient is claimed under the empty client id.
 fn claim(store: &StoreHandle, review_id: &str, at: CheckRef, check: &GuardianCheck) -> bool {
     let guard = store.lock();
-    let mut clients: Vec<String> = guard
-        .guardian_recipients(review_id)
-        .unwrap_or_default()
+    let recipients = guard.guardian_recipients(review_id).unwrap_or_else(|e| {
+        note(
+            &guard,
+            review_id,
+            crate::logging::LogLevel::WARNING,
+            format!("could not list review clients for auto-run claim review={review_id}: {e}"),
+            serde_json::json!({ "error": e.to_string() }),
+        );
+        Vec::new()
+    });
+    let mut clients: Vec<String> = recipients
         .into_iter()
         .filter(|client| client.enabled && client.local)
         .map(|client| client.id)
@@ -151,11 +175,16 @@ fn claim(store: &StoreHandle, review_id: &str, at: CheckRef, check: &GuardianChe
     let generation = generation_of(check);
     let mut any_new = false;
     for client in &clients {
-        if guard
-            .claim_auto_run(review_id, &key, client, generation)
-            .unwrap_or(false)
-        {
-            any_new = true;
+        match guard.claim_auto_run(review_id, &key, client, generation) {
+            Ok(true) => any_new = true,
+            Ok(false) => {}
+            Err(e) => note(
+                &guard,
+                review_id,
+                crate::logging::LogLevel::WARNING,
+                format!("could not claim auto-run review={review_id} check={key}: {e}"),
+                serde_json::json!({ "check": key, "client": client, "error": e.to_string() }),
+            ),
         }
     }
     any_new
@@ -166,29 +195,89 @@ fn claim(store: &StoreHandle, review_id: &str, at: CheckRef, check: &GuardianChe
 /// becomes ready; launching happens on its own thread so that worker -- which
 /// holds the review's preparation gate -- is never held up by a check.
 pub(crate) fn run_ready_checks(store: &StoreHandle, id: &str) {
-    let Ok(g) = store.lock().get_guardian(id) else {
-        return;
+    let g = {
+        let guard = store.lock();
+        match guard.get_guardian(id) {
+            Ok(g) => g,
+            Err(e) => {
+                note(
+                    &guard,
+                    id,
+                    crate::logging::LogLevel::WARNING,
+                    format!("auto-run skipped: could not load review {id}: {e}"),
+                    serde_json::json!({ "error": e.to_string() }),
+                );
+                return;
+            }
+        }
     };
     let plan = plan(&g);
     for (at, missing) in &plan.needs_input {
-        let note = format!(
+        let note_text = format!(
             "Auto-run skipped: no value for input{} {}. Fill in the value and run this check by hand.",
             if missing.len() == 1 { "" } else { "s" },
             missing.join(", ")
         );
-        let _ = store
-            .lock()
-            .set_check_auto_run_note(id, at.kind, at.index, Some(&note));
+        let guard = store.lock();
+        let saved = guard.set_check_auto_run_note(id, at.kind, at.index, Some(&note_text));
+        note(
+            &guard,
+            id,
+            if saved.is_ok() {
+                crate::logging::LogLevel::INFO
+            } else {
+                crate::logging::LogLevel::WARNING
+            },
+            format!(
+                "auto-run skipped review={id} check={}-{}: missing input value(s) {}",
+                at.kind,
+                at.index,
+                missing.join(", ")
+            ),
+            serde_json::json!({
+                "check": format!("{}-{}", at.kind, at.index),
+                "missing": missing,
+                "note_saved": saved.is_ok(),
+                "error": saved.err().map(|e| e.to_string()),
+            }),
+        );
     }
     for at in plan.runnable {
         let check = checks_of(&g, at.kind)[at.index].clone();
         if !claim(store, id, at, &check) {
             continue;
         }
-        if check.auto_run_note.is_some() {
-            let _ = store
-                .lock()
-                .set_check_auto_run_note(id, at.kind, at.index, None);
+        {
+            let guard = store.lock();
+            if check.auto_run_note.is_some() {
+                if let Err(e) = guard.set_check_auto_run_note(id, at.kind, at.index, None) {
+                    note(
+                        &guard,
+                        id,
+                        crate::logging::LogLevel::WARNING,
+                        format!(
+                            "could not clear stale auto-run note review={id} check={}-{}: {e}",
+                            at.kind, at.index
+                        ),
+                        serde_json::json!({ "error": e.to_string() }),
+                    );
+                }
+            }
+            note(
+                &guard,
+                id,
+                crate::logging::LogLevel::INFO,
+                format!(
+                    "auto-run triggered review={id} check={}-{} label={:?}",
+                    at.kind,
+                    at.index,
+                    display_label(&check, at)
+                ),
+                serde_json::json!({
+                    "check": format!("{}-{}", at.kind, at.index),
+                    "generation": generation_of(&check),
+                }),
+            );
         }
         let store = store.clone();
         let g = g.clone();
@@ -208,11 +297,48 @@ fn run_one(store: &StoreHandle, id: &str, g: &GuardianView, check: &GuardianChec
     let outcome = crate::server::run_check_unattended(store, g, check, at.kind, at.index);
     running().retain(|r| !(r.review_id == id && r.check == at));
     let detail = match outcome {
-        Some(Some(0)) | None => return,
+        Some(Some(0)) => {
+            note(
+                &store.lock(),
+                id,
+                crate::logging::LogLevel::INFO,
+                format!(
+                    "auto-run passed review={id} check={}-{} label={label:?}",
+                    at.kind, at.index
+                ),
+                serde_json::json!({ "check": format!("{}-{}", at.kind, at.index) }),
+            );
+            return;
+        }
+        None => {
+            note(
+                &store.lock(),
+                id,
+                crate::logging::LogLevel::WARNING,
+                format!(
+                    "auto-run did not start review={id} check={}-{} label={label:?}: no \
+                     terminal could be opened",
+                    at.kind, at.index
+                ),
+                serde_json::json!({ "check": format!("{}-{}", at.kind, at.index) }),
+            );
+            return;
+        }
         Some(Some(code)) => format!("exited with code {code}"),
         Some(None) => "timed out without reporting an exit code".to_string(),
     };
-    let _ = store.lock().notify_watchers(
+    let guard = store.lock();
+    note(
+        &guard,
+        id,
+        crate::logging::LogLevel::WARNING,
+        format!(
+            "auto-run failed review={id} check={}-{} label={label:?}: {detail}",
+            at.kind, at.index
+        ),
+        serde_json::json!({ "check": format!("{}-{}", at.kind, at.index), "detail": detail }),
+    );
+    let notified = guard.notify_watchers(
         NotifiableEventKind::ReviewAutoRunCheckFailed,
         &format!("guardian:{id}"),
         MailboxPriority::Normal,
@@ -222,6 +348,15 @@ fn run_one(store: &StoreHandle, id: &str, g: &GuardianView, check: &GuardianChec
         ),
         g.squad_id.as_deref(),
     );
+    if let Err(e) = notified {
+        note(
+            &guard,
+            id,
+            crate::logging::LogLevel::WARNING,
+            format!("could not notify watchers of failed auto-run review={id}: {e}"),
+            serde_json::json!({ "error": e.to_string() }),
+        );
+    }
 }
 
 /// Warn about every auto-run still in flight for review `id` because a newer
@@ -236,19 +371,55 @@ pub(crate) fn note_superseded(store: &StoreHandle, id: &str, trigger: &str) {
     if in_flight.is_empty() {
         return;
     }
-    let Ok(g) = store.lock().get_guardian(id) else {
-        return;
+    let g = {
+        let guard = store.lock();
+        match guard.get_guardian(id) {
+            Ok(g) => g,
+            Err(e) => {
+                note(
+                    &guard,
+                    id,
+                    crate::logging::LogLevel::WARNING,
+                    format!(
+                        "could not load review {id} to warn {} superseded auto-run(s): {e}",
+                        in_flight.len()
+                    ),
+                    serde_json::json!({ "trigger": trigger, "error": e.to_string() }),
+                );
+                return;
+            }
+        }
     };
     for r in in_flight {
         let message = superseded_message(trigger, &r.label);
         let guard = store.lock();
-        let _ = guard.set_check_auto_run_note(id, r.check.kind, r.check.index, Some(&message));
-        let _ = guard.notify_watchers(
+        let saved = guard.set_check_auto_run_note(id, r.check.kind, r.check.index, Some(&message));
+        let notified = guard.notify_watchers(
             NotifiableEventKind::ReviewAutoRunSuperseded,
             &format!("guardian:{id}"),
             MailboxPriority::Normal,
             &format!("Review \"{}\": {message}", g.name),
             g.squad_id.as_deref(),
+        );
+        let ok = saved.is_ok() && notified.is_ok();
+        note(
+            &guard,
+            id,
+            if ok {
+                crate::logging::LogLevel::INFO
+            } else {
+                crate::logging::LogLevel::WARNING
+            },
+            format!(
+                "in-flight auto-run superseded by {trigger} review={id} check={}-{} label={:?}",
+                r.check.kind, r.check.index, r.label
+            ),
+            serde_json::json!({
+                "trigger": trigger,
+                "check": format!("{}-{}", r.check.kind, r.check.index),
+                "note_error": saved.err().map(|e| e.to_string()),
+                "notify_error": notified.err().map(|e| e.to_string()),
+            }),
         );
     }
 }

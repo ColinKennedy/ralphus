@@ -27,6 +27,12 @@ fn llm_agent() -> &'static ureq::Agent {
     &AGENT
 }
 
+/// Model used for a `claude`/`anthropic` direct call that names none.
+const DEFAULT_CLAUDE_MODEL: &str = "claude-haiku-4-5";
+
+/// Model used for an `ollama` direct call that names none.
+const DEFAULT_OLLAMA_MODEL: &str = "qwen3:8b";
+
 /// One turn in a conversation, using Claude/OpenAI API role names.
 pub struct ChatMessage {
     /// `"user"` for reviewer turns, `"assistant"` for guardian turns.
@@ -75,31 +81,52 @@ pub fn call_direct_with_usage(
     messages: &[ChatMessage],
 ) -> Result<(String, ChatUsage), String> {
     let msg_count = messages.len();
+    let backend = agent.to_lowercase();
+    let resolved_model = match backend.as_str() {
+        "claude" | "anthropic" => Some(model.unwrap_or(DEFAULT_CLAUDE_MODEL)),
+        "ollama" => Some(model.unwrap_or(DEFAULT_OLLAMA_MODEL)),
+        _ => model,
+    };
+    let prompt_len = system.len() + messages.iter().map(|m| m.content.len()).sum::<usize>();
+    let images = messages.iter().filter(|m| m.image.is_some()).count();
     // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
     crate::rlog!(
-        DEBUG,
-        "ralphus [guardian] chat-api start backend={agent:?} model={model:?} messages={msg_count}"
+        INFO,
+        "ralphus [guardian] chat-api start backend={agent:?} model={resolved_model:?} messages={msg_count} prompt_len={prompt_len} images={images}"
     );
-    let result = match agent.to_lowercase().as_str() {
+    let started = std::time::Instant::now();
+    let result = match backend.as_str() {
         "claude" | "anthropic" => {
-            call_claude(model.unwrap_or("claude-haiku-4-5"), system, messages)
+            call_claude(model.unwrap_or(DEFAULT_CLAUDE_MODEL), system, messages)
         }
         "ollama" => {
             let base_url = std::env::var("RALPHUS_OLLAMA_URL")
                 .unwrap_or_else(|_| "http://localhost:11434/v1".to_string());
-            call_ollama(&base_url, model.unwrap_or("qwen3:8b"), system, messages)
+            call_ollama(
+                &base_url,
+                model.unwrap_or(DEFAULT_OLLAMA_MODEL),
+                system,
+                messages,
+            )
         }
         other => Err(format!(
             "agent '{other}' is not supported for direct chat; use the subprocess runner"
         )),
     };
+    let elapsed_ms = started.elapsed().as_millis();
     match &result {
         // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
-        Ok(_) => crate::rlog!(DEBUG, "ralphus [guardian] chat-api done backend={agent:?}"),
+        Ok((reply, usage)) => crate::rlog!(
+            INFO,
+            "ralphus [guardian] chat-api done backend={agent:?} model={resolved_model:?} elapsed_ms={elapsed_ms} tokens_in={} tokens_out={} reply_len={}",
+            usage.tokens_in,
+            usage.tokens_out,
+            reply.len()
+        ),
         // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
         Err(e) => crate::rlog!(
             ERROR,
-            "ralphus [guardian] chat-api error backend={agent:?}: {e}"
+            "ralphus [guardian] chat-api error backend={agent:?} model={resolved_model:?} elapsed_ms={elapsed_ms}: {e}"
         ),
     }
     result

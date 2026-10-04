@@ -43,6 +43,13 @@ fn main() -> ExitCode {
             eprintln!(
                 "ralphus-librarian serving on http://{bind_host}:{port} (daemon: {daemon_url})"
             );
+            match std::env::var_os(ralphus_librarian::assets::DEV_ASSETS_DIR_ENV) {
+                Some(dir) if !dir.is_empty() => eprintln!(
+                    "ralphus-librarian [asset] serving board assets from disk dir={}",
+                    std::path::Path::new(&dir).display()
+                ),
+                _ => eprintln!("ralphus-librarian [asset] serving embedded board assets"),
+            }
             let otel_provider = ralphus_librarian::config::opentelemetry_enabled()
                 .then(|| ralphus_librarian::otel::init("ralphus-librarian"))
                 .flatten();

@@ -1046,10 +1046,7 @@ impl PrCacheConfig {
 /// 300s) when the `[pr_cache]` table is absent.
 #[must_use]
 pub fn pr_cache_from_toml_str(s: &str) -> PrCacheConfig {
-    toml::from_str::<ConfigFile>(s)
-        .unwrap_or_default()
-        .pr_cache
-        .unwrap_or_default()
+    parse_config_file(s).pr_cache.unwrap_or_default()
 }
 
 /// Load the daemon-singleton RAL-366 PR-cache-poller config from the global
@@ -1060,7 +1057,7 @@ pub fn pr_cache_from_toml_str(s: &str) -> PrCacheConfig {
 #[must_use]
 pub fn load_pr_cache_config() -> PrCacheConfig {
     global_config_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|p| read_config_text(&p))
         .map(|s| pr_cache_from_toml_str(&s))
         .unwrap_or_default()
 }
@@ -1112,10 +1109,7 @@ impl HealthSweepConfig {
 /// (enabled, 3600s) when the `[health]` table is absent.
 #[must_use]
 pub fn health_sweep_from_toml_str(s: &str) -> HealthSweepConfig {
-    toml::from_str::<ConfigFile>(s)
-        .unwrap_or_default()
-        .health
-        .unwrap_or_default()
+    parse_config_file(s).health.unwrap_or_default()
 }
 
 /// Load the daemon-singleton RAL-416 health-sweep config from the global
@@ -1125,7 +1119,7 @@ pub fn health_sweep_from_toml_str(s: &str) -> HealthSweepConfig {
 #[must_use]
 pub fn load_health_sweep_config() -> HealthSweepConfig {
     global_config_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|p| read_config_text(&p))
         .map(|s| health_sweep_from_toml_str(&s))
         .unwrap_or_default()
 }
@@ -1163,10 +1157,7 @@ impl MonorepoConfig {
 /// monorepo) when the `[monorepo]` table is absent.
 #[must_use]
 pub fn monorepo_from_toml_str(s: &str) -> MonorepoConfig {
-    toml::from_str::<ConfigFile>(s)
-        .unwrap_or_default()
-        .monorepo
-        .unwrap_or_default()
+    parse_config_file(s).monorepo.unwrap_or_default()
 }
 
 /// Load the known-subprojects config for the project reached by walking up
@@ -1177,7 +1168,7 @@ pub fn monorepo_from_toml_str(s: &str) -> MonorepoConfig {
 #[must_use]
 pub fn load_monorepo_config(start: &Path) -> MonorepoConfig {
     find_project_config(start)
-        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|p| read_config_text(&p))
         .map(|s| monorepo_from_toml_str(&s))
         .unwrap_or_default()
 }
@@ -1211,10 +1202,7 @@ impl CommitConfig {
 /// when the `[commits]` table is absent.
 #[must_use]
 pub fn commit_config_from_toml_str(s: &str) -> CommitConfig {
-    toml::from_str::<ConfigFile>(s)
-        .unwrap_or_default()
-        .commits
-        .unwrap_or_default()
+    parse_config_file(s).commits.unwrap_or_default()
 }
 
 /// Load the effective commit-trailer config for the project reached by
@@ -1227,11 +1215,11 @@ pub fn commit_config_from_toml_str(s: &str) -> CommitConfig {
 #[must_use]
 pub fn load_commit_config(start: &Path) -> CommitConfig {
     let global = global_config_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|p| read_config_text(&p))
         .map(|s| commit_config_from_toml_str(&s))
         .unwrap_or_default();
     let local = find_project_config(start)
-        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|p| read_config_text(&p))
         .map(|s| commit_config_from_toml_str(&s))
         .unwrap_or_default();
     CommitConfig {
@@ -1243,10 +1231,7 @@ pub fn load_commit_config(start: &Path) -> CommitConfig {
 /// no model override, unbounded budget) when the `[arbiter]` table is absent.
 #[must_use]
 pub fn arbiter_from_toml_str(s: &str) -> ArbiterConfig {
-    toml::from_str::<ConfigFile>(s)
-        .unwrap_or_default()
-        .arbiter
-        .unwrap_or_default()
+    parse_config_file(s).arbiter.unwrap_or_default()
 }
 
 /// Load the daemon-singleton Arbiter config from the global config file only
@@ -1262,7 +1247,7 @@ pub fn arbiter_from_toml_str(s: &str) -> ArbiterConfig {
 #[must_use]
 pub fn load_arbiter_config() -> ArbiterConfig {
     global_config_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|p| read_config_text(&p))
         .map(|s| arbiter_from_toml_str(&s))
         .unwrap_or_default()
 }
@@ -1348,9 +1333,18 @@ impl DaemonConfig {
         self.downtime
             .iter()
             .filter_map(|w| {
-                let start = NaiveTime::parse_from_str(&w.start, "%H:%M").ok()?;
-                let end = NaiveTime::parse_from_str(&w.end, "%H:%M").ok()?;
-                Some((start, end))
+                let start = NaiveTime::parse_from_str(&w.start, "%H:%M");
+                let end = NaiveTime::parse_from_str(&w.end, "%H:%M");
+                if let (Ok(start), Ok(end)) = (start, end) {
+                    Some((start, end))
+                } else {
+                    warn_config_fallback(
+                        "daemon.downtime",
+                        &format!("start={:?} end={:?}", w.start, w.end),
+                        "no window (entry ignored; expected \"HH:MM\")",
+                    );
+                    None
+                }
             })
             .collect()
     }
@@ -1362,7 +1356,15 @@ impl DaemonConfig {
     pub fn max_concurrent(&self) -> i64 {
         match self.max_concurrent {
             Some(n) if n >= 0 => n,
-            _ => crate::DEFAULT_MAX_CONCURRENT,
+            Some(n) => {
+                warn_config_fallback(
+                    "daemon.max_concurrent",
+                    &n.to_string(),
+                    &format!("default {}", crate::DEFAULT_MAX_CONCURRENT),
+                );
+                crate::DEFAULT_MAX_CONCURRENT
+            }
+            None => crate::DEFAULT_MAX_CONCURRENT,
         }
     }
 
@@ -1567,7 +1569,14 @@ impl TerminalLogConfig {
     #[must_use]
     pub fn pane_history_limit(&self) -> Option<u32> {
         match self.pane_history_limit {
-            Some(n) if n >= 1 => u32::try_from(n).ok(),
+            Some(n) if n >= 1 => u32::try_from(n).ok().or_else(|| {
+                warn_config_fallback(
+                    "terminal_logs.pane_history_limit",
+                    &n.to_string(),
+                    "the built-in tmux history limit",
+                );
+                None
+            }),
             _ => None,
         }
     }
@@ -1577,10 +1586,7 @@ impl TerminalLogConfig {
 /// lines / 30 days / 2000 files) when the `[terminal_logs]` table is absent.
 #[must_use]
 pub fn terminal_log_from_toml_str(s: &str) -> TerminalLogConfig {
-    toml::from_str::<ConfigFile>(s)
-        .unwrap_or_default()
-        .terminal_logs
-        .unwrap_or_default()
+    parse_config_file(s).terminal_logs.unwrap_or_default()
 }
 
 /// Load the effective terminal-log config by layering the global config file
@@ -1589,14 +1595,14 @@ pub fn terminal_log_from_toml_str(s: &str) -> TerminalLogConfig {
 #[must_use]
 pub fn load_terminal_log_config() -> TerminalLogConfig {
     let global = global_config_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|p| read_config_text(&p))
         .map(|s| terminal_log_from_toml_str(&s))
         .unwrap_or_default();
     let local = std::env::current_dir()
         .ok()
         .as_deref()
         .and_then(find_project_config)
-        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|p| read_config_text(&p))
         .map(|s| terminal_log_from_toml_str(&s))
         .unwrap_or_default();
     TerminalLogConfig {
@@ -1657,7 +1663,15 @@ impl AgentHealthConfig {
     pub fn thinking_stall_window_lines(&self) -> usize {
         match self.thinking_stall_window_lines {
             Some(n) if n >= 2 => n as usize,
-            _ => 12,
+            Some(n) => {
+                warn_config_fallback(
+                    "agent.health.thinking_stall_window_lines",
+                    &n.to_string(),
+                    "default 12",
+                );
+                12
+            }
+            None => 12,
         }
     }
 
@@ -1666,7 +1680,15 @@ impl AgentHealthConfig {
     pub fn thinking_stall_diversity_threshold(&self) -> f64 {
         match self.thinking_stall_diversity_threshold {
             Some(n) if n > 0.0 && n <= 1.0 => n,
-            _ => 0.35,
+            Some(n) => {
+                warn_config_fallback(
+                    "agent.health.thinking_stall_diversity_threshold",
+                    &n.to_string(),
+                    "default 0.35",
+                );
+                0.35
+            }
+            None => 0.35,
         }
     }
 
@@ -1676,7 +1698,15 @@ impl AgentHealthConfig {
     pub fn thinking_stall_min_consecutive_samples(&self) -> u32 {
         match self.thinking_stall_min_consecutive_samples {
             Some(n) if n >= 1 => n as u32,
-            _ => 4,
+            Some(n) => {
+                warn_config_fallback(
+                    "agent.health.thinking_stall_min_consecutive_samples",
+                    &n.to_string(),
+                    "default 4",
+                );
+                4
+            }
+            None => 4,
         }
     }
 
@@ -1686,7 +1716,15 @@ impl AgentHealthConfig {
     pub fn thinking_stall_min_span_ms(&self) -> i64 {
         match self.thinking_stall_min_span_ms {
             Some(n) if n >= 0 => n,
-            _ => 20_000,
+            Some(n) => {
+                warn_config_fallback(
+                    "agent.health.thinking_stall_min_span_ms",
+                    &n.to_string(),
+                    "default 20000",
+                );
+                20_000
+            }
+            None => 20_000,
         }
     }
 }
@@ -1702,8 +1740,7 @@ pub struct AgentTableConfig {
 /// defaults when the `[agent.health]` table is absent.
 #[must_use]
 pub fn agent_health_from_toml_str(s: &str) -> AgentHealthConfig {
-    toml::from_str::<ConfigFile>(s)
-        .unwrap_or_default()
+    parse_config_file(s)
         .agent
         .unwrap_or_default()
         .health
@@ -1716,14 +1753,14 @@ pub fn agent_health_from_toml_str(s: &str) -> AgentHealthConfig {
 #[must_use]
 pub fn load_agent_health_config() -> AgentHealthConfig {
     let global = global_config_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|p| read_config_text(&p))
         .map(|s| agent_health_from_toml_str(&s))
         .unwrap_or_default();
     let local = std::env::current_dir()
         .ok()
         .as_deref()
         .and_then(find_project_config)
-        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|p| read_config_text(&p))
         .map(|s| agent_health_from_toml_str(&s))
         .unwrap_or_default();
     AgentHealthConfig {
@@ -1825,10 +1862,7 @@ pub const DEFAULT_TOOL_ARG_TRUNCATE_CHARS: u32 = 200;
 /// when the `[live_view]` table is absent.
 #[must_use]
 pub fn live_view_from_toml_str(s: &str) -> LiveViewConfig {
-    toml::from_str::<ConfigFile>(s)
-        .unwrap_or_default()
-        .live_view
-        .unwrap_or_default()
+    parse_config_file(s).live_view.unwrap_or_default()
 }
 
 /// Load the effective Live View config by layering the global config file
@@ -1838,14 +1872,14 @@ pub fn live_view_from_toml_str(s: &str) -> LiveViewConfig {
 #[must_use]
 pub fn load_live_view_config() -> LiveViewConfig {
     let global = global_config_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|p| read_config_text(&p))
         .map(|s| live_view_from_toml_str(&s))
         .unwrap_or_default();
     let local = std::env::current_dir()
         .ok()
         .as_deref()
         .and_then(find_project_config)
-        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|p| read_config_text(&p))
         .map(|s| live_view_from_toml_str(&s))
         .unwrap_or_default();
     LiveViewConfig {
@@ -1907,10 +1941,7 @@ pub const DEFAULT_THRASH_MIN_TURN_GAP: u32 = 2;
 /// the `[thrash]` table is absent.
 #[must_use]
 pub fn thrash_from_toml_str(s: &str) -> ThrashConfig {
-    toml::from_str::<ConfigFile>(s)
-        .unwrap_or_default()
-        .thrash
-        .unwrap_or_default()
+    parse_config_file(s).thrash.unwrap_or_default()
 }
 
 /// Load the effective thrash config by layering the global config file under
@@ -1919,14 +1950,14 @@ pub fn thrash_from_toml_str(s: &str) -> ThrashConfig {
 #[must_use]
 pub fn load_thrash_config() -> ThrashConfig {
     let global = global_config_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|p| read_config_text(&p))
         .map(|s| thrash_from_toml_str(&s))
         .unwrap_or_default();
     let local = std::env::current_dir()
         .ok()
         .as_deref()
         .and_then(find_project_config)
-        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|p| read_config_text(&p))
         .map(|s| thrash_from_toml_str(&s))
         .unwrap_or_default();
     ThrashConfig {
@@ -2145,14 +2176,11 @@ impl AgentIsolationConfig {
 /// (fully isolated) when the `[agent_isolation]` table is absent.
 #[must_use]
 pub fn agent_isolation_from_toml_str(s: &str) -> AgentIsolationConfig {
-    toml::from_str::<ConfigFile>(s)
-        .unwrap_or_default()
-        .agent_isolation
-        .unwrap_or_default()
+    parse_config_file(s).agent_isolation.unwrap_or_default()
 }
 
 fn load_agent_isolation_file(path: &Path) -> AgentIsolationConfig {
-    std::fs::read_to_string(path)
+    read_config_text(path)
         .map(|s| agent_isolation_from_toml_str(&s))
         .unwrap_or_default()
 }
@@ -2523,12 +2551,12 @@ struct ConfigFile {
 #[must_use]
 pub fn shared_store_root(project_root: &Path, name: &str) -> Option<PathBuf> {
     let mut stores = global_config_path()
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .and_then(|text| toml::from_str::<ConfigFile>(&text).ok())
+        .and_then(|path| read_config_text(&path))
+        .and_then(|text| parse_config_file_opt(&text))
         .map_or_else(Vec::new, |file| file.shared_store);
     if let Some(project_stores) = find_project_config(project_root)
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .and_then(|text| toml::from_str::<ConfigFile>(&text).ok())
+        .and_then(|path| read_config_text(&path))
+        .and_then(|text| parse_config_file_opt(&text))
         .map(|file| file.shared_store)
     {
         for store in project_stores {
@@ -2544,8 +2572,7 @@ pub fn shared_store_root(project_root: &Path, name: &str) -> Option<PathBuf> {
 
 #[must_use]
 pub fn ark_from_toml_str(s: &str) -> ArkConfig {
-    toml::from_str::<ConfigFile>(s)
-        .unwrap_or_default()
+    parse_config_file(s)
         .ark
         .unwrap_or_default()
         .apply(ArkConfig::default())
@@ -2556,14 +2583,14 @@ pub fn ark_from_toml_str(s: &str) -> ArkConfig {
 #[must_use]
 pub fn load_ark_config(project_root: &Path) -> ArkConfig {
     let global = global_config_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| toml::from_str::<ConfigFile>(&s).ok())
+        .and_then(|p| read_config_text(&p))
+        .and_then(|s| parse_config_file_opt(&s))
         .and_then(|file| file.ark)
         .unwrap_or_default()
         .apply(ArkConfig::default());
     find_project_config(project_root)
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| toml::from_str::<ConfigFile>(&s).ok())
+        .and_then(|p| read_config_text(&p))
+        .and_then(|s| parse_config_file_opt(&s))
         .and_then(|file| file.ark)
         .unwrap_or_default()
         .apply(global)
@@ -2574,16 +2601,116 @@ pub fn load_ark_config(project_root: &Path) -> ArkConfig {
 /// broken file never blocks a review.
 #[must_use]
 pub fn from_toml_str(s: &str) -> ReviewConfig {
-    let cf: ConfigFile = toml::from_str(s).unwrap_or_default();
+    let cf = parse_config_file(s);
     cf.review.or(cf.defaults).unwrap_or_default()
 }
 
 /// Read and parse a config file, or the default when it is absent/unreadable.
 #[must_use]
 pub fn load_file(path: &Path) -> ReviewConfig {
-    std::fs::read_to_string(path)
+    read_config_text(path)
         .map(|s| from_toml_str(&s))
         .unwrap_or_default()
+}
+
+/// Parse a whole config file's text. Malformed TOML yields the default
+/// (empty) config so a broken file never blocks the caller; the parse error
+/// itself is reported, with the file's path, by [`read_config_text`].
+fn parse_config_file(s: &str) -> ConfigFile {
+    toml::from_str(s).unwrap_or_default()
+}
+
+/// [`parse_config_file`], but `None` (instead of the default config) when
+/// the text does not parse.
+fn parse_config_file_opt(s: &str) -> Option<ConfigFile> {
+    toml::from_str(s).ok()
+}
+
+/// Config-diagnostic keys already logged this process, so a config loaded
+/// fresh on every poll or request reports each distinct problem or content
+/// change once rather than on every load.
+fn config_log_seen() -> &'static std::sync::Mutex<std::collections::HashMap<String, u64>> {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
+        std::sync::OnceLock::new();
+    SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Records `value` under `key`, returning `true` when it differs from the
+/// value last recorded for that key (including the first time `key` is seen).
+fn config_log_changed(key: &str, value: u64) -> bool {
+    let mut seen = config_log_seen()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    seen.insert(key.to_string(), value) != Some(value)
+}
+
+fn hash_text(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Logs, once per distinct `(key, value)`, that a config value was invalid
+/// and its default is being used instead.
+fn warn_config_fallback(key: &str, value: &str, fallback: &str) {
+    if config_log_changed(&format!("fallback:{key}"), hash_text(value)) {
+        // ralphus[ignore-rlog-pair]: config accessors run without a Store and before one exists at startup
+        crate::rlog!(
+            WARNING,
+            "ralphus [config] invalid value for {key} ({value}); using {fallback}"
+        );
+    }
+}
+
+/// Read one config file's text. An absent file is the normal "not
+/// configured" case and returns `None` silently; any other read failure is
+/// logged with the path and also returns `None`, so the caller falls back to
+/// defaults exactly as for an absent file. Text that is read is test-parsed
+/// so a malformed file -- which every section loader then treats as empty --
+/// is reported with its path and the parser's line/key detail. Both
+/// diagnostics, and an INFO line when a file's content is first seen or
+/// changes (a reload), are logged once per distinct content, not per load.
+fn read_config_text(path: impl AsRef<Path>) -> Option<String> {
+    let path = path.as_ref();
+    let display = path.display().to_string();
+    match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let digest = hash_text(&text);
+            if config_log_changed(&format!("file:{display}"), digest) {
+                match toml::from_str::<ConfigFile>(&text) {
+                    Ok(_) => {
+                        // ralphus[ignore-rlog-pair]: config loading runs without a Store and before one exists at startup
+                        crate::rlog!(
+                            INFO,
+                            "ralphus [config] loaded config file path={display} bytes={}",
+                            text.len()
+                        );
+                    }
+                    Err(e) => {
+                        let detail = e.to_string().replace('\n', " ");
+                        // ralphus[ignore-rlog-pair]: config loading runs without a Store and before one exists at startup
+                        crate::rlog!(
+                            WARNING,
+                            "ralphus [config] config file failed to parse; every setting it holds falls back to defaults path={display} error={detail}"
+                        );
+                    }
+                }
+            }
+            Some(text)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            if config_log_changed(&format!("read:{display}"), hash_text(&e.to_string())) {
+                // ralphus[ignore-rlog-pair]: config loading runs without a Store and before one exists at startup
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [config] config file unreadable; using defaults path={display} error={e}"
+                );
+            }
+            None
+        }
+    }
 }
 
 /// The global config path: `$RALPHUS_CONFIG_HOME/config.toml`, else
@@ -2620,10 +2747,7 @@ pub fn find_project_config(start: &Path) -> Option<PathBuf> {
 /// Parse a `DaemonConfig` from the given TOML text.
 #[must_use]
 pub fn daemon_from_toml_str(s: &str) -> DaemonConfig {
-    toml::from_str::<ConfigFile>(s)
-        .unwrap_or_default()
-        .daemon
-        .unwrap_or_default()
+    parse_config_file(s).daemon.unwrap_or_default()
 }
 
 /// A non-empty per-project down-time list wins outright over the global one
@@ -2679,17 +2803,17 @@ fn load_daemon_config_with(
     configuration_path_env: Option<&str>,
 ) -> DaemonConfig {
     let mut merged = global_config_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|p| read_config_text(&p))
         .map(|s| daemon_from_toml_str(&s))
         .unwrap_or_default();
     for path in configuration_path_entries(configuration_path_env) {
-        if let Ok(s) = std::fs::read_to_string(&path) {
+        if let Some(s) = read_config_text(&path) {
             merged = merge_daemon_config(merged, daemon_from_toml_str(&s));
         }
     }
     let local = cwd
         .and_then(find_project_config)
-        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|p| read_config_text(&p))
         .map(|s| daemon_from_toml_str(&s))
         .unwrap_or_default();
     merge_daemon_config(merged, local)
@@ -2706,10 +2830,7 @@ pub fn load_daemon_config() -> DaemonConfig {
 /// days / 50,000 rows) when the `[cartographer]` table is absent.
 #[must_use]
 pub fn cartographer_from_toml_str(s: &str) -> CartographerConfig {
-    toml::from_str::<ConfigFile>(s)
-        .unwrap_or_default()
-        .cartographer
-        .unwrap_or_default()
+    parse_config_file(s).cartographer.unwrap_or_default()
 }
 
 /// Load the effective Cartographer retention config by layering the global
@@ -2718,14 +2839,14 @@ pub fn cartographer_from_toml_str(s: &str) -> CartographerConfig {
 #[must_use]
 pub fn load_cartographer_config() -> CartographerConfig {
     let global = global_config_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|p| read_config_text(&p))
         .map(|s| cartographer_from_toml_str(&s))
         .unwrap_or_default();
     let local = std::env::current_dir()
         .ok()
         .as_deref()
         .and_then(find_project_config)
-        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|p| read_config_text(&p))
         .map(|s| cartographer_from_toml_str(&s))
         .unwrap_or_default();
     CartographerConfig {
@@ -2738,10 +2859,7 @@ pub fn load_cartographer_config() -> CartographerConfig {
 /// the `[budget]` table is absent.
 #[must_use]
 pub fn budget_from_toml_str(s: &str) -> BudgetConfig {
-    toml::from_str::<ConfigFile>(s)
-        .unwrap_or_default()
-        .budget
-        .unwrap_or_default()
+    parse_config_file(s).budget.unwrap_or_default()
 }
 
 /// Load the effective session cost-cap poll config by layering the global
@@ -2750,14 +2868,14 @@ pub fn budget_from_toml_str(s: &str) -> BudgetConfig {
 #[must_use]
 pub fn load_budget_config() -> BudgetConfig {
     let global = global_config_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|p| read_config_text(&p))
         .map(|s| budget_from_toml_str(&s))
         .unwrap_or_default();
     let local = std::env::current_dir()
         .ok()
         .as_deref()
         .and_then(find_project_config)
-        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|p| read_config_text(&p))
         .map(|s| budget_from_toml_str(&s))
         .unwrap_or_default();
     BudgetConfig {
@@ -2804,14 +2922,11 @@ pub fn project_review_config(cwd: &Path) -> ReviewConfig {
 /// Parse a `ForgeConfig` from the given TOML text.
 #[must_use]
 pub fn forge_from_toml_str(s: &str) -> ForgeConfig {
-    toml::from_str::<ConfigFile>(s)
-        .unwrap_or_default()
-        .forge
-        .unwrap_or_default()
+    parse_config_file(s).forge.unwrap_or_default()
 }
 
 fn load_forge_file(path: &Path) -> ForgeConfig {
-    std::fs::read_to_string(path)
+    read_config_text(path)
         .map(|s| forge_from_toml_str(&s))
         .unwrap_or_default()
 }
@@ -2838,7 +2953,7 @@ pub fn provider_defaults_from_toml_str(
     s: &str,
     kind: crate::forge::ForgeKind,
 ) -> ForgeProviderConfig {
-    let cfg = toml::from_str::<ConfigFile>(s).unwrap_or_default();
+    let cfg = parse_config_file(s);
     match kind {
         crate::forge::ForgeKind::GitHub => cfg.github.unwrap_or_default(),
         crate::forge::ForgeKind::GitLab => cfg.gitlab.unwrap_or_default(),
@@ -2848,7 +2963,7 @@ pub fn provider_defaults_from_toml_str(
 /// Load the effective provider-defaults config for `kind` from one config file.
 #[must_use]
 fn load_provider_defaults_file(path: &Path, kind: crate::forge::ForgeKind) -> ForgeProviderConfig {
-    std::fs::read_to_string(path)
+    read_config_text(path)
         .map(|s| provider_defaults_from_toml_str(&s, kind))
         .unwrap_or_default()
 }
@@ -2874,10 +2989,7 @@ pub fn resolve_pr_draft_by_default(cwd: &Path, kind: crate::forge::ForgeKind) ->
 /// Parse an `EnvOverridesConfig` from the given TOML text.
 #[must_use]
 pub fn env_overrides_from_toml_str(s: &str) -> EnvOverridesConfig {
-    toml::from_str::<ConfigFile>(s)
-        .unwrap_or_default()
-        .env_overrides
-        .unwrap_or_default()
+    parse_config_file(s).env_overrides.unwrap_or_default()
 }
 
 /// Load the effective env-override allowlist using the daemon process's own
@@ -2890,14 +3002,14 @@ pub fn env_overrides_from_toml_str(s: &str) -> EnvOverridesConfig {
 #[must_use]
 pub fn load_env_overrides_config() -> EnvOverridesConfig {
     let global = global_config_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|p| read_config_text(&p))
         .map(|s| env_overrides_from_toml_str(&s))
         .unwrap_or_default();
     let local = std::env::current_dir()
         .ok()
         .as_deref()
         .and_then(find_project_config)
-        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|p| read_config_text(&p))
         .map(|s| env_overrides_from_toml_str(&s))
         .unwrap_or_default();
     global.merge(local)
@@ -2911,9 +3023,7 @@ pub fn load_env_overrides_config() -> EnvOverridesConfig {
 /// [`default_template`].
 #[must_use]
 pub fn templates_from_toml_str(s: &str) -> Vec<TemplateDef> {
-    toml::from_str::<ConfigFile>(s)
-        .unwrap_or_default()
-        .templates
+    parse_config_file(s).templates
 }
 
 /// Load the effective `[[templates]]` list by unioning the global config
@@ -2927,14 +3037,14 @@ pub fn templates_from_toml_str(s: &str) -> Vec<TemplateDef> {
 #[must_use]
 pub fn load_templates_config() -> Vec<TemplateDef> {
     let global = global_config_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|p| read_config_text(&p))
         .map(|s| templates_from_toml_str(&s))
         .unwrap_or_default();
     let local = std::env::current_dir()
         .ok()
         .as_deref()
         .and_then(find_project_config)
-        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|p| read_config_text(&p))
         .map(|s| templates_from_toml_str(&s))
         .unwrap_or_default();
     let mut merged = Vec::new();
@@ -2975,10 +3085,7 @@ pub fn effective_templates() -> (Vec<TemplateDef>, bool) {
 /// Parse a `[ui]` table from the given TOML text (RAL-297).
 #[must_use]
 pub fn ui_from_toml_str(s: &str) -> UiConfig {
-    toml::from_str::<ConfigFile>(s)
-        .unwrap_or_default()
-        .ui
-        .unwrap_or_default()
+    parse_config_file(s).ui.unwrap_or_default()
 }
 
 /// Load the effective `[ui]` config the same way as
@@ -2986,14 +3093,14 @@ pub fn ui_from_toml_str(s: &str) -> UiConfig {
 #[must_use]
 pub fn load_ui_config() -> UiConfig {
     let global = global_config_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|p| read_config_text(&p))
         .map(|s| ui_from_toml_str(&s))
         .unwrap_or_default();
     let local = std::env::current_dir()
         .ok()
         .as_deref()
         .and_then(find_project_config)
-        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|p| read_config_text(&p))
         .map(|s| ui_from_toml_str(&s))
         .unwrap_or_default();
     UiConfig {
@@ -3004,10 +3111,7 @@ pub fn load_ui_config() -> UiConfig {
 /// Parse a `CorsConfig` from the given TOML text (RAL-220's `[cors]` table).
 #[must_use]
 pub fn cors_from_toml_str(s: &str) -> CorsConfig {
-    toml::from_str::<ConfigFile>(s)
-        .unwrap_or_default()
-        .cors
-        .unwrap_or_default()
+    parse_config_file(s).cors.unwrap_or_default()
 }
 
 /// Load the effective CORS allow-list using the daemon process's own current
@@ -3019,14 +3123,14 @@ pub fn cors_from_toml_str(s: &str) -> CorsConfig {
 pub fn load_cors_config() -> CorsConfig {
     CORS_LOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let global = global_config_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|p| read_config_text(&p))
         .map(|s| cors_from_toml_str(&s))
         .unwrap_or_default();
     let local = std::env::current_dir()
         .ok()
         .as_deref()
         .and_then(find_project_config)
-        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|p| read_config_text(&p))
         .map(|s| cors_from_toml_str(&s))
         .unwrap_or_default();
     global.merge(local)

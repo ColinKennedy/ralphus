@@ -269,12 +269,103 @@ pub fn live_session_path(workspace_root: &Path) -> PathBuf {
         .join(format!("{basename}.live_session"))
 }
 
+/// Best-effort: a failure only delays the daemon learning the session id
+/// early, so it is recorded as a warning rather than failing the cell.
 pub fn write_live_session_id(workspace_root: &Path, id: &str) {
     let path = live_session_path(workspace_root);
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            emit_child_lifecycle(
+                "runner",
+                "could not create live-session directory",
+                "warning",
+                serde_json::json!({"path": parent.display().to_string(), "error": e.to_string()}),
+            );
+        }
     }
-    let _ = std::fs::write(path, id);
+    if let Err(e) = std::fs::write(&path, id) {
+        emit_child_lifecycle(
+            "runner",
+            "could not write live-session file",
+            "warning",
+            serde_json::json!({"path": path.display().to_string(), "error": e.to_string()}),
+        );
+    }
+}
+
+/// Emits one Cartographer event for a step of an agent CLI child process's
+/// lifecycle (spawned, timed out, killed, exited). No `CellSpec` is in scope
+/// inside a backend, so this relies on the daemon's own squad/task/cell
+/// fallback when forwarding, same as every other backend-level event.
+pub fn emit_child_lifecycle(backend: &str, message: &str, level: &str, payload: serde_json::Value) {
+    crate::cartographer::emit(
+        backend,
+        message,
+        level,
+        crate::cartographer::EventContext::default(),
+        payload,
+    );
+}
+
+/// Records that `backend`'s agent CLI child exited, with its exit code (or
+/// the terminating signal, via the status's `Display`). A non-zero or
+/// signalled exit is a warning; a clean one is info.
+pub fn emit_child_exited(backend: &str, pid: u32, status: &std::process::ExitStatus) {
+    let level = if status.success() { "info" } else { "warning" };
+    emit_child_lifecycle(
+        backend,
+        "agent process exited",
+        level,
+        serde_json::json!({
+            "pid": pid,
+            "exit_code": status.code(),
+            "status": status.to_string(),
+        }),
+    );
+}
+
+/// Kills `child` (and reaps it) for `reason`, recording the kill and any
+/// kill/wait error rather than dropping it.
+pub fn kill_child(backend: &str, child: &mut std::process::Child, reason: &str) {
+    let pid = child.id();
+    emit_child_lifecycle(
+        backend,
+        "killing agent process",
+        "warning",
+        serde_json::json!({"pid": pid, "reason": reason}),
+    );
+    if let Err(e) = child.kill() {
+        emit_child_lifecycle(
+            backend,
+            "agent process kill failed",
+            "warning",
+            serde_json::json!({"pid": pid, "reason": reason, "error": e.to_string()}),
+        );
+    }
+    match child.wait() {
+        Ok(status) => emit_child_exited(backend, pid, &status),
+        Err(e) => emit_child_lifecycle(
+            backend,
+            "agent process wait failed after kill",
+            "warning",
+            serde_json::json!({"pid": pid, "reason": reason, "error": e.to_string()}),
+        ),
+    }
+}
+
+/// Removes a runner-owned temporary file, recording any failure other than
+/// the file already being gone.
+pub fn remove_temp_file(backend: &str, path: &Path) {
+    if let Err(e) = std::fs::remove_file(path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            emit_child_lifecycle(
+                backend,
+                "could not remove temporary file",
+                "warning",
+                serde_json::json!({"path": path.display().to_string(), "error": e.to_string()}),
+            );
+        }
+    }
 }
 
 #[cfg(test)]

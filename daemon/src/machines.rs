@@ -28,6 +28,7 @@
 //! - `local` — the daemon's own host. Also the implicit default when `machine`
 //!   is unset anywhere in the inheritance chain.
 
+use rusqlite::OptionalExtension;
 use serde::Serialize;
 
 use crate::store::{Result as StoreResult, Store, now_ms};
@@ -260,11 +261,57 @@ impl Store {
         ok: bool,
         note: Option<&str>,
     ) -> StoreResult<()> {
+        let key = scheme.trim().to_lowercase();
+        let previous: Option<Option<i64>> = self
+            .conn
+            .query_row(
+                "SELECT last_check_ok FROM machine_providers WHERE scheme = ?",
+                rusqlite::params![key],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
         self.conn.execute(
             "UPDATE machine_providers SET last_check_ms=?, last_check_ok=?, last_check_note=?
              WHERE scheme = ?",
-            rusqlite::params![now_ms(), i64::from(ok), note, scheme.trim().to_lowercase()],
+            rusqlite::params![now_ms(), i64::from(ok), note, key],
         )?;
+        // Only a change in reachability is logged: probes repeat on every
+        // health sweep, and an unchanged outcome carries no new information.
+        if let Some(previous) = previous {
+            let previous_ok = previous.map(|v| v != 0);
+            if previous_ok != Some(ok) {
+                let label = |v: Option<bool>| match v {
+                    None => "unchecked",
+                    Some(true) => "reachable",
+                    Some(false) => "unreachable",
+                };
+                let level = if ok {
+                    crate::logging::LogLevel::INFO
+                } else {
+                    crate::logging::LogLevel::WARNING
+                };
+                crate::cartographer::Note::new("machines")
+                    .level(level)
+                    .scope("machine")
+                    .emit(
+                        self,
+                        format!(
+                            "machine provider {key:?} {} → {}{}",
+                            label(previous_ok),
+                            label(Some(ok)),
+                            note.map(|n| format!(": {n}")).unwrap_or_default()
+                        ),
+                        serde_json::json!({
+                            "scheme": key,
+                            "previous_ok": previous_ok,
+                            "ok": ok,
+                            "note": note,
+                        }),
+                    );
+            }
+        }
         Ok(())
     }
 
@@ -375,9 +422,20 @@ impl Store {
                 uri: uri.to_string(),
             });
         }
-        let found = self.get_machine_provider(scheme).map_err(|_| {
+        let found = self.get_machine_provider(scheme).map_err(|e| {
             // A store failure here is indistinguishable to the caller from
-            // "not registered", and the actionable advice is the same.
+            // "not registered", and the actionable advice is the same -- so
+            // the underlying error is only visible in this log line.
+            crate::cartographer::Note::new("machines")
+                .level(crate::logging::LogLevel::WARNING)
+                .scope("machine")
+                .emit(
+                    self,
+                    format!(
+                        "machine provider lookup for scheme {scheme:?} failed, reporting it as unknown: {e}"
+                    ),
+                    serde_json::json!({ "scheme": scheme, "error": e.to_string() }),
+                );
             ResolveError::UnknownScheme {
                 scheme: scheme.to_string(),
                 known: vec![],
@@ -386,7 +444,19 @@ impl Store {
         let Some(provider) = found else {
             let mut known: Vec<String> = self
                 .list_machine_providers()
-                .unwrap_or_default()
+                .unwrap_or_else(|e| {
+                    crate::cartographer::Note::new("machines")
+                        .level(crate::logging::LogLevel::WARNING)
+                        .scope("machine")
+                        .emit(
+                            self,
+                            format!(
+                                "listing machine providers for an unknown-scheme error failed: {e}"
+                            ),
+                            serde_json::json!({ "scheme": scheme, "error": e.to_string() }),
+                        );
+                    Vec::new()
+                })
                 .into_iter()
                 .map(|p| p.scheme)
                 .collect();
@@ -447,6 +517,16 @@ impl Store {
                 created_at_ms=excluded.created_at_ms",
             rusqlite::params![squad_id, cell_id, scheme, uri, handle, now_ms()],
         )?;
+        crate::cartographer::Note::new("machines")
+            .level(crate::logging::LogLevel::DEBUG)
+            .scope("machine")
+            .squad(squad_id)
+            .cell(cell_id)
+            .emit(
+                self,
+                format!("remote exec handle saved for {squad_id}/{cell_id} on {scheme}"),
+                serde_json::json!({ "scheme": scheme }),
+            );
         Ok(())
     }
 
@@ -458,10 +538,22 @@ impl Store {
     /// # Errors
     /// Propagates any SQLite failure.
     pub fn clear_remote_exec_handle(&self, squad_id: &str, cell_id: &str) -> StoreResult<()> {
-        self.conn.execute(
+        let removed = self.conn.execute(
             "DELETE FROM remote_exec_handles WHERE squad_id = ? AND cell_id = ?",
             rusqlite::params![squad_id, cell_id],
         )?;
+        if removed > 0 {
+            crate::cartographer::Note::new("machines")
+                .level(crate::logging::LogLevel::DEBUG)
+                .scope("machine")
+                .squad(squad_id)
+                .cell(cell_id)
+                .emit(
+                    self,
+                    format!("remote exec handle cleared for {squad_id}/{cell_id}"),
+                    serde_json::json!({}),
+                );
+        }
         Ok(())
     }
 

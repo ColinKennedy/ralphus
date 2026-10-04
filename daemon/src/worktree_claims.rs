@@ -101,12 +101,28 @@ impl Store {
         branch: &str,
         squad_id: &str,
     ) -> StoreResult<()> {
-        self.conn.execute(
+        let inserted = self.conn.execute(
             "INSERT INTO task_worktree_claims(project, base_branch, branch, squad_id, created_at_ms)
              VALUES(?,?,?,?,?)
              ON CONFLICT(project, branch) DO NOTHING",
             rusqlite::params![project, base_branch, branch, squad_id, now_ms()],
         )?;
+        if inserted > 0 {
+            crate::cartographer::Note::new("worktrees")
+                .scope("squad")
+                .squad(squad_id)
+                .emit(
+                    self,
+                    format!(
+                        "squad {squad_id} claimed task worktree branch {branch} (project={project} base={base_branch})"
+                    ),
+                    serde_json::json!({
+                        "project": project,
+                        "base_branch": base_branch,
+                        "branch": branch,
+                    }),
+                );
+        }
         Ok(())
     }
 }

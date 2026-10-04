@@ -51,24 +51,33 @@ pub(crate) fn retire_session_artifacts_for_worktree(store: &Store, worktree_path
     let owners = match store.worktree_session_owners() {
         Ok(owners) => owners,
         Err(error) => {
-            // ralphus[ignore-rlog-pair]: store operation failed, cannot emit Cartographer note from error path
-            crate::rlog!(
-                WARNING,
-                "ralphus [guardian] could not list session owners while retiring transcripts for worktree {worktree_path}: {error}"
-            );
+            crate::cartographer::Note::new("guardian")
+                .level(crate::logging::LogLevel::WARNING)
+                .scope("worktree")
+                .emit(
+                    store,
+                    format!(
+                        "could not list session owners while retiring transcripts for worktree {worktree_path}: {error}"
+                    ),
+                    serde_json::json!({
+                        "worktree": worktree_path,
+                        "error": error.to_string(),
+                    }),
+                );
             return 0;
         }
     };
     let target =
         crate::guardian_merge::normalized_worktree_path(std::path::Path::new(worktree_path));
     let mut swept = 0;
+    let mut files_removed = 0usize;
     for owner in owners {
         if crate::guardian_merge::normalized_worktree_path(std::path::Path::new(&owner.cwd))
             != target
         {
             continue;
         }
-        delete_session_artifacts(&crate::tmux::session_name(
+        files_removed += delete_session_artifacts(&crate::tmux::session_name(
             &owner.squad_id,
             &owner.task_name,
             &owner.session_id,
@@ -79,19 +88,37 @@ pub(crate) fn retire_session_artifacts_for_worktree(store: &Store, worktree_path
         // extra, deterministic name covers every restart without needing
         // per-attempt bookkeeping. Best-effort deletion makes this a
         // harmless no-op for a session that was never restarted.
-        delete_session_artifacts(&crate::tmux::session_name(
+        files_removed += delete_session_artifacts(&crate::tmux::session_name(
             &owner.squad_id,
             &owner.task_name,
             &format!("{}-resume", owner.session_id),
         ));
         swept += 1;
     }
+    if swept > 0 {
+        crate::cartographer::Note::new("guardian")
+            .level(crate::logging::LogLevel::DEBUG)
+            .scope("worktree")
+            .emit(
+                store,
+                format!(
+                    "retired session artifacts for worktree {worktree_path}: sessions={swept} artifacts_removed={files_removed}"
+                ),
+                serde_json::json!({
+                    "worktree": worktree_path,
+                    "sessions_swept": swept,
+                    "artifacts_removed": files_removed,
+                }),
+            );
+    }
     swept
 }
 
-fn delete_session_artifacts(session_name: &str) {
-    crate::tmux::delete_pane_snapshot(session_name);
-    crate::terminal_log::delete_for_session(session_name);
+/// Delete one session's pane snapshot and terminal-log directory, returning
+/// how many of the two actually existed and were removed.
+fn delete_session_artifacts(session_name: &str) -> usize {
+    usize::from(crate::tmux::delete_pane_snapshot(session_name))
+        + usize::from(crate::terminal_log::delete_for_session(session_name))
 }
 
 #[cfg(test)]

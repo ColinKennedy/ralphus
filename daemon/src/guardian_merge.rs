@@ -980,7 +980,12 @@ fn is_ancestor(root: &Workspace, ancestor: &str, descendant: &str) -> bool {
 /// `root`. Clears leftovers from a merge that was killed before its [`CarryRefs`]
 /// guard ran, and runs when a guardian is deleted. Matching is path-component
 /// exact, so `<id>` never captures another guardian whose id shares this prefix.
-fn purge_carry_refs(root: &Workspace, id: &str) {
+///
+/// Returns a description of every ref that could not be listed or deleted, so
+/// a Store-owning caller can record the leak.
+#[must_use]
+fn purge_carry_refs(root: &Workspace, id: &str) -> Vec<String> {
+    let mut failures = Vec::new();
     let listed = git(
         root.root(),
         &[
@@ -989,10 +994,16 @@ fn purge_carry_refs(root: &Workspace, id: &str) {
             &format!("refs/ralphus/carry/{id}"),
         ],
     )
-    .unwrap_or_default();
+    .unwrap_or_else(|e| {
+        failures.push(format!("list refs/ralphus/carry/{id}: {e}"));
+        String::new()
+    });
     for name in listed.lines().map(str::trim).filter(|s| !s.is_empty()) {
-        let _ = root.git(&["update-ref", "--delete", name]);
+        if let Err(e) = root.git(&["update-ref", "--delete", name]) {
+            failures.push(format!("{name}: {e}"));
+        }
     }
+    failures
 }
 
 /// RAII holder for carry-forward protection refs. Each pinned ref
@@ -2275,6 +2286,59 @@ fn synthesize_proof_instructions(
           format, lint, and test instructions; run any applicable formatter and linter; \
           ensure the project builds without errors; then stage your changes."
             .to_string()
+    }
+}
+
+/// Load the review a background merge worker is about to run against. A
+/// review deleted between kickoff and the worker starting (or a store error)
+/// ends the worker without touching any state, recorded as a WARNING so the
+/// silent no-op is traceable.
+fn load_guardian_for_worker(
+    store: &crate::store_lock::StoreHandle,
+    id: &str,
+    worker: &str,
+) -> Option<crate::guardian::GuardianView> {
+    let guard = store.lock();
+    match guard.get_guardian(id) {
+        Ok(g) => Some(g),
+        Err(e) => {
+            crate::cartographer::Note::new("guardian")
+                .level(crate::logging::LogLevel::WARNING)
+                .scope("guardian")
+                .guardian(id)
+                .emit(
+                    &guard,
+                    format!("review {id} {worker} skipped: could not load review: {e}"),
+                    serde_json::json!({"worker": worker, "error": e.to_string()}),
+                );
+            None
+        }
+    }
+}
+
+/// Persist a review status transition on behalf of a merge worker. A failed
+/// write leaves the board showing a stale status while the worker carries on,
+/// so it is recorded as a WARNING rather than dropped.
+fn write_merge_status(
+    store: &crate::store_lock::StoreHandle,
+    id: &str,
+    status: GuardianStatus,
+    detail: Option<&str>,
+) {
+    let guard = store.lock();
+    if let Err(e) = guard.set_guardian_status(id, status, detail) {
+        crate::cartographer::Note::new("guardian")
+            .level(crate::logging::LogLevel::WARNING)
+            .scope("guardian")
+            .guardian(id)
+            .emit(
+                &guard,
+                format!(
+                    "review {id} status write → {} failed: {e}",
+                    status.as_str()
+                ),
+                serde_json::json!({"status": status.as_str(), "detail": detail, "error": e.to_string()}),
+            );
     }
 }
 
@@ -3980,10 +4044,43 @@ pub fn purge_worktrees(store: &crate::store_lock::StoreHandle, git_root: &str, i
     let root = Workspace::for_guardian(store, id, Path::new(git_root));
     let wt_base = root.at(worktree_dir(git_root, id));
     let claimed = claimed_review_branches(store, id, Some(git_root));
-    cleanup_review_worktrees(&root, &wt_base, id, &num, &claimed);
+    let mut summary = cleanup_review_worktrees(&root, &wt_base, id, &num, &claimed);
     // Also drop any carry-forward protection refs so a deleted guardian leaves
     // nothing pinning otherwise-unreachable commits.
-    purge_carry_refs(&root, id);
+    summary.failures.extend(purge_carry_refs(&root, id));
+    let guard = store.lock();
+    let payload = serde_json::json!({
+        "git_root": git_root,
+        "worktrees_removed": summary.worktrees_removed,
+        "branches_deleted": summary.branches_deleted,
+        "failures": summary.failures,
+    });
+    if summary.failures.is_empty() {
+        crate::cartographer::Note::new("guardian")
+            .scope("guardian")
+            .guardian(id)
+            .emit(
+                &guard,
+                format!(
+                    "review {id} worktrees purged worktrees={} branches={}",
+                    summary.worktrees_removed, summary.branches_deleted
+                ),
+                payload,
+            );
+    } else {
+        crate::cartographer::Note::new("guardian")
+            .level(crate::logging::LogLevel::WARNING)
+            .scope("guardian")
+            .guardian(id)
+            .emit(
+                &guard,
+                format!(
+                    "review {id} worktree purge incomplete: {} removal(s) failed",
+                    summary.failures.len()
+                ),
+                payload,
+            );
+    }
 }
 
 /// Validate the guardian and kick off a background merge. Returns immediately.
@@ -4106,6 +4203,15 @@ pub(crate) fn kickoff_merge(
             Ok(g) if g.status.as_str() == GuardianStatus::Merged.as_str()
         );
         if now_merged {
+            let guard = store.lock();
+            crate::cartographer::Note::new("guardian")
+                .scope("guardian")
+                .guardian(id)
+                .emit(
+                    &guard,
+                    format!("review {id} merge skipped: every linked PR has already merged"),
+                    serde_json::json!({"outcome": "already_merged", "via": "forge"}),
+                );
             return Ok(StartMergeOutcome::AlreadyMerged);
         }
     }
@@ -4114,6 +4220,17 @@ pub(crate) fn kickoff_merge(
     // another ralphus worktree) pushed commits, integrate and restack them
     // before claiming this new merge.
     if let Err(e) = crate::pr::sync_remote_pr_commits(&store, runner.as_ref(), id) {
+        let guard = store.lock();
+        crate::cartographer::Note::new("guardian")
+            .level(crate::logging::LogLevel::WARNING)
+            .scope("guardian")
+            .guardian(id)
+            .emit(
+                &guard,
+                format!("review {id} merge rejected: PR sync preflight failed: {e}"),
+                serde_json::json!({"outcome": "preflight_failed", "error": e}),
+            );
+        drop(guard);
         return Err(StartMergeError::Preflight(e));
     }
     // RAL-300: same idea, but via git ancestry rather than the forge -- a
@@ -4129,6 +4246,17 @@ pub(crate) fn kickoff_merge(
             && guardian_base_already_has_every_branch(&store, id, &guardian_snapshot)
             && approve_base_already_landed(&store, id)
         {
+            let guard = store.lock();
+            crate::cartographer::Note::new("guardian")
+                .scope("guardian")
+                .guardian(id)
+                .emit(
+                    &guard,
+                    format!(
+                        "review {id} merge skipped: base branch already contains every enabled branch"
+                    ),
+                    serde_json::json!({"outcome": "already_merged", "via": "git_ancestry"}),
+                );
             return Ok(StartMergeOutcome::AlreadyMerged);
         }
     }
@@ -4175,6 +4303,15 @@ pub(crate) fn kickoff_merge(
         (guardian, unfinished)
     };
     if guardian.branches.is_empty() {
+        let guard = store.lock();
+        crate::cartographer::Note::new("guardian")
+            .scope("guardian")
+            .guardian(id)
+            .emit(
+                &guard,
+                format!("review {id} merge rejected: review has no branches"),
+                serde_json::json!({"outcome": "no_branches"}),
+            );
         return Err(StartMergeError::NoBranches);
     }
     if !unfinished.is_empty() {
@@ -4385,7 +4522,28 @@ pub fn restart_guardian_merge(
     let key = format!("guardian:{id}");
     cancellations.cancel(&key);
     kill_guardian_agent_sessions(&store, id);
-    let _ = wait_for_merge_worker_stop(&cancellations, &key);
+    let worker_stopped = wait_for_merge_worker_stop(&cancellations, &key);
+    {
+        let guard = store.lock();
+        let note = crate::cartographer::Note::new("guardian")
+            .scope("guardian")
+            .guardian(id);
+        if worker_stopped {
+            note.emit(
+                &guard,
+                format!("review {id} merge restart requested"),
+                serde_json::json!({"worker_stopped": true}),
+            );
+        } else {
+            note.level(crate::logging::LogLevel::WARNING).emit(
+                &guard,
+                format!(
+                    "review {id} merge restart: previous merge worker did not stop within the wait budget; restarting anyway"
+                ),
+                serde_json::json!({"worker_stopped": false}),
+            );
+        }
+    }
     // RAL-507: a user-directed rebase gives the review's base-shift retry
     // campaign a fresh automatic budget -- clear it before the requested
     // rebase starts, the same boundary the manual Merge / rebase handler
@@ -4397,7 +4555,18 @@ pub fn restart_guardian_merge(
             "ralphus [guardian] review {id} could not reset base-shift rebuild budget before manual rebase: {e}"
         );
     }
-    if let Err(e) = store.lock().reset_guardian_to_collecting(id) {
+    let reset = store.lock().reset_guardian_to_collecting(id);
+    if let Err(e) = reset {
+        let guard = store.lock();
+        crate::cartographer::Note::new("guardian")
+            .level(crate::logging::LogLevel::WARNING)
+            .scope("guardian")
+            .guardian(id)
+            .emit(
+                &guard,
+                format!("review {id} merge restart aborted: could not reset to collecting: {e}"),
+                serde_json::json!({"error": e.to_string()}),
+            );
         return reply(500, &error_body("store_error", &e.to_string()));
     }
     // RAL-536: a human-triggered restart of the whole review always clears
@@ -4441,6 +4610,18 @@ pub fn reopen_guardian_merge(
 ) -> Reply {
     let key = format!("guardian:{id}");
     if !wait_for_merge_worker_stop(&cancellations, &key) {
+        let guard = store.lock();
+        crate::cartographer::Note::new("guardian")
+            .level(crate::logging::LogLevel::WARNING)
+            .scope("guardian")
+            .guardian(id)
+            .emit(
+                &guard,
+                format!(
+                    "review {id} reopen rejected: the cancelled merge worker is still stopping"
+                ),
+                serde_json::json!({"outcome": "merge_still_stopping"}),
+            );
         return reply(
             409,
             &error_body(
@@ -4449,10 +4630,40 @@ pub fn reopen_guardian_merge(
             ),
         );
     }
-    if let Err(e) = store.lock().reopen_guardian(id) {
+    let reopened = store.lock().reopen_guardian(id);
+    if let Err(e) = reopened {
+        let guard = store.lock();
+        crate::cartographer::Note::new("guardian")
+            .level(crate::logging::LogLevel::WARNING)
+            .scope("guardian")
+            .guardian(id)
+            .emit(
+                &guard,
+                format!("review {id} reopen rejected: {e}"),
+                serde_json::json!({"error": e.to_string()}),
+            );
         return reply(500, &error_body("store_error", &e.to_string()));
     }
-    let claimed = store.lock().claim_guardian_merge(id).unwrap_or(false);
+    let claimed = {
+        let guard = store.lock();
+        match guard.claim_guardian_merge(id) {
+            Ok(claimed) => claimed,
+            Err(e) => {
+                crate::cartographer::Note::new("guardian")
+                    .level(crate::logging::LogLevel::WARNING)
+                    .scope("guardian")
+                    .guardian(id)
+                    .emit(
+                        &guard,
+                        format!(
+                            "review {id} reopened but merge claim failed: {e}; leaving it collecting"
+                        ),
+                        serde_json::json!({"error": e.to_string()}),
+                    );
+                false
+            }
+        }
+    };
     if !claimed {
         // Lost the claim to a concurrent trigger (e.g. a task completing at
         // the same instant) -- that other caller's pass covers this reopen.
@@ -4502,6 +4713,16 @@ pub fn stop_guardian_merge(
     cancellations.cancel(&key);
     kill_guardian_agent_sessions(&store, id);
     if !wait_for_merge_worker_stop(&cancellations, &key) {
+        let guard = store.lock();
+        crate::cartographer::Note::new("guardian")
+            .level(crate::logging::LogLevel::WARNING)
+            .scope("guardian")
+            .guardian(id)
+            .emit(
+                &guard,
+                format!("review {id} stop not yet confirmed: merge worker is still stopping"),
+                serde_json::json!({"outcome": "merge_still_stopping"}),
+            );
         return reply(
             409,
             &error_body(
@@ -4510,7 +4731,8 @@ pub fn stop_guardian_merge(
             ),
         );
     }
-    match store.lock().stop_guardian_merge(id) {
+    let stopped = store.lock().stop_guardian_merge(id);
+    match stopped {
         Ok(status) => {
             // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
             crate::rlog!(
@@ -4520,7 +4742,19 @@ pub fn stop_guardian_merge(
             );
             reply(200, &format!("{{\"status\":\"{}\"}}", status.as_str()))
         }
-        Err(e) => reply(500, &error_body("store_error", &e.to_string())),
+        Err(e) => {
+            let guard = store.lock();
+            crate::cartographer::Note::new("guardian")
+                .level(crate::logging::LogLevel::WARNING)
+                .scope("guardian")
+                .guardian(id)
+                .emit(
+                    &guard,
+                    format!("review {id} stop rejected: {e}"),
+                    serde_json::json!({"error": e.to_string()}),
+                );
+            reply(500, &error_body("store_error", &e.to_string()))
+        }
     }
 }
 
@@ -4593,6 +4827,17 @@ pub fn start_resolve_input(
         );
     }
 
+    {
+        let guard = store.lock();
+        crate::cartographer::Note::new("guardian")
+            .scope("guardian")
+            .guardian(guardian_id)
+            .emit(
+                &guard,
+                format!("review {guardian_id} input '{input_name}' resolution started"),
+                serde_json::json!({"input": input_name}),
+            );
+    }
     let gid = guardian_id.to_string();
     std::thread::spawn(move || {
         let _permit = sem.acquire();
@@ -4635,6 +4880,17 @@ pub fn start_feedback(
     let feature = match guardian.branches.iter().find(|b| b.id == branch_id) {
         Some(b) if b.worktree.is_some() => b.branch.clone(),
         Some(_) => {
+            let guard = store.lock();
+            crate::cartographer::Note::new("guardian")
+                .scope("branch")
+                .guardian(id)
+                .emit(
+                    &guard,
+                    format!(
+                        "review {id} feedback rejected: branch {branch_id} has no review worktree yet"
+                    ),
+                    serde_json::json!({"branch_id": branch_id, "outcome": "not_ready"}),
+                );
             return reply(
                 409,
                 &error_body("not_ready", "run the review merge before giving feedback"),
@@ -4647,9 +4903,22 @@ pub fn start_feedback(
     // about to be overtaken by this one -- mark it `superseded` before
     // inserting the new message so its bubble never reads as still in
     // progress (or, worse, completed) once this newer request lands.
-    let _ = store
-        .lock()
-        .supersede_pending_branch_feedback(id, branch_id);
+    {
+        let guard = store.lock();
+        if let Err(e) = guard.supersede_pending_branch_feedback(id, branch_id) {
+            crate::cartographer::Note::new("guardian")
+                .level(crate::logging::LogLevel::WARNING)
+                .scope("branch")
+                .guardian(id)
+                .emit(
+                    &guard,
+                    format!(
+                        "review {id} branch {branch_id}: could not mark earlier pending feedback superseded: {e}"
+                    ),
+                    serde_json::json!({"branch_id": branch_id, "error": e.to_string()}),
+                );
+        }
+    }
     let message_seq = {
         let guard = store.lock();
         match guard.add_guardian_message(
@@ -4887,9 +5156,8 @@ pub fn run_merge_staged(
     id: &str,
     cancel: &CancelToken,
 ) {
-    let guardian = match store.lock().get_guardian(id) {
-        Ok(g) => g,
-        Err(_) => return,
+    let Some(guardian) = load_guardian_for_worker(store, id, "staged merge") else {
+        return;
     };
     if guardian.skip_worktrees {
         // Shared-worktree reviews have no per-branch worktrees to resume from,
@@ -4897,9 +5165,7 @@ pub fn run_merge_staged(
         // legacy merge, but only once every enabled branch's cells are done
         // (the only input it can build); otherwise stay collecting for now.
         if !all_enabled_branches_terminal(store, id) {
-            let _ = store
-                .lock()
-                .set_guardian_status(id, GuardianStatus::Collecting, None);
+            write_merge_status(store, id, GuardianStatus::Collecting, None);
         } else {
             run_merge_cancellable(store, runner, id, cancel);
         }
@@ -4908,7 +5174,7 @@ pub fn run_merge_staged(
     let _git_operation =
         git_review_operation_guard(Path::new(&guardian.git_root), guardian.machine.as_deref());
     let set_status = |s: GuardianStatus, detail: Option<&str>| {
-        let _ = store.lock().set_guardian_status(id, s, detail);
+        write_merge_status(store, id, s, detail);
     };
     let resolved = match resolve_resolver_agent(
         guardian.resolver_agent.as_deref(),
@@ -5117,7 +5383,7 @@ fn staged_merge_pass(
     }
 
     let set_status = |s: GuardianStatus, d: Option<&str>| {
-        let _ = store.lock().set_guardian_status(id, s, d);
+        write_merge_status(store, id, s, d);
     };
 
     // Resolve every project's base commit up front; if any base is unresolvable
@@ -5550,9 +5816,8 @@ pub fn run_merge_cancellable(
     id: &str,
     cancel: &CancelToken,
 ) {
-    let guardian = match store.lock().get_guardian(id) {
-        Ok(g) => g,
-        Err(_) => return,
+    let Some(guardian) = load_guardian_for_worker(store, id, "merge") else {
+        return;
     };
     let _git_operation =
         git_review_operation_guard(Path::new(&guardian.git_root), guardian.machine.as_deref());
@@ -5593,7 +5858,7 @@ pub fn run_merge_cancellable(
     }
 
     let set_status = |s: GuardianStatus, detail: Option<&str>| {
-        let _ = store.lock().set_guardian_status(id, s, detail);
+        write_merge_status(store, id, s, detail);
     };
     let resolved = match resolve_resolver_agent(
         guardian.resolver_agent.as_deref(),
@@ -5727,12 +5992,13 @@ pub fn run_merge_cancellable(
     // return, or panic); any leftovers from a merge killed before its guard ran
     // are purged first.
     let mut carry = CarryRefs::new();
+    let mut cleanup_failures: Vec<String> = Vec::new();
     for (proj, proj_branches) in &project_branches {
         // RAL-185: every path derived below carries the review's machine, so
         // each git command and file operation lands where the review was
         // assigned rather than on whichever host happens to be running this.
         let proot = ws_root.at(PathBuf::from(proj));
-        purge_carry_refs(&proot, id);
+        cleanup_failures.extend(purge_carry_refs(&proot, id));
         if let Some(sha) = old_base_by_proj.get(proj) {
             carry.pin(proot.root(), id, "base", sha);
         }
@@ -5754,7 +6020,23 @@ pub fn run_merge_cancellable(
         let root = ws_root.at(PathBuf::from(proj));
         let wt_base = ws_root.at(worktree_dir(proj, id));
         let claimed = claimed_review_branches(store, id, Some(proj));
-        cleanup_review_worktrees(&root, &wt_base, id, &num, &claimed);
+        let summary = cleanup_review_worktrees(&root, &wt_base, id, &num, &claimed);
+        cleanup_failures.extend(summary.failures);
+    }
+    if !cleanup_failures.is_empty() {
+        let guard = store.lock();
+        crate::cartographer::Note::new("guardian")
+            .level(crate::logging::LogLevel::WARNING)
+            .scope("guardian")
+            .guardian(id)
+            .emit(
+                &guard,
+                format!(
+                    "review {id} pre-merge cleanup could not remove {} item(s)",
+                    cleanup_failures.len()
+                ),
+                serde_json::json!({"failures": cleanup_failures}),
+            );
     }
 
     for (proj, proj_branches) in &project_branches {
@@ -6706,7 +6988,7 @@ fn run_feedback_pass(
     );
 
     let set_status = |s: GuardianStatus, detail: Option<&str>| {
-        let _ = store.lock().set_guardian_status(id, s, detail);
+        write_merge_status(store, id, s, detail);
     };
 
     // Resolve this branch's effective project root (RAL-29: may differ from primary).
@@ -7680,7 +7962,7 @@ pub fn pull_pr_commits(
     }
 
     let set_status = |s: GuardianStatus, detail: Option<&str>| {
-        let _ = store.lock().set_guardian_status(id, s, detail);
+        write_merge_status(store, id, s, detail);
     };
     let final_branch_id: Option<String> = guardian
         .branches
@@ -8267,7 +8549,7 @@ pub(crate) fn restack_stack_from(
     let git_root = Workspace::for_guardian(store, id, PathBuf::from(&guardian.git_root));
     let wt_base = git_root.at(worktree_dir(&guardian.git_root, id));
     let set_status = |s: GuardianStatus, d: Option<&str>| {
-        let _ = store.lock().set_guardian_status(id, s, d);
+        write_merge_status(store, id, s, d);
     };
     restack_from_position(
         store,
@@ -8983,7 +9265,7 @@ fn stack_pick(
     cancel: &CancelToken,
 ) -> std::result::Result<(), ()> {
     let set_status = |s: GuardianStatus, d: Option<&str>| {
-        let _ = store.lock().set_guardian_status(id, s, d);
+        write_merge_status(store, id, s, d);
     };
     match drive_rebase(
         store,
@@ -11461,10 +11743,14 @@ fn cleanup_review_worktrees(
     id: &str,
     num: &str,
     claimed_branches: &[String],
-) {
+) -> ReviewCleanupSummary {
+    let mut summary = ReviewCleanupSummary::default();
     let list = root
         .git(&["worktree", "list", "--porcelain"])
-        .unwrap_or_default();
+        .unwrap_or_else(|e| {
+            summary.failures.push(format!("git worktree list: {e}"));
+            String::new()
+        });
     for line in list.lines() {
         if let Some(path) = line.strip_prefix("worktree ") {
             let path = path.trim();
@@ -11472,7 +11758,12 @@ fn cleanup_review_worktrees(
                 // Unlock first so that a locked worktree does not block removal.
                 let _ = root.git(&["worktree", "unlock", path]);
                 // Two --force flags handle dirty/untracked (first) and locked (second).
-                let _ = root.git(&["worktree", "remove", "--force", "--force", path]);
+                match root.git(&["worktree", "remove", "--force", "--force", path]) {
+                    Ok(_) => summary.worktrees_removed += 1,
+                    Err(e) => summary
+                        .failures
+                        .push(format!("remove worktree {path}: {e}")),
+                }
             }
         }
     }
@@ -11486,7 +11777,16 @@ fn cleanup_review_worktrees(
     root.remove_path(root.root().join(".ralphus_guardian").join(id), true);
     root.remove_path(root.root().join(".ralphus_guardian"), true);
     for branch in claimed_branches {
-        let _ = root.git(&["branch", "--delete", "--force", branch]);
+        // A claimed readable name that was never created (or already
+        // deleted) is the common case here, so only an existing branch that
+        // survives the delete counts as a failure.
+        match root.git(&["branch", "--delete", "--force", branch]) {
+            Ok(_) => summary.branches_deleted += 1,
+            Err(e) if local_branch_exists(root, branch) => summary
+                .failures
+                .push(format!("delete branch {branch}: {e}")),
+            Err(_) => {}
+        }
     }
     // RAL-201: was `git(root.root(), ...)`, a direct bypass of `root`'s
     // machine sitting right next to the correctly-routed calls in this same
@@ -11508,10 +11808,30 @@ fn cleanup_review_worktrees(
             // unprefixed namespace readable review branches now occupy -- so
             // the only branches they can still match are a user's own.
         ])
-        .unwrap_or_default();
+        .unwrap_or_else(|e| {
+            summary
+                .failures
+                .push(format!("list guardian/{id} branches: {e}"));
+            String::new()
+        });
     for branch in refs.lines().map(str::trim).filter(|b| !b.is_empty()) {
-        let _ = root.git(&["branch", "--delete", "--force", branch]);
+        match root.git(&["branch", "--delete", "--force", branch]) {
+            Ok(_) => summary.branches_deleted += 1,
+            Err(e) => summary
+                .failures
+                .push(format!("delete branch {branch}: {e}")),
+        }
     }
+    summary
+}
+
+/// What one [`cleanup_review_worktrees`] pass removed, plus every removal it
+/// could not complete, for the Store-owning caller to log.
+#[derive(Debug, Default)]
+struct ReviewCleanupSummary {
+    worktrees_removed: usize,
+    branches_deleted: usize,
+    failures: Vec<String>,
 }
 
 /// Review worktrees with no activity for thirty days are stale. This is long
@@ -14468,6 +14788,18 @@ pub(crate) fn resolve_check_input(
     }) else {
         let guard = store.lock();
         let _ = guard.set_guardian_input_resolution_failed(guardian_id, &input.name);
+        crate::cartographer::Note::new("guardian")
+            .level(crate::logging::LogLevel::WARNING)
+            .scope("guardian")
+            .guardian(guardian_id)
+            .emit(
+                &guard,
+                format!(
+                    "review {guardian_id} input '{}' resolution failed: review could not be loaded",
+                    input.name
+                ),
+                serde_json::json!({"input": input.name}),
+            );
         return;
     };
     let resolved = match resolve_resolver_agent(
@@ -14536,6 +14868,22 @@ pub(crate) fn resolve_check_input(
     let guard = store.lock();
     if !result.is_done() || result.summary.trim().is_empty() {
         let _ = guard.set_guardian_input_resolution_failed(guardian_id, &input.name);
+        crate::cartographer::Note::new("guardian")
+            .level(crate::logging::LogLevel::WARNING)
+            .scope("guardian")
+            .guardian(guardian_id)
+            .emit(
+                &guard,
+                format!(
+                    "review {guardian_id} input '{}' resolution failed: agent returned no usable value",
+                    input.name
+                ),
+                serde_json::json!({
+                    "input": input.name,
+                    "status": result.status,
+                    "error": result.error,
+                }),
+            );
         return;
     }
 
@@ -14553,7 +14901,30 @@ pub(crate) fn resolve_check_input(
 
     if value.is_empty() {
         let _ = guard.set_guardian_input_resolution_failed(guardian_id, &input.name);
+        crate::cartographer::Note::new("guardian")
+            .level(crate::logging::LogLevel::WARNING)
+            .scope("guardian")
+            .guardian(guardian_id)
+            .emit(
+                &guard,
+                format!(
+                    "review {guardian_id} input '{}' resolution failed: agent reply had no value line",
+                    input.name
+                ),
+                serde_json::json!({"input": input.name}),
+            );
     } else {
+        crate::cartographer::Note::new("guardian")
+            .scope("guardian")
+            .guardian(guardian_id)
+            .emit(
+                &guard,
+                format!(
+                    "review {guardian_id} input '{}' resolved by agent",
+                    input.name
+                ),
+                serde_json::json!({"input": input.name, "value_len": value.len()}),
+            );
         let _ = guard.set_guardian_input_resolution_ready(guardian_id, &input.name, &value);
         let _ = guard.merge_guardian_input_values(
             guardian_id,

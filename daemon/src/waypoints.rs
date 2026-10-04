@@ -63,6 +63,26 @@ use crate::runner::Runner;
 use crate::store::{Result as StoreResult, Store, StoreError, now_ms};
 use crate::triage::SubprojectResolution;
 
+/// Unwraps a store result whose failure a waypoint sweep or notification
+/// tolerates (skipping, defaulting, or carrying on), recording the failure as
+/// a WARNING `waypoints` row first so it is not lost.
+fn log_swallowed<T>(store: &Store, context: &str, result: StoreResult<T>) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(e) => {
+            crate::cartographer::Note::new("waypoints")
+                .level(crate::logging::LogLevel::WARNING)
+                .scope("waypoint")
+                .emit(
+                    store,
+                    format!("{context} failed: {e}"),
+                    serde_json::json!({ "context": context, "error": e.to_string() }),
+                );
+            None
+        }
+    }
+}
+
 /// One `waypoint_roster` row with the state of the squad or review it names,
 /// as read by [`Store::block_gated_squads`]. The state of an entry that does
 /// not exist (or of the other kind) is `None`.
@@ -1952,8 +1972,16 @@ impl Store {
         }
         let closed = self.close_waypoint(waypoint_id)?;
         if closed {
-            let _ = self.cancel_queued_injections_for_waypoint(waypoint_id);
-            let _ = self.notify_affected_of_release(waypoint_id, "the waypoint closed");
+            log_swallowed(
+                self,
+                &format!("waypoint {waypoint_id} cancel queued injections on auto-close"),
+                self.cancel_queued_injections_for_waypoint(waypoint_id),
+            );
+            log_swallowed(
+                self,
+                &format!("waypoint {waypoint_id} release notice on auto-close"),
+                self.notify_affected_of_release(waypoint_id, "the waypoint closed"),
+            );
             crate::cartographer::Note::new("waypoints")
                 .scope("waypoint")
                 .emit(
@@ -2023,8 +2051,16 @@ impl Store {
     pub fn close_waypoint_manually(&self, id: &str) -> StoreResult<bool> {
         let closed = self.close_waypoint(id)?;
         if closed {
-            let _ = self.cancel_queued_injections_for_waypoint(id);
-            let _ = self.notify_affected_of_release(id, "the waypoint was closed by hand");
+            log_swallowed(
+                self,
+                &format!("waypoint {id} cancel queued injections on manual close"),
+                self.cancel_queued_injections_for_waypoint(id),
+            );
+            log_swallowed(
+                self,
+                &format!("waypoint {id} release notice on manual close"),
+                self.notify_affected_of_release(id, "the waypoint was closed by hand"),
+            );
             crate::cartographer::Note::new("waypoints")
                 .scope("waypoint")
                 .emit(
@@ -3022,15 +3058,23 @@ pub fn run_pending_surveys(
 ) {
     let waypoint_ids = {
         let guard = store.lock();
-        guard.list_open_waypoint_ids().unwrap_or_default()
+        log_swallowed(
+            &guard,
+            "list open waypoints",
+            guard.list_open_waypoint_ids(),
+        )
+        .unwrap_or_default()
     };
     let mut budget = SURVEY_MAX_PER_SWEEP;
     for waypoint_id in waypoint_ids {
         let candidates = {
             let guard = store.lock();
-            guard
-                .waypoint_survey_candidates(&waypoint_id)
-                .unwrap_or_default()
+            log_swallowed(
+                &guard,
+                &format!("waypoint {waypoint_id} list survey candidates"),
+                guard.waypoint_survey_candidates(&waypoint_id),
+            )
+            .unwrap_or_default()
         };
         let total = candidates.len();
         let taken = total.min(budget);
@@ -3063,8 +3107,20 @@ pub fn run_pending_surveys(
             let waypoint_halts = waypoint_halts.clone();
             let runner = Arc::clone(runner);
             std::thread::spawn(move || {
-                let _ =
+                let result =
                     survey_candidate(&store, &waypoint_id, &candidate, &waypoint_halts, &runner);
+                if result.is_ok() {
+                    return;
+                }
+                log_swallowed(
+                    &store.lock(),
+                    &format!(
+                        "waypoint {waypoint_id} survey of {} {}",
+                        candidate.kind.as_str(),
+                        candidate.entry_id
+                    ),
+                    result,
+                );
             });
         }
         budget -= taken;
@@ -3102,15 +3158,23 @@ pub fn run_pending_waypoint_resumes(
 ) {
     let halted = {
         let guard = store.lock();
-        guard.waypoint_halted_cells().unwrap_or_default()
+        log_swallowed(
+            &guard,
+            "list waypoint-halted cells",
+            guard.waypoint_halted_cells(),
+        )
+        .unwrap_or_default()
     };
     let mut resumed_squads: BTreeSet<String> = BTreeSet::new();
     for (squad_id, task_idx, idx) in halted {
         let guard = store.lock();
-        if guard
-            .squad_block_gating_waypoint(&squad_id)
-            .unwrap_or(None)
-            .is_some()
+        if log_swallowed(
+            &guard,
+            &format!("squad {squad_id} blocking-waypoint check before resume"),
+            guard.squad_block_gating_waypoint(&squad_id),
+        )
+        .flatten()
+        .is_some()
         {
             continue;
         }
@@ -3130,19 +3194,44 @@ pub fn run_pending_waypoint_resumes(
             guard.get_cell_agent_resume(&squad_id, task_idx, idx),
             Ok((_, _, Some(_)))
         ) {
-            let _ = guard.set_force_resume_own_session(&squad_id, task_idx, idx);
+            log_swallowed(
+                &guard,
+                &format!("squad {squad_id} cell {task_idx}/{idx} force-resume own session"),
+                guard.set_force_resume_own_session(&squad_id, task_idx, idx),
+            );
         }
-        if guard
-            .resume_waypoint_halted_cell(&squad_id, task_idx, idx)
-            .is_ok()
+        if log_swallowed(
+            &guard,
+            &format!("squad {squad_id} cell {task_idx}/{idx} resume from waypoint halt"),
+            guard.resume_waypoint_halted_cell(&squad_id, task_idx, idx),
+        )
+        .is_some()
         {
+            crate::cartographer::Note::new("waypoints")
+                .scope("waypoint")
+                .squad(&squad_id)
+                .emit(
+                    &guard,
+                    format!(
+                        "squad {squad_id} cell {task_idx}/{idx} resumed: no waypoint blocks it any more"
+                    ),
+                    serde_json::json!({
+                        "squad_id": squad_id,
+                        "task_idx": task_idx,
+                        "cell_idx": idx,
+                    }),
+                );
             resumed_squads.insert(squad_id);
         }
     }
     for squad_id in resumed_squads {
         if !cancellations.is_active(&squad_id) {
             let guard = store.lock();
-            let _ = guard.set_squad_state(&squad_id, crate::store::SquadState::Pending);
+            log_swallowed(
+                &guard,
+                &format!("squad {squad_id} re-queue after waypoint resume"),
+                guard.set_squad_state(&squad_id, crate::store::SquadState::Pending),
+            );
         }
     }
 }
@@ -3259,7 +3348,12 @@ pub fn run_pending_deliveries(
 ) {
     let waypoint_ids = {
         let guard = store.lock();
-        guard.list_open_waypoint_ids().unwrap_or_default()
+        log_swallowed(
+            &guard,
+            "list open waypoints",
+            guard.list_open_waypoint_ids(),
+        )
+        .unwrap_or_default()
     };
     for waypoint_id in waypoint_ids {
         let (waypoint, entries) = {
@@ -3267,9 +3361,12 @@ pub fn run_pending_deliveries(
             let Ok(waypoint) = guard.get_waypoint(&waypoint_id) else {
                 continue;
             };
-            let entries = guard
-                .list_affected_entries(&waypoint_id)
-                .unwrap_or_default();
+            let entries = log_swallowed(
+                &guard,
+                &format!("waypoint {waypoint_id} list affected entries"),
+                guard.list_affected_entries(&waypoint_id),
+            )
+            .unwrap_or_default();
             (waypoint, entries)
         };
         for entry in entries {
@@ -3339,11 +3436,15 @@ fn deliver_to_review(
         _ => DeliveryStatus::Failed,
     };
     let guard = store.lock();
-    let _ = guard.set_affected_delivery_status(
-        waypoint_id,
-        WaypointEntryKind::Review,
-        guardian_id,
-        status,
+    log_swallowed(
+        &guard,
+        &format!("waypoint {waypoint_id} record delivery status for review {guardian_id}"),
+        guard.set_affected_delivery_status(
+            waypoint_id,
+            WaypointEntryKind::Review,
+            guardian_id,
+            status,
+        ),
     );
     let note = crate::cartographer::Note::new("waypoints")
         .scope("waypoint")
@@ -3377,11 +3478,15 @@ fn mark_done_but_unreviewed_squad(
     if !terminal {
         return;
     }
-    let _ = guard.set_affected_delivery_status(
-        waypoint_id,
-        WaypointEntryKind::Squad,
-        squad_id,
-        DeliveryStatus::ViaRestack,
+    log_swallowed(
+        &guard,
+        &format!("waypoint {waypoint_id} mark squad {squad_id} via-restack"),
+        guard.set_affected_delivery_status(
+            waypoint_id,
+            WaypointEntryKind::Squad,
+            squad_id,
+            DeliveryStatus::ViaRestack,
+        ),
     );
     let note = crate::cartographer::Note::new("waypoints")
         .scope("waypoint")
@@ -3417,21 +3522,37 @@ pub fn record_waypoint_answer(
     message: &str,
 ) -> Vec<String> {
     let guard = store.lock();
-    let waypoints = match kind {
-        WaypointEntryKind::Squad => guard.open_waypoints_affecting_squad(entry_id),
-        WaypointEntryKind::Review => guard.open_waypoints_affecting_review(entry_id),
-    }
+    let waypoints = log_swallowed(
+        &guard,
+        &format!("list open waypoints affecting {} {entry_id}", kind.as_str()),
+        match kind {
+            WaypointEntryKind::Squad => guard.open_waypoints_affecting_squad(entry_id),
+            WaypointEntryKind::Review => guard.open_waypoints_affecting_review(entry_id),
+        },
+    )
     .unwrap_or_default();
     let mut answered = Vec::new();
     for waypoint_id in &waypoints {
-        if guard
-            .set_affected_bearing_decision(waypoint_id, kind, entry_id, decision)
-            .is_err()
+        if log_swallowed(
+            &guard,
+            &format!(
+                "waypoint {waypoint_id} record answer from {} {entry_id}",
+                kind.as_str()
+            ),
+            guard.set_affected_bearing_decision(waypoint_id, kind, entry_id, decision),
+        )
+        .is_none()
         {
             continue;
         }
-        let _ =
-            guard.append_waypoint_bearing(waypoint_id, kind, entry_id, message, None, None, None);
+        log_swallowed(
+            &guard,
+            &format!(
+                "waypoint {waypoint_id} append answer bearing from {} {entry_id}",
+                kind.as_str()
+            ),
+            guard.append_waypoint_bearing(waypoint_id, kind, entry_id, message, None, None, None),
+        );
         let note = crate::cartographer::Note::new("waypoints").scope("waypoint");
         let note = match kind {
             WaypointEntryKind::Squad => note.squad(entry_id),
@@ -3458,7 +3579,11 @@ pub fn record_waypoint_answer(
     // An answer can be the last thing a waypoint was waiting for.
     for waypoint_id in &answered {
         let guard = store.lock();
-        let _ = guard.maybe_auto_close_waypoint(waypoint_id);
+        log_swallowed(
+            &guard,
+            &format!("waypoint {waypoint_id} auto-close check after answer"),
+            guard.maybe_auto_close_waypoint(waypoint_id),
+        );
     }
     answered
 }
@@ -3555,7 +3680,12 @@ fn stand_down_text(waypoint: &WaypointView) -> String {
 pub fn run_pending_stand_down_notices(store: &crate::store_lock::StoreHandle) {
     let waypoint_ids = {
         let guard = store.lock();
-        guard.list_closed_waypoint_ids().unwrap_or_default()
+        log_swallowed(
+            &guard,
+            "list closed waypoints",
+            guard.list_closed_waypoint_ids(),
+        )
+        .unwrap_or_default()
     };
     for waypoint_id in waypoint_ids {
         let (waypoint, entries) = {
@@ -3563,9 +3693,12 @@ pub fn run_pending_stand_down_notices(store: &crate::store_lock::StoreHandle) {
             let Ok(waypoint) = guard.get_waypoint(&waypoint_id) else {
                 continue;
             };
-            let entries = guard
-                .list_affected_entries(&waypoint_id)
-                .unwrap_or_default();
+            let entries = log_swallowed(
+                &guard,
+                &format!("waypoint {waypoint_id} list affected entries"),
+                guard.list_affected_entries(&waypoint_id),
+            )
+            .unwrap_or_default();
             (waypoint, entries)
         };
         for entry in entries {
@@ -3606,17 +3739,24 @@ fn stand_down_review(
     guardian_id: &str,
 ) {
     let guard = store.lock();
-    let _ = guard.notify_watchers_with_context(
-        crate::monitor::NotifiableEventKind::WaypointAdvised,
-        &format!("guardian:{guardian_id}"),
-        crate::mailbox::MailboxPriority::Normal,
-        &stand_down_text(waypoint),
-        None,
-        None,
-        None,
+    log_swallowed(
+        &guard,
+        &format!("waypoint {waypoint_id} stand-down notice to review {guardian_id}"),
+        guard.notify_watchers_with_context(
+            crate::monitor::NotifiableEventKind::WaypointAdvised,
+            &format!("guardian:{guardian_id}"),
+            crate::mailbox::MailboxPriority::Normal,
+            &stand_down_text(waypoint),
+            None,
+            None,
+            None,
+        ),
     );
-    let _ =
-        guard.mark_affected_entry_stood_down(waypoint_id, WaypointEntryKind::Review, guardian_id);
+    log_swallowed(
+        &guard,
+        &format!("waypoint {waypoint_id} mark review {guardian_id} stood down"),
+        guard.mark_affected_entry_stood_down(waypoint_id, WaypointEntryKind::Review, guardian_id),
+    );
     crate::cartographer::Note::new("waypoints")
         .scope("waypoint")
         .guardian(guardian_id)
@@ -3658,30 +3798,47 @@ fn stand_down_squad(
     squad_id: &str,
 ) {
     let guard = store.lock();
-    let advised = guard
-        .waypoint_advised_cells(waypoint_id, squad_id)
-        .unwrap_or_default();
+    let advised = log_swallowed(
+        &guard,
+        &format!("waypoint {waypoint_id} list advised cells of squad {squad_id}"),
+        guard.waypoint_advised_cells(waypoint_id, squad_id),
+    )
+    .unwrap_or_default();
     let text = stand_down_text(waypoint);
     if advised.is_empty() {
-        let _ = guard.notify_watchers(
-            crate::monitor::NotifiableEventKind::WaypointAdvised,
-            &format!("squad:{squad_id}"),
-            crate::mailbox::MailboxPriority::Normal,
-            &text,
-            Some(squad_id),
-        );
-    } else {
-        for (task_idx, idx) in &advised {
-            let _ = guard.notify_watchers(
+        log_swallowed(
+            &guard,
+            &format!("waypoint {waypoint_id} stand-down notice to squad {squad_id}"),
+            guard.notify_watchers(
                 crate::monitor::NotifiableEventKind::WaypointAdvised,
-                &format!("cell:{squad_id}:{task_idx}:{idx}"),
+                &format!("squad:{squad_id}"),
                 crate::mailbox::MailboxPriority::Normal,
                 &text,
                 Some(squad_id),
+            ),
+        );
+    } else {
+        for (task_idx, idx) in &advised {
+            log_swallowed(
+                &guard,
+                &format!(
+                    "waypoint {waypoint_id} stand-down notice to cell {squad_id}:{task_idx}:{idx}"
+                ),
+                guard.notify_watchers(
+                    crate::monitor::NotifiableEventKind::WaypointAdvised,
+                    &format!("cell:{squad_id}:{task_idx}:{idx}"),
+                    crate::mailbox::MailboxPriority::Normal,
+                    &text,
+                    Some(squad_id),
+                ),
             );
         }
     }
-    let _ = guard.mark_affected_entry_stood_down(waypoint_id, WaypointEntryKind::Squad, squad_id);
+    log_swallowed(
+        &guard,
+        &format!("waypoint {waypoint_id} mark squad {squad_id} stood down"),
+        guard.mark_affected_entry_stood_down(waypoint_id, WaypointEntryKind::Squad, squad_id),
+    );
     crate::cartographer::Note::new("waypoints")
         .scope("waypoint")
         .squad(squad_id)
@@ -3767,15 +3924,22 @@ pub fn notify_entry_blocked(
         WaypointEntryKind::Squad => Some(entry_id),
         WaypointEntryKind::Review => None,
     };
-    let _ = store.notify_watchers_with_remediation(
-        crate::monitor::NotifiableEventKind::WaypointBlocked,
-        &affected_entry_uri(kind, entry_id),
-        crate::mailbox::MailboxPriority::Normal,
-        &message,
-        &remediation,
-        squad_scope,
-        None,
-        None,
+    log_swallowed(
+        store,
+        &format!(
+            "waypoint {waypoint_id} blocked notice to {} {entry_id}",
+            kind.as_str()
+        ),
+        store.notify_watchers_with_remediation(
+            crate::monitor::NotifiableEventKind::WaypointBlocked,
+            &affected_entry_uri(kind, entry_id),
+            crate::mailbox::MailboxPriority::Normal,
+            &message,
+            &remediation,
+            squad_scope,
+            None,
+            None,
+        ),
     );
 }
 
@@ -3807,14 +3971,21 @@ pub fn notify_entry_advised(
         WaypointEntryKind::Squad => Some(entry_id),
         WaypointEntryKind::Review => None,
     };
-    let _ = store.notify_watchers_with_context(
-        crate::monitor::NotifiableEventKind::WaypointAdvised,
-        &affected_entry_uri(kind, entry_id),
-        crate::mailbox::MailboxPriority::Normal,
-        &message,
-        squad_scope,
-        None,
-        None,
+    log_swallowed(
+        store,
+        &format!(
+            "waypoint {waypoint_id} advisory notice to {} {entry_id}",
+            kind.as_str()
+        ),
+        store.notify_watchers_with_context(
+            crate::monitor::NotifiableEventKind::WaypointAdvised,
+            &affected_entry_uri(kind, entry_id),
+            crate::mailbox::MailboxPriority::Normal,
+            &message,
+            squad_scope,
+            None,
+            None,
+        ),
     );
 }
 
@@ -3840,17 +4011,24 @@ pub fn notify_entry_released(
             None,
         ),
     };
-    let _ = store.notify_watchers_with_context(
-        event,
-        &affected_entry_uri(kind, entry_id),
-        crate::mailbox::MailboxPriority::Normal,
+    log_swallowed(
+        store,
         &format!(
-            "Waypoint {waypoint_id} no longer holds this {} ({entry_id}): {reason}.",
+            "waypoint {waypoint_id} release notice to {} {entry_id}",
             kind.as_str()
         ),
-        squad_scope,
-        None,
-        None,
+        store.notify_watchers_with_context(
+            event,
+            &affected_entry_uri(kind, entry_id),
+            crate::mailbox::MailboxPriority::Normal,
+            &format!(
+                "Waypoint {waypoint_id} no longer holds this {} ({entry_id}): {reason}.",
+                kind.as_str()
+            ),
+            squad_scope,
+            None,
+            None,
+        ),
     );
     // The mailbox only reaches watchers, and an entry often has none. A hold
     // lifting is a change to the waypoint's own state, so it belongs in the
@@ -4148,7 +4326,12 @@ fn stale_notice_text(waypoint: &WaypointView, kind: WaypointEntryKind, entry_id:
 pub fn run_pending_stale_notices(store: &crate::store_lock::StoreHandle) {
     let waypoint_ids = {
         let guard = store.lock();
-        guard.list_open_waypoint_ids().unwrap_or_default()
+        log_swallowed(
+            &guard,
+            "list open waypoints",
+            guard.list_open_waypoint_ids(),
+        )
+        .unwrap_or_default()
     };
     for waypoint_id in waypoint_ids {
         let (waypoint, entries) = {
@@ -4156,9 +4339,12 @@ pub fn run_pending_stale_notices(store: &crate::store_lock::StoreHandle) {
             let Ok(waypoint) = guard.get_waypoint(&waypoint_id) else {
                 continue;
             };
-            let entries = guard
-                .list_affected_entries(&waypoint_id)
-                .unwrap_or_default();
+            let entries = log_swallowed(
+                &guard,
+                &format!("waypoint {waypoint_id} list affected entries"),
+                guard.list_affected_entries(&waypoint_id),
+            )
+            .unwrap_or_default();
             (waypoint, entries)
         };
         for entry in entries {
@@ -4166,15 +4352,29 @@ pub fn run_pending_stale_notices(store: &crate::store_lock::StoreHandle) {
                 continue;
             }
             let guard = store.lock();
-            if !guard
-                .affected_entry_work_is_terminal(entry.kind, &entry.entry_id)
-                .unwrap_or(false)
+            if !log_swallowed(
+                &guard,
+                &format!(
+                    "waypoint {waypoint_id} terminal check for {} {}",
+                    entry.kind.as_str(),
+                    entry.entry_id
+                ),
+                guard.affected_entry_work_is_terminal(entry.kind, &entry.entry_id),
+            )
+            .unwrap_or(false)
             {
                 continue;
             }
-            if !guard
-                .mark_affected_entry_stale(&waypoint_id, entry.kind, &entry.entry_id)
-                .unwrap_or(false)
+            if !log_swallowed(
+                &guard,
+                &format!(
+                    "waypoint {waypoint_id} mark {} {} stale",
+                    entry.kind.as_str(),
+                    entry.entry_id
+                ),
+                guard.mark_affected_entry_stale(&waypoint_id, entry.kind, &entry.entry_id),
+            )
+            .unwrap_or(false)
             {
                 continue;
             }
@@ -4213,14 +4413,18 @@ pub fn run_pending_stale_notices(store: &crate::store_lock::StoreHandle) {
                 "{}{next_step}",
                 stale_notice_text(&waypoint, entry.kind, &entry.entry_id)
             );
-            let _ = guard.notify_watchers_with_context(
-                crate::monitor::NotifiableEventKind::SquadAttributesChanged,
-                &entity_uri,
-                crate::mailbox::MailboxPriority::Normal,
-                &body,
-                squad_scope,
-                None,
-                None,
+            log_swallowed(
+                &guard,
+                &format!("waypoint {waypoint_id} stale notice to {entity_uri}"),
+                guard.notify_watchers_with_context(
+                    crate::monitor::NotifiableEventKind::SquadAttributesChanged,
+                    &entity_uri,
+                    crate::mailbox::MailboxPriority::Normal,
+                    &body,
+                    squad_scope,
+                    None,
+                    None,
+                ),
             );
             let note = crate::cartographer::Note::new("waypoints").scope("waypoint");
             let note = match entry.kind {
@@ -4325,7 +4529,11 @@ pub fn redo_affected_entry(
     }
 
     let dirtied = store.restart_squad(entry_id)?;
-    let _ = store.clear_affected_entry_stale(waypoint_id, WaypointEntryKind::Squad, entry_id);
+    log_swallowed(
+        store,
+        &format!("waypoint {waypoint_id} clear stale flag on squad {entry_id}"),
+        store.clear_affected_entry_stale(waypoint_id, WaypointEntryKind::Squad, entry_id),
+    );
     crate::cartographer::Note::new("waypoints")
         .scope("waypoint")
         .squad(entry_id)

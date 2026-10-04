@@ -447,6 +447,29 @@ impl Store {
                 pr_kind,
             ],
         )?;
+        crate::cartographer::Note::new("pr")
+            .scope("guardian")
+            .guardian(guardian_id)
+            .emit(
+                self,
+                format!(
+                    "pr recorded id={id} forge={forge} repo={repo} number={} alias={branch_alias} base={base_ref} kind={pr_kind}",
+                    pr_number.map_or_else(|| "-".to_string(), |n| n.to_string())
+                ),
+                serde_json::json!({
+                    "pr_id": id,
+                    "branch_id": branch_id,
+                    "forge": forge,
+                    "repo": repo,
+                    "pr_number": pr_number,
+                    "pr_url": pr_url,
+                    "branch_alias": branch_alias,
+                    "base_ref": base_ref,
+                    "stack_id": stack_id,
+                    "draft": draft,
+                    "pr_kind": pr_kind,
+                }),
+            );
         Ok(id)
     }
 
@@ -647,6 +670,55 @@ impl Store {
         if n == 0 {
             return Err(StoreError::NotFound);
         }
+        // Push-baseline-only updates (`last_pushed_sha`/`last_pushed_base_ref`)
+        // happen on every push and stay silent; a change to the PR's state,
+        // forge number, alias, or base is a lifecycle event worth a row.
+        let state_changed = new_state != existing.state;
+        let number_changed = new_pr_number != existing.pr_number;
+        let alias_changed = new_alias != existing.branch_alias;
+        let base_changed = new_base_ref != existing.base_ref;
+        if state_changed || number_changed || alias_changed || base_changed {
+            let mut changes = Vec::new();
+            if state_changed {
+                changes.push(format!("state {} -> {new_state}", existing.state));
+            }
+            if number_changed {
+                changes.push(format!(
+                    "number {} -> {}",
+                    existing
+                        .pr_number
+                        .map_or_else(|| "-".to_string(), |n| n.to_string()),
+                    new_pr_number.map_or_else(|| "-".to_string(), |n| n.to_string())
+                ));
+            }
+            if alias_changed {
+                changes.push(format!("alias {} -> {new_alias}", existing.branch_alias));
+            }
+            if base_changed {
+                changes.push(format!("base {} -> {new_base_ref}", existing.base_ref));
+            }
+            crate::cartographer::Note::new("pr")
+                .scope("guardian")
+                .guardian(&existing.guardian_id)
+                .emit(
+                    self,
+                    format!("pr updated id={id} {}", changes.join(", ")),
+                    serde_json::json!({
+                        "pr_id": id,
+                        "branch_id": existing.branch_id,
+                        "forge": existing.forge,
+                        "repo": existing.repo,
+                        "old_state": existing.state,
+                        "new_state": new_state,
+                        "old_pr_number": existing.pr_number,
+                        "new_pr_number": new_pr_number,
+                        "old_branch_alias": existing.branch_alias,
+                        "new_branch_alias": new_alias,
+                        "old_base_ref": existing.base_ref,
+                        "new_base_ref": new_base_ref,
+                    }),
+                );
+        }
         Ok(())
     }
 
@@ -666,6 +738,16 @@ impl Store {
         if n == 0 {
             Err(StoreError::NotFound)
         } else {
+            let guardian_id = self.get_pull_request(id).ok().map(|pr| pr.guardian_id);
+            let mut note = crate::cartographer::Note::new("pr").scope("guardian");
+            if let Some(guardian_id) = guardian_id.as_deref() {
+                note = note.guardian(guardian_id);
+            }
+            note.emit(
+                self,
+                format!("pr dropped id={id}: {reason}"),
+                serde_json::json!({ "pr_id": id, "reason": reason }),
+            );
             Ok(())
         }
     }
@@ -684,6 +766,16 @@ impl Store {
             "UPDATE guardian_pull_requests SET state='dropped', dropped_reason=?, updated_at_ms=? WHERE guardian_id=? AND state='open'",
             params![reason, now_ms(), guardian_id],
         )?;
+        if n > 0 {
+            crate::cartographer::Note::new("pr")
+                .scope("guardian")
+                .guardian(guardian_id)
+                .emit(
+                    self,
+                    format!("dropped {n} open pr row(s) for review {guardian_id}: {reason}"),
+                    serde_json::json!({ "dropped": n, "reason": reason }),
+                );
+        }
         Ok(n)
     }
 
@@ -856,6 +948,16 @@ impl Store {
         if n == 0 {
             Err(StoreError::NotFound)
         } else {
+            let guardian_id = self.get_pull_request(id).ok().map(|pr| pr.guardian_id);
+            let mut note = crate::cartographer::Note::new("pr").scope("guardian");
+            if let Some(guardian_id) = guardian_id.as_deref() {
+                note = note.guardian(guardian_id);
+            }
+            note.emit(
+                self,
+                format!("pr superseded id={id} by={superseded_by}"),
+                serde_json::json!({ "pr_id": id, "superseded_by": superseded_by }),
+            );
             Ok(())
         }
     }
@@ -915,19 +1017,28 @@ impl Store {
         // verdict again), covers every caller from a single write path
         // instead of requiring each one to remember its own instrumentation.
         if changed {
-            let _ = self.cartographer_log(crate::cartographer::CartographerEntry {
-                level: crate::logging::LogLevel::INFO,
-                source: "pr",
-                message: "pr ci status changed",
-                scope: Some("branch"),
-                squad_id: None,
-                guardian_id: existing.as_ref().map(|pr| pr.guardian_id.as_str()),
-                cell_id: None,
-                task: None,
-                log_path: None,
-                payload: serde_json::json!({"pr_id": id, "new_status": status}),
-                admin_only: false,
-            });
+            let old_status = existing.as_ref().and_then(|pr| pr.ci_status.as_deref());
+            let pr_number = existing.as_ref().and_then(|pr| pr.pr_number);
+            let mut note = crate::cartographer::Note::new("pr").scope("branch");
+            if let Some(pr) = existing.as_ref() {
+                note = note.guardian(&pr.guardian_id);
+            }
+            note.emit(
+                self,
+                format!(
+                    "pr ci status changed pr={id} number={} {} -> {status}",
+                    pr_number.map_or_else(|| "-".to_string(), |n| n.to_string()),
+                    old_status.unwrap_or("none")
+                ),
+                serde_json::json!({
+                    "pr_id": id,
+                    "pr_number": pr_number,
+                    "branch_id": existing.as_ref().and_then(|pr| pr.branch_id.as_deref()),
+                    "old_status": old_status,
+                    "new_status": status,
+                    "job_url": job_url,
+                }),
+            );
         }
         Ok(())
     }
@@ -2695,8 +2806,71 @@ pub(crate) fn resolve_feedback_fork_remote(
         .filter(|o| !o.is_empty())
         .and_then(|o| store.lock().resolve_fork(&project_name, o).ok().flatten())
         .or_else(|| store.lock().resolve_fork(&project_name, "").ok().flatten())?;
-    crate::project_forks::ensure_fork_remote(root, &fork.remote_name, &fork.fork_url).ok()?;
+    if let Err(error) =
+        crate::project_forks::ensure_fork_remote(root, &fork.remote_name, &fork.fork_url)
+    {
+        crate::cartographer::Note::new("pr")
+            .level(crate::logging::LogLevel::WARNING)
+            .emit(
+                &store.lock(),
+                format!(
+                    "could not configure fork remote {} for a feedback push in {}; falling back \
+                     to the default push target: {error}",
+                    fork.remote_name,
+                    root.display()
+                ),
+                serde_json::json!({
+                    "project": project_name,
+                    "remote": fork.remote_name,
+                    "error": error,
+                }),
+            );
+        return None;
+    }
     Some(fork.remote_name)
+}
+
+/// Report a failed best-effort store write on the PR paths. These writes
+/// never abort the surrounding forge/git work, but a silently dropped one
+/// leaves the recorded PR mapping (base, last-pushed sha, branch status)
+/// out of step with the forge. `key` is the guardian id when
+/// `guardian_keyed`, else the PR row id. A `NotFound` (the row was deleted
+/// concurrently) is expected churn and logged at DEBUG only.
+fn warn_on_store_write<T>(
+    store: &crate::store_lock::StoreHandle,
+    op: &str,
+    key: &str,
+    guardian_keyed: bool,
+    result: Result<T>,
+) {
+    let Err(error) = result else {
+        return;
+    };
+    let level = if matches!(error, StoreError::NotFound) {
+        crate::logging::LogLevel::DEBUG
+    } else {
+        crate::logging::LogLevel::WARNING
+    };
+    let guard = store.lock();
+    let guardian_id = if guardian_keyed {
+        Some(key.to_string())
+    } else {
+        guard.get_pull_request(key).ok().map(|pr| pr.guardian_id)
+    };
+    let mut note = crate::cartographer::Note::new("pr").level(level);
+    if let Some(guardian_id) = guardian_id.as_deref() {
+        note = note.scope("guardian").guardian(guardian_id);
+    }
+    note.emit(
+        &guard,
+        format!("could not persist {op} for {key}: {error}"),
+        serde_json::json!({
+            "op": op,
+            "key": key,
+            "pr_id": (!guardian_keyed).then_some(key),
+            "error": error.to_string(),
+        }),
+    );
 }
 
 fn resync_pr_bases_inner(
@@ -2781,7 +2955,7 @@ fn resync_pr_bases_inner(
                 pr.base_ref
             );
             if !require_forge_success {
-                let _ = store.lock().update_pull_request_ex(
+                let result = store.lock().update_pull_request_ex(
                     &pr.id,
                     None,
                     None,
@@ -2791,6 +2965,7 @@ fn resync_pr_bases_inner(
                     None,
                     None,
                 );
+                warn_on_store_write(store, "update_pull_request_ex", &pr.id, false, result);
             }
             // RAL-338: only a registered fork makes `pr.repo` potentially
             // differ from the guardian's single resolved client (a
@@ -2811,7 +2986,7 @@ fn resync_pr_bases_inner(
                 let forge_base_matches = if require_forge_success {
                     match c.get_pull_request_base_state(num) {
                         Ok(state) if state.base == new_base => {
-                            let _ = store.lock().update_pull_request_ex(
+                            let result = store.lock().update_pull_request_ex(
                                 &pr.id,
                                 None,
                                 None,
@@ -2820,6 +2995,13 @@ fn resync_pr_bases_inner(
                                 Some(&new_base),
                                 None,
                                 Some(Some(&new_base)),
+                            );
+                            warn_on_store_write(
+                                store,
+                                "update_pull_request_ex",
+                                &pr.id,
+                                false,
+                                result,
                             );
                             true
                         }
@@ -2849,7 +3031,7 @@ fn resync_pr_bases_inner(
                     // a genuine forge-side retarget apart from a PATCH that
                     // silently failed here and never landed.
                     Ok(()) => {
-                        let _ = store.lock().update_pull_request_ex(
+                        let result = store.lock().update_pull_request_ex(
                             &pr.id,
                             None,
                             None,
@@ -2859,6 +3041,7 @@ fn resync_pr_bases_inner(
                             None,
                             Some(Some(&new_base)),
                         );
+                        warn_on_store_write(store, "update_pull_request_ex", &pr.id, false, result);
                     }
                     Err(e) => {
                         if is_stack_base_restriction(&e) {
@@ -2904,7 +3087,7 @@ fn resync_pr_bases_inner(
             match repoint_stacked_prs(store, id, c, &ordered_pr_numbers, &blocked_by_stack) {
                 Ok(()) if require_forge_success => {
                     for (pr_id, _, new_base) in &blocked_by_stack {
-                        let _ = store.lock().update_pull_request_ex(
+                        let result = store.lock().update_pull_request_ex(
                             pr_id,
                             None,
                             None,
@@ -2914,6 +3097,7 @@ fn resync_pr_bases_inner(
                             None,
                             None,
                         );
+                        warn_on_store_write(store, "update_pull_request_ex", pr_id, false, result);
                     }
                 }
                 Ok(()) => {}
@@ -3438,7 +3622,7 @@ fn maybe_promote_fork_root(
                         );
                 }
             }
-            let _ = store.lock().update_pull_request_ex(
+            let result = store.lock().update_pull_request_ex(
                 &old_stack_pr.id,
                 None,
                 None,
@@ -3447,6 +3631,13 @@ fn maybe_promote_fork_root(
                 None,
                 None,
                 None,
+            );
+            warn_on_store_write(
+                store,
+                "update_pull_request_ex",
+                &old_stack_pr.id,
+                false,
+                result,
             );
         }
     }
@@ -3559,7 +3750,7 @@ fn maybe_promote_fork_root(
         created.draft,
         "parent",
     );
-    let _ = store.lock().update_pull_request_ex(
+    let result = store.lock().update_pull_request_ex(
         &successor_pr.id,
         None,
         None,
@@ -3569,9 +3760,23 @@ fn maybe_promote_fork_root(
         None,
         None,
     );
+    warn_on_store_write(
+        store,
+        "update_pull_request_ex",
+        &successor_pr.id,
+        false,
+        result,
+    );
     match &new_id {
         Ok(new_id) => {
-            let _ = store.lock().set_pr_superseded_by(&successor_pr.id, new_id);
+            let result = store.lock().set_pr_superseded_by(&successor_pr.id, new_id);
+            warn_on_store_write(
+                store,
+                "set_pr_superseded_by",
+                &successor_pr.id,
+                false,
+                result,
+            );
             crate::rlog!(
                 INFO,
                 "ralphus [pr] review {id} promoted pr={} (old) -> {new_id} (new, number={})",
@@ -3748,7 +3953,7 @@ fn apply_pr_merge_state(
     };
     match result {
         Ok(state) if state != "open" => {
-            let _ = store.lock().update_pull_request_ex(
+            let result = store.lock().update_pull_request_ex(
                 &pr.id,
                 None,
                 None,
@@ -3758,6 +3963,7 @@ fn apply_pr_merge_state(
                 None,
                 None,
             );
+            warn_on_store_write(store, "update_pull_request_ex", &pr.id, false, result);
             if state == "merged" {
                 freshly_merged.push(pr.clone());
             } else {
@@ -3867,9 +4073,10 @@ fn mark_branch_pr_closed_externally(
             "linked pr closed without merging",
         ),
     };
-    let _ = store
+    let result = store
         .lock()
         .set_branch_status(id, branch_id, status, Some(detail));
+    warn_on_store_write(store, "set_branch_status", id, true, result);
 }
 
 fn log_pr_merge_check_failure(
@@ -3961,12 +4168,13 @@ fn settle_pr_merge_states(
                 .find(|b| b.id == branch_id)
                 .is_some_and(|b| b.merge_status == MergeStatus::Merged.as_str());
             if !already_marked {
-                let _ = store.lock().set_branch_status(
+                let result = store.lock().set_branch_status(
                     id,
                     branch_id,
                     MergeStatus::Merged,
                     Some("pr merged"),
                 );
+                warn_on_store_write(store, "set_branch_status", id, true, result);
                 any_branch_freshly_marked_merged = true;
             }
         }
@@ -4028,10 +4236,20 @@ fn settle_pr_merge_states(
     // row(s) rather than force a status change out from under it.
     for pr in freshly_merged {
         let guard = store.lock();
-        let _ = guard.drop_pull_request(
+        if let Err(error) = guard.drop_pull_request(
             &pr.id,
             "linked pr merged out-of-band while review was mid-flight",
-        );
+        ) {
+            crate::cartographer::Note::new("pr")
+                .level(crate::logging::LogLevel::WARNING)
+                .scope("guardian")
+                .guardian(id)
+                .emit(
+                    &guard,
+                    format!("could not drop out-of-band merged pr {}: {error}", pr.id),
+                    serde_json::json!({ "pr_id": pr.id, "error": error.to_string() }),
+                );
+        }
         let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
             level: crate::logging::LogLevel::WARNING,
             source: "pr",
@@ -4077,7 +4295,7 @@ fn settle_pr_merge_states(
             current_guardian.name,
         );
         let entity_uri = format!("guardian:{id}");
-        let _ = guard.enqueue_error_mailbox_message(
+        if let Err(error) = guard.enqueue_error_mailbox_message(
             crate::mailbox::MailboxPriority::High,
             &message,
             &crate::mailbox::Remediation::SuggestedCommand {
@@ -4090,7 +4308,20 @@ fn settle_pr_merge_states(
             None,
             Some(&entity_uri),
             Some("review"),
-        );
+        ) {
+            crate::cartographer::Note::new("pr")
+                .level(crate::logging::LogLevel::WARNING)
+                .scope("guardian")
+                .guardian(id)
+                .emit(
+                    &guard,
+                    format!(
+                        "could not enqueue the dropped-pr mailbox notice for pr {}: {error}",
+                        pr.id
+                    ),
+                    serde_json::json!({ "pr_id": pr.id, "error": error.to_string() }),
+                );
+        }
     }
     true
 }
@@ -4206,7 +4437,7 @@ pub fn sync_open_pr_branches(store: &crate::store_lock::StoreHandle, id: &str) {
             );
             continue;
         }
-        let _ = store.lock().update_pull_request_ex(
+        let result = store.lock().update_pull_request_ex(
             &pr.id,
             None,
             None,
@@ -4216,6 +4447,7 @@ pub fn sync_open_pr_branches(store: &crate::store_lock::StoreHandle, id: &str) {
             Some(Some(local_sha.as_str())),
             None,
         );
+        warn_on_store_write(store, "update_pull_request_ex", &pr.id, false, result);
         {
             let guard = store.lock();
             let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
@@ -4949,9 +5181,10 @@ pub fn poll_pr_base_drift(
                 skipped.id,
                 pr.id
             );
-            let _ = store
+            let result = store
                 .lock()
                 .set_branch_enabled_by_name(id, &skipped.branch, false);
+            warn_on_store_write(store, "set_branch_enabled_by_name", id, true, result);
         }
 
         // ralphus[ignore-rlog-pair]: per-PR drift-detection detail; the batch summary in poll_pr_base_drift_once records the structured workflow outcome
@@ -4961,7 +5194,7 @@ pub fn poll_pr_base_drift(
             pr.id,
             pr.base_ref
         );
-        let _ = store.lock().update_pull_request_ex(
+        let result = store.lock().update_pull_request_ex(
             &pr.id,
             None,
             None,
@@ -4971,6 +5204,7 @@ pub fn poll_pr_base_drift(
             None,
             Some(Some(&forge_base)),
         );
+        warn_on_store_write(store, "update_pull_request_ex", &pr.id, false, result);
         pulled += 1;
     }
 
@@ -5060,9 +5294,11 @@ fn poll_pr_comments(
                     crate::forge::PrCommentEndpoint::Conversation => "conversation",
                     crate::forge::PrCommentEndpoint::Review => "review",
                 };
-                let _ = store
-                    .lock()
-                    .replace_pr_forge_comments(pr_id, table_endpoint, &comments);
+                let result =
+                    store
+                        .lock()
+                        .replace_pr_forge_comments(pr_id, table_endpoint, &comments);
+                warn_on_store_write(store, "replace_pr_forge_comments", pr_id, false, result);
                 (etag.or(prior_etag), None)
             }
             Err(e) => {
@@ -5329,9 +5565,10 @@ fn refresh_pr_forge_cache_for_guardian(store: &crate::store_lock::StoreHandle, i
                 etag_review: new_review_etag.as_deref(),
             }),
         });
-        let _ = store
+        let result = store
             .lock()
             .upsert_pr_forge_cache(&pr.id, drift_half, comments_half);
+        warn_on_store_write(store, "upsert_pr_forge_cache", &pr.id, false, result);
         if !ok {
             cycle_ok = false;
             if cycle_error.is_none() {
@@ -5897,9 +6134,16 @@ pub(crate) fn retire_dual_root_upstream_branch(
     let root = PathBuf::from(&snapshot.git_root);
     let clear = |store: &crate::store_lock::StoreHandle| {
         // NotFound (review already deleted) is exactly the success shape here.
-        let _ = store
+        let result = store
             .lock()
             .set_guardian_dual_root_stack_branch(&snapshot.guardian_id, None);
+        warn_on_store_write(
+            store,
+            "set_guardian_dual_root_stack_branch",
+            &snapshot.guardian_id,
+            true,
+            result,
+        );
     };
     let Some(project_name) = store.lock().project_name_for_path(&snapshot.git_root) else {
         // ralphus[ignore-rlog-pair]: unresolvable project is permanent; nothing further to log per cycle
@@ -6608,7 +6852,7 @@ fn submit_stacked_branch_pr(
         let _ = store.lock().mark_prophecies_published(&ids, &row_id);
     }
     if let Some(sha) = &pushed_sha {
-        let _ = store.lock().update_pull_request_ex(
+        let result = store.lock().update_pull_request_ex(
             &row_id,
             None,
             None,
@@ -6618,6 +6862,7 @@ fn submit_stacked_branch_pr(
             Some(Some(sha.as_str())),
             None,
         );
+        warn_on_store_write(store, "update_pull_request_ex", &row_id, false, result);
     }
     {
         let guard = store.lock();
@@ -6786,9 +7031,10 @@ fn submit_stacked_branch_pr(
     // the periodic reconcile sweep -- would keep the badge up long after the
     // real problem is fixed. This is the one site every PR creation/adoption
     // funnels through, so clearing it here covers all of them uniformly.
-    let _ = store
+    let result = store
         .lock()
         .set_branch_auto_submit_error(id, branch_id, None);
+    warn_on_store_write(store, "set_branch_auto_submit_error", id, true, result);
     // RAL-<new>: a branch a human's forge-side close previously moved to
     // `MergeStatus::Closed` (see `mark_branch_pr_closed_externally`) just got
     // a fresh PR/MR through this exact site -- an explicit per-branch
@@ -6796,9 +7042,10 @@ fn submit_stacked_branch_pr(
     // at all. Revive it back to `Done` so the board stops showing a "closed
     // externally" badge next to a PR that is, right now, genuinely open.
     if branch.merge_status.as_str() == MergeStatus::Closed.as_str() {
-        let _ = store
+        let result = store
             .lock()
             .set_branch_status(id, branch_id, MergeStatus::Done, None);
+        warn_on_store_write(store, "set_branch_status", id, true, result);
     }
     // RAL-<new>: start watching this PR's CI status the moment it exists,
     // rather than leaving it to `ci_watch::poll_open_pr_ci_status`'s coarse,
@@ -7066,7 +7313,7 @@ fn refresh_open_prs<'a>(
                         pr.id,
                         pr.branch_id
                     );
-                    let _ = store.lock().update_pull_request_ex(
+                    let result = store.lock().update_pull_request_ex(
                         &pr.id,
                         None,
                         None,
@@ -7076,6 +7323,7 @@ fn refresh_open_prs<'a>(
                         None,
                         None,
                     );
+                    warn_on_store_write(store, "update_pull_request_ex", &pr.id, false, result);
                     // RAL-<new>: a PR closed without merging is a human's
                     // deliberate rejection -- mark the branch `Closed` right
                     // here, in the same call that is about to decide which
@@ -7796,9 +8044,10 @@ fn record_auto_submit_success(store: &crate::store_lock::StoreHandle, id: &str, 
         INFO,
         "ralphus [pr] review {id} branch {branch_label} auto-submit-pr-stack completed"
     );
-    let _ = store
+    let result = store
         .lock()
         .set_branch_auto_submit_error(id, branch_id, None);
+    warn_on_store_write(store, "set_branch_auto_submit_error", id, true, result);
     let guard = store.lock();
     let message = format!("auto-submit completed for branch {branch_label}");
     let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
@@ -7833,9 +8082,10 @@ fn record_auto_submit_failure(
         WARNING,
         "ralphus [pr] review {id} branch {branch_label} auto-submit-pr-stack failed: {error}"
     );
-    let _ = store
+    let result = store
         .lock()
         .set_branch_auto_submit_error(id, branch_id, Some(error));
+    warn_on_store_write(store, "set_branch_auto_submit_error", id, true, result);
     let guard = store.lock();
     let message = format!("auto-submit failed for branch {branch_label}");
     let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
@@ -8026,7 +8276,8 @@ pub fn sweep_pending_pr_auto_submits_once(store: &crate::store_lock::StoreHandle
     for id in due {
         let Some(claim) = guardian_merge::InFlightClaim::acquire(&AUTO_SUBMIT_IN_FLIGHT, &id)
         else {
-            let _ = store.lock().request_auto_submit_branch(&id, now_ms());
+            let result = store.lock().request_auto_submit_branch(&id, now_ms());
+            warn_on_store_write(store, "request_auto_submit_branch", &id, true, result);
             continue;
         };
         let store = Arc::clone(store);
@@ -8809,7 +9060,7 @@ pub fn pull_pr_commits(
     push_ref(&root, &remote_name, &local_ref, &pr.branch_alias)?;
     if let Ok(sha) = git(&root, &["rev-parse", &local_ref]) {
         let sha = sha.trim();
-        let _ = store.lock().update_pull_request_ex(
+        let result = store.lock().update_pull_request_ex(
             pr_id,
             None,
             None,
@@ -8819,6 +9070,7 @@ pub fn pull_pr_commits(
             Some(Some(sha)),
             None,
         );
+        warn_on_store_write(store, "update_pull_request_ex", pr_id, false, result);
         cancel_superseded_ci_after_push(
             store,
             &pr.guardian_id,
@@ -9196,9 +9448,16 @@ fn action_pr_feedback_inner(
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .unwrap_or(MANUAL_PR_FEEDBACK_AUTHOR);
-        let _ = store
+        let result = store
             .lock()
             .supersede_pending_branch_feedback(&pr.guardian_id, &branch_id);
+        warn_on_store_write(
+            store,
+            "supersede_pending_branch_feedback",
+            &pr.guardian_id,
+            true,
+            result,
+        );
         let message_seq = store
             .lock()
             .add_guardian_message(
@@ -9236,7 +9495,7 @@ fn action_pr_feedback_inner(
             // rather than re-pushing (and re-guarding-against-clobber) the
             // identical ref a second time.
             if let Some(sha) = outcome.pushed_sha.filter(|_| outcome.pushed) {
-                let _ = store.lock().update_pull_request_ex(
+                let result = store.lock().update_pull_request_ex(
                     pr_id,
                     None,
                     None,
@@ -9246,6 +9505,7 @@ fn action_pr_feedback_inner(
                     Some(Some(sha.as_str())),
                     None,
                 );
+                warn_on_store_write(store, "update_pull_request_ex", pr_id, false, result);
             } else if outcome.committed {
                 return Err("feedback applied but push back to the PR branch failed".to_string());
             }
@@ -9277,7 +9537,7 @@ fn action_pr_feedback_inner(
             push_ref(&root, &remote_name, &local_ref, &pr.branch_alias)?;
             if let Ok(sha) = git(&root, &["rev-parse", &local_ref]) {
                 let sha = sha.trim();
-                let _ = store.lock().update_pull_request_ex(
+                let result = store.lock().update_pull_request_ex(
                     pr_id,
                     None,
                     None,
@@ -9287,6 +9547,7 @@ fn action_pr_feedback_inner(
                     Some(Some(sha)),
                     None,
                 );
+                warn_on_store_write(store, "update_pull_request_ex", pr_id, false, result);
                 cancel_superseded_ci_after_push(
                     store,
                     &pr.guardian_id,
@@ -9309,17 +9570,19 @@ fn action_pr_feedback_inner(
     // that cap must not block). Best-effort: a transient forge error here
     // must not undo the comment-feedback work already applied above.
     let ci_checked = client.check_pr_ci_status(pr_number);
-    let _ = store
+    let result = store
         .lock()
         .record_pr_ci_check(pr_id, ci_checked.as_ref().err().map(String::as_str));
+    warn_on_store_write(store, "record_pr_ci_check", pr_id, false, result);
     if let Ok(state) = ci_checked {
         let job_url = match &state {
             crate::forge::PrCiState::Failing(f) => f.job_url.clone(),
             _ => None,
         };
-        let _ = store
+        let result = store
             .lock()
             .set_pr_ci_status(pr_id, state.as_str(), job_url.as_deref());
+        warn_on_store_write(store, "set_pr_ci_status", pr_id, false, result);
         if let crate::forge::PrCiState::Failing(failure) = state {
             crate::ci_watch::dispatch_pr_fix_manual(
                 store,

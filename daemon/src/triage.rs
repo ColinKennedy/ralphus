@@ -1089,7 +1089,21 @@ impl Store {
                 params![project, triage_type, cron_expr, anchor_date_ms, every_n, now_ms()],
             )
             .map_err(|e| e.to_string())?;
-        Ok(self.conn.last_insert_rowid())
+        let id = self.conn.last_insert_rowid();
+        crate::cartographer::Note::new("triage").emit(
+            self,
+            format!(
+                "triage schedule {id} added for ({project}, {triage_type}) cron={cron_expr:?} every_n={every_n}"
+            ),
+            serde_json::json!({
+                "schedule_id": id,
+                "project": project,
+                "triage_type": triage_type,
+                "cron_expr": cron_expr,
+                "every_n": every_n,
+            }),
+        );
+        Ok(id)
     }
 
     /// Every configured schedule entry, optionally filtered by `(project,
@@ -1137,6 +1151,13 @@ impl Store {
         let n = self
             .conn
             .execute("DELETE FROM triage_schedules WHERE id=?", params![id])?;
+        if n > 0 {
+            crate::cartographer::Note::new("triage").emit(
+                self,
+                format!("triage schedule {id} removed"),
+                serde_json::json!({"schedule_id": id}),
+            );
+        }
         Ok(n > 0)
     }
 
@@ -1253,7 +1274,19 @@ pub fn run_schedule_tick(store: &crate::store_lock::StoreHandle) {
     let now = now_ms();
     let schedules = {
         let guard = store.lock();
-        guard.list_triage_schedules(None).unwrap_or_default()
+        match guard.list_triage_schedules(None) {
+            Ok(schedules) => schedules,
+            Err(e) => {
+                crate::cartographer::Note::new("scheduler")
+                    .level(crate::logging::LogLevel::WARNING)
+                    .emit(
+                        &guard,
+                        format!("triage schedule tick skipped: could not list schedules: {e}"),
+                        serde_json::json!({"error": e.to_string()}),
+                    );
+                Vec::new()
+            }
+        }
     };
     for sched in schedules {
         let Some((count, last, fired)) = advance_schedule(
@@ -1267,7 +1300,22 @@ pub fn run_schedule_tick(store: &crate::store_lock::StoreHandle) {
             continue;
         };
         let guard = store.lock();
-        let _ = guard.advance_triage_schedule(sched.id, count, last);
+        if let Err(e) = guard.advance_triage_schedule(sched.id, count, last) {
+            // The cursor did not move, so the next tick re-evaluates the same
+            // occurrence window.
+            crate::cartographer::Note::new("scheduler")
+                .level(crate::logging::LogLevel::WARNING)
+                .emit(
+                    &guard,
+                    format!("triage schedule {} cursor advance failed: {e}", sched.id),
+                    serde_json::json!({
+                        "schedule_id": sched.id,
+                        "occurrence_count": count,
+                        "fired": fired,
+                        "error": e.to_string(),
+                    }),
+                );
+        }
         drop(guard);
         if fired {
             // No guard held across the sweep: its `orderer` callback performs

@@ -317,8 +317,62 @@ fn check_one_target(
 pub fn check_all_targets(
     store: &crate::store_lock::StoreHandle,
 ) -> Result<Vec<TargetHealthReport>, String> {
-    let targets = crate::machine_targets::load_machine_targets()?;
-    Ok(check_targets(store, targets.into_values().collect()))
+    let targets = match crate::machine_targets::load_machine_targets() {
+        Ok(targets) => targets,
+        Err(e) => {
+            crate::cartographer::Note::new("health")
+                .level(crate::logging::LogLevel::WARNING)
+                .scope("machine")
+                .emit(
+                    &store.lock(),
+                    format!("remote target health check could not load [machine.targets]: {e}"),
+                    serde_json::json!({ "error": e }),
+                );
+            return Err(e);
+        }
+    };
+    let reports = check_targets(store, targets.into_values().collect());
+    {
+        let guard = store.lock();
+        log_target_reports(&guard, &reports);
+    }
+    Ok(reports)
+}
+
+/// One Cartographer row per checked target: WARNING naming the failing
+/// checks when any check failed, DEBUG otherwise.
+fn log_target_reports(store: &crate::store::Store, reports: &[TargetHealthReport]) {
+    for report in reports {
+        let failing: Vec<&str> = report
+            .checks
+            .iter()
+            .filter(|c| c.status == FAIL)
+            .map(|c| c.name.as_str())
+            .collect();
+        let level = if failing.is_empty() {
+            crate::logging::LogLevel::DEBUG
+        } else {
+            crate::logging::LogLevel::WARNING
+        };
+        crate::cartographer::Note::new("health")
+            .level(level)
+            .scope("machine")
+            .emit(
+                store,
+                format!(
+                    "remote target health target={} machine={} failing=[{}]",
+                    report.target,
+                    report.machine,
+                    failing.join(",")
+                ),
+                serde_json::json!({
+                    "target": report.target,
+                    "machine": report.machine,
+                    "failing": failing,
+                    "checks": report.checks.len(),
+                }),
+            );
+    }
 }
 
 fn check_targets(
