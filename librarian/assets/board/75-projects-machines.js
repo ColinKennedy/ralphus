@@ -1969,6 +1969,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
           ? ` <span style="color:var(--muted)" data-tip="Resolved from the X-Ralphus-User header, falling back to [daemon].default_user.">(resolved as ${esc(currentUserName)})</span>`
           : "";
         /** @type {HTMLInputElement} */ (byId("auto-watch")).checked = autoWatch;
+        /** @type {HTMLInputElement} */ (byId("turn-colors")).checked = turnColorsEnabled();
         const watched = watches.map((w) => {
           const [kind, id] = w.entity_uri.split(":", 2);
           const squad = squads.find((s) => s.id === id);

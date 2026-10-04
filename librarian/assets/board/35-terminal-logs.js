@@ -185,7 +185,7 @@
               <pre id="peek-prompt-${cssKey}" class="peek-pre" style="height:${peekPaneHeight}px" data-tip="The exact system prompt this step's agent received — ralphus's hidden instructions plus the step's authored system prompt.\nShown on the System Prompt tab; the ⧉ Copy control copies this text.">${esc(peekPromptDisplay(peekSystemPrompt[key]))}</pre>
               <div class="peek-resize-handle" data-peek-key="${key}" data-tip="Drag to resize the live terminal view.\nYour chosen size is kept while you switch between tabs during this browser session."></div>
             </div>` : `<div class="peek-pre-wrap">
-              <pre id="peek-pre-${cssKey}" class="peek-pre" style="height:${peekPaneHeight}px" tabindex="0" data-key="${esc(key)}" onscroll="onPeekScroll(this.dataset.key)" onkeydown="handlePeekKeydown(event,this.dataset.key)" data-tip="Scroll through the live terminal output.\nClick here then press Ctrl+End to jump to the latest output, or Ctrl+Home to jump to the start.">${shown !== undefined ? esc(shown) : "Loading…"}</pre>
+              <pre id="peek-pre-${cssKey}" class="peek-pre" style="height:${peekPaneHeight}px" tabindex="0" data-key="${esc(key)}" onscroll="onPeekScroll(this.dataset.key)" onkeydown="handlePeekKeydown(event,this.dataset.key)" data-tip="Scroll through the live terminal output.\nClick here then press Ctrl+End to jump to the latest output, or Ctrl+Home to jump to the start.">${shown !== undefined ? transcriptHtml(shown) : "Loading…"}</pre>
               <button id="peek-jump-${cssKey}" class="peek-jump-btn" style="display:none" data-click="peekScrollToBottom" data-key="${esc(key)}" data-tip="Jump to the latest output.\nAppears once you've scrolled up from the bottom — also triggerable with Ctrl+End while the terminal is focused.">↓ Jump to latest</button>
               <div class="peek-resize-handle" data-peek-key="${key}" data-tip="Drag to resize the live terminal view.\nYour chosen size is kept while you switch between tabs during this browser session."></div>
             </div>`}
@@ -201,7 +201,7 @@
        */
       function setPeekPreText(preId, text) {
         const el = document.getElementById(preId);
-        if (el) el.textContent = text;
+        if (el) el.innerHTML = transcriptHtml(text);
       }
       /**
        * Fetches one peek box's live pane content and patches it into the DOM in
@@ -767,7 +767,7 @@
             : "One older, persisted attempt's full terminal-log content, read from durable on-disk storage (RAL-154).\nThis is a fixed historical record — it never changes, even if the cell later reattaches again.";
           return `<div class="history-box" data-tip="${viewingTip}">
               <div class="history-head"><span>Attempt ${viewing.attempt}</span><button class="btn" style="padding:1px 7px;font-size:11px" data-click="closeHistoryAttempt" data-key="${esc(key)}" data-tip="Back to the list of persisted attempts.">← Back</button></div>
-              <div class="peek-pre-wrap"><pre class="peek-pre" style="height:${peekPaneHeight}px">${esc(viewing.content)}</pre></div>
+              <div class="peek-pre-wrap"><pre class="peek-pre" style="height:${peekPaneHeight}px">${transcriptHtml(viewing.content)}</pre></div>
             </div>`;
         }
         const attempts = historyAttempts[key];

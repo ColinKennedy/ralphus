@@ -427,3 +427,14 @@ or similar to ensure the full hit-area is reachable and not clipped by parent
    override if needed), add a row to the palette + a semantic role here, then use it.
 3. Never hardcode a hex value or clone an existing hue's number inline — always go
    through a variable so the palette stays the one place colors are defined.
+
+## Exception: per-type transcript colors (RAL-563)
+
+Bracket-tagged transcript entries (`[usage]`, `[tool]`, `[tool.Bash]`, ...) in the
+Live View and log views are colored at runtime by `typeColor(type, theme)` in
+`board/31-turn-colors.js`. The hue is a hash of the type's base segment, so the set
+of types is open-ended and cannot be a fixed variable palette; the value is set as
+an inline `style="color:#rrggbb"`. This is the only sanctioned hardcoded-hex
+exception. Every generated color is clamped to at least 4.5:1 WCAG contrast
+against the active theme's `--bg`, and the "Color turn types in transcripts"
+preference (Preferences page, on by default) turns it off.
