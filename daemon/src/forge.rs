@@ -3464,6 +3464,41 @@ impl PrRoute {
     pub fn find_existing_pull_request(&self) -> Result<Option<ExistingPr>, String> {
         self.client.find_open_pull_request(&self.head)
     }
+
+    /// RAL-568: after [`Self::create_pull_request`] failed with `create_error`,
+    /// find out whether a concurrent submission (or a create whose response
+    /// was lost) already opened the PR/MR for this head. Only a duplicate-
+    /// shaped *status* (GitHub 422, GitLab 409/422) triggers the structured
+    /// head re-query -- the error text is never inspected. The forge's list
+    /// endpoint can lag a just-created PR, so the query runs once
+    /// immediately and again after each `backoff` delay. `Ok(None)` means no
+    /// open PR/MR turned up, so `create_error` is a genuine failure (e.g. a
+    /// missing base branch) the caller should surface.
+    ///
+    /// # Errors
+    /// Propagates a failure of the head lookup itself.
+    pub fn find_pull_request_after_failed_create(
+        &self,
+        create_error: &str,
+        backoff: &[Duration],
+    ) -> Result<Option<ExistingPr>, String> {
+        let duplicate_shaped = ["forge API 422:", "forge API 409:"]
+            .iter()
+            .any(|prefix| create_error.starts_with(prefix));
+        if !duplicate_shaped {
+            return Ok(None);
+        }
+        if let Some(found) = self.find_existing_pull_request()? {
+            return Ok(Some(found));
+        }
+        for delay in backoff {
+            std::thread::sleep(*delay);
+            if let Some(found) = self.find_existing_pull_request()? {
+                return Ok(Some(found));
+            }
+        }
+        Ok(None)
+    }
 }
 
 /// Pick whichever candidate client's repo label matches `repo` (RAL-338) --

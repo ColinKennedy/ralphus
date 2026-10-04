@@ -3812,6 +3812,7 @@ impl Store {
                 [],
             );
         }
+        let _ = self.collapse_duplicate_open_pull_requests();
         // RAL-293: the no-new-commits guard now reads a worktree's own
         // `@{upstream}` live (`crate::reviews::worktree_has_commits_ahead_of_upstream`)
         // instead of comparing HEAD against a squad-run-scoped baseline sha
