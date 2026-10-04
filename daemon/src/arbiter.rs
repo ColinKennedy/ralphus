@@ -211,7 +211,7 @@ pub fn inspect_large_diff(
     if !cfg.large_diff_oversight_enabled() {
         return None;
     }
-    let key = crate::store_memory::StoreMemory::cell_diff_key(squad_id, cell_id);
+    let key = crate::store_memory::StoreMemory::cell_diff_key(squad_id, task, cell_id);
     let (version, summary) = store.lock().memory().claim_cell_diff_inspection(&key)?;
     if !large_diff(&summary) {
         return None;

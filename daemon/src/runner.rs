@@ -1982,6 +1982,7 @@ fn consume_transcript_lines(
                 );
                 let key = crate::store_memory::StoreMemory::cell_diff_key(
                     target.squad_id,
+                    target.task,
                     target.cell_id,
                 );
                 stop_suspicious_large_diff(
@@ -2234,8 +2235,11 @@ impl SubprocessRunner {
             waypoint_halts: w,
             squad_id: &spec.squad_id,
         });
-        let arbiter_key =
-            crate::store_memory::StoreMemory::cell_diff_key(&spec.squad_id, &spec.cell_id);
+        let arbiter_key = crate::store_memory::StoreMemory::cell_diff_key(
+            &spec.squad_id,
+            &spec.task,
+            &spec.cell_id,
+        );
         let arbiter_stop_token = self
             .arbiter_stops
             .as_ref()
@@ -2685,6 +2689,7 @@ impl SubprocessRunner {
                 let _ = tmux.kill_session(session_name);
                 let arbiter_key = crate::store_memory::StoreMemory::cell_diff_key(
                     &attempt_spec.squad_id,
+                    &attempt_spec.task,
                     &attempt_spec.cell_id,
                 );
                 let numstat = self
@@ -2909,6 +2914,7 @@ impl SubprocessRunner {
                                             let key =
                                                 crate::store_memory::StoreMemory::cell_diff_key(
                                                     &attempt_spec.squad_id,
+                                                    &attempt_spec.task,
                                                     &attempt_spec.cell_id,
                                                 );
                                             stop_suspicious_large_diff(
@@ -3524,6 +3530,7 @@ pub(crate) fn forward_runner_event(
     if event.source == WORKTREE_DIFF_SOURCE && event.message == WORKTREE_DIFF_MESSAGE {
         let key = crate::store_memory::StoreMemory::cell_diff_key(
             event.squad_id.as_deref().unwrap_or(squad_id),
+            event.task.as_deref().unwrap_or(task),
             event.cell_id.as_deref().unwrap_or(cell_id),
         );
         guard
@@ -4757,13 +4764,24 @@ mod tests {
         forward_runner_event(Some(&store), "squad-1", "cell-a", "build", line);
         forward_runner_event(Some(&store), "squad-1", "cell-a", "build", line);
 
-        let key = crate::store_memory::StoreMemory::cell_diff_key("squad-1", "cell-a");
+        let key = crate::store_memory::StoreMemory::cell_diff_key("squad-1", "build", "cell-a");
         let state = store.lock().memory().cell_diff_state(&key).unwrap();
         assert_eq!(state.version, 2);
         assert!(state.is_dirty());
         assert_eq!(state.summary["files_changed"], 2);
-        let other = crate::store_memory::StoreMemory::cell_diff_key("squad-1", "cell-b");
+        let other = crate::store_memory::StoreMemory::cell_diff_key("squad-1", "build", "cell-b");
         assert!(store.lock().memory().cell_diff_state(&other).is_none());
+        // The same cell id under another task of the squad is a different
+        // cell with its own worktree, so it must not see this push.
+        let sibling_task =
+            crate::store_memory::StoreMemory::cell_diff_key("squad-1", "deploy", "cell-a");
+        assert!(
+            store
+                .lock()
+                .memory()
+                .cell_diff_state(&sibling_task)
+                .is_none()
+        );
 
         let page = store
             .lock()

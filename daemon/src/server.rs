@@ -7481,7 +7481,7 @@ fn cell_diff(daemon: &Daemon, id: &str, query: &str) -> Reply {
         return error(404, "not_found", "no such cell", vec![]);
     };
     let memory = daemon.lock().memory();
-    let key = crate::store_memory::StoreMemory::cell_diff_key(id, &row.cell_id);
+    let key = crate::store_memory::StoreMemory::cell_diff_key(id, &row.task_name, &row.cell_id);
     let state = memory.cell_diff_state(&key);
     let version = state.as_ref().map_or(0, |s| s.version);
     let summary = state
