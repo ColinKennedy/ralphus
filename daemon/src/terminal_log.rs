@@ -146,6 +146,57 @@ pub fn write_attempt(session_name: &str, attempt: u32, content: &str, max_lines:
     );
 }
 
+/// Path a remediation pass's copy of a failed command attempt's output lives
+/// (or would live) at: `<session_name>/<NNNN>.failure.txt`, next to the
+/// session's own `.log`/`.raw` files so [`prune`] and [`delete_with_prefix`]
+/// retire it with them. The `.txt` extension keeps it out of [`list_attempts`]
+/// and [`latest_attempt`], which only look at `.log`/`.raw`.
+#[must_use]
+pub fn failure_output_path(session_name: &str, attempt: u32) -> PathBuf {
+    session_dir_in(&terminal_log_root(), session_name).join(format!("{attempt:04}.failure.txt"))
+}
+
+/// Persist `content` -- the output a failed `command` attempt reported back
+/// through its `RunnerResult` -- as the file a remediation pass's prompt points
+/// at, truncated to its last `max_lines` and scrubbed of secrets the same way
+/// [`write_attempt`] scrubs a pane transcript. A command's pane transcript can
+/// hold only the runner wrapper (the runner captures the command's output
+/// itself and hands it back as the result), so this file, not the transcript,
+/// is what carries the diagnostic. Returns the path written, or `None` when it
+/// could not be (logged; the caller then tells the agent the output is
+/// unavailable).
+pub fn write_failure_output(
+    session_name: &str,
+    attempt: u32,
+    content: &str,
+    max_lines: usize,
+) -> Option<PathBuf> {
+    let path = failure_output_path(session_name, attempt);
+    let dir = path.parent()?;
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its caller records the repair pass
+        crate::rlog!(
+            WARNING,
+            "ralphus [terminal_log] could not create dir {}: {e}",
+            dir.display()
+        );
+        return None;
+    }
+    let content = crate::redact::redact_all(content);
+    let redacted = ralphus_core::redact::redact_secrets(&content);
+    let truncated = crate::runner::tail_lines(&redacted, max_lines);
+    if let Err(e) = std::fs::write(&path, truncated) {
+        // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its caller records the repair pass
+        crate::rlog!(
+            WARNING,
+            "ralphus [terminal_log] could not write failure output {}: {e}",
+            path.display()
+        );
+        return None;
+    }
+    Some(path)
+}
+
 /// Bound on how many bytes are read from the *tail* of a `.raw` transcript
 /// (RAL-397 Phase 2E) when deriving the durable, human-readable attempt log —
 /// a disk file can grow up to `ralphus-runner pipe-sink`'s own 256 MiB cap,

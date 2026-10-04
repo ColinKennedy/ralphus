@@ -8,10 +8,13 @@
 //! The critical design point (RAL-487's technical notes): a failed attempt's
 //! full stdout+stderr can be arbitrarily large, so the repair agent is never
 //! handed that output inline in its prompt. Instead it gets a *file path* --
-//! the same attempt-scoped terminal-log file every cell/proof already writes
-//! (`daemon/src/terminal_log.rs`) -- plus that file's size in human units, so
-//! the agent can decide how much of it to read (tail, grep, a byte range)
-//! rather than being forced to ingest the whole thing.
+//! a copy of the failed attempt's own reported output, written next to the
+//! session's terminal logs (`terminal_log::write_failure_output`) -- plus that
+//! file's size in human units, so the agent can decide how much of it to read
+//! (tail, grep, a byte range) rather than being forced to ingest the whole
+//! thing. The terminal log itself is only the fallback for an attempt that
+//! reported no output: a `command` runs inside the runner, which hands its
+//! output back in the result, so the pane transcript holds only the wrapper.
 
 use std::path::{Path, PathBuf};
 
@@ -123,6 +126,7 @@ pub fn run_command_with_remediation(
             runner,
             cancel,
             command_spec,
+            &result,
             attempt,
             repair_agent,
             if attempt == 1 {
@@ -285,6 +289,9 @@ impl Drop for SnapshotGuard {
     }
 }
 
+/// What [`diagnostic_text`] reports for a result with no summary or error.
+const NO_OUTPUT_CAPTURED: &str = "(no output captured)";
+
 /// `result`'s own summary+error, formatted the same way every existing
 /// caller already builds a human-readable diagnostic from a [`RunnerResult`]
 /// (see `scheduler.rs`'s proof-dispatch `"command"` branch) -- unified here
@@ -296,7 +303,7 @@ pub(crate) fn diagnostic_text(result: &RunnerResult) -> String {
         None => result.summary.clone(),
     };
     if text.trim().is_empty() {
-        "(no output captured)".to_string()
+        NO_OUTPUT_CAPTURED.to_string()
     } else {
         text
     }
@@ -350,6 +357,7 @@ pub(crate) fn run_repair_pass(
     runner: &dyn Runner,
     cancel: &CancelToken,
     command_spec: &RunnerSpec,
+    failed: &RunnerResult,
     attempt: u32,
     repair_agent: &RepairAgent<'_>,
     restart_guidance: Option<&str>,
@@ -359,26 +367,23 @@ pub(crate) fn run_repair_pass(
         &command_spec.task,
         &command_spec.cell_id,
     );
-    let output_note = match crate::terminal_log::latest_attempt(&session_name) {
-        Some(n) => {
-            let path = crate::terminal_log::attempt_path(&session_name, n);
-            match std::fs::metadata(&path) {
-                Ok(meta) => format!(
-                    "The failed command's full output (stdout+stderr) was captured to:\n{}\n\
-                     ({}). Read only as much of it as you need to diagnose the failure.",
-                    path.display(),
-                    format_size(meta.len()),
-                ),
-                Err(e) => format!(
-                    "The failed command's output should have been captured to {}, but it \
-                     could not be read ({e}). Proceed from whatever context you already have.",
-                    path.display(),
-                ),
-            }
-        }
-        None => "The failed command's output was not captured (no terminal log found for this \
-                  session). Proceed from whatever context you already have."
-            .to_string(),
+    let failure_text = diagnostic_text(failed);
+    let failure_file = if failure_text == NO_OUTPUT_CAPTURED {
+        None
+    } else {
+        crate::terminal_log::write_failure_output(
+            &session_name,
+            attempt,
+            &failure_text,
+            FAILURE_OUTPUT_MAX_LINES,
+        )
+    };
+    let output_note = match failure_file {
+        Some(path) => point_at_file(
+            "The failed command's output (stdout+stderr) was captured to",
+            &path,
+        ),
+        None => terminal_log_note(&session_name),
     };
     let command = command_spec
         .command
@@ -423,6 +428,43 @@ pub(crate) fn run_repair_pass(
         );
     }
     result
+}
+
+/// Most lines of a failed attempt's output kept in the file a repair pass
+/// reads -- the tail, where a build/test failure's diagnostic lives.
+const FAILURE_OUTPUT_MAX_LINES: usize = 20_000;
+
+/// "<lead>:\n<path>\n(<size>). Read only as much ..." -- the file pointer a
+/// repair prompt carries instead of the output itself.
+fn point_at_file(lead: &str, path: &Path) -> String {
+    match std::fs::metadata(path) {
+        Ok(meta) => format!(
+            "{lead}:\n{}\n({}). Read only as much of it as you need to diagnose the failure.",
+            path.display(),
+            format_size(meta.len()),
+        ),
+        Err(e) => format!(
+            "{lead} {}, but it could not be read ({e}). Proceed from whatever context you \
+             already have.",
+            path.display(),
+        ),
+    }
+}
+
+/// The pointer to a session's terminal log, for a failed attempt that reported
+/// no output of its own (so [`run_repair_pass`] has no file of its own to
+/// write).
+fn terminal_log_note(session_name: &str) -> String {
+    match crate::terminal_log::latest_attempt(session_name) {
+        Some(n) => point_at_file(
+            "The failed command's terminal log was captured to",
+            &crate::terminal_log::attempt_path(session_name, n),
+        ),
+        None => "The failed command's output was not captured (it reported none and no \
+                 terminal log was found for this session). Proceed from whatever context you \
+                 already have."
+            .to_string(),
+    }
 }
 
 /// Human-readable size, matching RAL-487's requirement that the repair agent
@@ -689,22 +731,30 @@ mod tests {
         assert!(error.contains("Last repair agent diagnosis"));
     }
 
+    /// Regression: a command proof runs inside the runner, which hands its
+    /// output back in the `RunnerResult`; the session's terminal log holds only
+    /// the runner wrapper. The repair prompt must point at a file carrying the
+    /// result's output, not at the output-less terminal log.
     #[test]
-    fn repair_prompt_points_at_the_captured_file_instead_of_inlining_it() {
+    fn repair_prompt_points_at_a_file_holding_the_failed_output_not_the_wrapper_log() {
         let _guard = TestRootGuard::new("remediation-repair-prompt");
         let spec = command_spec("squad-2", "cell-2", "cargo test");
         let session_name = crate::tmux::session_name(&spec.squad_id, &spec.task, &spec.cell_id);
-        let huge_output = "e2e-test-marker-line\n".repeat(10_000);
-        // `latest_attempt` (which the remediation loop uses to find the most
-        // recent attempt number) scans `.raw` files -- write one directly,
-        // plus the finalized `.log` sibling a real completed run would also
-        // have via `write_attempt`/`write_attempt_from_raw_transcript`.
+        let wrapper_only = "RALPHUS_EVENT: invoked\nRALPHUS_TMUX_DONE: failed\n";
         let raw_path = crate::terminal_log::raw_transcript_path(&session_name, 0);
         std::fs::create_dir_all(raw_path.parent().unwrap()).unwrap();
-        std::fs::write(&raw_path, huge_output.as_bytes()).unwrap();
-        crate::terminal_log::write_attempt(&session_name, 0, &huge_output, 100_000);
+        std::fs::write(&raw_path, wrapper_only.as_bytes()).unwrap();
+        crate::terminal_log::write_attempt(&session_name, 0, wrapper_only, 100_000);
 
-        let runner = ScriptedRunner::new(vec![failed(), done(), done()]);
+        let huge_output = format!(
+            "{}error[E0425]: cannot find value `branch_id` in this scope\n",
+            "e2e-test-marker-line\n".repeat(10_000)
+        );
+        let failing = RunnerResult {
+            error: Some(huge_output.clone()),
+            ..failed()
+        };
+        let runner = ScriptedRunner::new(vec![failing, done(), done()]);
         let result = run_command_with_remediation(
             &runner,
             &CancelToken::never(),
@@ -717,10 +767,18 @@ mod tests {
         assert!(result.is_done());
         let seen = runner.seen.lock().unwrap();
         let repair_prompt = seen[1].prompt.as_deref().unwrap_or_default();
-        let expected_path = crate::terminal_log::attempt_path(&session_name, 0);
+        let failure_path = crate::terminal_log::failure_output_path(&session_name, 1);
         assert!(
-            repair_prompt.contains(&expected_path.to_string_lossy().into_owned()),
-            "repair prompt should point at the attempt file: {repair_prompt}"
+            repair_prompt.contains(&failure_path.to_string_lossy().into_owned()),
+            "repair prompt should point at the failure-output file: {repair_prompt}"
+        );
+        assert!(
+            !repair_prompt.contains(
+                &crate::terminal_log::attempt_path(&session_name, 0)
+                    .to_string_lossy()
+                    .into_owned()
+            ),
+            "repair prompt must not point at the wrapper-only terminal log: {repair_prompt}"
         );
         assert!(
             repair_prompt.contains("KB") || repair_prompt.contains("bytes"),
@@ -729,6 +787,50 @@ mod tests {
         assert!(
             !repair_prompt.contains("e2e-test-marker-line"),
             "repair prompt must not inline the captured output: {repair_prompt}"
+        );
+        let on_disk = std::fs::read_to_string(&failure_path).unwrap();
+        assert!(
+            on_disk.contains("error[E0425]: cannot find value `branch_id`"),
+            "the failure file must hold the command's diagnostic: {on_disk}"
+        );
+    }
+
+    #[test]
+    fn repair_prompt_falls_back_to_the_terminal_log_when_the_failure_reported_no_output() {
+        let _guard = TestRootGuard::new("remediation-repair-prompt-fallback");
+        let spec = command_spec("squad-3", "cell-3", "cargo test");
+        let session_name = crate::tmux::session_name(&spec.squad_id, &spec.task, &spec.cell_id);
+        let raw_path = crate::terminal_log::raw_transcript_path(&session_name, 0);
+        std::fs::create_dir_all(raw_path.parent().unwrap()).unwrap();
+        std::fs::write(&raw_path, b"pane output").unwrap();
+        crate::terminal_log::write_attempt(&session_name, 0, "pane output", 100);
+
+        let silent = RunnerResult {
+            error: None,
+            summary: String::new(),
+            ..failed()
+        };
+        let runner = ScriptedRunner::new(vec![silent, done(), done()]);
+        let result = run_command_with_remediation(
+            &runner,
+            &CancelToken::never(),
+            &spec,
+            ralphus_core::schema::COMMAND_MODE_REMEDIATING,
+            Some(3),
+            &repair_agent(),
+            None,
+        );
+        assert!(result.is_done());
+        let seen = runner.seen.lock().unwrap();
+        let repair_prompt = seen[1].prompt.as_deref().unwrap_or_default();
+        let log_path = crate::terminal_log::attempt_path(&session_name, 0);
+        assert!(
+            repair_prompt.contains(&log_path.to_string_lossy().into_owned()),
+            "repair prompt should fall back to the terminal log: {repair_prompt}"
+        );
+        assert!(
+            !crate::terminal_log::failure_output_path(&session_name, 1).exists(),
+            "no failure-output file should be written for an attempt with no output"
         );
     }
 

@@ -3210,6 +3210,7 @@ fn run_cell_worker(
             runner,
             cancel,
             &spec,
+            &attempt_result,
             remediation_attempt,
             &repair_agent,
             if remediation_attempt == 1 {
