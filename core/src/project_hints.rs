@@ -196,7 +196,9 @@ fn placeholders(text: &str) -> Vec<String> {
             .next()
             .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
             && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-        if looks_like_a_name && !found.iter().any(|f| f == name) {
+        // `${HOME}` is shell expansion, not one of the check's inputs.
+        let shell_expansion = rest[..open].ends_with('$');
+        if looks_like_a_name && !shell_expansion && !found.iter().any(|f| f == name) {
             found.push(name.to_string());
         }
         rest = &after[close + 1..];
