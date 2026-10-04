@@ -530,6 +530,16 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                 declared explicitly in the task file are unaffected.
                 Unset inherits the project-level .ralphus.toml [review]
                 skip_manual_checks default, then false (generation runs).
+ auto_run
+        bool    Run each ready manual check automatically once its build
+                commands succeed (a check with no build commands runs as
+                soon as it is ready). Only checks whose inputs all have
+                defaults run; each runs once per machine per build, in a
+                visible terminal on that machine. Precedence: the check's
+                own auto_run, then the submission's [review] auto_run,
+                then the project's .ralphus.toml [review] auto_run, then
+                false. A submission that defines checks is authoritative:
+                project hints are not layered on top of them.
  rebuild_on
         string[] Which events tear down and rebuild this review's prepared
                 build (its preparation, then its actions): any of "rebase"
@@ -685,7 +695,7 @@ may embed <<ralphus:new-worktree/BRANCH?upstream=UPSTREAM
  dual_root_pr, auto_build, auto_submit_pr_stack, auto_fix_pr_errors,
  auto_fix_prompt_template, discourage_tests_during_auto_pull_request_fixes,
  auto_cancel_outdated_pr_pipelines, cache_manual_checks,
- skip_manual_checks, rebuild_on, and skip_auto_clean) can also be set from
+ skip_manual_checks, auto_run, rebuild_on, and skip_auto_clean) can also be set from
  the database, via `ralphus project review-settings set <name>
  [flags]` or the board's Projects tab (the ... menu -> Review
  Settings), instead of hand-editing .ralphus.toml. A database

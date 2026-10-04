@@ -48,6 +48,17 @@ true` project default, or the matching control in the review's Setup modal).
 No agent is asked to propose commands for that review; manual checks you
 declared yourself in the task file are unaffected.
 
+To have ready manual checks run by themselves, set `auto_run = true` on a
+check (`[[review.action]]`), on the review (`[[review]] auto_run = true`), or as
+a project default (`[review] auto_run = true` in `.ralphus.toml`, or the
+"auto-run manual checks after build" control in the Setup / Review Settings
+modals). The first of those that is set wins; nothing set means off. A check
+runs once its build commands succeed (immediately if it has none), once per
+machine per build, in a terminal you can watch on the daemon's machine. Only
+checks whose inputs all have defaults run, and a failure shows only an
+informational notice. When a submission defines its own checks they are used as
+written; project-level hints are not layered on top.
+
 ### When the prepared build is rebuilt
 
 By default every rebase, every applied piece of reviewer feedback, and every
