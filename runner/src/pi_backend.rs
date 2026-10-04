@@ -14,7 +14,7 @@ use crate::cli_agent_common::{BackendCommandHealth, live_session_path, write_liv
 use crate::mcp_init::{
     self, McpFileEdit, McpFileEditMode, McpInitializationPlan, McpInitializer, McpThirdPartyInstall,
 };
-use crate::shell_label::format_tool_input;
+use crate::shell_label::{exec_command_label, format_tool_input};
 use crate::shellcmd::{self, Env};
 use crate::tools::Workspace;
 
@@ -1203,7 +1203,7 @@ fn unfinished_tool_lines(state: &mut ParseState, tool_arg_truncate_chars: usize)
     std::mem::take(&mut state.pending_tool_calls)
         .into_values()
         .map(|pending| {
-            let tag = tool_type_code(pending.name.as_deref());
+            let tag = tool_type_code(pending.name.as_deref(), None);
             let raw = truncate_display(&pending.raw, tool_arg_truncate_chars);
             format!("[{tag}] {raw}")
         })
@@ -1277,10 +1277,19 @@ fn finish_thinking_block(state: &mut ParseState) {
 
 /// `tool.<name>` type tag for a Pi tool call, or `tool.unknown` when the
 /// event carried no name. Every name Pi reports (the eight built-ins and any
-/// extension-registered tool) renders under itself.
-fn tool_type_code(name: Option<&str>) -> String {
+/// extension-registered tool) renders under itself. `bash` and `powershell`
+/// refine to `tool.<name>.<cmd>` when `command` yields a label; the structured
+/// tool name, not a guess, picks the shell flavor.
+fn tool_type_code(name: Option<&str>, command: Option<&str>) -> String {
     match name {
-        Some(name) if !name.is_empty() => format!("tool.{name}"),
+        Some(name) if !name.is_empty() => {
+            if matches!(name, "bash" | "powershell") {
+                if let Some(cmd) = command.and_then(exec_command_label) {
+                    return format!("tool.{name}.{cmd}");
+                }
+            }
+            format!("tool.{name}")
+        }
         _ => "tool.unknown".to_string(),
     }
 }
@@ -1297,7 +1306,7 @@ fn format_pi_tool_line(
     raw: &str,
     truncate_chars: usize,
 ) -> String {
-    let tag = tool_type_code(name);
+    let tag = tool_type_code(name, arguments["command"].as_str());
     let display_name = name.filter(|n| !n.is_empty()).unwrap_or("unknown");
     let empty = arguments.as_object().is_none_or(|o| o.is_empty());
     let args = if empty && !raw.trim().is_empty() {
@@ -3254,19 +3263,62 @@ mod tests {
         let args = serde_json::json!({"command": "cargo check", "timeout": 900});
         assert_eq!(
             tool_line("bash", args.clone(), 200),
-            r#"[tool.bash] bash(command="cargo check", timeout=900)"#
+            r#"[tool.bash.cargo] bash(command="cargo check", timeout=900)"#
         );
         assert_eq!(
             tool_line("powershell", args, 200),
-            r#"[tool.powershell] powershell(command="cargo check", timeout=900)"#
+            r#"[tool.powershell.cargo] powershell(command="cargo check", timeout=900)"#
         );
+    }
+
+    #[test]
+    fn tool_type_code_labels_shell_commands() {
+        let cases = [
+            (
+                "bash",
+                "git status && git log --oneline -5",
+                "tool.bash.git",
+            ),
+            (
+                "bash",
+                "cargo clippy -p ralphus-daemon --all-targets 2>&1 | tail -20",
+                "tool.bash.cargo",
+            ),
+            ("bash", "cd \"$PWD\" && git status --short", "tool.bash.git"),
+            ("bash", "FOO=1 cargo build", "tool.bash.cargo"),
+            ("bash", "for i in 1 2 3; do echo $i; done", "tool.bash"),
+            ("bash", "until true; do sleep 1; done", "tool.bash"),
+            (
+                "powershell",
+                "Get-Content a.txt",
+                "tool.powershell.Get-Content",
+            ),
+            (
+                "powershell",
+                r#"cd "C:\x\wt" && git status"#,
+                "tool.powershell.git",
+            ),
+        ];
+        for (name, cmd, want) in cases {
+            assert_eq!(tool_type_code(Some(name), Some(cmd)), want, "{cmd}");
+        }
+        assert_eq!(tool_type_code(Some("bash"), None), "tool.bash");
+        assert_eq!(
+            tool_type_code(Some("read"), Some("git status")),
+            "tool.read"
+        );
+        assert_eq!(tool_type_code(None, Some("git status")), "tool.unknown");
     }
 
     #[test]
     fn tool_line_truncates_a_long_command() {
         assert_eq!(
-            tool_line("bash", serde_json::json!({"command": "a".repeat(250)}), 10),
-            format!(r#"[tool.bash] bash(command="{}…")"#, "a".repeat(10))
+            tool_line(
+                "bash",
+                serde_json::json!({"command": format!("git {}", "a".repeat(250))}),
+                10
+            ),
+            format!(r#"[tool.bash.git] bash(command="git {}…")"#, "a".repeat(6))
         );
     }
 
@@ -3413,7 +3465,7 @@ mod tests {
         assert_eq!(
             lines,
             vec![
-                r#"[tool.bash] bash(command="echo hi")"#.to_string(),
+                r#"[tool.bash.echo] bash(command="echo hi")"#.to_string(),
                 r#"[tool.read] read(path="a.txt")"#.to_string(),
             ]
         );
