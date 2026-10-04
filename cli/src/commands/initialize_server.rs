@@ -26,7 +26,7 @@ use crate::health::CheckResult;
 
 const TOTAL_STEPS: u32 = 8;
 const WINDOWS_MINIMUM_TMUX_VERSION: (u32, u32, u32) = (3, 3, 8);
-const SAMPLE_LABEL: &str = "ralphus initialize server: hello world";
+const SAMPLE_LABEL_PREFIX: &str = "ralphus initialize server: hello world";
 
 /// One answer exposed through both the terminal walkthrough and the
 /// non-interactive command line. Keep this list complete: the parity test
@@ -1046,8 +1046,9 @@ fn step_sample(
     });
     let toml_text = sample_task_toml(project, &mode, agent.as_deref());
     let client = opts.client();
+    let label = sample_label(&mode);
     let sample_already_submitted = client
-        .tasks(None, Some(SAMPLE_LABEL), None)
+        .tasks(None, Some(&label), None)
         .ok()
         .and_then(|payload| payload["squads"].as_array().cloned())
         .is_some_and(|squads| !squads.is_empty());
@@ -1061,12 +1062,16 @@ fn step_sample(
         println!("  error: could not write {}: {error}", path.display());
         return;
     }
-    match client.submit(&toml_text, false, Some(SAMPLE_LABEL)) {
+    match client.submit(&toml_text, false, Some(&label)) {
         Ok(payload) => println!("  submitted: {payload}"),
         Err(error) => println!("  error: submission failed: {error}"),
     }
     println!("  saved the submitted TOML to {}", path.display());
     println!("  equivalent command: ralphus submit {}", path.display());
+}
+
+fn sample_label(mode: &str) -> String {
+    format!("{SAMPLE_LABEL_PREFIX} ({mode})")
 }
 
 fn sample_mode(setup: &InitializeServerOptions) -> String {
@@ -1116,5 +1121,10 @@ mod tests {
             ralphus_core::validate::validate_toml(&toml).is_ok(),
             "{toml}"
         );
+    }
+
+    #[test]
+    fn sample_labels_are_idempotent_per_mode() {
+        assert_ne!(sample_label("agent"), sample_label("raw"));
     }
 }
