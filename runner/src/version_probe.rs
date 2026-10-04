@@ -5,7 +5,7 @@
 //! and an extraction closure, instead of a bespoke module per tool. Generalizes
 //! the exact shape [`crate::ripgrep`]'s `probe_version`/`probe_version_at`
 //! established for ripgrep (RAL-522), which keeps its own dedicated module
-//! since callers there also need `probe_path`'s detail-free PATH check.
+//! for its stricter `ripgrep <version>` output check.
 //!
 //! Like ripgrep's probe, this never reports a hard failure of its own --
 //! [`VersionProbe::status`] is a clean pass or a `warn`. Each tool-specific
@@ -20,10 +20,10 @@ use std::time::{Duration, Instant};
 
 use ralphus_core::process::which;
 
-/// How long `<program> <version-args>` may run before the child is killed
-/// and the probe reported as a timeout failure. Bounds a broken or shimmed
-/// binary so the hourly health sweep can never hang on it.
-const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Normal upper bound for a version command. Callers may choose a tighter
+/// bound when their health-check budget requires it; the probe kills a broken
+/// or shimmed binary when that bound elapses.
+pub const DEFAULT_VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Outcome of probing a program's version. Every non-[`VersionProbe::Ok`]
 /// shape carries its own distinct detail so an operator can tell "not
@@ -79,28 +79,31 @@ impl VersionProbe {
 }
 
 /// Resolves `program` on PATH and, when found, invokes it with
-/// `version_args`, extracting a version from its output via `extract`.
+/// `version_args`, bounded by `timeout`, extracting a version from its output
+/// via `extract`.
 #[must_use]
 pub fn probe_version(
     program: &str,
     version_args: &[&str],
+    timeout: Duration,
     extract: impl Fn(&str) -> Option<String>,
 ) -> VersionProbe {
     match which(program) {
-        Some(path) => probe_version_at(&path, version_args, extract),
+        Some(path) => probe_version_at(&path, version_args, timeout, extract),
         None => VersionProbe::NotFound,
     }
 }
 
-/// Runs `<resolved_path> <version_args>` and classifies the result via
-/// `extract`. Split out from [`probe_version`] so tests and callers that
-/// already have a resolved path (e.g. a backend's configured command, or
+/// Runs `<resolved_path> <version_args>` with `timeout` and classifies the
+/// result via `extract`. Split out from [`probe_version`] so tests and callers
+/// that already have a resolved path (e.g. a backend's configured command, or
 /// tmux's env-override/embedded-psmux path) can exercise every failure shape
 /// without going through a second PATH resolution.
 #[must_use]
 pub fn probe_version_at(
     resolved_path: &str,
     version_args: &[&str],
+    timeout: Duration,
     extract: impl Fn(&str) -> Option<String>,
 ) -> VersionProbe {
     let args_display = version_args.join(" ");
@@ -153,14 +156,12 @@ pub fn probe_version_at(
                 };
             }
         }
-        if start.elapsed() >= VERSION_PROBE_TIMEOUT {
+        if start.elapsed() >= timeout {
             let _ = child.kill();
             let _ = child.wait();
             return VersionProbe::BadOutput {
                 path: resolved_path.to_string(),
-                detail: format!(
-                    "{resolved_path} {args_display} did not exit within {VERSION_PROBE_TIMEOUT:?}"
-                ),
+                detail: format!("{resolved_path} {args_display} did not exit within {timeout:?}"),
             };
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -214,12 +215,119 @@ pub fn first_token_after_prefix(output: &str, prefix: &str) -> Option<String> {
     Some(token.to_string())
 }
 
+/// Extracts the first semver-shaped token from command output. External CLI
+/// version banners are not consistent about whether the program name or a
+/// `v` prefix comes first, so callers that do not need to validate a literal
+/// banner prefix can use this tolerant form.
+#[must_use]
+pub fn first_version_token(output: &str) -> Option<String> {
+    output.split_whitespace().find_map(|raw| {
+        let token = raw.trim_matches(|character: char| {
+            !character.is_ascii_alphanumeric() && character != '.' && character != '-'
+        });
+        let token = token.strip_prefix('v').unwrap_or(token);
+        let mut components = token.splitn(3, '.');
+        let major = components.next()?;
+        let minor = components.next()?;
+        let patch = components.next()?;
+        (major.chars().all(|character| character.is_ascii_digit())
+            && minor.chars().all(|character| character.is_ascii_digit())
+            && patch
+                .chars()
+                .next()
+                .is_some_and(|character| character.is_ascii_digit()))
+        .then(|| token.to_string())
+    })
+}
+
+/// The `extract` closure body for `nvidia-smi --version`, whose output is a
+/// `key : value` table rather than a single version line:
+///
+/// ```text
+/// NVIDIA-SMI version  : 616.56
+/// NVML version        : 616.56
+/// DRIVER version      : Deprecated, see "KMD version" instead
+/// CUDA version        : Deprecated, see "CUDA UMD version" instead
+/// KMD version         : 616.56
+/// CUDA UMD version    : 13.4
+/// ```
+///
+/// Returns the `NVIDIA-SMI version` followed by the driver and CUDA versions,
+/// e.g. `"616.56, KMD 616.56, CUDA UMD 13.4"`. Older drivers report the
+/// driver/CUDA versions under `DRIVER version`/`CUDA version` instead, so
+/// those are the fallback whenever their value isn't a `Deprecated` notice.
+/// `None` when there is no `NVIDIA-SMI version` row at all.
+#[must_use]
+pub fn nvidia_smi_version(output: &str) -> Option<String> {
+    let value_of = |key: &str| {
+        output.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            let value = value.trim();
+            (name.trim().eq_ignore_ascii_case(key)
+                && !value.is_empty()
+                && !value.starts_with("Deprecated"))
+            .then(|| value.to_string())
+        })
+    };
+    let mut parts = vec![value_of("NVIDIA-SMI version")?];
+    if let Some(driver) = value_of("KMD version") {
+        parts.push(format!("KMD {driver}"));
+    } else if let Some(driver) = value_of("DRIVER version") {
+        parts.push(format!("driver {driver}"));
+    }
+    if let Some(cuda) = value_of("CUDA UMD version") {
+        parts.push(format!("CUDA UMD {cuda}"));
+    } else if let Some(cuda) = value_of("CUDA version") {
+        parts.push(format!("CUDA {cuda}"));
+    }
+    Some(parts.join(", "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn nvidia_smi_version_reads_the_kmd_and_cuda_umd_rows() {
+        let output = "NVIDIA-SMI version  : 616.56\n\
+                      NVML version        : 616.56\n\
+                      DRIVER version      : Deprecated, see \"KMD version\" instead\n\
+                      CUDA version        : Deprecated, see \"CUDA UMD version\" instead\n\
+                      KMD version         : 616.56\n\
+                      CUDA UMD version    : 13.4\n";
+        assert_eq!(
+            nvidia_smi_version(output),
+            Some("616.56, KMD 616.56, CUDA UMD 13.4".to_string())
+        );
+    }
+
+    #[test]
+    fn nvidia_smi_version_falls_back_to_the_older_driver_and_cuda_rows() {
+        let output = "NVIDIA-SMI version  : 550.54.14\n\
+                      NVML version        : 550.54\n\
+                      DRIVER version      : 550.54.14\n\
+                      CUDA Version        : 12.4\n";
+        assert_eq!(
+            nvidia_smi_version(output),
+            Some("550.54.14, driver 550.54.14, CUDA 12.4".to_string())
+        );
+    }
+
+    #[test]
+    fn nvidia_smi_version_rejects_output_without_an_nvidia_smi_row() {
+        assert_eq!(nvidia_smi_version(""), None);
+        assert_eq!(
+            nvidia_smi_version("Invalid combination of input arguments."),
+            None
+        );
+    }
+
+    #[test]
     fn first_token_after_prefix_strips_a_literal_prefix() {
+        assert_eq!(
+            first_token_after_prefix("ripgrep 14.1.1\n", "ripgrep "),
+            Some("14.1.1".to_string())
+        );
         assert_eq!(
             first_token_after_prefix("git version 2.44.0.windows.1\n", "git version "),
             Some("2.44.0.windows.1".to_string())
@@ -268,10 +376,32 @@ mod tests {
     }
 
     #[test]
+    fn first_version_token_accepts_each_named_tool_banner_shape() {
+        for (output, expected) in [
+            ("ripgrep 14.1.1\n-PCRE2 10.39", "14.1.1"),
+            ("Claude Code 2.1.229\n", "2.1.229"),
+            ("codex-cli v0.157.0 (build abc)\n", "0.157.0"),
+            ("tmux 3.3.8\n", "3.3.8"),
+            ("git version 2.44.0.windows.1\n", "2.44.0.windows.1"),
+            ("gh version 2.93.0 (2026-05-27)\n", "2.93.0"),
+            ("glab 1.114.0 (4d7c6cd)\n", "1.114.0"),
+        ] {
+            assert_eq!(first_version_token(output).as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn first_version_token_skips_non_version_tokens() {
+        assert_eq!(first_version_token("Claude Code version unknown"), None);
+        assert_eq!(first_version_token("release 2 only"), None);
+    }
+
+    #[test]
     fn probe_version_at_reports_spawn_failure_for_a_missing_path() {
         let probe = probe_version_at(
             "definitely-not-a-real-program-ral546",
             &["--version"],
+            DEFAULT_VERSION_PROBE_TIMEOUT,
             |_| None,
         );
         match &probe {
@@ -292,7 +422,12 @@ mod tests {
     fn probe_version_at_reports_bad_output_when_extract_finds_nothing() {
         // `cargo` is on PATH for this test itself to have run, and its
         // `--version` exits cleanly, but the extractor is rigged to never match.
-        let probe = probe_version_at("cargo", &["--version"], |_| None);
+        let probe = probe_version_at(
+            "cargo",
+            &["--version"],
+            DEFAULT_VERSION_PROBE_TIMEOUT,
+            |_| None,
+        );
         match &probe {
             VersionProbe::BadOutput { path, detail } => {
                 assert_eq!(path, "cargo");
@@ -308,9 +443,12 @@ mod tests {
 
     #[test]
     fn probe_version_at_extracts_a_real_cargo_version() {
-        let probe = probe_version_at("cargo", &["--version"], |out| {
-            first_token_after_prefix(out, "cargo ")
-        });
+        let probe = probe_version_at(
+            "cargo",
+            &["--version"],
+            DEFAULT_VERSION_PROBE_TIMEOUT,
+            |out| first_token_after_prefix(out, "cargo "),
+        );
         match &probe {
             VersionProbe::Ok { path, version } => {
                 assert_eq!(path, "cargo");
@@ -333,6 +471,7 @@ mod tests {
         let probe = probe_version(
             "definitely-not-a-real-program-ral546",
             &["--version"],
+            DEFAULT_VERSION_PROBE_TIMEOUT,
             |_| None,
         );
         assert_eq!(probe, VersionProbe::NotFound);

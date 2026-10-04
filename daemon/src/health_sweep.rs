@@ -29,7 +29,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ralphus_core::health_catalog::{
     ID_CLAUDE_COMMAND, ID_CODEX_COMMAND, ID_GH, ID_GIT, ID_GLAB, ID_NVIDIA_SMI, ID_OLLAMA,
-    ID_PI_COMMAND, ID_RG_PATH, ID_RG_VERSION, ID_RUNNER, ID_TMUX,
+    ID_PI_COMMAND, ID_RG, ID_RUNNER, ID_TMUX,
 };
 use ralphus_core::process::which;
 use ralphus_runner::cli_agent_common::{self, BackendCommandHealth};
@@ -52,8 +52,7 @@ const SWEEP_CATALOG_IDS: &[&str] = &[
     ID_RUNNER,
     ID_GH,
     ID_GLAB,
-    ID_RG_PATH,
-    ID_RG_VERSION,
+    ID_RG,
     ID_NVIDIA_SMI,
     ID_OLLAMA,
     ID_CLAUDE_COMMAND,
@@ -145,9 +144,12 @@ fn now_ms() -> u128 {
 /// git whose version probe itself fails still `pass`es, since the binary is
 /// present and usable even if `--version` parsing broke.
 fn check_git() -> SweepCheck {
-    let probe = version_probe::probe_version("git", &["--version"], |out| {
-        version_probe::first_token_after_prefix(out, "git version ")
-    });
+    let probe = version_probe::probe_version(
+        "git",
+        &["--version"],
+        version_probe::DEFAULT_VERSION_PROBE_TIMEOUT,
+        |out| version_probe::first_token_after_prefix(out, "git version "),
+    );
     SweepCheck {
         id: ID_GIT,
         status: if matches!(probe, VersionProbe::NotFound) {
@@ -177,9 +179,12 @@ fn check_tmux() -> SweepCheck {
                     detail: format!("{program} (source: {source})"),
                 };
             }
-            let probe = version_probe::probe_version_at(&program, &["-V"], |out| {
-                version_probe::first_token_after_prefix(out, "tmux ")
-            });
+            let probe = version_probe::probe_version_at(
+                &program,
+                &["-V"],
+                version_probe::DEFAULT_VERSION_PROBE_TIMEOUT,
+                |out| version_probe::first_token_after_prefix(out, "tmux "),
+            );
             let detail = if let VersionProbe::Ok { version, .. } = &probe {
                 format!("{program} (source: {source}, version {version})")
             } else {
@@ -227,9 +232,12 @@ fn check_runner() -> SweepCheck {
 /// [`version_probe`] helper. Always `pass`es, found or not -- `gh` is
 /// optional, the same "never a hard fail" rule ripgrep's checks follow.
 fn check_gh() -> SweepCheck {
-    let probe = version_probe::probe_version("gh", &["--version"], |out| {
-        version_probe::first_token_after_prefix(out, "gh version ")
-    });
+    let probe = version_probe::probe_version(
+        "gh",
+        &["--version"],
+        version_probe::DEFAULT_VERSION_PROBE_TIMEOUT,
+        |out| version_probe::first_token_after_prefix(out, "gh version "),
+    );
     SweepCheck {
         id: ID_GH,
         status: PASS,
@@ -241,9 +249,12 @@ fn check_gh() -> SweepCheck {
 /// [`version_probe`] helper. Always `pass`es, found or not -- `glab` is
 /// optional, the same "never a hard fail" rule ripgrep's checks follow.
 fn check_glab() -> SweepCheck {
-    let probe = version_probe::probe_version("glab", &["--version"], |out| {
-        version_probe::first_token_after_prefix(out, "glab ")
-    });
+    let probe = version_probe::probe_version(
+        "glab",
+        &["--version"],
+        version_probe::DEFAULT_VERSION_PROBE_TIMEOUT,
+        |out| version_probe::first_token_after_prefix(out, "glab "),
+    );
     SweepCheck {
         id: ID_GLAB,
         status: PASS,
@@ -251,42 +262,35 @@ fn check_glab() -> SweepCheck {
     }
 }
 
-/// RAL-522: ripgrep PATH resolution, via the same shared probe the CLI's
-/// `check health` runs (`ralphus_runner::ripgrep`) so the two surfaces can
-/// never disagree. A `warn`, never a `fail`: agents fall back to `grep`.
-fn check_rg_path() -> SweepCheck {
-    let probe = ralphus_runner::ripgrep::probe_path();
-    SweepCheck {
-        id: ID_RG_PATH,
-        status: probe.status(),
-        detail: probe.detail(),
-    }
-}
-
-/// RAL-522: ripgrep version invocation (`rg --version` on the resolved
-/// executable), the second half of the same shared probe. A `warn`, never a
-/// `fail`, with a distinct detail per failure shape.
-fn check_rg_version() -> SweepCheck {
+/// RAL-522: ripgrep PATH resolution plus `rg --version` on the resolved
+/// executable, via the same shared probe the CLI's `check health` runs
+/// (`ralphus_runner::ripgrep`) so the two surfaces can never disagree. A
+/// `warn`, never a `fail` (agents fall back to `grep`), with a distinct
+/// detail per failure shape.
+fn check_rg() -> SweepCheck {
     let probe = ralphus_runner::ripgrep::probe_version();
     SweepCheck {
-        id: ID_RG_VERSION,
+        id: ID_RG,
         status: probe.status(),
         detail: probe.detail(),
     }
 }
 
+/// RAL-546: `nvidia-smi` PATH resolution plus `nvidia-smi --version`, via
+/// the shared [`version_probe`] helper, so the detail carries the
+/// NVIDIA-SMI, driver, and CUDA versions. A `warn` when it's missing or
+/// broken, never a `fail`: only the resource view's GPU column needs it.
 fn check_nvidia_smi() -> SweepCheck {
-    match which("nvidia-smi") {
-        Some(path) => SweepCheck {
-            id: ID_NVIDIA_SMI,
-            status: PASS,
-            detail: path,
-        },
-        None => SweepCheck {
-            id: ID_NVIDIA_SMI,
-            status: WARN,
-            detail: "not found on PATH".to_string(),
-        },
+    let probe = version_probe::probe_version(
+        "nvidia-smi",
+        &["--version"],
+        version_probe::DEFAULT_VERSION_PROBE_TIMEOUT,
+        version_probe::nvidia_smi_version,
+    );
+    SweepCheck {
+        id: ID_NVIDIA_SMI,
+        status: probe.status(),
+        detail: probe.detail("nvidia-smi"),
     }
 }
 
@@ -382,18 +386,17 @@ fn resolve_effective_command(
 pub(crate) fn diagnose_backend_command(backend: &str, command: &str) -> BackendCommandHealth {
     match backend {
         "pi" => pi_backend::diagnose_pi_command(command),
-        // Claude Code prints just "<version> (Claude Code)" on its first
-        // line -- no literal prefix to strip, so the version is simply the
-        // first line's first token.
+        // Claude Code's banner has changed shape across releases; accept the
+        // first semver-shaped token rather than depending on its wording.
         "claude-code" => {
             cli_agent_common::diagnose_command_with_version(command, &["--version"], |out| {
-                version_probe::first_token_after_prefix(out, "")
+                version_probe::first_version_token(out)
             })
         }
-        // Codex prints "codex-cli <version>" on its first line.
+        // Codex likewise has emitted both prefixed and unprefixed banners.
         "codex" => {
             cli_agent_common::diagnose_command_with_version(command, &["--version"], |out| {
-                version_probe::first_token_after_prefix(out, "codex-cli ")
+                version_probe::first_version_token(out)
             })
         }
         _ => cli_agent_common::diagnose_command(command),
@@ -435,8 +438,7 @@ pub fn run_sweep(store: &StoreHandle) -> SweepReport {
         check_runner(),
         check_gh(),
         check_glab(),
-        check_rg_path(),
-        check_rg_version(),
+        check_rg(),
         check_nvidia_smi(),
         check_ollama(),
         check_backend_command(
@@ -610,24 +612,19 @@ mod tests {
     }
 
     #[test]
-    fn ripgrep_checks_are_warns_at_worst_and_agree_on_the_resolved_path() {
-        // RAL-522: neither ripgrep half is ever a hard fail (agents fall
-        // back to grep), and when PATH resolution finds an rg, the version
-        // probe must have invoked that same resolved executable -- its
-        // detail names the path whatever the invocation outcome was.
-        let path_check = check_rg_path();
-        let version_check = check_rg_version();
-        assert_ne!(path_check.status, FAIL, "{path_check:?}");
-        assert_ne!(version_check.status, FAIL, "{version_check:?}");
-        if path_check.status == PASS {
-            assert!(
-                version_check.detail.contains(&path_check.detail),
-                "version detail {:?} should name the resolved path {:?}",
-                version_check.detail,
-                path_check.detail
-            );
-        } else {
-            assert_eq!(version_check.status, WARN, "{version_check:?}");
+    fn ripgrep_check_is_a_warn_at_worst_and_names_the_resolved_path() {
+        // RAL-522: the ripgrep check is never a hard fail (agents fall back
+        // to grep), and when PATH resolution finds an rg, the detail names
+        // that resolved executable whatever the invocation outcome was.
+        let check = check_rg();
+        assert_ne!(check.status, FAIL, "{check:?}");
+        match which("rg") {
+            Some(path) => assert!(
+                check.detail.contains(&path),
+                "detail {:?} should name the resolved path {path:?}",
+                check.detail
+            ),
+            None => assert_eq!(check.status, WARN, "{check:?}"),
         }
     }
 

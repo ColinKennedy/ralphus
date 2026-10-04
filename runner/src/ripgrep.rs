@@ -6,11 +6,10 @@
 //! never disagree about whether `rg` is usable -- the same "one shared
 //! probe" reasoning as [`crate::cli_agent_common::diagnose_command`].
 //!
-//! The probe has two halves, reported as two separate diagnostics so each
-//! failure shape gets its own actionable detail: whether `rg` resolves on
-//! PATH at all ([`probe_path`]), and whether the resolved executable can
-//! actually be invoked and report a version ([`probe_version`]). Neither
-//! half ever reports a `fail`: agents are prompted to prefer `rg` and fall
+//! [`probe_version`] resolves `rg` on PATH and invokes the resolved
+//! executable with `--version`, reported as a single `ripgrep` diagnostic
+//! whose detail distinguishes "not installed" from "installed but broken".
+//! It never reports a `fail`: agents are prompted to prefer `rg` and fall
 //! back to `grep` when it's unavailable (`runner/src/runner.rs`'s tools
 //! system prompt), so a missing or broken ripgrep degrades search speed,
 //! not correctness.
@@ -33,37 +32,7 @@ pub const RG_PROGRAM: &str = "rg";
 /// the hourly sweep can never hang on it.
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Outcome of the PATH-resolution half of the ripgrep health check.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RipgrepPathProbe {
-    /// `rg` resolved to this executable path.
-    Found(String),
-    /// Nothing named `rg` resolves on PATH.
-    NotFound,
-}
-
-impl RipgrepPathProbe {
-    /// The check status this outcome reports -- a clean pass or a `warn`,
-    /// never a `fail`.
-    #[must_use]
-    pub fn status(&self) -> &'static str {
-        match self {
-            Self::Found(_) => "pass",
-            Self::NotFound => "warn",
-        }
-    }
-
-    /// The human-readable observation for this outcome.
-    #[must_use]
-    pub fn detail(&self) -> String {
-        match self {
-            Self::Found(path) => path.clone(),
-            Self::NotFound => format!("{RG_PROGRAM} not found on PATH"),
-        }
-    }
-}
-
-/// Outcome of the `rg --version` half of the ripgrep health check. Every
+/// Outcome of the ripgrep health check. Every
 /// non-[`RipgrepVersionProbe::Ok`] shape carries its own distinct detail so
 /// an operator can tell "not installed" apart from "installed but broken".
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,10 +63,8 @@ impl RipgrepVersionProbe {
     #[must_use]
     pub fn detail(&self) -> String {
         match self {
-            Self::Ok { path, version } => format!("{path} (version {version})"),
-            Self::NotFound => {
-                format!("{RG_PROGRAM} not found on PATH; --version not probed")
-            }
+            Self::Ok { path, version } => format!("{path} ({version})"),
+            Self::NotFound => format!("{RG_PROGRAM} not found on PATH"),
             Self::SpawnFailed { detail, .. } | Self::BadOutput { detail, .. } => detail.clone(),
         }
     }
@@ -116,21 +83,12 @@ impl RipgrepVersionProbe {
 }
 
 /// Resolves `rg` on PATH (no cwd-first search -- the same PATH-only rule as
-/// [`crate::process::which`] itself).
-#[must_use]
-pub fn probe_path() -> RipgrepPathProbe {
-    match which(RG_PROGRAM) {
-        Some(path) => RipgrepPathProbe::Found(path),
-        None => RipgrepPathProbe::NotFound,
-    }
-}
-
-/// Resolves `rg` on PATH and, when found, invokes it with `--version`.
+/// [`which`] itself) and, when found, invokes it with `--version`.
 #[must_use]
 pub fn probe_version() -> RipgrepVersionProbe {
-    match probe_path() {
-        RipgrepPathProbe::Found(path) => probe_version_at(&path),
-        RipgrepPathProbe::NotFound => RipgrepVersionProbe::NotFound,
+    match which(RG_PROGRAM) {
+        Some(path) => probe_version_at(&path),
+        None => RipgrepVersionProbe::NotFound,
     }
 }
 
@@ -323,11 +281,8 @@ mod tests {
     }
 
     #[test]
-    fn probes_agree_with_each_other_when_rg_is_installed() {
-        let path_probe = probe_path();
-        if let RipgrepPathProbe::Found(path) = &path_probe {
-            assert_eq!(path_probe.status(), "pass");
-            assert_eq!(path_probe.detail(), *path);
+    fn probe_version_invokes_the_rg_resolved_on_path() {
+        if let Some(path) = which(RG_PROGRAM) {
             let version_probe = probe_version();
             assert_eq!(version_probe.resolved_path(), Some(path.as_str()));
             if let RipgrepVersionProbe::Ok { version, .. } = &version_probe {
@@ -340,7 +295,6 @@ mod tests {
                 assert_eq!(version_probe.status(), "warn", "{version_probe:?}");
             }
         } else {
-            assert_eq!(path_probe.status(), "warn");
             assert_eq!(probe_version(), RipgrepVersionProbe::NotFound);
         }
     }

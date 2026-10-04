@@ -589,22 +589,50 @@ fn check_runner() -> CheckResult {
     )
 }
 
+/// RAL-546: `nvidia-smi` PATH resolution plus `nvidia-smi --version`, via
+/// the same shared probe the daemon's Health-tab sweep runs, so the detail
+/// carries the NVIDIA-SMI, driver, and CUDA versions.
 fn check_nvidia_smi() -> CheckResult {
-    match which("nvidia-smi") {
-        None => CheckResult::machine(
-            "nvidia-smi",
-            WARN,
-            "not found on PATH",
-            "The resource view's GPU column shows N/A instead of live usage; nothing else is affected.",
-            "Optional: install NVIDIA drivers/nvidia-smi if you want GPU usage reported.",
-        ),
-        Some(path) => CheckResult::machine(
+    nvidia_smi_check_result(&ralphus_runner::version_probe::probe_version(
+        "nvidia-smi",
+        &["--version"],
+        ralphus_runner::version_probe::DEFAULT_VERSION_PROBE_TIMEOUT,
+        ralphus_runner::version_probe::nvidia_smi_version,
+    ))
+}
+
+/// Builds the `nvidia-smi` [`CheckResult`] from an already-run probe --
+/// split out so tests can exercise every outcome without a real GPU.
+fn nvidia_smi_check_result(probe: &ralphus_runner::version_probe::VersionProbe) -> CheckResult {
+    use ralphus_runner::version_probe::VersionProbe;
+    const MISSING_IMPACT: &str =
+        "The resource view's GPU column shows N/A instead of live usage; nothing else is affected.";
+    let result = match probe {
+        VersionProbe::Ok { .. } => CheckResult::machine(
             "nvidia-smi",
             PASS,
-            path,
+            probe.detail("nvidia-smi"),
             "GPU usage is reported in the resource view.",
             "No action needed.",
         ),
+        VersionProbe::NotFound => CheckResult::machine(
+            "nvidia-smi",
+            WARN,
+            probe.detail("nvidia-smi"),
+            MISSING_IMPACT,
+            "Optional: install NVIDIA drivers/nvidia-smi if you want GPU usage reported.",
+        ),
+        VersionProbe::SpawnFailed { .. } | VersionProbe::BadOutput { .. } => CheckResult::machine(
+            "nvidia-smi",
+            WARN,
+            probe.detail("nvidia-smi"),
+            MISSING_IMPACT,
+            "Update or reinstall the NVIDIA driver so `nvidia-smi --version` works.",
+        ),
+    };
+    match probe.resolved_path() {
+        Some(path) => result.with_provenance(path),
+        None => result,
     }
 }
 
@@ -690,72 +718,40 @@ fn check_glab() -> CheckResult {
     check_glab_for(which("glab"))
 }
 
-/// RAL-522: ripgrep (`rg`) availability, both halves (PATH resolution and an
-/// actual `rg --version` invocation) via the same shared probe the daemon's
+/// RAL-522: ripgrep (`rg`) availability -- PATH resolution plus an actual
+/// `rg --version` invocation -- via the same shared probe the daemon's
 /// Health-tab sweep runs (`ralphus_runner::ripgrep`), so this report and the
-/// board can never disagree about whether ripgrep is usable. Neither half is
-/// ever a hard `fail`: agents are prompted to prefer `rg` and fall back to
-/// `grep` when it's unavailable, so a missing/broken ripgrep degrades search
-/// speed, not correctness.
-fn check_ripgrep() -> Vec<CheckResult> {
-    ripgrep_check_results(
-        &ralphus_runner::ripgrep::probe_path(),
-        &ralphus_runner::ripgrep::probe_version(),
-    )
+/// board can never disagree about whether ripgrep is usable. Never a hard
+/// `fail`: agents are prompted to prefer `rg` and fall back to `grep` when
+/// it's unavailable, so a missing/broken ripgrep degrades search speed, not
+/// correctness.
+fn check_ripgrep() -> CheckResult {
+    ripgrep_check_result(&ralphus_runner::ripgrep::probe_version())
 }
 
-/// Assembles the two ripgrep [`CheckResult`]s from already-run probes --
-/// split out so tests can exercise every failure shape without mutating the
-/// real PATH environment.
-fn ripgrep_check_results(
-    path_probe: &ralphus_runner::ripgrep::RipgrepPathProbe,
-    version_probe: &ralphus_runner::ripgrep::RipgrepVersionProbe,
-) -> Vec<CheckResult> {
-    const PATH_IMPACT: &str = "Agents are prompted to prefer ripgrep for repository search; without it they fall back to grep, which is slower on large repositories.";
-    const VERSION_IMPACT: &str = "A resolved rg that cannot execute (or does not report a ripgrep version) means repository search silently falls back to grep despite ripgrep appearing installed.";
-    let path_result = if path_probe.status() == PASS {
-        CheckResult::harness(
-            "ripgrep-path",
-            PASS,
-            path_probe.detail(),
-            PATH_IMPACT,
-            "No action needed.",
-        )
-    } else {
-        CheckResult::harness(
-            "ripgrep-path",
+/// Builds the ripgrep [`CheckResult`] from an already-run probe -- split out
+/// so tests can exercise every failure shape without mutating the real PATH
+/// environment.
+fn ripgrep_check_result(probe: &ralphus_runner::ripgrep::RipgrepVersionProbe) -> CheckResult {
+    use ralphus_runner::ripgrep::RipgrepVersionProbe;
+    const IMPACT: &str = "Agents are prompted to prefer ripgrep for repository search; without a working rg they fall back to grep, which is slower on large repositories.";
+    let (status, remediation) = match probe {
+        RipgrepVersionProbe::Ok { .. } => (PASS, "No action needed."),
+        RipgrepVersionProbe::NotFound => (
             WARN,
-            path_probe.detail(),
-            PATH_IMPACT,
             "Optional: install ripgrep (https://github.com/BurntSushi/ripgrep#installation) and ensure rg resolves on PATH.",
-        )
-    }
-    .with_id(ralphus_core::health_catalog::ID_RG_PATH);
-    let version_result = if version_probe.status() == PASS {
-        CheckResult::harness(
-            "ripgrep-version",
-            PASS,
-            version_probe.detail(),
-            VERSION_IMPACT,
-            "No action needed.",
-        )
-    } else {
-        CheckResult::harness(
-            "ripgrep-version",
+        ),
+        RipgrepVersionProbe::SpawnFailed { .. } | RipgrepVersionProbe::BadOutput { .. } => (
             WARN,
-            version_probe.detail(),
-            VERSION_IMPACT,
             "Reinstall ripgrep so `rg --version` works, or remove the broken rg from PATH.",
-        )
-    }
-    .with_id(ralphus_core::health_catalog::ID_RG_VERSION);
-    // The resolved executable is the one contributing source the version
-    // probe has worth naming.
-    let version_result = match version_probe.resolved_path() {
-        Some(path) => version_result.with_provenance(path),
-        None => version_result,
+        ),
     };
-    vec![path_result, version_result]
+    let result = CheckResult::harness("ripgrep", status, probe.detail(), IMPACT, remediation)
+        .with_id(ralphus_core::health_catalog::ID_RG);
+    match probe.resolved_path() {
+        Some(path) => result.with_provenance(path),
+        None => result,
+    }
 }
 
 /// Resolves tmux/psmux exactly the way the daemon does
@@ -1943,7 +1939,7 @@ pub fn run_checks(
     results.push(check_tmux().with_id(ID_TMUX));
     results.push(check_gh().with_id(ID_GH));
     results.push(check_glab().with_id(ID_GLAB));
-    results.extend(check_ripgrep());
+    results.push(check_ripgrep());
     results.push(
         check_agent_command_via_daemon(daemon_url, ID_CLAUDE_COMMAND, "claude-command")
             .with_id(ID_CLAUDE_COMMAND),
@@ -2741,78 +2737,94 @@ mod tests {
     // ── ripgrep (RAL-522) ────────────────────────────────────────────────
 
     #[test]
-    fn check_ripgrep_warns_neither_fails_when_missing() {
-        let results = ripgrep_check_results(
-            &ralphus_runner::ripgrep::RipgrepPathProbe::NotFound,
-            &ralphus_runner::ripgrep::RipgrepVersionProbe::NotFound,
-        );
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].id, ralphus_core::health_catalog::ID_RG_PATH);
-        assert_eq!(results[1].id, ralphus_core::health_catalog::ID_RG_VERSION);
-        for r in &results {
-            assert_eq!(r.status, WARN, "{r:?}");
-            assert_eq!(r.section, HARNESS);
-            assert!(r.remediation.to_lowercase().contains("ripgrep"), "{r:?}");
-        }
-        assert!(results[0].detail.contains("not found on PATH"));
-        let version = &results[1];
-        assert!(version.detail.contains("not probed"), "{version:?}");
+    fn check_ripgrep_warns_never_fails_when_missing() {
+        let r = ripgrep_check_result(&ralphus_runner::ripgrep::RipgrepVersionProbe::NotFound);
+        assert_eq!(r.id, ralphus_core::health_catalog::ID_RG);
+        assert_eq!(r.name, "ripgrep");
+        assert_eq!(r.status, WARN, "{r:?}");
+        assert_eq!(r.section, HARNESS);
+        assert!(r.remediation.contains("install ripgrep"), "{r:?}");
+        assert!(r.detail.contains("not found on PATH"), "{r:?}");
+        assert_eq!(r.provenance, None);
     }
 
     #[test]
-    fn check_ripgrep_passes_when_found_and_versioned() {
-        let results = ripgrep_check_results(
-            &ralphus_runner::ripgrep::RipgrepPathProbe::Found("/usr/bin/rg".to_string()),
-            &ralphus_runner::ripgrep::RipgrepVersionProbe::Ok {
-                path: "/usr/bin/rg".to_string(),
-                version: "14.1.1".to_string(),
-            },
-        );
-        for r in &results {
-            assert_eq!(r.status, PASS, "{r:?}");
-            assert_eq!(r.remediation, "No action needed.");
-        }
-        assert_eq!(results[0].detail, "/usr/bin/rg");
-        let version = &results[1];
-        assert!(version.detail.contains("14.1.1"), "{version:?}");
-        assert_eq!(results[1].provenance.as_deref(), Some("/usr/bin/rg"));
+    fn check_ripgrep_passes_with_path_and_version_when_found() {
+        let r = ripgrep_check_result(&ralphus_runner::ripgrep::RipgrepVersionProbe::Ok {
+            path: "/usr/bin/rg".to_string(),
+            version: "14.1.1".to_string(),
+        });
+        assert_eq!(r.status, PASS, "{r:?}");
+        assert_eq!(r.remediation, "No action needed.");
+        assert_eq!(r.detail, "/usr/bin/rg (14.1.1)");
+        assert_eq!(r.provenance.as_deref(), Some("/usr/bin/rg"));
     }
 
     #[test]
-    fn check_ripgrep_version_warns_on_a_resolved_but_broken_rg() {
-        let results = ripgrep_check_results(
-            &ralphus_runner::ripgrep::RipgrepPathProbe::Found("/usr/bin/rg".to_string()),
-            &ralphus_runner::ripgrep::RipgrepVersionProbe::BadOutput {
-                path: "/usr/bin/rg".to_string(),
-                detail: "/usr/bin/rg --version did not report a ripgrep version: hi".to_string(),
-            },
-        );
-        // A PATH hit that can't run is exactly the split the two diagnostics
-        // exist to distinguish: the path half still passes, the version half
-        // warns.
-        assert_eq!(results[0].status, PASS);
-        assert_eq!(results[1].status, WARN);
-        let version = &results[1];
-        assert!(version.detail.contains("/usr/bin/rg"), "{version:?}");
-        assert!(version.remediation.contains("Reinstall"), "{version:?}");
+    fn check_ripgrep_warns_on_a_resolved_but_broken_rg() {
+        let r = ripgrep_check_result(&ralphus_runner::ripgrep::RipgrepVersionProbe::BadOutput {
+            path: "/usr/bin/rg".to_string(),
+            detail: "/usr/bin/rg --version did not report a ripgrep version: hi".to_string(),
+        });
+        // A PATH hit that can't run still names the path, but asks for a
+        // reinstall rather than an install.
+        assert_eq!(r.status, WARN);
+        assert!(r.detail.contains("/usr/bin/rg"), "{r:?}");
+        assert!(r.remediation.contains("Reinstall"), "{r:?}");
     }
 
     #[test]
     fn check_ripgrep_live_probe_never_fails() {
-        // Whatever this machine's actual ripgrep state is, neither half may
-        // ever report a hard failure -- and the two halves must agree on the
-        // resolved path when there is one.
-        let results = check_ripgrep();
-        assert_eq!(results.len(), 2);
-        for r in &results {
-            assert_ne!(r.status, FAIL, "{r:?}");
+        // Whatever this machine's actual ripgrep state is, the check may
+        // never report a hard failure -- and it names the resolved path when
+        // there is one.
+        let r = check_ripgrep();
+        assert_ne!(r.status, FAIL, "{r:?}");
+        if let Some(path) = which("rg") {
+            assert!(r.detail.contains(&path), "{r:?}");
         }
-        let found = ralphus_runner::ripgrep::probe_path();
-        if found.status() == PASS {
-            let path_detail = results[0].detail.clone();
-            let version = &results[1];
-            assert!(version.detail.contains(&path_detail), "{version:?}");
-        }
+    }
+
+    // ── nvidia-smi (RAL-546) ─────────────────────────────────────────────
+
+    #[test]
+    fn check_nvidia_smi_reports_path_and_versions_when_found() {
+        let r = nvidia_smi_check_result(&ralphus_runner::version_probe::VersionProbe::Ok {
+            path: "C:\\Windows\\system32\\nvidia-smi.exe".to_string(),
+            version: "616.56, KMD 616.56, CUDA UMD 13.4".to_string(),
+        });
+        assert_eq!(r.status, PASS, "{r:?}");
+        assert_eq!(
+            r.detail,
+            "C:\\Windows\\system32\\nvidia-smi.exe (version 616.56, KMD 616.56, CUDA UMD 13.4)"
+        );
+        assert_eq!(
+            r.provenance.as_deref(),
+            Some("C:\\Windows\\system32\\nvidia-smi.exe")
+        );
+    }
+
+    #[test]
+    fn check_nvidia_smi_warns_when_missing_or_broken() {
+        let missing =
+            nvidia_smi_check_result(&ralphus_runner::version_probe::VersionProbe::NotFound);
+        assert_eq!(missing.status, WARN, "{missing:?}");
+        assert!(missing.detail.contains("not found on PATH"), "{missing:?}");
+        assert!(missing.remediation.contains("install"), "{missing:?}");
+
+        let broken =
+            nvidia_smi_check_result(&ralphus_runner::version_probe::VersionProbe::BadOutput {
+                path: "/usr/bin/nvidia-smi".to_string(),
+                detail: "/usr/bin/nvidia-smi --version exited with 1".to_string(),
+            });
+        assert_eq!(broken.status, WARN, "{broken:?}");
+        assert!(broken.remediation.contains("reinstall"), "{broken:?}");
+    }
+
+    #[test]
+    fn check_nvidia_smi_live_probe_never_fails() {
+        let r = check_nvidia_smi();
+        assert_ne!(r.status, FAIL, "{r:?}");
     }
 
     // ── tmux resolution (RAL-415) ───────────────────────────────────────
