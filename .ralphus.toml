@@ -40,7 +40,7 @@ command = "npm ci --no-audit --no-fund"
 label = "Daemon API in an isolated dev stack"
 command = "bash scripts/build-debug.sh --daemon-port 7891 --librarian-port 7475 --db-path ~/.ralphus/tasks-review-7891.db"
 auto_run = false
-description = "Boots the isolated stack, then exercise the changed route, e.g. `curl http://127.0.0.1:7891/api/daemon`, or the CLI with `ralphus --daemon-url http://127.0.0.1:7891 ...`."
+description = "Boots the isolated stack, then exercise the changed route, e.g. `curl http://127.0.0.1:7891/api/daemon`, or the CLI pointed at that daemon with --daemon-url http://127.0.0.1:7891."
 success = "The changed endpoint answers with the documented shape, an existing database is migrated without errors in the daemon log, and the board still loads."
 hint.include_when = "Any change to daemon routes, the store schema (new tables or columns), the scheduler, or the guardian merge pipeline."
 hint.paths = ["daemon/src/server.rs", "daemon/src/store.rs", "daemon/src/scheduler.rs", "daemon/src/guardian*.rs", "daemon/src/delivery.rs"]
@@ -56,7 +56,7 @@ hint.paths = ["daemon/src/auto_run.rs", "daemon/src/guardian_merge.rs", "librari
 
 [[review.action.hint]]
 label = "CLI and MCP surface"
-prompt = "Build the CLI and MCP server, then run `ralphus <group> --help` for each command group you changed and confirm the help text, flags and defaults read correctly. List the MCP tools and confirm every new CLI command or flag has a matching tool."
+prompt = "Build the CLI and MCP server, then run the CLI with '<group> --help' for each command group you changed and confirm the help text, flags and defaults read correctly. List the MCP tools and confirm every new CLI command or flag has a matching tool."
 auto_run = false
 description = "Reads the changed help text the way a user would; mcp/tests/parity.rs only proves a tool exists, not that its description is right."
 success = "Help text is accurate, flags are documented with their defaults, and each new CLI command has an MCP tool."
