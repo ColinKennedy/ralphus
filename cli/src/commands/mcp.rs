@@ -124,7 +124,7 @@ pub(crate) fn initialize(
         );
     }
     if plan.third_party_installs.is_empty() && plan.commands.is_empty() && plan.edits.is_empty() {
-        println!("  no changes needed");
+        println!("  already configured; no changes needed");
         return 0;
     }
     for edit in &plan.edits {

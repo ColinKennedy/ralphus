@@ -63,6 +63,11 @@ alternatives to reach for are in
   logic for it — a closed enum, a numeric bound, or deliberately unvalidated
   are all plausible, and guessing wrong either rejects a wanted value or lets
   a typo through.
+- **Keep `ralphus initialize server` prompts and flags symmetric.** Every
+  interactive answer needs an explicit flag that supplies the same value, and
+  every initialization flag needs an equivalent interactive answer. Both paths
+  must drive the same setup behavior; `--yes` accepting a default is not a
+  substitute for a value-taking flag.
 - **Never run `cargo test --all-targets` / `cargo nextest run --all-targets`
   when ralphus itself is the one driving the work** (a ralphus cell/proof
   step developing ralphus, i.e. dogfooding) — that cell's own dev daemon/

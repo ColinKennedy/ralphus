@@ -579,6 +579,11 @@ impl DaemonClient {
         self.post("/api/users", Some(json!({"name": name})))
     }
 
+    /// `GET /api/users`: all registered users, including their admin state.
+    pub fn list_users(&self) -> Result<Value, DaemonError> {
+        self.get("/api/users")
+    }
+
     /// `POST /api/users/{name}/admin`: grant or revoke admin. Bootstrap-exempt
     /// on a fresh instance with zero admins registered.
     pub fn set_user_admin(&self, name: &str, is_admin: bool) -> Result<Value, DaemonError> {

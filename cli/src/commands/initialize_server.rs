@@ -2,11 +2,22 @@
 //! installation walkthrough. Deliberately absent from `help_map.rs` (see the
 //! `resolved_path` carve-out there), so it never appears in `--help`,
 //! `show help-map`, or the help-map-derived MCP tool surface, yet is still
-//! directly invocable as `ralphus initialize server [--yes]`.
+//! directly invocable as `ralphus initialize server [--yes]`. Every answer
+//! also has a flag, allowing a complete setup to run without a terminal.
 //!
 //! `--yes` accepts every stage's default answer instead of prompting, for
 //! non-interactive/scripted runs; without it, a non-TTY stdin is rejected
 //! the same way `ralphus mcp initialize` rejects one (see `mcp.rs`).
+//! Boolean answer flags take `yes` or `no`: `--install-tmux`,
+//! `--setup-mcp`, `--register-project`, `--review-auto-submit-pr-stack`,
+//! `--require-forks`, `--create-admin`, `--setup-forge-token`, `--submit-sample`.
+//! The value flags are `--tmux-program`, repeatable
+//! `--mcp-host`, `--project-name`, `--project-description`, `--project-is-fork`,
+//! `--project-fork-url`, `--project-url`,
+//! `--bug-threshold`, `--feature-threshold`, `--investigation-threshold`,
+//! `--unclassified-threshold`, `--fork-user`, `--fork-url`, `--forge-provider`,
+//! `--forge-host`, `--forge-token`, `--admin-name`,
+//! `--review-resolver-agent`, `--sample-mode`, and `--sample-agent`.
 
 use std::io::{IsTerminal as _, Write as _};
 use std::path::PathBuf;
@@ -16,11 +27,324 @@ use crate::client::ProjectReviewSettingsPatch;
 use crate::commands::misc::CheckArgs;
 use crate::health::CheckResult;
 
-const TOTAL_STEPS: u32 = 8;
+const TOTAL_STEPS: u32 = 9;
 const WINDOWS_MINIMUM_TMUX_VERSION: (u32, u32, u32) = (3, 3, 8);
+const SAMPLE_LABEL_PREFIX: &str = "ralphus initialize server: hello world";
 
-pub fn dispatch(opts: &GlobalOpts, yes: bool) -> i32 {
-    if !yes && !std::io::stdin().is_terminal() {
+pub(crate) fn validate_forge_host(host: &str) -> Result<(), String> {
+    let lower = host.to_ascii_lowercase();
+    if host.is_empty()
+        || lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("www.")
+        || host.contains(['/', ':', '?', '#', '@'])
+        || host.chars().any(char::is_whitespace)
+    {
+        return Err(
+            "expected a bare hostname such as gitlab.com (without http(s):// or www.)".to_string(),
+        );
+    }
+    if host.split('.').any(|label| {
+        label.is_empty()
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '-')
+    }) {
+        return Err("expected a valid bare hostname such as gitlab.com".to_string());
+    }
+    Ok(())
+}
+
+fn validate_project_fork_url(url: &str) -> Result<(), String> {
+    if !url.starts_with("https://") {
+        return Err(
+            "fork clone URLs must use HTTPS (for example https://github.com/owner/repo.git)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// One answer exposed through both the terminal walkthrough and the
+/// non-interactive command line. Keep this list complete: the parity test
+/// makes omissions fail CI.
+struct InitializeSetting {
+    prompt: &'static str,
+    flag: &'static str,
+}
+
+const INSTALL_TMUX: InitializeSetting = InitializeSetting {
+    prompt: "run the tmux installer",
+    flag: "--install-tmux",
+};
+const TMUX_PROGRAM: InitializeSetting = InitializeSetting {
+    prompt: "tmux program path",
+    flag: "--tmux-program",
+};
+const SETUP_MCP: InitializeSetting = InitializeSetting {
+    prompt: "set up MCP",
+    flag: "--setup-mcp",
+};
+const MCP_HOST: InitializeSetting = InitializeSetting {
+    prompt: "MCP host",
+    flag: "--mcp-host",
+};
+const REGISTER_PROJECT: InitializeSetting = InitializeSetting {
+    prompt: "register project",
+    flag: "--register-project",
+};
+const PROJECT_NAME: InitializeSetting = InitializeSetting {
+    prompt: "project name",
+    flag: "--project-name",
+};
+const PROJECT_DESCRIPTION: InitializeSetting = InitializeSetting {
+    prompt: "project description",
+    flag: "--project-description",
+};
+const PROJECT_IS_FORK: InitializeSetting = InitializeSetting {
+    prompt: "project is a fork",
+    flag: "--project-is-fork",
+};
+const PROJECT_FORK_URL: InitializeSetting = InitializeSetting {
+    prompt: "project fork URL",
+    flag: "--project-fork-url",
+};
+const PROJECT_URL: InitializeSetting = InitializeSetting {
+    prompt: "project URL",
+    flag: "--project-url",
+};
+const BUG_THRESHOLD: InitializeSetting = InitializeSetting {
+    prompt: "bug threshold",
+    flag: "--bug-threshold",
+};
+const FEATURE_THRESHOLD: InitializeSetting = InitializeSetting {
+    prompt: "feature threshold",
+    flag: "--feature-threshold",
+};
+const INVESTIGATION_THRESHOLD: InitializeSetting = InitializeSetting {
+    prompt: "investigation threshold",
+    flag: "--investigation-threshold",
+};
+const UNCLASSIFIED_THRESHOLD: InitializeSetting = InitializeSetting {
+    prompt: "unclassified threshold",
+    flag: "--unclassified-threshold",
+};
+const REVIEW_AUTO_SUBMIT_PR_STACK: InitializeSetting = InitializeSetting {
+    prompt: "review auto-submit PR stack",
+    flag: "--review-auto-submit-pr-stack",
+};
+const REVIEW_RESOLVER_AGENT: InitializeSetting = InitializeSetting {
+    prompt: "review resolver agent",
+    flag: "--review-resolver-agent",
+};
+const REQUIRE_FORKS: InitializeSetting = InitializeSetting {
+    prompt: "require forks",
+    flag: "--require-forks",
+};
+const FORK_USER: InitializeSetting = InitializeSetting {
+    prompt: "fork user",
+    flag: "--fork-user",
+};
+const FORK_URL: InitializeSetting = InitializeSetting {
+    prompt: "fork URL",
+    flag: "--fork-url",
+};
+const FORGE_HOST: InitializeSetting = InitializeSetting {
+    prompt: "forge host",
+    flag: "--forge-host",
+};
+const FORGE_TOKEN: InitializeSetting = InitializeSetting {
+    prompt: "forge token",
+    flag: "--forge-token",
+};
+const CREATE_ADMIN: InitializeSetting = InitializeSetting {
+    prompt: "create admin",
+    flag: "--create-admin",
+};
+const ADMIN_NAME: InitializeSetting = InitializeSetting {
+    prompt: "admin name",
+    flag: "--admin-name",
+};
+const SETUP_FORGE_TOKEN: InitializeSetting = InitializeSetting {
+    prompt: "set up forge token",
+    flag: "--setup-forge-token",
+};
+const FORGE_PROVIDER: InitializeSetting = InitializeSetting {
+    prompt: "forge provider",
+    flag: "--forge-provider",
+};
+const SUBMIT_SAMPLE: InitializeSetting = InitializeSetting {
+    prompt: "submit sample",
+    flag: "--submit-sample",
+};
+const SAMPLE_AGENT: InitializeSetting = InitializeSetting {
+    prompt: "sample agent",
+    flag: "--sample-agent",
+};
+const SAMPLE_MODE: InitializeSetting = InitializeSetting {
+    prompt: "sample mode",
+    flag: "--sample-mode",
+};
+
+const INTERACTIVE_SETTINGS: &[&InitializeSetting] = &[
+    &INSTALL_TMUX,
+    &TMUX_PROGRAM,
+    &SETUP_MCP,
+    &MCP_HOST,
+    &REGISTER_PROJECT,
+    &PROJECT_NAME,
+    &PROJECT_IS_FORK,
+    &PROJECT_FORK_URL,
+    &PROJECT_URL,
+    &PROJECT_DESCRIPTION,
+    &BUG_THRESHOLD,
+    &FEATURE_THRESHOLD,
+    &INVESTIGATION_THRESHOLD,
+    &UNCLASSIFIED_THRESHOLD,
+    &REVIEW_AUTO_SUBMIT_PR_STACK,
+    &REVIEW_RESOLVER_AGENT,
+    &REQUIRE_FORKS,
+    &FORK_USER,
+    &FORK_URL,
+    &CREATE_ADMIN,
+    &ADMIN_NAME,
+    &SETUP_FORGE_TOKEN,
+    &FORGE_PROVIDER,
+    &FORGE_HOST,
+    &FORGE_TOKEN,
+    &SUBMIT_SAMPLE,
+    &SAMPLE_MODE,
+    &SAMPLE_AGENT,
+];
+
+fn interactive_settings_are_valid() -> bool {
+    INTERACTIVE_SETTINGS
+        .iter()
+        .enumerate()
+        .all(|(index, setting)| {
+            !setting.prompt.is_empty()
+                && setting.flag.starts_with("--")
+                && INTERACTIVE_SETTINGS[..index]
+                    .iter()
+                    .all(|earlier| earlier.prompt != setting.prompt && earlier.flag != setting.flag)
+        })
+}
+
+#[derive(Default)]
+pub struct InitializeServerOptions {
+    pub yes: bool,
+    pub install_tmux: Option<bool>,
+    pub tmux_program: Option<String>,
+    pub setup_mcp: Option<bool>,
+    pub mcp_hosts: Vec<String>,
+    pub register_project: Option<bool>,
+    pub project_name: Option<String>,
+    pub project_is_fork: Option<bool>,
+    pub project_fork_url: Option<String>,
+    pub project_url: Option<String>,
+    pub project_description: Option<String>,
+    pub bug_threshold: Option<String>,
+    pub feature_threshold: Option<String>,
+    pub investigation_threshold: Option<String>,
+    pub unclassified_threshold: Option<String>,
+    pub review_auto_submit_pr_stack: Option<bool>,
+    pub review_resolver_agent: Option<String>,
+    pub require_forks: Option<bool>,
+    pub fork_user: Option<String>,
+    pub fork_url: Option<String>,
+    pub forge_host: Option<String>,
+    pub forge_token: Option<String>,
+    pub create_admin: Option<bool>,
+    pub admin_name: Option<String>,
+    pub setup_forge_token: Option<bool>,
+    pub forge_provider: Option<String>,
+    pub submit_sample: Option<bool>,
+    pub sample_mode: Option<String>,
+    pub sample_agent: Option<String>,
+}
+
+impl std::fmt::Debug for InitializeServerOptions {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InitializeServerOptions")
+            .field("yes", &self.yes)
+            .field("install_tmux", &self.install_tmux)
+            .field("tmux_program", &self.tmux_program)
+            .field("setup_mcp", &self.setup_mcp)
+            .field("mcp_hosts", &self.mcp_hosts)
+            .field("register_project", &self.register_project)
+            .field("project_name", &self.project_name)
+            .field("project_is_fork", &self.project_is_fork)
+            .field("project_fork_url", &self.project_fork_url)
+            .field("project_url", &self.project_url)
+            .field("project_description", &self.project_description)
+            .field("bug_threshold", &self.bug_threshold)
+            .field("feature_threshold", &self.feature_threshold)
+            .field("investigation_threshold", &self.investigation_threshold)
+            .field("unclassified_threshold", &self.unclassified_threshold)
+            .field(
+                "review_auto_submit_pr_stack",
+                &self.review_auto_submit_pr_stack,
+            )
+            .field("review_resolver_agent", &self.review_resolver_agent)
+            .field("require_forks", &self.require_forks)
+            .field("fork_user", &self.fork_user)
+            .field("fork_url", &self.fork_url)
+            .field("forge_host", &self.forge_host)
+            .field(
+                "forge_token",
+                &self.forge_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("create_admin", &self.create_admin)
+            .field("admin_name", &self.admin_name)
+            .field("setup_forge_token", &self.setup_forge_token)
+            .field("forge_provider", &self.forge_provider)
+            .field("submit_sample", &self.submit_sample)
+            .field("sample_mode", &self.sample_mode)
+            .field("sample_agent", &self.sample_agent)
+            .finish()
+    }
+}
+
+impl InitializeServerOptions {
+    fn is_non_interactive(&self) -> bool {
+        self.yes
+            || self.install_tmux.is_some()
+            || self.tmux_program.is_some()
+            || self.setup_mcp.is_some()
+            || !self.mcp_hosts.is_empty()
+            || self.register_project.is_some()
+            || self.project_name.is_some()
+            || self.project_is_fork.is_some()
+            || self.project_fork_url.is_some()
+            || self.project_url.is_some()
+            || self.project_description.is_some()
+            || self.bug_threshold.is_some()
+            || self.feature_threshold.is_some()
+            || self.investigation_threshold.is_some()
+            || self.unclassified_threshold.is_some()
+            || self.review_auto_submit_pr_stack.is_some()
+            || self.review_resolver_agent.is_some()
+            || self.require_forks.is_some()
+            || self.fork_user.is_some()
+            || self.fork_url.is_some()
+            || self.forge_host.is_some()
+            || self.forge_token.is_some()
+            || self.create_admin.is_some()
+            || self.admin_name.is_some()
+            || self.setup_forge_token.is_some()
+            || self.forge_provider.is_some()
+            || self.submit_sample.is_some()
+            || self.sample_mode.is_some()
+            || self.sample_agent.is_some()
+    }
+}
+
+pub fn dispatch(opts: &GlobalOpts, setup: InitializeServerOptions) -> i32 {
+    debug_assert!(interactive_settings_are_valid());
+    if !setup.yes && !setup.is_non_interactive() && !std::io::stdin().is_terminal() {
         println!(
             "error: ralphus initialize server needs a terminal to prompt interactively; pass --yes to accept every stage's default non-interactively"
         );
@@ -32,34 +356,37 @@ pub fn dispatch(opts: &GlobalOpts, yes: bool) -> i32 {
     let mut step = Step::new(TOTAL_STEPS);
 
     step.begin("Check tmux/psmux");
-    step_tmux(yes);
+    step_tmux(&setup);
 
     step.begin("Set up MCP hosts (optional)");
-    step_mcp(yes);
+    step_mcp(&setup);
 
     step.begin("Register this repository as a project (optional)");
-    let project = step_project(opts, yes);
+    let project = step_project(opts, &setup);
 
     step.begin("Configure review defaults and auto-review thresholds");
     match project.as_deref() {
-        Some(project) => step_review_settings(opts, project, yes),
+        Some(project) => step_review_settings(opts, project, &setup),
         None => println!("  skipped: no project was registered"),
     }
 
     step.begin("Configure fork requirements");
     match project.as_deref() {
-        Some(project) => step_forks(opts, project, yes),
+        Some(project) => step_forks(opts, project, &setup),
         None => println!("  skipped: no project was registered"),
     }
 
     step.begin("Create an optional default admin user");
-    step_admin(opts, yes);
+    let admin_user = step_admin(opts, &setup);
+
+    step.begin("Configure a forge token for the default admin user");
+    step_forge_token(opts, admin_user.as_deref(), &setup);
 
     step.begin("Run ralphus check health");
     let health_results = step_health(opts);
 
     step.begin("Submit a sample hello-world task (optional)");
-    step_sample(opts, project.as_deref(), &health_results, yes);
+    step_sample(opts, project.as_deref(), &health_results, &setup);
 
     println!();
     println!("setup complete.");
@@ -87,7 +414,16 @@ impl Step {
 
 // ---- prompt helpers -------------------------------------------------------
 
-fn prompt(question: &str, default: &str, yes: bool) -> String {
+fn prompt(
+    _setting: &InitializeSetting,
+    question: &str,
+    default: &str,
+    supplied: Option<&String>,
+    yes: bool,
+) -> String {
+    if let Some(supplied) = supplied {
+        return supplied.clone();
+    }
     if yes {
         return default.to_string();
     }
@@ -107,7 +443,16 @@ fn prompt(question: &str, default: &str, yes: bool) -> String {
     }
 }
 
-fn prompt_yes_no(question: &str, default: bool, yes: bool) -> bool {
+fn prompt_yes_no(
+    _setting: &InitializeSetting,
+    question: &str,
+    default: bool,
+    supplied: Option<bool>,
+    yes: bool,
+) -> bool {
+    if let Some(supplied) = supplied {
+        return supplied;
+    }
     if yes {
         return default;
     }
@@ -130,7 +475,7 @@ fn prompt_yes_no(question: &str, default: bool, yes: bool) -> bool {
 /// Windows -- so the terminal echoes the token as it's typed, same as a
 /// plain `read_line`. Every caller must be careful never to `println!` the
 /// returned value.
-fn prompt_secret(question: &str) -> String {
+fn prompt_secret(_setting: &InitializeSetting, question: &str) -> String {
     print!("{question}: ");
     let _ = std::io::stdout().flush();
     let mut answer = String::new();
@@ -146,7 +491,7 @@ fn default_user_name() -> String {
 
 // ---- tmux/psmux -----------------------------------------------------------
 
-fn step_tmux(yes: bool) -> bool {
+fn step_tmux(setup: &InitializeServerOptions) -> bool {
     match ralphus_daemon::tmux::resolve_tmux_program_with_source() {
         Ok((program, source)) => {
             println!("  found a tmux-compatible binary: {program} (source: {source})");
@@ -160,20 +505,20 @@ fn step_tmux(yes: bool) -> bool {
                             WINDOWS_MINIMUM_TMUX_VERSION.1,
                             WINDOWS_MINIMUM_TMUX_VERSION.2
                         );
-                        offer_tmux_alternative(yes)
+                        offer_tmux_alternative(setup)
                     } else {
                         true
                     }
                 }
                 None => {
                     println!("  warning: could not determine {program}'s version");
-                    offer_tmux_alternative(yes)
+                    offer_tmux_alternative(setup)
                 }
             }
         }
         Err(error) => {
             println!("  tmux is not available: {error}");
-            offer_tmux_alternative(yes)
+            offer_tmux_alternative(setup)
         }
     }
 }
@@ -215,8 +560,8 @@ fn version_at_least(version_text: &str, minimum: (u32, u32, u32)) -> bool {
     (major, minor, patch) >= minimum
 }
 
-fn offer_tmux_alternative(yes: bool) -> bool {
-    if yes {
+fn offer_tmux_alternative(setup: &InitializeServerOptions) -> bool {
+    if setup.yes && setup.install_tmux.is_none() && setup.tmux_program.is_none() {
         println!(
             "  skipping tmux install/alternative prompts (--yes); `ralphus check health` will report this below"
         );
@@ -224,7 +569,13 @@ fn offer_tmux_alternative(yes: bool) -> bool {
     }
     if cfg!(windows) {
         println!("  install/upgrade with: winget upgrade --id marlocarlo.psmux");
-        if prompt_yes_no("  run that command now?", true, yes) {
+        if prompt_yes_no(
+            &INSTALL_TMUX,
+            "  run that command now?",
+            true,
+            setup.install_tmux,
+            setup.yes,
+        ) {
             match std::process::Command::new("winget")
                 .args(["upgrade", "--id", "marlocarlo.psmux"])
                 .status()
@@ -243,9 +594,11 @@ fn offer_tmux_alternative(yes: bool) -> bool {
         );
     }
     let alternative = prompt(
+        &TMUX_PROGRAM,
         "  path to an existing tmux/psmux binary to use instead (blank to skip)",
         "",
-        yes,
+        setup.tmux_program.as_ref(),
+        setup.yes,
     );
     if alternative.is_empty() {
         return false;
@@ -267,7 +620,7 @@ fn offer_tmux_alternative(yes: bool) -> bool {
 
 // ---- MCP host setup ---------------------------------------------------------
 
-fn step_mcp(yes: bool) {
+fn step_mcp(setup: &InitializeServerOptions) {
     let hosts = ["claude", "codex", "pi"];
     let detected: Vec<&str> = hosts
         .into_iter()
@@ -278,12 +631,28 @@ fn step_mcp(yes: bool) {
         return;
     }
     println!("  detected MCP hosts: {}", detected.join(", "));
-    if !prompt_yes_no("  set up ralphus MCP for any of these hosts?", false, yes) {
+    let setup_mcp = setup
+        .setup_mcp
+        .or_else(|| (!setup.mcp_hosts.is_empty()).then_some(true));
+    if !prompt_yes_no(
+        &SETUP_MCP,
+        "  set up ralphus MCP for any of these hosts?",
+        false,
+        setup_mcp,
+        setup.yes,
+    ) {
         println!("  skipped");
         return;
     }
     for host in detected {
-        if prompt_yes_no(&format!("  set up ralphus MCP for {host}?"), true, yes) {
+        let selected = setup_mcp.map(|_| setup.mcp_hosts.iter().any(|candidate| candidate == host));
+        if prompt_yes_no(
+            &MCP_HOST,
+            &format!("  set up ralphus MCP for {host}?"),
+            true,
+            selected,
+            setup.yes,
+        ) {
             let code = crate::commands::mcp::initialize(host, None, false, true);
             if code == 0 {
                 println!("  {host}: done");
@@ -303,7 +672,7 @@ fn command_available(program: &str) -> bool {
 
 // ---- project registration --------------------------------------------------
 
-fn step_project(opts: &GlobalOpts, yes: bool) -> Option<String> {
+fn step_project(opts: &GlobalOpts, setup: &InitializeServerOptions) -> Option<String> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let probe = std::process::Command::new("git")
         .args([
@@ -321,30 +690,112 @@ fn step_project(opts: &GlobalOpts, yes: bool) -> Option<String> {
         );
         return None;
     }
-    if !prompt_yes_no(
-        "  register this repository as a ralphus project?",
-        true,
-        yes,
-    ) {
-        println!("  skipped");
-        return None;
-    }
     let default_name = cwd
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_else(|| "project".to_string());
-    let name = prompt("  project name", &default_name, yes);
-    let description = prompt("  one-line project description", "", yes);
+    let name = prompt(
+        &PROJECT_NAME,
+        "  project name",
+        &default_name,
+        setup.project_name.as_ref(),
+        setup.yes,
+    );
+    let is_fork = prompt_yes_no(
+        &PROJECT_IS_FORK,
+        "  you are about to register this project: is it a fork of another project?",
+        false,
+        setup.project_is_fork,
+        setup.yes,
+    );
+    let fork_url = if is_fork {
+        let fork_url = prompt(
+            &PROJECT_FORK_URL,
+            "  fork clone URL (HTTPS required)",
+            "",
+            setup.project_fork_url.as_ref(),
+            setup.yes,
+        );
+        if let Err(error) = validate_project_fork_url(&fork_url) {
+            println!("  invalid fork URL: {error}");
+            return None;
+        }
+        Some(fork_url)
+    } else {
+        None
+    };
+    let origin_url = git_remote_url(&cwd, "origin");
+    let project_url = prompt(
+        &PROJECT_URL,
+        if is_fork {
+            "  upstream/origin clone URL for the non-fork project (SSH recommended)"
+        } else {
+            "  project clone URL (SSH recommended)"
+        },
+        &origin_url,
+        setup.project_url.as_ref(),
+        setup.yes,
+    );
+    let description = prompt(
+        &PROJECT_DESCRIPTION,
+        "  one-line project description",
+        "",
+        setup.project_description.as_ref(),
+        setup.yes,
+    );
+    if !prompt_yes_no(
+        &REGISTER_PROJECT,
+        "  register this project with these settings?",
+        true,
+        setup.register_project,
+        setup.yes,
+    ) {
+        println!("  skipped");
+        return None;
+    }
     let target =
         ralphus_core::strip_verbatim_prefix(cwd.canonicalize().unwrap_or_else(|_| cwd.clone()));
     let target_str = target.to_string_lossy().to_string();
     let client = opts.client();
-    match client.register_project(&name, &target_str, &description, "git", None, false, None) {
+    match client.get_project(&name) {
+        Ok(existing) if existing["path"].as_str() == Some(&target_str) => {
+            println!("  already registered project \"{name}\" -> {target_str}; skipping");
+            return Some(name);
+        }
+        Ok(existing) => {
+            println!(
+                "  project \"{name}\" is already registered for {}; skipping to avoid changing it",
+                existing["path"].as_str().unwrap_or("an unknown path")
+            );
+            return None;
+        }
+        Err(error) if error.status_code != Some(404) => {
+            println!("  error: could not check existing project registration: {error}");
+            return None;
+        }
+        Err(_) => {}
+    }
+    let clone_url = (!project_url.is_empty()).then_some(project_url.as_str());
+    match client.register_project(
+        &name,
+        &target_str,
+        &description,
+        "git",
+        clone_url,
+        false,
+        None,
+    ) {
         Ok(payload) => {
             println!("  registered project \"{name}\" -> {target_str}");
             for warning in payload["warnings"].as_array().into_iter().flatten() {
                 if let Some(warning) = warning.as_str() {
                     println!("  warning: {warning}");
+                }
+            }
+            if let Some(fork_url) = fork_url {
+                match client.add_project_fork(&name, "", &fork_url, None, None) {
+                    Ok(_) => println!("  registered the project-wide fork URL"),
+                    Err(error) => println!("  error registering the project fork URL: {error}"),
                 }
             }
             Some(name)
@@ -356,9 +807,19 @@ fn step_project(opts: &GlobalOpts, yes: bool) -> Option<String> {
     }
 }
 
+fn git_remote_url(cwd: &std::path::Path, remote: &str) -> String {
+    std::process::Command::new("git")
+        .args(["-C", &cwd.to_string_lossy(), "remote", "get-url", remote])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
 // ---- review settings / auto-review thresholds ------------------------------
 
-fn step_review_settings(opts: &GlobalOpts, project: &str, yes: bool) {
+fn step_review_settings(opts: &GlobalOpts, project: &str, setup: &InitializeServerOptions) {
     let client = opts.client();
     match client.get_project_review_settings(project) {
         Ok(settings) => println!("  current review settings: {settings}"),
@@ -367,18 +828,47 @@ fn step_review_settings(opts: &GlobalOpts, project: &str, yes: bool) {
     println!(
         "  auto-review thresholds: submissions of that triage type queue until this many are pending, then an automatic review fires (blank disables it for that type)"
     );
-    for (triage_type, default_threshold) in [
-        ("bug", 3_i64),
-        ("feature", 5),
-        ("investigation", 3),
-        ("unclassified", 5),
+    let pools = client.list_triage_pools().unwrap_or_default();
+    for (setting, triage_type, default_threshold, supplied) in [
+        (&BUG_THRESHOLD, "bug", 3_i64, setup.bug_threshold.as_ref()),
+        (
+            &FEATURE_THRESHOLD,
+            "feature",
+            5,
+            setup.feature_threshold.as_ref(),
+        ),
+        (
+            &INVESTIGATION_THRESHOLD,
+            "investigation",
+            3,
+            setup.investigation_threshold.as_ref(),
+        ),
+        (
+            &UNCLASSIFIED_THRESHOLD,
+            "unclassified",
+            5,
+            setup.unclassified_threshold.as_ref(),
+        ),
     ] {
         let answer = prompt(
+            setting,
             &format!("    {triage_type} threshold"),
             &default_threshold.to_string(),
-            yes,
+            supplied,
+            setup.yes,
         );
         let threshold = answer.trim().parse::<i64>().ok();
+        let already_configured = pools["pools"].as_array().is_some_and(|pools| {
+            pools.iter().any(|pool| {
+                pool["project"].as_str() == Some(project)
+                    && pool["triage_type"].as_str() == Some(triage_type)
+                    && pool["threshold"].as_i64() == threshold
+            })
+        });
+        if already_configured {
+            println!("    {triage_type}: already configured; skipping");
+            continue;
+        }
         match client.set_triage_pool_threshold(project, triage_type, threshold) {
             Ok(_) => println!(
                 "    {triage_type}: {}",
@@ -387,97 +877,248 @@ fn step_review_settings(opts: &GlobalOpts, project: &str, yes: bool) {
             Err(error) => println!("    {triage_type}: error setting threshold: {error}"),
         }
     }
+    let auto_submit_pr_stack = prompt_yes_no(
+        &REVIEW_AUTO_SUBMIT_PR_STACK,
+        "  automatically submit this project's review PR stacks?",
+        true,
+        setup.review_auto_submit_pr_stack,
+        setup.yes,
+    );
+    let resolver_agent = prompt(
+        &REVIEW_RESOLVER_AGENT,
+        "  resolver agent for this project's reviews",
+        "claude-code",
+        setup.review_resolver_agent.as_ref(),
+        setup.yes,
+    );
+    let patch = ProjectReviewSettingsPatch {
+        auto_submit_pr_stack: Some(auto_submit_pr_stack),
+        default_resolver_agent: Some(&resolver_agent),
+        ..Default::default()
+    };
+    match client.set_project_review_settings(project, &patch) {
+        Ok(_) => println!(
+            "  review defaults: auto-submit PR stacks = {auto_submit_pr_stack}; resolver agent = {resolver_agent}"
+        ),
+        Err(error) => println!("  error setting review defaults: {error}"),
+    }
 }
 
 // ---- forks ------------------------------------------------------------------
 
-fn step_forks(opts: &GlobalOpts, project: &str, yes: bool) {
+fn step_forks(opts: &GlobalOpts, project: &str, setup: &InitializeServerOptions) {
     if !prompt_yes_no(
+        &REQUIRE_FORKS,
         "  does this project require contributors to work from forks?",
         false,
-        yes,
+        setup.require_forks,
+        setup.yes,
     ) {
         println!("  skipped: forks not required");
         return;
     }
     let client = opts.client();
-    let patch = ProjectReviewSettingsPatch {
-        dual_root_pr: Some(true),
-        ..Default::default()
-    };
-    match client.set_project_review_settings(project, &patch) {
-        Ok(_) => println!("  enabled dual-root PRs for \"{project}\""),
-        Err(error) => println!("  error enabling dual-root PRs: {error}"),
+    let dual_root_already_enabled = client
+        .get_project_review_settings(project)
+        .ok()
+        .and_then(|settings| settings["effective"]["dual_root_pr"].as_bool())
+        .unwrap_or(false);
+    if dual_root_already_enabled {
+        println!("  dual-root PRs are already enabled for \"{project}\"; skipping");
+    } else {
+        let patch = ProjectReviewSettingsPatch {
+            dual_root_pr: Some(true),
+            ..Default::default()
+        };
+        match client.set_project_review_settings(project, &patch) {
+            Ok(_) => println!("  enabled dual-root PRs for \"{project}\""),
+            Err(error) => println!("  error enabling dual-root PRs: {error}"),
+        }
     }
     let user = prompt(
+        &FORK_USER,
         "  ralphus user these fork credentials belong to",
         &default_user_name(),
-        yes,
+        setup.fork_user.as_ref(),
+        setup.yes,
     );
-    let fork_url = prompt("  your fork's clone URL", "", yes);
+    let fork_url = prompt(
+        &FORK_URL,
+        "  your fork's clone URL",
+        "",
+        setup.fork_url.as_ref(),
+        setup.yes,
+    );
     if fork_url.is_empty() {
         println!(
             "  no fork URL given; skipping fork registration (use `ralphus project fork add` later)"
         );
         return;
     }
-    match client.add_project_fork(project, &user, &fork_url, None, None) {
-        Ok(_) => println!("  registered a fork for {user}"),
-        Err(error) => println!("  error registering fork: {error}"),
-    }
-    if yes {
-        println!(
-            "  skipping personal access token prompt (--yes); set one later with `ralphus user set-forge-token`"
-        );
-        return;
-    }
-    let host = prompt(
-        "  forge host for the personal access token (e.g. github.com)",
-        "github.com",
-        yes,
-    );
-    let token = prompt_secret(
-        "  personal access token for that host (never echoed back or logged by ralphus)",
-    );
-    if token.is_empty() {
-        println!("  no token given; skipping (use `ralphus user set-forge-token` later)");
-        return;
-    }
-    match client.set_user_forge_token(&user, &host, &token) {
-        Ok(_) => println!("  stored a forge token for {user}@{host}"),
-        Err(error) => println!("  error storing forge token: {error}"),
+    let existing_fork = client.list_project_forks(project).ok().and_then(|payload| {
+        payload["forks"]
+            .as_array()
+            .and_then(|forks| {
+                forks
+                    .iter()
+                    .find(|fork| fork["user"].as_str() == Some(&user))
+            })
+            .cloned()
+    });
+    match existing_fork {
+        Some(fork) if fork["fork_url"].as_str() == Some(&fork_url) => {
+            println!("  fork for {user} is already registered; skipping");
+        }
+        Some(_) => match client.set_project_fork(project, &user, Some(&fork_url), None, None) {
+            Ok(_) => println!("  updated the registered fork for {user}"),
+            Err(error) => println!("  error updating fork registration: {error}"),
+        },
+        None => match client.add_project_fork(project, &user, &fork_url, None, None) {
+            Ok(_) => println!("  registered a fork for {user}"),
+            Err(error) => println!("  error registering fork: {error}"),
+        },
     }
 }
 
 // ---- default admin user ------------------------------------------------------
 
-fn step_admin(opts: &GlobalOpts, yes: bool) {
-    if !prompt_yes_no("  create a default admin user?", false, yes) {
+fn step_admin(opts: &GlobalOpts, setup: &InitializeServerOptions) -> Option<String> {
+    if !prompt_yes_no(
+        &CREATE_ADMIN,
+        "  create a default admin user?",
+        false,
+        setup.create_admin,
+        setup.yes,
+    ) {
         println!("  skipped");
-        return;
+        return None;
     }
-    let name = prompt("  admin user name", "John Smith", yes);
+    let name = prompt(
+        &ADMIN_NAME,
+        "  admin user name",
+        "John Smith",
+        setup.admin_name.as_ref(),
+        setup.yes,
+    );
     let client = opts.client();
-    if let Err(error) = client.create_user(&name) {
-        println!("  note: create_user reported {error} (the user may already exist)");
+    let existing_admin = client.list_users().ok().and_then(|payload| {
+        payload["users"]
+            .as_array()
+            .and_then(|users| {
+                users
+                    .iter()
+                    .find(|user| user["name"].as_str() == Some(&name))
+            })
+            .and_then(|user| user["is_admin"].as_bool())
+    });
+    if existing_admin == Some(true) {
+        println!("  {name} is already an admin; skipping server update");
+    } else if existing_admin.is_none() {
+        if let Err(error) = client.create_user(&name) {
+            println!("  error: could not create user {name}: {error}");
+            return None;
+        }
     }
-    if let Err(error) = client.set_user_admin(&name, true) {
-        println!("  error: could not grant admin to {name}: {error}");
-        return;
+    if existing_admin != Some(true) {
+        match client.set_user_admin(&name, true) {
+            Ok(_) => println!("  {name} is now an admin"),
+            Err(error) => {
+                println!("  error: could not grant admin to {name}: {error}");
+                return None;
+            }
+        }
     }
-    println!("  {name} is now an admin");
     match persist_default_admin(&name) {
-        Ok(path) => println!(
+        Ok((path, true)) => println!(
             "  wrote default_user/default_user_is_admin to {} (applies on the daemon's next restart)",
+            path.display()
+        ),
+        Ok((path, false)) => println!(
+            "  default admin is already persisted in {}; skipping",
             path.display()
         ),
         Err(error) => {
             println!("  warning: could not persist the default admin to the global config: {error}")
         }
     }
+    Some(name)
 }
 
-fn persist_default_admin(name: &str) -> Result<PathBuf, String> {
+// ---- forge token ------------------------------------------------------------
+
+fn step_forge_token(opts: &GlobalOpts, user: Option<&str>, setup: &InitializeServerOptions) {
+    let Some(user) = user else {
+        println!("  skipped: no default admin user was created");
+        return;
+    };
+    let supplied_token_requests_setup = setup.forge_token.as_ref().map(|_| true);
+    if !prompt_yes_no(
+        &SETUP_FORGE_TOKEN,
+        &format!("  configure a GitHub or GitLab personal access token for {user}?"),
+        true,
+        setup.setup_forge_token.or(supplied_token_requests_setup),
+        setup.yes,
+    ) {
+        println!("  skipped");
+        return;
+    }
+    let provider = prompt(
+        &FORGE_PROVIDER,
+        "  forge provider (github or gitlab)",
+        "github",
+        setup.forge_provider.as_ref(),
+        setup.yes,
+    );
+    let default_host = match provider.as_str() {
+        "github" => "github.com",
+        "gitlab" => "gitlab.com",
+        _ => {
+            println!("  invalid forge provider {provider:?}; expected github or gitlab");
+            return;
+        }
+    };
+    let host = prompt(
+        &FORGE_HOST,
+        "  forge host for the personal access token",
+        default_host,
+        setup.forge_host.as_ref(),
+        setup.yes,
+    );
+    if let Err(error) = validate_forge_host(&host) {
+        println!("  invalid forge host {host:?}: {error}");
+        return;
+    }
+    let token = setup.forge_token.clone().unwrap_or_else(|| {
+        prompt_secret(
+            &FORGE_TOKEN,
+            "  personal access token (never echoed back or logged by ralphus)",
+        )
+    });
+    if token.is_empty() {
+        println!("  no token given; skipping (use `ralphus user set-forge-token` later)");
+        return;
+    }
+    let client = opts.client();
+    let token_already_configured = client
+        .list_user_forge_tokens(user)
+        .ok()
+        .and_then(|payload| payload["tokens"].as_array().cloned())
+        .is_some_and(|tokens| {
+            tokens
+                .iter()
+                .any(|entry| entry["host"].as_str() == Some(&host))
+        });
+    if token_already_configured {
+        println!("  a forge token is already configured for {user}@{host}; skipping");
+        return;
+    }
+    match client.set_user_forge_token(user, &host, &token) {
+        Ok(_) => println!("  stored a {provider} forge token for {user}@{host}"),
+        Err(error) => println!("  error storing forge token: {error}"),
+    }
+}
+
+fn persist_default_admin(name: &str) -> Result<(PathBuf, bool), String> {
     let path = ralphus_daemon::config::global_config_path()
         .ok_or_else(|| "could not resolve a home directory for the global config".to_string())?;
     let mut root: toml::Table = if path.exists() {
@@ -487,6 +1128,19 @@ fn persist_default_admin(name: &str) -> Result<PathBuf, String> {
     } else {
         toml::Table::new()
     };
+    if root
+        .get("daemon")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|daemon| {
+            daemon.get("default_user").and_then(toml::Value::as_str) == Some(name)
+                && daemon
+                    .get("default_user_is_admin")
+                    .and_then(toml::Value::as_bool)
+                    == Some(true)
+        })
+    {
+        return Ok((path, false));
+    }
     let daemon_entry = root
         .entry("daemon")
         .or_insert_with(|| toml::Value::Table(toml::Table::new()));
@@ -506,7 +1160,7 @@ fn persist_default_admin(name: &str) -> Result<PathBuf, String> {
     }
     let text = toml::to_string_pretty(&root).map_err(|error| error.to_string())?;
     std::fs::write(&path, text).map_err(|error| error.to_string())?;
-    Ok(path)
+    Ok((path, true))
 }
 
 // ---- health -------------------------------------------------------------------
@@ -525,7 +1179,7 @@ fn step_health(opts: &GlobalOpts) -> Vec<CheckResult> {
     crate::health::run_checks(&opts.daemon_url, &cwd, false, false, false)
 }
 
-fn health_ok_for_sample(results: &[CheckResult]) -> bool {
+fn health_ok_for_sample(results: &[CheckResult], requires_agent: bool) -> bool {
     let daemon_ok = results
         .iter()
         .any(|r| r.id == ralphus_core::health_catalog::ID_DAEMON && !r.is_fail());
@@ -536,86 +1190,162 @@ fn health_ok_for_sample(results: &[CheckResult]) -> bool {
     ]
     .iter()
     .any(|id| results.iter().any(|r| r.id.as_str() == *id && !r.is_fail()));
-    daemon_ok && agent_ok
+    daemon_ok && (!requires_agent || agent_ok)
 }
 
 // ---- sample submission ----------------------------------------------------
 
-fn sample_task_toml(project: &str, branch: &str, agent: &str) -> String {
-    format!(
-        r#"[[review]]
-id = "ralphus:new-review/{branch}"
-name = "hello world"
-agent = "{agent}"
-skip_auto_build = true
+fn sample_task_toml(project: &str, mode: &str, agent: Option<&str>) -> String {
+    let review_id = "ralphus:new-review/ralphus-hello-world";
+    let mut toml = format!(
+        "[[review]]\nid = \"{review_id}\"\nname = \"Hello world for {project}\"\nproof_scope = \"nothing\"\n\n"
+    );
+    if let Some(agent) = agent {
+        toml.push_str(&format!("agent = \"{agent}\"\n\n"));
+    }
 
-[[task]]
-name = "{branch}"
-project = "{project}"
-
-  [[task.cell]]
-  id = "work"
-  agent = "{agent}"
-  cwd = "<<ralphus:new-worktree/{branch}?upstream=<<default>>>>"
-  review = "<<ralphus:new-review/{branch}>>"
-  system_prompt = "Do NOT commit and do NOT push under any circumstances. You are working in a dedicated git worktree of this repository; implement the work exactly as described and keep your changes only within the worktree."
-  system_prompt_position = "append"
-  prompt = "Create a file named hello-world.txt containing the single line \"Hello, world!\". Do not modify any other files."
-
-  [[task.cell]]
-  id = "finalize"
-  agent = "{agent}"
-  cwd = "<<ralphus:new-worktree/{branch}?upstream=<<default>>>>"
-  depends_on = ["work"]
-  system_prompt = "ONLY git stage the relevant source files, commit them, and push the commit if a remote exists -- do not make further edits."
-  system_prompt_position = "append"
-  prompt = "Stage, commit, and push hello-world.txt."
-"#
-    )
+    for suffix in ["alpha", "beta", "gamma"] {
+        let branch = format!("ralphus-hello-world-{suffix}");
+        let file = format!("hello-world-{suffix}.txt");
+        toml.push_str(&format!(
+            "[[task]]\nname = \"hello-world-{suffix}\"\nproject = \"{project}\"\n\n  [[task.cell]]\n  id = \"write\"\n  cwd = \"<<ralphus:new-worktree/{branch}?upstream=<<default>>>>\"\n  review = \"<<{review_id}>>\"\n"
+        ));
+        match mode {
+            "raw" => toml.push_str(&format!(
+                "  mode = \"raw\"\n  command = \"echo Hello from Ralphus task {suffix}.> {file} && git add -- {file} && git commit --message \\\"Add {file}\\\" && git push --set-upstream origin {branch}\"\n\n"
+            )),
+            "agent" => toml.push_str(&format!(
+                "  agent = \"{}\"\n  system_prompt = \"Work only in the dedicated git worktree. Create exactly the requested file, stage only that file, commit it, and push the branch.\"\n  system_prompt_position = \"append\"\n  prompt = \"Create {file} containing the single line \\\"Hello from Ralphus task {suffix}.\\\". Do not modify any other files. Then stage, commit, and push that file.\"\n\n",
+                agent.expect("agent mode supplies an agent")
+            )),
+            _ => unreachable!("sample mode is parsed before TOML generation"),
+        }
+    }
+    toml
 }
 
 fn step_sample(
     opts: &GlobalOpts,
     project: Option<&str>,
     health_results: &[CheckResult],
-    yes: bool,
+    setup: &InitializeServerOptions,
 ) {
     let Some(project) = project else {
         println!("  skipped: no project was registered");
         return;
     };
-    if !health_ok_for_sample(health_results) {
-        println!(
-            "  skipped: `ralphus check health` reported a failing daemon or no reachable agent -- fix that first, then submit a sample task yourself"
-        );
-        return;
-    }
     if !prompt_yes_no(
-        "  submit a sample two-cell hello-world task now?",
+        &SUBMIT_SAMPLE,
+        &format!("  submit a three-task hello-world squad for {project} now?"),
         true,
-        yes,
+        setup.submit_sample,
+        setup.yes,
     ) {
         println!("  skipped");
         return;
     }
-    let agent = prompt("  agent backend for the sample task", "claude-code", yes);
-    let branch = "ralphus-hello-world";
-    let toml_text = sample_task_toml(project, branch, &agent);
+    let mode = sample_mode(setup);
+    if !health_ok_for_sample(health_results, mode == "agent") {
+        let requirement = if mode == "agent" {
+            "a failing daemon or no reachable agent"
+        } else {
+            "a failing daemon"
+        };
+        println!(
+            "  skipped: `ralphus check health` reported {requirement} -- fix that first, then submit a sample task yourself"
+        );
+        return;
+    }
+    let agent = (mode == "agent").then(|| {
+        prompt(
+            &SAMPLE_AGENT,
+            "  agent backend for the hello-world prompts",
+            "claude-code",
+            setup.sample_agent.as_ref(),
+            setup.yes,
+        )
+    });
+    let toml_text = sample_task_toml(project, &mode, agent.as_deref());
+    let client = opts.client();
+    let label = sample_label(&mode);
+    let sample_already_submitted = client
+        .tasks(None, Some(&label), None)
+        .ok()
+        .and_then(|payload| payload["squads"].as_array().cloned())
+        .is_some_and(|squads| !squads.is_empty());
+    if sample_already_submitted {
+        println!("  sample hello-world task was already submitted; skipping");
+        return;
+    }
     let path =
         std::env::temp_dir().join(format!("ralphus-hello-world-{}.toml", std::process::id()));
     if let Err(error) = std::fs::write(&path, &toml_text) {
         println!("  error: could not write {}: {error}", path.display());
         return;
     }
-    let client = opts.client();
-    match client.submit(
-        &toml_text,
-        false,
-        Some("ralphus initialize server: hello world"),
-    ) {
+    match client.submit(&toml_text, false, Some(&label)) {
         Ok(payload) => println!("  submitted: {payload}"),
         Err(error) => println!("  error: submission failed: {error}"),
     }
     println!("  saved the submitted TOML to {}", path.display());
     println!("  equivalent command: ralphus submit {}", path.display());
+}
+
+fn sample_label(mode: &str) -> String {
+    format!("{SAMPLE_LABEL_PREFIX} ({mode})")
+}
+
+fn sample_mode(setup: &InitializeServerOptions) -> String {
+    loop {
+        let mode = prompt(
+            &SAMPLE_MODE,
+            "  run the hello-world tasks with an agent or raw commands",
+            "agent",
+            setup.sample_mode.as_ref(),
+            setup.yes,
+        );
+        if matches!(mode.as_str(), "agent" | "raw") {
+            return mode;
+        }
+        println!("  please enter `agent` or `raw`");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interactive_settings_have_unique_prompt_and_flag_contracts() {
+        assert!(interactive_settings_are_valid());
+        assert_eq!(INTERACTIVE_SETTINGS.len(), 28);
+    }
+
+    #[test]
+    fn sample_toml_uses_three_parallel_tasks_and_one_explicit_review() {
+        let toml = sample_task_toml("example", "agent", Some("claude-code"));
+        assert_eq!(toml.matches("[[task]]").count(), 3);
+        assert_eq!(toml.matches("review = \"<<ralphus:new-review/").count(), 3);
+        assert!(!toml.contains("depends_on"));
+        assert!(
+            ralphus_core::validate::validate_toml(&toml).is_ok(),
+            "{toml}"
+        );
+    }
+
+    #[test]
+    fn raw_sample_toml_has_no_agent_cells() {
+        let toml = sample_task_toml("example", "raw", None);
+        assert_eq!(toml.matches("mode = \"raw\"").count(), 3);
+        assert!(!toml.contains("  agent ="));
+        assert!(
+            ralphus_core::validate::validate_toml(&toml).is_ok(),
+            "{toml}"
+        );
+    }
+
+    #[test]
+    fn sample_labels_are_idempotent_per_mode() {
+        assert_ne!(sample_label("agent"), sample_label("raw"));
+    }
 }
