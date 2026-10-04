@@ -13763,6 +13763,74 @@ fn parse_manual_commands_response(text: &str) -> Vec<GuardianCheck> {
         .collect()
 }
 
+/// Upper bound on each guidance file embedded in the manual-checks prompt, so
+/// a sprawling AGENTS.md cannot crowd out the diff summary or hit OS
+/// command-line limits in harness backends.
+const GUIDANCE_FILE_LIMIT: usize = 6000;
+
+/// Repository files that tell a generator how this project is run and
+/// verified. The first of AGENTS.md / CLAUDE.md that exists is used (CLAUDE.md
+/// files conventionally just import AGENTS.md); the Ralphus project TOML is
+/// always considered on top.
+const GUIDANCE_AGENT_FILES: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
+const GUIDANCE_TOML_FILE: &str = ".ralphus.toml";
+
+/// Cut `text` to at most `limit` bytes on a char boundary, marking the cut.
+fn truncate_guidance(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.trim().to_string();
+    }
+    let mut end = limit;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n[... truncated ...]", text[..end].trim())
+}
+
+/// Render the guidance block for the manual-checks prompt from the already
+/// read file contents. Empty when neither source exists, so a bare repository
+/// produces exactly the prompt it did before.
+fn render_repository_guidance(agents: Option<(&str, &str)>, ralphus_toml: Option<&str>) -> String {
+    let mut sections = Vec::new();
+    if let Some((name, body)) = agents.filter(|(_, b)| !b.trim().is_empty()) {
+        sections.push(format!(
+            "--- {name} (how this repository is built, run and tested) ---\n{}",
+            truncate_guidance(body, GUIDANCE_FILE_LIMIT)
+        ));
+    }
+    if let Some(body) = ralphus_toml.filter(|b| !b.trim().is_empty()) {
+        sections.push(format!(
+            "--- {GUIDANCE_TOML_FILE} (Ralphus project configuration: any [[review.action]] / \
+             [[review.action.prepare]] entries show the commands and conventions reviewers \
+             already use) ---\n{}",
+            truncate_guidance(body, GUIDANCE_FILE_LIMIT)
+        ));
+    }
+    if sections.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n\nRepository guidance. Treat this as authoritative for how to launch the app and \
+         exercise it; prefer the commands and conventions documented here over guesses, and \
+         mirror the style of any existing review actions. A nested AGENTS.md next to the \
+         changed files may add more detail.\n\n{}",
+        sections.join("\n\n")
+    )
+}
+
+/// Read the repository's guidance files from `ws` (the review checkout) for
+/// [`render_repository_guidance`].
+fn repository_guidance(ws: &Workspace) -> String {
+    let agents = GUIDANCE_AGENT_FILES
+        .iter()
+        .find_map(|name| ws.read_file(name).map(|body| (*name, body)));
+    let toml = ws.read_file(GUIDANCE_TOML_FILE);
+    render_repository_guidance(
+        agents.as_ref().map(|(n, b)| (*n, b.as_str())),
+        toml.as_deref(),
+    )
+}
+
 /// Shared prompt body for [`generate_manual_commands`].
 pub fn manual_commands_prompt(tail: &str, steering: Option<&str>) -> String {
     let focus = "You are preparing a code review. Based on the changed files and commit \
@@ -13909,7 +13977,10 @@ fn generate_manual_commands(
         let log = root
             .git(&["log", "--format=%s", &format!("{base_sha}..{tip_ref}")])
             .unwrap_or_default();
-        let tail = format!("Changed files (stat):\n{stat}\n\nCommit messages:\n{log}");
+        let tail = format!(
+            "Changed files (stat):\n{stat}\n\nCommit messages:\n{log}{}",
+            repository_guidance(wt)
+        );
         (
             wt.root().to_string_lossy().into_owned(),
             wt.machine().map(str::to_string),
@@ -13938,7 +14009,10 @@ fn generate_manual_commands(
         let log = root
             .git(&["log", "--format=%s", &format!("{base_sha}..{tip_ref}")])
             .unwrap_or_default();
-        let tail = format!("Changed files:\n{files}\n\nCommit messages:\n{log}");
+        let tail = format!(
+            "Changed files:\n{files}\n\nCommit messages:\n{log}{}",
+            repository_guidance(root)
+        );
         (
             root.root().to_string_lossy().into_owned(),
             root.machine().map(str::to_string),
@@ -14359,6 +14433,55 @@ mod tests {
     use super::*;
     use crate::runner::RunnerResult;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[test]
+    fn repository_guidance_is_empty_without_any_guidance_file() {
+        assert_eq!(render_repository_guidance(None, None), "");
+        assert_eq!(
+            render_repository_guidance(Some(("AGENTS.md", "  ")), Some("")),
+            ""
+        );
+    }
+
+    #[test]
+    fn repository_guidance_embeds_agents_file_and_ralphus_toml() {
+        let out = render_repository_guidance(
+            Some(("AGENTS.md", "Run `python -m app`.")),
+            Some("[[review.action]]\nname = \"open\""),
+        );
+        assert!(out.contains("AGENTS.md"));
+        assert!(out.contains("Run `python -m app`."));
+        assert!(out.contains(".ralphus.toml"));
+        assert!(out.contains("name = \"open\""));
+        assert!(out.contains("authoritative"));
+    }
+
+    #[test]
+    fn repository_guidance_truncates_large_files_on_a_char_boundary() {
+        let big = "é".repeat(GUIDANCE_FILE_LIMIT);
+        let out = render_repository_guidance(Some(("AGENTS.md", &big)), None);
+        assert!(out.contains("[... truncated ...]"));
+        assert!(out.len() < GUIDANCE_FILE_LIMIT + 1000);
+    }
+
+    #[test]
+    fn repository_guidance_reads_agents_then_falls_back_to_claude_md() {
+        let dir = std::env::temp_dir().join(format!(
+            "ralphus-guidance-{}-{}",
+            std::process::id(),
+            crate::runner::generate_agent_session_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("CLAUDE.md"), "claude-only").unwrap();
+        std::fs::write(dir.join(".ralphus.toml"), "[review]\n").unwrap();
+        let ws = Workspace::local(&dir);
+        let out = repository_guidance(&ws);
+        assert!(out.contains("CLAUDE.md") && out.contains("claude-only"));
+        std::fs::write(dir.join("AGENTS.md"), "agents-wins").unwrap();
+        let out = repository_guidance(&ws);
+        assert!(out.contains("agents-wins") && !out.contains("claude-only"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn manual_preparation_ready_is_pushed_to_watchers() {
