@@ -846,6 +846,10 @@ pub struct ProjectReviewSettings {
     /// iterations. Defaults to `true` (on by default) when unset.
     #[serde(default)]
     pub cache_manual_checks: Option<bool>,
+    /// Project-level default for whether manual-check generation is skipped
+    /// for a review. Defaults to `false` when unset.
+    #[serde(default)]
+    pub skip_manual_checks: Option<bool>,
     /// Project-level default for which events (`rebase`, `feedback`,
     /// `auto_fix`) tear down and rebuild a review's prepared build. Unset
     /// resolves to all three; an empty list never rebuilds automatically.
@@ -904,6 +908,7 @@ impl ProjectReviewSettings {
                 .discourage_tests_during_auto_pull_request_fixes,
             auto_cancel_outdated_pr_pipelines: self.auto_cancel_outdated_pr_pipelines,
             cache_manual_checks: self.cache_manual_checks,
+            skip_manual_checks: self.skip_manual_checks,
             rebuild_on: self.rebuild_on,
             auto_fix_max_attempts: None,
             auto_fix_retry_base_seconds: None,
@@ -3483,6 +3488,10 @@ impl Store {
             // a JSON array of strings. NULL inherits the project/global
             // default, which resolves to all three events.
             "ALTER TABLE guardians ADD COLUMN rebuild_on TEXT",
+            // Per-review override of whether manual-check generation is
+            // skipped. NULL inherits the project/global default, which
+            // resolves to `false` (generation runs).
+            "ALTER TABLE guardians ADD COLUMN skip_manual_checks INTEGER",
             // RAL-<pending>: coarse-grained progress reporting for a squad
             // sitting in `materializing` (`run_submit_followup`'s named
             // phases -- fetching upstream refs, creating worktrees,
@@ -17453,6 +17462,7 @@ command = "e"
             discourage_tests_during_auto_pull_request_fixes: Some(true),
             auto_cancel_outdated_pr_pipelines: Some(false),
             cache_manual_checks: Some(false),
+            skip_manual_checks: Some(true),
             rebuild_on: Some(vec!["feedback".to_string(), "auto_fix".to_string()]),
             base_shift_maximum_rebuilds: Some(5),
             default_pr_user: Some("alice".to_string()),

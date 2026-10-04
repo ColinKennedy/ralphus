@@ -9230,6 +9230,38 @@ pub(crate) fn maybe_spawn_post_merge_for(
     spawn_guardian_post_merge(store, id, PostMergeJobs::ALL, trigger);
 }
 
+/// Whether a review should have manual-checks generation started for it right
+/// now: it has none yet and does not skip generation.
+fn settled_review_needs_manual_checks(guardian: &crate::guardian::GuardianView) -> bool {
+    !guardian.effective_skip_manual_checks && guardian.manual_commands.is_empty()
+}
+
+/// Start manual-checks generation for a review whose stack has already
+/// settled, when nothing else will: generation is otherwise only started by a
+/// merge, rebase or feedback pass finishing, so a review that settled while
+/// generation was skipped (or before its checks existed) would never get them.
+///
+/// No-op unless the review is `in_review` with a combined worktree, has no
+/// checks yet, and does not skip generation. The post-merge worker still makes
+/// the final call (cached result, unchanged diff basis).
+pub(crate) fn maybe_generate_manual_checks_for_settled(
+    store: &crate::store_lock::StoreHandle,
+    id: &str,
+) {
+    let Ok(guardian) = store.lock().get_guardian(id) else {
+        return;
+    };
+    if !settled_review_needs_manual_checks(&guardian) {
+        return;
+    }
+    spawn_guardian_post_merge(
+        store,
+        id,
+        PostMergeJobs::MANUAL_CHECKS_ONLY,
+        RebuildTrigger::Rebase,
+    );
+}
+
 /// Revoke every manual surface tied to the previous settled tip.
 ///
 /// This runs as soon as a rebase or feedback pass is claimed, before that
@@ -9723,7 +9755,11 @@ fn post_merge_jobs_inner(
     let cached = stored.as_ref().is_some_and(|g| {
         g.effective_cache_manual_checks && g.manual_checks_cached && g.manual_checks_basis.is_some()
     });
-    let generate_manual = jobs.manual_checks && !cached && (!commands_present || basis_changed);
+    let skip_manual = stored
+        .as_ref()
+        .is_some_and(|g| g.effective_skip_manual_checks);
+    let generate_manual =
+        jobs.manual_checks && !skip_manual && !cached && (!commands_present || basis_changed);
     // An explicit rebuild also re-prepares the already generated checks, which
     // a cached review would otherwise leave marked ready while this run resets
     // the checkout their build output lives in. Their commands are kept as-is
@@ -13912,7 +13948,10 @@ pub fn manual_commands_prompt(tail: &str, steering: Option<&str>) -> String {
          `{name}` placeholder in \"command\" for each declared input. When such a command \
          leaves something running that a rerun would collide with (e.g. a bound port, a \
          background process), also set \"cleanup_command\" on that same object to a \
-         command that stops/frees it first. A command with nothing variable and nothing \
+         command that stops/frees it first. A \"cleanup_command\" must stop only the \
+         process that check started (by its port, a PID file, or a specific window) -- never \
+         a blanket kill by image name such as `taskkill /IM python.exe` or `pkill python`, \
+         which would take down unrelated work on the machine. A command with nothing variable and nothing \
          left running can stay a plain string. Structured objects may also include \
          \"description\" and \"success\" guidance. Use \"run_on\": \"daemon\" unless the \
          command explicitly needs the review machine.";
@@ -13970,9 +14009,11 @@ fn elapsed_ms(started: std::time::Instant) -> u64 {
 /// are computed once, when the review's branches are first created, and
 /// every later pass reuses that result; a review whose cached marker is not
 /// set yet, or whose effective setting resolves to `false`, regenerates on
-/// every pass.
+/// every pass. A review whose `effective_skip_manual_checks` is on never
+/// generates them at all.
 fn manual_checks_should_generate(guardian: &crate::guardian::GuardianView) -> bool {
-    !(guardian.effective_cache_manual_checks && guardian.manual_checks_cached)
+    let reuse_cached = guardian.effective_cache_manual_checks && guardian.manual_checks_cached;
+    !(guardian.effective_skip_manual_checks || reuse_cached)
 }
 
 /// [`manual_checks_should_generate`] against a freshly loaded guardian -- for
@@ -15812,6 +15853,53 @@ mod tests {
             prophecies: Vec::new(),
             bearing: None,
         }
+    }
+
+    #[test]
+    fn manual_checks_generation_cost_counts_toward_the_review_total() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = store.lock().create_guardian("r", "main", "/repo").unwrap();
+
+        let outcome = record_guardian_call_cost(
+            &store,
+            &id,
+            None,
+            "manual_commands",
+            &fake_result(300, 90, 0.05),
+        );
+        assert!(outcome.is_ok(), "{outcome:?}");
+
+        let g = store.lock().get_guardian(&id).unwrap();
+        assert_eq!(g.cumulative_tokens_in, 300);
+        assert_eq!(g.cumulative_tokens_out, 90);
+        assert!((g.cumulative_cost_usd - 0.05).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_settled_review_needs_generation_only_without_checks_and_without_skip() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        let bare = store.get_guardian(&id).unwrap();
+        assert!(settled_review_needs_manual_checks(&bare));
+
+        let mut skipping = bare.clone();
+        skipping.effective_skip_manual_checks = true;
+        assert!(!settled_review_needs_manual_checks(&skipping));
+
+        let mut has_checks = bare;
+        has_checks.manual_commands = vec![GuardianCheck {
+            command: Some("python --version".to_string()),
+            ..GuardianCheck::default()
+        }];
+        assert!(!settled_review_needs_manual_checks(&has_checks));
+    }
+
+    #[test]
+    fn manual_commands_prompt_forbids_blanket_process_kills_in_cleanup() {
+        let prompt = manual_commands_prompt("tail", None);
+        assert!(prompt.contains("never a blanket kill by image name"));
     }
 
     #[test]

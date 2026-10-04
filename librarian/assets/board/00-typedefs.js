@@ -419,6 +419,8 @@
        * @property {string|null} [post_merge_detail] - the post-merge phase's note: what failed when `post_merge_status` is "failed", otherwise the gate's own summary (e.g. which build command ran). Null when there is nothing to report.
        * @property {number|null} [post_merge_started_at_ms] - epoch-ms when the post-merge phase most recently started, or null if it has never run.
        * @property {number|null} [post_merge_finished_at_ms] - epoch-ms when the post-merge phase most recently finished, or null while it is still running.
+       * @property {boolean|null} [skip_manual_checks] - this review's own override for whether manual-check generation is skipped; null = inherit the project default.
+       * @property {boolean} [effective_skip_manual_checks] - `skip_manual_checks` resolved against the project/global defaults (false -- generation runs -- when nothing sets it).
        * @property {string[]|null} [rebuild_on] - this review's own explicit list of events that rebuild its prepared build -- any of "rebase", "feedback", "auto_fix"; `[]` = manual only; null = inherit the project default.
        * @property {string[]} [effective_rebuild_on] - `rebuild_on` resolved against the project/global defaults (all three triggers when nothing sets it).
        * @property {string|null} [manual_checks_focus] - RAL-520: the reviewer's steering text for manual-checks regeneration, set via the board's regenerate control and folded into the generation agent's prompt. Null when no steering text is set.
@@ -766,6 +768,7 @@
        * @property {boolean|null|undefined} discourage_tests_during_auto_pull_request_fixes
        * @property {boolean|null|undefined} auto_cancel_outdated_pr_pipelines
        * @property {boolean|null|undefined} cache_manual_checks
+       * @property {boolean|null|undefined} skip_manual_checks
        * @property {string[]|null|undefined} rebuild_on - Which events rebuild a review's prepared build: any of "rebase", "feedback", "auto_fix". `[]` = manual only; null/absent = inherit.
        */
       /**
@@ -792,6 +795,7 @@
        * @property {boolean} discourage_tests_during_auto_pull_request_fixes
        * @property {boolean} auto_cancel_outdated_pr_pipelines
        * @property {boolean} cache_manual_checks
+       * @property {boolean} skip_manual_checks
        * @property {string[]|undefined} rebuild_on - The resolved file-config/global rebuild triggers a review inherits when neither it nor its project sets any.
        */
       /**

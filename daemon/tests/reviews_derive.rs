@@ -474,6 +474,69 @@ fn cache_manual_checks_precedence_review_over_project_over_default() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+// `skip_manual_checks` precedence from authored TOML -- the review's own
+// `[[review]] skip_manual_checks` wins over the project's `.ralphus.toml
+// [review] skip_manual_checks` default, which wins over the built-in default
+// of `false` (generation runs).
+#[test]
+fn skip_manual_checks_precedence_review_over_project_over_default() {
+    // Review override wins over the project file default.
+    let base = temp_base("skip-manual-precedence-override");
+    let cwd = repo_with_worktree(&base, "feature/skip-override");
+    std::fs::write(
+        base.join("repo").join(".ralphus.toml"),
+        "[review]\nskip_manual_checks = true\n",
+    )
+    .unwrap();
+    let toml = session_toml(
+        &cwd,
+        "override",
+        "skip_auto_build=true\nskip_manual_checks=false",
+    );
+    let file: TaskFile = toml::from_str(&toml).unwrap();
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    let squad_id = store.lock().insert_squad(&file, None, false).unwrap();
+    let guardian_id = derive_reviews(&store, &squad_id, &file).unwrap().remove(0);
+    let guardian = store.lock().get_guardian(&guardian_id).unwrap();
+    assert_eq!(guardian.skip_manual_checks, Some(false));
+    assert!(!guardian.effective_skip_manual_checks);
+    let _ = std::fs::remove_dir_all(&base);
+
+    // Project file default applies when the review leaves it unset.
+    let base = temp_base("skip-manual-precedence-project");
+    let cwd = repo_with_worktree(&base, "feature/skip-project");
+    std::fs::write(
+        base.join("repo").join(".ralphus.toml"),
+        "[review]\nskip_manual_checks = true\n",
+    )
+    .unwrap();
+    let toml = session_toml(&cwd, "project", "skip_auto_build=true");
+    let file: TaskFile = toml::from_str(&toml).unwrap();
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    let squad_id = store.lock().insert_squad(&file, None, false).unwrap();
+    let guardian_id = derive_reviews(&store, &squad_id, &file).unwrap().remove(0);
+    let guardian = store.lock().get_guardian(&guardian_id).unwrap();
+    assert_eq!(guardian.skip_manual_checks, None);
+    assert!(
+        guardian.effective_skip_manual_checks,
+        "project default should apply"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+
+    // Everything unset resolves to the built-in default: generation runs.
+    let base = temp_base("skip-manual-precedence-default");
+    let cwd = repo_with_worktree(&base, "feature/skip-default");
+    let toml = session_toml(&cwd, "default", "skip_auto_build=true");
+    let file: TaskFile = toml::from_str(&toml).unwrap();
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    let squad_id = store.lock().insert_squad(&file, None, false).unwrap();
+    let guardian_id = derive_reviews(&store, &squad_id, &file).unwrap().remove(0);
+    let guardian = store.lock().get_guardian(&guardian_id).unwrap();
+    assert_eq!(guardian.skip_manual_checks, None);
+    assert!(!guardian.effective_skip_manual_checks);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 // `rebuild_on` precedence from authored TOML -- the review's own
 // `[[review]] rebuild_on` (an empty list included) wins over the project's
 // `.ralphus.toml [review] rebuild_on` default, which wins over the built-in

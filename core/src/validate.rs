@@ -283,6 +283,7 @@ pub const REVIEW_KEYS: &[&str] = &[
     "auto_cancel_outdated_pr_pipelines",
     "summary_format",
     "cache_manual_checks",
+    "skip_manual_checks",
     "rebuild_on",
 ];
 /// The full set of top-level `[[waypoint]]` keys (RAL-400).
@@ -2000,6 +2001,7 @@ fn validate_review_blocks(value: Option<&toml::Value>, ctx: &mut Ctx) {
             header,
         );
         check_type(ctx, table, "cache_manual_checks", Ty::Bool, &rpath, header);
+        check_type(ctx, table, "skip_manual_checks", Ty::Bool, &rpath, header);
         validate_rebuild_on(table, &rpath, ctx, header);
         check_type(
             ctx,
@@ -4154,6 +4156,32 @@ prompt = "gate on review"
         assert!(
             r.errors.iter().any(|e| e.kind == ErrorKind::WrongType
                 && e.message.contains("auto_cancel_outdated_pr_pipelines")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    // ── [[review]] skip_manual_checks ──
+
+    #[test]
+    fn review_skip_manual_checks_accepted() {
+        for value in ["true", "false"] {
+            let src = format!(
+                "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nskip_manual_checks={value}\n"
+            );
+            let r = validate_toml(&src);
+            assert!(r.is_ok(), "{value}: {:?}", r.errors);
+        }
+    }
+
+    #[test]
+    fn review_skip_manual_checks_wrong_type_reported() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nskip_manual_checks=\"yes\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors.iter().any(
+                |e| e.kind == ErrorKind::WrongType && e.message.contains("skip_manual_checks")
+            ),
             "{:?}",
             r.errors
         );

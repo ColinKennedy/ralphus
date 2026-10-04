@@ -67,6 +67,8 @@
        * @property {string} originalAutoFixPromptTemplate
        * @property {boolean} discourageTests
        * @property {boolean} originalDiscourageTests
+       * @property {boolean} skipManualChecks - This review's own override for whether manual-check generation is skipped.
+       * @property {boolean} originalSkipManualChecks
        * @property {RebuildOnDraft} rebuildOn - When this review's prepared build is rebuilt; `inherit` means the project default applies.
        * @property {RebuildOnDraft} originalRebuildOn
        * @property {string[]} rebuildOnEffective - The resolved triggers shown while inheriting.
@@ -326,6 +328,7 @@
         const autoFixPrErrors = !!g.auto_fix_pr_errors;
         const autoFixPromptTemplate = g.auto_fix_prompt_template || "";
         const discourageTests = !!g.discourage_tests_during_auto_pull_request_fixes;
+        const skipManualChecks = !!g.effective_skip_manual_checks;
         const rebuildOnEffective = normalizeRebuildOn(g.effective_rebuild_on === undefined ? REBUILD_TRIGGERS : g.effective_rebuild_on);
         return {
           gid: g.id,
@@ -349,6 +352,7 @@
           autoFixPrErrors, originalAutoFixPrErrors: autoFixPrErrors,
           autoFixPromptTemplate, originalAutoFixPromptTemplate: autoFixPromptTemplate,
           discourageTests, originalDiscourageTests: discourageTests,
+          skipManualChecks, originalSkipManualChecks: skipManualChecks,
           rebuildOn: buildRebuildOnDraft(g.rebuild_on, rebuildOnEffective),
           originalRebuildOn: buildRebuildOnDraft(g.rebuild_on, rebuildOnEffective),
           rebuildOnEffective,
@@ -520,6 +524,12 @@
        * @returns {void}
        */
       function onEditDiscourageTests(checked) { if (reviewEditDraft) reviewEditDraft.discourageTests = checked; }
+      /**
+       * Stages the skip-manual-checks flag.
+       * @param {boolean} checked
+       * @returns {void}
+       */
+      function onEditSkipManualChecks(checked) { if (reviewEditDraft) reviewEditDraft.skipManualChecks = checked; }
       /**
        * Stages "use the project default" for when this review rebuilds its
        * prepared build.
@@ -900,6 +910,9 @@
               <div class="hint">Manual-check preparation is declared in task TOML and runs automatically before its controls unlock.</div></div>
             <div ${grp("rebuild")}><h3 class="section" data-tip="${esc(REBUILD_ON_TIP)}">rebuild preparation when</h3>
               ${renderRebuildOnFieldsHtml("review", draft.rebuildOn, draft.rebuildOnEffective, "use the project default", "Follow the project's default for when preparation is rebuilt (set in the project's Review Settings; every trigger when nothing sets one). Untick to give this review its own policy. Applies on Save.", "onEditRebuildOnInherit", "onEditRebuildOnTrigger")}</div>
+            <div ${grp("manual-checks")}><h3 class="section">manual checks</h3>
+              <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Overrides the project default for this review only: don't ask an agent to generate manual checks from the diff on any merge, rebase, or fix. Manual checks declared in the task file are unaffected. Applies on Save.">
+                <input type="checkbox" ${draft.skipManualChecks ? "checked" : ""} onchange="onEditSkipManualChecks(this.checked)">skip manual-check generation</label></div>
             <div ${grp("worktrees")}><h3 class="section">worktrees</h3>
               <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:6px" data-tip="Build the entire branch stack in one shared worktree instead of isolated per-branch worktrees. Applies on Save.">
                 <input type="checkbox" ${draft.skipWorktrees ? "checked" : ""} onchange="onEditSkipWorktrees(this.checked)">skip per-branch worktrees</label></div>
@@ -982,6 +995,7 @@
         if (draft.autoFixPrErrors !== draft.originalAutoFixPrErrors) body.auto_fix_pr_errors = draft.autoFixPrErrors;
         if (draft.autoFixPromptTemplate !== draft.originalAutoFixPromptTemplate) body.auto_fix_prompt_template = draft.autoFixPromptTemplate;
         if (draft.discourageTests !== draft.originalDiscourageTests) body.discourage_tests_during_auto_pull_request_fixes = draft.discourageTests;
+        if (draft.skipManualChecks !== draft.originalSkipManualChecks) body.skip_manual_checks = draft.skipManualChecks;
         if (rebuildOnChanged(draft.rebuildOn, draft.originalRebuildOn)) body.rebuild_on = rebuildOnBodyValue(draft.rebuildOn);
         const squashOn = draft.projects.filter((p) => draft.squash[p]).sort();
         if (JSON.stringify(squashOn) !== JSON.stringify(draft.originalSquashOn.slice().sort())) {

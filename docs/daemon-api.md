@@ -1891,6 +1891,21 @@ submissions via a `ralphus:new-review/<key>` link is one review, so its first
 generation (from whichever submission built its branches first) is what
 sticks.
 
+`skip_manual_checks` (boolean, default `false`) turns manual-check generation
+off for a review: when it is effectively `true` the daemon never asks the
+agent to propose commands from the diff, on the initial merge or on any later
+merge, rebase, or fix. Manual checks declared explicitly in the task file are
+unaffected. It is declared as `[[review]] skip_manual_checks` or
+`[review] skip_manual_checks` in `.ralphus.toml`, written through `POST
+/api/guardians/{id}/settings` (and `.../details`) and `POST
+/api/projects/{name}/review-settings`, and shown on the review as
+`skip_manual_checks` (this review's own value, `null` when inheriting) and
+`effective_skip_manual_checks` (the resolved boolean). Precedence mirrors
+`cache_manual_checks`: the review's own value wins over the project default,
+which wins over the global `[review]` value, which wins over `false`. A
+non-boolean value is a `400`. The project endpoint also reports the resolved
+default under `effective.skip_manual_checks`.
+
 `rebuild_on` (array of strings, default every event) controls which events tear
 down and rebuild a review's prepared build — the preparation that makes its
 test actions and generated manual checks runnable. Each entry is one of

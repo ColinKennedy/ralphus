@@ -508,6 +508,7 @@ impl DaemonClient {
             patch.auto_cancel_outdated_pr_pipelines,
         );
         set_if_some(&mut body, "cache_manual_checks", patch.cache_manual_checks);
+        set_if_some(&mut body, "skip_manual_checks", patch.skip_manual_checks);
         set_rebuild_on(&mut body, patch.rebuild_on.clone());
         self.post(&format!("/api/projects/{name}/review-settings"), Some(body))
     }
@@ -1757,6 +1758,7 @@ impl DaemonClient {
             "cache_manual_checks",
             settings.cache_manual_checks,
         );
+        set_if_some(&mut body, "skip_manual_checks", settings.skip_manual_checks);
         set_rebuild_on(&mut body, settings.rebuild_on.clone());
         self.post(
             &format!("/api/guardians/{guardian_id}/settings"),
@@ -2285,6 +2287,9 @@ pub struct GuardianSettings<'a> {
     /// merges, rebases, and automated fix iterations. Defaults to `true`
     /// (on by default) when unset.
     pub cache_manual_checks: Option<bool>,
+    /// Whether manual-check generation is skipped for this review (no agent
+    /// call proposes commands from the diff). Defaults to `false` when unset.
+    pub skip_manual_checks: Option<bool>,
     /// Which events tear down and rebuild this review's prepared build.
     /// Outer `None` leaves it alone, `Some(None)` clears the override back to
     /// inherit (sent as JSON `null`), `Some(Some(list))` sets it (an empty list
@@ -2338,6 +2343,9 @@ pub struct ProjectReviewSettingsPatch<'a> {
     /// then reused through later merges, rebases, and automated fix
     /// iterations. Defaults to `true` (on by default) when unset.
     pub cache_manual_checks: Option<bool>,
+    /// The project's default for whether manual-check generation is skipped.
+    /// Defaults to `false` when unset.
+    pub skip_manual_checks: Option<bool>,
     /// The project's default list of events that tear down and rebuild a
     /// review's prepared build. Outer `None` leaves it alone, `Some(None)`
     /// clears it back to inherit (sent as JSON `null`), `Some(Some(list))`

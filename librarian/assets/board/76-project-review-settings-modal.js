@@ -65,6 +65,8 @@
        * @property {boolean} originalAutoCancelOutdatedPrPipelines
        * @property {boolean} cacheManualChecks
        * @property {boolean} originalCacheManualChecks
+       * @property {boolean} skipManualChecks
+       * @property {boolean} originalSkipManualChecks
        * @property {RebuildOnDraft} rebuildOn - Default for when a future review rebuilds its prepared build; `inherit` means the file-config/global value applies.
        * @property {RebuildOnDraft} originalRebuildOn
        */
@@ -120,6 +122,7 @@
         const discourageTests = boolOr(s.discourage_tests_during_auto_pull_request_fixes, effective.discourage_tests_during_auto_pull_request_fixes);
         const autoCancelOutdatedPrPipelines = boolOr(s.auto_cancel_outdated_pr_pipelines, effective.auto_cancel_outdated_pr_pipelines);
         const cacheManualChecks = boolOr(s.cache_manual_checks, effective.cache_manual_checks);
+        const skipManualChecks = boolOr(s.skip_manual_checks, effective.skip_manual_checks);
         return {
           project,
           cwd: proj ? proj.path : "",
@@ -143,6 +146,7 @@
           discourageTests, originalDiscourageTests: discourageTests,
           autoCancelOutdatedPrPipelines, originalAutoCancelOutdatedPrPipelines: autoCancelOutdatedPrPipelines,
           cacheManualChecks, originalCacheManualChecks: cacheManualChecks,
+          skipManualChecks, originalSkipManualChecks: skipManualChecks,
           rebuildOn: buildRebuildOnDraft(s.rebuild_on, effective.rebuild_on),
           originalRebuildOn: buildRebuildOnDraft(s.rebuild_on, effective.rebuild_on),
         };
@@ -324,6 +328,12 @@
        */
       function onProjectEditCacheManualChecks(checked) { if (projectReviewSettingsDraft) projectReviewSettingsDraft.cacheManualChecks = checked; }
       /**
+       * Stages the skip-manual-checks default.
+       * @param {boolean} checked
+       * @returns {void}
+       */
+      function onProjectEditSkipManualChecks(checked) { if (projectReviewSettingsDraft) projectReviewSettingsDraft.skipManualChecks = checked; }
+      /**
        * Stages "inherit the file-config/global default" for the rebuild-on setting.
        * @param {boolean} checked
        * @returns {void}
@@ -388,6 +398,8 @@
               <input type="checkbox" ${draft.autoCancelOutdatedPrPipelines ? "checked" : ""} onchange="onProjectEditAutoCancelOutdatedPrPipelines(this.checked)">auto-cancel outdated CI pipelines</label>
             <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Compute a future review's manual checks once, when its review branches are first created, and reuse that result through later merges, rebases, and automated fix iterations, for a future review that declares no explicit cache_manual_checks setting of its own. Manual checks describe review work that does not change across ordinary rebases, so caching avoids re-running the manual-checks agent for nothing.">
               <input type="checkbox" ${draft.cacheManualChecks ? "checked" : ""} onchange="onProjectEditCacheManualChecks(this.checked)">cache manual checks across rebases</label>
+            <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Skip manual-check generation entirely, for a future review that declares no explicit skip_manual_checks setting of its own: no agent is asked to propose commands from the diff. Manual checks declared in a task file are unaffected.">
+              <input type="checkbox" ${draft.skipManualChecks ? "checked" : ""} onchange="onProjectEditSkipManualChecks(this.checked)">skip manual-check generation</label>
             <h3 class="section" data-tip="${esc(REBUILD_ON_TIP)}">rebuild preparation when</h3>
             ${renderRebuildOnFieldsHtml("project", draft.rebuildOn, draft.effective.rebuild_on, "inherit the file-config/global default", "Follow the file-config/global default for when a future review rebuilds its prepared build (every trigger when nothing sets one), for a future review that declares no explicit rebuild_on of its own. Untick to set this project's own default. Applies on Save.", "onProjectEditRebuildOnInherit", "onProjectEditRebuildOnTrigger")}
             ${err}
@@ -439,6 +451,7 @@
         if (draft.discourageTests !== draft.originalDiscourageTests) body.discourage_tests_during_auto_pull_request_fixes = draft.discourageTests;
         if (draft.autoCancelOutdatedPrPipelines !== draft.originalAutoCancelOutdatedPrPipelines) body.auto_cancel_outdated_pr_pipelines = draft.autoCancelOutdatedPrPipelines;
         if (draft.cacheManualChecks !== draft.originalCacheManualChecks) body.cache_manual_checks = draft.cacheManualChecks;
+        if (draft.skipManualChecks !== draft.originalSkipManualChecks) body.skip_manual_checks = draft.skipManualChecks;
         if (rebuildOnChanged(draft.rebuildOn, draft.originalRebuildOn)) body.rebuild_on = rebuildOnBodyValue(draft.rebuildOn);
         if (Object.keys(body).length === 0) { closeProjectReviewSettingsModal(); return; }
         try {

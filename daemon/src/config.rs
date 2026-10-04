@@ -268,6 +268,15 @@ pub struct ReviewConfig {
     /// (see `Guardian::cache_manual_checks` in `guardian.rs`) wins over this.
     #[serde(default)]
     pub cache_manual_checks: Option<bool>,
+    /// Whether the daemon skips manual-check generation for a review (no
+    /// agent call proposes commands from the diff). `None` means unset,
+    /// which resolves to `false` (see [`Self::skip_manual_checks`]);
+    /// per-project scalars win over the global layer, same as
+    /// `skip_worktrees`. A per-review override (see
+    /// `Guardian::skip_manual_checks` in `guardian.rs`) wins over this.
+    /// Manual checks declared explicitly are unaffected.
+    #[serde(default)]
+    pub skip_manual_checks: Option<bool>,
     /// Which events tear down and rebuild a review's prepared build (any of
     /// `ralphus_core::schema::REBUILD_ON_VALUES`). `None` means unset, which
     /// resolves to all three values (see [`Self::rebuild_on`]); the project
@@ -427,6 +436,7 @@ pub const REVIEW_CONFIG_KEYS: &[&str] = &[
     "auto_build",
     "summary_format",
     "cache_manual_checks",
+    "skip_manual_checks",
     "rebuild_on",
 ];
 
@@ -558,6 +568,13 @@ impl ReviewConfig {
     #[must_use]
     pub fn cache_manual_checks(&self) -> bool {
         self.cache_manual_checks.unwrap_or(true)
+    }
+
+    /// Whether manual-check generation is skipped when neither the review
+    /// nor any layer sets it (unset resolves to `false`).
+    #[must_use]
+    pub fn skip_manual_checks(&self) -> bool {
+        self.skip_manual_checks.unwrap_or(false)
     }
 
     /// The events that rebuild a review's prepared build when neither the
@@ -719,6 +736,7 @@ impl ReviewConfig {
                 .auto_cancel_outdated_pr_pipelines
                 .or(self.auto_cancel_outdated_pr_pipelines),
             cache_manual_checks: over.cache_manual_checks.or(self.cache_manual_checks),
+            skip_manual_checks: over.skip_manual_checks.or(self.skip_manual_checks),
             rebuild_on: over.rebuild_on.or(self.rebuild_on),
             auto_fix_prompt_template: over
                 .auto_fix_prompt_template
@@ -884,6 +902,10 @@ pub const REVIEW_FIELD_PARITY: &[(&str, ReviewFieldDefault)] = &[
     (
         "cache_manual_checks",
         ReviewFieldDefault::ProjectDefault(|c| c.cache_manual_checks.is_some()),
+    ),
+    (
+        "skip_manual_checks",
+        ReviewFieldDefault::ProjectDefault(|c| c.skip_manual_checks.is_some()),
     ),
     (
         "rebuild_on",
@@ -4802,6 +4824,38 @@ mod tests {
         assert!(!global.clone().merge(project).cache_manual_checks());
         // Project unset falls back to the global value.
         assert!(global.merge(ReviewConfig::default()).cache_manual_checks());
+    }
+
+    // ── skip_manual_checks ──────────────────────────────────────────────────
+
+    #[test]
+    fn skip_manual_checks_defaults_to_false_when_unset() {
+        assert!(!ReviewConfig::default().skip_manual_checks());
+        assert!(!from_toml_str("[review]\nskip_worktrees = true\n").skip_manual_checks());
+    }
+
+    #[test]
+    fn skip_manual_checks_parses_explicit_values() {
+        let c = from_toml_str("[review]\nskip_manual_checks = true\n");
+        assert_eq!(c.skip_manual_checks, Some(true));
+        assert!(c.skip_manual_checks());
+        let c = from_toml_str("[review]\nskip_manual_checks = false\n");
+        assert_eq!(c.skip_manual_checks, Some(false));
+        assert!(!c.skip_manual_checks());
+    }
+
+    #[test]
+    fn merge_skip_manual_checks_project_wins() {
+        let global = ReviewConfig {
+            skip_manual_checks: Some(true),
+            ..ReviewConfig::default()
+        };
+        let project = ReviewConfig {
+            skip_manual_checks: Some(false),
+            ..ReviewConfig::default()
+        };
+        assert!(!global.clone().merge(project).skip_manual_checks());
+        assert!(global.merge(ReviewConfig::default()).skip_manual_checks());
     }
 
     // ── rebuild_on ──────────────────────────────────────────────────────────

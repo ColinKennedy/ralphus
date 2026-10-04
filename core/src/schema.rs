@@ -1569,6 +1569,14 @@ pub struct ReviewDef {
     /// block to read it from.
     #[serde(default)]
     pub cache_manual_checks: Option<bool>,
+    /// Whether the daemon skips manual-check generation for this review
+    /// (no agent call proposes commands from the diff). Unset inherits the
+    /// project-level `.ralphus.toml [review] skip_manual_checks` default,
+    /// then `false`. Manual checks declared explicitly are unaffected.
+    /// Auto-created reviews (Arbiter/Triage) always use the project default
+    /// and never set this directly.
+    #[serde(default)]
+    pub skip_manual_checks: Option<bool>,
     /// Which events tear down and rebuild this review's prepared build: any
     /// of [`REBUILD_ON_VALUES`] (`"rebase"` -- a merge or restack of the
     /// stack, `"feedback"` -- applied reviewer feedback, `"auto_fix"` -- an

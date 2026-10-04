@@ -93,6 +93,7 @@ pub enum ProjectReviewSettingsCommand {
         discourage_tests_during_auto_pull_request_fixes: Option<bool>,
         auto_cancel_outdated_pr_pipelines: Option<bool>,
         cache_manual_checks: Option<bool>,
+        skip_manual_checks: Option<bool>,
         /// The project's default list of events that rebuild a review's
         /// prepared build. Outer `None` leaves it alone, `Some(None)` clears
         /// it back to inherit, `Some(Some(list))` sets it (an empty list never
@@ -368,6 +369,8 @@ fn parse_review_settings_set(
         crate::commands::review::take_tri_bool(scanner, "--auto-cancel-outdated-pr-pipelines");
     let cache_manual_checks =
         crate::commands::review::take_tri_bool(scanner, "--cache-manual-checks");
+    let skip_manual_checks =
+        crate::commands::review::take_tri_bool(scanner, "--skip-manual-checks");
     let rebuild_on = crate::commands::review::take_rebuild_on(scanner)?;
     if clear_maximum_budget_usd && maximum_budget_usd_raw.is_some() {
         return Err(UsageError(
@@ -428,6 +431,7 @@ fn parse_review_settings_set(
         discourage_tests_during_auto_pull_request_fixes,
         auto_cancel_outdated_pr_pipelines,
         cache_manual_checks,
+        skip_manual_checks,
         rebuild_on,
     })
 }
@@ -580,6 +584,7 @@ fn dispatch_review_settings(cmd: ProjectReviewSettingsCommand, opts: &GlobalOpts
             discourage_tests_during_auto_pull_request_fixes,
             auto_cancel_outdated_pr_pipelines,
             cache_manual_checks,
+            skip_manual_checks,
             rebuild_on,
         } => {
             let patch = crate::client::ProjectReviewSettingsPatch {
@@ -604,6 +609,7 @@ fn dispatch_review_settings(cmd: ProjectReviewSettingsCommand, opts: &GlobalOpts
                 discourage_tests_during_auto_pull_request_fixes,
                 auto_cancel_outdated_pr_pipelines,
                 cache_manual_checks,
+                skip_manual_checks,
                 rebuild_on,
             };
             match client.set_project_review_settings(&name, &patch) {
@@ -690,6 +696,7 @@ fn render_review_settings(payload: &Value) {
         "auto_cancel_outdated_pr_pipelines",
     );
     row_bool("cache manual checks:", "cache_manual_checks");
+    row_bool("skip manual checks:", "skip_manual_checks");
     let list = |value: &serde_json::Value| -> Option<String> {
         value.as_array().map(|entries| {
             if entries.is_empty() {
