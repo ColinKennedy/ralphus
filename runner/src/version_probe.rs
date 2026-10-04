@@ -215,6 +215,31 @@ pub fn first_token_after_prefix(output: &str, prefix: &str) -> Option<String> {
     Some(token.to_string())
 }
 
+/// Extracts the first semver-shaped token from command output. External CLI
+/// version banners are not consistent about whether the program name or a
+/// `v` prefix comes first, so callers that do not need to validate a literal
+/// banner prefix can use this tolerant form.
+#[must_use]
+pub fn first_version_token(output: &str) -> Option<String> {
+    output.split_whitespace().find_map(|raw| {
+        let token = raw.trim_matches(|character: char| {
+            !character.is_ascii_alphanumeric() && character != '.' && character != '-'
+        });
+        let token = token.strip_prefix('v').unwrap_or(token);
+        let mut components = token.splitn(3, '.');
+        let major = components.next()?;
+        let minor = components.next()?;
+        let patch = components.next()?;
+        (major.chars().all(|character| character.is_ascii_digit())
+            && minor.chars().all(|character| character.is_ascii_digit())
+            && patch
+                .chars()
+                .next()
+                .is_some_and(|character| character.is_ascii_digit()))
+        .then(|| token.to_string())
+    })
+}
+
 /// The `extract` closure body for `nvidia-smi --version`, whose output is a
 /// `key : value` table rather than a single version line:
 ///
@@ -348,6 +373,27 @@ mod tests {
             None
         );
         assert_eq!(first_token_after_prefix("", "git version "), None);
+    }
+
+    #[test]
+    fn first_version_token_accepts_each_named_tool_banner_shape() {
+        for (output, expected) in [
+            ("ripgrep 14.1.1\n-PCRE2 10.39", "14.1.1"),
+            ("Claude Code 2.1.229\n", "2.1.229"),
+            ("codex-cli v0.157.0 (build abc)\n", "0.157.0"),
+            ("tmux 3.3.8\n", "3.3.8"),
+            ("git version 2.44.0.windows.1\n", "2.44.0.windows.1"),
+            ("gh version 2.93.0 (2026-05-27)\n", "2.93.0"),
+            ("glab 1.114.0 (4d7c6cd)\n", "1.114.0"),
+        ] {
+            assert_eq!(first_version_token(output).as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn first_version_token_skips_non_version_tokens() {
+        assert_eq!(first_version_token("Claude Code version unknown"), None);
+        assert_eq!(first_version_token("release 2 only"), None);
     }
 
     #[test]

@@ -386,18 +386,17 @@ fn resolve_effective_command(
 pub(crate) fn diagnose_backend_command(backend: &str, command: &str) -> BackendCommandHealth {
     match backend {
         "pi" => pi_backend::diagnose_pi_command(command),
-        // Claude Code prints just "<version> (Claude Code)" on its first
-        // line -- no literal prefix to strip, so the version is simply the
-        // first line's first token.
+        // Claude Code's banner has changed shape across releases; accept the
+        // first semver-shaped token rather than depending on its wording.
         "claude-code" => {
             cli_agent_common::diagnose_command_with_version(command, &["--version"], |out| {
-                version_probe::first_token_after_prefix(out, "")
+                version_probe::first_version_token(out)
             })
         }
-        // Codex prints "codex-cli <version>" on its first line.
+        // Codex likewise has emitted both prefixed and unprefixed banners.
         "codex" => {
             cli_agent_common::diagnose_command_with_version(command, &["--version"], |out| {
-                version_probe::first_token_after_prefix(out, "codex-cli ")
+                version_probe::first_version_token(out)
             })
         }
         _ => cli_agent_common::diagnose_command(command),
