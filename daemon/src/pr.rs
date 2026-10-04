@@ -17424,14 +17424,10 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
                 "/projects/123/merge_requests",
             ),
         };
-        let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").unwrap());
-        let addr = server.server_addr().to_string();
-        let server_for_thread = Arc::clone(&server);
-        let handle = std::thread::spawn(move || {
-            let server = server_for_thread;
+        let mock = MockForge::start(move |server| {
             let mut list_calls = 0;
             let mut creates = 0;
-            while let Ok(mut req) = server.recv() {
+            for mut req in server.requests() {
                 let method = req.method().clone();
                 let url = req.url().to_string();
                 if method == tiny_http::Method::Get && url.starts_with(list_prefix) {
@@ -17498,12 +17494,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             .lock()
             .set_branch_review(&gid, &branch_id, "review-branch", root.to_str().unwrap())
             .unwrap();
-        let client = crate::forge::ForgeClient::new(
-            kind,
-            format!("http://{addr}"),
-            repo_path.to_string(),
-            Some("tok".to_string()),
-        );
+        let client = mock.client(kind, repo_path);
         let guardian = store.lock().get_guardian(&gid).unwrap();
         let ordered_enabled: Vec<&BranchView> = guardian.branches.iter().collect();
         let mut alias_by_branch = HashMap::new();
@@ -17562,8 +17553,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             .list_pull_requests_for_guardian(&gid)
             .unwrap()
             .len();
-        server.unblock();
-        let creates = handle.join().unwrap();
+        let creates = mock.finish();
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&remote_dir);
         (result, creates, rows)
