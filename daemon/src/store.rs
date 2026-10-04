@@ -5568,7 +5568,7 @@ impl Store {
         db_profiles: &HashMap<String, crate::agent_profile_store::AgentProfileView>,
     ) -> Result<HashMap<i64, Vec<CellView>>> {
         let mut stmt = conn.prepare(
-            "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date, machine, detached_at_ms, maximum_context, auto_compact_threshold, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, delayed_until_ms, completed_active_duration_ms, active_started_at_ms, turns, waypoint_halted_at_ms
+            "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date, machine, detached_at_ms, maximum_context, auto_compact_threshold, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, delayed_until_ms, completed_active_duration_ms, CASE WHEN state='running' THEN active_started_at_ms END, turns, waypoint_halted_at_ms
              FROM cells WHERE squad_id=? ORDER BY task_idx, idx",
         )?;
         let rows = stmt
@@ -5784,7 +5784,7 @@ impl Store {
         db_profiles: &HashMap<String, crate::agent_profile_store::AgentProfileView>,
     ) -> Result<HashMap<(i64, String, i64), Vec<ProofView>>> {
         let mut stmt = conn.prepare(
-            "SELECT task_idx, scope, cell_idx, vid, kind, state, delayed_until_ms, delayed_reason, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, completed_active_duration_ms, active_started_at_ms, turns FROM proofs
+            "SELECT task_idx, scope, cell_idx, vid, kind, state, delayed_until_ms, delayed_reason, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, completed_active_duration_ms, CASE WHEN state='running' THEN active_started_at_ms END, turns FROM proofs
              WHERE squad_id=? ORDER BY task_idx, scope, cell_idx, idx",
         )?;
         let rows = stmt
@@ -5854,7 +5854,7 @@ impl Store {
                 .map(|p| (p.name.clone(), p))
                 .collect();
         let mut stmt = self.conn.prepare(
-            "SELECT vid, kind, state, delayed_until_ms, delayed_reason, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, completed_active_duration_ms, active_started_at_ms, turns FROM proofs
+            "SELECT vid, kind, state, delayed_until_ms, delayed_reason, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, completed_active_duration_ms, CASE WHEN state='running' THEN active_started_at_ms END, turns FROM proofs
              WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? ORDER BY idx",
         )?;
         let rows = stmt
@@ -7487,8 +7487,10 @@ impl Store {
     /// proof step under one task (RAL-308), for enforcing a task-level
     /// `maximum_timeout_seconds` cap that's cumulative across the whole
     /// task's descendants (both cell-scope and task-scope proofs). A row
-    /// completed interval contributes its durable aggregate, and an active
-    /// row additionally contributes `now_ms - active_started_at_ms`. This
+    /// completed interval contributes its durable aggregate, and a `running`
+    /// row with an open interval additionally contributes
+    /// `now_ms - active_started_at_ms` (an open interval on any other state is
+    /// stale and contributes nothing). This
     /// excludes daemon downtime after recovery while retaining concurrent
     /// sibling work as separate consumed runtime.
     pub fn task_cumulative_runtime_ms(
@@ -7499,14 +7501,14 @@ impl Store {
     ) -> Result<i64> {
         let cells_ms: i64 = self.conn.query_row(
             "SELECT COALESCE(SUM(completed_active_duration_ms +
-                CASE WHEN active_started_at_ms IS NULL THEN 0 ELSE MAX(0, ?1 - active_started_at_ms) END), 0)
+                CASE WHEN active_started_at_ms IS NULL OR state <> 'running' THEN 0 ELSE MAX(0, ?1 - active_started_at_ms) END), 0)
              FROM cells WHERE squad_id=?2 AND task_idx=?3",
             params![now_ms, squad_id, task_idx],
             |r| r.get(0),
         )?;
         let proofs_ms: i64 = self.conn.query_row(
             "SELECT COALESCE(SUM(completed_active_duration_ms +
-                CASE WHEN active_started_at_ms IS NULL THEN 0 ELSE MAX(0, ?1 - active_started_at_ms) END), 0)
+                CASE WHEN active_started_at_ms IS NULL OR state <> 'running' THEN 0 ELSE MAX(0, ?1 - active_started_at_ms) END), 0)
              FROM proofs WHERE squad_id=?2 AND task_idx=?3",
             params![now_ms, squad_id, task_idx],
             |r| r.get(0),
@@ -7529,7 +7531,7 @@ impl Store {
             .conn
             .query_row(
                 "SELECT completed_active_duration_ms +
-                    CASE WHEN active_started_at_ms IS NULL THEN 0 ELSE MAX(0, ?1 - active_started_at_ms) END
+                    CASE WHEN active_started_at_ms IS NULL OR state <> 'running' THEN 0 ELSE MAX(0, ?1 - active_started_at_ms) END
                  FROM cells WHERE squad_id=?2 AND task_idx=?3 AND idx=?4",
                 params![now_ms, squad_id, task_idx, cell_idx],
                 |r| r.get(0),
@@ -7538,7 +7540,7 @@ impl Store {
             .unwrap_or(0);
         let proofs_ms: i64 = self.conn.query_row(
             "SELECT COALESCE(SUM(completed_active_duration_ms +
-                CASE WHEN active_started_at_ms IS NULL THEN 0 ELSE MAX(0, ?1 - active_started_at_ms) END), 0)
+                CASE WHEN active_started_at_ms IS NULL OR state <> 'running' THEN 0 ELSE MAX(0, ?1 - active_started_at_ms) END), 0)
              FROM proofs WHERE squad_id=?2 AND task_idx=?3 AND scope='cell' AND cell_idx=?4",
             params![now_ms, squad_id, task_idx, cell_idx],
             |r| r.get(0),
@@ -9013,7 +9015,55 @@ impl Store {
             )?;
         }
 
+        self.close_stale_active_intervals()?;
+
         Ok(ids)
+    }
+
+    /// Startup repair: closes every active-duration interval still open on a
+    /// cell or proof row that is not `running`. Only `running` ever opens an
+    /// interval, so such a row is one whose terminal (or reset-to-`pending`)
+    /// transition skipped closing it; left alone it keeps an
+    /// `active_started_at_ms` that no future transition clears.
+    ///
+    /// A cell is credited up to its `finished_at_ms` when that bounds the
+    /// interval; anything else (a proof row, which has no finish timestamp,
+    /// or a cell with none) is credited nothing, since there is no recorded
+    /// end to measure to and the time since the leak is not active work.
+    fn close_stale_active_intervals(&self) -> Result<()> {
+        let cells = self.conn.execute(
+            "UPDATE cells SET completed_active_duration_ms = completed_active_duration_ms +
+                    CASE WHEN finished_at_ms IS NOT NULL AND finished_at_ms >= active_started_at_ms
+                         THEN finished_at_ms - active_started_at_ms ELSE 0 END,
+                 active_started_at_ms = NULL
+             WHERE active_started_at_ms IS NOT NULL AND state <> 'running'",
+            [],
+        )?;
+        let proofs = self.conn.execute(
+            "UPDATE proofs SET active_started_at_ms = NULL
+             WHERE active_started_at_ms IS NOT NULL AND state <> 'running'",
+            [],
+        )?;
+        if cells + proofs > 0 {
+            crate::rlog!(
+                WARNING,
+                "ralphus [recovery] closed {cells} cell and {proofs} proof active-duration interval(s) left open on non-running rows"
+            );
+            let _ = self.cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::WARNING,
+                source: "recovery",
+                message: "closed stale active-duration intervals on non-running rows",
+                scope: None,
+                squad_id: None,
+                guardian_id: None,
+                cell_id: None,
+                task: None,
+                log_path: None,
+                payload: serde_json::json!({"cells": cells, "proofs": proofs}),
+                admin_only: false,
+            });
+        }
+        Ok(())
     }
 
     /// Task indices that have at least one cell in [`done_cells`] whose
@@ -13551,6 +13601,90 @@ command = "y"
             "recovery must discard an interval left open by the prior daemon rather than count downtime"
         );
         assert_eq!(store.running_cell_count().unwrap(), 0);
+    }
+
+    /// Leaves an open active interval on a `done` cell and its `done` proof,
+    /// the shape a completion path that skipped closing the interval leaves
+    /// behind.
+    fn leak_active_intervals_on_done_rows(store: &Store, id: &str, started_ms: i64) {
+        store
+            .conn
+            .execute(
+                "UPDATE cells SET state='done', completed_active_duration_ms=0,
+                     active_started_at_ms=?, finished_at_ms=?
+                 WHERE squad_id=? AND task_idx=0 AND idx=0",
+                params![started_ms, started_ms + 5_000, id],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE proofs SET state='done', completed_active_duration_ms=0, active_started_at_ms=?
+                 WHERE squad_id=? AND task_idx=0 AND scope='cell' AND cell_idx=0",
+                params![started_ms, id],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn open_interval_on_a_non_running_row_never_counts_as_active() {
+        // Regression test: a terminal squad's duration kept growing on the
+        // board because done rows still carried an open interval, and every
+        // view summed `now - active_started_at_ms` for them.
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+        let hour_ago = now_ms() - 3_600_000;
+        leak_active_intervals_on_done_rows(&store, &id, hour_ago);
+
+        let squad = store.get_squad(&id).unwrap();
+        let cell = &squad.tasks[0].cells[0];
+        assert_eq!(cell.duration_ms, 0);
+        assert_eq!(cell.active_duration_intervals, 0);
+        assert_eq!(cell.proof[0].duration_ms, 0);
+        assert_eq!(cell.proof[0].active_duration_intervals, 0);
+        assert_eq!(squad.duration_ms, 0);
+        assert_eq!(squad.active_duration_intervals, 0);
+        let proofs = store.proofs_for(&id, 0, "cell", 0).unwrap();
+        assert_eq!(proofs[0].active_duration_intervals, 0);
+        assert_eq!(
+            store.task_cumulative_runtime_ms(&id, 0, now_ms()).unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .cell_cumulative_runtime_ms(&id, 0, 0, now_ms())
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn recover_orphaned_squads_closes_stale_intervals_on_non_running_rows() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+        store.set_squad_state(&id, SquadState::Done).unwrap();
+        let hour_ago = now_ms() - 3_600_000;
+        leak_active_intervals_on_done_rows(&store, &id, hour_ago);
+
+        store.recover_orphaned_squads().unwrap();
+
+        let open: i64 = store
+            .conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM cells WHERE active_started_at_ms IS NOT NULL)
+                      + (SELECT COUNT(*) FROM proofs WHERE active_started_at_ms IS NOT NULL)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(open, 0);
+        let squad = store.get_squad(&id).unwrap();
+        let cell = &squad.tasks[0].cells[0];
+        assert_eq!(
+            cell.duration_ms, 5_000,
+            "a cell is credited up to its recorded finish, not up to now"
+        );
+        assert_eq!(cell.proof[0].duration_ms, 0);
     }
 
     #[test]
