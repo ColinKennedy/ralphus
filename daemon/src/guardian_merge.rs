@@ -2547,6 +2547,8 @@ fn resolve_conflicts_with_agent(
     // on, so a retry resumes that conversation instead of starting cold. Reset
     // to `None` whenever the rebase advances to a new commit.
     let mut current_commit_session_id: Option<String> = None;
+    // A pass has a permanent cell identity, keeping its transcript distinct.
+    let run_cell_id = format!("resolver-{branch_id}-{}", crate::store::now_ms());
     crate::rlog!(
         INFO,
         "ralphus [guardian] review {id} conflicts starting branch={branch:?} found={found} \
@@ -2556,24 +2558,6 @@ fn resolve_conflicts_with_agent(
         let guard = store.lock();
         let _ = guard.set_guardian_conflicts(id, Some(found), Some(0), Some(0));
         let _ = guard.set_branch_conflicts(id, branch_id, Some(found), Some(0), Some(0));
-        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
-            level: crate::logging::LogLevel::INFO,
-            source: "guardian",
-            message: "conflicts starting",
-            scope: Some("branch"),
-            squad_id: None,
-            guardian_id: Some(id),
-            cell_id: None,
-            task: None,
-            log_path: None,
-            payload: serde_json::json!({
-                "branch": branch,
-                "found": found,
-                "agent": agent,
-                "model": model,
-            }),
-            admin_only: false,
-        });
     }
 
     // Side-channel file where the Python backend writes the claude session ID as
@@ -2710,6 +2694,16 @@ fn resolve_conflicts_with_agent(
         // conflict-resolution cycle was the redundancy this ticket removes;
         // see the module-level RAL-168 notes.
         let system_prompt = CONFLICT_RESOLVER_SYSTEM_PROMPT;
+        if commit_attempts == 0 {
+            let guard = store.lock();
+            let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::INFO, source: "guardian", message: "conflicts starting",
+                scope: Some("branch"), squad_id: None, guardian_id: Some(id), cell_id: Some(&run_cell_id),
+                task: Some(RESOLVER_TASK), log_path: None,
+                payload: serde_json::json!({"branch": branch, "found": found, "agent": agent, "model": model,
+                    "task": RESOLVER_TASK, "cell_id": run_cell_id, "prompt": prompt}), admin_only: false,
+            });
+        }
         // This is either the commit's first pass (commit_attempts was reset to
         // 0 the last time the rebase advanced) or a retry -- in which case
         // current_commit_session_id carries the previous pass's session so the
@@ -2732,7 +2726,7 @@ fn resolve_conflicts_with_agent(
             // after a later reorder/add/remove shifts positions.
             squad_id: format!("guardian-{id}"),
             task: RESOLVER_TASK.to_string(),
-            cell_id: format!("resolver-{branch_id}"),
+            cell_id: run_cell_id.clone(),
             cwd: resolver_cwd,
             prompt: Some(prompt),
             command: None,
@@ -3124,19 +3118,6 @@ fn run_final_proof(
     {
         let guard = store.lock();
         let _ = guard.set_branch_status(id, branch_id, MergeStatus::ProofPending, None);
-        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
-            level: crate::logging::LogLevel::INFO,
-            source: "guardian",
-            message: "final proof starting",
-            scope: Some("branch"),
-            squad_id: None,
-            guardian_id: Some(id),
-            cell_id: None,
-            task: None,
-            log_path: None,
-            payload: serde_json::json!({"branch": branch}),
-            admin_only: false,
-        });
     }
     crate::rlog!(
         INFO,
@@ -3150,6 +3131,24 @@ fn run_final_proof(
          quality bar, so do not assume what state the code is in; inspect it yourself.{quality_note}"
     );
     let system_prompt = FINAL_PROOF_SYSTEM_PROMPT;
+    let proof_cell_id = format!("resolver-proof-{branch_id}-{}", crate::store::now_ms());
+    {
+        let guard = store.lock();
+        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+            level: crate::logging::LogLevel::INFO,
+            source: "guardian",
+            message: "final proof starting",
+            scope: Some("branch"),
+            squad_id: None,
+            guardian_id: Some(id),
+            cell_id: Some(&proof_cell_id),
+            task: Some(RESOLVER_PROOF_TASK),
+            log_path: None,
+            payload: serde_json::json!({"branch": branch, "task": RESOLVER_PROOF_TASK,
+                "cell_id": proof_cell_id, "prompt": prompt}),
+            admin_only: false,
+        });
+    }
     let proof_cwd = wt.root().to_string_lossy().into_owned();
     // RAL-517: resolve before `cwd: proof_cwd` moves the string below.
     let retry_after_unknown_default_seconds =
@@ -3164,7 +3163,7 @@ fn run_final_proof(
         // calls never collide on the same tmux session.
         squad_id: format!("guardian-{id}"),
         task: RESOLVER_PROOF_TASK.to_string(),
-        cell_id: format!("resolver-proof-{branch_id}"),
+        cell_id: proof_cell_id,
         cwd: proof_cwd,
         prompt: Some(prompt),
         command: None,
@@ -6696,22 +6695,6 @@ fn run_feedback_pass(
         INFO,
         "ralphus [guardian] review {id} feedback applying position={position}"
     );
-    {
-        let guard = store.lock();
-        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
-            level: crate::logging::LogLevel::INFO,
-            source: "guardian",
-            message: "feedback applying",
-            scope: Some("branch"),
-            squad_id: None,
-            guardian_id: Some(id),
-            cell_id: None,
-            task: None,
-            log_path: None,
-            payload: serde_json::json!({"position": position}),
-            admin_only: false,
-        });
-    }
 
     let set_status = |s: GuardianStatus, detail: Option<&str>| {
         let _ = store.lock().set_guardian_status(id, s, detail);
@@ -6767,6 +6750,24 @@ fn run_feedback_pass(
          status`, `git diff`, `git log`) to inspect the worktree or the change \
          so far, but do not commit or push -- a separate step handles that."
     );
+    let feedback_run_cell_id = format!("feedback-{branch_id}-{}", crate::store::now_ms());
+    {
+        let guard = store.lock();
+        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+            level: crate::logging::LogLevel::INFO,
+            source: "guardian",
+            message: "feedback applying",
+            scope: Some("branch"),
+            squad_id: None,
+            guardian_id: Some(id),
+            cell_id: Some(&feedback_run_cell_id),
+            task: Some(FEEDBACK_TASK),
+            log_path: None,
+            payload: serde_json::json!({"position": position, "branch_id": branch_id,
+                "task": FEEDBACK_TASK, "cell_id": feedback_run_cell_id, "prompt": prompt}),
+            admin_only: false,
+        });
+    }
     let resolved = match resolve_resolver_agent(
         guardian.resolver_agent.as_deref(),
         guardian.resolver_model.as_deref(),
@@ -6805,7 +6806,7 @@ fn run_feedback_pass(
         // fix on `generate_final_summary`'s spec).
         squad_id: format!("guardian-{id}"),
         task: FEEDBACK_TASK.to_string(),
-        cell_id: feedback_cell_id(branch_id),
+        cell_id: feedback_run_cell_id,
         cwd: wt_str.clone(),
         prompt: Some(prompt),
         command: None,

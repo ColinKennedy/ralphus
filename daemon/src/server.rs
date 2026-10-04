@@ -11839,6 +11839,30 @@ fn guardian_branch_pane_transcript(
     branch_id: &str,
     query: &str,
 ) -> Reply {
+    if let (Some(task), Some(cell_id)) = (query_param(query, "task"), query_param(query, "cell_id"))
+    {
+        match daemon.lock().guardian_branches(id) {
+            Ok(branches) if branches.iter().any(|branch| branch.id == branch_id) => {}
+            Ok(_) => return error(404, "not_found", "no such branch", vec![]),
+            Err(e) => return store_error(&e),
+        }
+        let valid = match task {
+            crate::guardian_merge::RESOLVER_TASK => {
+                cell_id.starts_with(&format!("resolver-{branch_id}-"))
+            }
+            crate::guardian_merge::RESOLVER_PROOF_TASK => {
+                cell_id.starts_with(&format!("resolver-proof-{branch_id}-"))
+            }
+            crate::guardian_merge::FEEDBACK_TASK => {
+                cell_id.starts_with(&format!("feedback-{branch_id}-"))
+            }
+            _ => false,
+        };
+        if !valid {
+            return error(404, "not_found", "no such branch run", vec![]);
+        }
+        return pane_transcript_range_reply(&format!("guardian-{id}"), task, cell_id, query);
+    }
     let (task, cell_id) = match resolver_task_and_cell_id(daemon, id, branch_id) {
         Ok(v) => v,
         Err(e) => return e,
@@ -25320,7 +25344,32 @@ remediation_attempts=1
         assert_eq!(v["content"], "3456");
         assert_eq!(v["start"], 3);
 
+        // A review pass has its own cell identity, so a walk-back request
+        // reads that pass rather than the branch's currently selected session.
+        let run_cell_id = format!("resolver-{branch_id}-123");
+        let run_name = crate::tmux::session_name(
+            &format!("guardian-{id}"),
+            crate::guardian_merge::RESOLVER_TASK,
+            &run_cell_id,
+        );
+        let run_raw = crate::terminal_log::raw_transcript_path(&run_name, 0);
+        std::fs::create_dir_all(run_raw.parent().unwrap()).unwrap();
+        std::fs::write(&run_raw, "walked-back pass").unwrap();
+        let run = route(
+            &d,
+            "GET",
+            &format!(
+                "/api/guardians/{id}/branches/{branch_id}/pane-transcript?task={}&cell_id={run_cell_id}",
+                crate::guardian_merge::RESOLVER_TASK
+            ),
+            "",
+        );
+        assert_eq!(run.status, 200, "{}", run.body);
+        let v: serde_json::Value = serde_json::from_str(&run.body).unwrap();
+        assert_eq!(v["content"], "walked-back pass");
+
         crate::terminal_log::delete_for_session(&name);
+        crate::terminal_log::delete_for_session(&run_name);
     }
 
     #[test]
