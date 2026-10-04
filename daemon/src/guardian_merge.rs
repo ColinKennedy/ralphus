@@ -10633,7 +10633,7 @@ fn prepare_action_hints(
                     .set_guardian_action_hints(id, &hints)
                     .map_err(|e| e.to_string())?;
             }
-            materialize_action_artifacts(
+            let prepared = materialize_action_artifacts(
                 id,
                 &format!("action-{index}"),
                 root,
@@ -10641,7 +10641,18 @@ fn prepare_action_hints(
                 &hints[index],
                 &action_env,
                 cancel,
-            )
+            )?;
+            let run_cwd = shared_store_cwd
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned())
+                .or_else(|| prepared.clone())
+                .unwrap_or_else(|| combined_str.to_string());
+            if let Some(anchored) =
+                anchor_check_command(&hints[index], &run_cwd, root.at(combined_str).is_local())?
+            {
+                hints[index].command = Some(anchored);
+            }
+            Ok(prepared)
         })();
 
         if cancel.is_cancelled() {
@@ -10804,11 +10815,27 @@ fn prepare_generated_manual_checks(
 
         match result {
             Ok(prepared_cwd) => {
-                checks[index].preparation_state = Some("ready".to_string());
-                checks[index].preparation_detail = None;
-                checks[index].prepared_at_ms = Some(crate::store::now_ms());
-                checks[index].prepared_cwd =
-                    prepared_cwd.or_else(|| Some(combined_str.to_string()));
+                let run_cwd = prepared_cwd.unwrap_or_else(|| combined_str.to_string());
+                match anchor_check_command(
+                    &checks[index],
+                    &run_cwd,
+                    root.at(combined_str).is_local(),
+                ) {
+                    Ok(anchored) => {
+                        if let Some(command) = anchored {
+                            checks[index].command = Some(command);
+                        }
+                        checks[index].preparation_state = Some("ready".to_string());
+                        checks[index].preparation_detail = None;
+                        checks[index].prepared_at_ms = Some(crate::store::now_ms());
+                        checks[index].prepared_cwd = Some(run_cwd);
+                    }
+                    Err(error) => {
+                        checks[index].preparation_state = Some("failed".to_string());
+                        checks[index].preparation_detail = Some(error.clone());
+                        failures.push(format!("manual check {}: {error}", index + 1));
+                    }
+                }
             }
             Err(error) => {
                 checks[index].preparation_state = Some("failed".to_string());
@@ -11159,6 +11186,84 @@ fn normalize_target_arch(value: &str) -> String {
         "arm64" | "aarch64" => "aarch64".to_string(),
         other => other.to_string(),
     }
+}
+
+/// A check's `command` with its leading executable anchored to `cwd`, or
+/// `None` when there is nothing to anchor.
+///
+/// A manual check's executable is either at an absolute (usually shared)
+/// location or a build output / copied artifact under the prepared directory;
+/// the latter is written relative and would resolve against whatever directory
+/// the reviewer's terminal happens to start in. Only checks that run on the
+/// daemon host against a local directory are touched.
+fn anchor_check_command(
+    check: &crate::guardian::GuardianCheck,
+    cwd: &str,
+    workspace_is_local: bool,
+) -> std::result::Result<Option<String>, String> {
+    let Some(command) = check.command.as_deref() else {
+        return Ok(None);
+    };
+    if check.run_on.as_deref() == Some("review_machine") || !workspace_is_local {
+        return Ok(None);
+    }
+    let cwd = Path::new(cwd);
+    if !cwd.is_dir() {
+        return Ok(None);
+    }
+    anchor_command_executable(command, cwd)
+}
+
+/// Resolve `command`'s first token against `cwd` when it is a relative path
+/// (it contains a separator and is not rooted, a URL, or a placeholder/variable
+/// reference). Errors when the resolved file does not exist, because a check
+/// whose executable is missing must not be offered as ready.
+fn anchor_command_executable(
+    command: &str,
+    cwd: &Path,
+) -> std::result::Result<Option<String>, String> {
+    let trimmed = command.trim_start();
+    let (token, rest) = match trimmed.strip_prefix('"') {
+        Some(after) => match after.split_once('"') {
+            Some((token, rest)) => (token, rest),
+            None => return Ok(None),
+        },
+        None => match trimmed.find(char::is_whitespace) {
+            Some(end) => trimmed.split_at(end),
+            None => (trimmed, ""),
+        },
+    };
+    let bytes = token.as_bytes();
+    let rooted = token.starts_with(['/', '\\', '~'])
+        || (bytes.len() >= 2 && bytes[1] == b':')
+        || Path::new(token).is_absolute();
+    let indirect = token.contains(['{', '%', '$', '`']) || token.contains("://");
+    if !token.contains(['/', '\\']) || rooted || indirect {
+        return Ok(None);
+    }
+    let candidate = cwd.join(token);
+    #[allow(unused_mut)]
+    let mut found = candidate.exists();
+    #[cfg(windows)]
+    if !found {
+        found = ["exe", "cmd", "bat", "com"]
+            .iter()
+            .any(|ext| Path::new(&format!("{}.{ext}", candidate.display())).exists());
+    }
+    let mut absolute = candidate.to_string_lossy().into_owned();
+    if cfg!(windows) {
+        absolute = absolute.replace('/', "\\");
+    }
+    if !found {
+        return Err(format!(
+            "executable {token:?} resolves to {absolute}, which does not exist; \
+             the action's prepare step did not produce it"
+        ));
+    }
+    if absolute.contains(char::is_whitespace) {
+        absolute = format!("\"{absolute}\"");
+    }
+    Ok(Some(format!("{absolute}{rest}")))
 }
 
 fn artifact_exists_command(relative: &str) -> String {
@@ -14072,7 +14177,10 @@ pub fn manual_commands_prompt(tail: &str, steering: Option<&str>) -> String {
          branch name, database file -- give that input the SAME \"name\" and the SAME \
          \"default\" in every check that uses it, so one value is consistent across all of the \
          review's checks and a reviewer changes it once. Use \"run_on\": \"daemon\" unless the \
-         command explicitly needs the review machine.";
+         command explicitly needs the review machine. A command that launches a built or \
+         copied executable may name it relative to the review checkout (e.g. \
+         `target\\debug\\app.exe`); Ralphus resolves it to an absolute path once its \
+         \"prepare\" steps have produced it, so the file must exist after those steps.";
     let format = " Return ONLY a valid JSON array where each element is either a plain string or \
           the object shape described above — no markdown fences, no explanation, no \
           other text.";
@@ -16012,6 +16120,72 @@ mod tests {
             ..GuardianCheck::default()
         }];
         assert!(!settled_review_needs_manual_checks(&has_checks));
+    }
+
+    #[test]
+    fn relative_executable_is_anchored_to_the_prepared_directory() {
+        let dir = std::env::temp_dir().join(format!("ralphus-anchor-{}", std::process::id()));
+        let bin = dir.join("target").join("debug");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("app.exe"), b"").unwrap();
+        std::fs::write(bin.join("tool"), b"").unwrap();
+
+        let anchored = anchor_command_executable("target/debug/tool --flag x", &dir)
+            .unwrap()
+            .unwrap();
+        assert!(anchored.ends_with(" --flag x"));
+        assert!(Path::new(anchored.split(' ').next().unwrap()).is_absolute());
+
+        // Quoted token, and a backslash-separated one.
+        let quoted = anchor_command_executable("\"target/debug/tool\" go", &dir)
+            .unwrap()
+            .unwrap();
+        assert!(quoted.ends_with(" go"));
+        #[cfg(windows)]
+        assert!(
+            anchor_command_executable("target\\debug\\app", &dir)
+                .unwrap()
+                .is_some(),
+            "an extensionless name resolves through PATHEXT-style extensions"
+        );
+
+        // Not relative paths: bare tools, rooted paths, URLs, placeholders.
+        for untouched in [
+            "cargo run",
+            "Start-Process \"http://127.0.0.1:{board_port}/\"",
+            "C:/tools/app.exe x",
+            "/usr/bin/env x",
+            "{bin}/app",
+            "%TEMP%\\app.exe",
+        ] {
+            assert_eq!(anchor_command_executable(untouched, &dir).unwrap(), None);
+        }
+
+        let missing = anchor_command_executable("target/debug/absent run", &dir).unwrap_err();
+        assert!(missing.contains("does not exist"), "{missing}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn anchor_check_command_skips_remote_and_missing_directories() {
+        let check = GuardianCheck {
+            command: Some("target/debug/app".to_string()),
+            ..GuardianCheck::default()
+        };
+        assert_eq!(anchor_check_command(&check, "/no/such/dir", true), Ok(None));
+        let here = std::env::temp_dir();
+        assert_eq!(
+            anchor_check_command(&check, &here.to_string_lossy(), false),
+            Ok(None)
+        );
+        let remote = GuardianCheck {
+            run_on: Some("review_machine".to_string()),
+            ..check
+        };
+        assert_eq!(
+            anchor_check_command(&remote, &here.to_string_lossy(), true),
+            Ok(None)
+        );
     }
 
     #[test]
