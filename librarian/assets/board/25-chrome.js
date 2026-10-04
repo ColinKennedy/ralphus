@@ -1078,8 +1078,10 @@
         // land on a review the current status/resolver/origin/PR-status/
         // search filter would otherwise exclude. Scoped to this single id;
         // it does not relax the filter for anything else.
+        const quick = activeReviewQuickFilter();
         return guardians.filter((g) => g.id === revealedGuardianId
           || (reviewFilters.status.has(g.status)
+            && reviewMatchesQuickFilter(quick, g)
             && reviewFilters.resolver.has(resolverOf(g))
             && reviewFilters.origin.has(originOf(g))
             && (g.id.toLowerCase().includes(reviewFilters.q) || g.name.toLowerCase().includes(reviewFilters.q))

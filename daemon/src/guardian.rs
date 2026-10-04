@@ -642,6 +642,42 @@ pub struct BranchView {
     pub auto_submit_error: Option<String>,
 }
 
+/// Whether a review sits at a decision point for a human (RAL-559) -- the one
+/// predicate behind the board's "Needs you" filter and its count badge.
+///
+/// * `merge_failed` / `merge_stopped` always need a person.
+/// * `in_review` needs one only once the whole stack has settled: every
+///   *enabled* branch has rebased cleanly (`done`, `conflict_resolved`, or
+///   already integrated/closed upstream) and no live PR is still processing
+///   (open with a pending or never-polled CI status). From there the stack
+///   is either fully mergeable or has a failing PR (including one whose
+///   auto-fix budget is exhausted, which is a failing PR by definition).
+/// * Every other status -- still collecting/merging, or terminal -- never does.
+///
+/// `branches` is `(enabled, merge_status)` per branch; `prs` is
+/// `(state, ci_status)` per PR row of this review.
+#[must_use]
+pub fn review_needs_attention(
+    status: &str,
+    branches: &[(bool, &str)],
+    prs: &[(&str, Option<&str>)],
+) -> bool {
+    match status {
+        "merge_failed" | "merge_stopped" => true,
+        "in_review" => {
+            let mut enabled = branches.iter().filter(|(on, _)| *on).peekable();
+            let stack_settled = enabled.peek().is_some()
+                && enabled
+                    .all(|(_, s)| matches!(*s, "done" | "conflict_resolved" | "merged" | "closed"));
+            let pr_processing = prs
+                .iter()
+                .any(|(state, ci)| *state == "open" && matches!(ci, None | Some("pending")));
+            stack_settled && !pr_processing
+        }
+        _ => false,
+    }
+}
+
 /// Human-readable label for a branch in Cartographer log text: its readable
 /// review-branch name (RAL-378, e.g. `ral-521-cache-review-manual-checks`,
 /// the same label shown in the board's review view) when one has been
@@ -10534,5 +10570,65 @@ mod tests {
                 .finish_guardian_post_merge(&id, second, true, None)
                 .unwrap()
         );
+    }
+}
+
+#[cfg(test)]
+mod needs_attention_tests {
+    use super::review_needs_attention as needs;
+
+    const DONE: (bool, &str) = (true, "done");
+
+    #[test]
+    fn incomplete_stack_is_hidden() {
+        for s in [
+            "pending",
+            "ready",
+            "in_progress",
+            "actioning",
+            "proof_pending",
+        ] {
+            assert!(!needs("in_review", &[DONE, (true, s)], &[]), "{s}");
+        }
+        assert!(!needs("in_review", &[], &[]), "empty stack");
+        assert!(!needs("collecting", &[DONE], &[]));
+        assert!(!needs("merging", &[DONE], &[]));
+    }
+
+    #[test]
+    fn disabled_branches_are_ignored() {
+        assert!(needs("in_review", &[DONE, (false, "pending")], &[]));
+    }
+
+    #[test]
+    fn fully_successful_stack_is_shown() {
+        let prs = [("open", Some("passing")), ("open", Some("passing"))];
+        assert!(needs("in_review", &[DONE, DONE], &prs));
+        assert!(needs("in_review", &[DONE, (true, "merged")], &[]));
+    }
+
+    #[test]
+    fn failed_pr_is_shown() {
+        let prs = [("open", Some("passing")), ("open", Some("failing"))];
+        assert!(needs("in_review", &[DONE, DONE], &prs));
+    }
+
+    #[test]
+    fn pending_pr_is_hidden() {
+        for ci in [None, Some("pending")] {
+            let prs = [("open", Some("failing")), ("open", ci)];
+            assert!(!needs("in_review", &[DONE, DONE], &prs));
+        }
+        // A dropped PR is no longer processing.
+        assert!(needs("in_review", &[DONE], &[("dropped", None)]));
+    }
+
+    #[test]
+    fn stalled_merges_are_shown_and_terminal_hidden() {
+        assert!(needs("merge_failed", &[(true, "failed")], &[]));
+        assert!(needs("merge_stopped", &[(true, "stopped")], &[]));
+        for s in ["merged", "approved", "cancelled", "deployed"] {
+            assert!(!needs(s, &[DONE], &[]), "{s}");
+        }
     }
 }

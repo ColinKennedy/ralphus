@@ -13993,6 +13993,11 @@ struct GuardianIndexEntry {
     /// Just the count -- the sidebar list shows "N branches", never a
     /// per-branch breakdown; that only renders once a review is open.
     branch_count: usize,
+    /// RAL-559: whether this review is at a human decision point -- the
+    /// board's "Needs you" filter and its count badge key on this one
+    /// daemon-derived flag (see [`crate::guardian::review_needs_attention`])
+    /// because the branch and PR detail it needs is not in the lean index.
+    needs_attention: bool,
     resolver_agent: Option<String>,
     git_root: String,
     projects: Vec<String>,
@@ -14001,9 +14006,22 @@ struct GuardianIndexEntry {
     notice_at_ms: Option<i64>,
 }
 
-impl From<crate::guardian::GuardianView> for GuardianIndexEntry {
-    fn from(value: crate::guardian::GuardianView) -> Self {
+impl GuardianIndexEntry {
+    fn new(value: crate::guardian::GuardianView, prs: &[crate::pr::PrIndexRow]) -> Self {
+        let branches: Vec<(bool, &str)> = value
+            .branches
+            .iter()
+            .map(|b| (b.enabled, b.merge_status.as_str()))
+            .collect();
+        let pr_states: Vec<(&str, Option<&str>)> = prs
+            .iter()
+            .filter(|p| p.guardian_id == value.id)
+            .map(|p| (p.state.as_str(), p.ci_status.as_deref()))
+            .collect();
+        let needs_attention =
+            crate::guardian::review_needs_attention(&value.status, &branches, &pr_states);
         Self {
+            needs_attention,
             id: value.id,
             name: value.name,
             status: value.status,
@@ -14025,15 +14043,24 @@ impl From<crate::guardian::GuardianView> for GuardianIndexEntry {
 /// serialization/transfer cost of the ~50 detail-only fields the sidebar
 /// list never reads.
 fn guardian_index(daemon: &Daemon) -> Reply {
-    match daemon.with_read_snapshot(Store::list_guardians_conn) {
-        Ok(gs) => {
+    let read = daemon.with_read_snapshot(|conn| {
+        Ok((
+            Store::list_guardians_conn(conn)?,
+            Store::list_pull_requests_index_conn(conn)?,
+        ))
+    });
+    match read {
+        Ok((gs, prs)) => {
             let queue = daemon.summary_queue_handle();
             for g in &gs {
                 if g.status == "collecting" {
                     queue.enqueue(&g.id, crate::summary_worker::Priority::Low);
                 }
             }
-            let entries: Vec<GuardianIndexEntry> = gs.into_iter().map(Into::into).collect();
+            let entries: Vec<GuardianIndexEntry> = gs
+                .into_iter()
+                .map(|g| GuardianIndexEntry::new(g, &prs))
+                .collect();
             json(200, &entries)
         }
         Err(e) => store_error(&e),

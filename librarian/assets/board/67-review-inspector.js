@@ -1147,7 +1147,8 @@
       // disclosure. Nothing is removed: the presets write the same
       // `reviewFilters.status` set the popovers do.
 
-      /** @type {{[preset: string]: {label: string, states: string[], tip: string}}} */
+      // RALPHUS-REVIEW-QUICK-FILTERS:BEGIN
+      /** @type {{[preset: string]: {label: string, states: string[], needsAttention?: boolean, tip: string}}} */
       const REVIEW_QUICK_FILTERS = {
         active: {
           label: "Active",
@@ -1157,7 +1158,11 @@
         needs: {
           label: "Needs you",
           states: ["in_review", "merge_failed", "merge_stopped"],
-          tip: "Reviews waiting on a human decision — ready to approve, or stalled and needing a call.",
+          // Status alone is not enough: an `in_review` stack still processing
+          // is not waiting on anyone. The daemon's `needs_attention` flag is
+          // the whole-stack verdict.
+          needsAttention: true,
+          tip: "Reviews waiting on a human decision — every branch rebased and its PRs settled (all passing, or one failing), or a stalled merge.",
         },
         closed: {
           label: "Closed",
@@ -1165,6 +1170,21 @@
           tip: "Reviews that are finished one way or another.",
         },
       };
+      /**
+       * Whether a review belongs to a quick-filter preset: its status is one
+       * the preset lists and, for a preset that asks for it, the daemon
+       * marked it as needing attention. Shared by the sidebar list, the
+       * count badges, and the Tasks tab's "needs me" check.
+       * @param {string} preset - A key of {@link REVIEW_QUICK_FILTERS}, or "" for no preset.
+       * @param {{status: string, needs_attention?: boolean}} g
+       * @returns {boolean}
+       */
+      function reviewMatchesQuickFilter(preset, g) {
+        const def = REVIEW_QUICK_FILTERS[preset];
+        if (!def) return true;
+        return def.states.includes(g.status) && (!def.needsAttention || !!g.needs_attention);
+      }
+      // RALPHUS-REVIEW-QUICK-FILTERS:END
       /** @type {boolean} Whether the full filter set is disclosed. */
       let reviewFiltersExpanded = false;
 
@@ -1214,7 +1234,7 @@
         // request -- a lean index entry carries the status this keys on.
         const counts = Object.fromEntries(Object.keys(REVIEW_QUICK_FILTERS).map((k) => [
           k,
-          guardians.filter((g) => REVIEW_QUICK_FILTERS[k].states.includes(g.status)
+          guardians.filter((g) => reviewMatchesQuickFilter(k, g)
             && (reviewFilters.showHidden || !hiddenGuardianIds.has(g.id))).length,
         ]));
         host.innerHTML = `<div class="quick-seg">${Object.keys(REVIEW_QUICK_FILTERS).map((k) =>

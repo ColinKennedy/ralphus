@@ -1007,16 +1007,17 @@
        * @param {string[]} notifyTiers
        * @param {TtReview[]} reviews
        * @param {number} prCount
+       * @param {Set<string>} [attentionReviewIds] - ids of reviews the Reviews tab's "Needs you" preset includes
        * @returns {{needs: boolean, reason: string|null}}
        */
-      function ttTaskNeedsMe(task, effectiveWatch, notifyTiers, reviews, prCount) {
+      function ttTaskNeedsMe(task, effectiveWatch, notifyTiers, reviews, prCount, attentionReviewIds = new Set()) {
         if (!effectiveWatch.watched) return { needs: false, reason: null };
         if (task.state === "failed" && ttTierAllows(notifyTiers, "failed")) {
           return { needs: true, reason: "This task failed." };
         }
-        const inReview = reviews.find((r) => r.status === "in_review");
+        const inReview = reviews.find((r) => attentionReviewIds.has(r.id));
         if (inReview && ttTierAllows(notifyTiers, "in_review")) {
-          return { needs: true, reason: `Review "${inReview.name}" is in_review, awaiting your approval.` };
+          return { needs: true, reason: `Review "${inReview.name}" is ${inReview.status}, awaiting your attention.` };
         }
         const merged = reviews.find((r) => r.status === "merged");
         if (merged && !prCount && ttTierAllows(notifyTiers, "merged_no_pr")) {
