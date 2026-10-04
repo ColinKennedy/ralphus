@@ -353,6 +353,17 @@ fn parse_initialize_bool(scanner: &mut Scanner, name: &str) -> Result<Option<boo
         })
 }
 
+fn parse_sample_mode(scanner: &mut Scanner) -> Result<Option<String>, UsageError> {
+    scanner
+        .take_value("--sample-mode")?
+        .map_or(Ok(None), |value| match value.as_str() {
+            "agent" | "raw" => Ok(Some(value)),
+            _ => Err(UsageError(format!(
+                "--sample-mode: expected agent or raw, got '{value}'"
+            ))),
+        })
+}
+
 fn parse_initialize_server(
     scanner: &mut Scanner,
 ) -> Result<initialize_server::InitializeServerOptions, UsageError> {
@@ -377,6 +388,7 @@ fn parse_initialize_server(
         create_admin: parse_initialize_bool(scanner, "--create-admin")?,
         admin_name: scanner.take_value("--admin-name")?,
         submit_sample: parse_initialize_bool(scanner, "--submit-sample")?,
+        sample_mode: parse_sample_mode(scanner)?,
         sample_agent: scanner.take_value("--sample-agent")?,
     })
 }
@@ -567,6 +579,8 @@ mod tests {
             "Ada",
             "--submit-sample",
             "yes",
+            "--sample-mode",
+            "agent",
             "--sample-agent",
             "claude-code",
         ])) {
@@ -575,6 +589,7 @@ mod tests {
                 assert_eq!(setup.mcp_hosts, ["claude"]);
                 assert_eq!(setup.project_name.as_deref(), Some("ralphus"));
                 assert_eq!(setup.forge_token.as_deref(), Some("token"));
+                assert_eq!(setup.sample_mode.as_deref(), Some("agent"));
                 assert_eq!(setup.sample_agent.as_deref(), Some("claude-code"));
             }
             other => panic!("unexpected: {other:?}"),
@@ -585,6 +600,14 @@ mod tests {
     fn initialize_server_rejects_invalid_boolean_answer() {
         match parse_args(&v(&["initialize", "server", "--create-admin", "perhaps"])) {
             Command::UsageError(message) => assert!(message.contains("expected yes or no")),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn initialize_server_rejects_invalid_sample_mode() {
+        match parse_args(&v(&["initialize", "server", "--sample-mode", "shell"])) {
+            Command::UsageError(message) => assert!(message.contains("expected agent or raw")),
             other => panic!("unexpected: {other:?}"),
         }
     }

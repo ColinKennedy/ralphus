@@ -10,11 +10,11 @@
 //! the same way `ralphus mcp initialize` rejects one (see `mcp.rs`).
 //! Boolean answer flags take `yes` or `no`: `--install-tmux`,
 //! `--setup-mcp`, `--register-project`, `--require-forks`, `--create-admin`,
-//! and `--submit-sample`. The value flags are `--tmux-program`, repeatable
+//! `--submit-sample`. The value flags are `--tmux-program`, repeatable
 //! `--mcp-host`, `--project-name`, `--project-description`,
 //! `--bug-threshold`, `--feature-threshold`, `--investigation-threshold`,
 //! `--unclassified-threshold`, `--fork-user`, `--fork-url`, `--forge-host`,
-//! `--forge-token`, `--admin-name`, and `--sample-agent`.
+//! `--forge-token`, `--admin-name`, `--sample-mode`, and `--sample-agent`.
 
 use std::io::{IsTerminal as _, Write as _};
 use std::path::PathBuf;
@@ -116,6 +116,10 @@ const SAMPLE_AGENT: InitializeSetting = InitializeSetting {
     prompt: "sample agent",
     flag: "--sample-agent",
 };
+const SAMPLE_MODE: InitializeSetting = InitializeSetting {
+    prompt: "sample mode",
+    flag: "--sample-mode",
+};
 
 const INTERACTIVE_SETTINGS: &[&InitializeSetting] = &[
     &INSTALL_TMUX,
@@ -137,6 +141,7 @@ const INTERACTIVE_SETTINGS: &[&InitializeSetting] = &[
     &CREATE_ADMIN,
     &ADMIN_NAME,
     &SUBMIT_SAMPLE,
+    &SAMPLE_MODE,
     &SAMPLE_AGENT,
 ];
 
@@ -175,6 +180,7 @@ pub struct InitializeServerOptions {
     pub create_admin: Option<bool>,
     pub admin_name: Option<String>,
     pub submit_sample: Option<bool>,
+    pub sample_mode: Option<String>,
     pub sample_agent: Option<String>,
 }
 
@@ -205,6 +211,7 @@ impl std::fmt::Debug for InitializeServerOptions {
             .field("create_admin", &self.create_admin)
             .field("admin_name", &self.admin_name)
             .field("submit_sample", &self.submit_sample)
+            .field("sample_mode", &self.sample_mode)
             .field("sample_agent", &self.sample_agent)
             .finish()
     }
@@ -232,6 +239,7 @@ impl InitializeServerOptions {
             || self.create_admin.is_some()
             || self.admin_name.is_some()
             || self.submit_sample.is_some()
+            || self.sample_mode.is_some()
             || self.sample_agent.is_some()
     }
 }
@@ -950,7 +958,7 @@ fn step_health(opts: &GlobalOpts) -> Vec<CheckResult> {
     crate::health::run_checks(&opts.daemon_url, &cwd, false, false, false)
 }
 
-fn health_ok_for_sample(results: &[CheckResult]) -> bool {
+fn health_ok_for_sample(results: &[CheckResult], requires_agent: bool) -> bool {
     let daemon_ok = results
         .iter()
         .any(|r| r.id == ralphus_core::health_catalog::ID_DAEMON && !r.is_fail());
@@ -961,42 +969,38 @@ fn health_ok_for_sample(results: &[CheckResult]) -> bool {
     ]
     .iter()
     .any(|id| results.iter().any(|r| r.id.as_str() == *id && !r.is_fail()));
-    daemon_ok && agent_ok
+    daemon_ok && (!requires_agent || agent_ok)
 }
 
 // ---- sample submission ----------------------------------------------------
 
-fn sample_task_toml(project: &str, branch: &str, agent: &str) -> String {
-    format!(
-        r#"[[review]]
-id = "ralphus:new-review/{branch}"
-name = "hello world"
-agent = "{agent}"
-skip_auto_build = true
+fn sample_task_toml(project: &str, mode: &str, agent: Option<&str>) -> String {
+    let review_id = "ralphus:new-review/ralphus-hello-world";
+    let mut toml = format!(
+        "[[review]]\nid = \"{review_id}\"\nname = \"Hello world for {project}\"\nproof_scope = \"nothing\"\n\n"
+    );
+    if let Some(agent) = agent {
+        toml.push_str(&format!("agent = \"{agent}\"\n\n"));
+    }
 
-[[task]]
-name = "{branch}"
-project = "{project}"
-
-  [[task.cell]]
-  id = "work"
-  agent = "{agent}"
-  cwd = "<<ralphus:new-worktree/{branch}?upstream=<<default>>>>"
-  review = "<<ralphus:new-review/{branch}>>"
-  system_prompt = "Do NOT commit and do NOT push under any circumstances. You are working in a dedicated git worktree of this repository; implement the work exactly as described and keep your changes only within the worktree."
-  system_prompt_position = "append"
-  prompt = "Create a file named hello-world.txt containing the single line \"Hello, world!\". Do not modify any other files."
-
-  [[task.cell]]
-  id = "finalize"
-  agent = "{agent}"
-  cwd = "<<ralphus:new-worktree/{branch}?upstream=<<default>>>>"
-  depends_on = ["work"]
-  system_prompt = "ONLY git stage the relevant source files, commit them, and push the commit if a remote exists -- do not make further edits."
-  system_prompt_position = "append"
-  prompt = "Stage, commit, and push hello-world.txt."
-"#
-    )
+    for suffix in ["alpha", "beta", "gamma"] {
+        let branch = format!("ralphus-hello-world-{suffix}");
+        let file = format!("hello-world-{suffix}.txt");
+        toml.push_str(&format!(
+            "[[task]]\nname = \"hello-world-{suffix}\"\nproject = \"{project}\"\n\n  [[task.cell]]\n  id = \"write\"\n  cwd = \"<<ralphus:new-worktree/{branch}?upstream=<<default>>>>\"\n  review = \"<<{review_id}>>\"\n"
+        ));
+        match mode {
+            "raw" => toml.push_str(&format!(
+                "  mode = \"raw\"\n  command = \"echo Hello from Ralphus task {suffix}.> {file} && git add -- {file} && git commit --message \\\"Add {file}\\\" && git push --set-upstream origin {branch}\"\n\n"
+            )),
+            "agent" => toml.push_str(&format!(
+                "  agent = \"{}\"\n  system_prompt = \"Work only in the dedicated git worktree. Create exactly the requested file, stage only that file, commit it, and push the branch.\"\n  system_prompt_position = \"append\"\n  prompt = \"Create {file} containing the single line \\\"Hello from Ralphus task {suffix}.\\\". Do not modify any other files. Then stage, commit, and push that file.\"\n\n",
+                agent.expect("agent mode supplies an agent")
+            )),
+            _ => unreachable!("sample mode is parsed before TOML generation"),
+        }
+    }
+    toml
 }
 
 fn step_sample(
@@ -1009,15 +1013,9 @@ fn step_sample(
         println!("  skipped: no project was registered");
         return;
     };
-    if !health_ok_for_sample(health_results) {
-        println!(
-            "  skipped: `ralphus check health` reported a failing daemon or no reachable agent -- fix that first, then submit a sample task yourself"
-        );
-        return;
-    }
     if !prompt_yes_no(
         &SUBMIT_SAMPLE,
-        "  submit a sample two-cell hello-world task now?",
+        &format!("  submit a three-task hello-world squad for {project} now?"),
         true,
         setup.submit_sample,
         setup.yes,
@@ -1025,15 +1023,28 @@ fn step_sample(
         println!("  skipped");
         return;
     }
-    let agent = prompt(
-        &SAMPLE_AGENT,
-        "  agent backend for the sample task",
-        "claude-code",
-        setup.sample_agent.as_ref(),
-        setup.yes,
-    );
-    let branch = "ralphus-hello-world";
-    let toml_text = sample_task_toml(project, branch, &agent);
+    let mode = sample_mode(setup);
+    if !health_ok_for_sample(health_results, mode == "agent") {
+        let requirement = if mode == "agent" {
+            "a failing daemon or no reachable agent"
+        } else {
+            "a failing daemon"
+        };
+        println!(
+            "  skipped: `ralphus check health` reported {requirement} -- fix that first, then submit a sample task yourself"
+        );
+        return;
+    }
+    let agent = (mode == "agent").then(|| {
+        prompt(
+            &SAMPLE_AGENT,
+            "  agent backend for the hello-world prompts",
+            "claude-code",
+            setup.sample_agent.as_ref(),
+            setup.yes,
+        )
+    });
+    let toml_text = sample_task_toml(project, &mode, agent.as_deref());
     let client = opts.client();
     let sample_already_submitted = client
         .tasks(None, Some(SAMPLE_LABEL), None)
@@ -1058,6 +1069,22 @@ fn step_sample(
     println!("  equivalent command: ralphus submit {}", path.display());
 }
 
+fn sample_mode(setup: &InitializeServerOptions) -> String {
+    loop {
+        let mode = prompt(
+            &SAMPLE_MODE,
+            "  run the hello-world tasks with an agent or raw commands",
+            "agent",
+            setup.sample_mode.as_ref(),
+            setup.yes,
+        );
+        if matches!(mode.as_str(), "agent" | "raw") {
+            return mode;
+        }
+        println!("  please enter `agent` or `raw`");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1065,6 +1092,29 @@ mod tests {
     #[test]
     fn interactive_settings_have_unique_prompt_and_flag_contracts() {
         assert!(interactive_settings_are_valid());
-        assert_eq!(INTERACTIVE_SETTINGS.len(), 20);
+        assert_eq!(INTERACTIVE_SETTINGS.len(), 21);
+    }
+
+    #[test]
+    fn sample_toml_uses_three_parallel_tasks_and_one_explicit_review() {
+        let toml = sample_task_toml("example", "agent", Some("claude-code"));
+        assert_eq!(toml.matches("[[task]]").count(), 3);
+        assert_eq!(toml.matches("review = \"<<ralphus:new-review/").count(), 3);
+        assert!(!toml.contains("depends_on"));
+        assert!(
+            ralphus_core::validate::validate_toml(&toml).is_ok(),
+            "{toml}"
+        );
+    }
+
+    #[test]
+    fn raw_sample_toml_has_no_agent_cells() {
+        let toml = sample_task_toml("example", "raw", None);
+        assert_eq!(toml.matches("mode = \"raw\"").count(), 3);
+        assert!(!toml.contains("  agent ="));
+        assert!(
+            ralphus_core::validate::validate_toml(&toml).is_ok(),
+            "{toml}"
+        );
     }
 }
