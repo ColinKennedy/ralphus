@@ -11,7 +11,7 @@
 // line count as padding above.
 
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -33,17 +33,16 @@ const totalLines = text.split("\n").length;
 const shell = readFileSync(shellPath, "utf8");
 const scriptStart = shell.slice(0, shell.search(/^.*<script src="\/board\//m)).split("\n").length;
 
-const knipBin = join(repoRoot, "node_modules", "knip", "bin", "knip.js");
-if (!existsSync(knipBin)) {
-  process.stderr.write(
-    "Knip is not installed in this checkout. Run `npm ci --no-audit --no-fund` from the repository root before rerunning `npm run knip`.\n",
-  );
-  process.exit(1);
-}
-const result = spawnSync(process.execPath, [knipBin], {
+// Invoke the package's public command through PATH. npm adds the project's
+// `.bin` directory to PATH for scripts, while the package's internal bin
+// layout is not a stable interface (and may not be materialized in a linked
+// or shared dependency installation).
+const knipCommand = process.platform === "win32" ? "knip.cmd" : "knip";
+const result = spawnSync(knipCommand, [], {
   cwd: repoRoot,
   encoding: "utf8",
   maxBuffer: 64 * 1024 * 1024,
+  shell: process.platform === "win32",
 });
 
 const SHELL_RE = /(librarian[\\/]assets[\\/]board\.html):(\d+):(\d+)/g;
