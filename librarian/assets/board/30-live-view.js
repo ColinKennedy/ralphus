@@ -726,9 +726,10 @@
        * @param {string[]} lines
        * @param {boolean} showDebug
        * @param {boolean} showThinking
+       * @param {LiveViewTypeFilter|undefined} typeFilter
        * @returns {string}
        */
-      function renderTapeLines(lines, showDebug, showThinking) {
+      function renderTapeLines(lines, showDebug, showThinking, typeFilter) {
         const out = [];
         let folding = false;
         // Whether the previous row wrapped, and if so whether the logical line
@@ -738,6 +739,11 @@
         let inWrap = false;
         /** @type {boolean} */
         let wrapIsThinking = false;
+        // A tmux wrap tail has no type marker of its own. Keep the excluded
+        // line's decision across its rows, without treating ordinary untagged
+        // continuation output as part of that line.
+        /** @type {boolean} */
+        let wrapTypeExcluded = false;
         for (const raw of lines) {
           const clean = renderPaneLine(raw).replace(/\r$/, "");
           /** @type {boolean} */
@@ -751,7 +757,13 @@
             rendered = clean;
           }
           wrapIsThinking = thinking;
+          /** @type {boolean} */
+          const typeExcluded = inWrap
+            ? wrapTypeExcluded
+            : typeFilter !== undefined && liveViewTypeIsExcluded(clean, typeFilter);
+          wrapTypeExcluded = typeExcluded;
           inWrap = tapeLineWrapped(raw);
+          if (typeExcluded) continue;
           if (rendered === null) continue;
           if (rendered === THINKING_FOLDED) {
             if (folding) continue;
@@ -980,22 +992,75 @@
           if (peekTape[key] !== undefined) renderPeekTape(key);
         }, 250);
       }
+      // RALPHUS-LIVE-VIEW-TYPES:BEGIN
+      /** @typedef {{includes: string[], excludes: string[]}} LiveViewTypeFilter */
+      /** Tooltip shared by every Live View type-filter control. */
+      const LIVE_VIEW_TYPE_FILTER_TIP = "Filter bracket-tagged terminal lines to focus on the events you need, such as hiding noisy [usage] updates.\nUse space-separated terms: plain terms include matching types; -term excludes matching types. Includes run first, then exclusions win; a bare - is ignored.\nMatching is case-insensitive substring matching, so -tool hides tool.Bash, tool.Read, and other tool.* lines.\nThis display-only filter re-renders already-loaded output without refetching.";
       /**
-       * Keeps tagged lines whose bracketed type code contains any
-       * space-separated filter term, case-insensitively. This deliberately
-       * understands every bracket kind rather than a fixed tool-name list.
+       * Gets a bracket-tagged line's type, ignoring leading indentation.
+       * @param {string} line
+       * @returns {string|null}
+       */
+      function parseLiveViewType(line) {
+        const match = line.trimStart().match(/^\[([^\]]+)\]/);
+        return match ? match[1] : null;
+      }
+      /**
+       * Splits a filter into inclusion and exclusion terms. A bare minus is
+       * ignored so incomplete typing does not unexpectedly hide every type.
+       * @param {string} filter
+       * @returns {LiveViewTypeFilter}
+       */
+      function parseLiveViewTypeFilter(filter) {
+        const includes = [];
+        const excludes = [];
+        for (const term of filter.toLowerCase().split(/\s+/).filter(Boolean)) {
+          if (term.startsWith("-")) {
+            if (term.length > 1) excludes.push(term.slice(1));
+          } else {
+            includes.push(term);
+          }
+        }
+        return { includes, excludes };
+      }
+      /**
+       * Whether a tagged line matches an exclusion term.
+       * @param {string} line
+       * @param {LiveViewTypeFilter} filter
+       * @returns {boolean}
+       */
+      function liveViewTypeIsExcluded(line, filter) {
+        const type = parseLiveViewType(line);
+        return type !== null && filter.excludes.some((term) => type.toLowerCase().includes(term));
+      }
+      /**
+       * Whether one rendered line remains visible under a type filter.
+       * Untagged lines stay visible for an exclude-only filter; include terms
+       * deliberately select tagged lines only, and exclusions always win.
+       * @param {string} line
+       * @param {LiveViewTypeFilter} filter
+       * @returns {boolean}
+       */
+      function liveViewTypeVisible(line, filter) {
+        const type = parseLiveViewType(line);
+        if (type === null) return filter.includes.length === 0;
+        const lower = type.toLowerCase();
+        if (filter.excludes.some((term) => lower.includes(term))) return false;
+        return filter.includes.length === 0 || filter.includes.some((term) => lower.includes(term));
+      }
+      /**
+       * Applies bracket-type include and exclude terms to rendered terminal
+       * text. Include terms select matching types first; exclusions then win.
        * @param {string} text
        * @param {string} filter
        * @returns {string}
        */
       function filterLiveViewTypes(text, filter) {
-        const terms = filter.toLowerCase().split(/\s+/).filter(Boolean);
-        if (terms.length === 0) return text;
-        return text.split("\n").filter((line) => {
-          const match = line.trimStart().match(/^\[([^\]]+)\]/);
-          return match !== null && terms.some((term) => match[1].toLowerCase().includes(term));
-        }).join("\n");
+        const parsed = parseLiveViewTypeFilter(filter);
+        if (parsed.includes.length === 0 && parsed.excludes.length === 0) return text;
+        return text.split("\n").filter((line) => liveViewTypeVisible(line, parsed)).join("\n");
       }
+      // RALPHUS-LIVE-VIEW-TYPES:END
       // RALPHUS-SHOW-THINKING:BEGIN
       /**
        * Whether Live View pane `key` currently expands the model's

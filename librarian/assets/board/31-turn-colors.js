@@ -129,8 +129,8 @@
       function colorizeTurnLines(text, theme) {
         let color = "";
         return text.split("\n").map((line) => {
-          const m = line.match(/^\s*\[([^\]\s]+)\]/);
-          if (m) color = typeColor(m[1], theme);
+          const type = parseLiveViewType(line);
+          if (type !== null) color = typeColor(type, theme);
           const safe = line.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
           return color && line !== "" ? `<span style="color:${color}">${safe}</span>` : safe;
         }).join("\n");

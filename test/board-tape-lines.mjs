@@ -14,6 +14,8 @@ import { dirname, join } from "node:path";
 
 const BEGIN = "// RALPHUS-TAPE-LINES:BEGIN";
 const END = "// RALPHUS-TAPE-LINES:END";
+const TYPE_BEGIN = "// RALPHUS-LIVE-VIEW-TYPES:BEGIN";
+const TYPE_END = "// RALPHUS-LIVE-VIEW-TYPES:END";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 export const boardPath = join(repoRoot, "librarian", "assets", "board");
@@ -21,13 +23,15 @@ export const boardPath = join(repoRoot, "librarian", "assets", "board");
 const html = boardScript();
 const from = html.indexOf(BEGIN);
 const to = html.indexOf(END);
-if (from === -1 || to === -1 || to < from) {
+const typeFrom = html.indexOf(TYPE_BEGIN);
+const typeTo = html.indexOf(TYPE_END);
+if (from === -1 || to === -1 || to < from || typeFrom === -1 || typeTo === -1 || typeTo < typeFrom) {
   throw new Error(
     `board-tape-lines: could not find the ${BEGIN} / ${END} markers in ${boardPath}. ` +
       "If the tape line pipeline moved, move the markers with it — these tests are its only coverage.",
   );
 }
-const source = html.slice(from + BEGIN.length, to);
+const source = `${html.slice(from + BEGIN.length, to)}\n${html.slice(typeFrom + TYPE_BEGIN.length, typeTo)}`;
 
 const exported = [
   "renderPaneLine",
@@ -36,6 +40,7 @@ const exported = [
   "classifyTapeLine",
   "renderTapeLines",
   "stripThinkingPrefixes",
+  "parseLiveViewTypeFilter",
   "THINKING_FOLDED_TEXT",
 ];
 // eslint-disable-next-line no-new-func -- evaluating the real shipped source is the point; see the header.

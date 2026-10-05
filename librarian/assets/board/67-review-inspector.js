@@ -881,10 +881,10 @@
               data-click="toggleShowDebugMessagesBtn" data-key="${esc(key)}"
               data-tip="${dead ? deadTip : "Show ralphus's own diagnostic/telemetry events inline, where they happened.\nOff by default so routine monitoring shows what the agent did.\nThis only changes what is rendered here — the daemon's logs always keep everything."}">
               <span class="bx"></span>Debug messages</button>
-            <input class="typefilter${(dead || !showDebug) ? " off" : ""}" placeholder="Filter types (e.g. read glob)"
-              value="${esc(peekTypeFilterInput[key] || "")}" ${(dead || !showDebug) ? "disabled" : ""}
+            <input class="typefilter${dead ? " dead" : ""}" placeholder="Filter types (e.g. read glob or -usage)"
+              value="${esc(peekTypeFilterInput[key] || "")}" ${dead ? "disabled" : ""}
               oninput="setPeekTypeFilter('${esc(key)}',this.value)" aria-label="Filter log types"
-              data-tip="${dead ? deadTip : (!showDebug ? "Turn on Debug messages to filter by type." : "Show only bracket-tagged lines whose type contains any space-separated term.\nCase-insensitive; 'read glob' shows tool.Read and tool.Glob.")}">
+              data-tip="${dead ? `${deadTip}\n${LIVE_VIEW_TYPE_FILTER_TIP}` : LIVE_VIEW_TYPE_FILTER_TIP}">
             ${canThink ? `<button class="tgl ${showThinking ? "on" : ""}${dead ? " off" : ""}" ${dead ? 'aria-disabled="true"' : ""}
               data-click="toggleShowThinkingBtn" data-key="${esc(key)}"
               data-tip="${dead ? deadTip : "Show the model's own reasoning expanded inline.\nOff folds each block to a single &lt;thinking…&gt; line.\nPurely a display choice — the reasoning is always captured, so toggling re-renders text already loaded without refetching."}">
