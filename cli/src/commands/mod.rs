@@ -546,11 +546,21 @@ pub fn dispatch(cmd: Command, opts: &GlobalOpts) -> i32 {
         Command::Mcp(c) => mcp::dispatch(c),
         Command::InitializeGit { path } => misc::cmd_initialize_git(path),
         Command::InitializeServer { setup } => initialize_server::dispatch(opts, *setup),
-        Command::InitializeWaypoint { state_dir } => initialize_waypoint::dispatch(state_dir),
-        Command::InitializeMailbox { state_dir } => initialize_mailbox::dispatch(state_dir),
-        Command::InitializeMachine { state_dir } => initialize_machine::dispatch(state_dir),
-        Command::InitializeTriage { state_dir } => initialize_triage::dispatch(state_dir),
-        Command::InitializeReview { state_dir } => initialize_review::dispatch(state_dir),
+        Command::InitializeWaypoint { state_dir } => {
+            initialize_exercise::run_logged("waypoint", || initialize_waypoint::dispatch(state_dir))
+        }
+        Command::InitializeMailbox { state_dir } => {
+            initialize_exercise::run_logged("mailbox", || initialize_mailbox::dispatch(state_dir))
+        }
+        Command::InitializeMachine { state_dir } => {
+            initialize_exercise::run_logged("machine", || initialize_machine::dispatch(state_dir))
+        }
+        Command::InitializeTriage { state_dir } => {
+            initialize_exercise::run_logged("triage", || initialize_triage::dispatch(state_dir))
+        }
+        Command::InitializeReview { state_dir } => {
+            initialize_exercise::run_logged("review", || initialize_review::dispatch(state_dir))
+        }
         Command::Project(c) => project::dispatch(c, opts),
         Command::Machine(c) => machine::dispatch(c, opts),
         Command::Agent(c) => agent::dispatch(c, opts),

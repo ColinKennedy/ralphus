@@ -903,8 +903,8 @@ const CHECK_CHILDREN: &[HelpNode] = &[
     ),
 ];
 
-// ralphus[ignore-endpoint-cli]: configures local git repo settings/hooks; no daemon round trip
 const INITIALIZE_CHILDREN: &[HelpNode] = &[
+    // ralphus[ignore-endpoint-cli]: configures local git repo settings/hooks; no daemon round trip
     node(
         "git",
         &[],
@@ -924,6 +924,7 @@ const INITIALIZE_CHILDREN: &[HelpNode] = &[
         false,
         &[],
     ),
+    // ralphus[ignore-endpoint-cli]: launches an isolated local daemon and exercises several daemon endpoints as one guided scenario.
     node(
         "mailbox",
         &[],
@@ -933,6 +934,7 @@ const INITIALIZE_CHILDREN: &[HelpNode] = &[
         false,
         &[],
     ),
+    // ralphus[ignore-endpoint-cli]: launches an isolated local daemon and exercises several daemon endpoints as one guided scenario.
     node(
         "machine",
         &[],
@@ -942,6 +944,7 @@ const INITIALIZE_CHILDREN: &[HelpNode] = &[
         false,
         &[],
     ),
+    // ralphus[ignore-endpoint-cli]: launches an isolated local daemon and exercises several daemon endpoints as one guided scenario.
     node(
         "triage",
         &[],
@@ -951,6 +954,7 @@ const INITIALIZE_CHILDREN: &[HelpNode] = &[
         false,
         &[],
     ),
+    // ralphus[ignore-endpoint-cli]: launches an isolated local daemon and exercises several daemon endpoints as one guided scenario.
     node(
         "review",
         &[],

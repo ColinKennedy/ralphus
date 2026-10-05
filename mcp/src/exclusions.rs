@@ -12,6 +12,29 @@
 /// unimplemented tool is.
 pub const EXCLUDED: &[(&[&str], &str)] = &[
     (
+        &["initialize", "waypoint"],
+        "Spawns a private, long-lived ralphus-daemon subprocess with its own database, token, \
+         and config, then drives a multi-step guided scenario against it and leaves it running \
+         for a human to inspect -- a local process launch, not a request/response against the \
+         daemon this MCP server is connected to.",
+    ),
+    (
+        &["initialize", "mailbox"],
+        "See `initialize waypoint`'s exclusion reason -- the same isolated-daemon launch.",
+    ),
+    (
+        &["initialize", "machine"],
+        "See `initialize waypoint`'s exclusion reason -- the same isolated-daemon launch.",
+    ),
+    (
+        &["initialize", "triage"],
+        "See `initialize waypoint`'s exclusion reason -- the same isolated-daemon launch.",
+    ),
+    (
+        &["initialize", "review"],
+        "See `initialize waypoint`'s exclusion reason -- the same isolated-daemon launch.",
+    ),
+    (
         &["mcp", "initialize"],
         "Chooses and writes a shell profile after an interactive path prompt, then presents a\
          confirmation before modifying the host configuration; those user-controlled local-file\

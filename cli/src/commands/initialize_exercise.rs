@@ -24,12 +24,30 @@ impl Exercise {
         std::fs::create_dir_all(&root)
             .map_err(|e| format!("could not create {}: {e}", root.display()))?;
         let port = reserve_port().map_err(|e| format!("could not reserve a local port: {e}"))?;
-        start_daemon(&root, kind, port)
-            .map_err(|e| format!("could not start isolated daemon: {e}"))?;
-        let token = wait_for_token(&root.join("home").join(".ralphus").join("daemon.token"))?;
+        let started = Instant::now();
+        let pid = start_daemon(&root, kind, port).map_err(|e| {
+            // stderr only: stdout is this command's output.
+            eprintln!(
+                "ralphus [exercise] isolated daemon failed to spawn kind={kind} root={} error={e}",
+                root.display()
+            );
+            format!("could not start isolated daemon: {e}")
+        })?;
+        let log_path = root.join("daemon.log");
+        eprintln!(
+            "ralphus [exercise] isolated daemon spawned kind={kind} pid={pid} port={port} root={} log={}",
+            root.display(),
+            log_path.display()
+        );
+        let token = wait_for_token(&root.join("home").join(".ralphus").join("daemon.token"))
+            .inspect_err(|e| log_not_ready(kind, pid, &log_path, e))?;
         let url = format!("http://127.0.0.1:{port}");
         let client = DaemonClient::with_token(&url, token);
-        wait_for_daemon(&client)?;
+        wait_for_daemon(&client).inspect_err(|e| log_not_ready(kind, pid, &log_path, e))?;
+        eprintln!(
+            "ralphus [exercise] isolated daemon ready kind={kind} pid={pid} url={url} elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
         Ok(Self { root, url, client })
     }
 
@@ -53,9 +71,39 @@ impl Exercise {
                 false,
                 None,
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| {
+                eprintln!(
+                    "ralphus [exercise] project registration failed name={name} path={path} error={e}"
+                );
+                e.to_string()
+            })?;
+        eprintln!("ralphus [exercise] project registered name={name} path={path}");
         Ok((name, path))
     }
+}
+
+/// Run one guided exercise and log its outcome on stderr: which exercise,
+/// its exit code, and how long it took. Every exercise reports its own
+/// failure reason on stdout; this line is the stderr record that it ran.
+pub fn run_logged(kind: &str, run: impl FnOnce() -> i32) -> i32 {
+    let started = Instant::now();
+    let code = run();
+    let outcome = if code == 0 { "completed" } else { "failed" };
+    eprintln!(
+        "ralphus [exercise] {outcome} kind={kind} exit_code={code} elapsed_ms={}",
+        started.elapsed().as_millis()
+    );
+    code
+}
+
+/// The daemon outlives this process by design (the exercise leaves it running
+/// for inspection), so a startup timeout names its pid and log file -- the
+/// only places left to find out why it never came up, or to stop it.
+fn log_not_ready(kind: &str, pid: u32, log_path: &Path, error: &str) {
+    eprintln!(
+        "ralphus [exercise] isolated daemon not ready kind={kind} pid={pid} log={} error={error}",
+        log_path.display()
+    );
 }
 
 fn reserve_port() -> std::io::Result<u16> {
@@ -64,7 +112,8 @@ fn reserve_port() -> std::io::Result<u16> {
         .map(|a| a.port())
 }
 
-fn start_daemon(root: &Path, kind: &str, port: u16) -> std::io::Result<()> {
+/// Spawn the isolated daemon and return its pid.
+fn start_daemon(root: &Path, kind: &str, port: u16) -> std::io::Result<u32> {
     let home = root.join("home");
     let config = root.join("config");
     let psmux_data = root.join("psmux");
@@ -109,7 +158,7 @@ fn start_daemon(root: &Path, kind: &str, port: u16) -> std::io::Result<()> {
         .env("RALPHUS_RUNNER_CMD", runner)
         .env_remove("RALPHUS_CONFIGURATION_PATH")
         .spawn()
-        .map(|_| ())
+        .map(|child| child.id())
 }
 
 fn wait_for_token(path: &Path) -> Result<String, String> {
