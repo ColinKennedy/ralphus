@@ -420,7 +420,10 @@ tool guidance. The markers that assembly teaches are parsed from the reply:
 - **`RALPHUS_PROPHECY: <kind>: <note>`** — an append-only design note from
   a prompt cell. Every standalone marker line is carried in the runner
   result, rather than only the last one; `<kind>` is one of `discovery`,
-  `decision`, `hazard`, or `deferred`. It is durable context for the
+  `decision`, `hazard`, `deferred`, or `unconfirmed`. `deferred` is
+  strictly *follow-up work someone should do later*; a note about what the
+  agent could not run, check or verify is `unconfirmed`, and a known risk
+  left behind is `hazard`. It is durable context for the
   eventual PR reader, not prompt context for another cell. The parser matches
   only the beginning of a trimmed line, never a substring, so an agent
   reading this guide does not accidentally create a prophecy.

@@ -17,7 +17,7 @@
 //! - **`kind` is a closed enum** ([`ProphecyKind`]), per §11.1's resolution:
 //!   an open string column becomes forty synonyms for "note" within a month
 //!   and nothing stays filterable. `discovery`/`decision`/`hazard`/
-//!   `deferred` covers the cases in the design doc's examples
+//!   `deferred`/`unconfirmed` covers the cases in the design doc's examples
 //!   (auto-fix/conflict-resolution decisions, a hazard left behind in a
 //!   rebase); revisit if a real write site needs a fifth.
 //! - **Survives its squad/guardian's deletion** (§11.2): `squad_id`/
@@ -48,8 +48,12 @@ pub enum ProphecyKind {
     Decision,
     /// A risk noticed but not (yet) fixed.
     Hazard,
-    /// Work explicitly left for later.
+    /// Follow-up work someone should do later, suggested as a task. Never a
+    /// "could not run or check this" note -- that is [`Self::Unconfirmed`].
     Deferred,
+    /// Something the agent could not verify or does not know (a test that
+    /// could not run, behavior not checked live, an untested assumption).
+    Unconfirmed,
 }
 
 impl ProphecyKind {
@@ -60,6 +64,7 @@ impl ProphecyKind {
             Self::Decision => "decision",
             Self::Hazard => "hazard",
             Self::Deferred => "deferred",
+            Self::Unconfirmed => "unconfirmed",
         }
     }
 }
@@ -73,6 +78,7 @@ impl std::str::FromStr for ProphecyKind {
             "decision" => Ok(Self::Decision),
             "hazard" => Ok(Self::Hazard),
             "deferred" => Ok(Self::Deferred),
+            "unconfirmed" => Ok(Self::Unconfirmed),
             _ => Err(()),
         }
     }
@@ -391,6 +397,7 @@ mod tests {
             ProphecyKind::Decision,
             ProphecyKind::Hazard,
             ProphecyKind::Deferred,
+            ProphecyKind::Unconfirmed,
         ] {
             assert_eq!(k.as_str().parse::<ProphecyKind>().unwrap(), k);
         }

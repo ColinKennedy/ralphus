@@ -478,6 +478,14 @@ agent-supplied text: an unrecognized string there should be dropped/logged as
 malformed, the same way `forward_runner_event` already treats an
 unparseable `RALPHUS_EVENT:` payload, rather than silently widening the enum.
 
+**Widened once, deliberately: `unconfirmed`.** A real write site appeared:
+agents were using `deferred` for "I could not run or verify this", which is
+not follow-up work. `Unconfirmed` now holds that case, and `deferred` is
+strictly *follow-up work someone should do later* (the kind the post-merge
+follow-up offer acts on). The `kind` column is plain `TEXT` with no `CHECK`,
+so no migration was needed; rows written before the split keep whatever kind
+they had.
+
 ### 11.2 Does a prophecy survive its squad's deletion?
 
 Ghosts cascade-delete. If a prophecy does too, deleting a squad silently strips
