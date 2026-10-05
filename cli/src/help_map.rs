@@ -359,6 +359,36 @@ const REVIEW_CHECKS_CHILDREN: &[HelpNode] = &[
     ),
 ];
 
+const REVIEW_FOLLOWUP_CHILDREN: &[HelpNode] = &[
+    node(
+        "show",
+        &["selector [str]"],
+        &[],
+        "Show a merged review's follow-up offer: the deferred items it would turn into a follow-up squad, and its status.",
+        false,
+        true, // ("review", "followup", "show")
+        &[],
+    ),
+    node(
+        "accept",
+        &["selector [str]"],
+        &[],
+        "Accept a follow-up offer: draft a follow-up squad from the deferred items and create the waypoint that explains it. The squad is held unless `[followup] auto_start` is on.",
+        false,
+        false,
+        &[],
+    ),
+    node(
+        "decline",
+        &["selector [str]"],
+        &[],
+        "Decline a follow-up offer; nothing is created and the review never offers again.",
+        false,
+        false,
+        &[],
+    ),
+];
+
 const REVIEW_ACTION_CHILDREN: &[HelpNode] = &[
     node(
         "list",
@@ -447,6 +477,15 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
         false,
         false,
         &[],
+    ),
+    node(
+        "followup",
+        &[],
+        &[],
+        "Follow-up work offered when a review merges with deferred prophecies.",
+        false,
+        false,
+        REVIEW_FOLLOWUP_CHILDREN,
     ),
     node(
         "reopen",

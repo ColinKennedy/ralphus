@@ -20332,6 +20332,83 @@ mod tests {
         d
     }
 
+    /// A review with one `deferred` prophecy, merged so its follow-up offer
+    /// exists. `project` is what the review's `project` column holds.
+    fn merged_review_with_an_offer(d: &Daemon, id: &str, project: Option<&str>) {
+        let store = d.lock();
+        let root = std::env::temp_dir().join(format!("ralphus-route-followup-{id}"));
+        std::fs::create_dir_all(&root).unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO guardians(id, name, base_branch, git_root, status, created_at_ms, updated_at_ms, project)
+                 VALUES (?,'the review','main',?,'in_review',0,0,?)",
+                rusqlite::params![id, root.to_string_lossy(), project],
+            )
+            .unwrap();
+        store
+            .add_prophecy(
+                "guardian:ignored",
+                0,
+                crate::prophecy::ProphecyKind::Deferred,
+                "add the cache",
+                None,
+                None,
+                Some(id),
+            )
+            .unwrap();
+        store
+            .set_guardian_status(id, crate::guardian::GuardianStatus::Merged, None)
+            .unwrap();
+    }
+
+    #[test]
+    fn followup_routes_show_decline_and_refuse_a_second_answer() {
+        let d = daemon();
+        merged_review_with_an_offer(&d, "g-followup", Some("proj"));
+
+        let shown = route(&d, "GET", "/api/guardians/g-followup/followup", "");
+        assert_eq!(shown.status, 200, "{}", shown.body);
+        let offer: serde_json::Value = serde_json::from_str(&shown.body).unwrap();
+        assert_eq!(offer["status"], "offered");
+        assert_eq!(offer["items"][0]["body"], "add the cache");
+
+        let missing = route(&d, "GET", "/api/guardians/never-merged/followup", "");
+        assert_eq!(missing.status, 404);
+
+        let declined = route(&d, "POST", "/api/guardians/g-followup/followup/decline", "");
+        assert_eq!(declined.status, 200, "{}", declined.body);
+        let again = route(&d, "POST", "/api/guardians/g-followup/followup/decline", "");
+        assert_eq!(
+            again.status, 409,
+            "a declined offer cannot be answered twice"
+        );
+        let accept = route(&d, "POST", "/api/guardians/g-followup/followup/accept", "");
+        assert_eq!(accept.status, 409, "a declined offer cannot be accepted");
+    }
+
+    #[test]
+    fn accepting_without_a_registered_project_fails_and_leaves_the_offer_open() {
+        let d = daemon();
+        merged_review_with_an_offer(&d, "g-noproject", None);
+
+        let accept = route(&d, "POST", "/api/guardians/g-noproject/followup/accept", "");
+        assert_eq!(accept.status, 400, "{}", accept.body);
+        assert!(
+            accept.body.contains("ralphus project git"),
+            "{}",
+            accept.body
+        );
+
+        let shown = route(&d, "GET", "/api/guardians/g-noproject/followup", "");
+        let offer: serde_json::Value = serde_json::from_str(&shown.body).unwrap();
+        assert_eq!(
+            offer["status"], "offered",
+            "a failure before the squad exists must put the offer back"
+        );
+        assert!(offer["squad_id"].is_null());
+    }
+
     /// Create a daemon without registering the default user. Useful for tests
     /// that specifically want to verify behavior when no user is available.
     fn daemon_without_default_user() -> Daemon {

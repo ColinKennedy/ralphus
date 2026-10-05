@@ -2002,6 +2002,29 @@ impl DaemonClient {
         self.post(&format!("/api/guardians/{guardian_id}/reopen"), None)
     }
 
+    /// The post-merge follow-up offer for a review (`GET
+    /// /api/guardians/{id}/followup`); a 404 means none was ever sent.
+    pub fn guardian_followup(&self, guardian_id: &str) -> Result<Value, DaemonError> {
+        self.get(&format!("/api/guardians/{guardian_id}/followup"))
+    }
+
+    /// Accept a review's follow-up offer: drafts the follow-up squad and its
+    /// waypoint.
+    pub fn guardian_followup_accept(&self, guardian_id: &str) -> Result<Value, DaemonError> {
+        self.post(
+            &format!("/api/guardians/{guardian_id}/followup/accept"),
+            None,
+        )
+    }
+
+    /// Decline a review's follow-up offer.
+    pub fn guardian_followup_decline(&self, guardian_id: &str) -> Result<Value, DaemonError> {
+        self.post(
+            &format!("/api/guardians/{guardian_id}/followup/decline"),
+            None,
+        )
+    }
+
     pub fn guardian_submit_prs(
         &self,
         guardian_id: &str,

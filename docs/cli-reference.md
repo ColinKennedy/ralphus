@@ -333,6 +333,9 @@ the daemon's hourly Free-tier background sweep
 | `review rename <selector> <name>` | Rename |
 | `review cancel <selector>` | Cancel |
 | `review reopen <selector>` | Reopen a cancelled or merged review, immediately staging in whatever branches are already ready |
+| `review followup show <selector>` | Show the follow-up offer a merged review sent for its `deferred` prophecies |
+| `review followup accept <selector>` | Draft a follow-up squad from the offer and create the waypoint that explains it (held unless `[followup] auto_start`) |
+| `review followup decline <selector>` | Decline the offer; nothing is created and the review never offers again |
 | `review delete <selector> [--yes]` | Delete + purge worktrees |
 | `review settings <selector> [--skip-checks] [--skip-worktrees] [--resolver-agent] [--resolver-model] [--base-branch]` | Update opt-out settings |
 | `review add-branch <selector> <branch>` | Add a branch |

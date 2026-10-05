@@ -222,6 +222,7 @@ pub enum ReviewCommand {
     Branch(ReviewBranchCommand),
     Checks(ReviewChecksCommand),
     Action(ReviewActionCommand),
+    Followup(ReviewFollowupCommand),
     UsageError(String),
 }
 
@@ -333,6 +334,15 @@ pub enum ReviewChecksCommand {
         selector: String,
         mode: String,
     },
+    UsageError(String),
+}
+
+#[derive(Debug, Clone)]
+pub enum ReviewFollowupCommand {
+    Help,
+    Show { selector: String },
+    Accept { selector: String },
+    Decline { selector: String },
     UsageError(String),
 }
 
@@ -599,6 +609,7 @@ pub fn parse(args: &[String]) -> ReviewCommand {
         Some("branch") => ReviewCommand::Branch(parse_branch(&scanner.remaining())),
         Some("checks") => ReviewCommand::Checks(parse_checks(&scanner.remaining())),
         Some("action") => ReviewCommand::Action(parse_action(&scanner.remaining())),
+        Some("followup") => ReviewCommand::Followup(parse_followup(&scanner.remaining())),
         Some(other) => ReviewCommand::UsageError(format!("unknown review subcommand: {other}")),
     }
 }
@@ -922,6 +933,26 @@ fn parse_terminal_mode(scanner: &mut Scanner) -> Result<String, String> {
             "--mode: invalid choice '{other}' (choose from 'open', 'readonly')"
         )),
         None => Ok("open".to_string()),
+    }
+}
+
+fn parse_followup(args: &[String]) -> ReviewFollowupCommand {
+    let scanner = Scanner::new(&args[1.min(args.len())..]);
+    let selector =
+        |make: fn(String) -> ReviewFollowupCommand| match scanner.remaining().into_iter().next() {
+            Some(selector) => make(selector),
+            None => ReviewFollowupCommand::UsageError(
+                "missing required <selector> argument".to_string(),
+            ),
+        };
+    match args.first().map(String::as_str) {
+        None | Some("help" | "--help" | "-h") => ReviewFollowupCommand::Help,
+        Some("show") => selector(|selector| ReviewFollowupCommand::Show { selector }),
+        Some("accept") => selector(|selector| ReviewFollowupCommand::Accept { selector }),
+        Some("decline") => selector(|selector| ReviewFollowupCommand::Decline { selector }),
+        Some(other) => ReviewFollowupCommand::UsageError(format!(
+            "unknown review followup subcommand: {other}"
+        )),
     }
 }
 
@@ -1682,6 +1713,7 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
         ReviewCommand::Branch(c) => dispatch_branch(c, opts, &client),
         ReviewCommand::Checks(c) => dispatch_checks(c, opts, &client),
         ReviewCommand::Action(c) => dispatch_action(c, opts, &client),
+        ReviewCommand::Followup(c) => dispatch_followup(c, opts, &client),
     }
 }
 
@@ -2098,6 +2130,61 @@ fn dispatch_branch_terminal(
         print_command_with_cwd(&cwd, &command_line, None)
     });
     0
+}
+
+fn dispatch_followup(cmd: ReviewFollowupCommand, opts: &GlobalOpts, client: &DaemonClient) -> i32 {
+    match cmd {
+        ReviewFollowupCommand::Help => {
+            println!(
+                "{}",
+                crate::help_map::command_help(&["review", "followup"])
+                    .expect("review followup help exists")
+            );
+            0
+        }
+        ReviewFollowupCommand::UsageError(m) => {
+            println!("usage error: {m}");
+            2
+        }
+        ReviewFollowupCommand::Show { selector } => run_and_report(opts, None, || {
+            let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
+            let offer = client.guardian_followup(&resolved.guardian_id)?;
+            emit(opts, &offer, |o| {
+                println!("{selector}: follow-up offer is {}", o["status"]);
+                for item in o["items"].as_array().into_iter().flatten() {
+                    println!("  - {}", item["body"].as_str().unwrap_or_default());
+                }
+                if let Some(squad) = o["squad_id"].as_str().filter(|s| !s.is_empty()) {
+                    println!("  squad {squad}, waypoint {}", o["waypoint_id"]);
+                }
+            });
+            Ok(())
+        }),
+        ReviewFollowupCommand::Accept { selector } => run_and_report(opts, None, || {
+            let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
+            let result = client.guardian_followup_accept(&resolved.guardian_id)?;
+            emit(opts, &result, |r| {
+                let state = if r["started"].as_bool().unwrap_or(false) {
+                    "started"
+                } else {
+                    "held; start it with `ralphus squad activate`"
+                };
+                println!(
+                    "{selector}: follow-up squad {} created ({state}), explained by waypoint {}",
+                    r["squad_id"], r["waypoint_id"]
+                );
+            });
+            Ok(())
+        }),
+        ReviewFollowupCommand::Decline { selector } => run_and_report(opts, None, || {
+            let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
+            let result = client.guardian_followup_decline(&resolved.guardian_id)?;
+            emit(opts, &result, |_| {
+                println!("{selector}: follow-up offer declined")
+            });
+            Ok(())
+        }),
+    }
 }
 
 fn dispatch_checks(cmd: ReviewChecksCommand, opts: &GlobalOpts, client: &DaemonClient) -> i32 {
@@ -3805,6 +3892,38 @@ mod tests {
             parse(&v(&["branch", "terminal", "g1~0", "--mode", "bogus"])),
             ReviewCommand::Branch(ReviewBranchCommand::UsageError(_))
         );
+    }
+
+    #[test]
+    fn parses_followup_subcommands() {
+        assert!(matches!(
+            parse(&v(&["followup", "show", "g1"])),
+            ReviewCommand::Followup(ReviewFollowupCommand::Show { .. })
+        ));
+        assert!(matches!(
+            parse(&v(&["followup", "accept", "g1"])),
+            ReviewCommand::Followup(ReviewFollowupCommand::Accept { .. })
+        ));
+        assert!(matches!(
+            parse(&v(&["followup", "decline", "g1"])),
+            ReviewCommand::Followup(ReviewFollowupCommand::Decline { .. })
+        ));
+        assert!(matches!(
+            parse(&v(&["followup"])),
+            ReviewCommand::Followup(ReviewFollowupCommand::Help)
+        ));
+    }
+
+    #[test]
+    fn followup_requires_a_selector_and_a_known_subcommand() {
+        assert!(matches!(
+            parse(&v(&["followup", "accept"])),
+            ReviewCommand::Followup(ReviewFollowupCommand::UsageError(_))
+        ));
+        assert!(matches!(
+            parse(&v(&["followup", "bogus"])),
+            ReviewCommand::Followup(ReviewFollowupCommand::UsageError(_))
+        ));
     }
 
     #[test]

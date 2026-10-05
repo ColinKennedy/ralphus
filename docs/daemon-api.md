@@ -155,6 +155,9 @@ where one exists.
 | POST | `/api/guardians/{id}/approve` | Approve an in_review or merge_stopped guardian (RAL-535) |
 | POST | `/api/guardians/{id}/cancel` | Cancel a review |
 | POST | `/api/guardians/{id}/reopen` | Reopen a cancelled, merged, or approved review (→ `collecting`) and immediately try a fresh merge pass if the daemon has capacity |
+| GET | `/api/guardians/{id}/followup` | The [follow-up offer](#get-apiguardiansidfollowup) a merged review sent for its `deferred` prophecies |
+| POST | `/api/guardians/{id}/followup/accept` | Accept the offer: draft the follow-up squad and its waypoint |
+| POST | `/api/guardians/{id}/followup/decline` | Decline the offer |
 | POST | `/api/guardians/{id}/run-manual-commands` | Launch a ready manual-check command at its prepared execution location; `409` until ready |
 | POST | `/api/guardians/{id}/run-action-hint` | Launch a ready authored action at its prepared execution location; prompt actions are expanded during preparation |
 | GET | `/api/guardians/{id}/check-runs/{kind}/{index}/output` | [Captured output of the last run of one board-launched check](#get-apiguardiansidcheck-runskindindexoutput) |
@@ -2891,6 +2894,59 @@ worker concurrency cap, so a busy daemon queues rather than blocking this
 call). The worker rebases the contiguous prefix of branches whose cells are
 already done and returns the review to `collecting` if any branch is still
 pending — it only reaches `in_review` once every enabled branch is done.
+
+### `GET /api/guardians/{id}/followup`
+
+The post-merge **follow-up offer** for a review. When a review reaches
+`merged`, the daemon collects the `deferred` prophecies its cells wrote,
+snapshots each with the prompt of the cell that wrote it, stores one offer row
+and sends one mailbox message (event kind `review_followup_offered`). A review
+offers **at most once**, ever: reopening it and merging again sends nothing.
+
+`404` when no offer exists: the review has not merged with any `deferred`
+prophecy, offers are off for its project, or it is at the follow-up depth cap.
+Otherwise `200` with `status` (`offered`, `accepted` or `declined`), the
+snapshotted `items` (`prophecy_id`, `entity_uri`, `body`, `prompt`, `agent`,
+`model`), `depth`, and — once accepted — `squad_id` and `waypoint_id`.
+
+### `POST /api/guardians/{id}/followup/accept`
+
+Accepts an open offer. The daemon drafts one squad — a task per deferred item,
+its prompt the deferred note plus the original prompt as context, started on
+the same agent and model — and submits it through the ordinary submit path, so
+every submit preflight applies. The squad is based on the branch the review
+merged into, or on the remote's default branch when that branch no longer
+exists. It is created **held** unless `auto_start` is on (see below).
+
+It also creates a blocking **waypoint** explaining the follow-up: the merged
+review is on its roster and the squad is its affected entry, answered
+`accepted` up front. The waypoint stays open while the follow-up is
+outstanding and auto-closes when the squad finishes.
+
+`201 {"squad_id","waypoint_id","base","started"}`. `409` if the offer was
+already accepted or declined (a second accept creates nothing); `400` when the
+review has no registered project; other statuses mirror the submit rejection.
+A failure before the squad exists puts the offer back to `offered`.
+
+### `POST /api/guardians/{id}/followup/decline`
+
+Declines an open offer; nothing is created. `409` if it was already answered.
+
+### Follow-up offer configuration
+
+Settings live in a `[followup]` table of the global config, overridable per
+project in `.ralphus.toml` (the project value wins field by field):
+
+```toml
+[followup]
+enabled = true    # offer follow-up work at all (default true)
+max_depth = 1     # generations of follow-up offered (default 1)
+auto_start = false  # start an accepted follow-up squad at once (default false)
+```
+
+`max_depth` counts generations: a review of ordinary work is generation 0 and
+the review of a follow-up squad is generation 1, so the default `1` never
+offers follow-ups for a follow-up's own deferrals. `0` offers nothing.
 
 ### `GET /api/pull-requests`
 Look up the ralphus PR row for a given forge PR/MR (the PR → worktree
