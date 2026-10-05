@@ -84,5 +84,8 @@ pub fn redacted(text: &str) -> String {
 /// performance optimization every provider may skip per the documented
 /// contract -- `run` falls back to a one-shot spawn per call when a provider
 /// does not support it, so there is no functionality gap, only an
-/// unexploited one.
-pub const UNIMPLEMENTED_VERBS: &[&str] = &["channel"];
+/// unexploited one. `retire` (automatic stale-worktree retirement) is optional
+/// too, and its "does not implement" reply is what the daemon reads as this
+/// provider opting out -- a bare "unknown verb" would instead be recorded as a
+/// failed retirement on every daily sweep.
+pub const UNIMPLEMENTED_VERBS: &[&str] = &["channel", "retire"];

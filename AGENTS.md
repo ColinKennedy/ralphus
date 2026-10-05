@@ -105,7 +105,7 @@ Eleven Rust workspace members; `cli-py/` is a Python project kept only for `docs
 | `ralphus-runner` | `runner/` | Rust bin+lib | The cell runner: executes one `CellSpec` (command/prompt/proof), reports a `CellResult`. Spawned per-cell by the daemon over the same stdin/stdout JSON contract the old Python runner used. | see `.agent/cli-runner-port.md` |
 | `ralphus-auth` | `auth/` | Rust lib | Ed25519 license verification (no-op without `--features secure-dist`). | `auth/AGENTS.md` |
 | `ralphus-keygen` | `keygen/` | Rust bin | Author-only tool: generate keypair + sign licenses. Never shipped to users. | `keygen/AGENTS.md` |
-| `ralphus-ssh-provider` | `ssh-provider/` | Rust bin+lib | Machine provider (RAL-185) reaching any host already SSH-accessible; `exec` verb only (RAL-200), see `docs/machine-providers.md`. | |
+| `ralphus-ssh-provider` | `ssh-provider/` | Rust bin+lib | Machine provider (RAL-185) reaching any host already SSH-accessible; every provider verb except `channel`/`retire` (RAL-200, RAL-355), see `docs/machine-providers.md`. | |
 | `ralphus-bench-types` | `bench-types/` | Rust lib | `BenchMeta` only — kept dependency-free to avoid a cyclic dependency between bench-tagged crates and the harness (RAL-94). | `bench-harness/AGENTS.md` |
 | `ralphus-bench-macros` | `bench-macros/` | Rust proc-macro | `#[ralphus_bench(patience = N)]` attribute (RAL-94). | `bench-harness/AGENTS.md` |
 | `ralphus-bench-harness` | `bench-harness/` | Rust lib+bin | Durable-minimum loop, stats/git/storage, `ralphus-bench-rs` opt-in entry point (RAL-94). | `bench-harness/AGENTS.md` |

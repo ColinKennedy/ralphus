@@ -258,10 +258,19 @@ fn render_squad_detail(squad: &Value) {
         "state",
         squad["state"].as_str().unwrap_or_default().to_string(),
     ));
+    if let Some(error) = non_empty_str(&squad["error"]) {
+        kv.push(("error", error.to_string()));
+    }
     crate::output::print_kv(&kv);
 
     for (ti, task) in squad["tasks"].as_array().into_iter().flatten().enumerate() {
         println!("\n[{ti}] task {}  {}", task["name"], task["state"]);
+        // A task can fail before any of its cells runs (an unresolvable
+        // machine target, a no-commits guard); without this line its cells
+        // all read "pending" with no hint why.
+        if let Some(error) = non_empty_str(&task["error"]) {
+            println!("    error: {error}");
+        }
         for (vi, v) in task["proof"].as_array().into_iter().flatten().enumerate() {
             println!("    proof/{vi}  {}  {}", v["kind"], v["state"]);
         }
@@ -276,6 +285,9 @@ fn render_squad_detail(squad: &Value) {
                 s["agent"],
                 s["model"].as_str().unwrap_or("-")
             );
+            if let Some(error) = non_empty_str(&s["error"]) {
+                println!("        error: {error}");
+            }
             for (vi, v) in s["proof"].as_array().into_iter().flatten().enumerate() {
                 println!("        proof/{vi}  {}  {}", v["kind"], v["state"]);
             }
@@ -288,6 +300,10 @@ fn render_squad_detail(squad: &Value) {
             println!("  {}  {}  {}", r["id"], r["name"], r["status"]);
         }
     }
+}
+
+fn non_empty_str(value: &Value) -> Option<&str> {
+    value.as_str().map(str::trim).filter(|s| !s.is_empty())
 }
 
 fn render_events(events: &Value) {

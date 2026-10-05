@@ -582,6 +582,7 @@ struct RemoteDerivation {
 /// "directory name is invalid" instead of saying what is actually wrong.
 fn remote_cell_derivation(
     store: &Store,
+    squad_id: &str,
     cell: &CellRow,
     raw_cwd: Option<&str>,
     task: Option<&TaskRow>,
@@ -603,7 +604,7 @@ fn remote_cell_derivation(
     // The branch must come from the *placeholder*, not the resolved cwd: by
     // this point `resolve_placeholders` has rewritten cwd to a path on the
     // remote machine, which says nothing about the branch name.
-    let branch = raw_cwd
+    let base_branch = raw_cwd
         .and_then(ralphus_core::schema::first_worktree_placeholder_in_text)
         .and_then(ralphus_core::schema::parse_worktree_placeholder)
         .map(str::to_string)
@@ -619,17 +620,26 @@ fn remote_cell_derivation(
             cell.cell_id
         ))
     })?;
-    let project_root = store
+    let project = store
         .resolve_project(project_name)
         .ok()
         .flatten()
-        .map(|p| p.path)
         .ok_or_else(|| {
             ReviewError::new(format!(
                 "cell \"{}\" references unregistered project \"{project_name}\"",
                 cell.cell_id
             ))
         })?;
+    // The placeholder names a *base* branch. RAL-337 hands each squad its own
+    // branch when that name is already taken (`l2-a` -> `l2-a-2`), so the
+    // branch this cell actually committed and pushed is the squad's claim --
+    // using the base name would fetch and merge another squad's work.
+    let branch = store
+        .task_worktree_claim_for_squad(&project.name, &base_branch, squad_id)
+        .ok()
+        .flatten()
+        .unwrap_or(base_branch);
+    let project_root = project.path;
     Ok(Some(RemoteDerivation {
         cell_id: cell.cell_id.clone(),
         machine: machine.to_string(),
@@ -946,6 +956,7 @@ pub fn derive_reviews_with_full_prefetch(
             // Store reads only (a machine lookup and the project root), so a
             // short lock here is right; the git work is further down.
             &store.lock(),
+            squad_id,
             &cells[pos],
             cell_info[pos].0.as_deref(),
             tasks_by_idx.get(&cells[pos].task_idx).copied().flatten(),
@@ -1791,6 +1802,7 @@ pub fn derive_triage_pools(
             }
             let remote = remote_cell_derivation(
                 &store,
+                squad_id,
                 row,
                 row.cwd.as_deref(),
                 tasks_by_idx.get(&row.task_idx).copied().flatten(),
@@ -2712,6 +2724,66 @@ mod tests {
     };
     use crate::store::{Store, TaskRow};
     use crate::workspace::Workspace;
+
+    #[test]
+    fn remote_cell_derivation_uses_the_squads_claimed_branch_not_the_base_name() {
+        // A resubmission is handed `l2-a-2` because an earlier squad already
+        // owns `l2-a`. The review must collect the branch this squad's cell
+        // actually pushed; the bare placeholder name would fetch and merge the
+        // earlier squad's commits instead.
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .register_machine_provider(
+                "loopback",
+                "",
+                "python",
+                &[],
+                crate::machines::PROTOCOL_VERSION,
+                false,
+            )
+            .unwrap();
+        store
+            .register_project("fx", "", "/home/me/fx", "git")
+            .unwrap();
+        let file: ralphus_core::schema::TaskFile = toml::from_str(
+            "[[task]]\nname=\"a\"\nproject=\"fx\"\nmachine=\"loopback:lb\"\n\
+             [[task.cell]]\ncwd=\"<<ralphus:new-worktree/l2-a?upstream=main>>\"\ncommand=\"echo\"\nmode=\"raw\"\n",
+        )
+        .unwrap();
+        let squad_id = store.insert_squad(&file, None, false).unwrap();
+        let cell = store.cells_of(&squad_id).unwrap().remove(0);
+        let raw_cwd = cell.cwd.clone();
+        let task = store.tasks_of(&squad_id).unwrap().remove(0);
+
+        let unclaimed = super::remote_cell_derivation(
+            &store,
+            &squad_id,
+            &cell,
+            raw_cwd.as_deref(),
+            Some(&task),
+        )
+        .unwrap()
+        .expect("remote cell");
+        assert_eq!(
+            unclaimed.branch, "l2-a",
+            "no claim yet: the base name is all there is"
+        );
+
+        store
+            .record_task_worktree_claim("fx", "l2-a", "l2-a-2", &squad_id)
+            .unwrap();
+        let claimed = super::remote_cell_derivation(
+            &store,
+            &squad_id,
+            &cell,
+            raw_cwd.as_deref(),
+            Some(&task),
+        )
+        .unwrap()
+        .expect("remote cell");
+        assert_eq!(claimed.branch, "l2-a-2");
+        assert_eq!(claimed.project_root, "/home/me/fx");
+    }
 
     fn completed_pool_cell(store: &mut Store) -> String {
         let file: ralphus_core::schema::TaskFile = toml::from_str(

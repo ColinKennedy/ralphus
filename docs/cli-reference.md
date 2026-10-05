@@ -717,16 +717,17 @@ use; see `READ_ONLY_NOTE`.
     - (read-only-safe) history selector [uri] --type [str]  {Show a cell/proof step's tmux history (one-shot snapshot; Python's --live tailing and --wait-until-valid are not yet ported).}
     - initialize  {One-time local setup helpers for a repository.}
         - git --path [path]  {Enable git rerere in a repo so review rebases replay conflict resolutions.}
-        - machine --state-dir [path]  {Launch an isolated daemon and register/ping the local loopback machine provider.}
-        - mailbox --state-dir [path]  {Launch an isolated daemon and verify cell/proof failure mailbox remediation.}
-        - review --state-dir [path]  {Launch an isolated daemon and create a disposable two-branch Guardian review fixture.}
-        - triage --state-dir [path]  {Launch an isolated daemon and configure a deterministic two-cell Triage pool.}
-        - waypoint --state-dir [path]  {Launch an isolated daemon and submit inspectable waypoint scenarios without touching normal ralphus state.}
+        - machine --remote --state-dir [path] --stop  {Launch an isolated daemon, register the loopback machine provider, and run a remote cell + proof in a worktree it provisions (always remote; --remote is accepted for symmetry). --stop shuts the daemon down afterwards.}
+        - mailbox --remote --state-dir [path] --stop  {Launch an isolated daemon and verify cell/proof failure mailbox remediation. --remote runs both failures on a strict loopback machine; --stop shuts the daemon down afterwards.}
+        - review --remote --state-dir [path] --stop  {Launch an isolated daemon and create a disposable two-branch Guardian review fixture (held). --remote instead runs both branches and the review merge on a strict loopback machine through to in_review; --stop shuts the daemon down afterwards.}
+        - triage --remote --state-dir [path] --stop  {Launch an isolated daemon and configure a deterministic two-cell Triage pool. --remote declares both candidates on a strict loopback machine; --stop shuts the daemon down afterwards.}
+        - waypoint --remote --state-dir [path] --stop  {Launch an isolated daemon and submit inspectable waypoint scenarios without touching normal ralphus state. --remote declares every scenario on a strict loopback machine; --stop shuts the daemon down afterwards.}
     - internal  {Machine-invoked interfaces with no interactive/task-file use (RAL-338 follow-up).}
         - fork-credential-helper action [str]  {Git credential-helper entry point installed on a fork-routed worktree's git config (never invoked directly by a human or a task file) -- implements git's credential protocol so a push authenticates using that worktree owner's stored forge token.}
     - (read-only-safe) license  {Print the embedded LICENSE text decoded from the binary's obfuscated copy.}
     - (read-only-safe) listen selector [uri] --timeout [seconds] --until [status]  {Block until a squad/task/cell/proof/review/review-worktree reaches a status.}
     - machine  {Register and inspect machine providers remote work runs on.}
+        - (read-only-safe) check machine [str]  {Ping a registered machine provider (by scheme, or a full scheme:uri) and report whether it answers. Side-effect free: the provider's `ping` verb does no work.}
         - cleanup machine [str] --branch [name] --project [name]  {Tear down one project's provisioned workspace on a machine provider -- the whole project directory, or just --branch's worktree (RAL-201, reshaped by RAL-355 Phase 2).}
         - (read-only-safe) get scheme [str]  {Show one registered machine provider by exact scheme.}
         - (read-only-safe) list  {List every registered machine provider, plus built-in schemes.}

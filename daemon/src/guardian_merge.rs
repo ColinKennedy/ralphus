@@ -1742,15 +1742,35 @@ fn rebase_head_commit_is_empty(wt: &Workspace) -> bool {
 /// the index is still fully staged for a *non-empty* commit; unconditionally
 /// skipping in that case would silently discard the whole commit instead of
 /// just the conflict `--skip` is meant to bypass. When the commit is not
-/// confirmed empty, this leaves the rebase paused rather than guessing —
-/// the caller's resolver loop will see it as still in progress and retry.
-fn advance_rebase(wt: &Workspace) {
-    if wt.git(&["rebase", "--continue"]).is_err()
-        && conflicted_files(wt).is_empty()
-        && rebase_head_commit_is_empty(wt)
-    {
-        let _ = wt.git(&["rebase", "--skip"]);
+/// confirmed empty, the rebase is left paused for inspection and the
+/// `--continue` error is returned: with nothing conflicted and nothing to
+/// skip, the same `--continue` would fail identically forever (no committer
+/// identity on the machine, a failing `prepare-commit-msg` hook), so the
+/// caller must fail the branch rather than retry.
+fn advance_rebase(wt: &Workspace) -> Result<(), String> {
+    let Err(error) = wt.git(&["rebase", "--continue"]) else {
+        return Ok(());
+    };
+    if !conflicted_files(wt).is_empty() {
+        // `--continue` committed this step and stopped on the next commit's
+        // conflict; the resolver loop picks that one up.
+        return Ok(());
     }
+    if rebase_head_commit_is_empty(wt) {
+        let _ = wt.git(&["rebase", "--skip"]);
+        return Ok(());
+    }
+    Err(error)
+}
+
+/// The branch-failure detail for an [`advance_rebase`] error.
+fn rebase_stuck_detail(branch: &str, error: &str) -> String {
+    format!(
+        "git rebase --continue failed for branch {branch} with every conflict already resolved, \
+         so retrying cannot help: {error}. The rebase is left paused in the review worktree. \
+         Check that git can commit there (user.name/user.email configured on that machine, \
+         commit hooks succeed), then restart this review."
+    )
 }
 
 /// The agent backend used to resolve conflicts: the review's own `stored` agent
@@ -2722,7 +2742,7 @@ fn resolve_conflicts_with_agent(
                 // conflict was resolved correctly, or because whatever resolved
                 // it made the diff disappear entirely.
                 guard_against_rebase_step_content_loss(store, id, branch, wt)?;
-                advance_rebase(wt);
+                advance_rebase(wt).map_err(|e| rebase_stuck_detail(branch, &e))?;
                 // RAL-144: advancing to the next commit -- nothing was found or
                 // committed for it yet.
                 committed = 0;
@@ -2787,7 +2807,7 @@ fn resolve_conflicts_with_agent(
             }
             wt.git(&["add", "--all"])?;
             guard_against_rebase_step_content_loss(store, id, branch, wt)?;
-            advance_rebase(wt);
+            advance_rebase(wt).map_err(|e| rebase_stuck_detail(branch, &e))?;
             // RAL-144: advancing to the next commit -- nothing committed for it yet.
             committed = 0;
             commit_attempts = 0;
@@ -3109,7 +3129,7 @@ fn resolve_conflicts_with_agent(
                 });
             }
             guard_against_rebase_step_content_loss(store, id, branch, wt)?;
-            advance_rebase(wt);
+            advance_rebase(wt).map_err(|e| rebase_stuck_detail(branch, &e))?;
             // RAL-144: advancing to the next commit -- nothing committed for it yet.
             committed = 0;
             commit_attempts = 0;
@@ -3200,7 +3220,7 @@ fn resolve_conflicts_with_agent(
         // Either way the loop re-checks and resolves any further conflicting
         // commits.
         guard_against_rebase_step_content_loss(store, id, branch, wt)?;
-        advance_rebase(wt);
+        advance_rebase(wt).map_err(|e| rebase_stuck_detail(branch, &e))?;
         // RAL-144: advancing to the next commit -- nothing committed for it yet.
         committed = 0;
         commit_attempts = 0;
@@ -8288,7 +8308,7 @@ pub fn review_maintenance(
         std::thread::spawn(move || {
             // Released when this worker exits, by any path.
             let _claim = claim;
-            let runner = crate::runner::SubprocessRunner::from_env();
+            let runner = crate::remote_runner::MachineRouter::from_env(Arc::clone(&store));
             // RAL-213: register/remove around the merge this may trigger, same
             // shape as `scheduler::tick`'s squad-level wrapping, so a guardian
             // -settings change made while this reopen is rebuilding can stop it.
@@ -8330,8 +8350,7 @@ pub fn review_maintenance(
         let cancellations = cancellations.clone();
         std::thread::spawn(move || {
             let _claim = claim;
-            let runner =
-                crate::runner::SubprocessRunner::from_env().with_cartographer(Arc::clone(&store));
+            let runner = crate::remote_runner::MachineRouter::from_env(Arc::clone(&store));
             crate::ci_watch::poll_open_pr_ci_status(&store, &runner, &cancellations, &id);
         });
     }
@@ -8355,9 +8374,9 @@ pub fn review_maintenance(
             // Released when this worker exits, including via the early return
             // on the PR-commit-sync error path below.
             let _claim = claim;
-            let runner: Arc<dyn Runner> = Arc::new(
-                crate::runner::SubprocessRunner::from_env().with_cartographer(Arc::clone(&store)),
-            );
+            let runner: Arc<dyn Runner> = Arc::new(crate::remote_runner::MachineRouter::from_env(
+                Arc::clone(&store),
+            ));
             // RAL-213: one token covers both the base-shift rebuild and (if
             // that didn't run) the manual-push restack below -- either may
             // trigger a merge for this guardian id.
@@ -9695,9 +9714,8 @@ pub(crate) fn spawn_guardian_post_merge(
     std::thread::Builder::new()
         .name(format!("postmerge-{id}"))
         .spawn(move || {
-            let runner: std::sync::Arc<dyn Runner> = std::sync::Arc::new(
-                crate::runner::SubprocessRunner::from_env().with_cartographer(store.clone()),
-            );
+            let runner: std::sync::Arc<dyn Runner> =
+                std::sync::Arc::new(crate::remote_runner::MachineRouter::from_env(store.clone()));
             run_guardian_post_merge_for(&store, runner.as_ref(), &id, jobs, trigger);
         })
         .ok();
@@ -10047,14 +10065,15 @@ fn post_merge_jobs_inner(
 ) -> std::result::Result<Option<String>, String> {
     let combined_path = PathBuf::from(combined_str);
     // Project root of the combined worktree: `<proj>/.git/.ralphus/g/<short>/review`.
-    let proj = combined_path
-        .ancestors()
-        .nth(5)
-        .map(|p| p.to_path_buf())
-        .filter(|p| {
-            // Sanity: must be a project this review actually covers (or its
-            // git root) -- otherwise the path layout assumption broke.
-            let candidates = guardian
+    // Sanity: it must be a project this review actually covers (or its git
+    // root) -- otherwise the path layout assumption broke. On a remote review
+    // the combined worktree lives in the project's repository on the machine,
+    // so a candidate also matches through its machine mapping; the daemon-local
+    // root is what the rest of this function keys on either way.
+    let layout_root = combined_path.ancestors().nth(5).map(Path::to_path_buf);
+    let proj = layout_root
+        .and_then(|root| {
+            guardian
                 .branches
                 .iter()
                 .map(|b| {
@@ -10063,8 +10082,11 @@ fn post_merge_jobs_inner(
                         .unwrap_or_else(|| guardian.git_root.clone())
                 })
                 .chain(std::iter::once(guardian.git_root.clone()))
-                .collect::<Vec<_>>();
-            candidates.iter().any(|c| Path::new(c) == p)
+                .map(PathBuf::from)
+                .find(|candidate| {
+                    *candidate == root
+                        || Workspace::for_guardian(store, id, candidate.clone()).root() == root
+                })
         })
         .ok_or_else(|| {
             format!("could not derive the project root from combined worktree path {combined_str}")
@@ -11623,21 +11645,49 @@ fn fetch_branch_for_remote_cell(
         clone_url.as_deref(),
         None,
     );
-    let vcs = {
-        let guard = store.lock();
-        crate::vcs::for_project_root(&guard, root)?
-    };
-
-    if let Err(e) = vcs.fetch_branch(root, &remote, &branch.branch) {
-        return Err(format!(
+    let not_published = |e: &str| {
+        format!(
             "branch \"{}\" was produced on machine \"{machine}\" but could not be fetched from \
              \"{remote}\": {e}. The task that owns this branch is responsible for pushing it \
              before it completes — ralphus never commits or pushes on a cell's behalf. Check \
              that cell's output, confirm it pushed, then restart this review.",
             branch.branch
-        ));
-    }
-    let sha = vcs.revision_of(root, &branch.branch).unwrap_or_default();
+        )
+    };
+    let review_machine = review
+        .as_ref()
+        .and_then(|g| g.machine.as_deref())
+        .map(str::trim)
+        .filter(|m| !m.is_empty() && !m.eq_ignore_ascii_case(ralphus_core::schema::LOCAL_MACHINE));
+    let sha = if let Some(review_machine) = review_machine {
+        // The review merges on its own machine, so the branch must land in the
+        // repository *there* -- fetching into the daemon's checkout would leave
+        // the machine's merge without it.
+        let ws = Workspace::for_guardian(store, guardian_id, root);
+        let head_ref = format!("refs/heads/{}", branch.branch);
+        if review_machine != machine {
+            let refspec = format!("+{head_ref}:{head_ref}");
+            ws.git(&["fetch", "--no-write-fetch-head", &remote, &refspec])
+                .map_err(|e| not_published(&e))?;
+        }
+        // Same machine: the cell's own worktree hangs off this repository, so
+        // the branch is already here (and checked out, which `fetch` would
+        // refuse to update). Its tip is the cell's own latest commit -- no
+        // pushed-but-stale copy can stand in for it.
+        ws.git(&["rev-parse", "--verify", &head_ref])
+            .map_err(|e| not_published(&e))?
+            .trim()
+            .to_string()
+    } else {
+        let vcs = {
+            let guard = store.lock();
+            crate::vcs::for_project_root(&guard, root)?
+        };
+        if let Err(e) = vcs.fetch_branch(root, &remote, &branch.branch) {
+            return Err(not_published(&e));
+        }
+        vcs.revision_of(root, &branch.branch).unwrap_or_default()
+    };
     crate::rlog!(
         INFO,
         "ralphus [guardian] review {guardian_id} fetched remote-produced branch {} from {remote} at {sha}",
@@ -14005,9 +14055,9 @@ pub fn sweep_pending_summaries(store: &crate::store_lock::StoreHandle, sem: &Arc
         let sem = Arc::clone(sem);
         std::thread::spawn(move || {
             let _permit = sem.acquire();
-            let runner: Arc<dyn Runner> = Arc::new(
-                crate::runner::SubprocessRunner::from_env().with_cartographer(Arc::clone(&store)),
-            );
+            let runner: Arc<dyn Runner> = Arc::new(crate::remote_runner::MachineRouter::from_env(
+                Arc::clone(&store),
+            ));
             generate_final_summary(&store, runner.as_ref(), &id, &signature);
         });
     }
@@ -16964,6 +17014,43 @@ mod tests {
     // extended-length-prefix support for these calls), so switching this
     // fixture to git2 would silently defeat the regression test it exists
     // to protect.
+    #[test]
+    fn advance_rebase_reports_a_continue_that_cannot_succeed_instead_of_looping() {
+        // The resolver loop retries `advance_rebase` whenever a rebase is
+        // still in progress with nothing conflicted. When `--continue` fails
+        // for a reason no retry changes (here: a stale index lock; on a fresh
+        // machine, no committer identity), it must surface the error --
+        // otherwise that loop spins forever.
+        let (base, repo, _fwt) = make_repo("advance-rebase-stuck");
+        std::fs::write(repo.join("base.txt"), "main\n").unwrap();
+        g(&repo, &["commit", "--all", "--message", "main edit"]);
+        g(&repo, &["checkout", "-b", "side", "HEAD~1"]);
+        std::fs::write(repo.join("base.txt"), "side\n").unwrap();
+        g(&repo, &["commit", "--all", "--message", "side edit"]);
+        let status = std::process::Command::new("git")
+            .args(["rebase", "main"])
+            .current_dir(&repo)
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .status()
+            .unwrap();
+        assert!(!status.success(), "the rebase must stop on its conflict");
+        std::fs::write(repo.join("base.txt"), "resolved\n").unwrap();
+        g(&repo, &["add", "base.txt"]);
+        let lock = repo.join(".git").join("index.lock");
+        std::fs::write(&lock, "").unwrap();
+
+        let wt = Workspace::local(&repo);
+        let error = advance_rebase(&wt).expect_err("a failing --continue must be reported");
+        std::fs::remove_file(&lock).unwrap();
+        assert!(
+            rebase_in_progress(&wt),
+            "the rebase stays paused for inspection"
+        );
+        assert!(rebase_stuck_detail("side", &error).contains("user.name/user.email"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     fn make_repo(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
         let base = tmp_dir(tag);
         let repo = base.join("repo");

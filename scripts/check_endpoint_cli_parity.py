@@ -88,6 +88,7 @@ ENDPOINT_TO_CLI: dict[str, list[str]] = {
     "GET /api/machines": ["machine list", "check health"],
     "POST /api/machines": ["machine register"],
     "GET /api/machines/{scheme}": ["machine get"],
+    "POST /api/machines/{scheme}/check": ["machine check"],
     "DELETE /api/machines/{scheme}": ["machine remove"],
     "POST /api/machines/cleanup": ["machine cleanup"],
     "GET /api/machines/targets/health": ["check health"],

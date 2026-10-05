@@ -1693,6 +1693,20 @@ impl MachineRouter {
         Self { local, store }
     }
 
+    /// The runner a review's background jobs use (straggler reopen, CI poll
+    /// and PR auto-fix, base-shift rebuild, post-merge checks, summaries, PR
+    /// submission/feedback/sync): the environment's `SubprocessRunner` for
+    /// local work, the review's machine for everything else. A bare
+    /// `SubprocessRunner` would run a remote review's agents on the daemon's
+    /// host, in a `cwd` that only exists on the machine.
+    #[must_use]
+    pub fn from_env(store: crate::store_lock::StoreHandle) -> Self {
+        let local: Arc<dyn Runner> = Arc::new(
+            crate::runner::SubprocessRunner::from_env().with_cartographer(Arc::clone(&store)),
+        );
+        Self::new(local, store)
+    }
+
     /// Build the provider runner for `machine`, or `None` when it resolves
     /// local. `Err` when the machine cannot be resolved or dispatched.
     fn provider_for(&self, machine: &str) -> Result<Option<ProviderRunner>, String> {

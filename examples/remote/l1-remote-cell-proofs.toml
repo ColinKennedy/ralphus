@@ -1,0 +1,35 @@
+# L1: one fully-remote task on loopback:lb.
+# - new-worktree placeholder => provider `provision` under remote_root
+# - command cell commits + pushes from the remote workspace
+# - cell environment must reach the remote runner (LIVE_ENV)
+# - cell proof (command) + task proof (command), both remote
+[[task]]
+name = "l1"
+project = "fx"
+machine = "loopback:lb"
+
+[[task.cell]]
+cwd = "<<ralphus:new-worktree/l1-remote?upstream=<<default>>>>"
+mode = "raw"
+command = "python -c \"import os,pathlib;pathlib.Path('l1.txt').write_text('LIVE_ENV='+os.environ.get('LIVE_ENV','<unset>')+chr(10))\" && git add l1.txt && git -c user.email=l@x -c user.name=l commit -q -m l1 && git push -q -u origin HEAD"
+
+[task.cell.environment]
+LIVE_ENV = "from-cell"
+
+[[task.cell.proof]]
+id = "cell-file"
+mode = "raw"
+command = "python -c \"import sys;t=open('l1.txt').read();print(t);sys.exit(0 if 'from-cell' in t else 1)\""
+
+[[task.cell.proof]]
+id = "cell-env"
+mode = "raw"
+command = "python check.py"
+
+[task.cell.proof.environment]
+LIVE_ENV = "from-proof"
+
+[[task.proof]]
+id = "task-proof"
+mode = "raw"
+command = "git log --oneline -1"
