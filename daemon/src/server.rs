@@ -6512,8 +6512,10 @@ fn submit(daemon: &Daemon, body: &str, query: &str, user_header: Option<&str>) -
     // access. Runs before `apply_presets` stamps field defaults into any of
     // this file's tasks'/cells'/proof steps' own unset fields, so every
     // stamp below is guaranteed to resolve a real preset.
-    let preset_errors =
-        crate::presets::validate_task_file_presets(&daemon.lock(), &req.toml, &file);
+    let preset_errors = {
+        let guard = daemon.lock();
+        crate::presets::validate_task_file_presets(&guard, &req.toml, &file)
+    };
     if !preset_errors.is_empty() {
         return error(
             400,
@@ -6522,7 +6524,10 @@ fn submit(daemon: &Daemon, body: &str, query: &str, user_header: Option<&str>) -
             preset_errors,
         );
     }
-    crate::presets::apply_presets(&daemon.lock(), &mut file);
+    {
+        let guard = daemon.lock();
+        crate::presets::apply_presets(&guard, &mut file);
+    }
 
     // RAL-318: an inline `triage_type` must name a registered Triage type --
     // `core::validate` only checked its structure (non-empty, requires
