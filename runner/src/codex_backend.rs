@@ -176,11 +176,18 @@ impl ModelBackend for CodexBackend {
                 .thrash_min_turn_gap
                 .unwrap_or(crate::thrash::DEFAULT_MIN_TURN_GAP),
         };
+        let sessions_root = codex_home
+            .clone()
+            .or_else(|| std::env::var_os("CODEX_HOME").map(std::path::PathBuf::from))
+            .or_else(|| crate::agent_isolation::home_dir().map(|h| h.join(".codex")))
+            .map(|dir| dir.join("sessions"));
         let outcome = drive_thread_events(
             &mut child,
             workspace,
             options.timeout_sec,
             thrash_thresholds,
+            sessions_root,
+            options.resume_agent_session_id.is_some(),
         );
 
         if !self.keep_temporary_files {
@@ -359,12 +366,146 @@ fn codex_infers_compaction(
     })
 }
 
+/// Cumulative `(uncached_input, cache_read, output)` tokens a Codex thread has
+/// used so far, in the same split [`split_turn_usage`] produces.
+type ThreadUsage = (i64, i64, i64);
+
+/// Extracts the thread's cumulative usage from one session-log line if it is a
+/// `token_count` event carrying totals.
+///
+/// `codex exec --json` only reports usage on `turn.completed`, which fires once
+/// the whole exec finishes -- so a running cell would show zero tokens. The
+/// session log (`rollout-*-<thread id>.jsonl`) gets a `token_count` event after
+/// every model call, with the running total in `info.total_token_usage`.
+fn token_count_usage(line: &str) -> Option<ThreadUsage> {
+    let event: Value = serde_json::from_str(line).ok()?;
+    if event["type"].as_str() != Some("event_msg")
+        || event["payload"]["type"].as_str() != Some("token_count")
+    {
+        return None;
+    }
+    let total = &event["payload"]["info"]["total_token_usage"];
+    total.is_object().then(|| split_turn_usage(total))
+}
+
+/// Finds `rollout-*-<thread_id>.jsonl` under `sessions_root` (laid out as
+/// `YYYY/MM/DD/`).
+fn find_rollout_file(
+    sessions_root: &std::path::Path,
+    thread_id: &str,
+) -> Option<std::path::PathBuf> {
+    let suffix = format!("-{thread_id}.jsonl");
+    let subdirs = |dir: &std::path::Path| -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .collect()
+    };
+    subdirs(sessions_root)
+        .iter()
+        .flat_map(|year| subdirs(year))
+        .flat_map(|month| subdirs(&month))
+        .flat_map(|day| subdirs(&day))
+        .find(|file| {
+            file.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(&suffix))
+        })
+}
+
+/// Polls the thread's session log while the cell runs and emits a live usage
+/// snapshot whenever the running total changes. `cost_usd` stays 0: Codex
+/// reports no cost and there is no price table to estimate one from.
+///
+/// A resumed thread's log already holds earlier cells' usage, so when
+/// `resumed` the totals present at first sight are subtracted, leaving only
+/// this cell's own spend (what `turn.completed` accumulation reports too).
+fn spawn_usage_tail(
+    sessions_root: std::path::PathBuf,
+    thread_id: String,
+    resumed: bool,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    use std::sync::atomic::Ordering;
+
+    std::thread::spawn(move || {
+        let mut path: Option<std::path::PathBuf> = None;
+        let mut offset = 0u64;
+        let mut pending = String::new();
+        let mut baseline: Option<ThreadUsage> = if resumed { None } else { Some((0, 0, 0)) };
+        let mut last_emitted: Option<ThreadUsage> = None;
+        while !stop.load(Ordering::Relaxed) {
+            if path.is_none() {
+                path = find_rollout_file(&sessions_root, &thread_id);
+            }
+            if let Some(file) = &path {
+                if let Ok(mut handle) = std::fs::File::open(file) {
+                    if handle.seek(SeekFrom::Start(offset)).is_ok() {
+                        let mut chunk = Vec::new();
+                        if handle.read_to_end(&mut chunk).is_ok() {
+                            offset += chunk.len() as u64;
+                            pending.push_str(&String::from_utf8_lossy(&chunk));
+                        }
+                    }
+                }
+                // Only complete lines: a trailing partial line stays pending.
+                let complete_end = pending.rfind('\n').map_or(0, |i| i + 1);
+                let mut latest: Option<ThreadUsage> = None;
+                for line in pending[..complete_end].lines() {
+                    if let Some(usage) = token_count_usage(line) {
+                        latest = Some(usage);
+                    }
+                }
+                pending.drain(..complete_end);
+                if let Some(usage) = latest {
+                    let base = *baseline.get_or_insert(usage);
+                    let own = (
+                        (usage.0 - base.0).max(0),
+                        (usage.1 - base.1).max(0),
+                        (usage.2 - base.2).max(0),
+                    );
+                    if last_emitted != Some(own) {
+                        last_emitted = Some(own);
+                        crate::cartographer::emit(
+                            "codex",
+                            crate::cartographer::LIVE_USAGE_MESSAGE,
+                            "info",
+                            crate::cartographer::EventContext::default(),
+                            serde_json::json!({
+                                "tokens_in": own.0,
+                                "tokens_out": own.2,
+                                "cache_creation_tokens": 0,
+                                "cache_read_tokens": own.1,
+                                "cost_usd": 0.0,
+                            }),
+                        );
+                    }
+                }
+            }
+            // Short slices so a stop request is honored promptly.
+            for _ in 0..10 {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    })
+}
+
 fn drive_thread_events(
     child: &mut Child,
     workspace: &Workspace,
     timeout_sec: Option<u64>,
     thrash_thresholds: crate::thrash::ThrashThresholds,
+    sessions_root: Option<std::path::PathBuf>,
+    resumed: bool,
 ) -> Result<BackendOutcome, BackendError> {
+    let usage_tail_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut usage_tail: Option<std::thread::JoinHandle<()>> = None;
     let stderr = child.stderr.take();
     let stderr_thread = stderr.map(|s| {
         std::thread::spawn(move || {
@@ -415,6 +556,16 @@ fn drive_thread_events(
                 if let Some(id) = event["thread_id"].as_str() {
                     agent_session_id = Some(id.to_string());
                     write_live_session_id(workspace.root(), id);
+                    if usage_tail.is_none() {
+                        if let Some(root) = sessions_root.clone() {
+                            usage_tail = Some(spawn_usage_tail(
+                                root,
+                                id.to_string(),
+                                resumed,
+                                usage_tail_stop.clone(),
+                            ));
+                        }
+                    }
                     crate::cartographer::emit(
                         "codex",
                         "thread-id known",
@@ -542,6 +693,11 @@ fn drive_thread_events(
         if compaction_thrash.is_some() {
             break;
         }
+    }
+
+    usage_tail_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(handle) = usage_tail {
+        let _ = handle.join();
     }
 
     if let Some(detail) = compaction_thrash {
@@ -703,6 +859,41 @@ fn wait_for_child(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_count_usage_reads_cumulative_totals_and_splits_cache() {
+        let line = r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":20780,"cached_input_tokens":11008,"output_tokens":128}}}}"#;
+        assert_eq!(token_count_usage(line), Some((9772, 11008, 128)));
+    }
+
+    #[test]
+    fn token_count_usage_ignores_other_events_and_null_info() {
+        assert_eq!(
+            token_count_usage(r#"{"type":"event_msg","payload":{"type":"agent_message"}}"#),
+            None
+        );
+        assert_eq!(
+            token_count_usage(
+                r#"{"type":"event_msg","payload":{"type":"token_count","info":null}}"#
+            ),
+            None
+        );
+        assert_eq!(token_count_usage("not json"), None);
+    }
+
+    #[test]
+    fn find_rollout_file_matches_the_thread_id_suffix() {
+        let root = std::env::temp_dir().join("ralphus-codex-rollout-find-test");
+        let _ = std::fs::remove_dir_all(&root);
+        let day = root.join("2026").join("10").join("04");
+        std::fs::create_dir_all(&day).unwrap();
+        let wanted = day.join("rollout-2026-10-04T00-00-00-abc-123.jsonl");
+        std::fs::write(&wanted, "").unwrap();
+        std::fs::write(day.join("rollout-2026-10-04T00-00-00-other.jsonl"), "").unwrap();
+        assert_eq!(find_rollout_file(&root, "abc-123"), Some(wanted));
+        assert_eq!(find_rollout_file(&root, "missing"), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// RAL-326: `cached_input_tokens` is a subset of `input_tokens`, not
     /// additional to it -- the field must be subtracted out, not summed in,
