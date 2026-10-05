@@ -718,7 +718,8 @@
       // teaches a user to write by hand.
       const NT_NO_COMMIT_SYSTEM_PROMPT =
         "Do NOT commit and do NOT push under any circumstances.\nYou are working in a dedicated git worktree of the ralphus repository. Implement the work exactly as-described and keep your changes only within the worktree.";
-      const NT_FINALIZE_TEXT = "ONLY git stage the relevant source files, commit them, and push the commit if a remote exists.";
+      const NT_PROOF_REMEDIATION_ATTEMPTS = 3;
+      const NT_FINALIZE_TEXT ="ONLY git stage the relevant source files, commit them, and push the commit if a remote exists.";
       // Mirrors `core::schema::agent_supports_system_prompt` -- the daemon's
       // TOML validator hard-rejects `system_prompt`/`system_prompt_position`
       // for any other *known* builtin agent name (e.g. "claude", "ollama"),
@@ -809,6 +810,10 @@
           lines.push("[[task.cell.proof]]");
           if (it.label.trim()) lines.push(`id = ${tomlStr(it.label.trim())}`);
           lines.push(`command = ${tomlStr(it.value.trim())}`);
+          // A `command` with no `mode` is a remediating command, which the
+          // validator requires a retry budget for (`core/src/validate.rs`
+          // `check_command_mode`).
+          lines.push(`remediation_attempts = ${NT_PROOF_REMEDIATION_ATTEMPTS}`);
         });
         lines.push("");
         lines.push("[[task.cell]]");
