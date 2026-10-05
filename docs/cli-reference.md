@@ -747,6 +747,11 @@ use; see `READ_ONLY_NOTE`.
         - (read-only-safe) watches --user [name]  {List the acting user's watches (RAL-320).}
     - mcp  {Configure agent hosts to use the ralphus MCP server.}
         - initialize host [claude|codex|pi] --dry-run --profile-file [path] --yes  {Preview and apply the local MCP setup required by an agent host.}
+    - preset  {Register and inspect presets -- named bundles of field defaults an "extends = [\"<<ralphus:presets/<name>>>\"]" entry stamps into a task's, cell's, or proof step's own unset fields when the squad is submitted.}
+        - deregister name [str]  {Remove a preset. Any preset, including a starter default, may be freely removed.}
+        - (read-only-safe) get name [str]  {Show one registered preset by exact name.}
+        - (read-only-safe) list  {List every registered preset.}
+        - register name [str] --auto-compact-threshold [integer] --maximum-context [integer] --maximum-tool-output-tokens [integer] --system-prompt [text] --system-prompt-position [text]  {Register (or update) a preset -- a named bundle of field defaults an "extends" sentinel stamps into a task's, cell's, or proof step's own unset fields when the squad is submitted.}
     - project  {Register and inspect projects known to the daemon.}
         - (read-only-safe) check-destination name [str]  {Run a manual reachability check for a project's destination repository -- its registered clone URL, else the checkout's forge remote -- against the forge REST API. SSH-style clone URLs resolve through their host/path pair (no SSH connection is opened); a URL no REST identity can be resolved from is reported as a failed check with an actionable diagnostic.}
         - fork  {Manage per-project, per-user fork registrations for fork-based stacked PR routing.}

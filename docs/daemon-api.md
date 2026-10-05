@@ -814,7 +814,7 @@ unclaimed rows.
 `GET /api/users/{name}/deletion-impact`,
 `POST /api/users/{name}/rename`, `POST /api/users/{name}/admin`,
 `POST /api/users/{name}/visit`, everything under `/api/machines`,
-everything under `/api/triage`, everything under `/api/secret-env-names`,
+everything under `/api/triage`, everything under `/api/presets`, everything under `/api/secret-env-names`,
 `POST /api/projects` (registering/editing a project), and
 `DELETE /api/projects/{name}` (unregistering one) all require the
 current placeholder identity (`X-Ralphus-User`, falling back to
