@@ -10,6 +10,7 @@ pub fn execute(cmd: PresetCommand, client: &DaemonClient) -> ExecResult {
         PresetCommand::Help | PresetCommand::UsageError(_) => Err(usage("no such tool")),
         PresetCommand::Register {
             name,
+            prompt,
             system_prompt,
             system_prompt_position,
             maximum_context,
@@ -17,6 +18,7 @@ pub fn execute(cmd: PresetCommand, client: &DaemonClient) -> ExecResult {
             maximum_tool_output_tokens,
         } => Ok(client.register_preset(
             &name,
+            prompt.as_deref(),
             system_prompt.as_deref(),
             system_prompt_position.as_deref(),
             maximum_context,

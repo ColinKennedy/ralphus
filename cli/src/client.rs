@@ -924,6 +924,7 @@ impl DaemonClient {
     pub fn register_preset(
         &self,
         name: &str,
+        prompt: Option<&str>,
         system_prompt: Option<&str>,
         system_prompt_position: Option<&str>,
         maximum_context: Option<u64>,
@@ -934,6 +935,7 @@ impl DaemonClient {
             "/api/presets",
             Some(json!({
                 "name": name,
+                "prompt": prompt,
                 "system_prompt": system_prompt,
                 "system_prompt_position": system_prompt_position,
                 "maximum_context": maximum_context,
@@ -948,11 +950,11 @@ impl DaemonClient {
     }
 
     pub fn get_preset(&self, name: &str) -> Result<Value, DaemonError> {
-        self.get(&format!("/api/presets/{name}"))
+        self.get(&format!("/api/presets/{}", urlencode(name)))
     }
 
     pub fn deregister_preset(&self, name: &str) -> Result<Value, DaemonError> {
-        self.delete(&format!("/api/presets/{name}"))
+        self.delete(&format!("/api/presets/{}", urlencode(name)))
     }
 
     /// `ralphus triage pool list` (RAL-318): every `(project, triage_type)`

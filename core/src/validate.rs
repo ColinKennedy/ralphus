@@ -1108,6 +1108,9 @@ fn validate_cells(
                 "cell cannot set both 'prompt' (AI-driven) and 'command' (deterministic); use one",
                 header,
             ),
+            // A cell that `extends` a preset may leave `prompt` to the
+            // preset; the daemon re-checks once the presets are applied.
+            (false, false) if has_extends(table) => {}
             (false, false) => ctx.error(
                 &path,
                 ErrorKind::MissingRequired,
@@ -2977,6 +2980,14 @@ fn check_review(ctx: &mut Ctx, table: &toml::Table, path: &str, header: Option<u
 /// registered is checked daemon-side at submit time
 /// (`daemon::presets::validate_task_file_presets`), the same two-phase
 /// pattern as `project`/`review`/Triage type names.
+/// Whether `table` has a non-empty `extends` array.
+fn has_extends(table: &toml::Table) -> bool {
+    table
+        .get("extends")
+        .and_then(toml::Value::as_array)
+        .is_some_and(|a| !a.is_empty())
+}
+
 fn check_extends(ctx: &mut Ctx, table: &toml::Table, path: &str, header: Option<u32>) {
     let Some(arr) = table.get("extends").and_then(toml::Value::as_array) else {
         return;
@@ -3287,6 +3298,8 @@ fn validate_proof_array(
             .filter(|k| table.contains_key(*k))
             .collect();
         match set.len() {
+            // As for a cell: a preset may supply the proof's `prompt`.
+            0 if has_extends(table) => {}
             0 => ctx.error(
                 &vpath,
                 ErrorKind::MissingRequired,
@@ -6365,6 +6378,32 @@ placement = "copy"
             "{:?}",
             r.errors
         );
+    }
+
+    #[test]
+    fn cell_extending_a_preset_may_omit_prompt_and_command() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nextends=[\"<<ralphus:presets/roles/reviewer>>\"]\n";
+        assert!(
+            validate_toml(src).is_ok(),
+            "{:?}",
+            validate_toml(src).errors
+        );
+    }
+
+    #[test]
+    fn proof_extending_a_preset_may_omit_its_kind() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.cell.proof]]\nextends=[\"<<ralphus:presets/roles/qa>>\"]\n";
+        assert!(
+            validate_toml(src).is_ok(),
+            "{:?}",
+            validate_toml(src).errors
+        );
+    }
+
+    #[test]
+    fn cell_without_extends_still_requires_prompt_or_command() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nextends=[]\n";
+        assert!(!validate_toml(src).is_ok());
     }
 
     #[test]

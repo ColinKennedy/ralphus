@@ -40,7 +40,7 @@ validation time — a typo fails fast at submit, before the daemon sees it.
 | `<<squad:<id>>>` | `[[waypoint]].roster` | an existing squad's id already known to the daemon (RAL-400) |
 | `<<ralphus:new-squad>>` | `[[waypoint]].roster` | the squad this same submission itself creates — no `<key>`, since one submission file always produces exactly one squad (RAL-400) |
 | `<<ralphus:linked-field/<path>>>` | `environment` value (task, cell, proof step, or `[[default]]`) | the field `<path>` addresses relative to where this value is declared — `cwd`/`id`, or a same-table sibling `environment.<key>` (RAL-460) |
-| `<<ralphus:presets/<name>>>` | `extends` (an array, on `[[task]]`, `[[task.cell]]`, or any `[[*.proof]]` block) | stamps a registered **preset**'s field values into any of that entity's own fields still unset |
+| `<<ralphus:presets/<name>>>` | `extends` (an array, on `[[task]]`, `[[task.cell]]`, or any `[[*.proof]]` block) | stamps a registered **preset**'s field values into any of that entity's own fields still unset; the name may be hierarchical (`roles/reviewer`) |
 
 Rules and risks:
 
@@ -238,13 +238,21 @@ values into any of the *same entity's own* fields still unset:
   preset only ever fills a field that is unset.
 - **When more than one named preset in one `extends` list defines the same
   field, the last one listed wins.**
-- **Only 5 fields are preset-eligible**: `system_prompt`,
-  `system_prompt_position` (cell-only), `maximum_context`,
-  `auto_compact_threshold` (task/cell only, not a proof step), and
-  `maximum_tool_output_tokens` (task/cell/proof). A preset field that
-  doesn't apply to the entity kind it's referenced from is **silently
+- **Only 6 fields are preset-eligible**: `prompt` (cell, and a `prompt`
+  proof step), `system_prompt`, `system_prompt_position` (cell-only),
+  `maximum_context`, `auto_compact_threshold` (task/cell only, not a proof
+  step), and `maximum_tool_output_tokens` (task/cell/proof). A preset field
+  that doesn't apply to the entity kind it's referenced from is **silently
   skipped**, not an error — e.g. a task-level `extends` naming a preset that
-  sets `system_prompt` simply has nothing to stamp there.
+  sets `system_prompt` simply has nothing to stamp there, and a `command`
+  cell is never given a `prompt`.
+- **A name may be hierarchical.** `roles/reviewer` is referenced as
+  `<<ralphus:presets/roles/reviewer>>`. The `/` is only part of the name —
+  there is no separate namespace object. Each `/`-separated segment is
+  letters, digits, `_`, `-` or `.`.
+- **A cell or proof step that `extends` a preset may omit its `prompt`.**
+  The daemon re-checks that a prompt exists once the presets are applied,
+  and rejects the submission if none of the presets supplied one.
 - **A task-level fill cascades to its cells** exactly like any other
   task-level value, through the existing task→cell inheritance — there is no
   separate mechanism for that.
@@ -254,6 +262,84 @@ values into any of the *same entity's own* fields still unset:
 - Once stamped, the resulting value is indistinguishable from one the author
   typed directly — presets carry no provenance and are never re-applied on a
   restart.
+
+#### Preset `prompt` / `system_prompt` templates and linked fields
+
+A preset's `prompt` and `system_prompt` are *templates*. A
+`<<ralphus:linked-field/<path>>>` inside one is expanded when the preset is
+applied, using the same `./` (this entity) and `../` (its parent) path syntax
+as an `environment` linked field. Only the `prompt` and `system_prompt`
+targets are expanded here; any other linked field is left as written.
+
+- `./prompt` — the entity's own prompt; `./system_prompt` — its own system
+  prompt.
+- `../prompt` — the parent's prompt. A proof step's parent is its cell, so a
+  preset applied to a proof can say what the cell was asked to do.
+- The replacement keeps the indentation of the line the reference is on, so
+  a multi-line value stays aligned. The value's trailing newlines are dropped.
+- A reference that cannot be resolved (no such parent, or the field is
+  unset) becomes `<field prompt was not found>`. It is never an error.
+- A reference sees the values the author wrote, not what another preset
+  field made of them.
+
+A preset template given to an entity that already has its own value follows
+one extra rule: **the entity's value is kept unless the template references
+that same field of the entity itself** (`./prompt` in a `prompt` template).
+That reference is the author's way of letting the preset frame their text, so
+the expanded template — with the author's text spliced in — replaces it.
+
+```toml
+[[task.cell]]
+extends = ["<<ralphus:presets/roles/foo>>"]
+prompt = """
+Some text here
+More lines
+"""
+```
+
+With `roles/foo` having the `system_prompt`
+
+```
+I am a foo role and I am special!
+
+    <<ralphus:linked-field/./prompt>>
+
+More text here
+```
+
+the cell's system prompt becomes
+
+```
+I am a foo role and I am special!
+
+    Some text here
+    More lines
+
+More text here
+```
+
+#### Where presets come from
+
+- **The database** — added, edited and removed at runtime (`ralphus preset
+  register/deregister`, the MCP tools, the board's Presets tab). A fresh
+  database is seeded once with the starter presets and a set of role presets
+  under `roles/` (`adversary`, `analyst`, `architect`, `backend`, `ci-fixer`,
+  `devops`, `docs`, `frontend`, `manager`, `qa`, `resolver`, `retrieval`,
+  `reviewer`, `security`, `visionary`, `vp`). Any of them can be edited or
+  deleted; a deleted one is not re-seeded.
+- **Files** — the daemon's global `config.toml` takes a top-level
+  `preset_paths = ["presets", "/opt/shared/presets"]` list. A relative entry
+  is relative to the directory holding `config.toml`. Each entry is a
+  directory (scanned recursively for `*.toml`) or a single `.toml` file. A
+  preset's name is its path under the entry without `.toml`, so
+  `presets/roles/foo.toml` defines `roles/foo`. A file holds the preset's
+  fields as top-level keys (`prompt`, `system_prompt`,
+  `system_prompt_position`, `maximum_context`, `auto_compact_threshold`,
+  `maximum_tool_output_tokens`). File presets are **read-only**: they cannot
+  be registered over or removed through the CLI, MCP or board, and a
+  same-named file preset wins over a database one. A file that does not parse
+  is skipped with a warning in the daemon log. Files are re-read on each use,
+  so edits take effect without a restart.
 
 ### `restart_on` grammar (proof steps)
 

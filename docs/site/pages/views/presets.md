@@ -24,3 +24,14 @@ through the matching MCP tool — all three read and write the same
 daemon-registered registry. Deregistering a preset never touches a squad
 that already had its fields stamped from it; only a future submission's
 `extends` referencing that name is affected.
+
+## Prompts, roles, and files
+
+A preset's `prompt` and `system_prompt` are templates: a
+`<<ralphus:linked-field/./prompt>>` inside one expands to the entity's own
+prompt (`../prompt` to its parent's, such as a proof step's cell). A new
+database starts with a set of **role** presets named `roles/…` (reviewer, qa,
+architect, and so on) built this way; edit or delete them freely. Presets can
+also be loaded from files named by `preset_paths` in the daemon's
+`config.toml`; those show as **read-only** here. See
+`docs/special-syntax.md` for the exact rules.

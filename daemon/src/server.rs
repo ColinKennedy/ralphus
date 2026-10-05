@@ -3862,6 +3862,8 @@ fn deregister_triage_type(daemon: &Daemon, name: &str) -> Reply {
 struct RegisterPresetBody {
     name: String,
     #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
     system_prompt: Option<String>,
     #[serde(default)]
     system_prompt_position: Option<String>,
@@ -3896,6 +3898,22 @@ fn register_preset(daemon: &Daemon, body: &str) -> Reply {
     if name.is_empty() {
         return error(400, "invalid_value", "'name' must not be empty", vec![]);
     }
+    if !ralphus_core::schema::is_valid_preset_name(name) {
+        return error(
+            400,
+            "invalid_value",
+            "'name' must be one or more '/'-separated segments of letters, digits, '_', '-' or '.' (e.g. \"roles/reviewer\")",
+            vec![],
+        );
+    }
+    if crate::presets::disk_preset_named(name).is_some() {
+        return error(
+            409,
+            "read_only",
+            &format!("preset \"{name}\" is defined on disk (config preset_paths) and is read-only"),
+            vec![],
+        );
+    }
     if let Some(pos) = &req.system_prompt_position {
         if pos != ralphus_core::schema::SYSTEM_PROMPT_POSITION_APPEND {
             return error(
@@ -3911,12 +3929,15 @@ fn register_preset(daemon: &Daemon, body: &str) -> Reply {
     }
     let view = crate::presets::PresetView {
         name: name.to_string(),
+        prompt: req.prompt,
         system_prompt: req.system_prompt,
         system_prompt_position: req.system_prompt_position,
         maximum_context: req.maximum_context,
         auto_compact_threshold: req.auto_compact_threshold,
         maximum_tool_output_tokens: req.maximum_tool_output_tokens,
         created_at_ms: 0,
+        source: crate::presets::PresetSource::Db,
+        path: None,
     };
     match daemon.lock().register_preset(&view) {
         Ok(()) => json(201, &serde_json::json!({"name": name})),
@@ -3926,15 +3947,27 @@ fn register_preset(daemon: &Daemon, body: &str) -> Reply {
 
 /// `GET /api/presets`: every registered preset.
 fn list_presets(daemon: &Daemon) -> Reply {
-    match daemon.lock().list_presets() {
-        Ok(presets) => json(200, &PresetsResponse { presets }),
+    let db = daemon.lock().list_presets();
+    match db {
+        Ok(db) => json(
+            200,
+            &PresetsResponse {
+                presets: crate::presets::merge_presets(db, &crate::config::load_preset_paths()),
+            },
+        ),
         Err(e) => store_error(&e),
     }
 }
 
 /// `GET /api/presets/{name}`.
 fn get_preset(daemon: &Daemon, name: &str) -> Reply {
-    match daemon.lock().get_preset(name) {
+    let name = url_decode(name);
+    let name = name.trim();
+    let found = match crate::presets::disk_preset_named(name) {
+        Some(p) => Ok(Some(p)),
+        None => daemon.lock().get_preset(name),
+    };
+    match found {
         Ok(Some(p)) => json(200, &p),
         Ok(None) => error(
             404,
@@ -3950,6 +3983,16 @@ fn get_preset(daemon: &Daemon, name: &str) -> Reply {
 /// may be freely removed -- no built-in-protection like the Triage
 /// registry's `unclassified` type.
 fn deregister_preset(daemon: &Daemon, name: &str) -> Reply {
+    let name = url_decode(name);
+    let name = name.as_str();
+    if crate::presets::disk_preset_named(name).is_some() {
+        return error(
+            409,
+            "read_only",
+            &format!("preset \"{name}\" is defined on disk (config preset_paths) and is read-only"),
+            vec![],
+        );
+    }
     match daemon.lock().deregister_preset(name) {
         Ok(true) => json(200, &serde_json::json!({"deleted": true})),
         Ok(false) => error(
@@ -6527,6 +6570,15 @@ fn submit(daemon: &Daemon, body: &str, query: &str, user_header: Option<&str>) -
     {
         let guard = daemon.lock();
         crate::presets::apply_presets(&guard, &mut file);
+    }
+    let post_preset_errors = crate::presets::check_required_fields_after_presets(&file);
+    if !post_preset_errors.is_empty() {
+        return error(
+            400,
+            "validation_failed",
+            "the submitted TOML is invalid",
+            post_preset_errors,
+        );
     }
 
     // RAL-318: an inline `triage_type` must name a registered Triage type --
