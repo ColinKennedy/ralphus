@@ -2670,6 +2670,7 @@ impl Store {
             -- required to exist.
             CREATE TABLE IF NOT EXISTS presets (
                 name                        TEXT PRIMARY KEY,
+                prompt                      TEXT,
                 system_prompt               TEXT,
                 system_prompt_position      TEXT,
                 maximum_context             INTEGER,
@@ -2704,11 +2705,15 @@ impl Store {
             }
         }
         if !presets_preexisting {
-            for seed in crate::presets::DEFAULT_PRESETS {
+            for seed in crate::presets::DEFAULT_PRESETS
+                .iter()
+                .chain(crate::preset_roles::ROLE_PRESETS)
+            {
                 self.conn.execute(
-                    "INSERT OR IGNORE INTO presets(name, system_prompt, system_prompt_position, maximum_context, auto_compact_threshold, maximum_tool_output_tokens, created_at_ms) VALUES(?,?,?,?,?,?,?)",
+                    "INSERT OR IGNORE INTO presets(name, prompt, system_prompt, system_prompt_position, maximum_context, auto_compact_threshold, maximum_tool_output_tokens, created_at_ms) VALUES(?,?,?,?,?,?,?,?)",
                     params![
                         seed.name,
+                        seed.prompt,
                         seed.system_prompt,
                         seed.system_prompt_position,
                         seed.maximum_context.map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
@@ -2730,6 +2735,7 @@ impl Store {
         // Best-effort migrations for databases created before these columns
         // existed. Each fails harmlessly (duplicate column) once present.
         for stmt in [
+            "ALTER TABLE presets ADD COLUMN prompt TEXT",
             "ALTER TABLE guardians ADD COLUMN squad_id TEXT",
             "ALTER TABLE guardians ADD COLUMN combined_worktree TEXT",
             "ALTER TABLE guardians ADD COLUMN conflicts_total INTEGER",

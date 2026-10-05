@@ -1258,7 +1258,8 @@ pub fn parse_affected_entry_sentinel(entry: &str) -> Option<AffectedEntryRef> {
 /// field defaults (`daemon::presets`) stamped into any of the entity's own
 /// fields still unset at submit time -- `core` has no store access, so it
 /// can only check this sentinel's shape, never whether the name is actually
-/// registered.
+/// registered. The name may be hierarchical, e.g.
+/// `<<ralphus:presets/roles/reviewer>>` (see [`is_valid_preset_name`]).
 pub const PRESET_LINK_PREFIX: &str = "ralphus:presets/";
 
 /// Parse one `extends` list entry as a `<<ralphus:presets/<name>>>` sentinel.
@@ -1271,7 +1272,26 @@ pub const PRESET_LINK_PREFIX: &str = "ralphus:presets/";
 pub fn parse_preset_sentinel(value: &str) -> Option<&str> {
     let inner = value.strip_prefix("<<")?.strip_suffix(">>")?;
     let name = inner.strip_prefix(PRESET_LINK_PREFIX)?.trim();
-    (!name.is_empty()).then_some(name)
+    is_valid_preset_name(name).then_some(name)
+}
+
+/// Whether `name` is a well-formed preset name. A name may be hierarchical
+/// (`roles/reviewer`): `/` separates namespace segments, but a namespace is
+/// only ever part of the name string -- there is no separate namespace
+/// object anywhere. Every segment must be non-empty, must not be `.` or
+/// `..` (so a name can never be mistaken for a path-relative reference), and
+/// may use only ASCII letters, digits, `_`, `-` and `.`.
+#[must_use]
+pub fn is_valid_preset_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.split('/').all(|segment| {
+            !segment.is_empty()
+                && segment != "."
+                && segment != ".."
+                && segment
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        })
 }
 
 /// The reserved `machine` value naming the daemon's own host. Also the
@@ -2903,6 +2923,32 @@ mod tests {
         assert_eq!(parse_cell_review_sentinel("<<review:>>"), None);
         assert_eq!(parse_cell_review_sentinel("<<unknown>>"), None);
         assert_eq!(parse_cell_review_sentinel(""), None);
+    }
+
+    #[test]
+    fn preset_sentinel_accepts_hierarchical_names() {
+        assert_eq!(
+            parse_preset_sentinel("<<ralphus:presets/roles/reviewer>>"),
+            Some("roles/reviewer")
+        );
+        assert_eq!(
+            parse_preset_sentinel("<<ralphus:presets/a/b/c.d-e_f>>"),
+            Some("a/b/c.d-e_f")
+        );
+    }
+
+    #[test]
+    fn preset_sentinel_rejects_malformed_hierarchies() {
+        for bad in [
+            "<<ralphus:presets//foo>>",
+            "<<ralphus:presets/foo/>>",
+            "<<ralphus:presets/../foo>>",
+            "<<ralphus:presets/./foo>>",
+            "<<ralphus:presets/foo bar>>",
+            "<<ralphus:presets/a\\b>>",
+        ] {
+            assert_eq!(parse_preset_sentinel(bad), None, "{bad}");
+        }
     }
 
     #[test]

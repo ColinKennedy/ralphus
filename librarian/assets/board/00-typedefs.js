@@ -672,12 +672,15 @@
        * field below is optional; a field this preset doesn't set is `null`.
        * @typedef {object} PresetView
        * @property {string} name
+       * @property {string|null} prompt
        * @property {string|null} system_prompt
        * @property {string|null} system_prompt_position
        * @property {number|null} maximum_context
        * @property {number|null} auto_compact_threshold
        * @property {number|null} maximum_tool_output_tokens
        * @property {number} created_at_ms
+       * @property {"db"|"disk"} source "disk" presets come from the daemon's `preset_paths` and are read-only
+       * @property {string} [path] the file an on-disk preset was read from
        */
       /**
        * The Arbiter's pooled-cell count for one `(project, triage_type)` key

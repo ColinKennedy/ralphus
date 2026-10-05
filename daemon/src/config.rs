@@ -1062,6 +1062,47 @@ pub fn load_pr_cache_config() -> PrCacheConfig {
         .unwrap_or_default()
 }
 
+/// Resolve the `preset_paths` list of a config file's text against
+/// `base_dir` (the directory holding that file): an absolute entry is kept
+/// as written, a relative one is joined onto `base_dir`. A leading `~/` is
+/// expanded to the home directory.
+#[must_use]
+pub fn preset_paths_from_toml_str(s: &str, base_dir: &Path) -> Vec<PathBuf> {
+    parse_config_file(s)
+        .preset_paths
+        .iter()
+        .map(|raw| {
+            let expanded = match raw.strip_prefix("~/") {
+                Some(rest) => std::env::var_os("USERPROFILE")
+                    .or_else(|| std::env::var_os("HOME"))
+                    .map_or_else(|| PathBuf::from(raw), |home| PathBuf::from(home).join(rest)),
+                None => PathBuf::from(raw),
+            };
+            if expanded.is_absolute() {
+                expanded
+            } else {
+                base_dir.join(expanded)
+            }
+        })
+        .collect()
+}
+
+/// The read-only, on-disk preset sources named by the global config file's
+/// top-level `preset_paths = ["...", ...]` list (each a directory scanned
+/// for `*.toml` files, or a single `.toml` file) -- see
+/// [`crate::presets`]. Daemon-singleton, so (like [`ArbiterConfig`]) it is
+/// read from the global config file only. Computed fresh at each call site.
+#[must_use]
+pub fn load_preset_paths() -> Vec<PathBuf> {
+    let Some(path) = global_config_path() else {
+        return Vec::new();
+    };
+    let base = path.parent().map(Path::to_path_buf).unwrap_or_default();
+    read_config_text(&path)
+        .map(|s| preset_paths_from_toml_str(&s, &base))
+        .unwrap_or_default()
+}
+
 /// RAL-416: the hourly background sweep that runs every Free-tier,
 /// daemon-local `ralphus_core::health_catalog` check and caches the latest
 /// results for the read-only health-report API -- daemon-singleton
@@ -2500,6 +2541,8 @@ struct ConfigFile {
     #[serde(default)]
     pr_cache: Option<PrCacheConfig>,
     #[serde(default)]
+    preset_paths: Vec<String>,
+    #[serde(default)]
     health: Option<HealthSweepConfig>,
     #[serde(default)]
     monorepo: Option<MonorepoConfig>,
@@ -3445,6 +3488,19 @@ mod tests {
             arbiter_from_toml_str("[review]\nskip_worktrees = true\n"),
             ArbiterConfig::default()
         );
+    }
+
+    #[test]
+    fn preset_paths_resolve_relative_to_the_config_directory() {
+        let base = std::env::temp_dir().join("ralphus-cfg");
+        let absolute = std::env::temp_dir().join("ralphus-shared");
+        let toml = format!(
+            "preset_paths = [\"presets\", {:?}]\n",
+            absolute.to_string_lossy()
+        );
+        let paths = preset_paths_from_toml_str(&toml, &base);
+        assert_eq!(paths, vec![base.join("presets"), absolute]);
+        assert!(preset_paths_from_toml_str("", &base).is_empty());
     }
 
     // ── pr_cache (RAL-366) ──────────────────────────────────────────────────

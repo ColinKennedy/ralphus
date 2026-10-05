@@ -1072,12 +1072,14 @@ const PRESET_CHILDREN: &[HelpNode] = &[
             "--auto-compact-threshold [integer]",
             "--maximum-context [integer]",
             "--maximum-tool-output-tokens [integer]",
+            "--prompt [text]",
             "--system-prompt [text]",
             "--system-prompt-position [text]",
         ],
         "Register (or update) a preset -- a named bundle of field defaults an \"extends\" \
          sentinel stamps into a task's, cell's, or proof step's own unset fields when the squad \
-         is submitted.",
+         is submitted. A name may be hierarchical (roles/reviewer). prompt and system-prompt may \
+         embed <<ralphus:linked-field/./prompt>> to splice in the entity's own prompt.",
         false,
         false,
         &[],

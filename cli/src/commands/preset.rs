@@ -15,6 +15,7 @@ pub enum PresetCommand {
     Help,
     Register {
         name: String,
+        prompt: Option<String>,
         system_prompt: Option<String>,
         system_prompt_position: Option<String>,
         maximum_context: Option<u64>,
@@ -37,6 +38,10 @@ pub fn parse(args: &[String]) -> PresetCommand {
     match args.first().map(String::as_str) {
         None | Some("help" | "--help" | "-h") => PresetCommand::Help,
         Some("register") => {
+            let prompt = match scanner.take_value("--prompt") {
+                Ok(v) => v,
+                Err(e) => return PresetCommand::UsageError(e.0),
+            };
             let system_prompt = match scanner.take_value("--system-prompt") {
                 Ok(v) => v,
                 Err(e) => return PresetCommand::UsageError(e.0),
@@ -62,6 +67,7 @@ pub fn parse(args: &[String]) -> PresetCommand {
             match scanner.remaining().into_iter().next() {
                 Some(name) => PresetCommand::Register {
                     name,
+                    prompt,
                     system_prompt,
                     system_prompt_position,
                     maximum_context,
@@ -112,6 +118,7 @@ pub fn dispatch(cmd: PresetCommand, opts: &GlobalOpts) -> i32 {
         }
         PresetCommand::Register {
             name,
+            prompt,
             system_prompt,
             system_prompt_position,
             maximum_context,
@@ -119,6 +126,7 @@ pub fn dispatch(cmd: PresetCommand, opts: &GlobalOpts) -> i32 {
             maximum_tool_output_tokens,
         } => match client.register_preset(
             &name,
+            prompt.as_deref(),
             system_prompt.as_deref(),
             system_prompt_position.as_deref(),
             maximum_context,
@@ -174,12 +182,26 @@ fn render_preset_list(payload: &Value) {
         return;
     }
     for p in &presets {
-        println!("{}", p["name"].as_str().unwrap_or_default());
+        let name = p["name"].as_str().unwrap_or_default();
+        if p["source"].as_str() == Some("disk") {
+            println!("{name} (read-only, on disk)");
+        } else {
+            println!("{name}");
+        }
     }
 }
 
 fn render_preset_detail(p: &Value) {
     println!("name: {}", p["name"].as_str().unwrap_or_default());
+    if let Some(v) = p["source"].as_str() {
+        println!("source: {v}");
+    }
+    if let Some(v) = p["path"].as_str() {
+        println!("path: {v}");
+    }
+    if let Some(v) = p["prompt"].as_str() {
+        println!("prompt: {v}");
+    }
     if let Some(v) = p["system_prompt"].as_str() {
         println!("system_prompt: {v}");
     }
@@ -214,6 +236,8 @@ mod tests {
     fn parses_register_with_flags() {
         match parse(&v(&[
             "register",
+            "--prompt",
+            "wrap <<ralphus:linked-field/./prompt>>",
             "--system-prompt",
             "do the thing",
             "--system-prompt-position",
@@ -228,6 +252,7 @@ mod tests {
         ])) {
             PresetCommand::Register {
                 name,
+                prompt,
                 system_prompt,
                 system_prompt_position,
                 maximum_context,
@@ -235,12 +260,24 @@ mod tests {
                 maximum_tool_output_tokens,
             } => {
                 assert_eq!(name, "easy_task");
+                assert_eq!(
+                    prompt.as_deref(),
+                    Some("wrap <<ralphus:linked-field/./prompt>>")
+                );
                 assert_eq!(system_prompt.as_deref(), Some("do the thing"));
                 assert_eq!(system_prompt_position.as_deref(), Some("append"));
                 assert_eq!(maximum_context, Some(75_000));
                 assert_eq!(auto_compact_threshold, Some(51_000));
                 assert_eq!(maximum_tool_output_tokens, Some(8_000));
             }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_accepts_a_hierarchical_name() {
+        match parse(&v(&["register", "roles/foo"])) {
+            PresetCommand::Register { name, .. } => assert_eq!(name, "roles/foo"),
             other => panic!("unexpected: {other:?}"),
         }
     }
