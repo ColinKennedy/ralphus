@@ -873,6 +873,8 @@
             showTab("machines");
           } else if (h.tab === "triage") {
             showTab("triage");
+          } else if (h.tab === "presets") {
+            showTab("presets");
           } else if (h.tab === "users") {
             showTab("users");
           } else if (h.tab === "secrets") {
@@ -905,6 +907,7 @@
       else if (pendingHash && pendingHash.tab === "projects") { pendingHash = null; showTab("projects"); }
       else if (pendingHash && pendingHash.tab === "machines") { pendingHash = null; showTab("machines"); }
       else if (pendingHash && pendingHash.tab === "triage") { pendingHash = null; showTab("triage"); }
+      else if (pendingHash && pendingHash.tab === "presets") { pendingHash = null; showTab("presets"); }
       else if (pendingHash && pendingHash.tab === "users") { pendingHash = null; showTab("users"); }
       else if (pendingHash && pendingHash.tab === "secrets") { pendingHash = null; showTab("secrets"); }
       else if (pendingHash && pendingHash.tab === "worktree-retirement") { pendingHash = null; showTab("worktree-retirement"); }

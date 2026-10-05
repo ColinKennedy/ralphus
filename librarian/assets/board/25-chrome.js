@@ -197,7 +197,7 @@
       initSplitters();
 
       // ---------- tabs ----------
-      const TABS = ["squads", "tasks", "queue", "reviews", "waypoints", "resources", "cartographer", "projects", "machines", "triage", "users", "secrets", "worktree-retirement", "health", "agents", "prefs"];
+      const TABS = ["squads", "tasks", "queue", "reviews", "waypoints", "resources", "cartographer", "projects", "machines", "triage", "presets", "users", "secrets", "worktree-retirement", "health", "agents", "prefs"];
       /**
        * Switches the active top-level tab, updates its URL hash, and re-renders.
        * @param {string} name
@@ -220,7 +220,7 @@
         byId("updated").textContent = "—";
         for (const t of TABS) {
           const page = byId(t + "-page");
-          page.style.display = name === t ? (t === "resources" || t === "queue" || t === "cartographer" || t === "projects" || t === "machines" || t === "triage" || t === "users" || t === "secrets" || t === "worktree-retirement" || t === "health" || t === "agents" || t === "prefs" ? "block" : "grid") : "none";
+          page.style.display = name === t ? (t === "resources" || t === "queue" || t === "cartographer" || t === "projects" || t === "machines" || t === "triage" || t === "presets" || t === "users" || t === "secrets" || t === "worktree-retirement" || t === "health" || t === "agents" || t === "prefs" ? "block" : "grid") : "none";
           byId("tab-" + t).classList.toggle("active", name === t);
         }
         // Entering the Queue tab is a deliberate action, so refresh it once on
@@ -371,6 +371,8 @@
           url = "#/machines";
         } else if (tab === "triage") {
           url = "#/triage";
+        } else if (tab === "presets") {
+          url = "#/presets";
         } else if (tab === "users") {
           url = "#/users";
         } else if (tab === "secrets") {
@@ -488,6 +490,7 @@
         if (raw.startsWith("projects")) return { tab: "projects" };
         if (raw.startsWith("machines")) return { tab: "machines" };
         if (raw.startsWith("triage")) return { tab: "triage" };
+        if (raw.startsWith("presets")) return { tab: "presets" };
         if (raw.startsWith("users")) return { tab: "users" };
         if (raw.startsWith("secrets")) return { tab: "secrets" };
         if (raw.startsWith("retirement")) return { tab: "worktree-retirement" };
