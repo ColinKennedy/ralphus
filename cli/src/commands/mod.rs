@@ -240,6 +240,9 @@ pub enum Command {
     InitializeReview {
         options: initialize::exercise::ExerciseOptions,
     },
+    InitializeFollowup {
+        options: initialize_exercise::ExerciseOptions,
+    },
     Project(project::ProjectCommand),
     Machine(machine::MachineCommand),
     Agent(agent::AgentCommand),
@@ -332,20 +335,21 @@ pub fn parse_args(args: &[String]) -> Command {
                         Err(error) => Command::UsageError(error.0),
                     }
                 }
-                Some(kind @ ("waypoint" | "mailbox" | "machine" | "triage" | "review")) => {
+                Some(kind @ ("waypoint" | "mailbox" | "machine" | "triage" | "review" | "followup")) => {
                     match parse_exercise_options(kind, &tail[1..]) {
                         Ok(options) => match kind {
                             "waypoint" => Command::InitializeWaypoint { options },
                             "mailbox" => Command::InitializeMailbox { options },
                             "machine" => Command::InitializeMachine { options },
                             "triage" => Command::InitializeTriage { options },
+                            "followup" => Command::InitializeFollowup { options },
                             _ => Command::InitializeReview { options },
                         },
                         Err(error) => Command::UsageError(error),
                     }
                 }
                 _ => Command::UsageError(
-                    "initialize: expected 'git', 'server', 'waypoint', 'mailbox', 'machine', 'triage', or 'review' subcommand"
+                    "initialize: expected 'git', 'server', 'waypoint', 'mailbox', 'machine', 'triage', 'review', or 'followup' subcommand"
                         .to_string(),
                 ),
             }
@@ -431,7 +435,7 @@ fn parse_project_fork_url(scanner: &mut Scanner) -> Result<Option<String>, Usage
 }
 
 /// The flags every guided exercise (`initialize waypoint|mailbox|machine|
-/// triage|review`) takes. An unrecognized argument is an error, so a typo such
+/// triage|review|followup`) takes. An unrecognized argument is an error, so a typo such
 /// as `--remot` cannot silently run the local variant instead.
 fn parse_exercise_options(
     kind: &str,
@@ -576,6 +580,11 @@ pub fn dispatch(cmd: Command, opts: &GlobalOpts) -> i32 {
         }
         Command::InitializeReview { options } => {
             initialize::exercise::run_logged("review", || initialize::review::dispatch(&options))
+        }
+        Command::InitializeFollowup { options } => {
+            initialize::exercise::run_logged("followup", || {
+                initialize::followup::dispatch(&options)
+            })
         }
         Command::Project(c) => project::dispatch(c, opts),
         Command::Machine(c) => machine::dispatch(c, opts),

@@ -12,6 +12,20 @@ The `ralphus initialize ...` commands. Two kinds live here:
 
 (`initialize git` is a one-liner in `../misc.rs`, not part of this folder.)
 
+## The one exemption: `followup`
+
+`followup.rs` (`ralphus initialize followup`) proves the deferred-prophecy
+follow-up flow end to end. It cannot follow the rules below: a `deferred`
+prophecy is only ever written by a prompt cell (`RALPHUS_PROPHECY:` markers
+are parsed from an agent's reply), the follow-up squad it drafts is always
+prompt cells, and its review merge is a git fast-forward in the daemon's own
+checkout, which has no `--remote` form. So it is not in `EXERCISES`; it is in
+`NON_EXERCISE_MODULES` in `cli/tests/initialize_exercise_ci_parity.rs` with
+that reason, and `scripts/check-initialize-exercises.sh` still runs it in CI,
+locally only. It still calls no model: its "agent" is a `raw` profile whose
+executable is a renamed copy of the `ralphus` binary that prints canned
+replies. Do not add another exemption without the same written reason.
+
 ## Every exercise must work in every mode, with no LLM, and run in CI
 
 These are the documented first-run checks, so they are tests as much as demos.

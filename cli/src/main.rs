@@ -14,6 +14,12 @@ fn main() -> std::process::ExitCode {
     // subcommand landing.
     std::hint::black_box(ralphus_core::license::embedded_license());
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    // `initialize followup` runs a copy of this binary, renamed, as its stub
+    // agent; that invocation is the agent, not the CLI.
+    if ralphus_cli::commands::initialize::followup::invoked_as_exercise_agent() {
+        let code = ralphus_cli::commands::initialize::followup::run_exercise_agent(&raw_args);
+        return std::process::ExitCode::from(u8::try_from(code).unwrap_or(1));
+    }
     if let Some(help) = ralphus_cli::help_map::requested_help(&raw_args) {
         println!("{help}");
         return std::process::ExitCode::SUCCESS;

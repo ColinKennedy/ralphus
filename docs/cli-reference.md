@@ -719,6 +719,7 @@ use; see `READ_ONLY_NOTE`.
     - (read-only-safe) graph squad_id [id, optional] --all --dot  {Render the task-order dependency graph. (Rust port simplifies Python's --global/--format ascii|dot choice to plain --dot/--all boolean flags.)}
     - (read-only-safe) history selector [uri] --type [str]  {Show a cell/proof step's tmux history (one-shot snapshot; Python's --live tailing and --wait-until-valid are not yet ported).}
     - initialize  {One-time local setup helpers for a repository.}
+        - followup --remote --state-dir [path] --stop  {Launch an isolated daemon and run the deferred-prophecy follow-up flow with a stub agent: a review merges, offers follow-up work, the offer is accepted, and the drafted squad runs under its waypoint. Local only (--remote is refused); --stop shuts the daemon down afterwards.}
         - git --path [path]  {Enable git rerere in a repo so review rebases replay conflict resolutions.}
         - machine --remote --state-dir [path] --stop  {Launch an isolated daemon, register the loopback machine provider, and run a remote cell + proof in a worktree it provisions (always remote; --remote is accepted for symmetry). --stop shuts the daemon down afterwards.}
         - mailbox --remote --state-dir [path] --stop  {Launch an isolated daemon and verify cell/proof failure mailbox remediation. --remote runs both failures on a strict loopback machine; --stop shuts the daemon down afterwards.}
@@ -807,6 +808,10 @@ use; see `READ_ONLY_NOTE`.
         - dismiss-reenable selector [uri]  {Dismiss the 're-enable' notification for a branch.}
         - (read-only-safe) env selector [uri] --scope [build|tests|manual-checks|worktree]  {List a review surface's resolved environment variables, read-only (RAL-324): the auto-build step, the check gates, manual checks, or one branch's review worktree.}
         - feedback selector [uri] text [str] --author [name]  {Post feedback on one branch, triggering a resolver re-attempt. --author attributes the feedback to a different registered user than the one submitting it (RAL-379); defaults to the submitter when omitted.}
+        - followup  {Follow-up work offered when a review merges with deferred prophecies.}
+            - accept selector [uri]  {Accept a follow-up offer: draft a follow-up squad from the deferred items and create the waypoint that explains it. The squad is held unless `[followup] auto_start` is on.}
+            - decline selector [uri]  {Decline a follow-up offer; nothing is created and the review never offers again.}
+            - (read-only-safe) show selector [uri]  {Show a merged review's follow-up offer: the deferred items it would turn into a follow-up squad, and its status.}
         - force-start selector [uri]  {Disable not-yet-done branches and merge immediately (only while collecting).}
         - link-cell selector [uri] cell [uri]  {Link a cell/task to an already-attached review branch, so its readiness follows that cell finishing (RAL-392).}
         - (read-only-safe) list --pr-ready --status [statuses]  {List reviews.}

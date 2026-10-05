@@ -1003,6 +1003,16 @@ const INITIALIZE_CHILDREN: &[HelpNode] = &[
         false,
         &[],
     ),
+    // ralphus[ignore-endpoint-cli]: launches an isolated local daemon and exercises several daemon endpoints as one guided scenario.
+    node(
+        "followup",
+        &[],
+        &["--remote", "--state-dir [path]", "--stop"],
+        "Launch an isolated daemon and run the deferred-prophecy follow-up flow with a stub agent: a review merges, offers follow-up work, the offer is accepted, and the drafted squad runs under its waypoint. Local only (--remote is refused); --stop shuts the daemon down afterwards.",
+        false,
+        false,
+        &[],
+    ),
 ];
 
 // ralphus[ignore-endpoint-cli]: local MCP-host setup (edits local config files); no daemon round trip

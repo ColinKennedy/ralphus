@@ -45,7 +45,8 @@ named Docker volumes; `down` preserves them and `destroy` removes them. See
 **Guided exercises — `bash scripts/check-initialize-exercises.sh`.** Runs every
 `ralphus initialize <exercise>` (machine, mailbox, triage, review, waypoint)
 live, locally and with `--remote` (every cell and review on the loopback
-machine provider in strict mode), each against its own throwaway daemon that
+machine provider in strict mode), plus the exempt `initialize followup`
+locally only, each against its own throwaway daemon that
 `--stop` shuts down. Build `ralphus`, `ralphus-daemon` and `ralphus-runner`
 first; needs git and Python 3. `--only review,waypoint`, `--local-only` /
 `--remote-only` narrow it. CI's `initialize-exercises` job runs it (Windows:
@@ -53,6 +54,15 @@ first; needs git and Python 3. `--only review,waypoint`, `--local-only` /
 dev stack: each exercise gets its own port, database, home, and psmux data dir.
 The rules every exercise must meet (no LLM, local and remote, CI-wired) live in
 [`cli/src/commands/initialize/AGENTS.md`](../cli/src/commands/initialize/AGENTS.md).
+
+`followup` (the deferred-prophecy follow-up flow) is agent-less: its cells run
+a `raw` agent profile whose executable is a renamed copy of the `ralphus`
+binary (`initialize/followup.rs`), and a review's merge is a git fast-forward
+the daemon notices through its already-in-base check, standing in for a forge
+merge. Everything else -- daemon, scheduler, runner, prophecy and waypoint
+stores, squad submission -- is real. It is local only: the review merge it
+drives is a git fast-forward in the daemon's own checkout. Because of both,
+it is a documented exemption from the exercise rules, not one of `EXERCISES`.
 
 **Documentation site.** `scripts/docs-build.sh` / `.cmd` renders
 `docs/site/pages/*.md` into `docs/site/_site/` via MkDocs + Material —

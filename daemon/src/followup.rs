@@ -469,6 +469,8 @@ pub fn draft_followup_toml(
     let review_key = "followup";
     let sentinel = format!("<<ralphus:new-review/{review_key}>>");
     let guardian_slug = slug(&guardian.id);
+    // A follow-up runs where the work it follows up on ran.
+    let machine = guardian.machine.as_deref().filter(|m| !m.is_empty());
     let tasks: Vec<toml::Value> = items
         .iter()
         .enumerate()
@@ -491,6 +493,9 @@ pub fn draft_followup_toml(
             let mut task = toml::Table::new();
             task.insert("name".into(), format!("followup-{n}").into());
             task.insert("project".into(), project.into());
+            if let Some(machine) = machine {
+                task.insert("machine".into(), machine.into());
+            }
             task.insert("cell".into(), toml::Value::Array(vec![cell.into()]));
             toml::Value::Table(task)
         })
@@ -501,15 +506,43 @@ pub fn draft_followup_toml(
         format!("ralphus:new-review/{review_key}").into(),
     );
     review.insert("upstream".into(), base.into());
+    if let Some(machine) = machine {
+        review.insert("machine".into(), machine.into());
+    }
     let mut root = toml::Table::new();
     root.insert("task".into(), toml::Value::Array(tasks));
     root.insert("review".into(), toml::Value::Array(vec![review.into()]));
     toml::to_string(&root).unwrap_or_default()
 }
 
-/// Whether `git` finds `branch` on `root`'s `origin`, falling back to the
-/// local refs when the remote cannot be asked (no `origin`, offline).
-fn branch_exists(root: &Path, branch: &str) -> bool {
+/// Splits a stored merge target into `(remote, branch)`. The daemon records a
+/// review's base either as a bare branch (`main`) or in remote-tracking form
+/// (`origin/main`), so a leading segment naming a configured remote is the
+/// remote, and anything else is a branch on `origin`.
+fn split_remote(root: &Path, name: &str) -> (String, String) {
+    if let Some((head, rest)) = name.split_once('/') {
+        let is_remote = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["remote"])
+            .output()
+            .map(|out| {
+                String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .any(|remote| remote.trim() == head)
+            })
+            .unwrap_or(false);
+        if is_remote {
+            return (head.to_string(), rest.to_string());
+        }
+    }
+    ("origin".to_string(), name.to_string())
+}
+
+/// Whether `git` finds `name` on its remote, falling back to the local refs
+/// when the remote cannot be asked (no such remote, offline).
+fn branch_exists(root: &Path, name: &str) -> bool {
+    let (remote, branch) = split_remote(root, name);
     let git = |args: &[&str]| {
         Command::new("git")
             .arg("-C")
@@ -519,7 +552,7 @@ fn branch_exists(root: &Path, branch: &str) -> bool {
             .output()
     };
     let heads = format!("refs/heads/{branch}");
-    if let Ok(out) = git(&["ls-remote", "--exit-code", "--heads", "origin", &heads]) {
+    if let Ok(out) = git(&["ls-remote", "--exit-code", "--heads", &remote, &heads]) {
         match out.status.code() {
             Some(0) => return true,
             // `--exit-code`: 2 means the remote answered and has no such ref.
@@ -527,7 +560,7 @@ fn branch_exists(root: &Path, branch: &str) -> bool {
             _ => {}
         }
     }
-    let remote_tracking = format!("refs/remotes/origin/{branch}");
+    let remote_tracking = format!("refs/remotes/{remote}/{branch}");
     [heads, remote_tracking].iter().any(|reference| {
         git(&["rev-parse", "--verify", "--quiet", reference])
             .map(|out| out.status.success())
@@ -946,6 +979,39 @@ mod tests {
     }
 
     #[test]
+    fn a_follow_up_runs_on_the_machine_its_review_ran_on() {
+        let s = store();
+        let root = temp_root("machine");
+        seed_guardian(&s, "g1", &root);
+        s.conn
+            .execute(
+                "UPDATE guardians SET machine='loopback:exercise' WHERE id='g1'",
+                [],
+            )
+            .unwrap();
+        let guardian = s.get_guardian("g1").unwrap();
+        let toml = draft_followup_toml("proj", &guardian, "main", &[item("later", None)]);
+        let file: ralphus_core::schema::TaskFile = toml::from_str(&toml).unwrap();
+        assert_eq!(file.task[0].machine.as_deref(), Some("loopback:exercise"));
+        assert_eq!(file.review[0].machine.as_deref(), Some("loopback:exercise"));
+
+        let local = draft_followup_toml(
+            "proj",
+            &{
+                s.conn
+                    .execute("UPDATE guardians SET machine=NULL WHERE id='g1'", [])
+                    .unwrap();
+                s.get_guardian("g1").unwrap()
+            },
+            "main",
+            &[item("later", None)],
+        );
+        let file: ralphus_core::schema::TaskFile = toml::from_str(&local).unwrap();
+        assert_eq!(file.task[0].machine, None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn a_missing_base_branch_falls_back_to_the_default_sentinel() {
         let root = temp_root("base");
         // Not a repository at all: nothing to find the branch in.
@@ -992,6 +1058,41 @@ mod tests {
             "a merge target deleted after the merge falls back to the remote default"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_remote_tracking_merge_target_is_checked_on_that_remote() {
+        let origin = temp_root("realorigin");
+        run_git(&origin, &["init", "-q", "-b", "main"]);
+        run_git(&origin, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        run_git(&origin, &["branch", "release/1.0"]);
+        let root = temp_root("realclone");
+        run_git(&root, &["init", "-q", "-b", "main"]);
+        run_git(
+            &root,
+            &["remote", "add", "origin", &origin.to_string_lossy()],
+        );
+
+        // The daemon stores a review's base as `origin/main`, not `main`.
+        assert_eq!(resolve_followup_base(&root, "origin/main"), "origin/main");
+        assert_eq!(resolve_followup_base(&root, "main"), "main");
+        assert_eq!(
+            resolve_followup_base(&root, "origin/release/1.0"),
+            "origin/release/1.0"
+        );
+
+        run_git(&origin, &["branch", "-D", "release/1.0"]);
+        assert_eq!(
+            resolve_followup_base(&root, "origin/release/1.0"),
+            DEFAULT_UPSTREAM,
+            "a base deleted on the remote after the merge falls back to the default"
+        );
+        assert_eq!(
+            resolve_followup_base(&root, "origin/gone"),
+            DEFAULT_UPSTREAM
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&origin);
     }
 
     #[test]

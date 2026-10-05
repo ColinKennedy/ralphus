@@ -109,7 +109,8 @@ pub fn execute(cmd: Command, client: &DaemonClient) -> ExecResult {
         | Command::InitializeMailbox { .. }
         | Command::InitializeMachine { .. }
         | Command::InitializeTriage { .. }
-        | Command::InitializeReview { .. } => Err(usage(
+        | Command::InitializeReview { .. }
+        | Command::InitializeFollowup { .. } => Err(usage(
             "initialize exercises launch an isolated daemon and are excluded from the MCP tool surface",
         )),
         Command::Project(c) => project::execute(c, client),

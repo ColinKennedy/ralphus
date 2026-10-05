@@ -1076,6 +1076,12 @@ impl Store {
         if squad_scopes.is_empty() {
             return Ok(Vec::new());
         }
+        // A squad already placed on a waypoint by hand (or by a follow-up
+        // offer) has had that entry handed to its review once the review
+        // formed, so the entry for its own review counts as the squad being
+        // enrolled already -- enrolling it again would add a second, unanswered
+        // entry for the same work.
+        let own_reviews = self.guardians_for_squad(squad_id)?;
         let mut enrolled = Vec::new();
         for waypoint_id in self.list_open_waypoint_ids()? {
             let waypoint_scopes = self.waypoint_scope_by_project(&waypoint_id)?;
@@ -1090,7 +1096,10 @@ impl Store {
             let already = self
                 .list_affected_entries(&waypoint_id)?
                 .into_iter()
-                .any(|e| e.kind == WaypointEntryKind::Squad && e.entry_id == squad_id);
+                .any(|e| match e.kind {
+                    WaypointEntryKind::Squad => e.entry_id == squad_id,
+                    WaypointEntryKind::Review => own_reviews.contains(&e.entry_id),
+                });
             if already {
                 continue;
             }
@@ -6370,6 +6379,43 @@ mod tests {
             !candidates.iter().any(|c| c.entry_id == "squad-seed"),
             "a surveyed entry must not be re-surveyed: {candidates:?}"
         );
+    }
+
+    #[test]
+    fn enrolling_a_squad_skips_a_waypoint_that_already_lists_its_own_review() {
+        // A squad placed on a waypoint by hand has that entry handed to its
+        // review once the review forms. Submit-time enrollment runs after
+        // that, so without recognizing the review's entry it would add the
+        // squad a second time, unanswered, and the waypoint could never close.
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_bare_squad(&store, "squad-new", SquadState::Pending);
+        insert_bare_task(&store, "squad-new", 0, "core");
+        insert_bare_cell(&store, "squad-new", 0, 0, None, None);
+        store
+            .conn
+            .execute(
+                "INSERT INTO guardians(id, name, base_branch, git_root, status, created_at_ms, updated_at_ms, squad_id)
+                 VALUES ('guardian-new','g','main','/repo','collecting',0,0,'squad-new')",
+                [],
+            )
+            .unwrap();
+        store
+            .add_affected_entry(
+                "waypoint-1",
+                WaypointEntryKind::Review,
+                "guardian-new",
+                AffectedMode::Block,
+            )
+            .unwrap();
+
+        let enrolled = store
+            .enroll_new_squad_in_open_waypoints("squad-new")
+            .unwrap();
+        assert!(enrolled.is_empty(), "already represented by its review");
+        let affected = store.list_affected_entries("waypoint-1").unwrap();
+        assert_eq!(affected.len(), 1, "no second entry for the same work");
+        assert_eq!(affected[0].kind, WaypointEntryKind::Review);
     }
 
     #[test]

@@ -11,7 +11,14 @@ use std::path::PathBuf;
 use ralphus_cli::commands::initialize::EXERCISES;
 
 /// Modules in `commands/initialize/` that are not guided exercises.
-const NON_EXERCISE_MODULES: &[&str] = &["mod", "exercise", "server"];
+///
+/// `followup` is a documented exemption (see `initialize/AGENTS.md`): the
+/// follow-up flow it proves only exists for prompt cells, whose
+/// `RALPHUS_PROPHECY:` markers are the only way a `deferred` prophecy is
+/// written, and its review merge is a git fast-forward in the daemon's own
+/// checkout, so it can follow neither the no-agent rule nor `--remote`. Its
+/// stub agent is a renamed copy of the CLI binary, so it still calls no model.
+const NON_EXERCISE_MODULES: &[&str] = &["mod", "exercise", "server", "followup"];
 
 /// Substrings that would mean an exercise reaches for a model or agent.
 const LLM_MARKERS: &[&str] = &[
