@@ -33,6 +33,7 @@ impl std::error::Error for DaemonError {}
 pub struct DaemonClient {
     base_url: String,
     timeout: Duration,
+    token: Option<String>,
 }
 
 impl DaemonClient {
@@ -50,6 +51,7 @@ impl DaemonClient {
         Self {
             base_url: base_url.into(),
             timeout: Duration::from_secs(secs),
+            token: daemon_token(),
         }
     }
 
@@ -58,6 +60,17 @@ impl DaemonClient {
         Self {
             base_url: base_url.into(),
             timeout,
+            token: daemon_token(),
+        }
+    }
+
+    /// Construct a client for an explicitly isolated daemon instance.
+    #[must_use]
+    pub fn with_token(base_url: impl Into<String>, token: String) -> Self {
+        Self {
+            base_url: base_url.into(),
+            timeout: Duration::from_secs(DEFAULT_DAEMON_TIMEOUT_SECS),
+            token: Some(token),
         }
     }
 
@@ -82,7 +95,7 @@ impl DaemonClient {
     /// the daemon's RAL-219 auth gate doesn't reject every request. Mirrors
     /// `librarian/src/server.rs::daemon_token()`/`proxy()`.
     fn authorize(&self, req: ureq::Request) -> ureq::Request {
-        match daemon_token() {
+        match &self.token {
             Some(token) => req.set("Authorization", &format!("Bearer {token}")),
             None => req,
         }
@@ -759,6 +772,10 @@ impl DaemonClient {
 
     pub fn get_machine(&self, scheme: &str) -> Result<Value, DaemonError> {
         self.get(&format!("/api/machines/{scheme}"))
+    }
+
+    pub fn check_machine(&self, scheme: &str) -> Result<Value, DaemonError> {
+        self.post(&format!("/api/machines/{scheme}/check"), None)
     }
 
     pub fn deregister_machine(&self, scheme: &str) -> Result<Value, DaemonError> {

@@ -717,6 +717,11 @@ use; see `READ_ONLY_NOTE`.
     - (read-only-safe) history selector [uri] --type [str]  {Show a cell/proof step's tmux history (one-shot snapshot; Python's --live tailing and --wait-until-valid are not yet ported).}
     - initialize  {One-time local setup helpers for a repository.}
         - git --path [path]  {Enable git rerere in a repo so review rebases replay conflict resolutions.}
+        - machine --state-dir [path]  {Launch an isolated daemon and register/ping the local loopback machine provider.}
+        - mailbox --state-dir [path]  {Launch an isolated daemon and verify cell/proof failure mailbox remediation.}
+        - review --state-dir [path]  {Launch an isolated daemon and create a disposable two-branch Guardian review fixture.}
+        - triage --state-dir [path]  {Launch an isolated daemon and configure a deterministic two-cell Triage pool.}
+        - waypoint --state-dir [path]  {Launch an isolated daemon and submit inspectable waypoint scenarios without touching normal ralphus state.}
     - internal  {Machine-invoked interfaces with no interactive/task-file use (RAL-338 follow-up).}
         - fork-credential-helper action [str]  {Git credential-helper entry point installed on a fork-routed worktree's git config (never invoked directly by a human or a task file) -- implements git's credential protocol so a push authenticates using that worktree owner's stored forge token.}
     - (read-only-safe) license  {Print the embedded LICENSE text decoded from the binary's obfuscated copy.}

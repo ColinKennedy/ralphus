@@ -903,16 +903,68 @@ const CHECK_CHILDREN: &[HelpNode] = &[
     ),
 ];
 
-// ralphus[ignore-endpoint-cli]: configures local git repo settings/hooks; no daemon round trip
-const INITIALIZE_CHILDREN: &[HelpNode] = &[node(
-    "git",
-    &[],
-    &["--path [path]"],
-    "Enable git rerere in a repo so review rebases replay conflict resolutions.",
-    false,
-    false,
-    &[],
-)];
+const INITIALIZE_CHILDREN: &[HelpNode] = &[
+    // ralphus[ignore-endpoint-cli]: configures local git repo settings/hooks; no daemon round trip
+    node(
+        "git",
+        &[],
+        &["--path [path]"],
+        "Enable git rerere in a repo so review rebases replay conflict resolutions.",
+        false,
+        false,
+        &[],
+    ),
+    // ralphus[ignore-endpoint-cli]: launches an isolated local daemon and exercises several daemon endpoints as one guided scenario.
+    node(
+        "waypoint",
+        &[],
+        &["--state-dir [path]"],
+        "Launch an isolated daemon and submit inspectable waypoint scenarios without touching normal ralphus state.",
+        false,
+        false,
+        &[],
+    ),
+    // ralphus[ignore-endpoint-cli]: launches an isolated local daemon and exercises several daemon endpoints as one guided scenario.
+    node(
+        "mailbox",
+        &[],
+        &["--state-dir [path]"],
+        "Launch an isolated daemon and verify cell/proof failure mailbox remediation.",
+        false,
+        false,
+        &[],
+    ),
+    // ralphus[ignore-endpoint-cli]: launches an isolated local daemon and exercises several daemon endpoints as one guided scenario.
+    node(
+        "machine",
+        &[],
+        &["--state-dir [path]"],
+        "Launch an isolated daemon and register/ping the local loopback machine provider.",
+        false,
+        false,
+        &[],
+    ),
+    // ralphus[ignore-endpoint-cli]: launches an isolated local daemon and exercises several daemon endpoints as one guided scenario.
+    node(
+        "triage",
+        &[],
+        &["--state-dir [path]"],
+        "Launch an isolated daemon and configure a deterministic two-cell Triage pool.",
+        false,
+        false,
+        &[],
+    ),
+    // ralphus[ignore-endpoint-cli]: launches an isolated local daemon and exercises several daemon endpoints as one guided scenario.
+    node(
+        "review",
+        &[],
+        &["--state-dir [path]"],
+        "Launch an isolated daemon and create a disposable two-branch Guardian review fixture.",
+        false,
+        false,
+        &[],
+    ),
+];
 
 // ralphus[ignore-endpoint-cli]: local MCP-host setup (edits local config files); no daemon round trip
 const MCP_CHILDREN: &[HelpNode] = &[node(

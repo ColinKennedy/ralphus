@@ -56,7 +56,7 @@ PROTOCOL_VERSION = 1
 # (holding the child's pid, its captured output, and its final result), plus one
 # workspace tree per `uri`. A real provider's equivalent lives on the remote
 # machine; the *shape* is the same.
-STATE_ROOT = Path(tempfile.gettempdir()) / "ralphus-loopback-provider"
+STATE_ROOT = Path(os.environ.get("RALPHUS_LOOPBACK_STATE_ROOT", tempfile.gettempdir())) / "ralphus-loopback-provider"
 
 
 def _reply(**fields: Any) -> None:

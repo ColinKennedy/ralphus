@@ -104,6 +104,13 @@ pub fn execute(cmd: Command, client: &DaemonClient) -> ExecResult {
         Command::InitializeServer { .. } => Err(usage(
             "initialize server is excluded from the MCP tool surface",
         )),
+        Command::InitializeWaypoint { .. }
+        | Command::InitializeMailbox { .. }
+        | Command::InitializeMachine { .. }
+        | Command::InitializeTriage { .. }
+        | Command::InitializeReview { .. } => Err(usage(
+            "initialize exercises launch an isolated daemon and are excluded from the MCP tool surface",
+        )),
         Command::Project(c) => project::execute(c, client),
         Command::Machine(c) => machine::execute(c, client),
         Command::Agent(c) => agent::execute(c, client),
