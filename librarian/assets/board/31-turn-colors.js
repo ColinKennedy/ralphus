@@ -4,6 +4,13 @@
       const TURN_COLOR_BG = { dark: "#0d1117", light: "#ffffff" };
       /** Minimum WCAG contrast ratio a type color must reach against its theme's background. */
       const TURN_COLOR_MIN_CONTRAST = 4.5;
+      /** @type {Record<string, string>} well-known base tags pinned to a semantic color variable (defined per theme in board.css). */
+      const TURN_PINNED_COLORS = Object.assign(Object.create(null), {
+        error: "var(--turn-error)",
+        warning: "var(--turn-warn)",
+        warn: "var(--turn-warn)",
+        thrash: "var(--turn-warn)",
+      });
       /** @type {Map<string, string>} memo of `theme|type` -> hex color. */
       const turnColorMemo = new Map();
       /**
@@ -76,12 +83,16 @@
        * `tool.Bash`) picks the hue; the remaining segments nudge hue and
        * lightness so a family looks related while each tool stays distinct.
        * Lightness is then pushed away from the background until the color
-       * reaches {@link TURN_COLOR_MIN_CONTRAST}.
+       * reaches {@link TURN_COLOR_MIN_CONTRAST}. Types in
+       * {@link TURN_PINNED_COLORS} (matched case-insensitively on the base
+       * segment) skip all of that and return their `var(--turn-*)` reference.
        * @param {string} type - the bracketed type code, e.g. `usage`, `tool.Bash`.
        * @param {string} theme - `"dark"` or `"light"`.
-       * @returns {string} `#rrggbb`
+       * @returns {string} `#rrggbb`, or `var(--turn-error)`/`var(--turn-warn)` for a pinned type.
        */
       function typeColor(type, theme) {
+        const pinned = TURN_PINNED_COLORS[type.split(".")[0].toLowerCase()];
+        if (pinned !== undefined) return pinned;
         const t = theme === "light" ? "light" : "dark";
         const memoKey = `${t}|${type}`;
         const hit = turnColorMemo.get(memoKey);

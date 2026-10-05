@@ -39,6 +39,8 @@ role in the table below, then use it.
 | `--ignored` | `#c9a227` | *(shared)* | status (amber — the **only** caution color) |
 | `--teal` | `#39c5cf` | *(shared)* | semantic (dependency / linked movement) |
 | `--warn` | `#d29922` | *(shared)* | semantic (Cartographer `warning`-level log severity, RAL-98) |
+| `--turn-error` | `var(--failed)` (`#f85149`) | `#cf222e` | semantic (transcript `[error]` tag, RAL-574) |
+| `--turn-warn` | `var(--warn)` (`#d29922`) | `#9a6700` | semantic (transcript `[warning]`/`[warn]`/`[thrash]` tags, RAL-574) |
 | `--unverified` | `#e3b341` | *(shared)* | semantic (review reached done with no build/test verification, RAL-101) |
 | `--waiting` | `#f778ba` | *(shared)* | status (a `pending` squad held back by a scheduler down-time window, RAL-122) |
 | `--solo` | `#ffa657` | *(shared)* | semantic (a task marked "soloed" — its siblings are paused, RAL-157) |
@@ -208,15 +210,25 @@ refreshed by every CI probe (which reads it from the same response), and
 like not-draft. GitHub and GitLab both expose the field through their REST
 APIs, so the two forges behave identically here.
 
-### Log severity — Cartographer only (RAL-98)
+### Log severity — Cartographer rows and transcript tags (RAL-98, RAL-574)
 Cartographer's event table (the global log, a squad's Logs "events" tab, and a
 review's Logs button) colors rows by `level`, a concept distinct from entity
 status: `error` reuses `--failed` (red), `warning` uses the dedicated `--warn`
 (a separate hue from `--ignored` — log severity is not the same concept as the
 caution-reserved `ignored` status), and `info`/`debug`/`trace` use the neutral
-`--pending`/`--cancelled` grays. Do not reuse `--warn` outside log-level
-display; it exists only because no existing role fit this new concept
-(see "Adding a new UI element" below).
+`--pending`/`--cancelled` grays.
+
+Transcript tag lines (Live View, saved terminal logs) are hash-colored per tag,
+except the well-known severity tags, which are pinned (case-insensitive,
+inherited by dotted sub-types such as `error.foo`): `[error]` uses
+`--turn-error`; `[warning]`, `[warn]` and `[thrash]` use `--turn-warn`. Both
+equal `--failed`/`--warn` in dark mode; in light mode they are darker
+(`#cf222e` / `#9a6700`) so they meet 4.5:1 on the white transcript background,
+which the shared `--failed`/`--warn` do not.
+
+Do not reuse `--warn` outside log-severity display (Cartographer rows and
+transcript warning tags); it exists only because no existing role fit this
+concept (see "Adding a new UI element" below).
 
 ### Down-time waiting — `--waiting` only (RAL-122)
 A squad that is `pending` purely because a configured scheduler down-time
