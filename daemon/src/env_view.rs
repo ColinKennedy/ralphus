@@ -213,6 +213,19 @@ fn backend_of(
 ) -> Option<(String, String)> {
     store
         .cells_of(squad_id)
+        .map_err(|e| {
+            crate::cartographer::Note::new("env-view")
+                .level(crate::logging::LogLevel::WARNING)
+                .scope("squad")
+                .squad(squad_id)
+                .emit(
+                    store,
+                    format!(
+                        "reading cells of {squad_id} for the env view failed; the agent-profile layer is omitted: {e}"
+                    ),
+                    serde_json::json!({ "error": e.to_string() }),
+                );
+        })
         .ok()?
         .into_iter()
         .find(|c| c.task_idx == task_idx && cell_idx.is_none_or(|si| c.idx == si))

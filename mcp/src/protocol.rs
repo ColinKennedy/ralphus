@@ -52,7 +52,10 @@ fn handle(server: &Server, request: &Value) -> Option<Value> {
         "tools/list" => Ok(server.tools_list_result()),
         "tools/call" => server.tools_call_result(&params),
         "ping" => Ok(json!({})),
-        other => Err((-32601, format!("method not found: {other}"))),
+        other => {
+            eprintln!("ralphus-mcp [rpc] method not found method={other}");
+            Err((-32601, format!("method not found: {other}")))
+        }
     };
 
     Some(match result {
@@ -74,11 +77,17 @@ pub fn serve(server: &Server, input: impl BufRead, mut output: impl Write) -> st
         }
         let response = match serde_json::from_str::<Value>(trimmed) {
             Ok(request) => handle(server, &request),
-            Err(e) => Some(error_response(
-                Value::Null,
-                -32700,
-                &format!("parse error: {e}"),
-            )),
+            Err(e) => {
+                eprintln!(
+                    "ralphus-mcp [rpc] request parse error len={} error={e}",
+                    trimmed.len()
+                );
+                Some(error_response(
+                    Value::Null,
+                    -32700,
+                    &format!("parse error: {e}"),
+                ))
+            }
         };
         if let Some(response) = response {
             write_message(&mut output, &response)?;

@@ -334,16 +334,44 @@ pub fn run_generation(
             .as_deref()
             .unwrap_or("generation call did not complete")
             .to_string();
+        // ralphus[ignore-rlog-pair]: generation runs on a store-less background thread with no squad to attach a row to
+        crate::rlog!(
+            WARNING,
+            "ralphus [generate] {} generation failed agent={} status={}: {message}",
+            req.kind,
+            req.agent,
+            result.status
+        );
         return (GenerationJob::Error { message }, result);
     }
     match parse_generated_items(&result.summary) {
-        Some(items) => (GenerationJob::Done { items }, result),
-        None => (
-            GenerationJob::Error {
-                message: "the agent's response was not a valid JSON list of items".to_string(),
-            },
-            result,
-        ),
+        Some(items) => {
+            // ralphus[ignore-rlog-pair]: generation runs on a store-less background thread with no squad to attach a row to
+            crate::rlog!(
+                INFO,
+                "ralphus [generate] {} generation done agent={} items={}",
+                req.kind,
+                req.agent,
+                items.len()
+            );
+            (GenerationJob::Done { items }, result)
+        }
+        None => {
+            // ralphus[ignore-rlog-pair]: generation runs on a store-less background thread with no squad to attach a row to
+            crate::rlog!(
+                WARNING,
+                "ralphus [generate] {} generation response was not a JSON item list agent={} summary_len={}",
+                req.kind,
+                req.agent,
+                result.summary.len()
+            );
+            (
+                GenerationJob::Error {
+                    message: "the agent's response was not a valid JSON list of items".to_string(),
+                },
+                result,
+            )
+        }
     }
 }
 

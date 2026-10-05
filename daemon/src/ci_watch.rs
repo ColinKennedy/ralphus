@@ -185,6 +185,61 @@ fn log_ci_watch(
         );
 }
 
+/// Report a failed best-effort store write on the CI-watch paths. Polling
+/// carries on regardless, but a dropped write leaves the board's CI badge or
+/// auto-fix outcome stale, so the failure is recorded instead of discarded.
+fn warn_on_store_error<T>(
+    store: &crate::store_lock::StoreHandle,
+    guardian_id: &str,
+    branch_id: &str,
+    op: &str,
+    result: crate::store::Result<T>,
+) {
+    if let Err(error) = result {
+        log_ci_watch(
+            store,
+            guardian_id,
+            branch_id,
+            LogLevel::WARNING,
+            format!(
+                "ralphus [ci-watch] review {guardian_id} branch {branch_id} could not persist {op}: {error}"
+            ),
+            serde_json::json!({"outcome": "store_error", "op": op, "error": error.to_string()}),
+        );
+    }
+}
+
+/// [`warn_on_store_error`] for a write keyed by one PR row.
+fn warn_on_pr_store_error<T>(
+    store: &crate::store_lock::StoreHandle,
+    guardian_id: &str,
+    pr: &PullRequestView,
+    op: &str,
+    result: crate::store::Result<T>,
+) {
+    if let Err(error) = result {
+        let branch_id = pr.branch_id.as_deref().unwrap_or("");
+        log_ci_watch(
+            store,
+            guardian_id,
+            branch_id,
+            LogLevel::WARNING,
+            format!(
+                "ralphus [ci-watch] review {guardian_id} pr {} (#{}) could not persist {op}: {error}",
+                pr.id,
+                pr.pr_number.unwrap_or_default()
+            ),
+            serde_json::json!({
+                "pr_id": pr.id,
+                "pr_number": pr.pr_number,
+                "outcome": "store_error",
+                "op": op,
+                "error": error.to_string(),
+            }),
+        );
+    }
+}
+
 /// Minimum interval between "poll succeeded" heartbeat rows for one
 /// `(branch, kind)` (RAL-553). A successful poll is otherwise silent, so the
 /// log dock could not show that a branch was being polled at all; the
@@ -348,9 +403,10 @@ fn run_watch(store: &crate::store_lock::StoreHandle, guardian_id: &str, branch_i
             return;
         }
         let checked = client.check_pr_ci_status(number);
-        let _ = store
+        let result = store
             .lock()
             .record_pr_ci_check(&pr.id, checked.as_ref().err().map(String::as_str));
+        warn_on_pr_store_error(store, guardian_id, pr, "record_pr_ci_check", result);
         if let Ok(state) = &checked {
             log_poll_success(
                 store,
@@ -388,9 +444,11 @@ fn run_watch(store: &crate::store_lock::StoreHandle, guardian_id: &str, branch_i
                     ),
                     serde_json::json!({"pr_number": number, "outcome": "passing"}),
                 );
-                let _ = store
-                    .lock()
-                    .set_pr_ci_status(&pr.id, PrCiState::Passing.as_str(), None);
+                let result =
+                    store
+                        .lock()
+                        .set_pr_ci_status(&pr.id, PrCiState::Passing.as_str(), None);
+                warn_on_pr_store_error(store, guardian_id, pr, "set_pr_ci_status", result);
                 return;
             }
             Ok(PrCiState::Failing(failure)) => {
@@ -406,11 +464,12 @@ fn run_watch(store: &crate::store_lock::StoreHandle, guardian_id: &str, branch_i
                     ),
                     serde_json::json!({"pr_number": number, "outcome": "failing", "reason": failure.reason}),
                 );
-                let _ = store.lock().set_pr_ci_status(
+                let result = store.lock().set_pr_ci_status(
                     &pr.id,
                     PrCiState::Failing(failure.clone()).as_str(),
                     failure.job_url.as_deref(),
                 );
+                warn_on_pr_store_error(store, guardian_id, pr, "set_pr_ci_status", result);
                 enqueue_ci_failure_notice(store, &guardian, branch, pr, &failure);
                 return;
             }
@@ -422,9 +481,11 @@ fn run_watch(store: &crate::store_lock::StoreHandle, guardian_id: &str, branch_i
                 // as this watch keeps polling, potentially its entire
                 // `MAX_WATCH_DURATION`, instead of reflecting that the
                 // forge already considers the new commit's CI in flight.
-                let _ = store
-                    .lock()
-                    .set_pr_ci_status(&pr.id, PrCiState::Pending.as_str(), None);
+                let result =
+                    store
+                        .lock()
+                        .set_pr_ci_status(&pr.id, PrCiState::Pending.as_str(), None);
+                warn_on_pr_store_error(store, guardian_id, pr, "set_pr_ci_status", result);
             }
             Err(e) => {
                 log_ci_watch(
@@ -749,10 +810,11 @@ pub fn poll_open_pr_ci_status(
                 ),
                 serde_json::json!({"pr_number": number, "outcome": "unavailable"}),
             );
-            let _ = store.lock().record_pr_ci_check(
+            let result = store.lock().record_pr_ci_check(
                 &pr.id,
                 Some("no forge client could be resolved for this PR's repo"),
             );
+            warn_on_pr_store_error(store, guardian_id, &pr, "record_pr_ci_check", result);
             continue;
         };
         let probe = match client.check_pr_ci_status_probe(number) {
@@ -768,11 +830,13 @@ pub fn poll_open_pr_ci_status(
                     ),
                     serde_json::json!({"pr_number": number, "outcome": "poll_error", "error": e}),
                 );
-                let _ = store.lock().record_pr_ci_check(&pr.id, Some(e.as_str()));
+                let result = store.lock().record_pr_ci_check(&pr.id, Some(e.as_str()));
+                warn_on_pr_store_error(store, guardian_id, &pr, "record_pr_ci_check", result);
                 continue;
             }
         };
-        let _ = store.lock().record_pr_ci_check(&pr.id, None);
+        let result = store.lock().record_pr_ci_check(&pr.id, None);
+        warn_on_pr_store_error(store, guardian_id, &pr, "record_pr_ci_check", result);
         log_poll_success(
             store,
             guardian_id,
@@ -786,10 +850,12 @@ pub fn poll_open_pr_ci_status(
             PrCiState::Failing(f) => f.job_url.clone(),
             _ => None,
         };
-        let _ = store
+        let result = store
             .lock()
             .set_pr_ci_status(&pr.id, state.as_str(), job_url.as_deref());
-        let _ = store.lock().set_pr_draft(&pr.id, probe.draft);
+        warn_on_pr_store_error(store, guardian_id, &pr, "set_pr_ci_status", result);
+        let result = store.lock().set_pr_draft(&pr.id, probe.draft);
+        warn_on_pr_store_error(store, guardian_id, &pr, "set_pr_draft", result);
         polled.push((pr, state));
     }
     // RAL-<new>: dispatch (or defer) only once every open PR's state for this
@@ -816,9 +882,16 @@ pub fn poll_open_pr_ci_status(
                     "outcome": "skipped_stopped",
                 }),
             );
-            let _ = store
+            let result = store
                 .lock()
                 .set_pr_auto_fix_outcome(&decision.pr.id, "skipped_stopped");
+            warn_on_pr_store_error(
+                store,
+                guardian_id,
+                decision.pr,
+                "set_pr_auto_fix_outcome",
+                result,
+            );
             continue;
         }
         if decision.dispatch {
@@ -830,6 +903,21 @@ pub fn poll_open_pr_ci_status(
                 &decision.pr.repo,
                 guardian.owner.as_deref(),
             ) else {
+                log_ci_watch(
+                    store,
+                    guardian_id,
+                    decision.pr.branch_id.as_deref().unwrap_or(""),
+                    LogLevel::WARNING,
+                    format!(
+                        "ralphus [ci-watch] review {guardian_id} pr #{} auto-fix skipped: could \
+                         not resolve a forge client for this PR's repo",
+                        decision.pr.pr_number.unwrap_or_default()
+                    ),
+                    serde_json::json!({
+                        "pr_number": decision.pr.pr_number,
+                        "outcome": "skipped_no_forge_client",
+                    }),
+                );
                 continue;
             };
             dispatch_pr_auto_fix_cancellable(
@@ -857,9 +945,16 @@ pub fn poll_open_pr_ci_status(
                     "outcome": "deferred_no_worktree",
                 }),
             );
-            let _ = store
+            let result = store
                 .lock()
                 .set_pr_auto_fix_outcome(&decision.pr.id, "deferred_no_worktree");
+            warn_on_pr_store_error(
+                store,
+                guardian_id,
+                decision.pr,
+                "set_pr_auto_fix_outcome",
+                result,
+            );
         } else {
             log_ci_watch(
                 store,
@@ -877,9 +972,16 @@ pub fn poll_open_pr_ci_status(
                     "outcome": "deferred_upstream_failing",
                 }),
             );
-            let _ = store
+            let result = store
                 .lock()
                 .set_pr_auto_fix_outcome(&decision.pr.id, "deferred_upstream_failing");
+            warn_on_pr_store_error(
+                store,
+                guardian_id,
+                decision.pr,
+                "set_pr_auto_fix_outcome",
+                result,
+            );
         }
     }
 }
@@ -1254,9 +1356,10 @@ pub fn dispatch_pr_auto_fix_cancellable(
             ),
             serde_json::json!({"pr_number": pr.pr_number, "outcome": "skipped_not_enabled"}),
         );
-        let _ = store
+        let result = store
             .lock()
             .set_pr_auto_fix_outcome(&pr.id, "skipped_not_enabled");
+        warn_on_pr_store_error(store, &guardian.id, pr, "set_pr_auto_fix_outcome", result);
         return;
     }
     let Some(branch_id) = pr_fix_branch_id(guardian, pr) else {
@@ -1273,9 +1376,10 @@ pub fn dispatch_pr_auto_fix_cancellable(
             ),
             serde_json::json!({"pr_number": pr.pr_number, "outcome": "skipped_no_branch"}),
         );
-        let _ = store
+        let result = store
             .lock()
             .set_pr_auto_fix_outcome(&pr.id, "skipped_no_branch");
+        warn_on_pr_store_error(store, &guardian.id, pr, "set_pr_auto_fix_outcome", result);
         return;
     };
     let cfg = store
@@ -1310,9 +1414,10 @@ pub fn dispatch_pr_auto_fix_cancellable(
                 ),
                 serde_json::json!({"pr_number": pr.pr_number, "outcome": "deferred_backoff", "next_attempt_at_ms": next_attempt_at_ms}),
             );
-            let _ = store
+            let result = store
                 .lock()
                 .set_pr_auto_fix_outcome(&pr.id, "deferred_backoff");
+            warn_on_pr_store_error(store, &guardian.id, pr, "set_pr_auto_fix_outcome", result);
             return;
         }
         Ok(AutoFixClaim::Exhausted { attempts }) => {
@@ -1332,7 +1437,8 @@ pub fn dispatch_pr_auto_fix_cancellable(
                     "attempts": attempts,
                 }),
             );
-            let _ = store.lock().set_pr_auto_fix_outcome(&pr.id, "exhausted");
+            let result = store.lock().set_pr_auto_fix_outcome(&pr.id, "exhausted");
+            warn_on_pr_store_error(store, &guardian.id, pr, "set_pr_auto_fix_outcome", result);
             if pr.auto_fix_exhausted_notified_at_ms.is_none() {
                 enqueue_auto_fix_exhausted_notice(store, guardian, pr, failure);
             }
@@ -1351,7 +1457,8 @@ pub fn dispatch_pr_auto_fix_cancellable(
                 ),
                 serde_json::json!({"pr_number": pr.pr_number, "outcome": "claim_failed", "error": error.to_string()}),
             );
-            let _ = store.lock().set_pr_auto_fix_outcome(&pr.id, "claim_failed");
+            let result = store.lock().set_pr_auto_fix_outcome(&pr.id, "claim_failed");
+            warn_on_pr_store_error(store, &guardian.id, pr, "set_pr_auto_fix_outcome", result);
             return;
         }
     }
@@ -1401,8 +1508,22 @@ pub fn dispatch_pr_fix_manual(
     client: &crate::forge::ForgeClient,
     submitted_by: Option<&str>,
 ) {
-    let _ = store.lock().clear_pr_auto_fix_attempted(&pr.id);
-    let _ = store.lock().mark_pr_auto_fix_attempted(&pr.id);
+    let result = store.lock().clear_pr_auto_fix_attempted(&pr.id);
+    warn_on_pr_store_error(
+        store,
+        &guardian.id,
+        pr,
+        "clear_pr_auto_fix_attempted",
+        result,
+    );
+    let result = store.lock().mark_pr_auto_fix_attempted(&pr.id);
+    warn_on_pr_store_error(
+        store,
+        &guardian.id,
+        pr,
+        "mark_pr_auto_fix_attempted",
+        result,
+    );
     let author = submitted_by
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -1444,10 +1565,27 @@ fn run_pr_fix(
         return;
     };
 
-    let cell_prompts = store
+    let cell_prompts_result = store
         .lock()
-        .cell_prompts_for_review_branch(&guardian.id, &branch.branch)
-        .unwrap_or_default();
+        .cell_prompts_for_review_branch(&guardian.id, &branch.branch);
+    let cell_prompts = match cell_prompts_result {
+        Ok(prompts) => prompts,
+        Err(error) => {
+            log_ci_watch(
+                store,
+                &guardian.id,
+                branch_id,
+                LogLevel::WARNING,
+                format!(
+                    "ralphus [ci-watch] review {} branch {branch_id} could not read cell prompts \
+                     for the PR fix prompt; continuing without them: {error}",
+                    guardian.id
+                ),
+                serde_json::json!({"outcome": "store_error", "op": "cell_prompts_for_review_branch", "error": error.to_string()}),
+            );
+            Vec::new()
+        }
+    };
 
     // RAL-<new>: one self-contained paragraph per failing check/job -- when a
     // forge poll found more than one (`failure.checks`), the agent gets every
@@ -1559,21 +1697,43 @@ fn run_pr_fix(
     // invariant: an older bubble must never read as in-progress once this
     // round has overtaken it. Best-effort -- a message-store failure must
     // never block the fix itself from running.
-    let _ = store
+    let result = store
         .lock()
         .supersede_pending_branch_feedback(&guardian.id, branch_id);
-    let message_seq = store
-        .lock()
-        .add_guardian_message(
-            &guardian.id,
-            "reviewer",
-            &feedback,
-            None,
-            Some(branch_id),
-            Some(author),
-            submitted_by,
-        )
-        .ok();
+    warn_on_store_error(
+        store,
+        &guardian.id,
+        branch_id,
+        "supersede_pending_branch_feedback",
+        result,
+    );
+    let message_seq = store.lock().add_guardian_message(
+        &guardian.id,
+        "reviewer",
+        &feedback,
+        None,
+        Some(branch_id),
+        Some(author),
+        submitted_by,
+    );
+    let message_seq = match message_seq {
+        Ok(seq) => Some(seq),
+        Err(error) => {
+            log_ci_watch(
+                store,
+                &guardian.id,
+                branch_id,
+                LogLevel::WARNING,
+                format!(
+                    "ralphus [ci-watch] review {} branch {branch_id} could not post the PR fix \
+                     request into the feedback thread; running the fix anyway: {error}",
+                    guardian.id
+                ),
+                serde_json::json!({"outcome": "store_error", "op": "add_guardian_message", "error": error.to_string()}),
+            );
+            None
+        }
+    };
 
     log_ci_watch(
         store,
@@ -1588,9 +1748,10 @@ fn run_pr_fix(
         ),
         serde_json::json!({"pr_number": pr.pr_number, "outcome": "auto_fix_dispatching"}),
     );
-    let _ = store
+    let result = store
         .lock()
         .set_pr_auto_fix_outcome(&pr.id, "auto_fix_dispatching");
+    warn_on_pr_store_error(store, &guardian.id, pr, "set_pr_auto_fix_outcome", result);
     let outcome = crate::guardian_merge::run_feedback_registered(
         store,
         runner,
@@ -1602,7 +1763,7 @@ fn run_pr_fix(
         true,
     );
     if let Some(sha) = outcome.pushed_sha.as_deref().filter(|_| outcome.pushed) {
-        let _ = store.lock().update_pull_request_ex(
+        let result = store.lock().update_pull_request_ex(
             &pr.id,
             None,
             None,
@@ -1612,6 +1773,7 @@ fn run_pr_fix(
             Some(Some(sha)),
             None,
         );
+        warn_on_pr_store_error(store, &guardian.id, pr, "update_pull_request_ex", result);
     }
     // `require_proof: true` above means `proof_passed` is only ever `None`
     // when `run_feedback` bailed out before the resolver agent ran at all
@@ -1622,7 +1784,14 @@ fn run_pr_fix(
     // infrastructure race permanently disable auto-fix for a PR whose CI
     // never stops reporting "failing" in between.
     let Some(passed) = outcome.proof_passed else {
-        let _ = store.lock().clear_pr_auto_fix_attempted(&pr.id);
+        let result = store.lock().clear_pr_auto_fix_attempted(&pr.id);
+        warn_on_pr_store_error(
+            store,
+            &guardian.id,
+            pr,
+            "clear_pr_auto_fix_attempted",
+            result,
+        );
         log_ci_watch(
             store,
             &guardian.id,
@@ -1640,9 +1809,10 @@ fn run_pr_fix(
                 "outcome": "auto_fix_not_attempted",
             }),
         );
-        let _ = store
+        let result = store
             .lock()
             .set_pr_auto_fix_outcome(&pr.id, "auto_fix_not_attempted");
+        warn_on_pr_store_error(store, &guardian.id, pr, "set_pr_auto_fix_outcome", result);
         return;
     };
     log_ci_watch(
@@ -1672,7 +1842,7 @@ fn run_pr_fix(
             "pushed": outcome.pushed,
         }),
     );
-    let _ = store.lock().set_pr_auto_fix_outcome(
+    let result = store.lock().set_pr_auto_fix_outcome(
         &pr.id,
         if passed {
             "auto_fix_passed"
@@ -1680,6 +1850,7 @@ fn run_pr_fix(
             "auto_fix_failed"
         },
     );
+    warn_on_pr_store_error(store, &guardian.id, pr, "set_pr_auto_fix_outcome", result);
 }
 
 #[cfg(test)]

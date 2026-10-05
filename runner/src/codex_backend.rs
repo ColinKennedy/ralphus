@@ -123,7 +123,28 @@ impl ModelBackend for CodexBackend {
 
         let codex_home = isolated_codex_home(options, workspace);
         let mut child = spawn(&program, compound, &args, workspace, codex_home.as_deref())
-            .map_err(|e| BackendError(format!("could not spawn {program}: {e}")))?;
+            .map_err(|e| {
+                crate::cli_agent_common::emit_child_lifecycle(
+                    "codex",
+                    "agent process spawn failed",
+                    "error",
+                    serde_json::json!({"compound": compound, "error": e.to_string()}),
+                );
+                BackendError(format!("could not spawn {program}: {e}"))
+            })?;
+        crate::cli_agent_common::emit_child_lifecycle(
+            "codex",
+            "agent process spawned",
+            "info",
+            serde_json::json!({
+                "pid": child.id(),
+                "model": options.model,
+                "compound": compound,
+                "resume": options.resume_agent_session_id.is_some(),
+                "isolated_config_dir": codex_home.is_some(),
+                "timeout_sec": options.timeout_sec,
+            }),
+        );
 
         // Human-readable header for the live tmux pane (RAL-102) -- everything
         // below this is Codex's own text/tool activity, not runner logging.
@@ -136,7 +157,14 @@ impl ModelBackend for CodexBackend {
         if let Some(mut stdin) = child.stdin.take() {
             let prompt = prompt.to_string();
             std::thread::spawn(move || {
-                let _ = stdin.write_all(prompt.as_bytes());
+                if let Err(e) = stdin.write_all(prompt.as_bytes()) {
+                    crate::cli_agent_common::emit_child_lifecycle(
+                        "codex",
+                        "could not write prompt to agent stdin",
+                        "warning",
+                        serde_json::json!({"error": e.to_string()}),
+                    );
+                }
             });
         }
 
@@ -156,7 +184,10 @@ impl ModelBackend for CodexBackend {
         );
 
         if !self.keep_temporary_files {
-            let _ = std::fs::remove_file(live_session_path(workspace.root()));
+            crate::cli_agent_common::remove_temp_file(
+                "codex",
+                &live_session_path(workspace.root()),
+            );
         }
 
         outcome
@@ -517,8 +548,7 @@ fn drive_thread_events(
         // RAL-339: the run is thrashing -- kill the child now rather than
         // wait for a natural exit that may be arbitrarily far off, then fail
         // the cell with whatever was captured live so far.
-        let _ = child.kill();
-        let _ = child.wait();
+        crate::cli_agent_common::kill_child("codex", child, "compaction thrash");
         if let Some(t) = stderr_thread {
             let _ = t.join();
         }
@@ -541,8 +571,17 @@ fn drive_thread_events(
         });
     }
 
-    let status =
-        wait_for_child(child, timeout_sec).map_err(|e| BackendError(format!("codex: {e}")))?;
+    let pid = child.id();
+    let status = wait_for_child(child, timeout_sec).map_err(|e| {
+        crate::cli_agent_common::emit_child_lifecycle(
+            "codex",
+            "agent process wait failed",
+            "error",
+            serde_json::json!({"pid": pid, "error": e.to_string()}),
+        );
+        BackendError(format!("codex: {e}"))
+    })?;
+    crate::cli_agent_common::emit_child_exited("codex", pid, &status);
     if let Some(t) = stderr_thread {
         let _ = t.join();
     }
@@ -641,7 +680,20 @@ fn wait_for_child(
             return Ok(status);
         }
         if start.elapsed() >= deadline {
-            let _ = child.kill();
+            crate::cli_agent_common::emit_child_lifecycle(
+                "codex",
+                "agent process timed out; killing",
+                "warning",
+                serde_json::json!({"pid": child.id(), "timeout_sec": secs}),
+            );
+            if let Err(e) = child.kill() {
+                crate::cli_agent_common::emit_child_lifecycle(
+                    "codex",
+                    "agent process kill failed",
+                    "warning",
+                    serde_json::json!({"pid": child.id(), "error": e.to_string()}),
+                );
+            }
             return child.wait();
         }
         std::thread::sleep(Duration::from_millis(100));

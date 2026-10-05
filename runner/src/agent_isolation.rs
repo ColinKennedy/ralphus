@@ -44,8 +44,11 @@ pub fn isolated_config_dir(workspace_root: &Path, backend: &str) -> PathBuf {
 /// redirected, so an OAuth/subscription login already stored on disk in the
 /// operator's real config dir keeps working under isolation instead of
 /// silently forcing a re-login. Every failure (missing source file, missing
-/// real dir, a create/copy error) is swallowed -- isolation must never fail a
-/// cell just because there was nothing to preserve.
+/// real dir, a create/copy error) is non-fatal -- isolation must never fail a
+/// cell just because there was nothing to preserve. A missing source is the
+/// normal "nothing to preserve" case and stays silent; a create/copy error
+/// on a file that does exist is recorded as a warning, since it is the likely
+/// cause of an unexpected re-login prompt under isolation.
 pub fn preserve_auth_file(real_dir: Option<&Path>, isolated_dir: &Path, filename: &str) {
     let Some(real_dir) = real_dir else {
         return;
@@ -54,10 +57,47 @@ pub fn preserve_auth_file(real_dir: Option<&Path>, isolated_dir: &Path, filename
     if !source.is_file() {
         return;
     }
-    if std::fs::create_dir_all(isolated_dir).is_err() {
+    if let Err(e) = std::fs::create_dir_all(isolated_dir) {
+        emit_isolation_warning(
+            "could not create isolated config directory",
+            isolated_dir,
+            filename,
+            &e,
+        );
         return;
     }
-    let _ = std::fs::copy(source, isolated_dir.join(filename));
+    match std::fs::copy(source, isolated_dir.join(filename)) {
+        Ok(_) => crate::cartographer::emit(
+            "runner",
+            "preserved file into isolated config directory",
+            "debug",
+            crate::cartographer::EventContext::default(),
+            serde_json::json!({
+                "isolated_dir": isolated_dir.display().to_string(),
+                "file": filename,
+            }),
+        ),
+        Err(e) => emit_isolation_warning(
+            "could not preserve file into isolated config directory",
+            isolated_dir,
+            filename,
+            &e,
+        ),
+    }
+}
+
+fn emit_isolation_warning(message: &str, isolated_dir: &Path, filename: &str, e: &std::io::Error) {
+    crate::cartographer::emit(
+        "runner",
+        message,
+        "warning",
+        crate::cartographer::EventContext::default(),
+        serde_json::json!({
+            "isolated_dir": isolated_dir.display().to_string(),
+            "file": filename,
+            "error": e.to_string(),
+        }),
+    );
 }
 
 #[cfg(test)]

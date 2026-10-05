@@ -485,12 +485,21 @@ fn resolve_squad_branch_claim(
         .record_task_worktree_claim(&project.name, base_branch, &candidate, squad_id)
         .map_err(|e| e.to_string())?;
     if candidate != base_branch {
-        // ralphus[ignore-rlog-pair]: the Store-owning scheduler caller records this squad's structured workflow outcome.
-        crate::rlog!(
-            INFO,
-            "ralphus [scheduler] worktree branch \"{base_branch}\" is already owned by another \
-             squad; {squad_id} gets a new branch \"{candidate}\""
-        );
+        crate::cartographer::Note::new("scheduler")
+            .scope("squad")
+            .squad(squad_id)
+            .emit(
+                store,
+                format!(
+                    "worktree branch \"{base_branch}\" is already owned by another squad; \
+                     {squad_id} gets a new branch \"{candidate}\""
+                ),
+                serde_json::json!({
+                    "project": project.name,
+                    "base_branch": base_branch,
+                    "branch": candidate,
+                }),
+            );
     }
     Ok(candidate)
 }
@@ -904,7 +913,15 @@ fn resync_remote_tracking_branch(wt: &Path) -> Result<(), String> {
         )
     })?;
     if git(wt, &["rebase", upstream]).is_err() {
-        let _ = git(wt, &["rebase", "--abort"]);
+        if let Err(e) = git(wt, &["rebase", "--abort"]) {
+            // ralphus[ignore-rlog-pair]: worktree git helper has no Store; the caller records the structured materialization failure
+            crate::rlog!(
+                WARNING,
+                "ralphus [worktrees] could not abort failed resync rebase in {}: {e} -- the \
+                 worktree may be left mid-rebase",
+                wt.display()
+            );
+        }
         return Err(format!(
             "could not rebase {} onto updated \"{upstream}\" -- it likely has local commits \
              that conflict with new commits on the remote; resolve manually in that worktree \
@@ -2539,7 +2556,21 @@ pub(crate) fn execute_local_worktree_jobs(jobs: &[LocalWorktreeJob]) -> HashMap<
                     })
                 })
                 .collect();
-            handles.into_iter().filter_map(|h| h.join().ok()).collect()
+            handles
+                .into_iter()
+                .filter_map(|h| {
+                    h.join()
+                        .map_err(|_| {
+                            // ralphus[ignore-rlog-pair]: this prefetch pass has no `Store` access by design; the live fallback pass records the structured outcome when it retries inline.
+                            crate::rlog!(
+                                WARNING,
+                                "ralphus [scheduler] prefetch worktree materialization thread \
+                                 panicked (will retry inline)"
+                            );
+                        })
+                        .ok()
+                })
+                .collect()
         });
         for (key, outcome) in outcomes {
             match outcome {

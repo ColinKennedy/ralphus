@@ -93,6 +93,10 @@ pub enum BusEvent {
 struct Subscriber {
     id: u64,
     tx: SyncSender<BusEvent>,
+    /// Events dropped since this subscriber's channel last accepted one;
+    /// non-zero means it is currently stalled. Drives the once-per-stall
+    /// log lines in [`EventBus::broadcast`].
+    dropped: u64,
 }
 
 /// Bounded per-subscriber channel capacity. A slow/stalled browser tab drops
@@ -125,7 +129,12 @@ impl EventBus {
     pub fn subscribe(&self) -> (u64, Receiver<BusEvent>) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
-        self.subscribers.lock().unwrap().push(Subscriber { id, tx });
+        self.subscribers
+            .lock()
+            .unwrap()
+            .push(Subscriber { id, tx, dropped: 0 });
+        // ralphus[ignore-rlog-pair]: the event bus is fed by cartographer_log itself, so a structured row here would recurse
+        crate::rlog!(DEBUG, "ralphus [events] subscriber {id} connected");
         (id, rx)
     }
 
@@ -133,6 +142,8 @@ impl EventBus {
     /// pruned by [`EventBus::publish`] noticing a disconnected channel.
     pub fn unsubscribe(&self, id: u64) {
         self.subscribers.lock().unwrap().retain(|s| s.id != id);
+        // ralphus[ignore-rlog-pair]: the event bus is fed by cartographer_log itself, so a structured row here would recurse
+        crate::rlog!(DEBUG, "ralphus [events] subscriber {id} unsubscribed");
     }
 
     /// Broadcast `row` to every live subscriber. A subscriber whose channel
@@ -156,11 +167,49 @@ impl EventBus {
         self.broadcast(BusEvent::Mailbox(notice));
     }
 
+    /// Sends `event` to every subscriber. Logs (stderr/file only -- this runs
+    /// inside `cartographer_log`, so a structured row would recurse) when a
+    /// subscriber starts dropping events because its channel is full, when it
+    /// catches up again (with the number it missed), and when a disconnected
+    /// subscriber is pruned -- once per transition, never once per event.
     fn broadcast(&self, event: BusEvent) {
         let mut subs = self.subscribers.lock().unwrap();
-        subs.retain(|s| match s.tx.try_send(event.clone()) {
-            Ok(()) | Err(TrySendError::Full(_)) => true,
-            Err(TrySendError::Disconnected(_)) => false,
+        subs.retain_mut(|s| match s.tx.try_send(event.clone()) {
+            Ok(()) => {
+                if s.dropped > 0 {
+                    // ralphus[ignore-rlog-pair]: the event bus is fed by cartographer_log itself, so a structured row here would recurse
+                    crate::rlog!(
+                        INFO,
+                        "ralphus [events] subscriber {} caught up after dropping {} event(s)",
+                        s.id,
+                        s.dropped
+                    );
+                    s.dropped = 0;
+                }
+                true
+            }
+            Err(TrySendError::Full(_)) => {
+                if s.dropped == 0 {
+                    // ralphus[ignore-rlog-pair]: the event bus is fed by cartographer_log itself, so a structured row here would recurse
+                    crate::rlog!(
+                        WARNING,
+                        "ralphus [events] subscriber {} channel full (capacity={SUBSCRIBER_CHANNEL_CAPACITY}); dropping events until it catches up",
+                        s.id
+                    );
+                }
+                s.dropped += 1;
+                true
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                // ralphus[ignore-rlog-pair]: the event bus is fed by cartographer_log itself, so a structured row here would recurse
+                crate::rlog!(
+                    DEBUG,
+                    "ralphus [events] pruned disconnected subscriber {} dropped_pending={}",
+                    s.id,
+                    s.dropped
+                );
+                false
+            }
         });
     }
 

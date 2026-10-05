@@ -1192,6 +1192,38 @@ impl Store {
 
     /// Open (creating if needed) a store at `path`, in WAL mode.
     pub fn open(path: &Path) -> Result<Self> {
+        let started = std::time::Instant::now();
+        match Self::open_file(path) {
+            Ok(store) => {
+                crate::cartographer::Note::new("store")
+                    .scope("database")
+                    .emit(
+                        &store,
+                        format!(
+                            "database opened at {} (schema ready in {}ms)",
+                            path.display(),
+                            started.elapsed().as_millis()
+                        ),
+                        serde_json::json!({
+                            "path": path.display().to_string(),
+                            "elapsed_ms": started.elapsed().as_millis() as u64,
+                        }),
+                    );
+                Ok(store)
+            }
+            Err(e) => {
+                // ralphus[ignore-rlog-pair]: the Store failed to open, so there is no database to hold a structured row
+                crate::rlog!(
+                    ERROR,
+                    "ralphus [store] could not open database at {}: {e}",
+                    path.display()
+                );
+                Err(e)
+            }
+        }
+    }
+
+    fn open_file(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         // Cap the `-wal` sidecar. SQLite's autocheckpoint keeps spilling the
@@ -1250,6 +1282,14 @@ impl Store {
         spawn_wal_checkpoint_thread(path.to_path_buf());
         Ok(store)
     }
+}
+
+/// Whether a schema-statement error only means the statement was already
+/// applied on an earlier startup -- see [`Store::run_idempotent_migration`].
+fn is_already_applied_migration_error(msg: &str) -> bool {
+    msg.contains("duplicate column name")
+        || msg.contains("no such column")
+        || msg.contains("already exists")
 }
 
 /// Periodically runs `PRAGMA wal_checkpoint(TRUNCATE)` against `path` on its
@@ -1395,6 +1435,72 @@ impl Store {
         Ok(out)
     }
 
+    /// Run one best-effort schema statement that re-runs on every startup.
+    /// An error meaning it was already applied on an earlier start (a
+    /// duplicate or already-renamed/dropped column, an existing table or
+    /// index) is the normal case and stays silent; any other failure is
+    /// logged as a WARNING, since the statement is otherwise skipped.
+    fn run_idempotent_migration(&self, stmt: &str) {
+        if let Err(e) = self.conn.execute(stmt, []) {
+            let msg = e.to_string();
+            if !is_already_applied_migration_error(&msg) {
+                let summary: String = stmt.split_whitespace().collect::<Vec<_>>().join(" ");
+                let summary: String = summary.chars().take(160).collect();
+                crate::cartographer::Note::new("store")
+                    .level(crate::logging::LogLevel::WARNING)
+                    .scope("migration")
+                    .emit(
+                        self,
+                        format!(
+                            "schema migration statement failed and was skipped: {summary}: {msg}"
+                        ),
+                        serde_json::json!({ "statement": summary, "error": msg }),
+                    );
+            }
+        }
+    }
+
+    /// Log the outcome of a one-shot migration that only runs when its guard
+    /// detects an older database shape. `rows` is the affected-row count where
+    /// the statement reports one (`0` for DDL).
+    fn note_migration(&self, name: &str, outcome: rusqlite::Result<usize>) {
+        match outcome {
+            Ok(rows) => crate::cartographer::Note::new("store")
+                .scope("migration")
+                .emit(
+                    self,
+                    format!("schema migration {name} applied rows={rows}"),
+                    serde_json::json!({ "migration": name, "rows": rows }),
+                ),
+            Err(e) => crate::cartographer::Note::new("store")
+                .level(crate::logging::LogLevel::WARNING)
+                .scope("migration")
+                .emit(
+                    self,
+                    format!("schema migration {name} failed and was skipped: {e}"),
+                    serde_json::json!({ "migration": name, "error": e.to_string() }),
+                ),
+        }
+    }
+
+    /// Logs a WARNING when a best-effort side effect fails; the caller
+    /// deliberately carries on rather than propagating the error.
+    fn warn_if_failed<T, E: std::fmt::Display>(
+        &self,
+        what: &str,
+        result: std::result::Result<T, E>,
+    ) {
+        if let Err(e) = result {
+            crate::cartographer::Note::new("store")
+                .level(crate::logging::LogLevel::WARNING)
+                .emit(
+                    self,
+                    format!("{what} failed (ignored): {e}"),
+                    serde_json::json!({ "operation": what, "error": e.to_string() }),
+                );
+        }
+    }
+
     fn init_schema(&self) -> Result<()> {
         // RAL-281: captured *before* the `CREATE TABLE IF NOT EXISTS` below so
         // the default seed (after the batch) runs exactly once, at first-ever
@@ -1445,7 +1551,7 @@ impl Store {
             .unwrap_or(0)
             > 0;
         if follows_table_preexisting {
-            let _ = self.conn.execute_batch(
+            let copied = self.conn.execute_batch(
                 "
                 CREATE TABLE IF NOT EXISTS watches (
                     id            TEXT PRIMARY KEY,
@@ -1461,6 +1567,7 @@ impl Store {
                 DROP TABLE follows;
                 ",
             );
+            self.note_migration("RAL-364 follows -> watches", copied.map(|()| 0));
         }
         // RAL-400: `waypoint_roster` used to hold both of a waypoint's lists
         // at once -- the work it is *about*, and the downstream work it lands
@@ -1486,10 +1593,11 @@ impl Store {
             .unwrap_or(0)
             > 0;
         if affected_is_pre_split {
-            let _ = self.conn.execute(
+            let renamed = self.conn.execute(
                 "ALTER TABLE waypoint_roster RENAME TO waypoint_affected",
                 [],
             );
+            self.note_migration("RAL-400 waypoint_roster -> waypoint_affected", renamed);
         }
         self.conn.execute_batch(
             "
@@ -2900,7 +3008,7 @@ impl Store {
             // the "parent" kind by construction.
             "ALTER TABLE guardian_pull_requests ADD COLUMN pr_kind TEXT NOT NULL DEFAULT 'parent'",
         ] {
-            let _ = self.conn.execute(stmt, []);
+            self.run_idempotent_migration(stmt);
         }
         // Codex support: `*claude_session_id` columns were named after the only
         // CLI harness that existed at the time, but they hold the resumable
@@ -2921,7 +3029,7 @@ impl Store {
             // columns above.
             "ALTER TABLE users RENAME COLUMN auto_follow TO auto_watch",
         ] {
-            let _ = self.conn.execute(stmt, []);
+            self.run_idempotent_migration(stmt);
         }
         for stmt in [
             "ALTER TABLE cells ADD COLUMN agent_session_id TEXT",
@@ -3610,24 +3718,26 @@ impl Store {
             // rebuild for the review's other worktrees.
             "ALTER TABLE guardians ADD COLUMN base_shift_rebuild_attempts_by_project TEXT",
         ] {
-            let _ = self.conn.execute(stmt, []);
+            self.run_idempotent_migration(stmt);
         }
         // RAL-479: the review status literal "approved" was renamed to
         // "merged" -- it always meant the linked PR/MR had merged, never
         // that a human had approved it. Remap every already-persisted row
         // so historical reviews display under the new name. Idempotent: a
         // no-op once no row still says "approved".
-        let _ = self.conn.execute(
+        match self.conn.execute(
             "UPDATE guardians SET status='merged' WHERE status='approved'",
             [],
-        );
+        ) {
+            Ok(0) => {}
+            outcome => self.note_migration("RAL-479 review status approved->merged", outcome),
+        }
         // RAL-155: task-scoped Cartographer filtering (`?task=`, and the
         // `entity=task:...` addressing scheme) needs this to not degrade into
         // a full-table scan as `cartographer_events` grows. Created after the
         // ALTER-TABLE migrations above, same reasoning as `idx_cells_review_branch`.
-        let _ = self.conn.execute(
+        self.run_idempotent_migration(
             "CREATE INDEX IF NOT EXISTS idx_carto_task ON cartographer_events(task)",
-            [],
         );
         // RAL-121: `hydrate_guardian` looks up each branch's most recent cell
         // by `review_branch` (set once, at submit time, by
@@ -3638,33 +3748,29 @@ impl Store {
         // scan per branch; `cells` only grows over a project's life. Created
         // after the ALTER-TABLE migrations above so it's safe against a database
         // created before the `review_branch` column existed.
-        let _ = self.conn.execute(
+        self.run_idempotent_migration(
             "CREATE INDEX IF NOT EXISTS idx_cells_review_branch ON cells(review_branch)",
-            [],
         );
         // `list_ready` runs under the store lock on every scheduler tick: this
         // turns its `state='pending' ORDER BY created_at_ms` lookup into an
         // index seek, and lets `dependency_satisfying_squads` read
         // `(id, state)` from the index alone instead of scanning `squads`
         // rows, which is what made a cold-cache first tick slow.
-        let _ = self.conn.execute(
+        self.run_idempotent_migration(
             "CREATE INDEX IF NOT EXISTS idx_squads_state_created ON squads(state, created_at_ms, id)",
-            [],
         );
         // RAL-314: same reasoning as `idx_cells_review_branch` above, for the
         // direct guardian-id join `reviews_by_branch`/`collecting_guardians_for_cells`
         // now prefer over the branch-string join.
-        let _ = self.conn.execute(
+        self.run_idempotent_migration(
             "CREATE INDEX IF NOT EXISTS idx_cells_review_guardian_id ON cells(review_guardian_id)",
-            [],
         );
         // RAL-122: enforce branch-id uniqueness at the DB layer (not just via
         // `next_id`'s own monotonic guarantee) -- a separate index because
         // SQLite's `ALTER TABLE ADD COLUMN` can't itself declare `UNIQUE` on a
         // non-empty table.
-        let _ = self.conn.execute(
+        self.run_idempotent_migration(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_guardian_branches_branch_id ON guardian_branches(id)",
-            [],
         );
         // WS-D.2: `guardian_branches`' primary key is (`guardian_id`,
         // `position`), so every lookup *by branch name* -- the branch-name arm
@@ -3672,22 +3778,19 @@ impl Store {
         // paths -- had no index to seek on and scanned. This is the index that
         // makes WS-D.1's `UNION` rewrite actually index-driven rather than
         // merely better-shaped.
-        let _ = self.conn.execute(
+        self.run_idempotent_migration(
             "CREATE INDEX IF NOT EXISTS idx_guardian_branches_branch ON guardian_branches(branch)",
-            [],
         );
         // WS-D.2: the board's review lists filter guardians by status
         // ("collecting", "merged", ...) and order them by creation time. The
         // `(created_at_ms, id)` pair matches `reviews_for_squad`'s and the
         // guardian index's `ORDER BY` exactly, so the sort can be satisfied by
         // walking the index instead of building a temporary b-tree.
-        let _ = self.conn.execute(
+        self.run_idempotent_migration(
             "CREATE INDEX IF NOT EXISTS idx_guardians_status ON guardians(status)",
-            [],
         );
-        let _ = self.conn.execute(
+        self.run_idempotent_migration(
             "CREATE INDEX IF NOT EXISTS idx_guardians_created ON guardians(created_at_ms, id)",
-            [],
         );
         // WS-D.2: three of `cartographer_events`' six indexes cover columns
         // that are almost always NULL -- measured against the captured
@@ -3718,7 +3821,7 @@ impl Store {
             "CREATE INDEX IF NOT EXISTS idx_carto_task_partial
                  ON cartographer_events(task) WHERE task IS NOT NULL",
         ] {
-            let _ = self.conn.execute(stmt, []);
+            self.run_idempotent_migration(stmt);
         }
         // RAL-110: one-time backfill of the old `skip_checks` column (present on
         // any database created before this change) into both new columns --
@@ -3735,14 +3838,16 @@ impl Store {
             .unwrap_or(None)
             .is_some();
         if has_old_skip_checks {
-            let _ = self.conn.execute(
+            let backfill = self.conn.execute(
                 "UPDATE guardians SET skip_auto_build = skip_checks, \
                  skip_worktree_checks = skip_checks",
                 [],
             );
-            let _ = self
+            self.note_migration("RAL-110 skip_checks backfill", backfill);
+            let drop = self
                 .conn
                 .execute("ALTER TABLE guardians DROP COLUMN skip_checks", []);
+            self.note_migration("RAL-110 drop guardians.skip_checks", drop);
         }
         // RAL-168: `verify_mid_resolution` is retired -- replaced outright by
         // `proof_scope`/`proof_skip_auto_clean` above, not mapped forward
@@ -3763,10 +3868,11 @@ impl Store {
             .unwrap_or(None)
             .is_some();
         if has_old_verify_mid_resolution {
-            let _ = self.conn.execute(
+            let drop = self.conn.execute(
                 "ALTER TABLE guardians DROP COLUMN verify_mid_resolution",
                 [],
             );
+            self.note_migration("RAL-168 drop guardians.verify_mid_resolution", drop);
         }
         // RAL-122: one-time backfill of `guardian_branches.id` for any row
         // created before this change -- naturally idempotent, since the
@@ -3776,12 +3882,19 @@ impl Store {
             .prepare("SELECT guardian_id, position FROM guardian_branches WHERE id IS NULL")?
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        let branch_id_backfill_rows = needs_branch_id_backfill.len();
         for (guardian_id, position) in needs_branch_id_backfill {
             let branch_id = self.next_id("branch_seq", "branch")?;
             self.conn.execute(
                 "UPDATE guardian_branches SET id = ?1 WHERE guardian_id = ?2 AND position = ?3",
                 params![branch_id, guardian_id, position],
             )?;
+        }
+        if branch_id_backfill_rows > 0 {
+            self.note_migration(
+                "RAL-122 guardian_branches.id backfill",
+                Ok(branch_id_backfill_rows),
+            );
         }
         // RAL-122: backfill `guardian_pull_requests.branch_id` from the old
         // `branch_position` column (an index) by joining to the now-backfilled
@@ -3797,7 +3910,7 @@ impl Store {
             .unwrap_or(None)
             .is_some();
         if has_old_branch_position {
-            let _ = self.conn.execute(
+            let backfill = self.conn.execute(
                 "UPDATE guardian_pull_requests
                  SET branch_id = (
                      SELECT gb.id FROM guardian_branches gb
@@ -3807,10 +3920,15 @@ impl Store {
                  WHERE branch_position IS NOT NULL",
                 [],
             );
-            let _ = self.conn.execute(
+            self.note_migration(
+                "RAL-122 guardian_pull_requests.branch_id backfill",
+                backfill,
+            );
+            let drop = self.conn.execute(
                 "ALTER TABLE guardian_pull_requests DROP COLUMN branch_position",
                 [],
             );
+            self.note_migration("RAL-122 drop guardian_pull_requests.branch_position", drop);
         }
         let _ = self.collapse_duplicate_open_pull_requests();
         // RAL-293: the no-new-commits guard now reads a worktree's own
@@ -3830,9 +3948,10 @@ impl Store {
             .unwrap_or(None)
             .is_some();
         if has_old_baseline_commit_sha {
-            let _ = self
+            let drop = self
                 .conn
                 .execute("ALTER TABLE tasks DROP COLUMN baseline_commit_sha", []);
+            self.note_migration("RAL-293 drop tasks.baseline_commit_sha", drop);
         }
         // RAL-386: broaden `guardian_worktree_retirements.status`'s CHECK
         // constraint to add `deferred`/`opted_out` and add `retry_at_ms`.
@@ -3873,6 +3992,7 @@ impl Store {
                  FROM guardian_worktree_retirements_ral385;
                  DROP TABLE guardian_worktree_retirements_ral385;",
             )?;
+            self.note_migration("RAL-386 guardian_worktree_retirements rebuild", Ok(0));
         }
         // RAL-365: broaden `hidden_items.kind` to add 'task', for hiding one
         // task independent of its owning squad. SQLite cannot alter a CHECK
@@ -3933,6 +4053,7 @@ impl Store {
                  CREATE INDEX IF NOT EXISTS idx_hidden_items_squad ON hidden_items(squad_id);
                  CREATE INDEX IF NOT EXISTS idx_hidden_items_guardian ON hidden_items(guardian_id);",
             )?;
+            self.note_migration("RAL-365 hidden_items rebuild", Ok(0));
         }
         // Safe unconditionally at this point: either the table was just
         // rebuilt above (and already has these), or it never needed
@@ -4387,9 +4508,12 @@ impl Store {
                 // the last non-terminal affected entry on one or more open
                 // waypoints -- best-effort, mirrors the existing
                 // `notify_watchers` side effects in this setter.
-                let _ = self.maybe_auto_close_waypoints_for_affected_entry(
-                    crate::waypoints::WaypointEntryKind::Squad,
-                    id,
+                self.warn_if_failed(
+                    "auto-close waypoints",
+                    self.maybe_auto_close_waypoints_for_affected_entry(
+                        crate::waypoints::WaypointEntryKind::Squad,
+                        id,
+                    ),
                 );
             }
             Ok(())
@@ -4476,14 +4600,16 @@ impl Store {
         // still-live) keeps counting it up in the running color even though
         // it's cancelled and will never run again. `proofs` has no
         // started_at_ms/finished_at_ms columns.
-        for table in ["cells", "tasks"] {
-            self.conn.execute(
+        let mut flipped = [0usize; 2];
+        for (slot, table) in flipped.iter_mut().zip(["cells", "tasks"]) {
+            *slot = self.conn.execute(
                 &format!(
                     "UPDATE {table} SET state='cancelled', finished_at_ms=? WHERE squad_id=? AND state IN {UNFINISHED}"
                 ),
                 params![now, squad_id],
             )?;
         }
+        let [cells_cancelled, tasks_cancelled] = flipped;
         self.conn.execute(
             "UPDATE cells SET completed_active_duration_ms = completed_active_duration_ms +
                     CASE WHEN active_started_at_ms IS NULL THEN 0 ELSE MAX(0, ? - active_started_at_ms) END,
@@ -4491,7 +4617,7 @@ impl Store {
              WHERE squad_id=? AND active_started_at_ms IS NOT NULL",
             params![now, squad_id],
         )?;
-        self.conn.execute(
+        let proofs_cancelled = self.conn.execute(
             "UPDATE proofs SET state='cancelled',
                  completed_active_duration_ms = completed_active_duration_ms +
                     CASE WHEN active_started_at_ms IS NULL THEN 0 ELSE MAX(0, ? - active_started_at_ms) END,
@@ -4499,6 +4625,22 @@ impl Store {
              WHERE squad_id=? AND state IN ('pending','running','failed')",
             params![now, squad_id],
         )?;
+        if cells_cancelled + tasks_cancelled + proofs_cancelled > 0 {
+            crate::cartographer::Note::new("state")
+                .scope("squad")
+                .squad(squad_id)
+                .emit(
+                    self,
+                    format!(
+                        "squad {squad_id} unfinished nodes → cancelled tasks={tasks_cancelled} cells={cells_cancelled} proofs={proofs_cancelled}"
+                    ),
+                    serde_json::json!({
+                        "tasks": tasks_cancelled,
+                        "cells": cells_cancelled,
+                        "proofs": proofs_cancelled,
+                    }),
+                );
+        }
         Ok(())
     }
 
@@ -4757,7 +4899,7 @@ impl Store {
             params![squad_id, task_idx, idx],
         )?;
         let now = now_ms();
-        self.conn.execute(
+        let proofs_forced = self.conn.execute(
             "UPDATE proofs SET state='done', env_out_of_date=0,
                  completed_active_duration_ms = completed_active_duration_ms +
                     CASE WHEN active_started_at_ms IS NULL THEN 0 ELSE MAX(0, ? - active_started_at_ms) END,
@@ -4766,6 +4908,18 @@ impl Store {
              AND state NOT IN ('done','failed','cancelled')",
             params![now, squad_id, task_idx, idx],
         )?;
+        if proofs_forced > 0 {
+            crate::cartographer::Note::new("state")
+                .scope("proof")
+                .squad(squad_id)
+                .emit(
+                    self,
+                    format!(
+                        "proof {squad_id}/t{task_idx}/cell/s{idx} unfinished proof steps → done (forced with cell) count={proofs_forced}"
+                    ),
+                    serde_json::json!({ "task_idx": task_idx, "cell_idx": idx, "proofs": proofs_forced }),
+                );
+        }
         Ok(())
     }
 
@@ -8054,12 +8208,15 @@ impl Store {
         if n == 0 {
             Err(StoreError::NotFound)
         } else {
-            let _ = self.notify_watchers(
-                crate::monitor::NotifiableEventKind::SquadAttributesChanged,
-                &format!("squad:{squad_id}"),
-                crate::mailbox::MailboxPriority::Normal,
-                "squad attributes changed",
-                Some(squad_id),
+            self.warn_if_failed(
+                "notify watchers",
+                self.notify_watchers(
+                    crate::monitor::NotifiableEventKind::SquadAttributesChanged,
+                    &format!("squad:{squad_id}"),
+                    crate::mailbox::MailboxPriority::Normal,
+                    "squad attributes changed",
+                    Some(squad_id),
+                ),
             );
             Ok(())
         }
@@ -8099,12 +8256,15 @@ impl Store {
         if n == 0 {
             Err(StoreError::NotFound)
         } else {
-            let _ = self.notify_watchers(
-                crate::monitor::NotifiableEventKind::SquadContentChanged,
-                &format!("squad:{squad_id}"),
-                crate::mailbox::MailboxPriority::Normal,
-                "squad task changed",
-                Some(squad_id),
+            self.warn_if_failed(
+                "notify watchers",
+                self.notify_watchers(
+                    crate::monitor::NotifiableEventKind::SquadContentChanged,
+                    &format!("squad:{squad_id}"),
+                    crate::mailbox::MailboxPriority::Normal,
+                    "squad task changed",
+                    Some(squad_id),
+                ),
             );
             Ok(())
         }
@@ -8173,12 +8333,15 @@ impl Store {
                 )?;
             }
         }
-        let _ = self.notify_watchers(
-            crate::monitor::NotifiableEventKind::SquadAttributesChanged,
-            &format!("squad:{squad_id}"),
-            crate::mailbox::MailboxPriority::Normal,
-            "task renamed",
-            Some(squad_id),
+        self.warn_if_failed(
+            "notify watchers",
+            self.notify_watchers(
+                crate::monitor::NotifiableEventKind::SquadAttributesChanged,
+                &format!("squad:{squad_id}"),
+                crate::mailbox::MailboxPriority::Normal,
+                "task renamed",
+                Some(squad_id),
+            ),
         );
         Ok(())
     }
@@ -8242,12 +8405,15 @@ impl Store {
         if n == 0 {
             Err(StoreError::NotFound)
         } else {
-            let _ = self.notify_watchers(
-                crate::monitor::NotifiableEventKind::SquadContentChanged,
-                &format!("squad:{squad_id}"),
-                crate::mailbox::MailboxPriority::Normal,
-                "squad proof changed",
-                Some(squad_id),
+            self.warn_if_failed(
+                "notify watchers",
+                self.notify_watchers(
+                    crate::monitor::NotifiableEventKind::SquadContentChanged,
+                    &format!("squad:{squad_id}"),
+                    crate::mailbox::MailboxPriority::Normal,
+                    "squad proof changed",
+                    Some(squad_id),
+                ),
             );
             Ok(())
         }
@@ -8358,12 +8524,15 @@ impl Store {
         if n == 0 {
             Err(StoreError::NotFound)
         } else {
-            let _ = self.notify_watchers(
-                crate::monitor::NotifiableEventKind::SquadContentChanged,
-                &format!("squad:{squad_id}"),
-                crate::mailbox::MailboxPriority::Normal,
-                "squad cell changed",
-                Some(squad_id),
+            self.warn_if_failed(
+                "notify watchers",
+                self.notify_watchers(
+                    crate::monitor::NotifiableEventKind::SquadContentChanged,
+                    &format!("squad:{squad_id}"),
+                    crate::mailbox::MailboxPriority::Normal,
+                    "squad cell changed",
+                    Some(squad_id),
+                ),
             );
             Ok(())
         }
@@ -8407,12 +8576,15 @@ impl Store {
             "UPDATE squads SET env_overrides=?, updated_at_ms=? WHERE id=?",
             params![to_json_map(&current), now_ms(), squad_id],
         )?;
-        let _ = self.notify_watchers(
-            crate::monitor::NotifiableEventKind::SquadContentChanged,
-            &format!("squad:{squad_id}"),
-            crate::mailbox::MailboxPriority::Normal,
-            "squad environment overrides changed",
-            Some(squad_id),
+        self.warn_if_failed(
+            "notify watchers",
+            self.notify_watchers(
+                crate::monitor::NotifiableEventKind::SquadContentChanged,
+                &format!("squad:{squad_id}"),
+                crate::mailbox::MailboxPriority::Normal,
+                "squad environment overrides changed",
+                Some(squad_id),
+            ),
         );
         Ok(current)
     }
@@ -8473,12 +8645,15 @@ impl Store {
             "UPDATE cells SET env_out_of_date=1 WHERE squad_id=? AND task_idx=?",
             params![squad_id, task_idx],
         )?;
-        let _ = self.notify_watchers(
-            crate::monitor::NotifiableEventKind::SquadContentChanged,
-            &format!("task:{squad_id}:{task_idx}"),
-            crate::mailbox::MailboxPriority::Normal,
-            "task environment overrides changed",
-            Some(squad_id),
+        self.warn_if_failed(
+            "notify watchers",
+            self.notify_watchers(
+                crate::monitor::NotifiableEventKind::SquadContentChanged,
+                &format!("task:{squad_id}:{task_idx}"),
+                crate::mailbox::MailboxPriority::Normal,
+                "task environment overrides changed",
+                Some(squad_id),
+            ),
         );
         Ok(current)
     }
@@ -8530,12 +8705,15 @@ impl Store {
             "UPDATE proofs SET env_out_of_date=1 WHERE squad_id=? AND task_idx=? AND scope='task'",
             params![squad_id, task_idx],
         )?;
-        let _ = self.notify_watchers(
-            crate::monitor::NotifiableEventKind::SquadContentChanged,
-            &format!("task:{squad_id}:{task_idx}"),
-            crate::mailbox::MailboxPriority::Normal,
-            "task proof environment overrides changed",
-            Some(squad_id),
+        self.warn_if_failed(
+            "notify watchers",
+            self.notify_watchers(
+                crate::monitor::NotifiableEventKind::SquadContentChanged,
+                &format!("task:{squad_id}:{task_idx}"),
+                crate::mailbox::MailboxPriority::Normal,
+                "task proof environment overrides changed",
+                Some(squad_id),
+            ),
         );
         Ok(current)
     }
@@ -8589,12 +8767,15 @@ impl Store {
             "UPDATE proofs SET env_out_of_date=1 WHERE squad_id=? AND task_idx=? AND scope='cell' AND cell_idx=?",
             params![squad_id, task_idx, cell_idx],
         )?;
-        let _ = self.notify_watchers(
-            crate::monitor::NotifiableEventKind::SquadContentChanged,
-            &format!("cell:{squad_id}:{task_idx}:{cell_idx}"),
-            crate::mailbox::MailboxPriority::Normal,
-            "cell environment overrides changed",
-            Some(squad_id),
+        self.warn_if_failed(
+            "notify watchers",
+            self.notify_watchers(
+                crate::monitor::NotifiableEventKind::SquadContentChanged,
+                &format!("cell:{squad_id}:{task_idx}:{cell_idx}"),
+                crate::mailbox::MailboxPriority::Normal,
+                "cell environment overrides changed",
+                Some(squad_id),
+            ),
         );
         Ok(current)
     }
@@ -8648,12 +8829,15 @@ impl Store {
             "UPDATE proofs SET env_out_of_date=1 WHERE squad_id=? AND task_idx=? AND scope='cell' AND cell_idx=?",
             params![squad_id, task_idx, cell_idx],
         )?;
-        let _ = self.notify_watchers(
-            crate::monitor::NotifiableEventKind::SquadContentChanged,
-            &format!("cell:{squad_id}:{task_idx}:{cell_idx}"),
-            crate::mailbox::MailboxPriority::Normal,
-            "cell proof environment overrides changed",
-            Some(squad_id),
+        self.warn_if_failed(
+            "notify watchers",
+            self.notify_watchers(
+                crate::monitor::NotifiableEventKind::SquadContentChanged,
+                &format!("cell:{squad_id}:{task_idx}:{cell_idx}"),
+                crate::mailbox::MailboxPriority::Normal,
+                "cell proof environment overrides changed",
+                Some(squad_id),
+            ),
         );
         Ok(current)
     }
@@ -8867,12 +9051,15 @@ impl Store {
             ],
         )?;
         let entity_uri = format!("proof:{squad_id}:{task_idx}:{scope}:{cell_idx}:{idx}");
-        let _ = self.notify_watchers(
-            crate::monitor::NotifiableEventKind::SquadContentChanged,
-            &entity_uri,
-            crate::mailbox::MailboxPriority::Normal,
-            "proof environment overrides changed",
-            Some(squad_id),
+        self.warn_if_failed(
+            "notify watchers",
+            self.notify_watchers(
+                crate::monitor::NotifiableEventKind::SquadContentChanged,
+                &entity_uri,
+                crate::mailbox::MailboxPriority::Normal,
+                "proof environment overrides changed",
+                Some(squad_id),
+            ),
         );
         Ok(current)
     }
@@ -8917,22 +9104,35 @@ impl Store {
     /// [`Store::set_cell_state`] and make the Details Pane show an
     /// inflated elapsed duration once it starts running again).
     pub fn reset_squad_to_pending(&self, squad_id: &str) -> Result<()> {
-        self.conn.execute(
+        let old = self.squad_state(squad_id).map_or("unknown", |s| s.as_str());
+        let squads = self.conn.execute(
             "UPDATE squads SET state='pending', updated_at_ms=?, started_at_ms=NULL, finished_at_ms=NULL WHERE id=?",
             params![now_ms(), squad_id],
         )?;
-        self.conn.execute(
+        let tasks = self.conn.execute(
             "UPDATE tasks SET state='pending', error=NULL, started_at_ms=NULL, finished_at_ms=NULL, env_out_of_date=0 WHERE squad_id=?",
             params![squad_id],
         )?;
-        self.conn.execute(
+        let cells = self.conn.execute(
             "UPDATE cells SET state='pending', error=NULL, started_at_ms=NULL, finished_at_ms=NULL, completed_active_duration_ms=0, active_started_at_ms=NULL, env_out_of_date=0 WHERE squad_id=?",
             params![squad_id],
         )?;
-        self.conn.execute(
+        let proofs = self.conn.execute(
             "UPDATE proofs SET state='pending', completed_active_duration_ms=0, active_started_at_ms=NULL, env_out_of_date=0, restart_note=NULL WHERE squad_id=?",
             params![squad_id],
         )?;
+        if squads > 0 {
+            crate::cartographer::Note::new("state")
+                .scope("squad")
+                .squad(squad_id)
+                .emit(
+                    self,
+                    format!(
+                        "squad {squad_id} {old} → pending (full reset) tasks={tasks} cells={cells} proofs={proofs}"
+                    ),
+                    serde_json::json!({ "old": old, "tasks": tasks, "cells": cells, "proofs": proofs }),
+                );
+        }
         Ok(())
     }
 
@@ -9556,6 +9756,7 @@ impl Store {
     /// earlier and other, unaffected cells may still be `Done`.
     pub fn restart_cell(&self, squad_id: &str, task_idx: i64, idx: i64) -> Result<Vec<String>> {
         let impact = self.compute_cell_restart_impact(squad_id, task_idx, idx)?;
+        let old = self.squad_state(squad_id).map_or("unknown", |s| s.as_str());
 
         for s in &impact.cells {
             self.conn.execute(
@@ -9581,6 +9782,25 @@ impl Store {
             "UPDATE squads SET state='pending', updated_at_ms=?, finished_at_ms=NULL WHERE id=?",
             params![now_ms(), squad_id],
         )?;
+        crate::cartographer::Note::new("state")
+            .scope("squad")
+            .squad(squad_id)
+            .emit(
+                self,
+                format!(
+                    "squad {squad_id} {old} → pending (cell t{task_idx}/s{idx} restart) cells={} tasks={}",
+                    impact.cells.len(),
+                    impact.tasks.len()
+                ),
+                serde_json::json!({
+                    "old": old,
+                    "task_idx": task_idx,
+                    "cell_idx": idx,
+                    "cells": impact.cells.len(),
+                    "tasks": impact.tasks.len(),
+                    "dirtied_squads": impact.dirtied_squads.len(),
+                }),
+            );
         let _ = self.log_event(
             Some(squad_id),
             None,
@@ -9693,6 +9913,7 @@ impl Store {
     /// dirtied dependent squad ids.
     pub fn restart_task(&self, squad_id: &str, task_idx: i64) -> Result<Vec<String>> {
         let impact = self.compute_task_restart_impact(squad_id, task_idx)?;
+        let old = self.squad_state(squad_id).map_or("unknown", |s| s.as_str());
 
         for s in &impact.cells {
             self.conn.execute(
@@ -9718,6 +9939,24 @@ impl Store {
             "UPDATE squads SET state='pending', updated_at_ms=? WHERE id=?",
             params![now_ms(), squad_id],
         )?;
+        crate::cartographer::Note::new("state")
+            .scope("squad")
+            .squad(squad_id)
+            .emit(
+                self,
+                format!(
+                    "squad {squad_id} {old} → pending (task t{task_idx} restart) cells={} tasks={}",
+                    impact.cells.len(),
+                    impact.tasks.len()
+                ),
+                serde_json::json!({
+                    "old": old,
+                    "task_idx": task_idx,
+                    "cells": impact.cells.len(),
+                    "tasks": impact.tasks.len(),
+                    "dirtied_squads": impact.dirtied_squads.len(),
+                }),
+            );
         let _ = self.log_event(
             Some(squad_id),
             None,
@@ -9936,6 +10175,14 @@ impl Store {
         if n == 0 {
             Err(StoreError::NotFound)
         } else {
+            crate::cartographer::Note::new("store")
+                .scope("squad")
+                .squad(squad_id)
+                .emit(
+                    self,
+                    format!("squad {squad_id} deleted with its tasks/cells/proofs"),
+                    serde_json::json!({}),
+                );
             Ok(())
         }
     }
@@ -9994,6 +10241,17 @@ impl Store {
                 [],
             )?;
             tx.commit()?;
+            crate::cartographer::Note::new("store").scope("squad").emit(
+                self,
+                format!(
+                    "cleared all state: squads_deleted={squads_deleted} guardians_deleted={guardians_deleted}"
+                ),
+                serde_json::json!({
+                    "filter": "all",
+                    "squads_deleted": squads_deleted,
+                    "guardians_deleted": guardians_deleted,
+                }),
+            );
             return Ok(ClearOutcome {
                 squads_deleted,
                 guardians_deleted,
@@ -10030,6 +10288,15 @@ impl Store {
             tx.execute("DELETE FROM squads WHERE id=?", params![id])?;
         }
         tx.commit()?;
+        crate::cartographer::Note::new("store").scope("squad").emit(
+            self,
+            format!(
+                "cleared squads in states [{}]: squads_deleted={}",
+                wanted.join(","),
+                ids.len()
+            ),
+            serde_json::json!({ "filter": wanted, "squads_deleted": ids.len() }),
+        );
         Ok(ClearOutcome {
             squads_deleted: ids.len(),
             guardians_deleted: 0,
@@ -10122,8 +10389,18 @@ impl Store {
         outcome: &CellOutcome,
     ) -> Result<()> {
         let entering_terminal = i64::from(outcome.state.is_terminal());
+        let old: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT state FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
+                params![squad_id, task_idx, idx],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
         let now = now_ms();
-        self.conn.execute(
+        let updated = self.conn.execute(
             "UPDATE cells SET state=?, tokens_in=?, tokens_out=?, cache_creation_tokens=?, cache_read_tokens=?, compaction_input_tokens=?, compaction_count=?, turns=?, cost_usd=?, cost_is_estimated=?, error=?, agent_session_id=COALESCE(?, agent_session_id),
                  finished_at_ms = CASE WHEN ?=1 THEN ? ELSE finished_at_ms END,
                  completed_active_duration_ms = completed_active_duration_ms +
@@ -10154,6 +10431,41 @@ impl Store {
                 outcome.state.as_str(),
             ],
         )?;
+        let Some(old) = old.as_deref() else {
+            return Ok(());
+        };
+        let new = outcome.state.as_str();
+        let task_name = self.task_name_at(squad_id, task_idx).ok().flatten();
+        let mut note = crate::cartographer::Note::new("state")
+            .scope("cell")
+            .squad(squad_id);
+        if let Some(task) = task_name.as_deref() {
+            note = note.task(task);
+        }
+        if updated == 0 {
+            note.emit(
+                self,
+                format!(
+                    "cell {squad_id}/t{task_idx}/s{idx} result {new} not recorded: cell is already {old} (manual override kept)"
+                ),
+                serde_json::json!({ "task_idx": task_idx, "cell_idx": idx, "old": old, "new": new }),
+            );
+        } else if old != new {
+            note.emit(
+                self,
+                format!("cell {squad_id}/t{task_idx}/s{idx} {old} → {new} (result recorded)"),
+                serde_json::json!({
+                    "task_idx": task_idx,
+                    "cell_idx": idx,
+                    "old": old,
+                    "new": new,
+                    "tokens_in": outcome.usage.tokens_in,
+                    "tokens_out": outcome.usage.tokens_out,
+                    "cost_usd": outcome.usage.cost_usd,
+                    "has_error": outcome.error.is_some(),
+                }),
+            );
+        }
         Ok(())
     }
 

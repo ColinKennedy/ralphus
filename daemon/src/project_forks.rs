@@ -434,10 +434,26 @@ pub(crate) fn ensure_fork_remote(
         &["config", "--get", &format!("remote.{remote_name}.url")],
     ) {
         Ok(existing) if existing.trim() == fork_url => Ok(()),
-        Ok(_) => crate::guardian_merge::git(root, &["remote", "set-url", remote_name, fork_url])
-            .map(|_| ()),
+        Ok(_) => {
+            crate::guardian_merge::git(root, &["remote", "set-url", remote_name, fork_url])?;
+            // The previous URL is not logged: a hand-configured remote may embed credentials.
+            // ralphus[ignore-rlog-pair]: pure git helper with no Store; fork routing callers record the structured outcome
+            crate::rlog!(
+                INFO,
+                "ralphus [fork] repointed git remote {remote_name} in {} to {fork_url}",
+                root.display()
+            );
+            Ok(())
+        }
         Err(_) => {
-            crate::guardian_merge::git(root, &["remote", "add", remote_name, fork_url]).map(|_| ())
+            crate::guardian_merge::git(root, &["remote", "add", remote_name, fork_url])?;
+            // ralphus[ignore-rlog-pair]: pure git helper with no Store; fork routing callers record the structured outcome
+            crate::rlog!(
+                INFO,
+                "ralphus [fork] added git remote {remote_name} -> {fork_url} in {}",
+                root.display()
+            );
+            Ok(())
         }
     }
 }
@@ -617,6 +633,12 @@ pub(crate) fn sync_review_upstream_branch(
             .and_then(|line| line.split_once('\t'))
             .map(|(sha, _)| sha.trim().to_string());
         if parent_sha.as_deref() == Some(tip.as_str()) {
+            // ralphus[ignore-rlog-pair]: pure git helper with no Store; callers record the structured failure
+            crate::rlog!(
+                WARNING,
+                "ralphus [fork] refusing to force-push review upstream branch {review_branch}: \
+                 parent {parent_remote_name} has a same-named branch at the fetched base tip {tip}"
+            );
             return Err(format!(
                 "refusing to force-push the review upstream branch {review_branch}: the \
                  parent remote already has a branch named {review_branch} whose tip matches \

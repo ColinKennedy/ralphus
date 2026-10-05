@@ -145,30 +145,46 @@ fn record_large_diff_verdict(
                     serde_json::json!({"summary": inspection.summary, "version": inspection.version}),
                 );
             if inspection.cfg.allow_waypoint_creation {
-                if let Ok(id) = inspection.store.next_id("waypoint_seq", "waypoint") {
-                    let prompt = format!(
-                        "Review the legitimate oversized change reported by Arbiter for {}/{}: {}",
-                        inspection.squad_id, inspection.cell_id, inspection.summary
-                    );
-                    if inspection
-                        .store
-                        .create_waypoint(
+                let created = inspection
+                    .store
+                    .next_id("waypoint_seq", "waypoint")
+                    .and_then(|id| {
+                        let prompt = format!(
+                            "Review the legitimate oversized change reported by Arbiter for {}/{}: {}",
+                            inspection.squad_id, inspection.cell_id, inspection.summary
+                        );
+                        inspection.store.create_waypoint(
                             &id,
                             Some("Arbiter large-diff review"),
                             &prompt,
                             None,
                             None,
                             true,
-                        )
-                        .is_ok()
-                    {
-                        let _ = inspection.store.add_affected_entry(
+                        )?;
+                        inspection.store.add_affected_entry(
                             &id,
                             crate::waypoints::WaypointEntryKind::Squad,
                             inspection.squad_id,
                             crate::waypoints::AffectedMode::Advisory,
-                        );
-                    }
+                        )?;
+                        Ok(id)
+                    });
+                let note = crate::cartographer::Note::new("arbiter")
+                    .squad(inspection.squad_id)
+                    .cell(inspection.cell_id)
+                    .task(inspection.task)
+                    .admin_only();
+                match created {
+                    Ok(id) => note.emit(
+                        inspection.store,
+                        format!("Arbiter opened advisory waypoint {id} for oversized change"),
+                        serde_json::json!({"waypoint_id": id, "version": inspection.version}),
+                    ),
+                    Err(e) => note.level(crate::logging::LogLevel::WARNING).emit(
+                        inspection.store,
+                        format!("Arbiter could not open advisory waypoint for oversized change: {e}"),
+                        serde_json::json!({"version": inspection.version, "error": e.to_string()}),
+                    ),
                 }
             }
         }
@@ -246,7 +262,21 @@ pub fn inspect_large_diff(
         }],
     ) {
         Ok(v) => v,
-        Err(_) => return None,
+        Err(e) => {
+            let guard = store.lock();
+            crate::cartographer::Note::new("arbiter")
+                .level(crate::logging::LogLevel::WARNING)
+                .squad(squad_id)
+                .cell(cell_id)
+                .task(task)
+                .admin_only()
+                .emit(
+                    &guard,
+                    format!("Arbiter large-diff numstat call failed: {e}"),
+                    serde_json::json!({"summary": summary, "version": version}),
+                );
+            return None;
+        }
     };
     let numstat_cost = estimate_cost_usd(
         &arbiter.agent,
@@ -268,7 +298,21 @@ pub fn inspect_large_diff(
         std::path::Path::new(cwd),
         summary.get("baseline").and_then(serde_json::Value::as_str),
     )
-    .unwrap_or_default();
+    .unwrap_or_else(|e| {
+        let guard = store.lock();
+        crate::cartographer::Note::new("arbiter")
+            .level(crate::logging::LogLevel::WARNING)
+            .squad(squad_id)
+            .cell(cell_id)
+            .task(task)
+            .admin_only()
+            .emit(
+                &guard,
+                format!("Arbiter large-diff inspection could not read the cell diff; inspecting numstat only: {e}"),
+                serde_json::json!({"cwd": cwd, "version": version}),
+            );
+        String::new()
+    });
     let diff = bounded_diff(&diff);
     let system = "You are the Arbiter overseeing a running coding task. A large diff alone is not suspicious. Compare the task context, numstat, and bounded diff. Reply with exactly LEGITIMATE if it remains in the task's spirit, otherwise exactly SUSPICIOUS for runaway, unhealthy, or out-of-scope work.";
     let message =
@@ -805,7 +849,17 @@ pub fn spawn_triage_followup(
         for p in &pending {
             let types = classify(&store_handle, &arbiter, &squad_id, &p.cell_id, &p.context);
             let guard = store_handle.lock();
-            let _ = guard.set_cell_triage_types(&squad_id, p.task_idx, p.idx, &types);
+            if let Err(e) = guard.set_cell_triage_types(&squad_id, p.task_idx, p.idx, &types) {
+                crate::cartographer::Note::new("arbiter")
+                    .level(crate::logging::LogLevel::WARNING)
+                    .squad(&squad_id)
+                    .cell(&p.cell_id)
+                    .emit(
+                        &guard,
+                        format!("could not persist Arbiter triage classification: {e}"),
+                        serde_json::json!({"types": types, "error": e.to_string()}),
+                    );
+            }
         }
         for p in &pending_subprojects {
             resolve_pending_subprojects(&store_handle, &arbiter, &squad_id, p);
@@ -874,7 +928,17 @@ fn resolve_pending_subprojects(
         return;
     };
     let guard = store_handle.lock();
-    let _ = guard.set_cell_subprojects(squad_id, p.task_idx, p.idx, &matched, true);
+    if let Err(e) = guard.set_cell_subprojects(squad_id, p.task_idx, p.idx, &matched, true) {
+        crate::cartographer::Note::new("arbiter")
+            .level(crate::logging::LogLevel::WARNING)
+            .squad(squad_id)
+            .cell(&p.cell_id)
+            .emit(
+                &guard,
+                format!("could not persist Arbiter subproject match: {e}"),
+                serde_json::json!({"subprojects": matched, "error": e.to_string()}),
+            );
+    }
 }
 
 fn note_and_return(

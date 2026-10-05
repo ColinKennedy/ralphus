@@ -36,9 +36,12 @@ fn main() {
         i += 1;
     }
 
+    // stdout is the JSON-RPC channel; every log line goes to stderr.
+    eprintln!("ralphus-mcp [startup] serving daemon={daemon_url} read_only={read_only}");
     let server = Server::new(daemon_url, read_only);
     if let Err(e) = protocol::serve(&server, BufReader::new(stdin()), stdout()) {
         eprintln!("ralphus-mcp: fatal I/O error: {e}");
         std::process::exit(1);
     }
+    eprintln!("ralphus-mcp [startup] stdin closed; exiting");
 }

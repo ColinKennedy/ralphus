@@ -304,7 +304,27 @@ impl ModelBackend for PiBackend {
             isolated_dir.as_deref(),
             &workspace_guard,
         )
-        .map_err(|e| BackendError(format!("could not spawn {program}: {e}")))?;
+        .map_err(|e| {
+            crate::cli_agent_common::emit_child_lifecycle(
+                "pi",
+                "agent process spawn failed",
+                "error",
+                serde_json::json!({"compound": compound, "error": e.to_string()}),
+            );
+            BackendError(format!("could not spawn {program}: {e}"))
+        })?;
+        crate::cli_agent_common::emit_child_lifecycle(
+            "pi",
+            "agent process spawned",
+            "info",
+            serde_json::json!({
+                "pid": child.id(),
+                "model": options.model,
+                "compound": compound,
+                "resume": options.resume_agent_session_id.is_some(),
+                "isolated_config_dir": isolated_dir.is_some(),
+            }),
+        );
 
         // Written on its own thread for the same reason as Codex's: writing
         // then closing stdin inline could deadlock against Pi filling its own
@@ -314,7 +334,14 @@ impl ModelBackend for PiBackend {
         if let Some(mut stdin) = child.stdin.take() {
             let prompt = prompt.to_string();
             std::thread::spawn(move || {
-                let _ = stdin.write_all(prompt.as_bytes());
+                if let Err(e) = stdin.write_all(prompt.as_bytes()) {
+                    crate::cli_agent_common::emit_child_lifecycle(
+                        "pi",
+                        "could not write prompt to agent stdin",
+                        "warning",
+                        serde_json::json!({"error": e.to_string()}),
+                    );
+                }
             });
         }
 
@@ -340,7 +367,7 @@ impl ModelBackend for PiBackend {
         )?;
 
         if !self.keep_temporary_files {
-            let _ = std::fs::remove_file(live_session_path(workspace.root()));
+            crate::cli_agent_common::remove_temp_file("pi", &live_session_path(workspace.root()));
         }
 
         Ok(outcome)
@@ -867,8 +894,7 @@ fn drive_json_events(
         // RAL-339: the run is thrashing -- kill the child now rather than
         // wait for a natural exit that may be arbitrarily far off, then fail
         // the cell with whatever was captured live so far.
-        let _ = child.kill();
-        let _ = child.wait();
+        crate::cli_agent_common::kill_child("pi", child, "compaction thrash");
         if let Some(t) = stderr_thread {
             let _ = t.join();
         }
@@ -891,7 +917,17 @@ fn drive_json_events(
         });
     }
 
-    let status = child.wait().map_err(|e| BackendError(format!("pi: {e}")))?;
+    let pid = child.id();
+    let status = child.wait().map_err(|e| {
+        crate::cli_agent_common::emit_child_lifecycle(
+            "pi",
+            "agent process wait failed",
+            "error",
+            serde_json::json!({"pid": pid, "error": e.to_string()}),
+        );
+        BackendError(format!("pi: {e}"))
+    })?;
+    crate::cli_agent_common::emit_child_exited("pi", pid, &status);
     let stderr_output = stderr_thread
         .and_then(|t| t.join().ok())
         .unwrap_or_default();

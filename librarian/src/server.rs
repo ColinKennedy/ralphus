@@ -301,8 +301,10 @@ fn proxy_conditional(
             );
         }
     };
+    let log_path = path.split('?').next().unwrap_or(path);
     match result {
         Ok(resp) => {
+            note_daemon_reachable(daemon_url);
             let status = resp.status();
             let etag = resp.header("ETag").map(str::to_string);
             // A 304 carries no body by definition; `into_string` would give an
@@ -311,20 +313,74 @@ fn proxy_conditional(
             let body = if status == 304 {
                 String::new()
             } else {
-                resp.into_string().unwrap_or_default()
+                read_daemon_body(resp, method, log_path)
             };
             let mut reply = Reply::json(status, body);
             reply.etag = etag;
             reply
         }
         Err(ureq::Error::Status(code, resp)) => {
-            Reply::json(code, resp.into_string().unwrap_or_default())
+            note_daemon_reachable(daemon_url);
+            if code >= 500 {
+                eprintln!(
+                    "ralphus-librarian [proxy] daemon error {method} {log_path} status={code}"
+                );
+            }
+            Reply::json(code, read_daemon_body(resp, method, log_path))
         }
-        Err(_) => Reply::json(
-            502,
-            r#"{"error":{"code":"daemon_unreachable","message":"the ralphus daemon is not running"}}"#,
-        ),
+        Err(e) => {
+            note_daemon_unreachable(daemon_url, method, log_path, &e);
+            Reply::json(
+                502,
+                r#"{"error":{"code":"daemon_unreachable","message":"the ralphus daemon is not running"}}"#,
+            )
+        }
     }
+}
+
+/// Whether the last proxied call failed to reach the daemon at all. The board
+/// polls several endpoints a second, so reachability is logged only when it
+/// changes, not once per failed request.
+static DAEMON_UNREACHABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn note_daemon_unreachable(daemon_url: &str, method: &str, path: &str, error: &ureq::Error) {
+    if !DAEMON_UNREACHABLE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        eprintln!(
+            "ralphus-librarian [proxy] daemon unreachable daemon={daemon_url} \
+             first_failure={method} {path} error={}",
+            ureq_error_detail(error)
+        );
+    }
+}
+
+/// A ureq error's kind and message without the request URL its `Display`
+/// would include -- the event-stream URL carries a single-use `?ticket=`.
+fn ureq_error_detail(error: &ureq::Error) -> String {
+    match error {
+        ureq::Error::Status(code, _) => format!("status {code}"),
+        ureq::Error::Transport(t) => match t.message() {
+            Some(message) => format!("{}: {message}", t.kind()),
+            None => t.kind().to_string(),
+        },
+    }
+}
+
+fn note_daemon_reachable(daemon_url: &str) {
+    if DAEMON_UNREACHABLE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        eprintln!("ralphus-librarian [proxy] daemon reachable again daemon={daemon_url}");
+    }
+}
+
+/// Reads a daemon response body, logging (rather than silently relaying an
+/// empty body for) a read that fails partway.
+fn read_daemon_body(resp: ureq::Response, method: &str, path: &str) -> String {
+    resp.into_string().unwrap_or_else(|e| {
+        eprintln!(
+            "ralphus-librarian [proxy] could not read daemon response body {method} {path} error={e}"
+        );
+        String::new()
+    })
 }
 
 /// The SSE push endpoint (RAL-167), proxied straight through rather than via
@@ -520,7 +576,12 @@ fn handle_request(mut request: tiny_http::Request, daemon_url: &str) {
     let if_none_match = header_value(&request, "If-None-Match");
 
     let mut body = String::new();
-    let _ = request.as_reader().read_to_string(&mut body);
+    if let Err(e) = request.as_reader().read_to_string(&mut body) {
+        let path = url.split('?').next().unwrap_or(&url);
+        eprintln!(
+            "ralphus-librarian [proxy] could not read request body {method} {path} error={e}"
+        );
+    }
 
     let reply = handle_with_trace_conditional(
         daemon_url,
@@ -591,7 +652,11 @@ fn proxy_events_stream(
     let mut writer = request.into_writer();
     let resp = match ureq::get(&url).call() {
         Ok(r) => r,
-        Err(_) => {
+        Err(e) => {
+            eprintln!(
+                "ralphus-librarian [proxy] event stream could not reach daemon error={}",
+                ureq_error_detail(&e)
+            );
             let _ = writer.write_all(
                 b"HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\n\r\ndaemon unreachable",
             );

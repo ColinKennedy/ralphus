@@ -314,6 +314,7 @@ impl Store {
             )
             .optional()?;
         let merged = merge_content(existing.as_deref(), new_content);
+        let truncated = merged.starts_with("…(earlier notes truncated)…");
         let now = now_ms();
         self.conn.execute(
             "INSERT INTO ghosts(owner_uri, kind, squad_id, guardian_id, content, revision, created_at_ms, updated_at_ms)
@@ -324,7 +325,44 @@ impl Store {
                 updated_at_ms=excluded.updated_at_ms",
             params![owner_uri, kind, squad_id, guardian_id, merged, revision, now, now],
         )?;
+        self.ghost_note(squad_id, guardian_id, crate::logging::LogLevel::DEBUG)
+            .emit(
+                self,
+                format!(
+                    "ghost written owner_uri={owner_uri} merged={} len={} truncated={truncated}",
+                    existing.is_some(),
+                    merged.len()
+                ),
+                serde_json::json!({
+                    "owner_uri": owner_uri,
+                    "kind": kind,
+                    "merged_into_existing": existing.is_some(),
+                    "len": merged.len(),
+                    "truncated": truncated,
+                    "revision": revision,
+                }),
+            );
         self.get_ghost(owner_uri).map(|g| g.expect("just written"))
+    }
+
+    /// A `ghost`-sourced Cartographer note carrying whichever owner
+    /// reference (squad or guardian) the ghost has.
+    fn ghost_note<'a>(
+        &self,
+        squad_id: Option<&'a str>,
+        guardian_id: Option<&'a str>,
+        level: crate::logging::LogLevel,
+    ) -> crate::cartographer::Note<'a> {
+        let mut note = crate::cartographer::Note::new("ghost")
+            .level(level)
+            .scope("ghost");
+        if let Some(squad_id) = squad_id {
+            note = note.squad(squad_id);
+        }
+        if let Some(guardian_id) = guardian_id {
+            note = note.guardian(guardian_id);
+        }
+        note
     }
 
     /// Remove and return the human-authored restart note for `owner_uri`.
@@ -339,11 +377,25 @@ impl Store {
             )
             .optional()?
             .flatten();
-        if note.is_some() {
+        if let Some(text) = note.as_deref() {
             self.conn.execute(
                 "UPDATE ghosts SET user_note=NULL, updated_at_ms=? WHERE owner_uri=?",
                 params![now_ms(), owner_uri],
             )?;
+            let owner = parse_owner_uri(owner_uri);
+            self.ghost_note(
+                owner.and_then(|(_, squad, _)| squad),
+                owner.and_then(|(_, _, guardian)| guardian),
+                crate::logging::LogLevel::INFO,
+            )
+            .emit(
+                self,
+                format!(
+                    "ghost restart note consumed owner_uri={owner_uri} len={}",
+                    text.len()
+                ),
+                serde_json::json!({ "owner_uri": owner_uri, "len": text.len() }),
+            );
         }
         Ok(note)
     }
@@ -371,6 +423,15 @@ impl Store {
                 updated_at_ms=excluded.updated_at_ms",
             params![owner_uri, kind, squad_id, guardian_id, note, now, now],
         )?;
+        self.ghost_note(squad_id, guardian_id, crate::logging::LogLevel::INFO)
+            .emit(
+                self,
+                format!(
+                    "ghost restart note set owner_uri={owner_uri} len={}",
+                    note.len()
+                ),
+                serde_json::json!({ "owner_uri": owner_uri, "kind": kind, "len": note.len() }),
+            );
         self.get_ghost(owner_uri).map(|g| g.expect("just written"))
     }
 
@@ -400,17 +461,44 @@ impl Store {
         target_squad_id: Option<&str>,
         target_guardian_id: Option<&str>,
     ) -> Result<GhostView> {
-        let source = self
-            .get_ghost(source_uri)?
-            .ok_or(crate::store::StoreError::NotFound)?;
-        self.upsert_ghost(
+        let Some(source) = self.get_ghost(source_uri)? else {
+            self.ghost_note(
+                target_squad_id,
+                target_guardian_id,
+                crate::logging::LogLevel::WARNING,
+            )
+            .emit(
+                self,
+                format!(
+                    "ghost copy rejected: source has no ghost source_uri={source_uri} target_uri={target_uri}"
+                ),
+                serde_json::json!({ "source_uri": source_uri, "target_uri": target_uri }),
+            );
+            return Err(crate::store::StoreError::NotFound);
+        };
+        let copied = self.upsert_ghost(
             target_uri,
             target_kind,
             target_squad_id,
             target_guardian_id,
             &source.content,
             source.revision.as_deref(),
+        )?;
+        self.ghost_note(
+            target_squad_id,
+            target_guardian_id,
+            crate::logging::LogLevel::INFO,
         )
+        .emit(
+            self,
+            format!("ghost copied source_uri={source_uri} target_uri={target_uri}"),
+            serde_json::json!({
+                "source_uri": source_uri,
+                "target_uri": target_uri,
+                "len": copied.content.len(),
+            }),
+        );
+        Ok(copied)
     }
 }
 

@@ -717,14 +717,28 @@ fn read_attempt_in(root: &std::path::Path, session_name: &str, attempt: u32) -> 
         .map(|s| ralphus_core::redact::redact_secrets(&s).into_owned())
 }
 
-/// Delete every persisted attempt for one session outright.
-pub fn delete_for_session(session_name: &str) {
-    delete_for_session_in(&terminal_log_root(), session_name);
+/// Delete every persisted attempt for one session outright. Returns whether
+/// a log directory existed and was removed; a missing directory is not an
+/// error, and any other I/O failure is logged as a warning.
+pub fn delete_for_session(session_name: &str) -> bool {
+    delete_for_session_in(&terminal_log_root(), session_name)
 }
 
-fn delete_for_session_in(root: &std::path::Path, session_name: &str) {
+fn delete_for_session_in(root: &std::path::Path, session_name: &str) -> bool {
     let dir = session_dir_in(root, session_name);
-    let _ = std::fs::remove_dir_all(dir);
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            // ralphus[ignore-rlog-pair]: filesystem cleanup helper has no Store; callers record the structured retirement outcome
+            crate::rlog!(
+                WARNING,
+                "ralphus [terminal_log] could not delete terminal logs for session {session_name} at {}: {e}",
+                dir.display()
+            );
+            false
+        }
+    }
 }
 
 /// Delete every session's terminal logs whose (already-sanitized)
@@ -736,14 +750,19 @@ fn delete_for_session_in(root: &std::path::Path, session_name: &str) {
 /// already use. Best-effort and silent on any I/O error, matching this
 /// module's other cleanup paths — a leftover log directory is a bounded,
 /// non-fatal disk-space cost, never worth failing a delete over.
-pub fn delete_with_prefix(prefix: &str) {
-    delete_with_prefix_in(&terminal_log_root(), prefix);
+///
+/// Returns how many session log directories were removed; a failed removal
+/// is logged as a warning and left out of the count.
+pub fn delete_with_prefix(prefix: &str) -> usize {
+    delete_with_prefix_in(&terminal_log_root(), prefix)
 }
 
-fn delete_with_prefix_in(root: &std::path::Path, prefix: &str) {
+fn delete_with_prefix_in(root: &std::path::Path, prefix: &str) -> usize {
     let Ok(entries) = std::fs::read_dir(root) else {
-        return;
+        return 0;
     };
+    let mut removed = 0usize;
+    let mut failed = 0usize;
     for entry in entries.filter_map(std::result::Result::ok) {
         let Ok(file_type) = entry.file_type() else {
             continue;
@@ -752,9 +771,28 @@ fn delete_with_prefix_in(root: &std::path::Path, prefix: &str) {
             continue;
         }
         if entry.file_name().to_string_lossy().starts_with(prefix) {
-            let _ = std::fs::remove_dir_all(entry.path());
+            match std::fs::remove_dir_all(entry.path()) {
+                Ok(()) => removed += 1,
+                Err(e) => {
+                    failed += 1;
+                    // ralphus[ignore-rlog-pair]: filesystem cleanup helper has no Store; the squad/guardian delete handler records the structured outcome
+                    crate::rlog!(
+                        WARNING,
+                        "ralphus [terminal_log] could not delete terminal logs at {}: {e}",
+                        entry.path().display()
+                    );
+                }
+            }
         }
     }
+    if removed > 0 || failed > 0 {
+        // ralphus[ignore-rlog-pair]: filesystem cleanup helper has no Store; the squad/guardian delete handler records the structured outcome
+        crate::rlog!(
+            INFO,
+            "ralphus [terminal_log] deleted terminal logs prefix={prefix} sessions_removed={removed} sessions_failed={failed}"
+        );
+    }
+    removed
 }
 
 /// Prune attempt log files across every session: first anything older than
@@ -808,11 +846,22 @@ fn prune_in(root: &std::path::Path, retention_days: i64, max_files: i64) -> usiz
     )
     .unwrap_or(i64::MAX);
 
+    let mut failed = 0usize;
+    let mut first_error: Option<String> = None;
+    let mut remove = |path: &std::path::Path| match std::fs::remove_file(path) {
+        Ok(()) => true,
+        Err(e) => {
+            failed += 1;
+            first_error.get_or_insert_with(|| format!("{}: {e}", path.display()));
+            false
+        }
+    };
+
     if retention_days > 0 {
         let cutoff = now_ms - retention_days * 86_400_000;
         files.retain(|(path, modified_ms)| {
             if *modified_ms < cutoff {
-                if std::fs::remove_file(path).is_ok() {
+                if remove(path) {
                     deleted += 1;
                 }
                 false
@@ -821,15 +870,33 @@ fn prune_in(root: &std::path::Path, retention_days: i64, max_files: i64) -> usiz
             }
         });
     }
+    let deleted_by_age = deleted;
 
     if max_files > 0 && files.len() as i64 > max_files {
         files.sort_by_key(|(_, modified_ms)| *modified_ms);
         let excess = files.len() as i64 - max_files;
         for (path, _) in files.iter().take(excess as usize) {
-            if std::fs::remove_file(path).is_ok() {
+            if remove(path) {
                 deleted += 1;
             }
         }
+    }
+
+    if failed > 0 {
+        // ralphus[ignore-rlog-pair]: filesystem prune helper has no Store; the scheduler records the structured prune count
+        crate::rlog!(
+            WARNING,
+            "ralphus [terminal_log] prune could not delete {failed} attempt file(s); first error: {}",
+            first_error.as_deref().unwrap_or("unknown")
+        );
+    }
+    if deleted > 0 {
+        // ralphus[ignore-rlog-pair]: filesystem prune helper has no Store; the scheduler records the structured prune count
+        crate::rlog!(
+            DEBUG,
+            "ralphus [terminal_log] prune breakdown deleted_by_age={deleted_by_age} deleted_by_cap={}",
+            deleted - deleted_by_age
+        );
     }
 
     // Best-effort cleanup of now-empty session directories.

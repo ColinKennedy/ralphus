@@ -147,7 +147,16 @@ impl DaemonClient {
         let mut value: Value = if text.is_empty() {
             Value::Null
         } else {
-            serde_json::from_str(&text).unwrap_or(Value::Null)
+            serde_json::from_str(&text).unwrap_or_else(|e| {
+                // stderr only: stdout is this command's output. The body
+                // itself is not echoed, since it can carry task content.
+                eprintln!(
+                    "ralphus [client] daemon returned a non-JSON body path={} len={} error={e}",
+                    path.split('?').next().unwrap_or(path),
+                    text.len()
+                );
+                Value::Null
+            })
         };
         if path.starts_with("/api/guardians") {
             redact_guardian_env_values(&mut value);
@@ -168,10 +177,21 @@ fn daemon_token() -> Option<String> {
             return Some(trimmed.to_string());
         }
     }
-    std::fs::read_to_string(ralphus_core::daemon_token_path())
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    let path = ralphus_core::daemon_token_path();
+    match std::fs::read_to_string(&path) {
+        Ok(s) => Some(s.trim().to_string()).filter(|s| !s.is_empty()),
+        // No token file is the normal unauthenticated/local case.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            // An unreadable token file would otherwise surface only as a
+            // confusing 401 from the daemon.
+            eprintln!(
+                "ralphus [client] could not read daemon token file path={} error={e}",
+                path.display()
+            );
+            None
+        }
+    }
 }
 
 fn extract_error_message(body: &Value) -> Option<String> {

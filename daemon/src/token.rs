@@ -36,10 +36,40 @@ const TOKEN_BYTES: usize = 32;
 /// # Errors
 /// Returns an error if the token file cannot be written.
 pub fn load_or_create(path: &Path) -> io::Result<String> {
-    if let Ok(existing) = fs::read_to_string(path) {
-        let trimmed = existing.trim();
-        if !trimmed.is_empty() {
-            return Ok(trimmed.to_string());
+    match fs::read_to_string(path) {
+        Ok(existing) => {
+            let trimmed = existing.trim();
+            if !trimmed.is_empty() {
+                // ralphus[ignore-rlog-pair]: token loading runs during startup before a Store-owning Daemon exists
+                crate::rlog!(
+                    INFO,
+                    "ralphus [token] reusing existing auth token file path={}",
+                    path.display()
+                );
+                return Ok(trimmed.to_string());
+            }
+            // ralphus[ignore-rlog-pair]: token loading runs during startup before a Store-owning Daemon exists
+            crate::rlog!(
+                WARNING,
+                "ralphus [token] auth token file is empty; generating a new token path={}",
+                path.display()
+            );
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            // ralphus[ignore-rlog-pair]: token loading runs during startup before a Store-owning Daemon exists
+            crate::rlog!(
+                INFO,
+                "ralphus [token] no auth token file yet; generating a new token path={}",
+                path.display()
+            );
+        }
+        Err(e) => {
+            // ralphus[ignore-rlog-pair]: token loading runs during startup before a Store-owning Daemon exists
+            crate::rlog!(
+                WARNING,
+                "ralphus [token] could not read auth token file; generating a new token (existing clients must re-read it) path={} error={e}",
+                path.display()
+            );
         }
     }
     let token = generate();
@@ -116,8 +146,17 @@ impl TicketStore {
         let ticket = generate();
         let ttl = self.ttl();
         let mut tickets = self.lock();
+        let before = tickets.len();
         tickets.retain(|_, issued| issued.elapsed() < ttl);
+        let expired = before - tickets.len();
         tickets.insert(ticket.clone(), Instant::now());
+        let outstanding = tickets.len();
+        drop(tickets);
+        // ralphus[ignore-rlog-pair]: TicketStore is reached from the HTTP accept loop without a Store
+        crate::rlog!(
+            DEBUG,
+            "ralphus [token] ticket minted outstanding={outstanding} expired_pruned={expired}"
+        );
         ticket
     }
 
@@ -126,9 +165,27 @@ impl TicketStore {
     #[must_use]
     pub fn consume(&self, ticket: &str) -> bool {
         let ttl = self.ttl();
-        match self.lock().remove(ticket) {
-            Some(issued) => issued.elapsed() < ttl,
-            None => false,
+        let removed = self.lock().remove(ticket);
+        match removed {
+            Some(issued) if issued.elapsed() < ttl => true,
+            Some(issued) => {
+                // ralphus[ignore-rlog-pair]: TicketStore is reached from the HTTP accept loop without a Store
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [token] ticket rejected reason=expired age_ms={} ttl_ms={}",
+                    issued.elapsed().as_millis(),
+                    ttl.as_millis()
+                );
+                false
+            }
+            None => {
+                // ralphus[ignore-rlog-pair]: TicketStore is reached from the HTTP accept loop without a Store
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [token] ticket rejected reason=unknown_or_already_used"
+                );
+                false
+            }
         }
     }
 

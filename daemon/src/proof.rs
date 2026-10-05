@@ -102,10 +102,21 @@ impl ProcessTree {
         // "forbid"` bans a raw `libc::kill` call in this crate, so `nix`'s
         // safe wrapper is used instead (the `unsafe` syscall stays confined
         // to that dependency).
-        let _ = nix::sys::signal::killpg(
+        if let Err(e) = nix::sys::signal::killpg(
             nix::unistd::Pid::from_raw(child.id() as i32),
             nix::sys::signal::Signal::SIGKILL,
-        );
+        ) {
+            // ESRCH: the whole group already exited, nothing left to kill.
+            if e != nix::errno::Errno::ESRCH {
+                // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [proof] could not kill check-gate process group pid={}, \
+                     its children may outlive it: {e}",
+                    child.id()
+                );
+            }
+        }
         let _ = child.kill();
     }
 }
@@ -248,9 +259,20 @@ pub fn run_command_proof_capture_with_timeout(
                 buf.push_str(&err);
             }
             if cancelled {
+                // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
+                crate::rlog!(
+                    INFO,
+                    "ralphus [proof] command cancelled, process tree killed cwd={cwd:?}"
+                );
                 buf.push_str("\n(cancelled)");
                 (false, truncate_output(&buf))
             } else if timed_out {
+                // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [proof] command timed out after {}s, process tree killed cwd={cwd:?}",
+                    timeout.map_or(0, |t| t.as_secs())
+                );
                 buf.push_str("\n(timed out)");
                 (false, truncate_output(&buf))
             } else {
@@ -258,7 +280,14 @@ pub fn run_command_proof_capture_with_timeout(
                 (ok, truncate_output(&buf))
             }
         }
-        Err(e) => (false, format!("could not run command: {e}")),
+        Err(e) => {
+            // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
+            crate::rlog!(
+                WARNING,
+                "ralphus [proof] command could not be spawned cwd={cwd:?}: {e}"
+            );
+            (false, format!("could not run command: {e}"))
+        }
     };
     span.set_status(if result.0 {
         Status::Ok

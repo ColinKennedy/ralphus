@@ -128,6 +128,8 @@ fn main() -> ExitCode {
         }
         Command::Serve { port, db, log_path } => {
             if let Err(e) = ralphus_auth::check_license() {
+                // Logging is not initialized yet (the config that names the
+                // log file is loaded below), so this stays on stderr.
                 eprintln!("Authorization error: {e}");
                 return ExitCode::FAILURE;
             }
@@ -143,9 +145,18 @@ fn main() -> ExitCode {
             // and a hang leaves nothing to diagnose.
             let cli_log_path: Option<String> =
                 log_path.as_ref().map(|p| p.to_string_lossy().into_owned());
-            ralphus_daemon::logging::init(
-                cli_log_path.as_deref().or(daemon_cfg.log_path.as_deref()),
-                daemon_cfg.log_level.as_deref(),
+            let effective_log_path = cli_log_path.as_deref().or(daemon_cfg.log_path.as_deref());
+            ralphus_daemon::logging::init(effective_log_path, daemon_cfg.log_level.as_deref());
+            ralphus_daemon::logging::write_line(
+                ralphus_daemon::logging::LogLevel::INFO,
+                &format!(
+                    "ralphus-daemon {} starting: config loaded (log_path={}, log_level={}, max_concurrent={}, opentelemetry={})",
+                    ralphus_core::version(),
+                    effective_log_path.unwrap_or("stderr"),
+                    daemon_cfg.log_level.as_deref().unwrap_or("default"),
+                    daemon_cfg.max_concurrent(),
+                    daemon_cfg.opentelemetry_enabled()
+                ),
             );
             // A misconfigured agent profile (e.g. a `from_env` var that isn't
             // set yet) is not fatal here -- the var may be provided later, or
@@ -190,7 +201,13 @@ fn main() -> ExitCode {
             let result = server::serve(addr, &db, daemon_cfg.max_concurrent());
             ralphus_daemon::otel::shutdown(otel_provider);
             match result {
-                Ok(()) => ExitCode::SUCCESS,
+                Ok(()) => {
+                    ralphus_daemon::logging::write_line(
+                        ralphus_daemon::logging::LogLevel::INFO,
+                        "ralphus-daemon stopped cleanly",
+                    );
+                    ExitCode::SUCCESS
+                }
                 Err(e) => {
                     ralphus_daemon::logging::write_line(
                         ralphus_daemon::logging::LogLevel::ERROR,

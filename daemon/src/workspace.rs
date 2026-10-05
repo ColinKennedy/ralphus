@@ -100,11 +100,34 @@ impl Workspace {
         guardian_id: &str,
         root: impl Into<PathBuf>,
     ) -> Self {
-        let machine = store
-            .lock()
-            .get_guardian(guardian_id)
-            .ok()
-            .and_then(|g| g.machine);
+        let machine = {
+            let guard = store.lock();
+            match guard.get_guardian(guardian_id) {
+                Ok(g) => g.machine,
+                Err(e) => {
+                    // A deleted guardian (its retained worktrees still being
+                    // retired) is expected; anything else is a store fault.
+                    let level = if matches!(e, crate::store::StoreError::NotFound) {
+                        crate::logging::LogLevel::DEBUG
+                    } else {
+                        crate::logging::LogLevel::WARNING
+                    };
+                    crate::cartographer::Note::new("workspace")
+                        .level(level)
+                        .scope("guardian")
+                        .guardian(guardian_id)
+                        .emit(
+                            &guard,
+                            format!(
+                                "could not load guardian {guardian_id} to resolve its machine; \
+                                 treating its workspace as local: {e}"
+                            ),
+                            serde_json::json!({ "error": e.to_string() }),
+                        );
+                    None
+                }
+            }
+        };
         Self::on(root, machine.as_deref()).with_store(Arc::clone(store))
     }
 
@@ -337,16 +360,36 @@ impl Workspace {
         let full = self.resolve(path);
         match &self.machine {
             None => {
-                if recursive {
-                    let _ = std::fs::remove_dir_all(&full);
+                let removed = if recursive {
+                    std::fs::remove_dir_all(&full)
                 } else {
-                    let _ = std::fs::remove_file(&full);
+                    std::fs::remove_file(&full)
+                };
+                match removed {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        // ralphus[ignore-rlog-pair]: callers may already hold the store lock, so locking it here to emit could deadlock
+                        crate::rlog!(
+                            WARNING,
+                            "ralphus [workspace] could not remove {} (recursive={recursive}): {e}",
+                            full.display()
+                        );
+                    }
                 }
             }
-            Some(_) => {
-                let _ = self.with_provider(|p, spec| {
+            Some(machine) => {
+                if let Err(e) = self.with_provider(|p, spec| {
                     p.remove_path(&full.to_string_lossy(), recursive, spec)
-                });
+                }) {
+                    // ralphus[ignore-rlog-pair]: callers may already hold the store lock, so locking it here to emit could deadlock
+                    crate::rlog!(
+                        WARNING,
+                        "ralphus [workspace] could not remove {} on machine {machine} \
+                         (recursive={recursive}): {e}",
+                        full.display()
+                    );
+                }
             }
         }
     }

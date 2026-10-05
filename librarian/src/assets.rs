@@ -51,7 +51,19 @@ pub fn dev_disk_asset(dev_dir: &std::path::Path, name: &str) -> Option<String> {
     if !crate::asset_rules::is_allowed_route(name) {
         return None;
     }
-    std::fs::read_to_string(dev_dir.join(name)).ok()
+    let path = dev_dir.join(name);
+    match std::fs::read_to_string(&path) {
+        Ok(body) => Some(body),
+        Err(e) => {
+            // Only allowed route names reach this read, so a failure here is
+            // a dev-mode asset folder that is missing a real board file.
+            eprintln!(
+                "ralphus-librarian [asset] could not read dev asset name={name} path={} error={e}",
+                path.display()
+            );
+            None
+        }
+    }
 }
 
 #[cfg(test)]

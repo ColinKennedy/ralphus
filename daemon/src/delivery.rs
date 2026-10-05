@@ -130,7 +130,29 @@ impl Store {
              WHERE guardian_action_generations.state NOT IN ('preparing', 'ready')",
             rusqlite::params![guardian_id, action_key, client_id, generation, definition_digest, now],
         )?;
-        Ok(changed > 0)
+        let claimed = changed > 0;
+        crate::cartographer::Note::new("delivery")
+            .level(if claimed {
+                crate::logging::LogLevel::INFO
+            } else {
+                crate::logging::LogLevel::DEBUG
+            })
+            .scope("guardian")
+            .guardian(guardian_id)
+            .emit(
+                self,
+                format!(
+                    "action generation {} guardian={guardian_id} action={action_key} client={client_id} generation={generation}",
+                    if claimed { "claimed" } else { "already owned" }
+                ),
+                serde_json::json!({
+                    "action_key": action_key,
+                    "client_id": client_id,
+                    "generation": generation,
+                    "claimed": claimed,
+                }),
+            );
+        Ok(claimed)
     }
 
     /// RAL-565: atomically take the auto-run slot of one check generation for
@@ -172,6 +194,29 @@ impl Store {
              WHERE guardian_id=?8 AND action_key=?9 AND client_id=?10 AND generation=?11",
             rusqlite::params![state, manifest_path, manifest_sha256, published_root, lease_expires_at_ms, detail, now_ms(), guardian_id, action_key, client_id, generation],
         )?;
+        crate::cartographer::Note::new("delivery")
+            .level(if state == "failed" {
+                crate::logging::LogLevel::WARNING
+            } else {
+                crate::logging::LogLevel::INFO
+            })
+            .scope("guardian")
+            .guardian(guardian_id)
+            .emit(
+                self,
+                format!(
+                    "action generation finished guardian={guardian_id} action={action_key} client={client_id} generation={generation} state={state}"
+                ),
+                serde_json::json!({
+                    "action_key": action_key,
+                    "client_id": client_id,
+                    "generation": generation,
+                    "state": state,
+                    "manifest_path": manifest_path,
+                    "published_root": published_root,
+                    "detail": detail,
+                }),
+            );
         Ok(())
     }
 
@@ -258,10 +303,20 @@ impl Store {
     /// intentionally idempotent, which is important when a submit/retry races
     /// the default submitter enrollment.
     pub fn subscribe_review_client(&self, guardian_id: &str, client_id: &str) -> StoreResult<()> {
-        self.conn.execute(
+        let changed = self.conn.execute(
             "INSERT OR IGNORE INTO guardian_recipients(guardian_id, client_id, subscribed_at_ms) VALUES(?1, ?2, ?3)",
             rusqlite::params![guardian_id, client_id, now_ms()],
         )?;
+        if changed > 0 {
+            crate::cartographer::Note::new("delivery")
+                .scope("guardian")
+                .guardian(guardian_id)
+                .emit(
+                    self,
+                    format!("review client subscribed guardian={guardian_id} client={client_id}"),
+                    serde_json::json!({ "client_id": client_id }),
+                );
+        }
         Ok(())
     }
 
@@ -299,6 +354,13 @@ impl Store {
     ) -> StoreResult<ReviewClientView> {
         let label = label.trim();
         if label.is_empty() {
+            crate::cartographer::Note::new("delivery")
+                .level(crate::logging::LogLevel::WARNING)
+                .emit(
+                    self,
+                    format!("review client rejected: empty label user={user_name}"),
+                    serde_json::json!({ "user_name": user_name }),
+                );
             return Err(StoreError::InvalidTransition(
                 "review client label must not be empty".to_string(),
             ));
@@ -312,9 +374,26 @@ impl Store {
                 |row| row.get(0),
             )
             .optional()?;
+        let created = existing.is_none();
         let id = existing.unwrap_or_else(|| {
             self.next_id("review_client_seq", "client")
-                .unwrap_or_else(|_| format!("client-{user_name}"))
+                .unwrap_or_else(|error| {
+                    let fallback = format!("client-{user_name}");
+                    crate::cartographer::Note::new("delivery")
+                        .level(crate::logging::LogLevel::WARNING)
+                        .emit(
+                            self,
+                            format!(
+                                "review client id allocation failed; using fallback id={fallback}: {error}"
+                            ),
+                            serde_json::json!({
+                                "user_name": user_name,
+                                "fallback_id": fallback,
+                                "error": error.to_string(),
+                            }),
+                        );
+                    fallback
+                })
         });
         let now = now_ms();
         self.conn.execute(
@@ -323,6 +402,20 @@ impl Store {
              ON CONFLICT(user_name, label) DO UPDATE SET enabled=excluded.enabled, updated_at_ms=excluded.updated_at_ms",
             rusqlite::params![id, user_name, label, i64::from(enabled), now],
         )?;
+        crate::cartographer::Note::new("delivery").emit(
+            self,
+            format!(
+                "review client {} id={id} user={user_name} label={label:?} enabled={enabled}",
+                if created { "registered" } else { "updated" }
+            ),
+            serde_json::json!({
+                "client_id": id,
+                "user_name": user_name,
+                "label": label,
+                "enabled": enabled,
+                "created": created,
+            }),
+        );
         self.conn.query_row(
             "SELECT id, user_name, label, enabled, local, created_at_ms, updated_at_ms FROM review_clients WHERE user_name=? AND label=?",
             rusqlite::params![user_name, label], row_to_client,
@@ -364,7 +457,16 @@ impl Store {
         user_name: &str,
         value: &ReviewDeliveryPreferences,
     ) -> StoreResult<()> {
-        validate_preferences(value)?;
+        if let Err(error) = validate_preferences(value) {
+            crate::cartographer::Note::new("delivery")
+                .level(crate::logging::LogLevel::WARNING)
+                .emit(
+                    self,
+                    format!("review delivery preferences rejected user={user_name}: {error}"),
+                    serde_json::json!({ "user_name": user_name, "preferences": value }),
+                );
+            return Err(error);
+        }
         self.ensure_user_row(user_name)?;
         self.conn.execute(
             "INSERT INTO user_review_delivery_preferences(user_name, on_rebase, on_feedback, on_auto_pr_fix, offline_delivery, on_reconnect, auto_register_submitter, updated_at_ms)
@@ -372,6 +474,11 @@ impl Store {
              ON CONFLICT(user_name) DO UPDATE SET on_rebase=excluded.on_rebase, on_feedback=excluded.on_feedback, on_auto_pr_fix=excluded.on_auto_pr_fix, offline_delivery=excluded.offline_delivery, on_reconnect=excluded.on_reconnect, auto_register_submitter=excluded.auto_register_submitter, updated_at_ms=excluded.updated_at_ms",
             rusqlite::params![user_name, value.on_rebase, value.on_feedback, value.on_auto_pr_fix, value.offline_delivery, value.on_reconnect, i64::from(value.auto_register_submitter), now_ms()],
         )?;
+        crate::cartographer::Note::new("delivery").emit(
+            self,
+            format!("review delivery preferences saved user={user_name}"),
+            serde_json::json!({ "user_name": user_name, "preferences": value }),
+        );
         Ok(())
     }
 }

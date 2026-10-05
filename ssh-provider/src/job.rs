@@ -135,6 +135,11 @@ pub fn start(uri: &str, spec_json: &str, config: &EffectiveConfig) -> Result<Str
     let handle = words.next().unwrap_or_default().to_string();
     validate_handle(&handle)?;
     if disposition == "existing" {
+        crate::emit_event(
+            "reattached to existing remote job",
+            "info",
+            serde_json::json!({"target": target.to_string(), "handle": handle}),
+        );
         return Ok(handle);
     }
     if disposition != "created" || handle != proposed {
@@ -155,6 +160,11 @@ pub fn start(uri: &str, spec_json: &str, config: &EffectiveConfig) -> Result<Str
         abandon_start(&target, &dir, config);
         return Err(error);
     }
+    crate::emit_event(
+        "remote job started",
+        "info",
+        serde_json::json!({"target": target.to_string(), "handle": handle, "job_dir": dir}),
+    );
     Ok(handle)
 }
 
@@ -327,7 +337,22 @@ fn abandon_start(target: &SshTarget, dir: &str, config: &EffectiveConfig) {
         "job={}; rm -f \"$job/environment\" \"$job/environment.tmp\"; printf 'lost\\n' > \"$job/state.tmp\"; mv \"$job/state.tmp\" \"$job/state\"",
         shell_quote_single(dir)
     );
-    let _ = ssh_command(target, &command, config, None);
+    match ssh_command(target, &command, config, None) {
+        Ok(_) => crate::emit_event(
+            "abandoned partially started remote job",
+            "warning",
+            serde_json::json!({"target": target.to_string(), "job_dir": dir}),
+        ),
+        Err(error) => crate::emit_event(
+            "could not mark partially started remote job lost",
+            "warning",
+            serde_json::json!({
+                "target": target.to_string(),
+                "job_dir": dir,
+                "error": crate::redacted(&error),
+            }),
+        ),
+    }
 }
 
 fn required_string<'a>(value: &'a serde_json::Value, field: &str) -> Result<&'a str, String> {

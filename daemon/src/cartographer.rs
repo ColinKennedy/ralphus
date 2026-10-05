@@ -487,6 +487,7 @@ impl Store {
                 params![cutoff],
             )?;
         }
+        let deleted_by_age = deleted;
         if max_rows > 0 {
             let total: i64 =
                 self.conn
@@ -500,6 +501,14 @@ impl Store {
                     params![excess],
                 )?;
             }
+        }
+        if deleted > 0 {
+            // ralphus[ignore-rlog-pair]: a row written from inside the prune would count against the cap it enforces; the scheduler records the structured total
+            crate::rlog!(
+                DEBUG,
+                "ralphus [cartographer] prune breakdown deleted_by_age={deleted_by_age} deleted_by_cap={}",
+                deleted - deleted_by_age
+            );
         }
         Ok(deleted)
     }

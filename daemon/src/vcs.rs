@@ -197,6 +197,13 @@ impl GitVcs {
             {
                 Some(status) => break status,
                 None if Instant::now() >= deadline => {
+                    // ralphus[ignore-rlog-pair]: the single git spawn site has no Store; callers record the structured failure from the returned error
+                    crate::rlog!(
+                        WARNING,
+                        "ralphus [vcs] git {} timed out after {GIT_TIMEOUT:?} in {}; killing it",
+                        args.join(" "),
+                        root.display()
+                    );
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(format!(
@@ -349,8 +356,18 @@ impl Vcs for GitVcs {
         }
 
         let untracked_root = snapshot_dir.join("untracked");
-        let listed =
-            std::fs::read_to_string(snapshot_dir.join("untracked_files.txt")).unwrap_or_default();
+        let listed_path = snapshot_dir.join("untracked_files.txt");
+        let listed = std::fs::read_to_string(&listed_path).unwrap_or_else(|e| {
+            // ralphus[ignore-rlog-pair]: VCS adapter has no Store; the restoring caller records the structured outcome
+            crate::rlog!(
+                WARNING,
+                "ralphus [vcs] could not read snapshot untracked-file list {}: {e} -- untracked \
+                 files removed by `git clean` in {} are not restored",
+                listed_path.display(),
+                root.display()
+            );
+            String::new()
+        });
         for rel in listed.lines().filter(|l| !l.is_empty()) {
             let src = untracked_root.join(rel);
             let dst = root.join(rel);
@@ -406,9 +423,25 @@ pub fn for_kind(kind: &str) -> Option<Box<dyn Vcs>> {
 /// # Errors
 /// When the project is registered with a kind no adapter implements.
 pub fn for_project_root(store: &crate::store::Store, root: &Path) -> Result<Box<dyn Vcs>, String> {
-    let want = store
-        .list_projects()
-        .unwrap_or_default()
+    let projects = store.list_projects().unwrap_or_else(|e| {
+        crate::cartographer::Note::new("vcs")
+            .level(crate::logging::LogLevel::WARNING)
+            .scope("project")
+            .emit(
+                store,
+                format!(
+                    "could not list projects to resolve the vcs kind for {}; assuming \
+                     \"{DEFAULT_KIND}\": {e}",
+                    root.display()
+                ),
+                serde_json::json!({
+                    "root": root.display().to_string(),
+                    "error": e.to_string(),
+                }),
+            );
+        Vec::new()
+    });
+    let want = projects
         .into_iter()
         .find(|p| Path::new(&p.path) == root)
         .map_or_else(|| DEFAULT_KIND.to_string(), |p| p.vcs);

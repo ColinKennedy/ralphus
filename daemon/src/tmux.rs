@@ -503,20 +503,34 @@ pub fn read_pane_snapshot(session_name: &str) -> Option<String> {
 /// Implementation behind [`delete_pane_snapshot`], taking `dir` explicitly so
 /// it's unit-testable against a throwaway directory instead of the real
 /// `state_dir()`.
-fn delete_pane_snapshot_in(dir: &std::path::Path, session_name: &str) {
-    let _ = std::fs::remove_file(pane_snapshot_path_in(dir, session_name));
+fn delete_pane_snapshot_in(dir: &std::path::Path, session_name: &str) -> bool {
+    let path = pane_snapshot_path_in(dir, session_name);
+    match std::fs::remove_file(&path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            // ralphus[ignore-rlog-pair]: filesystem cleanup helper has no Store; the retirement caller records the structured outcome
+            crate::rlog!(
+                WARNING,
+                "ralphus [tmux] could not delete pane snapshot for session {session_name} at {}: {e}",
+                path.display()
+            );
+            false
+        }
+    }
 }
 
 /// Delete a session's persisted pane snapshot outright, if one exists.
-/// Best-effort and silent on any I/O error (including "already gone"),
+/// Returns whether a snapshot file was removed. Best-effort: "already gone"
+/// is silent and any other I/O error is logged as a warning,
 /// matching `terminal_log::delete_for_session`'s cleanup contract -- called
 /// by `crate::worktree_transcript_retirement` once the worktree a session
 /// ran in has itself been retired (RAL-348). This deletes rather than
 /// archives; unlike local worktree pruning, which has a remote backup,
 /// pane-snapshot archival before deletion has no destination yet and is
 /// deliberately deferred future work.
-pub fn delete_pane_snapshot(session_name: &str) {
-    delete_pane_snapshot_in(&pane_snapshot_dir(), session_name);
+pub fn delete_pane_snapshot(session_name: &str) -> bool {
+    delete_pane_snapshot_in(&pane_snapshot_dir(), session_name)
 }
 
 /// Strip genuinely empty trailing rows from a raw `capture-pane` result —
@@ -952,9 +966,19 @@ impl Tmux {
         let names = self.list_sessions_with_prefix(prefix).unwrap_or_default();
         let count = names.len();
         for name in names {
-            let _ = self.kill_session(&name);
+            self.kill_session_logging_failure(&name);
         }
         count
+    }
+
+    /// [`Self::kill_session`] for best-effort cleanup paths: a failure is
+    /// logged as a warning instead of being dropped, since a session that
+    /// survives its kill keeps its agent process (and tmux server) alive.
+    fn kill_session_logging_failure(&self, name: &str) {
+        if let Err(e) = self.kill_session(name) {
+            // ralphus[ignore-rlog-pair]: tmux wrapper has no Store; the sweeping caller records the structured kill count
+            crate::rlog!(WARNING, "ralphus [tmux] could not kill session {name}: {e}");
+        }
     }
 
     /// Kill every currently-registered session whose name starts with any of
@@ -981,7 +1005,7 @@ impl Tmux {
             .collect();
         let count = names.len();
         for name in names {
-            let _ = self.kill_session(&name);
+            self.kill_session_logging_failure(&name);
         }
         count
     }
@@ -1074,7 +1098,13 @@ impl Tmux {
         // Best-effort: without this, tmux discards a dead pane's content
         // immediately, which would race the daemon's own sentinel-based
         // completion detection.
-        let _ = self.run(&["set-option", "-t", name, "remain-on-exit", "on"]);
+        if let Err(e) = self.run(&["set-option", "-t", name, "remain-on-exit", "on"]) {
+            // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
+            crate::rlog!(
+                WARNING,
+                "ralphus [tmux] could not enable remain-on-exit for {name}: {e} -- a dead pane's output may be discarded before completion detection reads it"
+            );
+        }
         // RAL-397 Phase 2H: the pane's scrollback ceiling sets its resident-
         // memory ceiling (`history-limit × pane width`; see
         // `TMUX_HISTORY_LIMIT`'s doc comment), so it is kept at the small
@@ -1186,7 +1216,7 @@ impl Tmux {
             self.run(&["respawn-pane", "-k", "-t", name, "-c", cwd, full.as_str()])
         };
         if let Err(e) = started {
-            let _ = self.kill_session(name);
+            self.kill_session_logging_failure(name);
             return Err(e);
         }
         Ok(())

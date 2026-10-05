@@ -361,7 +361,16 @@ fn ollama_tool_calls(resp: &Value) -> Vec<ToolCall> {
             let id = c["id"].as_str().unwrap_or_default().to_string();
             let name = c["function"]["name"].as_str()?.to_string();
             let raw_args = c["function"]["arguments"].as_str().unwrap_or("{}");
-            let input: Value = serde_json::from_str(raw_args).unwrap_or(json!({}));
+            let input: Value = serde_json::from_str(raw_args).unwrap_or_else(|e| {
+                crate::cartographer::emit(
+                    "llm-invoke",
+                    "tool-call arguments were not valid JSON; using {}",
+                    "warning",
+                    crate::cartographer::EventContext::default(),
+                    json!({"tool": name, "args_len": raw_args.len(), "error": e.to_string()}),
+                );
+                json!({})
+            });
             Some(ToolCall { id, name, input })
         })
         .collect()

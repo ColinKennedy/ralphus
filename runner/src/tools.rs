@@ -149,8 +149,27 @@ impl Workspace {
                 }
                 Ok(None) => {
                     if start.elapsed() >= deadline {
+                        crate::cartographer::emit(
+                            "runner",
+                            "command timed out; killing process tree",
+                            "warning",
+                            crate::cartographer::EventContext::default(),
+                            serde_json::json!({
+                                "pid": child.id(),
+                                "timeout_sec": secs,
+                                "command_len": command.len(),
+                            }),
+                        );
                         tree.kill(&mut child);
-                        let _ = child.wait();
+                        if let Err(e) = child.wait() {
+                            crate::cartographer::emit(
+                                "runner",
+                                "could not reap timed-out command",
+                                "warning",
+                                crate::cartographer::EventContext::default(),
+                                serde_json::json!({"pid": child.id(), "error": e.to_string()}),
+                            );
+                        }
                         return Ok(CommandOutput {
                             exit_code: 124,
                             stdout: String::new(),

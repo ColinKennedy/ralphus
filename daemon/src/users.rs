@@ -85,11 +85,16 @@ impl Store {
     /// Propagates any SQLite failure.
     pub fn create_user(&self, name: &str) -> StoreResult<()> {
         let name = name.trim();
-        self.conn.execute(
+        let inserted = self.conn.execute(
             "INSERT INTO users(name, created_at_ms, is_admin) VALUES(?,?,0)
              ON CONFLICT(name) DO NOTHING",
             rusqlite::params![name, now_ms()],
         )?;
+        // An already-registered name is a no-op upsert (every watch and
+        // preference write re-ensures its user), so only a real insert logs.
+        if inserted == 0 {
+            return Ok(());
+        }
         crate::rlog!(INFO, "ralphus [store] user {name:?} registered");
         let _ = self.cartographer_log(crate::cartographer::CartographerEntry {
             level: crate::logging::LogLevel::INFO,
@@ -174,9 +179,16 @@ impl Store {
             "UPDATE users SET auto_watch=?1, default_notify_tiers=?2 WHERE name=?3",
             rusqlite::params![auto_watch, tiers_csv, name],
         )?;
-        crate::rlog!(
-            INFO,
-            "ralphus [store] {name:?} notification preferences updated (auto_watch={auto_watch})"
+        crate::cartographer::Note::new("store").scope("user").emit(
+            self,
+            format!(
+                "{name:?} notification preferences updated (auto_watch={auto_watch} tiers={tiers_csv})"
+            ),
+            serde_json::json!({
+                "name": name,
+                "auto_watch": auto_watch,
+                "default_notify_tiers": tiers_csv,
+            }),
         );
         self.get_user(name)?.ok_or(StoreError::NotFound)
     }
@@ -242,9 +254,10 @@ impl Store {
         if n == 0 {
             return Err(StoreError::NotFound);
         }
-        crate::rlog!(
-            INFO,
-            "ralphus [store] user {old_name:?} renamed to {new_name:?}"
+        crate::cartographer::Note::new("store").scope("user").emit(
+            self,
+            format!("user {old_name:?} renamed to {new_name:?}"),
+            serde_json::json!({ "old_name": old_name, "new_name": new_name }),
         );
         Ok(())
     }

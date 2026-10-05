@@ -344,6 +344,15 @@ impl Store {
                 params![now, pr_id, id],
             )?;
         }
+        if !ids.is_empty() {
+            crate::cartographer::Note::new("prophecy")
+                .scope("prophecy")
+                .emit(
+                    self,
+                    format!("{} prophecy(ies) marked published into {pr_id}", ids.len()),
+                    serde_json::json!({ "count": ids.len(), "pr_id": pr_id }),
+                );
+        }
         Ok(())
     }
 }

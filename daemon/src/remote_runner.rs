@@ -834,7 +834,18 @@ impl ProviderRunner {
             }
             if let Some(budget) = budget {
                 if started.elapsed() >= budget {
-                    let _ = self.invoke_handle(VERB_CANCEL, handle, None, spec);
+                    if let Err(e) = self.invoke_handle(VERB_CANCEL, handle, None, spec) {
+                        self.note(
+                            spec,
+                            crate::logging::LogLevel::WARNING,
+                            "remote cell timed out; could not cancel its handle",
+                            serde_json::json!({
+                                "handle": handle,
+                                "scheme": self.scheme,
+                                "error": e.to_string(),
+                            }),
+                        );
+                    }
                     crate::tmux::write_pane_snapshot(&session_name, &transcript);
                     self.note(
                         spec,
@@ -978,18 +989,55 @@ impl ProviderRunner {
                 // this module is best-effort.
                 if let Some(store) = &self.cartographer {
                     let guard = store.lock();
-                    let _ = guard.save_remote_exec_handle(
+                    if let Err(e) = guard.save_remote_exec_handle(
                         &spec.squad_id,
                         &spec.cell_id,
                         &self.scheme,
                         &self.uri,
                         &handle,
-                    );
+                    ) {
+                        crate::cartographer::Note::new("remote")
+                            .level(crate::logging::LogLevel::WARNING)
+                            .scope("cell")
+                            .squad(&spec.squad_id)
+                            .cell(&spec.cell_id)
+                            .task(&spec.task)
+                            .emit(
+                                &guard,
+                                format!(
+                                    "could not persist remote exec handle {handle}; a daemon \
+                                     restart mid-poll cannot reconcile it: {e}"
+                                ),
+                                serde_json::json!({
+                                    "handle": handle,
+                                    "scheme": self.scheme,
+                                    "error": e.to_string(),
+                                }),
+                            );
+                    }
                 }
                 let result = self.poll_to_completion(&handle, &spec, cancel);
                 if let Some(store) = &self.cartographer {
                     let guard = store.lock();
-                    let _ = guard.clear_remote_exec_handle(&spec.squad_id, &spec.cell_id);
+                    if let Err(e) = guard.clear_remote_exec_handle(&spec.squad_id, &spec.cell_id) {
+                        crate::cartographer::Note::new("remote")
+                            .level(crate::logging::LogLevel::WARNING)
+                            .scope("cell")
+                            .squad(&spec.squad_id)
+                            .cell(&spec.cell_id)
+                            .task(&spec.task)
+                            .emit(
+                                &guard,
+                                format!(
+                                    "could not clear finished remote exec handle {handle}: {e}"
+                                ),
+                                serde_json::json!({
+                                    "handle": handle,
+                                    "scheme": self.scheme,
+                                    "error": e.to_string(),
+                                }),
+                            );
+                    }
                 }
                 result
             }
@@ -1359,6 +1407,30 @@ impl ProviderRunner {
         self.invoke(VERB_MATERIALIZE, &payload, spec).map(|_| ())
     }
 
+    /// Best-effort cleanup of one `probe_remote_root` scratch file after a
+    /// probe step already failed; a failed removal leaves a stray file under
+    /// the remote root, so it is logged as a WARNING rather than dropped.
+    fn remove_probe_path(&self, path: &str, spec: &RunnerSpec) {
+        let Err(e) = self.remove_path(path, false, spec) else {
+            return;
+        };
+        if self.cartographer.is_some() {
+            self.note(
+                spec,
+                crate::logging::LogLevel::WARNING,
+                &format!("could not remove remote_root probe file {path:?}: {e}"),
+                serde_json::json!({ "path": path, "scheme": self.scheme, "error": e }),
+            );
+        } else {
+            // ralphus[ignore-rlog-pair]: provider built without a cartographer store has nowhere to write a row
+            crate::rlog!(
+                WARNING,
+                "ralphus [remote] provider {} could not remove remote_root probe file {path:?}: {e}",
+                self.scheme
+            );
+        }
+    }
+
     /// Prove `remote_root` is actually usable on the machine: create a small
     /// probe file, read it back, rename it (approximated as write-under-a-
     /// new-name then remove-the-old-name, since the provider contract has no
@@ -1398,24 +1470,24 @@ impl ProviderRunner {
         })?;
 
         let readback = self.read_file(&created, spec).map_err(|e| {
-            let _ = self.remove_path(&created, false, spec);
+            self.remove_probe_path(&created, spec);
             format!("remote_root {root:?} probe: could not read the file back: {e}")
         })?;
         if readback.trim() != CONTENT {
-            let _ = self.remove_path(&created, false, spec);
+            self.remove_probe_path(&created, spec);
             return Err(format!(
                 "remote_root {root:?} probe: file round-tripped with unexpected content {readback:?}"
             ));
         }
 
         if let Err(e) = self.write_file(&renamed, CONTENT, spec) {
-            let _ = self.remove_path(&created, false, spec);
+            self.remove_probe_path(&created, spec);
             return Err(format!(
                 "remote_root {root:?} probe: could not create the renamed file: {e}"
             ));
         }
         if let Err(e) = self.remove_path(&created, false, spec) {
-            let _ = self.remove_path(&renamed, false, spec);
+            self.remove_probe_path(&renamed, spec);
             return Err(format!(
                 "remote_root {root:?} probe: could not remove the pre-rename file: {e}"
             ));
@@ -1583,7 +1655,22 @@ pub fn reconcile_remote_exec_handles(store: &Store) {
                     "error": outcome.err(),
                 }),
             );
-        let _ = store.clear_remote_exec_handle(&h.squad_id, &h.cell_id);
+        if let Err(e) = store.clear_remote_exec_handle(&h.squad_id, &h.cell_id) {
+            crate::cartographer::Note::new("recovery")
+                .level(crate::logging::LogLevel::WARNING)
+                .scope("cell")
+                .squad(&h.squad_id)
+                .cell(&h.cell_id)
+                .emit(
+                    store,
+                    format!(
+                        "could not clear reconciled remote exec handle {}; it will be \
+                         reconciled again next startup: {e}",
+                        h.handle
+                    ),
+                    serde_json::json!({ "handle": h.handle, "error": e.to_string() }),
+                );
+        }
     }
 }
 

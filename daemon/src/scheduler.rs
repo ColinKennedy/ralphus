@@ -20,6 +20,33 @@ use crate::otel;
 use crate::runner::{Runner, RunnerResult, RunnerSpec, SubprocessRunner};
 use crate::store::{CellOutcome, NodeState, SquadState, Store};
 
+/// Return a best-effort store call's value, emitting a WARNING Cartographer
+/// row (and stderr line) naming `op` when it failed, so a failed state write
+/// or read the scheduler deliberately tolerates is still visible. Takes the
+/// already-held `store` guard; never locks.
+fn store_ok<T>(
+    store: &Store,
+    squad_id: &str,
+    op: &str,
+    result: crate::store::Result<T>,
+) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(e) => {
+            crate::cartographer::Note::new("scheduler")
+                .level(crate::logging::LogLevel::WARNING)
+                .scope("squad")
+                .squad(squad_id)
+                .emit(
+                    store,
+                    format!("store call failed op={op} squad={squad_id}: {e}"),
+                    serde_json::json!({ "op": op, "error": e.to_string() }),
+                );
+            None
+        }
+    }
+}
+
 /// How long a worker holds nothing; the poll interval between ticks.
 pub const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
@@ -307,7 +334,23 @@ fn register_secret_named_env_values(
 ) {
     let secret_names = {
         let guard = store.lock();
-        guard.secret_env_names_cached().unwrap_or_default()
+        match guard.secret_env_names_cached() {
+            Ok(names) => names,
+            Err(e) => {
+                crate::cartographer::Note::new("scheduler")
+                    .level(crate::logging::LogLevel::WARNING)
+                    .scope("redaction")
+                    .emit(
+                        &guard,
+                        format!(
+                            "could not load secret env-var names; name-based redaction skipped \
+                             for this dispatch: {e}"
+                        ),
+                        serde_json::json!({ "error": e.to_string() }),
+                    );
+                std::collections::BTreeSet::new()
+            }
+        }
     };
     for (key, value) in env {
         if secret_names.contains(key) {
@@ -523,9 +566,33 @@ pub fn run_loop(
     {
         let ids = {
             let guard = store.lock();
-            let ids = guard.collecting_guardians_ready().unwrap_or_default();
+            let ids = match guard.collecting_guardians_ready() {
+                Ok(ids) => ids,
+                Err(e) => {
+                    crate::cartographer::Note::new("recovery")
+                        .level(crate::logging::LogLevel::WARNING)
+                        .scope("guardian")
+                        .emit(
+                            &guard,
+                            format!("could not list ready collecting reviews at startup: {e}"),
+                            serde_json::json!({ "error": e.to_string() }),
+                        );
+                    Vec::new()
+                }
+            };
             for gid in &ids {
-                let _ = guard.mark_guardian_branches_ready(gid);
+                let marked = guard.mark_guardian_branches_ready(gid);
+                let mut note = crate::cartographer::Note::new("recovery")
+                    .scope("guardian")
+                    .guardian(gid);
+                let message = match &marked {
+                    Ok(()) => format!("review {gid} branches marked ready; restarting review"),
+                    Err(e) => {
+                        note = note.level(crate::logging::LogLevel::WARNING);
+                        format!("review {gid} could not mark branches ready at startup: {e}")
+                    }
+                };
+                note.emit(&guard, message, serde_json::json!({ "ok": marked.is_ok() }));
             }
             ids
         };
@@ -1078,11 +1145,12 @@ fn execute_squad_inner(
         // "running" either. The squad only becomes Running once the dispatch
         // loop actually starts a cell (see `squad_marked_running` below).
         (
-            guard.cells_of(squad_id).unwrap_or_default(),
-            guard.tasks_of(squad_id).unwrap_or_default(),
+            store_ok(&guard, squad_id, "cells_of", guard.cells_of(squad_id)).unwrap_or_default(),
+            store_ok(&guard, squad_id, "tasks_of", guard.tasks_of(squad_id)).unwrap_or_default(),
             // Cells already Done are skipped, so a restarted squad only re-runs
             // its dirty (reset-to-pending) subset instead of redoing them (RAL-19).
-            guard.done_cells(squad_id).unwrap_or_default(),
+            store_ok(&guard, squad_id, "done_cells", guard.done_cells(squad_id))
+                .unwrap_or_default(),
             // Skipped cells whose cell-level proof previously failed still
             // condemn their task — without this seed, `already_failed` in the
             // task finalizer is false and the task is incorrectly marked Done.
@@ -1095,7 +1163,13 @@ fn execute_squad_inner(
             // flipped the whole squad back to Pending (RAL-1xx: `restart_cell`
             // on one cell resurrected every other still-failed independent
             // task in the squad).
-            guard.failed_cells(squad_id).unwrap_or_default(),
+            store_ok(
+                &guard,
+                squad_id,
+                "failed_cells",
+                guard.failed_cells(squad_id),
+            )
+            .unwrap_or_default(),
             // Cells that are Done but have pending proofs (e.g. after
             // restart_cell_proof). These skip the cell body and re-run
             // only their proof steps via run_proof_only_worker.
@@ -1330,7 +1404,15 @@ fn execute_squad_inner(
         // cell body; after proofs finish they transition to Done/Failed.
         if !proof_only_indices.is_empty() && !squad_marked_running {
             squad_marked_running = true;
-            let _ = store.lock().set_squad_state(squad_id, SquadState::Running);
+            {
+                let guard = store.lock();
+                store_ok(
+                    &guard,
+                    squad_id,
+                    "set_squad_state",
+                    guard.set_squad_state(squad_id, SquadState::Running),
+                );
+            }
         }
         for &i in &proof_only_indices {
             scope.spawn(move || {
@@ -1448,7 +1530,12 @@ fn execute_squad_inner(
                     // reclaimed cells/proofs, so a cell really is about to
                     // execute again (RAL-405).
                     if !reclaimed_tasks.is_empty() {
-                        let _ = guard.set_squad_state(squad_id, SquadState::Running);
+                        store_ok(
+                            &guard,
+                            squad_id,
+                            "set_squad_state",
+                            guard.set_squad_state(squad_id, SquadState::Running),
+                        );
                         squad_marked_running = true;
                     }
                     let reclaimed_cells: Vec<usize> = reclaimed_tasks
@@ -1720,7 +1807,15 @@ fn execute_squad_inner(
             // still in progress.
             if (!to_dispatch.is_empty() || !to_finalize.is_empty()) && !squad_marked_running {
                 squad_marked_running = true;
-                let _ = store.lock().set_squad_state(squad_id, SquadState::Running);
+                {
+                    let guard = store.lock();
+                    store_ok(
+                        &guard,
+                        squad_id,
+                        "set_squad_state",
+                        guard.set_squad_state(squad_id, SquadState::Running),
+                    );
+                }
             }
 
             // Record cells blocked by a failed prerequisite (store writes
@@ -1735,8 +1830,18 @@ fn execute_squad_inner(
                     agent_session_id: None,
                 };
                 let guard = store.lock();
-                let _ = guard.set_cell_state(squad_id, row.task_idx, row.idx, NodeState::Failed);
-                let _ = guard.record_cell_result(squad_id, row.task_idx, row.idx, &outcome);
+                store_ok(
+                    &guard,
+                    squad_id,
+                    "set_cell_state",
+                    guard.set_cell_state(squad_id, row.task_idx, row.idx, NodeState::Failed),
+                );
+                store_ok(
+                    &guard,
+                    squad_id,
+                    "record_cell_result",
+                    guard.record_cell_result(squad_id, row.task_idx, row.idx, &outcome),
+                );
             }
 
             // Same, for cells resolved terminally because a prerequisite was
@@ -1751,9 +1856,24 @@ fn execute_squad_inner(
                     agent_session_id: None,
                 };
                 let guard = store.lock();
-                let _ = guard.set_cell_state(squad_id, row.task_idx, row.idx, NodeState::Cancelled);
-                let _ = guard.record_cell_result(squad_id, row.task_idx, row.idx, &outcome);
-                let _ = guard.set_task_state(squad_id, row.task_idx, NodeState::Cancelled);
+                store_ok(
+                    &guard,
+                    squad_id,
+                    "set_cell_state",
+                    guard.set_cell_state(squad_id, row.task_idx, row.idx, NodeState::Cancelled),
+                );
+                store_ok(
+                    &guard,
+                    squad_id,
+                    "record_cell_result",
+                    guard.record_cell_result(squad_id, row.task_idx, row.idx, &outcome),
+                );
+                store_ok(
+                    &guard,
+                    squad_id,
+                    "set_task_state",
+                    guard.set_task_state(squad_id, row.task_idx, NodeState::Cancelled),
+                );
                 let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
                     level: crate::logging::LogLevel::WARNING,
                     source: "scheduler",
@@ -1847,9 +1967,30 @@ fn execute_squad_inner(
     // running" baseline to compare against and is safe to finalize straight
     // through regardless of its current (still-Pending) row.
     if squad_marked_running && !matches!(guard.squad_state(squad_id), Ok(SquadState::Running)) {
+        crate::cartographer::Note::new("scheduler")
+            .scope("squad")
+            .squad(squad_id)
+            .emit(
+                &guard,
+                format!(
+                    "squad {squad_id} left un-finalized: it is no longer running (reset or \
+                     edited mid-flight)"
+                ),
+                serde_json::json!({ "failed_tasks": failed_tasks.len() }),
+            );
         return;
     }
     if any_detached {
+        crate::cartographer::Note::new("scheduler")
+            .scope("squad")
+            .squad(squad_id)
+            .emit(
+                &guard,
+                format!(
+                    "squad {squad_id} left un-finalized: a cell is detached for manual takeover"
+                ),
+                serde_json::json!({ "failed_tasks": failed_tasks.len() }),
+            );
         return;
     }
     // A task left `cancelled` never ran, so the squad did not actually complete —
@@ -1864,7 +2005,12 @@ fn execute_squad_inner(
         .map(|t| !t.is_empty())
         .unwrap_or(false);
     let squad_state = Store::squad_terminal_state(!failed_tasks.is_empty(), any_cancelled);
-    let _ = guard.set_squad_state(squad_id, squad_state);
+    store_ok(
+        &guard,
+        squad_id,
+        "set_squad_state",
+        guard.set_squad_state(squad_id, squad_state),
+    );
     // Per-task review triggers fire from `run_task_finalizer` as each task
     // completes, so no squad-level sweep is needed here.
     drop(guard);
@@ -2038,7 +2184,7 @@ fn enqueue_cell_failure_mailbox(
         command: format!("ralphus cell restart {squad_id}/{task_name}/{cell_id}"),
         purpose: "retry the failed cell".to_string(),
     };
-    if let Ok(message_id) = guard.notify_watchers_with_remediation(
+    match guard.notify_watchers_with_remediation(
         crate::monitor::NotifiableEventKind::SquadFailed,
         &event_uri,
         priority,
@@ -2048,17 +2194,32 @@ fn enqueue_cell_failure_mailbox(
         Some(task_name),
         Some(cell_id),
     ) {
-        crate::cartographer::Note::new("scheduler")
-            .level(crate::logging::LogLevel::INFO)
-            .squad(squad_id)
-            .cell(cell_id)
-            .task(task_name)
-            .scope("mailbox")
-            .emit(
-                guard,
-                "mailbox message enqueued for cell failure",
-                serde_json::json!({"message_id": message_id, "priority": priority.as_str()}),
-            );
+        Ok(message_id) => {
+            crate::cartographer::Note::new("scheduler")
+                .level(crate::logging::LogLevel::INFO)
+                .squad(squad_id)
+                .cell(cell_id)
+                .task(task_name)
+                .scope("mailbox")
+                .emit(
+                    guard,
+                    "mailbox message enqueued for cell failure",
+                    serde_json::json!({"message_id": message_id, "priority": priority.as_str()}),
+                );
+        }
+        Err(e) => {
+            crate::cartographer::Note::new("scheduler")
+                .level(crate::logging::LogLevel::WARNING)
+                .squad(squad_id)
+                .task(task_name)
+                .scope("mailbox")
+                .cell(cell_id)
+                .emit(
+                    guard,
+                    format!("could not enqueue mailbox message for cell failure: {e}"),
+                    serde_json::json!({"error": e.to_string()}),
+                );
+        }
     }
 }
 
@@ -2093,7 +2254,7 @@ fn enqueue_waypoint_halt_mailbox(
              automatically"
         ),
     };
-    if let Ok(message_id) = guard.notify_watchers_with_remediation(
+    match guard.notify_watchers_with_remediation(
         crate::monitor::NotifiableEventKind::SquadWaypointHalted,
         &event_uri,
         crate::mailbox::MailboxPriority::High,
@@ -2103,17 +2264,32 @@ fn enqueue_waypoint_halt_mailbox(
         Some(task_name),
         Some(cell_id),
     ) {
-        crate::cartographer::Note::new("scheduler")
-            .level(crate::logging::LogLevel::INFO)
-            .squad(squad_id)
-            .cell(cell_id)
-            .task(task_name)
-            .scope("waypoint")
-            .emit(
-                guard,
-                "mailbox message enqueued for waypoint halt",
-                serde_json::json!({"message_id": message_id, "waypoint_id": waypoint_id}),
-            );
+        Ok(message_id) => {
+            crate::cartographer::Note::new("scheduler")
+                .level(crate::logging::LogLevel::INFO)
+                .squad(squad_id)
+                .cell(cell_id)
+                .task(task_name)
+                .scope("waypoint")
+                .emit(
+                    guard,
+                    "mailbox message enqueued for waypoint halt",
+                    serde_json::json!({"message_id": message_id, "waypoint_id": waypoint_id}),
+                );
+        }
+        Err(e) => {
+            crate::cartographer::Note::new("scheduler")
+                .level(crate::logging::LogLevel::WARNING)
+                .squad(squad_id)
+                .task(task_name)
+                .scope("mailbox")
+                .cell(cell_id)
+                .emit(
+                    guard,
+                    format!("could not enqueue mailbox message for waypoint halt: {e}"),
+                    serde_json::json!({"error": e.to_string()}),
+                );
+        }
     }
 }
 
@@ -2207,7 +2383,7 @@ fn enqueue_proof_failure_mailbox(
             ),
         },
     };
-    if let Ok(message_id) = guard.notify_watchers_with_remediation(
+    match guard.notify_watchers_with_remediation(
         crate::monitor::NotifiableEventKind::SquadFailed,
         &event_uri,
         priority,
@@ -2217,19 +2393,36 @@ fn enqueue_proof_failure_mailbox(
         Some(task_name),
         cell_id,
     ) {
-        let mut note = crate::cartographer::Note::new("scheduler")
-            .level(crate::logging::LogLevel::INFO)
-            .squad(squad_id)
-            .task(task_name)
-            .scope("mailbox");
-        if let Some(cell_id) = cell_id {
-            note = note.cell(cell_id);
+        Ok(message_id) => {
+            let mut note = crate::cartographer::Note::new("scheduler")
+                .level(crate::logging::LogLevel::INFO)
+                .squad(squad_id)
+                .task(task_name)
+                .scope("mailbox");
+            if let Some(cell_id) = cell_id {
+                note = note.cell(cell_id);
+            }
+            note.emit(
+                guard,
+                "mailbox message enqueued for proof failure",
+                serde_json::json!({"message_id": message_id, "priority": priority.as_str()}),
+            );
         }
-        note.emit(
-            guard,
-            "mailbox message enqueued for proof failure",
-            serde_json::json!({"message_id": message_id, "priority": priority.as_str()}),
-        );
+        Err(e) => {
+            let mut note = crate::cartographer::Note::new("scheduler")
+                .level(crate::logging::LogLevel::WARNING)
+                .squad(squad_id)
+                .task(task_name)
+                .scope("mailbox");
+            if let Some(cell_id) = cell_id {
+                note = note.cell(cell_id);
+            }
+            note.emit(
+                guard,
+                format!("could not enqueue mailbox message for proof failure: {e}"),
+                serde_json::json!({"error": e.to_string()}),
+            );
+        }
     }
 }
 
@@ -2460,8 +2653,18 @@ fn run_cell_with_rate_limit_retries<'a>(
         );
         {
             let guard = store.lock();
-            let _ = guard.stop_cell_active_interval(squad_id, row.task_idx, row.idx);
-            let _ = guard.mark_cell_delayed(squad_id, row.task_idx, row.idx, wake_at_ms);
+            store_ok(
+                &guard,
+                squad_id,
+                "stop_cell_active_interval",
+                guard.stop_cell_active_interval(squad_id, row.task_idx, row.idx),
+            );
+            store_ok(
+                &guard,
+                squad_id,
+                "mark_cell_delayed",
+                guard.mark_cell_delayed(squad_id, row.task_idx, row.idx, wake_at_ms),
+            );
             let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
                 level: crate::logging::LogLevel::INFO,
                 source: "scheduler",
@@ -2486,15 +2689,44 @@ fn run_cell_with_rate_limit_retries<'a>(
         let cancelled = sleep_out_rate_limit_retry(retry_after, cancel);
         {
             let guard = store.lock();
-            let _ = guard.clear_cell_delayed(squad_id, row.task_idx, row.idx);
+            store_ok(
+                &guard,
+                squad_id,
+                "clear_cell_delayed",
+                guard.clear_cell_delayed(squad_id, row.task_idx, row.idx),
+            );
+            let message = if cancelled {
+                "cell rate-limit retry abandoned: cancelled during delay"
+            } else {
+                "cell rate-limit delay elapsed; retrying"
+            };
+            crate::cartographer::Note::new("scheduler")
+                .scope("cell")
+                .squad(squad_id)
+                .cell(&row.cell_id)
+                .task(&row.task_name)
+                .emit(
+                    &guard,
+                    format!("{message} cell={squad_id}/{}", row.cell_id),
+                    serde_json::json!({
+                        "cancelled": cancelled,
+                        "retry_attempt": spec.retry_attempt.saturating_add(1),
+                    }),
+                );
         }
         if cancelled {
             return None;
         }
         permit = sem.acquire_ranked(dispatch_priority);
-        let _ = store
-            .lock()
-            .start_cell_active_interval(squad_id, row.task_idx, row.idx);
+        {
+            let guard = store.lock();
+            store_ok(
+                &guard,
+                squad_id,
+                "start_cell_active_interval",
+                guard.start_cell_active_interval(squad_id, row.task_idx, row.idx),
+            );
+        }
         spec.resume_agent_session_id = agent_session_id;
         spec.retry_attempt = spec.retry_attempt.saturating_add(1);
     }
@@ -2633,6 +2865,22 @@ pub(crate) fn handle_thinking_stall_attempt(
             strikes,
             THINKING_STALL_MAX_STRIKES,
         );
+        let _ = store.lock().cartographer_log(crate::cartographer::CartographerEntry {
+            level: crate::logging::LogLevel::WARNING,
+            source: "scheduler",
+            message: "thinking-repetition stall detected; automatic restart with recovery context",
+            scope: Some("cell"),
+            squad_id: Some(&spec.squad_id),
+            guardian_id: None,
+            cell_id: Some(&spec.cell_id),
+            task: Some(&spec.task),
+            log_path: None,
+            payload: serde_json::json!({
+                "strikes": strikes,
+                "max_strikes": THINKING_STALL_MAX_STRIKES,
+            }),
+            admin_only: false,
+        });
         spec.resume_agent_session_id = attempt
             .agent_session_id
             .clone()
@@ -2699,6 +2947,22 @@ pub(crate) fn handle_thinking_stall_attempt(
                     "priority": "high",
                     "strikes": strikes,
                 }),
+            );
+    } else {
+        crate::cartographer::Note::new("scheduler")
+            .level(crate::logging::LogLevel::WARNING)
+            .squad(&spec.squad_id)
+            .cell(&spec.cell_id)
+            .task(&spec.task)
+            .scope("mailbox")
+            .emit(
+                &guard,
+                format!(
+                    "could not enqueue mailbox message for thinking-stalled work ({}); \
+                     terminating without a human notice",
+                    spec.cell_id
+                ),
+                serde_json::json!({ "strikes": strikes }),
             );
     }
     ThinkingStallOutcome::Terminate(format!(
@@ -2803,7 +3067,12 @@ fn run_cell_worker(
         };
         {
             let guard = store.lock();
-            let _ = guard.record_cell_result(squad_id, row.task_idx, row.idx, &outcome);
+            store_ok(
+                &guard,
+                squad_id,
+                "record_cell_result",
+                guard.record_cell_result(squad_id, row.task_idx, row.idx, &outcome),
+            );
             let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
                 level: crate::logging::LogLevel::ERROR,
                 source: "scheduler",
@@ -2832,13 +3101,28 @@ fn run_cell_worker(
     }
     {
         let guard = store.lock();
-        let _ = guard.set_cell_state(squad_id, row.task_idx, row.idx, NodeState::Running);
-        let _ = guard.set_task_state(squad_id, row.task_idx, NodeState::Running);
+        store_ok(
+            &guard,
+            squad_id,
+            "set_cell_state",
+            guard.set_cell_state(squad_id, row.task_idx, row.idx, NodeState::Running),
+        );
+        store_ok(
+            &guard,
+            squad_id,
+            "set_task_state",
+            guard.set_task_state(squad_id, row.task_idx, NodeState::Running),
+        );
         // RAL-288: a fresh dispatch clears any stale `detached_at_ms` from a
         // previous attempt -- covers both a plain restart and a
         // resume-automation-triggered one, without either needing to know
         // about the other's bookkeeping.
-        let _ = guard.clear_cell_detached(squad_id, row.task_idx, row.idx);
+        store_ok(
+            &guard,
+            squad_id,
+            "clear_cell_detached",
+            guard.clear_cell_detached(squad_id, row.task_idx, row.idx),
+        );
         // RAL-400 Phase 3: same reasoning, for a stale `waypoint_halted_at_ms`
         // left behind by a previous attempt that was halted by a since-closed
         // waypoint.
@@ -2874,13 +3158,18 @@ fn run_cell_worker(
                     let uri = crate::ghost::cell_uri(squad_id, row.task_idx, row.idx);
                     let revision =
                         crate::ghost::current_revision(row.cwd.as_deref().unwrap_or_default());
-                    let _ = guard.upsert_ghost(
-                        &uri,
-                        crate::ghost::KIND_CELL,
-                        Some(squad_id),
-                        None,
-                        &crate::waypoints::render_resume_guidance(&view, rebased),
-                        revision.as_deref(),
+                    store_ok(
+                        &guard,
+                        squad_id,
+                        "upsert_ghost",
+                        guard.upsert_ghost(
+                            &uri,
+                            crate::ghost::KIND_CELL,
+                            Some(squad_id),
+                            None,
+                            &crate::waypoints::render_resume_guidance(&view, rebased),
+                            revision.as_deref(),
+                        ),
                     );
                 }
                 crate::cartographer::Note::new("waypoints")
@@ -2907,11 +3196,21 @@ fn run_cell_worker(
                     );
             }
         }
-        let _ = guard.clear_cell_waypoint_halted(squad_id, row.task_idx, row.idx);
+        store_ok(
+            &guard,
+            squad_id,
+            "clear_cell_waypoint_halted",
+            guard.clear_cell_waypoint_halted(squad_id, row.task_idx, row.idx),
+        );
         // RAL-435: same reasoning, for a stale `delayed_until_ms` left behind
         // by a previous attempt that was still waiting out a rate limit when
         // e.g. the daemon restarted.
-        let _ = guard.clear_cell_delayed(squad_id, row.task_idx, row.idx);
+        store_ok(
+            &guard,
+            squad_id,
+            "clear_cell_delayed",
+            guard.clear_cell_delayed(squad_id, row.task_idx, row.idx),
+        );
     }
 
     // Resolve handoff placeholders against completed upstream summaries.
@@ -2961,7 +3260,12 @@ fn run_cell_worker(
                 };
                 {
                     let guard = store.lock();
-                    let _ = guard.record_cell_result(squad_id, row.task_idx, row.idx, &outcome);
+                    store_ok(
+                        &guard,
+                        squad_id,
+                        "record_cell_result",
+                        guard.record_cell_result(squad_id, row.task_idx, row.idx, &outcome),
+                    );
                 }
                 let mut prog = progress.lock().expect("progress mutex poisoned");
                 prog.status[i] = CellState::Failed;
@@ -3256,7 +3560,12 @@ fn run_cell_worker(
         };
         {
             let guard = store.lock();
-            let _ = guard.record_cell_result(squad_id, row.task_idx, row.idx, &outcome);
+            store_ok(
+                &guard,
+                squad_id,
+                "record_cell_result",
+                guard.record_cell_result(squad_id, row.task_idx, row.idx, &outcome),
+            );
             let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
                 level: crate::logging::LogLevel::WARNING,
                 source: "scheduler",
@@ -3421,7 +3730,12 @@ fn run_cell_worker(
             agent_session_id: result.agent_session_id.clone(),
         };
         let guard = store.lock();
-        let _ = guard.record_cell_result(squad_id, row.task_idx, row.idx, &outcome);
+        store_ok(
+            &guard,
+            squad_id,
+            "record_cell_result",
+            guard.record_cell_result(squad_id, row.task_idx, row.idx, &outcome),
+        );
         crate::cartographer::Note::new("arbiter")
             .squad(squad_id)
             .cell(&row.cell_id)
@@ -3451,8 +3765,18 @@ fn run_cell_worker(
             agent_session_id: result.agent_session_id.clone(),
         };
         let guard = store.lock();
-        let _ = guard.record_cell_result(squad_id, row.task_idx, row.idx, &outcome);
-        let _ = guard.mark_cell_waypoint_halted(squad_id, row.task_idx, row.idx);
+        store_ok(
+            &guard,
+            squad_id,
+            "record_cell_result",
+            guard.record_cell_result(squad_id, row.task_idx, row.idx, &outcome),
+        );
+        store_ok(
+            &guard,
+            squad_id,
+            "mark_cell_waypoint_halted",
+            guard.mark_cell_waypoint_halted(squad_id, row.task_idx, row.idx),
+        );
         let waypoint_id = guard.squad_block_gating_waypoint(squad_id).ok().flatten();
         // RAL-400 Phase 5: fold the waypoint's current bearing list into this
         // cell's own ghost note (the same handoff channel a self-summarized
@@ -3467,13 +3791,18 @@ fn run_cell_worker(
                     let uri = crate::ghost::cell_uri(squad_id, row.task_idx, row.idx);
                     let revision =
                         crate::ghost::current_revision(row.cwd.as_deref().unwrap_or_default());
-                    let _ = guard.upsert_ghost(
-                        &uri,
-                        crate::ghost::KIND_CELL,
-                        Some(squad_id),
-                        None,
-                        &bearing_text,
-                        revision.as_deref(),
+                    store_ok(
+                        &guard,
+                        squad_id,
+                        "upsert_ghost",
+                        guard.upsert_ghost(
+                            &uri,
+                            crate::ghost::KIND_CELL,
+                            Some(squad_id),
+                            None,
+                            &bearing_text,
+                            revision.as_deref(),
+                        ),
                     );
                 }
             }
@@ -3538,8 +3867,18 @@ fn run_cell_worker(
             agent_session_id: result.agent_session_id.clone(),
         };
         let guard = store.lock();
-        let _ = guard.record_cell_result(squad_id, row.task_idx, row.idx, &outcome);
-        let _ = guard.mark_cell_detached(squad_id, row.task_idx, row.idx);
+        store_ok(
+            &guard,
+            squad_id,
+            "record_cell_result",
+            guard.record_cell_result(squad_id, row.task_idx, row.idx, &outcome),
+        );
+        store_ok(
+            &guard,
+            squad_id,
+            "mark_cell_detached",
+            guard.mark_cell_detached(squad_id, row.task_idx, row.idx),
+        );
         let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
             level: crate::logging::LogLevel::INFO,
             source: "scheduler",
@@ -3581,7 +3920,12 @@ fn run_cell_worker(
     };
     {
         let guard = store.lock();
-        let _ = guard.record_cell_result(squad_id, row.task_idx, row.idx, &outcome);
+        store_ok(
+            &guard,
+            squad_id,
+            "record_cell_result",
+            guard.record_cell_result(squad_id, row.task_idx, row.idx, &outcome),
+        );
         let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
             level: if result.is_done() {
                 crate::logging::LogLevel::INFO
@@ -3704,19 +4048,38 @@ fn run_cell_worker(
         let guard = store.lock();
         for marker in &result.prophecies {
             let Ok(kind) = marker.kind.parse::<crate::prophecy::ProphecyKind>() else {
+                crate::cartographer::Note::new("prophecy")
+                    .level(crate::logging::LogLevel::WARNING)
+                    .scope("cell")
+                    .squad(squad_id)
+                    .cell(&row.cell_id)
+                    .task(&row.task_name)
+                    .emit(
+                        &guard,
+                        format!(
+                            "prophecy marker dropped: unknown kind {:?} cell={squad_id}/{}",
+                            marker.kind, row.cell_id
+                        ),
+                        serde_json::json!({ "kind": marker.kind, "body_len": marker.body.len() }),
+                    );
                 continue;
             };
             // `add_prophecy` already emits its own Cartographer row (and the
             // log line that rides along with it) on success -- nothing
             // further to log here.
-            let _ = guard.add_prophecy(
-                &uri,
-                0,
-                kind,
-                &marker.body,
-                revision.as_deref(),
-                Some(squad_id),
-                None,
+            store_ok(
+                &guard,
+                squad_id,
+                "add_prophecy",
+                guard.add_prophecy(
+                    &uri,
+                    0,
+                    kind,
+                    &marker.body,
+                    revision.as_deref(),
+                    Some(squad_id),
+                    None,
+                ),
             );
         }
     }
@@ -3849,7 +4212,12 @@ fn run_proof_only_worker(
     // show a task as Done while its cell-level proofs are still in flight.
     {
         let guard = store.lock();
-        let _ = guard.set_task_state(squad_id, row.task_idx, NodeState::Running);
+        store_ok(
+            &guard,
+            squad_id,
+            "set_task_state",
+            guard.set_task_state(squad_id, row.task_idx, NodeState::Running),
+        );
     }
     let cwd = row.cwd.clone().unwrap_or_default();
     let proof_outcome = run_proofs(
@@ -4006,7 +4374,12 @@ fn check_task_no_commits_guard(
         workspaces.len(),
         if workspaces.len() == 1 { "" } else { "s" }
     );
-    let _ = guard.set_task_error(squad_id, task_idx, Some(&error));
+    store_ok(
+        &guard,
+        squad_id,
+        "set_task_error",
+        guard.set_task_error(squad_id, task_idx, Some(&error)),
+    );
     false
 }
 
@@ -4134,7 +4507,12 @@ fn run_task_finalizer(
         {
             let guard = store.lock();
             if matches!(guard.squad_state(squad_id), Ok(SquadState::Running)) {
-                let _ = guard.set_task_state(squad_id, task_idx, NodeState::Running);
+                store_ok(
+                    &guard,
+                    squad_id,
+                    "set_task_state",
+                    guard.set_task_state(squad_id, task_idx, NodeState::Running),
+                );
             }
         }
         let proof_outcome = run_proofs(
@@ -4253,7 +4631,12 @@ fn run_task_finalizer(
         // Don't clobber a squad an edit reset to Pending mid-flight (mirrors the
         // squad-level guard); leave the task for the re-run.
         if matches!(guard.squad_state(squad_id), Ok(SquadState::Running)) {
-            let _ = guard.set_task_state(squad_id, task_idx, state);
+            store_ok(
+                &guard,
+                squad_id,
+                "set_task_state",
+                guard.set_task_state(squad_id, task_idx, state),
+            );
             true
         } else {
             false
@@ -4340,9 +4723,35 @@ pub fn recover_interrupted_reviews(
 ) {
     let (interrupted, pending_feedback) = {
         let guard = store.lock();
-        let interrupted = guard.interrupted_merges().unwrap_or_default();
+        let interrupted = match guard.interrupted_merges() {
+            Ok(ids) => ids,
+            Err(e) => {
+                crate::cartographer::Note::new("recovery")
+                    .level(crate::logging::LogLevel::WARNING)
+                    .scope("guardian")
+                    .emit(
+                        &guard,
+                        format!("could not list interrupted review merges at startup: {e}"),
+                        serde_json::json!({ "error": e.to_string() }),
+                    );
+                Vec::new()
+            }
+        };
         for gid in &interrupted {
-            let _ = guard.reset_guardian_to_collecting(gid);
+            // A successful reset records its own `guardian` state-transition row.
+            if let Err(e) = guard.reset_guardian_to_collecting(gid) {
+                crate::cartographer::Note::new("recovery")
+                    .level(crate::logging::LogLevel::WARNING)
+                    .scope("guardian")
+                    .guardian(gid)
+                    .emit(
+                        &guard,
+                        format!(
+                            "review {gid} interrupted merge could not be reset to collecting: {e}"
+                        ),
+                        serde_json::json!({ "error": e.to_string() }),
+                    );
+            }
         }
         let pending_feedback = guard.branches_with_pending_feedback().unwrap_or_default();
         (interrupted, pending_feedback)
@@ -4706,10 +5115,25 @@ fn finalize_all_failed(
         admin_only: false,
     });
     for task in tasks {
-        let _ = guard.set_task_state(squad_id, task.idx, NodeState::Failed);
-        let _ = guard.set_task_error(squad_id, task.idx, Some(reason));
+        store_ok(
+            &guard,
+            squad_id,
+            "set_task_state",
+            guard.set_task_state(squad_id, task.idx, NodeState::Failed),
+        );
+        store_ok(
+            &guard,
+            squad_id,
+            "set_task_error",
+            guard.set_task_error(squad_id, task.idx, Some(reason)),
+        );
     }
-    let _ = guard.set_squad_state(squad_id, SquadState::Failed);
+    store_ok(
+        &guard,
+        squad_id,
+        "set_squad_state",
+        guard.set_squad_state(squad_id, SquadState::Failed),
+    );
 }
 
 /// Substitute `{handoff:<task>}` placeholders in a prompt with the summary of a
@@ -4927,9 +5351,15 @@ fn run_proof_with_rate_limit_retries(
             match handle_thinking_stall_attempt(store, spec, &result) {
                 ThinkingStallOutcome::Retry => continue,
                 ThinkingStallOutcome::Terminate(message) => {
-                    let _ = store
-                        .lock()
-                        .clear_proof_delayed(squad_id, task_idx, scope, cell_idx, idx);
+                    {
+                        let guard = store.lock();
+                        store_ok(
+                            &guard,
+                            squad_id,
+                            "clear_proof_delayed",
+                            guard.clear_proof_delayed(squad_id, task_idx, scope, cell_idx, idx),
+                        );
+                    }
                     result.status = "failed".to_string();
                     result.error = Some(message);
                     result.retry_after_secs = None;
@@ -4939,15 +5369,46 @@ fn run_proof_with_rate_limit_retries(
         }
 
         if !result.is_rate_limited() || cancel.is_cancelled() {
-            let _ = store
-                .lock()
-                .clear_proof_delayed(squad_id, task_idx, scope, cell_idx, idx);
+            {
+                let guard = store.lock();
+                store_ok(
+                    &guard,
+                    squad_id,
+                    "clear_proof_delayed",
+                    guard.clear_proof_delayed(squad_id, task_idx, scope, cell_idx, idx),
+                );
+            }
             return result;
         }
         if retries >= max_retries {
-            let _ = store
-                .lock()
-                .clear_proof_delayed(squad_id, task_idx, scope, cell_idx, idx);
+            {
+                let guard = store.lock();
+                store_ok(
+                    &guard,
+                    squad_id,
+                    "clear_proof_delayed",
+                    guard.clear_proof_delayed(squad_id, task_idx, scope, cell_idx, idx),
+                );
+                crate::cartographer::Note::new("scheduler")
+                    .level(crate::logging::LogLevel::WARNING)
+                    .scope("proof")
+                    .squad(squad_id)
+                    .emit(
+                        &guard,
+                        format!(
+                            "proof rate-limit retries exhausted squad={squad_id} task_idx={task_idx} \
+                             scope={scope} idx={idx} attempts={}",
+                            retries + 1
+                        ),
+                        serde_json::json!({
+                            "task_idx": task_idx,
+                            "proof_scope": scope,
+                            "cell_idx": cell_idx,
+                            "idx": idx,
+                            "attempts": retries + 1,
+                        }),
+                    );
+            }
             result.status = "failed".to_string();
             result.error = Some(format!(
                 "provider rate-limit retries exhausted after {} attempt(s)",
@@ -4968,9 +5429,19 @@ fn run_proof_with_rate_limit_retries(
         );
         {
             let guard = store.lock();
-            let _ = guard.stop_proof_active_interval(squad_id, task_idx, scope, cell_idx, idx);
-            let _ = guard.mark_proof_delayed(
-                squad_id, task_idx, scope, cell_idx, idx, wake_at_ms, &reason,
+            store_ok(
+                &guard,
+                squad_id,
+                "stop_proof_active_interval",
+                guard.stop_proof_active_interval(squad_id, task_idx, scope, cell_idx, idx),
+            );
+            store_ok(
+                &guard,
+                squad_id,
+                "mark_proof_delayed",
+                guard.mark_proof_delayed(
+                    squad_id, task_idx, scope, cell_idx, idx, wake_at_ms, &reason,
+                ),
             );
             let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
                 level: crate::logging::LogLevel::INFO,
@@ -4994,17 +5465,35 @@ fn run_proof_with_rate_limit_retries(
             });
         }
         if sleep_out_rate_limit_retry(delay, cancel) {
-            let _ = store
-                .lock()
-                .clear_proof_delayed(squad_id, task_idx, scope, cell_idx, idx);
+            {
+                let guard = store.lock();
+                store_ok(
+                    &guard,
+                    squad_id,
+                    "clear_proof_delayed",
+                    guard.clear_proof_delayed(squad_id, task_idx, scope, cell_idx, idx),
+                );
+            }
             return result;
         }
-        let _ = store
-            .lock()
-            .clear_proof_delayed(squad_id, task_idx, scope, cell_idx, idx);
-        let _ = store
-            .lock()
-            .start_proof_active_interval(squad_id, task_idx, scope, cell_idx, idx);
+        {
+            let guard = store.lock();
+            store_ok(
+                &guard,
+                squad_id,
+                "clear_proof_delayed",
+                guard.clear_proof_delayed(squad_id, task_idx, scope, cell_idx, idx),
+            );
+        }
+        {
+            let guard = store.lock();
+            store_ok(
+                &guard,
+                squad_id,
+                "start_proof_active_interval",
+                guard.start_proof_active_interval(squad_id, task_idx, scope, cell_idx, idx),
+            );
+        }
         spec.resume_agent_session_id = result.agent_session_id;
         spec.retry_attempt = retries;
     }
@@ -5445,16 +5934,21 @@ fn run_proofs(
         };
         {
             let guard = store.lock();
-            let _ = guard.set_proof_result(
+            store_ok(
+                &guard,
                 squad_id,
-                task_idx,
-                scope,
-                cell_idx,
-                idx,
-                state,
-                &output,
-                proof_claude_id.as_deref(),
-                proof_usage,
+                "set_proof_result",
+                guard.set_proof_result(
+                    squad_id,
+                    task_idx,
+                    scope,
+                    cell_idx,
+                    idx,
+                    state,
+                    &output,
+                    proof_claude_id.as_deref(),
+                    proof_usage,
+                ),
             );
             let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
                 level: if passed {
@@ -5566,7 +6060,12 @@ fn set_proof_running(
     idx: i64,
 ) {
     let guard = store.lock();
-    let _ = guard.set_proof_state(squad_id, task_idx, scope, cell_idx, idx, NodeState::Running);
+    store_ok(
+        &guard,
+        squad_id,
+        "set_proof_state",
+        guard.set_proof_state(squad_id, task_idx, scope, cell_idx, idx, NodeState::Running),
+    );
 }
 
 #[cfg(test)]

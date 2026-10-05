@@ -314,10 +314,16 @@ impl AgentDbSnapshot {
     /// resolution.
     #[must_use]
     pub fn load(store: &Store, agent: &str) -> Self {
-        let profile = store.get_agent_profile(agent).unwrap_or(None);
+        let profile = store.get_agent_profile(agent).unwrap_or_else(|e| {
+            warn_profile_read_failed(store, &format!("agent profile {agent:?}"), &e);
+            None
+        });
         let backend_commands = store
             .list_agent_backend_commands()
-            .unwrap_or_default()
+            .unwrap_or_else(|e| {
+                warn_profile_read_failed(store, "agent backend commands", &e);
+                Vec::new()
+            })
             .into_iter()
             .map(|c| (c.backend, c.command))
             .collect();
@@ -326,6 +332,19 @@ impl AgentDbSnapshot {
             backend_commands,
         }
     }
+}
+
+/// WARNING for a database read whose failure is degraded to "nothing
+/// stored" -- the resolution or health check carries on without it.
+fn warn_profile_read_failed(store: &Store, what: &str, e: &crate::store::StoreError) {
+    crate::cartographer::Note::new("agent-profiles")
+        .level(crate::logging::LogLevel::WARNING)
+        .scope("agent-profile")
+        .emit(
+            store,
+            format!("reading {what} failed, continuing as if none is stored: {e}"),
+            serde_json::json!({ "what": what, "error": e.to_string() }),
+        );
 }
 
 pub fn resolve_agent_for_path(agent: &str, cwd: &Path) -> Result<ResolvedAgentSelection, String> {
@@ -393,6 +412,20 @@ fn resolve_agent_for_path_with(
         }
         let resolved_env =
             agent_profile_env::resolve_agent_env(&db_profile.env, |name| std::env::var(name).ok());
+        let unresolved: Vec<&str> = db_profile
+            .env
+            .iter()
+            .filter(|e| !resolved_env.contains_key(&e.key))
+            .map(|e| e.key.as_str())
+            .collect();
+        if !unresolved.is_empty() {
+            // ralphus[ignore-rlog-pair]: pure resolver over a pre-loaded snapshot; no Store handle reaches this function
+            crate::rlog!(
+                WARNING,
+                "ralphus [agent-profiles] agent \"{agent}\": env var(s) {unresolved:?} link to a name \
+                 that is not set in the daemon environment; they are omitted from the agent's env"
+            );
+        }
         let secret_values: BTreeSet<String> =
             agent_profile_env::secret_values(&db_profile.env, |name| std::env::var(name).ok())
                 .into_iter()
@@ -1014,7 +1047,10 @@ fn check_profiles_for_root(root: &Path, suffix: &str) -> Vec<ProfileHealthResult
 /// [`resolve_agent_for_path_with`] applies it.
 fn check_db_profiles_health(store: &Store) -> Vec<ProfileHealthResult> {
     let mut results = Vec::new();
-    let commands = store.list_agent_backend_commands().unwrap_or_default();
+    let commands = store.list_agent_backend_commands().unwrap_or_else(|e| {
+        warn_profile_read_failed(store, "agent backend commands for health check", &e);
+        Vec::new()
+    });
     for cmd in &commands {
         let check_name = format!("agent-backend-command:{}", cmd.backend);
         // RAL-485: evaluated through the same `diagnose_backend_command`
@@ -1032,7 +1068,10 @@ fn check_db_profiles_health(store: &Store) -> Vec<ProfileHealthResult> {
             detail: format!("command={:?} {}", cmd.command, health.detail),
         });
     }
-    let profiles = store.list_agent_profiles().unwrap_or_default();
+    let profiles = store.list_agent_profiles().unwrap_or_else(|e| {
+        warn_profile_read_failed(store, "agent profiles for health check", &e);
+        Vec::new()
+    });
     for profile in &profiles {
         let check_name = format!("agent-profile:{} (database)", profile.name);
         let Some(executable) = profile.executable.as_deref() else {
@@ -1078,7 +1117,10 @@ pub fn check_profiles_health(store: &Store, cwd: &Path) -> Vec<ProfileHealthResu
     if let Some(path) = find_project_config(cwd) {
         seen_configs.insert(path);
     }
-    let projects = store.list_projects().unwrap_or_default();
+    let projects = store.list_projects().unwrap_or_else(|e| {
+        warn_profile_read_failed(store, "registered projects for profile health check", &e);
+        Vec::new()
+    });
     for project in projects {
         let project_path = PathBuf::from(&project.path);
         let Some(config_path) = find_project_config(&project_path) else {

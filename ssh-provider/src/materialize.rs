@@ -134,7 +134,15 @@ pub fn run(uri: &str, payload: &str, config: &EffectiveConfig) -> Result<(), Str
         )),
         (Err(error), _) | (_, Err(error)) => Err(error),
     };
-    let _ = std::fs::remove_dir_all(&temporary);
+    if let Err(e) = std::fs::remove_dir_all(&temporary) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            crate::emit_event(
+                "could not remove materialize staging directory",
+                "warning",
+                serde_json::json!({"path": temporary.display().to_string(), "error": e.to_string()}),
+            );
+        }
+    }
     result
 }
 

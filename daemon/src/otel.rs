@@ -168,6 +168,11 @@ pub fn traceparent_from_context(cx: &Context) -> Option<String> {
 struct UreqOtlpJsonExporter {
     traces_url: String,
     resource_attributes: Vec<serde_json::Value>,
+    /// Whether the most recent export failed. Export runs once per finished
+    /// span, so only a change between working and failing is logged.
+    failing: std::sync::atomic::AtomicBool,
+    /// Exports that failed since the last logged transition.
+    failures_since_change: std::sync::atomic::AtomicU64,
 }
 
 impl UreqOtlpJsonExporter {
@@ -179,6 +184,47 @@ impl UreqOtlpJsonExporter {
         Self {
             traces_url,
             resource_attributes,
+            failing: std::sync::atomic::AtomicBool::new(false),
+            failures_since_change: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+impl UreqOtlpJsonExporter {
+    /// Log an export that starts failing, and the first success after a
+    /// failure run, so a dead collector is visible without one line per span.
+    fn note_export_outcome(&self, result: &OTelSdkResult) {
+        use std::sync::atomic::Ordering;
+        match result {
+            Err(e) => {
+                let failed = self.failures_since_change.fetch_add(1, Ordering::Relaxed) + 1;
+                if !self.failing.swap(true, Ordering::Relaxed) {
+                    // ralphus[ignore-rlog-pair]: span exporter runs on the OpenTelemetry SDK export path with no Store handle reachable
+                    crate::rlog!(
+                        WARNING,
+                        "ralphus [otel] span export to {} failing (further failures are suppressed until it recovers): {e}",
+                        self.traces_url
+                    );
+                } else if failed.is_power_of_two() {
+                    // ralphus[ignore-rlog-pair]: span exporter runs on the OpenTelemetry SDK export path with no Store handle reachable
+                    crate::rlog!(
+                        WARNING,
+                        "ralphus [otel] span export to {} still failing after {failed} attempts: {e}",
+                        self.traces_url
+                    );
+                }
+            }
+            Ok(()) => {
+                if self.failing.swap(false, Ordering::Relaxed) {
+                    let failed = self.failures_since_change.swap(0, Ordering::Relaxed);
+                    // ralphus[ignore-rlog-pair]: span exporter runs on the OpenTelemetry SDK export path with no Store handle reachable
+                    crate::rlog!(
+                        INFO,
+                        "ralphus [otel] span export to {} recovered after {failed} failed attempt(s)",
+                        self.traces_url
+                    );
+                }
+            }
         }
     }
 }
@@ -200,12 +246,14 @@ impl SpanExporter for UreqOtlpJsonExporter {
         });
         // Bounded timeouts via the shared daemon agent: the OTLP endpoint
         // must never hang the export thread indefinitely on a stalled socket.
-        crate::forge::http_agent()
+        let result = crate::forge::http_agent()
             .post(&self.traces_url)
             .set("Content-Type", "application/json")
             .send_string(&body.to_string())
             .map(|_| ())
-            .map_err(|e| OTelSdkError::InternalFailure(e.to_string()))
+            .map_err(|e| OTelSdkError::InternalFailure(e.to_string()));
+        self.note_export_outcome(&result);
+        result
     }
 }
 

@@ -69,7 +69,7 @@ impl Store {
         // -- a review's forge calls can run under a different user's token
         // than the one editing it (fork routing), so narrowing this to
         // `user`'s own reviews could leave a stale suppression in place.
-        let _ = self.clear_all_poller_health();
+        self.clear_all_poller_health_logged("set", user, host);
         Ok(())
     }
 
@@ -160,9 +160,27 @@ impl Store {
             // RAL-545: see the matching note in `set_user_forge_token` -- a
             // removed token invalidates every review's upstream-poll state,
             // not just reviews owned by `user`.
-            let _ = self.clear_all_poller_health();
+            self.clear_all_poller_health_logged("removed", user, host);
         }
         Ok(n > 0)
+    }
+
+    /// Reset every review's upstream-poll health after a token change. A
+    /// failure leaves stale backoff/suppression in place, so it is reported
+    /// rather than dropped; the token change itself still succeeds.
+    fn clear_all_poller_health_logged(&self, change: &str, user: &str, host: &str) {
+        if let Err(error) = self.clear_all_poller_health() {
+            crate::cartographer::Note::new("store")
+                .level(crate::logging::LogLevel::WARNING)
+                .scope("user_forge_token")
+                .emit(
+                    self,
+                    format!(
+                        "forge token {change} for user {user:?} host {host:?} but poller health reset failed: {error}"
+                    ),
+                    serde_json::json!({ "user": user, "host": host, "error": error.to_string() }),
+                );
+        }
     }
 
     /// Mint (or replace) the credential-fetch grant for `worktree_id`,
@@ -193,6 +211,16 @@ impl Store {
                 created_at_ms = excluded.created_at_ms",
             rusqlite::params![worktree_id, secret, user, host, now],
         )?;
+        // The grant secret is deliberately left out of both the line and the payload.
+        crate::cartographer::Note::new("store")
+            .scope("user_forge_token")
+            .emit(
+                self,
+                format!(
+                    "worktree credential grant minted worktree={worktree_id} user={user:?} host={host:?}"
+                ),
+                serde_json::json!({ "worktree_id": worktree_id, "user": user, "host": host }),
+            );
         Ok(secret)
     }
 
@@ -241,14 +269,32 @@ impl Store {
             )
             .optional()?;
         let Some((expected_secret, user, host)) = grant else {
+            // ralphus[ignore-rlog-pair]: read-pool connection runs without StoreMutex, so no Store is reachable here
+            crate::rlog!(
+                WARNING,
+                "ralphus [store] worktree credential refused: no grant for worktree={worktree_id}"
+            );
             return Ok(None);
         };
         // Constant-time compare: this is exactly the kind of secret
         // comparison a timing side-channel could otherwise leak bytes of.
         if !constant_time_eq(expected_secret.as_bytes(), grant_secret.as_bytes()) {
+            // ralphus[ignore-rlog-pair]: read-pool connection runs without StoreMutex, so no Store is reachable here
+            crate::rlog!(
+                WARNING,
+                "ralphus [store] worktree credential refused: grant secret mismatch worktree={worktree_id}"
+            );
             return Ok(None);
         }
-        Self::get_user_forge_token_conn(conn, &user, &host)
+        let token = Self::get_user_forge_token_conn(conn, &user, &host)?;
+        if token.is_none() {
+            // ralphus[ignore-rlog-pair]: read-pool connection runs without StoreMutex, so no Store is reachable here
+            crate::rlog!(
+                WARNING,
+                "ralphus [store] worktree credential unavailable: no forge token for user={user:?} host={host:?} worktree={worktree_id}"
+            );
+        }
+        Ok(token)
     }
 }
 

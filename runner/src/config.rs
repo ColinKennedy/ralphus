@@ -103,12 +103,25 @@ fn find_git_root_config(start_dir: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Layers one config file onto `config`. A missing file is the normal case
+/// and is silent; an unreadable or unparseable one is skipped (the cell still
+/// runs on the remaining layers) but recorded as a warning, since its
+/// settings silently not applying is otherwise invisible.
 fn apply_file(config: &mut RunnerConfig, path: &Path) {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return;
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            warn_config_skipped(path, "could not read config file", &e.to_string());
+            return;
+        }
     };
-    let Ok(parsed) = text.parse::<toml::Table>() else {
-        return;
+    let parsed = match text.parse::<toml::Table>() {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            warn_config_skipped(path, "could not parse config file", e.message());
+            return;
+        }
     };
     if let Some(keep) = parsed
         .get("daemon")
@@ -131,6 +144,16 @@ fn apply_file(config: &mut RunnerConfig, path: &Path) {
     {
         config.maximum_timeout_seconds = if secs > 0 { Some(secs as u64) } else { None };
     }
+}
+
+fn warn_config_skipped(path: &Path, message: &str, error: &str) {
+    crate::cartographer::emit(
+        "runner",
+        message,
+        "warning",
+        crate::cartographer::EventContext::default(),
+        serde_json::json!({"path": path.display().to_string(), "error": error}),
+    );
 }
 
 #[cfg(test)]

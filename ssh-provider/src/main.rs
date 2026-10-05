@@ -111,8 +111,40 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
 
 fn read_stdin() -> String {
     let mut buf = String::new();
-    let _ = std::io::stdin().read_to_string(&mut buf);
+    if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
+        ralphus_ssh_provider::emit_event(
+            "could not read request payload from stdin",
+            "warning",
+            serde_json::json!({"error": e.to_string()}),
+        );
+    }
     buf
+}
+
+/// Records a verb's failure as a structured event alongside the error reply,
+/// so a failed provider step is queryable in Cartographer and not only in the
+/// caller's own error text.
+fn report_failure(verb: &str, uri: &str, error: &str) {
+    ralphus_ssh_provider::emit_event(
+        "verb failed",
+        "warning",
+        serde_json::json!({
+            "verb": verb,
+            "uri": uri,
+            "error": ralphus_ssh_provider::redacted(error),
+        }),
+    );
+}
+
+/// Records a state-changing verb's success. Read-only and polling verbs
+/// (`status`, `stream`, `read-file`, `run`, `capabilities`) do not call this:
+/// they run on every poll and would bury the timeline.
+fn report_ok(verb: &str, uri: &str, mut payload: serde_json::Value) {
+    if let Some(o) = payload.as_object_mut() {
+        o.insert("verb".to_string(), serde_json::json!(verb));
+        o.insert("uri".to_string(), serde_json::json!(uri));
+    }
+    ralphus_ssh_provider::emit_event("verb succeeded", "info", payload);
 }
 
 fn main() {
@@ -138,6 +170,7 @@ fn main() {
                 exec::run(&args.uri, &payload, &config).map(protocol::reply_exec_result)
             };
             if let Err(e) = result {
+                report_failure(&args.verb, &args.uri, &e);
                 protocol::reply_err(e);
             }
         }
@@ -146,7 +179,10 @@ fn main() {
             match required_handle(&args).and_then(|handle| job::status(&args.uri, handle, &config))
             {
                 Ok(status) => protocol::reply_status(status.state, status.result),
-                Err(e) => protocol::reply_err(e),
+                Err(e) => {
+                    report_failure(&args.verb, &args.uri, &e);
+                    protocol::reply_err(e);
+                }
             }
         }
         "stream" => {
@@ -162,23 +198,46 @@ fn main() {
                     }
                     protocol::reply_stream(stream.output, stream.next);
                 }
-                Err(e) => protocol::reply_err(e),
+                Err(e) => {
+                    report_failure(&args.verb, &args.uri, &e);
+                    protocol::reply_err(e);
+                }
             }
         }
         "cancel" => {
             let config = exec_config(&args);
             match required_handle(&args).and_then(|handle| job::cancel(&args.uri, handle, &config))
             {
-                Ok(()) => protocol::reply_ok(),
-                Err(e) => protocol::reply_err(e),
+                Ok(()) => {
+                    report_ok(
+                        &args.verb,
+                        &args.uri,
+                        serde_json::json!({"handle": args.handle}),
+                    );
+                    protocol::reply_ok();
+                }
+                Err(e) => {
+                    report_failure(&args.verb, &args.uri, &e);
+                    protocol::reply_err(e);
+                }
             }
         }
         "job-cleanup" => {
             let config = exec_config(&args);
             match required_handle(&args).and_then(|handle| job::cleanup(&args.uri, handle, &config))
             {
-                Ok(()) => protocol::reply_ok(),
-                Err(e) => protocol::reply_err(e),
+                Ok(()) => {
+                    report_ok(
+                        &args.verb,
+                        &args.uri,
+                        serde_json::json!({"handle": args.handle}),
+                    );
+                    protocol::reply_ok();
+                }
+                Err(e) => {
+                    report_failure(&args.verb, &args.uri, &e);
+                    protocol::reply_err(e);
+                }
             }
         }
         "ping" => {
@@ -188,7 +247,10 @@ fn main() {
             }
             match ping::run(&args.uri, &config) {
                 Ok(detail) => protocol::reply_ping_ok(detail),
-                Err(e) => protocol::reply_err(e),
+                Err(e) => {
+                    report_failure(&args.verb, &args.uri, &e);
+                    protocol::reply_err(e);
+                }
             }
         }
         "capabilities" => {
@@ -221,8 +283,18 @@ fn main() {
                 config.ssh_config_file = args.ssh_config_file.clone();
             }
             match provision::run(&args.uri, &payload, &config) {
-                Ok(workspace) => protocol::reply_provision_ok(workspace),
-                Err(e) => protocol::reply_err(e),
+                Ok(workspace) => {
+                    report_ok(
+                        &args.verb,
+                        &args.uri,
+                        serde_json::json!({"workspace": workspace}),
+                    );
+                    protocol::reply_provision_ok(workspace);
+                }
+                Err(e) => {
+                    report_failure(&args.verb, &args.uri, &e);
+                    protocol::reply_err(e);
+                }
             }
         }
         "read-file" => {
@@ -230,7 +302,10 @@ fn main() {
             let config = exec_config(&args);
             match fileops::read_file(&args.uri, &payload, &config) {
                 Ok(content) => protocol::reply_file_content(content),
-                Err(e) => protocol::reply_err(e),
+                Err(e) => {
+                    report_failure(&args.verb, &args.uri, &e);
+                    protocol::reply_err(e);
+                }
             }
         }
         "write-file" => {
@@ -238,7 +313,10 @@ fn main() {
             let config = exec_config(&args);
             match fileops::write_file(&args.uri, &payload, &config) {
                 Ok(()) => protocol::reply_ok(),
-                Err(e) => protocol::reply_err(e),
+                Err(e) => {
+                    report_failure(&args.verb, &args.uri, &e);
+                    protocol::reply_err(e);
+                }
             }
         }
         "remove-path" => {
@@ -246,15 +324,24 @@ fn main() {
             let config = exec_config(&args);
             match fileops::remove_path(&args.uri, &payload, &config) {
                 Ok(()) => protocol::reply_ok(),
-                Err(e) => protocol::reply_err(e),
+                Err(e) => {
+                    report_failure(&args.verb, &args.uri, &e);
+                    protocol::reply_err(e);
+                }
             }
         }
         "materialize" => {
             let payload = read_stdin();
             let config = exec_config(&args);
             match materialize::run(&args.uri, &payload, &config) {
-                Ok(()) => protocol::reply_ok(),
-                Err(e) => protocol::reply_err(e),
+                Ok(()) => {
+                    report_ok(&args.verb, &args.uri, serde_json::json!({}));
+                    protocol::reply_ok();
+                }
+                Err(e) => {
+                    report_failure(&args.verb, &args.uri, &e);
+                    protocol::reply_err(e);
+                }
             }
         }
         "run" => {
@@ -262,15 +349,28 @@ fn main() {
             let config = exec_config(&args);
             match fileops::run(&args.uri, &payload, &config) {
                 Ok((stdout, exit_code)) => protocol::reply_run_result(stdout, exit_code),
-                Err(e) => protocol::reply_err(e),
+                Err(e) => {
+                    report_failure(&args.verb, &args.uri, &e);
+                    protocol::reply_err(e);
+                }
             }
         }
         "cleanup" => {
             let payload = read_stdin();
             let config = exec_config(&args);
             match cleanup::run(&args.uri, &payload, &config) {
-                Ok(removed) => protocol::reply_cleanup_ok(removed),
-                Err(e) => protocol::reply_err(e),
+                Ok(removed) => {
+                    report_ok(
+                        &args.verb,
+                        &args.uri,
+                        serde_json::json!({"removed_dir": removed}),
+                    );
+                    protocol::reply_cleanup_ok(removed);
+                }
+                Err(e) => {
+                    report_failure(&args.verb, &args.uri, &e);
+                    protocol::reply_err(e);
+                }
             }
         }
         v if UNIMPLEMENTED_VERBS.contains(&v) => {

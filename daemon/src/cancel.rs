@@ -109,9 +109,16 @@ impl Cancellations {
     /// id. Used by daemon-wide shutdown (`ralphus-daemon stop`) to stop every
     /// live worker's subprocess without having to enumerate run ids itself.
     pub fn cancel_all(&self) {
-        for active in self.lock().values() {
+        let registrations = self.lock();
+        for active in registrations.values() {
             active.token.cancel();
         }
+        // ralphus[ignore-rlog-pair]: in-memory registry has no Store; shutdown runs as the store is closing
+        crate::rlog!(
+            INFO,
+            "ralphus [cancel] cancel-all signalled {} running key(s)",
+            registrations.len()
+        );
     }
 
     /// Whether `run_id` currently has a registered token — i.e. a worker

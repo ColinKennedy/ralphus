@@ -2500,7 +2500,7 @@ impl SubprocessRunner {
                     self.emit_terminal_log_note(attempt_spec, session_name, attempt - 1);
                 }
             }
-            let _ = tmux.kill_session(session_name);
+            self.kill_tmux_session(tmux, attempt_spec, session_name);
         }
         // RAL-397 Phase 2C: a durable, unbounded-depth transcript of this
         // attempt's raw pane output, written continuously via `pipe_pane` --
@@ -2653,32 +2653,43 @@ impl SubprocessRunner {
         let mut first_tick = true;
         let result = loop {
             if cancel.is_cancelled() {
-                let _ = tmux.kill_session(session_name);
+                self.kill_tmux_session(tmux, attempt_spec, session_name);
                 crate::rlog!(
                     INFO,
                     "ralphus [runner] cancelled squad={} cell={}",
                     attempt_spec.squad_id,
                     attempt_spec.cell_id
                 );
+                self.emit_tmux_note(attempt_spec, "tmux session killed: cancelled", session_name);
                 break RunnerResult::failure("cancelled");
             }
             if detach.is_some_and(crate::cancel::DetachToken::is_cancelled) {
-                let _ = tmux.kill_session(session_name);
+                self.kill_tmux_session(tmux, attempt_spec, session_name);
                 crate::rlog!(
                     INFO,
                     "ralphus [runner] detached squad={} cell={}",
                     attempt_spec.squad_id,
                     attempt_spec.cell_id
                 );
+                self.emit_tmux_note(
+                    attempt_spec,
+                    "tmux session killed: detached for manual takeover",
+                    session_name,
+                );
                 break RunnerResult::detached(current_usage, resumable_agent_session_id.clone());
             }
             if waypoint_halt.is_some_and(crate::cancel::WaypointHaltToken::is_cancelled) {
-                let _ = tmux.kill_session(session_name);
+                self.kill_tmux_session(tmux, attempt_spec, session_name);
                 crate::rlog!(
                     INFO,
                     "ralphus [runner] waypoint halted squad={} cell={}",
                     attempt_spec.squad_id,
                     attempt_spec.cell_id
+                );
+                self.emit_tmux_note(
+                    attempt_spec,
+                    "tmux session killed: waypoint halt",
+                    session_name,
                 );
                 break RunnerResult::waypoint_halted(
                     current_usage,
@@ -2686,7 +2697,7 @@ impl SubprocessRunner {
                 );
             }
             if arbiter_stop.is_some_and(crate::cancel::ArbiterStopToken::is_cancelled) {
-                let _ = tmux.kill_session(session_name);
+                self.kill_tmux_session(tmux, attempt_spec, session_name);
                 let arbiter_key = crate::store_memory::StoreMemory::cell_diff_key(
                     &attempt_spec.squad_id,
                     &attempt_spec.task,
@@ -2703,6 +2714,11 @@ impl SubprocessRunner {
                             .map(|state| state.summary)
                     })
                     .unwrap_or_default();
+                self.emit_tmux_note(
+                    attempt_spec,
+                    "tmux session killed: stopped by Arbiter",
+                    session_name,
+                );
                 break RunnerResult::arbiter_stopped(
                     current_usage,
                     format!(
@@ -2711,7 +2727,7 @@ impl SubprocessRunner {
                 );
             }
             if timed_out(started.elapsed(), deadline) {
-                let _ = tmux.kill_session(session_name);
+                self.kill_tmux_session(tmux, attempt_spec, session_name);
                 let secs = deadline.map(|d| d.as_secs()).unwrap_or(0);
                 crate::rlog!(
                     WARNING,
@@ -2719,11 +2735,12 @@ impl SubprocessRunner {
                     attempt_spec.squad_id,
                     attempt_spec.cell_id
                 );
+                self.emit_tmux_note(attempt_spec, "tmux session killed: timed out", session_name);
                 break RunnerResult::failure(format!("timed out after {secs}s"));
             }
             if let Some(cap) = attempt_spec.maximum_budget_usd {
                 if current_usage.cost_usd > cap {
-                    let _ = tmux.kill_session(session_name);
+                    self.kill_tmux_session(tmux, attempt_spec, session_name);
                     crate::rlog!(
                         WARNING,
                         "ralphus [runner] cost ${:.4} exceeded maximum_budget_usd cap ${cap:.4}, killing squad={} cell={}",
@@ -2743,7 +2760,7 @@ impl SubprocessRunner {
             // independent of (and checked alongside) `timeout_sec`/`deadline`
             // above, which stays exactly as it was for `timeout_minutes`.
             if let Some(reason) = self.maximum_timeout_exceeded(attempt_spec, started.elapsed()) {
-                let _ = tmux.kill_session(session_name);
+                self.kill_tmux_session(tmux, attempt_spec, session_name);
                 crate::rlog!(
                     WARNING,
                     "ralphus [runner] {reason}, killing squad={} cell={}",
@@ -2806,7 +2823,7 @@ impl SubprocessRunner {
                     stall_detector.as_mut(),
                 );
                 if let Some(sample) = stall_sample {
-                    let _ = tmux.kill_session(session_name);
+                    self.kill_tmux_session(tmux, attempt_spec, session_name);
                     crate::rlog!(
                         WARNING,
                         "ralphus [runner] thinking-repetition stall detected ({} consecutive low-diversity samples over {}ms), killing squad={} cell={} last_line={:?}",
@@ -3002,7 +3019,7 @@ impl SubprocessRunner {
             resumable_agent_session_id,
             &mut current_usage,
         );
-        let _ = tmux.kill_session(session_name);
+        self.kill_tmux_session(tmux, attempt_spec, session_name);
         let _ = std::fs::remove_file(spec_path);
         let _ = std::fs::remove_file(result_path);
         self.emit_tmux_note(attempt_spec, "tmux session ended", session_name);
@@ -3066,6 +3083,37 @@ impl SubprocessRunner {
         }
 
         (result, session_died_unexpectedly)
+    }
+
+    /// Kill this attempt's tmux session, logging a WARNING when the kill
+    /// fails -- a session that survives keeps its agent process (and its
+    /// tmux server) alive with nothing supervising it.
+    fn kill_tmux_session(&self, tmux: &Tmux, spec: &RunnerSpec, session_name: &str) {
+        let Err(e) = tmux.kill_session(session_name) else {
+            return;
+        };
+        if let Some(store) = &self.cartographer {
+            let guard = store.lock();
+            crate::cartographer::Note::new("runner")
+                .level(crate::logging::LogLevel::WARNING)
+                .squad(&spec.squad_id)
+                .cell(&spec.cell_id)
+                .task(&spec.task)
+                .scope("tmux")
+                .emit(
+                    &guard,
+                    format!("could not kill tmux session {session_name}: {e}"),
+                    serde_json::json!({"session_name": session_name, "error": e.to_string()}),
+                );
+        } else {
+            // ralphus[ignore-rlog-pair]: runner built without a cartographer store has nowhere to write a row
+            crate::rlog!(
+                WARNING,
+                "ralphus [runner] could not kill tmux session {session_name} squad={} cell={}: {e}",
+                spec.squad_id,
+                spec.cell_id
+            );
+        }
     }
 
     /// Emit a tmux session-lifecycle Cartographer note. Per RAL-102, only
@@ -3286,6 +3334,25 @@ impl SubprocessRunner {
                         "stall_secs": threshold_ms / 1000,
                     }),
                 );
+        } else {
+            crate::cartographer::Note::new("runner")
+                .level(crate::logging::LogLevel::WARNING)
+                .squad(&spec.squad_id)
+                .cell(&spec.cell_id)
+                .task(&spec.task)
+                .scope("mailbox")
+                .emit(
+                    &guard,
+                    format!(
+                        "session {session_name} stalled for over {}s; could not enqueue its \
+                         mailbox message",
+                        threshold_ms / 1000
+                    ),
+                    serde_json::json!({
+                        "session_name": session_name,
+                        "stall_secs": threshold_ms / 1000,
+                    }),
+                );
         }
         guard.note_stall_escalated(session_name, last_activity_ms);
     }
@@ -3465,12 +3532,24 @@ pub(crate) fn forward_runner_event(
         .get("agent_session_id")
         .and_then(|v| v.as_str())
     {
-        let _ = guard.set_cell_agent_session_id_live(
+        if let Err(e) = guard.set_cell_agent_session_id_live(
             event.squad_id.as_deref().unwrap_or(squad_id),
             event.task.as_deref().unwrap_or(task),
             event.cell_id.as_deref().unwrap_or(cell_id),
             sid,
-        );
+        ) {
+            crate::cartographer::Note::new("runner")
+                .level(crate::logging::LogLevel::WARNING)
+                .squad(event.squad_id.as_deref().unwrap_or(squad_id))
+                .cell(event.cell_id.as_deref().unwrap_or(cell_id))
+                .task(event.task.as_deref().unwrap_or(task))
+                .scope("cell")
+                .emit(
+                    &guard,
+                    format!("could not persist live agent session id: {e}"),
+                    serde_json::json!({ "error": e.to_string() }),
+                );
+        }
         captured_agent_session_id = Some(sid.to_string());
     }
     if let Some(cost_usd) = event
@@ -3517,12 +3596,20 @@ pub(crate) fn forward_runner_event(
             cache_read_tokens,
             cost_usd,
         };
-        let _ = guard.set_cell_live_usage(
+        if let Err(e) = guard.set_cell_live_usage(
             event.squad_id.as_deref().unwrap_or(squad_id),
             event.task.as_deref().unwrap_or(task),
             event.cell_id.as_deref().unwrap_or(cell_id),
             usage,
-        );
+        ) {
+            // ralphus[ignore-rlog-pair]: fires per usage event, so a row would flood Cartographer and the board's event stream
+            crate::rlog!(
+                DEBUG,
+                "ralphus [runner] could not persist live usage snapshot squad={} cell={}: {e}",
+                event.squad_id.as_deref().unwrap_or(squad_id),
+                event.cell_id.as_deref().unwrap_or(cell_id)
+            );
+        }
         live_usage = Some(usage);
     }
     // RAL-550: a pushed worktree change only marks the cell's diff dirty (in

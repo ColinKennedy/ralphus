@@ -2519,7 +2519,29 @@ impl ForgeClient {
                 evict_cli_token(self.kind, host);
             }
         }
-        describe_error(e)
+        let error = describe_error(e);
+        // Auth rejections and rate limits are logged here, at the one point
+        // every forge call's error passes through, so they are visible even
+        // where a caller downgrades the failure to a fallback. Only the
+        // status and Retry-After are logged -- never request headers.
+        if let Some(status @ (401 | 403 | 429)) = error.status {
+            // ralphus[ignore-rlog-pair]: forge HTTP boundary has no Store; callers record the structured workflow outcome
+            crate::rlog!(
+                WARNING,
+                "ralphus [forge] api {} kind={} repo={} status={status} retry_after={}",
+                if status == 401 {
+                    "auth rejected"
+                } else {
+                    "forbidden or rate limited"
+                },
+                self.kind.as_str(),
+                self.repo_path,
+                error
+                    .retry_after
+                    .map_or_else(|| "-".to_string(), |d| format!("{}s", d.as_secs()))
+            );
+        }
+        error
     }
 }
 
@@ -2641,8 +2663,25 @@ pub fn verify_forge_token(kind: ForgeKind, api_base: &str, token: &str) -> Token
     };
     match req.timeout(Duration::from_secs(10)).call() {
         Ok(_) => TokenVerifyOutcome::Valid,
-        Err(ureq::Error::Status(401 | 403, _)) => TokenVerifyOutcome::Invalid,
-        Err(_) => TokenVerifyOutcome::Unreachable,
+        Err(ureq::Error::Status(code @ (401 | 403), _)) => {
+            // ralphus[ignore-rlog-pair]: forge HTTP boundary has no Store; the token-settings caller records the outcome
+            crate::rlog!(
+                WARNING,
+                "ralphus [forge] token verification rejected kind={} api_base={api_base} status={code}",
+                kind.as_str()
+            );
+            TokenVerifyOutcome::Invalid
+        }
+        Err(e) => {
+            // ralphus[ignore-rlog-pair]: forge HTTP boundary has no Store; the token-settings caller records the outcome
+            crate::rlog!(
+                WARNING,
+                "ralphus [forge] token verification inconclusive kind={} api_base={api_base}: {}",
+                kind.as_str(),
+                describe_error(e)
+            );
+            TokenVerifyOutcome::Unreachable
+        }
     }
 }
 
@@ -3633,16 +3672,21 @@ impl ForgeClient {
 
     fn lookup_fork_network_github(&self) -> NetworkLookup {
         let Ok(token) = self.require_token() else {
+            log_fork_lookup_no_token(self);
             return NetworkLookup::NotVisible;
         };
         let url = format!("{}/repos/{}", self.api_base, self.repo_path);
-        let Ok(resp) = self.get(
+        let resp = match self.get(
             http_agent()
                 .get(&url)
                 .set("Authorization", &format!("Bearer {token}"))
                 .set("Accept", "application/vnd.github+json"),
-        ) else {
-            return NetworkLookup::NotVisible;
+        ) {
+            Ok(resp) => resp,
+            Err(e) => {
+                log_fork_lookup_failed(self, &self.repo_path, &e);
+                return NetworkLookup::NotVisible;
+            }
         };
         let Some(label) = resp["full_name"].as_str() else {
             return NetworkLookup::NotVisible;
@@ -3669,6 +3713,7 @@ impl ForgeClient {
 
     fn lookup_fork_network_gitlab(&self) -> NetworkLookup {
         let Ok(token) = self.require_token() else {
+            log_fork_lookup_no_token(self);
             return NetworkLookup::NotVisible;
         };
         let Some(mut resp) = self.get_gitlab_project(token, &self.repo_path) else {
@@ -3705,9 +3750,37 @@ impl ForgeClient {
 
     fn get_gitlab_project(&self, token: &str, path_or_id: &str) -> Option<serde_json::Value> {
         let url = format!("{}/projects/{path_or_id}", self.api_base);
-        self.get(http_agent().get(&url).set("PRIVATE-TOKEN", token))
-            .ok()
+        match self.get(http_agent().get(&url).set("PRIVATE-TOKEN", token)) {
+            Ok(resp) => Some(resp),
+            Err(e) => {
+                log_fork_lookup_failed(self, path_or_id, &e);
+                None
+            }
+        }
     }
+}
+
+/// A fork-network lookup with no token reads as "not visible", which callers
+/// must not mistake for "unrelated"; logged so that cause is diagnosable.
+fn log_fork_lookup_no_token(client: &ForgeClient) {
+    // ralphus[ignore-rlog-pair]: forge HTTP boundary has no Store; fork preflight/health callers record the structured verdict
+    crate::rlog!(
+        DEBUG,
+        "ralphus [forge] fork network lookup skipped: no token kind={} repo={}",
+        client.kind.as_str(),
+        client.repo_path
+    );
+}
+
+/// A failed fork-network API call is downgraded to `NotVisible` by its
+/// caller; this keeps the underlying forge error from vanishing.
+fn log_fork_lookup_failed(client: &ForgeClient, target: &str, error: &str) {
+    // ralphus[ignore-rlog-pair]: forge HTTP boundary has no Store; fork preflight/health callers record the structured verdict
+    crate::rlog!(
+        WARNING,
+        "ralphus [forge] fork network lookup failed kind={} repo={target}: {error}",
+        client.kind.as_str()
+    );
 }
 
 /// Steps 3-4 of [`resolve_remote_name`] on their own: the branch-independent
