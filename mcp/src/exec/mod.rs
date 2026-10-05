@@ -18,7 +18,6 @@ mod agent;
 mod cell;
 mod machine;
 mod mailbox;
-mod preset;
 mod project;
 mod proof;
 mod prophecy;
@@ -123,7 +122,6 @@ pub fn execute(cmd: Command, client: &DaemonClient) -> ExecResult {
         Command::User(c) => user::execute(c, client),
         Command::Waypoint(c) => waypoint::execute(c, client),
         Command::Internal(_) => Err(usage("internal is excluded from the MCP tool surface")),
-        Command::Preset(c) => preset::execute(c, client),
         Command::UsageError(m) => Err(usage(m)),
     }
 }

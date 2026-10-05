@@ -46,7 +46,6 @@ pub mod perf_timing;
 pub mod plan;
 pub mod poller_health;
 pub mod pr;
-pub mod presets;
 pub mod procreg;
 pub mod project_forks;
 pub mod proof;

@@ -5,11 +5,6 @@
       let machineBuiltins = [];
       /** Message from the last failed register/remove, shown inline above the table. */
       let machineError = "";
-      // ---- Presets tab (RAL-…) ----
-      /** @type {PresetView[]} registered presets */
-      let presets = [];
-      /** Message from the last failed register/remove, shown inline above the table. */
-      let presetsError = "";
       // ---- Triage tab (RAL-318) ----
       /** @type {TriageTypeView[]} registered Triage types */
       let triageTypes = [];
@@ -214,7 +209,7 @@
       // must not misfire just because the very first fetch hasn't landed.
       let whoAmIResolved = false;
       /** Tab names only ever shown to an admin (client-side hide -- the daemon enforces this server-side too). */
-      const ADMIN_ONLY_TABS = ["machines", "triage", "presets", "projects", "users", "secrets", "worktree-retirement", "health", "agents"];
+      const ADMIN_ONLY_TABS = ["machines", "triage", "projects", "users", "secrets", "worktree-retirement", "health", "agents"];
       // RAL-332 "Edit Profile": the target user name an admin is viewing
       // RAL-329's Preferences page as, or null for "viewing your own". Set by
       // `editUserProfile`, cleared the moment the admin navigates off the

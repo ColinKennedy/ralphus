@@ -26,7 +26,6 @@ pub mod machine;
 pub mod mailbox;
 pub mod mcp;
 pub mod misc;
-pub mod preset;
 pub mod project;
 pub mod proof;
 pub mod prophecy;
@@ -257,7 +256,6 @@ pub enum Command {
     User(user::UserCommand),
     Waypoint(waypoint::WaypointCommand),
     Internal(internal::InternalCommand),
-    Preset(preset::PresetCommand),
     UsageError(String),
 }
 
@@ -374,7 +372,6 @@ pub fn parse_args(args: &[String]) -> Command {
         Some("user") => Command::User(user::parse(&scanner.remaining())),
         Some("waypoint") => Command::Waypoint(waypoint::parse(&scanner.remaining())),
         Some("internal") => Command::Internal(internal::parse(&scanner.remaining())),
-        Some("preset") => Command::Preset(preset::parse(&scanner.remaining())),
         Some(other) => Command::UsageError(format!("unknown command: {other}")),
     }
 }
@@ -592,7 +589,6 @@ pub fn dispatch(cmd: Command, opts: &GlobalOpts) -> i32 {
         Command::User(c) => user::dispatch(c, opts),
         Command::Waypoint(c) => waypoint::dispatch(c, opts),
         Command::Internal(c) => internal::dispatch(c, opts),
-        Command::Preset(c) => preset::dispatch(c, opts),
     }
 }
 

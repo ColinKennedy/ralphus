@@ -40,7 +40,6 @@ validation time — a typo fails fast at submit, before the daemon sees it.
 | `<<squad:<id>>>` | `[[waypoint]].roster` | an existing squad's id already known to the daemon (RAL-400) |
 | `<<ralphus:new-squad>>` | `[[waypoint]].roster` | the squad this same submission itself creates — no `<key>`, since one submission file always produces exactly one squad (RAL-400) |
 | `<<ralphus:linked-field/<path>>>` | `environment` value (task, cell, proof step, or `[[default]]`) | the field `<path>` addresses relative to where this value is declared — `cwd`/`id`, or a same-table sibling `environment.<key>` (RAL-460) |
-| `<<ralphus:presets/<name>>>` | `extends` (an array, on `[[task]]`, `[[task.cell]]`, or any `[[*.proof]]` block) | stamps a registered **preset**'s field values into any of that entity's own fields still unset |
 
 Rules and risks:
 
@@ -224,36 +223,6 @@ or `..`; the last segment names the target field.
   runtime resolution error there instead, the same way an unresolvable
   placeholder anywhere else does. A task's own `environment` (inherited by
   every cell under that task) is validated the same leniently.
-
-### `extends` and preset sentinels (task, cell, proof)
-
-`extends` is an array of `<<ralphus:presets/<name>>>` sentinels, valid on
-`[[task]]`, `[[task.cell]]`, and any `[[*.proof]]` block. Each named preset
-is a daemon-registered bundle of field defaults (manage them via `ralphus
-preset register/list/get/deregister`, the CLI's MCP tool equivalents, or the
-board's Presets tab); at submit time the daemon stamps each preset's field
-values into any of the *same entity's own* fields still unset:
-
-- **A field the entity already set explicitly is never overridden** — a
-  preset only ever fills a field that is unset.
-- **When more than one named preset in one `extends` list defines the same
-  field, the last one listed wins.**
-- **Only 5 fields are preset-eligible**: `system_prompt`,
-  `system_prompt_position` (cell-only), `maximum_context`,
-  `auto_compact_threshold` (task/cell only, not a proof step), and
-  `maximum_tool_output_tokens` (task/cell/proof). A preset field that
-  doesn't apply to the entity kind it's referenced from is **silently
-  skipped**, not an error — e.g. a task-level `extends` naming a preset that
-  sets `system_prompt` simply has nothing to stamp there.
-- **A task-level fill cascades to its cells** exactly like any other
-  task-level value, through the existing task→cell inheritance — there is no
-  separate mechanism for that.
-- Like the worktree placeholder, a bare (unwrapped) preset name is a
-  validation error; only the wrapped `<<...>>` form is accepted, and an
-  `extends` entry naming an unregistered preset fails at submit time.
-- Once stamped, the resulting value is indistinguishable from one the author
-  typed directly — presets carry no provenance and are never re-applied on a
-  restart.
 
 ### `restart_on` grammar (proof steps)
 
