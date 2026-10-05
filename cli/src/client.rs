@@ -774,6 +774,15 @@ impl DaemonClient {
         self.get(&format!("/api/machines/{scheme}"))
     }
 
+    /// `POST /api/daemon/shutdown`: stop this daemon, cancelling in-flight
+    /// work first when `auto_cancel` is set.
+    pub fn shutdown_daemon(&self, auto_cancel: bool) -> Result<Value, DaemonError> {
+        self.post(
+            "/api/daemon/shutdown",
+            Some(json!({ "auto_cancel": auto_cancel })),
+        )
+    }
+
     pub fn check_machine(&self, scheme: &str) -> Result<Value, DaemonError> {
         self.post(&format!("/api/machines/{scheme}/check"), None)
     }

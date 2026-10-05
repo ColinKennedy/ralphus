@@ -2099,8 +2099,79 @@ fn provision_remote_with_targets(
         let workspace = crate::workspace::Workspace::on(workspace_root.as_str(), Some(machine))
             .with_store(std::sync::Arc::clone(store));
         sync_commit_metadata_hook_best_effort(&workspace, Path::new(&project.path));
+        if project.vcs == "git" {
+            if let Err(e) = pin_remote_upstream_and_baseline(&workspace, branch, upstream) {
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [worktrees] squad {squad_id} could not pin upstream for remote branch '{branch}' on {machine}: {e}"
+                );
+                crate::cartographer::Note::new("worktrees")
+                    .level(crate::logging::LogLevel::WARNING)
+                    .scope("cell")
+                    .squad(squad_id)
+                    .cell(&cell.cell_id)
+                    .emit(
+                        &store.lock(),
+                        "machine provision upstream pin failed",
+                        serde_json::json!({
+                            "machine": machine,
+                            "branch": branch,
+                            "upstream": upstream,
+                            "error": e,
+                        }),
+                    );
+            }
+        }
     }
     result
+}
+
+/// The remote counterpart of [`set_explicit_upstream`] +
+/// [`freeze_commit_baseline`]: point `branch`'s `@{upstream}` at the resolved
+/// `upstream` inside a provisioned remote workspace, then freeze
+/// `ralphus.<branch>.baseline` to that commit.
+///
+/// The no-new-commits guard (`crate::scheduler::check_task_no_commits_guard`)
+/// reads exactly these two keys through [`crate::workspace::Workspace::git`].
+/// Without them a remote branch's comparison point is whatever the provider or
+/// the cell's own `git push -u` happened to leave behind, so a task that
+/// committed and pushed its work reads as "no commits since baseline".
+fn pin_remote_upstream_and_baseline(
+    workspace: &crate::workspace::Workspace,
+    branch: &str,
+    upstream: &str,
+) -> Result<(), String> {
+    let upstream = upstream.trim();
+    let candidates = [
+        upstream.to_string(),
+        format!("refs/remotes/origin/{upstream}"),
+        format!("refs/remotes/{upstream}"),
+        format!("refs/heads/{upstream}"),
+    ];
+    let qualified = candidates
+        .iter()
+        .filter(|c| c.starts_with("refs/"))
+        .find(|c| {
+            workspace
+                .git(&["rev-parse", "--verify", "--quiet", c])
+                .is_ok()
+        })
+        .cloned()
+        .ok_or_else(|| format!("upstream \"{upstream}\" resolves to no ref in the workspace"))?;
+    let (remote, merge) = match qualified.strip_prefix("refs/remotes/") {
+        Some(remote_ref) => {
+            let (remote, remote_branch) = remote_ref
+                .split_once('/')
+                .ok_or_else(|| format!("malformed remote-tracking ref \"{remote_ref}\""))?;
+            (remote.to_string(), format!("refs/heads/{remote_branch}"))
+        }
+        None => (".".to_string(), qualified.clone()),
+    };
+    workspace.git(&["config", &format!("branch.{branch}.remote"), &remote])?;
+    workspace.git(&["config", &format!("branch.{branch}.merge"), &merge])?;
+    let sha = workspace.git(&["rev-parse", "--verify", &qualified])?;
+    workspace.git(&["config", &format!("ralphus.{branch}.baseline"), sha.trim()])?;
+    Ok(())
 }
 
 /// Resolve every placeholder `cwd` (`ralphus:new-worktree/<branch>`) among
@@ -2794,6 +2865,53 @@ mod tests {
         repo.set_head(&format!("refs/heads/{branch}")).unwrap();
         repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
             .unwrap();
+    }
+
+    #[test]
+    fn pinning_a_provisioned_branch_survives_its_own_push() {
+        // A remote cell commits and runs `git push -u origin HEAD`, which
+        // re-points `@{upstream}` at its own just-pushed branch. The
+        // no-commits guard must still see that commit as new work, which it
+        // does only because provisioning froze the baseline at the base.
+        let base = tmp_dir("pin-remote-upstream");
+        let origin = base.join("origin.git");
+        g(&base, &["init", "-q", "--bare", "-b", "main", "origin.git"]);
+        let clone = base.join("clone");
+        g(&base, &["clone", "-q", origin.to_str().unwrap(), "clone"]);
+        std::fs::write(clone.join("base.txt"), "base\n").unwrap();
+        g(&clone, &["add", "."]);
+        g(&clone, &["commit", "-q", "-m", "base"]);
+        g(&clone, &["push", "-q", "origin", "HEAD:main"]);
+        g(&clone, &["fetch", "-q", "origin"]);
+        g(&clone, &["checkout", "-q", "-b", "work", "origin/main"]);
+
+        let ws = crate::workspace::Workspace::local(&clone);
+        pin_remote_upstream_and_baseline(&ws, "work", "main").unwrap();
+        assert_eq!(
+            ws.git(&["config", "branch.work.merge"]).unwrap().trim(),
+            "refs/heads/main"
+        );
+        assert!(!crate::reviews::any_workspace_ahead_of_upstream(
+            std::slice::from_ref(&ws)
+        ));
+
+        std::fs::write(clone.join("work.txt"), "work\n").unwrap();
+        g(&clone, &["add", "."]);
+        g(&clone, &["commit", "-q", "-m", "work"]);
+        g(&clone, &["push", "-q", "-u", "origin", "HEAD"]);
+        assert!(
+            crate::reviews::any_workspace_ahead_of_upstream(std::slice::from_ref(&ws)),
+            "a pushed commit must still count as new work"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn pinning_an_unknown_upstream_is_an_error() {
+        let repo = init_repo("pin-remote-unknown");
+        let ws = crate::workspace::Workspace::local(&repo);
+        assert!(pin_remote_upstream_and_baseline(&ws, "main", "nope").is_err());
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     /// A fresh repo with one commit on `main`.

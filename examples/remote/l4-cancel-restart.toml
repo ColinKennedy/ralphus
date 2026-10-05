@@ -1,0 +1,16 @@
+# L4: lifecycle controls against a remote cell.
+# "slow" sleeps long enough to exercise, while it runs on the machine:
+#   ralphus squad cancel <squad>          -> provider `cancel` kills the remote tree
+#   ralphus cell restart <squad>/slow/0   -> re-dispatched to the same machine,
+#                                            reusing its provisioned worktree
+#   ralphus machine cleanup loopback:lb --project fx2 --branch <branch>
+[[task]]
+name = "slow"
+project = "fx2"
+machine = "loopback:lb"
+no_commit_required = true
+
+[[task.cell]]
+cwd = "<<ralphus:new-worktree/l4-slow?upstream=<<default>>>>"
+mode = "raw"
+command = "python -c \"import time,os;open('started.txt','w').write(str(os.getpid()));time.sleep(120)\""

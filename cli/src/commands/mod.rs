@@ -231,19 +231,19 @@ pub enum Command {
     },
     /// Set up an isolated daemon and submit a waypoint exercise suite.
     InitializeWaypoint {
-        state_dir: Option<String>,
+        options: initialize_exercise::ExerciseOptions,
     },
     InitializeMailbox {
-        state_dir: Option<String>,
+        options: initialize_exercise::ExerciseOptions,
     },
     InitializeMachine {
-        state_dir: Option<String>,
+        options: initialize_exercise::ExerciseOptions,
     },
     InitializeTriage {
-        state_dir: Option<String>,
+        options: initialize_exercise::ExerciseOptions,
     },
     InitializeReview {
-        state_dir: Option<String>,
+        options: initialize_exercise::ExerciseOptions,
     },
     Project(project::ProjectCommand),
     Machine(machine::MachineCommand),
@@ -336,25 +336,18 @@ pub fn parse_args(args: &[String]) -> Command {
                         Err(error) => Command::UsageError(error.0),
                     }
                 }
-                Some("waypoint") => {
-                    let mut inner = Scanner::new(&tail[1..]);
-                    let state_dir = inner.take_value("--state-dir").ok().flatten();
-                    Command::InitializeWaypoint { state_dir }
-                }
-                Some("mailbox") => {
-                    let mut inner = Scanner::new(&tail[1..]);
-                    Command::InitializeMailbox {
-                        state_dir: inner.take_value("--state-dir").ok().flatten(),
+                Some(kind @ ("waypoint" | "mailbox" | "machine" | "triage" | "review")) => {
+                    match parse_exercise_options(kind, &tail[1..]) {
+                        Ok(options) => match kind {
+                            "waypoint" => Command::InitializeWaypoint { options },
+                            "mailbox" => Command::InitializeMailbox { options },
+                            "machine" => Command::InitializeMachine { options },
+                            "triage" => Command::InitializeTriage { options },
+                            _ => Command::InitializeReview { options },
+                        },
+                        Err(error) => Command::UsageError(error),
                     }
                 }
-                Some("machine") => {
-                    let mut inner = Scanner::new(&tail[1..]);
-                    Command::InitializeMachine {
-                        state_dir: inner.take_value("--state-dir").ok().flatten(),
-                    }
-                }
-                Some("triage") => { let mut inner = Scanner::new(&tail[1..]); Command::InitializeTriage { state_dir: inner.take_value("--state-dir").ok().flatten() } }
-                Some("review") => { let mut inner = Scanner::new(&tail[1..]); Command::InitializeReview { state_dir: inner.take_value("--state-dir").ok().flatten() } }
                 _ => Command::UsageError(
                     "initialize: expected 'git', 'server', 'waypoint', 'mailbox', 'machine', 'triage', or 'review' subcommand"
                         .to_string(),
@@ -438,6 +431,30 @@ fn parse_project_fork_url(scanner: &mut Scanner) -> Result<Option<String>, Usage
                 )
             }).map(Some)
         })
+}
+
+/// The flags every guided exercise (`initialize waypoint|mailbox|machine|
+/// triage|review`) takes. An unrecognized argument is an error, so a typo such
+/// as `--remot` cannot silently run the local variant instead.
+fn parse_exercise_options(
+    kind: &str,
+    args: &[String],
+) -> Result<initialize_exercise::ExerciseOptions, String> {
+    let mut inner = Scanner::new(args);
+    let state_dir = inner
+        .take_value("--state-dir")
+        .map_err(|e| format!("initialize {kind}: {}", e.0))?;
+    let remote = inner.take_bool("--remote");
+    let stop = inner.take_bool("--stop");
+    let rest = inner.remaining();
+    if let Some(extra) = rest.first() {
+        return Err(format!("initialize {kind}: unexpected argument {extra:?}"));
+    }
+    Ok(initialize_exercise::ExerciseOptions {
+        state_dir,
+        remote,
+        stop,
+    })
 }
 
 fn parse_initialize_server(
@@ -546,20 +563,20 @@ pub fn dispatch(cmd: Command, opts: &GlobalOpts) -> i32 {
         Command::Mcp(c) => mcp::dispatch(c),
         Command::InitializeGit { path } => misc::cmd_initialize_git(path),
         Command::InitializeServer { setup } => initialize_server::dispatch(opts, *setup),
-        Command::InitializeWaypoint { state_dir } => {
-            initialize_exercise::run_logged("waypoint", || initialize_waypoint::dispatch(state_dir))
+        Command::InitializeWaypoint { options } => {
+            initialize_exercise::run_logged("waypoint", || initialize_waypoint::dispatch(&options))
         }
-        Command::InitializeMailbox { state_dir } => {
-            initialize_exercise::run_logged("mailbox", || initialize_mailbox::dispatch(state_dir))
+        Command::InitializeMailbox { options } => {
+            initialize_exercise::run_logged("mailbox", || initialize_mailbox::dispatch(&options))
         }
-        Command::InitializeMachine { state_dir } => {
-            initialize_exercise::run_logged("machine", || initialize_machine::dispatch(state_dir))
+        Command::InitializeMachine { options } => {
+            initialize_exercise::run_logged("machine", || initialize_machine::dispatch(&options))
         }
-        Command::InitializeTriage { state_dir } => {
-            initialize_exercise::run_logged("triage", || initialize_triage::dispatch(state_dir))
+        Command::InitializeTriage { options } => {
+            initialize_exercise::run_logged("triage", || initialize_triage::dispatch(&options))
         }
-        Command::InitializeReview { state_dir } => {
-            initialize_exercise::run_logged("review", || initialize_review::dispatch(state_dir))
+        Command::InitializeReview { options } => {
+            initialize_exercise::run_logged("review", || initialize_review::dispatch(&options))
         }
         Command::Project(c) => project::dispatch(c, opts),
         Command::Machine(c) => machine::dispatch(c, opts),

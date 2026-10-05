@@ -146,6 +146,49 @@ jobs:
         shell: cmd
         run: scripts\build-release.cmd
 
+  # Every guided `ralphus initialize <exercise>` run live against its own
+  # throwaway daemon, both on the daemon's host and fully remote (--remote:
+  # every cell and review on the loopback machine provider in strict mode,
+  # which refuses any path that is not on "the machine"). These are the
+  # documented first-run checks, so a change that breaks one is caught here
+  # rather than by a new user. Ubuntu runs both variants; Windows runs the
+  # remote variant only, because local cells need psmux, which only the
+  # psmux-integration job builds.
+  initialize-exercises:
+    name: Initialize exercises (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            modes: ""
+          - os: windows-latest
+            modes: "--remote-only"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install tmux
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y tmux
+      - name: Build the CLI, daemon, and runner
+        run: cargo build -p ralphus-cli -p ralphus-daemon -p ralphus-runner
+      - name: Run every exercise
+        shell: bash
+        run: bash scripts/check-initialize-exercises.sh ${{ matrix.modes }} --state-root "$RUNNER_TEMP/exercises"
+      - name: Upload exercise state on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: initialize-exercises-${{ matrix.os }}
+          path: ${{ runner.temp }}/exercises
+          retention-days: 7
+
   psmux-integration:
     name: Windows psmux integration
     runs-on: windows-latest

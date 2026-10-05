@@ -33,6 +33,11 @@ pub enum MachineCommand {
     Get {
         scheme: String,
     },
+    /// Ping a registered provider (`scheme`, or a full `scheme:uri`, whose
+    /// `uri` is ignored -- the provider answers for itself).
+    Check {
+        scheme: String,
+    },
     Remove {
         scheme: String,
     },
@@ -55,6 +60,16 @@ pub fn parse(args: &[String]) -> MachineCommand {
             Err(e) => MachineCommand::UsageError(e.0),
         },
         Some("get") => with_scheme(scanner, |scheme| MachineCommand::Get { scheme }, "get"),
+        Some("check") => with_scheme(
+            scanner,
+            |machine| MachineCommand::Check {
+                scheme: machine
+                    .split_once(':')
+                    .map_or(machine.as_str(), |(scheme, _)| scheme)
+                    .to_string(),
+            },
+            "check",
+        ),
         Some("remove") => with_scheme(
             scanner,
             |scheme| MachineCommand::Remove { scheme },
@@ -174,6 +189,25 @@ pub fn dispatch(cmd: MachineCommand, opts: &GlobalOpts) -> i32 {
             Ok(m) => {
                 render_machine_detail(&m);
                 0
+            }
+            Err(e) => {
+                CommandError::Daemon(e).print(false, None);
+                2
+            }
+        },
+        MachineCommand::Check { scheme } => match client.check_machine(&scheme) {
+            Ok(payload) => {
+                let detail = payload["detail"]
+                    .as_str()
+                    .or_else(|| payload["note"].as_str())
+                    .unwrap_or_default();
+                if payload["ok"] == true {
+                    println!("machine provider \"{scheme}\" is reachable: {detail}");
+                    0
+                } else {
+                    println!("machine provider \"{scheme}\" did not answer: {detail}");
+                    1
+                }
             }
             Err(e) => {
                 CommandError::Daemon(e).print(false, None);

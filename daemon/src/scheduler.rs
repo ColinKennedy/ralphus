@@ -4944,11 +4944,26 @@ fn start_reviews(
 /// then compared against the guardian's stored `git_root`. This correctly
 /// handles linked worktrees, which are siblings of the main repo rather than
 /// subdirectories of it.
-fn guardian_blocking_tasks(cells: &[crate::store::CellRow], git_root: &str) -> HashSet<i64> {
+///
+/// A cell on a remote machine is the exception: its cwd is a path on that
+/// machine, which the daemon's own filesystem cannot answer for. A remote
+/// review's `git_root` is its task's registered project path (see
+/// `reviews::remote_derivation`), so such a cell is attributed through
+/// `remote_task_roots` (task index → registered project path) instead.
+fn guardian_blocking_tasks(
+    cells: &[crate::store::CellRow],
+    git_root: &str,
+    remote_task_roots: &HashMap<i64, String>,
+) -> HashSet<i64> {
     let root_path = Path::new(git_root);
     cells
         .iter()
         .filter(|s| {
+            if is_remote_machine(s.machine.as_deref()) {
+                return remote_task_roots
+                    .get(&s.task_idx)
+                    .is_some_and(|root| Path::new(root) == root_path);
+            }
             s.cwd.as_deref().is_some_and(|c| {
                 crate::reviews::project_root_of(c)
                     .as_deref()
@@ -4957,6 +4972,44 @@ fn guardian_blocking_tasks(cells: &[crate::store::CellRow], git_root: &str) -> H
             })
         })
         .map(|s| s.task_idx)
+        .collect()
+}
+
+/// Whether `machine` names a provider-backed machine rather than the daemon's
+/// own host (unset, empty, or the reserved `local`).
+fn is_remote_machine(machine: Option<&str>) -> bool {
+    machine.map(str::trim).is_some_and(|m| {
+        !m.is_empty() && !m.eq_ignore_ascii_case(ralphus_core::schema::LOCAL_MACHINE)
+    })
+}
+
+/// Task index → registered project path for every task in `squad_id` that has
+/// a cell on a remote machine. See [`guardian_blocking_tasks`].
+fn remote_task_project_roots(
+    store: &crate::store::Store,
+    squad_id: &str,
+    cells: &[crate::store::CellRow],
+) -> HashMap<i64, String> {
+    let remote_tasks: HashSet<i64> = cells
+        .iter()
+        .filter(|c| is_remote_machine(c.machine.as_deref()))
+        .map(|c| c.task_idx)
+        .collect();
+    if remote_tasks.is_empty() {
+        return HashMap::new();
+    }
+    store
+        .tasks_of(squad_id)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|t| remote_tasks.contains(&t.idx))
+        .filter_map(|t| {
+            let project = store
+                .resolve_project(t.project.as_deref()?)
+                .ok()
+                .flatten()?;
+            Some((t.idx, project.path))
+        })
         .collect()
 }
 
@@ -5013,6 +5066,7 @@ pub(crate) fn try_start_ready_reviews_for_task(
     if guardian_ids.is_empty() {
         return;
     }
+    let remote_task_roots = remote_task_project_roots(&store.lock(), squad_id, cells);
     let mut ready = Vec::new();
     for gid in &guardian_ids {
         let git_root = {
@@ -5022,7 +5076,7 @@ pub(crate) fn try_start_ready_reviews_for_task(
                 Err(_) => continue,
             }
         };
-        let blocking = guardian_blocking_tasks(cells, &git_root);
+        let blocking = guardian_blocking_tasks(cells, &git_root, &remote_task_roots);
         // Only proceed when the just-completed task is one of the blockers; skip
         // guardians that are unrelated to this task.
         if blocking.is_empty() || !blocking.contains(&completed_task_idx) {
@@ -10419,8 +10473,27 @@ mod tests {
         // A cell without a cwd cannot be in any git project, so it must
         // never count as a blocker regardless of the guardian's git_root.
         let row = make_cell_row_no_cwd(0);
-        let blocking = guardian_blocking_tasks(&[row], "/any/project");
+        let blocking = guardian_blocking_tasks(&[row], "/any/project", &HashMap::new());
         assert!(blocking.is_empty(), "cell with no cwd should not block");
+    }
+
+    #[test]
+    fn guardian_blocking_tasks_attributes_a_remote_cell_by_its_task_project() {
+        // A remote cell's cwd is a path on the machine; probing it on the
+        // daemon host says nothing about which review it feeds. It must be
+        // attributed through its task's registered project path instead, or
+        // a review fed only by remote cells never starts merging.
+        let mut row = make_cell_row_no_cwd(3);
+        row.cwd = Some("/srv/remote-root/projects/fx-abc/worktrees/a-123".to_string());
+        row.machine = Some("loopback:lb".to_string());
+        let roots = HashMap::from([(3, "/home/me/fx".to_string())]);
+        let blocking = guardian_blocking_tasks(std::slice::from_ref(&row), "/home/me/fx", &roots);
+        assert_eq!(blocking, HashSet::from([3]));
+        let other = guardian_blocking_tasks(&[row], "/home/me/other", &roots);
+        assert!(
+            other.is_empty(),
+            "a remote cell of another project must not block"
+        );
     }
 
     // Sentinel-string parsing itself is covered by

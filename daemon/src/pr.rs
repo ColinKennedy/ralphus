@@ -5042,9 +5042,9 @@ pub fn poll_forge_reorders(
         let sem = Arc::clone(sem);
         let cancellations = cancellations.clone();
         std::thread::spawn(move || {
-            let runner: Arc<dyn Runner> = Arc::new(
-                crate::runner::SubprocessRunner::from_env().with_cartographer(Arc::clone(&store)),
-            );
+            let runner: Arc<dyn Runner> = Arc::new(crate::remote_runner::MachineRouter::from_env(
+                Arc::clone(&store),
+            ));
             check_and_apply_forge_reorder(&store, runner.as_ref(), &id, &sem, &cancellations);
         });
     }
@@ -8389,7 +8389,7 @@ pub fn sweep_pending_pr_auto_submits_once(store: &crate::store_lock::StoreHandle
         let store = Arc::clone(store);
         std::thread::spawn(move || {
             let _claim = claim;
-            let runner = crate::runner::SubprocessRunner::from_env();
+            let runner = crate::remote_runner::MachineRouter::from_env(Arc::clone(&store));
             run_auto_submit_pass(&store, &runner, &id);
         });
     }

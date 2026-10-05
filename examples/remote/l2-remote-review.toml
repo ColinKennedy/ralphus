@@ -1,0 +1,44 @@
+# L2: a review whose two branches and merge all live on loopback:lb.
+# - two stacked remote tasks, each pushing its own branch
+# - review merges on the machine (stacked linear rebase via `run` verb)
+# - project check gate (`python check.py`) runs on the machine
+# - prepare step runs on the machine with its own environment
+# - a command review action
+[[task]]
+name = "a"
+project = "fx"
+machine = "loopback:lb"
+
+[[task.cell]]
+cwd = "<<ralphus:new-worktree/l2-a?upstream=<<default>>>>"
+mode = "raw"
+command = "python -c \"open('a.txt','w').write('a\\n')\" && git add a.txt && git -c user.email=l@x -c user.name=l commit -q -m a && git push -q -u origin HEAD"
+review = "<<ralphus:new-review/l2>>"
+
+[[task]]
+name = "b"
+project = "fx"
+machine = "loopback:lb"
+depends_on = ["a"]
+
+[[task.cell]]
+cwd = "<<ralphus:new-worktree/l2-b?upstream=<<default>>>>"
+mode = "raw"
+command = "python -c \"open('b.txt','w').write('b\\n')\" && git add b.txt && git -c user.email=l@x -c user.name=l commit -q -m b && git push -q -u origin HEAD"
+review = "<<ralphus:new-review/l2>>"
+
+[[review]]
+id = "ralphus:new-review/l2"
+upstream = "main"
+machine = "loopback:lb"
+proof_scope = "nothing"
+skip_manual_checks = true
+
+[[review.prepare]]
+command = "python -c \"import os;open('prepared.txt','w').write(os.environ.get('PREP_ENV','<unset>'))\""
+[review.prepare.environment]
+PREP_ENV = "from-prepare"
+
+[[review.action]]
+label = "list files"
+command = "python -c \"import os;print(sorted(os.listdir('.')))\""

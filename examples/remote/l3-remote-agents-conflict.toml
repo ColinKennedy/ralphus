@@ -1,0 +1,57 @@
+# L3: remote agents + a conflicting remote review (project fx2, no check gates).
+# - an ollama prompt cell runs on loopback:lb (no commit expected)
+# - a prompt proof (ollama) runs on loopback:lb
+# - tasks x and y both rewrite line 2 of shared.txt -> rebase conflict that the
+#   review's ollama resolver must settle on the machine
+# - [[review.prepare]] runs (no check gates on fx2) with its own environment
+[[task]]
+name = "ask"
+project = "fx2"
+machine = "loopback:lb"
+no_commit_required = true
+agent = "ollama"
+model = "qwen3:8b"
+
+[[task.cell]]
+cwd = "<<ralphus:new-worktree/l3-ask?upstream=<<default>>>>"
+prompt = "List the files in the current directory using your tools, then reply with one short sentence naming them."
+
+[[task.cell.proof]]
+id = "judge"
+prompt = "The repository in the current directory should contain a file named README.md. Check, then answer."
+
+[[task]]
+name = "x"
+project = "fx2"
+machine = "loopback:lb"
+
+[[task.cell]]
+cwd = "<<ralphus:new-worktree/l3-x?upstream=<<default>>>>"
+mode = "raw"
+command = "python -c \"open('shared.txt','w').write('one\\nTWO-from-x\\nthree\\n')\" && git add shared.txt && git -c user.email=l@x -c user.name=l commit -q -m x && git push -q -u origin HEAD"
+review = "<<ralphus:new-review/l3>>"
+
+[[task]]
+name = "y"
+project = "fx2"
+machine = "loopback:lb"
+
+[[task.cell]]
+cwd = "<<ralphus:new-worktree/l3-y?upstream=<<default>>>>"
+mode = "raw"
+command = "python -c \"open('shared.txt','w').write('one\\nTWO-from-y\\nthree\\n')\" && git add shared.txt && git -c user.email=l@x -c user.name=l commit -q -m y && git push -q -u origin HEAD"
+review = "<<ralphus:new-review/l3>>"
+
+[[review]]
+id = "ralphus:new-review/l3"
+upstream = "main"
+machine = "loopback:lb"
+agent = "ollama"
+model = "qwen3:8b"
+proof_scope = "nothing"
+skip_manual_checks = true
+
+[[review.prepare]]
+command = "python -c \"import os;open('prepared.txt','w').write(os.environ.get('PREP_ENV','<unset>'))\""
+[review.prepare.environment]
+PREP_ENV = "from-prepare"

@@ -918,8 +918,8 @@ const INITIALIZE_CHILDREN: &[HelpNode] = &[
     node(
         "waypoint",
         &[],
-        &["--state-dir [path]"],
-        "Launch an isolated daemon and submit inspectable waypoint scenarios without touching normal ralphus state.",
+        &["--remote", "--state-dir [path]", "--stop"],
+        "Launch an isolated daemon and submit inspectable waypoint scenarios without touching normal ralphus state. --remote declares every scenario on a strict loopback machine; --stop shuts the daemon down afterwards.",
         false,
         false,
         &[],
@@ -928,8 +928,8 @@ const INITIALIZE_CHILDREN: &[HelpNode] = &[
     node(
         "mailbox",
         &[],
-        &["--state-dir [path]"],
-        "Launch an isolated daemon and verify cell/proof failure mailbox remediation.",
+        &["--remote", "--state-dir [path]", "--stop"],
+        "Launch an isolated daemon and verify cell/proof failure mailbox remediation. --remote runs both failures on a strict loopback machine; --stop shuts the daemon down afterwards.",
         false,
         false,
         &[],
@@ -938,8 +938,8 @@ const INITIALIZE_CHILDREN: &[HelpNode] = &[
     node(
         "machine",
         &[],
-        &["--state-dir [path]"],
-        "Launch an isolated daemon and register/ping the local loopback machine provider.",
+        &["--remote", "--state-dir [path]", "--stop"],
+        "Launch an isolated daemon, register the loopback machine provider, and run a remote cell + proof in a worktree it provisions (always remote; --remote is accepted for symmetry). --stop shuts the daemon down afterwards.",
         false,
         false,
         &[],
@@ -948,8 +948,8 @@ const INITIALIZE_CHILDREN: &[HelpNode] = &[
     node(
         "triage",
         &[],
-        &["--state-dir [path]"],
-        "Launch an isolated daemon and configure a deterministic two-cell Triage pool.",
+        &["--remote", "--state-dir [path]", "--stop"],
+        "Launch an isolated daemon and configure a deterministic two-cell Triage pool. --remote declares both candidates on a strict loopback machine; --stop shuts the daemon down afterwards.",
         false,
         false,
         &[],
@@ -958,8 +958,8 @@ const INITIALIZE_CHILDREN: &[HelpNode] = &[
     node(
         "review",
         &[],
-        &["--state-dir [path]"],
-        "Launch an isolated daemon and create a disposable two-branch Guardian review fixture.",
+        &["--remote", "--state-dir [path]", "--stop"],
+        "Launch an isolated daemon and create a disposable two-branch Guardian review fixture (held). --remote instead runs both branches and the review merge on a strict loopback machine through to in_review; --stop shuts the daemon down afterwards.",
         false,
         false,
         &[],
@@ -1059,6 +1059,15 @@ const TRIAGE_CHILDREN: &[HelpNode] = &[
 ];
 
 const MACHINE_CHILDREN: &[HelpNode] = &[
+    node(
+        "check",
+        &["machine [str]"],
+        &[],
+        "Ping a registered machine provider (by scheme, or a full scheme:uri) and report whether it answers. Side-effect free: the provider's `ping` verb does no work.",
+        false,
+        true, // ("machine", "check")
+        &[],
+    ),
     node(
         "cleanup",
         &["machine [str]"],

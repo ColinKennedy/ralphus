@@ -3,33 +3,37 @@
 //! The command owns a separate daemon process, SQLite database, token, and
 //! global configuration directory. Held examples exercise enrollment and
 //! guidance without starting agents; the completed fixture uses one raw
-//! command to prove the explicit redo path.
+//! command to prove the explicit redo path. With `--remote`, every example is
+//! declared on the strict loopback machine and the running examples execute
+//! there in provisioned worktrees.
 
-use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
 use crate::client::DaemonClient;
-use crate::commands::initialize_exercise::Exercise;
+use crate::commands::initialize_exercise::{Exercise, ExerciseOptions, Fixture, REMOTE_MACHINE};
 
-pub fn dispatch(state_dir: Option<String>) -> i32 {
-    let exercise = match Exercise::start("waypoint", state_dir) {
+pub fn dispatch(options: &ExerciseOptions) -> i32 {
+    let exercise = match Exercise::start("waypoint", options) {
         Ok(value) => value,
         Err(error) => {
             println!("error: {error}");
             return 1;
         }
     };
-    let (project, cwd_text) = match exercise.register_current_project("waypoint-exercise") {
+    let fixture = match exercise.fixture_project("waypoint") {
         Ok(value) => value,
         Err(error) => {
             println!("error: could not register the exercise project: {error}");
             return 1;
         }
     };
-    if let Err(error) = register_loopback(&exercise) {
+    // A remote exercise registered the loopback machine while starting.
+    if !exercise.remote()
+        && let Err(error) = exercise.register_loopback()
+    {
         println!("error: could not register private loopback provider: {error}");
         return 1;
     }
@@ -42,10 +46,10 @@ pub fn dispatch(state_dir: Option<String>) -> i32 {
     };
     let client = &exercise.client;
     let anchor = submit_example(
-        client,
+        &exercise,
+        &fixture,
         &examples,
         "01-anchor",
-        &cwd_text,
         "anchor work for the waypoint",
     )
     .and_then(|id| create_waypoint(client, &id).map(|waypoint| (id, waypoint)));
@@ -57,10 +61,10 @@ pub fn dispatch(state_dir: Option<String>) -> i32 {
         }
     };
     let candidate_id = match submit_example(
-        client,
+        &exercise,
+        &fixture,
         &examples,
         "02-submitted-after-waypoint",
-        &cwd_text,
         "new work that overlaps the waypoint",
     ) {
         Ok(id) => id,
@@ -69,7 +73,7 @@ pub fn dispatch(state_dir: Option<String>) -> i32 {
             return 1;
         }
     };
-    if !has_affected_entry(client, &waypoint_id, &candidate_id) {
+    if !wait_for_affected_entry(client, &waypoint_id, &candidate_id) {
         println!("error: daemon did not enroll the new overlapping submission on its waypoint");
         return 1;
     }
@@ -91,7 +95,7 @@ pub fn dispatch(state_dir: Option<String>) -> i32 {
         println!("error: could not append advisory guidance: {error}");
         return 1;
     }
-    let underway_id = match submit_underway_example(client, &examples, &project, &cwd_text) {
+    let underway_id = match submit_underway_example(&exercise, &fixture, &examples) {
         Ok(id) => id,
         Err(error) => {
             println!("error: could not submit the underway scenario: {error}");
@@ -129,7 +133,7 @@ pub fn dispatch(state_dir: Option<String>) -> i32 {
         println!("error: underway advisory guidance was not delivered to the next cell");
         return 1;
     }
-    let completed_id = match submit_completed_example(client, &examples, &project, &cwd_text) {
+    let completed_id = match submit_completed_example(&exercise, &fixture, &examples) {
         Ok(id) => id,
         Err(error) => {
             println!("error: could not submit completed redo scenario: {error}");
@@ -180,7 +184,7 @@ pub fn dispatch(state_dir: Option<String>) -> i32 {
         exercise.url
     );
     println!(
-        "The enrollment examples are held; the underway and completed examples ran only raw local loopback commands."
+        "The enrollment examples are held; the underway and completed examples ran only raw loopback commands."
     );
     println!("Activate a held enrollment scenario deliberately with:");
     println!(
@@ -193,14 +197,38 @@ pub fn dispatch(state_dir: Option<String>) -> i32 {
     0
 }
 
+/// Where a running example executes: the strict exercise machine in a fresh
+/// worktree when remote, else a named loopback machine in the fixture checkout.
+fn running_example_target(
+    exercise: &Exercise,
+    fixture: &Fixture,
+    uri: &str,
+    branch: &str,
+) -> (String, String) {
+    if exercise.remote() {
+        (
+            REMOTE_MACHINE.to_string(),
+            exercise.cell_cwd(fixture, branch),
+        )
+    } else {
+        (
+            format!("loopback:{uri}"),
+            fixture.path.to_string_lossy().into_owned(),
+        )
+    }
+}
+
 fn submit_completed_example(
-    client: &DaemonClient,
+    exercise: &Exercise,
+    fixture: &Fixture,
     directory: &std::path::Path,
-    project: &str,
-    cwd: &str,
 ) -> Result<String, String> {
+    let client = &exercise.client;
+    let project = &fixture.name;
+    let (machine, cwd) =
+        running_example_target(exercise, fixture, "waypoint-redo", "waypoint-completed");
     let toml = format!(
-        "[[task]]\nname = \"04-completed-before-waypoint\"\nproject = {project:?}\nmachine = \"loopback:waypoint-redo\"\nno_commit_required = true\n\n[[task.cell]]\ncwd = {cwd:?}\ncommand = \"cmd /c exit 0\"\nmode = \"raw\"\n"
+        "[[task]]\nname = \"04-completed-before-waypoint\"\nproject = {project:?}\nmachine = {machine:?}\nno_commit_required = true\n\n[[task.cell]]\ncwd = {cwd:?}\ncommand = \"exit 0\"\nmode = \"raw\"\n"
     );
     std::fs::write(directory.join("04-completed-before-waypoint.toml"), &toml)
         .map_err(|e| e.to_string())?;
@@ -218,13 +246,22 @@ fn submit_completed_example(
 }
 
 fn submit_underway_example(
-    client: &DaemonClient,
+    exercise: &Exercise,
+    fixture: &Fixture,
     directory: &std::path::Path,
-    project: &str,
-    cwd: &str,
 ) -> Result<String, String> {
+    let client = &exercise.client;
+    let project = &fixture.name;
+    let (machine, cwd) =
+        running_example_target(exercise, fixture, "waypoint-underway", "waypoint-underway");
+    // A short wait long enough for the waypoint to land between the cells.
+    let wait = if cfg!(windows) {
+        "ping -n 4 127.0.0.1 > NUL"
+    } else {
+        "sleep 3"
+    };
     let toml = format!(
-        "[[task]]\nname = \"03-underway-before-waypoint\"\nproject = {project:?}\nmachine = \"loopback:waypoint-underway\"\nno_commit_required = true\n\n[[task.cell]]\nid = \"wait\"\ncwd = {cwd:?}\ncommand = \"powershell -NoProfile -Command \\\"Start-Sleep -Seconds 3\\\"\"\nmode = \"raw\"\n\n[[task.cell]]\nid = \"after-guidance\"\ncwd = {cwd:?}\ncommand = \"cmd /c exit 0\"\nmode = \"raw\"\ndepends_on = [\"wait\"]\n"
+        "[[task]]\nname = \"03-underway-before-waypoint\"\nproject = {project:?}\nmachine = {machine:?}\nno_commit_required = true\n\n[[task.cell]]\nid = \"wait\"\ncwd = {cwd:?}\ncommand = {wait:?}\nmode = \"raw\"\n\n[[task.cell]]\nid = \"after-guidance\"\ncwd = {cwd:?}\ncommand = \"exit 0\"\nmode = \"raw\"\ndepends_on = [\"wait\"]\n"
     );
     std::fs::write(directory.join("03-underway-before-waypoint.toml"), &toml)
         .map_err(|e| e.to_string())?;
@@ -241,38 +278,9 @@ fn submit_underway_example(
         .ok_or_else(|| "submission response omitted squad_id".to_string())
 }
 
-fn register_loopback(exercise: &Exercise) -> Result<(), String> {
-    let script = loopback_script()?;
-    let args = vec![script.to_string_lossy().into_owned()];
-    exercise
-        .client
-        .register_machine(
-            "loopback",
-            "python",
-            "Private waypoint exercise provider",
-            Some(&args),
-            None,
-            false,
-        )
-        .map_err(|e| e.to_string())?;
-    exercise
-        .client
-        .check_machine("loopback")
-        .map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-fn loopback_script() -> Result<PathBuf, String> {
-    let path = std::env::current_dir()
-        .map_err(|e| e.to_string())?
-        .join("examples/providers/loopback.py");
-    path.is_file().then_some(path).ok_or_else(|| {
-        "examples/providers/loopback.py is unavailable from this checkout".to_string()
-    })
-}
-
 fn wait_done(client: &DaemonClient, squad: &str) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // A remote example provisions its worktree first.
+    let deadline = Instant::now() + Duration::from_secs(120);
     while Instant::now() < deadline {
         let state = client.squad(squad).map_err(|e| e.to_string())?["state"]
             .as_str()
@@ -287,7 +295,7 @@ fn wait_done(client: &DaemonClient, squad: &str) -> Result<(), String> {
 }
 
 fn wait_running(client: &DaemonClient, squad: &str) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(90);
     while Instant::now() < deadline {
         let state = client.squad(squad).map_err(|e| e.to_string())?["state"]
             .as_str()
@@ -305,13 +313,26 @@ fn wait_running(client: &DaemonClient, squad: &str) -> Result<(), String> {
 }
 
 fn submit_example(
-    client: &DaemonClient,
+    exercise: &Exercise,
+    fixture: &Fixture,
     directory: &std::path::Path,
     name: &str,
-    cwd: &str,
     purpose: &str,
 ) -> Result<String, String> {
-    let toml = example_toml(name, cwd, purpose);
+    let client = &exercise.client;
+    let cwd = exercise.cell_cwd(fixture, &format!("waypoint-{name}"));
+    let mut toml = example_toml(name, &cwd, purpose);
+    if exercise.remote() {
+        toml = toml.replacen(
+            "\n\n[[task.cell]]",
+            &format!(
+                "\nproject = {:?}\n{}\n[[task.cell]]",
+                fixture.name,
+                exercise.machine_line()
+            ),
+            1,
+        );
+    }
     std::fs::write(directory.join(format!("{name}.toml")), &toml).map_err(|e| e.to_string())?;
     client
         .submit(&toml, true, Some(&format!("waypoint exercise: {name}")))
@@ -347,6 +368,19 @@ fn create_advisory_waypoint(client: &DaemonClient, squad_id: &str) -> Result<Str
         .and_then(Value::as_str)
         .map(str::to_string)
         .ok_or_else(|| "waypoint response omitted id".to_string())
+}
+
+/// Submission returns while the squad is still materializing, and waypoint
+/// enrollment happens as part of that -- so poll rather than check once.
+fn wait_for_affected_entry(client: &DaemonClient, waypoint_id: &str, squad_id: &str) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if has_affected_entry(client, waypoint_id, squad_id) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    false
 }
 
 fn has_affected_entry(client: &DaemonClient, waypoint_id: &str, squad_id: &str) -> bool {

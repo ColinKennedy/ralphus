@@ -1397,7 +1397,6 @@ fn route_for_user(
         ("DELETE", ["api", "machines", scheme]) => {
             admin_gated(daemon, user_header, || deregister_machine(daemon, scheme))
         }
-        // ralphus[ignore-endpoint-cli]: board 'Machines' tab connectivity probe; CLI `machine get` reads config only
         ("POST", ["api", "machines", scheme, "check"]) => {
             admin_gated(daemon, user_header, || check_machine(daemon, scheme))
         }
@@ -14995,8 +14994,9 @@ fn guardian_submit_prs(daemon: &Daemon, id: &str, body: &str, user_header: Optio
         Ok(name) => name.unwrap_or_default(),
         Err(_) => String::new(),
     };
-    let runner: Arc<dyn Runner> =
-        Arc::new(SubprocessRunner::from_env().with_cartographer(daemon.store_handle()));
+    let runner: Arc<dyn Runner> = Arc::new(crate::remote_runner::MachineRouter::from_env(
+        daemon.store_handle(),
+    ));
     crate::pr::start_submit_pull_requests(
         daemon.store_handle(),
         runner,
@@ -15415,8 +15415,9 @@ fn pr_comments(daemon: &Daemon, pr_id: &str) -> Reply {
 /// `pr::MANUAL_PR_FEEDBACK_AUTHOR` instead of a named person.
 fn pr_action_feedback(daemon: &Daemon, user_header: Option<&str>, pr_id: &str) -> Reply {
     let submitted_by = current_user(daemon, user_header).ok().flatten();
-    let runner: Arc<dyn Runner> =
-        Arc::new(SubprocessRunner::from_env().with_cartographer(daemon.store_handle()));
+    let runner: Arc<dyn Runner> = Arc::new(crate::remote_runner::MachineRouter::from_env(
+        daemon.store_handle(),
+    ));
     crate::pr::start_action_pr_feedback(
         daemon.store_handle(),
         runner,
@@ -15473,8 +15474,9 @@ fn pr_sync_status(daemon: &Daemon, pr_id: &str) -> Reply {
 /// worktree in the background (RAL-190's "Pull PR commits" button) — see
 /// [`crate::pr::pull_pr_commits`].
 fn pr_pull_from_pr(daemon: &Daemon, pr_id: &str) -> Reply {
-    let runner: Arc<dyn Runner> =
-        Arc::new(SubprocessRunner::from_env().with_cartographer(daemon.store_handle()));
+    let runner: Arc<dyn Runner> = Arc::new(crate::remote_runner::MachineRouter::from_env(
+        daemon.store_handle(),
+    ));
     crate::pr::start_pull_pr_commits(daemon.store_handle(), runner, pr_id)
 }
 
@@ -16707,8 +16709,9 @@ fn trigger_forge_reorder_check(daemon: &Daemon, id: &str) {
     let cancellations = daemon.cancellations_handle();
     let sid = id.to_string();
     std::thread::spawn(move || {
-        let runner: Arc<dyn Runner> =
-            Arc::new(SubprocessRunner::from_env().with_cartographer(Arc::clone(&store)));
+        let runner: Arc<dyn Runner> = Arc::new(crate::remote_runner::MachineRouter::from_env(
+            Arc::clone(&store),
+        ));
         crate::pr::check_and_apply_forge_reorder(
             &store,
             runner.as_ref(),
@@ -16778,10 +16781,7 @@ fn guardian_reorder(daemon: &Daemon, id: &str, body: &str) -> Reply {
 /// local review pays nothing extra: `MachineRouter`'s local path is the same
 /// `SubprocessRunner::run` call this always was.
 fn guardian_agent_runner(daemon: &Daemon) -> Arc<dyn Runner> {
-    let local: Arc<dyn Runner> =
-        Arc::new(SubprocessRunner::from_env().with_cartographer(daemon.store_handle()));
-    Arc::new(crate::remote_runner::MachineRouter::new(
-        local,
+    Arc::new(crate::remote_runner::MachineRouter::from_env(
         daemon.store_handle(),
     ))
 }
@@ -24958,6 +24958,8 @@ remediation_attempts=1
         assert_eq!(
             rows,
             [
+                // Creating a review auto-subscribes its owner's review client.
+                format!("review client subscribed guardian={id} client=client-000000000001"),
                 format!("review {id} ('g') created, base=main"),
                 "review started".to_string(),
                 "branch resolver ran".to_string(),

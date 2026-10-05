@@ -42,6 +42,16 @@ Ralphus daemon. Its project/job root, test bare Git origin, and host key use
 named Docker volumes; `down` preserves them and `destroy` removes them. See
 [`docs/remote-docker-target.md`](../docs/remote-docker-target.md).
 
+**Guided exercises — `bash scripts/check-initialize-exercises.sh`.** Runs every
+`ralphus initialize <exercise>` (machine, mailbox, triage, review, waypoint)
+live, locally and with `--remote` (every cell and review on the loopback
+machine provider in strict mode), each against its own throwaway daemon that
+`--stop` shuts down. Build `ralphus`, `ralphus-daemon` and `ralphus-runner`
+first; needs git and Python 3. `--only review,waypoint`, `--local-only` /
+`--remote-only` narrow it. CI's `initialize-exercises` job runs it (Windows:
+`--remote-only`, since local cells need psmux). It never touches a running
+dev stack: each exercise gets its own port, database, home, and psmux data dir.
+
 **Documentation site.** `scripts/docs-build.sh` / `.cmd` renders
 `docs/site/pages/*.md` into `docs/site/_site/` via MkDocs + Material —
 fast, no Playwright, safe to re-run on every doc edit.

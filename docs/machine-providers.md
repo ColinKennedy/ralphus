@@ -569,14 +569,32 @@ every verb, but its "remote machine" is the local host — so you can exercise t
 entire remote path without a second machine, an SSH key, or a build farm:
 
 ```bash
-ralphus machine register --scheme loopback     --program "python /path/to/examples/providers/loopback.py"
+ralphus machine register --scheme loopback --program python --arg /path/to/examples/providers/loopback.py
 ralphus machine list
 ```
 
-Then point a task at `machine = "loopback:sandbox"`. Everything that makes it
-*local* is confined to two functions (`_provision_workspace`, `_run_locally`);
-the dispatch, JSON envelope, and handle lifecycle are what a real SSH or
-build-farm provider keeps.
+`--program` is one executable, never a command line: the interpreter goes in
+`--program` and the script in `--arg`.
+
+Then point a task at `machine = "loopback:sandbox"`. A git project provisioned
+there needs a `[machine.targets.*]` entry with a `remote_root`, exactly like a
+real machine; loopback lays it out the way `ralphus-ssh-provider` does
+(`<remote_root>/projects/<name>-<hash>/{repository,worktrees/<branch>-<hash>}`).
+Everything that makes it *local* is confined to two functions
+(`_provision_workspace`, `_run_locally`); the dispatch, JSON envelope, and
+handle lifecycle are what a real SSH or build-farm provider keeps.
+
+Two environment variables, read by the provider (so set them on the daemon,
+whose environment it inherits), make it a sharper test of the remote path:
+
+| Variable | Effect |
+|---|---|
+| `RALPHUS_LOOPBACK_STRICT=1` | Refuse any `cwd`/path outside the provider's own state root and the `remote_root`s it has provisioned into. Loopback can otherwise reach the daemon's own checkout — a real machine cannot — so this is what turns "the daemon sent a daemon-local path to the machine" from a silent success into a loud failure. |
+| `RALPHUS_LOOPBACK_TRACE=1` | Append every `run` request (cwd, argv, exit code) to `run-trace.log` under the provider's state root. |
+
+`ralphus initialize <exercise> --remote` runs each guided exercise this way,
+and `scripts/check-initialize-exercises.sh` runs all of them (local and
+`--remote`) in CI.
 
 You can also drive it by hand, exactly as the daemon does:
 
@@ -595,16 +613,18 @@ reaches any host you already have SSH access to — no agent to install, no
 port to open, no second daemon to keep alive. It is the first real (not
 throwaway-example) provider in the repo.
 
-> **Status: `exec`, `status`, `stream`, `cancel`, `job-cleanup`, `ping`, and
-> `provision` are implemented.** Configured targets use durable asynchronous
-> execution; legacy invocations without a matching target policy preserve the
-> synchronous `exec` result path. Project/worktree `cleanup`, `run`, and
-> `channel` remain explicit unsupported-verb errors.
-> `provision` (RAL-355 Phase 4) durably clones/fetches a project and creates
-> a `git worktree` per task branch under the machine's configured
-> `remote_root` (see the "Configuration" and "target" glossary entry) —
-> everything else replies with an explicit "not implemented, see RAL-201"
-> error rather than a bare "unknown verb".
+> **Status: every verb except `channel` and `retire` is implemented** —
+> `exec`, `status`, `stream`, `cancel`, `job-cleanup`, `provision`, `run`,
+> `read-file`, `write-file`, `remove-path`, `materialize`, `cleanup`,
+> `terminal`, `ping`, and `capabilities`. Configured targets use durable
+> asynchronous execution; legacy invocations without a matching target policy
+> preserve the synchronous `exec` result path. `provision` (RAL-355 Phase 4)
+> durably clones/fetches a project and creates a `git worktree` per task
+> branch under the machine's configured `remote_root` (see the
+> "Configuration" and "target" glossary entry). `channel` and `retire` reply
+> "does not implement" — both are optional, and for `retire` that exact reply
+> is what the daemon records as this provider opting out of automatic
+> worktree retirement.
 
 ### The `<uri>` forms
 

@@ -45,6 +45,98 @@ pub struct Workspace {
     /// workspace, which never consults the registry — keeping the local path
     /// free of any dependency it does not use.
     store: Option<crate::store_lock::StoreHandle>,
+    /// For a review workspace on a remote machine: `(daemon-local project
+    /// root, that project's repository on the machine)`. Paths the review
+    /// code derives from its daemon-local project root (`worktree_dir`, the
+    /// combined checkout, ...) are translated through it in [`Self::at`] and
+    /// when resolving an absolute path. `None` everywhere else.
+    path_map: Option<Arc<(PathBuf, PathBuf)>>,
+}
+
+/// One remote-produced branch of a review: the daemon-local project root it
+/// belongs to, the machine it ran on, and that cell's workspace on the machine.
+struct RemoteBranchSource {
+    local_root: PathBuf,
+    machine: String,
+    remote_cwd: String,
+}
+
+/// Every branch of `guardian` produced by a cell on some machine, with that
+/// cell's provisioned workspace path. Store reads only.
+fn remote_branch_sources(
+    store: &crate::store::Store,
+    guardian: &crate::guardian::GuardianView,
+) -> Vec<RemoteBranchSource> {
+    guardian
+        .branches
+        .iter()
+        .filter_map(|b| {
+            let machine = b
+                .source_cell_machine
+                .as_deref()
+                .map(str::trim)
+                .filter(|m| {
+                    !m.is_empty() && !m.eq_ignore_ascii_case(ralphus_core::schema::LOCAL_MACHINE)
+                })?;
+            let remote_cwd = store.cell_cwd_for_branch(&b.branch).ok().flatten()?;
+            Some(RemoteBranchSource {
+                local_root: PathBuf::from(b.project.as_deref().unwrap_or(&guardian.git_root)),
+                machine: machine.to_string(),
+                remote_cwd,
+            })
+        })
+        .collect()
+}
+
+/// Each review's `local project root -> repository on its machine` pairs,
+/// discovered once per review (the repository a machine provisioned never
+/// moves). Lives here rather than on `Store`: it is a cache of a provider's
+/// answer, not database state.
+static MACHINE_REPOSITORIES: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<(String, PathBuf), PathBuf>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+/// The `(daemon-local project root, repository on the machine)` pair for the
+/// project `root` belongs to, when one of the review's branches was produced on
+/// `machine`.
+///
+/// A review records its project by the daemon's registered path, which is its
+/// identity everywhere else (the board, PR routing, reviews keyed by root). On
+/// a remote machine that path does not exist: the project lives wherever the
+/// provider provisioned it. The repository is discovered from a contributing
+/// cell's own workspace there (`git rev-parse --git-common-dir`), so no
+/// provider has to report its storage layout.
+///
+/// `None` when no contributing cell ran on `machine` (e.g. a remote review fed
+/// only by local cells), which leaves the workspace's paths untouched.
+fn machine_repository_for(
+    guardian_id: &str,
+    machine: &str,
+    root: &Path,
+    sources: &[RemoteBranchSource],
+    store: &crate::store_lock::StoreHandle,
+) -> Option<(PathBuf, PathBuf)> {
+    for source in sources.iter().filter(|s| s.machine == machine) {
+        if !root.starts_with(&source.local_root) {
+            continue;
+        }
+        let key = (guardian_id.to_string(), source.local_root.clone());
+        if let Some(repository) = MACHINE_REPOSITORIES.lock().get(&key).cloned() {
+            return Some((source.local_root.clone(), repository));
+        }
+        let cell_ws =
+            Workspace::on(source.remote_cwd.as_str(), Some(machine)).with_store(Arc::clone(store));
+        let Ok(common) = cell_ws.git(&["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        else {
+            continue;
+        };
+        let Some(repository) = Path::new(common.trim()).parent().map(Path::to_path_buf) else {
+            continue;
+        };
+        MACHINE_REPOSITORIES.lock().insert(key, repository.clone());
+        return Some((source.local_root.clone(), repository));
+    }
+    None
 }
 
 impl std::fmt::Debug for Workspace {
@@ -67,6 +159,7 @@ impl Workspace {
             root: root.into(),
             machine: None,
             store: None,
+            path_map: None,
         }
     }
 
@@ -84,6 +177,7 @@ impl Workspace {
             root: root.into(),
             machine,
             store: None,
+            path_map: None,
         }
     }
 
@@ -100,10 +194,14 @@ impl Workspace {
         guardian_id: &str,
         root: impl Into<PathBuf>,
     ) -> Self {
-        let machine = {
+        let root = root.into();
+        let (machine, sources) = {
             let guard = store.lock();
             match guard.get_guardian(guardian_id) {
-                Ok(g) => g.machine,
+                Ok(g) => {
+                    let sources = remote_branch_sources(&guard, &g);
+                    (g.machine, sources)
+                }
                 Err(e) => {
                     // A deleted guardian (its retained worktrees still being
                     // retired) is expected; anything else is a store fault.
@@ -124,11 +222,18 @@ impl Workspace {
                             ),
                             serde_json::json!({ "error": e.to_string() }),
                         );
-                    None
+                    (None, Vec::new())
                 }
             }
         };
-        Self::on(root, machine.as_deref()).with_store(Arc::clone(store))
+        let mut workspace = Self::on(root, machine.as_deref()).with_store(Arc::clone(store));
+        if let Some(machine) = workspace.machine.clone() {
+            workspace.path_map =
+                machine_repository_for(guardian_id, &machine, &workspace.root, &sources, store)
+                    .map(Arc::new);
+            workspace.root = workspace.map_path(&workspace.root);
+        }
+        workspace
     }
 
     /// Attach the store handle a remote workspace needs to resolve its
@@ -169,9 +274,23 @@ impl Workspace {
     #[must_use]
     pub fn at(&self, path: impl Into<PathBuf>) -> Self {
         Self {
-            root: path.into(),
+            root: self.map_path(&path.into()),
             machine: self.machine.clone(),
             store: self.store.clone(),
+            path_map: self.path_map.clone(),
+        }
+    }
+
+    /// Translate a daemon-local path under this review's project root to the
+    /// same path on the machine (see `path_map`); anything else is unchanged.
+    fn map_path(&self, path: &Path) -> PathBuf {
+        match self.path_map.as_deref() {
+            Some((local, remote)) => match path.strip_prefix(local) {
+                Ok(suffix) if suffix.as_os_str().is_empty() => remote.clone(),
+                Ok(suffix) => remote.join(suffix),
+                Err(_) => path.to_path_buf(),
+            },
+            None => path.to_path_buf(),
         }
     }
 
@@ -220,12 +339,10 @@ impl Workspace {
     /// inherited environment (RAL-191) — used for a review's check gates, so
     /// they run under the same variables as the branch's agent invocations.
     ///
-    /// **Local workspaces only.** A remote workspace's
-    /// [`crate::remote_runner::RunRequest`] has no env field, so `env` is
-    /// ignored there rather than silently half-applied; a check gate on a
-    /// remote machine still runs exactly as it did before. `cancel` is
-    /// likewise local-only (RAL-239): a remote provider call has no polling
-    /// hook to kill mid-flight, so it blocks to completion same as before.
+    /// A remote workspace sends `env` in the
+    /// [`crate::remote_runner::RunRequest`] for the provider to apply on the
+    /// machine. `cancel` is local-only (RAL-239): a remote provider call has
+    /// no polling hook to kill mid-flight, so it blocks to completion.
     #[must_use]
     pub fn run_command_with_env(
         &self,
@@ -495,7 +612,7 @@ impl Workspace {
     fn resolve(&self, path: impl AsRef<Path>) -> PathBuf {
         let p = path.as_ref();
         if p.is_absolute() {
-            p.to_path_buf()
+            self.map_path(p)
         } else {
             self.root.join(p)
         }
@@ -586,15 +703,29 @@ impl Workspace {
     /// the provider's business — the contract says nothing about transport, so
     /// a farm on a LAN and a machine across a slow link can make different
     /// choices without ralphus changing (RAL-185 D7).
+    ///
+    /// Carries the same `GIT_EDITOR`/`GIT_SEQUENCE_EDITOR=true` the local path
+    /// sets (`crate::vcs::GitVcs`): without them `rebase --continue` on the
+    /// machine opens an editor with no terminal, fails, and the merge retries
+    /// it forever.
     fn git_remote(&self, _machine: &str, args: &[&str]) -> Result<String, String> {
         let req = crate::remote_runner::RunRequest {
             cwd: self.root.to_string_lossy().into_owned(),
             program: "git".to_string(),
             args: args.iter().map(|a| (*a).to_string()).collect(),
-            env: std::collections::BTreeMap::new(),
+            env: non_interactive_git_env(),
         };
         self.with_provider(|p, spec| p.run_vcs(&req, spec))
     }
+}
+
+/// The environment every remote `git` invocation runs under, so nothing it
+/// does can wait on an interactive editor.
+fn non_interactive_git_env() -> std::collections::BTreeMap<String, String> {
+    ["GIT_EDITOR", "GIT_SEQUENCE_EDITOR"]
+        .into_iter()
+        .map(|k| (k.to_string(), "true".to_string()))
+        .collect()
 }
 
 fn remove_local_destination(path: &Path) -> Result<(), String> {
