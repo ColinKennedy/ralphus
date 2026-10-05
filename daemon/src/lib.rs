@@ -24,6 +24,7 @@ pub mod delivery;
 pub mod entity_uri;
 pub mod env_view;
 pub mod events;
+pub mod followup;
 pub mod forge;
 pub mod generation;
 pub mod ghost;

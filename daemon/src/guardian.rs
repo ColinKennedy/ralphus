@@ -2878,6 +2878,14 @@ impl Store {
                 ) {
                     self.warn_status_side_effect(id, status, "auto-close waypoints", &e);
                 }
+                // Only a review whose PR/MR actually merged offers follow-up
+                // work: an approved or cancelled review never landed, so its
+                // deferred notes are not yet "later".
+                if status == GuardianStatus::Merged {
+                    if let Err(e) = self.maybe_offer_followups(id) {
+                        self.warn_status_side_effect(id, status, "offer follow-up work", &e);
+                    }
+                }
             }
             Ok(())
         }

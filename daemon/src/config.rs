@@ -1268,6 +1268,85 @@ pub fn load_commit_config(start: &Path) -> CommitConfig {
     }
 }
 
+/// Post-merge follow-up offers (`[followup]` table): once a review merges,
+/// the daemon offers to turn the `deferred` prophecies its cells wrote into a
+/// follow-up squad (see `crate::followup`). Every field is `None` when unset
+/// so a lower layer can supply it; resolved callers use the accessors, which
+/// carry the defaults. A per-project value wins over the global one, same as
+/// [`CommitConfig`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct FollowupConfig {
+    /// Whether to offer follow-up work at all (unset resolves to `true`).
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// How many generations of follow-up are offered: a review of ordinary
+    /// work is generation 0 and a follow-up squad's review is generation 1,
+    /// so the default `1` offers follow-ups for ordinary work only, never for
+    /// a follow-up's own deferrals. `0` offers nothing.
+    #[serde(default)]
+    pub max_depth: Option<u32>,
+    /// Whether an accepted follow-up squad starts running immediately
+    /// (unset resolves to `false`: it is created held, for the user to start).
+    #[serde(default)]
+    pub auto_start: Option<bool>,
+}
+
+impl FollowupConfig {
+    /// Whether follow-up offers are on (unset resolves to `true`).
+    #[must_use]
+    pub fn enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+
+    /// The follow-up generation cap (unset resolves to `1`).
+    #[must_use]
+    pub fn max_depth(&self) -> u32 {
+        self.max_depth.unwrap_or(1)
+    }
+
+    /// Whether an accepted follow-up squad starts at once (unset resolves
+    /// to `false`).
+    #[must_use]
+    pub fn auto_start(&self) -> bool {
+        self.auto_start.unwrap_or(false)
+    }
+
+    /// `over` wins field by field; whatever it leaves unset falls through to
+    /// `self`.
+    #[must_use]
+    pub fn merge(self, over: Self) -> Self {
+        Self {
+            enabled: over.enabled.or(self.enabled),
+            max_depth: over.max_depth.or(self.max_depth),
+            auto_start: over.auto_start.or(self.auto_start),
+        }
+    }
+}
+
+/// Parse a `FollowupConfig` from the given TOML text; every field unset when
+/// the `[followup]` table is absent.
+#[must_use]
+pub fn followup_config_from_toml_str(s: &str) -> FollowupConfig {
+    parse_config_file(s).followup.unwrap_or_default()
+}
+
+/// Load the effective follow-up config for the project reached by walking up
+/// from `start` to the nearest `.ralphus.toml`, layered over the global config
+/// file (per-project value wins). `start` is the review's git root, not the
+/// daemon's own working directory, since one daemon serves many projects.
+#[must_use]
+pub fn load_followup_config(start: &Path) -> FollowupConfig {
+    let global = global_config_path()
+        .and_then(|p| read_config_text(&p))
+        .map(|s| followup_config_from_toml_str(&s))
+        .unwrap_or_default();
+    let local = find_project_config(start)
+        .and_then(|p| read_config_text(&p))
+        .map(|s| followup_config_from_toml_str(&s))
+        .unwrap_or_default();
+    global.merge(local)
+}
+
 /// Parse an `ArbiterConfig` from the given TOML text; the default (`ollama`,
 /// no model override, unbounded budget) when the `[arbiter]` table is absent.
 #[must_use]
@@ -2549,6 +2628,8 @@ struct ConfigFile {
     #[serde(default)]
     commits: Option<CommitConfig>,
     #[serde(default)]
+    followup: Option<FollowupConfig>,
+    #[serde(default)]
     review: Option<ReviewConfig>,
     #[serde(default)]
     defaults: Option<ReviewConfig>,
@@ -3649,6 +3730,59 @@ mod tests {
         let loaded = load_commit_config(&nested);
         assert_eq!(loaded.add_coauthor, Some(false));
         assert!(!loaded.add_coauthor());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ── followup offers ──────────────────────────────────────────────────
+
+    #[test]
+    fn followup_config_defaults_offer_once_and_hold() {
+        let c = FollowupConfig::default();
+        assert!(c.enabled());
+        assert_eq!(c.max_depth(), 1);
+        assert!(!c.auto_start());
+        assert_eq!(followup_config_from_toml_str(""), c);
+    }
+
+    #[test]
+    fn followup_config_reads_every_field() {
+        let c = followup_config_from_toml_str(
+            "[followup]\nenabled = false\nmax_depth = 3\nauto_start = true\n",
+        );
+        assert!(!c.enabled());
+        assert_eq!(c.max_depth(), 3);
+        assert!(c.auto_start());
+    }
+
+    #[test]
+    fn followup_config_project_wins_field_by_field() {
+        let global =
+            followup_config_from_toml_str("[followup]\nmax_depth = 3\nauto_start = true\n");
+        let local = followup_config_from_toml_str("[followup]\nauto_start = false\n");
+        let effective = global.merge(local);
+        assert_eq!(
+            effective.max_depth(),
+            3,
+            "unset locally, so the global value stays"
+        );
+        assert!(
+            !effective.auto_start(),
+            "set locally, so it overrides the global value"
+        );
+    }
+
+    #[test]
+    fn load_followup_config_reads_per_project_override() {
+        let base =
+            std::env::temp_dir().join(format!("ralphus-cfg-followup-{}", std::process::id()));
+        let nested = base.join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(base.join(".ralphus.toml"), "[followup]\nmax_depth = 0\n").unwrap();
+
+        let loaded = load_followup_config(&nested);
+        assert_eq!(loaded.max_depth, Some(0));
+        assert_eq!(loaded.max_depth(), 0);
 
         let _ = std::fs::remove_dir_all(&base);
     }

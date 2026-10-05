@@ -314,6 +314,15 @@ impl Store {
         &self,
         guardian_id: &str,
     ) -> Result<Vec<ProphecyView>> {
+        let mut direct = self.list_all_prophecies_for_guardian(guardian_id)?;
+        direct.retain(|p| p.published_at_ms.is_none());
+        Ok(direct)
+    }
+
+    /// Every prophecy that belongs to `guardian_id`'s review (the same two
+    /// sources as [`Self::list_unpublished_prophecies_for_guardian`]),
+    /// published or not, oldest first.
+    pub fn list_all_prophecies_for_guardian(&self, guardian_id: &str) -> Result<Vec<ProphecyView>> {
         let mut direct = self.list_prophecies(&ProphecyFilter {
             guardian_id: Some(guardian_id.to_string()),
             limit: 10000,
@@ -333,7 +342,6 @@ impl Store {
         for uri in cell_uris {
             direct.extend(self.list_prophecies_for_entity(&uri)?);
         }
-        direct.retain(|p| p.published_at_ms.is_none());
         direct.sort_by_key(|p| p.created_at_ms);
         Ok(direct)
     }

@@ -2294,7 +2294,7 @@ impl Store {
         guardian_id: &str,
     ) -> StoreResult<()> {
         let mut stmt = self.conn.prepare(
-            "SELECT waypoint_id, mode, survey_verdict, survey_rationale
+            "SELECT waypoint_id, mode, survey_verdict, survey_rationale, bearing_decision, bearing_decided_at_ms
              FROM waypoint_affected WHERE kind='squad' AND entry_id=?",
         )?;
         let rows = stmt
@@ -2304,21 +2304,48 @@ impl Store {
                     r.get::<_, String>(1)?,
                     r.get::<_, Option<String>>(2)?,
                     r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<i64>>(5)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(stmt);
         let now = now_ms();
-        for (waypoint_id, mode, survey_verdict, survey_rationale) in rows {
+        for (
+            waypoint_id,
+            mode,
+            survey_verdict,
+            survey_rationale,
+            bearing_decision,
+            bearing_decided_at_ms,
+        ) in rows
+        {
+            // The bearing decision travels with the entry: it is the same
+            // work answering the same waypoint, and an entry that was already
+            // answered (a follow-up squad's waypoint answers for it up front)
+            // must not turn back into an unanswered block when its review
+            // forms.
             self.conn.execute(
-                "INSERT INTO waypoint_affected(waypoint_id, kind, entry_id, mode, survey_verdict, survey_rationale, delivery_status, created_at_ms, updated_at_ms)
-                 VALUES(?,'review',?,?,?,?,'undelivered',?,?)
+                "INSERT INTO waypoint_affected(waypoint_id, kind, entry_id, mode, survey_verdict, survey_rationale, delivery_status, created_at_ms, updated_at_ms, bearing_decision, bearing_decided_at_ms)
+                 VALUES(?,'review',?,?,?,?,'undelivered',?,?,?,?)
                  ON CONFLICT(waypoint_id, kind, entry_id) DO UPDATE SET
                      mode=excluded.mode,
                      survey_verdict=excluded.survey_verdict,
                      survey_rationale=excluded.survey_rationale,
+                     bearing_decision=COALESCE(excluded.bearing_decision, bearing_decision),
+                     bearing_decided_at_ms=COALESCE(excluded.bearing_decided_at_ms, bearing_decided_at_ms),
                      updated_at_ms=excluded.updated_at_ms",
-                params![waypoint_id, guardian_id, mode, survey_verdict, survey_rationale, now, now],
+                params![
+                    waypoint_id,
+                    guardian_id,
+                    mode,
+                    survey_verdict,
+                    survey_rationale,
+                    now,
+                    now,
+                    bearing_decision,
+                    bearing_decided_at_ms
+                ],
             )?;
             self.conn.execute(
                 "DELETE FROM waypoint_affected WHERE waypoint_id=? AND kind='squad' AND entry_id=?",

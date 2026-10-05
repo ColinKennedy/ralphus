@@ -2184,6 +2184,13 @@ fn route_for_user(
         ("POST", ["api", "guardians", id, "approve"]) => guardian_approve(daemon, id),
         ("POST", ["api", "guardians", id, "cancel"]) => guardian_cancel(daemon, id),
         ("POST", ["api", "guardians", id, "reopen"]) => guardian_reopen(daemon, id),
+        ("GET", ["api", "guardians", id, "followup"]) => guardian_followup_show(daemon, id),
+        ("POST", ["api", "guardians", id, "followup", "accept"]) => {
+            guardian_followup_accept(daemon, id)
+        }
+        ("POST", ["api", "guardians", id, "followup", "decline"]) => {
+            guardian_followup_decline(daemon, id)
+        }
         // ralphus[ignore-endpoint-cli]: daemon-host GUI execution for manual checks; CLI `review checks run` is deliberately headless
         ("POST", ["api", "guardians", id, "run-manual-commands"]) => {
             guardian_run_manual_commands(daemon, id, body)
@@ -6478,7 +6485,7 @@ fn generate_cancel(daemon: &Daemon, id: &str) -> Reply {
     json(202, &serde_json::json!({}))
 }
 
-fn submit(daemon: &Daemon, body: &str, query: &str, user_header: Option<&str>) -> Reply {
+pub(crate) fn submit(daemon: &Daemon, body: &str, query: &str, user_header: Option<&str>) -> Reply {
     let Ok(req) = serde_json::from_str::<SubmitBody>(body) else {
         return error(
             400,
@@ -17087,6 +17094,44 @@ fn guardian_cancel(daemon: &Daemon, id: &str) -> Reply {
 /// Reopen a `cancelled`, `merged`, or `approved` review (status →
 /// `collecting`) and immediately try a fresh merge pass if the daemon has
 /// capacity -- see [`crate::guardian_merge::reopen_guardian_merge`].
+/// `GET /api/guardians/{id}/followup`: the post-merge follow-up offer for a
+/// review (`crate::followup`), or 404 when none was ever sent.
+fn guardian_followup_show(daemon: &Daemon, id: &str) -> Reply {
+    let store = daemon.lock();
+    match store.get_followup_offer(id) {
+        Ok(Some(offer)) => json(200, &offer),
+        Ok(None) => error(
+            404,
+            "not_found",
+            "no follow-up offer exists for this review: it has not merged with any deferred \
+             prophecies, or offers are turned off for its project",
+            vec![],
+        ),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `POST /api/guardians/{id}/followup/accept`: drafts the follow-up squad and
+/// its waypoint from the offer.
+fn guardian_followup_accept(daemon: &Daemon, id: &str) -> Reply {
+    match crate::followup::accept_offer(daemon, id) {
+        Ok(result) => json(201, &result),
+        Err(crate::followup::AcceptError::Store(e)) => store_error(&e),
+        Err(crate::followup::AcceptError::Rejected { status, message }) => {
+            error(status, "followup_failed", &message, vec![])
+        }
+    }
+}
+
+/// `POST /api/guardians/{id}/followup/decline`: drops the offer.
+fn guardian_followup_decline(daemon: &Daemon, id: &str) -> Reply {
+    let store = daemon.lock();
+    match store.decline_followup_offer(id) {
+        Ok(offer) => json(200, &offer),
+        Err(e) => store_error(&e),
+    }
+}
+
 fn guardian_reopen(daemon: &Daemon, id: &str) -> Reply {
     let runner = guardian_agent_runner(daemon);
     crate::guardian_merge::reopen_guardian_merge(
