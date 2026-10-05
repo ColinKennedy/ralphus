@@ -35,6 +35,9 @@
         --amber-a: rgba(227,179,65,.13); --amber-b: rgba(227,179,65,.34);
         /* A unit of work a cross-squad waypoint affects in block mode (RAL-400). */
         --roster-block: #e8590c;
+        /* Transcript-scoped severity colors for pinned `[error]`/`[warning]` tags;
+           dark mode reuses the board-wide values, light mode darkens them to 4.5:1. */
+        --turn-error: var(--failed); --turn-warn: var(--warn);
       }
       [data-theme="light"] {
         --bg: #ffffff; --panel: #f6f8fa; --panel-2: #eef1f4; --border: #d0d7de;
@@ -47,6 +50,7 @@
         --failed-a: rgba(207,34,46,.08); --failed-b: rgba(207,34,46,.28);
         --queued-a: rgba(130,80,223,.08); --queued-b: rgba(130,80,223,.28);
         --amber-a: rgba(154,103,0,.08); --amber-b: rgba(154,103,0,.28);
+        --turn-error: #cf222e; --turn-warn: #9a6700;
       }
       * { box-sizing: border-box; }
       body { margin: 0; background: var(--bg); color: var(--text);
