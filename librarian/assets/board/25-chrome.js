@@ -371,6 +371,8 @@
           url = "#/machines";
         } else if (tab === "triage") {
           url = "#/triage";
+        } else if (tab === "presets") {
+          url = "#/presets";
         } else if (tab === "users") {
           url = "#/users";
         } else if (tab === "secrets") {
@@ -488,6 +490,7 @@
         if (raw.startsWith("projects")) return { tab: "projects" };
         if (raw.startsWith("machines")) return { tab: "machines" };
         if (raw.startsWith("triage")) return { tab: "triage" };
+        if (raw.startsWith("presets")) return { tab: "presets" };
         if (raw.startsWith("users")) return { tab: "users" };
         if (raw.startsWith("secrets")) return { tab: "secrets" };
         if (raw.startsWith("retirement")) return { tab: "worktree-retirement" };

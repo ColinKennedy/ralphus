@@ -34,6 +34,7 @@ TAB_ROUTES = {
     "projects": "projects",
     "machines": "machines",
     "triage": "triage",
+    "presets": "presets",
     "users": "users",
     "secrets": "secrets",
     "worktree-retirement": "retirement",
