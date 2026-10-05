@@ -13,6 +13,7 @@ const {
   classifyTapeLine,
   renderTapeLines,
   stripThinkingPrefixes,
+  parseLiveViewTypeFilter,
   THINKING_FOLDED_TEXT,
 } = lines;
 
@@ -267,6 +268,14 @@ test("a wrapped line of ordinary agent output is untouched by the thinking fold"
   const raw = ["ordinary output\b", "and its tail", "after"];
   assert.equal(renderTapeLines(raw, false, false), "ordinary output\nand its tail\nafter");
   assert.equal(renderTapeLines(raw, false, true), "ordinary output\nand its tail\nafter");
+});
+
+test("excluding a tagged line also hides its tmux wrap tails, but not continuation output", () => {
+  const raw = ["[usage] noisy totals\b", "continued totals", "[error] failed", "stderr continuation"];
+  assert.equal(
+    renderTapeLines(raw, false, true, parseLiveViewTypeFilter("-usage")),
+    "[error] failed\nstderr continuation",
+  );
 });
 
 test("a wrapped thinking line's tail is not re-parsed as a marker of its own", () => {
