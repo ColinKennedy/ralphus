@@ -31,11 +31,11 @@ pub fn dispatch(options: &ExerciseOptions) -> i32 {
         }
     };
     // A remote exercise registered the loopback machine while starting.
-    if !exercise.remote()
-        && let Err(error) = exercise.register_loopback()
-    {
-        println!("error: could not register private loopback provider: {error}");
-        return 1;
+    if !exercise.remote() {
+        if let Err(error) = exercise.register_loopback() {
+            println!("error: could not register private loopback provider: {error}");
+            return 1;
+        }
     }
     let examples = match exercise.examples_dir() {
         Ok(value) => value,
