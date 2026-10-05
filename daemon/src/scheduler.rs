@@ -5066,7 +5066,10 @@ pub(crate) fn try_start_ready_reviews_for_task(
     if guardian_ids.is_empty() {
         return;
     }
-    let remote_task_roots = remote_task_project_roots(&store.lock(), squad_id, cells);
+    let remote_task_roots = {
+        let guard = store.lock();
+        remote_task_project_roots(&guard, squad_id, cells)
+    };
     let mut ready = Vec::new();
     for gid in &guardian_ids {
         let git_root = {
