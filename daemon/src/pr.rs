@@ -1047,13 +1047,26 @@ impl Store {
              SET ci_status=?, ci_failure_job_url=?, updated_at_ms=?,
                  auto_fix_attempted_at_ms = CASE WHEN ?='passing' THEN NULL ELSE auto_fix_attempted_at_ms END,
                  auto_fix_attempt_count = CASE WHEN ?='passing' THEN 0 ELSE auto_fix_attempt_count END,
+                 auto_fix_claimed_checks = CASE WHEN ?='passing' THEN NULL ELSE auto_fix_claimed_checks END,
+                 ci_failing_checks = CASE WHEN ?='passing' THEN NULL ELSE ci_failing_checks END,
                  auto_fix_next_attempt_at_ms = CASE WHEN ?='passing' THEN NULL ELSE auto_fix_next_attempt_at_ms END,
                  auto_fix_error = CASE WHEN ?='passing' THEN NULL ELSE auto_fix_error END,
                  auto_fix_exhausted_notified_at_ms = CASE WHEN ?='passing' THEN NULL ELSE auto_fix_exhausted_notified_at_ms END,
                  auto_fix_last_outcome = CASE WHEN ?='passing' THEN NULL ELSE auto_fix_last_outcome END
              WHERE id=?",
             params![
-                status, job_url, now_ms(), status, status, status, status, status, status, id
+                status,
+                job_url,
+                now_ms(),
+                status,
+                status,
+                status,
+                status,
+                status,
+                status,
+                status,
+                status,
+                id
             ],
         )?;
         if n == 0 {
@@ -1125,6 +1138,71 @@ impl Store {
         }
     }
 
+    /// RAL-578: persist the failing check names from the latest poll and
+    /// refund one auto-fix attempt when that set is a strict subset of the set
+    /// recorded at the last claimed attempt (real progress). The count never
+    /// drops below 0, and the claimed set is rebased onto the shrunk set so a
+    /// flapping check cannot be refunded twice for the same progress. Returns
+    /// whether an attempt was refunded.
+    pub fn set_pr_failing_checks(&self, id: &str, names: &[String]) -> Result<bool> {
+        let pr = self.get_pull_request(id)?;
+        let current: std::collections::BTreeSet<&str> = names.iter().map(String::as_str).collect();
+        let json = serde_json::to_string(&current).unwrap_or_else(|_| "[]".to_string());
+        let claimed: Option<std::collections::BTreeSet<String>> = self
+            .conn
+            .query_row(
+                "SELECT auto_fix_claimed_checks FROM guardian_pull_requests WHERE id=?",
+                params![id],
+                |r| r.get::<_, Option<String>>(0),
+            )?
+            .and_then(|s| serde_json::from_str(&s).ok());
+        let refund = pr.auto_fix_attempt_count > 0
+            && claimed.as_ref().is_some_and(|claimed| {
+                current.len() < claimed.len() && current.iter().all(|n| claimed.contains(*n))
+            });
+        if refund {
+            self.conn.execute(
+                "UPDATE guardian_pull_requests
+                 SET ci_failing_checks=?, auto_fix_claimed_checks=?,
+                     auto_fix_attempt_count=MAX(auto_fix_attempt_count-1, 0),
+                     auto_fix_exhausted_notified_at_ms=NULL,
+                     updated_at_ms=?
+                 WHERE id=?",
+                params![json, json, now_ms(), id],
+            )?;
+            let refunded_to = pr.auto_fix_attempt_count - 1;
+            let claimed_len = claimed.as_ref().map_or(0, |c| c.len());
+            crate::rlog!(
+                INFO,
+                "ralphus [pr] pr={id} auto-fix attempt refunded: failing checks shrank {claimed_len} -> {} (attempts now {refunded_to})",
+                current.len()
+            );
+            let mut note = crate::cartographer::Note::new("pr").scope("branch");
+            note = note.guardian(&pr.guardian_id);
+            note.emit(
+                self,
+                format!(
+                    "pr auto-fix attempt refunded pr={id} failing checks {claimed_len} -> {} attempts={refunded_to}",
+                    current.len()
+                ),
+                serde_json::json!({
+                    "pr_id": id,
+                    "pr_number": pr.pr_number,
+                    "branch_id": pr.branch_id,
+                    "outcome": "auto_fix_refunded",
+                    "failing_checks": current,
+                    "attempts": refunded_to,
+                }),
+            );
+        } else {
+            self.conn.execute(
+                "UPDATE guardian_pull_requests SET ci_failing_checks=? WHERE id=?",
+                params![json, id],
+            )?;
+        }
+        Ok(refund)
+    }
+
     /// Atomically reserve one unattended auto-fix attempt, respecting the
     /// campaign ceiling and exponential retry deadline.
     pub fn claim_pr_auto_fix_attempt(
@@ -1159,6 +1237,7 @@ impl Store {
         self.conn.execute(
             "UPDATE guardian_pull_requests
              SET auto_fix_attempted_at_ms=?, auto_fix_attempt_count=?,
+                 auto_fix_claimed_checks=ci_failing_checks,
                  auto_fix_next_attempt_at_ms=?, auto_fix_error=NULL, updated_at_ms=?
              WHERE id=?",
             params![now, attempt, now.saturating_add(delay), now, id],
@@ -1593,6 +1672,7 @@ impl Store {
         let n = self.conn.execute(
             "UPDATE guardian_pull_requests
              SET auto_fix_attempted_at_ms=NULL, auto_fix_attempt_count=0,
+                 auto_fix_claimed_checks=NULL,
                  auto_fix_next_attempt_at_ms=NULL, auto_fix_error=NULL,
                  auto_fix_exhausted_notified_at_ms=NULL,
                  auto_fix_last_outcome = CASE WHEN auto_fix_last_outcome='exhausted' THEN NULL ELSE auto_fix_last_outcome END,
@@ -1617,6 +1697,7 @@ impl Store {
         Ok(self.conn.execute(
             "UPDATE guardian_pull_requests
              SET auto_fix_attempted_at_ms=NULL, auto_fix_attempt_count=0,
+                 auto_fix_claimed_checks=NULL,
                  auto_fix_next_attempt_at_ms=NULL, auto_fix_error=NULL,
                  auto_fix_exhausted_notified_at_ms=NULL, auto_fix_last_outcome=NULL,
                  updated_at_ms=?
@@ -13835,6 +13916,105 @@ mod tests {
         let after_passing = store.lock().get_pull_request(&pr_id).unwrap();
         assert_eq!(after_passing.auto_fix_attempt_count, 0);
         assert!(after_passing.auto_fix_attempted_at_ms.is_none());
+    }
+
+    fn refund_test_pr(s: &Store, forge: &str) -> String {
+        let gid = s.create_guardian("demo", "main", "/repo").unwrap();
+        s.add_guardian_branch(&gid, "a").unwrap();
+        let branch_id = s.get_guardian(&gid).unwrap().branches[0].id.clone();
+        s.create_pull_request(
+            &gid,
+            Some(&branch_id),
+            forge,
+            "acme/w",
+            "a",
+            "main",
+            "A",
+            "",
+            Some(1),
+            None,
+        )
+        .unwrap()
+    }
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn auto_fix_refunds_an_attempt_when_failing_checks_shrink_on_both_forges() {
+        for forge in ["github", "gitlab"] {
+            let s = store();
+            let id = refund_test_pr(&s, forge);
+            let mut attempts = Vec::new();
+            // Five sequential errors, each fixed in turn: more fixes than the
+            // ceiling of 3 allows without refunds.
+            let mut failing = vec!["a", "b", "c", "d", "e"];
+            s.set_pr_ci_status(&id, "failing", None).unwrap();
+            s.set_pr_failing_checks(&id, &names(&failing)).unwrap();
+            loop {
+                match s.claim_pr_auto_fix_attempt(&id, 3, 0).unwrap() {
+                    AutoFixClaim::Claimed { attempt } => attempts.push(attempt),
+                    other => panic!("{forge}: unexpected claim {other:?}"),
+                }
+                failing.pop();
+                if failing.is_empty() {
+                    break;
+                }
+                s.set_pr_ci_status(&id, "failing", None).unwrap();
+                assert!(s.set_pr_failing_checks(&id, &names(&failing)).unwrap());
+            }
+            assert_eq!(attempts, vec![1; 5], "{forge}");
+        }
+    }
+
+    #[test]
+    fn auto_fix_does_not_refund_equal_grown_or_disjoint_check_sets() {
+        let s = store();
+        let id = refund_test_pr(&s, "github");
+        s.set_pr_failing_checks(&id, &names(&["a", "b"])).unwrap();
+        s.claim_pr_auto_fix_attempt(&id, 3, 0).unwrap();
+        for set in [&["a", "b"][..], &["a", "b", "c"], &["c", "d"], &["c"]] {
+            assert!(!s.set_pr_failing_checks(&id, &names(set)).unwrap());
+        }
+        assert_eq!(s.get_pull_request(&id).unwrap().auto_fix_attempt_count, 1);
+        // Flapping back to a subset-of-nothing-new does not refund twice.
+        assert!(s.set_pr_failing_checks(&id, &names(&["a"])).unwrap());
+        assert!(!s.set_pr_failing_checks(&id, &names(&["a"])).unwrap());
+        assert!(!s.set_pr_failing_checks(&id, &names(&["a", "b"])).unwrap());
+        assert!(!s.set_pr_failing_checks(&id, &names(&["a"])).unwrap());
+    }
+
+    #[test]
+    fn auto_fix_refund_floors_at_zero_and_passing_clears_the_sets() {
+        let s = store();
+        let id = refund_test_pr(&s, "gitlab");
+        s.set_pr_failing_checks(&id, &names(&["a", "b"])).unwrap();
+        assert!(!s.set_pr_failing_checks(&id, &names(&["a"])).unwrap());
+        assert_eq!(s.get_pull_request(&id).unwrap().auto_fix_attempt_count, 0);
+        s.claim_pr_auto_fix_attempt(&id, 3, 0).unwrap();
+        s.set_pr_failing_checks(&id, &names(&["a"])).unwrap();
+        s.set_pr_ci_status(&id, "passing", None).unwrap();
+        assert_eq!(s.get_pull_request(&id).unwrap().auto_fix_attempt_count, 0);
+        s.set_pr_failing_checks(&id, &names(&["a", "b"])).unwrap();
+        assert!(!s.set_pr_failing_checks(&id, &names(&["a"])).unwrap());
+    }
+
+    #[test]
+    fn auto_fix_refund_unblocks_an_exhausted_pr() {
+        let s = store();
+        let id = refund_test_pr(&s, "github");
+        s.set_pr_failing_checks(&id, &names(&["a", "b"])).unwrap();
+        s.claim_pr_auto_fix_attempt(&id, 1, 0).unwrap();
+        assert_eq!(
+            s.claim_pr_auto_fix_attempt(&id, 1, 0).unwrap(),
+            AutoFixClaim::Exhausted { attempts: 1 }
+        );
+        assert!(s.set_pr_failing_checks(&id, &names(&["a"])).unwrap());
+        assert_eq!(
+            s.claim_pr_auto_fix_attempt(&id, 1, 0).unwrap(),
+            AutoFixClaim::Claimed { attempt: 1 }
+        );
     }
 
     #[test]

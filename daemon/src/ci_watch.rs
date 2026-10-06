@@ -470,6 +470,7 @@ fn run_watch(store: &crate::store_lock::StoreHandle, guardian_id: &str, branch_i
                     failure.job_url.as_deref(),
                 );
                 warn_on_pr_store_error(store, guardian_id, pr, "set_pr_ci_status", result);
+                record_failing_checks(store, guardian_id, pr, &failure);
                 enqueue_ci_failure_notice(store, &guardian, branch, pr, &failure);
                 return;
             }
@@ -503,6 +504,25 @@ fn run_watch(store: &crate::store_lock::StoreHandle, guardian_id: &str, branch_i
         }
         std::thread::sleep(next_poll_delay(elapsed));
     }
+}
+
+/// RAL-578: persist this poll's failing check names and refund an auto-fix
+/// attempt when the set strictly shrank since the last claimed attempt.
+fn record_failing_checks(
+    store: &crate::store_lock::StoreHandle,
+    guardian_id: &str,
+    pr: &PullRequestView,
+    failure: &PrFailure,
+) {
+    let names: Vec<String> = failure.checks.iter().map(|c| c.name.clone()).collect();
+    let result = store.lock().set_pr_failing_checks(&pr.id, &names);
+    warn_on_pr_store_error(
+        store,
+        guardian_id,
+        pr,
+        "set_pr_failing_checks",
+        result.map(|_| ()),
+    );
 }
 
 /// Enqueue the `"review"`-category mailbox notice for a terminal CI/merge
@@ -854,6 +874,9 @@ pub fn poll_open_pr_ci_status(
             .lock()
             .set_pr_ci_status(&pr.id, state.as_str(), job_url.as_deref());
         warn_on_pr_store_error(store, guardian_id, &pr, "set_pr_ci_status", result);
+        if let PrCiState::Failing(failure) = &state {
+            record_failing_checks(store, guardian_id, &pr, failure);
+        }
         let result = store.lock().set_pr_draft(&pr.id, probe.draft);
         warn_on_pr_store_error(store, guardian_id, &pr, "set_pr_draft", result);
         polled.push((pr, state));
