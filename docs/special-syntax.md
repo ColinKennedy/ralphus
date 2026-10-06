@@ -349,10 +349,18 @@ More text here
 - **The database** — added, edited and removed at runtime (`ralphus preset
   register/deregister`, the MCP tools, the board's Presets tab). A fresh
   database is seeded once with the starter presets and a set of role presets
-  under `roles/` (`adversary`, `analyst`, `architect`, `backend`, `ci-fixer`,
-  `devops`, `docs`, `frontend`, `manager`, `qa`, `resolver`, `retrieval`,
-  `reviewer`, `security`, `visionary`, `vp`). Any of them can be edited or
-  deleted; a deleted one is not re-seeded.
+  under `roles/`. The role templates embed `<<ralphus:linked-field/./..[proof]/prompt>>`,
+  so one role works on a cell (its own prompt) and on a proof (the parent
+  cell's prompt). **Judges** (`adversary`, `analyst`, `reviewer`, `security`)
+  are read-only, each sets its own `pass_score`, and are meant as `prompt`
+  proofs. **Editors** (`backend`, `ci-fixer`, `devops`, `docs`, `frontend`,
+  `qa`, `resolver`) change files and work as a cell or a proof. `retrieval`
+  is read-only and unscored. The planner roles (`architect`, `manager`,
+  `visionary`, `vp`) are not seeded: ralphus cannot yet hand a cell's plan to
+  downstream cells. Any of them can be edited or deleted; a deleted one is
+  not re-seeded. **Existing databases are not updated:** they keep the role
+  rows they were seeded with (including the planners). To adopt the new set,
+  delete the old `roles/…` rows and add the new ones yourself.
 - **Files** — the daemon's global `config.toml` takes a top-level
   `preset_paths = ["presets", "/opt/shared/presets"]` list. A relative entry
   is relative to the directory holding `config.toml`. Each entry is a
