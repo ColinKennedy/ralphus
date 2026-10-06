@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use crate::commands::initialize_exercise::{Exercise, ExerciseOptions, Fixture, squad_id};
+use crate::commands::initialize::exercise::{Exercise, ExerciseOptions, Fixture, squad_id};
 
 pub fn dispatch(options: &ExerciseOptions) -> i32 {
     let exercise = match Exercise::start("mailbox", options) {

@@ -13,6 +13,10 @@ per-command helpers here (`resolve_scoped`, `with_uri`, `proof_step_for`,
 call site inside this crate's own `dispatch`. Don't re-privatize one of these
 without checking `mcp/src/exec/` for a caller first.
 
+The `ralphus initialize ...` commands live in `src/commands/initialize/`, which
+has its own [`AGENTS.md`](src/commands/initialize/AGENTS.md) (guided exercises
+must need no LLM, work locally and `--remote`, and run in CI).
+
 ## Read-Only Quick-Start Safety List (RAL-194)
 
 Each `HelpNode` in `cli/src/help_map.rs`'s command tree (`ROOT` and its

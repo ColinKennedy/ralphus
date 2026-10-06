@@ -51,6 +51,8 @@ first; needs git and Python 3. `--only review,waypoint`, `--local-only` /
 `--remote-only` narrow it. CI's `initialize-exercises` job runs it (Windows:
 `--remote-only`, since local cells need psmux). It never touches a running
 dev stack: each exercise gets its own port, database, home, and psmux data dir.
+The rules every exercise must meet (no LLM, local and remote, CI-wired) live in
+[`cli/src/commands/initialize/AGENTS.md`](../cli/src/commands/initialize/AGENTS.md).
 
 **Documentation site.** `scripts/docs-build.sh` / `.cmd` renders
 `docs/site/pages/*.md` into `docs/site/_site/` via MkDocs + Material —

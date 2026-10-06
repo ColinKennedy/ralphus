@@ -14,13 +14,7 @@
 pub mod agent;
 pub mod cell;
 pub mod env;
-pub mod initialize_exercise;
-pub mod initialize_machine;
-pub mod initialize_mailbox;
-pub mod initialize_review;
-pub mod initialize_server;
-pub mod initialize_triage;
-pub mod initialize_waypoint;
+pub mod initialize;
 pub mod internal;
 pub mod machine;
 pub mod mailbox;
@@ -225,26 +219,26 @@ pub enum Command {
     /// `ralphus initialize server` (RAL-501): the interactive, hidden new
     /// installation walkthrough -- deliberately absent from
     /// `help_map.rs`/generated help/the MCP tool surface (see
-    /// `initialize_server.rs`'s module doc), reached only via the
+    /// `initialize/server.rs`'s module doc), reached only via the
     /// `resolved_path` exception in `help_map.rs`.
     InitializeServer {
-        setup: Box<initialize_server::InitializeServerOptions>,
+        setup: Box<initialize::server::InitializeServerOptions>,
     },
     /// Set up an isolated daemon and submit a waypoint exercise suite.
     InitializeWaypoint {
-        options: initialize_exercise::ExerciseOptions,
+        options: initialize::exercise::ExerciseOptions,
     },
     InitializeMailbox {
-        options: initialize_exercise::ExerciseOptions,
+        options: initialize::exercise::ExerciseOptions,
     },
     InitializeMachine {
-        options: initialize_exercise::ExerciseOptions,
+        options: initialize::exercise::ExerciseOptions,
     },
     InitializeTriage {
-        options: initialize_exercise::ExerciseOptions,
+        options: initialize::exercise::ExerciseOptions,
     },
     InitializeReview {
-        options: initialize_exercise::ExerciseOptions,
+        options: initialize::exercise::ExerciseOptions,
     },
     Project(project::ProjectCommand),
     Machine(machine::MachineCommand),
@@ -417,7 +411,7 @@ fn parse_forge_host(scanner: &mut Scanner) -> Result<Option<String>, UsageError>
     scanner
         .take_value("--forge-host")?
         .map_or(Ok(None), |host| {
-            initialize_server::validate_forge_host(&host)
+            initialize::server::validate_forge_host(&host)
                 .map(|()| Some(host))
                 .map_err(|error| UsageError(format!("--forge-host: {error}")))
         })
@@ -442,7 +436,7 @@ fn parse_project_fork_url(scanner: &mut Scanner) -> Result<Option<String>, Usage
 fn parse_exercise_options(
     kind: &str,
     args: &[String],
-) -> Result<initialize_exercise::ExerciseOptions, String> {
+) -> Result<initialize::exercise::ExerciseOptions, String> {
     let mut inner = Scanner::new(args);
     let state_dir = inner
         .take_value("--state-dir")
@@ -453,7 +447,7 @@ fn parse_exercise_options(
     if let Some(extra) = rest.first() {
         return Err(format!("initialize {kind}: unexpected argument {extra:?}"));
     }
-    Ok(initialize_exercise::ExerciseOptions {
+    Ok(initialize::exercise::ExerciseOptions {
         state_dir,
         remote,
         stop,
@@ -462,8 +456,8 @@ fn parse_exercise_options(
 
 fn parse_initialize_server(
     scanner: &mut Scanner,
-) -> Result<initialize_server::InitializeServerOptions, UsageError> {
-    Ok(initialize_server::InitializeServerOptions {
+) -> Result<initialize::server::InitializeServerOptions, UsageError> {
+    Ok(initialize::server::InitializeServerOptions {
         yes: scanner.take_bool("--yes"),
         install_tmux: parse_initialize_bool(scanner, "--install-tmux")?,
         tmux_program: scanner.take_value("--tmux-program")?,
@@ -565,21 +559,23 @@ pub fn dispatch(cmd: Command, opts: &GlobalOpts) -> i32 {
         Command::Queue(c) => queue::dispatch(c, opts),
         Command::Mcp(c) => mcp::dispatch(c),
         Command::InitializeGit { path } => misc::cmd_initialize_git(path),
-        Command::InitializeServer { setup } => initialize_server::dispatch(opts, *setup),
+        Command::InitializeServer { setup } => initialize::server::dispatch(opts, *setup),
         Command::InitializeWaypoint { options } => {
-            initialize_exercise::run_logged("waypoint", || initialize_waypoint::dispatch(&options))
+            initialize::exercise::run_logged("waypoint", || {
+                initialize::waypoint::dispatch(&options)
+            })
         }
         Command::InitializeMailbox { options } => {
-            initialize_exercise::run_logged("mailbox", || initialize_mailbox::dispatch(&options))
+            initialize::exercise::run_logged("mailbox", || initialize::mailbox::dispatch(&options))
         }
         Command::InitializeMachine { options } => {
-            initialize_exercise::run_logged("machine", || initialize_machine::dispatch(&options))
+            initialize::exercise::run_logged("machine", || initialize::machine::dispatch(&options))
         }
         Command::InitializeTriage { options } => {
-            initialize_exercise::run_logged("triage", || initialize_triage::dispatch(&options))
+            initialize::exercise::run_logged("triage", || initialize::triage::dispatch(&options))
         }
         Command::InitializeReview { options } => {
-            initialize_exercise::run_logged("review", || initialize_review::dispatch(&options))
+            initialize::exercise::run_logged("review", || initialize::review::dispatch(&options))
         }
         Command::Project(c) => project::dispatch(c, opts),
         Command::Machine(c) => machine::dispatch(c, opts),
