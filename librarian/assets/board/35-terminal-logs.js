@@ -411,7 +411,9 @@
        * @returns {Promise<RawTranscriptRange|null>}
        */
       async function fetchTapeRange(baseUrl, offset, limit) {
-        const resp = await fetch(`${baseUrl}?offset=${offset}&limit=${limit}`);
+        // A run-scoped key's URL already carries `?task=…&cell_id=…`.
+        const sep = baseUrl.includes("?") ? "&" : "?";
+        const resp = await fetch(`${baseUrl}${sep}offset=${offset}&limit=${limit}`);
         if (!resp.ok) return null;
         return /** @type {RawTranscriptRange} */ (await resp.json());
       }
