@@ -243,7 +243,7 @@ def _presets_overview(page: Page) -> None:
     ):
         _goto(page, base_url, "#/tasks")
         page.evaluate("showTab('presets', true)")
-        page.wait_for_selector("#presets .proj-table")
+        page.wait_for_selector("#presets .preset-card")
         _shoot(page, "presets-overview")
 
 

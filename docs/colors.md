@@ -432,6 +432,34 @@ or resizing a handle elsewhere, match the reference and use `right: 0; width: 12
 or similar to ensure the full hit-area is reachable and not clipped by parent
 `overflow: hidden`.
 
+## Form controls & buttons — one look everywhere
+
+Inputs, selects, textareas and buttons are not a place for per-tab styling. The
+reference is the **Tasks tab** (its filter box and `.btn` buttons), which the
+Squads, Reviews and Queue tabs already match. A new or restyled form — a Logs
+filter bar, a Machines/Triage/Users/Secrets "register" row, a modal field —
+must look like that, not like the browser default (white box, grey text, grey
+button):
+
+| Control | Look | How you get it |
+|---|---|---|
+| Text / number / date input, `select`, `textarea` | `--bg` fill, `1px solid --border`, `--text` text, 6px radius, `5px 8px` padding, `--faint` placeholder; focus = `--accent` border + `0 0 0 2px --accent-a` ring | Automatic: the zero-specificity base rule in `board.css` (right after the global `button` rule). Just write a bare `<input>`. |
+| Secondary button | `--panel-2` fill, `--border` border, `--text`, 6px radius | `class="btn"` (a class-less `<button>` gets the same look from the base rule) |
+| Primary / submit button (Register, Add, Apply-and-save) | `--accent` fill, `#fff` text, no border | `class="btn primary"` (a bare `class="primary"` also works) |
+| Destructive button | `--danger` text and border | `class="btn danger"` |
+| Disabled | 38–55% opacity, `not-allowed` cursor | the `disabled` attribute |
+
+Rules:
+- **Never** give an input or button its own background, border, border-radius or
+  text color — not in a stylesheet and not in an inline `style=`. Inline
+  `width`/`flex`/`min-width` for layout is fine.
+- **Never** restyle these per tab. If the shared look is wrong, change the base
+  rule or `.btn` once and every tab follows.
+- A form row is a flex row (`gap: 8px; flex-wrap: wrap`) of inputs followed by
+  one primary button, like the Tasks toolbar.
+- Checkboxes and radios keep their native control; label them in `--text`/`--muted`.
+- Every control still needs a `data-tip` (see `librarian/AGENTS.md`).
+
 ## Adding a new UI element — checklist
 
 1. Is there an existing semantic role above that fits? Use its variable.
@@ -439,6 +467,8 @@ or similar to ensure the full hit-area is reachable and not clipped by parent
    override if needed), add a row to the palette + a semantic role here, then use it.
 3. Never hardcode a hex value or clone an existing hue's number inline — always go
    through a variable so the palette stays the one place colors are defined.
+4. Adding an input, select, textarea or button? Use the shared look from
+   "Form controls & buttons" above — no per-element background, border or text color.
 
 ## Exception: per-type transcript colors (RAL-563)
 

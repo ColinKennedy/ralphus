@@ -1800,6 +1800,14 @@ def task_index_squads_from(squads: tuple[Json, ...]) -> tuple[Json, ...]:
     )
 
 
+# The Tasks tab renders from the compact `/api/task-index` board, not `/api/tasks`.
+TASKS_ROUTES["/api/task-index"] = {
+    "daemon": _daemon_status(running=1),
+    "squads": list(task_index_squads_from(TASKS_SQUADS)),
+}
+TASKS_ROUTES["/api/pull-requests/index"] = []
+
+
 def many_projects(n: int = 300) -> tuple[Json, ...]:
     """``n`` registered projects matching ``PROJECTS_ROWS``' shape via ``project()``."""
     return tuple(
