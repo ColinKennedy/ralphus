@@ -1,4 +1,4 @@
-      // ---------- Persistent personal-mailbox inbox widget (RAL-401) ----------
+﻿      // ---------- Persistent personal-mailbox inbox widget (RAL-401) ----------
       // A bottom-right fixture that replaces the old fire-and-forget toast
       // pattern for anything the daemon actually queues in the per-user
       // mailbox (RAL-241 broadcast queue, filtered per RAL-320 watches --
@@ -79,9 +79,18 @@
         const msg = mailboxMessages.find((m) => m.id === id);
         if (msg) msg.read = true;
         renderMailboxWidget();
+        let persisted = false;
         try {
-          await post(`/api/mailbox/personal/drain?user=${encodeURIComponent(currentUserName)}`, { message_ids: [id] });
-        } catch (e) { /* the next poll reconciles either way */ }
+          const resp = await post(`/api/mailbox/personal/drain?user=${encodeURIComponent(currentUserName)}`, { message_ids: [id] });
+          persisted = resp.ok;
+        } catch (e) { /* network failure: handled as not persisted below */ }
+        if (!persisted) {
+          // The daemon never recorded the dismissal, so the message would
+          // reappear on the next poll; put it back now instead of lying.
+          if (msg) msg.read = false;
+          renderMailboxWidget();
+          notify("error", "Could not dismiss the notification; it was not saved.");
+        }
       }
 
       /**

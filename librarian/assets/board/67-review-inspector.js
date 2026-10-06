@@ -1,4 +1,4 @@
-      // ---- Reviews tab: branch inspector + log dock ----
+﻿      // ---- Reviews tab: branch inspector + log dock ----
       //
       // Two surfaces that used to be buried inside the review's single
       // scrolling column:

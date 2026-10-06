@@ -14281,9 +14281,7 @@ struct PositionResponse {
 }
 
 /// Lean per-review projection for the Reviews tab's sidebar list, its
-/// status/origin/agent filters, and cross-review notice toasts
-/// (`checkGuardianNotices` in the board JS, which needs notice fields for
-/// every review, not just the one currently open) -- everything the list
+/// status/origin/agent filters -- everything the list
 /// needs without hydrating or serializing the full [`crate::guardian::GuardianView`]
 /// (env overrides, build/manual-checks environments, resolver session ids,
 /// token/cost accounting, per-branch detail, ...) for every review on every

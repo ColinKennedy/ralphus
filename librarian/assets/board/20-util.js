@@ -1,4 +1,4 @@
-      // ---------- helpers ----------
+﻿      // ---------- helpers ----------
       /**
        * Gets an element by id, asserting it is present. Use only where the
        * element is guaranteed to exist by the page's static structure (or by

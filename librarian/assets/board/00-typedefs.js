@@ -1,4 +1,4 @@
-      // ---- Shared type definitions (JSDoc-only; see docs/daemon-api.md for the
+﻿      // ---- Shared type definitions (JSDoc-only; see docs/daemon-api.md for the
       // authoritative wire shapes). Checked via `npm run typecheck` (tsc --checkJs
       // over the extracted <script> body) — see tsconfig.board.json. ----
       /**
@@ -466,8 +466,7 @@
        */
       /**
        * `GET /api/guardian-index` response shape -- the lean per-review
-       * summary the Reviews tab's sidebar list, its filters, and
-       * `checkGuardianNotices` read. Everything a `GuardianView` carries
+       * summary the Reviews tab's sidebar list and its filters read. Everything a `GuardianView` carries
        * beyond these fields (env overrides, resolver session ids, token/cost
        * accounting, per-branch detail, ...) is fetched separately, per
        * review, only once that review is actually opened -- see

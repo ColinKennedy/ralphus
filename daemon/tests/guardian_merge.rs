@@ -3963,14 +3963,15 @@ fn review_declared_auto_build_agent_failure_is_advisory_not_fatal() {
         "a failed review-declared auto_build agent call must still reach in_review: {:?}",
         view.detail
     );
-    assert_eq!(view.notice_kind.as_deref(), Some("auto_build_failed"));
+    let notices = store
+        .lock()
+        .mailbox_messages_for_client("test", false, None)
+        .unwrap();
     assert!(
-        view.notice_message
-            .as_deref()
-            .unwrap_or_default()
-            .contains("boom: agent exploded"),
-        "notice: {:?}",
-        view.notice_message
+        notices
+            .iter()
+            .any(|m| m.message.contains("boom: agent exploded")),
+        "notices: {notices:?}"
     );
 
     let page = store

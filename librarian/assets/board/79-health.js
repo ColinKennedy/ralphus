@@ -1,4 +1,4 @@
-      // ---------- Health tab (RAL-416) ----------
+﻿      // ---------- Health tab (RAL-416) ----------
       // Catalog-driven view of every check `ralphus_core::health_catalog`
       // knows about, joined against two live sources: this daemon's own
       // cached hourly Free-tier sweep (GET /api/health/report) and every

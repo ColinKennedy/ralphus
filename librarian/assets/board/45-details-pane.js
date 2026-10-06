@@ -1,4 +1,4 @@
-      // ---------- center graph ----------
+﻿      // ---------- center graph ----------
       /**
        * Renders the center dependency-graph pane for the selected squad.
        * @returns {void}

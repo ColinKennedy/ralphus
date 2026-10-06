@@ -1,4 +1,4 @@
-      // ---------- Cartographer (RAL-98): the unified structured event log ----------
+﻿      // ---------- Cartographer (RAL-98): the unified structured event log ----------
       // One shared table renderer + fetcher is used by three places: the global
       // Cartographer tab (full filter UI + pagination), a squad's Logs modal
       // "events" tab (filtered by squad_id), and a review's Logs button (filtered

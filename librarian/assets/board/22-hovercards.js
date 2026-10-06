@@ -1,4 +1,4 @@
-      // ---- Entity hovercard engine ----
+﻿      // ---- Entity hovercard engine ----
       //
       // The tooltip engine (20-util.js) answers "what does this control do" for
       // things you click. This one answers "what *is* this" for things you read: a

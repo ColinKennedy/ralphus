@@ -1,4 +1,4 @@
-      // ---------- polling ----------
+﻿      // ---------- polling ----------
       // RAL-7: a periodic/pushed refresh re-renders panes via `el.innerHTML = …`, which resets
       // scroll position and wipes in-progress text in a pane's inputs. Captures
       // the user's scroll position and focused field beforehand and restores them
@@ -1097,7 +1097,6 @@
             const prior = priorById.get(lean.id);
             return prior && prior.branches ? Object.assign({}, prior, lean) : lean;
           });
-          checkGuardianNotices(guardians);
           byId("conn").className = "dot on";
           markUpdated();
           if (pendingHash && pendingHash.tab === "reviews") {

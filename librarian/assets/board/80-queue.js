@@ -1,4 +1,4 @@
-      // ---------- Queue tab (RAL Queue) ----------
+﻿      // ---------- Queue tab (RAL Queue) ----------
       /**
        * @typedef {object} QueueItem
        * @property {string} path

@@ -1,4 +1,4 @@
-      // ---- Liveness signal (RAL-170) ----
+﻿      // ---- Liveness signal (RAL-170) ----
       // No new pane output for this long from a still-`running` cell is
       // flagged as possibly-stalled rather than just "quiet" -- long enough
       // to not flag normal pauses between a command's own output lines (a

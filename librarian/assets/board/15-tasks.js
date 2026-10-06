@@ -1,4 +1,4 @@
-      // ---------- Tasks tab: rendering + interaction (RAL-362) ----------
+﻿      // ---------- Tasks tab: rendering + interaction (RAL-362) ----------
       // Everything below turns the pure RALPHUS-TASK-TAB-LOGIC helpers above
       // into DOM: fetching (`pollWatches`/`pollTasksTab`), building rows from
       // `squads`/`taskTabPrIndex`/`taskTabWatches` (`ttBuildRows`), the

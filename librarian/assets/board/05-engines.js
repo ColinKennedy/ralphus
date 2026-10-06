@@ -1,4 +1,4 @@
-      // ---- Tooltip engine (RAL-40) ----
+﻿      // ---- Tooltip engine (RAL-40) ----
       // Attach data-tip="..." to any element for a styled dark-theme tooltip.
       // Multi-line content: use \n in the attribute value.
       /** Wires up the global hover-tooltip engine driven by `data-tip="..."` attributes; self-invoking, no exports. */
