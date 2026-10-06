@@ -780,7 +780,7 @@ fn branch_materialization(root: &Path, branch: &str) -> Result<BranchMaterializa
 /// `execute_worktree_plan` passes `--no-track` to every `worktree add -b`
 /// call for exactly this reason, so the *only* shared-`.git/config` writes
 /// are the explicit, lock-guarded ones here.
-static WORKTREE_CONFIG_LOCK: LazyLock<parking_lot::Mutex<()>> =
+pub(crate) static WORKTREE_CONFIG_LOCK: LazyLock<parking_lot::Mutex<()>> =
     LazyLock::new(|| parking_lot::Mutex::new(()));
 
 fn set_explicit_upstream(wt: &Path, branch: &str, upstream: &str) -> Result<(), String> {
@@ -858,12 +858,9 @@ fn freeze_commit_baseline(wt: &Path, branch: &str) {
         return;
     };
     // `set_worktree_commit_baseline` writes `ralphus.<branch>.baseline` to
-    // the same shared `.git/config` `set_explicit_upstream` writes to --
-    // needs the same `WORKTREE_CONFIG_LOCK` for the same reason (see that
-    // static's doc comment); a worktree's `freeze_commit_baseline` call can
-    // otherwise race a *different* worktree's concurrent
-    // `set_explicit_upstream` call on git's own `.git/config.lock`.
-    let _guard = WORKTREE_CONFIG_LOCK.lock();
+    // the same shared `.git/config` `set_explicit_upstream` writes to; it takes
+    // `WORKTREE_CONFIG_LOCK` itself (see that static's doc comment), so this
+    // caller must not already hold it.
     if let Err(e) = crate::reviews::set_worktree_commit_baseline(wt, upstream.trim()) {
         // ralphus[ignore-rlog-pair]: worktree helper has no Store; caller records review workflow outcomes
         crate::rlog!(
