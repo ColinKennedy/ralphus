@@ -2475,10 +2475,19 @@ fn append_insights_to_review_commit(
     remote_name: &str,
     alias: &str,
     prophecies: &[crate::prophecy::ProphecyView],
+    appraisal_block: Option<&str>,
 ) -> std::result::Result<Option<String>, String> {
-    let Some(block) = insights_commit_block(prophecies) else {
+    let block = [
+        appraisal_block.map(str::to_string),
+        insights_commit_block(prophecies),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("\n\n");
+    if block.is_empty() {
         return Ok(None);
-    };
+    }
     // `update-ref` (unlike `rev-parse`) does not DWIM-resolve a short branch
     // name -- it needs the fully-qualified ref it will actually write.
     let full_ref = git(root, &["rev-parse", "--symbolic-full-name", review_ref])?
@@ -6939,6 +6948,9 @@ fn submit_stacked_branch_pr(
             )
         }
     };
+    // RAL-575: the appraisals folded into a PR created below; stamped as
+    // published once the PR row exists so a resubmit does not repeat them.
+    let mut posted_appraisals: Vec<crate::appraisal::ReviewAppraisal> = Vec::new();
     let (created_pr, base, title, description, adopted) = match route
         .find_existing_pull_request()?
     {
@@ -6957,6 +6969,28 @@ fn submit_stacked_branch_pr(
                 Some(block) => format!("{description}\n\n{block}"),
                 None => description,
             };
+            // RAL-575: judges' appraisals never go through the relevance
+            // filter above; they are rendered deterministically and placed
+            // above the description (below it when a repo template leads
+            // with front matter). Skipped entirely when the review opts out
+            // -- they stay stored and on the board.
+            let appraisals = if crate::appraisal_pr::post_appraisals_enabled(guardian) {
+                store
+                    .lock()
+                    .list_unpublished_appraisals_for_guardian(id)
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let description = match crate::appraisal_pr::render_pr_block(
+                &appraisals,
+                crate::appraisal_pr::PR_BODY_BUDGET.saturating_sub(description.chars().count() + 2),
+            ) {
+                Some(block) => crate::appraisal_pr::compose_body(&block, &description),
+                None => description,
+            };
+            let appraisal_commit_block = crate::appraisal_pr::render_commit_block(&appraisals);
+            posted_appraisals = appraisals;
             // RAL-<new>: fold the same reviewer-relevant list into the
             // review branch's own tip commit, not just the PR body, so it
             // survives an eventual squash-merge after the PR itself is
@@ -6969,6 +7003,7 @@ fn submit_stacked_branch_pr(
                 remote_name,
                 &alias,
                 &reviewer_relevant_prophecies,
+                appraisal_commit_block.as_deref(),
             ) {
                 Ok(Some(new_sha)) => {
                     pushed_sha = Some(new_sha.clone());
@@ -7027,6 +7062,19 @@ fn submit_stacked_branch_pr(
             .map(|prophecy| prophecy.id)
             .collect::<Vec<_>>();
         let _ = store.lock().mark_prophecies_published(&ids, &row_id);
+    }
+    if !adopted {
+        let guard = store.lock();
+        for posted in &posted_appraisals {
+            let a = &posted.appraisal;
+            if let Err(e) = guard.mark_appraisal_published(&a.entity_uri, a.attempt, &row_id) {
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [pr] review {id} could not mark appraisal {} published: {e}",
+                    a.entity_uri
+                );
+            }
+        }
     }
     if let Some(sha) = &pushed_sha {
         let result = store.lock().update_pull_request_ex(
@@ -10245,9 +10293,16 @@ mod tests {
             crate::prophecy::ProphecyKind::Decision,
             "kept this one",
         )];
-        let new_sha = append_insights_to_review_commit(&root, "main", remote, "pr-x", &prophecies)
-            .unwrap()
-            .expect("a rewrite happened");
+        let new_sha = append_insights_to_review_commit(
+            &root,
+            "main",
+            remote,
+            "pr-x",
+            &prophecies,
+            Some("Appraisals recorded while this was built:\n\nsecurity — 4/10 FAIL"),
+        )
+        .unwrap()
+        .expect("a rewrite happened");
         assert_ne!(new_sha, old_sha);
 
         // The local ref and the remote alias both landed on the rewritten commit.
@@ -10265,9 +10320,14 @@ mod tests {
             "{message}"
         );
 
-        // No prophecies -> no rewrite, no push, ref untouched.
         assert!(
-            append_insights_to_review_commit(&root, "main", remote, "pr-x", &[])
+            message.contains("security — 4/10 FAIL"),
+            "the appraisal block is folded into the tip commit: {message}"
+        );
+
+        // No prophecies and no appraisals -> no rewrite, no push, ref untouched.
+        assert!(
+            append_insights_to_review_commit(&root, "main", remote, "pr-x", &[], None)
                 .unwrap()
                 .is_none()
         );
@@ -18305,6 +18365,249 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         mock.finish();
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&remote_dir);
+    }
+
+    /// RAL-575: a two-branch review submitted in stack order, with one stored
+    /// appraisal belonging to the review. Returns the creation POST bodies
+    /// (`title`/`body` fields normalized across forges), the PR rows, the
+    /// review-tip commit message pushed for the first branch, and the stored
+    /// appraisal rows -- so one fixture proves the block placement, the
+    /// bookkeeping, and that the stack still chains on both forges.
+    fn submit_two_branch_stack_with_an_appraisal(
+        forge: &str,
+    ) -> (
+        Vec<serde_json::Value>,
+        Vec<PullRequestView>,
+        String,
+        Vec<crate::appraisal::AppraisalView>,
+    ) {
+        let github = forge == "github";
+        let mock = MockForge::start(move |server| {
+            let mut posted = Vec::new();
+            let mut next_number = 61_i64;
+            for mut req in server.requests() {
+                let method = req.method().clone();
+                let url = req.url().to_string();
+                let path = url.split('?').next().unwrap_or(&url).to_string();
+                let is_list = path.ends_with(if github { "/pulls" } else { "/merge_requests" });
+                if method == tiny_http::Method::Get && is_list {
+                    req.respond(tiny_http::Response::from_string("[]").with_status_code(200))
+                        .unwrap();
+                } else if method == tiny_http::Method::Post && is_list {
+                    let mut body = String::new();
+                    req.as_reader().read_to_string(&mut body).unwrap();
+                    posted.push(serde_json::from_str::<serde_json::Value>(&body).unwrap());
+                    let number = next_number;
+                    next_number += 1;
+                    let reply = if github {
+                        format!(r#"{{"number":{number},"html_url":"http://x/{number}"}}"#)
+                    } else {
+                        format!(r#"{{"iid":{number},"web_url":"http://x/{number}"}}"#)
+                    };
+                    req.respond(tiny_http::Response::from_string(reply).with_status_code(201))
+                        .unwrap();
+                } else if method == tiny_http::Method::Get && path.ends_with("/actions/runs") {
+                    req.respond(
+                        tiny_http::Response::from_string(r#"{"workflow_runs":[]}"#)
+                            .with_status_code(200),
+                    )
+                    .unwrap();
+                } else if method == tiny_http::Method::Get && path.ends_with("/pipelines") {
+                    req.respond(tiny_http::Response::from_string("[]").with_status_code(200))
+                        .unwrap();
+                } else {
+                    req.respond(tiny_http::Response::from_string("{}").with_status_code(200))
+                        .unwrap();
+                }
+            }
+            posted
+        });
+
+        let root = tmp_dir("appraisal-stack-root");
+        let mut init_opts = git2::RepositoryInitOptions::new();
+        init_opts.initial_head("main");
+        let repo = git2::Repository::init_opts(&root, &init_opts).unwrap();
+        let sig = git2::Signature::now("t", "t@t").unwrap();
+        gwrite(&root, "base.txt", "base\n");
+        let base_oid = git2_commit_all(&repo, &sig, "base", &[]);
+        let base_commit = repo.find_commit(base_oid).unwrap();
+        repo.branch("review-1", &base_commit, false).unwrap();
+        git2_checkout(&repo, "review-1");
+        gwrite(&root, "one.txt", "one\n");
+        let one_oid = git2_commit_all(&repo, &sig, "one", &[&base_commit]);
+        let one_commit = repo.find_commit(one_oid).unwrap();
+        repo.branch("review-2", &one_commit, false).unwrap();
+        git2_checkout(&repo, "review-2");
+        gwrite(&root, "two.txt", "two\n");
+        git2_commit_all(&repo, &sig, "two", &[&one_commit]);
+
+        let remote_dir = tmp_dir("appraisal-stack-remote");
+        git2::Repository::init_bare(&remote_dir).unwrap();
+        repo.remote("origin", remote_dir.to_str().unwrap()).unwrap();
+        g(&root, &["push", "origin", "review-1:refs/heads/pr-1"]);
+        g(&root, &["push", "origin", "review-2:refs/heads/pr-2"]);
+
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let gid = store
+            .lock()
+            .create_guardian("demo", "main", root.to_str().unwrap())
+            .unwrap();
+        for (name, review) in [("b1", "review-1"), ("b2", "review-2")] {
+            store.lock().add_guardian_branch(&gid, name).unwrap();
+            let branch_id = store
+                .lock()
+                .get_guardian(&gid)
+                .unwrap()
+                .branches
+                .iter()
+                .find(|b| b.branch == name)
+                .unwrap()
+                .id
+                .clone();
+            store
+                .lock()
+                .set_branch_review(&gid, &branch_id, review, root.to_str().unwrap())
+                .unwrap();
+        }
+        {
+            let s = store.lock();
+            s.conn
+                .execute(
+                    "INSERT INTO squads(id, state, created_at_ms, updated_at_ms) VALUES ('squad-1','pending',0,0)",
+                    [],
+                )
+                .unwrap();
+            s.conn
+                .execute(
+                    "INSERT INTO cells(squad_id, task_idx, idx, sid, agent, state, review_guardian_id)
+                     VALUES ('squad-1', 0, 0, 'sid-1', 'claude', 'done', ?)",
+                    rusqlite::params![gid],
+                )
+                .unwrap();
+            s.record_appraisal(
+                "squad-1",
+                &crate::appraisal::proof_entity_uri("squad-1", 0, "cell", 0, 0),
+                4,
+                7,
+                "needs a gate",
+                &[crate::appraisal::AppraisalSectionView {
+                    title: "Exploit path".to_string(),
+                    body: "1. POST /x".to_string(),
+                }],
+            )
+            .unwrap();
+        }
+
+        let client = mock.client(
+            if github {
+                crate::forge::ForgeKind::GitHub
+            } else {
+                crate::forge::ForgeKind::GitLab
+            },
+            if github { "acme/w" } else { "acme%2Fw" },
+        );
+        let runner = NoopRunner;
+        let guardian = store.lock().get_guardian(&gid).unwrap();
+        let ordered_enabled: Vec<&BranchView> = guardian.branches.iter().collect();
+        let mut alias_by_branch = HashMap::new();
+        let mut prs = Vec::new();
+        for (i, branch) in ordered_enabled.iter().enumerate() {
+            let req = PrRequest {
+                branch_id: Some(branch.id.clone()),
+                branch_alias: Some(format!("pr-{}", i + 1)),
+                title: Some(format!("title {}", i + 1)),
+                description: Some(format!("description {}", i + 1)),
+                use_worktree_branch_name: None,
+                draft: None,
+            };
+            prs.push(
+                submit_stacked_branch_pr(
+                    &store,
+                    &runner,
+                    &client,
+                    &gid,
+                    &root,
+                    "origin",
+                    &guardian,
+                    &ordered_enabled,
+                    &mut alias_by_branch,
+                    "main",
+                    branch,
+                    &req,
+                    "{name}-alias",
+                    None,
+                    "stack-1",
+                    None,
+                    false,
+                )
+                .expect("each stacked branch must submit"),
+            );
+        }
+        let tip_message = g(&remote_dir, &["log", "-1", "--format=%B", "pr-1"]);
+        let stored = store
+            .lock()
+            .list_appraisals_for_entity(&crate::appraisal::proof_entity_uri(
+                "squad-1", 0, "cell", 0, 0,
+            ))
+            .unwrap();
+        let posted = mock.finish();
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote_dir);
+        (posted, prs, tip_message, stored)
+    }
+
+    fn assert_appraisal_lands_in_the_first_pr_and_the_stack_holds(forge: &str) {
+        let (posted, prs, tip_message, stored) = submit_two_branch_stack_with_an_appraisal(forge);
+        let body_key = if forge == "github" {
+            "body"
+        } else {
+            "description"
+        };
+        let base_key = if forge == "github" {
+            "base"
+        } else {
+            "target_branch"
+        };
+        assert_eq!(posted.len(), 2, "one PR per stacked branch");
+
+        // The block is above the description and carries the verbatim score.
+        let first_body = posted[0][body_key].as_str().unwrap();
+        let block_at = first_body.find("## Appraisals").expect("block present");
+        let description_at = first_body.find("description 1").expect("description kept");
+        assert!(block_at < description_at, "{first_body}");
+        assert!(first_body.contains("proof 1 — 4/10 · FAIL (needs ≥7)"));
+        assert!(first_body.contains("#### Exploit path\n1. POST /x"));
+
+        // Published once: the second PR does not repeat it.
+        assert!(!posted[1][body_key].as_str().unwrap().contains("Appraisals"));
+
+        // The same content is folded into the review branch's tip commit.
+        assert!(tip_message.contains("Appraisals recorded"), "{tip_message}");
+        assert!(tip_message.contains("Exploit path:\n1. POST /x"));
+
+        // Bookkeeping: stamped with the first PR's row id.
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].pr_id.as_deref(), Some(prs[0].id.as_str()));
+        assert!(stored[0].published_at_ms.is_some());
+
+        // Stack integrity: appraisals did not disturb the chain -- the first
+        // PR targets the base, the second targets the first PR's branch.
+        assert_eq!(posted[0][base_key], serde_json::json!("main"));
+        assert_eq!(posted[1][base_key], serde_json::json!(prs[0].branch_alias));
+        assert_eq!(prs[0].base_ref, "main");
+        assert_eq!(prs[1].base_ref, prs[0].branch_alias);
+        assert_eq!(prs[0].pr_number, Some(61));
+        assert_eq!(prs[1].pr_number, Some(62));
+    }
+
+    #[test]
+    fn appraisals_fold_into_the_first_github_pr_without_breaking_the_stack() {
+        assert_appraisal_lands_in_the_first_pr_and_the_stack_holds("github");
+    }
+
+    #[test]
+    fn appraisals_fold_into_the_first_gitlab_mr_without_breaking_the_stack() {
+        assert_appraisal_lands_in_the_first_pr_and_the_stack_holds("gitlab");
     }
 
     #[test]

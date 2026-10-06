@@ -209,19 +209,101 @@ impl Store {
     /// module doc). Returns how many proofs' latest appraisal was stamped.
     pub fn mark_appraisals_published(&self, squad_id: &str, pr_id: &str) -> Result<usize> {
         let latest = latest_appraisals_by_uri(&self.conn, squad_id)?;
-        let now = now_ms();
         for a in latest.values() {
-            self.conn.execute(
-                "UPDATE proof_appraisals SET published_at_ms=?, pr_id=? WHERE entity_uri=? AND attempt=?",
-                params![now, pr_id, a.entity_uri, a.attempt],
-            )?;
-            self.conn.execute(
-                "DELETE FROM proof_appraisals WHERE entity_uri=? AND attempt<?",
-                params![a.entity_uri, a.attempt],
-            )?;
+            self.mark_appraisal_published(&a.entity_uri, a.attempt, pr_id)?;
         }
         Ok(latest.len())
     }
+
+    /// Stamp one proof's `attempt` as published with `pr_id` and drop its
+    /// superseded attempts.
+    pub fn mark_appraisal_published(
+        &self,
+        entity_uri: &str,
+        attempt: i64,
+        pr_id: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE proof_appraisals SET published_at_ms=?, pr_id=? WHERE entity_uri=? AND attempt=?",
+            params![now_ms(), pr_id, entity_uri, attempt],
+        )?;
+        self.conn.execute(
+            "DELETE FROM proof_appraisals WHERE entity_uri=? AND attempt<?",
+            params![entity_uri, attempt],
+        )?;
+        Ok(())
+    }
+
+    /// The latest, not-yet-published appraisal of every scored proof that
+    /// belongs to review `guardian_id` -- a cell-scoped proof of one of its
+    /// cells, or a task-scoped proof of a task that has such a cell -- each
+    /// with the label the PR block shows for it (the proof step's `id`, else
+    /// `proof N`). Ordered by entity URI so the PR block is stable.
+    pub fn list_unpublished_appraisals_for_guardian(
+        &self,
+        guardian_id: &str,
+    ) -> Result<Vec<ReviewAppraisal>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT squad_id, task_idx, idx FROM cells WHERE review_guardian_id=?",
+        )?;
+        let cells: Vec<(String, i64, i64)> = stmt
+            .query_map(params![guardian_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        let mut squads: Vec<&str> = cells.iter().map(|(s, _, _)| s.as_str()).collect();
+        squads.sort_unstable();
+        squads.dedup();
+        let mut out = Vec::new();
+        for squad_id in squads {
+            for (uri, a) in latest_appraisals_by_uri(&self.conn, squad_id)? {
+                if a.published_at_ms.is_some() {
+                    continue;
+                }
+                let Some(EntityUri::Proof {
+                    task_idx,
+                    proof_scope,
+                    cell_idx,
+                    proof_idx,
+                    ..
+                }) = crate::entity_uri::parse(&uri)
+                else {
+                    continue;
+                };
+                let belongs = cells.iter().any(|(s, t, c)| {
+                    s == squad_id && *t == task_idx && (proof_scope == "task" || *c == cell_idx)
+                });
+                if !belongs {
+                    continue;
+                }
+                let vid: Option<String> = self
+                    .conn
+                    .query_row(
+                        "SELECT vid FROM proofs WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=?",
+                        params![squad_id, task_idx, proof_scope, cell_idx, proof_idx],
+                        |r| r.get(0),
+                    )
+                    .optional()?
+                    .flatten();
+                let label = vid
+                    .filter(|v| !v.trim().is_empty())
+                    .unwrap_or_else(|| format!("proof {}", proof_idx + 1));
+                out.push(ReviewAppraisal {
+                    label,
+                    appraisal: a,
+                });
+            }
+        }
+        out.sort_by(|a, b| a.appraisal.entity_uri.cmp(&b.appraisal.entity_uri));
+        Ok(out)
+    }
+}
+
+/// An appraisal paired with the label its PR block is headed by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewAppraisal {
+    pub label: String,
+    pub appraisal: AppraisalView,
 }
 
 #[cfg(test)]
@@ -280,5 +362,52 @@ mod tests {
         assert_eq!(rows[0].attempt, 2);
         assert_eq!(rows[0].pr_id.as_deref(), Some("pr-9"));
         assert!(rows[0].published_at_ms.is_some());
+    }
+
+    fn seed_cell(s: &Store, squad: &str, task_idx: i64, idx: i64, guardian: &str) {
+        s.conn
+            .execute(
+                "INSERT OR IGNORE INTO squads(id, state, created_at_ms, updated_at_ms) VALUES (?,'pending',0,0)",
+                params![squad],
+            )
+            .unwrap();
+        s.conn
+            .execute(
+                "INSERT INTO cells(squad_id, task_idx, idx, sid, agent, state, review_guardian_id)
+                 VALUES (?,?,?,?,?,?,?)",
+                params![squad, task_idx, idx, "sid", "claude", "done", guardian],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn unpublished_listing_is_scoped_to_the_review_and_skips_published() {
+        let s = Store::open_in_memory().unwrap();
+        seed_cell(&s, "squad-1", 0, 0, "g-1");
+        seed_cell(&s, "squad-1", 0, 1, "g-2");
+        let mine = proof_entity_uri("squad-1", 0, "cell", 0, 0);
+        let task_wide = proof_entity_uri("squad-1", 0, "task", 0, 1);
+        let other = proof_entity_uri("squad-1", 0, "cell", 1, 0);
+        for uri in [&mine, &task_wide, &other] {
+            s.record_appraisal("squad-1", uri, 4, 7, "bad", &sections())
+                .unwrap();
+        }
+        let listed = s.list_unpublished_appraisals_for_guardian("g-1").unwrap();
+        let uris: Vec<&str> = listed
+            .iter()
+            .map(|a| a.appraisal.entity_uri.as_str())
+            .collect();
+        assert_eq!(uris, vec![mine.as_str(), task_wide.as_str()]);
+        assert_eq!(listed[0].label, "proof 1");
+
+        s.mark_appraisal_published(&mine, 1, "pr-3").unwrap();
+        let listed = s.list_unpublished_appraisals_for_guardian("g-1").unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].appraisal.entity_uri, task_wide);
+        assert!(
+            s.list_unpublished_appraisals_for_guardian("nobody")
+                .unwrap()
+                .is_empty()
+        );
     }
 }
