@@ -5950,6 +5950,35 @@ fn run_proofs(
                     idx,
                 );
                 let passed = result.proof_passed();
+                if let (Some(appraisal), Some(pass_score)) =
+                    (&result.appraisal, runner_spec.pass_score)
+                {
+                    let sections: Vec<crate::appraisal::AppraisalSectionView> = appraisal
+                        .sections
+                        .iter()
+                        .map(|s| crate::appraisal::AppraisalSectionView {
+                            title: s.title.clone(),
+                            body: s.body.clone(),
+                        })
+                        .collect();
+                    let uri = crate::appraisal::proof_entity_uri(
+                        squad_id, task_idx, scope, cell_idx, idx,
+                    );
+                    let guard = store.lock();
+                    store_ok(
+                        &guard,
+                        squad_id,
+                        "record_appraisal",
+                        guard.record_appraisal(
+                            squad_id,
+                            &uri,
+                            i64::from(appraisal.score),
+                            i64::from(pass_score),
+                            &appraisal.summary,
+                            &sections,
+                        ),
+                    );
+                }
                 let output = match &result.error {
                     Some(err) if result.summary.is_empty() => err.clone(),
                     Some(err) => format!("{}\n{err}", result.summary),

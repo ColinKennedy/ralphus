@@ -3603,6 +3603,21 @@ and `.../proof/env`) -- see
 above for how these merge with the squad's. All four are raw unredacted
 `{key: value}` pairs, omitted from the JSON when empty, same as the squad's.
 
+A scored prompt `ProofView` (one with a `pass_score`) carries an `appraisal`
+object (RAL-575) once its judge has answered: `{ entity_uri, attempt, score,
+pass_score, passed, summary, sections: [{title, body}], created_at_ms,
+published_at_ms, pr_id }`. `entity_uri` is the step's `proof:` URI; `score` is
+1-10 and `passed` is `score >= pass_score` (the threshold in force when it was
+recorded). It is the **latest** attempt; every restart that produces an
+appraisal appends a new `proof_appraisals` row and keeps the earlier ones as
+history. The key is omitted for unscored steps and until one is recorded. Each
+write also emits a Cartographer row (`source: appraisal`, scope `proof`), so it
+shows in the squad timeline. `ralphus proof show`, the MCP `proof show` tool
+and the board all read this same field. Lifetime: all attempts are kept until
+the review's PR is submitted; afterwards only the latest per proof, for as long
+as the squad exists; deleting the squad drops them. These are not prophecies
+and never pass through the prophecy relevance filter.
+
 Each `TaskView`/`CellView`/`ProofView` also carries `env_out_of_date`
 (RAL-271): a cosmetic, non-blocking `boolean` that flips to `true` once the
 row's own env overrides (or, for a task/cell, its own proof steps'

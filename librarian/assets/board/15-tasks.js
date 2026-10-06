@@ -1321,7 +1321,7 @@
         html += `<h4 style="margin:14px 0 6px">Task proof steps</h4>`;
         const taskProof = row.task.proof || [];
         if (!taskProof.length) html += `<div class="empty" style="padding:6px 0">No task-scope proof steps.</div>`;
-        else html += taskProof.map((v) => `<div class="kv-row">${sdot(v.state)}<span class="k">${esc(v.id || v.kind)}</span><span class="v">${pill(v.state)}</span></div>`).join("");
+        else html += taskProof.map((v) => `<div class="kv-row">${sdot(v.state)}<span class="k">${esc(v.id || v.kind)}</span><span class="v">${pill(v.state)} ${appraisalBadge(v)}</span></div>`).join("");
         if (row.prPick) {
           html += `<h4 style="margin:14px 0 6px">PR check</h4>`;
           html += `<button class="btn" onclick="ttRunPrCheck('${esc(row.squadId)}',${row.taskIdx})" data-tip="On-demand only: fetches live drift (a git fetch), un-actioned feedback, and (while open) CI status -- three forge/git calls -- for this task's earliest PR.\nNot part of &quot;needs me&quot; or polled automatically -- at board scale that would be one round-trip per PR per refresh.">Check drift, feedback &amp; CI</button>`;
