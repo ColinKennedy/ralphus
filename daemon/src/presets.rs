@@ -52,6 +52,10 @@ pub struct PresetView {
     pub maximum_context: Option<u64>,
     pub auto_compact_threshold: Option<u64>,
     pub maximum_tool_output_tokens: Option<u64>,
+    /// Stamped into an extending `prompt` proof step's own `pass_score`, only
+    /// if left unset, making it a scored proof. Not applicable to a task or
+    /// cell.
+    pub pass_score: Option<u8>,
     pub created_at_ms: i64,
     /// Where this preset came from; on-disk presets are read-only.
     pub source: PresetSource,
@@ -84,6 +88,7 @@ pub struct PresetSeed {
     pub maximum_context: Option<u64>,
     pub auto_compact_threshold: Option<u64>,
     pub maximum_tool_output_tokens: Option<u64>,
+    pub pass_score: Option<u8>,
 }
 
 pub const DEFAULT_PRESETS: &[PresetSeed] = &[
@@ -95,6 +100,7 @@ pub const DEFAULT_PRESETS: &[PresetSeed] = &[
         maximum_context: Some(75_000),
         auto_compact_threshold: Some(51_000),
         maximum_tool_output_tokens: Some(8_000),
+        pass_score: None,
     },
     PresetSeed {
         name: "medium_task",
@@ -104,6 +110,7 @@ pub const DEFAULT_PRESETS: &[PresetSeed] = &[
         maximum_context: Some(120_000),
         auto_compact_threshold: Some(86_000),
         maximum_tool_output_tokens: Some(12_000),
+        pass_score: None,
     },
     PresetSeed {
         name: "complex_task",
@@ -113,6 +120,7 @@ pub const DEFAULT_PRESETS: &[PresetSeed] = &[
         maximum_context: Some(200_000),
         auto_compact_threshold: Some(150_000),
         maximum_tool_output_tokens: Some(15_000),
+        pass_score: None,
     },
     PresetSeed {
         name: "no_git_commit",
@@ -127,6 +135,7 @@ pub const DEFAULT_PRESETS: &[PresetSeed] = &[
         maximum_context: None,
         auto_compact_threshold: None,
         maximum_tool_output_tokens: None,
+        pass_score: None,
     },
     PresetSeed {
         name: "commit_and_push",
@@ -139,6 +148,7 @@ pub const DEFAULT_PRESETS: &[PresetSeed] = &[
         maximum_context: None,
         auto_compact_threshold: None,
         maximum_tool_output_tokens: None,
+        pass_score: None,
     },
 ];
 
@@ -153,9 +163,10 @@ impl Store {
     pub fn register_preset(&self, view: &PresetView) -> StoreResult<()> {
         let name = view.name.trim();
         self.conn.execute(
-            "INSERT INTO presets(name, prompt, system_prompt, system_prompt_position, maximum_context, auto_compact_threshold, maximum_tool_output_tokens, created_at_ms)
-             VALUES(?,?,?,?,?,?,?,?)
+            "INSERT INTO presets(name, prompt, system_prompt, system_prompt_position, maximum_context, auto_compact_threshold, maximum_tool_output_tokens, created_at_ms, pass_score)
+             VALUES(?,?,?,?,?,?,?,?,?)
              ON CONFLICT(name) DO UPDATE SET
+                pass_score=excluded.pass_score,
                 prompt=excluded.prompt,
                 system_prompt=excluded.system_prompt,
                 system_prompt_position=excluded.system_prompt_position,
@@ -174,6 +185,7 @@ impl Store {
                 view.maximum_tool_output_tokens
                     .map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
                 now_ms(),
+                view.pass_score.map(i64::from),
             ],
         )?;
         crate::rlog!(INFO, "ralphus [store] preset {name:?} registered");
@@ -199,7 +211,7 @@ impl Store {
     /// Propagates any SQLite failure.
     pub fn list_presets(&self) -> StoreResult<Vec<PresetView>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, prompt, system_prompt, system_prompt_position, maximum_context, auto_compact_threshold, maximum_tool_output_tokens, created_at_ms
+            "SELECT name, prompt, system_prompt, system_prompt_position, maximum_context, auto_compact_threshold, maximum_tool_output_tokens, created_at_ms, pass_score
              FROM presets ORDER BY name",
         )?;
         let rows = stmt
@@ -219,6 +231,9 @@ impl Store {
                         .get::<_, Option<i64>>(6)?
                         .map(|v| u64::try_from(v).unwrap_or(0)),
                     created_at_ms: r.get(7)?,
+                    pass_score: r
+                        .get::<_, Option<i64>>(8)?
+                        .and_then(|v| u8::try_from(v).ok()),
                     source: PresetSource::Db,
                     path: None,
                 })
@@ -414,6 +429,13 @@ struct DiskPreset {
     maximum_context: Option<u64>,
     auto_compact_threshold: Option<u64>,
     maximum_tool_output_tokens: Option<u64>,
+    pass_score: Option<u8>,
+}
+
+/// Whether `score` is an accepted `pass_score` (1 to 10 inclusive).
+#[must_use]
+pub fn pass_score_in_range(score: u8) -> bool {
+    (ralphus_core::schema::PASS_SCORE_MIN..=ralphus_core::schema::PASS_SCORE_MAX).contains(&score)
 }
 
 /// Collect every `*.toml` file at or under `path` (sorted, so the result is
@@ -517,8 +539,20 @@ pub fn load_disk_presets(roots: &[PathBuf]) -> (Vec<PresetView>, Vec<String>) {
                 continue;
             }
         }
+        if let Some(score) = parsed.pass_score {
+            if !pass_score_in_range(score) {
+                warnings.push(format!(
+                    "invalid preset file {}: 'pass_score' must be an integer from {} to {}",
+                    path.display(),
+                    ralphus_core::schema::PASS_SCORE_MIN,
+                    ralphus_core::schema::PASS_SCORE_MAX
+                ));
+                continue;
+            }
+        }
         presets.push(PresetView {
             name,
+            pass_score: parsed.pass_score,
             prompt: parsed.prompt,
             system_prompt: parsed.system_prompt,
             system_prompt_position: parsed.system_prompt_position,
@@ -815,10 +849,24 @@ fn apply_to_proof(
     by_name: &PresetMap<'_>,
     parent_frame: &TextFrame,
     parent_level: ScopeLevel,
+    path: &str,
+    warnings: &mut Vec<String>,
 ) {
     let presets = resolved_presets(&proof.extends, by_name);
     if presets.is_empty() {
         return;
+    }
+    if proof.pass_score.is_none() {
+        if let Some(score) = last_defined(&presets, |p| p.pass_score) {
+            if proof.command.is_some() || proof.brain.is_some() {
+                warnings.push(format!(
+                    "{path}: a preset in its `extends` supplies pass_score = {score}, but \
+                     only a `prompt` proof is scored, so it was ignored"
+                ));
+            } else {
+                proof.pass_score = Some(score);
+            }
+        }
     }
     // Only an AI (`prompt`) proof has a prompt to fill or frame; a
     // `command`/`brain` proof is left alone.
@@ -847,9 +895,11 @@ fn apply_to_proof(
 /// Stamp each task's, cell's, and proof step's named presets' field values
 /// into its own fields, using the registry [`effective_presets`] returns.
 /// See [`apply_presets_from`].
-pub fn apply_presets(store: &Store, file: &mut TaskFile) {
+///
+/// Returns the warnings the stamp produced (see [`apply_presets_from`]).
+pub fn apply_presets(store: &Store, file: &mut TaskFile) -> Vec<String> {
     let registered = effective_presets(store).unwrap_or_default();
-    apply_presets_from(&registered, file);
+    apply_presets_from(&registered, file)
 }
 
 /// Stamp each task's, cell's, and proof step's named presets' field values
@@ -877,22 +927,44 @@ pub fn apply_presets(store: &Store, file: &mut TaskFile) {
 /// `resolve_cell_maximum_tool_output_tokens` in `crate::store`) still
 /// cascades it to a cell exactly as it always has -- no changes needed
 /// there.
-pub fn apply_presets_from(registered: &[PresetView], file: &mut TaskFile) {
+///
+/// A proof step's `pass_score` is a scalar like the others (it fills only
+/// when unset; the last preset in `extends` defining it wins) but applies
+/// only to a `prompt` proof. A preset-supplied `pass_score` on a
+/// `command`/`brain` proof is skipped and reported in the returned warnings,
+/// which the submit response carries.
+pub fn apply_presets_from(registered: &[PresetView], file: &mut TaskFile) -> Vec<String> {
     let by_name: PresetMap<'_> = registered.iter().map(|p| (p.name.as_str(), p)).collect();
     let task_frame = TextFrame::default();
+    let mut warnings = Vec::new();
 
-    for task in &mut file.task {
+    for (task_idx, task) in file.task.iter_mut().enumerate() {
         apply_to_task(task, &by_name);
-        for proof in &mut task.proof {
-            apply_to_proof(proof, &by_name, &task_frame, ScopeLevel::Task);
+        for (i, proof) in task.proof.iter_mut().enumerate() {
+            apply_to_proof(
+                proof,
+                &by_name,
+                &task_frame,
+                ScopeLevel::Task,
+                &format!("task[{task_idx}].proof[{i}]"),
+                &mut warnings,
+            );
         }
-        for cell in &mut task.cell {
+        for (cell_idx, cell) in task.cell.iter_mut().enumerate() {
             let cell_frame = apply_to_cell(cell, &by_name, &task_frame);
-            for proof in &mut cell.proof {
-                apply_to_proof(proof, &by_name, &cell_frame, ScopeLevel::Cell);
+            for (i, proof) in cell.proof.iter_mut().enumerate() {
+                apply_to_proof(
+                    proof,
+                    &by_name,
+                    &cell_frame,
+                    ScopeLevel::Cell,
+                    &format!("task[{task_idx}].cell[{cell_idx}].proof[{i}]"),
+                    &mut warnings,
+                );
             }
         }
     }
+    warnings
 }
 
 /// After [`apply_presets`], re-check the "a cell has a `prompt` or a
@@ -1422,6 +1494,92 @@ extends = ["<<ralphus:presets/roles/reviewer>>"]
         assert_eq!(presets.len(), 1);
         assert_eq!(presets[0].name, "good");
         assert_eq!(warnings.len(), 4, "{warnings:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    const SCORED_PROOF: &str = r#"
+[[task]]
+name = "t"
+
+[[task.cell]]
+cwd = "/tmp"
+prompt = "hi"
+
+[[task.cell.proof]]
+prompt = "judge"
+extends = ["<<ralphus:presets/a>>", "<<ralphus:presets/b>>"]
+"#;
+
+    fn scored(name: &str, score: u8) -> PresetView {
+        PresetView {
+            pass_score: Some(score),
+            ..preset(name)
+        }
+    }
+
+    #[test]
+    fn pass_score_round_trips_through_the_database() {
+        let s = store();
+        s.register_preset(&scored("judge", 8)).unwrap();
+        let got = s.list_presets().unwrap();
+        let judge = got.iter().find(|p| p.name == "judge").unwrap();
+        assert_eq!(judge.pass_score, Some(8));
+        s.register_preset(&preset("judge")).unwrap();
+        let got = s.list_presets().unwrap();
+        assert_eq!(
+            got.iter().find(|p| p.name == "judge").unwrap().pass_score,
+            None
+        );
+    }
+
+    #[test]
+    fn pass_score_is_stamped_last_preset_wins() {
+        let file = applied(SCORED_PROOF, &[scored("a", 3), scored("b", 9)]);
+        assert_eq!(file.task[0].cell[0].proof[0].pass_score, Some(9));
+    }
+
+    #[test]
+    fn proof_level_pass_score_beats_the_preset() {
+        let raw = SCORED_PROOF.replace("prompt = \"judge\"", "prompt = \"judge\"\npass_score = 2");
+        let file = applied(&raw, &[scored("a", 3), scored("b", 9)]);
+        assert_eq!(file.task[0].cell[0].proof[0].pass_score, Some(2));
+    }
+
+    #[test]
+    fn preset_pass_score_on_a_command_proof_is_skipped_with_a_warning() {
+        let raw = r#"
+[[task]]
+name = "t"
+
+[[task.cell]]
+cwd = "/tmp"
+prompt = "hi"
+
+[[task.cell.proof]]
+command = "true"
+extends = ["<<ralphus:presets/a>>"]
+"#;
+        let mut file = file_from_toml(raw);
+        let warnings = apply_presets_from(&[scored("a", 5)], &mut file);
+        assert_eq!(file.task[0].cell[0].proof[0].pass_score, None);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("task[0].cell[0].proof[0]"),
+            "{warnings:?}"
+        );
+        assert!(warnings[0].contains("pass_score = 5"), "{warnings:?}");
+    }
+
+    #[test]
+    fn disk_preset_pass_score_loads_and_rejects_out_of_range() {
+        let dir = temp_dir("pass-score");
+        std::fs::write(dir.join("ok.toml"), "pass_score = 7\n").unwrap();
+        std::fs::write(dir.join("bad.toml"), "pass_score = 11\n").unwrap();
+        let (presets, warnings) = load_disk_presets(std::slice::from_ref(&dir));
+        assert_eq!(presets.len(), 1);
+        assert_eq!(presets[0].name, "ok");
+        assert_eq!(presets[0].pass_score, Some(7));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

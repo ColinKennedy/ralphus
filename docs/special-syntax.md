@@ -249,14 +249,17 @@ values into any of the *same entity's own* fields still unset:
   below).
 - **When more than one named preset in one `extends` list defines the same
   field, the last one listed wins.**
-- **Only 6 fields are preset-eligible**: `prompt` (cell, and a `prompt`
+- **Only 7 fields are preset-eligible**: `prompt` (cell, and a `prompt`
   proof step), `system_prompt`, `system_prompt_position` (cell-only),
   `maximum_context`, `auto_compact_threshold` (task/cell only, not a proof
-  step), and `maximum_tool_output_tokens` (task/cell/proof). A preset field
+  step), and `maximum_tool_output_tokens` (task/cell/proof), and `pass_score` (a
+  `prompt` proof step only, integer 1–10). A preset field
   that doesn't apply to the entity kind it's referenced from is **silently
   skipped**, not an error — e.g. a task-level `extends` naming a preset that
   sets `system_prompt` simply has nothing to stamp there, and a `command`
   cell is never given a `prompt`.
+  The one exception is a preset `pass_score` on a `command`/`brain` proof
+  step: it is skipped, but the submit response carries a warning.
 - **A name may be hierarchical.** `roles/reviewer` is referenced as
   `<<ralphus:presets/roles/reviewer>>`. The `/` is only part of the name —
   there is no separate namespace object. Each `/`-separated segment is
@@ -358,7 +361,7 @@ More text here
   `presets/roles/foo.toml` defines `roles/foo`. A file holds the preset's
   fields as top-level keys (`prompt`, `system_prompt`,
   `system_prompt_position`, `maximum_context`, `auto_compact_threshold`,
-  `maximum_tool_output_tokens`). File presets are **read-only**: they cannot
+  `maximum_tool_output_tokens`, `pass_score`). File presets are **read-only**: they cannot
   be registered over or removed through the CLI, MCP or board, and a
   same-named file preset wins over a database one. A file that does not parse
   is skipped with a warning in the daemon log. Files are re-read on each use,

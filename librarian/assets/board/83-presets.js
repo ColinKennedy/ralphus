@@ -113,7 +113,8 @@ extends = [<span class="preset-sentinel">"&lt;&lt;ralphus:presets/roles/reviewer
         const stats = stat("system_prompt_position", p.system_prompt_position, "Stamped alongside system_prompt. The only accepted value is &quot;append&quot;.")
           + stat("maximum_context", p.maximum_context, "Stamped into an extending task's or cell's own maximum_context field, only if left unset. Not applicable to a proof step.")
           + stat("auto_compact_threshold", p.auto_compact_threshold, "Stamped into an extending task's or cell's own auto_compact_threshold field, only if left unset. Not applicable to a proof step.")
-          + stat("maximum_tool_output_tokens", p.maximum_tool_output_tokens, "Stamped into an extending task's, cell's, or proof step's own maximum_tool_output_tokens field, only if left unset.");
+          + stat("maximum_tool_output_tokens", p.maximum_tool_output_tokens, "Stamped into an extending task's, cell's, or proof step's own maximum_tool_output_tokens field, only if left unset.")
+          + stat("pass_score", p.pass_score, "Stamped into an extending prompt proof step's own pass_score field, only if left unset. Skipped (with a submit warning) on a command or brain proof step; not applicable to a task or cell.");
         const body = template("system_prompt", p.system_prompt, "A system-prompt template stamped into an extending cell's own system_prompt field, only if that cell left it unset. Linked fields expand as in prompt.")
           + template("prompt", p.prompt, "A prompt template stamped into an extending cell's or prompt proof step's own prompt field. &lt;&lt;ralphus:linked-field/./prompt&gt;&gt; inside it expands to that entity's own prompt (&lt;&lt;ralphus:linked-field/../prompt&gt;&gt; to its parent's).\nWithout such a reference it only fills a prompt the entity left unset.")
           + (stats ? `<div class="preset-stats">${stats}</div>` : "");
@@ -172,6 +173,10 @@ extends = [<span class="preset-sentinel">"&lt;&lt;ralphus:presets/roles/reviewer
                 <span>maximum_tool_output_tokens</span>
                 <input id="preset-maximum-tool-output-tokens" type="number" min="1" step="1" placeholder="tokens" data-tip="Per-tool-call output token cap stamped into an extending task's, cell's, or proof step's own maximum_tool_output_tokens field, only if left unset." />
               </label>
+              <label class="preset-input">
+                <span>pass_score</span>
+                <input id="preset-pass-score" type="number" min="1" max="10" step="1" placeholder="1-10" data-tip="Score (1-10) a prompt proof step must reach to pass, stamped into an extending prompt proof step's own pass_score field only if left unset. Skipped on command and brain proof steps; not applicable to a task or cell." />
+              </label>
             </div>
             <div class="presets-editor-hint">Blank fields aren't stamped. A field the extending entity already sets always wins.</div>
             <div class="btn-row">
@@ -213,6 +218,7 @@ extends = [<span class="preset-sentinel">"&lt;&lt;ralphus:presets/roles/reviewer
         set("preset-maximum-context", p.maximum_context);
         set("preset-auto-compact-threshold", p.auto_compact_threshold);
         set("preset-maximum-tool-output-tokens", p.maximum_tool_output_tokens);
+        set("preset-pass-score", p.pass_score);
         setPresetEditing(p.name);
         byId("preset-name").scrollIntoView({ block: "nearest" });
         byId("preset-name").focus({ preventScroll: true });
@@ -223,7 +229,7 @@ extends = [<span class="preset-sentinel">"&lt;&lt;ralphus:presets/roles/reviewer
        */
       function clearPresetEditor() {
         for (const id of ["preset-name", "preset-prompt", "preset-system-prompt", "preset-system-prompt-position",
-          "preset-maximum-context", "preset-auto-compact-threshold", "preset-maximum-tool-output-tokens"]) {
+          "preset-maximum-context", "preset-auto-compact-threshold", "preset-maximum-tool-output-tokens", "preset-pass-score"]) {
           /** @type {HTMLInputElement} */ (byId(id)).value = "";
         }
         setPresetEditing("");
@@ -240,6 +246,7 @@ extends = [<span class="preset-sentinel">"&lt;&lt;ralphus:presets/roles/reviewer
         const maximumContext = /** @type {HTMLInputElement} */ (byId("preset-maximum-context")).value.trim();
         const autoCompactThreshold = /** @type {HTMLInputElement} */ (byId("preset-auto-compact-threshold")).value.trim();
         const maximumToolOutputTokens = /** @type {HTMLInputElement} */ (byId("preset-maximum-tool-output-tokens")).value.trim();
+        const passScore = /** @type {HTMLInputElement} */ (byId("preset-pass-score")).value.trim();
         if (!name) { presetsError = "Preset name is required."; renderPresets(); return; }
         try {
           const r = await fetch("/api/presets", {
@@ -253,6 +260,7 @@ extends = [<span class="preset-sentinel">"&lt;&lt;ralphus:presets/roles/reviewer
               maximum_context: maximumContext === "" ? null : Number(maximumContext),
               auto_compact_threshold: autoCompactThreshold === "" ? null : Number(autoCompactThreshold),
               maximum_tool_output_tokens: maximumToolOutputTokens === "" ? null : Number(maximumToolOutputTokens),
+              pass_score: passScore === "" ? null : Number(passScore),
             }),
           });
           presetsError = r.ok ? "" : await responseError(r, "register failed");

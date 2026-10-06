@@ -2676,7 +2676,8 @@ impl Store {
                 maximum_context             INTEGER,
                 auto_compact_threshold      INTEGER,
                 maximum_tool_output_tokens  INTEGER,
-                created_at_ms               INTEGER NOT NULL
+                created_at_ms               INTEGER NOT NULL,
+                pass_score                  INTEGER
             );
             ",
         )?;
@@ -2710,7 +2711,7 @@ impl Store {
                 .chain(crate::preset_roles::ROLE_PRESETS)
             {
                 self.conn.execute(
-                    "INSERT OR IGNORE INTO presets(name, prompt, system_prompt, system_prompt_position, maximum_context, auto_compact_threshold, maximum_tool_output_tokens, created_at_ms) VALUES(?,?,?,?,?,?,?,?)",
+                    "INSERT OR IGNORE INTO presets(name, prompt, system_prompt, system_prompt_position, maximum_context, auto_compact_threshold, maximum_tool_output_tokens, created_at_ms, pass_score) VALUES(?,?,?,?,?,?,?,?,?)",
                     params![
                         seed.name,
                         seed.prompt,
@@ -2719,7 +2720,8 @@ impl Store {
                         seed.maximum_context.map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
                         seed.auto_compact_threshold.map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
                         seed.maximum_tool_output_tokens.map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
-                        now_ms()
+                        now_ms(),
+                        seed.pass_score.map(i64::from)
                     ],
                 )?;
             }
@@ -2736,6 +2738,9 @@ impl Store {
         // existed. Each fails harmlessly (duplicate column) once present.
         for stmt in [
             "ALTER TABLE presets ADD COLUMN prompt TEXT",
+            // A scored-proof threshold a preset supplies to an extending
+            // proof step's unset `pass_score`.
+            "ALTER TABLE presets ADD COLUMN pass_score INTEGER",
             "ALTER TABLE guardians ADD COLUMN squad_id TEXT",
             "ALTER TABLE guardians ADD COLUMN combined_worktree TEXT",
             "ALTER TABLE guardians ADD COLUMN conflicts_total INTEGER",
@@ -13129,6 +13134,44 @@ prompt = "legacy cell, no review_guardian_id"
             .expect("legacy-proj must still be found");
         assert!(project.clone_url.is_none());
         assert_eq!(project.path, "/srv/legacy-proj");
+    }
+
+    #[test]
+    fn migration_adds_nullable_pass_score_column_to_existing_presets() {
+        let conn = Connection::open_in_memory().expect("open sqlite");
+        conn.execute_batch(
+            "CREATE TABLE presets (
+                name                       TEXT PRIMARY KEY,
+                system_prompt              TEXT,
+                system_prompt_position     TEXT,
+                maximum_context            INTEGER,
+                auto_compact_threshold     INTEGER,
+                maximum_tool_output_tokens INTEGER,
+                created_at_ms              INTEGER NOT NULL,
+                prompt                     TEXT
+             );
+             INSERT INTO presets (name, system_prompt, created_at_ms, prompt)
+             VALUES ('legacy', 'sys', 0, 'p');",
+        )
+        .expect("create legacy presets table (pre-pass_score)");
+        let store = Store {
+            conn,
+            event_bus: crate::events::EventBus::new(),
+            memory: crate::store_memory::StoreMemory::new(),
+            read_pool: crate::store_pool::ReadConnPool::open(&crate::store_pool::memory_location()),
+        };
+        store
+            .init_schema()
+            .expect("migration must add the nullable pass_score column");
+        let presets = store.list_presets().expect("list presets");
+        assert_eq!(
+            presets.len(),
+            1,
+            "an existing preset table is not re-seeded"
+        );
+        assert_eq!(presets[0].name, "legacy");
+        assert_eq!(presets[0].system_prompt.as_deref(), Some("sys"));
+        assert_eq!(presets[0].pass_score, None);
     }
 
     #[test]

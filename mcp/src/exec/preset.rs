@@ -16,6 +16,7 @@ pub fn execute(cmd: PresetCommand, client: &DaemonClient) -> ExecResult {
             maximum_context,
             auto_compact_threshold,
             maximum_tool_output_tokens,
+            pass_score,
         } => Ok(client.register_preset(
             &name,
             prompt.as_deref(),
@@ -24,6 +25,7 @@ pub fn execute(cmd: PresetCommand, client: &DaemonClient) -> ExecResult {
             maximum_context,
             auto_compact_threshold,
             maximum_tool_output_tokens,
+            pass_score,
         )?),
         PresetCommand::List => Ok(client.list_presets()?),
         PresetCommand::Get { name } => Ok(client.get_preset(&name)?),

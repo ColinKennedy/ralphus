@@ -930,6 +930,7 @@ impl DaemonClient {
         maximum_context: Option<u64>,
         auto_compact_threshold: Option<u64>,
         maximum_tool_output_tokens: Option<u64>,
+        pass_score: Option<u8>,
     ) -> Result<Value, DaemonError> {
         self.post(
             "/api/presets",
@@ -941,6 +942,7 @@ impl DaemonClient {
                 "maximum_context": maximum_context,
                 "auto_compact_threshold": auto_compact_threshold,
                 "maximum_tool_output_tokens": maximum_tool_output_tokens,
+                "pass_score": pass_score,
             })),
         )
     }
