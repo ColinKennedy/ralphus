@@ -444,6 +444,10 @@ struct Membership {
     /// PR/MR's still-running CI pipelines whenever a newer commit is
     /// force-pushed onto the same branch.
     auto_cancel_outdated_pr_pipelines: Option<bool>,
+    /// RAL-575: optional override declared on the review (`[[review]]
+    /// post_appraisals`) for whether this review writes its judges'
+    /// appraisals into the PR/MR body and tip commit.
+    post_appraisals: Option<bool>,
     /// RAL-521: optional override declared on the review (`[[review]]
     /// cache_manual_checks`) for whether this review's manual checks are
     /// computed once, when its review branches are first created, and then
@@ -1113,6 +1117,7 @@ pub fn derive_reviews_with_full_prefetch(
             discourage_tests_during_auto_pull_request_fixes: rv
                 .and_then(|r| r.discourage_tests_during_auto_pull_request_fixes),
             auto_cancel_outdated_pr_pipelines: rv.and_then(|r| r.auto_cancel_outdated_pr_pipelines),
+            post_appraisals: rv.and_then(|r| r.post_appraisals),
             cache_manual_checks: rv.and_then(|r| r.cache_manual_checks),
             skip_manual_checks: rv.and_then(|r| r.skip_manual_checks),
             auto_run: rv.and_then(|r| r.auto_run),
@@ -1587,6 +1592,13 @@ fn apply_resolver(
     {
         store
             .set_guardian_auto_cancel_outdated_pr_pipelines(gid, Some(enabled))
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+    }
+    // RAL-575: this review's own appraisal-posting override, authored via
+    // `[[review]] post_appraisals`.
+    if let Some(enabled) = members.iter().find_map(|m| m.post_appraisals) {
+        store
+            .set_guardian_post_appraisals(gid, Some(enabled))
             .map_err(|e| ReviewError::new(e.to_string()))?;
     }
     // RAL-521: this review's own manual-check caching override, authored via
@@ -3249,6 +3261,7 @@ mod tests {
             auto_fix_prompt_template: None,
             discourage_tests_during_auto_pull_request_fixes: None,
             auto_cancel_outdated_pr_pipelines: None,
+            post_appraisals: None,
             cache_manual_checks: None,
             skip_manual_checks: None,
             auto_run: None,
@@ -3346,6 +3359,7 @@ mod tests {
             summary_format: None,
             match_pr_branch_name: Some(true),
             separate_pr_branch: Some(true),
+            post_appraisals: Some(false),
             cache_manual_checks: Some(false),
             skip_manual_checks: Some(true),
             ..membership(None)
@@ -3358,6 +3372,8 @@ mod tests {
         assert_eq!(guardian.proof_skip_auto_clean, Some(true));
         assert_eq!(guardian.match_pr_branch_name, Some(true));
         assert_eq!(guardian.separate_pr_branch, Some(true));
+        assert_eq!(guardian.post_appraisals, Some(false));
+        assert!(!guardian.effective_post_appraisals);
         assert_eq!(guardian.cache_manual_checks, Some(false));
         assert_eq!(guardian.skip_manual_checks, Some(true));
     }

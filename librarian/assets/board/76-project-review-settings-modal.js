@@ -63,6 +63,8 @@
        * @property {boolean} originalDiscourageTests
        * @property {boolean} autoCancelOutdatedPrPipelines
        * @property {boolean} originalAutoCancelOutdatedPrPipelines
+       * @property {boolean} postAppraisals
+       * @property {boolean} originalPostAppraisals
        * @property {boolean} cacheManualChecks
        * @property {boolean} originalCacheManualChecks
        * @property {boolean} skipManualChecks
@@ -123,6 +125,7 @@
         const autoFixPromptTemplate = str(s.auto_fix_prompt_template);
         const discourageTests = boolOr(s.discourage_tests_during_auto_pull_request_fixes, effective.discourage_tests_during_auto_pull_request_fixes);
         const autoCancelOutdatedPrPipelines = boolOr(s.auto_cancel_outdated_pr_pipelines, effective.auto_cancel_outdated_pr_pipelines);
+        const postAppraisals = boolOr(s.post_appraisals, effective.post_appraisals);
         const cacheManualChecks = boolOr(s.cache_manual_checks, effective.cache_manual_checks);
         const skipManualChecks = boolOr(s.skip_manual_checks, effective.skip_manual_checks);
         const autoRun = boolOr(s.auto_run, effective.auto_run);
@@ -148,6 +151,7 @@
           autoFixPromptTemplate, originalAutoFixPromptTemplate: autoFixPromptTemplate,
           discourageTests, originalDiscourageTests: discourageTests,
           autoCancelOutdatedPrPipelines, originalAutoCancelOutdatedPrPipelines: autoCancelOutdatedPrPipelines,
+          postAppraisals, originalPostAppraisals: postAppraisals,
           cacheManualChecks, originalCacheManualChecks: cacheManualChecks,
           skipManualChecks, originalSkipManualChecks: skipManualChecks,
           autoRun, originalAutoRun: autoRun,
@@ -326,6 +330,12 @@
        */
       function onProjectEditAutoCancelOutdatedPrPipelines(checked) { if (projectReviewSettingsDraft) projectReviewSettingsDraft.autoCancelOutdatedPrPipelines = checked; }
       /**
+       * Stages the post-appraisals default (RAL-575).
+       * @param {boolean} checked
+       * @returns {void}
+       */
+      function onProjectEditPostAppraisals(checked) { if (projectReviewSettingsDraft) projectReviewSettingsDraft.postAppraisals = checked; }
+      /**
        * Stages the cache-manual-checks default (RAL-521).
        * @param {boolean} checked
        * @returns {void}
@@ -406,6 +416,8 @@
             ${autoFixSection}
             <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Cancel a PR/MR's still-running CI pipelines whenever a newer commit is force-pushed onto the same branch, for a future review that declares no explicit auto_cancel_outdated_pr_pipelines setting of its own. Reduces CI runner exhaustion when multiple reviews stack on a busy upstream.">
               <input type="checkbox" ${draft.autoCancelOutdatedPrPipelines ? "checked" : ""} onchange="onProjectEditAutoCancelOutdatedPrPipelines(this.checked)">auto-cancel outdated CI pipelines</label>
+            <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Write a future review's judges' appraisals (scored proof results) into its PR/MR body and tip commit, for a future review that declares no explicit post_appraisals setting of its own. On by default.">
+              <input type="checkbox" ${draft.postAppraisals ? "checked" : ""} onchange="onProjectEditPostAppraisals(this.checked)">post judges' appraisals in the PR/MR</label>
             <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Compute a future review's manual checks once, when its review branches are first created, and reuse that result through later merges, rebases, and automated fix iterations, for a future review that declares no explicit cache_manual_checks setting of its own. Manual checks describe review work that does not change across ordinary rebases, so caching avoids re-running the manual-checks agent for nothing.">
               <input type="checkbox" ${draft.cacheManualChecks ? "checked" : ""} onchange="onProjectEditCacheManualChecks(this.checked)">cache manual checks across rebases</label>
             <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Skip manual-check generation entirely, for a future review that declares no explicit skip_manual_checks setting of its own: no agent is asked to propose commands from the diff. Manual checks declared in a task file are unaffected.">
@@ -462,6 +474,7 @@
         if (draft.autoFixPromptTemplate !== draft.originalAutoFixPromptTemplate) body.auto_fix_prompt_template = draft.autoFixPromptTemplate;
         if (draft.discourageTests !== draft.originalDiscourageTests) body.discourage_tests_during_auto_pull_request_fixes = draft.discourageTests;
         if (draft.autoCancelOutdatedPrPipelines !== draft.originalAutoCancelOutdatedPrPipelines) body.auto_cancel_outdated_pr_pipelines = draft.autoCancelOutdatedPrPipelines;
+        if (draft.postAppraisals !== draft.originalPostAppraisals) body.post_appraisals = draft.postAppraisals;
         if (draft.cacheManualChecks !== draft.originalCacheManualChecks) body.cache_manual_checks = draft.cacheManualChecks;
         if (draft.skipManualChecks !== draft.originalSkipManualChecks) body.skip_manual_checks = draft.skipManualChecks;
         if (draft.autoRun !== draft.originalAutoRun) body.auto_run = draft.autoRun;

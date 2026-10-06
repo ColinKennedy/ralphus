@@ -816,6 +816,7 @@
        * @property {string|null|undefined} auto_fix_prompt_template
        * @property {boolean|null|undefined} discourage_tests_during_auto_pull_request_fixes
        * @property {boolean|null|undefined} auto_cancel_outdated_pr_pipelines
+       * @property {boolean|null|undefined} post_appraisals
        * @property {boolean|null|undefined} cache_manual_checks
        * @property {boolean|null|undefined} skip_manual_checks
        * @property {boolean|null|undefined} auto_run
@@ -844,6 +845,7 @@
        * @property {string|undefined} auto_fix_prompt_template
        * @property {boolean} discourage_tests_during_auto_pull_request_fixes
        * @property {boolean} auto_cancel_outdated_pr_pipelines
+       * @property {boolean} post_appraisals
        * @property {boolean} cache_manual_checks
        * @property {boolean} skip_manual_checks
        * @property {boolean} auto_run
