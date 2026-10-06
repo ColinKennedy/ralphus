@@ -125,11 +125,12 @@ This mode closes the *filesystem* half of the problem. It does **not**:
   instance (separate container, separate `RALPHUS_WORKSPACE_ROOT`, separate
   port/DB per RAL-164's multi-instance pattern) if two workloads must not
   share a filesystem view.
-- **Confine the SSH machine-provider path.** `ralphus-ssh-provider` /
-  `ssh-provider/` is untouched by this task by design — remote execution
-  there already gets a real isolation boundary for free (a separate machine).
-  A task routed to a `machine = "ssh:..."` target runs on that remote host
-  exactly as before, regardless of which mode the daemon itself runs in.
+- **Confine the SSH machine-provider path.** This mode puts the *daemon's*
+  host work in a container. A task routed to a `machine = "ssh:..."` target
+  still runs directly in that remote account, regardless of which mode the
+  daemon itself runs in. To containerise the remote side too, register the SSH
+  provider as a container-backed machine under a separate scheme — see
+  [Container-backed machines](machine-providers.md#container-backed-machines-docker-on-the-remote-host).
 
 ## tmux-wrapped live cells still work unchanged
 
@@ -239,11 +240,9 @@ path, not just reading the compose file's flags.
 
 Per-task/per-agent OS-level confinement — a separate sandbox boundary for
 *each cell*, rather than one shared container per daemon instance — was
-explicitly descoped for this task (see the ticket's "Resolved decision"). If
-that's ever needed: the shape most consistent with this codebase would be a
-new machine provider (see `docs/machine-providers.md`) that provisions a
-short-lived container (or a Linux namespace sandbox, `bubblewrap`-style) per
-cell rather than per daemon instance — the provider contract already
-exists and already isolates "this cell's work" from "the daemon's own
-process" for the SSH provider today, just with a real remote machine as the
-isolation boundary instead of a local sandbox.
+explicitly descoped for this task (see the ticket's "Resolved decision"). The
+machine-provider route now exists at machine granularity: the SSH provider's
+[container-backed machines](machine-providers.md#container-backed-machines-docker-on-the-remote-host)
+keep one container per remote machine, and a container's identity is a single
+function of a scope, so finer granularity (per project, squad, or cell) is a
+new scope variant rather than a rework.

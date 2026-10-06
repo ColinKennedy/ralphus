@@ -844,6 +844,91 @@ ssh-keyscan -H <host> >> ~/.ssh/known_hosts   # verify the fingerprint out-of-ba
 ssh-copy-id <user>@<host>                     # or otherwise install your public key
 ```
 
+### Container-backed machines: Docker on the remote host
+
+(Not to be confused with the daemon's own [container mode](container-mode.md),
+which confines the daemon host; the two are independent.)
+
+`ralphus-ssh-provider` can run everything it does on a machine — cells, proofs,
+review merges, file operations, runner upload, `materialize`, the Open Agent
+terminal — inside a Docker container on the SSH host instead of directly in the
+ssh account. The provider owns this entirely: the daemon neither knows nor
+cares, and there is no new task-file or `[machine.targets.*]` field. An
+operator registers the provider under its own scheme with container flags:
+
+```bash
+ralphus machine register --scheme ssh-docker \
+    --program /path/to/ralphus-ssh-provider \
+    --arg=--container-image --arg ghcr.io/me/ralphus-agent:1 \
+    --arg=--container-mount --arg /srv/ralphus:/srv/ralphus
+```
+
+```toml
+[[task]]
+name    = "build"
+project = "ralphus"
+machine = "ssh-docker:buildbox"     # same ssh target forms as `ssh:`
+```
+
+| Provider flag | Meaning |
+|---|---|
+| `--container-image` | **Required** once any container flag is given. The image the container is created from. |
+| `--container-name` | Pins the container name. Default: `ralphus-<target>-<hash>`, derived per machine. |
+| `--container-docker` | The Docker command as shell words, run on the remote host. Default `docker`. Operator-trusted: use it for `sudo docker` or a rootless-socket prefix. |
+| `--container-mount` | `docker run -v` value, repeatable. Must cover each target's `remote_root` for provisioned clones, worktrees and job state to outlive the container. |
+| `--container-run-arg` | One extra `docker run` argument, repeatable, passed verbatim (`--network=host`, `-e=KEY=value`, ...). |
+
+**How it works.** Every remote command in the provider is one shell string
+handed to `ssh::command_args`; in container mode that function rewrites it to
+`docker exec -i <name> sh -c '<command>'`. Launch, status, stream and cancel of
+a durable job therefore all run in the container's one PID namespace, which the
+job supervisor's `/proc` identity checks need. Only container management
+(`ensure`) runs on the host. `rsync` is bypassed (it would write the host
+filesystem), so the tar stream, which goes through `docker exec`, carries
+source sync. The terminal verb uses `docker exec -it` inside the `ssh -tt`
+session.
+
+**The image's shell.** The command runs under the container's `sh`, which is
+often dash or busybox rather than the bash a remote login account has. The
+provider's scripts are POSIX-clean for that reason (for example `kill -s TERM --
+-<pgid>`, not `kill -TERM -- -<pgid>`, which dash rejects). The image needs
+`sh`, `awk`, `git` for provisioned projects, and `ralphus-runner` (or upload
+mode) plus whichever agent CLIs the cells use; `tmux` if Live View is wanted.
+
+**Container lifecycle.** `ping`, `exec`, `provision`, `capabilities` and
+`terminal` first *ensure* the container: create it when absent, start it when
+stopped, and refuse (never silently adopt) one built from a different image.
+Docker's name uniqueness is the lock, so concurrent verbs are safe — a verb that
+loses the creation race waits for the winner's container. The container idles on
+a shell (`--entrypoint sh`, which overrides the image's own entrypoint) with
+`--init` so detached job workers are reaped. The other verbs address a container
+those verbs already made. Nothing is removed automatically; `docker rm -f <name>`
+on the host recreates it on the next `ping`. A container restart kills in-flight
+jobs: their durable state survives on the mount and `status` reports them as
+`lost` through its error channel.
+
+**Cancel.** `cancel` signals the supervisor's process group *and* every
+descendant it snapshots from `/proc` first (verified by start time, so a
+recycled pid is never hit). The runner puts each command in its own process
+group, so group signalling alone would orphan the command's whole tree.
+
+**Granularity.** Today a machine has exactly one container. Its identity is the
+pure function `container::container_name(config, scope, target)`; finer
+granularity (per project, squad, or cell) is expected to arrive as new
+`ContainerScope` variants. One rule is fixed regardless: **a review always owns
+exactly one container of its own** (`ContainerScope::Review`).
+
+**What it does not do.** It is filesystem isolation of whatever the operator
+mounts, nothing more: network egress is unrestricted unless `--container-run-arg`
+says otherwise. Image contents, users, credentials, and the Docker daemon's own
+permissions are the operator's — `docker` group membership is root-equivalent on
+that host, and the Docker socket must never be mounted into the work container.
+Credentials reach the agent through the same `execution_environment` path as any
+remote cell (an env file written inside the container, never command-line
+arguments).
+
+Live fixture and tests: [`remote-docker-target.md`](remote-docker-target.md#container-backed-machine-fixture).
+
 ### Configuration (environment variables)
 
 | Variable | Default | Meaning |

@@ -11,6 +11,7 @@ use crate::ssh;
 use crate::transport::shell_quote_single;
 use crate::uri::{self, SshTarget};
 
+#[derive(Debug)]
 pub struct Status {
     pub state: String,
     pub result: Option<serde_json::Value>,
@@ -90,6 +91,19 @@ fn job_dir(root: &str, handle: &str) -> Result<String, String> {
     Ok(format!("{root}/jobs/{}/{}/{handle}", parts[1], parts[2]))
 }
 
+/// Shell helpers for `cancel`, defined ahead of the script that uses them.
+///
+/// The runner puts each command it spawns in its own process group so it can
+/// kill that tree on a timeout, which also puts the tree outside the
+/// supervisor's group: signalling `-$pid` reaches the runner but orphans
+/// whatever the command started. `ralphus_descendants PID` snapshots every
+/// descendant (as `pid:starttime`, from `/proc`, so it must run *before* the
+/// supervisor dies and its children reparent); `ralphus_signal_descendants SIG
+/// LIST` signals each entry whose start time still matches, so a recycled pid
+/// is never hit. Both use only POSIX `sh` and `awk`, since the remote command
+/// may run under dash or busybox rather than the account's login shell.
+const SHELL_DESCENDANTS: &str = r#"ralphus_descendants() { awk -v root="$1" '{ n=split(FILENAME,a,"/"); p=a[3]; line=$0; sub(/^.*\) /,"",line); split(line,f," "); par[p]=f[2]; st[p]=f[20] } END { want[root]=1; do { ch=0; for (p in par) if (!(p in want) && (par[p] in want)) { want[p]=1; ch=1 } } while (ch); for (p in want) if (p != root) print p ":" st[p] }' /proc/[0-9]*/stat 2>/dev/null; }; ralphus_signal_descendants() { for e in $2; do p=${e%%:*}; s=${e#*:}; cur=$(awk '{ sub(/^.*\) /,""); split($0,f," "); print f[20] }' /proc/$p/stat 2>/dev/null || true); if [ "$cur" = "$s" ]; then kill -s "$1" "$p" 2>/dev/null || true; fi; done; }; "#;
+
 /// Start a remote runner and return as soon as its durable job state exists.
 pub fn start(uri: &str, spec_json: &str, config: &EffectiveConfig) -> Result<String, String> {
     let target = uri::parse(uri).map_err(|e| e.to_string())?;
@@ -115,8 +129,9 @@ pub fn start(uri: &str, spec_json: &str, config: &EffectiveConfig) -> Result<Str
     let dispatch = format!("{}/jobs/dispatches/{dispatch_key}", policy.remote_root);
     let locks = format!("{}/jobs/.dispatch-locks", policy.remote_root);
     let setup = format!(
-        "set -eu; umask 077; mkdir -p {locks} {parent}; exec 9>{lock}; flock 9; if [ -f {dispatch} ]; then old_handle=$(sed -n '1p' {dispatch}); old_dir=$(sed -n '2p' {dispatch}); case \"$old_dir\" in {jobs_prefix}*) ;; *) echo 'invalid existing dispatch path' >&2; exit 1;; esac; old_state=$(cat \"$old_dir/state\" 2>/dev/null || true); if [ \"$old_state\" = starting ] || [ \"$old_state\" = running ]; then pid=$(cat \"$old_dir/supervisor_pid\" 2>/dev/null || true); expected=$(cat \"$old_dir/supervisor_start\" 2>/dev/null || true); actual=$(awk '{{print $22}}' /proc/$pid/stat 2>/dev/null || true); created=$(cat \"$old_dir/created_at\" 2>/dev/null || echo 0); now=$(date +%s); if {{ [ -n \"$pid\" ] && [ \"$expected\" = \"$actual\" ]; }} || {{ [ \"$old_state\" = starting ] && [ $((now-created)) -le 10 ]; }}; then printf 'existing %s\\n' \"$old_handle\"; exit 0; fi; rm -f \"$old_dir/environment\" \"$old_dir/environment.tmp\"; printf 'lost\\n' > \"$old_dir/state.tmp\"; mv \"$old_dir/state.tmp\" \"$old_dir/state\"; fi; fi; mkdir -p {dir}; cat > {dir}/spec.json.tmp; mv {dir}/spec.json.tmp {dir}/spec.json; date +%s > {dir}/created_at; printf '0\\n' > {dir}/output_cursor; printf 'starting\\n' > {dir}/state.tmp; mv {dir}/state.tmp {dir}/state; printf '%s\\n%s\\n' {handle} {dir} > {dispatch}.tmp; mv {dispatch}.tmp {dispatch}; printf 'created %s\\n' {handle}",
+        "set -eu; umask 077; mkdir -p {locks} {dispatches} {parent}; exec 9>{lock}; flock 9; if [ -f {dispatch} ]; then old_handle=$(sed -n '1p' {dispatch}); old_dir=$(sed -n '2p' {dispatch}); case \"$old_dir\" in {jobs_prefix}*) ;; *) echo 'invalid existing dispatch path' >&2; exit 1;; esac; old_state=$(cat \"$old_dir/state\" 2>/dev/null || true); if [ \"$old_state\" = starting ] || [ \"$old_state\" = running ]; then pid=$(cat \"$old_dir/supervisor_pid\" 2>/dev/null || true); expected=$(cat \"$old_dir/supervisor_start\" 2>/dev/null || true); actual=$(awk '{{print $22}}' /proc/$pid/stat 2>/dev/null || true); created=$(cat \"$old_dir/created_at\" 2>/dev/null || echo 0); now=$(date +%s); if {{ [ -n \"$pid\" ] && [ \"$expected\" = \"$actual\" ]; }} || {{ [ \"$old_state\" = starting ] && [ $((now-created)) -le 10 ]; }}; then printf 'existing %s\\n' \"$old_handle\"; exit 0; fi; rm -f \"$old_dir/environment\" \"$old_dir/environment.tmp\"; printf 'lost\\n' > \"$old_dir/state.tmp\"; mv \"$old_dir/state.tmp\" \"$old_dir/state\"; fi; fi; mkdir -p {dir}; cat > {dir}/spec.json.tmp; mv {dir}/spec.json.tmp {dir}/spec.json; date +%s > {dir}/created_at; printf '0\\n' > {dir}/output_cursor; printf 'starting\\n' > {dir}/state.tmp; mv {dir}/state.tmp {dir}/state; printf '%s\\n%s\\n' {handle} {dir} > {dispatch}.tmp; mv {dispatch}.tmp {dispatch}; printf 'created %s\\n' {handle}",
         locks = shell_quote_single(&locks),
+        dispatches = shell_quote_single(&format!("{}/jobs/dispatches", policy.remote_root)),
         parent = shell_quote_single(&format!(
             "{}/jobs/{}/{}",
             policy.remote_root,
@@ -266,9 +281,10 @@ pub fn cancel(uri: &str, handle: &str, config: &EffectiveConfig) -> Result<(), S
     let policy = policy(config)?;
     let dir = job_dir(&policy.remote_root, handle)?;
     let script = format!(
-        "set -eu; umask 077; job={dir}; [ -d \"$job\" ] || exit 0; state=$(cat \"$job/state\" 2>/dev/null || true); case \"$state\" in done|failed|cancelled) exit 0;; esac; date +%s > \"$job/cancel_requested_at\"; printf '%s\\n' {requester} > \"$job/cancel_requested_by\"; pid=$(cat \"$job/supervisor_pid\" 2>/dev/null || true); expected=$(cat \"$job/supervisor_start\" 2>/dev/null || true); actual=$(awk '{{print $22}}' /proc/$pid/stat 2>/dev/null || true); if [ -n \"$pid\" ] && [ \"$expected\" = \"$actual\" ]; then kill -TERM -- -\"$pid\" 2>/dev/null || true; i=0; while [ $i -lt 50 ]; do actual=$(awk '{{print $22}}' /proc/$pid/stat 2>/dev/null || true); [ \"$expected\" != \"$actual\" ] && break; sleep 0.1; i=$((i+1)); done; actual=$(awk '{{print $22}}' /proc/$pid/stat 2>/dev/null || true); if [ \"$expected\" = \"$actual\" ]; then kill -KILL -- -\"$pid\" 2>/dev/null || true; i=0; while [ $i -lt 50 ]; do actual=$(awk '{{print $22}}' /proc/$pid/stat 2>/dev/null || true); [ \"$expected\" != \"$actual\" ] && break; sleep 0.1; i=$((i+1)); done; fi; actual=$(awk '{{print $22}}' /proc/$pid/stat 2>/dev/null || true); if [ \"$expected\" = \"$actual\" ]; then printf 'termination-unconfirmed\\n' > \"$job/cancel_outcome\"; echo 'remote process group termination could not be confirmed' >&2; exit 1; fi; fi; rm -f \"$job/environment\" \"$job/environment.tmp\"; printf '{{\"status\":\"failed\",\"summary\":\"cancelled\",\"error\":\"cancelled\"}}\\n' > \"$job/result.tmp\"; mv \"$job/result.tmp\" \"$job/result\"; printf 'cancelled\\n' > \"$job/state.tmp\"; mv \"$job/state.tmp\" \"$job/state\"; printf 'terminated\\n' > \"$job/cancel_outcome\"",
+        "set -eu; umask 077; {descendants_fns}job={dir}; [ -d \"$job\" ] || exit 0; state=$(cat \"$job/state\" 2>/dev/null || true); case \"$state\" in done|failed|cancelled) exit 0;; esac; date +%s > \"$job/cancel_requested_at\"; printf '%s\\n' {requester} > \"$job/cancel_requested_by\"; pid=$(cat \"$job/supervisor_pid\" 2>/dev/null || true); expected=$(cat \"$job/supervisor_start\" 2>/dev/null || true); actual=$(awk '{{print $22}}' /proc/$pid/stat 2>/dev/null || true); if [ -n \"$pid\" ] && [ \"$expected\" = \"$actual\" ]; then desc=$(ralphus_descendants \"$pid\" || true); kill -s TERM -- -\"$pid\" 2>/dev/null || true; ralphus_signal_descendants TERM \"$desc\"; i=0; while [ $i -lt 50 ]; do actual=$(awk '{{print $22}}' /proc/$pid/stat 2>/dev/null || true); [ \"$expected\" != \"$actual\" ] && break; sleep 0.1; i=$((i+1)); done; actual=$(awk '{{print $22}}' /proc/$pid/stat 2>/dev/null || true); if [ \"$expected\" = \"$actual\" ]; then kill -s KILL -- -\"$pid\" 2>/dev/null || true; i=0; while [ $i -lt 50 ]; do actual=$(awk '{{print $22}}' /proc/$pid/stat 2>/dev/null || true); [ \"$expected\" != \"$actual\" ] && break; sleep 0.1; i=$((i+1)); done; fi; ralphus_signal_descendants KILL \"$desc\"; actual=$(awk '{{print $22}}' /proc/$pid/stat 2>/dev/null || true); if [ \"$expected\" = \"$actual\" ]; then printf 'termination-unconfirmed\\n' > \"$job/cancel_outcome\"; echo 'remote process group termination could not be confirmed' >&2; exit 1; fi; fi; rm -f \"$job/environment\" \"$job/environment.tmp\"; printf '{{\"status\":\"failed\",\"summary\":\"cancelled\",\"error\":\"cancelled\"}}\\n' > \"$job/result.tmp\"; mv \"$job/result.tmp\" \"$job/result\"; printf 'cancelled\\n' > \"$job/state.tmp\"; mv \"$job/state.tmp\" \"$job/state\"; printf 'terminated\\n' > \"$job/cancel_outcome\"",
         dir = shell_quote_single(&dir),
         requester = shell_quote_single(CANCEL_REQUESTER),
+        descendants_fns = SHELL_DESCENDANTS,
     );
     ssh_command(&target, &script, config, None).map(|_| ())
 }

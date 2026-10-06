@@ -175,13 +175,28 @@ fn ssh_docker_target_passes_conformance() {
         println!("SKIP: set RALPHUS_SSH_DOCKER_TEST=1 after starting the SSH target fixture");
         return;
     }
-    // Cargo replaces dashes with underscores in this env var's name.
-    // `CARGO_BIN_EXE_<name>` only resolves for a binary target inside *this*
-    // crate, not a path dev-dependency's -- so the compiled
-    // `ralphus-ssh-provider` binary is located manually instead, relative to
-    // the workspace's shared `target/` directory `cargo build -p
-    // ralphus-ssh-provider` (or the workspace-wide default build) already
-    // produces it under.
+    let Some(binary) = ssh_provider_binary() else {
+        return;
+    };
+    let mut args = Vec::new();
+    if let Ok(ssh_config) = std::env::var("RALPHUS_SSH_CONFIG_FILE") {
+        args.push("--ssh-config".to_string());
+        args.push(ssh_config);
+    }
+    let provider = ProviderRunner::new(binary, args, "conformance-ssh-docker", "ralphus-docker");
+    run_conformance_suite(&provider);
+}
+
+/// Locate the compiled `ralphus-ssh-provider`, or print a SKIP and return
+/// `None` when it has not been built.
+///
+/// Cargo replaces dashes with underscores in `CARGO_BIN_EXE_<name>`, which
+/// only resolves for a binary target inside *this* crate, not a path
+/// dev-dependency's -- so the binary is located manually, relative to the
+/// workspace's shared `target/` directory that `cargo build -p
+/// ralphus-ssh-provider` (or the workspace-wide default build) produces it
+/// under.
+fn ssh_provider_binary() -> Option<String> {
     let binary = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("target")
@@ -195,19 +210,204 @@ fn ssh_docker_target_passes_conformance() {
         } else {
             "ralphus-ssh-provider"
         });
-    if !binary.is_file() {
+    if binary.is_file() {
+        Some(binary.to_string_lossy().into_owned())
+    } else {
         println!(
             "SKIP: {} not built yet -- run `cargo build -p ralphus-ssh-provider` first",
             binary.display()
         );
+        None
+    }
+}
+
+/// The daemon's own client (`ProviderRunner`, which polls `status`/`stream`
+/// and scrapes events exactly as the scheduler does) driving a real
+/// container-mode provider through a git workspace: provision, an async
+/// command proof, file operations, VCS commands, and cleanup. The generic
+/// suite above cannot be used for the SSH provider (it only provisions git
+/// projects), so this is its equivalent for container mode.
+#[test]
+#[ignore]
+fn ssh_docker_container_target_works_through_the_daemon_client() {
+    use ralphus_daemon::remote_runner::{CleanupRequest, RunRequest, TargetRunnerConfig};
+
+    if std::env::var("RALPHUS_SSH_DOCKER_CONTAINER_TEST")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        println!(
+            "SKIP: set RALPHUS_SSH_DOCKER_CONTAINER_TEST=1 after `scripts/ssh-docker-target.sh up`"
+        );
         return;
     }
-    let binary = binary.to_string_lossy().into_owned();
+    let Some(binary) = ssh_provider_binary() else {
+        return;
+    };
+    const ROOT: &str = "/home/ralphus/.ralphus/remote-work";
     let mut args = Vec::new();
     if let Ok(ssh_config) = std::env::var("RALPHUS_SSH_CONFIG_FILE") {
         args.push("--ssh-config".to_string());
         args.push(ssh_config);
     }
-    let provider = ProviderRunner::new(binary, args, "conformance-ssh-docker", "ralphus-docker");
-    run_conformance_suite(&provider);
+    for flag in [
+        "--container-image",
+        "ralphus-remote-agent:test",
+        "--container-name",
+        "ralphus-conformance",
+        "--container-mount",
+        "/srv/ralphus-work:/home/ralphus/.ralphus/remote-work",
+    ] {
+        args.push(flag.to_string());
+    }
+    let runner = TargetRunnerConfig {
+        mode: "installed".to_string(),
+        command: "ralphus-runner".to_string(),
+        artifacts: std::collections::BTreeMap::new(),
+        remote_root: ROOT.to_string(),
+    };
+    let provider = ProviderRunner::new(
+        binary,
+        args,
+        "conformance-ssh-docker-container",
+        "ralphus-docker-docker",
+    )
+    .with_target_runner(Some(runner.clone()));
+    let spec = conformance_spec(ROOT);
+
+    let detail = provider
+        .ping(&spec)
+        .expect("ping must bring the container up")
+        .unwrap_or_default();
+    assert!(detail.contains("container"), "{detail}");
+    let capabilities = provider
+        .capabilities(&spec)
+        .expect("capabilities")
+        .expect("the provider answers capabilities");
+    assert_eq!(
+        capabilities.os.as_deref(),
+        Some("linux"),
+        "capabilities must describe the container: {capabilities:?}"
+    );
+    assert!(capabilities.async_exec, "{capabilities:?}");
+
+    // Seed a bare origin inside the container with plain VCS commands.
+    let git_env = |cwd: &str, argv: &[&str], env: &[(&str, &str)]| {
+        provider
+            .run_vcs(
+                &RunRequest {
+                    cwd: cwd.to_string(),
+                    program: "git".to_string(),
+                    args: argv.iter().map(ToString::to_string).collect(),
+                    env: env
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect(),
+                },
+                &spec,
+            )
+            .unwrap_or_else(|e| panic!("git {argv:?} failed: {e}"))
+    };
+    let git = |cwd: &str, argv: &[&str]| git_env(cwd, argv, &[]);
+    let pid = std::process::id();
+    let origin = format!("client-origin-{pid}.git");
+    let seed = format!("client-seed-{pid}");
+    git(ROOT, &["init", "--bare", "-b", "main", &origin]);
+    git(ROOT, &["clone", &origin, &seed]);
+    git(
+        ROOT,
+        &[
+            "-C",
+            &seed,
+            "-c",
+            "user.name=fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "seed",
+        ],
+    );
+    git(ROOT, &["-C", &seed, "push", "origin", "HEAD:main"]);
+    let url = format!("file://{ROOT}/{origin}");
+
+    let branch = format!("client-branch-{pid}");
+    let req = ProvisionRequest {
+        project: "client-project".to_string(),
+        source: WorkspaceSource {
+            kind: "git".to_string(),
+            url: Some(url.clone()),
+            branch: Some(branch.clone()),
+            upstream: Some("origin/main".to_string()),
+        },
+        squad_id: "client-squad".to_string(),
+        cell_id: "client-cell".to_string(),
+        remote_root: Some(ROOT.to_string()),
+        runner: Some(runner),
+    };
+    let workspace = provider.provision(&req, &spec).expect("provision");
+    assert!(workspace.starts_with(ROOT), "{workspace}");
+    assert_eq!(
+        workspace,
+        provider.provision(&req, &spec).expect("idempotent"),
+        "provision must be idempotent"
+    );
+
+    // An async command proof, dispatched and polled like the scheduler does.
+    // It records who and where it ran, so the result can only have come from
+    // the container (Debian, uid 10001), not the Alpine host account.
+    let mut exec_spec = conformance_spec(&workspace);
+    exec_spec.command = Some(
+        "{ id -u; grep ^ID= /etc/os-release; } > container-facts.txt; test -s container-facts.txt"
+            .to_string(),
+    );
+    let result = provider.run(&exec_spec);
+    assert_eq!(result.status, "done", "{result:?}");
+    let facts = provider
+        .read_file(&format!("{workspace}/container-facts.txt"), &spec)
+        .expect("the proof's output must be readable through the provider");
+    assert!(facts.contains("10001"), "{facts}");
+    assert!(facts.contains("ID=debian"), "{facts}");
+
+    // A failing command is a normal "failed" outcome, not a provider error.
+    let mut failing = conformance_spec(&workspace);
+    failing.cell_id = "client-failing".to_string();
+    failing.command = Some("exit 3".to_string());
+    assert_eq!(provider.run(&failing).status, "failed");
+
+    // VCS state is visible through the container too.
+    let head = git(&workspace, &["rev-parse", "--abbrev-ref", "HEAD"]);
+    assert_eq!(head.trim(), branch, "worktree is on the requested branch");
+
+    // Environment overrides on a VCS command reach the process in the
+    // container (the daemon uses them to carry per-command git settings).
+    let ident = git_env(
+        &workspace,
+        &["var", "GIT_AUTHOR_IDENT"],
+        &[
+            ("GIT_AUTHOR_NAME", "Env Override"),
+            ("GIT_AUTHOR_EMAIL", "env@example.invalid"),
+        ],
+    );
+    assert!(ident.contains("Env Override"), "{ident}");
+
+    provider
+        .cleanup(
+            &CleanupRequest {
+                project: req.project.clone(),
+                clone_url: url,
+                branch: Some(branch),
+                remote_root: Some(ROOT.to_string()),
+            },
+            &spec,
+        )
+        .expect("cleanup removes the worktree");
+    assert!(
+        provider
+            .read_file(&format!("{workspace}/container-facts.txt"), &spec)
+            .is_err(),
+        "cleanup must have removed the worktree's files"
+    );
 }

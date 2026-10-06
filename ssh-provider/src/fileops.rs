@@ -194,26 +194,7 @@ pub fn run(
             return Err(format!("invalid environment key in run request: {key:?}"));
         }
     }
-    let invocation = if req.program == "git" {
-        let quoted_args = req
-            .args
-            .iter()
-            .map(|a| shell_quote_single(a))
-            .collect::<Vec<_>>()
-            .join(" ");
-        format!("{} {quoted_args}", shell_quote_single(&req.program))
-    } else {
-        let assignments = req
-            .env
-            .iter()
-            .map(|(key, value)| shell_quote_single(&format!("{key}={value}")))
-            .collect::<Vec<_>>()
-            .join(" ");
-        format!(
-            "env {assignments} sh -c {}",
-            shell_quote_single(&req.args[0])
-        )
-    };
+    let invocation = run_invocation(&req);
     let script = format!(
         "cd {cwd} && {{ {invocation}; }} 2>&1; printf '\\n{marker}%s\\n' \"$?\"",
         cwd = shell_quote_single(&req.cwd),
@@ -221,6 +202,39 @@ pub fn run(
     );
     let raw = ssh_command(&target, &script, config, None)?;
     split_run_output(&raw)
+}
+
+/// The shell text that runs one validated [`RunRequest`], with its `env`
+/// overrides applied to both forms (`git` argv and one authored shell command).
+fn run_invocation(req: &RunRequest) -> String {
+    let assignments = req
+        .env
+        .iter()
+        .map(|(key, value)| shell_quote_single(&format!("{key}={value}")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if req.program == "git" {
+        let quoted_args = req
+            .args
+            .iter()
+            .map(|a| shell_quote_single(a))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let env_prefix = if assignments.is_empty() {
+            String::new()
+        } else {
+            format!("env {assignments} ")
+        };
+        format!(
+            "{env_prefix}{} {quoted_args}",
+            shell_quote_single(&req.program)
+        )
+    } else {
+        format!(
+            "env {assignments} sh -c {}",
+            shell_quote_single(&req.args[0])
+        )
+    }
 }
 
 fn split_run_output(raw: &str) -> Result<(String, i64), String> {
@@ -248,6 +262,47 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn request(program: &str, args: &[&str], env: &[(&str, &str)]) -> RunRequest {
+        RunRequest {
+            cwd: "/srv/x".to_string(),
+            program: program.to_string(),
+            args: args.iter().map(ToString::to_string).collect(),
+            env: env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_git_command_with_no_env_is_exactly_the_quoted_argv() {
+        assert_eq!(
+            run_invocation(&request("git", &["status", "-s"], &[])),
+            "'git' 'status' '-s'"
+        );
+    }
+
+    #[test]
+    fn env_overrides_are_applied_to_a_git_command_too() {
+        let invocation = run_invocation(&request(
+            "git",
+            &["var", "GIT_AUTHOR_IDENT"],
+            &[("GIT_AUTHOR_NAME", "A B"), ("GIT_TERMINAL_PROMPT", "0")],
+        ));
+        assert_eq!(
+            invocation,
+            "env 'GIT_AUTHOR_NAME=A B' 'GIT_TERMINAL_PROMPT=0' 'git' 'var' 'GIT_AUTHOR_IDENT'"
+        );
+    }
+
+    #[test]
+    fn env_overrides_are_applied_to_an_authored_shell_command() {
+        assert_eq!(
+            run_invocation(&request("", &["echo $X"], &[("X", "1")])),
+            "env 'X=1' sh -c 'echo $X'"
+        );
+    }
 
     fn config() -> EffectiveConfig {
         EffectiveConfig {

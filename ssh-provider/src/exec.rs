@@ -139,7 +139,11 @@ fn sync_source(
 ) -> Result<(), String> {
     let excludes = transport::merge_excludes(transport::DEFAULT_EXCLUDES, &config.extra_excludes);
     let host_os = transport::local_os();
-    let rsync_available = host_os == HostOs::Unix && program_on_path("rsync");
+    // rsync writes to the host filesystem directly, bypassing the container;
+    // in container mode the tar stream (which goes through `docker exec`) is
+    // the only transport that lands the source where the runner will look.
+    let rsync_available =
+        host_os == HostOs::Unix && crate::container::active().is_none() && program_on_path("rsync");
     let transport = transport::choose_transport(host_os, rsync_available);
     let started = std::time::Instant::now();
     let (name, result) = match transport {

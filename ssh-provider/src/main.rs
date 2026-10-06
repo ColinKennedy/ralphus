@@ -5,8 +5,8 @@
 use std::io::Read;
 
 use ralphus_ssh_provider::{
-    UNIMPLEMENTED_VERBS, capabilities, cleanup, exec, fileops, job, materialize, ping, protocol,
-    provision, terminal,
+    UNIMPLEMENTED_VERBS, capabilities, cleanup, container, exec, fileops, job, materialize, ping,
+    protocol, provision, terminal,
 };
 
 struct Args {
@@ -20,6 +20,16 @@ struct Args {
     /// `terminal` only: initial terminal size.
     cols: u16,
     lines: u16,
+    /// Container mode (see `ralphus_ssh_provider::container`); `None` runs
+    /// every command directly in the ssh account.
+    container: Option<container::ContainerConfig>,
+}
+
+/// Value of a flag that takes one, or the standard "requires a value" error.
+fn flag_value(argv: &[String], i: usize, flag: &str) -> Result<String, String> {
+    argv.get(i + 1)
+        .cloned()
+        .ok_or_else(|| format!("{flag} requires a value"))
 }
 
 fn parse_args(argv: &[String]) -> Result<Args, String> {
@@ -31,6 +41,8 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
     let mut command = None;
     let mut cols = 80_u16;
     let mut lines = 24_u16;
+    let mut container_config = container::ContainerConfig::default();
+    let mut container_flag_seen = false;
     let mut i = 0;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -90,6 +102,35 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
                     .map_err(|_| "--lines must be a positive integer".to_string())?;
                 i += 2;
             }
+            "--container-image" => {
+                container_config.image = flag_value(argv, i, "--container-image")?;
+                container_flag_seen = true;
+                i += 2;
+            }
+            "--container-name" => {
+                container_config.name = Some(flag_value(argv, i, "--container-name")?);
+                container_flag_seen = true;
+                i += 2;
+            }
+            "--container-docker" => {
+                container_config.docker = Some(flag_value(argv, i, "--container-docker")?);
+                container_flag_seen = true;
+                i += 2;
+            }
+            "--container-mount" => {
+                container_config
+                    .mounts
+                    .push(flag_value(argv, i, "--container-mount")?);
+                container_flag_seen = true;
+                i += 2;
+            }
+            "--container-run-arg" => {
+                container_config
+                    .run_args
+                    .push(flag_value(argv, i, "--container-run-arg")?);
+                container_flag_seen = true;
+                i += 2;
+            }
             value if !value.starts_with('-') && verb.is_none() => {
                 verb = Some(value.to_string());
                 i += 1;
@@ -97,6 +138,12 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
             _ => i += 1,
         }
     }
+    let container = if container_flag_seen {
+        container_config.validate()?;
+        Some(container_config)
+    } else {
+        None
+    };
     Ok(Args {
         verb: verb.ok_or_else(|| "missing verb argument".to_string())?,
         uri,
@@ -106,6 +153,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
         command,
         cols,
         lines,
+        container,
     })
 }
 
@@ -156,6 +204,32 @@ fn main() {
             return;
         }
     };
+
+    if let Some(container_config) = args.container.clone() {
+        container::configure(container_config);
+        // Verbs that create or enter machine state bring the container up
+        // first; the rest address a container those verbs already made, and
+        // fail with docker's own "no such container" if it has vanished.
+        if matches!(
+            args.verb.as_str(),
+            "exec" | "provision" | "capabilities" | "terminal"
+        ) {
+            if let Err(e) = container::ensure(&args.uri, &exec_config(&args)) {
+                // `terminal` has no JSON reply; its errors go to stderr.
+                if args.verb == "terminal" {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+                if args.verb == "capabilities" {
+                    // Capabilities are best-effort and never an error.
+                    protocol::reply_capabilities(serde_json::json!({}));
+                    return;
+                }
+                protocol::reply_err(e);
+                return;
+            }
+        }
+    }
 
     match args.verb.as_str() {
         "exec" => {
@@ -456,6 +530,71 @@ mod tests {
         assert_eq!(args.uri, "host");
         assert_eq!(args.handle.as_deref(), Some("h1"));
         assert_eq!(args.since, 0);
+    }
+
+    fn argv(items: &[&str]) -> Vec<String> {
+        items.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn container_mode_is_off_without_container_flags() {
+        let args = parse_args(&argv(&["ping", "--uri", "host"])).unwrap();
+        assert_eq!(args.container, None);
+    }
+
+    #[test]
+    fn container_flags_build_a_container_config() {
+        let args = parse_args(&argv(&[
+            "--container-image",
+            "img:1",
+            "--container-name",
+            "box",
+            "--container-docker",
+            "sudo docker",
+            "--container-mount",
+            "/a:/b",
+            "--container-mount",
+            "/c:/d:ro",
+            "--container-run-arg",
+            "--network=host",
+            "ping",
+            "--uri",
+            "host",
+        ]))
+        .unwrap();
+        let container = args.container.expect("container mode on");
+        assert_eq!(container.image, "img:1");
+        assert_eq!(container.name.as_deref(), Some("box"));
+        assert_eq!(container.docker.as_deref(), Some("sudo docker"));
+        assert_eq!(container.mounts, vec!["/a:/b", "/c:/d:ro"]);
+        assert_eq!(container.run_args, vec!["--network=host"]);
+    }
+
+    #[test]
+    fn a_container_flag_without_an_image_is_an_error() {
+        let err = parse_args(&argv(&["--container-name", "box", "ping", "--uri", "h"]))
+            .err()
+            .expect("an image is required once any container flag is given");
+        assert!(err.contains("--container-image"), "{err}");
+    }
+
+    #[test]
+    fn a_bad_container_name_is_rejected_up_front() {
+        let err = parse_args(&argv(&[
+            "--container-image",
+            "i",
+            "--container-name",
+            "-x",
+            "ping",
+        ]))
+        .err()
+        .expect("invalid name");
+        assert!(err.contains("container name"), "{err}");
+    }
+
+    #[test]
+    fn a_container_flag_missing_its_value_is_an_error() {
+        assert!(parse_args(&argv(&["ping", "--container-image"])).is_err());
     }
 
     #[test]

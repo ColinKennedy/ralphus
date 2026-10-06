@@ -51,10 +51,17 @@ pub fn run(
 ) -> Result<i32, String> {
     let target = uri::parse(uri).map_err(|e| e.to_string())?;
     let sized_command = format!("export COLUMNS={cols} LINES={lines}; {command}",);
+    let remote_command = if crate::container::active().is_some() {
+        // `docker exec -it` is already a complete, correctly quoted shell
+        // command for the host's login shell.
+        crate::container::wrap_active(&target.target_string(), &sized_command, true)
+    } else {
+        shell_quote_single(&sized_command)
+    };
     let args = ssh::pty_command_args(
         &target.target_string(),
         config.connect_timeout_secs,
-        &shell_quote_single(&sized_command),
+        &remote_command,
         config.ssh_config_file.as_deref(),
     );
     // The quoted command above is itself passed as ssh's single trailing

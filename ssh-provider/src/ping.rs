@@ -26,6 +26,14 @@ const PING_MARKER: &str = "ralphus-ssh-provider-ping-ok";
 /// [`ssh::interpret_failure`].
 pub fn run(uri: &str, config: &EffectiveConfig) -> Result<Option<String>, String> {
     let target = uri::parse(uri).map_err(|e| e.to_string())?;
+    // Container mode: the host round trip below goes through the container,
+    // so bring it up first -- ping is also how an operator checks a freshly
+    // registered containerised machine, and the container must be creatable.
+    let container = if crate::container::active().is_some() {
+        Some(crate::container::ensure(uri, config)?)
+    } else {
+        None
+    };
     let ssh_args = ssh::command_args(
         &target.target_string(),
         config.connect_timeout_secs,
@@ -50,7 +58,10 @@ pub fn run(uri: &str, config: &EffectiveConfig) -> Result<Option<String>, String
             stdout.trim()
         ));
     }
-    Ok(Some(format!("reachable via ssh as {target}")))
+    Ok(Some(match container {
+        Some(name) => format!("reachable via ssh as {target}; container {name} is running"),
+        None => format!("reachable via ssh as {target}"),
+    }))
 }
 
 #[cfg(test)]

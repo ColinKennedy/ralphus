@@ -110,6 +110,8 @@ above: users see "Triage", the code says "Arbiter".
 | **workspace** | A directory *plus the machine it lives on* (`crate::workspace::Workspace`). Introduced because a bare path answers "which folder" but not "which host". |
 | **local** | Reserved machine value meaning the daemon's own host. Also the implicit default. |
 | **target** | One statically-configured `[machine.targets.<name>]` entry (RAL-355 Phase 2): a `machine` value plus that machine's durable `remote_root` and runner policy. Config-file-only for v1 (`daemon/src/machine_targets.rs`, global scope only — no project-local override, unlike **agent profile**). A target's `machine` field holds the *full* `<scheme>:<uri>` value, never just the **uri** half, to avoid colliding with that already-taken term. |
+| **container-backed machine** | A machine whose provider runs everything inside a Docker container on the remote host rather than directly in the ssh account — `ralphus-ssh-provider` registered with `--container-image` (see `docs/machine-providers.md`). A provider-side setting: the daemon and task files do not know it exists. One container per machine today; a **review** will always get exactly one container of its own. |
+| **container mode** | The *daemon's own* execution mode (RAL-225, `docs/container-mode.md`): the daemon, librarian and runner run inside one hardened container on the daemon's host. **Not** the same thing as a **container-backed machine**, which confines remote work; the two are independent and can be combined. |
 
 ## Storage and identity
 

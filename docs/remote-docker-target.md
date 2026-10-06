@@ -3,7 +3,9 @@
 This fixture runs a Linux/OpenSSH machine target in Docker while the Ralphus
 daemon remains on the host. It exercises the real SSH provider boundary and is
 separate from [container mode](container-mode.md), where the daemon and runner
-live together inside one container.
+live together inside one container. For running the work in a container *on*
+the remote host, see the [container-backed machine fixture](#container-backed-machine-fixture)
+below.
 
 The target contains:
 
@@ -168,6 +170,41 @@ scripts/ssh-target.sh down
 scripts/ssh-target.sh destroy
 scripts/ssh-target.sh reset-origin
 ```
+
+## Container-backed machine fixture
+
+The fixture above makes the *remote host* a container. To exercise the SSH
+provider's [container-backed machines](machine-providers.md#container-backed-machines-docker-on-the-remote-host)
+— where the work itself runs in a Docker container *on* the remote host — the
+host needs its own Docker engine. `scripts/ssh-docker-target.sh` builds one
+(docker-in-docker plus sshd, `docker/ssh-docker-target/`), builds the work image
+(`docker/remote-agent/`: runner, git, tmux, mock `claude`), and loads it into the
+host's inner engine, so the whole daemon → ssh → `docker exec` chain is real on
+one machine:
+
+```bash
+scripts/ssh-docker-target.sh up      # also: stop | down | destroy | status | config
+```
+
+```powershell
+$env:RALPHUS_SSH_DOCKER_CONTAINER_TEST = '1'
+$env:RALPHUS_SSH_CONFIG_FILE = (Resolve-Path .docker-ssh-docker-target/ssh_config)
+cargo build -p ralphus-ssh-provider
+cargo nextest run -p ralphus-ssh-provider --test docker_container_target --run-ignored all
+cargo nextest run -p ralphus-daemon --test provider_conformance --run-ignored all
+```
+
+`docker_container_target` covers container create/reuse/restart/recreate and
+image-mismatch refusal, work provably running in the container (Debian, uid
+10001, against an Alpine uid 10002 host), the bind-mounted remote root, the
+legacy synchronous path, the durable async job lifecycle, descendant cancel, a
+container restart reading as `lost`, binary-safe file operations and
+`materialize`, and the terminal pty. The `provider_conformance` test drives the
+same provider through the daemon's own `ProviderRunner` client. Run these with
+nextest: each test is its own process, which the provider's process-wide
+container setting needs. Fixture state lives in `.docker-ssh-docker-target/` (git-ignored),
+port 2223. The host's inner Docker engine is privileged (docker-in-docker); this
+fixture is for local testing only.
 
 ## What this fixture does not prove
 

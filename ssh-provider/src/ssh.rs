@@ -55,8 +55,27 @@ pub fn non_interactive_args(connect_timeout_secs: u32, config_file: Option<&str>
 
 /// Build a full `ssh <non-interactive flags> <target> -- <remote_command>`
 /// argument vector (everything after the `ssh` program name itself).
+///
+/// In container mode ([`crate::container`]) `remote_command` runs inside the
+/// machine's container rather than in the ssh account itself, so every verb
+/// that builds its remote command here lands in the container without knowing.
+/// Use [`host_command_args`] for the few commands that must run on the host.
 #[must_use]
 pub fn command_args(
+    target: &str,
+    connect_timeout_secs: u32,
+    remote_command: &str,
+    config_file: Option<&str>,
+) -> Vec<String> {
+    let command = crate::container::wrap_active(target, remote_command, false);
+    host_command_args(target, connect_timeout_secs, &command, config_file)
+}
+
+/// [`command_args`] without container wrapping: `remote_command` runs in the
+/// ssh account on the host itself. Used for managing the container (creating
+/// and starting it) and nothing else.
+#[must_use]
+pub fn host_command_args(
     target: &str,
     connect_timeout_secs: u32,
     remote_command: &str,

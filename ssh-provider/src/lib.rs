@@ -19,6 +19,9 @@
 //! that same layout -- see [`fileops`]. `cleanup` (RAL-355 Phase 2
 //! remainder) explicitly tears one workspace down -- see [`cleanup`].
 //!
+//! Given `--container-image`, every one of these runs inside a Docker
+//! container on the host instead of in the ssh account -- see [`container`].
+//!
 //! The wire contract (argv shape, stdin payload, one JSON object on stdout)
 //! is modeled on `examples/providers/loopback.py`, the project's reference
 //! provider, and documented in full in `docs/machine-providers.md`.
@@ -34,6 +37,7 @@
 pub mod capabilities;
 pub mod cleanup;
 pub mod config;
+pub mod container;
 pub mod exec;
 pub mod fileops;
 pub mod job;

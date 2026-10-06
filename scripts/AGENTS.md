@@ -42,6 +42,16 @@ Ralphus daemon. Its project/job root, test bare Git origin, and host key use
 named Docker volumes; `down` preserves them and `destroy` removes them. See
 [`docs/remote-docker-target.md`](../docs/remote-docker-target.md).
 
+**Remote host with its own Docker engine.** `scripts/ssh-docker-target.sh`
+(`up|stop|down|destroy|status|config`) is the counterpart for a
+**container-backed machine**: a docker-in-docker host with sshd, plus the work
+image (`docker/remote-agent/`) loaded into its inner engine, so the SSH
+provider's container flags have something real to create containers on (port
+2223, state in the git-ignored `.docker-ssh-docker-target/`). Like the target
+above it never starts or stops a Ralphus daemon. The host's inner engine runs
+privileged; it is a local test fixture only. See
+[`docs/remote-docker-target.md`](../docs/remote-docker-target.md#container-backed-machine-fixture).
+
 **Guided exercises — `bash scripts/check-initialize-exercises.sh`.** Runs every
 `ralphus initialize <exercise>` (machine, mailbox, triage, review, waypoint)
 live, locally and with `--remote` (every cell and review on the loopback

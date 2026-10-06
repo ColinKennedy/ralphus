@@ -50,3 +50,6 @@ bundle-dist/
 # writes here from the vendor/psmux git submodule; only the submodule's
 # pinned source is committed, never the built binary.
 /daemon/assets/tmux/windows/tmux.exe
+
+# Remote-host-with-Docker fixture state (scripts/ssh-docker-target.sh)
+/.docker-ssh-docker-target/

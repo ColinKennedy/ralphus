@@ -1,0 +1,33 @@
+# Remote-machine fixture with its own Docker engine (docker-in-docker), for
+# exercising the SSH provider's container mode end to end on one machine. The
+# Ralphus daemon stays on the host; see docs/remote-docker-target.md.
+
+name: ralphus-ssh-docker-target
+
+services:
+  target:
+    build:
+      context: ..
+      dockerfile: docker/ssh-docker-target/Dockerfile
+    privileged: true
+    ports:
+      - "127.0.0.1:${RALPHUS_SSH_DOCKER_TEST_PORT:-2223}:22"
+    volumes:
+      - type: bind
+        source: ${RALPHUS_SSH_TEST_AUTHORIZED_KEYS:?set RALPHUS_SSH_TEST_AUTHORIZED_KEYS to the generated public-key file}
+        target: /bootstrap/authorized_keys
+        read_only: true
+      - inner-docker:/var/lib/docker
+      - work-root:/srv/ralphus-work
+      - host-keys:/etc/ssh/ralphus-host-keys
+    healthcheck:
+      test: ["CMD-SHELL", "docker info >/dev/null 2>&1 && pgrep sshd >/dev/null"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 5s
+
+volumes:
+  inner-docker:
+  work-root:
+  host-keys:
