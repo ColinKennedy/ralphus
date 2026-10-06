@@ -14,10 +14,22 @@
 //! The value flags are `--tmux-program`, repeatable
 //! `--mcp-host`, `--agent-logins` (`claude,codex`, `all`, or `none`), `--project-name`, `--project-description`, `--project-is-fork`,
 //! `--project-fork-url`, `--project-url`,
-//! `--bug-threshold`, `--feature-threshold`, `--investigation-threshold`,
-//! `--unclassified-threshold`, `--fork-user`, `--fork-url`, `--forge-provider`,
+//! `--fork-user`, `--fork-url`, `--forge-provider`,
 //! `--forge-host`, `--forge-token`, `--admin-name`,
 //! `--review-resolver-agent`, `--sample-mode`, and `--sample-agent`.
+//!
+//! Project registration (`--register-project`) is asked up front, before any
+//! other project question, and the actual `register_project`/review-settings/
+//! fork daemon calls only happen once every project, review-defaults, and
+//! fork-requirements answer has been collected (end of the "Configure fork
+//! requirements" step) -- never mid-step-4, so there is no point where only
+//! part of a project's settings have been committed. Auto-review thresholds
+//! are not customizable here; every project registers with the recommended
+//! defaults (bug=3, feature=5, investigation=3, unclassified=5). Likewise a
+//! registered project always gets a bundle of recommended review-setting
+//! defaults: `auto_fix_pr_errors`, `discourage_tests_during_auto_pull_request_fixes`,
+//! and `rebuild_on = [feedback, auto_fix]`; `dual_root_pr` is additionally
+//! enabled whenever the project itself is a fork or requires contributor forks.
 //!
 //! Every run ends by writing an answers file (see [`answers`]) recording each
 //! setting's value and source; `--answers-file <path>` replays one, with flags
@@ -126,22 +138,6 @@ const PROJECT_URL: InitializeSetting = InitializeSetting {
     prompt: "project URL",
     flag: "--project-url",
 };
-const BUG_THRESHOLD: InitializeSetting = InitializeSetting {
-    prompt: "bug threshold",
-    flag: "--bug-threshold",
-};
-const FEATURE_THRESHOLD: InitializeSetting = InitializeSetting {
-    prompt: "feature threshold",
-    flag: "--feature-threshold",
-};
-const INVESTIGATION_THRESHOLD: InitializeSetting = InitializeSetting {
-    prompt: "investigation threshold",
-    flag: "--investigation-threshold",
-};
-const UNCLASSIFIED_THRESHOLD: InitializeSetting = InitializeSetting {
-    prompt: "unclassified threshold",
-    flag: "--unclassified-threshold",
-};
 const REVIEW_AUTO_SUBMIT_PR_STACK: InitializeSetting = InitializeSetting {
     prompt: "review auto-submit PR stack",
     flag: "--review-auto-submit-pr-stack",
@@ -211,10 +207,6 @@ const INTERACTIVE_SETTINGS: &[&InitializeSetting] = &[
     &PROJECT_FORK_URL,
     &PROJECT_URL,
     &PROJECT_DESCRIPTION,
-    &BUG_THRESHOLD,
-    &FEATURE_THRESHOLD,
-    &INVESTIGATION_THRESHOLD,
-    &UNCLASSIFIED_THRESHOLD,
     &REVIEW_AUTO_SUBMIT_PR_STACK,
     &REVIEW_RESOLVER_AGENT,
     &REQUIRE_FORKS,
@@ -262,10 +254,6 @@ pub struct InitializeServerOptions {
     pub project_fork_url: Option<String>,
     pub project_url: Option<String>,
     pub project_description: Option<String>,
-    pub bug_threshold: Option<String>,
-    pub feature_threshold: Option<String>,
-    pub investigation_threshold: Option<String>,
-    pub unclassified_threshold: Option<String>,
     pub review_auto_submit_pr_stack: Option<bool>,
     pub review_resolver_agent: Option<String>,
     pub require_forks: Option<bool>,
@@ -299,10 +287,6 @@ impl std::fmt::Debug for InitializeServerOptions {
             .field("project_fork_url", &self.project_fork_url)
             .field("project_url", &self.project_url)
             .field("project_description", &self.project_description)
-            .field("bug_threshold", &self.bug_threshold)
-            .field("feature_threshold", &self.feature_threshold)
-            .field("investigation_threshold", &self.investigation_threshold)
-            .field("unclassified_threshold", &self.unclassified_threshold)
             .field(
                 "review_auto_submit_pr_stack",
                 &self.review_auto_submit_pr_stack,
@@ -342,10 +326,6 @@ impl InitializeServerOptions {
             || self.project_fork_url.is_some()
             || self.project_url.is_some()
             || self.project_description.is_some()
-            || self.bug_threshold.is_some()
-            || self.feature_threshold.is_some()
-            || self.investigation_threshold.is_some()
-            || self.unclassified_threshold.is_some()
             || self.review_auto_submit_pr_stack.is_some()
             || self.review_resolver_agent.is_some()
             || self.require_forks.is_some()
@@ -393,19 +373,28 @@ pub fn dispatch(opts: &GlobalOpts, mut setup: InitializeServerOptions) -> i32 {
     let logins = step_agent_logins(opts, &setup);
 
     step.begin("Register this repository as a project (optional)");
-    let project = step_project(opts, &setup);
+    let pending_project = step_project(opts, &setup);
 
     step.begin("Configure review defaults and auto-review thresholds");
-    match project.as_deref() {
-        Some(project) => step_review_settings(opts, project, &setup),
-        None => println!("  skipped: no project was registered"),
-    }
+    let review_defaults = match &pending_project {
+        Some(_) => step_review_settings(&setup),
+        None => {
+            println!("  skipped: no project was registered");
+            ReviewDefaults::default()
+        }
+    };
 
     step.begin("Configure fork requirements");
-    match project.as_deref() {
-        Some(project) => step_forks(opts, project, &setup),
-        None => println!("  skipped: no project was registered"),
-    }
+    let project = match pending_project {
+        Some(pending) => {
+            let forks = step_forks(&setup);
+            finalize_project_registration(opts, pending, review_defaults, forks)
+        }
+        None => {
+            println!("  skipped: no project was registered");
+            None
+        }
+    };
 
     step.begin("Create an optional default admin user");
     let admin_user = step_admin(opts, &setup);
@@ -1112,7 +1101,25 @@ fn log_in(
 
 // ---- project registration --------------------------------------------------
 
-fn step_project(opts: &GlobalOpts, setup: &InitializeServerOptions) -> Option<String> {
+/// Everything collected across "Register this repository as a project",
+/// "Configure review defaults and auto-review thresholds", and "Configure
+/// fork requirements", before any of it reaches the daemon.
+/// [`finalize_project_registration`] is the only place that mutates
+/// anything, once all three steps' answers are in hand -- so there is never
+/// a point where only part of a project's settings have been committed.
+struct PendingProject {
+    name: String,
+    description: String,
+    is_fork: bool,
+    fork_url: Option<String>,
+    project_url: String,
+    target_str: String,
+    /// A project is already registered at this exact path -- registration
+    /// itself is skipped, but review defaults and fork settings still apply.
+    already_registered: bool,
+}
+
+fn step_project(opts: &GlobalOpts, setup: &InitializeServerOptions) -> Option<PendingProject> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let probe = std::process::Command::new("git")
         .args([
@@ -1128,6 +1135,16 @@ fn step_project(opts: &GlobalOpts, setup: &InitializeServerOptions) -> Option<St
             "  {} is not inside a git working tree; skipping project registration",
             cwd.display()
         );
+        return None;
+    }
+    if !prompt_yes_no(
+        &REGISTER_PROJECT,
+        "  register this repository as a project?",
+        true,
+        setup.register_project,
+        setup.yes,
+    ) {
+        println!("  skipped");
         return None;
     }
     let default_name = cwd
@@ -1164,15 +1181,24 @@ fn step_project(opts: &GlobalOpts, setup: &InitializeServerOptions) -> Option<St
     } else {
         None
     };
-    let origin_url = git_remote_url(&cwd, "origin");
+    // In a forked clone, "origin" is almost always the fork itself, not the
+    // upstream project -- autofilling it here would suggest the wrong URL,
+    // so the fork branch gets a generic example instead of a real default.
+    let (question, default) = if is_fork {
+        (
+            format!("  origin clone URL (SSH recommended) [git@github.com:{{owner}}/{name}.git]"),
+            String::new(),
+        )
+    } else {
+        (
+            "  project clone URL (SSH recommended)".to_string(),
+            git_remote_url(&cwd, "origin"),
+        )
+    };
     let project_url = prompt(
         &PROJECT_URL,
-        if is_fork {
-            "  upstream/origin clone URL for the non-fork project (SSH recommended)"
-        } else {
-            "  project clone URL (SSH recommended)"
-        },
-        &origin_url,
+        &question,
+        &default,
         setup.project_url.as_ref(),
         setup.yes,
     );
@@ -1183,25 +1209,12 @@ fn step_project(opts: &GlobalOpts, setup: &InitializeServerOptions) -> Option<St
         setup.project_description.as_ref(),
         setup.yes,
     );
-    if !prompt_yes_no(
-        &REGISTER_PROJECT,
-        "  register this project with these settings?",
-        true,
-        setup.register_project,
-        setup.yes,
-    ) {
-        println!("  skipped");
-        return None;
-    }
     let target =
         ralphus_core::strip_verbatim_prefix(cwd.canonicalize().unwrap_or_else(|_| cwd.clone()));
     let target_str = target.to_string_lossy().to_string();
     let client = opts.client();
-    match client.get_project(&name) {
-        Ok(existing) if existing["path"].as_str() == Some(&target_str) => {
-            println!("  already registered project \"{name}\" -> {target_str}; skipping");
-            return Some(name);
-        }
+    let already_registered = match client.get_project(&name) {
+        Ok(existing) if existing["path"].as_str() == Some(&target_str) => true,
         Ok(existing) => {
             println!(
                 "  project \"{name}\" is already registered for {}; skipping to avoid changing it",
@@ -1213,38 +1226,17 @@ fn step_project(opts: &GlobalOpts, setup: &InitializeServerOptions) -> Option<St
             println!("  error: could not check existing project registration: {error}");
             return None;
         }
-        Err(_) => {}
-    }
-    let clone_url = (!project_url.is_empty()).then_some(project_url.as_str());
-    match client.register_project(
-        &name,
-        &target_str,
-        &description,
-        "git",
-        clone_url,
-        false,
-        None,
-    ) {
-        Ok(payload) => {
-            println!("  registered project \"{name}\" -> {target_str}");
-            for warning in payload["warnings"].as_array().into_iter().flatten() {
-                if let Some(warning) = warning.as_str() {
-                    println!("  warning: {warning}");
-                }
-            }
-            if let Some(fork_url) = fork_url {
-                match client.add_project_fork(&name, "", &fork_url, None, None) {
-                    Ok(_) => println!("  registered the project-wide fork URL"),
-                    Err(error) => println!("  error registering the project fork URL: {error}"),
-                }
-            }
-            Some(name)
-        }
-        Err(error) => {
-            println!("  error: could not register project: {error}");
-            None
-        }
-    }
+        Err(_) => false,
+    };
+    Some(PendingProject {
+        name,
+        description,
+        is_fork,
+        fork_url,
+        project_url,
+        target_str,
+        already_registered,
+    })
 }
 
 fn git_remote_url(cwd: &std::path::Path, remote: &str) -> String {
@@ -1259,64 +1251,26 @@ fn git_remote_url(cwd: &std::path::Path, remote: &str) -> String {
 
 // ---- review settings / auto-review thresholds ------------------------------
 
-fn step_review_settings(opts: &GlobalOpts, project: &str, setup: &InitializeServerOptions) {
-    let client = opts.client();
-    match client.get_project_review_settings(project) {
-        Ok(settings) => println!("  current review settings: {settings}"),
-        Err(error) => println!("  could not read review settings: {error}"),
-    }
+/// Recommended, non-customizable auto-review thresholds applied to every
+/// newly registered project (submissions of that triage type queue until
+/// this many are pending, then an automatic review fires).
+const RECOMMENDED_TRIAGE_THRESHOLDS: [(&str, i64); 4] = [
+    ("bug", 3),
+    ("feature", 5),
+    ("investigation", 3),
+    ("unclassified", 5),
+];
+
+#[derive(Default)]
+struct ReviewDefaults {
+    auto_submit_pr_stack: bool,
+    resolver_agent: String,
+}
+
+fn step_review_settings(setup: &InitializeServerOptions) -> ReviewDefaults {
     println!(
-        "  auto-review thresholds: submissions of that triage type queue until this many are pending, then an automatic review fires (blank disables it for that type)"
+        "  using the recommended auto-review thresholds (bug=3, feature=5, investigation=3, unclassified=5)"
     );
-    let pools = client.list_triage_pools().unwrap_or_default();
-    for (setting, triage_type, default_threshold, supplied) in [
-        (&BUG_THRESHOLD, "bug", 3_i64, setup.bug_threshold.as_ref()),
-        (
-            &FEATURE_THRESHOLD,
-            "feature",
-            5,
-            setup.feature_threshold.as_ref(),
-        ),
-        (
-            &INVESTIGATION_THRESHOLD,
-            "investigation",
-            3,
-            setup.investigation_threshold.as_ref(),
-        ),
-        (
-            &UNCLASSIFIED_THRESHOLD,
-            "unclassified",
-            5,
-            setup.unclassified_threshold.as_ref(),
-        ),
-    ] {
-        let answer = prompt(
-            setting,
-            &format!("    {triage_type} threshold"),
-            &default_threshold.to_string(),
-            supplied,
-            setup.yes,
-        );
-        let threshold = answer.trim().parse::<i64>().ok();
-        let already_configured = pools["pools"].as_array().is_some_and(|pools| {
-            pools.iter().any(|pool| {
-                pool["project"].as_str() == Some(project)
-                    && pool["triage_type"].as_str() == Some(triage_type)
-                    && pool["threshold"].as_i64() == threshold
-            })
-        });
-        if already_configured {
-            println!("    {triage_type}: already configured; skipping");
-            continue;
-        }
-        match client.set_triage_pool_threshold(project, triage_type, threshold) {
-            Ok(_) => println!(
-                "    {triage_type}: {}",
-                threshold.map_or_else(|| "disabled".to_string(), |t| t.to_string())
-            ),
-            Err(error) => println!("    {triage_type}: error setting threshold: {error}"),
-        }
-    }
     let auto_submit_pr_stack = prompt_yes_no(
         &REVIEW_AUTO_SUBMIT_PR_STACK,
         "  automatically submit this project's review PR stacks?",
@@ -1331,49 +1285,35 @@ fn step_review_settings(opts: &GlobalOpts, project: &str, setup: &InitializeServ
         setup.review_resolver_agent.as_ref(),
         setup.yes,
     );
-    let patch = ProjectReviewSettingsPatch {
-        auto_submit_pr_stack: Some(auto_submit_pr_stack),
-        default_resolver_agent: Some(&resolver_agent),
-        ..Default::default()
-    };
-    match client.set_project_review_settings(project, &patch) {
-        Ok(_) => println!(
-            "  review defaults: auto-submit PR stacks = {auto_submit_pr_stack}; resolver agent = {resolver_agent}"
-        ),
-        Err(error) => println!("  error setting review defaults: {error}"),
+    ReviewDefaults {
+        auto_submit_pr_stack,
+        resolver_agent,
     }
 }
 
 // ---- forks ------------------------------------------------------------------
 
-fn step_forks(opts: &GlobalOpts, project: &str, setup: &InitializeServerOptions) {
-    if !prompt_yes_no(
+/// A contributor fork collected in "Configure fork requirements", applied
+/// only once [`finalize_project_registration`] runs.
+struct ForkSettings {
+    require_forks: bool,
+    contributor: Option<(String, String)>,
+}
+
+fn step_forks(setup: &InitializeServerOptions) -> ForkSettings {
+    let require_forks = prompt_yes_no(
         &REQUIRE_FORKS,
         "  does this project require contributors to work from forks?",
         false,
         setup.require_forks,
         setup.yes,
-    ) {
+    );
+    if !require_forks {
         println!("  skipped: forks not required");
-        return;
-    }
-    let client = opts.client();
-    let dual_root_already_enabled = client
-        .get_project_review_settings(project)
-        .ok()
-        .and_then(|settings| settings["effective"]["dual_root_pr"].as_bool())
-        .unwrap_or(false);
-    if dual_root_already_enabled {
-        println!("  dual-root PRs are already enabled for \"{project}\"; skipping");
-    } else {
-        let patch = ProjectReviewSettingsPatch {
-            dual_root_pr: Some(true),
-            ..Default::default()
+        return ForkSettings {
+            require_forks: false,
+            contributor: None,
         };
-        match client.set_project_review_settings(project, &patch) {
-            Ok(_) => println!("  enabled dual-root PRs for \"{project}\""),
-            Err(error) => println!("  error enabling dual-root PRs: {error}"),
-        }
     }
     let user = prompt(
         &FORK_USER,
@@ -1393,31 +1333,136 @@ fn step_forks(opts: &GlobalOpts, project: &str, setup: &InitializeServerOptions)
         println!(
             "  no fork URL given; skipping fork registration (use `ralphus project fork add` later)"
         );
-        return;
+        return ForkSettings {
+            require_forks: true,
+            contributor: None,
+        };
     }
-    let existing_fork = client.list_project_forks(project).ok().and_then(|payload| {
-        payload["forks"]
-            .as_array()
-            .and_then(|forks| {
-                forks
-                    .iter()
-                    .find(|fork| fork["user"].as_str() == Some(&user))
-            })
-            .cloned()
-    });
-    match existing_fork {
-        Some(fork) if fork["fork_url"].as_str() == Some(&fork_url) => {
-            println!("  fork for {user} is already registered; skipping");
+    ForkSettings {
+        require_forks: true,
+        contributor: Some((user, fork_url)),
+    }
+}
+
+// ---- finalize: the only place project registration mutates anything -------
+
+fn finalize_project_registration(
+    opts: &GlobalOpts,
+    pending: PendingProject,
+    review: ReviewDefaults,
+    forks: ForkSettings,
+) -> Option<String> {
+    let PendingProject {
+        name,
+        description,
+        is_fork,
+        fork_url,
+        project_url,
+        target_str,
+        already_registered,
+    } = pending;
+    let client = opts.client();
+
+    if already_registered {
+        println!(
+            "  project \"{name}\" is already registered at {target_str}; skipping registration"
+        );
+    } else {
+        let clone_url = (!project_url.is_empty()).then_some(project_url.as_str());
+        match client.register_project(
+            &name,
+            &target_str,
+            &description,
+            "git",
+            clone_url,
+            false,
+            None,
+        ) {
+            Ok(payload) => {
+                println!("  registered project \"{name}\" -> {target_str}");
+                for warning in payload["warnings"].as_array().into_iter().flatten() {
+                    if let Some(warning) = warning.as_str() {
+                        println!("  warning: {warning}");
+                    }
+                }
+            }
+            Err(error) => {
+                println!("  error: could not register project: {error}");
+                return None;
+            }
         }
-        Some(_) => match client.set_project_fork(project, &user, Some(&fork_url), None, None) {
-            Ok(_) => println!("  updated the registered fork for {user}"),
-            Err(error) => println!("  error updating fork registration: {error}"),
-        },
-        None => match client.add_project_fork(project, &user, &fork_url, None, None) {
-            Ok(_) => println!("  registered a fork for {user}"),
-            Err(error) => println!("  error registering fork: {error}"),
-        },
+        if let Some(fork_url) = &fork_url {
+            match client.add_project_fork(&name, "", fork_url, None, None) {
+                Ok(_) => println!("  registered the project-wide fork URL"),
+                Err(error) => println!("  error registering the project fork URL: {error}"),
+            }
+        }
     }
+
+    let pools = client.list_triage_pools().unwrap_or_default();
+    for (triage_type, threshold) in RECOMMENDED_TRIAGE_THRESHOLDS {
+        let already_configured = pools["pools"].as_array().is_some_and(|pools| {
+            pools.iter().any(|pool| {
+                pool["project"].as_str() == Some(name.as_str())
+                    && pool["triage_type"].as_str() == Some(triage_type)
+                    && pool["threshold"].as_i64() == Some(threshold)
+            })
+        });
+        if already_configured {
+            println!("  {triage_type} threshold: already configured; skipping");
+            continue;
+        }
+        match client.set_triage_pool_threshold(&name, triage_type, Some(threshold)) {
+            Ok(_) => println!("  {triage_type} threshold: {threshold}"),
+            Err(error) => println!("  {triage_type} threshold: error setting threshold: {error}"),
+        }
+    }
+
+    let dual_root_pr = is_fork || forks.require_forks;
+    let patch = ProjectReviewSettingsPatch {
+        auto_submit_pr_stack: Some(review.auto_submit_pr_stack),
+        default_resolver_agent: Some(&review.resolver_agent),
+        dual_root_pr: dual_root_pr.then_some(true),
+        auto_fix_pr_errors: Some(true),
+        discourage_tests_during_auto_pull_request_fixes: Some(true),
+        rebuild_on: Some(Some(vec!["feedback".to_string(), "auto_fix".to_string()])),
+        ..Default::default()
+    };
+    match client.set_project_review_settings(&name, &patch) {
+        Ok(_) => println!(
+            "  review defaults: auto-submit PR stacks = {}; resolver agent = {}; dual-root PRs = {dual_root_pr}; auto-fix PR errors = on; discourage tests during auto-fix = on; rebuild on feedback/auto-fix = on",
+            review.auto_submit_pr_stack, review.resolver_agent
+        ),
+        Err(error) => println!("  error setting review defaults: {error}"),
+    }
+
+    if let Some((user, fork_url)) = forks.contributor {
+        let existing_fork = client.list_project_forks(&name).ok().and_then(|payload| {
+            payload["forks"]
+                .as_array()
+                .and_then(|forks| {
+                    forks
+                        .iter()
+                        .find(|fork| fork["user"].as_str() == Some(&user))
+                })
+                .cloned()
+        });
+        match existing_fork {
+            Some(fork) if fork["fork_url"].as_str() == Some(fork_url.as_str()) => {
+                println!("  fork for {user} is already registered; skipping");
+            }
+            Some(_) => match client.set_project_fork(&name, &user, Some(&fork_url), None, None) {
+                Ok(_) => println!("  updated the registered fork for {user}"),
+                Err(error) => println!("  error updating fork registration: {error}"),
+            },
+            None => match client.add_project_fork(&name, &user, &fork_url, None, None) {
+                Ok(_) => println!("  registered a fork for {user}"),
+                Err(error) => println!("  error registering fork: {error}"),
+            },
+        }
+    }
+
+    Some(name)
 }
 
 // ---- default admin user ------------------------------------------------------
@@ -1781,7 +1826,7 @@ mod tests {
     #[test]
     fn interactive_settings_have_unique_prompt_and_flag_contracts() {
         assert!(interactive_settings_are_valid());
-        assert_eq!(INTERACTIVE_SETTINGS.len(), 29);
+        assert_eq!(INTERACTIVE_SETTINGS.len(), 25);
     }
 
     #[test]
