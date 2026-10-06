@@ -7815,6 +7815,7 @@ fn guardian_cartographer(
     }
     let filter = crate::cartographer::CartographerFilter {
         review_worktrees_for_guardian: Some(id.to_string()),
+        source: query_filter(query, "source"),
         limit: query_param(query, "limit")
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(100),
@@ -25325,6 +25326,45 @@ remediation_attempts=1
         let r_missing = route(&d, "GET", "/api/cartographer?squad_id=squad-nope", "");
         assert_eq!(r_missing.status, 200);
         assert!(r_missing.body.contains("\"total\":0"));
+    }
+
+    #[test]
+    fn guardian_cartographer_source_filter_reaches_past_the_row_limit() {
+        let d = daemon();
+        let id = d.lock().create_guardian("g", "main", "/r").unwrap();
+        {
+            let store = d.lock();
+            for (source, message) in [
+                ("guardian", "conflicts starting"),
+                ("poller_health", "poll healthy"),
+                ("poller_health", "poll healthy"),
+            ] {
+                let _ = store.cartographer_log(crate::cartographer::CartographerEntry {
+                    level: crate::logging::LogLevel::INFO,
+                    source,
+                    message,
+                    scope: Some("guardian"),
+                    squad_id: None,
+                    guardian_id: Some(id.as_str()),
+                    cell_id: None,
+                    task: None,
+                    log_path: None,
+                    payload: serde_json::json!({}),
+                    admin_only: false,
+                });
+            }
+        }
+        let reply = route(
+            &d,
+            "GET",
+            &format!("/api/guardians/{id}/cartographer?source=guardian&limit=1"),
+            "",
+        );
+        assert_eq!(reply.status, 200, "{}", reply.body);
+        let body = serde_json::from_str::<serde_json::Value>(&reply.body).unwrap();
+        let rows = body["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["message"], "conflicts starting");
     }
 
     #[test]

@@ -1908,13 +1908,26 @@
        */
       async function loadReviewDockEvents(gid) {
         try {
-          // Newest window, not oldest: a long-lived review has thousands of rows,
-          // and the current run is the one the Live tab and the drawer need.
-          const r = await fetch(`/api/guardians/${encodeURIComponent(gid)}/cartographer?limit=200&sort=desc`);
-          if (!r.ok) { reviewDockEvents[gid] = []; afterReviewDockEvents(); return; }
+          // Two windows, merged. The newest 200 rows of every kind feed the
+          // drawer, but a long-lived review has thousands of poller/PR/CI rows
+          // that bury the run lifecycle rows (`conflicts starting`, `final proof
+          // starting`, `feedback applying`), so a branch's earlier runs vanished
+          // from the Live tab. The `guardian`-source rows are the only ones
+          // branchRuns() reads and are sparse, so fetch them separately.
+          const base = `/api/guardians/${encodeURIComponent(gid)}/cartographer`;
+          const [recent, lifecycle] = await Promise.all([
+            fetch(`${base}?limit=200&sort=desc`),
+            fetch(`${base}?source=guardian&limit=1000&sort=desc`),
+          ]);
+          if (!recent.ok) { reviewDockEvents[gid] = []; afterReviewDockEvents(); return; }
           /** @type {{rows: CartographerRow[], total: number}} */
-          const data = await r.json();
-          reviewDockEvents[gid] = (data.rows || []).slice().reverse();
+          const data = await recent.json();
+          /** @type {CartographerRow[]} */
+          const extra = lifecycle.ok ? ((await lifecycle.json()).rows || []) : [];
+          /** @type {Map<number, CartographerRow>} */
+          const byId = new Map();
+          for (const row of [...(data.rows || []), ...extra]) byId.set(row.id, row);
+          reviewDockEvents[gid] = [...byId.values()].sort((x, y) => x.at_ms - y.at_ms || x.id - y.id);
         } catch {
           reviewDockEvents[gid] = [];
         }
