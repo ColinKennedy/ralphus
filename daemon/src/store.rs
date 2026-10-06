@@ -349,6 +349,10 @@ pub struct ProofView {
     /// set. No behavioral effect; see [`Store::set_proof_step_env_overrides`].
     #[serde(default)]
     pub env_out_of_date: bool,
+    /// RAL-575: the latest appraisal a scored (`pass_score`) prompt proof
+    /// produced. Absent for unscored steps and until one has been recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub appraisal: Option<crate::appraisal::AppraisalView>,
 }
 
 /// A cell as shown in the board.
@@ -2347,6 +2351,23 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_prophecies_entity ON prophecies(entity_uri);
             CREATE INDEX IF NOT EXISTS idx_prophecies_squad ON prophecies(squad_id);
             CREATE INDEX IF NOT EXISTS idx_prophecies_guardian ON prophecies(guardian_id);
+            -- RAL-575: scored-proof appraisals, one row per proof attempt
+            -- (see `appraisal.rs`). Not prophecies.
+            CREATE TABLE IF NOT EXISTS proof_appraisals (
+                entity_uri      TEXT NOT NULL,
+                squad_id        TEXT NOT NULL,
+                attempt         INTEGER NOT NULL,
+                score           INTEGER NOT NULL,
+                pass_score      INTEGER NOT NULL,
+                passed          INTEGER NOT NULL,
+                summary         TEXT NOT NULL DEFAULT '',
+                sections        TEXT NOT NULL DEFAULT '[]',
+                created_at_ms   INTEGER NOT NULL,
+                published_at_ms INTEGER,
+                pr_id           TEXT,
+                PRIMARY KEY (entity_uri, attempt)
+            );
+            CREATE INDEX IF NOT EXISTS idx_proof_appraisals_squad ON proof_appraisals(squad_id);
             -- RAL-241: the escalation mailbox. `mailbox_clients` is who can
             -- drain (registered via `POST /api/mailbox/register`);
             -- `mailbox_messages` is what got enqueued (a failed cell, a
@@ -6067,6 +6088,7 @@ impl Store {
                         compaction_input_tokens: r.get::<_, i64>(23)?,
                         compaction_count: r.get::<_, i64>(24)?,
                         turns: r.get::<_, Option<i64>>(27)?,
+                        appraisal: None,
                     },
                 ))
             })?
@@ -6074,6 +6096,17 @@ impl Store {
         let mut map: HashMap<(i64, String, i64), Vec<ProofView>> = HashMap::new();
         for (task_idx, scope, cell_idx, v) in rows {
             map.entry((task_idx, scope, cell_idx)).or_default().push(v);
+        }
+        let mut appraisals = crate::appraisal::latest_appraisals_by_uri(conn, squad_id)?;
+        if !appraisals.is_empty() {
+            for ((task_idx, scope, cell_idx), steps) in &mut map {
+                for (idx, step) in steps.iter_mut().enumerate() {
+                    let uri = crate::appraisal::proof_entity_uri(
+                        squad_id, *task_idx, scope, *cell_idx, idx as i64,
+                    );
+                    step.appraisal = appraisals.remove(&uri);
+                }
+            }
         }
         Ok(map)
     }
@@ -6131,9 +6164,20 @@ impl Store {
                     compaction_input_tokens: r.get::<_, i64>(20)?,
                     compaction_count: r.get::<_, i64>(21)?,
                     turns: r.get::<_, Option<i64>>(24)?,
+                    appraisal: None,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut rows = rows;
+        let mut appraisals = crate::appraisal::latest_appraisals_by_uri(&self.conn, squad_id)?;
+        if !appraisals.is_empty() {
+            for (idx, step) in rows.iter_mut().enumerate() {
+                let uri = crate::appraisal::proof_entity_uri(
+                    squad_id, task_idx, scope, cell_idx, idx as i64,
+                );
+                step.appraisal = appraisals.remove(&uri);
+            }
+        }
         Ok(rows)
     }
 
@@ -10238,6 +10282,10 @@ impl Store {
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM events WHERE squad_id=?", params![squad_id])?;
         tx.execute("DELETE FROM proofs WHERE squad_id=?", params![squad_id])?;
+        tx.execute(
+            "DELETE FROM proof_appraisals WHERE squad_id=?",
+            params![squad_id],
+        )?;
         tx.execute("DELETE FROM cells WHERE squad_id=?", params![squad_id])?;
         tx.execute("DELETE FROM tasks WHERE squad_id=?", params![squad_id])?;
         tx.execute("DELETE FROM ghosts WHERE squad_id=?", params![squad_id])?;
@@ -10316,6 +10364,7 @@ impl Store {
             let tx = self.conn.transaction()?;
             tx.execute("DELETE FROM events", [])?;
             tx.execute("DELETE FROM proofs", [])?;
+            tx.execute("DELETE FROM proof_appraisals", [])?;
             tx.execute("DELETE FROM cells", [])?;
             tx.execute("DELETE FROM tasks", [])?;
             tx.execute("DELETE FROM ghosts", [])?;
@@ -10373,6 +10422,7 @@ impl Store {
         for id in &ids {
             tx.execute("DELETE FROM events WHERE squad_id=?", params![id])?;
             tx.execute("DELETE FROM proofs WHERE squad_id=?", params![id])?;
+            tx.execute("DELETE FROM proof_appraisals WHERE squad_id=?", params![id])?;
             tx.execute("DELETE FROM cells WHERE squad_id=?", params![id])?;
             tx.execute("DELETE FROM tasks WHERE squad_id=?", params![id])?;
             tx.execute("DELETE FROM ghosts WHERE squad_id=?", params![id])?;

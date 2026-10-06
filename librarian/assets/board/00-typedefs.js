@@ -2,7 +2,26 @@
       // authoritative wire shapes). Checked via `npm run typecheck` (tsc --checkJs
       // over the extracted <script> body) — see tsconfig.board.json. ----
       /**
+       * @typedef {object} AppraisalSection
+       * @property {string} title
+       * @property {string} body - Markdown.
+       */
+      /**
+       * @typedef {object} AppraisalView
+       * @property {string} entity_uri - The judged proof step's `proof:` entity URI.
+       * @property {number} attempt - 1-based; the latest attempt is the one shown.
+       * @property {number} score - 1-10.
+       * @property {number} pass_score - Threshold in force when this appraisal was recorded.
+       * @property {boolean} passed - `score >= pass_score`.
+       * @property {string} summary
+       * @property {AppraisalSection[]} sections
+       * @property {number} created_at_ms
+       * @property {number|null} published_at_ms
+       * @property {string|null} pr_id
+       */
+      /**
        * @typedef {object} ProofView
+       * @property {AppraisalView} [appraisal] - RAL-575: latest appraisal of a scored prompt proof step; absent for unscored steps and until one is recorded.
        * @property {string|null} id
        * @property {string} kind - "command" | "prompt" | "brain" | "approval"
        * @property {string} state - "pending" | "running" | "done" | "failed" | "cancelled"

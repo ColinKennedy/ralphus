@@ -537,6 +537,40 @@
           <div class="btn-row" style="margin-top:0"><button class="btn" onclick="bulkSetStatus(event)" data-tip="Override the status of all ${multiSel.size} selected squads to any valid state.\nA confirmation dialog will list all affected squads before applying.\nTerminal states (done/failed/cancelled) cannot be undone.">Set Status ${multiSel.size}</button><button class="btn" onclick="openAddDependencyDialog(event,[...multiSel])" data-tip="Make all ${multiSel.size} selected squads wait for another squad to finish before they can be scheduled.\nSearch for the target squad by ID or name, then confirm.\nThe target squad itself is not modified.">🔗 Add Dependency ${multiSel.size}</button><button class="btn" onclick="bulkCancel()" data-tip="Cancel all selected squads — stops running cells and marks them as cancelled.">Cancel ${multiSel.size}</button><button class="btn" onclick="bulkHideSquads()" data-tip="Hide all ${multiSel.size} selected squads from your own view.\nWho/when: use this after shift-selecting a range of squads you want to declutter at once.\nA personal preference — it never affects what other users see or any squad's status.">🙈 Hide ${multiSel.size}</button><button class="btn" onclick="bulkUnhideSquads()" data-tip="Re-enable all ${multiSel.size} selected squads in your own view, if hidden.">👁 Unhide ${multiSel.size}</button><button class="btn danger" onclick="bulkDelete()" data-tip="Delete all selected squads and their data permanently. This cannot be undone.">Delete ${multiSel.size}</button></div>`;
       }
 
+      /**
+       * RAL-575: the score / threshold / pass badge of a scored proof step.
+       * Renders nothing for an unscored step or one with no appraisal yet.
+       * @param {ProofView} v
+       * @returns {string}
+       */
+      function appraisalBadge(v) {
+        const a = v.appraisal;
+        if (!a) return "";
+        const color = a.passed ? "var(--done)" : "var(--failed)";
+        const tip = `Appraisal (attempt ${a.attempt}): the judge scored this proof step ${a.score}/10; it needs at least ${a.pass_score} to pass.\nWho/when: read this to see how close a failed proof step came, or how much margin a passing one had.\nSelect the proof step for the full summary and sections. Each restart adds an attempt; the latest one counts.`;
+        return `<span class="mono" style="color:${color}" data-tip="${esc(tip)}">${a.score}/${a.pass_score} ${a.passed ? "pass" : "fail"}</span>`;
+      }
+
+      /**
+       * RAL-575: the full appraisal (summary + each section) for the proof
+       * detail pane. Section bodies are markdown, shown as its source text in
+       * a wrapped block since the board has no markdown renderer.
+       * @param {ProofView} v
+       * @returns {string}
+       */
+      function appraisalDetailHtml(v) {
+        const a = v.appraisal;
+        if (!a) return "";
+        const color = a.passed ? "var(--done)" : "var(--failed)";
+        const block = "white-space:pre-wrap;margin:4px 0 10px;color:var(--muted)";
+        const sections = a.sections.map((s) => `<div class="k" data-tip="A section of the appraisal, titled and structured by the judge's role.">${esc(s.title)}</div><div class="mono" style="${block}">${esc(s.body)}</div>`).join("");
+        return `<div class="dhead"><span class="k">appraisal</span></div>
+          <div class="kv-row" data-tip="Score the judge gave against the threshold in force when it was recorded. The proof step passes when score is at least the threshold."><span class="k">score</span><span class="v" style="color:${color}">${a.score}/10 (needs ${a.pass_score}) — ${a.passed ? "pass" : "fail"}</span></div>
+          <div class="kv-row" data-tip="Appraisals are kept per attempt; the latest is shown here."><span class="k">attempt</span><span class="v">${a.attempt}</span></div>
+          ${a.summary ? `<div class="mono" style="${block}" data-tip="The judge's one-paragraph verdict.">${esc(a.summary)}</div>` : ""}
+          ${sections}`;
+      }
+
       // A cell's own proof steps (`[[task.cell.proof]]`), listed under a
       // dashed separator inside the cell card with a status dot each, so you
       // can see which proof step is running/passed/failed. Clicking one selects it
@@ -555,6 +589,6 @@
         if (!vs.length) return "";
         const rows = vs.map((v, vi) =>
           `<div class="sv-row selectable ${selCls("proof", ti, si, vi)}" data-tip="Cell proof step: ${esc(v.kind)}${v.id ? " — " + esc(v.id) : ""}\nRuns after this cell completes to validate its output.\nCurrent state: ${esc(v.state)}.\nShift/Ctrl-click to multi-select; right-click for batch actions." data-click="onGraphNodeClick" data-ctx="openProofMenu" data-squad-id="${esc(squadId)}" data-kind="proof" data-ti="${ti}" data-si="${si}" data-vi="${vi}">
-             ${sdot(v.state)}<span class="sv-name">${esc(v.id || v.kind)}</span> ${pill(v.state)}${delayedGraphBadge(v.delayed_until_ms, v.delayed_reason || "")}${v.output ? `<button class="logs-btn" data-tip="View proof output — the raw response from the proof step's AI call." data-full="${esc(v.output)}" onclick="event.stopPropagation();openCmdPopup(event)">📄</button>` : ""}</div>`).join("");
+             ${sdot(v.state)}<span class="sv-name">${esc(v.id || v.kind)}</span> ${pill(v.state)} ${appraisalBadge(v)}${delayedGraphBadge(v.delayed_until_ms, v.delayed_reason || "")}${v.output ? `<button class="logs-btn" data-tip="View proof output — the raw response from the proof step's AI call." data-full="${esc(v.output)}" onclick="event.stopPropagation();openCmdPopup(event)">📄</button>` : ""}</div>`).join("");
         return `<div class="sproof"><span class="label">proof</span>${rows}</div>`;
       }
