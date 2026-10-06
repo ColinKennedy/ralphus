@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use crate::commands::initialize_exercise::{
+use crate::commands::initialize::exercise::{
     Exercise, ExerciseOptions, REMOTE_MACHINE, commit_and_push_command, squad_id,
 };
 

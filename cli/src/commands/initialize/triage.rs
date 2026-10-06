@@ -5,7 +5,7 @@
 //! on the strict loopback machine, so pooling runs through remote-cell review
 //! derivation instead of reading a local worktree.
 
-use crate::commands::initialize_exercise::{Exercise, ExerciseOptions, Fixture, squad_id};
+use crate::commands::initialize::exercise::{Exercise, ExerciseOptions, Fixture, squad_id};
 
 pub fn dispatch(options: &ExerciseOptions) -> i32 {
     let exercise = match Exercise::start("triage", options) {

@@ -265,6 +265,7 @@ files (each paired with a `CLAUDE.md` containing `@AGENTS.md`):
 - [`daemon/AGENTS.md`](daemon/AGENTS.md) — store/scheduler/API detail, Rust integration test table
 - [`librarian/AGENTS.md`](librarian/AGENTS.md) — board chunks JSDoc/lint/knip/tooltip/color rules
 - [`cli/AGENTS.md`](cli/AGENTS.md) — CLI module map, Read-Only Quick-Start Safety List
+- [`cli/src/commands/initialize/AGENTS.md`](cli/src/commands/initialize/AGENTS.md) — `ralphus initialize` guided exercises: no LLM, every mode (local + `--remote`), wired into CI
 - [`mcp/AGENTS.md`](mcp/AGENTS.md) — MCP server module map, tool-generation/exclusion/parity-check detail
 - [`cli-py/AGENTS.md`](cli-py/AGENTS.md) — Python docsgen/bench-graph project, its test table
 - [`auth/AGENTS.md`](auth/AGENTS.md) — secure-dist license format and signing workflow

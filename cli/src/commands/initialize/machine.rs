@@ -1,14 +1,14 @@
 //! `ralphus initialize machine`: verify the local loopback provider.
 //!
 //! Always runs against the strict loopback machine (see
-//! `initialize_exercise::REMOTE_MACHINE`), with or without `--remote`: the
+//! `exercise::REMOTE_MACHINE`), with or without `--remote`: the
 //! machine *is* the subject of this exercise. One task provisions a fresh
 //! worktree on the machine, runs a cell there with an environment variable,
 //! and proves on the machine that the variable arrived.
 
 use std::time::Duration;
 
-use crate::commands::initialize_exercise::{Exercise, ExerciseOptions, REMOTE_MACHINE, squad_id};
+use crate::commands::initialize::exercise::{Exercise, ExerciseOptions, REMOTE_MACHINE, squad_id};
 
 const EXPECTED: &str = "remote-ok";
 

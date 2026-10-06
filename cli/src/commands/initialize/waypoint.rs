@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::client::DaemonClient;
-use crate::commands::initialize_exercise::{Exercise, ExerciseOptions, Fixture, REMOTE_MACHINE};
+use crate::commands::initialize::exercise::{Exercise, ExerciseOptions, Fixture, REMOTE_MACHINE};
 
 pub fn dispatch(options: &ExerciseOptions) -> i32 {
     let exercise = match Exercise::start("waypoint", options) {
