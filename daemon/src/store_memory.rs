@@ -141,6 +141,37 @@ struct PreparationState {
     gates: HashMap<String, std::sync::Arc<Mutex<()>>>,
 }
 
+/// RAL-400: which waypoint surveys are running right now, and how many times
+/// the work each one is judging has been edited since.
+///
+/// Both halves are needed together: `in_flight` stops a slow classifier call
+/// from being launched a second time by the next sweep, and `generations` lets
+/// the call that is already running notice that the prompt it read has since
+/// been replaced, so its verdict is dropped rather than recorded against text
+/// nobody asked it about.
+#[derive(Default)]
+struct SurveyState {
+    /// Bumped each time a candidate's prompt text changes, keyed by
+    /// `(kind, entry_id)`. Absent means never edited (generation 0).
+    generations: HashMap<(String, String), u64>,
+    /// `(waypoint_id, kind, entry_id)` of every survey currently running.
+    in_flight: HashSet<(String, String, String)>,
+}
+
+/// Exclusive right to survey one candidate against one waypoint. Dropping it
+/// -- including by a panic in the survey thread -- frees the slot, so a
+/// crashed survey is retried by the next sweep rather than blocking forever.
+pub struct SurveyClaim {
+    memory: std::sync::Arc<StoreMemory>,
+    key: (String, String, String),
+}
+
+impl Drop for SurveyClaim {
+    fn drop(&mut self) {
+        self.memory.survey.lock().in_flight.remove(&self.key);
+    }
+}
+
 /// One `Store`'s non-database state. Cloning the `Arc` is cheap and touches no
 /// lock, so a caller can hold a handle to this without holding the store.
 #[derive(Default)]
@@ -176,12 +207,64 @@ pub struct StoreMemory {
     /// gate keeps their retained checkout and artifacts from being mutated by
     /// two workers at once.
     preparation: Mutex<PreparationState>,
+    /// RAL-400: waypoint survey in-flight set and edit generations, see
+    /// [`SurveyState`]. Independent of every other group here.
+    survey: Mutex<SurveyState>,
 }
 
 impl StoreMemory {
     #[must_use]
     pub fn new() -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self::default())
+    }
+
+    // ---- waypoint survey guard ----
+
+    /// Claim the right to survey `entry_id` against `waypoint_id`, or `None`
+    /// if a survey of that pair is already running.
+    #[must_use]
+    pub fn try_claim_survey(
+        self: &std::sync::Arc<Self>,
+        waypoint_id: &str,
+        kind: &str,
+        entry_id: &str,
+    ) -> Option<SurveyClaim> {
+        let key = (
+            waypoint_id.to_string(),
+            kind.to_string(),
+            entry_id.to_string(),
+        );
+        if !self.survey.lock().in_flight.insert(key.clone()) {
+            return None;
+        }
+        Some(SurveyClaim {
+            memory: std::sync::Arc::clone(self),
+            key,
+        })
+    }
+
+    /// How many times the work behind `(kind, entry_id)` has been edited. A
+    /// survey reads this before it describes the work and again before it
+    /// records a verdict; a difference means the description it judged is stale.
+    #[must_use]
+    pub fn survey_generation(&self, kind: &str, entry_id: &str) -> u64 {
+        self.survey
+            .lock()
+            .generations
+            .get(&(kind.to_string(), entry_id.to_string()))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Record that the work behind `(kind, entry_id)` changed, invalidating any
+    /// survey already running against the old text.
+    pub fn invalidate_surveys(&self, kind: &str, entry_id: &str) {
+        let mut state = self.survey.lock();
+        let generation = state
+            .generations
+            .entry((kind.to_string(), entry_id.to_string()))
+            .or_insert(0);
+        *generation = generation.saturating_add(1);
     }
 
     // ---- review preparation ownership ----

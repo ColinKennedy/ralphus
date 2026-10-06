@@ -8468,6 +8468,12 @@ impl Store {
                     Some(squad_id),
                 ),
             );
+            if matches!(edit.body, Some(ProofBody::Prompt(_))) {
+                self.warn_if_failed(
+                    "reset waypoint survey",
+                    self.reset_survey_for_squad(squad_id),
+                );
+            }
             Ok(())
         }
     }
@@ -8587,6 +8593,12 @@ impl Store {
                     Some(squad_id),
                 ),
             );
+            if prompt_touched || system_prompt_touched {
+                self.warn_if_failed(
+                    "reset waypoint survey",
+                    self.reset_survey_for_squad(squad_id),
+                );
+            }
             Ok(())
         }
     }
