@@ -4561,7 +4561,7 @@ fn project_forks_health(daemon: &Daemon) -> Reply {
     let store = daemon.store_handle();
     let mut checks: Vec<crate::project_forks::ForkHealthCheck> = Vec::new();
     for fork in &forks {
-        let (mut fork_checks, project_path, clone_url) = {
+        let (mut fork_checks, project_path, clone_url, tokens) = {
             let guard = store.lock();
             crate::project_forks::fork_health_store_inputs(&guard, fork)
         };
@@ -4570,6 +4570,7 @@ fn project_forks_health(daemon: &Daemon) -> Reply {
                 &project_path,
                 fork,
                 clone_url.as_deref(),
+                &tokens,
             ));
         }
         checks.extend(fork_checks);
@@ -15290,7 +15291,14 @@ fn guardian_unlink_prs(daemon: &Daemon, id: &str) -> Reply {
     if let Some(stack_number) = stack_number {
         let root = Path::new(&guardian.git_root);
         let forge_cfg = crate::config::resolve_forge(root);
-        match crate::forge::resolve_remote(root, &guardian.base_branch, &forge_cfg) {
+        let identity = crate::forge::effective_forge_identity(None, guardian.owner.as_deref());
+        match crate::forge::resolve_remote_for_base_with_store(
+            &daemon.store_handle(),
+            root,
+            &guardian.base_branch,
+            &forge_cfg,
+            identity.as_deref(),
+        ) {
             Ok(client) => {
                 if let Err(e) = client.unstack(stack_number) {
                     crate::rlog!(
@@ -15756,7 +15764,14 @@ fn pr_refresh_ci(daemon: &Daemon, pr_id: &str) -> Reply {
     };
     let root = Path::new(&guardian.git_root);
     let forge_cfg = crate::config::resolve_forge(root);
-    let client = match crate::forge::resolve_remote(root, &guardian.base_branch, &forge_cfg) {
+    let identity = crate::forge::effective_forge_identity(None, guardian.owner.as_deref());
+    let client = match crate::forge::resolve_remote_for_base_with_store(
+        &daemon.store_handle(),
+        root,
+        &guardian.base_branch,
+        &forge_cfg,
+        identity.as_deref(),
+    ) {
         Ok(c) => c,
         Err(e) => return error(502, "forge_error", &e, vec![]),
     };

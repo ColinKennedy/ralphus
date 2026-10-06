@@ -17,19 +17,25 @@
 //!
 //! ## Auth (RAL-117 Q8)
 //!
-//! A forge API token is read from an environment variable — never from a
-//! config file or the database — so credentials never touch disk under
-//! ralphus's control. The variable name is `[forge].token_env` if set,
-//! otherwise `RALPHUS_GITHUB_TOKEN` / `RALPHUS_GITLAB_TOKEN` depending on the
-//! resolved forge kind. Missing tokens are only an error at the point a call
-//! actually needs one (public-repo reads may work unauthenticated); this keeps
-//! `resolve_remote` usable for kind/repo detection even when no token is
-//! configured yet. Future work reusing forge auth should follow this same
-//! env-var convention rather than inventing a new mechanism.
+//! A forge API token is resolved in this precedence:
 //!
-//! If the env var isn't set, [`resolve_cli_token`] falls back to asking the
-//! forge's own CLI (`gh auth token` / `glab auth status --show-token`) for a
-//! token already cached from a prior interactive login.
+//! 1. the acting ralphus user's stored personal access token for the remote's
+//!    host (`crate::user_forge_tokens`, set with `ralphus user
+//!    set-forge-token`), via [`resolve_remote_with_store`]. The identity is the
+//!    acting user, then the review's owner, then `[daemon].default_user`
+//!    ([`effective_forge_identity`]); when that user has no token for the host,
+//!    `default_user`'s is tried, and no other user's token is ever borrowed;
+//! 2. the environment variable named by `[forge].token_env`, otherwise
+//!    `RALPHUS_GITHUB_TOKEN` / `RALPHUS_GITLAB_TOKEN` for the resolved kind;
+//! 3. the forge's own CLI ([`resolve_cli_token`]: `gh auth token` / `glab auth
+//!    status --show-token`), for a token cached by a prior interactive login.
+//!
+//! A stored token is an explicit credential: a 401/403 on it is reported, not
+//! retried with the env/CLI token. Missing tokens are only an error at the
+//! point a call actually needs one (public-repo reads may work
+//! unauthenticated); this keeps `resolve_remote` usable for kind/repo
+//! detection even when no token is configured yet. [`resolve_remote`] and
+//! [`resolve_remote_for`] take no store and so only see steps 2-3.
 //!
 //! TODO: Replace with real user-service authentication once RAL-245 is complete.
 
@@ -449,6 +455,10 @@ pub struct ForgeClient {
     /// from an env var instead: evicting an absent/irrelevant cache entry is
     /// a no-op.
     cli_token_host: Option<String>,
+    /// The ralphus user whose stored token was (or would have been) looked up
+    /// for this client, and the host it was looked up under; only used to make
+    /// [`Self::require_token`]'s error actionable.
+    lookup_identity: Option<(String, String)>,
 }
 
 impl ForgeClient {
@@ -467,7 +477,16 @@ impl ForgeClient {
             repo_path,
             token,
             cli_token_host: None,
+            lookup_identity: None,
         }
+    }
+
+    /// Records which `(user, host)` stored-token lookup this client's token
+    /// came from (or failed to come from), for [`Self::require_token`]'s error.
+    #[must_use]
+    fn with_lookup_identity(mut self, user: Option<String>, host: &str) -> Self {
+        self.lookup_identity = user.map(|u| (u, host.to_string()));
+        self
     }
 
     /// Tags this client with the host its `token` was resolved against, so a
@@ -529,8 +548,16 @@ impl ForgeClient {
             return Ok("test-token");
         }
         self.token.as_deref().ok_or_else(|| {
+            let looked_up = match (&self.lookup_identity, &self.cli_token_host) {
+                (Some((user, host)), _) => {
+                    format!(" for user '{user}' on host '{host}'")
+                }
+                (None, Some(host)) => format!(" for host '{host}'"),
+                (None, None) => String::new(),
+            };
             format!(
-                "no {} token configured (set ${})",
+                "no {} token configured{looked_up}: store one for that user (`ralphus user \
+                 set-forge-token`) or set ${}",
                 self.kind.as_str(),
                 self.kind.default_token_env()
             )
@@ -3871,7 +3898,112 @@ pub fn resolve_remote_for(
     remote_name: &str,
     cfg: &ForgeConfig,
 ) -> Result<ForgeClient, String> {
-    resolve_remote_for_logged(root, remote_name, cfg, None)
+    resolve_remote_for_logged(root, remote_name, cfg, None, &|_| None)
+}
+
+/// A per-user forge token read from the database, with the ralphus user it
+/// was stored under.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct StoredToken {
+    pub user: String,
+    pub token: String,
+}
+
+impl std::fmt::Debug for StoredToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredToken")
+            .field("user", &self.user)
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
+/// The ralphus user a forge call authenticates as: the first non-empty of the
+/// acting user and the review owner, then `[daemon].default_user`.
+#[must_use]
+pub(crate) fn effective_forge_identity(
+    acting: Option<&str>,
+    owner: Option<&str>,
+) -> Option<String> {
+    [acting, owner]
+        .into_iter()
+        .flatten()
+        .find(|u| !u.is_empty())
+        .map(str::to_string)
+        .or_else(|| crate::config::load_daemon_config().default_user)
+        .filter(|u| !u.is_empty())
+}
+
+/// `user`'s stored token for `host`, if any. Store errors read as "none".
+#[must_use]
+pub(crate) fn stored_token_for_user(
+    store: &crate::store::Store,
+    user: &str,
+    host: &str,
+) -> Option<StoredToken> {
+    if user.is_empty() {
+        return None;
+    }
+    store
+        .get_user_forge_token(user, host)
+        .ok()
+        .flatten()
+        .map(|token| StoredToken {
+            user: user.to_string(),
+            token,
+        })
+}
+
+/// The stored token for `identity` on `host`; when that user has none, the
+/// `[daemon].default_user`'s token. Never borrows any other user's token.
+#[must_use]
+pub(crate) fn stored_token_for_identity(
+    store: &crate::store::Store,
+    identity: Option<&str>,
+    host: &str,
+) -> Option<StoredToken> {
+    let identity = identity.filter(|u| !u.is_empty());
+    identity
+        .and_then(|u| stored_token_for_user(store, u, host))
+        .or_else(|| {
+            let default_user = crate::config::load_daemon_config().default_user?;
+            if identity == Some(default_user.as_str()) {
+                return None;
+            }
+            stored_token_for_user(store, &default_user, host)
+        })
+}
+
+/// Like [`resolve_remote_for`], with the token resolved as
+/// stored per-user token -> env var -> forge CLI token. `identity` is the
+/// acting user or review owner (see [`effective_forge_identity`]); the user's
+/// stored token for the remote URL's host is read under a short store lock
+/// taken only after `git remote get-url` has returned, so no git subprocess
+/// or network call runs under it.
+pub(crate) fn resolve_remote_with_store(
+    store: &crate::store_lock::StoreHandle,
+    root: &Path,
+    remote_name: &str,
+    cfg: &ForgeConfig,
+    identity: Option<&str>,
+) -> Result<ForgeClient, String> {
+    resolve_remote_for_logged(root, remote_name, cfg, identity, &|host| {
+        let guard = store.lock();
+        stored_token_for_identity(&guard, identity, host)
+    })
+}
+
+/// Store-aware [`resolve_remote`]: derives the remote from `base_branch`, then
+/// resolves as [`resolve_remote_with_store`].
+pub(crate) fn resolve_remote_for_base_with_store(
+    store: &crate::store_lock::StoreHandle,
+    root: &Path,
+    base_branch: &str,
+    cfg: &ForgeConfig,
+    identity: Option<&str>,
+) -> Result<ForgeClient, String> {
+    let remote_name = resolve_remote_name(root, base_branch, cfg);
+    resolve_remote_with_store(store, root, &remote_name, cfg, identity)
 }
 
 /// Like [`resolve_remote_for`], but resolves the API token from
@@ -3896,16 +4028,24 @@ pub fn resolve_remote_for_as(
     cfg: &ForgeConfig,
     token_override: Option<&str>,
 ) -> Result<ForgeClient, String> {
-    resolve_remote_for_logged(root, remote_name, cfg, token_override)
+    resolve_remote_for_logged(root, remote_name, cfg, None, &|_| {
+        token_override.map(|t| StoredToken {
+            user: String::new(),
+            token: t.to_string(),
+        })
+    })
 }
 
+/// `lookup_user` is only the name reported by [`ForgeClient::require_token`]'s
+/// error; `lookup` supplies the stored token for the remote's host.
 fn resolve_remote_for_logged(
     root: &Path,
     remote_name: &str,
     cfg: &ForgeConfig,
-    token_override: Option<&str>,
+    lookup_user: Option<&str>,
+    lookup: &dyn Fn(&str) -> Option<StoredToken>,
 ) -> Result<ForgeClient, String> {
-    let result = resolve_remote_for_inner(root, remote_name, cfg, token_override);
+    let result = resolve_remote_for_inner(root, remote_name, cfg, lookup_user, lookup);
     match &result {
         // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
         Ok(client) => crate::rlog!(
@@ -3925,7 +4065,8 @@ fn resolve_remote_for_inner(
     root: &Path,
     remote_name: &str,
     cfg: &ForgeConfig,
-    token_override: Option<&str>,
+    lookup_user: Option<&str>,
+    lookup: &dyn Fn(&str) -> Option<StoredToken>,
 ) -> Result<ForgeClient, String> {
     let url = crate::guardian_merge::git(root, &["remote", "get-url", remote_name])
         .map_err(|e| format!("could not read remote '{remote_name}': {e}"))?;
@@ -3950,8 +4091,8 @@ fn resolve_remote_for_inner(
         .token_env
         .clone()
         .unwrap_or_else(|| kind.default_token_env().to_string());
-    // `token_override` (RAL-338 follow-up: a per-user stored forge token)
-    // wins when given; otherwise the env var wins when set; otherwise fall
+    // A stored per-user token (`lookup`, keyed by this remote's host) wins
+    // when there is one; otherwise the env var wins when set; otherwise fall
     // back to the forge CLI's own cached login (see `resolve_cli_token`'s
     // doc comment for scope/limits). A failed fallback is logged loudly
     // rather than folded silently into "no token" -- a client built with no
@@ -3959,10 +4100,28 @@ fn resolve_remote_for_inner(
     // "Auth" section), which only 404 much later against a private repo
     // with zero clue as to why.
     // TODO: Replace with real user-service authentication once RAL-245 is complete.
-    let token = match token_override {
-        Some(t) => Some(t.to_string()),
+    let token = match lookup(&host) {
+        Some(stored) => {
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+            crate::rlog!(
+                DEBUG,
+                "ralphus [forge] token source=stored kind={} user={:?} host={host}",
+                kind.as_str(),
+                stored.user
+            );
+            Some(stored.token)
+        }
         None => match std::env::var(&token_env) {
-            Ok(t) => Some(t),
+            Ok(t) => {
+                // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+                crate::rlog!(
+                    DEBUG,
+                    "ralphus [forge] token source=env kind={} user={:?} host={host}",
+                    kind.as_str(),
+                    lookup_user.unwrap_or_default()
+                );
+                Some(t)
+            }
             Err(_) => match resolve_cli_token_cached(kind, &host) {
                 Ok(t) => {
                     // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
@@ -3993,7 +4152,9 @@ fn resolve_remote_for_inner(
         ForgeKind::GitLab => path.replace('/', "%2F"),
     };
 
-    Ok(ForgeClient::new(kind, api_base, repo_path, token).with_cli_token_host(host))
+    Ok(ForgeClient::new(kind, api_base, repo_path, token)
+        .with_lookup_identity(lookup_user.map(str::to_string), &host)
+        .with_cli_token_host(host))
 }
 
 #[cfg(test)]
@@ -5468,6 +5629,105 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    fn stored_lookup<'a>(
+        store: &'a crate::store::Store,
+        user: &'a str,
+    ) -> impl Fn(&str) -> Option<StoredToken> + 'a {
+        move |host| stored_token_for_user(store, user, host)
+    }
+
+    /// RAL-577: stored token beats env beats CLI, for both forges.
+    #[test]
+    fn stored_token_beats_env_for_github_and_gitlab() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        store.create_user("alice").unwrap();
+        store
+            .set_user_forge_token("alice", "github.com", "gh-stored")
+            .unwrap();
+        store
+            .set_user_forge_token("alice", "gitlab.com", "gl-stored")
+            .unwrap();
+        let path_value = std::env::var("PATH").unwrap();
+        let cfg = ForgeConfig {
+            token_env: Some("PATH".to_string()),
+            ..ForgeConfig::default()
+        };
+        for (url, want) in [
+            ("https://github.com/o/r.git", "gh-stored"),
+            ("https://gitlab.com/o/r.git", "gl-stored"),
+        ] {
+            let root = tmp_dir("stored-beats-env");
+            g(&root, &["init", "--initial-branch", "main"]);
+            g(&root, &["remote", "add", "origin", url]);
+            let client = resolve_remote_for_logged(
+                &root,
+                "origin",
+                &cfg,
+                Some("alice"),
+                &stored_lookup(&store, "alice"),
+            )
+            .unwrap();
+            assert_eq!(client.token.as_deref(), Some(want));
+            // No stored token (a different user) -> the env var wins.
+            let env_client = resolve_remote_for_logged(
+                &root,
+                "origin",
+                &cfg,
+                Some("bob"),
+                &stored_lookup(&store, "bob"),
+            )
+            .unwrap();
+            assert_eq!(env_client.token.as_deref(), Some(path_value.as_str()));
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// RAL-577: a token stored under one user is never handed to another.
+    #[test]
+    fn stored_token_for_user_does_not_leak_across_users_or_hosts() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        store.create_user("alice").unwrap();
+        store.create_user("bob").unwrap();
+        store
+            .set_user_forge_token("alice", "gitlab.com", "alices")
+            .unwrap();
+        assert!(stored_token_for_user(&store, "bob", "gitlab.com").is_none());
+        assert!(stored_token_for_user(&store, "alice", "github.com").is_none());
+        assert!(stored_token_for_user(&store, "", "gitlab.com").is_none());
+        assert_eq!(
+            stored_token_for_user(&store, "alice", "gitlab.com")
+                .unwrap()
+                .token,
+            "alices"
+        );
+    }
+
+    #[test]
+    fn effective_forge_identity_prefers_acting_user_then_owner() {
+        assert_eq!(
+            effective_forge_identity(Some("alice"), Some("bob")).as_deref(),
+            Some("alice")
+        );
+        assert_eq!(
+            effective_forge_identity(Some(""), Some("bob")).as_deref(),
+            Some("bob")
+        );
+    }
+
+    #[test]
+    fn require_token_error_names_the_user_and_host() {
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            "https://gitlab.example/api/v4".to_string(),
+            "o%2Fr".to_string(),
+            None,
+        )
+        .with_lookup_identity(Some("alice".to_string()), "gitlab.example");
+        let err = client.require_token().unwrap_err();
+        assert!(err.contains("alice"), "{err}");
+        assert!(err.contains("gitlab.example"), "{err}");
+        assert!(err.contains("set-forge-token"), "{err}");
+    }
     #[test]
     fn resolve_remote_name_falls_back_to_default_for_a_slash_namespaced_branch_name() {
         let root = tmp_dir("effective-remote-namespaced");

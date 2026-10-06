@@ -7484,19 +7484,31 @@ fn run_feedback_pass(
                     // remote branch this force-push just superseded CI on is
                     // `review_branch` itself, not some derived alias.
                     if let Some(remote_name) = push_remote.as_deref() {
-                        if let Ok(client) = crate::forge::resolve_remote_for(
+                        let identity =
+                            crate::forge::effective_forge_identity(None, owner.as_deref());
+                        match crate::forge::resolve_remote_with_store(
+                            store,
                             Path::new(&branch_project),
                             remote_name,
                             &forge_cfg,
+                            identity.as_deref(),
                         ) {
-                            crate::pr::cancel_superseded_ci_after_push(
+                            Ok(client) => crate::pr::cancel_superseded_ci_after_push(
                                 store,
                                 id,
                                 guardian.auto_cancel_outdated_pr_pipelines.unwrap_or(true),
                                 Some(&client),
                                 &review_branch,
                                 &sha,
-                            );
+                            ),
+                            Err(e) => {
+                                // ralphus[ignore-rlog-pair]: best-effort CI cancel; the next push retries
+                                crate::rlog!(
+                                    WARNING,
+                                    "ralphus [guardian] review {id} could not build the forge \
+                                     client for superseded-CI cancel on {remote_name}: {e}"
+                                );
+                            }
                         }
                     }
                 }
