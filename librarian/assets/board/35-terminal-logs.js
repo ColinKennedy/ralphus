@@ -201,8 +201,15 @@
        */
       function setPeekPreText(preId, text) {
         const el = document.getElementById(preId);
-        if (el) el.innerHTML = transcriptHtml(text);
+        if (!el) return;
+        // Rewriting innerHTML with identical text still destroys the reader's
+        // text selection, so an unchanged poll leaves the node alone.
+        if (peekPreLastText.get(el) === text) return;
+        peekPreLastText.set(el, text);
+        el.innerHTML = transcriptHtml(text);
       }
+      /** @type {WeakMap<Element, string>} The text last written into each peek `<pre>`. */
+      const peekPreLastText = new WeakMap();
       /**
        * Fetches one peek box's live pane content and patches it into the DOM in
        * place. Scrolls the box to the bottom when `forceBottom` is set (a fresh
