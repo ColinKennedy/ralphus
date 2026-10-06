@@ -19,13 +19,13 @@ use std::path::Path;
 
 /// Minimum number of distinct `GET` handlers served from the read pool.
 ///
-/// Raise this as handlers migrate; never lower it. At the time of writing the
-/// pooled set is the 5 hottest board endpoints plus `health`, and WS-E.2 added
-/// six more. The plan's E.4 target is every `GET` handler, which is not reached
-/// yet -- several remaining ones are multi-layer composites (`get_squad`,
-/// `squad_worktrees`) whose private helpers each need their own `_conn` split
-/// first.
-const MIN_POOLED_GET_HANDLERS: usize = 12;
+/// Raise this as handlers migrate; never lower it. The pooled set started as
+/// the 5 hottest board endpoints plus `health`, WS-E.2 added six more, and the
+/// Live View pane polls and the personal mailbox poll followed. The plan's E.4
+/// target is every `GET` handler, which is not reached yet -- several
+/// remaining ones are multi-layer composites (`get_squad`, `squad_worktrees`)
+/// whose private helpers each need their own `_conn` split first.
+const MIN_POOLED_GET_HANDLERS: usize = 15;
 
 /// Handlers that are known to be pooled and must stay that way.
 ///
@@ -40,6 +40,10 @@ const MUST_STAY_POOLED: &[&str] = &[
     "guardian_index",
     "guardian_list",
     "pr_index_list",
+    "personal_mailbox_messages",
+    // The Live View polls these every couple of seconds per open pane.
+    "cell_pane",
+    "cell_pane_transcript",
     // Health must never wait on the writer: a wedged daemon has to stay able to
     // report that it is wedged.
     "health",
@@ -71,10 +75,12 @@ fn body_of(src: &str, name: &str) -> Option<String> {
     None
 }
 
-/// Every handler named by a `("GET", [...]) => handler(` route arm.
+/// Every handler named by a `("GET", [...]) => handler(` route arm, including
+/// arms rustfmt wraps into a block (`=> {` with the call on the next line).
 fn get_handlers(src: &str) -> Vec<String> {
     let mut out = Vec::new();
-    for line in src.lines() {
+    let mut lines = src.lines().peekable();
+    while let Some(line) = lines.next() {
         let trimmed = line.trim();
         if !trimmed.starts_with("(\"GET\", [") {
             continue;
@@ -82,7 +88,13 @@ fn get_handlers(src: &str) -> Vec<String> {
         let Some(arrow) = trimmed.find("=> ") else {
             continue;
         };
-        let rest = &trimmed[arrow + 3..];
+        let mut rest = trimmed[arrow + 3..].trim().to_string();
+        if rest == "{" {
+            rest = lines
+                .peek()
+                .map(|l| l.trim().to_string())
+                .unwrap_or_default();
+        }
         let name: String = rest
             .chars()
             .take_while(|c| c.is_alphanumeric() || *c == '_')
@@ -183,11 +195,18 @@ fn locked_one(daemon: &Daemon) -> Reply {
         (\"GET\", [\"api\", \"daemon\"]) => health(daemon),
         (\"GET\", [\"api\", \"queue\"]) => queue(daemon),
         (\"POST\", [\"api\", \"squads\"]) => submit(daemon, body),
+        (\"GET\", [\"api\", \"squads\", id, \"cells\", ti, si, \"pane\"]) => {
+            cell_pane(daemon, id, ti, si, query)
+        }
 ";
     let found = get_handlers(routes);
     assert_eq!(
         found,
-        vec!["health".to_string(), "queue".to_string()],
+        vec![
+            "health".to_string(),
+            "queue".to_string(),
+            "cell_pane".to_string()
+        ],
         "the route scan mis-parsed GET arms (or picked up a POST)"
     );
 }

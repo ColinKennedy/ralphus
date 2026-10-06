@@ -5127,7 +5127,16 @@ impl Store {
 
     /// The ordered branches of a guardian (all, including disabled).
     pub fn guardian_branches(&self, guardian_id: &str) -> Result<Vec<OrderedBranch>> {
-        let mut stmt = self.conn.prepare(
+        Self::guardian_branches_conn(&self.conn, guardian_id)
+    }
+
+    /// [`Self::guardian_branches`] against any connection, so the
+    /// review-branch Live View's transcript poll can read it from the pool.
+    pub(crate) fn guardian_branches_conn(
+        conn: &Connection,
+        guardian_id: &str,
+    ) -> Result<Vec<OrderedBranch>> {
+        let mut stmt = conn.prepare(
             "SELECT position, branch, enabled, id, readable_review_branch, review_branch_name
              FROM guardian_branches WHERE guardian_id=? ORDER BY position",
         )?;
@@ -5491,8 +5500,14 @@ impl Store {
 
     /// Fetch a single guardian view.
     pub fn get_guardian(&self, id: &str) -> Result<GuardianView> {
-        let row = self
-            .conn
+        Self::get_guardian_conn(&self.conn, id)
+    }
+
+    /// [`Self::get_guardian`] against any connection, so the read pool
+    /// (`crate::store_pool`) can serve it without the writer lock -- its
+    /// hydration reads the review's project config from disk.
+    pub(crate) fn get_guardian_conn(conn: &Connection, id: &str) -> Result<GuardianView> {
+        let row = conn
             .query_row(
                 "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus, summary_format, base_shift_rebuild_attempts_by_project, rebuild_on, skip_manual_checks, auto_run, followup_enabled, followup_auto_start
                   FROM guardians WHERE id=?", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
@@ -5510,8 +5525,8 @@ impl Store {
             )
             .optional()?
             .ok_or(StoreError::NotFound)?;
-        let ctx = self.build_hydration_ctx(std::iter::once(row.git_root.as_str()));
-        self.hydrate_guardian(row, &ctx)
+        let ctx = Self::build_hydration_ctx_conn(conn, std::iter::once(row.git_root.as_str()));
+        Self::hydrate_guardian_conn(conn, row, &ctx)
     }
 
     /// [`branch_log_label_for`]'s minimal lookup (RAL-523): just the two
@@ -5566,10 +5581,15 @@ impl Store {
     /// from `guardian_branches` (the same source `list_guardians` uses), just
     /// via one direct aggregate instead of building a full branch view per
     /// row.
-    pub(crate) fn list_guardian_base_fetch_rows(
-        &self,
+    ///
+    /// Takes a connection rather than `&self` because the poll runs it on the
+    /// read pool: the shared hydration context below reads every review
+    /// root's project config from disk, which is too slow to do under the
+    /// store lock.
+    pub(crate) fn list_guardian_base_fetch_rows_conn(
+        conn: &Connection,
     ) -> Result<Vec<crate::guardian_merge::GuardianBaseFetchInfo>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = conn.prepare(
             "SELECT g.status, g.base_branch, g.git_root, g.machine,
                     (SELECT GROUP_CONCAT(gb.project, char(31)) FROM guardian_branches gb
                      WHERE gb.guardian_id = g.id AND gb.enabled = 1 AND gb.project IS NOT NULL),
@@ -5612,10 +5632,8 @@ impl Store {
         // the flag from its project or the global config rather than setting
         // it per-review, quietly dropping that review's fork-side upstream
         // refresh.
-        let ctx = Self::build_hydration_ctx_conn(
-            &self.conn,
-            rows.iter().map(|(i, _)| i.git_root.as_str()),
-        );
+        let ctx =
+            Self::build_hydration_ctx_conn(conn, rows.iter().map(|(i, _)| i.git_root.as_str()));
         Ok(rows
             .into_iter()
             .map(|(mut info, own_override)| {
@@ -5664,15 +5682,9 @@ impl Store {
     /// `GUARDIAN_PERF.local.md`. Loads the full `projects` stamp table and
     /// the global config exactly once, and memoizes the per-`git_root`
     /// filesystem config resolution so guardians sharing a repo (the common
-    /// case) only pay that walk once for the whole call.
-    fn build_hydration_ctx<'a>(
-        &self,
-        git_roots: impl Iterator<Item = &'a str>,
-    ) -> GuardianHydrationCtx {
-        Self::build_hydration_ctx_conn(&self.conn, git_roots)
-    }
-    /// [`Self::build_hydration_ctx`] against any connection, so the read pool
-    /// (`crate::store_pool`) can serve it without the writer lock.
+    /// case) only pay that walk once for the whole call. Takes any connection
+    /// so the read pool (`crate::store_pool`) can serve it without the writer
+    /// lock.
     fn build_hydration_ctx_conn<'a>(
         conn: &Connection,
         git_roots: impl Iterator<Item = &'a str>,
@@ -5789,14 +5801,8 @@ impl Store {
         })
     }
 
-    fn hydrate_guardian(
-        &self,
-        row: GuardianRow,
-        ctx: &GuardianHydrationCtx,
-    ) -> Result<GuardianView> {
-        Self::hydrate_guardian_conn(&self.conn, row, ctx)
-    }
-    /// [`Self::hydrate_guardian`] against any connection, so the read pool
+    /// Turn one `guardians` row into its full view: its branches, effective
+    /// settings and terminal modes. Takes any connection so the read pool
     /// (`crate::store_pool`) can serve it without the writer lock.
     fn hydrate_guardian_conn(
         conn: &Connection,

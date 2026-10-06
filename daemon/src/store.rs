@@ -26,7 +26,7 @@ use crate::runner::{effective_cell_system_prompt, effective_proof_system_prompt}
 const WAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
 
 /// How often the dedicated WAL checkpoint thread (spawned by [`Store::open`])
-/// runs `PRAGMA wal_checkpoint(PASSIVE)`.
+/// runs a checkpoint pass ([`wal_checkpoint_pass`]).
 ///
 /// Short enough that there is rarely much for a checkpoint to do by the time
 /// it runs -- the point of this thread is to keep the writer's own commits
@@ -34,6 +34,12 @@ const WAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
 /// doc comment).
 #[cfg(not(test))]
 const WAL_CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A checkpoint pass at or above this long is logged, with its mode, so the
+/// cost a checkpoint still imposes stays visible instead of surfacing only as
+/// an unexplained slow write somewhere else.
+#[cfg(not(test))]
+const SLOW_CHECKPOINT_LOG_MS: u128 = 100;
 
 /// Errors the store can produce.
 #[derive(Debug)]
@@ -1292,8 +1298,8 @@ fn is_already_applied_migration_error(msg: &str) -> bool {
         || msg.contains("already exists")
 }
 
-/// Periodically runs `PRAGMA wal_checkpoint(TRUNCATE)` against `path` on its
-/// own dedicated connection, entirely outside [`crate::store_lock::StoreMutex`].
+/// Periodically runs a [`wal_checkpoint_pass`] against `path` on its own
+/// dedicated connection, entirely outside [`crate::store_lock::StoreMutex`].
 ///
 /// SQLite's automatic checkpoint-on-commit is itself effectively `PASSIVE` --
 /// it never blocks on a busy reader -- but the I/O it does when it runs
@@ -1306,23 +1312,14 @@ fn is_already_applied_migration_error(msg: &str) -> bool {
 /// ordinary, otherwise-fast `store.lock()` call into the multi-second hold
 /// the `store_lock` watchdog panics on. [`Store::open`] disables the
 /// writer's own `wal_autocheckpoint` so this thread is the only place that
-/// cost is ever paid, on a connection nothing else is waiting on.
+/// cost is ever paid.
 ///
-/// `TRUNCATE` mode checkpoints exactly like `PASSIVE` first -- it never skips
-/// or delays reclaiming whatever frames are already safe to reclaim -- and
-/// only *additionally* waits (bounded by this connection's own
-/// `busy_timeout`) for old readers to catch up so it can also truncate the
-/// `-wal` file back to empty; a `PASSIVE` checkpoint alone happily
-/// checkpoints every frame but leaves the file sitting at its all-time
-/// high-water mark forever (the very problem `journal_size_limit`, set on
-/// the writer in [`Store::open`], exists to bound -- `TRUNCATE` is what
-/// actually collects on that bound). Run here rather than on the writer
-/// because that potential wait is exactly the kind of thing that must never
-/// happen while holding the store lock; on this dedicated thread it blocks
-/// nothing but itself, and the next tick just tries again. Runs for the life
-/// of the process, matching every other background sweep in this daemon
-/// (`health_sweep::spawn_health_sweep`, `pr::spawn_pr_base_drift_poller`,
-/// ...): none of them have a shutdown handle either.
+/// Running the checkpoint on its own connection does not on its own keep it
+/// off the writer's path: see [`wal_checkpoint_pass`] for why the routine
+/// pass is `PASSIVE`. Runs for the life of the process, matching every other
+/// background sweep in this daemon (`health_sweep::spawn_health_sweep`,
+/// `pr::spawn_pr_base_drift_poller`, ...): none of them have a shutdown
+/// handle either.
 #[cfg(not(test))]
 fn spawn_wal_checkpoint_thread(path: std::path::PathBuf) {
     std::thread::spawn(move || {
@@ -1345,17 +1342,105 @@ fn spawn_wal_checkpoint_thread(path: std::path::PathBuf) {
                 "ralphus [store] wal checkpoint thread: busy_timeout failed: {e}"
             );
         }
+        let wal_path = wal_sidecar_path(&path);
         loop {
             std::thread::sleep(WAL_CHECKPOINT_INTERVAL);
-            if let Err(e) = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(())) {
-                // ralphus[ignore-rlog-pair]: same bare-connection boundary as above -- no Store to emit a structured row through
-                crate::rlog!(
-                    WARNING,
-                    "ralphus [store] wal checkpoint (truncate) failed: {e}"
-                );
+            let mode = WalCheckpointMode::for_wal_size(wal_file_size(&wal_path));
+            match wal_checkpoint_pass(&conn, mode) {
+                Ok(elapsed) if elapsed.as_millis() >= SLOW_CHECKPOINT_LOG_MS => {
+                    // ralphus[ignore-rlog-pair]: same bare-connection boundary as above -- no Store to emit a structured row through
+                    crate::rlog!(
+                        WARNING,
+                        "ralphus [store] slow wal checkpoint mode={} took {}ms",
+                        mode.as_sql(),
+                        elapsed.as_millis()
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    // ralphus[ignore-rlog-pair]: same bare-connection boundary as above -- no Store to emit a structured row through
+                    crate::rlog!(
+                        WARNING,
+                        "ralphus [store] wal checkpoint mode={} failed: {e}",
+                        mode.as_sql()
+                    );
+                }
             }
         }
     });
+}
+
+/// Which `PRAGMA wal_checkpoint` mode a [`wal_checkpoint_pass`] runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WalCheckpointMode {
+    /// Copy every frame no reader still needs back into the database, without
+    /// waiting on -- or blocking -- any reader or writer.
+    Passive,
+    /// Checkpoint everything, then reset the `-wal` file to zero bytes.
+    Truncate,
+}
+
+impl WalCheckpointMode {
+    /// `Passive` normally; `Truncate` only once the `-wal` file has grown past
+    /// [`WAL_SIZE_LIMIT_BYTES`].
+    ///
+    /// SQLite documents `FULL`, `RESTART` and `TRUNCATE` as blocking new
+    /// writers for as long as the checkpoint is pending, and all three wait
+    /// (up to the checkpointing connection's `busy_timeout`) for every reader
+    /// to move off the old WAL snapshot first. The read pool keeps readers on
+    /// the database almost continuously, so a `TRUNCATE` on every pass would
+    /// keep making the writer -- which commits only while holding the store
+    /// lock -- wait on that, turning one-row `UPDATE`s into store-lock holds
+    /// of hundreds of milliseconds. `PASSIVE` takes no writer lock at all.
+    ///
+    /// The file stays bounded without truncating on every pass: once a
+    /// `PASSIVE` pass has backfilled the whole WAL, the writer restarts it
+    /// from the beginning and, with `journal_size_limit` set (see
+    /// [`Store::open`]), trims it to [`WAL_SIZE_LIMIT_BYTES`] on that commit.
+    /// Growth past the limit therefore means readers kept a restart from
+    /// happening, and only then is the blocking `TRUNCATE` worth its cost.
+    pub(crate) fn for_wal_size(wal_bytes: u64) -> Self {
+        if wal_bytes > WAL_SIZE_LIMIT_BYTES.unsigned_abs() {
+            Self::Truncate
+        } else {
+            Self::Passive
+        }
+    }
+
+    pub(crate) fn as_sql(self) -> &'static str {
+        match self {
+            Self::Passive => "PASSIVE",
+            Self::Truncate => "TRUNCATE",
+        }
+    }
+}
+
+/// Run one `PRAGMA wal_checkpoint(<mode>)` on `conn`, returning how long it
+/// took.
+pub(crate) fn wal_checkpoint_pass(
+    conn: &Connection,
+    mode: WalCheckpointMode,
+) -> rusqlite::Result<std::time::Duration> {
+    let started = std::time::Instant::now();
+    conn.query_row(
+        &format!("PRAGMA wal_checkpoint({})", mode.as_sql()),
+        [],
+        |_| Ok(()),
+    )?;
+    Ok(started.elapsed())
+}
+
+/// The `-wal` sidecar SQLite keeps next to the database file at `db_path`.
+fn wal_sidecar_path(db_path: &Path) -> std::path::PathBuf {
+    let mut wal = db_path.as_os_str().to_owned();
+    wal.push("-wal");
+    std::path::PathBuf::from(wal)
+}
+
+/// Size of the file at `path` in bytes, or `0` when it does not exist (no
+/// WAL yet, or one just truncated away).
+fn wal_file_size(path: &Path) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
 impl Store {
@@ -10559,14 +10644,25 @@ impl Store {
     /// Returns `Err(StoreError::NotFound)` when the squad or cell row does
     /// not exist.
     pub fn get_cell_id(&self, squad_id: &str, task_idx: i64, cell_idx: i64) -> Result<String> {
-        self.conn
-            .query_row(
-                "SELECT sid FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
-                params![squad_id, task_idx, cell_idx],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()?
-            .ok_or(StoreError::NotFound)
+        Self::get_cell_id_conn(&self.conn, squad_id, task_idx, cell_idx)
+    }
+
+    /// [`Self::get_cell_id`] against any connection -- the Live View pane
+    /// polls resolve it every couple of seconds per open pane, so they read
+    /// it from the read pool rather than queueing behind the writer.
+    pub(crate) fn get_cell_id_conn(
+        conn: &Connection,
+        squad_id: &str,
+        task_idx: i64,
+        cell_idx: i64,
+    ) -> Result<String> {
+        conn.query_row(
+            "SELECT sid FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
+            params![squad_id, task_idx, cell_idx],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or(StoreError::NotFound)
     }
 
     /// A cell's primary intent text for the RAL-412 semantic-ordering
@@ -10673,14 +10769,23 @@ impl Store {
     /// Returns `Err(StoreError::NotFound)` when the squad or task row does not
     /// exist.
     pub fn get_task_name(&self, squad_id: &str, task_idx: i64) -> Result<String> {
-        self.conn
-            .query_row(
-                "SELECT name FROM tasks WHERE squad_id=? AND idx=?",
-                params![squad_id, task_idx],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()?
-            .ok_or(StoreError::NotFound)
+        Self::get_task_name_conn(&self.conn, squad_id, task_idx)
+    }
+
+    /// [`Self::get_task_name`] against any connection, for the same pooled
+    /// pane-poll reads as [`Self::get_cell_id_conn`].
+    pub(crate) fn get_task_name_conn(
+        conn: &Connection,
+        squad_id: &str,
+        task_idx: i64,
+    ) -> Result<String> {
+        conn.query_row(
+            "SELECT name FROM tasks WHERE squad_id=? AND idx=?",
+            params![squad_id, task_idx],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or(StoreError::NotFound)
     }
 
     /// Fetch a cell's cwd, agent, and (if any) recorded CLI-agent session
@@ -18486,9 +18591,10 @@ command = "e"
     /// `spawn_wal_checkpoint_thread`'s doc comment). The background thread
     /// itself is disabled in this crate's own unit tests (`cfg(not(test))`
     /// in `Store::open`, to avoid leaking a thread that outlives this test's
-    /// temp directory), so this drives the exact pragma it runs -- `PRAGMA
-    /// wal_checkpoint(TRUNCATE)` -- directly, proving the mechanism rather
-    /// than the thread's scheduling.
+    /// temp directory), so this drives the pass it runs once the WAL has
+    /// outgrown its limit -- [`wal_checkpoint_pass`] in
+    /// [`WalCheckpointMode::Truncate`] -- directly, proving the mechanism
+    /// rather than the thread's scheduling.
     ///
     /// Touches every pooled read connection before checkpointing: SQLite
     /// pins a WAL reader's snapshot at whatever it last read *even after
@@ -18517,7 +18623,8 @@ command = "e"
              that cost belongs solely to the dedicated background thread"
         );
 
-        let wal_path = dir.join("tasks.db-wal");
+        let wal_path = wal_sidecar_path(&db_path);
+        assert_eq!(wal_path, dir.join("tasks.db-wal"));
         for i in 0..2_000 {
             store
                 .cartographer_log(crate::cartographer::CartographerEntry {
@@ -18535,7 +18642,7 @@ command = "e"
                 })
                 .unwrap();
         }
-        let grown = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+        let grown = wal_file_size(&wal_path);
         assert!(
             grown > 0,
             "with the writer's autocheckpoint disabled, 2,000 inserts must \
@@ -18558,10 +18665,9 @@ command = "e"
         checkpointer
             .busy_timeout(crate::store_pool::BUSY_TIMEOUT)
             .unwrap();
-        checkpointer
-            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+        wal_checkpoint_pass(&checkpointer, WalCheckpointMode::Truncate)
             .expect("truncate checkpoint");
-        let shrunk = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+        let shrunk = wal_file_size(&wal_path);
         assert!(
             shrunk < grown,
             "a truncate checkpoint against the same database must shrink the \
@@ -18570,6 +18676,126 @@ command = "e"
         );
 
         drop(checkpointer);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checkpoint_mode_is_passive_until_the_wal_outgrows_its_limit() {
+        let limit = WAL_SIZE_LIMIT_BYTES.unsigned_abs();
+        assert_eq!(
+            WalCheckpointMode::for_wal_size(0),
+            WalCheckpointMode::Passive
+        );
+        assert_eq!(
+            WalCheckpointMode::for_wal_size(limit),
+            WalCheckpointMode::Passive,
+            "a WAL at its journal_size_limit is the steady state the writer \
+             trims it back to; truncating it would block writers for nothing"
+        );
+        assert_eq!(
+            WalCheckpointMode::for_wal_size(limit + 1),
+            WalCheckpointMode::Truncate
+        );
+        assert_eq!(
+            wal_file_size(&std::env::temp_dir().join("ralphus-no-such-wal-file")),
+            0
+        );
+    }
+
+    /// Why the routine checkpoint pass is `PASSIVE`: while any reader still
+    /// holds an older snapshot -- which the read pool does almost
+    /// continuously -- a pending `TRUNCATE` holds SQLite's writer lock, so the
+    /// store's writer (which only commits while holding the store lock) sits
+    /// in its busy handler for as long as the checkpoint waits. A `PASSIVE`
+    /// pass under the same pinned reader never stops a write.
+    ///
+    /// The writer here has a zero busy timeout, so "blocked" shows up as an
+    /// immediate `SQLITE_BUSY` rather than a wait, and every wait in the test
+    /// is bounded.
+    #[test]
+    fn truncate_checkpoint_blocks_writers_while_a_reader_pins_the_wal_but_passive_does_not() {
+        use std::time::{Duration, Instant};
+
+        let dir = std::env::temp_dir().join(format!(
+            "ralphus-wal-checkpoint-blocking-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let db_path = dir.join("tasks.db");
+        let store = Store::open(&db_path).expect("open store");
+        store
+            .conn
+            .execute_batch("CREATE TABLE ckpt_probe (x INTEGER)")
+            .expect("create probe table");
+
+        let writer = Connection::open(&db_path).expect("open writer");
+        writer.busy_timeout(Duration::ZERO).unwrap();
+        writer
+            .execute("INSERT INTO ckpt_probe VALUES (0)", [])
+            .unwrap();
+
+        // Pin a snapshot, then commit past it so the WAL holds frames the
+        // pinned reader still needs.
+        let reader = Connection::open(&db_path).expect("open reader");
+        reader.execute_batch("BEGIN").unwrap();
+        let _: i64 = reader
+            .query_row("SELECT count(*) FROM ckpt_probe", [], |r| r.get(0))
+            .unwrap();
+        writer
+            .execute("INSERT INTO ckpt_probe VALUES (1)", [])
+            .unwrap();
+
+        // Try a write every few ms for `window`, counting SQLITE_BUSY refusals,
+        // while `mode` checkpoints run on another thread.
+        let busy_writes_during = |mode: WalCheckpointMode, window: Duration| -> usize {
+            let path = db_path.clone();
+            let checkpointer = std::thread::spawn(move || {
+                let conn = Connection::open(&path).expect("open checkpointer");
+                conn.busy_timeout(Duration::from_millis(1_500)).unwrap();
+                let until = Instant::now() + Duration::from_millis(600);
+                while Instant::now() < until {
+                    let _ = wal_checkpoint_pass(&conn, mode);
+                }
+            });
+            let mut busy = 0;
+            let until = Instant::now() + window;
+            while Instant::now() < until {
+                match writer.execute("INSERT INTO ckpt_probe VALUES (2)", []) {
+                    Ok(_) => {}
+                    Err(rusqlite::Error::SqliteFailure(e, _))
+                        if e.code == rusqlite::ErrorCode::DatabaseBusy =>
+                    {
+                        busy += 1;
+                    }
+                    Err(e) => panic!("unexpected write error: {e}"),
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            checkpointer.join().expect("checkpointer thread");
+            busy
+        };
+
+        let passive_busy =
+            busy_writes_during(WalCheckpointMode::Passive, Duration::from_millis(500));
+        let truncate_busy =
+            busy_writes_during(WalCheckpointMode::Truncate, Duration::from_millis(800));
+
+        assert_eq!(
+            passive_busy, 0,
+            "a PASSIVE checkpoint must never refuse a write, even with a reader \
+             pinned behind the WAL"
+        );
+        assert!(
+            truncate_busy > 0,
+            "a pending TRUNCATE with a pinned reader holds the writer lock -- \
+             this is the stall the routine PASSIVE pass exists to avoid"
+        );
+
+        reader.execute_batch("COMMIT").unwrap();
+        drop(reader);
+        drop(writer);
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }

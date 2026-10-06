@@ -52,20 +52,52 @@ static HOLDER: LazyLock<parking_lot::Mutex<Option<HolderInfo>>> =
 const SLOW_WAIT_LOG_THRESHOLD: Duration = Duration::from_secs(2);
 
 /// A `Store` behind an eventually-fair, timed mutex. See the module doc
-/// comment. The `memory` field is stored separately to allow
-/// [`lock_free_memory`] to access it without acquiring the store lock.
+/// comment. The `memory` and `read_pool` fields are stored separately so
+/// [`StoreMutex::lock_free_memory`] and [`StoreMutex::with_read_snapshot`] can
+/// reach them without acquiring the store lock.
 pub struct StoreMutex {
     store: parking_lot::Mutex<Store>,
     memory: std::sync::Arc<crate::store_memory::StoreMemory>,
+    read_pool: std::sync::Arc<crate::store_pool::ReadConnPool>,
 }
 
 impl StoreMutex {
     #[must_use]
     pub fn new(store: Store) -> Self {
         let memory = std::sync::Arc::clone(&store.memory());
+        let read_pool = store.read_pool();
         Self {
             store: parking_lot::Mutex::new(store),
             memory,
+            read_pool,
+        }
+    }
+
+    /// Run `f` against a pooled read-only connection inside one read
+    /// transaction, so a multi-statement read observes a single consistent
+    /// snapshot and never takes the store lock. Falls back to the writer
+    /// connection (under the lock) only when the pool has no connections at
+    /// all (see [`crate::store_pool::ReadConnPool::acquire`]).
+    ///
+    /// This is the read path for background workers, which hold a
+    /// [`StoreHandle`] rather than a `Daemon`: a hydrated read such as
+    /// `get_guardian` reads project config files from disk, and doing that
+    /// under the store lock stalls every writer and every locked request
+    /// behind a filesystem walk.
+    pub fn with_read_snapshot<T>(
+        &self,
+        f: impl FnOnce(&rusqlite::Connection) -> crate::store::Result<T>,
+    ) -> crate::store::Result<T> {
+        match self.read_pool.acquire() {
+            Some(conn) => {
+                let tx = conn.unchecked_transaction()?;
+                f(&tx)
+            }
+            None => {
+                let store = self.lock();
+                let tx = store.conn.unchecked_transaction()?;
+                f(&tx)
+            }
         }
     }
 
@@ -514,6 +546,26 @@ mod tests {
         assert_eq!(take_request_lock_wait_ms(), 12);
         reset_request_lock_wait();
         assert_eq!(take_request_lock_wait_ms(), 0);
+    }
+
+    #[test]
+    fn with_read_snapshot_does_not_wait_for_the_store_lock() {
+        let mutex = std::sync::Arc::new(StoreMutex::new(
+            Store::open_in_memory().expect("open store"),
+        ));
+        let guard = mutex.lock();
+        let reader = std::sync::Arc::clone(&mutex);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(reader.with_read_snapshot(|conn| {
+                Ok(conn.query_row("SELECT 1", [], |r| r.get::<_, i64>(0))?)
+            }));
+        });
+        let got = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a pooled read waited on the store lock");
+        assert_eq!(got.expect("pooled read"), 1);
+        drop(guard);
     }
 
     #[test]

@@ -552,12 +552,27 @@ impl Store {
         unread_only: bool,
         priority: Option<MailboxPriority>,
     ) -> Result<Vec<MailboxMessageView>> {
-        let watches = self.list_watches(user_name)?;
+        Self::personal_mailbox_messages_for_user_conn(&self.conn, user_name, unread_only, priority)
+    }
+
+    /// [`Self::personal_mailbox_messages_for_user`] against any connection --
+    /// the board polls the personal mailbox on every refresh, so it reads
+    /// from the pool rather than the writer lock.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub(crate) fn personal_mailbox_messages_for_user_conn(
+        conn: &rusqlite::Connection,
+        user_name: &str,
+        unread_only: bool,
+        priority: Option<MailboxPriority>,
+    ) -> Result<Vec<MailboxMessageView>> {
+        let watches = Self::list_watches_conn(conn, user_name)?;
         if watches.is_empty() {
             return Ok(Vec::new());
         }
         let priority_str = priority.map(MailboxPriority::as_str);
-        let mut stmt = self.conn.prepare(
+        let mut stmt = conn.prepare(
             "SELECT m.id, m.priority, m.message, m.squad_id, m.task, m.cell_id, m.created_at_ms,
                     d.user_name IS NOT NULL AS read, m.entity_uri, m.event_kind, m.category
              FROM mailbox_messages m

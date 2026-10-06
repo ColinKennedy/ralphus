@@ -38,7 +38,6 @@ use crate::guardian::{
 use crate::runner::{Runner, RunnerSpec};
 use crate::scheduler::Semaphore;
 use crate::server::Reply;
-#[cfg(test)]
 use crate::store::Store;
 use crate::vcs::{GitOps, GitVcs};
 use crate::workspace::Workspace;
@@ -2041,8 +2040,10 @@ impl ProofGate {
     /// `effective_proof_skip_auto_clean` with whether this particular
     /// branch is the last one in the stack.
     fn resolve(store: &crate::store_lock::StoreHandle, id: &str, is_final_branch: bool) -> Self {
-        let guard = store.lock();
-        let g = guard.get_guardian(id).ok();
+        // Pooled read: hydrating a review reads its project config from disk.
+        let g = store
+            .with_read_snapshot(|conn| Store::get_guardian_conn(conn, id))
+            .ok();
         ProofGate {
             scope: g
                 .as_ref()
@@ -11857,7 +11858,9 @@ fn rebuild_combined(
 /// Best-effort: a write failure here must never fail the review itself, so
 /// errors are swallowed rather than propagated.
 fn regenerate_readme(store: &crate::store_lock::StoreHandle, root: &Workspace) {
-    let guardians = store.lock().list_guardians().unwrap_or_default();
+    let guardians = store
+        .with_read_snapshot(Store::list_guardians_conn)
+        .unwrap_or_default();
     let mut mappings: Vec<(String, String)> = Vec::new();
     for gv in guardians
         .iter()
@@ -13192,14 +13195,15 @@ static DUAL_ROOT_UPSTREAM_IN_FLIGHT: LazyLock<Mutex<HashSet<String>>> =
 /// This never triggers a rebuild itself — it only updates local refs so the
 /// very next [`review_maintenance`] pass observes a shift the normal way,
 /// through [`rebuild_on_base_shift`]'s own unchanged logic. Listing+dedup is
-/// one cheap store read; each fetch is spawned onto its own thread (mirroring
+/// one read on the read pool -- never the store lock, since resolving each
+/// review's effective `dual_root_pr` reads its project config from disk -- and
+/// each fetch is spawned onto its own thread (mirroring
 /// `pr::poll_forge_reorders`) so one slow/unreachable remote never blocks
 /// this call or, transitively, the scheduler's own hot loop.
 pub fn poll_base_branch_freshness_once(store: &crate::store_lock::StoreHandle) {
-    let inputs: Vec<GuardianBaseFetchInfo> = {
-        let guard = store.lock();
-        guard.list_guardian_base_fetch_rows().unwrap_or_default()
-    };
+    let inputs: Vec<GuardianBaseFetchInfo> = store
+        .with_read_snapshot(Store::list_guardian_base_fetch_rows_conn)
+        .unwrap_or_default();
     for target in collect_base_fetch_targets(&inputs) {
         let key = format!(
             "{}|{}|{}",
@@ -15639,6 +15643,39 @@ mod tests {
             fetch_info("deployed", "origin/main", &["/repo/a"], None),
         ];
         assert!(collect_base_fetch_targets(&guardians).is_empty());
+    }
+
+    /// The once-a-minute base-freshness poll and the per-branch proof gate both
+    /// hydrate reviews, which reads each review's project config from disk.
+    /// They read from the pool, so neither may wait on a held store lock.
+    #[test]
+    fn base_freshness_poll_and_proof_gate_do_not_wait_for_the_store_lock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let store: crate::store_lock::StoreHandle = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        // `collecting` is not a maintained status, so the poll lists and
+        // hydrates this review without spawning a real `git fetch` for it.
+        let gid = store.lock().create_guardian("r", "main", "/repo").unwrap();
+        let guard = store.lock();
+
+        let (tx, rx) = mpsc::channel();
+        let worker_store = Arc::clone(&store);
+        std::thread::spawn(move || {
+            poll_base_branch_freshness_once(&worker_store);
+            let gate = ProofGate::resolve(&worker_store, &gid, true);
+            let _ = tx.send(gate.scope);
+        });
+        let scope = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a review read waited on the store lock");
+        assert_eq!(
+            scope, "each_branch",
+            "the gate must still resolve the review's own settings"
+        );
+        drop(guard);
     }
 
     #[test]

@@ -464,6 +464,21 @@ impl Daemon {
         }
     }
 
+    /// Run `f` against a pooled read-only connection inside one read
+    /// transaction, so a multi-statement read observes a single consistent
+    /// snapshot and never takes the writer lock -- see
+    /// [`crate::store_lock::StoreMutex::with_read_snapshot`].
+    ///
+    /// The transaction is what preserves the atomicity the writer lock used
+    /// to supply implicitly — see [`Store::board_snapshot_conn`] for the
+    /// torn-read this prevents.
+    pub(crate) fn with_read_snapshot<T>(
+        &self,
+        f: impl FnOnce(&rusqlite::Connection) -> crate::store::Result<T>,
+    ) -> crate::store::Result<T> {
+        self.store.with_read_snapshot(f)
+    }
+
     /// [`Store::board_snapshot_conn`] routed through the RAL-393 Stage 3
     /// read pool, so the board poll — by far the largest and most frequent
     /// read the daemon serves — no longer holds the writer lock away from
@@ -473,31 +488,6 @@ impl Daemon {
     ///
     /// Snapshot consistency comes from the read transaction inside
     /// `board_snapshot_conn`, not from excluding the writer.
-    /// Run `f` against a pooled read-only connection inside one read
-    /// transaction, so a multi-statement read observes a single consistent
-    /// snapshot and never takes the writer lock. Falls back to the writer
-    /// connection when the pool has none (see [`ReadConnPool::acquire`]).
-    ///
-    /// The transaction is what preserves the atomicity the writer lock used
-    /// to supply implicitly — see [`Store::board_snapshot_conn`] for the
-    /// torn-read this prevents.
-    pub(crate) fn with_read_snapshot<T>(
-        &self,
-        f: impl FnOnce(&rusqlite::Connection) -> crate::store::Result<T>,
-    ) -> crate::store::Result<T> {
-        match self.read_pool.acquire() {
-            Some(conn) => {
-                let tx = conn.unchecked_transaction()?;
-                f(&tx)
-            }
-            None => {
-                let store = self.lock();
-                let tx = store.conn.unchecked_transaction()?;
-                f(&tx)
-            }
-        }
-    }
-
     pub(crate) fn read_board_snapshot(&self) -> crate::store::Result<crate::store::BoardSnapshot> {
         match self.read_pool.acquire() {
             Some(conn) => Store::board_snapshot_conn(&conn),
@@ -5571,10 +5561,9 @@ fn personal_mailbox_messages(daemon: &Daemon, query: &str) -> Reply {
             }
         },
     };
-    match daemon
-        .lock()
-        .personal_mailbox_messages_for_user(&user, unread_only, priority)
-    {
+    match daemon.with_read_snapshot(|conn| {
+        Store::personal_mailbox_messages_for_user_conn(conn, &user, unread_only, priority)
+    }) {
         Ok(messages) => json(200, &messages),
         Err(e) => store_error(&e),
     }
@@ -10470,7 +10459,11 @@ fn capture_pane_reply(
                 content: strip_ralphus_pane_markers(&ralphus_core::redact::redact_secrets(
                     &content,
                 )),
-                last_activity_ms: daemon.lock().live_activity_ms(&name),
+                // In-memory liveness (WS-E.1) -- no store lock needed.
+                last_activity_ms: daemon
+                    .store_handle()
+                    .lock_free_memory()
+                    .live_activity_ms(&name),
             },
         ),
         Err(_) => inactive_pane_reply(&name),
@@ -11077,19 +11070,29 @@ fn cell_pane(daemon: &Daemon, id: &str, ti: &str, si: &str, query: &str) -> Repl
             vec![],
         );
     };
-    let (cell_id, task) = {
-        let store = daemon.lock();
-        let cell_id = match store.get_cell_id(id, task_idx, cell_idx) {
+    let (cell_id, task) =
+        match daemon.with_read_snapshot(|c| pane_cell_and_task(c, id, task_idx, cell_idx)) {
             Ok(v) => v,
             Err(e) => return store_error(&e),
         };
-        let task = match store.get_task_name(id, task_idx) {
-            Ok(v) => v,
-            Err(e) => return store_error(&e),
-        };
-        (cell_id, task)
-    };
     capture_pane_reply(daemon, id, &task, &cell_id, query)
+}
+
+/// A task cell's `(cell id, task name)` -- the pair its tmux session name is
+/// derived from. The Live View polls both pane endpoints every couple of
+/// seconds for every open pane, so callers read this from the pool rather
+/// than queueing behind the scheduler or a guardian-merge worker holding the
+/// store lock.
+fn pane_cell_and_task(
+    conn: &rusqlite::Connection,
+    squad_id: &str,
+    task_idx: i64,
+    cell_idx: i64,
+) -> crate::store::Result<(String, String)> {
+    Ok((
+        Store::get_cell_id_conn(conn, squad_id, task_idx, cell_idx)?,
+        Store::get_task_name_conn(conn, squad_id, task_idx)?,
+    ))
 }
 
 /// A requested byte range of a task cell's raw transcript, for Live View
@@ -11104,18 +11107,11 @@ fn cell_pane_transcript(daemon: &Daemon, id: &str, ti: &str, si: &str, query: &s
             vec![],
         );
     };
-    let (cell_id, task) = {
-        let store = daemon.lock();
-        let cell_id = match store.get_cell_id(id, task_idx, cell_idx) {
+    let (cell_id, task) =
+        match daemon.with_read_snapshot(|c| pane_cell_and_task(c, id, task_idx, cell_idx)) {
             Ok(v) => v,
             Err(e) => return store_error(&e),
         };
-        let task = match store.get_task_name(id, task_idx) {
-            Ok(v) => v,
-            Err(e) => return store_error(&e),
-        };
-        (cell_id, task)
-    };
     pane_transcript_range_reply(id, &task, &cell_id, query)
 }
 
@@ -11590,9 +11586,10 @@ fn resolver_task_and_cell_id(
     id: &str,
     branch_id: &str,
 ) -> std::result::Result<(&'static str, String), Reply> {
+    // Pooled: the review-branch Live View polls this every couple of seconds,
+    // and hydrating a review reads its project config from disk.
     let g = daemon
-        .lock()
-        .get_guardian(id)
+        .with_read_snapshot(|conn| Store::get_guardian_conn(conn, id))
         .map_err(|e| store_error(&e))?;
     let Some(b) = g.branches.iter().find(|b| b.id == branch_id) else {
         return Err(error(404, "not_found", "no such branch", vec![]));
@@ -12101,7 +12098,7 @@ fn guardian_branch_pane_transcript(
 ) -> Reply {
     if let (Some(task), Some(cell_id)) = (query_param(query, "task"), query_param(query, "cell_id"))
     {
-        match daemon.lock().guardian_branches(id) {
+        match daemon.with_read_snapshot(|conn| Store::guardian_branches_conn(conn, id)) {
             Ok(branches) if branches.iter().any(|branch| branch.id == branch_id) => {}
             Ok(_) => return error(404, "not_found", "no such branch", vec![]),
             Err(e) => return store_error(&e),
@@ -20453,6 +20450,50 @@ mod tests {
     /// that specifically want to verify behavior when no user is available.
     fn daemon_without_default_user() -> Daemon {
         Daemon::new(Store::open_in_memory().unwrap(), 12)
+    }
+
+    /// The Live View polls the pane-transcript endpoints every couple of
+    /// seconds per open pane, and the board polls the personal mailbox on
+    /// every refresh. Their store reads come from the read pool, so each must
+    /// still answer while something else holds the store lock -- a scheduler
+    /// tick or a guardian-merge worker, in the real daemon.
+    #[test]
+    fn live_view_and_mailbox_polls_answer_while_the_store_lock_is_held() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let d = Arc::new(Daemon::new(Store::open_in_memory().unwrap(), 0));
+        let gid = d.lock().create_guardian("r", "main", "/repo").unwrap();
+        let held = d.store_handle();
+        let guard = held.lock();
+
+        let polls = [
+            (
+                "/api/squads/squad-missing/cells/0/0/pane-transcript".to_string(),
+                404,
+            ),
+            (
+                format!("/api/guardians/{gid}/branches/branch-missing/pane-transcript"),
+                404,
+            ),
+            (
+                "/api/mailbox/personal/messages?user=nobody".to_string(),
+                200,
+            ),
+        ];
+        for (path, expected) in polls {
+            let daemon = Arc::clone(&d);
+            let (tx, rx) = mpsc::channel();
+            let request = path.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(route(&daemon, "GET", &request, "").status);
+            });
+            let status = rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap_or_else(|_| panic!("GET {path} waited on the store lock"));
+            assert_eq!(status, expected, "GET {path}");
+        }
+        drop(guard);
     }
 
     /// RAL-468: a `RALPHUS_CLAUDE_COMMAND` wrapper like `foo bar -- claude`
