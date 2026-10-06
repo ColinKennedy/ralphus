@@ -815,8 +815,14 @@
         }
         // The run list is derived from the review's event rows, which the log
         // drawer also reads -- one fetch per review, on the first thing that
-        // needs it, rather than one per tab.
-        if (reviewDockEvents[g.id] === undefined) loadReviewDockEvents(g.id);
+        // needs it, rather than one per tab. The rows are re-read whenever a
+        // branch changes state: a run that starts after they were loaded
+        // (a feedback pass, a restack) is otherwise invisible until reload.
+        const eventsStamp = reviewEventsStamp(g);
+        if (reviewDockEvents[g.id] === undefined || reviewDockEventsStamp[g.id] !== eventsStamp) {
+          reviewDockEventsStamp[g.id] = eventsStamp;
+          loadReviewDockEvents(g.id);
+        }
         const runs = branchRuns(g, b);
         const ri = curRunIdx(runs, b.id);
         const run = ri >= 0 ? runs[ri] : null;
@@ -1853,6 +1859,21 @@
        * @type {{[guardianId: string]: CartographerRow[]}}
        */
       const reviewDockEvents = {};
+      /**
+       * The {@link reviewEventsStamp} each review's `reviewDockEvents` were
+       * fetched under, so the Live tab can tell when they have gone stale.
+       * @type {{[guardianId: string]: string}}
+       */
+      const reviewDockEventsStamp = {};
+      /**
+       * A fingerprint of the review's state that changes whenever a branch
+       * starts or finishes work -- the moments new agent runs appear.
+       * @param {GuardianView} g - The review.
+       * @returns {string}
+       */
+      function reviewEventsStamp(g) {
+        return `${g.status}|${(g.branches || []).map((x) => `${x.id}:${x.merge_status}`).join(",")}`;
+      }
       /**
        * Cartographer rows for one branch alone (`<guardianId>|<branchId>`),
        * fetched with the daemon's `branch_id` filter and a small limit.
