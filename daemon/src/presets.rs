@@ -1236,8 +1236,19 @@ prompt = "hi"
             .filter(|n| n.starts_with("roles/"))
             .collect();
         assert_eq!(roles.len(), crate::preset_roles::ROLE_PRESETS.len());
-        for expected in ["roles/reviewer", "roles/qa", "roles/ci-fixer", "roles/vp"] {
+        for expected in [
+            "roles/reviewer",
+            "roles/qa",
+            "roles/ci-fixer",
+            "roles/retrieval",
+        ] {
             assert!(roles.iter().any(|r| r == expected), "{expected} missing");
+        }
+        for planner in ["architect", "manager", "visionary", "vp"] {
+            assert!(
+                !roles.iter().any(|r| r == &format!("roles/{planner}")),
+                "planner {planner} must not be seeded"
+            );
         }
         assert!(
             !roles
@@ -1249,10 +1260,14 @@ prompt = "hi"
             assert!(seed.system_prompt.is_some_and(|t| !t.trim().is_empty()));
             assert!(
                 seed.prompt
-                    .is_some_and(|t| t.contains("<<ralphus:linked-field/./prompt>>")),
-                "{} should frame the entity's own prompt",
+                    .is_some_and(|t| t.contains(crate::preset_roles::SUBJECT_PROMPT)),
+                "{} should frame the work being done or judged",
                 seed.name
             );
+            let judge = ["adversary", "analyst", "reviewer", "security"]
+                .iter()
+                .any(|r| seed.name == format!("roles/{r}"));
+            assert_eq!(seed.pass_score.is_some(), judge, "{}", seed.name);
         }
     }
 
