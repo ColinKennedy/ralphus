@@ -49,6 +49,10 @@ pub struct CellSpec {
     pub auto_compact_threshold: Option<u64>,
     pub timeout_sec: Option<u64>,
     pub proof: bool,
+    /// Appraisal pass threshold (1-10) of a scored proof step. `Some` on a
+    /// prompt proof switches it from the `RALPHUS_PROOF` verdict contract to
+    /// the `RALPHUS_APPRAISAL` one: `proofed = score >= pass_score`.
+    pub pass_score: Option<u8>,
     pub trace_context: Option<String>,
     pub resume_agent_session_id: Option<String>,
     /// A session id the daemon pre-generated and persisted before this cell
@@ -132,6 +136,13 @@ impl CellSpec {
         let auto_compact_threshold = opt_uint(obj, "auto_compact_threshold")?;
         let timeout_sec = opt_uint(obj, "timeout_sec")?;
         let proof = opt_bool(obj, "proof")?.unwrap_or(false);
+        let pass_score = match opt_uint(obj, "pass_score")? {
+            Some(v) => Some(
+                u8::try_from(v)
+                    .map_err(|_| SpecError("pass_score must be a small integer".to_string()))?,
+            ),
+            None => None,
+        };
         let trace_context = opt_str(obj, "trace_context")?;
         let resume_agent_session_id = opt_str(obj, "resume_agent_session_id")?;
         let assigned_agent_session_id = opt_str(obj, "assigned_agent_session_id")?;
@@ -174,6 +185,7 @@ impl CellSpec {
             auto_compact_threshold,
             timeout_sec,
             proof,
+            pass_score,
             trace_context,
             resume_agent_session_id,
             assigned_agent_session_id,
@@ -336,6 +348,11 @@ pub struct CellResult {
     /// append-only, so the agent may report several insights in one reply.
     #[serde(default)]
     pub prophecies: Vec<crate::prophecy::ProphecyMarker>,
+    /// The parsed `RALPHUS_APPRAISAL:` of a scored proof step. `None` for
+    /// everything else, and for a scored proof whose reply carried no valid
+    /// appraisal (which fails closed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub appraisal: Option<crate::appraisal::AppraisalMarker>,
     /// How this cell answered any waypoint affecting its squad, if it did.
     /// `None` means it never emitted a `RALPHUS_BEARING:` line -- which for a
     /// `block`-mode entry is what keeps it held.
@@ -364,6 +381,7 @@ impl CellResult {
             ghost: None,
             retry_after_secs: None,
             prophecies: Vec::new(),
+            appraisal: None,
             bearing: None,
         }
     }
@@ -388,6 +406,7 @@ impl CellResult {
             ghost: None,
             retry_after_secs: None,
             prophecies: Vec::new(),
+            appraisal: None,
             bearing: None,
         }
     }
@@ -434,6 +453,7 @@ impl CellResult {
             ghost: None,
             retry_after_secs: Some(retry_after_secs),
             prophecies: Vec::new(),
+            appraisal: None,
             bearing: None,
         }
     }
@@ -478,6 +498,7 @@ impl CellResult {
             ghost: None,
             retry_after_secs: None,
             prophecies: Vec::new(),
+            appraisal: None,
             bearing: None,
         }
     }

@@ -318,6 +318,11 @@ pub struct RunnerSpec {
     /// [`SubprocessRunner::maximum_timeout_exceeded`] for enforcement.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub maximum_timeout: Option<MaximumTimeoutCaps>,
+    /// A scored proof's resolved `pass_score` (a `prompt` proof step only):
+    /// the runner teaches the `RALPHUS_APPRAISAL:` contract instead of the
+    /// PASS/FAIL one and decides `proofed` as `score >= pass_score`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pass_score: Option<u8>,
 }
 
 /// Wall-clock hard-cap accounting for the task-file `maximum_timeout_seconds`
@@ -418,6 +423,21 @@ const PROOF_SYSTEM_PROMPT: &str = "This is a PROOF step, not a normal task. Inve
      if you can reasonably do so. When you are done, your FINAL line of \
      output must be exactly one of:\nRALPHUS_PROOF: PASS\nRALPHUS_PROOF: FAIL\nwith \
      nothing else on that line.";
+/// Taught instead of [`PROOF_SYSTEM_PROMPT`] to a scored proof step (a prompt
+/// proof with a resolved `pass_score`). Must stay byte-identical to the
+/// runner's `APPRAISAL_SYSTEM_PROMPT` in `runner/src/execute.rs`.
+const APPRAISAL_SYSTEM_PROMPT: &str = "This is a PROOF step, not a normal task. Investigate the work being judged \
+     and appraise it; do not modify files unless your instructions say to. \
+     When you are done, end your reply with the exact marker \
+     'RALPHUS_APPRAISAL:' followed by one JSON object, and nothing after \
+     it:\nRALPHUS_APPRAISAL: {\"score\": <integer 1-10>, \"summary\": \"<one or two \
+     sentences>\", \"sections\": [{\"title\": \"<heading>\", \"body\": \"<markdown>\"}]}\n\
+     Only the JSON after your LAST marker is kept; the JSON may span several \
+     lines, and any key other than score, summary, and sections is ignored. \
+     `score` must be an integer from 1 to 10: 1-3 means you found a blocking \
+     defect, 4-6 means significant concerns, and 7 or more means no blocking \
+     concerns. `summary` is required. `sections` is an ordered list of titled \
+     markdown bodies; your instructions define which sections to write.";
 const GHOST_SYSTEM_PROMPT: &str = "Operational logging note, not a request to change your behavior: this \
      ralphus task run keeps a short handoff record for whichever agent picks \
      up dependent work next. That agent will see your code changes but not \
@@ -612,12 +632,26 @@ pub(crate) fn effective_cell_system_prompt(
 }
 
 pub(crate) fn effective_proof_system_prompt(spec_system_prompt: Option<&str>) -> String {
+    effective_proof_system_prompt_scored(spec_system_prompt, false)
+}
+
+/// [`effective_proof_system_prompt`], teaching the `RALPHUS_APPRAISAL:`
+/// contract instead of the PASS/FAIL verdict when `scored` (the proof has a
+/// resolved `pass_score`).
+pub(crate) fn effective_proof_system_prompt_scored(
+    spec_system_prompt: Option<&str>,
+    scored: bool,
+) -> String {
     combine_system_prompts([
         Some(NON_INTERACTIVE_SYSTEM_PROMPT),
         Some(TOOLS_SYSTEM_PROMPT),
         Some(WAYPOINT_SYSTEM_PROMPT),
         Some(ASYNC_SYSTEM_PROMPT),
-        Some(PROOF_SYSTEM_PROMPT),
+        Some(if scored {
+            APPRAISAL_SYSTEM_PROMPT
+        } else {
+            PROOF_SYSTEM_PROMPT
+        }),
         // Proof specs receive this only from the scheduler's runtime-managed
         // context, after the proof's earlier results are known. Keep it last
         // so its scoped verification instruction narrows the generic proof
@@ -769,6 +803,7 @@ impl RunnerSpec {
                 };
                 caps.has_any_cap().then_some(caps)
             },
+            pass_score: None,
         }
     }
 
@@ -880,6 +915,7 @@ impl RunnerSpec {
             // RAL-308: attached via `with_maximum_timeout_caps` by callers
             // that need it (the scheduler); most test-only callers don't.
             maximum_timeout: None,
+            pass_score: None,
         }
     }
 
@@ -890,7 +926,10 @@ impl RunnerSpec {
     pub fn effective_system_prompt(&self) -> Option<String> {
         self.prompt.as_ref()?;
         Some(if self.proof {
-            effective_proof_system_prompt(self.system_prompt.as_deref())
+            effective_proof_system_prompt_scored(
+                self.system_prompt.as_deref(),
+                self.pass_score.is_some(),
+            )
         } else {
             combine_system_prompts([
                 self.system_prompt.as_deref(),
@@ -966,6 +1005,7 @@ impl RunnerSpec {
             // RAL-308: attached via `with_maximum_timeout_caps` by callers
             // that need it (the scheduler); most test-only callers don't.
             maximum_timeout: None,
+            pass_score: None,
         }
     }
 }
@@ -1073,6 +1113,10 @@ pub struct RunnerResult {
     /// cells, proof steps, or when the agent reported no prophecies.
     #[serde(default)]
     pub prophecies: Vec<RunnerProphecyMarker>,
+    /// The parsed `RALPHUS_APPRAISAL:` marker of a scored proof step, when
+    /// the agent produced a valid one. `None` for every unscored step.
+    #[serde(default)]
+    pub appraisal: Option<RunnerAppraisalMarker>,
     /// RAL-536: set only when `status == "thinking_stalled"` -- the last
     /// `RALPHUS_THINKING:` line [`crate::thinking_stall::ThinkingStallDetector`]
     /// observed before tripping. Carried through so the retry loop that
@@ -1100,6 +1144,22 @@ pub struct RunnerProphecyMarker {
     pub body: String,
 }
 
+/// Wire shape of one appraisal in a [`RunnerResult`], mirroring
+/// `ralphus-runner`'s `appraisal::AppraisalMarker`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RunnerAppraisalMarker {
+    pub score: u8,
+    pub summary: String,
+    pub sections: Vec<RunnerAppraisalSection>,
+}
+
+/// One titled markdown section of a [`RunnerAppraisalMarker`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct RunnerAppraisalSection {
+    pub title: String,
+    pub body: String,
+}
+
 impl RunnerResult {
     /// A synthetic failure (e.g. the runner process could not be spawned).
     #[must_use]
@@ -1122,6 +1182,7 @@ impl RunnerResult {
             ghost: None,
             retry_after_secs: None,
             prophecies: Vec::new(),
+            appraisal: None,
             thinking_stall_last_line: None,
             bearing: None,
         }
@@ -1164,6 +1225,7 @@ impl RunnerResult {
             ghost: None,
             retry_after_secs: None,
             prophecies: Vec::new(),
+            appraisal: None,
             thinking_stall_last_line: None,
             bearing: None,
         }
@@ -1199,6 +1261,7 @@ impl RunnerResult {
             ghost: None,
             retry_after_secs: None,
             prophecies: Vec::new(),
+            appraisal: None,
             thinking_stall_last_line: None,
             bearing: None,
         }
@@ -1233,6 +1296,7 @@ impl RunnerResult {
             ghost: None,
             retry_after_secs: None,
             prophecies: Vec::new(),
+            appraisal: None,
             thinking_stall_last_line: None,
             bearing: None,
         }
@@ -1269,6 +1333,7 @@ impl RunnerResult {
             ghost: None,
             retry_after_secs: None,
             prophecies: Vec::new(),
+            appraisal: None,
             bearing: None,
         }
     }
@@ -1293,6 +1358,7 @@ impl RunnerResult {
             ghost: None,
             retry_after_secs: None,
             prophecies: Vec::new(),
+            appraisal: None,
             thinking_stall_last_line: None,
             bearing: None,
         }
@@ -1349,6 +1415,7 @@ impl RunnerResult {
                 retry_after_secs,
             )),
             prophecies: Vec::new(),
+            appraisal: None,
             thinking_stall_last_line: None,
         }
     }
@@ -1394,6 +1461,7 @@ impl RunnerResult {
             ghost: None,
             retry_after_secs: None,
             prophecies: Vec::new(),
+            appraisal: None,
             thinking_stall_last_line: Some(last_line),
             bearing: None,
         }
@@ -3782,11 +3850,43 @@ pub(crate) fn tail_lines(text: &str, n: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    // Test harness output (`SKIP:` notices) legitimately goes to stdout so
-    // `cargo test --nocapture` shows it; no JSON contract exists here.
     #![allow(clippy::print_stdout)]
 
     use super::*;
+
+    #[test]
+    fn scored_proof_prompt_teaches_appraisal_not_verdict() {
+        let scored = effective_proof_system_prompt_scored(None, true);
+        assert!(scored.contains("RALPHUS_APPRAISAL:"));
+        assert!(!scored.contains("RALPHUS_PROOF: PASS"));
+        let plain = effective_proof_system_prompt(None);
+        assert!(plain.contains("RALPHUS_PROOF: PASS"));
+        assert!(!plain.contains("RALPHUS_APPRAISAL:"));
+    }
+
+    #[test]
+    fn appraisal_prompt_matches_the_runner_byte_for_byte() {
+        fn appraisal_const(src: &str) -> String {
+            src.lines()
+                .skip_while(|l| !l.starts_with("const APPRAISAL_SYSTEM_PROMPT"))
+                .scan(false, |done, l| {
+                    if *done {
+                        return None;
+                    }
+                    *done = l.ends_with("\";");
+                    Some(l)
+                })
+                .collect::<Vec<_>>()
+                .join(" | ")
+        }
+        let from_runner = appraisal_const(include_str!("../../runner/src/execute.rs"));
+        let from_daemon = appraisal_const(include_str!("runner.rs"));
+        assert!(!from_runner.is_empty());
+        assert_eq!(from_runner, from_daemon);
+    }
+
+    // Test harness output (`SKIP:` notices) legitimately goes to stdout so
+    // `cargo test --nocapture` shows it; no JSON contract exists here.
 
     #[test]
     fn arbiter_stop_is_terminally_cancelled() {
@@ -4261,6 +4361,7 @@ mod tests {
             retry_after_unknown_default_seconds:
                 crate::config::DEFAULT_RETRY_AFTER_UNKNOWN_DEFAULT_SECONDS,
             maximum_timeout: None,
+            pass_score: None,
         }
     }
 
@@ -4656,6 +4757,7 @@ mod tests {
             turns: None,
             retry_after_secs: None,
             prophecies: Vec::new(),
+            appraisal: None,
             thinking_stall_last_line: None,
             bearing: None,
         };
@@ -6278,6 +6380,7 @@ prompt = "make it build"
             retry_after_unknown_default_seconds:
                 crate::config::DEFAULT_RETRY_AFTER_UNKNOWN_DEFAULT_SECONDS,
             maximum_timeout: None,
+            pass_score: None,
         };
         let session_name = crate::tmux::session_name(&spec.squad_id, &spec.task, &spec.cell_id);
 
@@ -6421,6 +6524,7 @@ prompt = "make it build"
             retry_after_unknown_default_seconds:
                 crate::config::DEFAULT_RETRY_AFTER_UNKNOWN_DEFAULT_SECONDS,
             maximum_timeout: None,
+            pass_score: None,
         };
         let session_name = crate::tmux::session_name(&spec.squad_id, &spec.task, &spec.cell_id);
 

@@ -365,6 +365,7 @@ fn run_agent_with_rate_limit_retry(
                 ghost: None,
                 retry_after_secs: None,
                 prophecies: Vec::new(),
+                appraisal: None,
                 thinking_stall_last_line: None,
                 bearing: None,
             };
@@ -2330,6 +2331,7 @@ fn synthesize_proof_instructions(
         retry_attempt: 0,
         retry_after_unknown_default_seconds,
         maximum_timeout: None,
+        pass_score: None,
     };
     let result = run_agent_with_stall_recovery(store, &mut spec, runner, cancel, None);
     // RAL-193: not fatal from this helper (it returns a plain `String`, not a
@@ -2918,6 +2920,7 @@ fn resolve_conflicts_with_agent(
             retry_attempt: 0,
             retry_after_unknown_default_seconds,
             maximum_timeout: None,
+            pass_score: None,
         };
 
         // Clean up any stale file from a previous pass so the watcher does not
@@ -3350,6 +3353,7 @@ fn run_final_proof(
         retry_attempt: 0,
         retry_after_unknown_default_seconds,
         maximum_timeout: None,
+        pass_score: None,
     };
     // RAL-259: the final-proof agent is actually beginning to run — stamp the
     // branch's Live-View start time. COALESCE means a branch that already
@@ -6701,6 +6705,7 @@ fn run_commit_step(
         retry_after_unknown_default_seconds: crate::config::resolve(std::path::Path::new(wt_str))
             .retry_after_unknown_default_seconds(),
         maximum_timeout: None,
+        pass_score: None,
     };
     let result = run_agent_with_stall_recovery(
         store,
@@ -7216,6 +7221,7 @@ fn run_feedback_pass(
         retry_after_unknown_default_seconds: crate::config::resolve(std::path::Path::new(&wt_str))
             .retry_after_unknown_default_seconds(),
         maximum_timeout: None,
+        pass_score: None,
     };
     // Stash any pre-existing dirty state so we only include the resolver's
     // own changes in the new commit -- run unconditionally now (RAL-<new>): a
@@ -10598,6 +10604,7 @@ fn run_review_auto_build(
         retry_attempt: 0,
         retry_after_unknown_default_seconds,
         maximum_timeout: None,
+        pass_score: None,
     };
     let result = run_agent_with_stall_recovery(store, &mut spec, runner, cancel, None);
     let _ = record_guardian_call_cost(store, id, None, "auto_build", &result);
@@ -11241,6 +11248,7 @@ fn expand_action_prompt(
         retry_after_unknown_default_seconds: crate::config::resolve(Path::new(combined_str))
             .retry_after_unknown_default_seconds(),
         maximum_timeout: None,
+        pass_score: None,
     };
     let result = run_agent_with_stall_recovery(store, &mut spec, runner, cancel, None);
     if !result.is_done() {
@@ -14296,6 +14304,7 @@ fn generate_final_summary(
         retry_attempt: 0,
         retry_after_unknown_default_seconds,
         maximum_timeout: None,
+        pass_score: None,
     };
     let result = runner.run(&spec);
     let _ = record_guardian_call_cost(store, id, None, "summary", &result);
@@ -14811,6 +14820,7 @@ fn generate_manual_commands(
         retry_attempt: 0,
         retry_after_unknown_default_seconds,
         maximum_timeout: None,
+        pass_score: None,
     };
 
     // Side-channel file where the Python backend writes the claude session ID as
@@ -15107,6 +15117,7 @@ pub(crate) fn resolve_check_input(
         retry_attempt: 0,
         retry_after_unknown_default_seconds,
         maximum_timeout: None,
+        pass_score: None,
     };
 
     let result = runner.run(&spec);
@@ -16547,6 +16558,7 @@ mod tests {
             ghost: None,
             turns: None,
             prophecies: Vec::new(),
+            appraisal: None,
             bearing: None,
         }
     }
@@ -16865,6 +16877,7 @@ mod tests {
                 turns: None,
                 ghost: None,
                 prophecies: Vec::new(),
+                appraisal: None,
                 bearing: None,
             }
         }
@@ -17148,6 +17161,7 @@ mod tests {
                 turns: None,
                 ghost: None,
                 prophecies: Vec::new(),
+                appraisal: None,
                 bearing: None,
             }
         }
@@ -20215,6 +20229,7 @@ mod tests {
                 ghost: None,
                 turns: None,
                 prophecies: Vec::new(),
+                appraisal: None,
                 bearing: None,
             }
         }
@@ -21375,6 +21390,7 @@ mod tests {
                 ghost: None,
                 turns: None,
                 prophecies: Vec::new(),
+                appraisal: None,
                 bearing: None,
             }
         }

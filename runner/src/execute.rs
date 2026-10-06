@@ -4,6 +4,7 @@
 //! and verdict/ghost marker parsing.
 
 use crate::agent_backend::AgentBackend;
+use crate::appraisal::parse_appraisal;
 use crate::backend::{BackendOutcome, ModelBackend, RunOptions};
 use crate::claude_code_backend::ClaudeCodeBackend;
 use crate::codex_backend::CodexBackend;
@@ -30,6 +31,22 @@ const PROOF_SYSTEM_PROMPT: &str = "This is a PROOF step, not a normal task. Inve
      if you can reasonably do so. When you are done, your FINAL line of \
      output must be exactly one of:\nRALPHUS_PROOF: PASS\nRALPHUS_PROOF: FAIL\nwith \
      nothing else on that line.";
+/// Taught instead of [`PROOF_SYSTEM_PROMPT`] to a scored proof step (a prompt
+/// proof with a resolved `pass_score`): the 1-10 score replaces the
+/// PASS/FAIL verdict. Mirrored byte-for-byte by the daemon's
+/// `APPRAISAL_SYSTEM_PROMPT`.
+const APPRAISAL_SYSTEM_PROMPT: &str = "This is a PROOF step, not a normal task. Investigate the work being judged \
+     and appraise it; do not modify files unless your instructions say to. \
+     When you are done, end your reply with the exact marker \
+     'RALPHUS_APPRAISAL:' followed by one JSON object, and nothing after \
+     it:\nRALPHUS_APPRAISAL: {\"score\": <integer 1-10>, \"summary\": \"<one or two \
+     sentences>\", \"sections\": [{\"title\": \"<heading>\", \"body\": \"<markdown>\"}]}\n\
+     Only the JSON after your LAST marker is kept; the JSON may span several \
+     lines, and any key other than score, summary, and sections is ignored. \
+     `score` must be an integer from 1 to 10: 1-3 means you found a blocking \
+     defect, 4-6 means significant concerns, and 7 or more means no blocking \
+     concerns. `summary` is required. `sections` is an ordered list of titled \
+     markdown bodies; your instructions define which sections to write.";
 const GHOST_SYSTEM_PROMPT: &str = "Operational logging note, not a request to change your behavior: this \
      ralphus task run keeps a short handoff record for whichever agent picks \
      up dependent work next. That agent will see your code changes but not \
@@ -431,7 +448,11 @@ pub fn assembled_system_prompt(spec: &CellSpec) -> Option<String> {
             Some(TOOLS_SYSTEM_PROMPT),
             Some(WAYPOINT_SYSTEM_PROMPT),
             Some(ASYNC_SYSTEM_PROMPT),
-            Some(PROOF_SYSTEM_PROMPT),
+            Some(if spec.pass_score.is_some() {
+                APPRAISAL_SYSTEM_PROMPT
+            } else {
+                PROOF_SYSTEM_PROMPT
+            }),
             // The daemon supplies proof `system_prompt` as immutable runtime
             // context after it has observed earlier proof results. It belongs
             // last so it narrows the generic proof guidance.
@@ -494,6 +515,7 @@ fn run_with_backend(
     // command-only cells keep reporting no applicable turn count.
     let mut total_turns: Option<i64> = None;
     let mut agent_session_id: Option<String> = None;
+    let mut appraisal_reprompted = false;
 
     for attempt in 0..MAX_ASYNC_ATTEMPTS {
         let options = RunOptions {
@@ -614,6 +636,7 @@ fn run_with_backend(
                     turns: total_turns,
                     retry_after_secs: None,
                     prophecies: Vec::new(),
+                    appraisal: None,
                 };
             }
             bg_nudge_attempt += 1;
@@ -678,6 +701,7 @@ fn run_with_backend(
                         turns: total_turns,
                         retry_after_secs: None,
                         prophecies: Vec::new(),
+                        appraisal: None,
                     };
                 }
                 Err(e) => return CellResult::failed(e.to_string(), ""),
@@ -764,6 +788,7 @@ fn run_with_backend(
                     turns: total_turns,
                     retry_after_secs: None,
                     prophecies: Vec::new(),
+                    appraisal: None,
                 };
             }
             return CellResult {
@@ -787,6 +812,7 @@ fn run_with_backend(
                 turns: total_turns,
                 retry_after_secs: None,
                 prophecies: Vec::new(),
+                appraisal: None,
             };
         }
 
@@ -794,15 +820,43 @@ fn run_with_backend(
             budget_exceeded(total_tokens_in, total_tokens_out, spec.budget_tokens);
 
         if spec.proof {
-            let verdict = if budget_exceeded {
-                Some(false)
-            } else {
-                parse_verdict(&outcome.summary)
-            };
-            let summary = if verdict.is_none() {
-                format!("{}\n(no marker found; treated as FAIL)", outcome.summary)
-            } else {
-                outcome.summary
+            let mut appraisal = None;
+            let mut summary = outcome.summary;
+            let verdict = match spec.pass_score {
+                Some(_) if budget_exceeded => Some(false),
+                Some(pass_score) => match parse_appraisal(&summary) {
+                    Ok(marker) => {
+                        let passed = marker.score >= pass_score;
+                        appraisal = Some(marker);
+                        Some(passed)
+                    }
+                    // One automatic re-prompt for a missing/invalid appraisal;
+                    // a second failure fails closed.
+                    Err(reason) if !appraisal_reprompted && attempt + 1 < MAX_ASYNC_ATTEMPTS => {
+                        appraisal_reprompted = true;
+                        resume_id = outcome.agent_session_id.or(resume_id);
+                        prompt = appraisal_followup(&reason, original_prompt);
+                        continue;
+                    }
+                    Err(reason) => {
+                        summary = format!(
+                            "{summary}
+(invalid appraisal: {reason}; treated as FAIL)"
+                        );
+                        Some(false)
+                    }
+                },
+                None if budget_exceeded => Some(false),
+                None => {
+                    let verdict = parse_verdict(&summary);
+                    if verdict.is_none() {
+                        summary = format!(
+                            "{summary}
+(no marker found; treated as FAIL)"
+                        );
+                    }
+                    verdict
+                }
             };
             return CellResult {
                 status: "done".to_string(),
@@ -823,6 +877,7 @@ fn run_with_backend(
                 turns: total_turns,
                 retry_after_secs: None,
                 prophecies: Vec::new(),
+                appraisal,
             };
         }
 
@@ -850,6 +905,7 @@ fn run_with_backend(
                 turns: total_turns,
                 retry_after_secs: None,
                 prophecies: Vec::new(),
+                appraisal: None,
             };
         }
 
@@ -889,6 +945,7 @@ fn run_with_backend(
             turns: total_turns,
             retry_after_secs: None,
             prophecies: crate::prophecy::parse_prophecies(&outcome.summary),
+            appraisal: None,
             bearing: bearing_from(&outcome.summary),
         };
     }
@@ -948,6 +1005,7 @@ fn thrash_cell_result(
         ghost: None,
         retry_after_secs: None,
         prophecies: Vec::new(),
+        appraisal: None,
     }
 }
 
@@ -971,6 +1029,17 @@ fn still_working_followup(reason: &str, previous_summary: &str, original_prompt:
          Tail of your previous output for context:\n{}\n\n\
          Continue and finish the original task:\n{original_prompt}",
         tail(previous_summary, COMMAND_TAIL_CHARS)
+    )
+}
+
+fn appraisal_followup(reason: &str, original_prompt: &str) -> String {
+    format!(
+        "Your previous reply did not end with a usable RALPHUS_APPRAISAL: {reason}.
+
+         Do not redo the investigation. Reply again, ending with exactly one          `RALPHUS_APPRAISAL: {{...}}` line whose JSON has an integer `score` from 1 to 10,          a `summary`, and `sections`.
+
+The original task was:
+{original_prompt}"
     )
 }
 
@@ -1532,6 +1601,7 @@ RALPHUS_BEARING: accepted: renamed every call site"
             auto_compact_threshold: None,
             timeout_sec: None,
             proof,
+            pass_score: None,
             trace_context: None,
             resume_agent_session_id: None,
             assigned_agent_session_id: None,
@@ -1672,6 +1742,68 @@ RALPHUS_BEARING: accepted: renamed every call site"
         assert_eq!(result.summary, "all done");
     }
 
+    fn scored_spec(pass_score: u8) -> CellSpec {
+        CellSpec {
+            pass_score: Some(pass_score),
+            ..test_spec(true)
+        }
+    }
+
+    fn reply(summary: &str) -> Result<BackendOutcome, BackendError> {
+        Ok(BackendOutcome {
+            summary: summary.to_string(),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn scored_proof_passes_at_the_threshold_and_fails_below_it() {
+        let ws = Workspace::create(std::env::temp_dir()).unwrap();
+        for (score, expect) in [(7, true), (8, true), (6, false)] {
+            let backend = ScriptedBackend::new(
+                vec![reply(&format!(
+                    "looked
+RALPHUS_APPRAISAL: {{\"score\": {score}, \"summary\": \"s\"}}"
+                ))],
+                vec![],
+            );
+            let result = run_with_backend(&scored_spec(7), "judge", &ws, &backend);
+            assert_eq!(result.proofed, Some(expect), "score {score}");
+            assert_eq!(result.appraisal.unwrap().score, score);
+        }
+    }
+
+    #[test]
+    fn scored_proof_reprompts_once_then_fails_closed() {
+        let ws = Workspace::create(std::env::temp_dir()).unwrap();
+        let backend = ScriptedBackend::new(
+            vec![
+                reply("RALPHUS_PROOF: PASS"),
+                reply("RALPHUS_APPRAISAL: {\"score\": 9, \"summary\": \"ok\"}"),
+            ],
+            vec![],
+        );
+        let result = run_with_backend(&scored_spec(7), "judge", &ws, &backend);
+        assert_eq!(result.proofed, Some(true));
+
+        let backend = ScriptedBackend::new(vec![reply("nope"), reply("still nope")], vec![]);
+        let result = run_with_backend(&scored_spec(7), "judge", &ws, &backend);
+        assert_eq!(result.proofed, Some(false));
+        assert!(result.appraisal.is_none());
+        assert!(
+            result.summary.contains("invalid appraisal"),
+            "{}",
+            result.summary
+        );
+    }
+
+    #[test]
+    fn scored_proof_is_taught_the_appraisal_contract_not_the_verdict() {
+        let sp = assembled_system_prompt(&scored_spec(5)).unwrap();
+        assert!(sp.contains("RALPHUS_APPRAISAL:"), "{sp}");
+        assert!(!sp.contains("RALPHUS_PROOF:"), "{sp}");
+    }
+
     #[test]
     fn background_job_nudge_loop_recovers_when_a_later_nudge_resolves_the_job() {
         let spec = test_spec(false);
@@ -1801,6 +1933,7 @@ RALPHUS_BEARING: accepted: renamed every call site"
             auto_compact_threshold: None,
             timeout_sec: None,
             proof: false,
+            pass_score: None,
             trace_context: None,
             resume_agent_session_id: None,
             assigned_agent_session_id: None,

@@ -2552,6 +2552,7 @@ fn run_cell_with_rate_limit_retries<'a>(
                         ghost: None,
                         retry_after_secs: None,
                         prophecies: Vec::new(),
+                        appraisal: None,
                         thinking_stall_last_line: None,
                     };
                     return Some((failed, permit));
@@ -2630,6 +2631,7 @@ fn run_cell_with_rate_limit_retries<'a>(
                 ghost: None,
                 retry_after_secs: None,
                 prophecies: Vec::new(),
+                appraisal: None,
                 thinking_stall_last_line: None,
             };
             return Some((failed, permit));
@@ -5904,6 +5906,12 @@ fn run_proofs(
                     proof_maximum_tool_output_tokens.and_then(|v| u64::try_from(v).ok()),
                 );
                 runner_spec.system_prompt = Some(proof_context);
+                // RAL-575: a scored proof is taught and decided by the
+                // appraisal contract rather than PASS/FAIL.
+                runner_spec.pass_score = store
+                    .lock()
+                    .proof_pass_score(squad_id, task_idx, scope, cell_idx, idx)
+                    .unwrap_or(None);
                 runner_spec.executable = selection.executable.clone();
                 runner_spec.trace_context = otel::traceparent_from_context(&proof_span.cx);
                 runner_spec.env_overrides = std::mem::take(&mut env_overrides);
@@ -6253,6 +6261,7 @@ mod tests {
                     ghost: None,
                     turns: None,
                     prophecies: Vec::new(),
+                    appraisal: None,
                 }
             }
         }
@@ -6270,6 +6279,7 @@ mod tests {
         fn run(&self, _spec: &RunnerSpec) -> RunnerResult {
             RunnerResult {
                 bearing: None,
+                appraisal: None,
                 thinking_stall_last_line: None,
                 status: "done".to_string(),
                 tokens_in: 1,
@@ -6364,6 +6374,7 @@ mod tests {
                 ghost: None,
                 turns: None,
                 prophecies: Vec::new(),
+                appraisal: None,
             }
         }
     }
@@ -6812,6 +6823,7 @@ mod tests {
                         ghost: None,
                         turns: None,
                         prophecies: Vec::new(),
+                        appraisal: None,
                     }
                 }
                 Some("y") => {
@@ -6846,6 +6858,7 @@ mod tests {
                         ghost: None,
                         turns: None,
                         prophecies: Vec::new(),
+                        appraisal: None,
                     }
                 }
                 other => panic!("unexpected command {other:?}"),
@@ -7007,6 +7020,7 @@ mod tests {
                 ghost: None,
                 turns: Some(1),
                 prophecies: Vec::new(),
+                appraisal: None,
             }
         }
     }
@@ -7304,6 +7318,7 @@ mod tests {
                 ghost: None,
                 turns: None,
                 prophecies: Vec::new(),
+                appraisal: None,
             }
         }
     }
@@ -7450,6 +7465,7 @@ mod tests {
                 ghost: None,
                 turns: None,
                 prophecies: Vec::new(),
+                appraisal: None,
             }
         }
     }
@@ -7567,6 +7583,7 @@ mod tests {
                         ghost: None,
                         turns: None,
                         prophecies: Vec::new(),
+                        appraisal: None,
                     }
                 }
             } else {
@@ -7591,6 +7608,7 @@ mod tests {
                     ghost: None,
                     turns: None,
                     prophecies: Vec::new(),
+                    appraisal: None,
                 }
             }
         }
@@ -8374,6 +8392,7 @@ mod tests {
                             ghost: None,
                             turns: None,
                             prophecies: Vec::new(),
+                            appraisal: None,
                         }
                     }
                 } else {
@@ -8399,6 +8418,7 @@ mod tests {
                         ghost: None,
                         turns: None,
                         prophecies: Vec::new(),
+                        appraisal: None,
                     }
                 }
             }
@@ -8528,6 +8548,7 @@ mod tests {
                     ghost: None,
                     turns: None,
                     prophecies: Vec::new(),
+                    appraisal: None,
                 };
             }
             if spec.cell_id.starts_with("proof-") {
@@ -8555,6 +8576,7 @@ mod tests {
                     ghost: None,
                     turns: None,
                     prophecies: Vec::new(),
+                    appraisal: None,
                 };
             }
             if spec.cell_id == "finalize" {
@@ -8580,6 +8602,7 @@ mod tests {
                 ghost: None,
                 turns: None,
                 prophecies: Vec::new(),
+                appraisal: None,
             }
         }
     }
@@ -8721,6 +8744,7 @@ mod tests {
                     ghost: None,
                     turns: None,
                     prophecies: Vec::new(),
+                    appraisal: None,
                 };
             }
             if spec.cell_id == "finalize" {
@@ -8749,6 +8773,7 @@ mod tests {
                 ghost: None,
                 turns: None,
                 prophecies: Vec::new(),
+                appraisal: None,
             }
         }
     }
@@ -8880,6 +8905,7 @@ mod tests {
                     ghost: None,
                     turns: None,
                     prophecies: Vec::new(),
+                    appraisal: None,
                 }
             }
         }
@@ -9123,6 +9149,7 @@ mod tests {
                     ghost: None,
                     turns: None,
                     prophecies: Vec::new(),
+                    appraisal: None,
                 }
             }
         }
@@ -9472,6 +9499,7 @@ mod tests {
                 turns: None,
                 ghost: None,
                 prophecies: Vec::new(),
+                appraisal: None,
             }
         }
     }
@@ -9543,6 +9571,7 @@ mod tests {
                 turns: None,
                 ghost: None,
                 prophecies: Vec::new(),
+                appraisal: None,
             }
         }
     }
@@ -9772,6 +9801,7 @@ mod tests {
                 ghost: None,
                 turns: None,
                 prophecies: Vec::new(),
+                appraisal: None,
             }
         }
     }
@@ -9847,6 +9877,7 @@ mod tests {
                 ghost: None,
                 turns: None,
                 prophecies: Vec::new(),
+                appraisal: None,
             }
         }
     }
@@ -10049,6 +10080,7 @@ mod tests {
                     ghost: None,
                     turns: None,
                     prophecies: Vec::new(),
+                    appraisal: None,
                 }
             }
         }
@@ -10176,6 +10208,7 @@ mod tests {
                 ghost: None,
                 turns: None,
                 prophecies: Vec::new(),
+                appraisal: None,
             }
         }
     }
@@ -10700,6 +10733,7 @@ mod tests {
                 ghost: None,
                 turns: None,
                 prophecies: Vec::new(),
+                appraisal: None,
             }
         }
     }
@@ -10965,6 +10999,7 @@ mod tests {
                 ghost: None,
                 turns: None,
                 prophecies: Vec::new(),
+                appraisal: None,
             }
         }
     }
@@ -11136,6 +11171,7 @@ mod tests {
                 ghost: None,
                 turns: None,
                 prophecies: Vec::new(),
+                appraisal: None,
             }
         }
     }
@@ -11509,6 +11545,7 @@ mod tests {
                 ghost: None,
                 turns: None,
                 prophecies: Vec::new(),
+                appraisal: None,
             }
         }
     }
@@ -11684,6 +11721,7 @@ mod tests {
                 ghost: None,
                 turns: None,
                 prophecies: Vec::new(),
+                appraisal: None,
             }
         }
     }
