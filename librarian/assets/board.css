@@ -58,6 +58,25 @@
       code, .mono { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; }
       button { font: inherit; cursor: pointer; }
 
+      /* Base form controls (docs/colors.md "Form controls & buttons"). Every text-like
+         input, select and textarea reads like the Tasks tab filter box, and every
+         button the board hasn't given its own class reads like `.btn` (`.primary`
+         like `.btn.primary`). Wrapped in :where() so specificity is zero: any
+         component rule or inline style still wins, but a bare control is never the
+         browser's white-with-grey-text default. */
+      :where(input:not([type=checkbox], [type=radio], [type=file], [type=range], [type=color], [type=button], [type=submit])),
+      :where(select),
+      :where(textarea) {
+        background: var(--bg); border: 1px solid var(--border); color: var(--text);
+        border-radius: 6px; padding: 5px 8px; font: inherit; font-size: 13px; }
+      :where(input, select, textarea):where(:focus) { outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-a); }
+      :where(input, textarea)::placeholder { color: var(--faint); }
+      :where(input, select, textarea):where(:disabled) { opacity: 0.55; cursor: not-allowed; }
+      :where(button:not([class])) { border: 1px solid var(--border); background: var(--panel-2); color: var(--text); border-radius: 6px; padding: 5px 12px; }
+      :where(button:not([class])):where(:hover) { border-color: var(--accent); }
+      :where(button.primary:not(.btn)) { background: var(--accent); color: #fff; border: none; border-radius: 6px; padding: 5px 12px; font-weight: 600; }
+      :where(button.primary:not(.btn)):where(:hover) { filter: brightness(1.1); }
+
       header { display: flex; align-items: center; justify-content: space-between;
         padding: 9px 16px; border-bottom: 1px solid var(--border); background: var(--panel); }
       .brand { display: flex; align-items: center; gap: 14px; font-weight: 600; }
@@ -167,6 +186,8 @@
         .presets-layout { grid-template-columns: 1fr; }
         .presets-editor { position: static; order: -1; }
       }
+      /* Admin/list pages share the Projects/Resources/Presets page gutter, so their headings, filter bars and register forms don't sit flush against the window edge. */
+      main#cartographer-page, main#users-page, main#secrets-page, main#agents-page, main#prefs-page, main#machines-page, main#triage-page, main#worktree-retirement-page, main#health-page { height: calc(100vh - 51px); overflow-y: auto; padding: 18px 20px; }
       /* ---- Projects tab (RAL-100/RAL-101) ---- */
       main#projects-page { height: calc(100vh - 51px); overflow-y: auto; padding: 18px 20px; }
       .proj-table { width: 100%; border-collapse: collapse; font-size: 13px; }

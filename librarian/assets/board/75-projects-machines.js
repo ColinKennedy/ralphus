@@ -447,7 +447,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
             <td><span class="proj-name">${esc(p.triage_type)}</span></td>
             <td>${p.count}</td>
             <td><div class="row" style="gap:4px">
-              <input type="number" min="1" step="1" class="mono pool-threshold-input" value="${esc(thresholdVal)}" placeholder="none" style="width:70px;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:2px 5px;font-size:12px" data-tip="Draining this pool creates a review once it holds this many cells, in threshold-sized batches -- each full batch becomes its own review and a sub-threshold remainder stays pooled. Clear the field and press Preview to see what removing the count-based trigger would do." />
+              <input type="number" min="1" step="1" class="mono pool-threshold-input" value="${esc(thresholdVal)}" placeholder="none" style="width:70px" data-tip="Draining this pool creates a review once it holds this many cells, in threshold-sized batches -- each full batch becomes its own review and a sub-threshold remainder stays pooled. Clear the field and press Preview to see what removing the count-based trigger would do." />
               <button class="btn" style="padding:2px 8px;font-size:11px" data-click="previewPoolThreshold" data-project="${esc(p.project)}" data-triage-type="${esc(p.triage_type)}" data-tip="Preview what confirming this threshold would drain (non-mutating: nothing is persisted, drained, or reviewed until you Confirm).">Preview</button>
             </div>${confirmLine}</td>
             <td><div class="row" style="gap:4px">${drainButton}</div>${drainLine}</td>
@@ -810,11 +810,11 @@ Work submitted against it will fail — fix the machine or deregister the provid
         return `<div style="margin-top:24px;padding-top:12px;border-top:1px solid var(--border)">
             <div style="font-weight:600;margin-bottom:8px" data-tip="Every cell across every squad that has opted into Triage (triage = true) and hasn't been linked to an actual review yet -- decided at submission, before the cell even runs. A cell appears here the moment its Triage type(s) resolve, and drops off once its pool drains into a review.">Candidates (${triageCandidates.length})</div>
             <div class="row" style="gap:8px;flex-wrap:wrap;margin-bottom:8px">
-              <select id="triage-cand-type" onchange="onTriageCandidateTypeFilter(this.value)" style="background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:2px 5px;font-size:12px" data-tip="Filter the candidate list down to one Triage type.">
+              <select id="triage-cand-type" onchange="onTriageCandidateTypeFilter(this.value)" data-tip="Filter the candidate list down to one Triage type.">
                 <option value="">All types</option>${typeOptions}
               </select>
               <span class="row" id="triage-project-filter">${triageProjectFilterHtml()}</span>
-              <input id="triage-cand-q" type="text" placeholder="filter by task/cell name…" value="${esc(triageCandidateFilters.q)}" oninput="onTriageCandidateNameFilter(this.value)" style="flex:1;min-width:200px;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:2px 5px;font-size:12px" data-tip="Filter the candidate list by task or cell name/id." />
+              <input id="triage-cand-q" type="text" placeholder="filter by task/cell name…" value="${esc(triageCandidateFilters.q)}" oninput="onTriageCandidateNameFilter(this.value)" style="flex:1;min-width:200px" data-tip="Filter the candidate list by task or cell name/id." />
             </div>
             ${table}
           </div>`;
@@ -2476,7 +2476,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
                   <td><span class="proj-name">${esc(p.triage_type)}</span></td>
                   <td>${p.count}</td>
                   <td><div class="row" style="gap:4px">
-                    <input type="number" min="1" step="1" class="mono ptm-threshold-input" id="ptm-threshold-${esc(p.triage_type)}" value="${esc(thresholdVal)}" placeholder="none" style="width:70px;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:2px 5px;font-size:12px" data-tip="Draining this pool creates a review once it holds this many ${esc(p.triage_type)} cells for ${esc(projectName)}, in threshold-sized batches (each batch its own review; a sub-threshold remainder stays pooled). Clear the field and press Preview to see what removing the count-based trigger would do." />
+                    <input type="number" min="1" step="1" class="mono ptm-threshold-input" id="ptm-threshold-${esc(p.triage_type)}" value="${esc(thresholdVal)}" placeholder="none" style="width:70px" data-tip="Draining this pool creates a review once it holds this many ${esc(p.triage_type)} cells for ${esc(projectName)}, in threshold-sized batches (each batch its own review; a sub-threshold remainder stays pooled). Clear the field and press Preview to see what removing the count-based trigger would do." />
                     <button class="btn" style="padding:2px 8px;font-size:11px" data-click="previewProjectTriageThreshold" data-triage-type="${esc(p.triage_type)}" data-tip="Preview what confirming this threshold would drain (non-mutating: nothing is persisted, drained, or reviewed until you Confirm).">Preview</button>
                   </div>${confirmLine}</td>
                 </tr>`;

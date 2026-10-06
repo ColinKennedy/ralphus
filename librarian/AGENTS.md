@@ -300,5 +300,10 @@ Rules:
 - If no existing semantic role fits, add a new variable in `librarian/assets/board.css`
   (and its light-theme override if needed), document it in `docs/colors.md`,
   *then* use it.
+- Inputs, selects, textareas and buttons must look like the Tasks tab's (white
+  browser-default boxes and grey default buttons are bugs). The base rules in
+  `board.css` give bare controls that look, `.btn` / `.btn.primary` give buttons
+  theirs — don't override background/border/color per tab. See
+  [`docs/colors.md`](../docs/colors.md) "Form controls & buttons".
 - Every new UI element also needs a `data-tip` tooltip — see "UI Tooltip Rule
   (RAL-40)" above.
