@@ -459,6 +459,9 @@ fn parse_initialize_server(
 ) -> Result<initialize::server::InitializeServerOptions, UsageError> {
     Ok(initialize::server::InitializeServerOptions {
         yes: scanner.take_bool("--yes"),
+        answers_file: scanner
+            .take_value("--answers-file")?
+            .map(std::path::PathBuf::from),
         install_tmux: parse_initialize_bool(scanner, "--install-tmux")?,
         tmux_program: scanner.take_value("--tmux-program")?,
         setup_mcp: parse_initialize_bool(scanner, "--setup-mcp")?,

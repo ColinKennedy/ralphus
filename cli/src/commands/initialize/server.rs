@@ -18,13 +18,20 @@
 //! `--unclassified-threshold`, `--fork-user`, `--fork-url`, `--forge-provider`,
 //! `--forge-host`, `--forge-token`, `--admin-name`,
 //! `--review-resolver-agent`, `--sample-mode`, and `--sample-agent`.
+//!
+//! Every run ends by writing an answers file (see [`answers`]) recording each
+//! setting's value and source; `--answers-file <path>` replays one, with flags
+//! overriding it and it overriding the prompts and defaults.
 
 use std::io::{IsTerminal as _, Write as _};
 use std::path::PathBuf;
 
+mod answers;
+
 use crate::args::GlobalOpts;
 use crate::client::ProjectReviewSettingsPatch;
 use crate::health::CheckResult;
+use answers::Source;
 use ralphus_runner::login_probe::{LoginProbe, LoginState, LoginStatus, StatusRun, login_probes};
 
 const TOTAL_STEPS: u32 = 10;
@@ -240,6 +247,8 @@ fn interactive_settings_are_valid() -> bool {
 #[derive(Default)]
 pub struct InitializeServerOptions {
     pub yes: bool,
+    /// Saved answers to replay (`--answers-file`); flags still win.
+    pub answers_file: Option<PathBuf>,
     pub install_tmux: Option<bool>,
     pub tmux_program: Option<String>,
     pub setup_mcp: Option<bool>,
@@ -278,6 +287,7 @@ impl std::fmt::Debug for InitializeServerOptions {
         formatter
             .debug_struct("InitializeServerOptions")
             .field("yes", &self.yes)
+            .field("answers_file", &self.answers_file)
             .field("install_tmux", &self.install_tmux)
             .field("tmux_program", &self.tmux_program)
             .field("setup_mcp", &self.setup_mcp)
@@ -320,6 +330,7 @@ impl std::fmt::Debug for InitializeServerOptions {
 impl InitializeServerOptions {
     fn is_non_interactive(&self) -> bool {
         self.yes
+            || self.answers_file.is_some()
             || self.install_tmux.is_some()
             || self.tmux_program.is_some()
             || self.setup_mcp.is_some()
@@ -352,8 +363,15 @@ impl InitializeServerOptions {
     }
 }
 
-pub fn dispatch(opts: &GlobalOpts, setup: InitializeServerOptions) -> i32 {
+pub fn dispatch(opts: &GlobalOpts, mut setup: InitializeServerOptions) -> i32 {
     debug_assert!(interactive_settings_are_valid());
+    answers::reset();
+    if let Some(path) = setup.answers_file.clone() {
+        if let Err(error) = answers::load_into(&path, &mut setup) {
+            println!("error: {error}");
+            return 2;
+        }
+    }
     if !setup.yes && !setup.is_non_interactive() && !std::io::stdin().is_terminal() {
         println!(
             "error: ralphus initialize server needs a terminal to prompt interactively; pass --yes to accept every stage's default non-interactively"
@@ -401,6 +419,29 @@ pub fn dispatch(opts: &GlobalOpts, setup: InitializeServerOptions) -> i32 {
     step.begin("Submit a sample hello-world task (optional)");
     step_sample(opts, project.as_deref(), &health_results, &logins, &setup);
 
+    let answers_text = answers::render(&mut setup);
+    let answers_path = match answers::write(&answers_text) {
+        Ok(path) => path,
+        Err(error) => {
+            println!();
+            println!("error: could not save your answers: {error}");
+            return 1;
+        }
+    };
+    println!();
+    println!(
+        "here are your answers (saved to {}):",
+        answers_path.display()
+    );
+    println!("{answers_text}");
+    println!(
+        "  equivalent command: ralphus initialize server --answers-file {}",
+        answers_path.display()
+    );
+    println!(
+        "  note: tmux paths, MCP hosts, and project names/URLs may be specific to this machine; the forge token is not stored"
+    );
+
     println!();
     println!("setup complete.");
     0
@@ -428,46 +469,44 @@ impl Step {
 // ---- prompt helpers -------------------------------------------------------
 
 fn prompt(
-    _setting: &InitializeSetting,
+    setting: &InitializeSetting,
     question: &str,
     default: &str,
     supplied: Option<&String>,
     yes: bool,
 ) -> String {
-    if let Some(supplied) = supplied {
-        return supplied.clone();
-    }
-    if yes {
-        return default.to_string();
-    }
-    if default.is_empty() {
-        print!("{question}: ");
+    let (value, source) = if let Some(supplied) = supplied {
+        (supplied.clone(), answers::supplied_source(setting))
+    } else if yes {
+        (default.to_string(), Source::Default)
     } else {
-        print!("{question} [{default}]: ");
-    }
-    let _ = std::io::stdout().flush();
-    let mut answer = String::new();
-    let _ = std::io::stdin().read_line(&mut answer);
-    let answer = answer.trim();
-    if answer.is_empty() {
-        default.to_string()
-    } else {
-        answer.to_string()
-    }
+        if default.is_empty() {
+            print!("{question}: ");
+        } else {
+            print!("{question} [{default}]: ");
+        }
+        let _ = std::io::stdout().flush();
+        let mut answer = String::new();
+        let _ = std::io::stdin().read_line(&mut answer);
+        let answer = answer.trim();
+        if answer.is_empty() {
+            (default.to_string(), Source::Default)
+        } else {
+            (answer.to_string(), Source::Prompt)
+        }
+    };
+    answers::record_str(setting, &value, source);
+    value
 }
 
-fn prompt_yes_no(
-    _setting: &InitializeSetting,
-    question: &str,
-    default: bool,
-    supplied: Option<bool>,
-    yes: bool,
-) -> bool {
+/// Asks a yes/no question and reports where the answer came from, without
+/// recording it (for callers whose answer is not a plain boolean setting).
+fn ask_yes_no(question: &str, default: bool, supplied: Option<bool>, yes: bool) -> (bool, Source) {
     if let Some(supplied) = supplied {
-        return supplied;
+        return (supplied, Source::Flag);
     }
     if yes {
-        return default;
+        return (default, Source::Default);
     }
     let hint = if default { "Y/n" } else { "y/N" };
     print!("{question} [{hint}] ");
@@ -475,10 +514,27 @@ fn prompt_yes_no(
     let mut answer = String::new();
     let _ = std::io::stdin().read_line(&mut answer);
     match answer.trim().to_ascii_lowercase().as_str() {
-        "y" | "yes" => true,
-        "n" | "no" => false,
-        _ => default,
+        "y" | "yes" => (true, Source::Prompt),
+        "n" | "no" => (false, Source::Prompt),
+        _ => (default, Source::Default),
     }
+}
+
+fn prompt_yes_no(
+    setting: &InitializeSetting,
+    question: &str,
+    default: bool,
+    supplied: Option<bool>,
+    yes: bool,
+) -> bool {
+    let (value, source) = ask_yes_no(question, default, supplied, yes);
+    let source = if source == Source::Flag {
+        answers::supplied_source(setting)
+    } else {
+        source
+    };
+    answers::record_bool(setting, value, source);
+    value
 }
 
 /// Reads a line for a secret (the forge personal access token) without ever
@@ -657,15 +713,22 @@ fn step_mcp(setup: &InitializeServerOptions) {
         println!("  skipped");
         return;
     }
+    answers::begin_list(&MCP_HOST);
     for host in detected {
         let selected = setup_mcp.map(|_| setup.mcp_hosts.iter().any(|candidate| candidate == host));
-        if prompt_yes_no(
-            &MCP_HOST,
+        let (chosen, source) = ask_yes_no(
             &format!("  set up ralphus MCP for {host}?"),
             true,
             selected,
             setup.yes,
-        ) {
+        );
+        let source = if source == Source::Flag {
+            answers::supplied_source(&MCP_HOST)
+        } else {
+            source
+        };
+        answers::record_list_item(&MCP_HOST, host, chosen, source);
+        if chosen {
             let code = crate::commands::mcp::initialize(host, None, false, true);
             if code == 0 {
                 println!("  {host}: done");
@@ -849,6 +912,13 @@ fn run_agent_logins(
     selection: Option<&str>,
     yes: bool,
 ) -> Vec<AgentLoginReport> {
+    if let Some(selection) = selection {
+        answers::record_str(
+            &AGENT_LOGINS,
+            selection,
+            answers::supplied_source(&AGENT_LOGINS),
+        );
+    }
     let mut reports = Vec::new();
     let mut candidates: Vec<(&dyn LoginProbe, String)> = Vec::new();
     for &probe in probes {
@@ -894,6 +964,7 @@ fn run_agent_logins(
     let answer = match selection {
         Some(answer) => answer.to_string(),
         None if yes => {
+            answers::record_str(&AGENT_LOGINS, "none", Source::Default);
             println!(
                 "  skipping logins (--yes); run the commands above yourself, or pass --agent-logins <claude,codex|all|none>"
             );
@@ -907,10 +978,16 @@ fn run_agent_logins(
                 .iter()
                 .map(|(probe, _)| probe.default_program())
                 .collect();
-            host.read_line(&format!(
+            let typed = host.read_line(&format!(
                 "  log in to which? ({}, all, or none) [none]:",
                 names.join(", ")
-            ))
+            ));
+            let (recorded, source) = match typed.trim() {
+                "" => ("none", Source::Default),
+                other => (other, Source::Prompt),
+            };
+            answers::record_str(&AGENT_LOGINS, recorded, source);
+            typed
         }
     };
     let chosen = select_logins(&answer, &candidates);
@@ -1451,12 +1528,20 @@ fn step_forge_token(opts: &GlobalOpts, user: Option<&str>, setup: &InitializeSer
         println!("  invalid forge host {host:?}: {error}");
         return;
     }
-    let token = setup.forge_token.clone().unwrap_or_else(|| {
-        prompt_secret(
-            &FORGE_TOKEN,
-            "  personal access token (never echoed back or logged by ralphus)",
-        )
-    });
+    let (token, token_source) = match (&setup.forge_token, answers::forge_token_from_env()) {
+        (Some(token), _) => (token.clone(), answers::supplied_source(&FORGE_TOKEN)),
+        (None, Some(token)) => (token, Source::Env),
+        (None, None) => (
+            prompt_secret(
+                &FORGE_TOKEN,
+                "  personal access token (never echoed back or logged by ralphus)",
+            ),
+            Source::Prompt,
+        ),
+    };
+    if !token.is_empty() {
+        answers::record_forge_token(&FORGE_TOKEN, token_source);
+    }
     if token.is_empty() {
         println!("  no token given; skipping (use `ralphus user set-forge-token` later)");
         return;
