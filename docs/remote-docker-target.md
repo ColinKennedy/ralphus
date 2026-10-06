@@ -206,6 +206,25 @@ container setting needs. Fixture state lives in `.docker-ssh-docker-target/` (gi
 port 2223. The host's inner Docker engine is privileged (docker-in-docker); this
 fixture is for local testing only.
 
+### Running the same tests against a real second machine
+
+The live tests address the machine only through the ssh alias
+`ralphus-docker-docker`, so a real host needs no code change — give that alias
+its own ssh config and run the suite against it:
+
+1. On the host (Linux, sshd, Docker, the ssh user able to run `docker`), create
+   the directory the tests bind-mount as the remote root, owned by the work
+   image's uid: `sudo install -d -o 10001 -g 10001 -m 0750 /srv/ralphus-work`.
+2. Put the work image there: build it where you like with
+   `docker build -f docker/remote-agent/Dockerfile -t ralphus-remote-agent:test .`
+   and `docker save ralphus-remote-agent:test | ssh <host> docker load`.
+3. Write an ssh config containing a `Host ralphus-docker-docker` entry (real
+   `HostName`/`User`/`IdentityFile`, and a `UserKnownHostsFile` pinned with
+   `ssh-keyscan`; the provider is always `BatchMode` + `StrictHostKeyChecking`).
+4. Point `RALPHUS_SSH_CONFIG_FILE` at it and run the two `nextest` commands
+   above. Latency, a flaky link, and a hardened Docker setup (locked-down
+   `docker` group, SELinux, rootless) are what this adds over the local fixture.
+
 ## What this fixture does not prove
 
 The Linux target covers platform-neutral provider behavior. It does not prove:
