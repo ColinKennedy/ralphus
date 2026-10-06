@@ -3693,6 +3693,12 @@ impl Store {
             // RAL-565: per-review default for auto-running manual checks. NULL
             // inherits the project/global default, which resolves to `false`.
             "ALTER TABLE guardians ADD COLUMN auto_run INTEGER",
+            // Per-review overrides of the global `[followup]` config: whether
+            // this review offers follow-up work when it merges, and whether an
+            // accepted follow-up squad starts at once. NULL inherits the
+            // global value, which resolves to `true` for both.
+            "ALTER TABLE guardians ADD COLUMN followup_enabled INTEGER",
+            "ALTER TABLE guardians ADD COLUMN followup_auto_start INTEGER",
             // RAL-562: write-once marker (epoch ms) of the first moment every
             // enabled branch was settled while the review was `in_review` --
             // the "review is ready" banner shows only for reviews carrying it.

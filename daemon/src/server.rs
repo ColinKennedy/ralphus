@@ -14065,6 +14065,20 @@ struct GuardianSettingsBody {
     /// default again.
     #[serde(default, deserialize_with = "deserialize_present")]
     rebuild_on: Option<Option<Vec<String>>>,
+    /// This review's own override of whether it offers follow-up work for
+    /// its `deferred` prophecies when it merges. Absent leaves it untouched,
+    /// a bool sets it, and an explicit `null` clears it so the review
+    /// inherits the global `[followup] enabled` again.
+    #[serde(default, deserialize_with = "deserialize_present")]
+    // ralphus[ignore-review-parity]: set on a live review only; the default lives in the global config's [followup] table, not in task files
+    followup_enabled: Option<Option<bool>>,
+    /// This review's own override of whether an accepted follow-up squad
+    /// starts at once; same absent/bool/`null` shape as
+    /// [`Self::followup_enabled`], inheriting the global `[followup]
+    /// auto_start`.
+    #[serde(default, deserialize_with = "deserialize_present")]
+    // ralphus[ignore-review-parity]: set on a live review only; the default lives in the global config's [followup] table, not in task files
+    followup_auto_start: Option<Option<bool>>,
 }
 
 /// Deserialize a field that distinguishes "absent" (`None`, via
@@ -14153,6 +14167,12 @@ struct GuardianDetailsBody {
     /// See [`GuardianSettingsBody::rebuild_on`].
     #[serde(default, deserialize_with = "deserialize_present")]
     rebuild_on: Option<Option<Vec<String>>>,
+    /// See [`GuardianSettingsBody::followup_enabled`].
+    #[serde(default, deserialize_with = "deserialize_present")]
+    followup_enabled: Option<Option<bool>>,
+    /// See [`GuardianSettingsBody::followup_auto_start`].
+    #[serde(default, deserialize_with = "deserialize_present")]
+    followup_auto_start: Option<Option<bool>>,
     /// Full desired squash membership: every project in this list gets
     /// squash turned ON, every other project in the review's
     /// [`crate::guardian::GuardianView::projects`] gets it turned OFF.
@@ -14674,6 +14694,16 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
             return store_error(&e);
         }
     }
+    if let Some(enabled) = req.followup_enabled {
+        if let Err(e) = store.set_guardian_followup_enabled(id, enabled) {
+            return store_error(&e);
+        }
+    }
+    if let Some(enabled) = req.followup_auto_start {
+        if let Err(e) = store.set_guardian_followup_auto_start(id, enabled) {
+            return store_error(&e);
+        }
+    }
     // RAL-213: every setting above is a plain DB column write that a running
     // merge never re-reads mid-flight -- restart it now so the new setting
     // actually takes effect on this build instead of only the next one.
@@ -15007,6 +15037,16 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
     }
     if let Some(events) = &req.rebuild_on {
         if let Err(e) = store.set_guardian_rebuild_on(id, events.as_deref()) {
+            return store_error(&e);
+        }
+    }
+    if let Some(enabled) = req.followup_enabled {
+        if let Err(e) = store.set_guardian_followup_enabled(id, enabled) {
+            return store_error(&e);
+        }
+    }
+    if let Some(enabled) = req.followup_auto_start {
+        if let Err(e) = store.set_guardian_followup_auto_start(id, enabled) {
             return store_error(&e);
         }
     }
@@ -31631,6 +31671,32 @@ remediation_attempts=1
         assert_eq!(r.status, 200);
         assert!(r.body.contains("\"proof_skip_auto_clean\":true"));
         assert!(r.body.contains("\"effective_proof_skip_auto_clean\":true"));
+    }
+
+    #[test]
+    fn guardian_settings_sets_and_clears_the_follow_up_overrides() {
+        let d = daemon();
+        let gid = make_guardian(&d);
+        let path = format!("/api/guardians/{gid}/settings");
+        let r = route(&d, "GET", &format!("/api/guardians/{gid}"), "");
+        assert!(r.body.contains("\"followup_enabled\":null"));
+        assert!(r.body.contains("\"effective_followup_auto_start\":true"));
+
+        let body = serde_json::json!({"followup_enabled": false, "followup_auto_start": false});
+        let r = route(&d, "POST", &path, &body.to_string());
+        assert_eq!(r.status, 200);
+        let g = d.lock().get_guardian(&gid).unwrap();
+        assert_eq!(g.followup_enabled, Some(false));
+        assert!(!g.effective_followup_enabled);
+        assert!(!g.effective_followup_auto_start);
+
+        // Absent leaves a field alone; an explicit null clears it to inherit.
+        let body = serde_json::json!({"followup_enabled": null});
+        let r = route(&d, "POST", &path, &body.to_string());
+        assert_eq!(r.status, 200);
+        let g = d.lock().get_guardian(&gid).unwrap();
+        assert_eq!(g.followup_enabled, None);
+        assert_eq!(g.followup_auto_start, Some(false));
     }
 
     #[test]

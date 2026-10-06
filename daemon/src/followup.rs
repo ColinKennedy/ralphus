@@ -172,20 +172,31 @@ impl Store {
     /// Offers follow-up work for the `deferred` prophecies of a review that
     /// just merged. Returns whether an offer was sent.
     ///
-    /// Sends nothing -- and records nothing -- when the project turned offers
-    /// off, when the `[followup]` config is invalid, when the review is already at the configured follow-up depth, or
-    /// when it wrote no `deferred` prophecy. Once a row exists the review
+    /// Sends nothing -- and records nothing -- when offers are off for this
+    /// review (its own `followup_enabled` override, else the global
+    /// `[followup] enabled`), when the `[followup]` config is invalid, when
+    /// the review is already at the configured follow-up depth, or when it
+    /// wrote no `deferred` prophecy. Once a row exists the review
     /// never offers again, so reopening it and re-merging is silent.
     pub fn maybe_offer_followups(&self, guardian_id: &str) -> Result<bool> {
+        self.maybe_offer_followups_with(guardian_id, &crate::config::global_followup_config())
+    }
+
+    /// [`Self::maybe_offer_followups`] against an explicit global `[followup]`
+    /// config, so tests need not touch the process-wide config file.
+    fn maybe_offer_followups_with(
+        &self,
+        guardian_id: &str,
+        config: &crate::config::FollowupConfig,
+    ) -> Result<bool> {
         if self.get_followup_offer(guardian_id)?.is_some() {
             return Ok(false);
         }
         let guardian = self.get_guardian(guardian_id)?;
-        let config = crate::config::load_followup_config(Path::new(&guardian.git_root));
-        if !config.enabled() {
+        if !guardian.effective_followup_enabled {
             return Ok(false);
         }
-        if let Err(error) = config.validate() {
+        if let Err(error) = config.validate(true) {
             crate::cartographer::Note::new("followup")
                 .level(crate::logging::LogLevel::WARNING)
                 .scope("followup")
@@ -687,9 +698,8 @@ fn submit_followup_squad(
         ));
     }
     let root = Path::new(&guardian.git_root);
-    let config = crate::config::load_followup_config(root);
     let base = resolve_followup_base(root, &guardian.base_branch);
-    let started = config.auto_start();
+    let started = guardian.effective_followup_auto_start;
     let body = serde_json::json!({
         "toml": draft_followup_toml(&project, guardian, &base, &offer.items),
         "hold": !started,
@@ -713,6 +723,7 @@ fn submit_followup_squad(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::FollowupConfig;
 
     fn item(body: &str, prompt: Option<&str>) -> FollowupItem {
         FollowupItem {
@@ -750,8 +761,7 @@ mod tests {
         Store::open_in_memory().unwrap()
     }
 
-    /// A review whose git root is a throwaway directory, so a test can drop a
-    /// `.ralphus.toml` next to it.
+    /// A review whose git root is a throwaway directory.
     fn seed_guardian(s: &Store, id: &str, root: &Path) {
         s.conn
             .execute(
@@ -854,15 +864,58 @@ mod tests {
     }
 
     #[test]
-    fn a_project_can_turn_offers_off() {
+    fn a_review_can_turn_offers_off() {
         use crate::prophecy::ProphecyKind;
         let s = store();
         let root = temp_root("off");
-        std::fs::write(root.join(".ralphus.toml"), "[followup]\nenabled = false\n").unwrap();
         seed_guardian(&s, "g1", &root);
+        s.set_guardian_followup_enabled("g1", Some(false)).unwrap();
         defer(&s, "g1", ProphecyKind::Deferred, "later");
         merge(&s, "g1");
         assert!(s.get_followup_offer("g1").unwrap().is_none());
+
+        // Clearing the override inherits the global default, which is on.
+        s.set_guardian_followup_enabled("g1", None).unwrap();
+        assert!(
+            s.maybe_offer_followups_with("g1", &FollowupConfig::default())
+                .unwrap()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_review_can_turn_offers_on_when_the_global_config_has_them_off() {
+        use crate::prophecy::ProphecyKind;
+        let s = store();
+        let root = temp_root("on");
+        seed_guardian(&s, "g1", &root);
+        s.set_guardian_followup_enabled("g1", Some(true)).unwrap();
+        defer(&s, "g1", ProphecyKind::Deferred, "later");
+        let off = FollowupConfig {
+            enabled: Some(false),
+            ..FollowupConfig::default()
+        };
+        assert!(s.maybe_offer_followups_with("g1", &off).unwrap());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn follow_up_settings_default_on_and_resolve_per_review() {
+        let s = store();
+        let root = temp_root("settings");
+        seed_guardian(&s, "g1", &root);
+        let g = s.get_guardian("g1").unwrap();
+        assert_eq!(g.followup_enabled, None);
+        assert_eq!(g.followup_auto_start, None);
+        assert!(g.effective_followup_enabled, "offers default on");
+        assert!(g.effective_followup_auto_start, "auto-start defaults on");
+
+        s.set_guardian_followup_auto_start("g1", Some(false))
+            .unwrap();
+        let g = s.get_guardian("g1").unwrap();
+        assert_eq!(g.followup_auto_start, Some(false));
+        assert!(!g.effective_followup_auto_start);
+        assert!(s.set_guardian_followup_enabled("nope", Some(true)).is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -905,9 +958,12 @@ mod tests {
             "the default cap of 1 offers nothing for a follow-up's own deferrals"
         );
 
-        // Raising the cap for the project lets the second generation offer.
-        std::fs::write(root.join(".ralphus.toml"), "[followup]\nmax_depth = 2\n").unwrap();
-        s.maybe_offer_followups("g2").unwrap();
+        // Raising the global cap lets the second generation offer.
+        let deeper = FollowupConfig {
+            max_depth: Some(2),
+            ..FollowupConfig::default()
+        };
+        s.maybe_offer_followups_with("g2", &deeper).unwrap();
         let offer = s
             .get_followup_offer("g2")
             .unwrap()
@@ -921,18 +977,23 @@ mod tests {
         use crate::prophecy::ProphecyKind;
         let s = store();
         let root = temp_root("invalid-config");
-        std::fs::write(root.join(".ralphus.toml"), "[followup]\nmax_depth = 0\n").unwrap();
         seed_guardian(&s, "g1", &root);
         defer(&s, "g1", ProphecyKind::Deferred, "later");
-        merge(&s, "g1");
+        let zero = FollowupConfig {
+            max_depth: Some(0),
+            ..FollowupConfig::default()
+        };
         assert!(
-            s.get_followup_offer("g1").unwrap().is_none(),
+            !s.maybe_offer_followups_with("g1", &zero).unwrap(),
             "max_depth = 0 while enabled is rejected, so nothing is offered"
         );
+        assert!(s.get_followup_offer("g1").unwrap().is_none());
 
-        // Nothing was recorded, so fixing the config lets a later merge offer.
-        std::fs::write(root.join(".ralphus.toml"), "[followup]\nmax_depth = 1\n").unwrap();
-        assert!(s.maybe_offer_followups("g1").unwrap());
+        // Nothing was recorded, so a fixed config can still offer.
+        assert!(
+            s.maybe_offer_followups_with("g1", &FollowupConfig::default())
+                .unwrap()
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

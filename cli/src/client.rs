@@ -327,6 +327,17 @@ fn set_rebuild_on(obj: &mut Value, value: Option<Option<Vec<String>>>) {
     }
 }
 
+/// Insert a tri-state override: outer `None` omits the key (leave as-is),
+/// `Some(None)` sends JSON `null` (clear back to inherit), `Some(Some(v))`
+/// sends the value.
+fn set_tri_state<T: Into<Value>>(obj: &mut Value, key: &str, value: Option<Option<T>>) {
+    match value {
+        None => {}
+        Some(None) => obj[key] = Value::Null,
+        Some(Some(v)) => obj[key] = v.into(),
+    }
+}
+
 impl DaemonClient {
     // ---- health / validate / submit ------------------------------------
 
@@ -1853,6 +1864,12 @@ impl DaemonClient {
         set_if_some(&mut body, "skip_manual_checks", settings.skip_manual_checks);
         set_if_some(&mut body, "auto_run", settings.auto_run);
         set_rebuild_on(&mut body, settings.rebuild_on.clone());
+        set_tri_state(&mut body, "followup_enabled", settings.followup_enabled);
+        set_tri_state(
+            &mut body,
+            "followup_auto_start",
+            settings.followup_auto_start,
+        );
         self.post(
             &format!("/api/guardians/{guardian_id}/settings"),
             Some(body),
@@ -2414,6 +2431,14 @@ pub struct GuardianSettings<'a> {
     /// inherit (sent as JSON `null`), `Some(Some(list))` sets it (an empty list
     /// never rebuilds automatically).
     pub rebuild_on: Option<Option<Vec<String>>>,
+    /// Whether this review offers follow-up work for its `deferred`
+    /// prophecies when it merges. Outer `None` leaves it alone, `Some(None)`
+    /// clears the override back to the global `[followup] enabled` (sent as
+    /// JSON `null`), `Some(Some(b))` sets it.
+    pub followup_enabled: Option<Option<bool>>,
+    /// Whether an accepted follow-up squad starts at once; same shape as
+    /// [`Self::followup_enabled`], inheriting `[followup] auto_start`.
+    pub followup_auto_start: Option<Option<bool>>,
 }
 
 /// RAL-408: bundled optional fields for

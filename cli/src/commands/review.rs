@@ -142,6 +142,13 @@ pub enum ReviewCommand {
         /// it back to inherit, `Some(Some(list))` sets it (an empty list never
         /// rebuilds automatically).
         rebuild_on: Option<Option<Vec<String>>>,
+        /// This review's own follow-up offer override (`--followup
+        /// on|off|inherit`). Outer `None` leaves it alone, `Some(None)`
+        /// clears it back to the global `[followup] enabled`.
+        followup_enabled: Option<Option<bool>>,
+        /// This review's own follow-up auto-start override
+        /// (`--followup-auto-start on|off|inherit`), same shape.
+        followup_auto_start: Option<Option<bool>>,
     },
     /// Tear down and rebuild a settled review's prepared build now.
     Rebuild {
@@ -456,6 +463,15 @@ pub fn parse(args: &[String]) -> ReviewCommand {
                 Ok(value) => value,
                 Err(UsageError(message)) => return ReviewCommand::UsageError(message),
             };
+            let followup_auto_start =
+                match take_override_switch(&mut scanner, "--followup-auto-start") {
+                    Ok(value) => value,
+                    Err(UsageError(message)) => return ReviewCommand::UsageError(message),
+                };
+            let followup_enabled = match take_override_switch(&mut scanner, "--followup") {
+                Ok(value) => value,
+                Err(UsageError(message)) => return ReviewCommand::UsageError(message),
+            };
             with_selector(scanner, |selector| ReviewCommand::Settings {
                 selector,
                 skip_auto_build,
@@ -479,6 +495,8 @@ pub fn parse(args: &[String]) -> ReviewCommand {
                 skip_manual_checks,
                 auto_run,
                 rebuild_on,
+                followup_enabled,
+                followup_auto_start,
             })
         }
         Some("rebuild") => with_selector(scanner, |selector| ReviewCommand::Rebuild { selector }),
@@ -670,6 +688,24 @@ pub(crate) fn take_rebuild_on(
 /// `argparse.BooleanOptionalAction` (default `None`). `name` must be the
 /// positive spelling (e.g. `"--skip-auto-build"`); the negative form is
 /// derived by inserting `no-` after the leading `--`.
+/// Take an `<on|off|inherit>` override switch: `None` when the flag is
+/// absent, `Some(None)` for `inherit` (clear the override), `Some(Some(b))`
+/// for `on`/`off`.
+pub(crate) fn take_override_switch(
+    scanner: &mut Scanner,
+    name: &str,
+) -> Result<Option<Option<bool>>, UsageError> {
+    match scanner.take_value(name)?.as_deref() {
+        None => Ok(None),
+        Some("on") => Ok(Some(Some(true))),
+        Some("off") => Ok(Some(Some(false))),
+        Some("inherit") => Ok(Some(None)),
+        Some(other) => Err(UsageError(format!(
+            "{name}: expected on, off, or inherit, got {other:?}"
+        ))),
+    }
+}
+
 pub(crate) fn take_tri_bool(scanner: &mut Scanner, name: &str) -> Option<bool> {
     let neg = format!("--no-{}", &name[2..]);
     let mut result = None;
@@ -1457,6 +1493,8 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
             skip_manual_checks,
             auto_run,
             rebuild_on,
+            followup_enabled,
+            followup_auto_start,
         } => run_and_report(opts, None, || {
             let resolved = resolve_guardian_selector(&client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
             let settings = GuardianSettings {
@@ -1481,6 +1519,8 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
                 skip_manual_checks,
                 auto_run,
                 rebuild_on,
+                followup_enabled,
+                followup_auto_start,
             };
             let result = client.guardian_settings(&resolved.guardian_id, &settings)?;
             emit(opts, &result, |_| println!("{selector} settings updated"));
@@ -3263,6 +3303,43 @@ mod tests {
             } => assert_eq!(cache_manual_checks, None),
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_settings_follow_up_switches() {
+        let of = |args: &[&str]| match parse(&v(args)) {
+            ReviewCommand::Settings {
+                followup_enabled,
+                followup_auto_start,
+                ..
+            } => (followup_enabled, followup_auto_start),
+            other => panic!("unexpected: {other:?}"),
+        };
+        assert_eq!(of(&["settings", "g1"]), (None, None));
+        assert_eq!(
+            of(&[
+                "settings",
+                "g1",
+                "--followup",
+                "off",
+                "--followup-auto-start",
+                "on"
+            ]),
+            (Some(Some(false)), Some(Some(true)))
+        );
+        assert_eq!(
+            of(&[
+                "settings",
+                "g1",
+                "--followup-auto-start=inherit",
+                "--followup=on"
+            ]),
+            (Some(Some(true)), Some(None))
+        );
+        assert!(matches!(
+            parse(&v(&["settings", "g1", "--followup", "maybe"])),
+            ReviewCommand::UsageError(_)
+        ));
     }
 
     #[test]

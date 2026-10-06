@@ -164,6 +164,8 @@ pub fn execute(cmd: ReviewCommand, client: &DaemonClient) -> ExecResult {
             skip_manual_checks,
             auto_run,
             rebuild_on,
+            followup_enabled,
+            followup_auto_start,
         } => {
             let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
             let settings = GuardianSettings {
@@ -188,6 +190,8 @@ pub fn execute(cmd: ReviewCommand, client: &DaemonClient) -> ExecResult {
                 skip_manual_checks,
                 auto_run,
                 rebuild_on,
+                followup_enabled,
+                followup_auto_start,
             };
             Ok(client.guardian_settings(&resolved.guardian_id, &settings)?)
         }

@@ -1908,6 +1908,19 @@ submissions via a `ralphus:new-review/<key>` link is one review, so its first
 generation (from whichever submission built its branches first) is what
 sticks.
 
+`followup_enabled` and `followup_auto_start` (boolean or `null`, both
+default `true`) are this review's own overrides of the global [`[followup]`
+config](#follow-up-offer-configuration): whether the review offers follow-up
+work for its `deferred` prophecies when it merges, and whether an accepted
+follow-up squad starts at once instead of being created held. An absent field
+is left alone, a boolean sets it, and an explicit `null` clears it so the
+review inherits the global value again. They are set on a live review only
+(this endpoint, `.../details`, `ralphus review settings --followup
+on|off|inherit` / `--followup-auto-start on|off|inherit`, or the board's
+review Setup dialog), not in task files or `.ralphus.toml`. The review shows
+them as `followup_enabled`/`followup_auto_start` (`null` when inheriting) and
+`effective_followup_enabled`/`effective_followup_auto_start` (resolved).
+
 `skip_manual_checks` (boolean, default `false`) turns manual-check generation
 off for a review: when it is effectively `true` the daemon never asks the
 agent to propose commands from the diff, on the initial merge or on any later
@@ -2904,7 +2917,7 @@ and sends one mailbox message (event kind `review_followup_offered`). A review
 offers **at most once**, ever: reopening it and merging again sends nothing.
 
 `404` when no offer exists: the review has not merged with any `deferred`
-prophecy, offers are off for its project, or it is at the follow-up depth cap.
+prophecy, offers are off for it, or it is at the follow-up depth cap.
 Otherwise `200` with `status` (`offered`, `accepted` or `declined`), the
 snapshotted `items` (`prophecy_id`, `entity_uri`, `body`, `prompt`, `agent`,
 `model`), `depth`, and — once accepted — `squad_id` and `waypoint_id`.
@@ -2916,7 +2929,9 @@ its prompt the deferred note plus the original prompt as context, started on
 the same agent and model — and submits it through the ordinary submit path, so
 every submit preflight applies. The squad is based on the branch the review
 merged into, or on the remote's default branch when that branch no longer
-exists. It is created **held** unless `auto_start` is on (see below).
+exists. It starts at once unless auto-start is off for the review (its own
+`followup_auto_start`, else the global `auto_start`), in which case it is
+created **held**.
 
 It also creates a blocking **waypoint** explaining the follow-up: the merged
 review is on its roster and the squad is its affected entry, answered
@@ -2934,20 +2949,24 @@ Declines an open offer; nothing is created. `409` if it was already answered.
 
 ### Follow-up offer configuration
 
-Settings live in a `[followup]` table of the global config, overridable per
-project in `.ralphus.toml` (the project value wins field by field):
+Defaults live in a `[followup]` table of the global config only; a project's
+`.ralphus.toml` does not set them. Each review can override `enabled` and
+`auto_start` for itself through `followup_enabled`/`followup_auto_start` on
+[`POST /api/guardians/{id}/settings`](#post-apiguardiansidsettings); the
+review's own value wins over the global one.
 
 ```toml
 [followup]
-enabled = true    # offer follow-up work at all (default true)
-max_depth = 1     # generations of follow-up offered (default 1)
-auto_start = false  # start an accepted follow-up squad at once (default false)
+enabled = true     # offer follow-up work at all (default true)
+max_depth = 1      # generations of follow-up offered (default 1)
+auto_start = true  # start an accepted follow-up squad at once (default true)
 ```
 
 `max_depth` counts generations: a review of ordinary work is generation 0 and
 the review of a follow-up squad is generation 1, so the default `1` never
-offers follow-ups for a follow-up's own deferrals. While `enabled` is on,
-`max_depth` must be at least `1`; use `enabled = false` to turn offers off.
+offers follow-ups for a follow-up's own deferrals. While offers are on for a
+review, `max_depth` must be at least `1`; use `enabled = false` (or the
+review's `followup_enabled`) to turn offers off.
 An invalid `[followup]` config sends no offer and logs a warning instead.
 
 ### `GET /api/pull-requests`

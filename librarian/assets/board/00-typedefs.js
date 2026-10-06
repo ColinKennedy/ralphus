@@ -426,6 +426,10 @@
        * @property {boolean|null} [skip_manual_checks] - this review's own override for whether manual-check generation is skipped; null = inherit the project default.
        * @property {boolean|null} [auto_run] - this review's own override for whether ready manual checks run automatically after their build succeeds; null = inherit the project default.
        * @property {boolean} [effective_auto_run] - `auto_run` resolved against the project/global defaults (false when nothing sets it).
+       * @property {boolean|null} [followup_enabled] - this review's own override for whether it offers follow-up work for its deferred prophecies when it merges; null = inherit the global [followup] enabled.
+       * @property {boolean} [effective_followup_enabled] - `followup_enabled` resolved against the global [followup] config (true when nothing sets it).
+       * @property {boolean|null} [followup_auto_start] - this review's own override for whether an accepted follow-up squad starts at once; null = inherit the global [followup] auto_start.
+       * @property {boolean} [effective_followup_auto_start] - `followup_auto_start` resolved against the global [followup] config (true when nothing sets it).
        * @property {boolean} [effective_skip_manual_checks] - `skip_manual_checks` resolved against the project/global defaults (false -- generation runs -- when nothing sets it).
        * @property {string[]|null} [rebuild_on] - this review's own explicit list of events that rebuild its prepared build -- any of "rebase", "feedback", "auto_fix"; `[]` = manual only; null = inherit the project default.
        * @property {string[]} [effective_rebuild_on] - `rebuild_on` resolved against the project/global defaults (all three triggers when nothing sets it).

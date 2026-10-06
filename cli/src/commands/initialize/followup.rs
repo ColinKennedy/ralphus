@@ -140,7 +140,8 @@ fn run(options: &ExerciseOptions) -> Result<(), String> {
     )?;
     step("the merge offered a follow-up for the deferred prophecy only");
 
-    // 4. Accepting drafts a held squad and a blocking waypoint.
+    // 4. Accepting drafts a squad that starts at once (auto-start is on by
+    //    default) and a blocking waypoint.
     let accepted = client
         .guardian_followup_accept(&review)
         .map_err(|e| format!("accepting the offer failed: {e}"))?;
@@ -160,8 +161,8 @@ fn run(options: &ExerciseOptions) -> Result<(), String> {
         &accepted,
     )?;
     expect(
-        accepted["started"] == false,
-        "the follow-up is held by default",
+        accepted["started"] == true,
+        "the follow-up starts at once by default",
         &accepted,
     )?;
     step("accepting created a follow-up squad and a waypoint");
@@ -191,11 +192,7 @@ fn run(options: &ExerciseOptions) -> Result<(), String> {
     )?;
     step("the waypoint lists the review as roster and the squad as blocking");
 
-    // 5. Held until started; started, it runs under the waypoint.
-    wait_for_squad_state(&exercise, &followup, "queued")?;
-    client
-        .activate_squad(&followup)
-        .map_err(|e| format!("could not start the follow-up squad: {e}"))?;
+    // 5. The follow-up runs under the waypoint.
     expect_done(&exercise, &followup)?;
     step("the follow-up squad ran to completion");
 
@@ -335,16 +332,6 @@ fn expect_done(exercise: &Exercise, squad: &str) -> Result<(), String> {
         return Ok(());
     }
     Err(format!("squad {squad} ended {state}, not done"))
-}
-
-fn wait_for_squad_state(exercise: &Exercise, squad: &str, want: &str) -> Result<(), String> {
-    poll(&format!("squad {squad} to be {want}"), || {
-        let state = exercise.client.squad(squad).map_err(|e| e.to_string())?["state"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-        Ok((state == want).then_some(()))
-    })
 }
 
 /// The first review that is not in `known`.
