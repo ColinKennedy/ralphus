@@ -3988,7 +3988,8 @@ pub(crate) fn resolve_remote_with_store(
     identity: Option<&str>,
 ) -> Result<ForgeClient, String> {
     resolve_remote_for_logged(root, remote_name, cfg, identity, &|host| {
-        stored_token_for_identity(&store.lock(), identity, host)
+        let guard = store.lock();
+        stored_token_for_identity(&guard, identity, host)
     })
 }
 
