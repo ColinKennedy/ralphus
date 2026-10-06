@@ -241,7 +241,7 @@ pub enum Command {
         options: initialize::exercise::ExerciseOptions,
     },
     InitializeFollowup {
-        options: initialize_exercise::ExerciseOptions,
+        options: initialize::exercise::ExerciseOptions,
     },
     Project(project::ProjectCommand),
     Machine(machine::MachineCommand),
