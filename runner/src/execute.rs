@@ -35,7 +35,7 @@ const PROOF_SYSTEM_PROMPT: &str = "This is a PROOF step, not a normal task. Inve
 /// proof with a resolved `pass_score`): the 1-10 score replaces the
 /// PASS/FAIL verdict. Mirrored byte-for-byte by the daemon's
 /// `APPRAISAL_SYSTEM_PROMPT`.
-const APPRAISAL_SYSTEM_PROMPT: &str = "This is a PROOF step, not a normal task. Investigate the work being judged \
+const APPRAISAL_SYSTEM_PROMPT: &str = "You are appraising work, not performing a normal task. Investigate the work being judged \
      and appraise it; do not modify files unless your instructions say to. \
      When you are done, end your reply with the exact marker \
      'RALPHUS_APPRAISAL:' followed by one JSON object, and nothing after \

@@ -426,7 +426,7 @@ const PROOF_SYSTEM_PROMPT: &str = "This is a PROOF step, not a normal task. Inve
 /// Taught instead of [`PROOF_SYSTEM_PROMPT`] to a scored proof step (a prompt
 /// proof with a resolved `pass_score`). Must stay byte-identical to the
 /// runner's `APPRAISAL_SYSTEM_PROMPT` in `runner/src/execute.rs`.
-const APPRAISAL_SYSTEM_PROMPT: &str = "This is a PROOF step, not a normal task. Investigate the work being judged \
+const APPRAISAL_SYSTEM_PROMPT: &str = "You are appraising work, not performing a normal task. Investigate the work being judged \
      and appraise it; do not modify files unless your instructions say to. \
      When you are done, end your reply with the exact marker \
      'RALPHUS_APPRAISAL:' followed by one JSON object, and nothing after \
