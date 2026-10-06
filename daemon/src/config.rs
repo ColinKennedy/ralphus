@@ -1282,7 +1282,8 @@ pub struct FollowupConfig {
     /// How many generations of follow-up are offered: a review of ordinary
     /// work is generation 0 and a follow-up squad's review is generation 1,
     /// so the default `1` offers follow-ups for ordinary work only, never for
-    /// a follow-up's own deferrals. `0` offers nothing.
+    /// a follow-up's own deferrals. Must be at least `1` while follow-ups are
+    /// enabled (see [`Self::validate`]); `enabled = false` is the off switch.
     #[serde(default)]
     pub max_depth: Option<u32>,
     /// Whether an accepted follow-up squad starts running immediately
@@ -1309,6 +1310,21 @@ impl FollowupConfig {
     #[must_use]
     pub fn auto_start(&self) -> bool {
         self.auto_start.unwrap_or(false)
+    }
+
+    /// Validate the effective (already layered) config. While follow-ups are
+    /// enabled, `max_depth` must be at least `1`: `enabled = false` is the
+    /// one way to turn offers off, so a `0` cap is rejected rather than
+    /// acting as a second off switch.
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if self.enabled() && self.max_depth() == 0 {
+            return Err(
+                "[followup] max_depth must be at least 1 while follow-ups are enabled \
+                 (set enabled = false to turn follow-up offers off)"
+                    .to_string(),
+            );
+        }
+        Ok(())
     }
 
     /// `over` wins field by field; whatever it leaves unset falls through to
@@ -3778,13 +3794,38 @@ mod tests {
             std::env::temp_dir().join(format!("ralphus-cfg-followup-{}", std::process::id()));
         let nested = base.join("a").join("b");
         std::fs::create_dir_all(&nested).unwrap();
-        std::fs::write(base.join(".ralphus.toml"), "[followup]\nmax_depth = 0\n").unwrap();
+        std::fs::write(base.join(".ralphus.toml"), "[followup]\nmax_depth = 3\n").unwrap();
 
         let loaded = load_followup_config(&nested);
-        assert_eq!(loaded.max_depth, Some(0));
-        assert_eq!(loaded.max_depth(), 0);
+        assert_eq!(loaded.max_depth, Some(3));
+        assert_eq!(loaded.max_depth(), 3);
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn followup_config_validate_requires_a_positive_max_depth_while_enabled() {
+        assert!(FollowupConfig::default().validate().is_ok());
+        assert!(
+            followup_config_from_toml_str("[followup]\nmax_depth = 1\n")
+                .validate()
+                .is_ok()
+        );
+
+        let err = followup_config_from_toml_str("[followup]\nmax_depth = 0\n")
+            .validate()
+            .unwrap_err();
+        assert!(err.contains("max_depth must be at least 1"), "{err}");
+
+        // `enabled` defaults to true, so a bare `0` is rejected too, and so is
+        // a `0` that only appears once a project layer turns offers back on.
+        let global = followup_config_from_toml_str("[followup]\nenabled = false\nmax_depth = 0\n");
+        assert!(
+            global.clone().validate().is_ok(),
+            "disabled, so the cap is moot"
+        );
+        let local = followup_config_from_toml_str("[followup]\nenabled = true\n");
+        assert!(global.merge(local).validate().is_err());
     }
 
     // ── summary_format (RAL-124) ──────────────────────────────────────────

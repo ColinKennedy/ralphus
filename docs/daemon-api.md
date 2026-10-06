@@ -2946,7 +2946,9 @@ auto_start = false  # start an accepted follow-up squad at once (default false)
 
 `max_depth` counts generations: a review of ordinary work is generation 0 and
 the review of a follow-up squad is generation 1, so the default `1` never
-offers follow-ups for a follow-up's own deferrals. `0` offers nothing.
+offers follow-ups for a follow-up's own deferrals. While `enabled` is on,
+`max_depth` must be at least `1`; use `enabled = false` to turn offers off.
+An invalid `[followup]` config sends no offer and logs a warning instead.
 
 ### `GET /api/pull-requests`
 Look up the ralphus PR row for a given forge PR/MR (the PR → worktree

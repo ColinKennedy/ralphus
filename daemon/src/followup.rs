@@ -173,7 +173,7 @@ impl Store {
     /// just merged. Returns whether an offer was sent.
     ///
     /// Sends nothing -- and records nothing -- when the project turned offers
-    /// off, when the review is already at the configured follow-up depth, or
+    /// off, when the `[followup]` config is invalid, when the review is already at the configured follow-up depth, or
     /// when it wrote no `deferred` prophecy. Once a row exists the review
     /// never offers again, so reopening it and re-merging is silent.
     pub fn maybe_offer_followups(&self, guardian_id: &str) -> Result<bool> {
@@ -183,6 +183,21 @@ impl Store {
         let guardian = self.get_guardian(guardian_id)?;
         let config = crate::config::load_followup_config(Path::new(&guardian.git_root));
         if !config.enabled() {
+            return Ok(false);
+        }
+        if let Err(error) = config.validate() {
+            crate::cartographer::Note::new("followup")
+                .level(crate::logging::LogLevel::WARNING)
+                .scope("followup")
+                .guardian(guardian_id)
+                .emit(
+                    self,
+                    format!(
+                        "review {guardian_id}: invalid [followup] config, no follow-up offered: \
+                         {error}"
+                    ),
+                    serde_json::json!({"error": error}),
+                );
             return Ok(false);
         }
         let depth = self.followup_depth_of_review(guardian_id)?;
@@ -898,6 +913,26 @@ mod tests {
             .unwrap()
             .expect("allowed at depth 2");
         assert_eq!(offer.depth, 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_invalid_followup_config_offers_nothing() {
+        use crate::prophecy::ProphecyKind;
+        let s = store();
+        let root = temp_root("invalid-config");
+        std::fs::write(root.join(".ralphus.toml"), "[followup]\nmax_depth = 0\n").unwrap();
+        seed_guardian(&s, "g1", &root);
+        defer(&s, "g1", ProphecyKind::Deferred, "later");
+        merge(&s, "g1");
+        assert!(
+            s.get_followup_offer("g1").unwrap().is_none(),
+            "max_depth = 0 while enabled is rejected, so nothing is offered"
+        );
+
+        // Nothing was recorded, so fixing the config lets a later merge offer.
+        std::fs::write(root.join(".ralphus.toml"), "[followup]\nmax_depth = 1\n").unwrap();
+        assert!(s.maybe_offer_followups("g1").unwrap());
         let _ = std::fs::remove_dir_all(&root);
     }
 
