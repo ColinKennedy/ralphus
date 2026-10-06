@@ -1676,6 +1676,54 @@ impl Store {
         Ok(n)
     }
 
+    /// A cell or proof prompt (or system prompt) in this squad changed, so every
+    /// earlier judgement of what the squad does is out of date.
+    ///
+    /// Two things happen. A survey already running for the squad is invalidated,
+    /// so it drops its verdict instead of recording one for text that no longer
+    /// exists. And the daemon-recorded verdict on each *open* waypoint is
+    /// cleared, putting the squad back in the classifier's queue for the next
+    /// sweep -- the same thing [`Self::clear_auto_enrolled_survey_verdicts`]
+    /// does for a waypoint-wide resurvey, scoped to one squad. Human-declared
+    /// entries are left alone for the reason given there.
+    ///
+    /// A squad that has already finished is not re-queued: the sweep never
+    /// surveys a terminal squad, so clearing its verdict would only leave a
+    /// blocking-by-default entry nothing will ever resolve.
+    ///
+    /// Returns how many verdicts were cleared.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn reset_survey_for_squad(&self, squad_id: &str) -> StoreResult<usize> {
+        self.memory()
+            .invalidate_surveys(WaypointEntryKind::Squad.as_str(), squad_id);
+        if self.squad_state(squad_id)?.is_terminal() {
+            return Ok(0);
+        }
+        let cleared = self.conn.execute(
+            "UPDATE waypoint_affected
+             SET survey_verdict=NULL, survey_rationale=NULL, updated_at_ms=?
+             WHERE kind=? AND entry_id=? AND auto_enrolled=1
+               AND waypoint_id IN (SELECT id FROM waypoints WHERE state='open')",
+            params![now_ms(), WaypointEntryKind::Squad.as_str(), squad_id],
+        )?;
+        if cleared > 0 {
+            crate::cartographer::Note::new("waypoints")
+                .scope("waypoint")
+                .squad(squad_id)
+                .emit(
+                    self,
+                    format!(
+                        "squad {squad_id} prompt changed; {cleared} waypoint survey verdict(s) \
+                         cleared for re-survey"
+                    ),
+                    serde_json::json!({ "squad_id": squad_id, "cleared": cleared }),
+                );
+        }
+        Ok(cleared)
+    }
+
     /// Delivery-status counts for every waypoint at once, keyed by waypoint id.
     ///
     /// The list endpoint renders a progress meter per row, which previously
@@ -2635,9 +2683,32 @@ impl Store {
             let _ = write!(out, " (label: {label})");
         }
         out.push('\n');
-        for task in &squad.tasks {
+        // The system prompt a person wrote, not the effective one the cell view
+        // carries (that adds ralphus's own boilerplate). It can change how the
+        // work is carried out as much as the prompt does, so it is shown too.
+        let mut authored_system_prompts: BTreeMap<(usize, usize), String> = BTreeMap::new();
+        let mut stmt = self.conn.prepare(
+            "SELECT task_idx, idx, system_prompt FROM cells
+             WHERE squad_id=? AND system_prompt IS NOT NULL AND TRIM(system_prompt) != ''",
+        )?;
+        let rows = stmt
+            .query_map(params![squad_id], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+        for (task_idx, idx, text) in rows {
+            if let (Ok(task_idx), Ok(idx)) = (usize::try_from(task_idx), usize::try_from(idx)) {
+                authored_system_prompts.insert((task_idx, idx), text);
+            }
+        }
+        for (task_idx, task) in squad.tasks.iter().enumerate() {
             let _ = writeln!(out, "- task \"{}\" (project: {})", task.name, task.project);
-            for cell in &task.cells {
+            for (cell_idx, cell) in task.cells.iter().enumerate() {
                 let what = cell
                     .prompt
                     .as_deref()
@@ -2650,6 +2721,9 @@ impl Store {
                     .unwrap_or_else(|| "no prompt or command".to_string());
                 let name = cell.name.as_deref().unwrap_or(&cell.id);
                 let _ = writeln!(out, "  - cell \"{name}\" {what}");
+                if let Some(text) = authored_system_prompts.get(&(task_idx, cell_idx)) {
+                    let _ = writeln!(out, "    system prompt: {}", truncate_for_survey(text));
+                }
                 if let Some(cwd) = cell.cwd.as_deref().filter(|c| !c.trim().is_empty()) {
                     let _ = writeln!(out, "    cwd: {cwd}");
                 }
@@ -2961,6 +3035,10 @@ pub fn survey_candidate(
     waypoint_halts: &crate::cancel::WaypointHalts,
     runner: &Arc<dyn Runner>,
 ) -> StoreResult<SurveyVerdict> {
+    // Read before the work is described, so an edit landing any time after this
+    // point is seen below and the verdict for the superseded text is dropped.
+    let memory = store.lock_free_memory();
+    let generation = memory.survey_generation(candidate.kind.as_str(), &candidate.entry_id);
     let guard = store.lock();
     let waypoint = guard.get_waypoint(waypoint_id)?;
     // `enroll_affected_entry`, not `add_affected_entry`: a discovered candidate is
@@ -3020,6 +3098,32 @@ pub fn survey_candidate(
     let verdict = resolve_survey_verdict(call_result, waypoint.allow_advisory);
 
     let guard = store.lock();
+    // Checked under the store lock, the same one an edit holds while it bumps
+    // the generation, so an edit cannot slip between this check and the write.
+    if memory.survey_generation(candidate.kind.as_str(), &candidate.entry_id) != generation {
+        // Left unrecorded: the entry keeps its NULL verdict, so it is still a
+        // candidate and the next sweep judges the edited text.
+        let note = crate::cartographer::Note::new("waypoints").scope("waypoint");
+        let note = match candidate.kind {
+            WaypointEntryKind::Squad => note.squad(&candidate.entry_id),
+            WaypointEntryKind::Review => note.guardian(&candidate.entry_id),
+        };
+        note.emit(
+            &guard,
+            format!(
+                "waypoint {waypoint_id} survey of {} {} discarded: its prompt changed while the \
+                 survey was running",
+                candidate.kind.as_str(),
+                candidate.entry_id
+            ),
+            serde_json::json!({
+                "waypoint_id": waypoint_id,
+                "candidate_kind": candidate.kind.as_str(),
+                "candidate_id": candidate.entry_id,
+            }),
+        );
+        return Ok(verdict);
+    }
     guard.set_affected_survey_result(waypoint_id, candidate.kind, &candidate.entry_id, &verdict)?;
     // Tell the entity's watchers what the verdict means for them. Every branch
     // notifies, including the release: someone told their work was held needs
@@ -3113,8 +3217,26 @@ pub fn run_pending_surveys(
             .unwrap_or_default()
         };
         let total = candidates.len();
-        let taken = total.min(budget);
-        if taken < total {
+        // A candidate whose survey is still running from an earlier sweep is
+        // skipped without spending budget: a model call slower than the sweep
+        // interval must not be launched again, and must not crowd out the
+        // candidates behind it either.
+        let memory = store.lock_free_memory();
+        let mut claimed = Vec::new();
+        let mut examined = 0;
+        for candidate in candidates {
+            if claimed.len() >= budget {
+                break;
+            }
+            examined += 1;
+            if let Some(claim) =
+                memory.try_claim_survey(&waypoint_id, candidate.kind.as_str(), &candidate.entry_id)
+            {
+                claimed.push((candidate, claim));
+            }
+        }
+        let taken = claimed.len();
+        if examined < total {
             // Never let a cap look like completed coverage: say what was
             // deferred and why, since the deferred entries stay blocked (NULL
             // verdict) in the meantime and someone will want to know why.
@@ -3127,7 +3249,7 @@ pub fn run_pending_surveys(
                     format!(
                         "waypoint {waypoint_id} surveyed {taken} of {total} candidates this \
                          sweep; {} deferred to the next one",
-                        total - taken
+                        total - examined
                     ),
                     serde_json::json!({
                         "waypoint_id": waypoint_id,
@@ -3137,12 +3259,15 @@ pub fn run_pending_surveys(
                     }),
                 );
         }
-        for candidate in candidates.into_iter().take(taken) {
+        for (candidate, claim) in claimed {
             let store = std::sync::Arc::clone(store);
             let waypoint_id = waypoint_id.clone();
             let waypoint_halts = waypoint_halts.clone();
             let runner = Arc::clone(runner);
             std::thread::spawn(move || {
+                // Held for the whole survey; dropping it (even by panic) frees
+                // the slot for the next sweep.
+                let _claim = claim;
                 let result =
                     survey_candidate(&store, &waypoint_id, &candidate, &waypoint_halts, &runner);
                 if result.is_ok() {
@@ -8087,6 +8212,370 @@ mod tests {
             dispatched <= SURVEY_MAX_PER_SWEEP,
             "one sweep must never dispatch more than {SURVEY_MAX_PER_SWEEP}, got {dispatched}"
         );
+    }
+
+    /// An open waypoint whose classifier is a terminal agent, so a survey goes
+    /// through the injected `Runner` rather than a real chat API.
+    fn runner_waypoint(store: &Store, id: &str) {
+        store
+            .create_waypoint(
+                id,
+                None,
+                "greet() is being renamed",
+                Some("claude-code"),
+                None,
+                false,
+            )
+            .unwrap();
+    }
+
+    /// A survey that is still running from an earlier sweep must not be
+    /// launched a second time, and the guard must free itself when it ends.
+    #[test]
+    fn a_sweep_does_not_relaunch_a_survey_that_is_still_running() {
+        let store = Store::open_in_memory().unwrap();
+        runner_waypoint(&store, "waypoint-1");
+        insert_squad_with_cwd(&store, "squad-seed", "/repo");
+        store
+            .add_affected_entry(
+                "waypoint-1",
+                WaypointEntryKind::Squad,
+                "squad-seed",
+                AffectedMode::Block,
+            )
+            .unwrap();
+        insert_squad_with_cwd(&store, "squad-slow", "/repo");
+        let handle = handle(store);
+        let runner = SurveyTestRunner::new("IMPACTED: no\nRATIONALE: unrelated");
+        let as_runner: Arc<dyn Runner> = runner.clone();
+
+        let running = handle
+            .lock_free_memory()
+            .try_claim_survey("waypoint-1", "squad", "squad-slow")
+            .expect("nothing is running yet");
+        run_pending_surveys(&handle, &Cancellations::new(), &as_runner);
+        // The claim is taken before any thread is spawned, so a skipped
+        // candidate leaves nothing to wait for and this is final, not a race.
+        assert!(
+            runner.seen.lock().unwrap().is_empty(),
+            "a survey already in flight must not be dispatched again"
+        );
+
+        drop(running);
+        run_pending_surveys(&handle, &Cancellations::new(), &as_runner);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while runner.seen.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            runner.seen.lock().unwrap().len(),
+            1,
+            "once the earlier survey ends the candidate is surveyed again"
+        );
+    }
+
+    /// A runner that edits the squad's prompt while the survey is waiting on it,
+    /// standing in for a user editing a cell during a slow classifier call.
+    struct EditDuringSurveyRunner {
+        store: Arc<StoreMutex>,
+        squad_id: String,
+    }
+
+    impl crate::runner::Runner for EditDuringSurveyRunner {
+        fn run(&self, _spec: &crate::runner::RunnerSpec) -> crate::runner::RunnerResult {
+            self.store
+                .lock()
+                .reset_survey_for_squad(&self.squad_id)
+                .unwrap();
+            crate::runner::RunnerResult {
+                status: "done".to_string(),
+                summary: "IMPACTED: no\nRATIONALE: unrelated".to_string(),
+                error: None,
+                ..crate::runner::RunnerResult::failure("unused")
+            }
+        }
+    }
+
+    #[test]
+    fn a_survey_whose_prompt_changed_mid_flight_records_nothing() {
+        let store = Store::open_in_memory().unwrap();
+        runner_waypoint(&store, "waypoint-1");
+        insert_squad_with_cwd(&store, "squad-1", "/repo");
+        let handle = handle(store);
+        let as_runner: Arc<dyn Runner> = Arc::new(EditDuringSurveyRunner {
+            store: Arc::clone(&handle),
+            squad_id: "squad-1".to_string(),
+        });
+        let candidate = SurveyCandidate {
+            kind: WaypointEntryKind::Squad,
+            entry_id: "squad-1".to_string(),
+        };
+
+        survey_candidate(
+            &handle,
+            "waypoint-1",
+            &candidate,
+            &Cancellations::new(),
+            &as_runner,
+        )
+        .unwrap();
+
+        let guard = handle.lock();
+        let entry = guard
+            .list_affected_entries("waypoint-1")
+            .unwrap()
+            .into_iter()
+            .find(|e| e.entry_id == "squad-1")
+            .expect("the survey enrolled the squad before judging it");
+        assert_eq!(
+            entry.survey_verdict, None,
+            "a verdict for the old prompt must not be recorded"
+        );
+        assert!(
+            guard
+                .waypoint_survey_candidates("waypoint-1")
+                .unwrap()
+                .iter()
+                .any(|c| c.entry_id == "squad-1"),
+            "the squad stays a candidate so the next sweep judges the new prompt"
+        );
+    }
+
+    fn untouched_cell_edit() -> crate::store::CellEdit<'static> {
+        crate::store::CellEdit {
+            cwd: None,
+            agent: None,
+            model: None,
+            prompt: None,
+            command: None,
+            auto_compact_threshold: None,
+            maximum_context: None,
+            maximum_tool_output_tokens: None,
+            system_prompt: None,
+        }
+    }
+
+    #[test]
+    fn the_survey_description_shows_a_cells_authored_system_prompt() {
+        let store = Store::open_in_memory().unwrap();
+        insert_squad_with_cwd(&store, "squad-1", "/repo");
+        assert!(
+            !store
+                .describe_squad_for_survey("squad-1")
+                .unwrap()
+                .contains("system prompt:"),
+            "a cell with no system prompt has nothing to show"
+        );
+
+        store
+            .edit_cell_fields(
+                "squad-1",
+                0,
+                0,
+                &crate::store::CellEdit {
+                    system_prompt: Some(Some("never touch the greet module")),
+                    ..untouched_cell_edit()
+                },
+            )
+            .unwrap();
+
+        let description = store.describe_squad_for_survey("squad-1").unwrap();
+        assert!(
+            description.contains("system prompt: never touch the greet module"),
+            "the authored system prompt must reach the classifier: {description}"
+        );
+        assert!(
+            !description.contains("ralphus"),
+            "only what the author wrote, not the generated effective prompt: {description}"
+        );
+    }
+
+    fn record_not_impacted(store: &Store, entry_id: &str) {
+        store
+            .set_affected_survey_result(
+                "waypoint-1",
+                WaypointEntryKind::Squad,
+                entry_id,
+                &SurveyVerdict {
+                    impacted: false,
+                    mode: AffectedMode::Block,
+                    rationale: "unrelated".to_string(),
+                },
+            )
+            .unwrap();
+    }
+
+    fn verdict_of(store: &Store, entry_id: &str) -> Option<String> {
+        store
+            .list_affected_entries("waypoint-1")
+            .unwrap()
+            .into_iter()
+            .find(|e| e.entry_id == entry_id)
+            .expect("entry present")
+            .survey_verdict
+    }
+
+    #[test]
+    fn editing_a_cell_prompt_or_system_prompt_re_queues_the_squad() {
+        for edit in [
+            crate::store::CellEdit {
+                prompt: Some(Some("rewrite the farewell callers")),
+                ..untouched_cell_edit()
+            },
+            crate::store::CellEdit {
+                system_prompt: Some(Some("be terse")),
+                ..untouched_cell_edit()
+            },
+        ] {
+            let store = Store::open_in_memory().unwrap();
+            open_waypoint(&store, "waypoint-1");
+            insert_squad_with_cwd(&store, "squad-1", "/repo");
+            store
+                .enroll_affected_entry(
+                    "waypoint-1",
+                    WaypointEntryKind::Squad,
+                    "squad-1",
+                    AffectedMode::Block,
+                )
+                .unwrap();
+            record_not_impacted(&store, "squad-1");
+            assert!(
+                store
+                    .waypoint_survey_candidates("waypoint-1")
+                    .unwrap()
+                    .is_empty(),
+                "precondition: a judged squad is not asked about again"
+            );
+
+            store.edit_cell_fields("squad-1", 0, 0, &edit).unwrap();
+
+            assert_eq!(verdict_of(&store, "squad-1"), None);
+            assert!(
+                store
+                    .waypoint_survey_candidates("waypoint-1")
+                    .unwrap()
+                    .iter()
+                    .any(|c| c.entry_id == "squad-1"),
+                "the edit must put the squad back in the survey queue"
+            );
+        }
+    }
+
+    #[test]
+    fn editing_something_other_than_a_prompt_keeps_the_verdict() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_squad_with_cwd(&store, "squad-1", "/repo");
+        store
+            .enroll_affected_entry(
+                "waypoint-1",
+                WaypointEntryKind::Squad,
+                "squad-1",
+                AffectedMode::Block,
+            )
+            .unwrap();
+        record_not_impacted(&store, "squad-1");
+
+        store
+            .edit_cell_fields(
+                "squad-1",
+                0,
+                0,
+                &crate::store::CellEdit {
+                    model: Some(Some("haiku")),
+                    ..untouched_cell_edit()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            verdict_of(&store, "squad-1").as_deref(),
+            Some("not_impacted"),
+            "only a prompt or system prompt change invalidates the judgement"
+        );
+    }
+
+    #[test]
+    fn a_prompt_edit_spares_human_declared_entries_and_finished_squads() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_squad_with_cwd(&store, "squad-explicit", "/repo");
+        store
+            .add_affected_entry(
+                "waypoint-1",
+                WaypointEntryKind::Squad,
+                "squad-explicit",
+                AffectedMode::Block,
+            )
+            .unwrap();
+        record_not_impacted(&store, "squad-explicit");
+        insert_bare_squad(&store, "squad-done", SquadState::Done);
+        insert_bare_task(&store, "squad-done", 0, "core");
+        store
+            .enroll_affected_entry(
+                "waypoint-1",
+                WaypointEntryKind::Squad,
+                "squad-done",
+                AffectedMode::Block,
+            )
+            .unwrap();
+        record_not_impacted(&store, "squad-done");
+
+        assert_eq!(store.reset_survey_for_squad("squad-explicit").unwrap(), 0);
+        assert_eq!(store.reset_survey_for_squad("squad-done").unwrap(), 0);
+
+        assert_eq!(
+            verdict_of(&store, "squad-explicit").as_deref(),
+            Some("not_impacted"),
+            "an explicit declaration is never re-judged, so its verdict must stay"
+        );
+        assert_eq!(
+            verdict_of(&store, "squad-done").as_deref(),
+            Some("not_impacted"),
+            "the sweep never surveys a finished squad, so clearing would strand it"
+        );
+    }
+
+    #[test]
+    fn editing_a_proof_prompt_re_queues_the_squad() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_squad_with_cwd(&store, "squad-1", "/repo");
+        store
+            .conn
+            .execute(
+                "INSERT INTO proofs(squad_id, task_idx, scope, cell_idx, idx, vid, kind, state, spec)
+                 VALUES('squad-1', 0, 'cell', 0, 0, 'v0', 'prompt', 'pending', 'check it')",
+                [],
+            )
+            .unwrap();
+        store
+            .enroll_affected_entry(
+                "waypoint-1",
+                WaypointEntryKind::Squad,
+                "squad-1",
+                AffectedMode::Block,
+            )
+            .unwrap();
+        record_not_impacted(&store, "squad-1");
+
+        store
+            .edit_proof_fields(
+                "squad-1",
+                0,
+                "cell",
+                0,
+                0,
+                &crate::store::ProofEdit {
+                    agent: None,
+                    model: None,
+                    body: Some(crate::store::ProofBody::Prompt("check it more carefully")),
+                    maximum_tool_output_tokens: None,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(verdict_of(&store, "squad-1"), None);
     }
 
     #[test]

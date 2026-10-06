@@ -227,9 +227,9 @@ produced no pane output.
 **Waypoints (RAL-400)**
 | Method | Path | What |
 |---|---|---|
-| POST | `/api/waypoints` | [Create a waypoint](#waypoints-ral-400) with its initial roster (≥1 entry required) |
+| POST | `/api/waypoints` | [Create a waypoint](#waypoints-ral-400) with the work it lands on (`affected`, ≥1 entry required) and an optional completion `roster` |
 | GET | `/api/waypoints` | List every waypoint (bare array); `?state=open\|closed` and `?project=` filter |
-| GET | `/api/waypoints/{id}` | [One waypoint's full detail](#waypoints-ral-400): settings, roster, bearings |
+| GET | `/api/waypoints/{id}` | [One waypoint's full detail](#waypoints-ral-400): settings, affected, roster, bearings |
 | PATCH | `/api/waypoints/{id}` | [Update a waypoint's settings](#waypoints-ral-400): label, guidance prompt, survey agent/model, advisory policy |
 | GET | `/api/waypoints/{id}/resurvey-preview` | [What re-running the survey would act on](#waypoints-ral-400), resolved before anything changes |
 | POST | `/api/waypoints/{id}/roster` | Add to the [completion list](#waypoints-ral-400) — what must land for this waypoint to be carried out |
@@ -4024,7 +4024,7 @@ Examples: `task:squad-000000000001:0`, `cell:squad-000000000001:0:1`,
 `proof:squad-000000000001:0:cell:1:0`, `guardian:guardian-000000000001`,
 `waypoint:waypoint-000000000001`. `Waypoint` (like `Guardian`) is a leaf —
 it has no owning squad and covers only itself, not the squads/reviews on its
-roster; the board's `gotoEntityUri()` recognizes the `waypoint:` prefix
+affected list or roster; the board's `gotoEntityUri()` recognizes the `waypoint:` prefix
 alongside `squad:`/`guardian:` to jump straight to a waypoint's detail pane
 (see [Waypoints (RAL-400)](#waypoints-ral-400) below).
 
@@ -4554,11 +4554,18 @@ polling this endpoint sees them no matter which mode it's operating in.
 ## Waypoints (RAL-400)
 
 A **waypoint** is a cross-squad coordination join point: a named `prompt`
-plus a **roster** of squads and/or reviews that must (`block` mode) or may
-(`advisory` mode) check in before the waypoint is considered settled. A
-waypoint's tracked **projects** are inferred entirely from its roster (by
-resolving each roster entry's own squad/review scope), so creation requires
-at least one roster entry.
+plus two lists that must not be confused:
+
+- **affected** — the work *downstream* of the waypoint, which it lands on.
+  Each entry is `block` (held until the roster has landed) or `advisory`
+  (never held; it just receives the waypoint's guidance).
+- **roster** — the completion list: the work whose landing *is* the waypoint
+  being carried out. It only comes into play for `block`-mode affected work,
+  which waits on it. Advisory work never does.
+
+A waypoint's tracked **projects** are inferred from its affected entries (by
+resolving each entry's own squad/review scope), so creation requires at least
+one affected entry.
 
 #### `POST /api/waypoints`
 ```json
@@ -4568,18 +4575,22 @@ at least one roster entry.
   "agent": null,
   "model": null,
   "allow_advisory": true,
-  "roster": [
+  "affected": [
     { "kind": "squad", "entry_id": "squad-000000000042", "mode": "block" },
     { "kind": "review", "entry_id": "guardian-000000000007" }
+  ],
+  "roster": [
+    { "kind": "squad", "entry_id": "squad-000000000001", "note": "the rename itself" }
   ]
 }
 ```
-`prompt` and a non-empty `roster` (≥1 entry) are required; `label`, `agent`,
-`model` are optional; `allow_advisory` defaults to `false`. Each roster
-entry's `kind` must be `"review"` or `"squad"`, `entry_id` must be
-non-empty, and `mode` (optional, defaults to `"block"`) must be `"block"` or
-`"advisory"` — any violation is `400 bad_request`. On success: `201
-{"id": "waypoint-..."}`, and every roster entry's own watchers (the squad's
+`prompt` and a non-empty `affected` (≥1 entry) are required; `roster`,
+`label`, `agent`, `model` are optional; `allow_advisory` defaults to `false`.
+Each affected entry's `kind` must be `"review"` or `"squad"`, `entry_id` must
+be non-empty, and `mode` (optional, defaults to `"block"`) must be `"block"`
+or `"advisory"`; each roster entry takes `kind`, `entry_id` and an optional
+`note` and no `mode` — any violation is `400 bad_request`. On success: `201
+{"id": "waypoint-..."}`, and every affected entry's own watchers (the squad's
 `squad:{id}` watchers or the review's `guardian:{id}` watchers) get an
 ordinary `Normal`-priority mailbox notice that a waypoint now tracks them
 (not a failure/remediation notice — see `notify_watchers_with_context` vs.
@@ -4597,7 +4608,8 @@ filter; an invalid `state` value is `400 bad_request`.
     "state": "open",
     "allow_advisory": true,
     "projects": ["ralphus"],
-    "roster_count": 2,
+    "affected_count": 2,
+    "delivery_summary": { "undelivered": 1, "delivered": 1, "via_restack": 0, "failed": 0 },
     "created_at_ms": 1732999999000,
     "updated_at_ms": 1733000500000,
     "closed_at_ms": null
@@ -4606,7 +4618,7 @@ filter; an invalid `state` value is `400 bad_request`.
 ```
 
 #### `GET /api/waypoints/{id}`
-The full `WaypointDetail`: settings, roster, inferred projects, and a
+The full `WaypointDetail`: settings, affected, roster, inferred projects, and a
 delivery-status rollup. `prompt` is passed through
 `ralphus_core::redact::redact_secrets` before it leaves the daemon, the same
 as every other user-authored content field. `404 not_found` for an unknown
@@ -4624,7 +4636,7 @@ id.
   "updated_at_ms": 1733000500000,
   "closed_at_ms": null,
   "projects": ["ralphus"],
-  "roster": [
+  "affected": [
     {
       "waypoint_id": "waypoint-000000000003",
       "kind": "squad",
@@ -4638,17 +4650,27 @@ id.
       "updated_at_ms": 1732999999000
     }
   ],
+  "roster": [
+    {
+      "waypoint_id": "waypoint-000000000003",
+      "kind": "squad",
+      "entry_id": "squad-000000000001",
+      "note": "the rename itself",
+      "terminal": false,
+      "created_at_ms": 1732999999000
+    }
+  ],
   "delivery_summary": { "undelivered": 1, "delivered": 0, "via_restack": 0, "failed": 0 }
 }
 ```
-`roster[].kind`/`mode`/`delivery_status` all serialize with
+`affected[].kind`/`mode`/`delivery_status` all serialize with
 `#[serde(rename_all = "snake_case")]`. This matters for `delivery_status`
 specifically: its Rust `as_str()` (used for CLI/display text) renders the
 "delivered as part of an unrelated rebase, not a dedicated injection" state
 as the hyphenated `"via-restack"`, but its actual **JSON** value here (and
 everywhere else on the wire) is the underscored `"via_restack"` — match on
 the underscored form when consuming this API. Every other endpoint below
-that returns a waypoint (`roster` add/remove/patch, `close`, `reopen`)
+that returns a waypoint (`roster` and `affected` add/remove/patch, `close`, `reopen`)
 returns this same `WaypointDetail` shape, so a caller always sees the
 post-mutation state without a second `GET`.
 
@@ -4665,9 +4687,10 @@ defaults to `false` when omitted.
   "allow_advisory": true
 }
 ```
-Roster membership is deliberately **not** editable here — an entry carries
-its own mode, survey verdict and delivery state, so it has its own
-`roster` endpoints rather than being replaced wholesale by a settings save.
+Roster and affected membership are deliberately **not** editable here — an
+affected entry carries its own mode, survey verdict and delivery state, so
+each list has its own endpoints rather than being replaced wholesale by a
+settings save.
 
 Editing `prompt` does **not** clear survey verdicts on its own. An entry the
 survey has already judged keeps that verdict, so rewording guidance can never
@@ -4767,37 +4790,37 @@ not_found` if that entry is not on the list. Returns the updated
 `WaypointDetail`.
 
 #### `POST /api/waypoints/{id}/affected`
-Add a roster entry, or update an existing one's `mode` (same underlying
+Add an affected entry, or update an existing one's `mode` (same underlying
 upsert as `PATCH .../affected/{entry_id}`).
 ```json
 { "kind": "squad", "entry_id": "squad-000000000099", "mode": "advisory" }
 ```
 `kind`/`entry_id`/`mode` validate exactly like `POST /api/waypoints`'s
-roster entries (`mode` optional, defaults to `"block"`). Returns the
+affected entries (`mode` optional, defaults to `"block"`). Returns the
 waypoint's `WaypointDetail`; a nonexistent `id` surfaces as `404 not_found`
 from the `get_waypoint` lookup used to build that response.
 
 #### `DELETE /api/waypoints/{id}/affected/{entry_id}`
-Remove one roster entry (`kind` is inferred from `entry_id`'s prefix —
+Remove one affected entry (`kind` is inferred from `entry_id`'s prefix —
 `squad-...` vs. `guardian-...` — so no `kind` query parameter is needed).
-`404 not_found` if `entry_id` isn't on this waypoint's roster. Returns the
+`404 not_found` if `entry_id` isn't on this waypoint's affected list. Returns the
 updated `WaypointDetail`.
 
 #### `PATCH /api/waypoints/{id}/affected/{entry_id}`
-A human override of a roster entry's block/advisory mode (e.g. overruling
+A human override of an affected entry's block/advisory mode (e.g. overruling
 the survey's own verdict) — never touches that entry's `survey_verdict`/
 `survey_rationale`.
 ```json
 { "mode": "advisory" }
 ```
 `mode` must be `"block"` or `"advisory"`; `404 not_found` if `entry_id`
-isn't on this waypoint's roster. Returns the updated `WaypointDetail`.
+isn't on this waypoint's affected list. Returns the updated `WaypointDetail`.
 
 #### `POST /api/waypoints/{id}/close` / `POST /api/waypoints/{id}/reopen`
 Manual lifecycle overrides — no request body. `close` works regardless of
-whether every roster entry has reached a terminal delivery state yet (a
-waypoint also closes itself automatically once every `block`-mode entry has
-delivered). Both return the updated `WaypointDetail`.
+whether every affected entry has reached a terminal delivery state yet (a
+waypoint also closes itself automatically once its roster has landed and every
+`block`-mode affected entry has delivered). Both return the updated `WaypointDetail`.
 
 #### `POST /api/waypoints/{id}/bearings`
 Append a bearing: a durable, auditable record of guidance or completed work
@@ -4896,15 +4919,15 @@ than one), and such an effect appears under each of them.
 ]
 ```
 
-**Injection into cell/proof prompts.** A rostered squad's cells and proof
+**Injection into cell/proof prompts.** An affected squad's cells and proof
 steps receive their waypoint's current bearings as coordination context
 (rendered by `crate::waypoints::render_bearing_block`, prepended to the
 cell's prompt the same way RAL-136 ghost context is), alongside a static,
 always-present system-prompt section explaining what a bearing is and is
 not. See "Cross-squad waypoint bearings" in
 [`docs/special-syntax.md`](special-syntax.md) for the exact injected text
-and format. This same gating also drives squad scheduling: a rostered squad
-whose waypoint is still open halts each affected cell at `status:
+and format. This same gating also drives squad scheduling: a `block`-mode affected squad
+whose waypoint is still open and whose roster has not landed halts each cell at `status:
 "waypoint_halted"` rather than running it past an unresolved coordination
 point, auto-resuming once the waypoint closes — see
 [Squad lifecycle](#squad-lifecycle) above and
