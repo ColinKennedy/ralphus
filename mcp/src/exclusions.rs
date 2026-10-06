@@ -35,6 +35,10 @@ pub const EXCLUDED: &[(&[&str], &str)] = &[
         "See `initialize waypoint`'s exclusion reason -- the same isolated-daemon launch.",
     ),
     (
+        &["initialize", "followup"],
+        "See `initialize waypoint`'s exclusion reason -- the same isolated-daemon launch.",
+    ),
+    (
         &["mcp", "initialize"],
         "Chooses and writes a shell profile after an interactive path prompt, then presents a\
          confirmation before modifying the host configuration; those user-controlled local-file\

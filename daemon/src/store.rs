@@ -2678,6 +2678,26 @@ impl Store {
                 maximum_tool_output_tokens  INTEGER,
                 created_at_ms               INTEGER NOT NULL
             );
+            -- Post-merge follow-up offers (`crate::followup`): at most one row
+            -- per review, ever -- `guardian_id` is the primary key, so reopening
+            -- and re-merging a review can never offer a second time. `items` is
+            -- the JSON snapshot of the deferred prophecies (with each writing
+            -- cell's prompt) taken at offer time, since the prophecies outlive
+            -- their squad but the prompt does not. `depth` is the follow-up
+            -- generation of the review that triggered the offer; the squad an
+            -- accepted offer creates is generation `depth + 1`.
+            CREATE TABLE IF NOT EXISTS followup_offers (
+                guardian_id    TEXT PRIMARY KEY,
+                status         TEXT NOT NULL,
+                items          TEXT NOT NULL,
+                depth          INTEGER NOT NULL DEFAULT 0,
+                waypoint_id    TEXT,
+                squad_id       TEXT,
+                created_at_ms  INTEGER NOT NULL,
+                resolved_at_ms INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_followup_offers_squad
+                ON followup_offers(squad_id);
             ",
         )?;
         // RAL-318: the built-in `unclassified` Triage type always exists and
@@ -3673,6 +3693,12 @@ impl Store {
             // RAL-565: per-review default for auto-running manual checks. NULL
             // inherits the project/global default, which resolves to `false`.
             "ALTER TABLE guardians ADD COLUMN auto_run INTEGER",
+            // Per-review overrides of the global `[followup]` config: whether
+            // this review offers follow-up work when it merges, and whether an
+            // accepted follow-up squad starts at once. NULL inherits the
+            // global value, which resolves to `true` for both.
+            "ALTER TABLE guardians ADD COLUMN followup_enabled INTEGER",
+            "ALTER TABLE guardians ADD COLUMN followup_auto_start INTEGER",
             // RAL-562: write-once marker (epoch ms) of the first moment every
             // enabled branch was settled while the review was `in_review` --
             // the "review is ready" banner shows only for reviews carrying it.

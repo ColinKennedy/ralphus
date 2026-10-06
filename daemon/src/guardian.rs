@@ -897,6 +897,20 @@ pub struct GuardianView {
     /// [`Self::auto_run`] resolved against the project settings and global
     /// config -- always a plain `bool`, `false` when every layer is unset.
     pub effective_auto_run: bool,
+    /// This review's own override of whether it offers follow-up work for
+    /// its `deferred` prophecies when it merges. `None` inherits the global
+    /// `[followup] enabled`.
+    pub followup_enabled: Option<bool>,
+    /// [`Self::followup_enabled`] resolved against the global `[followup]
+    /// enabled` -- always a plain `bool`, `true` when both are unset.
+    pub effective_followup_enabled: bool,
+    /// This review's own override of whether an accepted follow-up squad
+    /// starts at once. `None` inherits the global `[followup] auto_start`.
+    pub followup_auto_start: Option<bool>,
+    /// [`Self::followup_auto_start`] resolved against the global
+    /// `[followup] auto_start` -- always a plain `bool`, `true` when both are
+    /// unset.
+    pub effective_followup_auto_start: bool,
     /// This review's own list of events (`rebase`, `feedback`, `auto_fix`)
     /// that tear down and rebuild its prepared build. `None` means "inherit the
     /// project/global default" (resolved into [`Self::effective_rebuild_on`]
@@ -2878,6 +2892,14 @@ impl Store {
                 ) {
                     self.warn_status_side_effect(id, status, "auto-close waypoints", &e);
                 }
+                // Only a review whose PR/MR actually merged offers follow-up
+                // work: an approved or cancelled review never landed, so its
+                // deferred notes are not yet "later".
+                if status == GuardianStatus::Merged {
+                    if let Err(e) = self.maybe_offer_followups(id) {
+                        self.warn_status_side_effect(id, status, "offer follow-up work", &e);
+                    }
+                }
             }
             Ok(())
         }
@@ -3539,6 +3561,40 @@ impl Store {
     pub fn set_guardian_skip_manual_checks(&self, id: &str, enabled: Option<bool>) -> Result<()> {
         let n = self.conn.execute(
             "UPDATE guardians SET skip_manual_checks=?, updated_at_ms=? WHERE id=?",
+            params![enabled.map(i64::from), crate::store::now_ms(), id],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Set this review's own follow-up offer override (the settings
+    /// endpoint). `None` inherits the global `[followup] enabled`.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] when no such guardian exists.
+    pub fn set_guardian_followup_enabled(&self, id: &str, enabled: Option<bool>) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE guardians SET followup_enabled=?, updated_at_ms=? WHERE id=?",
+            params![enabled.map(i64::from), crate::store::now_ms(), id],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Set this review's own follow-up auto-start override (the settings
+    /// endpoint). `None` inherits the global `[followup] auto_start`.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] when no such guardian exists.
+    pub fn set_guardian_followup_auto_start(&self, id: &str, enabled: Option<bool>) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE guardians SET followup_auto_start=?, updated_at_ms=? WHERE id=?",
             params![enabled.map(i64::from), crate::store::now_ms(), id],
         )?;
         if n == 0 {
@@ -5438,7 +5494,7 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus, summary_format, base_shift_rebuild_attempts_by_project, rebuild_on, skip_manual_checks, auto_run
+                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus, summary_format, base_shift_rebuild_attempts_by_project, rebuild_on, skip_manual_checks, auto_run, followup_enabled, followup_auto_start
                   FROM guardians WHERE id=?", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
                 /*
                 "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus
@@ -5584,7 +5640,7 @@ impl Store {
     /// (`crate::store_pool`) can serve it without the writer lock.
     pub(crate) fn list_guardians_conn(conn: &Connection) -> Result<Vec<GuardianView>> {
         let mut stmt = conn.prepare(
-            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus, summary_format, base_shift_rebuild_attempts_by_project, rebuild_on, skip_manual_checks, auto_run
+            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus, summary_format, base_shift_rebuild_attempts_by_project, rebuild_on, skip_manual_checks, auto_run, followup_enabled, followup_auto_start
               FROM guardians ORDER BY created_at_ms DESC", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
         )?;
         let rows = stmt
@@ -5641,6 +5697,7 @@ impl Store {
         GuardianHydrationCtx {
             project_stamps: Self::load_all_project_stamps_conn(conn),
             live_global: crate::config::global_review_config(),
+            live_followup: crate::config::global_followup_config(),
             config_by_git_root,
             db_profiles,
         }
@@ -5727,6 +5784,8 @@ impl Store {
             rebuild_on: r.get(74)?,
             skip_manual_checks: r.get::<_, Option<i64>>(75)?.map(|v| v != 0),
             auto_run: r.get::<_, Option<i64>>(76)?.map(|v| v != 0),
+            followup_enabled: r.get::<_, Option<i64>>(77)?.map(|v| v != 0),
+            followup_auto_start: r.get::<_, Option<i64>>(78)?.map(|v| v != 0),
         })
     }
 
@@ -6166,6 +6225,17 @@ impl Store {
             .or(live_global.auto_run)
             .unwrap_or(false);
 
+        // Follow-up offers: per-review override > the live global
+        // `[followup]` config > on. No project layer.
+        let effective_followup_enabled = row
+            .followup_enabled
+            .or(ctx.live_followup.enabled)
+            .unwrap_or(true);
+        let effective_followup_auto_start = row
+            .followup_auto_start
+            .or(ctx.live_followup.auto_start)
+            .unwrap_or(true);
+
         // Which events rebuild the prepared build, layered the same way:
         // per-review override > database-backed project default > explicit
         // `.ralphus.toml [review]` value > the live global config > every
@@ -6291,6 +6361,10 @@ impl Store {
             effective_skip_manual_checks,
             auto_run: row.auto_run,
             effective_auto_run,
+            followup_enabled: row.followup_enabled,
+            effective_followup_enabled,
+            followup_auto_start: row.followup_auto_start,
+            effective_followup_auto_start,
             rebuild_on,
             effective_rebuild_on,
             manual_checks_cached: row.manual_checks_cached != 0,
@@ -6655,6 +6729,8 @@ struct GuardianHydrationCtx {
     /// The global config -- identical for every guardian regardless of
     /// `git_root`, so it is read once instead of once per guardian.
     live_global: crate::config::ReviewConfig,
+    /// The live global `[followup]` config, read once per hydration batch.
+    live_followup: crate::config::FollowupConfig,
     /// Per-`git_root`: `(the layered global+project+database config, the
     /// project-file-only config, this project's raw database-backed
     /// settings)` -- memoized so guardians sharing a repo (the common case)
@@ -6846,6 +6922,10 @@ struct GuardianRow {
     skip_manual_checks: Option<bool>,
     /// This review's own manual-check auto-run default. `None` inherits.
     auto_run: Option<bool>,
+    /// This review's own follow-up offer override. `None` inherits.
+    followup_enabled: Option<bool>,
+    /// This review's own follow-up auto-start override. `None` inherits.
+    followup_auto_start: Option<bool>,
 }
 
 #[cfg(test)]

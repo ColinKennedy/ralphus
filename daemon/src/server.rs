@@ -2184,6 +2184,13 @@ fn route_for_user(
         ("POST", ["api", "guardians", id, "approve"]) => guardian_approve(daemon, id),
         ("POST", ["api", "guardians", id, "cancel"]) => guardian_cancel(daemon, id),
         ("POST", ["api", "guardians", id, "reopen"]) => guardian_reopen(daemon, id),
+        ("GET", ["api", "guardians", id, "followup"]) => guardian_followup_show(daemon, id),
+        ("POST", ["api", "guardians", id, "followup", "accept"]) => {
+            guardian_followup_accept(daemon, id)
+        }
+        ("POST", ["api", "guardians", id, "followup", "decline"]) => {
+            guardian_followup_decline(daemon, id)
+        }
         // ralphus[ignore-endpoint-cli]: daemon-host GUI execution for manual checks; CLI `review checks run` is deliberately headless
         ("POST", ["api", "guardians", id, "run-manual-commands"]) => {
             guardian_run_manual_commands(daemon, id, body)
@@ -6478,7 +6485,7 @@ fn generate_cancel(daemon: &Daemon, id: &str) -> Reply {
     json(202, &serde_json::json!({}))
 }
 
-fn submit(daemon: &Daemon, body: &str, query: &str, user_header: Option<&str>) -> Reply {
+pub(crate) fn submit(daemon: &Daemon, body: &str, query: &str, user_header: Option<&str>) -> Reply {
     let Ok(req) = serde_json::from_str::<SubmitBody>(body) else {
         return error(
             400,
@@ -14058,6 +14065,20 @@ struct GuardianSettingsBody {
     /// default again.
     #[serde(default, deserialize_with = "deserialize_present")]
     rebuild_on: Option<Option<Vec<String>>>,
+    /// This review's own override of whether it offers follow-up work for
+    /// its `deferred` prophecies when it merges. Absent leaves it untouched,
+    /// a bool sets it, and an explicit `null` clears it so the review
+    /// inherits the global `[followup] enabled` again.
+    #[serde(default, deserialize_with = "deserialize_present")]
+    // ralphus[ignore-review-parity]: set on a live review only; the default lives in the global config's [followup] table, not in task files
+    followup_enabled: Option<Option<bool>>,
+    /// This review's own override of whether an accepted follow-up squad
+    /// starts at once; same absent/bool/`null` shape as
+    /// [`Self::followup_enabled`], inheriting the global `[followup]
+    /// auto_start`.
+    #[serde(default, deserialize_with = "deserialize_present")]
+    // ralphus[ignore-review-parity]: set on a live review only; the default lives in the global config's [followup] table, not in task files
+    followup_auto_start: Option<Option<bool>>,
 }
 
 /// Deserialize a field that distinguishes "absent" (`None`, via
@@ -14146,6 +14167,12 @@ struct GuardianDetailsBody {
     /// See [`GuardianSettingsBody::rebuild_on`].
     #[serde(default, deserialize_with = "deserialize_present")]
     rebuild_on: Option<Option<Vec<String>>>,
+    /// See [`GuardianSettingsBody::followup_enabled`].
+    #[serde(default, deserialize_with = "deserialize_present")]
+    followup_enabled: Option<Option<bool>>,
+    /// See [`GuardianSettingsBody::followup_auto_start`].
+    #[serde(default, deserialize_with = "deserialize_present")]
+    followup_auto_start: Option<Option<bool>>,
     /// Full desired squash membership: every project in this list gets
     /// squash turned ON, every other project in the review's
     /// [`crate::guardian::GuardianView::projects`] gets it turned OFF.
@@ -14667,6 +14694,16 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
             return store_error(&e);
         }
     }
+    if let Some(enabled) = req.followup_enabled {
+        if let Err(e) = store.set_guardian_followup_enabled(id, enabled) {
+            return store_error(&e);
+        }
+    }
+    if let Some(enabled) = req.followup_auto_start {
+        if let Err(e) = store.set_guardian_followup_auto_start(id, enabled) {
+            return store_error(&e);
+        }
+    }
     // RAL-213: every setting above is a plain DB column write that a running
     // merge never re-reads mid-flight -- restart it now so the new setting
     // actually takes effect on this build instead of only the next one.
@@ -15000,6 +15037,16 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
     }
     if let Some(events) = &req.rebuild_on {
         if let Err(e) = store.set_guardian_rebuild_on(id, events.as_deref()) {
+            return store_error(&e);
+        }
+    }
+    if let Some(enabled) = req.followup_enabled {
+        if let Err(e) = store.set_guardian_followup_enabled(id, enabled) {
+            return store_error(&e);
+        }
+    }
+    if let Some(enabled) = req.followup_auto_start {
+        if let Err(e) = store.set_guardian_followup_auto_start(id, enabled) {
             return store_error(&e);
         }
     }
@@ -17087,6 +17134,44 @@ fn guardian_cancel(daemon: &Daemon, id: &str) -> Reply {
 /// Reopen a `cancelled`, `merged`, or `approved` review (status →
 /// `collecting`) and immediately try a fresh merge pass if the daemon has
 /// capacity -- see [`crate::guardian_merge::reopen_guardian_merge`].
+/// `GET /api/guardians/{id}/followup`: the post-merge follow-up offer for a
+/// review (`crate::followup`), or 404 when none was ever sent.
+fn guardian_followup_show(daemon: &Daemon, id: &str) -> Reply {
+    let store = daemon.lock();
+    match store.get_followup_offer(id) {
+        Ok(Some(offer)) => json(200, &offer),
+        Ok(None) => error(
+            404,
+            "not_found",
+            "no follow-up offer exists for this review: it has not merged with any deferred \
+             prophecies, or offers are turned off for its project",
+            vec![],
+        ),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `POST /api/guardians/{id}/followup/accept`: drafts the follow-up squad and
+/// its waypoint from the offer.
+fn guardian_followup_accept(daemon: &Daemon, id: &str) -> Reply {
+    match crate::followup::accept_offer(daemon, id) {
+        Ok(result) => json(201, &result),
+        Err(crate::followup::AcceptError::Store(e)) => store_error(&e),
+        Err(crate::followup::AcceptError::Rejected { status, message }) => {
+            error(status, "followup_failed", &message, vec![])
+        }
+    }
+}
+
+/// `POST /api/guardians/{id}/followup/decline`: drops the offer.
+fn guardian_followup_decline(daemon: &Daemon, id: &str) -> Reply {
+    let store = daemon.lock();
+    match store.decline_followup_offer(id) {
+        Ok(offer) => json(200, &offer),
+        Err(e) => store_error(&e),
+    }
+}
+
 fn guardian_reopen(daemon: &Daemon, id: &str) -> Reply {
     let runner = guardian_agent_runner(daemon);
     crate::guardian_merge::reopen_guardian_merge(
@@ -20285,6 +20370,83 @@ mod tests {
             let _ = d.lock().create_user(&default_user);
         }
         d
+    }
+
+    /// A review with one `deferred` prophecy, merged so its follow-up offer
+    /// exists. `project` is what the review's `project` column holds.
+    fn merged_review_with_an_offer(d: &Daemon, id: &str, project: Option<&str>) {
+        let store = d.lock();
+        let root = std::env::temp_dir().join(format!("ralphus-route-followup-{id}"));
+        std::fs::create_dir_all(&root).unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO guardians(id, name, base_branch, git_root, status, created_at_ms, updated_at_ms, project)
+                 VALUES (?,'the review','main',?,'in_review',0,0,?)",
+                rusqlite::params![id, root.to_string_lossy(), project],
+            )
+            .unwrap();
+        store
+            .add_prophecy(
+                "guardian:ignored",
+                0,
+                crate::prophecy::ProphecyKind::Deferred,
+                "add the cache",
+                None,
+                None,
+                Some(id),
+            )
+            .unwrap();
+        store
+            .set_guardian_status(id, crate::guardian::GuardianStatus::Merged, None)
+            .unwrap();
+    }
+
+    #[test]
+    fn followup_routes_show_decline_and_refuse_a_second_answer() {
+        let d = daemon();
+        merged_review_with_an_offer(&d, "g-followup", Some("proj"));
+
+        let shown = route(&d, "GET", "/api/guardians/g-followup/followup", "");
+        assert_eq!(shown.status, 200, "{}", shown.body);
+        let offer: serde_json::Value = serde_json::from_str(&shown.body).unwrap();
+        assert_eq!(offer["status"], "offered");
+        assert_eq!(offer["items"][0]["body"], "add the cache");
+
+        let missing = route(&d, "GET", "/api/guardians/never-merged/followup", "");
+        assert_eq!(missing.status, 404);
+
+        let declined = route(&d, "POST", "/api/guardians/g-followup/followup/decline", "");
+        assert_eq!(declined.status, 200, "{}", declined.body);
+        let again = route(&d, "POST", "/api/guardians/g-followup/followup/decline", "");
+        assert_eq!(
+            again.status, 409,
+            "a declined offer cannot be answered twice"
+        );
+        let accept = route(&d, "POST", "/api/guardians/g-followup/followup/accept", "");
+        assert_eq!(accept.status, 409, "a declined offer cannot be accepted");
+    }
+
+    #[test]
+    fn accepting_without_a_registered_project_fails_and_leaves_the_offer_open() {
+        let d = daemon();
+        merged_review_with_an_offer(&d, "g-noproject", None);
+
+        let accept = route(&d, "POST", "/api/guardians/g-noproject/followup/accept", "");
+        assert_eq!(accept.status, 400, "{}", accept.body);
+        assert!(
+            accept.body.contains("ralphus project git"),
+            "{}",
+            accept.body
+        );
+
+        let shown = route(&d, "GET", "/api/guardians/g-noproject/followup", "");
+        let offer: serde_json::Value = serde_json::from_str(&shown.body).unwrap();
+        assert_eq!(
+            offer["status"], "offered",
+            "a failure before the squad exists must put the offer back"
+        );
+        assert!(offer["squad_id"].is_null());
     }
 
     /// Create a daemon without registering the default user. Useful for tests
@@ -31509,6 +31671,32 @@ remediation_attempts=1
         assert_eq!(r.status, 200);
         assert!(r.body.contains("\"proof_skip_auto_clean\":true"));
         assert!(r.body.contains("\"effective_proof_skip_auto_clean\":true"));
+    }
+
+    #[test]
+    fn guardian_settings_sets_and_clears_the_follow_up_overrides() {
+        let d = daemon();
+        let gid = make_guardian(&d);
+        let path = format!("/api/guardians/{gid}/settings");
+        let r = route(&d, "GET", &format!("/api/guardians/{gid}"), "");
+        assert!(r.body.contains("\"followup_enabled\":null"));
+        assert!(r.body.contains("\"effective_followup_auto_start\":true"));
+
+        let body = serde_json::json!({"followup_enabled": false, "followup_auto_start": false});
+        let r = route(&d, "POST", &path, &body.to_string());
+        assert_eq!(r.status, 200);
+        let g = d.lock().get_guardian(&gid).unwrap();
+        assert_eq!(g.followup_enabled, Some(false));
+        assert!(!g.effective_followup_enabled);
+        assert!(!g.effective_followup_auto_start);
+
+        // Absent leaves a field alone; an explicit null clears it to inherit.
+        let body = serde_json::json!({"followup_enabled": null});
+        let r = route(&d, "POST", &path, &body.to_string());
+        assert_eq!(r.status, 200);
+        let g = d.lock().get_guardian(&gid).unwrap();
+        assert_eq!(g.followup_enabled, None);
+        assert_eq!(g.followup_auto_start, Some(false));
     }
 
     #[test]

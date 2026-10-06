@@ -28,7 +28,7 @@ const PROPHECY_MARKER: &str = "RALPHUS_PROPHECY:";
 /// crate has no dependency on `ralphus-daemon`. A line naming any other
 /// kind is treated as malformed and dropped, the same way the daemon drops
 /// an unparseable `RALPHUS_EVENT:` payload rather than guessing.
-const KNOWN_KINDS: [&str; 4] = ["discovery", "decision", "hazard", "deferred"];
+const KNOWN_KINDS: [&str; 5] = ["discovery", "decision", "hazard", "deferred", "unconfirmed"];
 
 /// One `RALPHUS_PROPHECY:` marker found in the agent's reply -- the wire
 /// shape carried on `CellResult`/`RunnerResult.prophecies`.
@@ -129,6 +129,14 @@ mod tests {
             parse_prophecies("grep result: 42:RALPHUS_PROPHECY: hazard: prefixed, not standalone")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn parses_the_unconfirmed_kind() {
+        let markers =
+            parse_prophecies("RALPHUS_PROPHECY: unconfirmed: the regression test could not run");
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].kind, "unconfirmed");
     }
 
     #[test]

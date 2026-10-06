@@ -359,6 +359,36 @@ const REVIEW_CHECKS_CHILDREN: &[HelpNode] = &[
     ),
 ];
 
+const REVIEW_FOLLOWUP_CHILDREN: &[HelpNode] = &[
+    node(
+        "show",
+        &["selector [str]"],
+        &[],
+        "Show a merged review's follow-up offer: the deferred items it would turn into a follow-up squad, and its status.",
+        false,
+        true, // ("review", "followup", "show")
+        &[],
+    ),
+    node(
+        "accept",
+        &["selector [str]"],
+        &[],
+        "Accept a follow-up offer: draft a follow-up squad from the deferred items and create the waypoint that explains it. The squad starts at once unless auto-start is off for the review (`review settings --followup-auto-start`, else `[followup] auto_start`).",
+        false,
+        false,
+        &[],
+    ),
+    node(
+        "decline",
+        &["selector [str]"],
+        &[],
+        "Decline a follow-up offer; nothing is created and the review never offers again.",
+        false,
+        false,
+        &[],
+    ),
+];
+
 const REVIEW_ACTION_CHILDREN: &[HelpNode] = &[
     node(
         "list",
@@ -447,6 +477,15 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
         false,
         false,
         &[],
+    ),
+    node(
+        "followup",
+        &[],
+        &[],
+        "Follow-up work offered when a review merges with deferred prophecies.",
+        false,
+        false,
+        REVIEW_FOLLOWUP_CHILDREN,
     ),
     node(
         "reopen",
@@ -664,6 +703,8 @@ root is reset and its prepare steps run again.",
             "--skip-worktrees/--no-skip-worktrees",
             "--proof-scope [each_branch|final_branch|nothing]",
             "--rebuild-on [none|inherit|rebase|feedback|auto_fix...]",
+            "--followup [on|off|inherit]",
+            "--followup-auto-start [on|off|inherit]",
         ],
         "Update per-review opt-out settings.",
         false,
@@ -960,6 +1001,16 @@ const INITIALIZE_CHILDREN: &[HelpNode] = &[
         &[],
         &["--remote", "--state-dir [path]", "--stop"],
         "Launch an isolated daemon and create a disposable two-branch Guardian review fixture (held). --remote instead runs both branches and the review merge on a strict loopback machine through to in_review; --stop shuts the daemon down afterwards.",
+        false,
+        false,
+        &[],
+    ),
+    // ralphus[ignore-endpoint-cli]: launches an isolated local daemon and exercises several daemon endpoints as one guided scenario.
+    node(
+        "followup",
+        &[],
+        &["--remote", "--state-dir [path]", "--stop"],
+        "Launch an isolated daemon and run the deferred-prophecy follow-up flow with a stub agent: a review merges, offers follow-up work, the offer is accepted, and the drafted squad runs under its waypoint. Local only (--remote is refused); --stop shuts the daemon down afterwards.",
         false,
         false,
         &[],

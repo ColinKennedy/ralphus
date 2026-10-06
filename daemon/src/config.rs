@@ -1268,6 +1268,87 @@ pub fn load_commit_config(start: &Path) -> CommitConfig {
     }
 }
 
+/// Post-merge follow-up offers (`[followup]` table of the global config
+/// only): once a review merges, the daemon offers to turn the `deferred`
+/// prophecies its cells wrote into a follow-up squad (see `crate::followup`).
+/// Every field is `None` when unset; resolved callers use the accessors,
+/// which carry the defaults. A per-project `.ralphus.toml` does not set
+/// these: a review's own `followup_enabled`/`followup_auto_start` overrides,
+/// stored with the review, are the only layer above this one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct FollowupConfig {
+    /// Whether to offer follow-up work at all (unset resolves to `true`).
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// How many generations of follow-up are offered: a review of ordinary
+    /// work is generation 0 and a follow-up squad's review is generation 1,
+    /// so the default `1` offers follow-ups for ordinary work only, never for
+    /// a follow-up's own deferrals. Must be at least `1` wherever follow-ups
+    /// are enabled (see [`Self::validate`]).
+    #[serde(default)]
+    pub max_depth: Option<u32>,
+    /// Whether an accepted follow-up squad starts running immediately
+    /// (unset resolves to `true`; `false` creates it held, for the user to
+    /// start).
+    #[serde(default)]
+    pub auto_start: Option<bool>,
+}
+
+impl FollowupConfig {
+    /// Whether follow-up offers are on (unset resolves to `true`).
+    #[must_use]
+    pub fn enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+
+    /// The follow-up generation cap (unset resolves to `1`).
+    #[must_use]
+    pub fn max_depth(&self) -> u32 {
+        self.max_depth.unwrap_or(1)
+    }
+
+    /// Whether an accepted follow-up squad starts at once (unset resolves
+    /// to `true`).
+    #[must_use]
+    pub fn auto_start(&self) -> bool {
+        self.auto_start.unwrap_or(true)
+    }
+
+    /// Validate this config for a review whose follow-ups resolve to
+    /// `enabled` (the review's own override, else [`Self::enabled`]). While
+    /// enabled, `max_depth` must be at least `1`: `enabled = false` is the
+    /// one way to turn offers off, so a `0` cap is rejected rather than
+    /// acting as a second off switch.
+    pub fn validate(&self, enabled: bool) -> std::result::Result<(), String> {
+        if enabled && self.max_depth() == 0 {
+            return Err(
+                "[followup] max_depth must be at least 1 while follow-ups are enabled \
+                 (set enabled = false to turn follow-up offers off)"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Parse a `FollowupConfig` from the given TOML text; every field unset when
+/// the `[followup]` table is absent.
+#[must_use]
+pub fn followup_config_from_toml_str(s: &str) -> FollowupConfig {
+    parse_config_file(s).followup.unwrap_or_default()
+}
+
+/// The live global follow-up config: the global config file's `[followup]`
+/// table, read fresh on every call so an edit takes effect without a
+/// restart. Every field unset when there is no global config file.
+#[must_use]
+pub fn global_followup_config() -> FollowupConfig {
+    global_config_path()
+        .and_then(|p| read_config_text(&p))
+        .map(|s| followup_config_from_toml_str(&s))
+        .unwrap_or_default()
+}
+
 /// Parse an `ArbiterConfig` from the given TOML text; the default (`ollama`,
 /// no model override, unbounded budget) when the `[arbiter]` table is absent.
 #[must_use]
@@ -2549,6 +2630,8 @@ struct ConfigFile {
     #[serde(default)]
     commits: Option<CommitConfig>,
     #[serde(default)]
+    followup: Option<FollowupConfig>,
+    #[serde(default)]
     review: Option<ReviewConfig>,
     #[serde(default)]
     defaults: Option<ReviewConfig>,
@@ -3651,6 +3734,36 @@ mod tests {
         assert!(!loaded.add_coauthor());
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ── followup offers ──────────────────────────────────────────────────
+
+    #[test]
+    fn followup_config_defaults_offer_and_start() {
+        let c = FollowupConfig::default();
+        assert!(c.enabled());
+        assert_eq!(c.max_depth(), 1);
+        assert!(c.auto_start());
+        assert_eq!(followup_config_from_toml_str(""), c);
+    }
+
+    #[test]
+    fn followup_config_reads_every_field() {
+        let c = followup_config_from_toml_str(
+            "[followup]\nenabled = false\nmax_depth = 3\nauto_start = false\n",
+        );
+        assert!(!c.enabled());
+        assert_eq!(c.max_depth(), 3);
+        assert!(!c.auto_start());
+    }
+
+    #[test]
+    fn followup_config_validate_requires_a_positive_max_depth_while_enabled() {
+        assert!(FollowupConfig::default().validate(true).is_ok());
+        let zero = followup_config_from_toml_str("[followup]\nmax_depth = 0\n");
+        let err = zero.validate(true).unwrap_err();
+        assert!(err.contains("max_depth must be at least 1"), "{err}");
+        assert!(zero.validate(false).is_ok(), "disabled, so the cap is moot");
     }
 
     // ── summary_format (RAL-124) ──────────────────────────────────────────

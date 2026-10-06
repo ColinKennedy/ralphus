@@ -45,8 +45,13 @@ fi
 mkdir -p "$state_root"
 
 exercises="machine mailbox triage review waypoint"
+# `followup` is exempt from the exercise rules (cli/src/commands/initialize/
+# AGENTS.md), so it is not in EXERCISES, but it still runs here, locally only.
+exempt="followup"
 if [ -n "$only" ]; then
     exercises=$(echo "$only" | tr ',' ' ')
+else
+    exercises="$exercises $exempt"
 fi
 
 # Exercises resolve the loopback provider from the checkout they run in.
@@ -59,6 +64,11 @@ for name in $exercises; do
         [ "$mode" = remote ] && flag="--remote"
         # `machine` always runs remote; its local pass would repeat the same run.
         if [ "$name" = machine ] && [ "$mode" = local ]; then
+            continue
+        fi
+        # `followup` drives its review merge as a git fast-forward in the
+        # daemon's own checkout, so it has no remote variant.
+        if [ "$name" = followup ] && [ "$mode" = remote ]; then
             continue
         fi
         dir="$state_root/$name-$mode"

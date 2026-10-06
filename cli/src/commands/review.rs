@@ -142,6 +142,13 @@ pub enum ReviewCommand {
         /// it back to inherit, `Some(Some(list))` sets it (an empty list never
         /// rebuilds automatically).
         rebuild_on: Option<Option<Vec<String>>>,
+        /// This review's own follow-up offer override (`--followup
+        /// on|off|inherit`). Outer `None` leaves it alone, `Some(None)`
+        /// clears it back to the global `[followup] enabled`.
+        followup_enabled: Option<Option<bool>>,
+        /// This review's own follow-up auto-start override
+        /// (`--followup-auto-start on|off|inherit`), same shape.
+        followup_auto_start: Option<Option<bool>>,
     },
     /// Tear down and rebuild a settled review's prepared build now.
     Rebuild {
@@ -222,6 +229,7 @@ pub enum ReviewCommand {
     Branch(ReviewBranchCommand),
     Checks(ReviewChecksCommand),
     Action(ReviewActionCommand),
+    Followup(ReviewFollowupCommand),
     UsageError(String),
 }
 
@@ -337,6 +345,15 @@ pub enum ReviewChecksCommand {
 }
 
 #[derive(Debug, Clone)]
+pub enum ReviewFollowupCommand {
+    Help,
+    Show { selector: String },
+    Accept { selector: String },
+    Decline { selector: String },
+    UsageError(String),
+}
+
+#[derive(Debug, Clone)]
 pub enum ReviewActionCommand {
     Help,
     List {
@@ -446,6 +463,15 @@ pub fn parse(args: &[String]) -> ReviewCommand {
                 Ok(value) => value,
                 Err(UsageError(message)) => return ReviewCommand::UsageError(message),
             };
+            let followup_auto_start =
+                match take_override_switch(&mut scanner, "--followup-auto-start") {
+                    Ok(value) => value,
+                    Err(UsageError(message)) => return ReviewCommand::UsageError(message),
+                };
+            let followup_enabled = match take_override_switch(&mut scanner, "--followup") {
+                Ok(value) => value,
+                Err(UsageError(message)) => return ReviewCommand::UsageError(message),
+            };
             with_selector(scanner, |selector| ReviewCommand::Settings {
                 selector,
                 skip_auto_build,
@@ -469,6 +495,8 @@ pub fn parse(args: &[String]) -> ReviewCommand {
                 skip_manual_checks,
                 auto_run,
                 rebuild_on,
+                followup_enabled,
+                followup_auto_start,
             })
         }
         Some("rebuild") => with_selector(scanner, |selector| ReviewCommand::Rebuild { selector }),
@@ -599,6 +627,7 @@ pub fn parse(args: &[String]) -> ReviewCommand {
         Some("branch") => ReviewCommand::Branch(parse_branch(&scanner.remaining())),
         Some("checks") => ReviewCommand::Checks(parse_checks(&scanner.remaining())),
         Some("action") => ReviewCommand::Action(parse_action(&scanner.remaining())),
+        Some("followup") => ReviewCommand::Followup(parse_followup(&scanner.remaining())),
         Some(other) => ReviewCommand::UsageError(format!("unknown review subcommand: {other}")),
     }
 }
@@ -659,6 +688,24 @@ pub(crate) fn take_rebuild_on(
 /// `argparse.BooleanOptionalAction` (default `None`). `name` must be the
 /// positive spelling (e.g. `"--skip-auto-build"`); the negative form is
 /// derived by inserting `no-` after the leading `--`.
+/// Take an `<on|off|inherit>` override switch: `None` when the flag is
+/// absent, `Some(None)` for `inherit` (clear the override), `Some(Some(b))`
+/// for `on`/`off`.
+pub(crate) fn take_override_switch(
+    scanner: &mut Scanner,
+    name: &str,
+) -> Result<Option<Option<bool>>, UsageError> {
+    match scanner.take_value(name)?.as_deref() {
+        None => Ok(None),
+        Some("on") => Ok(Some(Some(true))),
+        Some("off") => Ok(Some(Some(false))),
+        Some("inherit") => Ok(Some(None)),
+        Some(other) => Err(UsageError(format!(
+            "{name}: expected on, off, or inherit, got {other:?}"
+        ))),
+    }
+}
+
 pub(crate) fn take_tri_bool(scanner: &mut Scanner, name: &str) -> Option<bool> {
     let neg = format!("--no-{}", &name[2..]);
     let mut result = None;
@@ -922,6 +969,26 @@ fn parse_terminal_mode(scanner: &mut Scanner) -> Result<String, String> {
             "--mode: invalid choice '{other}' (choose from 'open', 'readonly')"
         )),
         None => Ok("open".to_string()),
+    }
+}
+
+fn parse_followup(args: &[String]) -> ReviewFollowupCommand {
+    let scanner = Scanner::new(&args[1.min(args.len())..]);
+    let selector =
+        |make: fn(String) -> ReviewFollowupCommand| match scanner.remaining().into_iter().next() {
+            Some(selector) => make(selector),
+            None => ReviewFollowupCommand::UsageError(
+                "missing required <selector> argument".to_string(),
+            ),
+        };
+    match args.first().map(String::as_str) {
+        None | Some("help" | "--help" | "-h") => ReviewFollowupCommand::Help,
+        Some("show") => selector(|selector| ReviewFollowupCommand::Show { selector }),
+        Some("accept") => selector(|selector| ReviewFollowupCommand::Accept { selector }),
+        Some("decline") => selector(|selector| ReviewFollowupCommand::Decline { selector }),
+        Some(other) => ReviewFollowupCommand::UsageError(format!(
+            "unknown review followup subcommand: {other}"
+        )),
     }
 }
 
@@ -1426,6 +1493,8 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
             skip_manual_checks,
             auto_run,
             rebuild_on,
+            followup_enabled,
+            followup_auto_start,
         } => run_and_report(opts, None, || {
             let resolved = resolve_guardian_selector(&client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
             let settings = GuardianSettings {
@@ -1450,6 +1519,8 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
                 skip_manual_checks,
                 auto_run,
                 rebuild_on,
+                followup_enabled,
+                followup_auto_start,
             };
             let result = client.guardian_settings(&resolved.guardian_id, &settings)?;
             emit(opts, &result, |_| println!("{selector} settings updated"));
@@ -1682,6 +1753,7 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
         ReviewCommand::Branch(c) => dispatch_branch(c, opts, &client),
         ReviewCommand::Checks(c) => dispatch_checks(c, opts, &client),
         ReviewCommand::Action(c) => dispatch_action(c, opts, &client),
+        ReviewCommand::Followup(c) => dispatch_followup(c, opts, &client),
     }
 }
 
@@ -2098,6 +2170,61 @@ fn dispatch_branch_terminal(
         print_command_with_cwd(&cwd, &command_line, None)
     });
     0
+}
+
+fn dispatch_followup(cmd: ReviewFollowupCommand, opts: &GlobalOpts, client: &DaemonClient) -> i32 {
+    match cmd {
+        ReviewFollowupCommand::Help => {
+            println!(
+                "{}",
+                crate::help_map::command_help(&["review", "followup"])
+                    .expect("review followup help exists")
+            );
+            0
+        }
+        ReviewFollowupCommand::UsageError(m) => {
+            println!("usage error: {m}");
+            2
+        }
+        ReviewFollowupCommand::Show { selector } => run_and_report(opts, None, || {
+            let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
+            let offer = client.guardian_followup(&resolved.guardian_id)?;
+            emit(opts, &offer, |o| {
+                println!("{selector}: follow-up offer is {}", o["status"]);
+                for item in o["items"].as_array().into_iter().flatten() {
+                    println!("  - {}", item["body"].as_str().unwrap_or_default());
+                }
+                if let Some(squad) = o["squad_id"].as_str().filter(|s| !s.is_empty()) {
+                    println!("  squad {squad}, waypoint {}", o["waypoint_id"]);
+                }
+            });
+            Ok(())
+        }),
+        ReviewFollowupCommand::Accept { selector } => run_and_report(opts, None, || {
+            let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
+            let result = client.guardian_followup_accept(&resolved.guardian_id)?;
+            emit(opts, &result, |r| {
+                let state = if r["started"].as_bool().unwrap_or(false) {
+                    "started"
+                } else {
+                    "held; start it with `ralphus squad activate`"
+                };
+                println!(
+                    "{selector}: follow-up squad {} created ({state}), explained by waypoint {}",
+                    r["squad_id"], r["waypoint_id"]
+                );
+            });
+            Ok(())
+        }),
+        ReviewFollowupCommand::Decline { selector } => run_and_report(opts, None, || {
+            let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
+            let result = client.guardian_followup_decline(&resolved.guardian_id)?;
+            emit(opts, &result, |_| {
+                println!("{selector}: follow-up offer declined")
+            });
+            Ok(())
+        }),
+    }
 }
 
 fn dispatch_checks(cmd: ReviewChecksCommand, opts: &GlobalOpts, client: &DaemonClient) -> i32 {
@@ -3179,6 +3306,43 @@ mod tests {
     }
 
     #[test]
+    fn parses_settings_follow_up_switches() {
+        let of = |args: &[&str]| match parse(&v(args)) {
+            ReviewCommand::Settings {
+                followup_enabled,
+                followup_auto_start,
+                ..
+            } => (followup_enabled, followup_auto_start),
+            other => panic!("unexpected: {other:?}"),
+        };
+        assert_eq!(of(&["settings", "g1"]), (None, None));
+        assert_eq!(
+            of(&[
+                "settings",
+                "g1",
+                "--followup",
+                "off",
+                "--followup-auto-start",
+                "on"
+            ]),
+            (Some(Some(false)), Some(Some(true)))
+        );
+        assert_eq!(
+            of(&[
+                "settings",
+                "g1",
+                "--followup-auto-start=inherit",
+                "--followup=on"
+            ]),
+            (Some(Some(true)), Some(None))
+        );
+        assert!(matches!(
+            parse(&v(&["settings", "g1", "--followup", "maybe"])),
+            ReviewCommand::UsageError(_)
+        ));
+    }
+
+    #[test]
     fn parses_settings_skip_manual_checks_tri_state() {
         match parse(&v(&["settings", "g1", "--skip-manual-checks"])) {
             ReviewCommand::Settings {
@@ -3805,6 +3969,38 @@ mod tests {
             parse(&v(&["branch", "terminal", "g1~0", "--mode", "bogus"])),
             ReviewCommand::Branch(ReviewBranchCommand::UsageError(_))
         );
+    }
+
+    #[test]
+    fn parses_followup_subcommands() {
+        assert!(matches!(
+            parse(&v(&["followup", "show", "g1"])),
+            ReviewCommand::Followup(ReviewFollowupCommand::Show { .. })
+        ));
+        assert!(matches!(
+            parse(&v(&["followup", "accept", "g1"])),
+            ReviewCommand::Followup(ReviewFollowupCommand::Accept { .. })
+        ));
+        assert!(matches!(
+            parse(&v(&["followup", "decline", "g1"])),
+            ReviewCommand::Followup(ReviewFollowupCommand::Decline { .. })
+        ));
+        assert!(matches!(
+            parse(&v(&["followup"])),
+            ReviewCommand::Followup(ReviewFollowupCommand::Help)
+        ));
+    }
+
+    #[test]
+    fn followup_requires_a_selector_and_a_known_subcommand() {
+        assert!(matches!(
+            parse(&v(&["followup", "accept"])),
+            ReviewCommand::Followup(ReviewFollowupCommand::UsageError(_))
+        ));
+        assert!(matches!(
+            parse(&v(&["followup", "bogus"])),
+            ReviewCommand::Followup(ReviewFollowupCommand::UsageError(_))
+        ));
     }
 
     #[test]

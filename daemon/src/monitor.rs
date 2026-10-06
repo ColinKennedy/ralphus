@@ -66,6 +66,10 @@ pub enum NotifiableEventKind {
     /// `advisory` mode -- it is not held, but it is expected to take the
     /// guidance into account. Informational, so no remediation.
     WaypointAdvised,
+    /// A merged review wrote `deferred` prophecies, and ralphus is offering to
+    /// turn them into a follow-up squad (`crate::followup`). Informational:
+    /// the user answers it with `review followup accept`/`decline`.
+    ReviewFollowupOffered,
 }
 
 impl NotifiableEventKind {
@@ -86,6 +90,7 @@ impl NotifiableEventKind {
             Self::WaypointCreated => "waypoint_created",
             Self::WaypointBlocked => "waypoint_blocked",
             Self::WaypointAdvised => "waypoint_advised",
+            Self::ReviewFollowupOffered => "review_followup_offered",
         }
     }
 }
