@@ -160,7 +160,11 @@ fn exec_submit(client: &DaemonClient, args: misc::SubmitArgs) -> ExecResult {
         }
         if args.wait {
             if let Some(id) = &squad_id {
-                return Ok(wait_for_terminal(client, id)?);
+                let mut squad = wait_for_terminal(client, id)?;
+                if let (Some(obj), Some(w)) = (squad.as_object_mut(), result.get("warnings")) {
+                    obj.insert("warnings".to_string(), w.clone());
+                }
+                return Ok(squad);
             }
         }
         Ok(result)

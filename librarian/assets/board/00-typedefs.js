@@ -682,6 +682,7 @@
        * @property {number|null} maximum_context
        * @property {number|null} auto_compact_threshold
        * @property {number|null} maximum_tool_output_tokens
+       * @property {number|null} pass_score 1-10; stamped onto a prompt proof step only
        * @property {number} created_at_ms
        * @property {"db"|"disk"} source "disk" presets come from the daemon's `preset_paths` and are read-only
        * @property {string} [path] the file an on-disk preset was read from

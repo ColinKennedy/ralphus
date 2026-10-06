@@ -1200,6 +1200,11 @@ pub const COMMAND_MODE_REMEDIATING: &str = "remediating";
 /// `remediation_attempts` field permitted ("raw command").
 pub const COMMAND_MODE_RAW: &str = "raw";
 
+/// Lowest accepted `pass_score` (and appraisal score).
+pub const PASS_SCORE_MIN: u8 = 1;
+/// Highest accepted `pass_score` (and appraisal score).
+pub const PASS_SCORE_MAX: u8 = 10;
+
 /// Every accepted `mode` literal, in the order shown to a user.
 pub const COMMAND_MODE_VALUES: &[&str] = &[COMMAND_MODE_REMEDIATING, COMMAND_MODE_RAW];
 
@@ -1959,6 +1964,13 @@ pub struct ProofStep {
     /// override (RAL-290).
     #[serde(default)]
     pub prompt: Option<String>,
+    /// Minimum appraisal score (an integer from [`PASS_SCORE_MIN`] to
+    /// [`PASS_SCORE_MAX`]) a `prompt` proof must reach to pass. A proof step
+    /// with a resolved `pass_score` is a *scored proof*: its verdict is the
+    /// agent's score compared against this threshold. Only valid on a
+    /// `prompt` proof; a preset may supply it when left unset here.
+    #[serde(default)]
+    pub pass_score: Option<u8>,
     /// Backend override for this proof step (RAL-290). Falls back to the
     /// owning cell's resolved agent for a cell-scope step, or the task's for
     /// a task-scope one -- see [`ResolvedAgent::resolve`]/[`ResolvedAgent::from_task`].

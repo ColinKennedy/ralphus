@@ -21,6 +21,7 @@ pub enum PresetCommand {
         maximum_context: Option<u64>,
         auto_compact_threshold: Option<u64>,
         maximum_tool_output_tokens: Option<u64>,
+        pass_score: Option<u8>,
     },
     List,
     Get {
@@ -64,6 +65,10 @@ pub fn parse(args: &[String]) -> PresetCommand {
                     Ok(v) => v,
                     Err(e) => return PresetCommand::UsageError(e.0),
                 };
+            let pass_score = match scanner.take_parsed::<u8>("--pass-score") {
+                Ok(v) => v,
+                Err(e) => return PresetCommand::UsageError(e.0),
+            };
             match scanner.remaining().into_iter().next() {
                 Some(name) => PresetCommand::Register {
                     name,
@@ -73,6 +78,7 @@ pub fn parse(args: &[String]) -> PresetCommand {
                     maximum_context,
                     auto_compact_threshold,
                     maximum_tool_output_tokens,
+                    pass_score,
                 },
                 None => {
                     PresetCommand::UsageError("register requires a <name> argument".to_string())
@@ -124,6 +130,7 @@ pub fn dispatch(cmd: PresetCommand, opts: &GlobalOpts) -> i32 {
             maximum_context,
             auto_compact_threshold,
             maximum_tool_output_tokens,
+            pass_score,
         } => match client.register_preset(
             &name,
             prompt.as_deref(),
@@ -132,6 +139,7 @@ pub fn dispatch(cmd: PresetCommand, opts: &GlobalOpts) -> i32 {
             maximum_context,
             auto_compact_threshold,
             maximum_tool_output_tokens,
+            pass_score,
         ) {
             Ok(_) => {
                 println!("registered preset \"{name}\"");
@@ -217,6 +225,9 @@ fn render_preset_detail(p: &Value) {
     if let Some(v) = p["maximum_tool_output_tokens"].as_u64() {
         println!("maximum_tool_output_tokens: {v}");
     }
+    if let Some(v) = p["pass_score"].as_u64() {
+        println!("pass_score: {v}");
+    }
 }
 
 #[cfg(test)]
@@ -248,6 +259,8 @@ mod tests {
             "51000",
             "--maximum-tool-output-tokens",
             "8000",
+            "--pass-score",
+            "7",
             "easy_task",
         ])) {
             PresetCommand::Register {
@@ -258,7 +271,9 @@ mod tests {
                 maximum_context,
                 auto_compact_threshold,
                 maximum_tool_output_tokens,
+                pass_score,
             } => {
+                assert_eq!(pass_score, Some(7));
                 assert_eq!(name, "easy_task");
                 assert_eq!(
                     prompt.as_deref(),

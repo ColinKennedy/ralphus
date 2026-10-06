@@ -483,6 +483,12 @@ validation errors) if invalid. On success `201`:
 ```json
 { "squad_id": "squad-000000000001", "state": "pending" }
 ```
+When the submit-time preset stamp skipped something it was asked to apply
+(a preset's `pass_score` on a `command`/`brain` proof step, which is only
+valid on a `prompt` proof), the response also carries
+`"warnings": ["task[0].proof[1]: a preset in its `extends` supplies pass_score = 7, ..."]`.
+The key is omitted when there are none. The CLI prints each as a `warning:`
+line and the MCP `submit` tool returns the key in its result.
 
 ### `POST /api/projects`
 Register (or re-register, updating its fields) a project by name (RAL-100).
