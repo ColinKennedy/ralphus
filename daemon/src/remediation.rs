@@ -530,6 +530,7 @@ mod tests {
             retry_after_unknown_default_seconds:
                 crate::config::DEFAULT_RETRY_AFTER_UNKNOWN_DEFAULT_SECONDS,
             maximum_timeout: None,
+            pass_score: None,
         }
     }
 

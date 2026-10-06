@@ -149,6 +149,7 @@ impl Runner for CapturingRunner {
             ghost: None,
             turns: None,
             prophecies: Vec::new(),
+            appraisal: None,
         }
     }
 }

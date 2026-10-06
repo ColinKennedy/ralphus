@@ -14,7 +14,10 @@ use ralphus_core::schema::{ResolvedAgent, TaskFile};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, named_params, params};
 use serde::{Deserialize, Serialize};
 
-use crate::runner::{effective_cell_system_prompt, effective_proof_system_prompt};
+use crate::runner::{
+    effective_cell_system_prompt, effective_proof_system_prompt,
+    effective_proof_system_prompt_scored,
+};
 
 /// Ceiling, in bytes, that a checkpoint truncates the `-wal` sidecar back
 /// down to (`PRAGMA journal_size_limit`, applied in [`Store::open`]).
@@ -3563,6 +3566,10 @@ impl Store {
             "ALTER TABLE tasks ADD COLUMN maximum_timeout_sec INTEGER",
             "ALTER TABLE cells ADD COLUMN maximum_timeout_sec INTEGER",
             "ALTER TABLE proofs ADD COLUMN maximum_timeout_sec INTEGER",
+            // RAL-575: a scored `prompt` proof's resolved `pass_score`
+            // (NULL for every unscored step), read back by the scheduler to
+            // tell the runner to teach and decide the appraisal contract.
+            "ALTER TABLE proofs ADD COLUMN pass_score INTEGER",
             // RAL-308: a proof step's own wall-clock span, needed so its
             // contribution to its owning cell's/task's cumulative
             // `maximum_timeout_seconds` budget can be summed the same way
@@ -7323,8 +7330,17 @@ fn insert_proof(
     let maximum_timeout_sec = v
         .maximum_timeout_seconds
         .map(|s| i64::try_from(s).unwrap_or(i64::MAX));
+    // RAL-575: only a `prompt` proof can be scored.
+    let pass_score = if kind == "prompt" {
+        v.pass_score.map(i64::from)
+    } else {
+        None
+    };
     let effective_system_prompt = if kind == "prompt" {
-        Some(effective_proof_system_prompt(None))
+        Some(effective_proof_system_prompt_scored(
+            None,
+            pass_score.is_some(),
+        ))
     } else {
         None
     };
@@ -7341,8 +7357,8 @@ fn insert_proof(
         (None, None)
     };
     tx.execute(
-        "INSERT INTO proofs(squad_id, task_idx, scope, cell_idx, idx, vid, kind, spec, effective_system_prompt, model, agent, state, timeout_sec, maximum_timeout_sec, budget_tokens, maximum_tool_output_tokens, turns, env_overrides, mode, remediation_attempts)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO proofs(squad_id, task_idx, scope, cell_idx, idx, vid, kind, spec, effective_system_prompt, model, agent, state, timeout_sec, maximum_timeout_sec, budget_tokens, maximum_tool_output_tokens, turns, env_overrides, mode, remediation_attempts, pass_score)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         params![
             squad_id,
             task_idx,
@@ -7369,6 +7385,7 @@ fn insert_proof(
             to_json_map(&v.environment),
             mode,
             remediation_attempts,
+            pass_score,
         ],
     )?;
     Ok(())
@@ -7968,6 +7985,28 @@ impl Store {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// The resolved `pass_score` of one proof step; `None` for an unscored
+    /// step (or one that does not exist).
+    pub fn proof_pass_score(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        scope: &str,
+        cell_idx: i64,
+        idx: i64,
+    ) -> Result<Option<u8>> {
+        let score: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT pass_score FROM proofs WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=?",
+                params![squad_id, task_idx, scope, cell_idx, idx],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(score.and_then(|s| u8::try_from(s).ok()))
     }
 
     /// Fresh current state of one proof step (not a snapshot from
