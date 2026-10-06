@@ -223,6 +223,7 @@ fn git_config_write(cwd: &Path, args: &[&str]) -> std::result::Result<(), String
         match git(cwd, args) {
             Ok(_) => return Ok(()),
             Err(e) if attempt < ATTEMPTS && e.contains("could not lock config file") => {
+                // allow-lock-io: `_guard` is the config-writer mutex, not the store lock; holding it across this bounded retry (<= ~5s total) is what serializes the writers
                 std::thread::sleep(std::time::Duration::from_millis(25 * u64::from(attempt)));
                 attempt += 1;
             }
