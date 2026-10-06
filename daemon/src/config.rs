@@ -1289,13 +1289,13 @@ pub fn load_commit_config(start: &Path) -> CommitConfig {
     }
 }
 
-/// Post-merge follow-up offers (`[followup]` table of the global config
-/// only): once a review merges, the daemon offers to turn the `deferred`
-/// prophecies its cells wrote into a follow-up squad (see `crate::followup`).
-/// Every field is `None` when unset; resolved callers use the accessors,
-/// which carry the defaults. A per-project `.ralphus.toml` does not set
-/// these: a review's own `followup_enabled`/`followup_auto_start` overrides,
-/// stored with the review, are the only layer above this one.
+/// Post-merge follow-up offers (`[followup]` table of the global config or a
+/// project's `.ralphus.toml`): once a review merges, the daemon offers to
+/// turn the `deferred` prophecies its cells wrote into a follow-up squad (see
+/// `crate::followup`). Every field is `None` when unset; resolved callers use
+/// the accessors, which carry the defaults. A project's field wins over the
+/// global one, and a review's own `followup_enabled`/`followup_auto_start`
+/// overrides, stored with the review, win over both.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct FollowupConfig {
     /// Whether to offer follow-up work at all (unset resolves to `true`).
@@ -1368,6 +1368,28 @@ pub fn global_followup_config() -> FollowupConfig {
         .and_then(|p| read_config_text(&p))
         .map(|s| followup_config_from_toml_str(&s))
         .unwrap_or_default()
+}
+
+/// The `[followup]` table of the nearest project `.ralphus.toml` at or above
+/// `cwd`; every field unset when there is none.
+#[must_use]
+pub fn project_followup_config(cwd: &Path) -> FollowupConfig {
+    find_project_config(cwd)
+        .and_then(|p| read_config_text(&p))
+        .map(|s| followup_config_from_toml_str(&s))
+        .unwrap_or_default()
+}
+
+/// The follow-up config for a project: its `.ralphus.toml` `[followup]`
+/// fields over the given global ones, field by field.
+#[must_use]
+pub fn layered_followup_config(cwd: &Path, global: &FollowupConfig) -> FollowupConfig {
+    let project = project_followup_config(cwd);
+    FollowupConfig {
+        enabled: project.enabled.or(global.enabled),
+        max_depth: project.max_depth.or(global.max_depth),
+        auto_start: project.auto_start.or(global.auto_start),
+    }
 }
 
 /// Parse an `ArbiterConfig` from the given TOML text; the default (`ollama`,
@@ -3766,6 +3788,22 @@ mod tests {
         assert_eq!(c.max_depth(), 1);
         assert!(c.auto_start());
         assert_eq!(followup_config_from_toml_str(""), c);
+    }
+
+    #[test]
+    fn project_followup_fields_win_over_global_field_by_field() {
+        let dir = std::env::temp_dir().join(format!("ralphus-cfg-followup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(".ralphus.toml"),
+            "[followup]\nauto_start = false\n",
+        )
+        .unwrap();
+        let global = followup_config_from_toml_str("[followup]\nenabled = false\nmax_depth = 3\n");
+        let layered = layered_followup_config(&dir, &global);
+        assert_eq!(layered.enabled, Some(false));
+        assert_eq!(layered.max_depth, Some(3));
+        assert_eq!(layered.auto_start, Some(false));
     }
 
     #[test]
