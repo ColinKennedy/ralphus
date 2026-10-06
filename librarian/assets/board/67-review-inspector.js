@@ -1908,11 +1908,13 @@
        */
       async function loadReviewDockEvents(gid) {
         try {
-          const r = await fetch(`/api/guardians/${encodeURIComponent(gid)}/cartographer?limit=200&sort=asc`);
+          // Newest window, not oldest: a long-lived review has thousands of rows,
+          // and the current run is the one the Live tab and the drawer need.
+          const r = await fetch(`/api/guardians/${encodeURIComponent(gid)}/cartographer?limit=200&sort=desc`);
           if (!r.ok) { reviewDockEvents[gid] = []; afterReviewDockEvents(); return; }
           /** @type {{rows: CartographerRow[], total: number}} */
           const data = await r.json();
-          reviewDockEvents[gid] = data.rows || [];
+          reviewDockEvents[gid] = (data.rows || []).slice().reverse();
         } catch {
           reviewDockEvents[gid] = [];
         }
