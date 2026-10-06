@@ -163,7 +163,7 @@ list of candidates.
 | `task show-tutor` | Print the Task TOML schema reference |
 | `queue list [--all]` / `reorder <paths...>` / `set-position <paths...> --to N [--relative]` / `set-status <path> <state>` | Inspect/reorder the squad queue by priority |
 | `initialize git [--path]` | Enable git rerere in a repository |
-| `initialize server [--yes] [--agent-logins claude,codex\|all\|none] ...` | Guided first-run server setup. See [Initialize server](#initialize-server) below |
+| `initialize server [--yes] [--answers-file <path>] [--agent-logins claude,codex\|all\|none] ...` | Guided first-run server setup. See [Initialize server](#initialize-server) below |
 
 ### Initialize server
 
@@ -171,6 +171,39 @@ list of candidates.
 printed as `Step N of 10`), ending with a health run and a sample squad. Every
 interactive answer has a matching flag, and `--yes` accepts defaults without
 prompting.
+
+#### Answers file
+
+Every run ends by writing an **answers file** (TOML) and printing its path and
+contents just before `setup complete.`, together with
+`equivalent command: ralphus initialize server --answers-file <path>`. It is
+saved as `answers-<timestamp>-<pid>.toml` (plus a stable `answers-latest.toml`
+copy) in `initialize-server/` next to the global ralphus config
+(`~/.config/ralphus/`, or `$RALPHUS_CONFIG_HOME`). It is written only when the
+run finishes; an aborted run leaves no file.
+
+The file starts with `version = 1` and has one `[key]` table per setting, keyed
+by the setting's flag name with `-` as `_` (`--review-auto-submit-pr-stack` is
+`review_auto_submit_pr_stack`). Each table records `prompt`, `flag`, `value`
+(the effective value, defaults included) and `source` (`flag`, `file`,
+`prompt`, `env` or `default`). Settings the run never reached (for example the
+fork questions when forks are not required) are included with their default
+and a `# not asked in this run` comment; replaying them does not force the
+skipped step to run.
+
+`--answers-file <path>` replays a saved file. Precedence is **flag > answers
+file > interactive prompt/default**: settings the file covers are not
+prompted for, an explicit flag still overrides the file, and anything missing
+is prompted for (or defaulted without a terminal). A malformed file, a missing
+or unsupported `version`, a wrongly typed value, or an unknown key is an error
+naming the file and the offending key or line. Entries may also be written as a
+bare `key = value`.
+
+The forge token is never stored: `forge_token` is written as `"<redacted>"`,
+which replay treats as not provided, so it is prompted for or read from
+`RALPHUS_FORGE_TOKEN`. Credentials embedded in URLs (`https://user:pass@host`)
+are stripped. Values such as tmux paths, MCP hosts, and project names/URLs may
+be specific to the machine that wrote the file.
 
 The **Agent logins** step probes the Claude Code and Codex CLIs with the same
 login probes as `ralphus check health`:
