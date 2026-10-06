@@ -3010,6 +3010,9 @@ struct EffectiveReviewDefaults {
     auto_fix_prompt_template: Option<String>,
     discourage_tests_during_auto_pull_request_fixes: bool,
     auto_cancel_outdated_pr_pipelines: bool,
+    /// RAL-575: the resolved appraisal-posting default (per-review override >
+    /// database default > `.ralphus.toml`/global > `true`).
+    post_appraisals: bool,
     /// RAL-521: the resolved manual-check caching default (per-review
     /// override > database default > `.ralphus.toml`/global > `true`).
     cache_manual_checks: bool,
@@ -3047,6 +3050,7 @@ impl EffectiveReviewDefaults {
             discourage_tests_during_auto_pull_request_fixes: cfg
                 .discourage_tests_during_auto_pull_request_fixes(),
             auto_cancel_outdated_pr_pipelines: cfg.auto_cancel_outdated_pr_pipelines(),
+            post_appraisals: cfg.post_appraisals(),
             cache_manual_checks: cfg.cache_manual_checks(),
             skip_manual_checks: cfg.skip_manual_checks(),
             auto_run: cfg.auto_run(),
@@ -3152,6 +3156,11 @@ struct ProjectReviewSettingsBody {
     /// Defaults to `true` when unset.
     #[serde(default)]
     auto_cancel_outdated_pr_pipelines: Option<bool>,
+    /// RAL-575: project-level default for whether a review writes its
+    /// judges' appraisals into the PR/MR body and tip commit -- see
+    /// [`crate::store::ProjectReviewSettings`]. Defaults to `true` when unset.
+    #[serde(default)]
+    post_appraisals: Option<bool>,
     /// RAL-521: project-level default for whether a review's manual checks
     /// are computed once, when its review branches are first created, and
     /// then reused through later merges, rebases, and automated fix
@@ -3366,6 +3375,9 @@ fn set_project_review_settings(daemon: &Daemon, name: &str, body: &str) -> Reply
     }
     if let Some(v) = req.auto_cancel_outdated_pr_pipelines {
         settings.auto_cancel_outdated_pr_pipelines = Some(v);
+    }
+    if let Some(v) = req.post_appraisals {
+        settings.post_appraisals = Some(v);
     }
     if let Some(v) = req.cache_manual_checks {
         settings.cache_manual_checks = Some(v);
@@ -14058,6 +14070,12 @@ struct GuardianSettingsBody {
     /// by default -- unlike most of the overrides above).
     #[serde(default)]
     auto_cancel_outdated_pr_pipelines: Option<bool>,
+    /// RAL-575: this review's own override for whether its judges' appraisals
+    /// are written into the PR/MR body and tip commit. `None` (or the field
+    /// being absent) means "inherit the project/global default", which
+    /// resolves to `true` (posting on by default).
+    #[serde(default)]
+    post_appraisals: Option<bool>,
     /// RAL-521: this review's own override for whether its manual checks are
     /// computed once, when its review branches are first created, and then
     /// reused through later merges, rebases, and automated fix iterations.
@@ -14157,6 +14175,9 @@ struct GuardianDetailsBody {
     /// RAL-510: see [`GuardianSettingsBody::auto_cancel_outdated_pr_pipelines`].
     #[serde(default)]
     auto_cancel_outdated_pr_pipelines: Option<bool>,
+    /// RAL-575: see [`GuardianSettingsBody::post_appraisals`].
+    #[serde(default)]
+    post_appraisals: Option<bool>,
     /// RAL-521: see [`GuardianSettingsBody::cache_manual_checks`].
     #[serde(default)]
     cache_manual_checks: Option<bool>,
@@ -14670,6 +14691,11 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
             return store_error(&e);
         }
     }
+    if let Some(enabled) = req.post_appraisals {
+        if let Err(e) = store.set_guardian_post_appraisals(id, Some(enabled)) {
+            return store_error(&e);
+        }
+    }
     if let Some(enabled) = req.cache_manual_checks {
         if let Err(e) = store.set_guardian_cache_manual_checks(id, Some(enabled)) {
             return store_error(&e);
@@ -15003,6 +15029,11 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
     }
     if let Some(enabled) = req.auto_cancel_outdated_pr_pipelines {
         if let Err(e) = store.set_guardian_auto_cancel_outdated_pr_pipelines(id, Some(enabled)) {
+            return store_error(&e);
+        }
+    }
+    if let Some(enabled) = req.post_appraisals {
+        if let Err(e) = store.set_guardian_post_appraisals(id, Some(enabled)) {
             return store_error(&e);
         }
     }

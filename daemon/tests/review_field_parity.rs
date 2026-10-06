@@ -17,6 +17,7 @@ const PAIRS: &[(&str, &str)] = &[
     ("skip_base_updates", "skip_base_updates"),
     ("proof_skip_auto_clean", "proof_skip_auto_clean"),
     ("summary_format", "summary_format"),
+    ("post_appraisals", "post_appraisals"),
     ("cache_manual_checks", "cache_manual_checks"),
     ("skip_manual_checks", "skip_manual_checks"),
     ("auto_run", "auto_run"),

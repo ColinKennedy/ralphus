@@ -1889,6 +1889,17 @@ also declarable at submit time in `[[review]]` as the same names, except
 `[[review]] upstream`: the guardian's base branch is minted from that declared
 or inferred upstream when the review is created.
 
+`post_appraisals` (RAL-575, boolean, default `true`) controls whether a
+review's judges' appraisals (the scored proof results) are written into its
+PR/MR body and tip commit. The daemon resolves it per review and exposes the
+result as `effective_post_appraisals` (the review's own `post_appraisals`,
+when set, is returned alongside). Precedence is the usual layered one: the
+review's own `[[review]] post_appraisals` (or a `POST .../settings` write)
+wins over the project default (database project review-settings, then
+`.ralphus.toml [review] post_appraisals`), which wins over the global
+config's `[review]` value, which wins over the built-in `true`. The setting
+is only the gate; rendering lives with the PR/MR body builder.
+
 `cache_manual_checks` (RAL-521, boolean, default `true`) controls whether a
 review's manual checks — the agent-suggested shell commands a human reviewer
 can run by hand — are computed once, when the review's branches are first

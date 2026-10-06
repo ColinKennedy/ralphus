@@ -1685,6 +1685,15 @@ pub struct ReviewDef {
     /// `[[review]]` block to read it from.
     #[serde(default)]
     pub auto_cancel_outdated_pr_pipelines: Option<bool>,
+    /// RAL-575: whether this review writes its judges' appraisals into the
+    /// PR/MR body and the review branch's tip commit. Unset inherits the
+    /// project-level `.ralphus.toml [review] post_appraisals` default, then
+    /// `true` (on by default). When `false`, appraisals are still stored and
+    /// shown on the board; only PR publication is skipped. Auto-created
+    /// reviews (Arbiter/Triage) always use the project default and never set
+    /// this directly, since they have no `[[review]]` block to read it from.
+    #[serde(default)]
+    pub post_appraisals: Option<bool>,
     /// RAL-521: whether this review's manual checks are computed once, when
     /// its review branches are first created, and then reused through later
     /// merges, rebases, and automated fix iterations. Unset inherits the

@@ -283,6 +283,7 @@ pub const REVIEW_KEYS: &[&str] = &[
     "auto_fix_prompt_template",
     "discourage_tests_during_auto_pull_request_fixes",
     "auto_cancel_outdated_pr_pipelines",
+    "post_appraisals",
     "summary_format",
     "cache_manual_checks",
     "skip_manual_checks",
@@ -2056,6 +2057,7 @@ fn validate_review_blocks(value: Option<&toml::Value>, ctx: &mut Ctx) {
             &rpath,
             header,
         );
+        check_type(ctx, table, "post_appraisals", Ty::Bool, &rpath, header);
         check_type(ctx, table, "cache_manual_checks", Ty::Bool, &rpath, header);
         check_type(ctx, table, "skip_manual_checks", Ty::Bool, &rpath, header);
         check_type(ctx, table, "auto_run", Ty::Bool, &rpath, header);

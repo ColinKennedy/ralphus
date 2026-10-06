@@ -513,6 +513,12 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                 project-level .ralphus.toml [review]
                 auto_cancel_outdated_pr_pipelines default, then true
                 (on by default -- unlike most opt-in review settings).
+ post_appraisals
+        bool    Write this review's judges' appraisals (scored proof
+                results) into the PR/MR body and tip commit (RAL-575).
+                Unset inherits the project-level .ralphus.toml [review]
+                post_appraisals default, then true (on by default).
+                Set false to keep appraisals out of the PR/MR.
  cache_manual_checks
         bool    Compute this review's manual checks once, when its review
                 branches are first created, and reuse that result through
@@ -694,7 +700,7 @@ may embed <<ralphus:new-worktree/BRANCH?upstream=UPSTREAM
  skip_base_updates, match_pr_branch_name, separate_pr_branch,
  dual_root_pr, auto_build, auto_submit_pr_stack, auto_fix_pr_errors,
  auto_fix_prompt_template, discourage_tests_during_auto_pull_request_fixes,
- auto_cancel_outdated_pr_pipelines, cache_manual_checks,
+ auto_cancel_outdated_pr_pipelines, post_appraisals, cache_manual_checks,
  skip_manual_checks, auto_run, rebuild_on, and skip_auto_clean) can also be set from
  the database, via `ralphus project review-settings set <name>
  [flags]` or the board's Projects tab (the ... menu -> Review
@@ -1136,6 +1142,7 @@ upstream           = "foo"
 agent              = "{<insert recommended agent here>}"  # claude-code, codex-cli, claude, ollama, etc
 auto_fix_pr_errors = true  # dispatch the resolver agent to fix a failing PR/MR CI status automatically
 auto_cancel_outdated_pr_pipelines = true  # on by default; cancel stale CI runs when a newer commit is force-pushed
+post_appraisals = true  # on by default; write judges' appraisals into the PR/MR body and tip commit (RAL-575)
 cache_manual_checks = true  # on by default; compute manual checks once at first branch creation (RAL-521)
 rebuild_on = ["rebase", "feedback", "auto_fix"]  # default: every event rebuilds the prepared build; [] = only `ralphus review rebuild`
 
