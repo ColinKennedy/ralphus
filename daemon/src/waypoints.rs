@@ -2647,9 +2647,32 @@ impl Store {
             let _ = write!(out, " (label: {label})");
         }
         out.push('\n');
-        for task in &squad.tasks {
+        // The system prompt a person wrote, not the effective one the cell view
+        // carries (that adds ralphus's own boilerplate). It can change how the
+        // work is carried out as much as the prompt does, so it is shown too.
+        let mut authored_system_prompts: BTreeMap<(usize, usize), String> = BTreeMap::new();
+        let mut stmt = self.conn.prepare(
+            "SELECT task_idx, idx, system_prompt FROM cells
+             WHERE squad_id=? AND system_prompt IS NOT NULL AND TRIM(system_prompt) != ''",
+        )?;
+        let rows = stmt
+            .query_map(params![squad_id], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+        for (task_idx, idx, text) in rows {
+            if let (Ok(task_idx), Ok(idx)) = (usize::try_from(task_idx), usize::try_from(idx)) {
+                authored_system_prompts.insert((task_idx, idx), text);
+            }
+        }
+        for (task_idx, task) in squad.tasks.iter().enumerate() {
             let _ = writeln!(out, "- task \"{}\" (project: {})", task.name, task.project);
-            for cell in &task.cells {
+            for (cell_idx, cell) in task.cells.iter().enumerate() {
                 let what = cell
                     .prompt
                     .as_deref()
@@ -2662,6 +2685,9 @@ impl Store {
                     .unwrap_or_else(|| "no prompt or command".to_string());
                 let name = cell.name.as_deref().unwrap_or(&cell.id);
                 let _ = writeln!(out, "  - cell \"{name}\" {what}");
+                if let Some(text) = authored_system_prompts.get(&(task_idx, cell_idx)) {
+                    let _ = writeln!(out, "    system prompt: {}", truncate_for_survey(text));
+                }
                 if let Some(cwd) = cell.cwd.as_deref().filter(|c| !c.trim().is_empty()) {
                     let _ = writeln!(out, "    cwd: {cwd}");
                 }
@@ -8254,6 +8280,41 @@ mod tests {
             maximum_tool_output_tokens: None,
             system_prompt: None,
         }
+    }
+
+    #[test]
+    fn the_survey_description_shows_a_cells_authored_system_prompt() {
+        let store = Store::open_in_memory().unwrap();
+        insert_squad_with_cwd(&store, "squad-1", "/repo");
+        assert!(
+            !store
+                .describe_squad_for_survey("squad-1")
+                .unwrap()
+                .contains("system prompt:"),
+            "a cell with no system prompt has nothing to show"
+        );
+
+        store
+            .edit_cell_fields(
+                "squad-1",
+                0,
+                0,
+                &crate::store::CellEdit {
+                    system_prompt: Some(Some("never touch the greet module")),
+                    ..untouched_cell_edit()
+                },
+            )
+            .unwrap();
+
+        let description = store.describe_squad_for_survey("squad-1").unwrap();
+        assert!(
+            description.contains("system prompt: never touch the greet module"),
+            "the authored system prompt must reach the classifier: {description}"
+        );
+        assert!(
+            !description.contains("ralphus"),
+            "only what the author wrote, not the generated effective prompt: {description}"
+        );
     }
 
     fn record_not_impacted(store: &Store, entry_id: &str) {
