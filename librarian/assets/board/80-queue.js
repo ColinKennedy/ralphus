@@ -900,14 +900,14 @@
       // No `waypoints` branch here on purpose: this runs while chunk 80 loads,
       // and every function that branch needs lives in chunk 82, which has not
       // loaded yet -- so it threw and took the whole initial route with it.
-      // Chunk 82 handles its own initial hash at the end of its own load.
+      // Chunk 82 handles its own initial hash at the end of its own load; the
+      // `presets` tab is routed the same way by chunk 83, which loads later still.
       else if (pendingHash && pendingHash.tab === "resources") { pendingHash = null; showTab("resources"); }
       else if (pendingHash && pendingHash.tab === "queue") { pendingHash = null; showTab("queue"); }
       else if (pendingHash && pendingHash.tab === "cartographer") { applyCartoQuery(pendingHash.cartoQuery || {}); pendingHash = null; showTab("cartographer"); }
       else if (pendingHash && pendingHash.tab === "projects") { pendingHash = null; showTab("projects"); }
       else if (pendingHash && pendingHash.tab === "machines") { pendingHash = null; showTab("machines"); }
       else if (pendingHash && pendingHash.tab === "triage") { pendingHash = null; showTab("triage"); }
-      else if (pendingHash && pendingHash.tab === "presets") { pendingHash = null; showTab("presets"); }
       else if (pendingHash && pendingHash.tab === "users") { pendingHash = null; showTab("users"); }
       else if (pendingHash && pendingHash.tab === "secrets") { pendingHash = null; showTab("secrets"); }
       else if (pendingHash && pendingHash.tab === "worktree-retirement") { pendingHash = null; showTab("worktree-retirement"); }

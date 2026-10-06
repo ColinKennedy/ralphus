@@ -275,3 +275,9 @@ extends = [<span class="preset-sentinel">"&lt;&lt;ralphus:presets/roles/reviewer
         } catch (e) { presetsError = "daemon unreachable"; }
         await pollPresets();
       }
+      // Chunk 80 routes the initial hash before this chunk has loaded, so it
+      // leaves a `#/presets` deep link for here, once `pollPresets` exists.
+      if (typeof pendingHash !== "undefined" && pendingHash && pendingHash.tab === "presets") {
+        pendingHash = null;
+        showTab("presets");
+      }
