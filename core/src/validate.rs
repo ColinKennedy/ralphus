@@ -773,6 +773,9 @@ fn check_environment_lenient(ctx: &mut Ctx, table: &toml::Table, path: &str, hea
                         "every path segment before the last must be exactly \".\" or \"..\""
                     }
                     E::EmptyField => "the path must end in a field name, e.g. \"./cwd\"",
+                    E::InvalidKindStep => {
+                        "a bracketed step must be exactly \"..[task]\", \"..[cell]\", or \"..[proof]\""
+                    }
                 };
                 let line = ctx.key_line(header, "environment");
                 ctx.error(
@@ -1423,6 +1426,9 @@ fn check_environment_link(
                         "every path segment before the last must be exactly \".\" or \"..\""
                     }
                     E::EmptyField => "the path must end in a field name, e.g. \"./cwd\"",
+                    E::InvalidKindStep => {
+                        "a bracketed step must be exactly \"..[task]\", \"..[cell]\", or \"..[proof]\""
+                    }
                 };
                 let line = ctx.key_line(header, "environment");
                 ctx.error(
@@ -1441,7 +1447,9 @@ fn check_environment_link(
         if let Some(query) = link.query {
             check_linked_field_query(ctx, path, header, key, query);
         }
-        if parsed.ups >= chain.len() {
+        let levels: Vec<crate::schema::ScopeLevel> = chain.iter().map(|s| s.level).collect();
+        let ups = parsed.resolve_ups(&levels);
+        if ups >= chain.len() {
             let line = ctx.key_line(header, "environment");
             ctx.error(
                 &format!("{path}.environment.{key}"),
@@ -1449,13 +1457,13 @@ fn check_environment_link(
                 format!(
                     "environment value for \"{key}\" links \"{}\" levels up, past the top of \
                      this submission",
-                    parsed.ups
+                    ups
                 ),
                 line,
             );
             continue;
         }
-        let target_scope = chain[chain.len() - 1 - parsed.ups];
+        let target_scope = chain[chain.len() - 1 - ups];
         let Some(target) = crate::schema::parse_link_target(parsed.field) else {
             let line = ctx.key_line(header, "environment");
             ctx.error(
@@ -1475,7 +1483,7 @@ fn check_environment_link(
         // `environment.<key>` can't be addressed unambiguously once the
         // daemon merges the whole hierarchy into one map at runtime. `cwd`
         // and `id` don't have this problem and may still cross a `..`.
-        if matches!(target, crate::schema::LinkTarget::Environment(_)) && parsed.ups > 0 {
+        if matches!(target, crate::schema::LinkTarget::Environment(_)) && ups > 0 {
             let line = ctx.key_line(header, "environment");
             ctx.error(
                 &format!("{path}.environment.{key}"),

@@ -825,24 +825,82 @@ pub enum LinkedFieldPathError {
     /// The final (field-name) segment was empty (e.g. a trailing `/`, or the
     /// whole path being only navigation segments).
     EmptyField,
+    /// A bracketed navigation segment was malformed or named an unknown kind:
+    /// it must be exactly `..[task]`, `..[cell]`, or `..[proof]`.
+    InvalidKindStep,
 }
 
-/// A [`LinkedFieldRef::path`], split into how many levels to walk up
-/// (`ups`: the count of `..` segments; a lone `.` contributes zero) and the
-/// final field-name segment.
+/// One navigation segment of a linked field's path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavStep {
+    /// `.` -- stay on the current table.
+    Stay,
+    /// `..` -- climb one level.
+    Up,
+    /// `..[<kind>]` -- climb one level only if the table being stepped from
+    /// is of that kind; otherwise stay (like `.`).
+    UpIf(ScopeLevel),
+}
+
+/// A [`LinkedFieldRef::path`], split into its navigation steps (applied left
+/// to right) and the final field-name segment.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedLinkedFieldPath<'a> {
-    /// Levels to walk up from where this linked field is declared before
-    /// reading `field`. Zero means "this same table".
-    pub ups: usize,
+    /// The navigation segments before the field name, in path order.
+    pub steps: Vec<NavStep>,
     /// The target field name -- see [`parse_link_target`].
     pub field: &'a str,
 }
 
+impl ParsedLinkedFieldPath<'_> {
+    /// The number of levels to walk up from where the linked field is
+    /// declared, given `levels` (the kinds of the enclosing tables, outermost
+    /// first, the declaring table last). Each conditional step is evaluated
+    /// against the table it is stepping from. The result may exceed
+    /// `levels.len() - 1` when the path climbs past the top; callers report
+    /// that.
+    #[must_use]
+    pub fn resolve_ups(&self, levels: &[ScopeLevel]) -> usize {
+        let mut ups = 0usize;
+        for step in &self.steps {
+            match step {
+                NavStep::Stay => {}
+                NavStep::Up => ups += 1,
+                NavStep::UpIf(kind) => {
+                    let current = levels
+                        .len()
+                        .checked_sub(1 + ups)
+                        .and_then(|i| levels.get(i));
+                    if current == Some(kind) {
+                        ups += 1;
+                    }
+                }
+            }
+        }
+        ups
+    }
+}
+
+fn parse_nav_step(seg: &str) -> Result<NavStep, LinkedFieldPathError> {
+    match seg {
+        "." => Ok(NavStep::Stay),
+        ".." => Ok(NavStep::Up),
+        _ if seg.contains('[') || seg.contains(']') => {
+            match seg.strip_prefix("..[").and_then(|s| s.strip_suffix(']')) {
+                Some("task") => Ok(NavStep::UpIf(ScopeLevel::Task)),
+                Some("cell") => Ok(NavStep::UpIf(ScopeLevel::Cell)),
+                Some("proof") => Ok(NavStep::UpIf(ScopeLevel::ProofStep)),
+                _ => Err(LinkedFieldPathError::InvalidKindStep),
+            }
+        }
+        _ => Err(LinkedFieldPathError::InvalidNavigationSegment),
+    }
+}
+
 /// Parse a linked field's `<path>` (e.g. `"./cwd"`, `"../id"`,
-/// `"../../environment.BASE"`) into navigation + target field. Every
-/// `/`-separated segment before the last must be exactly `.` or `..`; the
-/// last segment is the target field name.
+/// `"../../environment.BASE"`, `"./..[proof]/prompt"`) into navigation +
+/// target field. Every `/`-separated segment before the last must be `.`,
+/// `..`, or `..[task|cell|proof]`; the last segment is the target field name.
 ///
 /// # Errors
 /// See [`LinkedFieldPathError`].
@@ -859,18 +917,14 @@ pub fn parse_linked_field_path(
     if nav.is_empty() {
         return Err(LinkedFieldPathError::MissingNavigation);
     }
-    let mut ups = 0usize;
-    for seg in nav {
-        match *seg {
-            "." => {}
-            ".." => ups += 1,
-            _ => return Err(LinkedFieldPathError::InvalidNavigationSegment),
-        }
-    }
+    let steps = nav
+        .iter()
+        .map(|seg| parse_nav_step(seg))
+        .collect::<Result<Vec<_>, _>>()?;
     if field.is_empty() {
         return Err(LinkedFieldPathError::EmptyField);
     }
-    Ok(ParsedLinkedFieldPath { ups, field })
+    Ok(ParsedLinkedFieldPath { steps, field })
 }
 
 /// A linked field's final path segment, interpreted as one of the field
@@ -3542,22 +3596,78 @@ mod tests {
     #[test]
     fn parse_linked_field_path_reads_same_table_reference() {
         let parsed = parse_linked_field_path("./cwd").expect("parse ok");
-        assert_eq!(parsed.ups, 0);
+        assert_eq!(parsed.resolve_ups(&ALL_LEVELS), 0);
         assert_eq!(parsed.field, "cwd");
     }
 
     #[test]
     fn parse_linked_field_path_reads_parent_reference() {
         let parsed = parse_linked_field_path("../id").expect("parse ok");
-        assert_eq!(parsed.ups, 1);
+        assert_eq!(parsed.resolve_ups(&ALL_LEVELS), 1);
         assert_eq!(parsed.field, "id");
     }
 
     #[test]
     fn parse_linked_field_path_reads_multiple_levels_up() {
         let parsed = parse_linked_field_path("../../environment.BASE").expect("parse ok");
-        assert_eq!(parsed.ups, 2);
+        assert_eq!(parsed.resolve_ups(&ALL_LEVELS), 2);
         assert_eq!(parsed.field, "environment.BASE");
+    }
+
+    const ALL_LEVELS: [ScopeLevel; 3] = [ScopeLevel::Task, ScopeLevel::Cell, ScopeLevel::ProofStep];
+
+    #[test]
+    fn parse_linked_field_path_accepts_kind_steps() {
+        for (kind, level) in [
+            ("task", ScopeLevel::Task),
+            ("cell", ScopeLevel::Cell),
+            ("proof", ScopeLevel::ProofStep),
+        ] {
+            let path = format!("./..[{kind}]/prompt");
+            let parsed = parse_linked_field_path(&path).expect("parse ok");
+            assert_eq!(parsed.steps, vec![NavStep::Stay, NavStep::UpIf(level)]);
+        }
+        // The leading `./` stays optional.
+        let parsed = parse_linked_field_path("..[proof]/prompt").expect("parse ok");
+        assert_eq!(parsed.steps, vec![NavStep::UpIf(ScopeLevel::ProofStep)]);
+    }
+
+    #[test]
+    fn parse_linked_field_path_rejects_bad_kind_steps() {
+        for bad in [
+            "./..[/prompt",
+            "./..[]/prompt",
+            "./.[proof]/prompt",
+            "./..[proof]x/prompt",
+            "./..[nope]/prompt",
+            "./..[Proof]/prompt",
+        ] {
+            assert_eq!(
+                parse_linked_field_path(bad),
+                Err(LinkedFieldPathError::InvalidKindStep),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_ups_applies_kind_steps_against_the_declaring_kind() {
+        let p = parse_linked_field_path("./..[proof]/prompt").expect("parse ok");
+        // On a cell: no-op. On a cell's proof: climbs to the cell.
+        assert_eq!(p.resolve_ups(&[ScopeLevel::Task, ScopeLevel::Cell]), 0);
+        assert_eq!(p.resolve_ups(&ALL_LEVELS), 1);
+        // A task-level proof climbs to the task.
+        assert_eq!(p.resolve_ups(&[ScopeLevel::Task, ScopeLevel::ProofStep]), 1);
+    }
+
+    #[test]
+    fn resolve_ups_chains_kind_steps_step_by_step() {
+        let p = parse_linked_field_path("./..[proof]/..[cell]/prompt").expect("parse ok");
+        assert_eq!(p.resolve_ups(&ALL_LEVELS), 2);
+        assert_eq!(p.resolve_ups(&[ScopeLevel::Task, ScopeLevel::Cell]), 1);
+        let p = parse_linked_field_path("..[cell]/..[proof]/prompt").expect("parse ok");
+        // From a proof: first step is a no-op (not a cell), second climbs.
+        assert_eq!(p.resolve_ups(&ALL_LEVELS), 1);
     }
 
     #[test]

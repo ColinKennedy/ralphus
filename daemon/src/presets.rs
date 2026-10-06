@@ -26,7 +26,9 @@ use std::path::{Path, PathBuf};
 use rusqlite::params;
 use serde::Serialize;
 
-use ralphus_core::schema::{CellDef, ProofStep, TaskDef, TaskFile, parse_preset_sentinel};
+use ralphus_core::schema::{
+    CellDef, ProofStep, ScopeLevel, TaskDef, TaskFile, parse_preset_sentinel,
+};
 use ralphus_core::validate::{ErrorKind, ValidationError};
 
 use crate::store::{Result as StoreResult, Store, now_ms};
@@ -641,7 +643,7 @@ fn not_found_text(field: &str) -> String {
 /// `system_prompt`. A reference that is handled but cannot be satisfied
 /// (nothing that many levels up, or the field is unset) yields
 /// [`not_found_text`].
-fn resolve_text_link(body: &str, chain: &[TextFrame]) -> Option<String> {
+fn resolve_text_link(body: &str, chain: &[TextFrame], levels: &[ScopeLevel]) -> Option<String> {
     let link = ralphus_core::schema::parse_linked_field(body)?;
     if link.query.is_some() {
         return None;
@@ -652,7 +654,7 @@ fn resolve_text_link(body: &str, chain: &[TextFrame]) -> Option<String> {
     }
     let value = chain
         .len()
-        .checked_sub(1 + parsed.ups)
+        .checked_sub(1 + parsed.resolve_ups(levels))
         .and_then(|i| chain.get(i))
         .and_then(|frame| frame.field(parsed.field));
     Some(value.map_or_else(|| not_found_text(parsed.field), str::to_string))
@@ -664,7 +666,7 @@ fn resolve_text_link(body: &str, chain: &[TextFrame]) -> Option<String> {
 /// written indented inside a template stays indented once expanded. A
 /// value's trailing newlines are dropped, so the template's own blank lines
 /// (not the value's) decide the spacing that follows it.
-fn expand_template(template: &str, chain: &[TextFrame]) -> String {
+fn expand_template(template: &str, chain: &[TextFrame], levels: &[ScopeLevel]) -> String {
     template
         .split('\n')
         .map(|line| {
@@ -674,7 +676,7 @@ fn expand_template(template: &str, chain: &[TextFrame]) -> String {
                 .collect();
             let expanded: Result<String, std::convert::Infallible> =
                 ralphus_core::schema::replace_text_placeholders(line, |body| {
-                    Ok(resolve_text_link(body, chain).map(|value| {
+                    Ok(resolve_text_link(body, chain, levels).map(|value| {
                         let value = value.trim_end_matches(['\n', '\r']);
                         value
                             .split('\n')
@@ -697,14 +699,15 @@ fn expand_template(template: &str, chain: &[TextFrame]) -> String {
 }
 
 /// Whether `template` references `field` of the very entity it is being
-/// applied to (`<<ralphus:linked-field/./<field>>>`).
-fn template_wraps_own(template: &str, field: &str) -> bool {
+/// applied to (`<<ralphus:linked-field/./<field>>>`), evaluating any
+/// `..[kind]` steps against `levels`.
+fn template_wraps_own(template: &str, field: &str, levels: &[ScopeLevel]) -> bool {
     ralphus_core::schema::text_placeholders(template)
         .into_iter()
         .filter_map(ralphus_core::schema::parse_linked_field)
         .filter(|link| link.query.is_none())
         .filter_map(|link| ralphus_core::schema::parse_linked_field_path(link.path).ok())
-        .any(|p| p.ups == 0 && p.field == field)
+        .any(|p| p.resolve_ups(levels) == 0 && p.field == field)
 }
 
 /// Apply one preset text `template` to an entity's `field`, which currently
@@ -716,12 +719,18 @@ fn template_wraps_own(template: &str, field: &str) -> bool {
 /// * `own` set, template references it (`./<field>`): the author asked for
 ///   the preset to frame their text, so the expanded template, with `own`
 ///   spliced in where it is referenced, replaces it.
-fn apply_text(own: &mut Option<String>, field: &str, template: Option<&str>, chain: &[TextFrame]) {
+fn apply_text(
+    own: &mut Option<String>,
+    field: &str,
+    template: Option<&str>,
+    chain: &[TextFrame],
+    levels: &[ScopeLevel],
+) {
     let Some(template) = template else { return };
-    if own.is_some() && !template_wraps_own(template, field) {
+    if own.is_some() && !template_wraps_own(template, field, levels) {
         return;
     }
-    *own = Some(expand_template(template, chain));
+    *own = Some(expand_template(template, chain, levels));
 }
 
 fn apply_to_task(task: &mut TaskDef, by_name: &PresetMap<'_>) {
@@ -755,11 +764,13 @@ fn apply_to_cell(cell: &mut CellDef, by_name: &PresetMap<'_>, task_frame: &TextF
             system_prompt: cell.system_prompt.clone(),
         };
         let chain = [task_frame.clone(), own];
+        let levels = [ScopeLevel::Task, ScopeLevel::Cell];
         apply_text(
             &mut cell.system_prompt,
             "system_prompt",
             last_defined(&presets, |p| p.system_prompt.clone()).as_deref(),
             &chain,
+            &levels,
         );
         // A `command` cell has no prompt for a preset to fill or frame.
         if cell.command.is_none() {
@@ -768,6 +779,7 @@ fn apply_to_cell(cell: &mut CellDef, by_name: &PresetMap<'_>, task_frame: &TextF
                 "prompt",
                 last_defined(&presets, |p| p.prompt.clone()).as_deref(),
                 &chain,
+                &levels,
             );
         }
         if cell.system_prompt_position.is_none() {
@@ -791,7 +803,12 @@ fn apply_to_cell(cell: &mut CellDef, by_name: &PresetMap<'_>, task_frame: &TextF
     }
 }
 
-fn apply_to_proof(proof: &mut ProofStep, by_name: &PresetMap<'_>, parent_frame: &TextFrame) {
+fn apply_to_proof(
+    proof: &mut ProofStep,
+    by_name: &PresetMap<'_>,
+    parent_frame: &TextFrame,
+    parent_level: ScopeLevel,
+) {
     let presets = resolved_presets(&proof.extends, by_name);
     if presets.is_empty() {
         return;
@@ -809,6 +826,7 @@ fn apply_to_proof(proof: &mut ProofStep, by_name: &PresetMap<'_>, parent_frame: 
             "prompt",
             last_defined(&presets, |p| p.prompt.clone()).as_deref(),
             &chain,
+            &[parent_level, ScopeLevel::ProofStep],
         );
     }
     if proof.maximum_tool_output_tokens.is_none() {
@@ -857,12 +875,12 @@ pub fn apply_presets_from(registered: &[PresetView], file: &mut TaskFile) {
     for task in &mut file.task {
         apply_to_task(task, &by_name);
         for proof in &mut task.proof {
-            apply_to_proof(proof, &by_name, &task_frame);
+            apply_to_proof(proof, &by_name, &task_frame, ScopeLevel::Task);
         }
         for cell in &mut task.cell {
             let cell_frame = apply_to_cell(cell, &by_name, &task_frame);
             for proof in &mut cell.proof {
-                apply_to_proof(proof, &by_name, &cell_frame);
+                apply_to_proof(proof, &by_name, &cell_frame, ScopeLevel::Cell);
             }
         }
     }
@@ -1237,6 +1255,39 @@ extends = ["<<ralphus:presets/roles/reviewer>>"]
             Some("Check this work:\n  build the thing\n  in two lines")
         );
         assert!(check_required_fields_after_presets(&out).is_empty());
+    }
+
+    fn subject_role() -> PresetView {
+        PresetView {
+            prompt: Some("Review:\n<<ralphus:linked-field/./..[proof]/prompt>>".to_string()),
+            ..preset("roles/subject")
+        }
+    }
+
+    #[test]
+    fn kind_step_template_resolves_to_the_subject_on_cell_and_cell_proof() {
+        let raw = "[[task]]\nname = \"t\"\n[[task.cell]]\ncwd = \"/tmp\"\nprompt = \"the work\"\nextends = [\"<<ralphus:presets/roles/subject>>\"]\n[[task.cell]]\ncwd = \"/tmp\"\nprompt = \"parent work\"\n[[task.cell.proof]]\nextends = [\"<<ralphus:presets/roles/subject>>\"]\n";
+        let out = applied(raw, &[subject_role()]);
+        // On a cell the step is a no-op, so the template wraps the cell's own
+        // prompt (not discarded).
+        assert_eq!(
+            out.task[0].cell[0].prompt.as_deref(),
+            Some("Review:\nthe work")
+        );
+        assert_eq!(
+            out.task[0].cell[1].proof[0].prompt.as_deref(),
+            Some("Review:\nparent work")
+        );
+    }
+
+    #[test]
+    fn kind_step_template_is_not_found_on_a_task_level_proof() {
+        let raw = "[[task]]\nname = \"t\"\n[[task.proof]]\nextends = [\"<<ralphus:presets/roles/subject>>\"]\n[[task.cell]]\ncwd = \"/tmp\"\nprompt = \"x\"\n";
+        let out = applied(raw, &[subject_role()]);
+        assert_eq!(
+            out.task[0].proof[0].prompt.as_deref(),
+            Some("Review:\n<field prompt was not found>")
+        );
     }
 
     #[test]
