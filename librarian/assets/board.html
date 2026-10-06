@@ -340,9 +340,13 @@
 
     <main id="presets-page" style="display:none">
       <div class="row" style="justify-content:space-between;margin-bottom:12px">
-        <b data-tip="Presets — named bundles of field defaults an &quot;extends = [&quot;&lt;&lt;ralphus:presets/&lt;name&gt;&gt;&gt;&quot;]&quot; entry stamps into a task's, cell's, or proof step's own unset fields at submit time.\nA field the author already set explicitly is never overridden; when more than one named preset in the list sets the same field, the last one wins.">Presets</b>
-        <button class="btn" onclick="pollPresets()" data-tip="Re-query the daemon for registered presets.">↻ Refresh</button>
+        <b data-tip="Presets — named bundles of field defaults an &quot;extends = [&quot;&lt;&lt;ralphus:presets/&lt;name&gt;&gt;&gt;&quot;]&quot; entry stamps into a task's, cell's, or proof step's own unset fields at submit time.\nA field the author already set explicitly is never overridden; when more than one named preset in the list sets the same field, the last one wins.">🧩 Presets</b>
+        <span class="row" style="gap:12px">
+          <span style="color:var(--muted)" id="presets-summary"></span>
+          <button class="btn" onclick="pollPresets()" data-tip="Re-query the daemon for registered presets.">↻ Refresh</button>
+        </span>
       </div>
+      <div class="presets-intro" data-tip="A field the extending entity already sets explicitly always wins over a preset. When several presets in one extends list set the same field, the last one wins.">Named bundles of field defaults. A task, cell, or proof step that lists one in <code>extends</code> gets its unset fields stamped from it at submit time.</div>
       <div id="presets"><div class="empty">Loading…</div></div>
     </main>
 
