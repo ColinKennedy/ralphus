@@ -1,4 +1,4 @@
-      // ---------- Worktree retirement tab (RAL-385, RAL-386) ----------
+﻿      // ---------- Worktree retirement tab (RAL-385, RAL-386) ----------
       // Originally a popup reachable from the Reviews tab; moved to its own
       // admin-only tab (ADMIN_ONLY_TABS in 25-chrome.js) so it follows the
       // same gated-tab pattern as Machines/Triage/Projects/Users/Secrets

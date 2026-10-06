@@ -1,4 +1,4 @@
-      // ---------- new task modal ----------
+﻿      // ---------- new task modal ----------
       // RAL-97: "Files" (drag-and-drop / browse, accepts multiple .toml
       // files, each queued as its own squad) and "Paste" (single TOML
       // pasted/edited inline). RAL-297 adds "Simple": a deterministic,

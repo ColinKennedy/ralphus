@@ -2363,10 +2363,10 @@ If a reorder is found: the review is claimed (`in_review` → `merging`, same
 CAS the other restack triggers use); if the review was busy with something
 else at that moment, RAL-273's "GitHub wins" rule applies -- the in-flight
 operation is cancelled and the claim retried for a few seconds before giving
-up. When that happens, `GuardianView.notice_kind` is set to
-`forge_reorder_interrupted_local` (with `notice_message`/`notice_at_ms`) so
-the board can show a one-time bottom-right toast; a plain reorder (nothing
-was running) applies silently other than the usual Cartographer log entry.
+up. When that happens, a dismissible `review`-category mailbox message is
+enqueued for `guardian:{id}` (RAL-579; durable, so a dismissal survives a daemon
+restart); a plain reorder (nothing was running) applies silently other than
+the usual Cartographer log entry.
 
 ### `POST /api/guardians/{id}/branches/{branch_id}/move`
 Move a branch out of this review and into another (RAL-118: "compose a review

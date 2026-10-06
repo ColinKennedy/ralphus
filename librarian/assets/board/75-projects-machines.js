@@ -1,4 +1,4 @@
-      // ---------- resource usage (RAL-11) ----------
+﻿      // ---------- resource usage (RAL-11) ----------
       /**
        * Polls `/api/resources` and re-renders the Resources tab.
        * @returns {Promise<void>}

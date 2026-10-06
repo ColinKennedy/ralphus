@@ -1849,21 +1849,22 @@ pub(crate) fn cancel_superseded_ci_after_push(
             // in the base repo -- the fork owner's token can't manage a run
             // it doesn't own. That's a genuine, review-visible error (not a
             // transient/benign one like the 409-already-terminal case
-            // filtered out above), so it gets the same one-shot advisory
-            // toast every other non-fatal forge hiccup already uses --
-            // deliberately not a new notice mechanism, just this existing
-            // one with its own `notice_kind`.
+            // filtered out above), so it is surfaced as a durable, dismissible
+            // mailbox notice.
             if e.contains("forge API 403") {
                 let guard = store.lock();
-                let _ = guard.set_guardian_notice(
+                let _ = guard.enqueue_guardian_notice(
                     guardian_id,
-                    "cancel_superseded_ci_forbidden",
                     &format!(
                         "Cancelling a superseded CI run on branch={branch_alias} was \
                          rejected (403) -- likely a fork-owned PR run in the base repo \
                          that this review's token can't manage. The stale run will keep \
                          going, but it can't affect this PR's CI status."
                     ),
+                    Some(&crate::mailbox::Remediation::ManualInterventionRequired {
+                        guidance: "cancel the stale run on the forge by hand, or ignore it"
+                            .to_string(),
+                    }),
                 );
             }
         }
@@ -4455,7 +4456,7 @@ fn settle_pr_merge_states(
             current_guardian.name,
         );
         let entity_uri = format!("guardian:{id}");
-        if let Err(error) = guard.enqueue_error_mailbox_message(
+        if let Err(error) = guard.enqueue_error_mailbox_message_deduped(
             crate::mailbox::MailboxPriority::High,
             &message,
             &crate::mailbox::Remediation::SuggestedCommand {
@@ -5084,10 +5085,10 @@ pub fn check_and_apply_forge_reorder(
             admin_only: false,
         });
         if interrupted_local {
-            let _ = guard.set_guardian_notice(
+            let _ = guard.enqueue_guardian_notice(
                 id,
-                "forge_drift_interrupted_local",
                 "A GitHub/GitLab stack edit arrived while a local review edit was in progress; the newest base edit won.",
+                None,
             );
         }
     }

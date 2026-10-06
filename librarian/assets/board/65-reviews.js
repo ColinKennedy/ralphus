@@ -1,4 +1,4 @@
-      // ---------- structured check inputs (RAL-164) ----------
+﻿      // ---------- structured check inputs (RAL-164) ----------
       // A GuardianCheck (either an AI-synthesized manual check or a
       // user-declared [[review.action]] hint) may declare named `inputs`
       // (e.g. a port number) referenced in its command as `{name}`
@@ -2778,55 +2778,6 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
       // the same failure (a double-click, a few failed polls in a row)
       // doesn't flood the screen with toasts.
 
-      // ---- Guardian notices -> toast (RAL-273) ----
-      // A guardian notice (`notice_kind`/`notice_message`/`notice_at_ms`) is
-      // server-recorded, one-shot, purely informational state -- e.g. an
-      // incoming GitHub/GitLab stack reorder interrupting a local reorder in
-      // flight (`forge_drift_interrupted_local`; see `Store::set_guardian_notice`).
-      // There is no server-side "seen" tracking: each poll of `/api/guardians`
-      // re-sends whatever the last notice was, so the board itself remembers
-      // which `notice_at_ms` it already showed per guardian and only toasts
-      // once per new one. RAL-451: a linked PR merging out-of-band while a
-      // rebase/feedback pass owned the review's worktrees (`pr_merged_mid_flight`,
-      // RAL-300) used to go through this same mechanism, but repeated drops
-      // kept re-obstructing the board with no way to dismiss them -- it now
-      // goes through the dismissible mailbox widget instead (`82-mailbox.js`,
-      // `daemon/src/pr.rs`'s `settle_pr_merge_states`).
-      // RALPHUS-GUARDIAN-NOTICE:BEGIN
-      /**
-       * Which of `list`'s guardian notices are newer than what `shown` last
-       * recorded for that guardian, as ready-to-display toast text (RAL-273).
-       * Pure: does not touch the DOM or mutate `shown` -- the caller applies
-       * the result.
-       * @param {GuardianView[]} list
-       * @param {Map<string, number>} shown - guardian id -> last-shown notice_at_ms
-       * @returns {{id: string, notice_at_ms: number, text: string}[]}
-       */
-      function pendingGuardianNoticeToasts(list, shown) {
-        const out = [];
-        for (const g of list) {
-          if (!g.notice_kind || !g.notice_at_ms) continue;
-          const lastShown = shown.get(g.id) || 0;
-          if (g.notice_at_ms <= lastShown) continue;
-          out.push({ id: g.id, notice_at_ms: g.notice_at_ms, text: `${g.name}: ${g.notice_message || g.notice_kind}` });
-        }
-        return out;
-      }
-      // RALPHUS-GUARDIAN-NOTICE:END
-      /** @type {Map<string, number>} guardian id -> last-shown notice_at_ms */
-      const _guardianNoticeShown = new Map();
-      /**
-       * Shows a toast for any guardian whose `notice_at_ms` is newer than
-       * what was last shown for it (RAL-273).
-       * @param {GuardianView[]} list
-       * @returns {void}
-       */
-      function checkGuardianNotices(list) {
-        for (const toast of pendingGuardianNoticeToasts(list, _guardianNoticeShown)) {
-          _guardianNoticeShown.set(toast.id, toast.notice_at_ms);
-          notify("info", toast.text);
-        }
-      }
       // POST to a guardian/review action endpoint; on failure, surfaces a
       // deduped toast instead of silently no-oping. `body`, when given, is
       // JSON-encoded. Returns the Response (or null on a network error) so
