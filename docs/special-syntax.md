@@ -243,8 +243,10 @@ preset register/list/get/deregister`, the CLI's MCP tool equivalents, or the
 board's Presets tab); at submit time the daemon stamps each preset's field
 values into any of the *same entity's own* fields still unset:
 
-- **A field the entity already set explicitly is never overridden** — a
-  preset only ever fills a field that is unset.
+- **A scalar field the entity already set explicitly is never overridden** — a
+  preset only ever fills a scalar field that is unset. `prompt` and
+  `system_prompt` templates are different: they are always applied (see
+  below).
 - **When more than one named preset in one `extends` list defines the same
   field, the last one listed wins.**
 - **Only 6 fields are preset-eligible**: `prompt` (cell, and a `prompt`
@@ -291,11 +293,23 @@ targets are expanded here; any other linked field is left as written.
 - A reference sees the values the author wrote, not what another preset
   field made of them.
 
-A preset template given to an entity that already has its own value follows
-one extra rule: **the entity's value is kept unless the template references
-that same field of the entity itself** (`./prompt` in a `prompt` template).
-That reference is the author's way of letting the preset frame their text, so
-the expanded template — with the author's text spliced in — replaces it.
+A preset template is **always applied**, on tasks, cells, and proof steps and
+for every text field (`prompt`, `system_prompt`). What happens to the entity's
+own value depends on whether the template references it (a reference that,
+after any `..[kind]` steps resolve for the applied kind, lands on the entity
+itself, e.g. `./prompt` in a `prompt` template):
+
+| Entity's own value | Template references it? | Result |
+|---|---|---|
+| unset | — | the expanded template |
+| set | yes | the expanded template, with the own value spliced in where referenced |
+| set | no | the expanded template, a blank line, then the own value verbatim |
+
+With several presets in `extends`, the last one defining the field supplies the
+template and the rule applies once. The appended own value gets no heading;
+a template that wants one references the value explicitly. (Before this rule,
+a template that did not reference the entity's own value was discarded
+whenever the entity set it.)
 
 ```toml
 [[task.cell]]

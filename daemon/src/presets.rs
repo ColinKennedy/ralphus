@@ -11,8 +11,10 @@
 //! redeployed.
 //!
 //! Applying a preset is a one-time, submit-time stamp: [`apply_presets`]
-//! fills only a field an entity left unset, never overrides one the author
-//! typed explicitly, and silently skips any preset field that doesn't exist
+//! fills a scalar field only when the entity left it unset (an explicit value
+//! wins), always applies a `prompt`/`system_prompt` template (an author's own
+//! text the template doesn't reference is appended after it), and silently
+//! skips any preset field that doesn't exist
 //! on the entity kind it's applied to (e.g. `system_prompt` via a
 //! task-level `extends` -- `system_prompt` only exists on `CellDef`; see
 //! each field's doc comment on `TaskDef`/`CellDef`/`ProofStep` for the
@@ -714,11 +716,13 @@ fn template_wraps_own(template: &str, field: &str, levels: &[ScopeLevel]) -> boo
 /// holds `own`.
 ///
 /// * `own` unset: the expanded template fills it.
-/// * `own` set, template does **not** reference the entity's own `field`:
-///   `own` stays untouched -- an explicit value outranks a preset.
-/// * `own` set, template references it (`./<field>`): the author asked for
-///   the preset to frame their text, so the expanded template, with `own`
-///   spliced in where it is referenced, replaces it.
+/// * `own` set, template references the entity's own `field` (any reference
+///   that lands on the entity itself once `..[kind]` steps resolve): the
+///   expanded template, with `own` spliced in where it is referenced.
+/// * `own` set, template does **not** reference it: the expanded template,
+///   a blank line, then `own` verbatim.
+///
+/// The same rule applies to every entity kind and every text field.
 fn apply_text(
     own: &mut Option<String>,
     field: &str,
@@ -727,10 +731,13 @@ fn apply_text(
     levels: &[ScopeLevel],
 ) {
     let Some(template) = template else { return };
-    if own.is_some() && !template_wraps_own(template, field, levels) {
-        return;
-    }
-    *own = Some(expand_template(template, chain, levels));
+    let expanded = expand_template(template, chain, levels);
+    *own = Some(match own.take() {
+        Some(value) if !template_wraps_own(template, field, levels) => {
+            format!("{expanded}\n\n{value}")
+        }
+        _ => expanded,
+    });
 }
 
 fn apply_to_task(task: &mut TaskDef, by_name: &PresetMap<'_>) {
@@ -855,8 +862,10 @@ pub fn apply_presets(store: &Store, file: &mut TaskFile) {
 /// Scalar fields only fill a field that is currently `None`, so a value the
 /// author typed explicitly is never overridden; when more than one preset
 /// in an entity's own `extends` list defines the same field, the last one
-/// in the list wins. `prompt` and `system_prompt` are *templates* (see
-/// [`apply_text`]): `<<ralphus:linked-field/<path>>>` references inside them
+/// in the list wins. `prompt` and `system_prompt` are *templates* that are
+/// always applied (see [`apply_text`]: the entity's own text is spliced in
+/// where referenced, else appended after the template):
+/// `<<ralphus:linked-field/<path>>>` references inside them
 /// to a `prompt`/`system_prompt` field are expanded -- `./prompt` is the
 /// entity's own prompt, `../prompt` its parent's (a proof step's cell) --
 /// and a reference that cannot be resolved becomes
@@ -1045,7 +1054,11 @@ extends = ["<<ralphus:presets/commit_and_push>>"]
         let mut file = file_from_toml(raw);
         apply_presets(&s, &mut file);
         let cell = &file.task[0].cell[0];
-        assert_eq!(cell.system_prompt.as_deref(), Some("I am an override!"));
+        let expected = format!(
+            "{}\n\nI am an override!",
+            DEFAULT_PRESETS[4].system_prompt.unwrap()
+        );
+        assert_eq!(cell.system_prompt.as_deref(), Some(expected.as_str()));
         assert_eq!(
             cell.system_prompt_position.as_deref(),
             Some(ralphus_core::schema::SYSTEM_PROMPT_POSITION_APPEND)
@@ -1220,8 +1233,8 @@ extends = ["<<ralphus:presets/roles/reviewer>>"]
                 "I am a foo role and I am special!\n\n    Some text here\n    More lines\n\nMore text here"
             )
         );
-        // The author's own prompt is untouched: this preset only frames it
-        // from the system prompt.
+        // The author's own prompt is untouched: the preset supplies no prompt
+        // template, and only frames it from the system prompt.
         assert_eq!(
             out.task[0].cell[0].prompt.as_deref(),
             Some("Some text here\nMore lines\n")
@@ -1291,7 +1304,7 @@ extends = ["<<ralphus:presets/roles/reviewer>>"]
     }
 
     #[test]
-    fn an_explicit_prompt_wins_unless_the_template_frames_it() {
+    fn an_unreferenced_own_prompt_is_appended_after_the_template() {
         let plain = PresetView {
             prompt: Some("Preset prompt".to_string()),
             ..preset("plain")
@@ -1302,12 +1315,33 @@ extends = ["<<ralphus:presets/roles/reviewer>>"]
         };
         let raw = "[[task]]\nname = \"t\"\n[[task.cell]]\ncwd = \"/tmp\"\nprompt = \"mine\"\nextends = [\"<<ralphus:presets/plain>>\"]\n[[task.cell]]\ncwd = \"/tmp\"\nprompt = \"mine\"\nextends = [\"<<ralphus:presets/framing>>\"]\n[[task.cell]]\ncwd = \"/tmp\"\nextends = [\"<<ralphus:presets/plain>>\"]\n";
         let out = applied(raw, &[plain, framing]);
-        assert_eq!(out.task[0].cell[0].prompt.as_deref(), Some("mine"));
+        assert_eq!(
+            out.task[0].cell[0].prompt.as_deref(),
+            Some("Preset prompt\n\nmine")
+        );
         assert_eq!(
             out.task[0].cell[1].prompt.as_deref(),
             Some("Before\nmine\nAfter")
         );
         assert_eq!(out.task[0].cell[2].prompt.as_deref(), Some("Preset prompt"));
+    }
+
+    #[test]
+    fn a_cell_proof_with_its_own_prompt_gets_subject_then_own() {
+        let raw = "[[task]]\nname = \"t\"\n[[task.cell]]\ncwd = \"/tmp\"\nprompt = \"parent work\"\n[[task.cell.proof]]\nprompt = \"focus on auth\"\nextends = [\"<<ralphus:presets/roles/subject>>\"]\n";
+        let out = applied(raw, &[subject_role()]);
+        assert_eq!(
+            out.task[0].cell[0].proof[0].prompt.as_deref(),
+            Some("Review:\nparent work\n\nfocus on auth")
+        );
+    }
+
+    #[test]
+    fn a_cell_with_a_subject_template_includes_its_prompt_once() {
+        let raw = "[[task]]\nname = \"t\"\n[[task.cell]]\ncwd = \"/tmp\"\nprompt = \"the work\"\nextends = [\"<<ralphus:presets/roles/subject>>\"]\n";
+        let out = applied(raw, &[subject_role()]);
+        let prompt = out.task[0].cell[0].prompt.as_deref().unwrap();
+        assert_eq!(prompt.matches("the work").count(), 1);
     }
 
     #[test]
