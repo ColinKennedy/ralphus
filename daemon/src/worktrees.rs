@@ -1830,11 +1830,18 @@ fn resolve_linked_field(
             ctx.cell_id, parsed.field
         ));
     };
+    use ralphus_core::schema::ScopeLevel;
+    let levels: &[ScopeLevel] = if ctx.is_proof_scope {
+        &[ScopeLevel::Task, ScopeLevel::Cell, ScopeLevel::ProofStep]
+    } else {
+        &[ScopeLevel::Task, ScopeLevel::Cell]
+    };
+    let ups = parsed.resolve_ups(levels);
     let value = match target {
-        ralphus_core::schema::LinkTarget::Cwd => resolve_linked_cwd(ctx, parsed.ups, key),
-        ralphus_core::schema::LinkTarget::Id => resolve_linked_id(ctx, parsed.ups, key),
+        ralphus_core::schema::LinkTarget::Cwd => resolve_linked_cwd(ctx, ups, key),
+        ralphus_core::schema::LinkTarget::Id => resolve_linked_id(ctx, ups, key),
         ralphus_core::schema::LinkTarget::Environment(target_key) => {
-            if parsed.ups != 0 {
+            if ups != 0 {
                 return Err(format!(
                     "cell '{}': environment \"{key}\" links to \"environment.{target_key}\" \
                      with \"..\" -- an environment.<key> target must stay in the same table",
