@@ -2910,6 +2910,21 @@ fn fork_token_for(
             fork.fork_url,
             fork.remote_name
         );
+        let _ = store
+            .lock()
+            .cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::WARNING,
+                source: "pr",
+                message: "fork_url did not parse; skipping stored-token lookup",
+                scope: None,
+                squad_id: None,
+                guardian_id: None,
+                cell_id: None,
+                task: None,
+                log_path: None,
+                payload: serde_json::json!({}),
+                admin_only: false,
+            });
         return None;
     };
     let store = store.lock();
