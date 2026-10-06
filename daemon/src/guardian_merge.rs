@@ -1747,6 +1747,7 @@ fn rebase_head_commit_is_empty(wt: &Workspace) -> bool {
 /// identity on the machine, a failing `prepare-commit-msg` hook), so the
 /// caller must fail the branch rather than retry.
 fn advance_rebase(wt: &Workspace) -> Result<(), String> {
+    let head_before = rebase_head_sha(wt);
     let Err(error) = wt.git(&["rebase", "--continue"]) else {
         return Ok(());
     };
@@ -1755,11 +1756,28 @@ fn advance_rebase(wt: &Workspace) -> Result<(), String> {
         // conflict; the resolver loop picks that one up.
         return Ok(());
     }
+    let head_after = rebase_head_sha(wt);
+    if head_after.is_some() && head_after != head_before {
+        // `--continue` committed this step and stopped on a *different*
+        // commit whose conflict `rerere` already resolved and staged
+        // (`Staged '<file>' using previous resolution`), so nothing reads as
+        // unmerged. Git still exits non-zero for that stop; the resolver
+        // loop's next pass finishes it.
+        return Ok(());
+    }
     if rebase_head_commit_is_empty(wt) {
         let _ = wt.git(&["rebase", "--skip"]);
         return Ok(());
     }
     Err(error)
+}
+
+/// `REBASE_HEAD` (the commit the paused rebase is replaying), or `None` when
+/// there is none.
+fn rebase_head_sha(wt: &Workspace) -> Option<String> {
+    let sha = wt.git(&["rev-parse", "--verify", "REBASE_HEAD"]).ok()?;
+    let sha = sha.trim();
+    (!sha.is_empty()).then(|| sha.to_string())
 }
 
 /// The branch-failure detail for an [`advance_rebase`] error.
@@ -17097,6 +17115,62 @@ mod tests {
             "the rebase stays paused for inspection"
         );
         assert!(rebase_stuck_detail("side", &error).contains("user.name/user.email"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn advance_rebase_accepts_a_stop_on_a_commit_rerere_already_resolved() {
+        // `--continue` commits step 1 and stops on step 2, whose conflict
+        // `rerere` replays and stages ("Staged ... using previous
+        // resolution"). Git exits non-zero with nothing unmerged and a
+        // non-empty commit in flight; that is progress, not a stuck rebase.
+        let (base, repo, _fwt) = make_repo("advance-rebase-rerere");
+        g(&repo, &["config", "user.name", "t"]);
+        g(&repo, &["config", "user.email", "t@t"]);
+        g(&repo, &["config", "rerere.enabled", "true"]);
+        g(&repo, &["config", "rerere.autoUpdate", "true"]);
+        std::fs::write(repo.join("one.txt"), "base\n").unwrap();
+        std::fs::write(repo.join("two.txt"), "base\n").unwrap();
+        g(&repo, &["add", "."]);
+        g(&repo, &["commit", "--message", "files"]);
+        std::fs::write(repo.join("one.txt"), "main\n").unwrap();
+        std::fs::write(repo.join("two.txt"), "main\n").unwrap();
+        g(&repo, &["commit", "--all", "--message", "main edit"]);
+        g(&repo, &["checkout", "-b", "side", "HEAD~1"]);
+        std::fs::write(repo.join("one.txt"), "side\n").unwrap();
+        g(&repo, &["commit", "--all", "--message", "side one"]);
+        std::fs::write(repo.join("two.txt"), "side\n").unwrap();
+        g(&repo, &["commit", "--all", "--message", "side two"]);
+        let wt = Workspace::local(&repo);
+        let original = wt.git(&["rev-parse", "HEAD"]).unwrap();
+        let rebase = |expect_success: bool| {
+            let status = std::process::Command::new("git")
+                .args(["rebase", "main"])
+                .current_dir(&repo)
+                .status()
+                .unwrap();
+            assert_eq!(status.success(), expect_success);
+        };
+
+        // First pass: resolve both conflicts by hand so rerere records them.
+        rebase(false);
+        std::fs::write(repo.join("one.txt"), "resolved one\n").unwrap();
+        g(&repo, &["add", "one.txt"]);
+        assert!(wt.git(&["rebase", "--continue"]).is_err());
+        std::fs::write(repo.join("two.txt"), "resolved two\n").unwrap();
+        g(&repo, &["add", "two.txt"]);
+        g(&repo, &["rebase", "--continue"]);
+        assert!(!rebase_in_progress(&wt));
+
+        // Second pass: rerere now stages both steps on its own.
+        g(&repo, &["checkout", "-B", "side", original.trim()]);
+        rebase(false);
+        assert!(conflicted_files(&wt).is_empty(), "rerere staged step 1");
+        advance_rebase(&wt).expect("a rerere-staged next step is progress");
+        assert!(rebase_in_progress(&wt), "paused on step 2");
+        assert!(conflicted_files(&wt).is_empty(), "rerere staged step 2");
+        advance_rebase(&wt).expect("finishing the last step succeeds");
+        assert!(!rebase_in_progress(&wt));
         let _ = std::fs::remove_dir_all(&base);
     }
 
