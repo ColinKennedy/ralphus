@@ -30,6 +30,11 @@
 //! defaults: `auto_fix_pr_errors`, `discourage_tests_during_auto_pull_request_fixes`,
 //! and `rebuild_on = [feedback, auto_fix]`; `dual_root_pr` is additionally
 //! enabled whenever the project itself is a fork or requires contributor forks.
+//! Any fork URL registered here (project-wide or a contributor's) also gets
+//! its local git remote (`fork`/`fork-<user>`) created or repointed right
+//! away, rather than left to the daemon's lazy, submit-time
+//! `ensure_fork_remote` -- so `ralphus check health`'s fork-remote check
+//! never has to warn about a remote that is not there yet.
 //!
 //! Every run ends by writing an answers file (see [`answers`]) recording each
 //! setting's value and source; `--answers-file <path>` replays one, with flags
@@ -44,6 +49,7 @@ use crate::args::GlobalOpts;
 use crate::client::ProjectReviewSettingsPatch;
 use crate::health::CheckResult;
 use answers::Source;
+use ralphus_daemon::project_forks::default_remote_name;
 use ralphus_runner::login_probe::{LoginProbe, LoginState, LoginStatus, StatusRun, login_probes};
 
 const TOTAL_STEPS: u32 = 10;
@@ -1113,6 +1119,7 @@ struct PendingProject {
     is_fork: bool,
     fork_url: Option<String>,
     project_url: String,
+    cwd: PathBuf,
     target_str: String,
     /// A project is already registered at this exact path -- registration
     /// itself is skipped, but review defaults and fork settings still apply.
@@ -1234,9 +1241,56 @@ fn step_project(opts: &GlobalOpts, setup: &InitializeServerOptions) -> Option<Pe
         is_fork,
         fork_url,
         project_url,
+        cwd,
         target_str,
         already_registered,
     })
+}
+
+/// Mirrors the daemon's lazy `ensure_fork_remote` (`project_forks.rs`):
+/// creates or repoints the local git remote for a fork right away, so
+/// `ralphus check health`'s fork-remote check does not warn about a remote
+/// that would otherwise only appear automatically on the first submission
+/// through that fork.
+fn configure_fork_remote(cwd: &std::path::Path, remote_name: &str, fork_url: &str) {
+    let existing = std::process::Command::new("git")
+        .args([
+            "-C",
+            &cwd.to_string_lossy(),
+            "config",
+            "--get",
+            &format!("remote.{remote_name}.url"),
+        ])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string());
+    if existing.as_deref() == Some(fork_url) {
+        return;
+    }
+    let subcommand = if existing.is_some() { "set-url" } else { "add" };
+    match std::process::Command::new("git")
+        .args([
+            "-C",
+            &cwd.to_string_lossy(),
+            "remote",
+            subcommand,
+            remote_name,
+            fork_url,
+        ])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            println!("  git remote \"{remote_name}\" -> {fork_url}");
+        }
+        Ok(output) => println!(
+            "  warning: could not configure git remote \"{remote_name}\": {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(error) => {
+            println!("  warning: could not configure git remote \"{remote_name}\": {error}");
+        }
+    }
 }
 
 fn git_remote_url(cwd: &std::path::Path, remote: &str) -> String {
@@ -1358,6 +1412,7 @@ fn finalize_project_registration(
         is_fork,
         fork_url,
         project_url,
+        cwd,
         target_str,
         already_registered,
     } = pending;
@@ -1393,7 +1448,10 @@ fn finalize_project_registration(
         }
         if let Some(fork_url) = &fork_url {
             match client.add_project_fork(&name, "", fork_url, None, None) {
-                Ok(_) => println!("  registered the project-wide fork URL"),
+                Ok(_) => {
+                    println!("  registered the project-wide fork URL");
+                    configure_fork_remote(&cwd, &default_remote_name(""), fork_url);
+                }
                 Err(error) => println!("  error registering the project fork URL: {error}"),
             }
         }
@@ -1447,16 +1505,24 @@ fn finalize_project_registration(
                 })
                 .cloned()
         });
+        let remote_name = default_remote_name(&user);
         match existing_fork {
             Some(fork) if fork["fork_url"].as_str() == Some(fork_url.as_str()) => {
                 println!("  fork for {user} is already registered; skipping");
+                configure_fork_remote(&cwd, &remote_name, &fork_url);
             }
             Some(_) => match client.set_project_fork(&name, &user, Some(&fork_url), None, None) {
-                Ok(_) => println!("  updated the registered fork for {user}"),
+                Ok(_) => {
+                    println!("  updated the registered fork for {user}");
+                    configure_fork_remote(&cwd, &remote_name, &fork_url);
+                }
                 Err(error) => println!("  error updating fork registration: {error}"),
             },
             None => match client.add_project_fork(&name, &user, &fork_url, None, None) {
-                Ok(_) => println!("  registered a fork for {user}"),
+                Ok(_) => {
+                    println!("  registered a fork for {user}");
+                    configure_fork_remote(&cwd, &remote_name, &fork_url);
+                }
                 Err(error) => println!("  error registering fork: {error}"),
             },
         }
