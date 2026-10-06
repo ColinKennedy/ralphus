@@ -108,11 +108,9 @@
         inspectorLiveAttached[branchId] = true;
         const g = guardians.find((x) => x.id === selectedGuardian);
         if (!g) return false;
-        const key = `guardian|${g.id}|${branchId}`;
-        if (peekOpen[key]) return false;
-        peekOpen[key] = true;
+        // The peek key depends on which run the pane shows, which is only
+        // known while rendering -- `inspectorLiveTab` opens and fetches it.
         renderReviewInspector();
-        fetchPeek(key, true);
         return true;
       }
       /**
@@ -823,6 +821,12 @@
         const ri = curRunIdx(runs, b.id);
         const run = ri >= 0 ? runs[ri] : null;
         const key = `guardian|${g.id}|${b.id}${run && run.task && run.cellId ? `|${run.task}|${run.cellId}` : ""}`;
+        // The key names the shown run, so it changes as runs load or are
+        // stepped through; whichever one is on screen is the one polled.
+        if (!peekOpen[key]) {
+          peekOpen[key] = true;
+          setTimeout(() => fetchPeek(key, true), 0);
+        }
         const isLatest = ri === runs.length - 1;
         const sub = liveSub[b.id] || "terminal";
         const ended = !!peekEnded[key];
@@ -898,7 +902,8 @@
           + `data-tip="${esc(LIVE_SUB_TIP[s[0]])}">${s[1]}</button>`).join("")}</div>`;
 
         const top = identity + histBar + ctl + tabs;
-        if (sub === "system") return top + liveSystemPromptView(g, key);
+        // The system prompt is per branch, not per run: `setLiveSub` fetches it under the branch-level key.
+        if (sub === "system") return top + liveSystemPromptView(g, `guardian|${g.id}|${b.id}`);
         if (sub === "prompt") return top + livePromptView(g, b, run);
         return top + liveTerminalView(g, b, key, run, onNewestTape);
       }
