@@ -200,7 +200,7 @@ pub(crate) fn set_worktree_commit_baseline(
     let branch = worktree_branch(cwd)?;
     let qualified = crate::guardian_merge::qualify_ambiguous_ref(cwd, baseline);
     let resolved = git(cwd, &["rev-parse", "--verify", &qualified])?;
-    git(
+    git_config_write(
         cwd,
         &[
             "config",
@@ -208,7 +208,28 @@ pub(crate) fn set_worktree_commit_baseline(
             resolved.trim(),
         ],
     )
-    .map(|_| ())
+}
+
+/// Run a `git config` write against the shared `.git/config`, serialized with
+/// the daemon's other config writers and retried while another process (a
+/// sibling cell's `git push -u`, an agent's own `git config`) holds
+/// `config.lock` -- git fails immediately with "could not lock config file"
+/// instead of waiting, and the lock is only held for milliseconds.
+fn git_config_write(cwd: &Path, args: &[&str]) -> std::result::Result<(), String> {
+    const ATTEMPTS: u32 = 20;
+    let _guard = crate::worktrees::WORKTREE_CONFIG_LOCK.lock();
+    let mut attempt = 1;
+    loop {
+        match git(cwd, args) {
+            Ok(_) => return Ok(()),
+            Err(e) if attempt < ATTEMPTS && e.contains("could not lock config file") => {
+                // allow-lock-io: `_guard` is the config-writer mutex, not the store lock; holding it across this bounded retry (<= ~5s total) is what serializes the writers
+                std::thread::sleep(std::time::Duration::from_millis(25 * u64::from(attempt)));
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// The upstream (`branch@{upstream}`) of the worktree's branch, if any.
@@ -3474,6 +3495,33 @@ mod tests {
             workspace_has_commits_ahead_of_upstream(&Workspace::local(root.clone())),
             "the child's own commit must satisfy the no-commits guard"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn baseline_write_retries_while_config_lock_is_held() {
+        // Another process holding `.git/config.lock` makes `git config` fail
+        // immediately; the baseline write must wait it out, not fail the cell.
+        let root = temp_repo();
+        git(&root, &["init", "--initial-branch", "main"]);
+        git(&root, &["config", "user.email", "t@example.com"]);
+        git(&root, &["config", "user.name", "t"]);
+        std::fs::write(root.join("a.txt"), "a\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "--message", "init"]);
+        git(&root, &["branch", "upstream"]);
+
+        let lock = root.join(".git").join("config.lock");
+        std::fs::write(&lock, "").unwrap();
+        let releaser = std::thread::spawn({
+            let lock = lock.clone();
+            move || {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                std::fs::remove_file(lock).unwrap();
+            }
+        });
+        set_worktree_commit_baseline(&root, "upstream").unwrap();
+        releaser.join().unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }
 
