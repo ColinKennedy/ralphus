@@ -2949,8 +2949,8 @@ Declines an open offer; nothing is created. `409` if it was already answered.
 
 ### Follow-up offer configuration
 
-Defaults live in a `[followup]` table of the global config only; a project's
-`.ralphus.toml` does not set them. Each review can override `enabled` and
+Defaults live in a `[followup]` table of the global config, which a project's
+`.ralphus.toml` `[followup]` table overrides field by field. Each review can override `enabled` and
 `auto_start` for itself through `followup_enabled`/`followup_auto_start` on
 [`POST /api/guardians/{id}/settings`](#post-apiguardiansidsettings); the
 review's own value wins over the global one.

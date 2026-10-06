@@ -5689,8 +5689,15 @@ impl Store {
         conn: &Connection,
         git_roots: impl Iterator<Item = &'a str>,
     ) -> GuardianHydrationCtx {
+        let live_followup = crate::config::global_followup_config();
+        let mut followup_by_git_root = std::collections::HashMap::new();
         let mut config_by_git_root = std::collections::HashMap::new();
         for root in git_roots {
+            followup_by_git_root
+                .entry(root.to_string())
+                .or_insert_with(|| {
+                    crate::config::layered_followup_config(Path::new(root), &live_followup)
+                });
             config_by_git_root
                 .entry(root.to_string())
                 .or_insert_with(|| {
@@ -5709,7 +5716,8 @@ impl Store {
         GuardianHydrationCtx {
             project_stamps: Self::load_all_project_stamps_conn(conn),
             live_global: crate::config::global_review_config(),
-            live_followup: crate::config::global_followup_config(),
+            live_followup,
+            followup_by_git_root,
             config_by_git_root,
             db_profiles,
         }
@@ -6231,15 +6239,16 @@ impl Store {
             .or(live_global.auto_run)
             .unwrap_or(false);
 
-        // Follow-up offers: per-review override > the live global
-        // `[followup]` config > on. No project layer.
-        let effective_followup_enabled = row
-            .followup_enabled
-            .or(ctx.live_followup.enabled)
-            .unwrap_or(true);
+        // Follow-up offers: per-review override > the project's
+        // `.ralphus.toml [followup]` > the live global `[followup]` config > on.
+        let followup = ctx
+            .followup_by_git_root
+            .get(&row.git_root)
+            .unwrap_or(&ctx.live_followup);
+        let effective_followup_enabled = row.followup_enabled.or(followup.enabled).unwrap_or(true);
         let effective_followup_auto_start = row
             .followup_auto_start
-            .or(ctx.live_followup.auto_start)
+            .or(followup.auto_start)
             .unwrap_or(true);
 
         // Which events rebuild the prepared build, layered the same way:
@@ -6737,6 +6746,8 @@ struct GuardianHydrationCtx {
     live_global: crate::config::ReviewConfig,
     /// The live global `[followup]` config, read once per hydration batch.
     live_followup: crate::config::FollowupConfig,
+    /// Per-`git_root`: the project's `[followup]` fields over `live_followup`.
+    followup_by_git_root: std::collections::HashMap<String, crate::config::FollowupConfig>,
     /// Per-`git_root`: `(the layered global+project+database config, the
     /// project-file-only config, this project's raw database-backed
     /// settings)` -- memoized so guardians sharing a repo (the common case)
