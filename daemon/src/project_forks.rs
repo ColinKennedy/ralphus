@@ -732,15 +732,51 @@ fn check(
 /// tries to submit through it.
 #[must_use]
 pub fn check_fork_health(store: &Store, fork: &ForkRecord) -> Vec<ForkHealthCheck> {
-    let (mut out, project_path, clone_url) = fork_health_store_inputs(store, fork);
+    let (mut out, project_path, clone_url, tokens) = fork_health_store_inputs(store, fork);
     if let Some(project_path) = project_path {
         out.extend(check_fork_network_health(
             &project_path,
             fork,
             clone_url.as_deref(),
+            &tokens,
         ));
     }
     out
+}
+
+/// Stored forge tokens read up front by [`fork_health_store_inputs`] so
+/// [`check_fork_network_health`] needs no store access. The fork client
+/// authenticates as `fork.user` (the `[daemon].default_user` for the
+/// project-wide default row); the parent client as `[daemon].default_user`,
+/// since a health probe has no acting user. `None` falls back to env/CLI.
+#[derive(Clone, Default)]
+pub struct ForkHealthTokens {
+    pub fork: Option<String>,
+    pub parent: Option<String>,
+}
+
+fn fork_health_tokens(
+    store: &Store,
+    fork: &ForkRecord,
+    clone_url: Option<&str>,
+) -> ForkHealthTokens {
+    let default_user = crate::config::load_daemon_config().default_user;
+    let fork_host = crate::forge::parse_remote_url(fork.fork_url.trim()).map(|(h, _)| h);
+    let parent_host = clone_url
+        .and_then(|u| crate::forge::parse_remote_url(u.trim()).map(|(h, _)| h))
+        .or_else(|| fork_host.clone());
+    let fork_user = if fork.user.is_empty() {
+        default_user.clone()
+    } else {
+        Some(fork.user.clone())
+    };
+    let lookup = |user: Option<&String>, host: Option<&String>| {
+        crate::forge::stored_token_for_user(store, user?, host?).map(|t| t.token)
+    };
+    ForkHealthTokens {
+        fork: lookup(fork_user.as_ref(), fork_host.as_ref()),
+        parent: lookup(default_user.as_ref(), parent_host.as_ref()),
+    }
 }
 
 /// The store-read prologue of [`check_fork_health`]: the orphaned-user and
@@ -757,6 +793,7 @@ pub fn fork_health_store_inputs(
     Vec<ForkHealthCheck>,
     Option<std::path::PathBuf>,
     Option<String>,
+    ForkHealthTokens,
 ) {
     let mut out = Vec::new();
     if !fork.user.is_empty() && matches!(store.get_user(&fork.user), Ok(None)) {
@@ -781,7 +818,7 @@ pub fn fork_health_store_inputs(
                 "fail",
                 "the project this fork was registered against is no longer registered",
             ));
-            return (out, None, None);
+            return (out, None, None, ForkHealthTokens::default());
         }
         Err(e) => {
             out.push(check(
@@ -791,11 +828,17 @@ pub fn fork_health_store_inputs(
                 "fail",
                 e.to_string(),
             ));
-            return (out, None, None);
+            return (out, None, None, ForkHealthTokens::default());
         }
     };
     let clone_url = project.clone_url.clone();
-    (out, Some(std::path::PathBuf::from(project.path)), clone_url)
+    let tokens = fork_health_tokens(store, fork, clone_url.as_deref());
+    (
+        out,
+        Some(std::path::PathBuf::from(project.path)),
+        clone_url,
+        tokens,
+    )
 }
 
 /// The I/O tail of [`check_fork_health`]: a `git config --get` subprocess
@@ -809,6 +852,7 @@ pub fn check_fork_network_health(
     project_path: &std::path::Path,
     fork: &ForkRecord,
     clone_url: Option<&str>,
+    tokens: &ForkHealthTokens,
 ) -> Vec<ForkHealthCheck> {
     let mut out = Vec::new();
     let root = project_path;
@@ -859,8 +903,18 @@ pub fn check_fork_network_health(
         clone_url,
         Some(&fork.remote_name),
     );
-    let parent_client = crate::forge::resolve_remote_for(root, &parent_remote_name, &forge_cfg);
-    let fork_client = crate::forge::resolve_remote_for(root, &fork.remote_name, &forge_cfg);
+    let parent_client = crate::forge::resolve_remote_for_as(
+        root,
+        &parent_remote_name,
+        &forge_cfg,
+        tokens.parent.as_deref(),
+    );
+    let fork_client = crate::forge::resolve_remote_for_as(
+        root,
+        &fork.remote_name,
+        &forge_cfg,
+        tokens.fork.as_deref(),
+    );
     match (parent_client, fork_client) {
         (Ok(parent_client), Ok(fork_client)) => {
             let fork_lookup = fork_client.lookup_fork_network();

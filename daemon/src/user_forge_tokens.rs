@@ -3,17 +3,17 @@
 //! helper fetch one without the token ever touching a git config file on
 //! disk.
 //!
-//! `forge.rs`'s own token resolution deliberately reads a forge API token
-//! from an environment variable only, never the database, because that
-//! covers a single daemon operator with a single identity. This module is a
-//! deliberate, narrower exception for a different problem that convention
-//! doesn't answer: many *different ralphus users*, each with their own
-//! personal fork and their own distinct forge credential, served by the same
-//! daemon. Storing each user's own token, which only they set (via CLI/board,
-//! scoped to their own name), is the trade-off made instead of either (a)
-//! requiring every host that runs a push to have that user's key/token
-//! pre-provisioned out of band, or (b) standing up an external identity
-//! service.
+//! `forge.rs` resolves a forge API token as stored per-user token, then the
+//! env var, then the forge CLI's cached login (see its module Auth doc). This
+//! module holds the first of those: many *different ralphus users*, each with
+//! their own forge credential, served by the same daemon. Every forge client
+//! (parent or fork, REST or git push) authenticates as the acting user's
+//! stored token for the remote's host, falling back to `[daemon].default_user`'s
+//! and then to the daemon-wide env/CLI identity. Storing each user's own
+//! token, which only they set (via CLI/board, scoped to their own name), is
+//! the trade-off made instead of either (a) requiring every host that runs a
+//! push to have that user's key/token pre-provisioned out of band, or (b)
+//! standing up an external identity service.
 
 use serde::Serialize;
 

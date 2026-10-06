@@ -2805,6 +2805,9 @@ fn resolve_pr_repo_routing(
             .or_else(|| store.lock().resolve_fork(p, "").ok().flatten())
     });
     let clone_url = project_clone_url(store, project_name.as_deref());
+    // The identity every client built here authenticates as unless a fork's
+    // own registered user takes over for the fork client.
+    let identity = crate::forge::effective_forge_identity(None, owner);
     let Some(fork) = fork else {
         let parent_remote_name = crate::forge::resolve_parent_remote_name(
             root,
@@ -2814,8 +2817,14 @@ fn resolve_pr_repo_routing(
             None,
         );
         return PrRepoRouting {
-            parent_client: crate::forge::resolve_remote_for(root, &parent_remote_name, forge_cfg)
-                .ok(),
+            parent_client: crate::forge::resolve_remote_with_store(
+                store,
+                root,
+                &parent_remote_name,
+                forge_cfg,
+                identity.as_deref(),
+            )
+            .ok(),
             parent_remote_name,
             fork_client: None,
             fork_remote_name: None,
@@ -2828,21 +2837,22 @@ fn resolve_pr_repo_routing(
         clone_url.as_deref(),
         Some(&fork.remote_name),
     );
-    let parent_client = crate::forge::resolve_remote_for(root, &parent_remote_name, forge_cfg).ok();
+    let parent_client = crate::forge::resolve_remote_with_store(
+        store,
+        root,
+        &parent_remote_name,
+        forge_cfg,
+        identity.as_deref(),
+    )
+    .ok();
     // RAL-338 follow-up: the fork's own client must authenticate as the
     // fork's registered owner (`fork.user`), not the daemon's single shared
-    // identity -- unlike the parent client above (there is only ever one
-    // parent), the fork's owner may be a different person entirely, and the
+    // identity -- the fork's owner may be a different person entirely, and the
     // daemon's own token routinely lacks visibility into that user's fork
     // (GitLab/GitHub answer with a 404, not a 403, for a resource the
     // token can't see, so this looked identical to "the PR doesn't exist").
-    let fork_token = crate::forge::parse_remote_url(fork.fork_url.trim()).and_then(|(host, _)| {
-        store
-            .lock()
-            .get_user_forge_token(&fork.user, &host)
-            .ok()
-            .flatten()
-    });
+    // The project-wide default fork row has no `user`; it uses `identity`.
+    let fork_token = fork_token_for(store, &fork, identity.as_deref());
     let fork_client = crate::forge::resolve_remote_for_as(
         root,
         &fork.remote_name,
@@ -2855,6 +2865,58 @@ fn resolve_pr_repo_routing(
         parent_remote_name,
         fork_client,
         fork_remote_name: Some(fork.remote_name),
+    }
+}
+
+/// Wires `credential.helper` on a review's root worktree for its parent
+/// remote so `git push` authenticates as `identity`, the same person the REST
+/// client uses. A fork routes through [`prepare_fork_worktree`] instead; an
+/// SSH remote, or an identity with no stored token, is left on ambient auth.
+fn wire_parent_credential_helper(
+    store: &crate::store_lock::StoreHandle,
+    root: &Path,
+    parent_remote_name: &str,
+    identity: Option<&str>,
+) {
+    let Some(identity) = identity.filter(|u| !u.is_empty()) else {
+        return;
+    };
+    let Ok(url) = crate::guardian_merge::git(root, &["remote", "get-url", parent_remote_name])
+    else {
+        return;
+    };
+    crate::worktrees::apply_worktree_credential_helper_best_effort(
+        store,
+        root,
+        identity,
+        url.trim(),
+    );
+}
+
+/// The stored token a fork's own client authenticates with: `fork.user`'s
+/// token for the fork's host, or -- for the project-wide default fork row,
+/// which has no `user` -- `identity`'s (then `[daemon].default_user`'s). A
+/// `fork_url` that does not parse skips the lookup, logged.
+fn fork_token_for(
+    store: &crate::store_lock::StoreHandle,
+    fork: &crate::project_forks::ForkRecord,
+    identity: Option<&str>,
+) -> Option<String> {
+    let Some((host, _)) = crate::forge::parse_remote_url(fork.fork_url.trim()) else {
+        crate::rlog!(
+            WARNING,
+            "ralphus [pr] fork_url {:?} for remote {} did not parse; skipping the stored-token \
+             lookup and falling back to env/CLI",
+            fork.fork_url,
+            fork.remote_name
+        );
+        return None;
+    };
+    let store = store.lock();
+    if fork.user.is_empty() {
+        crate::forge::stored_token_for_identity(&store, identity, &host).map(|t| t.token)
+    } else {
+        crate::forge::stored_token_for_user(&store, &fork.user, &host).map(|t| t.token)
     }
 }
 
@@ -5869,24 +5931,23 @@ fn resolve_fork_routing(
         clone_url.as_deref(),
         Some(&fork.remote_name),
     );
-    let parent_client = crate::forge::resolve_remote_for(root, &parent_remote_name, forge_cfg)?;
+    let identity = crate::forge::effective_forge_identity(Some(user), guardian.owner.as_deref());
+    let parent_client = crate::forge::resolve_remote_with_store(
+        store,
+        root,
+        &parent_remote_name,
+        forge_cfg,
+        identity.as_deref(),
+    )?;
     // RAL-338 follow-up: the fork's own forge REST API client must
     // authenticate as the fork's owning user, not the daemon's single
-    // shared identity -- unlike the parent client above (there is only
-    // ever one parent, so the daemon's own env-var/CLI-token identity is
-    // correct there), the fork's owner may be a different person entirely.
+    // shared identity -- the fork's owner may be a different person entirely.
     // Without this, git push (already routed through this user's stored
     // token via the credential helper) succeeds, but the REST call to
     // actually open the PR/MR fails with a permissions error, since it
     // authenticated as whoever the daemon's shared identity is instead of
     // the fork's actual owner.
-    let fork_token = crate::forge::parse_remote_url(fork.fork_url.trim()).and_then(|(host, _)| {
-        store
-            .lock()
-            .get_user_forge_token(user, &host)
-            .ok()
-            .flatten()
-    });
+    let fork_token = fork_token_for(store, &fork, identity.as_deref());
     let fork_client = crate::forge::resolve_remote_for_as(
         root,
         &fork.remote_name,
@@ -6165,17 +6226,30 @@ pub(crate) fn refresh_dual_root_upstream_branch(
                 .get_guardian(guardian_id)
                 .ok()
                 .is_some_and(|g| g.auto_cancel_outdated_pr_pipelines.unwrap_or(true));
-            if let Ok(fork_client) =
-                crate::forge::resolve_remote_for(&root, &fork.remote_name, &forge_cfg)
-            {
-                cancel_superseded_ci_after_push(
+            let fork_token = fork_token_for(store, &fork, Some(user));
+            match crate::forge::resolve_remote_for_as(
+                &root,
+                &fork.remote_name,
+                &forge_cfg,
+                fork_token.as_deref(),
+            ) {
+                Ok(fork_client) => cancel_superseded_ci_after_push(
                     store,
                     guardian_id,
                     auto_cancel,
                     Some(&fork_client),
                     &branch,
                     &sha,
-                );
+                ),
+                Err(e) => {
+                    // ralphus[ignore-rlog-pair]: best-effort CI cancel; the next push retries
+                    crate::rlog!(
+                        WARNING,
+                        "ralphus [pr] review {guardian_id} could not build the fork client for \
+                         superseded-CI cancel on {}: {e}",
+                        fork.remote_name
+                    );
+                }
             }
         }
         Ok(None) => {}
@@ -7962,8 +8036,24 @@ fn auto_submit_terminal_branches(
     let remote_name = push_remote_for(fork_routing.as_ref(), &parent_remote_name).to_string();
     let client = match &fork_routing {
         Some(routing) => routing.fork_client.clone(),
-        None => crate::forge::resolve_remote_for(&root, &parent_remote_name, &forge_cfg)?,
+        None => crate::forge::resolve_remote_with_store(
+            store,
+            &root,
+            &parent_remote_name,
+            &forge_cfg,
+            crate::forge::effective_forge_identity(Some(&poller_user), guardian.owner.as_deref())
+                .as_deref(),
+        )?,
     };
+    if fork_routing.is_none() {
+        wire_parent_credential_helper(
+            store,
+            &root,
+            &parent_remote_name,
+            crate::forge::effective_forge_identity(Some(&poller_user), guardian.owner.as_deref())
+                .as_deref(),
+        );
+    }
     let pr_branch_convention = forge_cfg.resolved_pr_branch_convention().to_string();
     // RAL-196: auto-submitted branches follow the project default (there is
     // no human submitting to override it) -- resolve it the same way the
@@ -8509,8 +8599,24 @@ fn submit_pull_requests_inner(
     let remote_name = push_remote_for(fork_routing.as_ref(), &parent_remote_name).to_string();
     let client = match &fork_routing {
         Some(routing) => routing.fork_client.clone(),
-        None => crate::forge::resolve_remote_for(&root, &parent_remote_name, &forge_cfg)?,
+        None => crate::forge::resolve_remote_with_store(
+            store,
+            &root,
+            &parent_remote_name,
+            &forge_cfg,
+            crate::forge::effective_forge_identity(Some(user), guardian.owner.as_deref())
+                .as_deref(),
+        )?,
     };
+    if fork_routing.is_none() {
+        wire_parent_credential_helper(
+            store,
+            &root,
+            &parent_remote_name,
+            crate::forge::effective_forge_identity(Some(user), guardian.owner.as_deref())
+                .as_deref(),
+        );
+    }
     let pr_branch_convention = forge_cfg.resolved_pr_branch_convention().to_string();
     // RAL-196: the project's effective provider-specific draft-by-default
     // (global → per-project config layered at the review root). Every branch
