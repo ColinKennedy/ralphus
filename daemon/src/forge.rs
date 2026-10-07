@@ -3021,42 +3021,13 @@ pub fn check_repository_url(
     Ok(ForgeClient::new(kind, api_base, repo_path, token).check_repo())
 }
 
-/// Parse a git remote URL into `(host, path)`, where `path` has no leading
-/// slash, trailing slash, or `.git` suffix. Supports the three shapes git
-/// itself accepts: `git@host:owner/repo.git`, `https://host/owner/repo.git`,
-/// and `ssh://git@host/owner/repo.git`.
+/// Parse a git remote URL into `(host, path)` -- the logic lives in
+/// [`ralphus_core::git_remote`] so `ralphus initialize server` normalizes
+/// URLs identically.
 ///
 /// `pub(crate)` (RAL-338) so `project_forks`/`pr.rs` can reuse it to derive a
 /// fork registration's owner without re-deriving this parsing a second time.
-pub(crate) fn parse_remote_url(url: &str) -> Option<(String, String)> {
-    let url = url.trim();
-    let (host, path) = if let Some(rest) = url
-        .strip_prefix("ssh://")
-        .or_else(|| url.strip_prefix("git://"))
-    {
-        let rest = rest.split('@').next_back().unwrap_or(rest);
-        let mut parts = rest.splitn(2, '/');
-        (parts.next()?, parts.next()?)
-    } else if let Some(rest) = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-    {
-        let rest = rest.split('@').next_back().unwrap_or(rest);
-        let mut parts = rest.splitn(2, '/');
-        (parts.next()?, parts.next()?)
-    } else {
-        let (rest, idx) = url.strip_prefix("git@").and_then(|r| {
-            let idx = r.find(':')?;
-            Some((r, idx))
-        })?;
-        (&rest[..idx], &rest[idx + 1..])
-    };
-    let path = path.trim_end_matches('/').trim_end_matches(".git");
-    if host.is_empty() || path.is_empty() {
-        return None;
-    }
-    Some((host.to_string(), path.to_string()))
-}
+pub(crate) use ralphus_core::git_remote::parse_remote_url;
 
 /// Best-effort GitHub owner/org login parsed from a fork's remote URL
 /// (RAL-338), for the fork registration surface's optional `fork_owner`

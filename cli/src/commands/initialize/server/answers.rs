@@ -421,7 +421,7 @@ fn unasked_default(key: &str) -> toml::Value {
         ),
         "project_url" => Text(
             std::env::current_dir()
-                .map(|cwd| super::git_remote_url(&cwd, "origin"))
+                .map(|cwd| super::default_upstream_url(&cwd, None))
                 .unwrap_or_default(),
         ),
         "review_resolver_agent" | "sample_agent" => Text("claude-code".to_string()),
@@ -534,8 +534,11 @@ mod tests {
 
     fn temp_file(name: &str, text: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
-            "ralphus-answers-test-{}-{name}.toml",
-            std::process::id()
+            "ralphus-answers-test-{}-{}-{name}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
         ));
         std::fs::write(&path, text).unwrap();
         path

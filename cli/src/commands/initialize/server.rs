@@ -49,7 +49,7 @@ use crate::args::GlobalOpts;
 use crate::client::ProjectReviewSettingsPatch;
 use crate::health::CheckResult;
 use answers::Source;
-use ralphus_daemon::project_forks::default_remote_name;
+use ralphus_core::git_remote::{default_upstream_remote, find_remote_for_url};
 use ralphus_runner::login_probe::{LoginProbe, LoginState, LoginStatus, StatusRun, login_probes};
 
 const TOTAL_STEPS: u32 = 10;
@@ -412,7 +412,7 @@ pub fn dispatch(opts: &GlobalOpts, mut setup: InitializeServerOptions) -> i32 {
     let health_results = step_health(opts);
 
     step.begin("Submit a sample hello-world task (optional)");
-    step_sample(opts, project.as_deref(), &health_results, &logins, &setup);
+    step_sample(opts, project.as_ref(), &health_results, &logins, &setup);
 
     let answers_text = answers::render(&mut setup);
     let answers_path = match answers::write(&answers_text) {
@@ -1126,6 +1126,13 @@ struct PendingProject {
     already_registered: bool,
 }
 
+/// A project `initialize server` registered (or found already registered) and
+/// the git remote of this checkout that points at its non-fork upstream.
+struct ProjectSetup {
+    name: String,
+    upstream_remote: String,
+}
+
 fn step_project(opts: &GlobalOpts, setup: &InitializeServerOptions) -> Option<PendingProject> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let probe = std::process::Command::new("git")
@@ -1188,27 +1195,39 @@ fn step_project(opts: &GlobalOpts, setup: &InitializeServerOptions) -> Option<Pe
     } else {
         None
     };
-    // In a forked clone, "origin" is almost always the fork itself, not the
-    // upstream project -- autofilling it here would suggest the wrong URL,
-    // so the fork branch gets a generic example instead of a real default.
-    let (question, default) = if is_fork {
-        (
-            format!("  origin clone URL (SSH recommended) [git@github.com:{{owner}}/{name}.git]"),
-            String::new(),
-        )
-    } else {
-        (
-            "  project clone URL (SSH recommended)".to_string(),
-            git_remote_url(&cwd, "origin"),
-        )
-    };
+    let remotes = git_remotes(&cwd);
+    let fork_remote = fork_url
+        .as_deref()
+        .and_then(|fork| find_remote_for_url(&remotes, fork, &[]))
+        .map(str::to_string);
+    let default_url = default_upstream_remote(&remotes, fork_url.as_deref())
+        .map(|(_, url)| url.clone())
+        .unwrap_or_default();
     let project_url = prompt(
         &PROJECT_URL,
-        &question,
-        &default,
+        if is_fork {
+            "  upstream/origin clone URL for the non-fork project (SSH recommended)"
+        } else {
+            "  project clone URL (SSH recommended)"
+        },
+        &default_url,
         setup.project_url.as_ref(),
         setup.yes,
     );
+    let exclude: Vec<&str> = fork_remote.as_deref().into_iter().collect();
+    let matched_remote = (!project_url.is_empty())
+        .then(|| find_remote_for_url(&remotes, &project_url, &exclude))
+        .flatten()
+        .map(str::to_string);
+    let remote_to_add = (!project_url.is_empty() && matched_remote.is_none())
+        .then(|| free_remote_name(&remotes, &["origin", "upstream", "ralphus-upstream"]));
+    match (&matched_remote, &remote_to_add) {
+        (Some(name), _) => println!("  using git remote \"{name}\" for {project_url}"),
+        (None, Some(name)) => println!(
+            "  no git remote points at {project_url}; will add one named \"{name}\" once you confirm"
+        ),
+        (None, None) => {}
+    }
     let description = prompt(
         &PROJECT_DESCRIPTION,
         "  one-line project description",
@@ -1293,14 +1312,66 @@ fn configure_fork_remote(cwd: &std::path::Path, remote_name: &str, fork_url: &st
     }
 }
 
-fn git_remote_url(cwd: &std::path::Path, remote: &str) -> String {
-    std::process::Command::new("git")
-        .args(["-C", &cwd.to_string_lossy(), "remote", "get-url", remote])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+/// Every configured remote of the repository at `cwd` as `(name, url)`, read
+/// from the raw config so a global `url.<x>.insteadOf` rewrite cannot make a
+/// remote look different from what was configured.
+fn git_remotes(cwd: &std::path::Path) -> Vec<(String, String)> {
+    let output = std::process::Command::new("git")
+        .args([
+            "-C",
+            &cwd.to_string_lossy(),
+            "config",
+            "--get-regexp",
+            r"^remote\..*\.url$",
+        ])
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let (key, url) = line.split_once(' ')?;
+            let name = key.strip_prefix("remote.")?.strip_suffix(".url")?;
+            Some((name.to_string(), url.trim().to_string()))
+        })
+        .collect()
+}
+
+/// The URL `initialize server` offers as the project's upstream: the first
+/// remote that is not `fork_url`, preferring `origin`. Empty when none.
+fn default_upstream_url(cwd: &std::path::Path, fork_url: Option<&str>) -> String {
+    default_upstream_remote(&git_remotes(cwd), fork_url)
+        .map(|(_, url)| url.clone())
         .unwrap_or_default()
+}
+
+/// The first of `preferred` not already a remote name, else a numbered
+/// `ralphus-upstream-N`.
+fn free_remote_name(remotes: &[(String, String)], preferred: &[&str]) -> String {
+    let taken = |name: &str| remotes.iter().any(|(existing, _)| existing == name);
+    preferred
+        .iter()
+        .find(|name| !taken(name))
+        .map(|name| (*name).to_string())
+        .unwrap_or_else(|| {
+            (2..)
+                .map(|n| format!("ralphus-upstream-{n}"))
+                .find(|name| !taken(name))
+                .expect("an unbounded range yields a free name")
+        })
+}
+
+fn git_add_remote(cwd: &std::path::Path, name: &str, url: &str) -> Result<(), String> {
+    let output = std::process::Command::new("git")
+        .args(["-C", &cwd.to_string_lossy(), "remote", "add", name, url])
+        .output()
+        .map_err(|error| error.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
 }
 
 // ---- review settings / auto-review thresholds ------------------------------
@@ -1405,7 +1476,7 @@ fn finalize_project_registration(
     pending: PendingProject,
     review: ReviewDefaults,
     forks: ForkSettings,
-) -> Option<String> {
+) -> Option<ProjectSetup> {
     let PendingProject {
         name,
         description,
@@ -1417,6 +1488,24 @@ fn finalize_project_registration(
         already_registered,
     } = pending;
     let client = opts.client();
+
+    let remotes = git_remotes(&cwd);
+    let fork_remote = fork_url
+        .as_deref()
+        .and_then(|fork| find_remote_for_url(&remotes, fork, &[]))
+        .map(str::to_string);
+    let exclude: Vec<&str> = fork_remote.as_deref().into_iter().collect();
+    let matched_remote = (!project_url.is_empty())
+        .then(|| find_remote_for_url(&remotes, &project_url, &exclude))
+        .flatten()
+        .map(str::to_string);
+    let remote_to_add = (!project_url.is_empty() && matched_remote.is_none())
+        .then(|| free_remote_name(&remotes, &["origin", "upstream", "ralphus-upstream"]));
+    let upstream_remote = match (&matched_remote, &remote_to_add) {
+        (Some(name), _) => name.clone(),
+        (None, Some(name)) => name.clone(),
+        (None, None) => "origin".to_string(),
+    };
 
     if already_registered {
         println!(
@@ -1446,13 +1535,27 @@ fn finalize_project_registration(
                 return None;
             }
         }
-        if let Some(fork_url) = &fork_url {
-            match client.add_project_fork(&name, "", fork_url, None, None) {
+
+        if let Some(ref fork_url_val) = fork_url {
+            match client.add_project_fork(&name, "", fork_url_val, fork_remote.as_deref(), None) {
                 Ok(_) => {
                     println!("  registered the project-wide fork URL");
-                    configure_fork_remote(&cwd, &default_remote_name(""), fork_url);
+                    if let Some(ref remote_name) = fork_remote {
+                        configure_fork_remote(&cwd, remote_name, fork_url_val);
+                    }
                 }
                 Err(error) => println!("  error registering the project fork URL: {error}"),
+            }
+        }
+
+        if let Some(remote_name) = &remote_to_add {
+            match git_add_remote(&cwd, remote_name, &project_url) {
+                Ok(()) => {
+                    println!("  added git remote \"{remote_name}\" -> {project_url}");
+                }
+                Err(error) => {
+                    println!("  error: could not add git remote \"{remote_name}\": {error}");
+                }
             }
         }
     }
@@ -1495,6 +1598,26 @@ fn finalize_project_registration(
     }
 
     if let Some((user, fork_url)) = forks.contributor {
+        let contributor_fork_remote =
+            find_remote_for_url(&remotes, &fork_url, &[]).map(str::to_string);
+        let contributor_remote_to_add = contributor_fork_remote
+            .is_none()
+            .then(|| free_remote_name(&remotes, &[&format!("fork-{user}"), "fork"]));
+        let contributor_remote = match (&contributor_fork_remote, &contributor_remote_to_add) {
+            (Some(name), _) => Some(name.clone()),
+            (None, Some(name)) => match git_add_remote(&cwd, name, &fork_url) {
+                Ok(()) => {
+                    println!("  added git remote \"{name}\" -> {fork_url}");
+                    Some(name.clone())
+                }
+                Err(error) => {
+                    println!("  error: could not add git remote for {user} fork: {error}");
+                    None
+                }
+            },
+            (None, None) => None,
+        };
+
         let existing_fork = client.list_project_forks(&name).ok().and_then(|payload| {
             payload["forks"]
                 .as_array()
@@ -1505,30 +1628,50 @@ fn finalize_project_registration(
                 })
                 .cloned()
         });
-        let remote_name = default_remote_name(&user);
         match existing_fork {
             Some(fork) if fork["fork_url"].as_str() == Some(fork_url.as_str()) => {
                 println!("  fork for {user} is already registered; skipping");
-                configure_fork_remote(&cwd, &remote_name, &fork_url);
+                if let Some(ref remote_name) = contributor_remote {
+                    configure_fork_remote(&cwd, remote_name, &fork_url);
+                }
             }
-            Some(_) => match client.set_project_fork(&name, &user, Some(&fork_url), None, None) {
+            Some(_) => match client.set_project_fork(
+                &name,
+                &user,
+                Some(&fork_url),
+                contributor_remote.as_deref(),
+                None,
+            ) {
                 Ok(_) => {
                     println!("  updated the registered fork for {user}");
-                    configure_fork_remote(&cwd, &remote_name, &fork_url);
+                    if let Some(ref remote_name) = contributor_remote {
+                        configure_fork_remote(&cwd, remote_name, &fork_url);
+                    }
                 }
                 Err(error) => println!("  error updating fork registration: {error}"),
             },
-            None => match client.add_project_fork(&name, &user, &fork_url, None, None) {
+            None => match client.add_project_fork(
+                &name,
+                &user,
+                &fork_url,
+                contributor_remote.as_deref(),
+                None,
+            ) {
                 Ok(_) => {
                     println!("  registered a fork for {user}");
-                    configure_fork_remote(&cwd, &remote_name, &fork_url);
+                    if let Some(ref remote_name) = contributor_remote {
+                        configure_fork_remote(&cwd, remote_name, &fork_url);
+                    }
                 }
                 Err(error) => println!("  error registering fork: {error}"),
             },
         }
     }
 
-    Some(name)
+    Some(ProjectSetup {
+        name,
+        upstream_remote,
+    })
 }
 
 // ---- default admin user ------------------------------------------------------
@@ -1748,7 +1891,7 @@ fn health_ok_for_sample(results: &[CheckResult], requires_agent: bool) -> bool {
 
 // ---- sample submission ----------------------------------------------------
 
-fn sample_task_toml(project: &str, mode: &str, agent: Option<&str>) -> String {
+fn sample_task_toml(project: &str, remote: &str, mode: &str, agent: Option<&str>) -> String {
     let review_id = "ralphus:new-review/ralphus-hello-world";
     let mut toml = format!(
         "[[review]]\nid = \"{review_id}\"\nname = \"Hello world for {project}\"\nproof_scope = \"nothing\"\n\n"
@@ -1765,7 +1908,7 @@ fn sample_task_toml(project: &str, mode: &str, agent: Option<&str>) -> String {
         ));
         match mode {
             "raw" => toml.push_str(&format!(
-                "  mode = \"raw\"\n  command = \"echo Hello from Ralphus task {suffix}.> {file} && git add -- {file} && git commit --message \\\"Add {file}\\\" && git push --set-upstream origin {branch}\"\n\n"
+                "  mode = \"raw\"\n  command = \"echo Hello from Ralphus task {suffix}.> {file} && git add -- {file} && git commit --message \\\"Add {file}\\\" && git push --set-upstream {remote} {branch}\"\n\n"
             )),
             "agent" => toml.push_str(&format!(
                 "  agent = \"{}\"\n  system_prompt = \"Work only in the dedicated git worktree. Create exactly the requested file, stage only that file, commit it, and push the branch.\"\n  system_prompt_position = \"append\"\n  prompt = \"Create {file} containing the single line \\\"Hello from Ralphus task {suffix}.\\\". Do not modify any other files. Then stage, commit, and push that file.\"\n\n",
@@ -1779,12 +1922,16 @@ fn sample_task_toml(project: &str, mode: &str, agent: Option<&str>) -> String {
 
 fn step_sample(
     opts: &GlobalOpts,
-    project: Option<&str>,
+    project: Option<&ProjectSetup>,
     health_results: &[CheckResult],
     logins: &[AgentLoginReport],
     setup: &InitializeServerOptions,
 ) {
-    let Some(project) = project else {
+    let Some(ProjectSetup {
+        name: project,
+        upstream_remote,
+    }) = project
+    else {
         println!("  skipped: no project was registered");
         return;
     };
@@ -1825,7 +1972,7 @@ fn step_sample(
         }
         agent
     });
-    let toml_text = sample_task_toml(project, &mode, agent.as_deref());
+    let toml_text = sample_task_toml(project, upstream_remote, &mode, agent.as_deref());
     let client = opts.client();
     let label = sample_label(&mode);
     let sample_already_submitted = client
@@ -1897,7 +2044,7 @@ mod tests {
 
     #[test]
     fn sample_toml_uses_three_parallel_tasks_and_one_explicit_review() {
-        let toml = sample_task_toml("example", "agent", Some("claude-code"));
+        let toml = sample_task_toml("example", "origin", "agent", Some("claude-code"));
         assert_eq!(toml.matches("[[task]]").count(), 3);
         assert_eq!(toml.matches("review = \"<<ralphus:new-review/").count(), 3);
         assert!(!toml.contains("depends_on"));
@@ -1908,9 +2055,46 @@ mod tests {
     }
 
     #[test]
+    fn upstream_is_found_by_url_under_a_non_origin_remote_name() {
+        let dir = std::env::temp_dir().join(format!("ral583-remotes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["remote", "add", "origin", "git@github.com:me/app.git"]);
+        git(&["remote", "add", "main-repo", "git@github.com:acme/app.git"]);
+        let remotes = git_remotes(&dir);
+        assert_eq!(remotes.len(), 2);
+        assert_eq!(
+            find_remote_for_url(&remotes, "https://github.com/acme/app", &[]),
+            Some("main-repo")
+        );
+        assert_eq!(
+            default_upstream_url(&dir, Some("https://github.com/me/app.git")),
+            "git@github.com:acme/app.git"
+        );
+        assert_eq!(
+            free_remote_name(&remotes, &["origin", "upstream"]),
+            "upstream"
+        );
+        git_add_remote(&dir, "upstream", "git@github.com:x/y.git").unwrap();
+        assert_eq!(git_remotes(&dir).len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn raw_sample_toml_has_no_agent_cells() {
-        let toml = sample_task_toml("example", "raw", None);
+        let toml = sample_task_toml("example", "upstream", "raw", None);
         assert_eq!(toml.matches("mode = \"raw\"").count(), 3);
+        assert_eq!(toml.matches("git push --set-upstream upstream ").count(), 3);
         assert!(!toml.contains("  agent ="));
         assert!(
             ralphus_core::validate::validate_toml(&toml).is_ok(),
