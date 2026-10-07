@@ -3730,6 +3730,12 @@ impl Store {
             "ALTER TABLE guardian_pull_requests ADD COLUMN auto_fix_attempt_count INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE guardian_pull_requests ADD COLUMN auto_fix_next_attempt_at_ms INTEGER",
             "ALTER TABLE guardian_pull_requests ADD COLUMN auto_fix_error TEXT",
+            // RAL-578: JSON arrays of failing check names -- `ci_failing_checks`
+            // is the latest poll's set, `auto_fix_claimed_checks` the set at
+            // the last claimed auto-fix attempt. A strict shrink from the
+            // latter refunds one attempt (`Store::set_pr_failing_checks`).
+            "ALTER TABLE guardian_pull_requests ADD COLUMN ci_failing_checks TEXT",
+            "ALTER TABLE guardian_pull_requests ADD COLUMN auto_fix_claimed_checks TEXT",
             // RAL-476: the user who submitted this squad, resolved once at
             // submit time (explicit TOML `submitter`, else the acting
             // request's identity) -- see `server::resolve_submitter`.
