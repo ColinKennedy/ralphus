@@ -120,7 +120,6 @@ export function makePollReviews({ selectionWithin = () => false, pendingHash = n
     return new Promise((resolve, reject) => { pendingFetches.push({ url, resolve, reject }); });
   };
   const deps = {
-    checkGuardianNotices: () => {},
     byId: () => ({ className: "" }),
     markUpdated: () => { calls.markUpdated++; },
     findGuardian: (id) => (callState().guardians || []).find((g) => g.id === id),
@@ -149,7 +148,7 @@ export function makePollReviews({ selectionWithin = () => false, pendingHash = n
   const factory = new Function(
     "deps",
     "fetchImpl",
-    `const { checkGuardianNotices, byId, markUpdated, findGuardian, visibleGuardians, syncHash, refreshExpandedBranchMessages,
+    `const { byId, markUpdated, findGuardian, visibleGuardians, syncHash, refreshExpandedBranchMessages,
              pollBranchConflicts, pollPullRequests, pollPrErrors, fetchGuardianDetail, preserveUserState, renderReviews, renderReviewDetail,
              selectionWithin, document } = deps;
      const fetch = fetchImpl;

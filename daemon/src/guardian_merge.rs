@@ -10406,13 +10406,20 @@ fn final_checks_inner(
     Ok((!notes.is_empty()).then(|| notes.join("; ")))
 }
 
+/// Remediation attached to every auto_build failure mailbox notice (RAL-502).
+fn auto_build_remediation() -> crate::mailbox::Remediation {
+    crate::mailbox::Remediation::ManualInterventionRequired {
+        guidance: "check the auto_build output and re-run the step manually if needed".to_string(),
+    }
+}
+
 /// Run this review's declared `[[review.auto_build]]` step (RAL-342) against the
 /// finished combined worktree -- either a static shell `command`, or an agent
 /// invocation described by `def`'s remaining fields (exactly one shape is
 /// populated, enforced by `core::validate` at parse time).
 ///
 /// Returns `Some(note)` when the step ran, whether it succeeded or failed --
-/// per Q5 a failure is surfaced as an advisory [`Store::set_guardian_notice`]
+/// per Q5 a failure is surfaced as an advisory [`Store::enqueue_guardian_notice`]
 /// plus a Cartographer log entry, never as an `Err`, so the caller always
 /// treats this tier as "handled" once it fires and falls through to `InReview`
 /// exactly as if this tier had been absent. `None` only when `def` describes
@@ -10508,14 +10515,13 @@ fn run_review_auto_build(
                     admin_only: false,
                 });
             if !ok {
-                let _ = store.lock().set_guardian_notice(
+                let _ = store.lock().enqueue_guardian_notice(
                     id,
-                    "auto_build_failed",
                     &format!(
                         "This review's declared auto_build command failed: {cmd}. The review has \
-                     still moved to In Review -- check the build output and re-run manually if \
-                     needed."
+                     still moved to In Review."
                     ),
+                    Some(&auto_build_remediation()),
                 );
             }
             if !ok {
@@ -10552,13 +10558,13 @@ fn run_review_auto_build(
     ) {
         Ok(r) => r,
         Err(message) => {
-            let _ = store.lock().set_guardian_notice(
+            let _ = store.lock().enqueue_guardian_notice(
                 id,
-                "auto_build_failed",
                 &format!(
                     "This review's declared auto_build agent could not be resolved: {message}. \
                      The review has still moved to In Review."
                 ),
+                Some(&auto_build_remediation()),
             );
             return Err(format!(
                 "preparation agent could not be resolved: {message}"
@@ -10633,15 +10639,14 @@ fn run_review_auto_build(
             admin_only: false,
         });
     if !ok {
-        let _ = store.lock().set_guardian_notice(
+        let _ = store.lock().enqueue_guardian_notice(
             id,
-            "auto_build_failed",
             &format!(
                 "This review's declared auto_build agent invocation failed: {}. The review has \
-                 still moved to In Review -- check the agent output and re-run manually if \
-                 needed.",
+                 still moved to In Review.",
                 result.error.as_deref().unwrap_or("no summary produced")
             ),
+            Some(&auto_build_remediation()),
         );
     }
     if ok {
@@ -21439,15 +21444,19 @@ mod tests {
         assert!(result.unwrap_err().contains("agent exploded"));
 
         let guard = store.lock();
-        let view = guard.get_guardian(&id).unwrap();
-        assert_eq!(view.notice_kind.as_deref(), Some("auto_build_failed"));
+        let notices = guard
+            .mailbox_messages_for_client("test", false, None)
+            .unwrap();
+        assert_eq!(notices.len(), 1, "notices: {notices:?}");
         assert!(
-            view.notice_message
-                .as_deref()
-                .unwrap()
-                .contains("boom: agent exploded"),
+            notices[0].message.contains("boom: agent exploded")
+                && notices[0].message.contains("Manual intervention required"),
             "notice: {:?}",
-            view.notice_message
+            notices[0].message
+        );
+        assert_eq!(
+            notices[0].entity_uri.as_deref(),
+            Some(format!("guardian:{id}").as_str())
         );
 
         let (_, _, cumulative) = guard.guardian_cost_total(&id).unwrap();

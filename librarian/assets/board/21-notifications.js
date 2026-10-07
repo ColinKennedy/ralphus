@@ -1,4 +1,4 @@
-      // ---------- Unified board-action notifications (RAL-433) ----------
+﻿      // ---------- Unified board-action notifications (RAL-433) ----------
       // One notification system for every user-visible board action (create
       // squad, cancel/restart/delete/retry, merge/rebase, bulk operations,
       // ...), replacing the three single-purpose toast helpers RAL-108

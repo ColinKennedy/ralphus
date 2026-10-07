@@ -1,4 +1,4 @@
-      // ---------- logs modal ----------
+﻿      // ---------- logs modal ----------
       /** @type {string|null} */
       let logSquadId = null;
       let logsTab = "cells";

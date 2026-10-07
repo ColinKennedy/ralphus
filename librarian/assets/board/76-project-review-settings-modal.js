@@ -1,4 +1,4 @@
-      // ---------- Project "Review Settings" modal (RAL-408) ----------
+﻿      // ---------- Project "Review Settings" modal (RAL-408) ----------
       // A project's database-backed DEFAULT review settings -- resolver
       // agent/model, machine, budget, proof scope, and the project-level
       // equivalents of every `ralphus review settings` opt-out flag.

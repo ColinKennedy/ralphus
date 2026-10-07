@@ -1,4 +1,4 @@
-      // ---------- theme ----------
+﻿      // ---------- theme ----------
       // RAL-257: the toggle swaps inline SVG icons instead of a Unicode glyph.
       // Each icon uses `currentColor`, so it inherits the .icon-btn
       // `color: var(--text)` and stays legible in either theme: the flashbang

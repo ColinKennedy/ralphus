@@ -1,4 +1,4 @@
-      // ---- Projects tab (RAL-100/RAL-101) ----
+﻿      // ---- Projects tab (RAL-100/RAL-101) ----
       /** @type {MachineProviderView[]} registered machine providers (RAL-185) */
       let machines = [];
       /** @type {string[]} schemes that always resolve without a registry row */

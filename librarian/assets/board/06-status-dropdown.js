@@ -1,4 +1,4 @@
-      // RALPHUS-STATUS-DROPDOWN:BEGIN
+﻿      // RALPHUS-STATUS-DROPDOWN:BEGIN
       // ---------- Shared Status dropdown component (RAL-475) ----------
       // One data-driven Status filter control used everywhere a view lets
       // users show/hide rows by lifecycle status: Squads, Tasks, Reviews,

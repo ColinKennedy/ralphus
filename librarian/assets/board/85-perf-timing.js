@@ -1,4 +1,4 @@
-      // ---------- RAL-414: dormant-by-default cold-navigation timing ----------
+﻿      // ---------- RAL-414: dormant-by-default cold-navigation timing ----------
       /**
        * Mirrors `daemon/src/perf_timing.rs`'s opt-in shape: disabled by
        * default, turned on with `?ralphusTiming=1` in the URL (persisted to

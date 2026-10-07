@@ -1,4 +1,4 @@
-      // ---- Set Status picker (RAL-74) ----
+﻿      // ---- Set Status picker (RAL-74) ----
       // Floating ctx-menu showing valid states. stopPropagation on the trigger click
       // prevents the document listener from immediately closing the just-opened picker.
       /**

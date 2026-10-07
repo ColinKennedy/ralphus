@@ -1,4 +1,4 @@
-      // ---- Remote Open Agent terminal relay (RAL-355 Phase 10) ----
+﻿      // ---- Remote Open Agent terminal relay (RAL-355 Phase 10) ----
       // The browser counterpart of `ralphus cell remote-terminal`
       // (cli/src/terminal_relay.rs): a cell whose `machine` is set has no
       // window to open on the daemon's own desktop the way `openAgentTerminal`

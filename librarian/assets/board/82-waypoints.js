@@ -1,4 +1,4 @@
-      // ---------- Waypoints tab (RAL-400) ----------
+﻿      // ---------- Waypoints tab (RAL-400) ----------
       // A waypoint is a cross-squad coordination join point: a affected of squads
       // and/or reviews that must (block mode) or may (advisory mode) check in
       // before the waypoint's own work proceeds. This chunk owns the whole

@@ -1,4 +1,4 @@
-      // ---------- per-type turn colors (RAL-563) ----------
+﻿      // ---------- per-type turn colors (RAL-563) ----------
       // RALPHUS-TURN-COLORS:BEGIN
       /** Page background per theme, mirrored from `--bg` in board.css; the contrast guard measures against these. */
       const TURN_COLOR_BG = { dark: "#0d1117", light: "#ffffff" };

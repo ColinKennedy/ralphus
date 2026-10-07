@@ -1,4 +1,4 @@
-      // ---- Agents tab (RAL-473: DB-backed agent profiles + built-in backend command overrides) ----
+﻿      // ---- Agents tab (RAL-473: DB-backed agent profiles + built-in backend command overrides) ----
 
       /** Every backend a profile's `backend` field may select — mirrors `agent_profiles::PROFILE_BACKENDS`. */
       const AGENT_PROFILE_BACKENDS = ["claude", "claude-code", "codex", "pi", "ollama", "anthropic", "raw"];

@@ -15,7 +15,7 @@
 //! session is out of scope here (see the ticket's Q&A) — only turn-boundary
 //! polling is implemented.
 
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
 
 use crate::store::{Result, Store, now_ms};
@@ -480,6 +480,88 @@ impl Store {
             entity_uri,
             category,
         )
+    }
+
+    /// [`Self::enqueue_error_mailbox_message`] that is a no-op when a row with
+    /// the same `entity_uri`, `category` and rendered message (remediation
+    /// included) already exists -- read, dismissed or not. Returns that row's
+    /// id instead of inserting. For failures a periodic or restart-time sweep
+    /// can re-report verbatim: the user's dismissal stays dismissed, while a
+    /// changed message (a different command, a different error) is a new row.
+    /// Without an `entity_uri` there is nothing to key on, so it always
+    /// inserts.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_error_mailbox_message_deduped(
+        &self,
+        priority: MailboxPriority,
+        message: &str,
+        remediation: &Remediation,
+        squad_id: Option<&str>,
+        task: Option<&str>,
+        cell_id: Option<&str>,
+        entity_uri: Option<&str>,
+        category: Option<&str>,
+    ) -> Result<String> {
+        if let Some(uri) = entity_uri {
+            let full_message = format!("{message} {}", remediation.render());
+            let existing: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT id FROM mailbox_messages
+                     WHERE entity_uri=?1 AND message=?2 AND category IS ?3
+                     ORDER BY created_at_ms ASC LIMIT 1",
+                    params![uri, full_message, category],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(id) = existing {
+                return Ok(id);
+            }
+        }
+        self.enqueue_error_mailbox_message(
+            priority,
+            message,
+            remediation,
+            squad_id,
+            task,
+            cell_id,
+            entity_uri,
+            category,
+        )
+    }
+
+    /// Record a durable, dismissible review notice in the mailbox (RAL-579)
+    /// for guardian `guardian_id`, addressed to `guardian:{id}` in the
+    /// `"review"` category. Failure notices carry `remediation` and are
+    /// deduped; with `None` the notice is informational and always inserted.
+    pub fn enqueue_guardian_notice(
+        &self,
+        guardian_id: &str,
+        message: &str,
+        remediation: Option<&Remediation>,
+    ) -> Result<String> {
+        let entity_uri = format!("guardian:{guardian_id}");
+        match remediation {
+            Some(remediation) => self.enqueue_error_mailbox_message_deduped(
+                MailboxPriority::High,
+                message,
+                remediation,
+                None,
+                None,
+                None,
+                Some(&entity_uri),
+                Some("review"),
+            ),
+            None => self.enqueue_mailbox_message_ex(
+                MailboxPriority::Normal,
+                message,
+                None,
+                None,
+                None,
+                Some(&entity_uri),
+                Some("review"),
+            ),
+        }
     }
 
     /// List mailbox messages visible to `client_id`, most-recently-enqueued
@@ -1120,6 +1202,86 @@ mod tests {
             .undrain_mailbox_messages(&client_id, Some(&[msg_id, "mailbox-bogus".to_string()]))
             .unwrap();
         assert_eq!(undrained, 0);
+    }
+
+    /// RAL-579: a dismissal survives a daemon restart (the store re-opened
+    /// from disk), and re-reporting the same failure afterwards neither adds a
+    /// row nor un-dismisses the original; a changed message is a new row.
+    #[test]
+    fn dismissal_survives_store_reopen_and_deduped_failure_is_not_reenqueued() {
+        let dir = std::env::temp_dir().join(format!(
+            "ralphus-mailbox-dismissal-durability-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let db_path = dir.join("tasks.db");
+        let uri = "guardian:guardian-1";
+        let remediation = Remediation::ManualInterventionRequired {
+            guidance: "look".to_string(),
+        };
+        let enqueue = |store: &Store, message: &str| {
+            store
+                .enqueue_error_mailbox_message_deduped(
+                    MailboxPriority::High,
+                    message,
+                    &remediation,
+                    None,
+                    None,
+                    None,
+                    Some(uri),
+                    Some("review"),
+                )
+                .unwrap()
+        };
+        let id = {
+            let store = Store::open(&db_path).unwrap();
+            store
+                .create_watch("alice", "guardian:guardian-1", &[MailboxPriority::High])
+                .unwrap();
+            let id = enqueue(&store, "auto_build failed");
+            assert_eq!(
+                enqueue(&store, "auto_build failed"),
+                id,
+                "a verbatim repeat must not insert a second row"
+            );
+            assert_eq!(
+                store
+                    .drain_personal_mailbox_messages("alice", Some(std::slice::from_ref(&id)))
+                    .unwrap(),
+                1
+            );
+            id
+        };
+
+        let reopened = Store::open(&db_path).unwrap();
+        assert!(
+            reopened
+                .personal_mailbox_messages_for_user("alice", true, None)
+                .unwrap()
+                .is_empty(),
+            "a dismissed notification must stay dismissed after a restart"
+        );
+        assert_eq!(
+            enqueue(&reopened, "auto_build failed"),
+            id,
+            "a re-report after restart must not resurrect the dismissed notice"
+        );
+        assert!(
+            reopened
+                .personal_mailbox_messages_for_user("alice", true, None)
+                .unwrap()
+                .is_empty()
+        );
+        let changed = enqueue(&reopened, "auto_build failed differently");
+        assert_ne!(changed, id);
+        let unread = reopened
+            .personal_mailbox_messages_for_user("alice", true, None)
+            .unwrap();
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0].id, changed);
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

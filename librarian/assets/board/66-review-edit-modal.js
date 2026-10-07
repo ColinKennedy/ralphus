@@ -1,4 +1,4 @@
-      // ---------- Review "Edit Details" modal (RAL-410) ----------
+﻿      // ---------- Review "Edit Details" modal (RAL-410) ----------
       // Batches every editable Guardian/Review setting -- upstream, resolver
       // agent/model, proof scope, build/worktree flags, per-project squash,
       // PR settings, and the three environment-override scopes -- into one

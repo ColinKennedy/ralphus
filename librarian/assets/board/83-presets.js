@@ -1,4 +1,4 @@
-      // ---- Presets tab (RAL-…) ----
+﻿      // ---- Presets tab (RAL-…) ----
       /**
        * The preset name the editor panel was last loaded from via Edit, or ""
        * while it holds a new, unsaved preset.
