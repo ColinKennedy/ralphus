@@ -251,13 +251,60 @@ impl Store {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?))
             })?
             .collect::<std::result::Result<_, _>>()?;
+        self.appraisals_for_cells(&cells, false)
+    }
+
+    /// The latest appraisal of every scored proof belonging to review branch
+    /// `branch_id` of `guardian_id`, published or not -- the stored source of
+    /// truth the board's appraisals tab shows, independent of what the PR body
+    /// rendered. A cell belongs to the branch when its `review_branch` is the
+    /// branch's name and its review link is this guardian (or, for a row
+    /// predating the direct link, unset). A task-scoped proof is included for
+    /// every branch holding one of its task's cells. `None` when no such
+    /// branch exists.
+    pub fn list_appraisals_for_branch(
+        &self,
+        guardian_id: &str,
+        branch_id: &str,
+    ) -> Result<Option<Vec<ReviewAppraisal>>> {
+        let branch: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT branch FROM guardian_branches WHERE guardian_id=? AND id=?",
+                params![guardian_id, branch_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(branch) = branch else {
+            return Ok(None);
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT squad_id, task_idx, idx FROM cells
+             WHERE review_branch=? AND (review_guardian_id=? OR review_guardian_id IS NULL)",
+        )?;
+        let cells: Vec<(String, i64, i64)> = stmt
+            .query_map(params![branch, guardian_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(Some(self.appraisals_for_cells(&cells, true)?))
+    }
+
+    /// The latest appraisal of every proof reachable from `cells`
+    /// (`(squad_id, task_idx, cell idx)`), labelled and ordered by entity URI.
+    /// Published ones are kept only when `include_published`.
+    fn appraisals_for_cells(
+        &self,
+        cells: &[(String, i64, i64)],
+        include_published: bool,
+    ) -> Result<Vec<ReviewAppraisal>> {
         let mut squads: Vec<&str> = cells.iter().map(|(s, _, _)| s.as_str()).collect();
         squads.sort_unstable();
         squads.dedup();
         let mut out = Vec::new();
         for squad_id in squads {
             for (uri, a) in latest_appraisals_by_uri(&self.conn, squad_id)? {
-                if a.published_at_ms.is_some() {
+                if !include_published && a.published_at_ms.is_some() {
                     continue;
                 }
                 let Some(EntityUri::Proof {
@@ -409,5 +456,45 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn branch_listing_keeps_published_and_folds_in_task_proofs() {
+        let s = Store::open_in_memory().unwrap();
+        let g = s.create_guardian("r", "main", "/repo").unwrap();
+        s.add_guardian_branch(&g, "feat-a").unwrap();
+        s.add_guardian_branch(&g, "feat-b").unwrap();
+        let branches = s.get_guardian(&g).unwrap().branches;
+        let (a, b) = (&branches[0], &branches[1]);
+        seed_cell(&s, "squad-1", 0, 0, &g);
+        seed_cell(&s, "squad-1", 0, 1, &g);
+        for (idx, branch) in [(0, "feat-a"), (1, "feat-b")] {
+            s.conn
+                .execute(
+                    "UPDATE cells SET review_branch=? WHERE squad_id='squad-1' AND idx=?",
+                    params![branch, idx],
+                )
+                .unwrap();
+        }
+        let mine = proof_entity_uri("squad-1", 0, "cell", 0, 0);
+        let theirs = proof_entity_uri("squad-1", 0, "cell", 1, 0);
+        let task_wide = proof_entity_uri("squad-1", 0, "task", 0, 1);
+        for uri in [&mine, &theirs, &task_wide] {
+            s.record_appraisal("squad-1", uri, 4, 7, "bad", &sections())
+                .unwrap();
+        }
+        s.mark_appraisal_published(&mine, 1, "pr-3").unwrap();
+
+        let uris = |bid: &str| -> Vec<String> {
+            s.list_appraisals_for_branch(&g, bid)
+                .unwrap()
+                .unwrap()
+                .into_iter()
+                .map(|a| a.appraisal.entity_uri)
+                .collect()
+        };
+        assert_eq!(uris(&a.id), vec![mine.clone(), task_wide.clone()]);
+        assert_eq!(uris(&b.id), vec![theirs, task_wide]);
+        assert!(s.list_appraisals_for_branch(&g, "nope").unwrap().is_none());
     }
 }

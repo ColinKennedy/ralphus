@@ -2061,6 +2061,10 @@ fn route_for_user(
                 "pane-transcript",
             ],
         ) => guardian_branch_pane_transcript(daemon, id, branch_id, query),
+        // ralphus[ignore-endpoint-cli]: board 'Appraisals' inspector tab for the branch (RAL-588); no CLI equivalent
+        ("GET", ["api", "guardians", id, "branches", branch_id, "appraisals"]) => {
+            guardian_branch_appraisals(daemon, id, branch_id)
+        }
         // ralphus[ignore-endpoint-cli]: board conflict-resolution view for the branch
         ("GET", ["api", "guardians", id, "branches", branch_id, "conflicts"]) => {
             guardian_branch_conflicts(daemon, id, branch_id)
@@ -12514,6 +12518,39 @@ fn guardian_branch_system_prompt(daemon: &Daemon, id: &str, branch_id: &str) -> 
     json(
         200,
         &serde_json::json!({"available": true, "system_prompt": system_prompt}),
+    )
+}
+
+/// `GET /api/guardians/{id}/branches/{branch_id}/appraisals` (RAL-588) -- the
+/// latest appraisal of every scored proof belonging to one review branch,
+/// published or not, read straight from `proof_appraisals` rather than the PR
+/// body's render path, so it shows what *should* be on the PR even when the PR
+/// was pushed without it. `post_appraisals` is the review's effective posting
+/// setting, so the board can say why a PR may lack them.
+fn guardian_branch_appraisals(daemon: &Daemon, id: &str, branch_id: &str) -> Reply {
+    let guardian = match daemon.lock().get_guardian(id) {
+        Ok(g) => g,
+        Err(e) => return store_error(&e),
+    };
+    let listed = match daemon.lock().list_appraisals_for_branch(id, branch_id) {
+        Ok(Some(v)) => v,
+        Ok(None) => return error(404, "not_found", "no such branch", vec![]),
+        Err(e) => return store_error(&e),
+    };
+    let appraisals: Vec<serde_json::Value> = listed
+        .into_iter()
+        .map(|r| {
+            let mut v = serde_json::to_value(&r.appraisal).unwrap_or_default();
+            v["label"] = serde_json::Value::String(r.label);
+            v
+        })
+        .collect();
+    json(
+        200,
+        &serde_json::json!({
+            "post_appraisals": guardian.effective_post_appraisals,
+            "appraisals": appraisals,
+        }),
     )
 }
 
