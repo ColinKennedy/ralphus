@@ -266,7 +266,10 @@ fn install_stub_agent(root: &Path) -> Result<PathBuf, String> {
 pub fn invoked_as_exercise_agent() -> bool {
     std::env::current_exe()
         .ok()
-        .and_then(|path| path.file_stem().map(|stem| stem == STUB_AGENT_FILE))
+        .and_then(|path| {
+            path.file_stem()
+                .map(|stem| stem.to_string_lossy() == STUB_AGENT_FILE)
+        })
         .unwrap_or(false)
 }
 
