@@ -179,7 +179,11 @@ impl Store {
     /// wrote no `deferred` prophecy. Once a row exists the review
     /// never offers again, so reopening it and re-merging is silent.
     pub fn maybe_offer_followups(&self, guardian_id: &str) -> Result<bool> {
-        self.maybe_offer_followups_with(guardian_id, &crate::config::global_followup_config())
+        let global = crate::config::global_followup_config();
+        let git_root = self.get_guardian(guardian_id)?.git_root;
+        let config =
+            crate::config::layered_followup_config(std::path::Path::new(&git_root), &global);
+        self.maybe_offer_followups_with(guardian_id, &config)
     }
 
     /// [`Self::maybe_offer_followups`] against an explicit global `[followup]`
