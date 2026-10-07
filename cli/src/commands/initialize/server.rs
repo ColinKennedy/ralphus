@@ -49,7 +49,7 @@ use crate::args::GlobalOpts;
 use crate::client::ProjectReviewSettingsPatch;
 use crate::health::CheckResult;
 use answers::Source;
-use ralphus_core::git_remote::{default_upstream_remote, find_remote_for_url, remote_urls_match};
+use ralphus_core::git_remote::{default_upstream_remote, find_remote_for_url};
 use ralphus_runner::login_probe::{LoginProbe, LoginState, LoginStatus, StatusRun, login_probes};
 
 const TOTAL_STEPS: u32 = 10;
@@ -1598,24 +1598,23 @@ fn finalize_project_registration(
     }
 
     if let Some((user, fork_url)) = forks.contributor {
-        let contributor_fork_remote = find_remote_for_url(&remotes, &fork_url, &[])
-            .map(str::to_string);
-        let contributor_remote_to_add = contributor_fork_remote.is_none()
+        let contributor_fork_remote =
+            find_remote_for_url(&remotes, &fork_url, &[]).map(str::to_string);
+        let contributor_remote_to_add = contributor_fork_remote
+            .is_none()
             .then(|| free_remote_name(&remotes, &[&format!("fork-{user}"), "fork"]));
         let contributor_remote = match (&contributor_fork_remote, &contributor_remote_to_add) {
             (Some(name), _) => Some(name.clone()),
-            (None, Some(name)) => {
-                match git_add_remote(&cwd, name, &fork_url) {
-                    Ok(()) => {
-                        println!("  added git remote \"{name}\" -> {fork_url}");
-                        Some(name.clone())
-                    }
-                    Err(error) => {
-                        println!("  error: could not add git remote for {user} fork: {error}");
-                        None
-                    }
+            (None, Some(name)) => match git_add_remote(&cwd, name, &fork_url) {
+                Ok(()) => {
+                    println!("  added git remote \"{name}\" -> {fork_url}");
+                    Some(name.clone())
                 }
-            }
+                Err(error) => {
+                    println!("  error: could not add git remote for {user} fork: {error}");
+                    None
+                }
+            },
             (None, None) => None,
         };
 
@@ -1636,7 +1635,13 @@ fn finalize_project_registration(
                     configure_fork_remote(&cwd, remote_name, &fork_url);
                 }
             }
-            Some(_) => match client.set_project_fork(&name, &user, Some(&fork_url), contributor_remote.as_deref(), None) {
+            Some(_) => match client.set_project_fork(
+                &name,
+                &user,
+                Some(&fork_url),
+                contributor_remote.as_deref(),
+                None,
+            ) {
                 Ok(_) => {
                     println!("  updated the registered fork for {user}");
                     if let Some(ref remote_name) = contributor_remote {
@@ -1645,7 +1650,13 @@ fn finalize_project_registration(
                 }
                 Err(error) => println!("  error updating fork registration: {error}"),
             },
-            None => match client.add_project_fork(&name, &user, &fork_url, contributor_remote.as_deref(), None) {
+            None => match client.add_project_fork(
+                &name,
+                &user,
+                &fork_url,
+                contributor_remote.as_deref(),
+                None,
+            ) {
                 Ok(_) => {
                     println!("  registered a fork for {user}");
                     if let Some(ref remote_name) = contributor_remote {
