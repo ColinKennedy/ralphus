@@ -951,7 +951,7 @@
        * @param {string} text - The plain text to show.
        * @returns {string}
        */
-      function promptBox(scrollKey, text) {
+      function reviewPromptBox(scrollKey, text) {
         return `<div class="promptbox" data-scroll-key="${esc(scrollKey)}" onscroll="savePromptBoxScroll(this)">${esc(text)}</div>`;
       }
       /**
@@ -989,17 +989,17 @@
       function livePromptView(g, b, run) {
         const scrollKey = `${g.id}:${b.id}:prompt:${run ? `${run.task || ""}/${run.cellId || ""}/${run.label}` : ""}`;
         if (run && run.prompt) {
-          return `${promptBox(scrollKey, run.prompt)}
+          return `${reviewPromptBox(scrollKey, run.prompt)}
             <div class="hint">The instruction dispatched to this run.</div>`;
         }
         if (run && run.kind === "feedback") {
           const msgs = branchMessages[`${g.id}:${b.id}`];
-          if (msgs === undefined) { loadBranchMessages(g.id, b.id); return promptBox(scrollKey, "Loading…"); }
+          if (msgs === undefined) { loadBranchMessages(g.id, b.id); return reviewPromptBox(scrollKey, "Loading…"); }
           // The daemon's roles are "reviewer" and "guardian" -- there is no
           // "user" role, so matching one never found anything.
           const last = [...msgs].reverse().find((m) => m.role === "reviewer");
           if (last) {
-            return `${promptBox(scrollKey, last.text)}
+            return `${reviewPromptBox(scrollKey, last.text)}
               <div class="hint">The reviewer feedback this run was dispatched to act on. ralphus wraps it in
               standing instructions before sending; only the authored half is retained, and this is it.</div>`;
           }
@@ -1026,7 +1026,7 @@
         }
         const ps = peekSystemPrompt[key];
         const body = ps === undefined || ps === "loading" ? "Loading…" : peekPromptDisplay(ps);
-        return `${promptBox(`${g.id}:${key}:system`, body)}
+        return `${reviewPromptBox(`${g.id}:${key}:system`, body)}
           <div class="run-foot"><button class="btn" style="padding:3px 8px;font-size:11.5px" data-click="openEditReviewDetails" data-guardian-id="${esc(g.id)}" data-focus="resolver"
             data-tip="The authored half of this prompt comes from the resolver agent and model. Change those in review setup.">Resolver settings</button></div>
           <div class="hint">Read-only — the effective system prompt actually appended to this agent
