@@ -853,6 +853,11 @@ pub struct ProjectReviewSettings {
     /// onto the same branch. Defaults to `true` (on by default) when unset.
     #[serde(default)]
     pub auto_cancel_outdated_pr_pipelines: Option<bool>,
+    /// RAL-575: project-level default for whether a review writes its
+    /// judges' appraisals into the PR/MR body and tip commit. Defaults to
+    /// `true` (on by default) when unset.
+    #[serde(default)]
+    pub post_appraisals: Option<bool>,
     /// RAL-521: project-level default for whether a review's manual checks
     /// are computed once, when its review branches are first created, and
     /// then reused through later merges, rebases, and automated fix
@@ -924,6 +929,7 @@ impl ProjectReviewSettings {
             discourage_tests_during_auto_pull_request_fixes: self
                 .discourage_tests_during_auto_pull_request_fixes,
             auto_cancel_outdated_pr_pipelines: self.auto_cancel_outdated_pr_pipelines,
+            post_appraisals: self.post_appraisals,
             cache_manual_checks: self.cache_manual_checks,
             skip_manual_checks: self.skip_manual_checks,
             auto_run: self.auto_run,
@@ -3788,6 +3794,11 @@ impl Store {
             // project/global default, which resolves to `true` (on by
             // default -- unlike most opt-in review settings).
             "ALTER TABLE guardians ADD COLUMN auto_cancel_outdated_pr_pipelines INTEGER",
+            // RAL-575: per-review override for whether this review writes
+            // its judges' appraisals into the PR/MR body and tip commit.
+            // `None` inherits the project/global default, which resolves to
+            // `true` (on by default).
+            "ALTER TABLE guardians ADD COLUMN post_appraisals INTEGER",
             // RAL-521: per-review override for whether this review's manual
             // checks are computed once, when its review branches are first
             // created, and then reused through later merges, rebases, and
@@ -18280,6 +18291,7 @@ command = "e"
             auto_fix_prompt_template: Some("fix it <<prompt>>".to_string()),
             discourage_tests_during_auto_pull_request_fixes: Some(true),
             auto_cancel_outdated_pr_pipelines: Some(false),
+            post_appraisals: Some(false),
             cache_manual_checks: Some(false),
             skip_manual_checks: Some(true),
             auto_run: Some(true),

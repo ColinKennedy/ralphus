@@ -92,6 +92,7 @@ pub enum ProjectReviewSettingsCommand {
         auto_fix_prompt_template: Option<String>,
         discourage_tests_during_auto_pull_request_fixes: Option<bool>,
         auto_cancel_outdated_pr_pipelines: Option<bool>,
+        post_appraisals: Option<bool>,
         cache_manual_checks: Option<bool>,
         skip_manual_checks: Option<bool>,
         auto_run: Option<bool>,
@@ -368,6 +369,7 @@ fn parse_review_settings_set(
         crate::commands::review::take_tri_bool(scanner, "--discourage-tests-during-auto-pr-fixes");
     let auto_cancel_outdated_pr_pipelines =
         crate::commands::review::take_tri_bool(scanner, "--auto-cancel-outdated-pr-pipelines");
+    let post_appraisals = crate::commands::review::take_tri_bool(scanner, "--post-appraisals");
     let cache_manual_checks =
         crate::commands::review::take_tri_bool(scanner, "--cache-manual-checks");
     let skip_manual_checks =
@@ -432,6 +434,7 @@ fn parse_review_settings_set(
         auto_fix_prompt_template,
         discourage_tests_during_auto_pull_request_fixes,
         auto_cancel_outdated_pr_pipelines,
+        post_appraisals,
         cache_manual_checks,
         skip_manual_checks,
         auto_run,
@@ -586,6 +589,7 @@ fn dispatch_review_settings(cmd: ProjectReviewSettingsCommand, opts: &GlobalOpts
             auto_fix_prompt_template,
             discourage_tests_during_auto_pull_request_fixes,
             auto_cancel_outdated_pr_pipelines,
+            post_appraisals,
             cache_manual_checks,
             skip_manual_checks,
             auto_run,
@@ -612,6 +616,7 @@ fn dispatch_review_settings(cmd: ProjectReviewSettingsCommand, opts: &GlobalOpts
                 auto_fix_prompt_template: auto_fix_prompt_template.as_deref(),
                 discourage_tests_during_auto_pull_request_fixes,
                 auto_cancel_outdated_pr_pipelines,
+                post_appraisals,
                 cache_manual_checks,
                 skip_manual_checks,
                 auto_run,
@@ -700,6 +705,7 @@ fn render_review_settings(payload: &Value) {
         "auto cancel outdated pr pipelines:",
         "auto_cancel_outdated_pr_pipelines",
     );
+    row_bool("post appraisals:", "post_appraisals");
     row_bool("cache manual checks:", "cache_manual_checks");
     row_bool("skip manual checks:", "skip_manual_checks");
     row_bool("auto run manual checks:", "auto_run");

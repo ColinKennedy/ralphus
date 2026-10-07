@@ -258,6 +258,14 @@ pub struct ReviewConfig {
     /// over this.
     #[serde(default)]
     pub auto_cancel_outdated_pr_pipelines: Option<bool>,
+    /// RAL-575: whether a review writes its judges' appraisals into the
+    /// PR/MR body and the review branch's tip commit. `None` means unset,
+    /// which resolves to `true` (see [`Self::post_appraisals`], on by
+    /// default); per-project scalars win over the global layer. A per-review
+    /// override (see `Guardian::post_appraisals` in `guardian.rs`) wins over
+    /// this. Appraisals are stored and shown on the board either way.
+    #[serde(default)]
+    pub post_appraisals: Option<bool>,
     /// RAL-521: whether a review's manual checks are computed once, when its
     /// review branches are first created, and then reused through later
     /// merges, rebases, and automated fix iterations. `None` means unset,
@@ -441,6 +449,7 @@ pub const REVIEW_CONFIG_KEYS: &[&str] = &[
     "checks",
     "auto_build",
     "summary_format",
+    "post_appraisals",
     "cache_manual_checks",
     "skip_manual_checks",
     "auto_run",
@@ -567,6 +576,13 @@ impl ReviewConfig {
     #[must_use]
     pub fn auto_cancel_outdated_pr_pipelines(&self) -> bool {
         self.auto_cancel_outdated_pr_pipelines.unwrap_or(true)
+    }
+
+    /// Whether a review writes its judges' appraisals into the PR/MR body and
+    /// tip commit (unset resolves to `true` -- on by default). RAL-575.
+    #[must_use]
+    pub fn post_appraisals(&self) -> bool {
+        self.post_appraisals.unwrap_or(true)
     }
 
     /// Whether a review's manual checks are computed once at initial branch
@@ -748,6 +764,7 @@ impl ReviewConfig {
             auto_cancel_outdated_pr_pipelines: over
                 .auto_cancel_outdated_pr_pipelines
                 .or(self.auto_cancel_outdated_pr_pipelines),
+            post_appraisals: over.post_appraisals.or(self.post_appraisals),
             cache_manual_checks: over.cache_manual_checks.or(self.cache_manual_checks),
             skip_manual_checks: over.skip_manual_checks.or(self.skip_manual_checks),
             auto_run: over.auto_run.or(self.auto_run),
@@ -912,6 +929,10 @@ pub const REVIEW_FIELD_PARITY: &[(&str, ReviewFieldDefault)] = &[
     (
         "auto_cancel_outdated_pr_pipelines",
         ReviewFieldDefault::ProjectDefault(|c| c.auto_cancel_outdated_pr_pipelines.is_some()),
+    ),
+    (
+        "post_appraisals",
+        ReviewFieldDefault::ProjectDefault(|c| c.post_appraisals.is_some()),
     ),
     (
         "cache_manual_checks",
@@ -3994,6 +4015,18 @@ mod tests {
             ..ReviewConfig::default()
         };
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn post_appraisals_defaults_on_and_project_wins() {
+        assert!(ReviewConfig::default().post_appraisals());
+        let global = ReviewConfig::default();
+        let project = ReviewConfig {
+            post_appraisals: Some(false),
+            ..ReviewConfig::default()
+        };
+        assert!(!global.merge(project).post_appraisals());
+        assert!(!from_toml_str("[review]\npost_appraisals = false\n").post_appraisals());
     }
 
     #[test]

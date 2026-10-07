@@ -551,6 +551,7 @@ impl DaemonClient {
             "auto_cancel_outdated_pr_pipelines",
             patch.auto_cancel_outdated_pr_pipelines,
         );
+        set_if_some(&mut body, "post_appraisals", patch.post_appraisals);
         set_if_some(&mut body, "cache_manual_checks", patch.cache_manual_checks);
         set_if_some(&mut body, "skip_manual_checks", patch.skip_manual_checks);
         set_if_some(&mut body, "auto_run", patch.auto_run);
@@ -1858,6 +1859,7 @@ impl DaemonClient {
             "auto_cancel_outdated_pr_pipelines",
             settings.auto_cancel_outdated_pr_pipelines,
         );
+        set_if_some(&mut body, "post_appraisals", settings.post_appraisals);
         set_if_some(
             &mut body,
             "cache_manual_checks",
@@ -2417,6 +2419,10 @@ pub struct GuardianSettings<'a> {
     /// pipelines whenever a newer commit is force-pushed onto the same
     /// branch. Defaults to `true` (on by default) when unset.
     pub auto_cancel_outdated_pr_pipelines: Option<bool>,
+    /// RAL-575: whether this review writes its judges' appraisals into the
+    /// PR/MR body and tip commit. Defaults to `true` (on by default) when
+    /// unset.
+    pub post_appraisals: Option<bool>,
     /// RAL-521: whether this review's manual checks are computed once, when
     /// its review branches are first created, and then reused through later
     /// merges, rebases, and automated fix iterations. Defaults to `true`
@@ -2484,6 +2490,10 @@ pub struct ProjectReviewSettingsPatch<'a> {
     /// still-running CI pipelines whenever a newer commit is force-pushed
     /// onto the same branch. Defaults to `true` (on by default) when unset.
     pub auto_cancel_outdated_pr_pipelines: Option<bool>,
+    /// RAL-575: the project's default for whether a review writes its judges'
+    /// appraisals into the PR/MR body and tip commit. Defaults to `true` (on
+    /// by default) when unset.
+    pub post_appraisals: Option<bool>,
     /// RAL-521: the project's default for whether a review's manual checks
     /// are computed once, when its review branches are first created, and
     /// then reused through later merges, rebases, and automated fix
