@@ -79,3 +79,28 @@ All of the following hold for **every** exercise, with no exceptions:
   [`.agent/logging-policy.md`](../../../../.agent/logging-policy.md): stdout is
   the exercise's output, diagnostics go to stderr with the `ralphus [exercise]`
   prefix.
+
+## The answers file (RAL-576)
+
+`ralphus initialize server` writes an answers file at the end of each run,
+recording every setting's final value and the source it came from (flag,
+file, prompt, environment, or default). The file is TOML, lives next to the
+global ralphus config (`~/.config/ralphus/answers-latest.toml` + a
+timestamped backup), and can be replayed with `--answers-file <path>`:
+
+```bash
+ralphus initialize server --answers-file ~/.config/ralphus/answers-latest.toml [flags]
+```
+
+**Precedence**: flag > answers file > interactive prompt/default. A loaded
+answers file only fills options a flag left unset. Sensitive values
+(forge tokens, URLs with embedded credentials) are redacted in the written
+file and must be supplied via flag or environment variable on replay.
+
+Keys are the flag names without `--`, with `-` as `_`:
+`--review-auto-submit-pr-stack` becomes `review_auto_submit_pr_stack`.
+
+The answers file format (`version = 1`) includes the `value`, `source`, and
+whether the setting was `asked` interactively. Unknown or malformed files
+are rejected with a clear error; upgrade is not supported (future versions
+will fail with a version mismatch, never silent data loss).
