@@ -75,6 +75,16 @@ if "%db_path%"=="" if not "%daemon_port%"=="7890" (
     set "db_path=%USERPROFILE%\.ralphus\tasks-%daemon_port%.db"
 )
 
+rem A non-default stack also gets its own psmux data dir. Two daemons that share
+rem one are not isolated even with separate DBs and ports: a daemon's startup
+rem reap kills every `ralphus_` tmux server of its own psmux instance, so the
+rem instance key (PSMUX_DATA_DIR) is what keeps this stack from killing -- or
+rem being killed by -- the regular one. An explicit PSMUX_DATA_DIR wins.
+if not "%daemon_port%"=="7890" if "%PSMUX_DATA_DIR%"=="" (
+    set "PSMUX_DATA_DIR=%USERPROFILE%\.ralphus\psmux-%daemon_port%"
+    if not exist "%PSMUX_DATA_DIR%" mkdir "%PSMUX_DATA_DIR%"
+)
+
 rem 1. Build all four Rust bins in debug (fast incremental rebuild picks up
 rem    any CLI/runner/librarian source edit alike).
 echo == cargo build (debug) daemon + librarian + runner + cli ==
@@ -116,6 +126,11 @@ if "%db_path%"=="" (
     echo    db        -^> ^<default: %%USERPROFILE%%\.ralphus\tasks.db^>
 ) else (
     echo    db        -^> %db_path%
+)
+if "%PSMUX_DATA_DIR%"=="" (
+    echo    psmux     -^> ^<default: %%USERPROFILE%%\.psmux^>
+) else (
+    echo    psmux     -^> %PSMUX_DATA_DIR%
 )
 echo    librarian -^> http://127.0.0.1:%librarian_port%
 echo    board dev mode -^> reading librarian\assets from disk (RALPHUS_BOARD_ASSETS_DIR); edits are live on browser refresh

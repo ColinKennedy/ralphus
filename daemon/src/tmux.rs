@@ -1400,6 +1400,12 @@ impl Tmux {
 /// platforms and on any failure to run the lookup -- best-effort cleanup,
 /// never load-bearing for a session's own result.
 ///
+/// Only processes of this daemon's own psmux instance are candidates: one whose
+/// `PSMUX_DATA_DIR` differs from the daemon's own (including a daemon with it
+/// unset versus one with a private directory) is never touched, so a second,
+/// isolated daemon cannot kill the first one's live sessions. See
+/// [`same_psmux_instance`].
+///
 /// # Safety of the wildcard match
 /// This has no way to distinguish a legitimate process from a zombie on its
 /// own -- callers must only pass a `needle` that already makes every match
@@ -1425,27 +1431,27 @@ impl Tmux {
 /// directly via `sysinfo` (no subprocess) instead, the same fix for the same
 /// reason.
 fn force_kill_tmux_processes(needle: &str) -> usize {
+    force_kill_tmux_processes_in(needle, std::env::var_os(PSMUX_DATA_DIR_ENV).as_deref())
+}
+
+/// [`force_kill_tmux_processes`] for an explicit psmux instance (`own` is that
+/// instance's `PSMUX_DATA_DIR`, `None` = unset), so a test can exercise the
+/// scoping without mutating this process's own environment.
+fn force_kill_tmux_processes_in(needle: &str, own: Option<&std::ffi::OsStr>) -> usize {
     #[cfg(target_os = "windows")]
     {
-        use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
-        // `cmd()` is empty by default under `sysinfo` -- fetching a process's
-        // command line is comparatively expensive, so it's opt-in via this
-        // refresh-kind flag, same as `find_server_pid_windows`.
-        let refresh_kind = ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always);
-        let mut sys = System::new();
-        sys.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind);
+        let mut sys = sysinfo::System::new();
+        sys.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::All,
+            true,
+            instance_scan_refresh_kind(),
+        );
         let mut killed = 0;
-        for proc in sys.processes().values() {
-            if !proc.name().eq_ignore_ascii_case("tmux.exe") {
-                continue;
-            }
-            let cmd = proc
-                .cmd()
-                .iter()
-                .map(|arg| arg.to_string_lossy())
-                .collect::<Vec<_>>()
-                .join(" ");
-            if cmd.contains(needle) && cmd.contains("server") && proc.kill() {
+        for pid in matching_server_pids(&sys, needle, own) {
+            if sys
+                .process(sysinfo::Pid::from_u32(pid))
+                .is_some_and(sysinfo::Process::kill)
+            {
                 killed += 1;
             }
         }
@@ -1453,13 +1459,89 @@ fn force_kill_tmux_processes(needle: &str) -> usize {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = needle;
+        let _ = (needle, own);
         0
     }
 }
 
-/// Force-terminate every `ralphus_`-named `tmux.exe` process still alive,
-/// unconditionally. Only ever safe to call at daemon startup, before the
+/// What a process-table refresh must fetch for [`matching_server_pids`]: the
+/// command line (to find `needle` and `server`) and the environment (to tell
+/// which psmux instance the process belongs to). Both are opt-in under
+/// `sysinfo` because fetching them is comparatively expensive.
+#[cfg(target_os = "windows")]
+fn instance_scan_refresh_kind() -> sysinfo::ProcessRefreshKind {
+    sysinfo::ProcessRefreshKind::nothing()
+        .with_cmd(sysinfo::UpdateKind::Always)
+        .with_environ(sysinfo::UpdateKind::Always)
+}
+
+/// Pids of the `tmux.exe` servers in `sys` whose command line contains
+/// `needle` and `server` **and** that belong to this daemon's own psmux
+/// instance (see [`same_psmux_instance`]). `sys` must have been refreshed with
+/// [`instance_scan_refresh_kind`].
+#[cfg(target_os = "windows")]
+fn matching_server_pids(
+    sys: &sysinfo::System,
+    needle: &str,
+    own: Option<&std::ffi::OsStr>,
+) -> Vec<u32> {
+    sys.processes()
+        .values()
+        .filter(|proc| proc.name().eq_ignore_ascii_case("tmux.exe"))
+        .filter(|proc| {
+            let cmd = proc
+                .cmd()
+                .iter()
+                .map(|arg| arg.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(" ");
+            cmd.contains(needle) && cmd.contains("server")
+        })
+        .filter(|proc| same_psmux_instance(own, proc.environ()))
+        .map(|proc| proc.pid().as_u32())
+        .collect()
+}
+
+/// psmux's own switch for relocating its data directory (the `.port`/`.key`
+/// files and so its whole session namespace). A daemon started with it set --
+/// as every `ralphus initialize` exercise's daemon is -- owns a private psmux
+/// server set that no other daemon on the machine shares.
+const PSMUX_DATA_DIR_ENV: &str = "PSMUX_DATA_DIR";
+
+/// Canonical form of a psmux data directory for comparison: separators
+/// unified, trailing separator dropped, case folded (Windows paths are
+/// case-insensitive), and an empty value treated as unset.
+#[cfg(any(target_os = "windows", test))]
+fn normalize_psmux_data_dir(raw: &std::ffi::OsStr) -> Option<String> {
+    let text = raw.to_string_lossy().replace('\\', "/");
+    let text = text.trim_end_matches('/').to_ascii_lowercase();
+    (!text.is_empty()).then_some(text)
+}
+
+/// Whether a process whose environment is `environ` (`KEY=value` entries)
+/// belongs to the same psmux instance as a daemon whose own
+/// `PSMUX_DATA_DIR` is `own` (`None` = unset, the shared default instance).
+///
+/// An empty `environ` means the process's environment could not be read, which
+/// is *not* the same as "variable unset": it is treated as a different
+/// instance, so the answer errs towards leaving a process alone rather than
+/// killing another daemon's live session.
+#[cfg(any(target_os = "windows", test))]
+fn same_psmux_instance(own: Option<&std::ffi::OsStr>, environ: &[std::ffi::OsString]) -> bool {
+    if environ.is_empty() {
+        return false;
+    }
+    let theirs = environ.iter().find_map(|entry| {
+        let entry = entry.to_string_lossy();
+        let (key, value) = entry.split_once('=')?;
+        key.eq_ignore_ascii_case(PSMUX_DATA_DIR_ENV)
+            .then(|| normalize_psmux_data_dir(std::ffi::OsStr::new(value)))
+    });
+    theirs.flatten() == own.and_then(normalize_psmux_data_dir)
+}
+
+/// Force-terminate every `ralphus_`-named `tmux.exe` process of this daemon's
+/// own psmux instance (same `PSMUX_DATA_DIR`) still alive. Only ever safe to call at daemon startup, before the
 /// scheduler has dispatched anything -- relies on the exact same "nothing is
 /// executing yet, so anything found is orphaned" invariant
 /// `Store::recover_orphaned_runs` already uses for `Running` DB rows,
@@ -1622,32 +1704,22 @@ pub fn find_server_pid(name: &str) -> Option<u32> {
 /// large net win even in the worst case.
 #[cfg(target_os = "windows")]
 fn find_server_pid_windows(name: &str) -> Option<u32> {
-    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
     const RETRIES: u32 = 5;
     const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
-    // `cmd()` is empty by default under `sysinfo` -- fetching a process's
-    // command line is comparatively expensive, so it's opt-in via this
-    // refresh-kind flag. Without it every process silently reports `cmd:
-    // []`, and the substring match below would never find anything.
-    let refresh_kind = ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always);
+    // Without the command line every process silently reports `cmd: []` and
+    // the substring match would never find anything; without the environment
+    // a same-named session of another psmux instance could be returned.
+    let refresh_kind = instance_scan_refresh_kind();
+    let own = std::env::var_os(PSMUX_DATA_DIR_ENV);
 
-    let mut sys = System::new();
+    let mut sys = sysinfo::System::new();
     for attempt in 0..RETRIES {
-        sys.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind);
-        let found = sys.processes().values().find_map(|proc| {
-            if !proc.name().eq_ignore_ascii_case("tmux.exe") {
-                return None;
-            }
-            let cmd = proc
-                .cmd()
-                .iter()
-                .map(|arg| arg.to_string_lossy())
-                .collect::<Vec<_>>()
-                .join(" ");
-            (cmd.contains(name) && cmd.contains("server")).then(|| proc.pid().as_u32())
-        });
-        if found.is_some() {
-            return found;
+        sys.refresh_processes_specifics(sysinfo::ProcessesToUpdate::All, true, refresh_kind);
+        if let Some(pid) = matching_server_pids(&sys, name, own.as_deref())
+            .into_iter()
+            .next()
+        {
+            return Some(pid);
         }
         if attempt + 1 < RETRIES {
             std::thread::sleep(RETRY_DELAY);
@@ -1768,6 +1840,144 @@ mod tests {
     #![allow(clippy::print_stdout)]
 
     use super::*;
+
+    fn environ(entries: &[&str]) -> Vec<std::ffi::OsString> {
+        entries.iter().map(std::ffi::OsString::from).collect()
+    }
+
+    #[test]
+    fn same_instance_when_both_use_the_default_data_dir() {
+        assert!(same_psmux_instance(
+            None,
+            &environ(&["PATH=C:/x", "HOME=C:/h"])
+        ));
+    }
+
+    #[test]
+    fn same_instance_when_data_dirs_match_ignoring_separators_case_and_trailing_slash() {
+        let own = std::ffi::OsString::from(r"C:\State\Psmux\");
+        assert!(same_psmux_instance(
+            Some(own.as_os_str()),
+            &environ(&["PATH=C:/x", "psmux_data_dir=c:/state/psmux"]),
+        ));
+    }
+
+    #[test]
+    fn different_instance_when_only_one_side_has_a_private_data_dir() {
+        let private = std::ffi::OsString::from("C:/state/psmux");
+        // A default-instance daemon must not reap a private instance's server...
+        assert!(!same_psmux_instance(
+            None,
+            &environ(&["PSMUX_DATA_DIR=C:/state/psmux"]),
+        ));
+        // ...and a private-instance daemon must not reap the default one's.
+        assert!(!same_psmux_instance(
+            Some(private.as_os_str()),
+            &environ(&["PATH=C:/x"]),
+        ));
+    }
+
+    #[test]
+    fn different_instance_when_data_dirs_differ() {
+        let own = std::ffi::OsString::from("C:/state/a");
+        assert!(!same_psmux_instance(
+            Some(own.as_os_str()),
+            &environ(&["PSMUX_DATA_DIR=C:/state/b"]),
+        ));
+    }
+
+    #[test]
+    fn unreadable_environment_is_never_treated_as_the_same_instance() {
+        assert!(!same_psmux_instance(None, &[]));
+    }
+
+    #[test]
+    fn an_empty_data_dir_counts_as_unset() {
+        assert!(same_psmux_instance(None, &environ(&["PSMUX_DATA_DIR="])));
+    }
+
+    /// Spawns a long-lived process that `sysinfo` sees as a `tmux.exe` server
+    /// for session `needle`, under psmux instance `data_dir` (`None` = unset).
+    /// A copy of `cmd.exe` named `tmux.exe` stands in for psmux so the test
+    /// needs no psmux and cannot touch a real session.
+    #[cfg(target_os = "windows")]
+    fn spawn_fake_tmux_server(
+        dir: &std::path::Path,
+        needle: &str,
+        data_dir: Option<&str>,
+    ) -> std::process::Child {
+        let fake = dir.join("tmux.exe");
+        if !fake.exists() {
+            let cmd = std::env::var_os("ComSpec").expect("ComSpec is set on Windows");
+            std::fs::copy(cmd, &fake).expect("copy cmd.exe to tmux.exe");
+        }
+        let mut command = std::process::Command::new(&fake);
+        command
+            .args([
+                "/c",
+                &format!("ping -n 60 127.0.0.1 >nul & rem {needle} server"),
+            ])
+            .env_remove(PSMUX_DATA_DIR_ENV)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if let Some(data_dir) = data_dir {
+            command.env(PSMUX_DATA_DIR_ENV, data_dir);
+        }
+        command.spawn().expect("spawn fake tmux.exe")
+    }
+
+    #[cfg(target_os = "windows")]
+    fn wait_until_exited(child: &mut std::process::Child) -> bool {
+        for _ in 0..40 {
+            if child.try_wait().expect("try_wait").is_some() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn force_kill_only_reaches_servers_of_the_callers_own_psmux_instance() {
+        let dir = std::env::temp_dir().join(format!("ralphus-reap-scope-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        // `needle` is unique to this test so a real `ralphus_` session on the
+        // machine can never match.
+        let needle = format!("ralphus_reapscope_{}", std::process::id());
+
+        let mut shared_default = spawn_fake_tmux_server(&dir, &needle, None);
+        let mut other_private = spawn_fake_tmux_server(&dir, &needle, Some("C:/reap-scope/other"));
+        let mut own_private = spawn_fake_tmux_server(&dir, &needle, Some("C:/reap-scope/own"));
+        // Let all three finish starting so each shows up in the process table.
+        std::thread::sleep(Duration::from_millis(800));
+
+        let own = std::ffi::OsString::from("C:/reap-scope/own");
+        let killed = force_kill_tmux_processes_in(&needle, Some(own.as_os_str()));
+
+        let own_died = wait_until_exited(&mut own_private);
+        let default_alive = shared_default.try_wait().expect("try_wait").is_none();
+        let other_alive = other_private.try_wait().expect("try_wait").is_none();
+        let _ = shared_default.kill();
+        let _ = other_private.kill();
+        let _ = own_private.kill();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            killed, 1,
+            "exactly the caller's own instance's server is reaped"
+        );
+        assert!(
+            own_died,
+            "the caller's own instance's server must be reaped"
+        );
+        assert!(default_alive, "the default instance's server must survive");
+        assert!(
+            other_alive,
+            "another private instance's server must survive"
+        );
+    }
 
     #[test]
     fn process_exit_helper_preserves_numeric_stdout_over_stderr() {

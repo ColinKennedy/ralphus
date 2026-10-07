@@ -66,6 +66,16 @@ if [ -z "$db_path" ] && [ "$daemon_port" != "7890" ]; then
   db_path="${state_home}/.ralphus/tasks-${daemon_port}.db"
 fi
 
+# A non-default stack also gets its own psmux data dir. Two daemons that share
+# one are not isolated even with separate DBs and ports: a daemon's startup
+# reap kills every `ralphus_` tmux server of its own psmux instance, so the
+# instance key (PSMUX_DATA_DIR) is what keeps this stack from killing -- or
+# being killed by -- the regular one. An explicit PSMUX_DATA_DIR wins.
+if [ "$daemon_port" != "7890" ] && [ -z "${PSMUX_DATA_DIR:-}" ]; then
+  export PSMUX_DATA_DIR="${USERPROFILE:-${HOME:-.}}/.ralphus/psmux-${daemon_port}"
+  mkdir -p "$PSMUX_DATA_DIR"
+fi
+
 # Root is whichever checkout this script lives in (main or a worktree) --
 # mirrors build-debug.cmd's `%~dp0..` resolution, so a review worktree builds
 # and runs its own binaries instead of the main checkout's.
@@ -89,6 +99,7 @@ echo "   runner    -> $RALPHUS_RUNNER_CMD"
 echo "   cli       -> $root/target/debug/ralphus${ext} (not started; run it yourself, e.g. 'ralphus status')"
 echo "   daemon    -> $RALPHUS_DAEMON_URL"
 echo "   db        -> ${db_path:-<default: ~/.ralphus/tasks.db>}"
+echo "   psmux     -> ${PSMUX_DATA_DIR:-<default: ~/.psmux>}"
 echo "   librarian -> http://127.0.0.1:${librarian_port}"
 echo "   board dev mode -> reading librarian/assets from disk (RALPHUS_BOARD_ASSETS_DIR); edits are live on browser refresh"
 daemon_args=(serve --port "$daemon_port")
