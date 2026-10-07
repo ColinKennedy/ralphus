@@ -48,7 +48,7 @@ All of the following hold for **every** exercise, with no exceptions:
    [`.agent/agent-conduct.md`](../../../../.agent/agent-conduct.md).)
 3. **No LLM, ever.** An exercise must pass with no model, API key, network
    access, or agent backend available. Use raw `command` cells/proofs only —
-   never a `prompt` cell, an agent, a `brain` proof, or anything that calls
+   never a `prompt` cell, an agent, or anything that calls
    Claude, Codex, Ollama, or similar. If a behavior can only be shown with a
    model, it is not an exercise.
 4. **Local or remote, same code path.** Differences between modes go through

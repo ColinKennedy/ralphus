@@ -742,7 +742,7 @@ may embed <<ralphus:new-worktree/BRANCH?upstream=UPSTREAM
 ---------------------------------------------------------------
  [[task.proof]] runs after ALL of a task's cells complete.
  [[task.cell.proof]] runs after its own cell finishes.
- Exactly ONE of `command`, `brain`, or `prompt` is required.
+ Exactly ONE of `command` or `prompt` is required.
 
  Key                Type           Notes
  id                 string         Stable id for restart_on references
@@ -791,7 +791,6 @@ may embed <<ralphus:new-worktree/BRANCH?upstream=UPSTREAM
                                    Example:
                                      command = "cargo test"
                                      remediation_attempts = 3   # mode defaults to "remediating"
- brain              string  ONE-OF Local-LLM check (planned; not yet run in MVP).
  prompt             string  ONE-OF AI proof prompt -- the check to run. (Works
                                    today.) NOT a backend name: unlike the
                                    cell-level `agent`, this is instruction
@@ -823,7 +822,6 @@ may embed <<ralphus:new-worktree/BRANCH?upstream=UPSTREAM
                                    cell's/task's `maximum_timeout_seconds`,
                                    which are separate, independently-enforced
                                    budgets that still apply on top of this one.
- requires_approval  boolean        Pause for human sign-off (planned)
  restart_on         array<string>  Re-run this task when a referenced proof
                                    step fires. Grammar:
                                    "task/cell/proof?on=pass|fail|both",
@@ -837,9 +835,8 @@ may embed <<ralphus:new-worktree/BRANCH?upstream=UPSTREAM
                                    [[task.proof]] blocks can set the same key
                                    to different values without colliding.
 
- NOTE: today the runner executes `command` and `prompt` proof steps; `brain`
- (local-LLM) and `approval` (human) proof steps are still accepted by the schema
- but deferred, and stay pending. A `mode = "remediating"` command's repair-agent
+ NOTE: the runner executes `command` and `prompt` proof steps. A
+ `mode = "remediating"` command's repair-agent
  retry loop is fully wired: a failed attempt's captured output is handed to
  the owning cell's resolved agent/model as a file path (never inlined), and
  the command is retried up to `remediation_attempts` times.

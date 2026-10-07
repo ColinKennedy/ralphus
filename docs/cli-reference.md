@@ -318,7 +318,7 @@ the daemon's hourly Free-tier background sweep
 | `proof show <selector>` | Proof step detail (kind, state, spec, output) |
 | `proof set-status <selector> <state>` | Override a proof step's status |
 | `proof restart <selector>` | Restart a proof step (dispatches to the task- or cell-scoped restart endpoint) |
-| `proof edit <selector> [--agent] [--model] [--command] [--prompt] [--brain] [--maximum-tool-output-tokens]` | Edit a proof step's agent/model/command/prompt/brain/tool-output-cap overrides |
+| `proof edit <selector> [--agent] [--model] [--command] [--prompt] [--maximum-tool-output-tokens]` | Edit a proof step's agent/model/command/prompt/tool-output-cap overrides |
 
 ## review
 
@@ -776,7 +776,7 @@ use; see `READ_ONLY_NOTE`.
             - (read-only-safe) get name [str]  {Show a project's current review-setting overrides plus the fully resolved effective value for each (file config + database).}
             - set name [str] --auto-build [command] --auto-cancel-outdated-pr-pipelines/--no-auto-cancel-outdated-pr-pipelines --auto-fix-pr-errors/--no-auto-fix-pr-errors --auto-fix-prompt-template [str] --auto-run/--no-auto-run --auto-submit-pr-stack/--no-auto-submit-pr-stack --base-shift-maximum-rebuilds [count] --cache-manual-checks/--no-cache-manual-checks --clear-base-shift-maximum-rebuilds --clear-maximum-budget-usd --discourage-tests-during-auto-pr-fixes/--no-discourage-tests-during-auto-pr-fixes --dual-root-pr/--no-dual-root-pr --machine [scheme:uri] --match-pr-branch-name/--no-match-pr-branch-name --maximum-budget-usd [usd] --post-appraisals/--no-post-appraisals --proof-scope [each_branch|final_branch|nothing] --rebuild-on [none|inherit|rebase|feedback|auto_fix...] --resolver-agent [name] --resolver-model [name] --separate-pr-branch/--no-separate-pr-branch --skip-auto-clean/--no-skip-auto-clean --skip-base-updates/--no-skip-base-updates --skip-manual-checks/--no-skip-manual-checks --skip-worktrees/--no-skip-worktrees  {Update a project's DEFAULT review settings, applied to future reviews only (an Arbiter-created review with no [[review]] block, or any review whose own block leaves a field unset) -- existing reviews are unaffected.}
     - proof  {Inspect and act on proof steps.}
-        - edit selector [uri] --agent [name] --brain [text] --command [cmd] --maximum-tool-output-tokens [tokens] --model [name] --prompt [text]  {Edit a proof step's agent/model/command/prompt/brain overrides.}
+        - edit selector [uri] --agent [name] --command [cmd] --maximum-tool-output-tokens [tokens] --model [name] --prompt [text]  {Edit a proof step's agent/model/command/prompt overrides.}
         - (read-only-safe) env selector [uri]  {List a proof step's resolved environment variables, read-only (RAL-324); values of names registered in the Secrets tab are masked.}
         - restart selector [uri]  {Restart this proof step (and any later ones in its scope).}
         - set-status selector [uri] state [str]  {Manually override a proof step's status.}

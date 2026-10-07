@@ -1619,7 +1619,6 @@ impl DaemonClient {
         model: Option<&str>,
         command: Option<&str>,
         prompt: Option<&str>,
-        brain: Option<&str>,
         maximum_tool_output_tokens: Option<&str>,
     ) -> Result<Value, DaemonError> {
         let mut body = json!({
@@ -1633,7 +1632,6 @@ impl DaemonClient {
         set_if_some(&mut body, "model", model.map(str::to_string));
         set_if_some(&mut body, "command", command.map(str::to_string));
         set_if_some(&mut body, "prompt", prompt.map(str::to_string));
-        set_if_some(&mut body, "brain", brain.map(str::to_string));
         set_if_some(
             &mut body,
             "maximum_tool_output_tokens",

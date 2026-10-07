@@ -488,7 +488,7 @@ validation errors) if invalid. On success `201`:
 { "squad_id": "squad-000000000001", "state": "pending" }
 ```
 When the submit-time preset stamp skipped something it was asked to apply
-(a preset's `pass_score` on a `command`/`brain` proof step, which is only
+(a preset's `pass_score` on a `command` proof step, which is only
 valid on a `prompt` proof), the response also carries
 `"warnings": ["task[0].proof[1]: a preset in its `extends` supplies pass_score = 7, ..."]`.
 The key is omitted when there are none. The CLI prints each as a `warning:`
@@ -1350,7 +1350,7 @@ other keys are read:
 | `squad` | — | `label` |
 | `task` | `task_idx` | `name`, `project`, `model` |
 | `cell` | `task_idx`, `cell_idx` | `cwd`, `agent`, `model`, `prompt`, `command`, `auto_compact_threshold`, `maximum_tool_output_tokens`, `system_prompt` |
-| `proof` | `task_idx`, `proof_scope`, `cell_idx`, `proof_idx` | `agent`, `model`, `command`, `prompt`, `brain`, `maximum_tool_output_tokens` |
+| `proof` | `task_idx`, `proof_scope`, `cell_idx`, `proof_idx` | `agent`, `model`, `command`, `prompt`, `maximum_tool_output_tokens` |
 
 Every editable key is optional and uses the same three-state convention: the
 key **absent** leaves the field untouched, present-but-empty (`""`) **clears**
@@ -1359,10 +1359,10 @@ distinguish "set to empty string" from "clear" — clearing is the meaning.
 
 For `kind: "cell"`, `prompt` and `command` stay mutually exclusive: whichever
 of the two the caller supplies wins and clears the other; supplying neither
-leaves both as they were. For `kind: "proof"`, `command`/`prompt`/`brain` are
-a three-way version of the same rule: whichever one the caller supplies
-replaces the step's stored kind/body outright (precedence when more than one
-is somehow present in the same request: `command`, then `brain`, then
+leaves both as they were. For `kind: "proof"`, `command`/`prompt` are
+a two-way version of the same rule: whichever one the caller supplies
+replaces the step's stored kind/body outright (precedence when both
+are somehow present in the same request: `command`, then
 `prompt`); supplying none leaves the step's kind/body as it was.
 
 `auto_compact_threshold` and `maximum_tool_output_tokens` are integers and must
@@ -3639,21 +3639,20 @@ Both *task*-level proof steps (`[[task.proof]]`, on `TaskView.proof`) and
 are exposed here, each in task/cell declaration order. A proof entry carries:
 
 - `id` — optional step id from TOML (e.g. `"fmt"`).
-- `kind` — one of `command` / `prompt` / `brain` / `approval`.
+- `kind` — one of `command` / `prompt`.
 - `state` — lifecycle state (`pending` / `running` / `done` / `failed` / `cancelled`).
 - `output` — captured output once run; `null` before execution.
 - `spec` — the step definition: command text for `command` kind, prompt text for
-  `prompt` / `brain` kind, or empty string for `approval`.
+  `prompt` kind.
 - `system_prompt` — the read-only effective appended system prompt that the
   agent actually received for this proof step, including ralphus-added hidden
   instructions (proof mode, unattended execution, async retry policy, etc.).
-  Omitted for `command` / `brain` / `approval` kinds, and may also be absent on
+  Omitted for the `command` kind, and may also be absent on
   historical rows created before August 15, 2026.
 - `model` — model override for `prompt`-kind steps; `null` when unset.
 
 `command` and `prompt` proof steps actually run (`pending` → `running` →
-`done`/`failed`); `brain`/`approval` steps are accepted but deferred and stay
-`pending` forever. A `prompt` step's `output` is the AI's final response
+`done`/`failed`). A `prompt` step's `output` is the AI's final response
 text (used to derive its pass/fail verdict), not command stdout.
 
 Each squad also carries an `env_overrides` field (RAL-150): the squad's persistent

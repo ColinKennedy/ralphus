@@ -19,7 +19,7 @@ right — most of the collisions worth avoiding are with these.
 | **squad** | One *submission*. What `ralphus submit x.toml` creates: the whole TOML file's worth of work, with its own id (`squad-…`), state, and dependency graph. A squad contains tasks. |
 | **task** | One unit of work inside a squad, named by the author (`[[task]] name = "ral-169"`). Owns a workspace, a project, and — since RAL-185 — a machine. A task contains cells. |
 | **cell** | One agent (or command) invocation inside a task (`[[task.cell]]`). The thing that actually runs a model or a shell command. Cells in a task share a workspace and hand off through files on disk. |
-| **proof** / **proof step** | A check that runs *after* its owning cell (cell-scope) or after all of a task's cells (task-scope). Kinds: `command` (exit code is the verdict), `prompt` (an agent returns `RALPHUS_PROOF: PASS/FAIL`), `brain` and `approval` (declared, not yet implemented). |
+| **proof** / **proof step** | A check that runs *after* its owning cell (cell-scope) or after all of a task's cells (task-scope). Kinds: `command` (exit code is the verdict), `prompt` (an agent returns `RALPHUS_PROOF: PASS/FAIL`). |
 
 Do **not** reuse *cell* for anything else — notably not for connection reuse
 or transport (see **channel**).

@@ -28,7 +28,7 @@ the old term lands on the current one:
 | Run | Squad | One submission (`ralphus submit x.toml`), id prefix `squad-…`. |
 | Task | Task | Unchanged — was never part of this rename. |
 | Session | Cell | One agent/command invocation inside a task, `[[task.cell]]`. |
-| Verify (the step) | Proof | A `command`/`prompt`/`brain`/`approval` check, `[[task.proof]]` / `[[task.cell.proof]]`. |
+| Verify (the step) | Proof | A `command`/`prompt` check, `[[task.proof]]` / `[[task.cell.proof]]`. |
 
 `ralphus-runner` (the binary/crate) keeps its name — it means "the thing that
 runs a cell or proof step," not the Run-submission noun, so it was never part
@@ -258,9 +258,9 @@ debugging anything that looks like "this used to work."
 
 ## Status
 
-What's built (Phases 0–5) and what's explicitly not yet built (proof
-retry policy, detached daemon lifecycle, the draggable node-graph canvas, ...):
-[`.agent/roadmap.md`](.agent/roadmap.md).
+What's built (Phases 0–5) and what's explicitly not yet built (a proof step's
+`arguments`, a detached daemon lifecycle, the
+draggable node-graph canvas, ...): [`.agent/roadmap.md`](.agent/roadmap.md).
 
 ## Documentation Map
 

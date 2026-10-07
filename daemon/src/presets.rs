@@ -858,7 +858,7 @@ fn apply_to_proof(
     }
     if proof.pass_score.is_none() {
         if let Some(score) = last_defined(&presets, |p| p.pass_score) {
-            if proof.command.is_some() || proof.brain.is_some() {
+            if proof.command.is_some() {
                 warnings.push(format!(
                     "{path}: a preset in its `extends` supplies pass_score = {score}, but \
                      only a `prompt` proof is scored, so it was ignored"
@@ -869,8 +869,8 @@ fn apply_to_proof(
         }
     }
     // Only an AI (`prompt`) proof has a prompt to fill or frame; a
-    // `command`/`brain` proof is left alone.
-    if proof.command.is_none() && proof.brain.is_none() {
+    // `command` proof is left alone.
+    if proof.command.is_none() {
         let own = TextFrame {
             prompt: proof.prompt.clone(),
             system_prompt: None,
@@ -931,7 +931,7 @@ pub fn apply_presets(store: &Store, file: &mut TaskFile) -> Vec<String> {
 /// A proof step's `pass_score` is a scalar like the others (it fills only
 /// when unset; the last preset in `extends` defining it wins) but applies
 /// only to a `prompt` proof. A preset-supplied `pass_score` on a
-/// `command`/`brain` proof is skipped and reported in the returned warnings,
+/// `command` proof is skipped and reported in the returned warnings,
 /// which the submit response carries.
 pub fn apply_presets_from(registered: &[PresetView], file: &mut TaskFile) -> Vec<String> {
     let by_name: PresetMap<'_> = registered.iter().map(|p| (p.name.as_str(), p)).collect();
@@ -980,11 +980,11 @@ pub fn check_required_fields_after_presets(file: &TaskFile) -> Vec<ValidationErr
             if proof.extends.is_empty() {
                 return;
             }
-            if proof.command.is_none() && proof.brain.is_none() && proof.prompt.is_none() {
+            if proof.command.is_none() && proof.prompt.is_none() {
                 errors.push(ValidationError {
                     path,
                     kind: ErrorKind::MissingRequired,
-                    message: "proof step requires one of: command, brain, prompt (none of its \
+                    message: "proof step requires one of: command, prompt (none of its \
                               `extends` presets supplies a prompt)"
                         .to_string(),
                     line: None,

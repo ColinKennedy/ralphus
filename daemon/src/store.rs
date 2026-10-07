@@ -256,7 +256,7 @@ pub type ProofSpecRow = (
 pub struct ProofView {
     /// Optional step id.
     pub id: Option<String>,
-    /// One of `command` / `brain` / `prompt` / `approval`.
+    /// One of `command` / `prompt`.
     pub kind: String,
     /// Current state string.
     pub state: String,
@@ -273,10 +273,10 @@ pub struct ProofView {
     pub delayed_reason: Option<String>,
     /// Captured command output, once the proof step has run (CCTL-99).
     pub output: Option<String>,
-    /// The step definition: command text, prompt text, or empty for brain/approval.
+    /// The step definition: command text or prompt text.
     pub spec: String,
     /// Read-only effective system prompt actually appended to this agent
-    /// invocation. Omitted for command/brain/approval kinds and for rows
+    /// invocation. Omitted for the command kind and for rows
     /// created before RAL-180 first populated it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
@@ -7486,12 +7486,8 @@ fn insert_proof(
 ) -> Result<()> {
     let (kind, spec) = if let Some(c) = &v.command {
         ("command", c.clone())
-    } else if let Some(b) = &v.brain {
-        ("brain", b.clone())
     } else if let Some(p) = &v.prompt {
         ("prompt", p.clone())
-    } else if v.requires_approval {
-        ("approval", String::new())
     } else {
         ("unknown", String::new())
     };
@@ -7742,9 +7738,9 @@ pub struct ProofEdit<'a> {
     /// Model override (meaningful for `prompt`-kind steps).
     pub model: Option<Option<&'a str>>,
     /// The step's new body when the caller supplies one of
-    /// `command`/`prompt`/`brain` -- whichever they give replaces the
+    /// `command`/`prompt` -- whichever they give replaces the
     /// stored `kind`/`spec` pair outright, since a proof step is exactly one
-    /// of the three (see `core::validate`'s one-of rule). `None` leaves
+    /// of the two (see `core::validate`'s one-of rule). `None` leaves
     /// `kind`/`spec` untouched.
     pub body: Option<ProofBody<'a>>,
     /// Per-step cap on a single tool-call output, in tokens (RAL-333).
@@ -7753,12 +7749,11 @@ pub struct ProofEdit<'a> {
     pub maximum_tool_output_tokens: Option<Option<i64>>,
 }
 
-/// The (kind, spec) pair a proof edit's `command`/`prompt`/`brain` field
+/// The (kind, spec) pair a proof edit's `command`/`prompt` field
 /// resolves to -- see [`ProofEdit::body`].
 #[derive(Debug, Clone, Copy)]
 pub enum ProofBody<'a> {
     Command(&'a str),
-    Brain(&'a str),
     Prompt(&'a str),
 }
 
@@ -7766,14 +7761,13 @@ impl<'a> ProofBody<'a> {
     fn kind(&self) -> &'static str {
         match self {
             ProofBody::Command(_) => "command",
-            ProofBody::Brain(_) => "brain",
             ProofBody::Prompt(_) => "prompt",
         }
     }
 
     fn spec(&self) -> &'a str {
         match *self {
-            ProofBody::Command(s) | ProofBody::Brain(s) | ProofBody::Prompt(s) => s,
+            ProofBody::Command(s) | ProofBody::Prompt(s) => s,
         }
     }
 }
@@ -8646,7 +8640,7 @@ impl Store {
         let model_value = edit.model.flatten();
         let maximum_tool_output_tokens_touched = edit.maximum_tool_output_tokens.is_some();
         let maximum_tool_output_tokens_value = edit.maximum_tool_output_tokens.flatten();
-        // Whichever of command/prompt/brain the caller supplied (if any)
+        // Whichever of command/prompt the caller supplied (if any)
         // replaces `kind`/`spec` outright -- mirrors `insert_proof`'s
         // derivation, including recomputing `effective_system_prompt` only
         // for the "prompt" kind.
@@ -8655,8 +8649,7 @@ impl Store {
         let spec_value = edit.body.as_ref().map(ProofBody::spec);
         let effective_system_prompt_value = match edit.body {
             Some(ProofBody::Prompt(_)) => Some(effective_proof_system_prompt(None, true)),
-            Some(ProofBody::Command(_) | ProofBody::Brain(_)) => None,
-            None => None,
+            Some(ProofBody::Command(_)) | None => None,
         };
         let n = self.conn.execute(
             "UPDATE proofs SET
