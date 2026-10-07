@@ -28375,6 +28375,7 @@ remediation_attempts = 1
                     turns: None,
                     ghost: None,
                     prophecies: Vec::new(),
+                    appraisal: None,
                 }
             }
         }
@@ -28531,6 +28532,7 @@ remediation_attempts = 1
                     turns: None,
                     ghost: None,
                     prophecies: Vec::new(),
+                    appraisal: None,
                 }
             }
         }

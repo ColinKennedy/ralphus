@@ -44,6 +44,7 @@ impl Runner for OkRunner {
             ghost: None,
             turns: None,
             prophecies: Vec::new(),
+            appraisal: None,
         }
     }
 }
@@ -110,6 +111,7 @@ impl Runner for ConflictResolvingRunner {
             ghost: None,
             turns: None,
             prophecies: Vec::new(),
+            appraisal: None,
         }
     }
 }
@@ -1467,6 +1469,7 @@ fn ok_result() -> RunnerResult {
         ghost: None,
         turns: None,
         prophecies: Vec::new(),
+        appraisal: None,
     }
 }
 
@@ -1512,6 +1515,7 @@ impl Runner for GatableRunner {
                 ghost: None,
                 turns: None,
                 prophecies: Vec::new(),
+                appraisal: None,
             };
         }
         ok_result()

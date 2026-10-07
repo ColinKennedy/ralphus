@@ -2295,6 +2295,7 @@ fn synthesize_pr_text(
         retry_attempt: 0,
         retry_after_unknown_default_seconds,
         maximum_timeout: None,
+        pass_score: None,
     };
     // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
     crate::rlog!(
@@ -10156,6 +10157,7 @@ mod tests {
                 ghost: None,
                 turns: None,
                 prophecies: Vec::new(),
+                appraisal: None,
                 thinking_stall_last_line: None,
             }
         }

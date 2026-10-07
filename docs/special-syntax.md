@@ -425,6 +425,17 @@ tool guidance. The markers that assembly teaches are parsed from the reply:
   line (local models sometimes embed it mid-sentence), even though the
   assembled prompt teaches a final exact line. A reply with no verdict at
   all is fail-closed (`proofed = false`).
+- **`RALPHUS_APPRAISAL: {"score": <1-10>, "summary": "...", "sections": [...]}`**
+  — the verdict contract of a *scored* proof step (a `prompt` proof with a
+  resolved `pass_score`), taught **instead of** `RALPHUS_PROOF`. Parsing takes
+  the **last** marker and reads the first complete JSON value after it (it may
+  span lines; trailing prose is ignored), keeping only `score`, `summary`, and
+  `sections` (`title`/`body` pairs); over-cap text is cut with a visible
+  `…(truncated)`. The decision is `proofed = score >= pass_score`. A missing
+  marker, unparseable JSON, or a score that is not an integer from 1 to 10
+  triggers **one** automatic re-prompt (resuming the same session); a second
+  failure is fail-closed (`proofed = false`). `RALPHUS_STILL_WORKING` keeps
+  working for scored proofs.
 - **`RALPHUS_STILL_WORKING: <one-line reason>`** — the continuation escape
   hatch. Applies to prompt cells **and** prompt proof steps (the async
   fragment is in both). When present, the runner re-invokes the same agent
