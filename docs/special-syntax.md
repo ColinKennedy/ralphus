@@ -119,8 +119,17 @@ Grammar:
 "<<ralphus:linked-field/<path>>>"
 ```
 
-`<path>` is `/`-separated: every segment before the last must be exactly `.`
-or `..`; the last segment names the target field.
+`<path>` is `/`-separated: every segment before the last must be `.`, `..`,
+or `..[<kind>]` (`<kind>` is `task`, `cell`, or `proof`); the last segment
+names the target field.
+
+`..[<kind>]` climbs one level only if the table it is stepping **from** is of
+that kind, and is otherwise a no-op (like `.`). Steps are evaluated left to
+right, so `./..[proof]/..[cell]/prompt` composes. This lets one preset template
+work on both a cell and a proof: `./..[proof]/prompt` is a cell's own prompt,
+a cell-proof's parent-cell prompt, and `<field prompt was not found>` on a
+task-level proof. Anything else in brackets (`..[`, `..[]`, `.[proof]`,
+`..[proof]x`, an unknown kind) is a validation error.
 
 - **Embeds like a worktree placeholder.** A linked field is found by the same
   `<<...>>` scan a worktree placeholder is (`core::schema::text_placeholders`)
