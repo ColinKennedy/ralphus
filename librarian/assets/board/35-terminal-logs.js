@@ -378,6 +378,14 @@
           // Render from the tape when we have one (ANSI-strip/classify pipeline,
           // re-resolving the `<pre>` by id per the RAL-186 rule above), else
           // from the `/pane` snapshot fallback.
+          // Re-measure now, synchronously with the render: the reader may have
+          // scrolled while the requests above were in flight, and the offsets
+          // captured before them would drag the box back to where it was.
+          const liveBefore = document.getElementById(preId);
+          const pinned = forceBottom || (liveBefore && liveBefore === before && !freshLoad
+            ? liveBefore.scrollTop + liveBefore.clientHeight >= liveBefore.scrollHeight - 4
+            : atBottom);
+          const heldTop = liveBefore && liveBefore === before ? liveBefore.scrollTop : priorTop;
           if (usingTape && peekTape[key]) renderPeekTape(key);
           else renderPeekFallback(key, paneContent);
           if (next.headerChanged) rerenderOwningPane();
@@ -386,7 +394,7 @@
           // A just-revived (or just-ended) box gets pinned to the bottom
           // regardless of where it was scrolled: its content is a different
           // log now, so the old offset means nothing.
-          if (atBottom || next.headerChanged) {
+          if (pinned || next.headerChanged) {
             pre.scrollTop = pre.scrollHeight;
           } else if (freshLoad) {
             // Not bottom-pinned, but this is the first render into a rebuilt
@@ -398,7 +406,7 @@
           } else if (before === pre) {
             // Scrolled up and the same node: the text swap must not move the
             // reader, so re-assert the offset they had before it.
-            pre.scrollTop = priorTop;
+            pre.scrollTop = heldTop;
           }
           savePeekScrollState(key, pre);
           updatePeekJumpVisibility(key);
