@@ -49,7 +49,7 @@ use crate::args::GlobalOpts;
 use crate::client::ProjectReviewSettingsPatch;
 use crate::health::CheckResult;
 use answers::Source;
-use ralphus_core::git_remote::{default_upstream_remote, find_remote_for_url, remote_urls_match};
+use ralphus_core::git_remote::{default_upstream_remote, find_remote_for_url};
 use ralphus_runner::login_probe::{LoginProbe, LoginState, LoginStatus, StatusRun, login_probes};
 
 const TOTAL_STEPS: u32 = 10;
