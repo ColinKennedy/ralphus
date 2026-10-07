@@ -10344,12 +10344,43 @@ fn inactive_pane_reply(session_name: &str) -> Reply {
         200,
         &PaneResponse {
             active: false,
-            content: strip_ralphus_pane_markers(
-                &crate::tmux::read_pane_snapshot(session_name).unwrap_or_default(),
-            ),
+            content: snapshot_pane_content(session_name),
             last_activity_ms: None,
         },
     )
+}
+
+/// The persisted pane snapshot for `session_name`, with ralphus's own marker
+/// lines stripped (empty when none exists).
+fn snapshot_pane_content(session_name: &str) -> String {
+    strip_ralphus_pane_markers(&crate::tmux::read_pane_snapshot(session_name).unwrap_or_default())
+}
+
+/// The `/pane` reply for a session with no tmux pane to capture.
+///
+/// A cell on a remote machine never has a pane on this host: its output
+/// reaches the board as a snapshot the remote poll loop keeps rewriting
+/// ([`crate::remote_runner`]). While that loop runs it holds the session's
+/// in-memory liveness mark, which is what separates a remote cell that is still
+/// producing output (reported `active`, with the snapshot as its content, so
+/// the board shows a live view) from one that has ended (the read-only
+/// historical record [`inactive_pane_reply`] serves).
+fn pane_reply_without_session(daemon: &Daemon, session_name: &str) -> Reply {
+    let live = daemon
+        .store_handle()
+        .lock_free_memory()
+        .live_activity_ms(session_name);
+    match live {
+        Some(last_activity_ms) => json(
+            200,
+            &PaneResponse {
+                active: true,
+                content: snapshot_pane_content(session_name),
+                last_activity_ms: Some(last_activity_ms),
+            },
+        ),
+        None => inactive_pane_reply(session_name),
+    }
 }
 
 /// Strips ralphus's own `RALPHUS_EVENT:`/`RALPHUS_TMUX_DONE` marker lines out
@@ -10467,7 +10498,7 @@ fn capture_pane_reply(
                     .live_activity_ms(&name),
             },
         ),
-        Err(_) => inactive_pane_reply(&name),
+        Err(_) => pane_reply_without_session(daemon, &name),
     }
 }
 
@@ -30543,6 +30574,45 @@ after"
     #[test]
     fn strip_ralphus_pane_markers_empty_input_stays_empty() {
         assert_eq!(strip_ralphus_pane_markers(""), "");
+    }
+
+    #[test]
+    fn a_remote_cell_is_active_in_the_pane_reply_only_while_it_holds_its_liveness_mark() {
+        // A remote cell has no tmux pane here, only the snapshot the remote poll
+        // loop rewrites. While that loop holds the session's liveness mark the
+        // board must be told the cell is live; otherwise it labels a running
+        // cell a read-only historical record of an ended session.
+        let d = daemon();
+        let name = crate::tmux::session_name("squad-pane-live", "task", "remote-live-cell");
+        crate::tmux::write_pane_snapshot(&name, "streamed from the machine\nRALPHUS_EVENT: {}\n");
+        let body = |reply: Reply| -> serde_json::Value {
+            assert_eq!(reply.status, 200);
+            serde_json::from_str(&reply.body).unwrap()
+        };
+
+        let ended = body(pane_reply_without_session(&d, &name));
+        assert_eq!(ended["active"], false);
+        assert_eq!(ended["last_activity_ms"], serde_json::Value::Null);
+        assert_eq!(ended["content"], "streamed from the machine");
+
+        d.store_handle()
+            .lock_free_memory()
+            .note_live_activity(&name, 1234);
+        let live = body(pane_reply_without_session(&d, &name));
+        assert_eq!(live["active"], true);
+        assert_eq!(live["last_activity_ms"], 1234);
+        assert_eq!(
+            live["content"], "streamed from the machine",
+            "a live remote cell serves the same snapshot, marker lines still stripped"
+        );
+
+        d.store_handle()
+            .lock_free_memory()
+            .clear_live_activity(&name);
+        let after = body(pane_reply_without_session(&d, &name));
+        assert_eq!(after["active"], false, "the mark must not outlive the cell");
+
+        let _ = std::fs::remove_file(crate::tmux::pane_snapshot_path(&name));
     }
 
     #[test]

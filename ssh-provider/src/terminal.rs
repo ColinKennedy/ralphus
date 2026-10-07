@@ -23,6 +23,7 @@
 
 use std::io::{self, Read, Write};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::exec::EffectiveConfig;
@@ -31,6 +32,18 @@ use crate::transport::shell_quote_single;
 use crate::uri;
 
 const BUFFER_SIZE: usize = 4096;
+
+/// The remote command string for a terminal session on a machine reached
+/// directly (no container): `sh -c '<command>'`.
+///
+/// ssh hands its trailing argument to the remote account's login shell as one
+/// command line. The command here is a whole script (`export ...; claude
+/// --resume ...`), so it has to be an argument to `sh -c`; quoting it alone
+/// makes the login shell look for a program named after the entire script and
+/// exit 127.
+fn plain_remote_command(sized_command: &str) -> String {
+    format!("sh -c {}", shell_quote_single(sized_command))
+}
 
 /// Run the `terminal` verb: spawn `ssh -tt <target> <command>` (with
 /// `COLUMNS`/`LINES` set to `cols`/`lines` for the remote shell) and relay
@@ -50,13 +63,21 @@ pub fn run(
     config: &EffectiveConfig,
 ) -> Result<i32, String> {
     let target = uri::parse(uri).map_err(|e| e.to_string())?;
-    let sized_command = format!("export COLUMNS={cols} LINES={lines}; {command}",);
+    // A process started by `docker exec` outlives the ssh session that started
+    // it, so in container mode the command carries an id the cleanup at the
+    // bottom can find it by.
+    let terminal_id = crate::container::active().map(|_| crate::container::new_terminal_id());
+    let marker = terminal_id
+        .as_deref()
+        .map(|id| format!(" RALPHUS_TERMINAL={id}"))
+        .unwrap_or_default();
+    let sized_command = format!("export COLUMNS={cols} LINES={lines}{marker}; {command}",);
     let remote_command = if crate::container::active().is_some() {
         // `docker exec -it` is already a complete, correctly quoted shell
         // command for the host's login shell.
         crate::container::wrap_active(&target.target_string(), &sized_command, true)
     } else {
-        shell_quote_single(&sized_command)
+        plain_remote_command(&sized_command)
     };
     let args = ssh::pty_command_args(
         &target.target_string(),
@@ -82,11 +103,15 @@ pub fn run(
 
     let mut child_stdin = child.stdin.take().expect("stdin piped at spawn");
     let mut child_stdout = child.stdout.take().expect("stdout piped at spawn");
+    let child = Arc::new(Mutex::new(child));
 
     // This process's own stdin (bytes the daemon relays in from the WS
     // client) -> the remote pty. Runs on its own thread so it can block on
-    // `read` independently of the child-stdout loop below.
-    let writer = thread::spawn(move || {
+    // `read` independently of the child-stdout loop below, and is never joined:
+    // when the remote side ends first this thread may still be parked in a
+    // `read`, and the process exits right after `run` returns.
+    let killer = Arc::clone(&child);
+    thread::spawn(move || {
         let mut buf = [0_u8; BUFFER_SIZE];
         let mut stdin = io::stdin();
         loop {
@@ -99,8 +124,16 @@ pub fn run(
                 }
             }
         }
-        // Dropping `child_stdin` here closes ssh's stdin, which is how a
-        // closed WS connection propagates into the remote session ending.
+        // The daemon closed our stdin (the client's WebSocket went away), so the
+        // session is over. Closing ssh's stdin is not enough -- a pty session
+        // keeps running without input -- so end ssh itself, which also ends the
+        // output loop below. Leaving it to the daemon to kill this process
+        // would orphan ssh on a host where killing a process does not take its
+        // children with it.
+        drop(child_stdin);
+        if let Ok(mut ssh) = killer.lock() {
+            let _ = ssh.kill();
+        }
     });
 
     // The remote pty's output -> this process's own stdout (bytes the
@@ -118,10 +151,17 @@ pub fn run(
         }
     }
 
-    let _ = writer.join();
     let status = child
+        .lock()
+        .map_err(|_| "the ssh child lock was poisoned".to_string())?
         .wait()
         .map_err(|e| format!("could not wait on ssh: {e}"))?;
+    if let Some(id) = terminal_id {
+        // Best effort: the session is already over either way.
+        if let Err(e) = crate::container::cleanup_terminal(uri, &id, config) {
+            eprintln!("could not clean up the container terminal {id}: {e}");
+        }
+    }
     Ok(status.code().unwrap_or(-1))
 }
 
@@ -138,6 +178,14 @@ mod tests {
             ssh_config_file: None,
             target_runner_config: None,
         }
+    }
+
+    #[test]
+    fn a_plain_terminal_command_is_run_by_sh_c_not_looked_up_as_a_program_name() {
+        assert_eq!(
+            plain_remote_command("export COLUMNS=80 LINES=24; claude --resume 'x'"),
+            "sh -c 'export COLUMNS=80 LINES=24; claude --resume '\\''x'\\'''"
+        );
     }
 
     #[test]

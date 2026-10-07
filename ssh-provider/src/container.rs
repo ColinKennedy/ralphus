@@ -182,6 +182,75 @@ pub fn wrap_active(target: &str, cmd: &str, pty: bool) -> String {
     }
 }
 
+/// A fresh id for one `terminal` session, 16 hex digits.
+///
+/// Embedded in the session's command line as `RALPHUS_TERMINAL=<id>` so
+/// [`cleanup_terminal`] can find what `docker exec` leaves running when the
+/// client that started it goes away.
+#[must_use]
+pub fn new_terminal_id() -> String {
+    let mut bytes = [0_u8; 8];
+    // A failure here only costs uniqueness-by-randomness; fall back to the clock
+    // rather than refuse to open a terminal.
+    if getrandom::getrandom(&mut bytes).is_err() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        bytes = (nanos as u64).to_le_bytes();
+    }
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The in-container script that ends the process tree of terminal session `id`.
+///
+/// The `[R]` bracket keeps `pgrep` from matching this script's own command
+/// line. The session's `sh` is found by its `RALPHUS_TERMINAL=<id>` argument,
+/// its children (the agent) are hung up first, then anything left is killed.
+/// `id` is expected to come from [`new_terminal_id`]; anything that is not hex
+/// yields a script that matches nothing.
+#[must_use]
+pub fn terminal_cleanup_script(id: &str) -> String {
+    let id: String = id.chars().filter(char::is_ascii_hexdigit).collect();
+    format!(
+        "p=$(pgrep -f '[R]ALPHUS_TERMINAL={id}' | head -n 1); \
+         if [ -n \"$p\" ]; then \
+         pkill -HUP -P \"$p\" 2>/dev/null; kill -HUP \"$p\" 2>/dev/null; sleep 1; \
+         pkill -KILL -P \"$p\" 2>/dev/null; kill -KILL \"$p\" 2>/dev/null; \
+         fi; true"
+    )
+}
+
+/// Ends whatever a `terminal` session left running in the container.
+///
+/// A process started by `docker exec` is not stopped when its client
+/// disconnects, so the ssh session ending is not the end of the agent.
+///
+/// # Errors
+/// An unreachable host or an ssh failure; the session is over either way.
+pub fn cleanup_terminal(uri_str: &str, id: &str, config: &EffectiveConfig) -> Result<(), String> {
+    let target = uri::parse(uri_str).map_err(|e| e.to_string())?;
+    let args = ssh::command_args(
+        &target.target_string(),
+        config.connect_timeout_secs,
+        &terminal_cleanup_script(id),
+        config.ssh_config_file.as_deref(),
+    );
+    let out = Command::new("ssh")
+        .args(&args)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("could not run ssh to reach {target}: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(ssh::interpret_failure(
+            "ssh",
+            out.status.code(),
+            &String::from_utf8_lossy(&out.stderr),
+        ))
+    }
+}
+
 /// Exit status [`ensure_script`] uses when the existing container was made
 /// from a different image than configured.
 const EXIT_IMAGE_MISMATCH: i32 = 42;
@@ -452,6 +521,41 @@ mod tests {
     fn ensure_script_starts_a_stopped_container_instead_of_recreating_it() {
         let script = ensure_script(&cfg(), "box");
         assert!(script.contains("docker start"), "{script}");
+    }
+
+    #[test]
+    fn terminal_ids_are_sixteen_hex_digits_and_differ() {
+        let (a, b) = (new_terminal_id(), new_terminal_id());
+        assert_eq!(a.len(), 16, "{a}");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()), "{a}");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn the_cleanup_script_finds_the_session_by_its_marker_without_matching_itself() {
+        let script = terminal_cleanup_script("00ff00ff00ff00ff");
+        assert!(
+            script.contains("pgrep -f '[R]ALPHUS_TERMINAL=00ff00ff00ff00ff'"),
+            "{script}"
+        );
+        assert!(script.contains("pkill -HUP -P"), "{script}");
+        assert!(script.contains("pkill -KILL -P"), "{script}");
+        assert!(
+            script.ends_with("true"),
+            "must never fail the caller: {script}"
+        );
+    }
+
+    #[test]
+    fn a_non_hex_id_cannot_inject_into_the_cleanup_script() {
+        let script = terminal_cleanup_script("'; rm -rf / #");
+        assert!(!script.contains("rm -rf"), "{script}");
+        // Only the hex digit survives ("f" from "-rf"); the quote and the
+        // semicolon that would have ended the pattern are gone.
+        assert!(
+            script.contains("pgrep -f '[R]ALPHUS_TERMINAL=f' |"),
+            "{script}"
+        );
     }
 
     #[test]

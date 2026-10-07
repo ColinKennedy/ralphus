@@ -800,6 +800,9 @@ impl ProviderRunner {
 
     /// Drive an async `exec` handle to completion: poll `status`, pump `stream`
     /// into the cell's Live View snapshot, and `cancel` if the token trips.
+    ///
+    /// The cell counts as live (see [`Self::note_remote_activity`]) for exactly
+    /// as long as this runs, on every way out of it.
     fn poll_to_completion(
         &self,
         handle: &str,
@@ -807,6 +810,42 @@ impl ProviderRunner {
         cancel: Option<&CancelToken>,
     ) -> RunnerResult {
         let session_name = crate::tmux::session_name(&spec.squad_id, &spec.task, &spec.cell_id);
+        self.note_remote_activity(&session_name);
+        let result = self.poll_loop(handle, spec, cancel, &session_name);
+        self.clear_remote_activity(&session_name);
+        result
+    }
+
+    /// Marks the cell's Live View session as live now.
+    ///
+    /// A remote cell has no tmux pane on this host, so the board's `/pane`
+    /// probe finds nothing to capture. This in-memory mark (the one tmux-wrapped
+    /// cells feed as their panes grow) is what lets `/pane` answer "still
+    /// running" for it; without it the board labels a running remote cell a
+    /// "historical record" of an ended session. A no-op without a store handle.
+    fn note_remote_activity(&self, session_name: &str) {
+        if let Some(store) = &self.cartographer {
+            store
+                .lock_free_memory()
+                .note_live_activity(session_name, crate::store::now_ms());
+        }
+    }
+
+    /// Removes the mark [`Self::note_remote_activity`] set.
+    fn clear_remote_activity(&self, session_name: &str) {
+        if let Some(store) = &self.cartographer {
+            store.lock_free_memory().clear_live_activity(session_name);
+        }
+    }
+
+    fn poll_loop(
+        &self,
+        handle: &str,
+        spec: &RunnerSpec,
+        cancel: Option<&CancelToken>,
+        session_name: &str,
+    ) -> RunnerResult {
+        let session_name = session_name.to_string();
         let started = Instant::now();
         let budget = spec.timeout_sec.map(Duration::from_secs);
         let mut transcript = String::new();
@@ -912,6 +951,7 @@ impl ProviderRunner {
                     if let Some(chunk) = resp.output.filter(|c| !c.is_empty()) {
                         transcript.push_str(&chunk);
                         crate::tmux::write_pane_snapshot(&session_name, &transcript);
+                        self.note_remote_activity(&session_name);
                     }
                     if resp.next.is_some() {
                         cursor = resp.next;
@@ -2578,6 +2618,73 @@ else:
             snapshot.contains("hello from the farm"),
             "streamed output must land in the pane snapshot the board reads; got {snapshot:?}"
         );
+        assert_eq!(
+            s.lock_free_memory().live_activity_ms(&name),
+            None,
+            "a finished remote cell must not stay marked live"
+        );
+        let _ = std::fs::remove_file(crate::tmux::pane_snapshot_path(&name));
+    }
+
+    #[test]
+    fn a_remote_cells_liveness_mark_is_set_and_cleared_through_the_stores_memory() {
+        let s = store();
+        let provider =
+            ProviderRunner::new("unused", vec![], "ib", "A").with_cartographer(Arc::clone(&s));
+        let name = crate::tmux::session_name("squad-mark", "t", "mark-cell");
+        assert_eq!(s.lock_free_memory().live_activity_ms(&name), None);
+        provider.note_remote_activity(&name);
+        assert!(s.lock_free_memory().live_activity_ms(&name).is_some());
+        provider.clear_remote_activity(&name);
+        assert_eq!(s.lock_free_memory().live_activity_ms(&name), None);
+    }
+
+    #[test]
+    fn a_remote_cell_is_marked_live_while_its_handle_is_polled() {
+        // Each provider verb is its own process spawn, so the poll lasts long
+        // enough for a watcher that spins until the run returns to see the mark
+        // set mid-poll, not only before and after.
+        let script = fake_async_provider(
+            "async-live-mark",
+            &[
+                ("exec", r#"{"ok":true,"protocol_version":1,"handle":"h1"}"#),
+                (
+                    "stream",
+                    r#"{"ok":true,"protocol_version":1,"output":"working","next":1}"#,
+                ),
+                (
+                    "status",
+                    r#"{"ok":true,"protocol_version":1,"state":"done","result":{"status":"done","summary":"ok"}}"#,
+                ),
+            ],
+        );
+        let s = store();
+        register(&s, "ib", &script);
+        let (router, _local) = router(Arc::clone(&s));
+        let mut sp = spec(Some("ib:A"));
+        sp.cell_id = "s0-live-mark".to_string();
+        let name = crate::tmux::session_name(&sp.squad_id, &sp.task, &sp.cell_id);
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watcher = {
+            let (s, name, finished) = (Arc::clone(&s), name.clone(), Arc::clone(&finished));
+            std::thread::spawn(move || {
+                let mut seen_live = false;
+                while !finished.load(std::sync::atomic::Ordering::SeqCst) {
+                    seen_live |= s.lock_free_memory().live_activity_ms(&name).is_some();
+                    std::thread::yield_now();
+                }
+                seen_live
+            })
+        };
+        let r = router.run(&sp);
+        finished.store(true, std::sync::atomic::Ordering::SeqCst);
+        let seen_live = watcher.join().unwrap();
+        assert_eq!(r.status, "done", "{r:?}");
+        assert!(
+            seen_live,
+            "the cell must be marked live while it is being polled"
+        );
+        assert_eq!(s.lock_free_memory().live_activity_ms(&name), None);
         let _ = std::fs::remove_file(crate::tmux::pane_snapshot_path(&name));
     }
 

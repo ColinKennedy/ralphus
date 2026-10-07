@@ -473,27 +473,166 @@ fn terminal_allocates_a_pty_inside_the_container_with_the_requested_size() {
             "101",
             "--lines",
             "31",
-            // The trailing sleep keeps the pty open long enough for the output
-            // to drain before this test's closed stdin ends the session.
             "--command",
-            "echo uid=$(id -u) cols=$COLUMNS lines=$LINES; tty; sleep 2",
+            "echo uid=$(id -u) cols=$COLUMNS lines=$LINES; tty",
         ]
         .map(str::to_string),
     );
-    let out = Command::new(env!("CARGO_BIN_EXE_ralphus-ssh-provider"))
+    // The provider ends the session when its stdin closes, as the daemon's relay
+    // relies on, so stdin stays open while the output is read and the command
+    // (which ends on its own) closes the session.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ralphus-ssh-provider"))
         .args(&args)
-        .stdin(Stdio::null())
-        .output()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .expect("run the provider's terminal verb");
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let _keep_open = child.stdin.take();
+    let mut stdout = String::new();
+    {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        child
+            .stdout
+            .take()
+            .expect("piped stdout")
+            .read_to_end(&mut bytes)
+            .expect("read the terminal stream until the command ends");
+        stdout.push_str(&String::from_utf8_lossy(&bytes));
+    }
+    let _ = child.wait();
     assert!(
         stdout.contains("uid=10001 cols=101 lines=31"),
-        "the command must run in the container with the requested size: {stdout:?} / {}",
-        String::from_utf8_lossy(&out.stderr)
+        "the command must run in the container with the requested size: {stdout:?}"
     );
     assert!(
         stdout.contains("/dev/pts/"),
         "the command must have a real terminal: {stdout:?}"
+    );
+}
+
+#[test]
+#[ignore]
+fn terminal_runs_a_script_on_a_plain_ssh_machine_with_no_container() {
+    // The fixture's host is also an ordinary ssh target. Without container
+    // flags the provider talks to its account directly, and a terminal command
+    // is a script, not a program name.
+    let Some(config) = fixture() else { return };
+    let args = [
+        format!(
+            "--ssh-config={}",
+            config.ssh_config_file.clone().expect("ssh config")
+        ),
+        "terminal".to_string(),
+        "--uri".to_string(),
+        URI.to_string(),
+        "--command".to_string(),
+        "echo plain-uid=$(id -u) cols=$COLUMNS; tty".to_string(),
+        "--cols".to_string(),
+        "90".to_string(),
+    ];
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ralphus-ssh-provider"))
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("run the provider's terminal verb");
+    let _keep_open = child.stdin.take();
+    let mut bytes = Vec::new();
+    {
+        use std::io::Read;
+        child
+            .stdout
+            .take()
+            .expect("piped stdout")
+            .read_to_end(&mut bytes)
+            .expect("read the terminal stream");
+    }
+    let status = child.wait().expect("wait");
+    let stdout = String::from_utf8_lossy(&bytes);
+    assert!(
+        stdout.contains("plain-uid=10002 cols=90"),
+        "the script must run as the host account (uid 10002, not the container's): {stdout:?}"
+    );
+    assert!(stdout.contains("/dev/pts/"), "{stdout:?}");
+    assert!(status.success(), "{status:?}");
+}
+
+#[test]
+#[ignore]
+fn closing_a_terminals_input_ends_the_session_and_leaves_nothing_in_the_container() {
+    let Some(config) = fixture() else { return };
+    let container_name = container::ensure(URI, &config).expect("create");
+    let mut args = vec![
+        "--ssh-config".to_string(),
+        config.ssh_config_file.clone().expect("ssh config"),
+        "--container-image".to_string(),
+        WORK_IMAGE.to_string(),
+        "--container-mount".to_string(),
+        format!("{HOST_WORK_ROOT}:{REMOTE_ROOT}"),
+    ];
+    args.extend(
+        [
+            "terminal",
+            "--uri",
+            URI,
+            // A command that would run for hours if nothing ended it.
+            "--command",
+            "sleep 4244",
+        ]
+        .map(str::to_string),
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ralphus-ssh-provider"))
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start the provider's terminal verb");
+
+    let count = |config: &EffectiveConfig| -> String {
+        on_host(
+            config,
+            &format!("docker exec '{container_name}' pgrep -fc '[s]leep 4244' || true"),
+        )
+        .1
+    };
+    let mut running = false;
+    for _ in 0..40 {
+        if count(&config) != "0" {
+            running = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    assert!(
+        running,
+        "the session's command must be running in the container"
+    );
+
+    // The daemon's relay does exactly this when the browser's socket goes away.
+    drop(child.stdin.take());
+    let mut exited_by_itself = false;
+    for _ in 0..80 {
+        if child.try_wait().expect("poll the provider").is_some() {
+            exited_by_itself = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    if !exited_by_itself {
+        let _ = child.kill();
+    }
+    assert!(
+        exited_by_itself,
+        "the provider must end the session itself once its input closes"
+    );
+    assert_eq!(
+        count(&config),
+        "0",
+        "nothing the session started may outlive it in the container"
     );
 }
 

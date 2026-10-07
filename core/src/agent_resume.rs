@@ -119,6 +119,32 @@ pub fn resume_agent_command_posix(program: &str, session_id: &str) -> String {
     )
 }
 
+/// [`resume_agent_command_posix`] run where the cell's session actually lives:
+/// from `cwd`, the cell's own worktree on the machine, and with the cell's
+/// isolated Claude config directory if the runner made one.
+///
+/// Claude Code files each conversation under the project directory it ran in,
+/// so a resume started from any other directory (a remote account's home, say)
+/// finds no such session. The runner also redirects each cell's
+/// `CLAUDE_CONFIG_DIR` to `<tmp>/ralphus/agent_isolation/claude-code/<worktree
+/// name>` (`runner::agent_isolation::isolated_config_dir`), which is where the
+/// transcript is written; this reproduces that path on the machine and uses it
+/// only when it exists, so a cell run without isolation resumes from the
+/// default config as before. An empty `cwd` leaves the command unchanged.
+#[must_use]
+pub fn resume_agent_command_posix_in_dir(cwd: &str, program: &str, session_id: &str) -> String {
+    let resume = resume_agent_command_posix(program, session_id);
+    if cwd.trim().is_empty() {
+        return resume;
+    }
+    let dir = posix_quote_single(cwd);
+    format!(
+        "d=\"${{TMPDIR:-/tmp}}/ralphus/agent_isolation/claude-code/$(basename {dir})\"; \
+         if [ -d \"$d\" ]; then export CLAUDE_CONFIG_DIR=\"$d\"; fi; \
+         cd {dir} && {resume}"
+    )
+}
+
 /// POSIX single-quote a value: wraps it in `'...'`, ending/re-opening the
 /// quote around any embedded `'` (the standard POSIX-shell escape, since a
 /// single-quoted string cannot itself contain an escaped quote).
@@ -264,6 +290,45 @@ mod tests {
         let cmd = resume_agent_command_posix("my'claude", "sess'123");
         assert!(cmd.contains("my'\\''claude"), "{cmd}");
         assert!(cmd.contains("sess'\\''123"), "{cmd}");
+    }
+
+    #[test]
+    fn resume_in_dir_changes_into_the_cells_worktree_before_resuming() {
+        let cmd = resume_agent_command_posix_in_dir("/srv/work/wt", "claude", "sess-1");
+        assert!(
+            cmd.ends_with(
+                "cd '/srv/work/wt' && 'claude' --resume 'sess-1' --dangerously-skip-permissions"
+            ),
+            "{cmd}"
+        );
+    }
+
+    #[test]
+    fn resume_in_dir_points_claude_at_the_cells_isolated_config_dir_when_it_exists() {
+        let cmd = resume_agent_command_posix_in_dir("/srv/work/wt", "claude", "sess-1");
+        assert!(
+            cmd.starts_with(
+                "d=\"${TMPDIR:-/tmp}/ralphus/agent_isolation/claude-code/$(basename '/srv/work/wt')\"; \
+                 if [ -d \"$d\" ]; then export CLAUDE_CONFIG_DIR=\"$d\"; fi; "
+            ),
+            "the runner writes the session under this directory: {cmd}"
+        );
+    }
+
+    #[test]
+    fn resume_in_dir_quotes_a_hostile_worktree_path_as_one_word_everywhere_it_appears() {
+        let cmd = resume_agent_command_posix_in_dir("/a b/it's; rm -rf /", "claude", "s");
+        let quoted = "'/a b/it'\\''s; rm -rf /'";
+        assert!(cmd.contains(&format!("$(basename {quoted})")), "{cmd}");
+        assert!(cmd.contains(&format!("cd {quoted} && ")), "{cmd}");
+    }
+
+    #[test]
+    fn resume_in_dir_with_no_cwd_is_the_plain_resume() {
+        assert_eq!(
+            resume_agent_command_posix_in_dir("  ", "claude", "s"),
+            resume_agent_command_posix("claude", "s")
+        );
     }
 
     #[test]

@@ -295,9 +295,21 @@ it spawns the provider program with `terminal --uri <uri> --command <cmd>
 --cols <n> --lines <n>` and piped stdio (`ProviderRunner::spawn_terminal`),
 then relays bytes between that child's stdin/stdout and a WebSocket
 connection itself. `--command` is the already-built resume command (e.g.
-`'claude' --resume '<session-id>' --dangerously-skip-permissions`, POSIX-quoted
-— see `ralphus_core::agent_resume::resume_agent_command_posix`), not
-something the provider constructs.
+`cd '<worktree>' && 'claude' --resume '<session-id>'
+--dangerously-skip-permissions`, POSIX-quoted, preceded by the cell's isolated
+`CLAUDE_CONFIG_DIR` when the runner made one — see
+`ralphus_core::agent_resume::resume_agent_command_posix_in_dir`), not
+something the provider constructs. A session is filed under the directory it ran
+in and under the runner's per-cell config directory, so resuming from anywhere
+else finds "No conversation".
+
+**Ending a session.** The session ends when the provider's stdin closes: the
+provider stops its own `ssh -tt` (closing ssh's stdin alone does not end a pty
+session) and the relay waits a few seconds for it to exit before killing it.
+Killing the provider outright would, on Windows, orphan the ssh it spawned and
+leave the relay's output reader (and the cell's single terminal slot) stuck.
+The remote command runs as `sh -c '<script>'`, so a script such as `export
+COLUMNS=..; cd ..; claude ..` is one command, not a program name.
 
 **Claude Code only, this release.** The daemon's ticket-mint route
 (`POST /api/squads/{id}/cells/{task}/{cell}/terminal-ticket`) refuses any
@@ -899,8 +911,9 @@ often dash or busybox rather than the bash a remote login account has. The
 provider's scripts are POSIX-clean for that reason (for example `kill -s TERM --
 -<pgid>`, not `kill -TERM -- -<pgid>`, which dash rejects). The image needs
 `sh`, `awk`, `git` for provisioned projects, and `ralphus-runner` (or upload
-mode) plus whichever agent CLIs the cells use; `tmux` if Live View is wanted.
-It also needs a **git committer identity** (`git config --system user.name` /
+mode) plus whichever agent CLIs the cells use. No `tmux`: remote Live View does
+not use one (see "Live View and the terminal" below). `pkill`/`pgrep` (procps) are
+needed for the terminal cleanup. It also needs a **git committer identity** (`git config --system user.name` /
 `user.email`): a review's rebase commits as whoever git says the committer is,
 and a container has no `~/.gitconfig` to inherit, so a stacked review's second
 branch otherwise fails with "Committer identity unknown". An existing container
@@ -919,6 +932,37 @@ those verbs already made. Nothing is removed automatically; `docker rm -f <name>
 on the host recreates it on the next `ping`. A container restart kills in-flight
 jobs: their durable state survives on the mount and `status` reports them as
 `lost` through its error channel.
+
+**Real agent CLIs and credentials.** Layer the agent CLI onto the work image, as
+`docker/remote-agent/Dockerfile.claude-code` does for Claude Code (Node >= 22
+and `npm install -g @anthropic-ai/claude-code`). Credentials are never baked in.
+An API key can reach a cell through its normal environment path. A subscription
+login is a `.credentials.json` that lives in a config directory: give the
+container a *private copy* of that directory, mounted at its `~/.claude`
+(`--container-mount=<host dir>:/home/<user>/.claude`) and owned by the container
+user, and delete it when done. Do not mount your real `~/.claude`: each cell runs
+with its own isolated config directory seeded from it, and a second client
+refreshing an OAuth token can rotate the refresh token out from under your own
+session, so prefer an API key or a long-lived token for anything unattended.
+Verified with the real Claude Code CLI: a cell authenticated in the container,
+created and pushed a commit, the proof ran there, and the review merged it.
+
+**Live View and the terminal.** The board's Live View works for a cell on a
+container-backed machine exactly as for any remote cell, with the daemon on your
+own machine and no tmux involved. While the cell runs, the daemon polls the
+provider's `stream` verb, appends the text to the cell's pane snapshot, and holds
+an in-memory liveness mark so `/pane` reports the cell `active` (the board shows
+a live view that advances as the agent works); when the cell ends the same
+content becomes the read-only historical record. "Open Agent" (the interactive
+`terminal` verb, Claude Code cells only, after the cell has finished) resumes the
+cell's session in a pty inside the container: from the cell's own worktree and
+with the cell's isolated config directory, because a session is filed under both.
+The first open in a fresh worktree shows Claude's own onboarding, folder-trust and
+bypass-permissions prompts. Closing the client ends the session: the provider
+stops its `ssh -tt` and, because a process started by `docker exec` outlives its
+client, hangs up and then kills the session's process tree in the container by an
+id embedded in its command line. Nothing from the session survives, and the
+cell's one-terminal-at-a-time slot is released.
 
 **Cancel.** `cancel` signals the supervisor's process group *and* every
 descendant it snapshots from `/proc` first (verified by start time, so a

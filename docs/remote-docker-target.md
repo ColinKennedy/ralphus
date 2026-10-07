@@ -236,6 +236,31 @@ container, the review's stacked rebase ran there too and reached `in_review`
 with the container's committer identity, a mock-agent cell reported its tokens,
 and cancelling a running squad left no process of its command tree behind.
 
+### A real agent, and the board's Live View
+
+The steps above use the mock `claude`. To run the real Claude Code CLI in the
+container and watch it in the board:
+
+1. Build the image with the CLI and load it into the fixture host's engine:
+   `docker build -f docker/remote-agent/Dockerfile.claude-code -t
+   ralphus-remote-agent:claude-code .`, then `docker save
+   ralphus-remote-agent:claude-code | docker exec -i
+   ralphus-ssh-docker-target-target-1 docker load`.
+2. Give the container a private config directory holding a *copy* of
+   `.credentials.json` (owned by uid 10001, mode 0600, plus a `.claude.json`
+   containing `{"hasCompletedOnboarding":true}`), and mount it with
+   `--arg=--container-mount=/srv/ralphus-claude:/home/ralphus/.claude` and
+   `--arg=--container-run-arg=-e=CLAUDE_CONFIG_DIR=/home/ralphus/.claude`, with
+   `--container-image` set to the new image. Delete the copy afterwards. See
+   [Real agent CLIs and credentials](machine-providers.md#container-backed-machines-docker-on-the-remote-host).
+3. Submit a task whose cell uses `agent = "claude-code"` and a `model`. Start
+   `ralphus-librarian serve` against the same isolated daemon
+   (`RALPHUS_DAEMON_URL`, the same private `HOME`) and open the cell's **Show Live
+   View**: the streamed agent output advances while the cell runs and becomes the
+   read-only historical record when it ends.
+4. After the cell finishes, **Open Agent** (`POST .../terminal-ticket`, then the
+   relay WebSocket) resumes the same session in a pty in the container.
+
 ### Running the same tests against a real second machine
 
 The live tests address the machine only through the ssh alias

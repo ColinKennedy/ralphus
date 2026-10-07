@@ -50,7 +50,7 @@ use std::net::{IpAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tungstenite::{Message, WebSocket};
 
@@ -61,6 +61,9 @@ use crate::server::{Daemon, query_param};
 /// process while also listening for WebSocket frames -- small enough that
 /// typing feels immediate, large enough not to busy-loop.
 const POLL_INTERVAL: Duration = Duration::from_millis(30);
+/// How long a provider's `terminal` process gets to end the remote session and
+/// clean up after its stdin closes, before the relay kills it.
+const PROVIDER_EXIT_GRACE: Duration = Duration::from_secs(8);
 const CHILD_READ_BUFFER: usize = 4096;
 
 /// Bind the terminal-relay listener on `(bind_ip, port)` (`port` `0` picks
@@ -260,8 +263,13 @@ fn run_session(
 
     let claude_program =
         std::env::var("RALPHUS_CLAUDE_COMMAND").unwrap_or_else(|_| "claude".to_string());
-    let command =
-        ralphus_core::agent_resume::resume_agent_command_posix(&claude_program, &session_id);
+    // From the cell's worktree: a session is filed under the directory it ran
+    // in, so resuming anywhere else finds nothing to resume.
+    let command = ralphus_core::agent_resume::resume_agent_command_posix_in_dir(
+        &cwd,
+        &claude_program,
+        &session_id,
+    );
 
     let session_name = crate::tmux::session_name(
         &params.squad_id,
@@ -331,7 +339,17 @@ fn run_session(
 
     let outcome = relay_loop(ws, &mut child, &mut child_stdin, &rx, log_file.as_mut());
 
+    // Closing the provider's stdin is its cue to end the remote session (it
+    // stops its own ssh and cleans up whatever the session left on the
+    // machine). Give it a moment to do that before forcing it: killing it
+    // outright strands that cleanup, and on Windows also its ssh child, which
+    // keeps the output pipe open so `reader.join()` below would never return and
+    // this cell's single terminal slot would never be released.
     drop(child_stdin);
+    let grace = Instant::now() + PROVIDER_EXIT_GRACE;
+    while Instant::now() < grace && matches!(child.try_wait(), Ok(None)) {
+        thread::sleep(Duration::from_millis(50));
+    }
     let _ = child.kill();
     let _ = child.wait();
     let _ = reader.join();
