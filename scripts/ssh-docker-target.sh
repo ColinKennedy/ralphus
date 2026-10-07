@@ -56,7 +56,7 @@ EOC
         echo "Ralphus remote host with Docker engine is ready."
         echo "SSH: ssh -F $ssh_config ralphus-docker-docker"
         echo "Work image (inside the host): $work_image"
-        echo "Register provider: ralphus machine register --scheme ssh-docker --program $root/target/debug/ralphus-ssh-provider --arg=--ssh-config --arg $ssh_config --arg=--container-image --arg $work_image --arg=--container-mount --arg /srv/ralphus-work:/home/ralphus/.ralphus/remote-work"
+        echo "Register provider: ralphus machine register --scheme ssh-docker --program $root/target/debug/ralphus-ssh-provider --arg=--ssh-config=$ssh_config --arg=--container-image=$work_image --arg=--container-mount=/srv/ralphus-work:/home/ralphus/.ralphus/remote-work"
         echo "Task machine value: ssh-docker:ralphus-docker-docker"
         echo "Remote root (inside the work container): /home/ralphus/.ralphus/remote-work"
         ;;

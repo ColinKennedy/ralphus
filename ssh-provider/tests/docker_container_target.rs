@@ -195,12 +195,11 @@ fn ping_creates_the_container_once_and_reuses_it() {
     // The machine's container is among the host's managed ones, and running.
     let (code, out, err) = on_host(
         &config,
-        "docker ps --filter label=ralphus.managed=1 --format '{{.Names}} {{.Image}}'",
+        "docker ps --filter label=ralphus.managed=1 --format '{{.Names}}'",
     );
     assert_eq!(code, 0, "{err}");
-    let expected = format!("{name} {WORK_IMAGE}");
     assert_eq!(
-        out.lines().filter(|line| *line == expected).count(),
+        out.lines().filter(|line| *line == name).count(),
         1,
         "exactly one container per machine: {out}"
     );

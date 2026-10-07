@@ -21,6 +21,12 @@ RUN apt-get update \
         tmux \
     && rm -rf /var/lib/apt/lists/*
 
+# A review's rebase commits as whoever git says the committer is, and a
+# container has no ~/.gitconfig to inherit. Without a system identity the
+# second branch of a stacked review fails with "Committer identity unknown".
+RUN git config --system user.name "Ralphus Remote Agent" \
+    && git config --system user.email "ralphus-remote-agent@example.invalid"
+
 RUN useradd --create-home --uid 10001 --shell /bin/bash ralphus \
     && install -d -m 0750 -o ralphus -g ralphus /home/ralphus/.ralphus/remote-work
 

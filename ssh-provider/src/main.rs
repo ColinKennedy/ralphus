@@ -32,7 +32,39 @@ fn flag_value(argv: &[String], i: usize, flag: &str) -> Result<String, String> {
         .ok_or_else(|| format!("{flag} requires a value"))
 }
 
+/// Provider-level flags that may also be written `--flag=value`.
+///
+/// `ralphus machine register` collects every `--arg=...` token into one group
+/// and every `--arg <value>` token into another, so a registration with more
+/// than one flag/value pair loses its pairing. The `=` form is one token per
+/// flag and survives that grouping.
+const EQUALS_FORM_FLAGS: &[&str] = &[
+    "--ssh-config",
+    "--container-image",
+    "--container-name",
+    "--container-docker",
+    "--container-mount",
+    "--container-run-arg",
+];
+
+/// Split each `--flag=value` for an [`EQUALS_FORM_FLAGS`] flag into `--flag`,
+/// `value`; every other argument passes through untouched.
+fn split_equals_form(argv: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(argv.len());
+    for arg in argv {
+        match arg.split_once('=') {
+            Some((flag, value)) if EQUALS_FORM_FLAGS.contains(&flag) => {
+                out.push(flag.to_string());
+                out.push(value.to_string());
+            }
+            _ => out.push(arg.clone()),
+        }
+    }
+    out
+}
+
 fn parse_args(argv: &[String]) -> Result<Args, String> {
+    let argv = &split_equals_form(argv);
     let mut verb = None;
     let mut uri = String::new();
     let mut ssh_config_file = None;
@@ -595,6 +627,35 @@ mod tests {
     #[test]
     fn a_container_flag_missing_its_value_is_an_error() {
         assert!(parse_args(&argv(&["ping", "--container-image"])).is_err());
+    }
+
+    #[test]
+    fn provider_flags_may_be_written_with_an_equals_sign() {
+        // The shape `ralphus machine register --arg=--flag=value` produces: one
+        // token per flag, so grouping of the CLI's --arg values cannot reorder it.
+        let args = parse_args(&argv(&[
+            "--ssh-config=C:/a b/ssh_config",
+            "--container-image=img:1",
+            "--container-mount=/a:/b",
+            "--container-mount=/c:/d",
+            "--container-run-arg=-e=K=V",
+            "ping",
+            "--uri",
+            "host",
+        ]))
+        .unwrap();
+        assert_eq!(args.ssh_config_file.as_deref(), Some("C:/a b/ssh_config"));
+        let container = args.container.expect("container mode on");
+        assert_eq!(container.image, "img:1");
+        assert_eq!(container.mounts, vec!["/a:/b", "/c:/d"]);
+        // Only the first `=` splits: the value keeps its own.
+        assert_eq!(container.run_args, vec!["-e=K=V"]);
+    }
+
+    #[test]
+    fn an_equals_sign_in_a_non_provider_flag_is_left_alone() {
+        let args = parse_args(&argv(&["ping", "--uri", "alice@host=odd"])).unwrap();
+        assert_eq!(args.uri, "alice@host=odd");
     }
 
     #[test]

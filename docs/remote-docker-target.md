@@ -206,6 +206,36 @@ container setting needs. Fixture state lives in `.docker-ssh-docker-target/` (gi
 port 2223. The host's inner Docker engine is privileged (docker-in-docker); this
 fixture is for local testing only.
 
+### A squad and a review through a real daemon
+
+The tests above stop at the provider. To run a squad and a stacked review
+through an actual (isolated) daemon on the container-backed machine:
+
+1. Start a throwaway daemon the way `ralphus initialize` does: its own `--port`
+   and `--db`, a private `HOME`/`USERPROFILE`, `RALPHUS_CONFIG_HOME`, and
+   `PSMUX_DATA_DIR`, so nothing is shared with a regular dev stack. **A second
+   daemon's startup reaps every `ralphus_` tmux session on the machine**
+   (`tmux::reap_orphaned_sessions_at_startup` is machine-wide), so do this only
+   when no live agent sessions matter.
+2. Give the daemon a target in `$RALPHUS_CONFIG_HOME/config.toml`:
+   `[machine.targets.e2e]` with `machine = "ssh-docker:ralphus-docker-docker"` and
+   `remote_root = "/home/ralphus/.ralphus/remote-work"`.
+3. Register the provider with every flag as one `--arg=--flag=value` token (see
+   [Container-backed machines](machine-providers.md#container-backed-machines-docker-on-the-remote-host)),
+   e.g. `ralphus machine register --scheme ssh-docker --program <provider> "--arg=--ssh-config=<ssh_config>" --arg=--container-image=ralphus-remote-agent:test "--arg=--container-mount=/srv/ralphus-work:/home/ralphus/.ralphus/remote-work"`.
+4. Make a bare origin *inside the container* under the remote root, mirror it
+   locally, and register the project with the local clone as `--path` and the
+   container-reachable `file:///home/ralphus/.ralphus/remote-work/<origin>.git`
+   as `--url`.
+5. Submit tasks with `machine = "ssh-docker:ralphus-docker-docker"` whose cells
+   commit and push their own branch, plus a `[[review]]` with the same
+   `machine`. Remote tasks must push before they complete.
+
+This ran green end to end: two dependent tasks ran as uid 10001 in the
+container, the review's stacked rebase ran there too and reached `in_review`
+with the container's committer identity, a mock-agent cell reported its tokens,
+and cancelling a running squad left no process of its command tree behind.
+
 ### Running the same tests against a real second machine
 
 The live tests address the machine only through the ssh alias

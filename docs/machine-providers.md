@@ -859,9 +859,15 @@ operator registers the provider under its own scheme with container flags:
 ```bash
 ralphus machine register --scheme ssh-docker \
     --program /path/to/ralphus-ssh-provider \
-    --arg=--container-image --arg ghcr.io/me/ralphus-agent:1 \
-    --arg=--container-mount --arg /srv/ralphus:/srv/ralphus
+    --arg=--container-image=ghcr.io/me/ralphus-agent:1 \
+    --arg=--container-mount=/srv/ralphus:/srv/ralphus
 ```
+
+Write each provider flag as one `--arg=--flag=value` token. `ralphus machine
+register` groups every `--arg=...` token apart from every `--arg <value>` token,
+so a registration with more than one flag written as `--arg=--flag --arg value`
+pairs loses its pairing; the provider accepts the `=` form for exactly that
+reason.
 
 ```toml
 [[task]]
@@ -894,6 +900,13 @@ provider's scripts are POSIX-clean for that reason (for example `kill -s TERM --
 -<pgid>`, not `kill -TERM -- -<pgid>`, which dash rejects). The image needs
 `sh`, `awk`, `git` for provisioned projects, and `ralphus-runner` (or upload
 mode) plus whichever agent CLIs the cells use; `tmux` if Live View is wanted.
+It also needs a **git committer identity** (`git config --system user.name` /
+`user.email`): a review's rebase commits as whoever git says the committer is,
+and a container has no `~/.gitconfig` to inherit, so a stacked review's second
+branch otherwise fails with "Committer identity unknown". An existing container
+is matched by image *reference*, not image id, so a container keeps running the
+old image after the same tag is rebuilt; run `docker rm -f <name>` on the host to
+pick the new one up.
 
 **Container lifecycle.** `ping`, `exec`, `provision`, `capabilities` and
 `terminal` first *ensure* the container: create it when absent, start it when
