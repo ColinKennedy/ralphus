@@ -44,12 +44,17 @@
 //! ghost note (`Store::upsert_ghost`), so the existing ghost-context prepend
 //! to a cell's prompt on redispatch (already built for dependency handoffs)
 //! carries it forward once the waypoint closes and the cell resumes -- no
-//! new delivery channel, no new `CellSpec`/`RunnerSpec` field. The static,
-//! unconditional half of the waypoint-injection prompt contract (what a
-//! bearing block means, and that the agent must inspect its own working
-//! state rather than assume) lives instead in `daemon/src/runner.rs`'s
+//! new delivery channel. The static half of the waypoint-injection prompt
+//! contract (what a bearing block means, that the agent must inspect its own
+//! working state rather than assume, and that it answers with a
+//! `RALPHUS_BEARING:` line only when a bearing actually appears in its
+//! context) lives instead in `daemon/src/runner.rs`'s
 //! `WAYPOINT_SYSTEM_PROMPT`, mirrored byte-identically in
-//! `runner/src/execute.rs`.
+//! `runner/src/execute.rs`. It is gated by the `waypoint_context` wire field
+//! on `RunnerSpec`/`CellSpec` (default true): squad cells and proofs carry
+//! it, while review/guardian agent runs that no waypoint can reach (feedback,
+//! PR auto-fix, conflict resolver, final proof, synthesis) set it false and
+//! never see the section.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;

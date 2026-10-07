@@ -2293,6 +2293,7 @@ fn synthesize_pr_text(
         thrash_min_turn_gap: None,
         allow_personal_settings: false,
         allow_personal_memory: false,
+        waypoint_context: false,
         retry_attempt: 0,
         retry_after_unknown_default_seconds,
         maximum_timeout: None,

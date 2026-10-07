@@ -104,6 +104,10 @@ pub struct CellSpec {
     /// consolidation of either). Falls back to the daemon's own default (30)
     /// when a hand-authored spec omits the key entirely.
     pub retry_after_unknown_default_seconds: u64,
+    /// Whether the system prompt includes the cross-squad waypoint section.
+    /// Defaults to `true` when omitted; the daemon sends `false` for
+    /// review/guardian agent runs that no waypoint can reach.
+    pub waypoint_context: bool,
 }
 
 impl CellSpec {
@@ -160,6 +164,7 @@ impl CellSpec {
         // "claude" fallback above).
         let retry_after_unknown_default_seconds =
             opt_uint(obj, "retry_after_unknown_default_seconds")?.unwrap_or(30);
+        let waypoint_context = opt_bool(obj, "waypoint_context")?.unwrap_or(true);
 
         if prompt.is_some() == command.is_some() {
             return Err(SpecError(
@@ -197,6 +202,7 @@ impl CellSpec {
             allow_personal_memory,
             retry_attempt,
             retry_after_unknown_default_seconds,
+            waypoint_context,
         })
     }
 }
@@ -694,6 +700,21 @@ mod tests {
         v["retry_after_unknown_default_seconds"] = serde_json::json!("soon");
         let err = CellSpec::from_json(&v.to_string()).unwrap_err();
         assert!(err.0.contains("retry_after_unknown_default_seconds"));
+    }
+
+    #[test]
+    fn waypoint_context_defaults_to_true_when_omitted() {
+        let spec = CellSpec::from_json(&base().to_string()).unwrap();
+        assert!(spec.waypoint_context);
+        let mut v = base();
+        v["waypoint_context"] = serde_json::json!(false);
+        assert!(
+            !CellSpec::from_json(&v.to_string())
+                .unwrap()
+                .waypoint_context
+        );
+        v["waypoint_context"] = serde_json::json!("no");
+        assert!(CellSpec::from_json(&v.to_string()).is_err());
     }
 
     #[test]

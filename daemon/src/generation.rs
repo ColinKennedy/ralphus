@@ -321,6 +321,7 @@ pub fn run_generation(
         thrash_min_turn_gap: None,
         allow_personal_settings: false,
         allow_personal_memory: false,
+        waypoint_context: false,
         retry_attempt: 0,
         retry_after_unknown_default_seconds:
             crate::config::DEFAULT_RETRY_AFTER_UNKNOWN_DEFAULT_SECONDS,

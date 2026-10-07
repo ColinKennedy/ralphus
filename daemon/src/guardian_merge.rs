@@ -188,7 +188,7 @@ fn try_git_maintenance_guard(
 /// `server.rs`'s branch `.../system-prompt` endpoint can re-derive exactly the
 /// effective prompt the resolver received: that pass runs `proof: false` with
 /// this as its only authored system prompt, so its effective prompt is
-/// `crate::runner::effective_cell_system_prompt(Some(THIS), &[])`.
+/// `crate::runner::effective_cell_system_prompt(Some(THIS), &[], false)`.
 pub(crate) const CONFLICT_RESOLVER_SYSTEM_PROMPT: &str = "You are a git merge-conflict resolver running inside a checked-out worktree \
              during an active `git rebase`. Your job is to eliminate every conflict marker and \
              produce correctly merged files -- nothing more.\n\
@@ -224,7 +224,7 @@ pub(crate) const CONFLICT_RESOLVER_SYSTEM_PROMPT: &str = "You are a git merge-co
 /// `server.rs`'s branch `.../system-prompt` endpoint can re-derive exactly the
 /// effective prompt the final-proof agent received: that pass runs `proof: true`
 /// with this as its only authored system prompt, so its effective prompt is
-/// `crate::runner::effective_proof_system_prompt(Some(THIS))`.
+/// `crate::runner::effective_proof_system_prompt(Some(THIS), false)`.
 pub(crate) const FINAL_PROOF_SYSTEM_PROMPT: &str = "You are running the dedicated final-proof pass of a git rebase \
          conflict-resolution cycle, in a checked-out worktree. Confirm the code meets the \
          quality bar described in the prompt, fixing anything you reasonably can. If you edit \
@@ -2328,6 +2328,7 @@ fn synthesize_proof_instructions(
         thrash_min_turn_gap: None,
         allow_personal_settings: false,
         allow_personal_memory: false,
+        waypoint_context: false,
         retry_attempt: 0,
         retry_after_unknown_default_seconds,
         maximum_timeout: None,
@@ -2917,6 +2918,7 @@ fn resolve_conflicts_with_agent(
             thrash_min_turn_gap: None,
             allow_personal_settings: false,
             allow_personal_memory: false,
+            waypoint_context: false,
             retry_attempt: 0,
             retry_after_unknown_default_seconds,
             maximum_timeout: None,
@@ -3350,6 +3352,7 @@ fn run_final_proof(
         thrash_min_turn_gap: None,
         allow_personal_settings: false,
         allow_personal_memory: false,
+        waypoint_context: false,
         retry_attempt: 0,
         retry_after_unknown_default_seconds,
         maximum_timeout: None,
@@ -6701,6 +6704,7 @@ fn run_commit_step(
         thrash_min_turn_gap: None,
         allow_personal_settings: false,
         allow_personal_memory: false,
+        waypoint_context: false,
         retry_attempt: 0,
         retry_after_unknown_default_seconds: crate::config::resolve(std::path::Path::new(wt_str))
             .retry_after_unknown_default_seconds(),
@@ -7217,6 +7221,7 @@ fn run_feedback_pass(
         thrash_min_turn_gap: None,
         allow_personal_settings: false,
         allow_personal_memory: false,
+        waypoint_context: false,
         retry_attempt: 0,
         retry_after_unknown_default_seconds: crate::config::resolve(std::path::Path::new(&wt_str))
             .retry_after_unknown_default_seconds(),
@@ -10607,6 +10612,7 @@ fn run_review_auto_build(
         thrash_min_turn_gap: None,
         allow_personal_settings: false,
         allow_personal_memory: false,
+        waypoint_context: false,
         retry_attempt: 0,
         retry_after_unknown_default_seconds,
         maximum_timeout: None,
@@ -11249,6 +11255,7 @@ fn expand_action_prompt(
         thrash_min_turn_gap: None,
         allow_personal_settings: false,
         allow_personal_memory: false,
+        waypoint_context: false,
         retry_attempt: 0,
         retry_after_unknown_default_seconds: crate::config::resolve(Path::new(combined_str))
             .retry_after_unknown_default_seconds(),
@@ -14306,6 +14313,7 @@ fn generate_final_summary(
         thrash_min_turn_gap: None,
         allow_personal_settings: false,
         allow_personal_memory: false,
+        waypoint_context: false,
         retry_attempt: 0,
         retry_after_unknown_default_seconds,
         maximum_timeout: None,
@@ -14822,6 +14830,7 @@ fn generate_manual_commands(
         thrash_min_turn_gap: None,
         allow_personal_settings: false,
         allow_personal_memory: false,
+        waypoint_context: false,
         retry_attempt: 0,
         retry_after_unknown_default_seconds,
         maximum_timeout: None,
@@ -15119,6 +15128,7 @@ pub(crate) fn resolve_check_input(
         thrash_min_turn_gap: None,
         allow_personal_settings: false,
         allow_personal_memory: false,
+        waypoint_context: false,
         retry_attempt: 0,
         retry_after_unknown_default_seconds,
         maximum_timeout: None,

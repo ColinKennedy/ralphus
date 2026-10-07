@@ -76,13 +76,17 @@ have one place to check instead of re-deriving them:
   closes. For a **squad**, advisory = let it keep running while the note is
   delivered for awareness (no cell halted), block = halt its in-flight
   cell(s) until the waypoint closes.
-- Injected-waypoint prompt contract: every cell/proof system prompt must
+- Injected-waypoint prompt contract: every squad cell/proof system prompt
+  (the `waypoint_context` runner wire field, default true; review/guardian
+  agent runs set it false and omit the section) must
   state that waypoint information may be injected and is expected; that it
   may describe completed/required/planned/proposed changes and their
   interaction with current work; that the agent must inspect visible/base
   state rather than assume the described change already exists locally;
   and that the agent should respond as applicable, not treat the injection
-  as unexpected or as something that blindly overrides its own task.
+  as unexpected or as something that blindly overrides its own task. It
+  answers with a `RALPHUS_BEARING:` line only when a bearing actually
+  appears in its context.
 - Bearing contract: waypoints keep an append-only list of actual change
   bearings, including relevant git commits and commit-message summaries
   when available, so a later agent can narrow investigation before
