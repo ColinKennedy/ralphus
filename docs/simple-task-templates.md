@@ -84,7 +84,7 @@ substitution is pure string formatting, and the generated task/cell
 structure is fixed: a `work` cell (the substituted prompt, the chosen
 agent/model, an optional `proofs` list) that runs in a fresh
 `ralphus:new-worktree/<branch>?upstream=<upstream>` worktree for the chosen
-project, plus a `finalize` cell that stages/commits/pushes, matching
+project, plus a `finalize` cell that stages/commits/pushes (its prompt and system prompt allow only that and forbid running tests, formatters, or linters), matching
 `ralphus task show-tutor`'s recommended per-branch layout and reusing its
 system prompts verbatim. The assembled TOML is submitted through the same
 `POST /api/squads` endpoint the Paste tab uses -- so the only difference
