@@ -899,6 +899,7 @@
           <div class="kv-row" data-tip="${PROOF_LIFETIME_COST_TIP}"><span class="k">lifetime</span><span class="v"><span id="${proofCartoElId}">—</span> <button class="btn" data-click="loadCumulativeCost" data-carto-key="${esc(proofCartoKey)}" data-carto-kind="proof" data-el-id="${esc(proofCartoElId)}" data-squad-id="${esc(r.id)}" data-tip="${PROOF_LIFETIME_COST_TIP}">Σ load total</button></span></div>
           <div class="kv-row"><span class="k">result</span><span class="v">${logBtn}</span></div>
           ${maximumToolOutputTokensRow(v)}
+          ${appraisalDetailHtml(v)}
           ${specSection}${systemPromptSection}${terminalBtns}
           ${envSection}`;
       }

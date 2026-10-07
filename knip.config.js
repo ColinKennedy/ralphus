@@ -164,8 +164,14 @@ export default {
   // are never imported by anything — without this knip would report them as
   // unused files. The shell itself is the entry and must NOT be covered by
   // this ignore.
+  //
+  // Worktree directories (.wt-*) and test-probe scripts in vendor/ are also
+  // excluded as they are development/testing artifacts not part of the main
+  // project source tree.
   ignore: [
     "librarian/assets/board/**",
     "librarian/assets/vendor/**",
+    ".wt-*/**",
+    "vendor/psmux/tests/**",
   ],
 };

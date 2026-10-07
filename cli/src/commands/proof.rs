@@ -227,9 +227,39 @@ fn render_proof_detail(v: &Value, scope: &str) {
         ("model", v["model"].as_str().unwrap_or_default().to_string()),
         ("spec", v["spec"].to_string()),
     ]);
+    render_appraisal(&v["appraisal"]);
     if let Some(output) = v["output"].as_str().filter(|o| !o.is_empty()) {
         println!("\noutput:");
         println!("{output}");
+    }
+}
+
+/// Print a scored proof's latest appraisal (RAL-575): score against the
+/// threshold, the summary, then each section as a markdown heading + body.
+/// Prints nothing for an unscored step (no `appraisal` object).
+fn render_appraisal(a: &Value) {
+    let Some(score) = a["score"].as_i64() else {
+        return;
+    };
+    println!(
+        "\nappraisal (attempt {}): {score}/10, needs >={} -- {}",
+        a["attempt"].as_i64().unwrap_or_default(),
+        a["pass_score"].as_i64().unwrap_or_default(),
+        if a["passed"].as_bool().unwrap_or(false) {
+            "PASS"
+        } else {
+            "FAIL"
+        }
+    );
+    if let Some(summary) = a["summary"].as_str().filter(|s| !s.is_empty()) {
+        println!("{summary}");
+    }
+    for s in a["sections"].as_array().into_iter().flatten() {
+        println!(
+            "\n## {}\n{}",
+            s["title"].as_str().unwrap_or_default(),
+            s["body"].as_str().unwrap_or_default()
+        );
     }
 }
 
