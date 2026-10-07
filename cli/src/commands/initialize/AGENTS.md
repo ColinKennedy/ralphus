@@ -42,6 +42,10 @@ All of the following hold for **every** exercise, with no exceptions:
    a fixed port, path, project name, or machine name between exercises, and
    never touch the user's real daemon or global config. Any exercise must be
    runnable in any order, or concurrently with another.
+   (Isolation covers state, not tmux: a daemon's startup reap kills every
+   `ralphus_` tmux server machine-wide, so an exercise must never be run from
+   inside a ralphus cell or feedback pass; see
+   [`.agent/agent-conduct.md`](../../../../.agent/agent-conduct.md).)
 3. **No LLM, ever.** An exercise must pass with no model, API key, network
    access, or agent backend available. Use raw `command` cells/proofs only —
    never a `prompt` cell, an agent, a `brain` proof, or anything that calls

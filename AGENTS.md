@@ -74,6 +74,12 @@ alternatives to reach for are in
   librarian exe is locked from underneath it, so `--all-targets` doesn't just
   fail, it often hangs. Use `cargo nextest run -p ralphus-daemon --lib` (and
   the same for `ralphus-librarian`) instead. See `.agent/gotchas.md`.
+- **Never launch a second daemon or tmux server from inside a ralphus cell or
+  feedback pass** (dogfooding) — no `scripts/check-initialize-exercises.sh`, no
+  `ralphus initialize <exercise>`. Its startup reap kills every `ralphus_`
+  tmux server machine-wide, including your own pane, and the run is lost.
+  Read the code, verify with fmt/clippy/`--lib` tests, and report the exercise
+  as unverified. See [`.agent/agent-conduct.md`](.agent/agent-conduct.md).
 - **GitHub and GitLab must stay at feature parity, and forge calls go
   through each provider's REST API directly, never the `gh`/`glab` CLIs**
   (the one sanctioned exception is `resolve_cli_token`'s best-effort token
