@@ -24,6 +24,35 @@ comes back (a validation message, a 4xx body), that is proof the daemon is
 reachable — don't let an earlier flaky probe override it. Plain git operations
 on worktrees are not "touching the daemon" and are fine.
 
+## Never launch a second daemon or tmux server from inside a ralphus run
+
+When ralphus itself is driving the work (a cell, a proof step, or a Guardian
+feedback/auto-fix pass developing ralphus), do not run anything that starts
+another daemon: `scripts/check-initialize-exercises.sh`, `ralphus initialize
+<exercise>` (every guided exercise starts its own throwaway daemon), or a
+hand-launched `ralphus-daemon serve` on another port.
+
+Every daemon start calls `tmux::reap_orphaned_sessions_at_startup`
+(`daemon/src/tmux.rs`), which force-kills every `ralphus_`-prefixed tmux
+server **machine-wide** -- not only the new daemon's own. The host daemon's
+live sessions go with it, including the pane your agent is running in. The
+symptom is a branch/cell that fails with `runner produced no result file ...
+os error 2` and a pane tail ending in `tmux server process exit code:
+unknown`, repeating on every retry because the retry re-runs the same
+command. The isolated state root and port the exercise uses do not help: the
+reap is not scoped by them.
+
+Do this instead:
+
+- Reproduce by reading the code: the exercise source in
+  `cli/src/commands/initialize/` and its fixtures say what it asserts.
+- Verify with `cargo fmt --all -- --check`, `cargo clippy --all-targets --
+  -D warnings` and `cargo nextest run -p <crate> --lib` (never `--all-targets`;
+  see [`gotchas.md`](gotchas.md)).
+- Say plainly in your final message that the initialize exercise was **not**
+  run, and let the user run it from their own terminal. CI's
+  `initialize-exercises` job runs it on a clean runner.
+
 ## Never use `git stash` in this repo
 
 Not bare, not chained with an immediate `pop`, not "just this once", not even
