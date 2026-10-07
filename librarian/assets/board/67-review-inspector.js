@@ -128,6 +128,7 @@
         // shows the pane -- a second "Show Live View" click bought nothing,
         // since nothing had loaded before the tab was opened either way.
         const bid = inspectorBranchId;
+        if (tab === "appraisals" && bid) delete branchAppraisals[`${selectedGuardian}:${bid}`];
         if (tab === "live" && bid && attachInspectorLive(bid)) return;
         renderReviewInspector();
       }
@@ -195,6 +196,7 @@
           ["worktree", "Worktree", "The on-disk worktree for this branch — its path, its environment layer, and what it retires with."],
           ["feedback", "Feedback", "Your conversation with the resolver agent about this branch.\nWhat you write here is routed into the branch's worktree as a change request."],
           ["live", "Live", "The resolver agent's terminal for this branch.\nNothing attaches until you open this tab."],
+          ["appraisals", "Appraisals", "The judge's scored appraisals of this branch's proof steps, read from what the daemon stored — not from the PR body.\nUse it to tell whether a PR lacks appraisals because none exist or because rendering them failed.\nNothing loads until you open this tab."],
         ];
         host.innerHTML = `
           <div class="insp-head">
@@ -274,7 +276,68 @@
         if (inspectorTab === "worktree") return inspectorWorktreeTab(g, b);
         if (inspectorTab === "feedback") return inspectorFeedbackTab(g, b);
         if (inspectorTab === "live") return inspectorLiveTab(g, b);
+        if (inspectorTab === "appraisals") return inspectorAppraisalsTab(g, b);
         return inspectorOverviewTab(g, b);
+      }
+      /**
+       * Appraisals per `guardianId:branchId`, fetched when the Appraisals tab
+       * is opened. `"loading"` while in flight, `"error"` on failure; dropped
+       * when the tab is opened again so each open refetches.
+       * @type {{[key: string]: BranchAppraisals|"loading"|"error"}}
+       */
+      const branchAppraisals = {};
+      /**
+       * Fetches `GET /api/guardians/{id}/branches/{bid}/appraisals` -- the
+       * stored appraisals, not what the PR body rendered.
+       * @param {string} gid - The review id.
+       * @param {string} bid - The branch id.
+       * @returns {Promise<void>}
+       */
+      async function loadBranchAppraisals(gid, bid) {
+        const key = `${gid}:${bid}`;
+        branchAppraisals[key] = "loading";
+        try {
+          const r = await fetch(`/api/guardians/${encodeURIComponent(gid)}/branches/${encodeURIComponent(bid)}/appraisals`);
+          branchAppraisals[key] = r.ok ? await r.json() : "error";
+        } catch {
+          branchAppraisals[key] = "error";
+        }
+        if (inspectorTab === "appraisals") renderReviewInspector();
+      }
+      /**
+       * The Appraisals tab: every appraisal the daemon holds for this branch's
+       * proofs, with an explicit empty state. Requests data the first time it
+       * renders after the tab is opened.
+       * @param {GuardianView} g - The review.
+       * @param {GuardianBranch} b - The selected branch.
+       * @returns {string}
+       */
+      function inspectorAppraisalsTab(g, b) {
+        const key = `${g.id}:${b.id}`;
+        const data = branchAppraisals[key];
+        if (data === undefined) { loadBranchAppraisals(g.id, b.id); return `<div class="empty">Loading appraisals…</div>`; }
+        if (data === "loading") return `<div class="empty">Loading appraisals…</div>`;
+        if (data === "error") return `<div class="empty" data-tip="The daemon could not return this branch's appraisals. Reopen the tab to retry.">Could not load appraisals.</div>`;
+        const note = data.post_appraisals ? "" : `<div class="insp-pr-sub" style="color:var(--ignored)" data-tip="This review's posting setting is off, so its PR omits appraisals on purpose. The appraisals below are still stored.\nChange it in the review's settings.">Posting disabled for this review — appraisals are not added to its PR.</div>`;
+        if (!data.appraisals.length) {
+          return `${note}<div class="empty" data-tip="No scored proof step of this branch's cells has recorded an appraisal. If the PR is missing appraisals, that is why.">No appraisals</div>`;
+        }
+        const block = "white-space:pre-wrap;margin:4px 0 10px;color:var(--muted)";
+        const cards = data.appraisals.map((a) => {
+          const color = a.passed ? "var(--done)" : "var(--failed)";
+          const sections = a.sections.map((s) => `<div class="k" data-tip="A section of the appraisal, titled and structured by the judge's role.">${esc(s.title)}</div><div class="mono" style="${block}">${esc(s.body)}</div>`).join("");
+          const published = a.published_at_ms
+            ? `${a.pr_id ? esc(a.pr_id) + " · " : ""}${esc(new Date(a.published_at_ms).toLocaleString())}`
+            : "not yet";
+          return `<div class="dhead" data-tip="${esc(a.entity_uri)}"><span class="k">${esc(a.label)}</span></div>
+            <div class="kv-row" data-tip="Score the judge gave against the threshold in force when it was recorded. The proof step passes when score is at least the threshold."><span class="k">score</span><span class="v" style="color:${color}">${a.score}/10 (needs ${a.pass_score}) — ${a.passed ? "pass" : "fail"}</span></div>
+            <div class="kv-row" data-tip="Each proof restart adds an attempt; the latest one is shown."><span class="k">attempt</span><span class="v">${a.attempt}</span></div>
+            <div class="kv-row" data-tip="When the judge recorded this appraisal."><span class="k">recorded</span><span class="v">${esc(new Date(a.created_at_ms).toLocaleString())}</span></div>
+            <div class="kv-row" data-tip="Whether this appraisal has been published with a PR, and which one."><span class="k">published</span><span class="v">${published}</span></div>
+            ${a.summary ? `<div class="mono" style="${block}" data-tip="The judge's one-paragraph verdict.">${esc(a.summary)}</div>` : ""}
+            ${sections}`;
+        }).join("");
+        return `${note}${cards}`;
       }
       /**
        * @typedef {object} PrPollEntry

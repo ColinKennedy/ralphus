@@ -20,6 +20,14 @@
        * @property {string|null} pr_id
        */
       /**
+       * @typedef {AppraisalView & {label: string}} BranchAppraisal - RAL-588: one appraisal with the label of its proof step (its `id`, else `proof N`).
+       */
+      /**
+       * @typedef {object} BranchAppraisals
+       * @property {boolean} post_appraisals - The review's effective posting setting; false means the PR omits appraisals on purpose.
+       * @property {BranchAppraisal[]} appraisals - Latest attempt of every scored proof of this branch's cells, published or not.
+       */
+      /**
        * @typedef {object} ProofView
        * @property {AppraisalView} [appraisal] - RAL-575: latest appraisal of a scored prompt proof step; absent for unscored steps and until one is recorded.
        * @property {string|null} id
