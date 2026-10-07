@@ -3879,10 +3879,10 @@ mod tests {
 
     #[test]
     fn scored_proof_prompt_teaches_appraisal_not_verdict() {
-        let scored = effective_proof_system_prompt_scored(None, true);
+        let scored = effective_proof_system_prompt_scored(None, true, true);
         assert!(scored.contains("RALPHUS_APPRAISAL:"));
         assert!(!scored.contains("RALPHUS_PROOF: PASS"));
-        let plain = effective_proof_system_prompt(None);
+        let plain = effective_proof_system_prompt(None, true);
         assert!(plain.contains("RALPHUS_PROOF: PASS"));
         assert!(!plain.contains("RALPHUS_APPRAISAL:"));
     }
