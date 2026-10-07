@@ -296,6 +296,16 @@ fn wait_for_terminal(client: &DaemonClient, squad_id: &str) -> Result<Value, Dae
     }
 }
 
+/// Print the submit response's non-fatal `warnings` (e.g. a preset's
+/// `pass_score` skipped on a non-`prompt` proof), one `warning:` line each.
+fn print_submit_warnings(result: &Value) {
+    for w in result["warnings"].as_array().into_iter().flatten() {
+        if let Some(text) = w.as_str() {
+            println!("warning: {text}");
+        }
+    }
+}
+
 fn finish_submission(
     opts: &GlobalOpts,
     client: &DaemonClient,
@@ -380,7 +390,8 @@ pub fn cmd_submit(opts: &GlobalOpts, args: SubmitArgs) -> i32 {
             match client.submit(&text, hold, args.label.as_deref()) {
                 Ok(result) => {
                     emit(opts, &result, |r| {
-                        println!("{} ({})", r["squad_id"], r["state"])
+                        println!("{} ({})", r["squad_id"], r["state"]);
+                        print_submit_warnings(r);
                     });
                     exit_code = exit_code.max(finish_submission(opts, &client, &result, &args));
                 }
@@ -411,7 +422,8 @@ pub fn cmd_submit(opts: &GlobalOpts, args: SubmitArgs) -> i32 {
     match client.submit(&text, hold, args.label.as_deref()) {
         Ok(result) => {
             emit(opts, &result, |r| {
-                println!("{} ({})", r["squad_id"], r["state"])
+                println!("{} ({})", r["squad_id"], r["state"]);
+                print_submit_warnings(r);
             });
             finish_submission(opts, &client, &result, &args)
         }

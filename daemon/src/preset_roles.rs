@@ -25,6 +25,7 @@ const fn role(name: &'static str, system_prompt: &'static str, prompt: &'static 
         maximum_context: None,
         auto_compact_threshold: None,
         maximum_tool_output_tokens: None,
+        pass_score: None,
     }
 }
 

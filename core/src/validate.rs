@@ -355,6 +355,7 @@ const PROOF_KEYS: &[&str] = &[
     "remediation_attempts",
     "brain",
     "prompt",
+    "pass_score",
     "agent",
     "model",
     "machine",
@@ -459,6 +460,40 @@ fn check_positive_number(
             &format!("{path}.{key}"),
             ErrorKind::InvalidValue,
             format!("'{key}' must be greater than 0"),
+            line,
+        );
+    }
+}
+
+/// Validates a proof step's `pass_score`: an integer in
+/// [`crate::schema::PASS_SCORE_MIN`]..=[`crate::schema::PASS_SCORE_MAX`], and
+/// only on a `prompt` proof (a `command` or `brain` step has no appraisal to
+/// score).
+fn check_pass_score(ctx: &mut Ctx, table: &toml::Table, path: &str, header: Option<u32>) {
+    check_type(ctx, table, "pass_score", Ty::Int, path, header);
+    let Some(n) = table.get("pass_score").and_then(toml::Value::as_integer) else {
+        return;
+    };
+    let line = ctx.key_line(header, "pass_score");
+    if !(i64::from(crate::schema::PASS_SCORE_MIN)..=i64::from(crate::schema::PASS_SCORE_MAX))
+        .contains(&n)
+    {
+        ctx.error(
+            &format!("{path}.pass_score"),
+            ErrorKind::InvalidValue,
+            format!(
+                "'pass_score' must be an integer from {} to {} -- got {n}",
+                crate::schema::PASS_SCORE_MIN,
+                crate::schema::PASS_SCORE_MAX
+            ),
+            line,
+        );
+    }
+    if table.contains_key("command") || table.contains_key("brain") {
+        ctx.error(
+            &format!("{path}.pass_score"),
+            ErrorKind::InvalidValue,
+            "'pass_score' is only valid on a 'prompt' proof step",
             line,
         );
     }
@@ -3326,6 +3361,7 @@ fn validate_proof_array(
             ),
         }
         check_command_mode(ctx, table, table.contains_key("command"), &vpath, None);
+        check_pass_score(ctx, table, &vpath, None);
 
         check_type(ctx, table, "requires_approval", Ty::Bool, &vpath, None);
         check_type(ctx, table, "budget_tokens", Ty::Int, &vpath, None);
@@ -6412,6 +6448,46 @@ placement = "copy"
     fn cell_without_extends_still_requires_prompt_or_command() {
         let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nextends=[]\n";
         assert!(!validate_toml(src).is_ok());
+    }
+
+    fn pass_score_src(proof_body: &str) -> String {
+        format!(
+            "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.cell.proof]]\n{proof_body}\n"
+        )
+    }
+
+    #[test]
+    fn pass_score_on_a_prompt_proof_is_valid_across_the_range() {
+        for score in [1, 5, 10] {
+            let src = pass_score_src(&format!("prompt=\"j\"\npass_score={score}"));
+            let r = validate_toml(&src);
+            assert!(r.is_ok(), "{score}: {:?}", r.errors);
+        }
+    }
+
+    #[test]
+    fn pass_score_out_of_range_or_wrong_type_is_rejected() {
+        for bad in ["0", "11", "-1", "\"7\"", "7.5"] {
+            let src = pass_score_src(&format!("prompt=\"j\"\npass_score={bad}"));
+            assert!(!validate_toml(&src).is_ok(), "{bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn pass_score_on_command_or_brain_proof_is_rejected() {
+        for body in [
+            "command=\"true\"\npass_score=5",
+            "brain=\"look\"\npass_score=5",
+        ] {
+            let r = validate_toml(&pass_score_src(body));
+            assert!(
+                r.errors
+                    .iter()
+                    .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("pass_score")),
+                "{body}: {:?}",
+                r.errors
+            );
+        }
     }
 
     #[test]

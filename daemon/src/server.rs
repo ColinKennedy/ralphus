@@ -1116,6 +1116,10 @@ struct ValidateResponse<'a> {
 struct SubmitResponse<'a> {
     squad_id: String,
     state: &'a str,
+    /// Non-fatal notes from the submit-time preset stamp (e.g. a preset's
+    /// `pass_score` skipped on a non-`prompt` proof). Omitted when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -3870,6 +3874,8 @@ struct RegisterPresetBody {
     auto_compact_threshold: Option<u64>,
     #[serde(default)]
     maximum_tool_output_tokens: Option<u64>,
+    #[serde(default)]
+    pass_score: Option<u8>,
 }
 
 #[derive(Serialize)]
@@ -3924,7 +3930,23 @@ fn register_preset(daemon: &Daemon, body: &str) -> Reply {
             );
         }
     }
+    if req
+        .pass_score
+        .is_some_and(|s| !crate::presets::pass_score_in_range(s))
+    {
+        return error(
+            400,
+            "invalid_value",
+            &format!(
+                "'pass_score' must be an integer from {} to {}",
+                ralphus_core::schema::PASS_SCORE_MIN,
+                ralphus_core::schema::PASS_SCORE_MAX
+            ),
+            vec![],
+        );
+    }
     let view = crate::presets::PresetView {
+        pass_score: req.pass_score,
         name: name.to_string(),
         prompt: req.prompt,
         system_prompt: req.system_prompt,
@@ -6564,10 +6586,10 @@ pub(crate) fn submit(daemon: &Daemon, body: &str, query: &str, user_header: Opti
             preset_errors,
         );
     }
-    {
+    let preset_warnings = {
         let guard = daemon.lock();
-        crate::presets::apply_presets(&guard, &mut file);
-    }
+        crate::presets::apply_presets(&guard, &mut file)
+    };
     let post_preset_errors = crate::presets::check_required_fields_after_presets(&file);
     if !post_preset_errors.is_empty() {
         return error(
@@ -6767,6 +6789,7 @@ pub(crate) fn submit(daemon: &Daemon, body: &str, query: &str, user_header: Opti
         &SubmitResponse {
             squad_id,
             state: SquadState::Materializing.as_str(),
+            warnings: preset_warnings,
         },
     )
 }
