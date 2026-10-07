@@ -1991,6 +1991,9 @@ fn route_for_user(
         ("GET", ["api", "guardians", id, "branches", branch_id, "messages"]) => {
             guardian_branch_messages(daemon, id, branch_id)
         }
+        ("GET", ["api", "guardians", id, "branches", branch_id, "runs"]) => {
+            guardian_branch_runs(daemon, id, branch_id)
+        }
         ("GET", ["api", "guardians", id, "base-branches"]) => guardian_base_branches(daemon, id),
         ("POST", ["api", "guardians", id, "base"]) => guardian_change_base(daemon, id, body),
         ("POST", ["api", "guardians", id, "force_start"]) => guardian_force_start(daemon, id),
@@ -7863,7 +7866,6 @@ fn guardian_cartographer(
     }
     let filter = crate::cartographer::CartographerFilter {
         review_worktrees_for_guardian: Some(id.to_string()),
-        source: query_filter(query, "source"),
         limit: query_param(query, "limit")
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(100),
@@ -19069,6 +19071,15 @@ struct MessagesResponse {
 
 /// One review branch's read-only feedback thread (RAL-272) -- populated by
 /// `POST .../branches/{branch_id}/feedback`.
+/// One review branch's agent runs (rebase, final proof, feedback), paired and
+/// attributed, oldest first (RAL-587).
+fn guardian_branch_runs(daemon: &Daemon, id: &str, branch_id: &str) -> Reply {
+    match daemon.lock().guardian_branch_runs(id, branch_id) {
+        Ok(runs) => json(200, &serde_json::json!({ "runs": runs })),
+        Err(e) => store_error(&e),
+    }
+}
+
 fn guardian_branch_messages(daemon: &Daemon, id: &str, branch_id: &str) -> Reply {
     match daemon.lock().guardian_branch_messages(id, branch_id) {
         Ok(messages) => json(200, &MessagesResponse { messages }),
@@ -25477,42 +25488,74 @@ remediation_attempts=1
     }
 
     #[test]
-    fn guardian_cartographer_source_filter_reaches_past_the_row_limit() {
+    fn guardian_branch_runs_pairs_rows_past_the_cartographer_page_limit() {
         let d = daemon();
         let id = d.lock().create_guardian("g", "main", "/r").unwrap();
-        {
-            let store = d.lock();
-            for (source, message) in [
-                ("guardian", "conflicts starting"),
-                ("poller_health", "poll healthy"),
-                ("poller_health", "poll healthy"),
-            ] {
-                let _ = store.cartographer_log(crate::cartographer::CartographerEntry {
+        d.lock().add_guardian_branch(&id, "feature/a").unwrap();
+        d.lock().add_guardian_branch(&id, "feature/b").unwrap();
+        let views = d.lock().get_guardian(&id).unwrap().branches;
+        let (a, b) = (views[0].id.clone(), views[1].id.clone());
+        let log = |message: &str, payload: serde_json::Value| {
+            let _ = d
+                .lock()
+                .cartographer_log(crate::cartographer::CartographerEntry {
                     level: crate::logging::LogLevel::INFO,
-                    source,
+                    source: "guardian",
                     message,
-                    scope: Some("guardian"),
+                    scope: Some("branch"),
                     squad_id: None,
                     guardian_id: Some(id.as_str()),
                     cell_id: None,
                     task: None,
                     log_path: None,
-                    payload: serde_json::json!({}),
+                    payload,
                     admin_only: false,
                 });
-            }
+        };
+        log(
+            "conflicts starting",
+            serde_json::json!({"branch_id": a, "found": 1, "cell_id": "cell-a"}),
+        );
+        for _ in 0..1100 {
+            log("branch status changed", serde_json::json!({"branch_id": a}));
         }
+        log(
+            "conflicts resolved",
+            serde_json::json!({"branch_id": a, "committed": true}),
+        );
+        log("final proof starting", serde_json::json!({"branch_id": b}));
+
         let reply = route(
             &d,
             "GET",
-            &format!("/api/guardians/{id}/cartographer?source=guardian&limit=1"),
+            &format!("/api/guardians/{id}/branches/{a}/runs"),
             "",
         );
         assert_eq!(reply.status, 200, "{}", reply.body);
         let body = serde_json::from_str::<serde_json::Value>(&reply.body).unwrap();
-        let rows = body["rows"].as_array().unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["message"], "conflicts starting");
+        let runs = body["runs"].as_array().unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["kind"], "rebase");
+        assert_eq!(runs[0]["outcome"], "resolved");
+        assert_eq!(runs[0]["cell_id"], "cell-a");
+
+        let reply = route(
+            &d,
+            "GET",
+            &format!("/api/guardians/{id}/branches/{b}/runs"),
+            "",
+        );
+        let body = serde_json::from_str::<serde_json::Value>(&reply.body).unwrap();
+        assert_eq!(body["runs"][0]["outcome"], "running");
+        assert!(body["runs"][0]["end_at_ms"].is_null());
+
+        let missing = route(
+            &d,
+            "GET",
+            &format!("/api/guardians/{id}/branches/nope/runs"),
+            "",
+        );
+        assert_eq!(missing.status, 404);
     }
 
     #[test]

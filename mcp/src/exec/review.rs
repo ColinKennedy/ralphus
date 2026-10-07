@@ -520,6 +520,13 @@ fn exec_branch(cmd: ReviewBranchCommand, client: &DaemonClient) -> ExecResult {
         ReviewBranchCommand::Terminal { selector, mode } => {
             exec_branch_terminal(client, &selector, &mode)
         }
+        ReviewBranchCommand::Runs { selector } => {
+            let resolved = resolve_branch(client, &selector)?;
+            Ok(client.guardian_branch_runs(
+                &resolved.guardian_id,
+                resolved.branch_id.as_deref().unwrap_or_default(),
+            )?)
+        }
     }
 }
 

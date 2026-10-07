@@ -2496,7 +2496,7 @@ fn finish_branch_resolved(
             cell_id: None,
             task: None,
             log_path: None,
-            payload: serde_json::json!({"branch": branch, "committed": committed}),
+            payload: serde_json::json!({"branch": branch, "branch_id": branch_id, "committed": committed}),
             admin_only: false,
         });
         // Prophecy (§4.4 of docs/prophecy-design.md): a daemon-side writer
@@ -2853,7 +2853,7 @@ fn resolve_conflicts_with_agent(
                 level: crate::logging::LogLevel::INFO, source: "guardian", message: "conflicts starting",
                 scope: Some("branch"), squad_id: None, guardian_id: Some(id), cell_id: Some(&run_cell_id),
                 task: Some(RESOLVER_TASK), log_path: None,
-                payload: serde_json::json!({"branch": branch, "found": found, "agent": agent, "model": model,
+                payload: serde_json::json!({"branch": branch, "branch_id": branch_id, "found": found, "agent": agent, "model": model,
                     "task": RESOLVER_TASK, "cell_id": run_cell_id, "prompt": prompt}), admin_only: false,
             });
         }
@@ -3052,7 +3052,7 @@ fn resolve_conflicts_with_agent(
                     cell_id: None,
                     task: None,
                     log_path: None,
-                    payload: serde_json::json!({"branch": branch, "error": err}),
+                    payload: serde_json::json!({"branch": branch, "branch_id": branch_id, "cell_id": run_cell_id, "error": err}),
                     admin_only: false,
                 });
             }
@@ -3299,7 +3299,7 @@ fn run_final_proof(
             cell_id: Some(&proof_cell_id),
             task: Some(RESOLVER_PROOF_TASK),
             log_path: None,
-            payload: serde_json::json!({"branch": branch, "task": RESOLVER_PROOF_TASK,
+            payload: serde_json::json!({"branch": branch, "branch_id": branch_id, "task": RESOLVER_PROOF_TASK,
                 "cell_id": proof_cell_id, "prompt": prompt}),
             admin_only: false,
         });
@@ -3318,7 +3318,7 @@ fn run_final_proof(
         // calls never collide on the same tmux session.
         squad_id: format!("guardian-{id}"),
         task: RESOLVER_PROOF_TASK.to_string(),
-        cell_id: proof_cell_id,
+        cell_id: proof_cell_id.clone(),
         cwd: proof_cwd,
         prompt: Some(prompt),
         command: None,
@@ -3400,7 +3400,7 @@ fn run_final_proof(
             cell_id: None,
             task: None,
             log_path: None,
-            payload: serde_json::json!({"branch": branch, "passed": passed}),
+            payload: serde_json::json!({"branch": branch, "branch_id": branch_id, "cell_id": proof_cell_id, "passed": passed}),
             admin_only: false,
         });
     }
@@ -7192,7 +7192,7 @@ fn run_feedback_pass(
         // fix on `generate_final_summary`'s spec).
         squad_id: format!("guardian-{id}"),
         task: FEEDBACK_TASK.to_string(),
-        cell_id: feedback_run_cell_id,
+        cell_id: feedback_run_cell_id.clone(),
         cwd: wt_str.clone(),
         prompt: Some(prompt),
         command: None,
@@ -7691,6 +7691,8 @@ fn run_feedback_pass(
             log_path: None,
             payload: serde_json::json!({
                 "position": position,
+                "branch_id": branch_id,
+                "cell_id": feedback_run_cell_id,
                 "attempt_commit": attempt_commit,
                 "committed": committed,
             }),

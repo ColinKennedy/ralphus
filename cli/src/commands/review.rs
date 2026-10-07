@@ -326,6 +326,7 @@ pub enum ReviewBranchCommand {
     Enable { selector: String },
     Disable { selector: String },
     Terminal { selector: String, mode: String },
+    Runs { selector: String },
     UsageError(String),
 }
 
@@ -956,6 +957,9 @@ fn parse_branch(args: &[String]) -> ReviewBranchCommand {
         Some("disable") => with_selector_branch(scanner, |selector| ReviewBranchCommand::Disable {
             selector,
         }),
+        Some("runs") => {
+            with_selector_branch(scanner, |selector| ReviewBranchCommand::Runs { selector })
+        }
         Some("terminal") => {
             let mode = match parse_terminal_mode(&mut scanner) {
                 Ok(m) => m,
@@ -2130,6 +2134,49 @@ fn dispatch_branch(cmd: ReviewBranchCommand, opts: &GlobalOpts, client: &DaemonC
         ReviewBranchCommand::Terminal { selector, mode } => {
             dispatch_branch_terminal(opts, client, selector, mode)
         }
+        ReviewBranchCommand::Runs { selector } => dispatch_branch_runs(opts, client, &selector),
+    }
+}
+
+fn dispatch_branch_runs(opts: &GlobalOpts, client: &DaemonClient, selector: &str) -> i32 {
+    let resolved = match resolve_branch(opts, client, selector) {
+        Ok(r) => r,
+        Err(code) => return code,
+    };
+    match client.guardian_branch_runs(
+        &resolved.guardian_id,
+        resolved.branch_id.as_deref().unwrap_or_default(),
+    ) {
+        Ok(result) => {
+            emit(opts, &result, |data| {
+                let runs = data["runs"].as_array().cloned().unwrap_or_default();
+                if runs.is_empty() {
+                    println!("no runs recorded for {selector}");
+                    return;
+                }
+                let rows: Vec<Vec<String>> = runs
+                    .iter()
+                    .map(|r| {
+                        vec![
+                            r["kind"].as_str().unwrap_or("").to_string(),
+                            r["label"].as_str().unwrap_or("").to_string(),
+                            r["outcome"].as_str().unwrap_or("").to_string(),
+                            r["elapsed_ms"]
+                                .as_i64()
+                                .map_or_else(|| "-".to_string(), |ms| format!("{}s", ms / 1000)),
+                            r["agent"].as_str().unwrap_or("-").to_string(),
+                            r["cell_id"].as_str().unwrap_or("-").to_string(),
+                        ]
+                    })
+                    .collect();
+                crate::output::print_table(
+                    &["KIND", "LABEL", "OUTCOME", "ELAPSED", "AGENT", "CELL"],
+                    &rows,
+                );
+            });
+            0
+        }
+        Err(e) => fail_daemon(opts, e),
     }
 }
 
@@ -4081,6 +4128,20 @@ mod tests {
             parse(&v(&["branch", "disable", "g1~0"])),
             ReviewCommand::Branch(ReviewBranchCommand::Disable { .. })
         );
+    }
+
+    #[test]
+    fn parses_branch_runs() {
+        match parse(&v(&["branch", "runs", "g1~0"])) {
+            ReviewCommand::Branch(ReviewBranchCommand::Runs { selector }) => {
+                assert_eq!(selector, "g1~0");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(matches!(
+            parse(&v(&["branch", "runs"])),
+            ReviewCommand::Branch(ReviewBranchCommand::UsageError(_))
+        ));
     }
 
     #[test]

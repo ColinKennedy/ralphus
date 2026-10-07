@@ -1699,6 +1699,18 @@ impl DaemonClient {
         self.get(&format!("/api/guardians/{guardian_id}"))
     }
 
+    /// `GET /api/guardians/{id}/branches/{bid}/runs`: one branch's paired,
+    /// attributed agent runs, oldest first.
+    pub fn guardian_branch_runs(
+        &self,
+        guardian_id: &str,
+        branch_id: &str,
+    ) -> Result<Value, DaemonError> {
+        self.get(&format!(
+            "/api/guardians/{guardian_id}/branches/{branch_id}/runs"
+        ))
+    }
+
     pub fn guardian_logs(&self, guardian_id: &str) -> Result<Value, DaemonError> {
         self.get(&format!("/api/guardians/{guardian_id}/logs"))
     }
