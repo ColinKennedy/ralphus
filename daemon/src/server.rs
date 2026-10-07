@@ -2179,6 +2179,15 @@ fn route_for_user(
         ("POST", ["api", "guardians", id, "cancel"]) => guardian_cancel(daemon, id),
         ("POST", ["api", "guardians", id, "reopen"]) => guardian_reopen(daemon, id),
         ("GET", ["api", "guardians", id, "followup"]) => guardian_followup_show(daemon, id),
+        ("GET", ["api", "guardians", id, "followup", "items"]) => {
+            guardian_followup_items(daemon, id)
+        }
+        ("POST", ["api", "guardians", id, "followup", "ignore"]) => {
+            guardian_followup_set_ignored(daemon, id, body, true)
+        }
+        ("POST", ["api", "guardians", id, "followup", "unignore"]) => {
+            guardian_followup_set_ignored(daemon, id, body, false)
+        }
         ("POST", ["api", "guardians", id, "followup", "accept"]) => {
             guardian_followup_accept(daemon, id)
         }
@@ -14547,7 +14556,10 @@ fn guardian_create(daemon: &Daemon, user_header: Option<&str>, body: &str) -> Re
 }
 
 fn guardian_get(daemon: &Daemon, id: &str) -> Reply {
-    match daemon.lock().get_guardian(id) {
+    // Bind first so the store lock is released before the arm re-locks for the
+    // pending-follow-up summary (a guard in the scrutinee lives for the match).
+    let guardian = daemon.lock().get_guardian(id);
+    match guardian {
         Ok(g) => {
             // RAL-121: fetching a single guardian is the review page's "the
             // user is looking at this one now" signal -- promote its summary
@@ -14564,7 +14576,17 @@ fn guardian_get(daemon: &Daemon, id: &str) -> Reply {
             if g.status == "collecting" {
                 daemon.summary_queue_handle().promote(id);
             }
-            json(200, &g)
+            // The board's "Deferred follow-ups" button reads this summary off
+            // the review view, so it refreshes with every review poll.
+            let pending = daemon.lock().pending_followups_summary(id).ok();
+            let mut value = serde_json::to_value(&g).unwrap_or_default();
+            if let (Some(obj), Some(pending)) = (value.as_object_mut(), pending) {
+                obj.insert(
+                    "pending_followups".to_string(),
+                    serde_json::to_value(pending).unwrap_or_default(),
+                );
+            }
+            json(200, &value)
         }
         Err(e) => store_error(&e),
     }
@@ -17214,6 +17236,44 @@ fn guardian_followup_show(daemon: &Daemon, id: &str) -> Reply {
              prophecies, or offers are turned off for its project",
             vec![],
         ),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `GET /api/guardians/{id}/followup/items`: the deferred follow-ups the
+/// review would offer when it merges, with which are ignored.
+fn guardian_followup_items(daemon: &Daemon, id: &str) -> Reply {
+    match daemon.lock().pending_followups(id) {
+        Ok(items) => json(200, &items),
+        Err(e) => store_error(&e),
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct FollowupIgnoreBody {
+    /// The deferred prophecy to (un)ignore; absent means every pending one.
+    #[serde(default)]
+    prophecy_id: Option<i64>,
+}
+
+/// `POST /api/guardians/{id}/followup/ignore|unignore`: marks one pending
+/// deferral (or all of them) as ignored, so the merge-time offer leaves it
+/// out, or reverses that.
+fn guardian_followup_set_ignored(daemon: &Daemon, id: &str, body: &str, ignored: bool) -> Reply {
+    let req = if body.trim().is_empty() {
+        FollowupIgnoreBody::default()
+    } else {
+        match serde_json::from_str::<FollowupIgnoreBody>(body) {
+            Ok(r) => r,
+            Err(_) => return error(400, "bad_request", "invalid body", vec![]),
+        }
+    };
+    let store = daemon.lock();
+    if let Err(e) = store.set_followup_ignored(id, req.prophecy_id, ignored) {
+        return store_error(&e);
+    }
+    match store.pending_followups(id) {
+        Ok(items) => json(200, &items),
         Err(e) => store_error(&e),
     }
 }

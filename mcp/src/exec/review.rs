@@ -586,6 +586,24 @@ fn exec_followup(cmd: ReviewFollowupCommand, client: &DaemonClient) -> ExecResul
             let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
             Ok(client.guardian_followup(&resolved.guardian_id)?)
         }
+        ReviewFollowupCommand::List { selector } => {
+            let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
+            Ok(client.guardian_followup_items(&resolved.guardian_id)?)
+        }
+        ReviewFollowupCommand::Ignore {
+            selector,
+            prophecy_id,
+        } => {
+            let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
+            Ok(client.guardian_followup_set_ignored(&resolved.guardian_id, prophecy_id, true)?)
+        }
+        ReviewFollowupCommand::Unignore {
+            selector,
+            prophecy_id,
+        } => {
+            let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
+            Ok(client.guardian_followup_set_ignored(&resolved.guardian_id, prophecy_id, false)?)
+        }
         ReviewFollowupCommand::Accept { selector } => {
             let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
             Ok(client.guardian_followup_accept(&resolved.guardian_id)?)

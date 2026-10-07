@@ -333,6 +333,12 @@ the daemon's hourly Free-tier background sweep
 | `review rename <selector> <name>` | Rename |
 | `review cancel <selector>` | Cancel |
 | `review reopen <selector>` | Reopen a cancelled or merged review, immediately staging in whatever branches are already ready |
+| `review followup list <selector>` | List the review's pending deferred follow-ups (latest attempt of each cell), marking the ignored ones |
+| `review followup ignore <selector> [prophecy_id]` | Leave one deferred follow-up (or all, with no id) out of the merge-time offer; refused once the offer exists |
+| `review followup unignore <selector> [prophecy_id]` | Reverse `ignore`; refused once the offer exists |
+| `review followup show <selector>` | Show the follow-up offer a merged review sent for its `deferred` prophecies |
+| `review followup accept <selector>` | Draft a follow-up squad from the offer and create the waypoint that explains it (held unless `[followup] auto_start`) |
+| `review followup decline <selector>` | Decline the offer; nothing is created and the review never offers again |
 | `review delete <selector> [--yes]` | Delete + purge worktrees |
 | `review settings <selector> [--skip-checks] [--skip-worktrees] [--resolver-agent] [--resolver-model] [--base-branch]` | Update opt-out settings |
 | `review add-branch <selector> <branch>` | Add a branch |
@@ -809,7 +815,10 @@ use; see `READ_ONLY_NOTE`.
         - followup  {Follow-up work offered when a review merges with deferred prophecies.}
             - accept selector [uri]  {Accept a follow-up offer: draft a follow-up squad from the deferred items and create the waypoint that explains it. The squad starts at once unless auto-start is off for the review (`review settings --followup-auto-start`, else `[followup] auto_start`).}
             - decline selector [uri]  {Decline a follow-up offer; nothing is created and the review never offers again.}
+            - ignore selector [uri] prophecy_id [integer, optional]  {Ignore a pending deferred follow-up (or every one when no prophecy id is given) so the review's merge-time offer leaves it out. Refused once the offer exists.}
+            - (read-only-safe) list selector [uri]  {List the deferred follow-ups a review has pending (latest attempt of each cell), which of them are ignored, and whether follow-ups are on for the review.}
             - (read-only-safe) show selector [uri]  {Show a merged review's follow-up offer: the deferred items it would turn into a follow-up squad, and its status.}
+            - unignore selector [uri] prophecy_id [integer, optional]  {Reverse `ignore` for one pending deferred follow-up (or every one when no prophecy id is given). Refused once the offer exists.}
         - force-start selector [uri]  {Disable not-yet-done branches and merge immediately (only while collecting).}
         - link-cell selector [uri] cell [uri]  {Link a cell/task to an already-attached review branch, so its readiness follows that cell finishing (RAL-392).}
         - (read-only-safe) list --pr-ready --status [statuses]  {List reviews.}

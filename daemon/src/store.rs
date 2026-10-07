@@ -2814,6 +2814,15 @@ impl Store {
             );
             CREATE INDEX IF NOT EXISTS idx_followup_offers_squad
                 ON followup_offers(squad_id);
+            -- Deferred prophecies a user ignored on a review before it merged
+            -- (`crate::followup`). Keyed by (review, prophecy) so it exists
+            -- before any offer row does; the prophecy rows stay untouched.
+            CREATE TABLE IF NOT EXISTS followup_ignored (
+                guardian_id   TEXT NOT NULL,
+                prophecy_id   INTEGER NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (guardian_id, prophecy_id)
+            );
             ",
         )?;
         // RAL-318: the built-in `unclassified` Triage type always exists and

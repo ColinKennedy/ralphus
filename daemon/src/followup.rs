@@ -108,6 +108,57 @@ fn map_offer_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<FollowupOfferView> {
     })
 }
 
+/// One deferred prophecy a review has pending, with whether the user ignored
+/// it. Only the latest attempt of each cell is listed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PendingFollowupItem {
+    #[serde(flatten)]
+    pub item: FollowupItem,
+    /// The attempt of the writing cell this deferral came from.
+    pub attempt: i64,
+    /// Whether the user ignored it; ignored items are left out of the offer.
+    pub ignored: bool,
+    pub created_at_ms: i64,
+}
+
+/// A review's pending follow-ups: what the board's button shows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PendingFollowupsSummary {
+    /// Whether the review would offer follow-up at merge: it is enabled for
+    /// the review and no offer was made yet.
+    pub enabled: bool,
+    /// The review's follow-up setting resolved to off.
+    pub off: bool,
+    /// An offer row already exists; the snapshot is final.
+    pub offered: bool,
+    /// Deferrals not ignored.
+    pub count: usize,
+    /// Every deferral, ignored or not.
+    pub total: usize,
+}
+
+/// The `GET /api/guardians/{id}/followup/items` body.
+#[derive(Debug, Clone, Serialize)]
+pub struct PendingFollowups {
+    #[serde(flatten)]
+    pub summary: PendingFollowupsSummary,
+    pub items: Vec<PendingFollowupItem>,
+}
+
+fn summarize_pending(
+    items: &[PendingFollowupItem],
+    enabled_for_review: bool,
+    offered: bool,
+) -> PendingFollowupsSummary {
+    PendingFollowupsSummary {
+        enabled: enabled_for_review && !offered,
+        off: !enabled_for_review,
+        offered,
+        count: items.iter().filter(|i| !i.ignored).count(),
+        total: items.len(),
+    }
+}
+
 fn truncate_chars(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.to_string();
@@ -167,6 +218,137 @@ impl Store {
             .into_iter()
             .find(|c| c.task_idx == task_idx && c.idx == cell_idx)?;
         Some((cell.prompt, cell.agent, cell.model))
+    }
+
+    /// The `deferred` prophecies `guardian_id`'s review would offer: for each
+    /// owner (cell), only the deferrals of its latest attempt, oldest first,
+    /// each flagged with whether the user ignored it.
+    pub fn pending_followup_items(&self, guardian_id: &str) -> Result<Vec<PendingFollowupItem>> {
+        let deferred: Vec<_> = self
+            .list_all_prophecies_for_guardian(guardian_id)?
+            .into_iter()
+            .filter(|p| p.kind == crate::prophecy::ProphecyKind::Deferred.as_str())
+            .collect();
+        let mut latest: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        for p in &deferred {
+            let slot = latest.entry(p.entity_uri.clone()).or_insert(p.attempt);
+            *slot = (*slot).max(p.attempt);
+        }
+        let ignored = self.ignored_followup_ids(guardian_id)?;
+        Ok(deferred
+            .into_iter()
+            .filter(|p| latest.get(&p.entity_uri) == Some(&p.attempt))
+            .map(|p| {
+                let context = self.cell_context_for_uri(&p.entity_uri);
+                PendingFollowupItem {
+                    ignored: ignored.contains(&p.id),
+                    attempt: p.attempt,
+                    created_at_ms: p.created_at_ms,
+                    item: FollowupItem {
+                        prophecy_id: p.id,
+                        prompt: context
+                            .as_ref()
+                            .and_then(|(prompt, _, _)| prompt.as_deref())
+                            .map(|prompt| truncate_chars(prompt, MAX_PROMPT_CHARS)),
+                        agent: context.as_ref().map(|(_, agent, _)| agent.clone()),
+                        model: context.and_then(|(_, _, model)| model),
+                        entity_uri: p.entity_uri,
+                        body: p.body,
+                    },
+                }
+            })
+            .collect())
+    }
+
+    fn ignored_followup_ids(&self, guardian_id: &str) -> Result<std::collections::HashSet<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT prophecy_id FROM followup_ignored WHERE guardian_id=?")?;
+        let ids = stmt
+            .query_map(params![guardian_id], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(ids)
+    }
+
+    /// The items and button state of the review's pending follow-ups.
+    pub fn pending_followups(&self, guardian_id: &str) -> Result<PendingFollowups> {
+        let items = self.pending_followup_items(guardian_id)?;
+        let summary = self.summarize_pending_for(guardian_id, &items)?;
+        Ok(PendingFollowups { summary, items })
+    }
+
+    /// Just the button state of the review's pending follow-ups.
+    pub fn pending_followups_summary(&self, guardian_id: &str) -> Result<PendingFollowupsSummary> {
+        let items = self.pending_followup_items(guardian_id)?;
+        self.summarize_pending_for(guardian_id, &items)
+    }
+
+    fn summarize_pending_for(
+        &self,
+        guardian_id: &str,
+        items: &[PendingFollowupItem],
+    ) -> Result<PendingFollowupsSummary> {
+        let guardian = self.get_guardian(guardian_id)?;
+        Ok(summarize_pending(
+            items,
+            guardian.effective_followup_enabled,
+            self.get_followup_offer(guardian_id)?.is_some(),
+        ))
+    }
+
+    /// Ignores (`ignored`) or un-ignores one pending deferral, or every
+    /// pending deferral when `prophecy_id` is `None`. Returns how many items
+    /// changed state. Refused once the review's offer exists: the merge-time
+    /// snapshot is final. An id that is not one of the review's pending
+    /// deferrals is `NotFound`.
+    pub fn set_followup_ignored(
+        &self,
+        guardian_id: &str,
+        prophecy_id: Option<i64>,
+        ignored: bool,
+    ) -> Result<usize> {
+        if self.get_followup_offer(guardian_id)?.is_some() {
+            return Err(StoreError::InvalidTransition(
+                "this review's follow-up offer already exists; its items are final".to_string(),
+            ));
+        }
+        let items = self.pending_followup_items(guardian_id)?;
+        let targets: Vec<&PendingFollowupItem> = match prophecy_id {
+            Some(id) => vec![
+                items
+                    .iter()
+                    .find(|i| i.item.prophecy_id == id)
+                    .ok_or(StoreError::NotFound)?,
+            ],
+            None => items.iter().collect(),
+        };
+        let mut changed = 0;
+        for item in targets.into_iter().filter(|i| i.ignored != ignored) {
+            let id = item.item.prophecy_id;
+            if ignored {
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO followup_ignored(guardian_id, prophecy_id, created_at_ms)
+                     VALUES(?,?,?)",
+                    params![guardian_id, id, now_ms()],
+                )?;
+            } else {
+                self.conn.execute(
+                    "DELETE FROM followup_ignored WHERE guardian_id=? AND prophecy_id=?",
+                    params![guardian_id, id],
+                )?;
+            }
+            changed += 1;
+            let verb = if ignored { "ignored" } else { "un-ignored" };
+            crate::cartographer::Note::new("followup")
+                .scope("followup")
+                .guardian(guardian_id)
+                .emit(
+                    self,
+                    format!("review {guardian_id}: deferred follow-up (prophecy {id}) {verb}"),
+                    serde_json::json!({"prophecy_id": id, "ignored": ignored}),
+                );
+        }
+        Ok(changed)
     }
 
     /// Offers follow-up work for the `deferred` prophecies of a review that
@@ -232,23 +414,10 @@ impl Store {
             return Ok(false);
         }
         let items: Vec<FollowupItem> = self
-            .list_all_prophecies_for_guardian(guardian_id)?
+            .pending_followup_items(guardian_id)?
             .into_iter()
-            .filter(|p| p.kind == crate::prophecy::ProphecyKind::Deferred.as_str())
-            .map(|p| {
-                let context = self.cell_context_for_uri(&p.entity_uri);
-                FollowupItem {
-                    prophecy_id: p.id,
-                    prompt: context
-                        .as_ref()
-                        .and_then(|(prompt, _, _)| prompt.as_deref())
-                        .map(|prompt| truncate_chars(prompt, MAX_PROMPT_CHARS)),
-                    agent: context.as_ref().map(|(_, agent, _)| agent.clone()),
-                    model: context.and_then(|(_, _, model)| model),
-                    entity_uri: p.entity_uri,
-                    body: p.body,
-                }
-            })
+            .filter(|p| !p.ignored)
+            .map(|p| p.item)
             .collect();
         if items.is_empty() {
             return Ok(false);
@@ -998,6 +1167,121 @@ mod tests {
             s.maybe_offer_followups_with("g1", &FollowupConfig::default())
                 .unwrap()
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn defer_as(s: &Store, guardian_id: &str, owner: &str, attempt: i64, body: &str) -> i64 {
+        s.add_prophecy(
+            owner,
+            attempt,
+            crate::prophecy::ProphecyKind::Deferred,
+            body,
+            None,
+            None,
+            Some(guardian_id),
+        )
+        .unwrap()
+        .id
+    }
+
+    #[test]
+    fn only_the_latest_attempt_of_each_owner_is_pending() {
+        let s = store();
+        let root = temp_root("attempts");
+        seed_guardian(&s, "g1", &root);
+        defer_as(&s, "g1", "guardian:a", 0, "old a");
+        let new_a = defer_as(&s, "g1", "guardian:a", 1, "new a");
+        let b = defer_as(&s, "g1", "guardian:b", 0, "only b");
+
+        let items = s.pending_followup_items("g1").unwrap();
+        let mut ids: Vec<i64> = items.iter().map(|i| i.item.prophecy_id).collect();
+        ids.sort();
+        assert_eq!(ids, vec![new_a, b]);
+
+        merge(&s, "g1");
+        let offer = s.get_followup_offer("g1").unwrap().expect("offered");
+        let mut offered: Vec<&str> = offer.items.iter().map(|i| i.body.as_str()).collect();
+        offered.sort();
+        assert_eq!(
+            offered,
+            vec!["new a", "only b"],
+            "snapshot uses the same rule"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ignores_persist_and_are_left_out_of_the_offer() {
+        let s = store();
+        let root = temp_root("ignore");
+        seed_guardian(&s, "g1", &root);
+        let keep = defer_as(&s, "g1", "guardian:a", 0, "keep");
+        let drop = defer_as(&s, "g1", "guardian:b", 0, "drop");
+
+        assert_eq!(s.set_followup_ignored("g1", Some(drop), true).unwrap(), 1);
+        assert_eq!(
+            s.set_followup_ignored("g1", Some(drop), true).unwrap(),
+            0,
+            "ignoring twice changes nothing"
+        );
+        let summary = s.pending_followups_summary("g1").unwrap();
+        assert_eq!((summary.count, summary.total), (1, 2));
+        assert!(summary.enabled && !summary.off && !summary.offered);
+        assert!(matches!(
+            s.set_followup_ignored("g1", Some(99_999), true),
+            Err(StoreError::NotFound)
+        ));
+
+        s.set_followup_ignored("g1", Some(drop), false).unwrap();
+        assert_eq!(s.pending_followups_summary("g1").unwrap().count, 2);
+        s.set_followup_ignored("g1", Some(drop), true).unwrap();
+
+        merge(&s, "g1");
+        let offer = s.get_followup_offer("g1").unwrap().expect("offered");
+        let ids: Vec<i64> = offer.items.iter().map(|i| i.prophecy_id).collect();
+        assert_eq!(ids, vec![keep]);
+        assert_eq!(
+            s.list_all_prophecies_for_guardian("g1").unwrap().len(),
+            2,
+            "the prophecy rows are untouched"
+        );
+
+        // The snapshot is final: nothing may change once the offer exists.
+        assert!(matches!(
+            s.set_followup_ignored("g1", Some(drop), false),
+            Err(StoreError::InvalidTransition(_))
+        ));
+        let summary = s.pending_followups_summary("g1").unwrap();
+        assert!(summary.offered && !summary.enabled);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ignoring_every_deferral_offers_nothing_and_writes_no_row() {
+        let s = store();
+        let root = temp_root("ignore-all");
+        seed_guardian(&s, "g1", &root);
+        defer_as(&s, "g1", "guardian:a", 0, "one");
+        defer_as(&s, "g1", "guardian:b", 0, "two");
+        assert_eq!(s.set_followup_ignored("g1", None, true).unwrap(), 2);
+        assert_eq!(s.pending_followups_summary("g1").unwrap().count, 0);
+
+        merge(&s, "g1");
+        assert!(s.get_followup_offer("g1").unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_summary_reports_off_when_followups_are_disabled_for_the_review() {
+        let s = store();
+        let root = temp_root("summary-off");
+        seed_guardian(&s, "g1", &root);
+        assert_eq!(s.pending_followups_summary("g1").unwrap().total, 0);
+        defer_as(&s, "g1", "guardian:a", 0, "one");
+        s.set_guardian_followup_enabled("g1", Some(false)).unwrap();
+        let summary = s.pending_followups_summary("g1").unwrap();
+        assert!(summary.off && !summary.enabled);
+        assert_eq!(summary.count, 1);
         let _ = std::fs::remove_dir_all(&root);
     }
 
