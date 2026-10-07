@@ -421,7 +421,7 @@ fn unasked_default(key: &str) -> toml::Value {
         ),
         "project_url" => Text(
             std::env::current_dir()
-                .map(|cwd| super::git_remote_url(&cwd, "origin"))
+                .map(|cwd| super::default_upstream_url(&cwd, None))
                 .unwrap_or_default(),
         ),
         "review_resolver_agent" | "sample_agent" => Text("claude-code".to_string()),
