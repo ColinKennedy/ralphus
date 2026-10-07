@@ -1506,7 +1506,6 @@ fn matching_server_pids(
 /// files and so its whole session namespace). A daemon started with it set --
 /// as every `ralphus initialize` exercise's daemon is -- owns a private psmux
 /// server set that no other daemon on the machine shares.
-#[cfg(any(target_os = "windows", test))]
 const PSMUX_DATA_DIR_ENV: &str = "PSMUX_DATA_DIR";
 
 /// Canonical form of a psmux data directory for comparison: separators
