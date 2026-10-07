@@ -202,10 +202,6 @@ fn slot<'a>(setup: &'a mut InitializeServerOptions, key: &str) -> Option<Slot<'a
         "project_fork_url" => Slot::Text(&mut setup.project_fork_url),
         "project_url" => Slot::Text(&mut setup.project_url),
         "project_description" => Slot::Text(&mut setup.project_description),
-        "bug_threshold" => Slot::Text(&mut setup.bug_threshold),
-        "feature_threshold" => Slot::Text(&mut setup.feature_threshold),
-        "investigation_threshold" => Slot::Text(&mut setup.investigation_threshold),
-        "unclassified_threshold" => Slot::Text(&mut setup.unclassified_threshold),
         "review_auto_submit_pr_stack" => Slot::Bool(&mut setup.review_auto_submit_pr_stack),
         "review_resolver_agent" => Slot::Text(&mut setup.review_resolver_agent),
         "require_forks" => Slot::Bool(&mut setup.require_forks),
@@ -428,8 +424,6 @@ fn unasked_default(key: &str) -> toml::Value {
                 .map(|cwd| super::git_remote_url(&cwd, "origin"))
                 .unwrap_or_default(),
         ),
-        "bug_threshold" | "investigation_threshold" => Text("3".to_string()),
-        "feature_threshold" | "unclassified_threshold" => Text("5".to_string()),
         "review_resolver_agent" | "sample_agent" => Text("claude-code".to_string()),
         "fork_user" => Text(super::default_user_name()),
         "forge_provider" => Text("github".to_string()),
@@ -641,7 +635,11 @@ mod tests {
             ..Default::default()
         };
         record_forge_token(&super::super::FORGE_TOKEN, Source::Flag);
-        record_str(&super::super::BUG_THRESHOLD, "7", Source::Prompt);
+        record_str(
+            &super::super::REVIEW_RESOLVER_AGENT,
+            "codex",
+            Source::Prompt,
+        );
         let text = render(&mut first);
         assert!(
             !text.contains("ghp_supersecret") && !text.contains("pw@"),
@@ -652,7 +650,7 @@ mod tests {
         let mut second = InitializeServerOptions::default();
         load(&text, &mut second).unwrap();
         assert_eq!(second.admin_name.as_deref(), Some("Ada"));
-        assert_eq!(second.bug_threshold.as_deref(), Some("7"));
+        assert_eq!(second.review_resolver_agent.as_deref(), Some("codex"));
         assert_eq!(second.mcp_hosts, vec!["claude".to_string()]);
         assert_eq!(
             second.fork_url.as_deref(),
