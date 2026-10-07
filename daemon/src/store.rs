@@ -4441,7 +4441,11 @@ impl Store {
                     .maximum_timeout_seconds
                     .map(|s| i64::try_from(s).unwrap_or(i64::MAX));
                 let effective_system_prompt = cell.prompt.as_ref().map(|_| {
-                    effective_cell_system_prompt(cell.system_prompt.as_deref(), &cell.subprojects)
+                    effective_cell_system_prompt(
+                        cell.system_prompt.as_deref(),
+                        &cell.subprojects,
+                        true,
+                    )
                 });
                 // RAL-487/RAL-488: resolved once here, same as
                 // `share_session` above -- meaningless (and left `None`) for
@@ -7506,6 +7510,7 @@ fn insert_proof(
         Some(effective_proof_system_prompt_scored(
             None,
             pass_score.is_some(),
+            true,
         ))
     } else {
         None
@@ -8634,7 +8639,7 @@ impl Store {
         let kind_value = edit.body.as_ref().map(ProofBody::kind);
         let spec_value = edit.body.as_ref().map(ProofBody::spec);
         let effective_system_prompt_value = match edit.body {
-            Some(ProofBody::Prompt(_)) => Some(effective_proof_system_prompt(None)),
+            Some(ProofBody::Prompt(_)) => Some(effective_proof_system_prompt(None, true)),
             Some(ProofBody::Command(_) | ProofBody::Brain(_)) => None,
             None => None,
         };
@@ -8748,8 +8753,9 @@ impl Store {
             authored_system_prompt.as_deref()
         };
         let effective_system_prompt_touched = system_prompt_touched || prompt_value.is_some();
-        let effective_system_prompt = effective_system_prompt_touched
-            .then(|| effective_cell_system_prompt(effective_authored_system_prompt, &subprojects));
+        let effective_system_prompt = effective_system_prompt_touched.then(|| {
+            effective_cell_system_prompt(effective_authored_system_prompt, &subprojects, true)
+        });
 
         let n = self.conn.execute(
             "UPDATE cells SET

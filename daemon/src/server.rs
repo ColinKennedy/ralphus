@@ -12490,13 +12490,15 @@ fn guardian_branch_system_prompt(daemon: &Daemon, id: &str, branch_id: &str) -> 
         Err(e) => return store_error(&e),
     };
     let system_prompt = match merge_status.as_deref() {
-        Some("actioning") => crate::runner::effective_cell_system_prompt(None, &[]),
-        Some("proof_pending") => crate::runner::effective_proof_system_prompt(Some(
-            crate::guardian_merge::FINAL_PROOF_SYSTEM_PROMPT,
-        )),
+        Some("actioning") => crate::runner::effective_cell_system_prompt(None, &[], false),
+        Some("proof_pending") => crate::runner::effective_proof_system_prompt(
+            Some(crate::guardian_merge::FINAL_PROOF_SYSTEM_PROMPT),
+            false,
+        ),
         Some(_) => crate::runner::effective_cell_system_prompt(
             Some(crate::guardian_merge::CONFLICT_RESOLVER_SYSTEM_PROMPT),
             &[],
+            false,
         ),
         None => return error(404, "not_found", "no such branch", vec![]),
     };
@@ -12515,7 +12517,7 @@ fn guardian_manual_checks_system_prompt(daemon: &Daemon, id: &str) -> Reply {
     if let Err(e) = daemon.lock().get_guardian(id) {
         return store_error(&e);
     }
-    let system_prompt = crate::runner::effective_cell_system_prompt(None, &[]);
+    let system_prompt = crate::runner::effective_cell_system_prompt(None, &[], false);
     json(
         200,
         &serde_json::json!({"available": true, "system_prompt": system_prompt}),
@@ -31017,6 +31019,7 @@ remediation_attempts=1
             crate::runner::effective_cell_system_prompt(
                 Some(crate::guardian_merge::CONFLICT_RESOLVER_SYSTEM_PROMPT),
                 &[],
+                false,
             )
         );
         assert!(fresh.contains("git merge-conflict resolver"));
@@ -31027,9 +31030,10 @@ remediation_attempts=1
         let final_proof = fetch(&d);
         assert_eq!(
             final_proof,
-            crate::runner::effective_proof_system_prompt(Some(
-                crate::guardian_merge::FINAL_PROOF_SYSTEM_PROMPT
-            ))
+            crate::runner::effective_proof_system_prompt(
+                Some(crate::guardian_merge::FINAL_PROOF_SYSTEM_PROMPT),
+                false
+            )
         );
         assert!(final_proof.contains("dedicated final-proof pass"));
 
@@ -31044,7 +31048,7 @@ remediation_attempts=1
         let actioning = fetch(&d);
         assert_eq!(
             actioning,
-            crate::runner::effective_cell_system_prompt(None, &[])
+            crate::runner::effective_cell_system_prompt(None, &[], false)
         );
         assert!(!actioning.contains("git merge-conflict resolver"));
         assert!(!actioning.contains("dedicated final-proof pass"));
@@ -31091,7 +31095,7 @@ remediation_attempts=1
         let prompt = v["system_prompt"].as_str().map(String::from).unwrap();
         assert_eq!(
             prompt,
-            crate::runner::effective_cell_system_prompt(None, &[])
+            crate::runner::effective_cell_system_prompt(None, &[], false)
         );
         assert!(!prompt.contains("git merge-conflict resolver"), "{prompt}");
     }

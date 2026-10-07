@@ -418,12 +418,12 @@ Every `prompt` cell and `prompt` proof step gets ralphus's system
 instructions appended to the agent's instructions, assembled in this order:
 `## Background` (non-interactive framing) → `## Regarding Tools` (prefer
 `rg` over `grep`, with `grep` as the fallback when `rg` is unavailable) →
-`## Cross-Squad Waypoints` (RAL-400; unconditional — see below) →
+`## Cross-Squad Waypoints` (RAL-400; squad cells and proofs only — see below) →
 `## Conclusion` (async framing, then either the proof or the ghost
 fragment). The review's own agent passes — conflict resolution during a
 rebase, the dedicated final-proof pass, and the feedback/auto-fix
 actioning pass — run through the same assembly, so they teach the same
-tool guidance. The markers that assembly teaches are parsed from the reply:
+tool guidance, but without the waypoint section (`waypoint_context` false). The markers that assembly teaches are parsed from the reply:
 
 - **`RALPHUS_PROOF: PASS` / `RALPHUS_PROOF: FAIL`** — the verdict contract of
   a `prompt` proof step. Applies to prompt proof steps only: normal cells
@@ -485,11 +485,15 @@ Two distinct, independently-triggered pieces of a cell/proof prompt cover
 [waypoints](glossary.md): a static section every prompt gets, and a dynamic
 block only a *rostered* cell gets.
 
-**The static half — unconditional, every prompt.** `## Cross-Squad
+**The static half — every squad cell/proof prompt.** `## Cross-Squad
 Waypoints` (`WAYPOINT_SYSTEM_PROMPT`, identical in `runner/src/execute.rs`
 and `daemon/src/runner.rs`) is appended to every `prompt` cell/proof step's
 system instructions regardless of whether that cell is rostered on any
-waypoint — see the assembly order above. Its text:
+waypoint — see the assembly order above. The `waypoint_context` runner
+wire field (default true) gates it: review/guardian agent runs, which no
+waypoint can reach, set it false and omit the section. The agent answers
+with a `RALPHUS_BEARING:` line only when a bearing actually appears in its
+context. Its text:
 
 > This cell's prompt may include a waypoint bearing block: a note from
 > another squad or review coordinating with yours through a shared
