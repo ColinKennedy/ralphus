@@ -351,9 +351,26 @@ pub enum ReviewChecksCommand {
 #[derive(Debug, Clone)]
 pub enum ReviewFollowupCommand {
     Help,
-    Show { selector: String },
-    Accept { selector: String },
-    Decline { selector: String },
+    Show {
+        selector: String,
+    },
+    Accept {
+        selector: String,
+    },
+    Decline {
+        selector: String,
+    },
+    List {
+        selector: String,
+    },
+    Ignore {
+        selector: String,
+        prophecy_id: Option<i64>,
+    },
+    Unignore {
+        selector: String,
+        prophecy_id: Option<i64>,
+    },
     UsageError(String),
 }
 
@@ -992,6 +1009,37 @@ fn parse_followup(args: &[String]) -> ReviewFollowupCommand {
         Some("show") => selector(|selector| ReviewFollowupCommand::Show { selector }),
         Some("accept") => selector(|selector| ReviewFollowupCommand::Accept { selector }),
         Some("decline") => selector(|selector| ReviewFollowupCommand::Decline { selector }),
+        Some("list") => selector(|selector| ReviewFollowupCommand::List { selector }),
+        Some(verb @ ("ignore" | "unignore")) => {
+            let rest = Scanner::new(&args[1..]).remaining();
+            let Some(selector) = rest.first().cloned() else {
+                return ReviewFollowupCommand::UsageError(
+                    "missing required <selector> argument".to_string(),
+                );
+            };
+            let prophecy_id = match rest.get(1) {
+                None => None,
+                Some(raw) => match raw.parse::<i64>() {
+                    Ok(id) => Some(id),
+                    Err(_) => {
+                        return ReviewFollowupCommand::UsageError(format!(
+                            "<prophecy-id> must be a whole number, got `{raw}`"
+                        ));
+                    }
+                },
+            };
+            if verb == "ignore" {
+                ReviewFollowupCommand::Ignore {
+                    selector,
+                    prophecy_id,
+                }
+            } else {
+                ReviewFollowupCommand::Unignore {
+                    selector,
+                    prophecy_id,
+                }
+            }
+        }
         Some(other) => ReviewFollowupCommand::UsageError(format!(
             "unknown review followup subcommand: {other}"
         )),
@@ -2224,6 +2272,20 @@ fn dispatch_followup(cmd: ReviewFollowupCommand, opts: &GlobalOpts, client: &Dae
             });
             Ok(())
         }),
+        ReviewFollowupCommand::List { selector } => run_and_report(opts, None, || {
+            let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
+            let pending = client.guardian_followup_items(&resolved.guardian_id)?;
+            emit(opts, &pending, |p| print_pending_followups(&selector, p));
+            Ok(())
+        }),
+        ReviewFollowupCommand::Ignore {
+            selector,
+            prophecy_id,
+        } => run_followup_ignore(opts, client, &selector, prophecy_id, true),
+        ReviewFollowupCommand::Unignore {
+            selector,
+            prophecy_id,
+        } => run_followup_ignore(opts, client, &selector, prophecy_id, false),
         ReviewFollowupCommand::Decline { selector } => run_and_report(opts, None, || {
             let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
             let result = client.guardian_followup_decline(&resolved.guardian_id)?;
@@ -2232,6 +2294,49 @@ fn dispatch_followup(cmd: ReviewFollowupCommand, opts: &GlobalOpts, client: &Dae
             });
             Ok(())
         }),
+    }
+}
+
+fn run_followup_ignore(
+    opts: &GlobalOpts,
+    client: &DaemonClient,
+    selector: &str,
+    prophecy_id: Option<i64>,
+    ignored: bool,
+) -> i32 {
+    run_and_report(opts, None, || {
+        let resolved = resolve_guardian_selector(client, selector, DEFAULT_REVIEW_LIST_HINT)?;
+        let pending =
+            client.guardian_followup_set_ignored(&resolved.guardian_id, prophecy_id, ignored)?;
+        emit(opts, &pending, |p| print_pending_followups(selector, p));
+        Ok(())
+    })
+}
+
+fn print_pending_followups(selector: &str, pending: &serde_json::Value) {
+    let off = pending["off"].as_bool().unwrap_or(false);
+    println!(
+        "{selector}: {} deferred follow-up(s) pending ({} total){}",
+        pending["count"],
+        pending["total"],
+        if off {
+            " -- follow-ups are off for this review"
+        } else {
+            ""
+        }
+    );
+    for item in pending["items"].as_array().into_iter().flatten() {
+        let mark = if item["ignored"].as_bool().unwrap_or(false) {
+            "ignored"
+        } else {
+            "pending"
+        };
+        println!(
+            "  [{mark}] #{} {} ({})",
+            item["prophecy_id"],
+            item["body"].as_str().unwrap_or_default(),
+            item["entity_uri"].as_str().unwrap_or_default()
+        );
     }
 }
 
@@ -3995,6 +4100,39 @@ mod tests {
             parse(&v(&["branch", "terminal", "g1~0", "--mode", "bogus"])),
             ReviewCommand::Branch(ReviewBranchCommand::UsageError(_))
         );
+    }
+
+    #[test]
+    fn parses_followup_list_ignore_and_unignore() {
+        assert!(matches!(
+            parse(&v(&["followup", "list", "g1"])),
+            ReviewCommand::Followup(ReviewFollowupCommand::List { .. })
+        ));
+        match parse(&v(&["followup", "ignore", "g1", "12"])) {
+            ReviewCommand::Followup(ReviewFollowupCommand::Ignore {
+                selector,
+                prophecy_id,
+            }) => {
+                assert_eq!(selector, "g1");
+                assert_eq!(prophecy_id, Some(12));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(matches!(
+            parse(&v(&["followup", "unignore", "g1"])),
+            ReviewCommand::Followup(ReviewFollowupCommand::Unignore {
+                prophecy_id: None,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse(&v(&["followup", "ignore", "g1", "abc"])),
+            ReviewCommand::Followup(ReviewFollowupCommand::UsageError(_))
+        ));
+        assert!(matches!(
+            parse(&v(&["followup", "ignore"])),
+            ReviewCommand::Followup(ReviewFollowupCommand::UsageError(_))
+        ));
     }
 
     #[test]

@@ -361,6 +361,33 @@ const REVIEW_CHECKS_CHILDREN: &[HelpNode] = &[
 
 const REVIEW_FOLLOWUP_CHILDREN: &[HelpNode] = &[
     node(
+        "list",
+        &["selector [str]"],
+        &[],
+        "List the deferred follow-ups a review has pending (latest attempt of each cell), which of them are ignored, and whether follow-ups are on for the review.",
+        false,
+        true, // ("review", "followup", "list")
+        &[],
+    ),
+    node(
+        "ignore",
+        &["selector [str]", "prophecy_id [integer, optional]"],
+        &[],
+        "Ignore a pending deferred follow-up (or every one when no prophecy id is given) so the review's merge-time offer leaves it out. Refused once the offer exists.",
+        false,
+        false,
+        &[],
+    ),
+    node(
+        "unignore",
+        &["selector [str]", "prophecy_id [integer, optional]"],
+        &[],
+        "Reverse `ignore` for one pending deferred follow-up (or every one when no prophecy id is given). Refused once the offer exists.",
+        false,
+        false,
+        &[],
+    ),
+    node(
         "show",
         &["selector [str]"],
         &[],

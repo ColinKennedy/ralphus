@@ -2029,6 +2029,27 @@ impl DaemonClient {
         self.get(&format!("/api/guardians/{guardian_id}/followup"))
     }
 
+    /// The deferred follow-ups a review would offer when it merges, with
+    /// which are ignored (`GET /api/guardians/{id}/followup/items`).
+    pub fn guardian_followup_items(&self, guardian_id: &str) -> Result<Value, DaemonError> {
+        self.get(&format!("/api/guardians/{guardian_id}/followup/items"))
+    }
+
+    /// Ignore (or un-ignore) one pending deferred follow-up, or all of them
+    /// when `prophecy_id` is `None`.
+    pub fn guardian_followup_set_ignored(
+        &self,
+        guardian_id: &str,
+        prophecy_id: Option<i64>,
+        ignored: bool,
+    ) -> Result<Value, DaemonError> {
+        let verb = if ignored { "ignore" } else { "unignore" };
+        self.post(
+            &format!("/api/guardians/{guardian_id}/followup/{verb}"),
+            Some(serde_json::json!({ "prophecy_id": prophecy_id })),
+        )
+    }
+
     /// Accept a review's follow-up offer: drafts the follow-up squad and its
     /// waypoint.
     pub fn guardian_followup_accept(&self, guardian_id: &str) -> Result<Value, DaemonError> {

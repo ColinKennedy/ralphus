@@ -342,6 +342,9 @@
       CLICK_HANDLERS.openReviewTitleMenu = (e, ds) => openReviewTitleMenu(e, ds.guardianId || "");
       CLICK_HANDLERS.openReviewPrStacks = (e, ds) => openReviewPrStacks(ds.guardianId || "");
       CLICK_HANDLERS.openEditReviewDetails = (e, ds) => openEditReviewDetails(ds.guardianId || "", ds.focus || "");
+      CLICK_HANDLERS.openFollowupList = (e, ds) => openFollowupList(ds.guardianId || "");
+      CLICK_HANDLERS.ignoreFollowup = (e, ds) => setFollowupIgnored(ds.guardianId || "", Number(ds.prophecyId), true);
+      CLICK_HANDLERS.unignoreFollowup = (e, ds) => setFollowupIgnored(ds.guardianId || "", Number(ds.prophecyId), false);
       CLICK_HANDLERS.openEnvOverridesEditor = (e, ds) => { closeSquadMenu(); openEnvOverridesEditor(ds.guardianId || "", ds.scope || "", ds.branchId || ""); };
       CLICK_HANDLERS.addEnvOverrideRow = (e, ds) => addEnvOverrideRow(ds.scope || "", ds.branchId || "");
       CLICK_HANDLERS.removeEnvOverrideRow = (e, ds) => removeEnvOverrideRow(ds.scope || "", ds.branchId || "", Number(ds.i));

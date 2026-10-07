@@ -156,6 +156,9 @@ where one exists.
 | POST | `/api/guardians/{id}/cancel` | Cancel a review |
 | POST | `/api/guardians/{id}/reopen` | Reopen a cancelled, merged, or approved review (→ `collecting`) and immediately try a fresh merge pass if the daemon has capacity |
 | GET | `/api/guardians/{id}/followup` | The [follow-up offer](#get-apiguardiansidfollowup) a merged review sent for its `deferred` prophecies |
+| GET | `/api/guardians/{id}/followup/items` | The review's [pending deferred follow-ups](#get-apiguardiansidfollowupitems), ignored ones marked |
+| POST | `/api/guardians/{id}/followup/ignore` | Ignore one pending follow-up (or all) so the merge-time offer leaves it out |
+| POST | `/api/guardians/{id}/followup/unignore` | Reverse an ignore |
 | POST | `/api/guardians/{id}/followup/accept` | Accept the offer: draft the follow-up squad and its waypoint |
 | POST | `/api/guardians/{id}/followup/decline` | Decline the offer |
 | POST | `/api/guardians/{id}/run-manual-commands` | Launch a ready manual-check command at its prepared execution location; `409` until ready |
@@ -2938,6 +2941,33 @@ prophecy, offers are off for it, or it is at the follow-up depth cap.
 Otherwise `200` with `status` (`offered`, `accepted` or `declined`), the
 snapshotted `items` (`prophecy_id`, `entity_uri`, `body`, `prompt`, `agent`,
 `model`), `depth`, and — once accepted — `squad_id` and `waypoint_id`.
+
+### `GET /api/guardians/{id}/followup/items`
+
+The review's **pending follow-ups**: the `deferred` prophecies its cells wrote
+that the merge-time offer would carry. Only the **latest attempt** of each
+cell counts, and the merge-time offer snapshot uses the same rule. `200` with
+`enabled` (the review would offer at merge: follow-up is on and no offer exists
+yet), `off` (follow-up is switched off for the review), `offered` (the offer
+row exists, so the list is final), `count` (not ignored), `total`, and `items`
+(`prophecy_id`, `entity_uri` of the originating cell, `body`, `prompt`,
+`agent`, `model`, `attempt`, `ignored`, `created_at_ms`). `GET
+/api/guardians/{id}` carries the same counts, minus `items`, as
+`pending_followups`, which is what the board's **Deferred follow-ups** button
+shows.
+
+### `POST /api/guardians/{id}/followup/ignore`
+
+Body `{"prophecy_id": 12}`, or `{}` for every pending item. Ignored items are
+stored per (review, prophecy) and left out of the offer made at merge; if all
+of them are ignored there is no offer and no row. Returns the updated
+`GET .../followup/items` body. `404` for a prophecy that is not pending on
+this review; `409` once the offer exists, because the snapshot is final.
+Logged to stderr and written as a Cartographer row.
+
+### `POST /api/guardians/{id}/followup/unignore`
+
+The reverse of `ignore`, with the same body, response and errors.
 
 ### `POST /api/guardians/{id}/followup/accept`
 

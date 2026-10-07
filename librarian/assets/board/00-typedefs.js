@@ -383,6 +383,28 @@
        * @property {GuardianDeleteBatchResult[]} results
        */
       /**
+       * A review's follow-up counts (RAL-582), as sent with the review detail.
+       * @typedef {object} FollowupSummary
+       * @property {boolean} enabled - the review would offer follow-up at merge.
+       * @property {boolean} off - follow-up is switched off for this review.
+       * @property {boolean} offered - the merge-time offer already exists; the list is final.
+       * @property {number} count - deferrals not ignored.
+       * @property {number} total - every deferral, ignored or not.
+       */
+      /**
+       * One deferred note on a review's follow-up list.
+       * @typedef {object} PendingFollowupItem
+       * @property {number} prophecy_id
+       * @property {string} entity_uri - the owner (`cell:...`) that deferred it.
+       * @property {string} body - the deferred note.
+       * @property {string|null} [prompt] - the originating cell's prompt, truncated.
+       * @property {boolean} ignored
+       */
+      /**
+       * `GET /api/guardians/{id}/followup/items`: the counts plus the items.
+       * @typedef {FollowupSummary & {items: PendingFollowupItem[]}} PendingFollowups
+       */
+      /**
        * @typedef {object} GuardianView
        * @property {string} id
        * @property {string} name
@@ -447,6 +469,7 @@
        * @property {boolean} [effective_auto_run] - `auto_run` resolved against the project/global defaults (false when nothing sets it).
        * @property {boolean|null} [followup_enabled] - this review's own override for whether it offers follow-up work for its deferred prophecies when it merges; null = inherit the global [followup] enabled.
        * @property {boolean} [effective_followup_enabled] - `followup_enabled` resolved against the global [followup] config (true when nothing sets it).
+       * @property {FollowupSummary} [pending_followups] - the review's deferred follow-ups: how many are pending (RAL-582).
        * @property {boolean|null} [followup_auto_start] - this review's own override for whether an accepted follow-up squad starts at once; null = inherit the global [followup] auto_start.
        * @property {boolean} [effective_followup_auto_start] - `followup_auto_start` resolved against the global [followup] config (true when nothing sets it).
        * @property {boolean} [effective_skip_manual_checks] - `skip_manual_checks` resolved against the project/global defaults (false -- generation runs -- when nothing sets it).

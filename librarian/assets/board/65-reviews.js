@@ -1708,6 +1708,94 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           + `<span class="sc-k">${esc(label)}</span><b>${value}</b></button>`;
       }
       /**
+       * The "Deferred follow-ups" button above a review's rows (RAL-582): the
+       * count of pending, not-ignored deferrals as a badge. Disabled with
+       * nothing pending, and reads "follow-ups off" when this review's
+       * follow-up setting is off.
+       * @param {GuardianView} g - The review.
+       * @returns {string}
+       */
+      function followupButtonHtml(g) {
+        const p = g.pending_followups;
+        if (!p) return "";
+        const gid = esc(g.id);
+        if (p.off) {
+          return `<button class="btn setup-edit" disabled data-tip="Follow-ups are switched off for this review, so its deferred notes will not be offered when it merges.
+Turn them on in this review's setup.">Deferred follow-ups: follow-ups off</button>`;
+        }
+        const tip = p.offered
+          ? "This review already made its follow-up offer at merge; the list is final.\nClick to see what was deferred."
+          : p.count > 0
+            ? "Work agents deferred while this review's cells ran.\nClick to see each note and ignore the ones that should not be offered when the review merges."
+            : "Nothing is pending: no cell deferred any work.";
+        const disabled = p.total === 0;
+        return `<button class="btn setup-edit" ${disabled ? "disabled " : ""}data-click="openFollowupList" data-guardian-id="${gid}" data-tip="${esc(tip)}">`
+          + `Deferred follow-ups <span class="badge">${p.count}</span></button>`;
+      }
+      /**
+       * Renders the follow-up list modal body.
+       * @param {string} gid
+       * @param {PendingFollowups} data
+       * @returns {string}
+       */
+      function followupListHtml(gid, data) {
+        const frozen = data.offered;
+        const rows = data.items.map((it) => {
+          const act = frozen ? "" : `<button class="btn" data-click="${it.ignored ? "unignoreFollowup" : "ignoreFollowup"}" data-guardian-id="${esc(gid)}" data-prophecy-id="${it.prophecy_id}" data-tip="${it.ignored ? "Offer this note again when the review merges." : "Leave this note out of the follow-up offer made when the review merges."}">${it.ignored ? "Un-ignore" : "Ignore"}</button>`;
+          const prompt = it.prompt ? `<div class="hint mono" data-tip="The prompt of the cell that deferred this note.">${esc(it.prompt)}</div>` : "";
+          return `<div class="kv-row" style="${it.ignored ? "opacity:0.55" : ""}"><div style="flex:1">`
+            + `<div>${esc(it.body)}</div>`
+            + `<div class="hint mono" data-tip="The cell that deferred this note.">${esc(it.entity_uri)}</div>${prompt}</div>${act}</div>`;
+        }).join("");
+        return rows || `<div class="empty">No deferred follow-ups.</div>`;
+      }
+      /**
+       * Opens the deferred follow-ups list for a review.
+       * @param {string} gid
+       * @returns {Promise<void>}
+       */
+      async function openFollowupList(gid) {
+        let resp;
+        try { resp = await fetch(`/api/guardians/${encodeURIComponent(gid)}/followup/items`); } catch (e) { notify("error", "daemon unreachable"); return; }
+        if (!resp.ok) { notify("error", await responseError(resp, "could not load follow-ups")); return; }
+        renderFollowupModal(gid, await resp.json());
+      }
+      /**
+       * Mounts the follow-up modal into `#modal-root`.
+       * @param {string} gid
+       * @param {PendingFollowups} data
+       * @returns {void}
+       */
+      function renderFollowupModal(gid, data) {
+        byId("modal-root").innerHTML = `<div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal" style="width:640px;max-width:94vw">
+          <h2 data-tip="Notes work agents deferred during this review. Ignored notes are left out of the follow-up offer made when the review merges.">Deferred follow-ups</h2>
+          ${followupListHtml(gid, data)}
+          <div class="btn-row" style="margin-top:12px;justify-content:flex-end"><button class="btn" onclick="closeModal()" data-tip="Close this list.">Close</button></div>
+        </div></div>`;
+      }
+      /**
+       * Ignores or un-ignores one deferred note and refreshes the list and
+       * the review's button badge from the daemon's answer.
+       * @param {string} gid
+       * @param {number} prophecyId
+       * @param {boolean} ignore
+       * @returns {Promise<void>}
+       */
+      async function setFollowupIgnored(gid, prophecyId, ignore) {
+        let resp;
+        try {
+          resp = await post(`/api/guardians/${encodeURIComponent(gid)}/followup/${ignore ? "ignore" : "unignore"}`, { prophecy_id: prophecyId });
+        } catch (e) { notify("error", "daemon unreachable"); return; }
+        if (!resp.ok) { notify("error", await responseError(resp, ignore ? "ignore failed" : "un-ignore failed")); return; }
+        const data = await resp.json();
+        const g = guardians.find((x) => x.id === gid);
+        if (g) {
+          g.pending_followups = { enabled: data.enabled, off: data.off, offered: data.offered, count: data.count, total: data.total };
+          renderReviewDetail();
+        }
+        renderFollowupModal(gid, data);
+      }
+      /**
        * The review's settings as one strip of chips, replacing the column of
        * read-only kv-rows RAL-410 left behind when it moved editing into the
        * Edit Details modal. Those rows cost a screen of vertical space to show
@@ -1761,7 +1849,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           + `</div>`
           + `<button class="btn setup-edit" data-click="openEditReviewDetails" data-guardian-id="${esc(g.id)}" `
           + `data-tip="Edit this review's settings — name, upstream, resolver, proof scope, build and squash options, PR settings.\nEvery chip to the left opens this same editor, landing on the setting it shows.\nEnvironment overrides are not here: each section's ⋯ edits the environment its own commands run in.\nNothing takes effect until you click Save; Save applies every change in one request and triggers at most one rebase.">`
-          + `✎ Edit setup</button></div>`;
+          + `✎ Edit setup</button>${followupButtonHtml(g)}</div>`;
       }
 
       /**
