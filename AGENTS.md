@@ -259,8 +259,8 @@ debugging anything that looks like "this used to work."
 ## Status
 
 What's built (Phases 0–5) and what's explicitly not yet built (proof
-retry policy, multi-round Guardian cycles, detached daemon lifecycle, the
-draggable node-graph canvas, ...): [`.agent/roadmap.md`](.agent/roadmap.md).
+retry policy, detached daemon lifecycle, the draggable node-graph canvas, ...):
+[`.agent/roadmap.md`](.agent/roadmap.md).
 
 ## Documentation Map
 
