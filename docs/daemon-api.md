@@ -140,6 +140,7 @@ where one exists.
 | GET | `/api/guardians/{id}/tests-env` | Legacy alias for the stored automated-check environment while existing reviews drain (RAL-324) |
 | GET | `/api/guardians/{id}/manual-checks-env` | Resolved environment variables for the manual-checks step (RAL-324) |
 | GET | `/api/guardians/{id}/branches/{branch_id}/conflicts` | [Live conflicting-files list](#get-apiguardiansidbranchesbranch_idconflicts) for the board's Reviews UI (RAL-148) |
+| GET | `/api/guardians/{id}/branches/{branch_id}/appraisals` | [Stored appraisals of one review branch](#get-apiguardiansidbranchesbranch_idappraisals) for the board's inspector Appraisals tab (RAL-588) |
 | POST | `/api/guardians/{id}/branches/{branch_id}/open-terminal` | Spawn a resolver terminal **on the daemon host** |
 | GET | `/api/guardians/{id}/branches/{branch_id}/debug-events` | [The resolver's current-attempt debug stream](#get-apisquadsidcellstisidebug-events-and-its-proofguardian-siblings-ral-296) (RAL-296) |
 | GET | `/api/guardians/{id}/branches/{branch_id}/system-prompt` | [The branch resolver's exact effective system prompt](#get-apisquadsidcellstisisi-system-prompt-and-its-siblings-ral-428) (RAL-428, admin) |
@@ -2523,6 +2524,32 @@ Cartographer row (`check run started` / `check run finished`), the latter
 carrying `has_output` so the board knows whether to offer the expander.
 Output and result files are stable per `(guardian, kind, index)`, so a new run
 of the same check overwrites its predecessor rather than accumulating.
+
+### `GET /api/guardians/{id}/branches/{branch_id}/appraisals`
+The latest appraisal (RAL-575) of every scored proof step belonging to one
+review branch, published or not (RAL-588) — what *should* be on the branch's
+PR, read straight from the `proof_appraisals` table rather than from the PR
+body's render path, so it stays correct when the PR was pushed without them.
+A cell belongs to the branch when its `review_branch` is the branch's name and
+it is linked to this review; a task-scoped proof is included for every branch
+holding one of its task's cells. Board-only (no CLI command).
+```json
+{
+  "post_appraisals": true,
+  "appraisals": [
+    { "label": "judge", "entity_uri": "proof:squad-1:0:cell:0:0", "attempt": 2,
+      "score": 8, "pass_score": 7, "passed": true, "summary": "…",
+      "sections": [{ "title": "Findings", "body": "…" }],
+      "created_at_ms": 1700000000000, "published_at_ms": null, "pr_id": null }
+  ]
+}
+```
+- `post_appraisals` — the review's effective posting setting; `false` means
+  its PR omits appraisals on purpose.
+- `appraisals` — ordered by `entity_uri`; `label` is the proof step's `id`,
+  else `proof N`. Empty when none were recorded.
+
+`404` if `id` or `branch_id` doesn't address a real guardian/branch.
 
 ### `GET /api/guardians/{id}/branches/{branch_id}/conflicts`
 The live list of files still carrying unresolved `<<<<<<<` merge-conflict
