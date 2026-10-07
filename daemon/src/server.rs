@@ -14556,7 +14556,10 @@ fn guardian_create(daemon: &Daemon, user_header: Option<&str>, body: &str) -> Re
 }
 
 fn guardian_get(daemon: &Daemon, id: &str) -> Reply {
-    match daemon.lock().get_guardian(id) {
+    // Bind first so the store lock is released before the arm re-locks for the
+    // pending-follow-up summary (a guard in the scrutinee lives for the match).
+    let guardian = daemon.lock().get_guardian(id);
+    match guardian {
         Ok(g) => {
             // RAL-121: fetching a single guardian is the review page's "the
             // user is looking at this one now" signal -- promote its summary
