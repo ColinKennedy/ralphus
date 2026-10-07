@@ -128,6 +128,7 @@ where one exists.
 | POST | `/api/guardians/{id}/sync-pr` | [Check the forge for a stack reorder, on demand](#post-apiguardiansidsync-pr) |
 | POST | `/api/guardians/{id}/branches/{branch_id}/feedback` | Feedback on one branch → resolver re-attempt |
 | GET | `/api/guardians/{id}/branches/{branch_id}/messages` | [Per-branch feedback thread](#get-apiguardiansidbranchesbranch_idmessages) |
+| GET | `/api/guardians/{id}/branches/{branch_id}/runs` | [Per-branch agent runs](#get-apiguardiansidbranchesbranch_idruns) |
 | GET | `/api/guardians/{id}/base-branches` | Candidate base branches (same remote) |
 | POST | `/api/guardians/{id}/base` | Change base branch + rebuild |
 | POST | `/api/guardians/{id}/force_start` | Disable not-yet-done branches, merge immediately |
@@ -2546,6 +2547,24 @@ review spanning several projects honours each project's setting independently.
 The change is persisted and applied on the next `merge`/rebuild (like the other
 per-review opt-out toggles). Returns `200` with the updated guardian view, whose
 `squash_projects` array lists the project roots with squash enabled.
+
+### `GET /api/guardians/{id}/branches/{branch_id}/runs`
+Every agent run one review branch has had, oldest first -- rebase passes,
+final proofs and feedback revisions. The daemon derives them from the
+review's whole `guardian`-source Cartographer history (paged internally, so a
+long-lived review is not truncated); a run is the span between its start row
+and its end row.
+```json
+{ "runs": [ { "id": "rebase-911494", "kind": "rebase", "label": "rebase onto alt/staging · 2 conflicts", "at_ms": 1791300000000, "outcome": "resolved", "elapsed_ms": 0, "who": "claude-code", "task": "resolve", "cell_id": "resolve-branch-000000000579-1791300000000", "prompt": null } ] }
+```
+`kind` is `rebase`, `proof` or `feedback`. `outcome` is `running` until an end
+row closes the run, then `resolved`, `resolved, nothing to commit`, `failed`,
+`passed`, `committed` or `no change committed`. `elapsed_ms` is `0` when no
+emitter measured one. `task` and `cell_id` locate the run's transcript; `who`
+falls back to the review's resolver agent when the row named none. Branch
+attribution matches `payload.ref`, `payload.branch`, `payload.branch_id` or the
+stack position, so history written before a stable id was emitted still
+attributes. `404` when the branch is not in the review.
 
 ### `GET /api/guardians/{id}/branches/{branch_id}/messages`
 One review branch's read-only feedback thread (RAL-272), oldest first:

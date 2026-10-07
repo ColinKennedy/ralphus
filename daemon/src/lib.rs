@@ -13,6 +13,7 @@ pub mod agent_profiles;
 pub mod arbiter;
 pub mod ark;
 pub mod auto_run;
+pub mod branch_runs;
 pub mod cancel;
 pub mod cartographer;
 pub mod channel;

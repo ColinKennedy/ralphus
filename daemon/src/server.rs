@@ -1987,6 +1987,10 @@ fn route_for_user(
         ("GET", ["api", "guardians", id, "branches", branch_id, "messages"]) => {
             guardian_branch_messages(daemon, id, branch_id)
         }
+        // ralphus[ignore-endpoint-cli]: board Live tab run history per branch; the CLI's `review logs` shows the raw rows
+        ("GET", ["api", "guardians", id, "branches", branch_id, "runs"]) => {
+            guardian_branch_runs(daemon, id, branch_id)
+        }
         ("GET", ["api", "guardians", id, "base-branches"]) => guardian_base_branches(daemon, id),
         ("POST", ["api", "guardians", id, "base"]) => guardian_change_base(daemon, id, body),
         ("POST", ["api", "guardians", id, "force_start"]) => guardian_force_start(daemon, id),
@@ -18921,6 +18925,56 @@ struct MessagesResponse {
 
 /// One review branch's read-only feedback thread (RAL-272) -- populated by
 /// `POST .../branches/{branch_id}/feedback`.
+/// Every agent run one review branch has had, oldest first. Pages through the
+/// review's `guardian`-source events (the only rows that carry run lifecycle)
+/// rather than trusting any single page to hold them all.
+fn guardian_branch_runs(daemon: &Daemon, id: &str, branch_id: &str) -> Reply {
+    let guard = daemon.lock();
+    let view = match guard.get_guardian(id) {
+        Ok(v) => v,
+        Err(e) => return store_error(&e),
+    };
+    let Some(branch) = view.branches.iter().find(|b| b.id == branch_id) else {
+        return error(404, "not_found", "no such branch in this review", vec![]);
+    };
+    let mut rows = Vec::new();
+    let mut offset = 0;
+    loop {
+        let filter = crate::cartographer::CartographerFilter {
+            review_worktrees_for_guardian: Some(id.to_string()),
+            source: Some("guardian".to_string()),
+            limit: 1000,
+            offset,
+            ascending: true,
+            include_admin_only: true,
+            ..crate::cartographer::CartographerFilter::default()
+        };
+        match guard.cartographer_query(&filter) {
+            Ok(page) => {
+                let got = page.rows.len() as i64;
+                rows.extend(page.rows);
+                offset += got;
+                if got == 0 || offset >= page.total {
+                    break;
+                }
+            }
+            Err(e) => return store_error(&e),
+        }
+    }
+    let key = crate::branch_runs::BranchKey {
+        id: &branch.id,
+        branch: &branch.branch,
+        position: branch.position,
+    };
+    let mut runs = crate::branch_runs::derive(&rows, &key, &view.base_branch);
+    for run in &mut runs {
+        if run.who.is_none() {
+            run.who.clone_from(&view.resolver_agent);
+        }
+    }
+    json(200, &serde_json::json!({ "runs": runs }))
+}
+
 fn guardian_branch_messages(daemon: &Daemon, id: &str, branch_id: &str) -> Reply {
     match daemon.lock().guardian_branch_messages(id, branch_id) {
         Ok(messages) => json(200, &MessagesResponse { messages }),
@@ -28836,6 +28890,21 @@ remediation_attempts = 1
             &body,
         );
         assert_eq!(r.status, 404);
+    }
+
+    #[test]
+    fn guardian_branch_runs_endpoint_404s_for_a_branch_not_in_the_review() {
+        let d = daemon();
+        let body =
+            serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo"}).to_string();
+        route(&d, "POST", "/api/guardians", &body);
+        let r = route(
+            &d,
+            "GET",
+            "/api/guardians/guardian-000000000001/branches/branch-x/runs",
+            "",
+        );
+        assert_eq!(r.status, 404, "{}", r.body);
     }
 
     #[test]

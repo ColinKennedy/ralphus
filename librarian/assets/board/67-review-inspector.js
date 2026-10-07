@@ -637,9 +637,9 @@
        * "What was it doing at that time" is not a question about rebase
        * attempts alone -- a branch rebases, proves, and revises against
        * feedback, and any of those is a point someone wants to walk back to.
-       * The daemon records each as a Cartographer event, so a run is the span
-       * between its start and end rows; this reads rows the board already has
-       * for the review rather than asking for anything new.
+       * The daemon records each as a Cartographer event and derives the runs
+       * from the review's whole event history (`GET .../branches/{id}/runs`);
+       * this reads what loadBranchRuns last fetched, and is empty until then.
        *
        * Only passes that ran under a pane are listed. A PR submit goes out over
        * the forge's REST API and preparation commands run as plain commands, so
@@ -652,74 +652,64 @@
        * @returns {BranchRun[]}
        */
       function branchRuns(g, b) {
-        const rows = reviewDockEvents[g.id];
-        if (!rows) return [];
-        /** @type {BranchRun[]} */
-        const runs = [];
-        const resolver = resolverOf(g);
-        // Branch attribution is not uniform across emitters: status transitions
-        // key on `payload.ref` (a branch id), the rebase/proof passes on
-        // `payload.branch` (a branch *name*), the PR and feedback-posting rows
-        // on `payload.branch_id`, and the feedback pass itself on
-        // `payload.position` (a stack ordinal -- which a reorder can move, so
-        // it is matched last and only when nothing better identifies the row).
-        const mine = rows.filter((r) => rowBelongsToBranch(r, b, true));
-        const ordered = mine.slice().sort((x, y) => x.at_ms - y.at_ms);
-        /**
-         * Closes the most recent still-running run of a kind.
-         * @param {string} kind - Which kind to close.
-         * @param {string} outcome - The outcome to record.
-         * @param {number} [ms] - Measured duration, when the emitter reports one.
-         * @returns {void}
-         */
-        const close = (kind, outcome, ms) => {
-          const open = [...runs].reverse().find((x) => x.kind === kind && x.outcome === "running");
-          if (!open) return;
-          open.outcome = outcome;
-          if (ms) open.elapsedMs = ms;
-        };
-        for (const r of ordered) {
-          const msg = r.message || "";
-          const p = r.payload || {};
-          if (msg.startsWith("conflicts starting")) {
-            const found = p.found ? ` · ${p.found} conflict${p.found === 1 ? "" : "s"}` : "";
-            runs.push({
-              id: `rebase-${r.id}`, kind: "rebase",
-              label: `rebase onto ${g.base_branch || "upstream"}${found}`,
-              atMs: r.at_ms, outcome: "running", elapsedMs: 0,
-              who: String(p.agent || resolver), task: String(r.task || p.task || "resolver"),
-              cellId: typeof r.cell_id === "string" ? r.cell_id : (typeof p.cell_id === "string" ? p.cell_id : undefined),
-              prompt: typeof p.prompt === "string" ? p.prompt : undefined,
-            });
-          } else if (msg.startsWith("conflicts resolved")) {
-            close("rebase", p.committed ? "resolved" : "resolved, nothing to commit");
-          } else if (msg.startsWith("conflicts failed")) {
-            close("rebase", "failed");
-          } else if (msg.startsWith("final proof starting")) {
-            runs.push({
-              id: `proof-${r.id}`, kind: "proof", label: "final proof",
-              atMs: r.at_ms, outcome: "running", elapsedMs: 0, who: resolver,
-              task: String(r.task || p.task || "resolver-proof"),
-              cellId: typeof r.cell_id === "string" ? r.cell_id : (typeof p.cell_id === "string" ? p.cell_id : undefined),
-              prompt: typeof p.prompt === "string" ? p.prompt : undefined,
-            });
-          } else if (msg.startsWith("final proof done")) {
-            close("proof", p.passed ? "passed" : "failed");
-          } else if (msg.startsWith("feedback applying")) {
-            runs.push({
-              id: `fb-${r.id}`, kind: "feedback", label: "feedback revision",
-              atMs: r.at_ms, outcome: "running", elapsedMs: 0, who: resolver,
-              task: String(r.task || p.task || "feedback"),
-              cellId: typeof r.cell_id === "string" ? r.cell_id : (typeof p.cell_id === "string" ? p.cell_id : undefined),
-              prompt: typeof p.prompt === "string" ? p.prompt : undefined,
-            });
-          } else if (msg.startsWith("feedback done")) {
-            close("feedback", p.committed ? "committed" : "no change committed");
-          }
+        const entry = branchRunsCache[`${g.id}|${b.id}`];
+        return entry ? entry.runs : [];
+      }
+      /**
+       * @typedef {object} BranchRunsEntry
+       * @property {BranchRun[]} runs - The branch's runs, oldest first.
+       * @property {number} fetchedAt - When they were last fetched (ms).
+       */
+      /** @type {{[key: string]: BranchRunsEntry}} Per `reviewId|branchId`, filled lazily by loadBranchRuns. */
+      const branchRunsCache = {};
+      /** @type {Set<string>} Keys with a runs fetch in flight. */
+      const branchRunsInFlight = new Set();
+      /** Minimum gap between re-fetches of one branch's runs while its Live tab stays open. */
+      const BRANCH_RUNS_REFRESH_MS = 5000;
+      /**
+       * Fetches one branch's runs from the daemon, which derives them from the
+       * review's whole event history. Fetched only for a branch whose Live tab
+       * is open, and at most once per BRANCH_RUNS_REFRESH_MS while it stays so.
+       * @param {GuardianView} g - The review.
+       * @param {GuardianBranch} b - The branch.
+       * @returns {Promise<void>}
+       */
+      async function loadBranchRuns(g, b) {
+        const key = `${g.id}|${b.id}`;
+        if (branchRunsInFlight.has(key)) return;
+        branchRunsInFlight.add(key);
+        try {
+          const r = await fetch(`/api/guardians/${encodeURIComponent(g.id)}/branches/${encodeURIComponent(b.id)}/runs`);
+          if (!r.ok) { branchRunsCache[key] = { runs: (branchRunsCache[key] || { runs: [] }).runs, fetchedAt: Date.now() }; return; }
+          /** @type {{runs: {id: string, kind: string, label: string, at_ms: number, outcome: string, elapsed_ms: number, who: string|null, task: string, cell_id: string|null, prompt: string|null}[]}} */
+          const data = await r.json();
+          const resolver = resolverOf(g);
+          /** @type {BranchRun[]} */
+          const runs = (data.runs || []).map((x) => ({
+            id: x.id, kind: x.kind, label: x.label, atMs: x.at_ms, outcome: x.outcome,
+            elapsedMs: x.elapsed_ms, who: x.who || resolver, task: x.task,
+            cellId: x.cell_id || undefined, prompt: x.prompt || undefined,
+          }));
+          const prev = branchRunsCache[key];
+          const changed = !prev || JSON.stringify(prev.runs) !== JSON.stringify(runs);
+          branchRunsCache[key] = { runs, fetchedAt: Date.now() };
+          if (changed) renderReviewInspector();
+        } catch {
+          branchRunsCache[key] = { runs: (branchRunsCache[key] || { runs: [] }).runs, fetchedAt: Date.now() };
+        } finally {
+          branchRunsInFlight.delete(key);
         }
-        // One timeline, in the order things actually happened.
-        runs.sort((x, y) => x.atMs - y.atMs);
-        return runs;
+      }
+      /**
+       * Starts a fetch of the branch's runs when none has happened yet or the
+       * last one is stale.
+       * @param {GuardianView} g - The review.
+       * @param {GuardianBranch} b - The branch.
+       * @returns {void}
+       */
+      function ensureBranchRuns(g, b) {
+        const entry = branchRunsCache[`${g.id}|${b.id}`];
+        if (!entry || Date.now() - entry.fetchedAt > BRANCH_RUNS_REFRESH_MS) loadBranchRuns(g, b);
       }
       /**
        * Formats a run's "05:12:30 · passed" metadata line.
@@ -813,10 +803,9 @@
         if (!b.worktree) {
           return `<div class="empty">No worktree yet — a resolver session starts when this branch begins rebasing.</div>`;
         }
-        // The run list is derived from the review's event rows, which the log
-        // drawer also reads -- one fetch per review, on the first thing that
-        // needs it, rather than one per tab.
-        if (reviewDockEvents[g.id] === undefined) loadReviewDockEvents(g.id);
+        // The daemon derives the run list from the review's whole event
+        // history; only this branch's runs are fetched, on opening its tab.
+        ensureBranchRuns(g, b);
         const runs = branchRuns(g, b);
         const ri = curRunIdx(runs, b.id);
         const run = ri >= 0 ? runs[ri] : null;
@@ -1908,26 +1897,13 @@
        */
       async function loadReviewDockEvents(gid) {
         try {
-          // Two windows, merged. The newest 200 rows of every kind feed the
-          // drawer, but a long-lived review has thousands of poller/PR/CI rows
-          // that bury the run lifecycle rows (`conflicts starting`, `final proof
-          // starting`, `feedback applying`), so a branch's earlier runs vanished
-          // from the Live tab. The `guardian`-source rows are the only ones
-          // branchRuns() reads and are sparse, so fetch them separately.
-          const base = `/api/guardians/${encodeURIComponent(gid)}/cartographer`;
-          const [recent, lifecycle] = await Promise.all([
-            fetch(`${base}?limit=200&sort=desc`),
-            fetch(`${base}?source=guardian&limit=1000&sort=desc`),
-          ]);
-          if (!recent.ok) { reviewDockEvents[gid] = []; afterReviewDockEvents(); return; }
+          // The newest window feeds the drawer; run history comes from the
+          // per-branch runs endpoint, which reads the whole event log.
+          const r = await fetch(`/api/guardians/${encodeURIComponent(gid)}/cartographer?limit=200&sort=desc`);
+          if (!r.ok) { reviewDockEvents[gid] = []; afterReviewDockEvents(); return; }
           /** @type {{rows: CartographerRow[], total: number}} */
-          const data = await recent.json();
-          /** @type {CartographerRow[]} */
-          const extra = lifecycle.ok ? ((await lifecycle.json()).rows || []) : [];
-          /** @type {Map<number, CartographerRow>} */
-          const byId = new Map();
-          for (const row of [...(data.rows || []), ...extra]) byId.set(row.id, row);
-          reviewDockEvents[gid] = [...byId.values()].sort((x, y) => x.at_ms - y.at_ms || x.id - y.id);
+          const data = await r.json();
+          reviewDockEvents[gid] = (data.rows || []).slice().reverse();
         } catch {
           reviewDockEvents[gid] = [];
         }
