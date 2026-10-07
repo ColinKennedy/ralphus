@@ -1013,14 +1013,17 @@ Guardian exists to surface, and is almost never what you want.
     it. Keep this an AI cell, not `git add -A`, so junk never gets
     committed.
 
-    Put "do not run formatters, linters, or tests" in `system_prompt`
-    (system_prompt_position = "append"), not in `prompt`. The proof
-    steps already ran those checks -- finalize re-running them (and
-    possibly "fixing" something) risks producing a diff that never
-    went through proof, and can distract the agent from its one job.
-    A `system_prompt` is a hard constraint, so it reliably keeps
-    finalize to exactly: stage the intended source files, commit, and
-    push.
+    Put the restriction in BOTH `system_prompt` (system_prompt_position
+    = "append") and `prompt`: name what the cell may do (stage the
+    intended source files, commit, push if a remote exists; re-staging
+    and retrying after a commit-hook failure is fine) and state that it
+    must NOT run tests, formatters, or linters or modify any file. The
+    proof steps already ran those checks -- finalize re-running them
+    (and possibly "fixing" something) risks producing a diff that never
+    went through proof, wastes time and tokens, and can fail for
+    environment reasons unrelated to the commit. Models sometimes run
+    tests anyway when only told what to do, so the explicit "do NOT"
+    sentence is deliberate.
 
  4b. BRANCH STACKING (DEFAULT when this task continues prior work in
     the same repo): add `upstream = "<<task:prior-task-name>>"` to the
@@ -1205,10 +1208,9 @@ project = "my-project"            # both cells' worktree materializes under this
   agent                  = "claude-code"  # claude-code/claude-cli/codex/codex-cli/pi all support system_prompt (see field reference above)
   cwd                    = "<<ralphus:new-worktree/ral-2?upstream=staging>>"
   depends_on             = ["work"]
-  system_prompt          = "ONLY git stage the relevant source files, commit them, and push the commit if a remote exists."
+  system_prompt          = "ONLY git stage the intended source files, commit them, and push the commit if a remote exists. \n                            Re-staging and retrying the commit is fine if a commit hook fails. \n                            Do NOT run tests, formatters, or linters, and do NOT modify any file."
   system_prompt_position = "append"
-  prompt                 = """ONLY git stage the relevant source files, commit them, and \
-                             push the commit if a remote exists."""
+  prompt                 = """ONLY git stage the intended source files, commit them, and \n                              push the commit if a remote exists. Re-staging and retrying the \n                              commit is fine if a commit hook fails. Do NOT run tests, \n                              formatters, or linters, and do NOT modify any file."""
 
 # A second ticket that stacks on ral-2. `upstream` rebases RAL-3's
 # worktree branch onto ral-2's finalized tip before the agent starts.
@@ -1471,20 +1473,21 @@ mod tests {
     }
 
     #[test]
-    fn finalize_prompt_and_system_prompt_use_affirmative_only_phrasing() {
+    fn finalize_prompt_and_system_prompt_allow_only_git_and_forbid_checks() {
+        let forbidden = "Do NOT run tests, formatters, or linters, and do NOT modify any file.";
         assert!(TASK_TUTOR.contains(
-            "system_prompt          = \"ONLY git stage the relevant source files, commit them, \
-             and push the commit if a remote exists.\""
+            "Re-staging and retrying the commit is fine if a commit hook fails. \
+"
         ));
-        assert!(TASK_TUTOR.contains(
-            "prompt                 = \"\"\"ONLY git stage the relevant source files, commit them, and \\"
-        ));
-        assert!(TASK_TUTOR.contains("push the commit if a remote exists.\"\"\""));
+        assert!(TASK_TUTOR.contains("formatters, or linters, and do NOT modify any file.\"\"\""));
+        assert_eq!(
+            TASK_TUTOR.matches(forbidden).count(),
+            1,
+            "system_prompt carries the forbidden sentence on one line"
+        );
         assert!(
-            !TASK_TUTOR.contains(
-                "Do NOT run formatters, linters, or tests. Just stage, commit, and push."
-            ),
-            "finalize's old negative-phrased system_prompt must be fully replaced"
+            !TASK_TUTOR.contains("ONLY git stage the relevant source files"),
+            "finalize text must use the updated allowed-list wording"
         );
     }
 

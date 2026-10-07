@@ -74,7 +74,10 @@ silently pick). Keep it short:
 - **Prompt fidelity:** the session `prompt` should be the ticket text pasted
   in as-is (light tweaks only), not your paraphrase.
 - **Finalize:** if commits/pushes are wanted, include a finalize AI session that
-  stages only source files and commits after the verifiers pass.
+  stages only source files, commits, and pushes after the verifiers pass.
+  Its prompt and system prompt must say it may ONLY stage, commit, and push
+  (re-staging after a commit-hook failure is fine) and must NOT run tests,
+  formatters, or linters or modify any file.
 
 Now write the TOML file(s) based on all of the information above.
 Then SHOW ME THE TOML text, in full! Stop to ask me if I want to make any final changes.
