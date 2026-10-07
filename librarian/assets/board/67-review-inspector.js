@@ -211,6 +211,7 @@
         restoreInspectorUiState(snap, `${g.id}:${b.id}:${inspectorTab}`);
         // The rewrite above recreated any live `.runterm` at scrollTop 0.
         restorePeekScrollPositions();
+        restorePromptBoxScroll();
       }
       /**
        * @typedef {object} InspectorUiSnapshot
@@ -940,6 +941,40 @@
           <div class="hint">Read-only — nothing typed here reaches the agent. Every run's text is
           captured separately, so walking back survives a restart.</div>`;
       }
+      // RALPHUS-PROMPTBOX-SCROLL:BEGIN
+      /** @type {{[scrollKey: string]: number}} Scroll offset of each Live prompt box, surviving the inspector's repaints. */
+      const promptBoxScroll = {};
+      /**
+       * A scrollable Live-tab prompt box whose scroll offset is remembered, so
+       * the inspector's periodic repaint does not send the reader back to the top.
+       * @param {string} scrollKey - Identifies this box's content across repaints.
+       * @param {string} text - The plain text to show.
+       * @returns {string}
+       */
+      function promptBox(scrollKey, text) {
+        return `<div class="promptbox" data-scroll-key="${esc(scrollKey)}" onscroll="savePromptBoxScroll(this)">${esc(text)}</div>`;
+      }
+      /**
+       * Remembers a prompt box's scroll offset.
+       * @param {HTMLElement} el - The `.promptbox` that scrolled.
+       * @returns {void}
+       */
+      function savePromptBoxScroll(el) {
+        const k = el.dataset.scrollKey;
+        if (k) promptBoxScroll[k] = el.scrollTop;
+      }
+      /**
+       * Re-applies remembered offsets to freshly painted prompt boxes.
+       * @returns {void}
+       */
+      function restorePromptBoxScroll() {
+        document.querySelectorAll("#review-inspector .promptbox[data-scroll-key]").forEach((el0) => {
+          const el = /** @type {HTMLElement} */ (el0);
+          const top = promptBoxScroll[el.dataset.scrollKey || ""];
+          if (top) el.scrollTop = top;
+        });
+      }
+      // RALPHUS-PROMPTBOX-SCROLL:END
       /**
        * The Live tab's Prompt view: the instruction this run's agent was given.
        *
@@ -952,18 +987,19 @@
        * @returns {string}
        */
       function livePromptView(g, b, run) {
+        const scrollKey = `${g.id}:${b.id}:prompt:${run ? `${run.task || ""}/${run.cellId || ""}/${run.label}` : ""}`;
         if (run && run.prompt) {
-          return `<div class="promptbox">${esc(run.prompt)}</div>
+          return `${promptBox(scrollKey, run.prompt)}
             <div class="hint">The instruction dispatched to this run.</div>`;
         }
         if (run && run.kind === "feedback") {
           const msgs = branchMessages[`${g.id}:${b.id}`];
-          if (msgs === undefined) { loadBranchMessages(g.id, b.id); return `<div class="promptbox">Loading…</div>`; }
+          if (msgs === undefined) { loadBranchMessages(g.id, b.id); return promptBox(scrollKey, "Loading…"); }
           // The daemon's roles are "reviewer" and "guardian" -- there is no
           // "user" role, so matching one never found anything.
           const last = [...msgs].reverse().find((m) => m.role === "reviewer");
           if (last) {
-            return `<div class="promptbox">${esc(last.text)}</div>
+            return `${promptBox(scrollKey, last.text)}
               <div class="hint">The reviewer feedback this run was dispatched to act on. ralphus wraps it in
               standing instructions before sending; only the authored half is retained, and this is it.</div>`;
           }
@@ -990,7 +1026,7 @@
         }
         const ps = peekSystemPrompt[key];
         const body = ps === undefined || ps === "loading" ? "Loading…" : peekPromptDisplay(ps);
-        return `<div class="promptbox">${esc(body)}</div>
+        return `${promptBox(`${g.id}:${key}:system`, body)}
           <div class="run-foot"><button class="btn" style="padding:3px 8px;font-size:11.5px" data-click="openEditReviewDetails" data-guardian-id="${esc(g.id)}" data-focus="resolver"
             data-tip="The authored half of this prompt comes from the resolver agent and model. Change those in review setup.">Resolver settings</button></div>
           <div class="hint">Read-only — the effective system prompt actually appended to this agent
