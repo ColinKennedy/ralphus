@@ -1131,6 +1131,8 @@ struct PendingProject {
 struct ProjectSetup {
     name: String,
     upstream_remote: String,
+    /// The project was registered as a fork of another project.
+    is_fork: bool,
 }
 
 fn step_project(opts: &GlobalOpts, setup: &InitializeServerOptions) -> Option<PendingProject> {
@@ -1671,6 +1673,7 @@ fn finalize_project_registration(
     Some(ProjectSetup {
         name,
         upstream_remote,
+        is_fork,
     })
 }
 
@@ -1891,11 +1894,59 @@ fn health_ok_for_sample(results: &[CheckResult], requires_agent: bool) -> bool {
 
 // ---- sample submission ----------------------------------------------------
 
-fn sample_task_toml(project: &str, remote: &str, mode: &str, agent: Option<&str>) -> String {
+/// The default branch of `remote`, read from its `HEAD` symref over the
+/// network. `None` when the remote is unreachable or reports no symref.
+fn remote_default_branch(cwd: &std::path::Path, remote: &str) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args([
+            "-C",
+            &cwd.to_string_lossy(),
+            "ls-remote",
+            "--symref",
+            remote,
+            "HEAD",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_symref_head(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// The branch named by a `ref: refs/heads/<branch>\tHEAD` line of
+/// `git ls-remote --symref` output.
+fn parse_symref_head(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let rest = line.strip_prefix("ref: refs/heads/")?;
+        let (branch, target) = rest.split_once('\t')?;
+        (target.trim() == "HEAD" && !branch.is_empty()).then(|| branch.to_string())
+    })
+}
+
+/// The `<remote>/<branch>` upstream for a forked project, or `None` when the
+/// parent's default branch cannot be found (the daemon's `<<default>>`
+/// resolution applies then).
+fn fork_upstream(cwd: &std::path::Path, remote: &str) -> Option<String> {
+    remote_default_branch(cwd, remote).map(|branch| format!("{remote}/{branch}"))
+}
+
+fn sample_task_toml(
+    project: &str,
+    remote: &str,
+    mode: &str,
+    agent: Option<&str>,
+    explicit_upstream: Option<&str>,
+) -> String {
     let review_id = "ralphus:new-review/ralphus-hello-world";
+    let cell_upstream = explicit_upstream.unwrap_or("<<default>>");
     let mut toml = format!(
-        "[[review]]\nid = \"{review_id}\"\nname = \"Hello world for {project}\"\nproof_scope = \"nothing\"\n\n"
+        "[[review]]\nid = \"{review_id}\"\nname = \"Hello world for {project}\"\nproof_scope = \"nothing\"\n"
     );
+    if let Some(upstream) = explicit_upstream {
+        toml.push_str(&format!("upstream = \"{upstream}\"\n"));
+    }
+    toml.push('\n');
     if let Some(agent) = agent {
         toml.push_str(&format!("agent = \"{agent}\"\n\n"));
     }
@@ -1904,7 +1955,7 @@ fn sample_task_toml(project: &str, remote: &str, mode: &str, agent: Option<&str>
         let branch = format!("ralphus-hello-world-{suffix}");
         let file = format!("hello-world-{suffix}.txt");
         toml.push_str(&format!(
-            "[[task]]\nname = \"hello-world-{suffix}\"\nproject = \"{project}\"\n\n  [[task.cell]]\n  id = \"write\"\n  cwd = \"<<ralphus:new-worktree/{branch}?upstream=<<default>>>>\"\n  review = \"<<{review_id}>>\"\n"
+            "[[task]]\nname = \"hello-world-{suffix}\"\nproject = \"{project}\"\n\n  [[task.cell]]\n  id = \"write\"\n  cwd = \"<<ralphus:new-worktree/{branch}?upstream={cell_upstream}>>\"\n  review = \"<<{review_id}>>\"\n"
         ));
         match mode {
             "raw" => toml.push_str(&format!(
@@ -1930,6 +1981,7 @@ fn step_sample(
     let Some(ProjectSetup {
         name: project,
         upstream_remote,
+        is_fork,
     }) = project
     else {
         println!("  skipped: no project was registered");
@@ -1972,7 +2024,26 @@ fn step_sample(
         }
         agent
     });
-    let toml_text = sample_task_toml(project, upstream_remote, &mode, agent.as_deref());
+    let explicit_upstream = if *is_fork {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let found = fork_upstream(&cwd, upstream_remote);
+        match &found {
+            Some(upstream) => println!("  fork project: basing the sample on {upstream}"),
+            None => println!(
+                "  fork project: could not read {upstream_remote}'s default branch; using the default upstream"
+            ),
+        }
+        found
+    } else {
+        None
+    };
+    let toml_text = sample_task_toml(
+        project,
+        upstream_remote,
+        &mode,
+        agent.as_deref(),
+        explicit_upstream.as_deref(),
+    );
     let client = opts.client();
     let label = sample_label(&mode);
     let sample_already_submitted = client
@@ -2044,7 +2115,9 @@ mod tests {
 
     #[test]
     fn sample_toml_uses_three_parallel_tasks_and_one_explicit_review() {
-        let toml = sample_task_toml("example", "origin", "agent", Some("claude-code"));
+        let toml = sample_task_toml("example", "origin", "agent", Some("claude-code"), None);
+        assert_eq!(toml.matches("?upstream=<<default>>>>").count(), 3);
+        assert!(!toml.contains("\nupstream = "));
         assert_eq!(toml.matches("[[task]]").count(), 3);
         assert_eq!(toml.matches("review = \"<<ralphus:new-review/").count(), 3);
         assert!(!toml.contains("depends_on"));
@@ -2091,8 +2164,73 @@ mod tests {
     }
 
     #[test]
+    fn fork_sample_toml_pins_cells_and_review_to_the_upstream_remote() {
+        let toml = sample_task_toml("example", "main-repo", "raw", None, Some("main-repo/trunk"));
+        assert_eq!(toml.matches("?upstream=main-repo/trunk>>").count(), 3);
+        assert!(toml.contains("\nupstream = \"main-repo/trunk\"\n"));
+        assert!(!toml.contains("<<default>>"));
+        assert!(
+            ralphus_core::validate::validate_toml(&toml).is_ok(),
+            "{toml}"
+        );
+    }
+
+    #[test]
+    fn symref_head_is_parsed_from_ls_remote_output() {
+        let out = "ref: refs/heads/trunk\tHEAD\n0123abc\tHEAD\n";
+        assert_eq!(parse_symref_head(out).as_deref(), Some("trunk"));
+        assert_eq!(parse_symref_head("0123abc\tHEAD\n"), None);
+    }
+
+    #[test]
+    fn fork_upstream_reads_the_default_branch_of_the_matched_remote() {
+        let base = std::env::temp_dir().join(format!("ral584-fork-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let parent = base.join("parent.git");
+        let work = base.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        std::fs::create_dir_all(&parent).unwrap();
+        git(&parent, &["init", "-q", "--bare", "--initial-branch=trunk"]);
+        git(&work, &["init", "-q"]);
+        git(
+            &work,
+            &["remote", "add", "main-repo", &parent.to_string_lossy()],
+        );
+        git(
+            &work,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        );
+        git(&work, &["push", "-q", "main-repo", "HEAD:refs/heads/trunk"]);
+        assert_eq!(
+            fork_upstream(&work, "main-repo").as_deref(),
+            Some("main-repo/trunk")
+        );
+        assert_eq!(fork_upstream(&work, "no-such-remote"), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn raw_sample_toml_has_no_agent_cells() {
-        let toml = sample_task_toml("example", "upstream", "raw", None);
+        let toml = sample_task_toml("example", "upstream", "raw", None, None);
         assert_eq!(toml.matches("mode = \"raw\"").count(), 3);
         assert_eq!(toml.matches("git push --set-upstream upstream ").count(), 3);
         assert!(!toml.contains("  agent ="));
