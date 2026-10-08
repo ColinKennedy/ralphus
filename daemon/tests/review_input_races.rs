@@ -1349,13 +1349,31 @@ impl Fixture {
                     "carried",
                     "rebuilt",
                     "built from",
-                    "merge executing",
                     "executing",
+                    "deferred",
+                    "not claimable",
+                    "skipped",
+                    "restack",
+                    "lease",
                 ]
                 .iter()
                 .any(|k| r.message.contains(k))
             }) {
-                out.push_str(&format!("\n  log: {}", row.message));
+                let short = |key: &str| {
+                    row.payload[key]
+                        .as_str()
+                        .map(|s| format!(" {key}={s:.9}"))
+                        .unwrap_or_default()
+                };
+                out.push_str(&format!(
+                    "\n  log: {}{}{}{}{}{}",
+                    row.message,
+                    short("branch"),
+                    short("reason"),
+                    short("source"),
+                    short("upstream"),
+                    short("old_tip"),
+                ));
             }
         }
         out
