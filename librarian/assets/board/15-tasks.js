@@ -997,7 +997,7 @@
        */
       function ttOpenProjectFilterMenu(e) {
         e.preventDefault(); e.stopPropagation();
-        ttCloseColMenu(); closeProjectFilterMenu(); triageCloseProjectFilterMenu(); closeWaypointProjectFilterMenu();
+        ttCloseColMenu(); closeProjectFilterMenu(); closeWaypointProjectFilterMenu();
         const existing = document.getElementById("tt-project-filter-menu");
         if (existing) { existing.remove(); return; }
         const menu = document.createElement("div");

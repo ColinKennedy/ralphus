@@ -1,17 +1,14 @@
-// RAL-421: the Triage threshold editor's preview -> confirm -> cancel flow.
-// The flow is the same at both editor entry points (the Triage tab's pool
-// table and the Projects tab's auto-review-thresholds popup): typed input
-// never mutates anything; a non-mutating `/preview` fetch populates a
-// Confirm/Cancel line; Confirm posts the *previewed* threshold (never a
-// re-read of the input) which persists it and drains the pool in
-// threshold-sized batches; Cancel discards the preview with zero requests.
-// See ./board-triage-confirm.mjs for how the shipped code is sliced out.
+// RAL-421: the shared threshold-preview helpers the Projects tab's
+// auto-review-thresholds popup renders its Confirm/Cancel line with, and
+// RAL-449: the Triage tab details pane's "Drain now" request -> confirm ->
+// cancel flow. See ./board-triage-confirm.mjs for how the shipped code is
+// sliced out.
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { makeTriageConfirm, makeRowEvent, DRAINING_PREVIEW, DRAINABLE_POOL } from "./board-triage-confirm.mjs";
+import { makeTriageConfirm, DRAINING_PREVIEW, DRAINABLE_POOL } from "./board-triage-confirm.mjs";
 
-// ---- pure helpers (shared by both editor entry points) ----
+// ---- pure preview helpers (the Projects-tab popup) ----
 
 test("triagePreviewKey is distinct per (project, triage_type) pair", () => {
   const { triagePreviewKey } = makeTriageConfirm();
@@ -49,92 +46,16 @@ test("preview effect for a clear says the trigger is removed without draining", 
 
 test("confirm line renders Confirm and Cancel wired to the previewed key", () => {
   const { triageThresholdConfirmLine } = makeTriageConfirm();
-  const line = triageThresholdConfirmLine(DRAINING_PREVIEW);
-  assert.ok(line.includes("data-click=\"confirmPoolThreshold\""), line);
-  assert.ok(line.includes("data-click=\"cancelPoolThresholdPreview\""), line);
+  const line = triageThresholdConfirmLine(DRAINING_PREVIEW, "confirmProjectTriageThreshold", "cancelProjectTriageThresholdPreview");
   assert.ok(line.includes("data-project=\"proj\""), line);
   assert.ok(line.includes("data-triage-type=\"bug\""), line);
 });
 
-test("confirm line can point a second editor entry point at its own handlers", () => {
+test("confirm line wires Confirm and Cancel to the handlers it is given", () => {
   const { triageThresholdConfirmLine } = makeTriageConfirm();
   const line = triageThresholdConfirmLine(DRAINING_PREVIEW, "confirmProjectTriageThreshold", "cancelProjectTriageThresholdPreview");
   assert.ok(line.includes("data-click=\"confirmProjectTriageThreshold\""), line);
   assert.ok(line.includes("data-click=\"cancelProjectTriageThresholdPreview\""), line);
-});
-
-// ---- Triage-tab handler flow (entry point 1) ----
-
-test("preview pools the row's input and never touches the confirm route", async () => {
-  const api = makeTriageConfirm();
-  const { previewPoolThreshold } = api;
-  const e = makeRowEvent("  3  ");
-  await previewPoolThreshold(e, "proj", "bug");
-
-  assert.equal(api.calls.fetches.length, 1, "preview is exactly one request");
-  const [req] = api.calls.fetches;
-  assert.equal(req.url, "/api/triage/pools/threshold/preview");
-  assert.equal(req.init.method, "POST");
-  assert.deepEqual(JSON.parse(req.init.body), { project: "proj", triage_type: "bug", threshold: 3 });
-  // The preview response is now driving the Confirm/Cancel line.
-  assert.deepEqual(api.previews()[api.triagePreviewKey("proj", "bug")], DRAINING_PREVIEW);
-  assert.equal(api.calls.pollTriage, 0, "preview must not re-poll");
-  assert.equal(api.calls.renderTriage, 1, "preview re-renders to show the Confirm line");
-});
-
-test("preview maps a blank input to threshold null (a clear preview)", async () => {
-  const api = makeTriageConfirm();
-  const { previewPoolThreshold } = api;
-  await previewPoolThreshold(makeRowEvent("  "), "proj", "bug");
-  assert.equal(api.calls.fetches.length, 1);
-  assert.deepEqual(
-    JSON.parse(api.calls.fetches[0].init.body),
-    { project: "proj", triage_type: "bug", threshold: null },
-  );
-});
-
-test("preview rejects a malformed threshold without any request", async () => {
-  const api = makeTriageConfirm();
-  const { previewPoolThreshold } = api;
-  await previewPoolThreshold(makeRowEvent("0"), "proj", "bug");
-  assert.equal(api.calls.fetches.length, 0, "an invalid threshold must never reach the daemon");
-  assert.equal(api.triageError(), "Threshold must be a whole number of at least 1, or blank to clear it.");
-});
-
-test("confirm posts the previewed threshold, not the drifted input", async () => {
-  const api = makeTriageConfirm();
-  const { previewPoolThreshold, confirmPoolThreshold } = api;
-  await previewPoolThreshold(makeRowEvent("3"), "proj", "bug");
-
-  // The input drifts after preview -- a human edits the box again. Confirm
-  // must still fire the exact previewed value, never this new one.
-  await confirmPoolThreshold("proj", "bug");
-
-  assert.equal(api.calls.fetches.length, 2);
-  const [previewReq, confirmReq] = api.calls.fetches;
-  assert.equal(previewReq.url, "/api/triage/pools/threshold/preview");
-  assert.equal(confirmReq.url, "/api/triage/pools/threshold");
-  assert.deepEqual(JSON.parse(confirmReq.init.body), { project: "proj", triage_type: "bug", threshold: 3 });
-  assert.equal(api.calls.pollTriage, 1, "confirm re-polls to refresh pool state");
-  assert.equal(api.previews()[api.triagePreviewKey("proj", "bug")], undefined, "confirm clears the preview");
-});
-
-test("confirm with no preview is a no-op (defense in depth)", async () => {
-  const api = makeTriageConfirm();
-  const { confirmPoolThreshold } = api;
-  await confirmPoolThreshold("proj", "bug");
-  assert.equal(api.calls.fetches.length, 0);
-});
-
-test("cancel discards the preview with zero requests", async () => {
-  const api = makeTriageConfirm();
-  const { previewPoolThreshold, cancelPoolThresholdPreview } = api;
-  await previewPoolThreshold(makeRowEvent("3"), "proj", "bug");
-  const before = api.calls.fetches.length;
-  cancelPoolThresholdPreview("proj", "bug");
-  assert.equal(api.calls.fetches.length, before, "cancel never talks to the daemon");
-  assert.equal(api.previews()[api.triagePreviewKey("proj", "bug")], undefined);
-  assert.equal(api.calls.renderTriage, 2, "cancel re-renders to drop the Confirm line");
 });
 
 // ---- RAL-449 manual "Drain now" flow ----
@@ -156,13 +77,14 @@ test("drain confirm line says no threshold is configured when the pool has none"
   assert.ok(line.includes("no threshold is configured"), line);
 });
 
-test("requesting a drain captures the row's current pool state without any request", () => {
+test("requesting a drain captures the pool's current state without any request", () => {
   const api = makeTriageConfirm();
   const { requestDrainTriagePool } = api;
   requestDrainTriagePool({}, "proj", "bug");
   assert.equal(api.calls.fetches.length, 0, "requesting a drain must never talk to the daemon");
   assert.deepEqual(api.drainConfirms()[api.triagePreviewKey("proj", "bug")], DRAINABLE_POOL);
   assert.equal(api.calls.renderTriage, 1, "requesting a drain re-renders to show the Confirm line");
+  assert.equal(api.selKey(), api.triagePreviewKey("proj", "bug"), "requesting a drain selects that pool so its Confirm line is visible");
 });
 
 test("requesting a drain on a pool with no eligible candidates is a no-op", () => {

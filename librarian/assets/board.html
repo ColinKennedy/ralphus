@@ -331,11 +331,22 @@
     </main>
 
     <main id="triage-page" style="display:none">
-      <div class="row" style="justify-content:space-between;margin-bottom:12px">
-        <b data-tip="Triage (RAL-318) — Triage types, pool state, and drain schedules for the Arbiter subsystem.\nA cell opts in with triage = true instead of naming an explicit [[review]]; classified cells sit pooled per (project, triage type) until a count threshold or cron schedule fires, then the Arbiter drains the pool into one fresh review.">Triage</b>
-        <span style="color:var(--muted)" id="triage-summary">—</span>
+      <div class="tri-shell">
+      <div class="tri-toolbar">
+        <div class="tri-seg" data-tip="Flow shows what the Arbiter is doing right now — cells in flight, pooled, and drained into reviews.\nConfiguration shows how it is set up — the triage type registry and every cron drain schedule.">
+          <button id="triage-seg-flow" class="on" onclick="setTriageView('flow')" data-tip="Flow — live pool state and the cells moving through it.">Flow</button>
+          <button id="triage-seg-cfg" onclick="setTriageView('cfg')" data-tip="Configuration — the triage type registry and every cron drain schedule.">Configuration</button>
+        </div>
+        <input id="triage-q" class="tri-flow-only" type="text" placeholder="filter by task / cell name…" oninput="onTriageQuery(this.value)" data-tip="Filter pools, in-flight, and excluded cells by task or cell name (case-insensitive substring).\nWho/when: find one specific cell without scanning every pool." />
+        <span id="triage-type-filter" class="tri-flow-only"></span>
+        <label class="tri-flow-only tri-check" data-tip="Include cells permanently excluded because their proof failed.\nA failed cell never counts toward a threshold and is never swept into a review, but it stays listed as a record."><input type="checkbox" onchange="onTriageShowExcluded(this.checked)" /> show excluded</label>
+        <span style="flex:1"></span>
+        <button class="btn" onclick="setTriageView('cfg')" data-tip="Register a new triage type, or edit an existing one, on the Configuration view.\nA type's description is fed to the Arbiter's classification prompt — write it so the Arbiter can tell this type apart from the others.">＋ Register type</button>
+        <button class="btn" onclick="pollTriage()" data-tip="Re-query the daemon for triage types, pool state, schedules, and candidates.">⟳ Refresh</button>
       </div>
+      <div class="tri-summary" id="triage-summary"></div>
       <div id="triage"><div class="empty">Loading…</div></div>
+      </div>
     </main>
 
     <main id="presets-page" style="display:none">
@@ -418,6 +429,7 @@
     <script src="/board/66-review-edit-modal.js"></script>
     <script src="/board/67-review-inspector.js"></script>
     <script src="/board/70-sse.js"></script>
+    <script src="/board/74-triage.js"></script>
     <script src="/board/75-projects-machines.js"></script>
     <script src="/board/76-project-review-settings-modal.js"></script>
     <script src="/board/77-mailbox.js"></script>

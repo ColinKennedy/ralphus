@@ -835,7 +835,7 @@
        */
       function openProjectFilterMenu(e) {
         e.preventDefault(); e.stopPropagation();
-        ttCloseProjectFilterMenu(); triageCloseProjectFilterMenu(); closeWaypointProjectFilterMenu();
+        ttCloseProjectFilterMenu(); closeWaypointProjectFilterMenu();
         const existing = document.getElementById("project-filter-menu");
         if (existing) { existing.remove(); return; }
         const menu = document.createElement("div");
