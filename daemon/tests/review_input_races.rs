@@ -1322,6 +1322,41 @@ impl Fixture {
                 "\n  [{p}] {} {} detail={:?} local={local:.9} remote={remote:.9}",
                 b.branch, b.merge_status, b.detail
             ));
+            // What is on the branch, newest first (tolerant, like `local`).
+            if let Some(rev) = b.review_branch.as_deref() {
+                if let Ok(o) = std::process::Command::new("git")
+                    .args(["log", "--format=%h %s", "-n", "6", rev])
+                    .current_dir(&self.root)
+                    .output()
+                {
+                    for line in String::from_utf8_lossy(&o.stdout).lines() {
+                        out.push_str(&format!("\n      | {line}"));
+                    }
+                }
+            }
+        }
+        // The rebuild decisions the daemon logged, oldest first.
+        if let Ok(page) = self.store.lock().cartographer_query(
+            &ralphus_daemon::cartographer::CartographerFilter {
+                guardian_id: Some(self.id.clone()),
+                limit: 200,
+                ascending: true,
+                ..Default::default()
+            },
+        ) {
+            for row in page.rows.iter().filter(|r| {
+                [
+                    "carried",
+                    "rebuilt",
+                    "built from",
+                    "merge executing",
+                    "executing",
+                ]
+                .iter()
+                .any(|k| r.message.contains(k))
+            }) {
+                out.push_str(&format!("\n  log: {}", row.message));
+            }
         }
         out
     }
