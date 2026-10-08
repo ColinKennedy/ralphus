@@ -269,6 +269,7 @@
           triageSchedules = schedulesData.schedules || [];
           triageCandidates = candidatesData.candidates || [];
           if (triageDrainedOpen) await loadTriageDrained();
+          if (triageView === "cfg") await refreshRegisteredProjectNames();
           if (!triageSelKey || !triagePools.some((p) => triagePreviewKey(p.project, p.triage_type) === triageSelKey)) {
             const first = triageVisiblePools()[0];
             triageSelKey = first ? triagePreviewKey(first.project, first.triage_type) : null;
@@ -421,6 +422,7 @@
           el.innerHTML = flow ? triageFlowPageHtml() : triageCfgHtml();
         });
         if (triagePaneEdit) triagePaneEditHints();
+        if (!flow) triageSchedFormHints(false);
       }
       /**
        * The one muted summary line under the toolbar; every count follows the rail focus.
@@ -880,12 +882,22 @@
         const eff = triageThresholdEffect(p ? p.count : 0, e.threshold, e.scheds.length);
         const nh = document.getElementById("tri-pe-n-hint");
         if (nh) { nh.textContent = eff.text; nh.classList.toggle("bad", !eff.ok); }
+        const n = document.getElementById("tri-pe-n");
+        if (n) n.classList.toggle("tri-bad", !eff.ok);
         if (!eff.ok) ok = false;
         document.querySelectorAll(".tri-pe-sched").forEach((row) => {
           const d = e.scheds[Number(row.getAttribute("data-i"))];
           if (!d) return;
-          const err = triageCronError(d.cron) || (/^\d+$/.test(d.every.trim()) && Number(d.every) >= 1 ? "" : "Every must be a whole number of 1 or more.")
-            || (d.anchor ? "" : "Pick an anchor date.");
+          const cronErr = triageCronError(d.cron);
+          const everyErr = /^\d+$/.test(d.every.trim()) && Number(d.every) >= 1 ? "" : "Every must be a whole number of 1 or more.";
+          const anchorErr = d.anchor ? "" : "Pick an anchor date.";
+          /** @type {[string, string][]} */
+          const marks = [[".tri-pe-cron", cronErr], [".tri-pe-every", everyErr], [".tri-pe-anchor", anchorErr]];
+          for (const [sel, msg] of marks) {
+            const input = row.querySelector(sel);
+            if (input) input.classList.toggle("tri-bad", !!msg);
+          }
+          const err = cronErr || everyErr || anchorErr;
           const h = /** @type {HTMLElement} */ (row.querySelector(".tri-pe-hint"));
           if (err) { h.textContent = err; h.classList.add("bad"); ok = false; return; }
           const spec = /** @type {TriageCronSpec} */ (triageParseCron(d.cron));
@@ -1009,9 +1021,15 @@
       /**
        * Switches between the Flow and Configuration views.
        * @param {"flow"|"cfg"} v
-       * @returns {void}
+       * @returns {Promise<void>}
        */
-      function setTriageView(v) { triageView = v; triageError = ""; renderTriage(); }
+      async function setTriageView(v) {
+        triageView = v;
+        triageError = "";
+        renderTriage();
+        // The project dropdown's names are only needed here, so they load on open.
+        if (v === "cfg") { await refreshRegisteredProjectNames(); if (triageView === "cfg") renderTriage(); }
+      }
       /**
        * Toolbar name search.
        * @param {string} v
@@ -1132,15 +1150,7 @@
                 <th data-tip="When this schedule next drains its pool (UTC).">Next</th>
                 <th data-tip="When the daemon last advanced this schedule.">Last checked</th><th></th>
               </tr></thead><tbody>${scheds}</tbody></table>
-              <div class="tri-form-row">
-                <input id="triage-sched-project" type="text" placeholder="project" style="width:140px" data-tip="Registered project name this schedule drains." />
-                <input id="triage-sched-sub" type="text" placeholder="subproject (optional)" style="width:170px" data-tip="Only for a project that uses subproject keying (RAL-346): the subproject whose pool this schedule drains. Leave blank for the project's own pool." />
-                <input id="triage-sched-type" type="text" placeholder="triage type" style="width:130px" data-tip="Must be a registered triage type." />
-                <input id="triage-sched-cron" type="text" placeholder="0 0 9 * * Mon" style="width:160px" class="mono" data-tip="Cron expression in UTC with a leading seconds field: sec min hour day month weekday (weekday 1-7 from Sunday, or Sun-Sat)." />
-                <input id="triage-sched-anchor" type="date" style="width:150px" data-tip="Reference date the every-Nth count is measured from. Stored as UTC." />
-                <input id="triage-sched-every-n" type="number" min="1" step="1" value="1" style="width:80px" data-tip="Fire on every Nth occurrence of the expression, counted from the anchor — 1 means every occurrence." />
-                <button class="btn primary" onclick="addTriageSchedule()" data-tip="Add this drain schedule. It races the pool's count threshold and any other schedule on the same key.">Add</button>
-              </div>
+              ${triageSchedFormHtml()}
             </div>
           </div>`;
       }
@@ -1208,34 +1218,120 @@
         await pollTriage();
       }
       /**
+       * The add-schedule form: project and triage type are single-choice
+       * dropdowns of what the daemon has registered; cron and every-N are
+       * checked as you type. Values come from `triageSchedForm`, so a
+       * periodic re-render keeps them.
+       * @returns {string}
+       */
+      function triageSchedFormHtml() {
+        const f = triageSchedForm;
+        /**
+         * @param {string} placeholder
+         * @param {string[]} values
+         * @param {string} current
+         * @param {(v: string) => string} label
+         * @returns {string}
+         */
+        const options = (placeholder, values, current, label) =>
+          `<option value=""${current ? "" : " selected"} disabled>${esc(placeholder)}</option>`
+          + values.map((v) => `<option value="${esc(v)}"${v === current ? " selected" : ""}>${esc(label(v))}</option>`).join("");
+        const typeLabel = (/** @type {string} */ v) => {
+          const t = triageTypes.find((x) => x.name === v);
+          return t && t.label && t.label !== v ? `${v} — ${t.label}` : v;
+        };
+        return `<div class="tri-form-row">
+            <select id="triage-sched-project" style="width:160px" onchange="onTriageSchedField('project', this.value)" data-tip="The registered project whose pool this schedule drains. Register a project on the Projects tab to add it here.">${options(registeredProjectNames.length ? "project…" : "no projects registered", registeredProjectNames, f.project, (v) => v)}</select>
+            <input id="triage-sched-sub" type="text" placeholder="subproject (optional)" style="width:170px" value="${esc(f.sub)}" oninput="onTriageSchedField('sub', this.value)" data-tip="Only for a project that uses subproject keying (RAL-346): the subproject whose pool this schedule drains. Leave blank for the project's own pool." />
+            <select id="triage-sched-type" style="width:170px" onchange="onTriageSchedField('type', this.value)" data-tip="The registered triage type whose pool this schedule drains. Register a new type above to add it here.">${options("triage type…", triageTypes.map((t) => t.name), f.type, typeLabel)}</select>
+            <input id="triage-sched-cron" type="text" placeholder="0 0 9 * * Mon" style="width:160px" class="mono" value="${esc(f.cron)}" oninput="onTriageSchedField('cron', this.value)" data-tip="Cron expression in UTC with a leading seconds field: sec min hour day month weekday (weekday 1-7 from Sunday, or Sun-Sat)." />
+            <input id="triage-sched-anchor" type="date" style="width:150px" value="${esc(f.anchor)}" onchange="onTriageSchedField('anchor', this.value)" data-tip="Reference date the every-Nth count is measured from. Stored as UTC." />
+            <input id="triage-sched-every-n" type="number" min="1" step="1" style="width:80px" value="${esc(f.every)}" oninput="onTriageSchedField('every', this.value)" data-tip="Fire on every Nth occurrence of the expression, counted from the anchor — 1 means every occurrence." />
+            <button class="btn primary" onclick="addTriageSchedule()" data-tip="Add this drain schedule. It races the pool's count threshold and any other schedule on the same key.">Add</button>
+            <div class="tri-hint tri-form-hint" id="triage-sched-hint"></div>
+          </div>`;
+      }
+      /**
+       * Why the add-schedule form can't be submitted yet, or "" when it can.
+       * `strict` also requires the dropdowns and anchor to be filled; without
+       * it only what has been typed so far is judged.
+       * @param {boolean} strict
+       * @returns {{field: string, text: string}}
+       */
+      function triageSchedFormError(strict) {
+        const f = triageSchedForm;
+        if (f.cron.trim()) {
+          const err = triageCronError(f.cron);
+          if (err) return { field: "cron", text: err };
+        }
+        if (f.every.trim() && !(/^\d+$/.test(f.every.trim()) && Number(f.every) >= 1)) {
+          return { field: "every", text: "Every must be a whole number of 1 or more." };
+        }
+        if (!strict) return { field: "", text: "" };
+        if (!f.project) return { field: "project", text: "Pick a project." };
+        if (!f.type) return { field: "type", text: "Pick a triage type." };
+        if (!f.cron.trim()) return { field: "cron", text: "Enter a cron expression." };
+        if (!f.anchor) return { field: "anchor", text: "Pick an anchor date." };
+        return { field: "", text: "" };
+      }
+      /**
+       * Marks the add-schedule form's invalid field red and shows why, in
+       * place (no re-render, so typing is never interrupted). When the cron
+       * is valid, the hint says when it would first fire instead.
+       * @param {boolean} strict
+       * @returns {boolean} true when the form is valid
+       */
+      function triageSchedFormHints(strict) {
+        const err = triageSchedFormError(strict);
+        /** @type {[string, string][]} */
+        const ids = [["project", "triage-sched-project"], ["type", "triage-sched-type"], ["cron", "triage-sched-cron"], ["anchor", "triage-sched-anchor"], ["every", "triage-sched-every-n"]];
+        for (const [field, id] of ids) {
+          const el = document.getElementById(id);
+          if (el) el.classList.toggle("tri-bad", err.field === field);
+        }
+        const hint = document.getElementById("triage-sched-hint");
+        if (!hint) return !err.field;
+        if (err.field) {
+          hint.textContent = err.text;
+          hint.classList.add("bad");
+        } else {
+          const spec = triageSchedForm.cron.trim() ? triageParseCron(triageSchedForm.cron) : null;
+          const next = spec ? triageCronNextAfter(spec, Date.now()) : null;
+          hint.textContent = spec ? (next === null ? "Never fires within ten years." : `Fires in UTC — first match after now: ${triageFormatNext(next)}.`) : "";
+          hint.classList.remove("bad");
+        }
+        return !err.field;
+      }
+      /**
+       * Records one add-schedule form field and re-checks the form in place.
+       * @param {keyof TriageScheduleForm} field
+       * @param {string} value
+       * @returns {void}
+       */
+      function onTriageSchedField(field, value) {
+        triageSchedForm[field] = value;
+        triageSchedFormHints(false);
+      }
+      /**
        * Adds a cron schedule from the Configuration form; a subproject joins the
        * project as the composite `project::subproject` pool key.
        * @returns {Promise<void>}
        */
       async function addTriageSchedule() {
-        const proj = /** @type {HTMLInputElement} */ (byId("triage-sched-project")).value.trim();
-        const sub = /** @type {HTMLInputElement} */ (byId("triage-sched-sub")).value.trim();
-        const triageType = /** @type {HTMLInputElement} */ (byId("triage-sched-type")).value.trim();
-        const cronExpr = /** @type {HTMLInputElement} */ (byId("triage-sched-cron")).value.trim().split(/\s+/).join(" ");
-        const anchorDate = /** @type {HTMLInputElement} */ (byId("triage-sched-anchor")).value;
-        const everyNRaw = /** @type {HTMLInputElement} */ (byId("triage-sched-every-n")).value.trim();
-        if (!proj || !triageType || !cronExpr || !anchorDate) {
-          triageError = "Project, triage type, cron expression, and anchor date are all required.";
-          renderTriage();
-          return;
-        }
-        const cronErr = triageCronError(cronExpr);
-        if (cronErr) { triageError = cronErr; renderTriage(); return; }
+        if (!triageSchedFormHints(true)) return;
+        const f = triageSchedForm;
+        const sub = f.sub.trim();
         try {
           const r = await fetch("/api/triage/schedules", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              project: sub ? `${proj}::${sub}` : proj, triage_type: triageType, cron_expr: cronExpr,
-              anchor_date_ms: Date.parse(`${anchorDate}T00:00:00Z`), every_n: everyNRaw === "" ? 1 : Number(everyNRaw),
+              project: sub ? `${f.project}::${sub}` : f.project, triage_type: f.type, cron_expr: f.cron.trim().split(/\s+/).join(" "),
+              anchor_date_ms: Date.parse(`${f.anchor}T00:00:00Z`), every_n: f.every.trim() === "" ? 1 : Number(f.every),
             }),
           });
           triageError = r.ok ? "" : await responseError(r, "add schedule failed");
+          if (r.ok) triageSchedForm = { project: "", sub: "", type: "", cron: "", anchor: "", every: "1" };
         } catch (e) { triageError = "daemon unreachable"; }
         await pollTriage();
       }

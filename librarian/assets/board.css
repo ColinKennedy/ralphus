@@ -290,6 +290,9 @@
       .tri-tedit input.tri-n { width: 64px; }
       .tri-hint { color: var(--muted); font-size: 11.5px; }
       .tri-hint.bad { color: var(--failed); }
+      /* an input or select whose value would be rejected */
+      #triage-page .tri-bad, #triage-page .tri-bad:focus { border-color: var(--failed); outline-color: var(--failed); box-shadow: 0 0 0 1px var(--failed); }
+      .tri-form-hint { flex: 1 1 100%; min-height: 15px; }
       .tri-cfg { max-width: 1120px; padding: 16px 18px 60px; height: 100%; overflow-y: auto; box-sizing: border-box; }
       .tri-card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 13px 15px; margin-bottom: 14px; }
       .tri-card > h2 { margin: 0 0 3px; font-size: 11px; font-weight: 600; letter-spacing: .11em; text-transform: uppercase; color: var(--text); }

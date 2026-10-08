@@ -45,6 +45,12 @@
       let triageExcludedOpen = true;
       /** @type {TriagePaneEditDraft|null} the details pane's edit-mode draft, or null when not editing. */
       let triagePaneEdit = null;
+      /**
+       * The Configuration view's add-schedule form, kept here so a periodic
+       * re-render never drops what is being picked or typed.
+       * @type {TriageScheduleForm}
+       */
+      let triageSchedForm = { project: "", sub: "", type: "", cron: "", anchor: "", every: "1" };
       /** Message from the last failed Triage action, shown inline in the flow and the details pane. */
       let triageError = "";
       /**

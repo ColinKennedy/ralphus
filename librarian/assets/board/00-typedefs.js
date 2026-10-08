@@ -848,6 +848,17 @@
        * @property {string} anchor - YYYY-MM-DD (UTC)
        */
       /**
+       * The Triage Configuration view's add-schedule form; every field holds
+       * the raw control value ("" when nothing is picked or typed yet).
+       * @typedef {object} TriageScheduleForm
+       * @property {string} project - a registered project name
+       * @property {string} sub - optional subproject
+       * @property {string} type - a registered triage type
+       * @property {string} cron
+       * @property {string} anchor - YYYY-MM-DD (UTC)
+       * @property {string} every
+       */
+      /**
        * The Triage details pane's edit-mode draft for one pool.
        * @typedef {object} TriagePaneEditDraft
        * @property {string} key - `triagePreviewKey(project, triageType)`
