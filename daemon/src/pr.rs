@@ -4444,7 +4444,73 @@ fn fetch_pr_merge_state(
     client: &crate::forge::ForgeClient,
 ) -> Option<std::result::Result<String, String>> {
     let number = pr.pr_number?;
-    Some(client.get_pull_request_state(number))
+    Some(
+        client
+            .get_pull_request_state_and_head(number)
+            .map(|(state, head)| {
+                if let Some(head) = head {
+                    note_forge_head(&pr.id, &head);
+                }
+                state
+            }),
+    )
+}
+
+/// How long a forge-reported PR head ([`note_forge_head`]) may stand in for a
+/// `git fetch` of that PR's branch. Covers the gap between a maintenance
+/// pass's merge check and its remote-commit sync with room to spare, and is
+/// short enough that a stale entry is never trusted across passes.
+const FORGE_HEAD_FRESH_FOR: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The longest [`fetch_remote_pr_tip`] goes without a real fetch of a PR
+/// branch even while the forge keeps reporting an unchanged head -- a floor
+/// against the forge's REST view and its git view ever disagreeing.
+const PR_FETCH_MAX_SKIP: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Per PR id: the head SHA the forge last reported, and when.
+fn forge_heads() -> &'static parking_lot::Mutex<HashMap<String, (std::time::Instant, String)>> {
+    static HEADS: std::sync::OnceLock<
+        parking_lot::Mutex<HashMap<String, (std::time::Instant, String)>>,
+    > = std::sync::OnceLock::new();
+    HEADS.get_or_init(Default::default)
+}
+
+/// Per PR id: when [`fetch_remote_pr_tip`] last really fetched the branch.
+fn last_pr_fetches() -> &'static parking_lot::Mutex<HashMap<String, std::time::Instant>> {
+    static FETCHES: std::sync::OnceLock<parking_lot::Mutex<HashMap<String, std::time::Instant>>> =
+        std::sync::OnceLock::new();
+    FETCHES.get_or_init(Default::default)
+}
+
+/// Record the head SHA the forge just reported for `pr_id`.
+fn note_forge_head(pr_id: &str, head: &str) {
+    forge_heads().lock().insert(
+        pr_id.to_string(),
+        (std::time::Instant::now(), head.to_string()),
+    );
+}
+
+/// Whether [`fetch_remote_pr_tip`] can skip fetching: the forge reported a
+/// head within [`FORGE_HEAD_FRESH_FOR`], the sync ref already holds exactly
+/// that commit, that commit is also the one this daemon last pushed (when it
+/// has pushed at all -- a push of ours the forge has not reflected yet must
+/// never be read back as the old tip), and the branch was really fetched
+/// within [`PR_FETCH_MAX_SKIP`]. Missing information always means "fetch".
+fn can_skip_pr_fetch(
+    forge_head: Option<(std::time::Duration, &str)>,
+    local_sync_sha: Option<&str>,
+    last_pushed_sha: Option<&str>,
+    since_last_fetch: Option<std::time::Duration>,
+) -> bool {
+    match (forge_head, local_sync_sha, since_last_fetch) {
+        (Some((age, head)), Some(local), Some(since)) => {
+            age < FORGE_HEAD_FRESH_FOR
+                && head == local
+                && last_pushed_sha.is_none_or(|pushed| pushed == head)
+                && since < PR_FETCH_MAX_SKIP
+        }
+        _ => false,
+    }
 }
 
 /// The store-writing half of a single PR's merge-state check: apply an
@@ -9486,18 +9552,50 @@ fn fetch_remote_pr_tip(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dest_ref = sync_fetch_ref(pr_id);
+    // A `git fetch` is a git process, a transport process (ssh or a remote
+    // helper) and a network connection. When the forge's REST view -- read
+    // moments ago by this same maintenance pass's merge check -- says the
+    // branch head is exactly what the sync ref already holds, the fetch
+    // would write the same commit, so skip it (bounded by
+    // `PR_FETCH_MAX_SKIP`).
+    let now = std::time::Instant::now();
+    let forge_head = forge_heads()
+        .lock()
+        .get(pr_id)
+        .map(|(at, head)| (now.duration_since(*at), head.clone()));
+    let since_last_fetch = last_pr_fetches()
+        .lock()
+        .get(pr_id)
+        .map(|at| now.duration_since(*at));
+    if forge_head.is_some() && since_last_fetch.is_some() {
+        let local = git(&root, &["rev-parse", "--verify", "--quiet", &dest_ref])
+            .ok()
+            .map(|s| s.trim().to_string());
+        if can_skip_pr_fetch(
+            forge_head.as_ref().map(|(age, head)| (*age, head.as_str())),
+            local.as_deref(),
+            pr.last_pushed_sha.as_deref(),
+            since_last_fetch,
+        ) {
+            return Ok(local);
+        }
+    }
     // `+` forces the update: a reviewer force-pushing the PR branch
     // (an amend, a rebase onto a new base) makes its new tip a
     // non-fast-forward from whatever this ref last pointed at, which a
     // plain refspec would otherwise refuse to write.
     let refspec = format!("+{}:{dest_ref}", pr.branch_alias);
-    Ok(git(
+    let fetched = git(
         &root,
         &["fetch", "--no-write-fetch-head", &remote_name, &refspec],
     )
-    .ok()
-    .and_then(|_| git(&root, &["rev-parse", &dest_ref]).ok())
-    .map(|s| s.trim().to_string()))
+    .ok();
+    if fetched.is_some() {
+        last_pr_fetches().lock().insert(pr_id.to_string(), now);
+    }
+    Ok(fetched
+        .and_then(|_| git(&root, &["rev-parse", &dest_ref]).ok())
+        .map(|s| s.trim().to_string()))
 }
 
 /// The comparison logic shared by [`compute_sync_status`] and
@@ -10506,6 +10604,36 @@ mod tests {
 
     fn store() -> Store {
         Store::open_in_memory().unwrap()
+    }
+
+    #[test]
+    fn pr_fetch_is_skipped_only_when_the_forge_head_is_fresh_known_and_ours() {
+        use std::time::Duration;
+        let fresh = Some((Duration::from_secs(2), "abc"));
+        let recent = Some(Duration::from_secs(10));
+        assert!(can_skip_pr_fetch(fresh, Some("abc"), Some("abc"), recent));
+        assert!(can_skip_pr_fetch(fresh, Some("abc"), None, recent));
+        // The forge moved (a reviewer push): fetch it.
+        assert!(!can_skip_pr_fetch(fresh, Some("old"), Some("old"), recent));
+        // We pushed something the forge has not reflected yet: fetch.
+        assert!(!can_skip_pr_fetch(fresh, Some("abc"), Some("new"), recent));
+        // Stale forge read, or no real fetch for too long: fetch.
+        assert!(!can_skip_pr_fetch(
+            Some((Duration::from_secs(30), "abc")),
+            Some("abc"),
+            Some("abc"),
+            recent
+        ));
+        assert!(!can_skip_pr_fetch(
+            fresh,
+            Some("abc"),
+            Some("abc"),
+            Some(Duration::from_secs(61))
+        ));
+        // Missing information always fetches.
+        assert!(!can_skip_pr_fetch(None, Some("abc"), Some("abc"), recent));
+        assert!(!can_skip_pr_fetch(fresh, None, Some("abc"), recent));
+        assert!(!can_skip_pr_fetch(fresh, Some("abc"), Some("abc"), None));
     }
 
     fn tmp_dir(tag: &str) -> PathBuf {

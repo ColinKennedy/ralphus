@@ -907,6 +907,17 @@ impl ForgeClient {
     /// silently does nothing). Logs the outbound call (start/done/error) via
     /// `rlog!`.
     pub fn get_pull_request_state(&self, number: i64) -> Result<String, String> {
+        self.get_pull_request_state_and_head(number)
+            .map(|(state, _)| state)
+    }
+
+    /// [`Self::get_pull_request_state`] plus the PR/MR's current source-head
+    /// commit SHA, which both forges return in the same response (GitHub's
+    /// `head.sha`, GitLab's `sha`); `None` when the response carries none.
+    pub fn get_pull_request_state_and_head(
+        &self,
+        number: i64,
+    ) -> Result<(String, Option<String>), String> {
         // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
         crate::rlog!(
             DEBUG,
@@ -917,7 +928,7 @@ impl ForgeClient {
         let result = self.get_pull_request_state_inner(number);
         match &result {
             // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
-            Ok(state) => crate::rlog!(
+            Ok((state, _)) => crate::rlog!(
                 DEBUG,
                 "ralphus [forge] get pr state done kind={} repo={} number={number} state={state}",
                 self.kind.as_str(),
@@ -934,7 +945,10 @@ impl ForgeClient {
         result
     }
 
-    fn get_pull_request_state_inner(&self, number: i64) -> Result<String, String> {
+    fn get_pull_request_state_inner(
+        &self,
+        number: i64,
+    ) -> Result<(String, Option<String>), String> {
         let token = self.require_token()?;
         match self.kind {
             ForgeKind::GitHub => {
@@ -945,10 +959,11 @@ impl ForgeClient {
                         .set("Authorization", &format!("Bearer {token}"))
                         .set("Accept", "application/vnd.github+json"),
                 )?;
+                let head = resp["head"]["sha"].as_str().map(str::to_string);
                 if resp["merged"].as_bool().unwrap_or(false) {
-                    return Ok("merged".to_string());
+                    return Ok(("merged".to_string(), head));
                 }
-                Ok(resp["state"].as_str().unwrap_or("open").to_string())
+                Ok((resp["state"].as_str().unwrap_or("open").to_string(), head))
             }
             ForgeKind::GitLab => {
                 let url = format!(
@@ -956,10 +971,15 @@ impl ForgeClient {
                     self.api_base, self.repo_path
                 );
                 let resp = self.get(http_agent().get(&url).set("PRIVATE-TOKEN", token))?;
-                Ok(match resp["state"].as_str().unwrap_or("opened") {
+                let head = resp["sha"]
+                    .as_str()
+                    .or_else(|| resp["diff_refs"]["head_sha"].as_str())
+                    .map(str::to_string);
+                let state = match resp["state"].as_str().unwrap_or("opened") {
                     "opened" => "open".to_string(),
                     other => other.to_string(),
-                })
+                };
+                Ok((state, head))
             }
         }
     }
