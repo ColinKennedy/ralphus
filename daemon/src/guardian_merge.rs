@@ -10012,7 +10012,10 @@ struct BaseShiftDetection {
     all_have_baseline: bool,
     /// RAL-300: whether every project's enabled branches are already an
     /// ancestor of that project's *current* base -- the shift IS this
-    /// review landing, not upstream work to rebase onto.
+    /// review landing, not upstream work to rebase onto. Only computed when
+    /// [`detect_base_shift`] is asked to (`false` otherwise): it costs up to
+    /// two `merge-base` processes per branch and only matters once a shift
+    /// has been seen.
     fully_landed: bool,
     shift_detail: Vec<String>,
     /// RAL-507: the upstream base SHA each shifted project would be rebuilt
@@ -10024,10 +10027,11 @@ fn detect_base_shift(
     store: &crate::store_lock::StoreHandle,
     id: &str,
     guardian: &crate::guardian::GuardianView,
+    check_landed: bool,
 ) -> BaseShiftDetection {
     let mut any_shifted = false;
     let mut all_have_baseline = true;
-    let mut fully_landed = !guardian.projects.is_empty();
+    let mut fully_landed = check_landed && !guardian.projects.is_empty();
     let mut shift_detail: Vec<String> = Vec::new();
     let mut shift_targets: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
@@ -10060,7 +10064,7 @@ fn detect_base_shift(
                 ));
             }
         }
-        if !project_already_in_base(&root, guardian, proj, &current) {
+        if fully_landed && !project_already_in_base(&root, guardian, proj, &current) {
             fully_landed = false;
         }
     }
@@ -10124,7 +10128,7 @@ pub fn rebuild_on_base_shift_with_debounce(
         return false;
     }
 
-    let first_pass = detect_base_shift(store, id, &guardian);
+    let first_pass = detect_base_shift(store, id, &guardian, false);
     // Also fall back to the legacy single-project base_commit for existing rows
     // that were created before multi-project support was added.
     if !first_pass.any_shifted && !first_pass.all_have_baseline {
@@ -10141,7 +10145,7 @@ pub fn rebuild_on_base_shift_with_debounce(
     // retry-budget check below so no pending shift ever consumes budget
     // before it has actually settled.
     std::thread::sleep(debounce);
-    let settled = detect_base_shift(store, id, &guardian);
+    let settled = detect_base_shift(store, id, &guardian, true);
     if !settled.any_shifted {
         // The shift resolved itself during the debounce wait (e.g. the base
         // branch was reset back to the prior baseline) -- nothing to rebuild.
