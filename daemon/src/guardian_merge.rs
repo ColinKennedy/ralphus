@@ -8352,6 +8352,11 @@ fn run_feedback_pass(
             if cancel.is_cancelled() {
                 stop_feedback!();
             }
+            // A review deleted while this round was running has nothing left
+            // to publish to: pushing now would recreate its remote branch.
+            if store.lock().get_guardian(id).is_err() {
+                stop_feedback!();
+            }
             // The branch's open PR may be published under an alias other than
             // the review branch's own name (`separate_pr_branch`, an explicit
             // alias, a legacy internal review ref) -- the feedback must land
