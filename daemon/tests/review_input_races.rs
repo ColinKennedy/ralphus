@@ -3551,6 +3551,13 @@ impl FakeGitHub {
                         409,
                     );
                 }
+                let base_name = req["target_branch"].as_str().unwrap_or("main");
+                if Self::adds_nothing_to(bare, bare, &head, base_name) {
+                    return json_reply(
+                        serde_json::json!({"message": ["Cannot create a merge request: no changes between the branches"]}),
+                        422,
+                    );
+                }
                 let pr = FakePr {
                     repo: "acme/w".to_string(),
                     head_repo: "acme/w".to_string(),
@@ -3654,6 +3661,39 @@ impl FakeGitHub {
         }
     }
 
+    /// Whether `head` (in `head_bare`) adds nothing to `base` (in `bare`): every
+    /// commit it has is already in the base. Real forges refuse to open a PR/MR
+    /// in that case ("No commits between ...").
+    fn adds_nothing_to(bare: &Path, head_bare: &Path, head: &str, base: &str) -> bool {
+        let head_sha = Self::head_sha(head_bare, head);
+        if head_sha.is_empty() {
+            return false;
+        }
+        // The head's objects may live in another repository: fetch them into
+        // `bare` only when it differs (a cross-repository PR).
+        if head_bare != bare {
+            let _ = std::process::Command::new("git")
+                .args([
+                    "fetch",
+                    "-q",
+                    &head_bare.display().to_string(),
+                    &format!("refs/heads/{head}:refs/fake-forge/head"),
+                ])
+                .current_dir(bare)
+                .output();
+        }
+        std::process::Command::new("git")
+            .args([
+                "merge-base",
+                "--is-ancestor",
+                &head_sha,
+                &format!("refs/heads/{base}"),
+            ])
+            .current_dir(bare)
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
     /// The tip of `refs/heads/<head>` on the bare upstream (empty if unborn).
     fn head_sha(bare: &Path, head: &str) -> String {
         std::process::Command::new("git")
@@ -3742,6 +3782,15 @@ impl FakeGitHub {
                     .any(|pr| pr.repo == repo && pr.open && pr.head == head)
                 {
                     return json_reply(serde_json::json!({"message": "exists"}), 422);
+                }
+                let base_name = req["base"].as_str().unwrap_or("main");
+                let repo_bare = Self::bare_of(&st, &repo, bare);
+                let head_bare = Self::bare_of(&st, &head_repo, bare);
+                if Self::adds_nothing_to(&repo_bare, &head_bare, &head, base_name) {
+                    return json_reply(
+                        serde_json::json!({"message": "Validation Failed: No commits between the base and the head"}),
+                        422,
+                    );
                 }
                 let pr = FakePr {
                     repo: repo.clone(),
@@ -8755,4 +8804,55 @@ fn restart_merge_keeps_a_reviewer_commit_the_daemon_already_pulled() {
 #[test]
 fn restart_merge_keeps_a_reviewer_commit_pushed_just_before_it() {
     restart_merge_after_a_reviewer_push(false);
+}
+
+/// A PR is merged on the forge and a submission pass runs before the daemon
+/// has fetched the new base (no maintenance pump here: the daemon is "not
+/// there yet"). The merged branches' work is already upstream, so the pass
+/// must not file fresh PRs for them.
+fn submission_right_after_a_forge_merge_does_not_refile_merged_work_on(kind: &str) {
+    let what = "submit right after a forge merge";
+    let (fx, forge) = Fixture::with_forge_kind(&["feature/a", "feature/b", "feature/c"], kind);
+    fx.submit_stack();
+    let created_before = forge.state.lock().unwrap().prs.len();
+    assert_eq!(created_before, 3, "{what}: setup");
+    // PR b (with a's commits under it) merges: both branches' work is upstream.
+    fx.merge_pr_on_forge(&forge, 1);
+
+    let result = ralphus_daemon::pr::submit_pull_requests(
+        &fx.store,
+        &NoAgentExpected,
+        &fx.id,
+        stack_request(),
+        "tester",
+        false,
+    );
+    let created_after = forge.state.lock().unwrap().prs.len();
+    assert_eq!(
+        created_after,
+        created_before,
+        "{what}: a submission pass filed {} new PR(s) for work that already landed upstream \
+         (result: {:?}); forge PRs now: {:?}\n{}",
+        created_after - created_before,
+        result.as_ref().map(|prs| prs.len()),
+        forge
+            .state
+            .lock()
+            .unwrap()
+            .prs
+            .iter()
+            .map(|p| (p.number, p.head.clone(), p.base.clone(), p.open, p.merged))
+            .collect::<Vec<_>>(),
+        fx.describe()
+    );
+}
+
+#[test]
+fn submission_right_after_a_forge_merge_does_not_refile_merged_work() {
+    submission_right_after_a_forge_merge_does_not_refile_merged_work_on("github");
+}
+
+#[test]
+fn submission_right_after_a_forge_merge_does_not_refile_merged_work_on_gitlab() {
+    submission_right_after_a_forge_merge_does_not_refile_merged_work_on("gitlab");
 }

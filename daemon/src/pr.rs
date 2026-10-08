@@ -8165,6 +8165,21 @@ fn submit_stack_for_guardian(
                 .collect()
         })
         .unwrap_or_default();
+    // A PR the `refresh_open_prs` call above just found merged on the forge is
+    // not yet settled into its branch's own `merged` status -- that happens on
+    // the next merge poll, once the merged base has been fetched. Until then
+    // the branch must not be filed again when nothing was committed since that
+    // PR's last push: the new PR would re-open work that already landed (and,
+    // stacked on its lower neighbour, show it as a fresh diff). A branch with
+    // newer commits still gets its new PR.
+    let landed_pushes: Vec<(String, String)> = store
+        .lock()
+        .list_pull_requests_for_guardian(id)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|pr| pr.state == "merged")
+        .filter_map(|pr| Some((pr.branch_id?, pr.last_pushed_sha?)))
+        .collect();
     let mut created = Vec::new();
     // One branch's PR failing to submit (e.g. GitHub's "no commits between
     // X and Y" once a stacked branch's diff is already in its base) must
@@ -8185,6 +8200,30 @@ fn submit_stack_for_guardian(
             Some("merged") | Some("closed")
         ) {
             continue;
+        }
+        if landed_pushes
+            .iter()
+            .any(|(branch_id, _)| *branch_id == branch.id)
+        {
+            let branch_root = branch.project.as_deref().map_or(root, Path::new);
+            let tip = branch
+                .review_branch
+                .as_deref()
+                .and_then(|rev| crate::guardian_merge::git(branch_root, &["rev-parse", rev]).ok())
+                .map(|sha| sha.trim().to_string());
+            if landed_pushes
+                .iter()
+                .any(|(branch_id, sha)| *branch_id == branch.id && Some(sha) == tip.as_ref())
+            {
+                // ralphus[ignore-rlog-pair]: a skipped re-file; the merge poll records the branch's `merged` transition
+                crate::rlog!(
+                    INFO,
+                    "ralphus [pr] review {id} branch {} not re-filed: its last push is already \
+                     merged on the forge",
+                    branch.branch
+                );
+                continue;
+            }
         }
         let req = PrRequest {
             branch_id: Some(branch.id.clone()),
