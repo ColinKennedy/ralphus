@@ -157,6 +157,12 @@ pub struct PendingFollowups {
     #[serde(flatten)]
     pub summary: PendingFollowupsSummary,
     pub items: Vec<PendingFollowupItem>,
+    /// The merge-time offer's status (`offered`/`accepted`/`declined`), or
+    /// `None` before any offer exists.
+    pub offer_status: Option<String>,
+    /// The squad an accepted offer created for these items; `None` while the
+    /// offer is unanswered, declined, or its squad was not created.
+    pub offer_squad_id: Option<String>,
 }
 
 fn summarize_pending(
@@ -304,7 +310,13 @@ impl Store {
     pub fn pending_followups(&self, guardian_id: &str) -> Result<PendingFollowups> {
         let items = self.pending_followup_items(guardian_id)?;
         let summary = self.summarize_pending_for(guardian_id, &items)?;
-        Ok(PendingFollowups { summary, items })
+        let offer = self.get_followup_offer(guardian_id)?;
+        Ok(PendingFollowups {
+            summary,
+            items,
+            offer_status: offer.as_ref().map(|o| o.status.clone()),
+            offer_squad_id: offer.and_then(|o| o.squad_id).filter(|s| !s.is_empty()),
+        })
     }
 
     /// Just the button state of the review's pending follow-ups.
