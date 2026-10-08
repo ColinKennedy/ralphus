@@ -4559,10 +4559,9 @@ fn middle_pr_merged_on_the_forge_while_feedback_is_in_flight_on_gitlab() {
 
 /// Every PR in the stack is merged on the forge while a feedback round on the
 /// top branch is held. No late push may revive a merged PR branch.
-#[test]
-fn every_pr_merged_on_the_forge_while_feedback_is_in_flight() {
+fn every_pr_merged_on_the_forge_while_feedback_is_in_flight_on(kind: &str) {
     let what = "all PRs merged on forge";
-    let (fx, forge) = Fixture::with_forge(&["feature/a", "feature/b", "feature/c"]);
+    let (fx, forge) = Fixture::with_forge_kind(&["feature/a", "feature/b", "feature/c"], kind);
     fx.submit_stack();
     let unexpected: Unexpected = Arc::default();
     let _daemon = DaemonPump::start(&fx);
@@ -4642,6 +4641,16 @@ fn every_pr_merged_on_the_forge_while_feedback_is_in_flight() {
         );
     }
     fx.assert_forge_routed_everything(what, &forge);
+}
+
+#[test]
+fn every_pr_merged_on_the_forge_while_feedback_is_in_flight() {
+    every_pr_merged_on_the_forge_while_feedback_is_in_flight_on("github");
+}
+
+#[test]
+fn every_pr_merged_on_the_forge_while_feedback_is_in_flight_on_gitlab() {
+    every_pr_merged_on_the_forge_while_feedback_is_in_flight_on("gitlab");
 }
 
 /// A PR is closed (not merged) on the forge while feedback on its branch is
@@ -4910,10 +4919,9 @@ fn simultaneous_submissions_open_one_pr_per_branch_on_gitlab() {
 
 /// A branch appended to the review while the stack is rebasing gets its PR
 /// through a later submission without disturbing the others.
-#[test]
-fn submitting_a_newly_appended_branch_while_the_stack_rebases() {
+fn submitting_a_newly_appended_branch_while_the_stack_rebases_on(kind: &str) {
     let what = "submit appended branch";
-    let (fx, forge) = Fixture::with_forge(&["feature/a", "feature/b", "feature/c"]);
+    let (fx, forge) = Fixture::with_forge_kind(&["feature/a", "feature/b", "feature/c"], kind);
     fx.submit_stack();
     let unexpected: Unexpected = Arc::default();
     let _daemon = DaemonPump::start(&fx);
@@ -4957,6 +4965,16 @@ fn submitting_a_newly_appended_branch_while_the_stack_rebases() {
         &[(0, "feature-a.txt", "feedback on a")],
         &["upstream1.txt"],
     );
+}
+
+#[test]
+fn submitting_a_newly_appended_branch_while_the_stack_rebases() {
+    submitting_a_newly_appended_branch_while_the_stack_rebases_on("github");
+}
+
+#[test]
+fn submitting_a_newly_appended_branch_while_the_stack_rebases_on_gitlab() {
+    submitting_a_newly_appended_branch_while_the_stack_rebases_on("gitlab");
 }
 
 /// Two PR-comment feedback actions on the same PR at once (double click, two
@@ -5062,10 +5080,9 @@ fn pr_comment_feedback_on_a_closed_pr_is_not_applied() {
 
 /// The forge reports a failure for an *old* head SHA after the branch has
 /// moved on: the fix is already in, so no auto-fix may be dispatched.
-#[test]
-fn ci_failure_on_a_stale_sha_does_not_dispatch_a_fix() {
+fn ci_failure_on_a_stale_sha_does_not_dispatch_a_fix_on(kind: &str) {
     let what = "stale CI SHA";
-    let (fx, forge) = Fixture::with_forge(&["feature/a", "feature/b", "feature/c"]);
+    let (fx, forge) = Fixture::with_forge_kind(&["feature/a", "feature/b", "feature/c"], kind);
     fx.submit_stack();
     fx.store
         .lock()
@@ -5110,14 +5127,23 @@ fn ci_failure_on_a_stale_sha_does_not_dispatch_a_fix() {
     fx.assert_forge_routed_everything(what, &forge);
 }
 
+#[test]
+fn ci_failure_on_a_stale_sha_does_not_dispatch_a_fix() {
+    ci_failure_on_a_stale_sha_does_not_dispatch_a_fix_on("github");
+}
+
+#[test]
+fn ci_failure_on_a_stale_sha_does_not_dispatch_a_fix_on_gitlab() {
+    ci_failure_on_a_stale_sha_does_not_dispatch_a_fix_on("gitlab");
+}
+
 /// Both the middle and the top PR fail CI while auto-fix is on: the earlier
 /// PR must be fixed first (the later one is deferred), and its fix reaches
 /// the top PR. The top PR's own head then changes, so the forge's failure for
 /// the old head is stale and needs no fix of its own.
-#[test]
-fn auto_fix_fixes_the_earlier_failing_pr_first() {
+fn auto_fix_fixes_the_earlier_failing_pr_first_on(kind: &str) {
     let what = "two failing PRs";
-    let (fx, forge) = Fixture::with_forge(&["feature/a", "feature/b", "feature/c"]);
+    let (fx, forge) = Fixture::with_forge_kind(&["feature/a", "feature/b", "feature/c"], kind);
     fx.submit_stack();
     fx.store
         .lock()
@@ -5169,6 +5195,16 @@ fn auto_fix_fixes_the_earlier_failing_pr_first() {
     fx.assert_forge_routed_everything(what, &forge);
 }
 
+#[test]
+fn auto_fix_fixes_the_earlier_failing_pr_first() {
+    auto_fix_fixes_the_earlier_failing_pr_first_on("github");
+}
+
+#[test]
+fn auto_fix_fixes_the_earlier_failing_pr_first_on_gitlab() {
+    auto_fix_fixes_the_earlier_failing_pr_first_on("gitlab");
+}
+
 /// A resolver that fixes whichever branch it runs in by committing a file
 /// named after that branch, recording each branch it fixed.
 #[derive(Default)]
@@ -5197,10 +5233,9 @@ impl Runner for BranchFixRunner {
 
 /// A forge reorder (a, c, b) and an upstream push arrive together while a
 /// feedback round is held: the rebuild must take both, in the forge's order.
-#[test]
-fn forge_reorder_and_base_change_together_while_feedback_is_in_flight() {
+fn forge_reorder_and_base_change_together_while_feedback_is_in_flight_on(kind: &str) {
     let what = "forge reorder + base change";
-    let (fx, forge) = Fixture::with_forge(&["feature/a", "feature/b", "feature/c"]);
+    let (fx, forge) = Fixture::with_forge_kind(&["feature/a", "feature/b", "feature/c"], kind);
     fx.submit_stack();
     let unexpected: Unexpected = Arc::default();
     let daemon = DaemonPump::start(&fx);
@@ -5252,12 +5287,21 @@ fn forge_reorder_and_base_change_together_while_feedback_is_in_flight() {
     );
 }
 
+#[test]
+fn forge_reorder_and_base_change_together_while_feedback_is_in_flight() {
+    forge_reorder_and_base_change_together_while_feedback_is_in_flight_on("github");
+}
+
+#[test]
+fn forge_reorder_and_base_change_together_while_feedback_is_in_flight_on_gitlab() {
+    forge_reorder_and_base_change_together_while_feedback_is_in_flight_on("gitlab");
+}
+
 /// A local reorder (the board's drag) lands while a forge reorder is pending
 /// and feedback is held: whichever order wins, no commit may be lost.
-#[test]
-fn forge_reorder_racing_a_local_reorder_loses_no_commit() {
+fn forge_reorder_racing_a_local_reorder_loses_no_commit_on(kind: &str) {
     let what = "forge vs local reorder";
-    let (fx, forge) = Fixture::with_forge(&["feature/a", "feature/b", "feature/c"]);
+    let (fx, forge) = Fixture::with_forge_kind(&["feature/a", "feature/b", "feature/c"], kind);
     fx.submit_stack();
     let unexpected: Unexpected = Arc::default();
     let daemon = DaemonPump::start(&fx);
@@ -5338,13 +5382,22 @@ fn forge_reorder_racing_a_local_reorder_loses_no_commit() {
     fx.assert_forge_routed_everything(what, &forge);
 }
 
+#[test]
+fn forge_reorder_racing_a_local_reorder_loses_no_commit() {
+    forge_reorder_racing_a_local_reorder_loses_no_commit_on("github");
+}
+
+#[test]
+fn forge_reorder_racing_a_local_reorder_loses_no_commit_on_gitlab() {
+    forge_reorder_racing_a_local_reorder_loses_no_commit_on("gitlab");
+}
+
 /// Forge API trouble: the first PR requests of a submission fail with 503
 /// while feedback is in flight. The submission may fail, but a retry must
 /// converge on exactly one PR per branch and no commit is lost.
-#[test]
-fn forge_5xx_during_submission_converges_on_retry() {
+fn forge_5xx_during_submission_converges_on_retry_on(kind: &str) {
     let what = "forge 5xx";
-    let (fx, forge) = Fixture::with_forge(&["feature/a", "feature/b", "feature/c"]);
+    let (fx, forge) = Fixture::with_forge_kind(&["feature/a", "feature/b", "feature/c"], kind);
     let unexpected: Unexpected = Arc::default();
     let _daemon = DaemonPump::start(&fx);
     let mut held = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
@@ -5386,6 +5439,16 @@ fn forge_5xx_during_submission_converges_on_retry() {
     fx.assert_no_unexpected_agent_calls(what, &unexpected);
     fx.assert_forge_routed_everything(what, &forge);
     fx.assert_everything_published(what, &[(1, "feature-b.txt", "feedback on b")], &[]);
+}
+
+#[test]
+fn forge_5xx_during_submission_converges_on_retry() {
+    forge_5xx_during_submission_converges_on_retry_on("github");
+}
+
+#[test]
+fn forge_5xx_during_submission_converges_on_retry_on_gitlab() {
+    forge_5xx_during_submission_converges_on_retry_on("gitlab");
 }
 
 impl Fixture {
@@ -6568,10 +6631,9 @@ fn superseded_ci_cancel_hits_only_the_stale_run_on_gitlab() {
 
 /// A PR is closed on the forge and then reopened while feedback is held and
 /// the base moves: no duplicate PR appears and no commit is lost.
-#[test]
-fn pr_closed_then_reopened_on_the_forge_keeps_one_pr_and_the_feedback() {
+fn pr_closed_then_reopened_on_the_forge_keeps_one_pr_and_the_feedback_on(kind: &str) {
     let what = "PR closed then reopened";
-    let (fx, forge) = Fixture::with_forge(&["feature/a", "feature/b", "feature/c"]);
+    let (fx, forge) = Fixture::with_forge_kind(&["feature/a", "feature/b", "feature/c"], kind);
     fx.submit_stack();
     let unexpected: Unexpected = Arc::default();
     let _daemon = DaemonPump::start(&fx);
@@ -6632,13 +6694,22 @@ fn pr_closed_then_reopened_on_the_forge_keeps_one_pr_and_the_feedback() {
     fx.assert_forge_routed_everything(what, &forge);
 }
 
+#[test]
+fn pr_closed_then_reopened_on_the_forge_keeps_one_pr_and_the_feedback() {
+    pr_closed_then_reopened_on_the_forge_keeps_one_pr_and_the_feedback_on("github");
+}
+
+#[test]
+fn pr_closed_then_reopened_on_the_forge_keeps_one_pr_and_the_feedback_on_gitlab() {
+    pr_closed_then_reopened_on_the_forge_keeps_one_pr_and_the_feedback_on("gitlab");
+}
+
 /// "Sync PR" is hammered (from several threads, repeatedly) while feedback is
 /// held and the base moves. The forge matches the stack, so nothing may be
 /// reordered, republished from a stale view, or lost.
-#[test]
-fn hammered_sync_pr_during_a_race_changes_nothing_it_should_not() {
+fn hammered_sync_pr_during_a_race_changes_nothing_it_should_not_on(kind: &str) {
     let what = "hammered sync-pr";
-    let (fx, forge) = Fixture::with_forge(&["feature/a", "feature/b", "feature/c"]);
+    let (fx, forge) = Fixture::with_forge_kind(&["feature/a", "feature/b", "feature/c"], kind);
     fx.submit_stack();
     let unexpected: Unexpected = Arc::default();
     let daemon = DaemonPump::start(&fx);
@@ -6689,6 +6760,16 @@ fn hammered_sync_pr_during_a_race_changes_nothing_it_should_not() {
         &[(1, "feature-b.txt", "feedback on b")],
         &["upstream1.txt"],
     );
+}
+
+#[test]
+fn hammered_sync_pr_during_a_race_changes_nothing_it_should_not() {
+    hammered_sync_pr_during_a_race_changes_nothing_it_should_not_on("github");
+}
+
+#[test]
+fn hammered_sync_pr_during_a_race_changes_nothing_it_should_not_on_gitlab() {
+    hammered_sync_pr_during_a_race_changes_nothing_it_should_not_on("gitlab");
 }
 
 // ---------------------------------------------------------------------------
