@@ -519,8 +519,8 @@
       }
       // RALPHUS-REVIEW-HIDE:END
       /**
-       * The review's primary action, as a split button: the thing you came to
-       * press, with everything else behind its ▾.
+       * The review's primary action: the thing you came to press, with a ⋯
+       * menu beside it holding everything else.
        *
        * The actions used to sit in a row at the foot of the pane, below the
        * branch stack -- so the one control a reviewer reaches for most was
@@ -538,13 +538,13 @@
           ? { ...reopenButtonView(g.status, pendingMergeActions.has(g.id)), action: "reopenReview" }
           : { ...mergeButtonView(g.status, pendingMergeActions.has(g.id)), action: "mergeReview" };
         const tip = esc(view.tip);
-        const btn = `<button class="btn primary split-main" data-click="${view.action}" data-guardian-id="${esc(g.id)}" `
+        const btn = `<button class="btn primary" data-click="${view.action}" data-guardian-id="${esc(g.id)}" `
           + `data-status="${esc(g.status)}" ${view.enabled ? "" : "disabled"} data-tip="${tip}">${esc(view.label)}</button>`;
         // A disabled <button> swallows mouseover, so its tooltip lives on a
         // wrapper -- the same reason every other gated button here does this.
-        return `<span class="split">${view.enabled ? btn : `<span data-tip="${tip}">${btn}</span>`}`
-          + `<button class="btn primary split-caret" data-click="openReviewTitleMenu" data-guardian-id="${esc(g.id)}" `
-          + `data-tip="Every other action for this review — approving it, its PR stack, and the destructive ones.">▾</button></span>`;
+        return `${view.enabled ? btn : `<span data-tip="${tip}">${btn}</span>`}`
+          + `<button class="icon-btn" data-click="openReviewTitleMenu" data-guardian-id="${esc(g.id)}" `
+          + `data-tip="More actions for this review — logs, setup, approving it, its PR stack, and the destructive ones.">⋯</button>`;
       }
       /**
        * Opens the review's action menu, grouped by what each action acts on:
@@ -590,8 +590,10 @@
         const syncItem = canSync
           ? `<div data-click="syncPrReview" data-guardian-id="${esc(id)}" data-tip="Check GitHub/GitLab for a stack reorder made outside ralphus (e.g. dragging PRs into a new order) and apply it here, retriggering a rebase.\nRuns in the background; watch this review's branch order/status for the result.\nAlso happens automatically every 5 minutes for reviews with an active stack.">⇅ Sync PR order</div>`
           : `<div class="ctx-disabled" data-tip="Not available — a stack reorder can only be detected once this review has an open PR stack (status in_review or merging).">⇅ Sync PR order</div>`;
+        const logsItem = `<div data-click="toggleReviewDock" data-guardian-id="${esc(id)}" data-tip="Open the log drawer docked at the bottom of this review.\nIt follows whatever you select — the whole review, one branch, or one command — and stays open while you work instead of covering the page.">☰ Logs</div>`;
+        const setupItem = `<div data-click="openEditReviewDetails" data-guardian-id="${esc(id)}" data-tip="Edit this review's settings — name, upstream branch, resolver, proof scope, build/squash options, PR settings.\nEnvironment overrides live on each section's ⋯, next to the commands they govern.\nNothing takes effect until you click Save; Save applies every change in a single request and triggers at most one rebase.">✎ Setup</div>`;
         menu.innerHTML = `<div class="ctx-group">review</div>`
-          + approveItem + submitItem + syncItem + stopItem
+          + logsItem + setupItem + approveItem + submitItem + syncItem + stopItem
           + `<div class="ctx-sep"></div><div class="ctx-group">stack</div>`
           + stacksItem + cancelItem;
         document.body.appendChild(menu);
@@ -1847,9 +1849,7 @@ Turn them on in this review's setup.">Deferred follow-ups: follow-ups off</butto
           + `<span class="setup-chip ident hc-anchor" data-card="gCombinedWorktree" data-guardian-id="${esc(g.id)}">`
           + `<span class="sc-k">review branch</span><b>${esc(g.review_branch || "—")}</b></span>`
           + `</div>`
-          + `<button class="btn setup-edit" data-click="openEditReviewDetails" data-guardian-id="${esc(g.id)}" `
-          + `data-tip="Edit this review's settings — name, upstream, resolver, proof scope, build and squash options, PR settings.\nEvery chip to the left opens this same editor, landing on the setting it shows.\nEnvironment overrides are not here: each section's ⋯ edits the environment its own commands run in.\nNothing takes effect until you click Save; Save applies every change in one request and triggers at most one rebase.">`
-          + `✎ Edit setup</button>${followupButtonHtml(g)}</div>`;
+          + `${followupButtonHtml(g)}</div>`;
       }
 
       /**
@@ -1978,8 +1978,6 @@ Turn them on in this review's setup.">Deferred follow-ups: follow-ups off</butto
               ${reviewCostChip(g)}
               <div class="cmd-actions">
                 ${watchersHtml(`guardian:${g.id}`)}
-                <button class="icon-btn" data-click="toggleReviewDock" data-guardian-id="${esc(g.id)}" data-tip="Open the log drawer docked at the bottom of this review.\nIt follows whatever you select — the whole review, one branch, or one command — and stays open while you work instead of covering the page.">☰ Logs</button>
-                <button class="icon-btn" data-click="openEditReviewDetails" data-guardian-id="${esc(g.id)}" data-tip="Edit this review's settings — name, upstream branch, resolver, proof scope, build/squash options, PR settings.\nEnvironment overrides live on each section's ⋯, next to the commands they govern.\nNothing takes effect until you click Save; Save applies every change in a single request and triggers at most one rebase.">✎ Setup</button>
                 ${reviewPrimaryAction(g)}
               </div>
             </div>
