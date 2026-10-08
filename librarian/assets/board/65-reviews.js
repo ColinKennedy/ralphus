@@ -1738,9 +1738,11 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        * @param {string} gid - The review id.
        * @param {PendingFollowupItem} it - The follow-up.
        * @param {boolean} frozen - Whether the merge-time offer already exists.
+       * @param {string|null|undefined} offerStatus - The offer's status, if any.
+       * @param {string|null|undefined} squadId - The squad the accepted offer created, if any.
        * @returns {string}
        */
-      function followupCardHtml(gid, it, frozen) {
+      function followupCardHtml(gid, it, frozen, offerStatus, squadId) {
         const branch = it.branch
           ? `<span class="fu-chip mono" data-tip="The review branch whose work deferred this note.">⎇ ${esc(it.branch)}</span>`
           : `<span class="fu-chip" data-tip="The cell that deferred this note is gone, so its branch is no longer known.">branch unknown</span>`;
@@ -1753,6 +1755,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         const status = it.ignored
           ? `<span class="fu-chip fu-ignored" data-tip="This note is left out of the follow-ups made when the review merges.">Ignored</span>`
           : "";
+        const squad = frozen && !it.ignored ? followupSquadHtml(offerStatus, squadId) : "";
         const action = frozen
           ? `<span class="fu-status ${it.ignored ? "off" : ""}" data-tip="${it.ignored ? "This note was left out of the offer made when the review merged." : "This note was included in the offer made when the review merged."}">${it.ignored ? "Ignored" : "Offered"}</span>`
           : `<button class="btn fu-btn" data-click="${it.ignored ? "unignoreFollowup" : "ignoreFollowup"}" data-guardian-id="${esc(gid)}" data-prophecy-id="${it.prophecy_id}" data-tip="${it.ignored ? "Offer this note again when the review merges.\nClick to re-enable it." : "Leave this note out of the follow-ups made when the review merges.\nYou can re-enable it later."}">${it.ignored ? "Re-enable" : "Ignore"}</button>`;
@@ -1761,7 +1764,26 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           : "";
         return `<div class="fu-card ${it.ignored ? "ignored" : ""}" data-tip="${esc(`Deferred by ${it.entity_uri}`)}">`
           + `<div class="fu-head"><div class="fu-title">${esc(it.body)}</div>${action}</div>`
-          + `<div class="fu-meta">${status}${branch}${task}${agent}</div>${prompt}</div>`;
+          + `<div class="fu-meta">${status}${branch}${task}${agent}${squad}</div>${prompt}</div>`;
+      }
+      /**
+       * The chip tying an offered follow-up to the squad it produced: a link
+       * once the squad exists, otherwise an honest pending/declined/failed state.
+       * @param {string|null|undefined} offerStatus - The offer's status, if any.
+       * @param {string|null|undefined} squadId - The created squad's id, if any.
+       * @returns {string}
+       */
+      function followupSquadHtml(offerStatus, squadId) {
+        if (squadId) {
+          return `<span class="fu-chip mono" role="link" style="cursor:pointer;color:var(--accent)" data-click="openFollowupSquad" data-squad-id="${esc(squadId)}" data-tip="Open the follow-up squad created from this note on the Squads tab.\nAll accepted notes of this review share one squad.">→ ${esc(squadId)}</span>`;
+        }
+        if (offerStatus === "declined") {
+          return `<span class="fu-chip" data-tip="The offer was declined, so no squad was created for this note.">No squad (declined)</span>`;
+        }
+        if (offerStatus === "accepted") {
+          return `<span class="fu-chip fu-ignored" data-tip="The offer was accepted but no squad was recorded, so creating it may have failed.\nCheck the review's mailbox messages, or accept the offer again.">Squad creation failed</span>`;
+        }
+        return `<span class="fu-chip" data-tip="The offer has not been accepted yet, so no squad exists for this note.">Squad pending</span>`;
       }
       /**
        * Renders the follow-up list modal body: a plain-language intro, then
@@ -1774,7 +1796,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         const intro = data.offered
           ? "This review has already merged and made its follow-up offer, so this list is final."
           : "When this review merges, each follow-up below becomes a new task in a follow-up squad. Keep the ones you want built and ignore the rest.";
-        const cards = data.items.map((it) => followupCardHtml(gid, it, data.offered)).join("");
+        const cards = data.items.map((it) => followupCardHtml(gid, it, data.offered, data.offer_status, data.offer_squad_id)).join("");
         return `<p class="fu-intro">${intro}</p>`
           + (cards ? `<div class="fu-list">${cards}</div>` : `<div class="empty">No deferred follow-ups.</div>`);
       }

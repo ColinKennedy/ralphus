@@ -27,7 +27,7 @@ const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replac
 const menuItem = new Function("esc", `${functionSource("followupMenuItem")}; return followupMenuItem;`)(esc);
 const list = new Function(
   "esc",
-  `${functionSource("followupCardHtml")}; ${functionSource("followupListHtml")}; return followupListHtml;`,
+  `${functionSource("followupSquadHtml")}; ${functionSource("followupCardHtml")}; ${functionSource("followupListHtml")}; return followupListHtml;`,
 )(esc);
 
 const summary = (o) => ({ enabled: true, off: false, offered: false, count: 0, total: 0, ...o });
