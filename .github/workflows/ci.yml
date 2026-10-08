@@ -81,10 +81,10 @@ jobs:
         if: matrix.suite == 'full'
         env:
           RALPHUS_GUARD_HOLD_PANIC_MS: "8000"
-        # The review-input race suite (daemon/tests/review_input_races.rs, well
-        # over a hundred real-git scenarios) runs in its own `review-races` job
-        # below, in parallel with this one, so it does not lengthen this job.
-        run: cargo "+${{ matrix.toolchain }}" nextest run --workspace --all-targets -E 'not binary(review_input_races)'
+        # The review-input race suite (daemon/tests/review_input_races.rs) is
+        # excluded from this default run by `.config/nextest.toml`
+        # (`default-filter`); it runs in the `review-races` job below.
+        run: cargo "+${{ matrix.toolchain }}" nextest run --workspace --all-targets
       - name: Doctests
         if: matrix.suite == 'full'
         run: cargo "+${{ matrix.toolchain }}" test --doc --workspace
@@ -434,7 +434,7 @@ jobs:
       # The ~15-minute eight-branch soak (`soak_*`) runs in its own
       # `review-race-soak` job instead, in parallel with this one.
       - name: Rust review-input race stress
-        run: cargo nextest run -p ralphus-daemon --test review_input_races --run-ignored only -E 'not test(/^soak_/)'
+        run: cargo nextest run -P review-races -p ralphus-daemon --run-ignored only -E 'not test(/^soak_/)'
       # WS-D.8: the submit path's worst store-lock hold. Not #[ignore]d -- it
       # runs in the default suite too -- but repeated here so a regression is
       # attributed to the perf job rather than looking like an unrelated flake.
@@ -492,7 +492,7 @@ jobs:
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
       - name: Rust review-input race soak
-        run: cargo nextest run -p ralphus-daemon --test review_input_races --run-ignored only -E 'test(/^soak_/)'
+        run: cargo nextest run -P review-races -p ralphus-daemon --run-ignored only -E 'test(/^soak_/)'
 
   # The review-input race suite: every input to a review (feedback, PR fixes,
   # reviewer pushes, commits made by hand, upstream moves, forge events, user
@@ -507,6 +507,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
@@ -514,13 +515,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
-      # Same value and reasoning as the `rust` job's Test step: integration
-      # test binaries use the 2,000 ms store-guard hold limit by default, which
-      # a busy shared runner can cross with no blocking I/O under the lock.
+      # RALPHUS_GUARD_HOLD_PANIC_MS: integration test binaries use a 2,000 ms
+      # store-guard hold limit by default, which a busy shared runner can cross
+      # with no blocking I/O under the lock (the `rust` job raises it to 8,000).
+      # This suite runs dozens of real-git daemons at once, and on windows-latest
+      # a WAL checkpoint alone has taken over 10 s, so the limit is higher still.
+      # --no-fail-fast: report every failing scenario in one run.
       - name: Review-input race suite
         env:
-          RALPHUS_GUARD_HOLD_PANIC_MS: "8000"
-        run: cargo nextest run -p ralphus-daemon --test review_input_races
+          RALPHUS_GUARD_HOLD_PANIC_MS: "30000"
+        run: cargo nextest run -P review-races -p ralphus-daemon --no-fail-fast
 
   bench-patience:
     name: Bench patience comment lint

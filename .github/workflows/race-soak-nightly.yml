@@ -5,8 +5,8 @@ name: Race soak (nightly)
 # it picks a fresh seed each night, runs seeded rounds of concurrent writers
 # (feedback, PR fixes, reviewer pushes, upstream moves) for the time box, and
 # prints `RACE SOAK SEED: <n>` up front. A failure is replayed locally with
-# `RALPHUS_RACE_SEED=<n> RALPHUS_RACE_NIGHTLY=1 cargo nextest run -p
-# ralphus-daemon --test review_input_races --run-ignored only -E
+# `RALPHUS_RACE_SEED=<n> RALPHUS_RACE_NIGHTLY=1 cargo nextest run
+# -P review-races -p ralphus-daemon --run-ignored only -E
 # 'test(soak_randomly_seeded_time_boxed)'`.
 
 on:
@@ -44,6 +44,6 @@ jobs:
           RALPHUS_RACE_SOAK_SECONDS: ${{ inputs.seconds || '3000' }}
           RALPHUS_RACE_SEED: ${{ inputs.seed }}
         run: >
-          cargo nextest run -p ralphus-daemon --test review_input_races
+          cargo nextest run -P review-races -p ralphus-daemon
           --run-ignored only --no-capture
           -E 'test(soak_randomly_seeded_time_boxed)'

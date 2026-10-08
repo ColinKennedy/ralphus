@@ -6,6 +6,13 @@
 //! guardian entry points with fake resolver agents, and asserts that each
 //! input's commit is still on the branch afterwards -- locally *and*, where a
 //! push is involved, on the remote ref a PR would show.
+//!
+//! **Not part of the default test run.** ~140 real-git scenarios (~25
+//! CPU-minutes) are excluded from every plain `cargo nextest run`, including
+//! `--workspace --all-targets`, by `.config/nextest.toml`'s `default-filter`.
+//! Run them only on purpose, through their own profile:
+//! `cargo nextest run -P review-races -p ralphus-daemon [-E 'test(name)']`
+//! (add `--run-ignored only` for the `soak_*` tests).
 
 mod common;
 
@@ -43,6 +50,10 @@ fn ensure_hermetic_environment() {
         .args(std::env::args().skip(1))
         .env("RALPHUS_RACE_HERMETIC", "1")
         .env("RALPHUS_CONFIG_HOME", &home)
+        // No real agent runner: a developer's PATH may have `ralphus-runner`, a
+        // CI box does not, and these tests must behave the same on both. Any
+        // path that falls through to the production runner fails loudly.
+        .env("RALPHUS_RUNNER_CMD", "ralphus-runner-absent-in-race-tests")
         .env_remove("RALPHUS_CONFIGURATION_PATH")
         .current_dir(&home)
         .status()
@@ -4128,7 +4139,23 @@ fn first_pr_submission_racing_feedback_and_an_upstream_rebase_on(kind: &str) {
     };
     std::thread::sleep(PARK_WAIT);
     held.finish();
-    let submitted = submitting.join().expect("submit thread");
+    let mut submitted = submitting.join().expect("submit thread");
+    // The held round and the submission both create the same new remote branch;
+    // whichever loses git's atomic ref creation ("reference already exists")
+    // fails that submission. A user retries, and the retry must converge.
+    for _ in 0..3 {
+        if submitted.is_ok() {
+            break;
+        }
+        submitted = ralphus_daemon::pr::submit_pull_requests(
+            &fx.store,
+            &NoAgentExpected,
+            &fx.id,
+            stack_request(),
+            "tester",
+            false,
+        );
+    }
     assert!(submitted.is_ok(), "{what}: submit failed: {submitted:?}");
 
     fx.wait_settled_on(&upstream, what);
@@ -5657,6 +5684,21 @@ fn disabling_a_branch_with_a_held_feedback_round_then_reenabling() {
     held.finish();
     fx.wait_built_on(&upstream, "while disabled");
     arrange(&fx, &daemon, "feature/b", true);
+    // The review is already idle on the new base, so "built on upstream" is
+    // true before the re-enable's rebuild even starts: wait for b's work to
+    // reappear above it first.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !fx
+        .try_review_ref(2)
+        .is_some_and(|rev| fx.files_on(&fx.root, &rev).contains("feature-b.txt"))
+    {
+        assert!(
+            Instant::now() < deadline,
+            "{what}: b never came back into the stack\n{}",
+            fx.describe()
+        );
+        std::thread::sleep(SETTLE_POLL);
+    }
     fx.wait_built_on(&upstream, what);
     fx.assert_no_unexpected_agent_calls(what, &unexpected);
     fx.assert_review_branches(
@@ -6410,10 +6452,15 @@ fn crash_mid_conflict_resolution_is_finished_by_the_restarted_daemon() {
     let db = fx.root.join(".git").join("ralphus-test.db");
     fx.store = Arc::new(StoreMutex::new(Store::open(&db).unwrap()));
     let daemon = DaemonPump::start_resolving(&fx, &unexpected);
-    ralphus_daemon::scheduler::recover_interrupted_reviews(
-        &fx.store,
-        &daemon.sem,
-        &daemon.cancellations,
+    // Startup recovery (`recover_interrupted_reviews`) resumes with the
+    // production runner, which has no agent here; resume the interrupted merge
+    // the way a user's "Merge / rebase" does, with the stand-in resolver.
+    ralphus_daemon::guardian_merge::restart_guardian_merge(
+        Arc::clone(&fx.store),
+        daemon.cancellations.clone(),
+        Arc::new(UnionResolver(Arc::clone(&unexpected))),
+        &fx.id,
+        Arc::clone(&daemon.sem),
     );
     fx.wait_settled_on(&upstream, what);
     fx.assert_review_branches(

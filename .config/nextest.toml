@@ -1,4 +1,14 @@
+# The review-input race suite (daemon/tests/review_input_races.rs) is ~140
+# real-git scenarios (~25 CPU-minutes) and is deliberately NOT part of the
+# default run: a plain `cargo nextest run [--workspace] [--all-targets]` skips
+# it. It runs only under its own profile, `-P review-races` (CI's
+# `review-races` and `review-race-soak` jobs, the nightly soak workflow, and
+# anyone who means to run it). Agents: do not run it unless asked to.
 [profile.default]
+default-filter = "not binary(review_input_races)"
+
+[profile.review-races]
+default-filter = "binary(review_input_races)"
 
 [[profile.default.overrides]]
 filter = "test(rapid_upstream_commits_coalesce_into_a_single_debounced_rebuild)"
