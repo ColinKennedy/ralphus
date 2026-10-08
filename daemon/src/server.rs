@@ -12116,6 +12116,45 @@ fn detach_and_open_agent(
     )
 }
 
+/// The specific run a Live View request names via `?task=…&cell_id=…`, after
+/// checking it belongs to `branch_id`. `Ok(None)` when the query names no run
+/// (the caller falls back to [`resolver_task_and_cell_id`]). Shared by the
+/// `/pane` liveness probe and the `/pane-transcript` content read so both
+/// resolve the same session: a feedback run's cell id carries a per-run
+/// timestamp, so the branch-level default can never name it.
+fn requested_branch_run<'q>(
+    daemon: &Daemon,
+    id: &str,
+    branch_id: &str,
+    query: &'q str,
+) -> std::result::Result<Option<(&'q str, &'q str)>, Reply> {
+    let (Some(task), Some(cell_id)) = (query_param(query, "task"), query_param(query, "cell_id"))
+    else {
+        return Ok(None);
+    };
+    match daemon.with_read_snapshot(|conn| Store::guardian_branches_conn(conn, id)) {
+        Ok(branches) if branches.iter().any(|branch| branch.id == branch_id) => {}
+        Ok(_) => return Err(error(404, "not_found", "no such branch", vec![])),
+        Err(e) => return Err(store_error(&e)),
+    }
+    let valid = match task {
+        crate::guardian_merge::RESOLVER_TASK => {
+            cell_id.starts_with(&format!("resolver-{branch_id}-"))
+        }
+        crate::guardian_merge::RESOLVER_PROOF_TASK => {
+            cell_id.starts_with(&format!("resolver-proof-{branch_id}-"))
+        }
+        crate::guardian_merge::FEEDBACK_TASK => {
+            cell_id.starts_with(&format!("feedback-{branch_id}-"))
+        }
+        _ => false,
+    };
+    if !valid {
+        return Err(error(404, "not_found", "no such branch run", vec![]));
+    }
+    Ok(Some((task, cell_id)))
+}
+
 /// The live pane content of a review branch's conflict-resolver tmux
 /// cell, for the auto-refreshing "read-only terminal" peek view in the
 /// Review tab (RAL-102).
@@ -12128,6 +12167,13 @@ fn guardian_branch_pane(daemon: &Daemon, id: &str, branch_id: &str, query: &str)
     // `resolver_task_and_cell_id` also picks the dedicated final-proof
     // cell while the branch is `proof_pending`, so this peek view tracks
     // whichever call is actually live.
+    match requested_branch_run(daemon, id, branch_id, query) {
+        Ok(Some((task, cell_id))) => {
+            return capture_pane_reply(daemon, &format!("guardian-{id}"), task, cell_id, query);
+        }
+        Ok(None) => {}
+        Err(e) => return e,
+    }
     let (task, cell_id) = match resolver_task_and_cell_id(daemon, id, branch_id) {
         Ok(v) => v,
         Err(e) => return e,
@@ -12145,29 +12191,12 @@ fn guardian_branch_pane_transcript(
     branch_id: &str,
     query: &str,
 ) -> Reply {
-    if let (Some(task), Some(cell_id)) = (query_param(query, "task"), query_param(query, "cell_id"))
-    {
-        match daemon.with_read_snapshot(|conn| Store::guardian_branches_conn(conn, id)) {
-            Ok(branches) if branches.iter().any(|branch| branch.id == branch_id) => {}
-            Ok(_) => return error(404, "not_found", "no such branch", vec![]),
-            Err(e) => return store_error(&e),
+    match requested_branch_run(daemon, id, branch_id, query) {
+        Ok(Some((task, cell_id))) => {
+            return pane_transcript_range_reply(&format!("guardian-{id}"), task, cell_id, query);
         }
-        let valid = match task {
-            crate::guardian_merge::RESOLVER_TASK => {
-                cell_id.starts_with(&format!("resolver-{branch_id}-"))
-            }
-            crate::guardian_merge::RESOLVER_PROOF_TASK => {
-                cell_id.starts_with(&format!("resolver-proof-{branch_id}-"))
-            }
-            crate::guardian_merge::FEEDBACK_TASK => {
-                cell_id.starts_with(&format!("feedback-{branch_id}-"))
-            }
-            _ => false,
-        };
-        if !valid {
-            return error(404, "not_found", "no such branch run", vec![]);
-        }
-        return pane_transcript_range_reply(&format!("guardian-{id}"), task, cell_id, query);
+        Ok(None) => {}
+        Err(e) => return e,
     }
     let (task, cell_id) = match resolver_task_and_cell_id(daemon, id, branch_id) {
         Ok(v) => v,
@@ -26755,6 +26784,28 @@ remediation_attempts=1
         assert_eq!(v["start"], 3);
 
         crate::terminal_log::delete_for_session(&name);
+    }
+
+    #[test]
+    fn guardian_branch_pane_route_validates_the_requested_run() {
+        // The Live View probes liveness with the same `task`/`cell_id` it
+        // reads content with; a run belonging to another branch is refused
+        // instead of being probed.
+        let d = daemon();
+        let id = d.lock().create_guardian("g", "main", "/r").unwrap();
+        d.lock().add_guardian_branch(&id, "feature/a").unwrap();
+        let branch_id = d.lock().guardian_branches(&id).unwrap()[0].id.clone();
+        let foreign = route(
+            &d,
+            "GET",
+            &format!(
+                "/api/guardians/{id}/branches/{branch_id}/pane?task={}&cell_id=feedback-branch-other-1",
+                crate::guardian_merge::FEEDBACK_TASK
+            ),
+            "",
+        );
+        assert_eq!(foreign.status, 404, "{}", foreign.body);
+        assert!(foreign.body.contains("no such branch run"));
     }
 
     #[test]
