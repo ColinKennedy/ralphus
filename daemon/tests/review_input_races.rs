@@ -3865,3 +3865,324 @@ fn forge_reorder_racing_an_in_flight_feedback_round() {
         fx.describe()
     );
 }
+
+// ---------------------------------------------------------------------------
+// More forge-side stack events racing in-flight feedback.
+// ---------------------------------------------------------------------------
+
+impl Fixture {
+    /// "Merge" the PR at position `p` on the forge: its branch (with everything
+    /// below it) lands on upstream `main` and the fake PR flips to merged.
+    /// Returns the new upstream tip.
+    fn merge_pr_on_forge(&self, forge: &FakeGitHub, p: usize) -> String {
+        let (_, alias) = self.open_pr_row(p);
+        let number = forge.pr_for(&alias).number;
+        let clone = temp_dir();
+        let _ = std::fs::remove_dir_all(&clone);
+        git(
+            clone.parent().unwrap(),
+            &[
+                "clone",
+                "-q",
+                "--branch",
+                "main",
+                self.remote.to_str().unwrap(),
+                clone.file_name().unwrap().to_str().unwrap(),
+            ],
+        );
+        git(
+            &clone,
+            &[
+                "merge",
+                "--no-ff",
+                "-m",
+                &format!("Merge PR {p}"),
+                &format!("origin/{alias}"),
+            ],
+        );
+        git(&clone, &["push", "-q", "origin", "main"]);
+        let sha = git(&clone, &["rev-parse", "HEAD"]).trim().to_string();
+        let _ = std::fs::remove_dir_all(&clone);
+        forge.with_pr(number, |pr| {
+            pr.open = false;
+            pr.merged = true;
+        });
+        sha
+    }
+
+    fn merge_statuses(&self) -> Vec<String> {
+        self.store
+            .lock()
+            .get_guardian(&self.id)
+            .unwrap()
+            .branches
+            .iter()
+            .map(|b| b.merge_status.clone())
+            .collect()
+    }
+}
+
+/// The middle PR is merged on the forge (carrying the bottom one's commits
+/// with it) while a feedback round on the top branch is in flight: both
+/// merged branches must be recognised, and the top PR keeps its feedback on
+/// the new base.
+#[test]
+fn middle_pr_merged_on_the_forge_while_feedback_is_in_flight() {
+    let what = "middle PR merged on forge";
+    let (fx, forge) = Fixture::with_forge(&["feature/a", "feature/b", "feature/c"]);
+    fx.submit_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    fx.wait_settled_on(first.trim(), "before the merge");
+
+    let mut held = Held::new("feature-c.txt", "feedback on c", &unexpected).feedback(&fx, 2);
+    let upstream = fx.merge_pr_on_forge(&forge, 1);
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+
+    fx.wait_settled_on(&upstream, what);
+    let statuses = fx.merge_statuses();
+    assert_eq!(
+        statuses[..2],
+        ["merged", "merged"],
+        "{what}: {statuses:?}\n{}",
+        fx.describe()
+    );
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_forge_routed_everything(what, &forge);
+    fx.assert_everything_published(what, &[(2, "feature-c.txt", "feedback on c")], &[]);
+}
+
+/// Every PR in the stack is merged on the forge while a feedback round on the
+/// top branch is held. No late push may revive a merged PR branch.
+#[test]
+fn every_pr_merged_on_the_forge_while_feedback_is_in_flight() {
+    let what = "all PRs merged on forge";
+    let (fx, forge) = Fixture::with_forge(&["feature/a", "feature/b", "feature/c"]);
+    fx.submit_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    fx.wait_settled_on(first.trim(), "before the merge");
+    let aliases: Vec<String> = (0..3).map(|p| fx.open_pr_row(p).1).collect();
+    let tips_before: Vec<String> = aliases.iter().map(|a| fx.remote_tip(a)).collect();
+
+    let mut held = Held::new("feature-c.txt", "feedback on c", &unexpected).feedback(&fx, 2);
+    let upstream = fx.merge_pr_on_forge(&forge, 2);
+    for number in 1..=3 {
+        forge.with_pr(number, |pr| {
+            pr.open = false;
+            pr.merged = true;
+        });
+    }
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+    // Not `wait_settled_on`: the top branch's review commit is never pushed
+    // (its PR is merged), which that helper treats as unsettled.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let view = fx.store.lock().get_guardian(&fx.id).unwrap();
+        if view.status == "in_review"
+            && view.base_commit.is_some_and(|b| b.trim() == upstream)
+            && fx.merge_statuses()[..2].iter().all(|s| s == "merged")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what}: never settled\n{}",
+            fx.describe()
+        );
+        std::thread::sleep(SETTLE_POLL);
+    }
+    std::thread::sleep(PARK_WAIT * 4);
+    let statuses = fx.merge_statuses();
+    assert!(
+        statuses[..2].iter().all(|s| s == "merged"),
+        "{what}: merged branches not recognised: {statuses:?}\n{}",
+        fx.describe()
+    );
+    // The fully merged branches must not be revived. The top branch's late
+    // feedback commit is new, unmerged work, so it may be published again --
+    // under a fresh PR -- but then it must carry the feedback.
+    for p in 0..2 {
+        assert_eq!(
+            fx.remote_tip(&aliases[p]),
+            tips_before[p],
+            "{what}: a late push moved merged PR branch {p}\n{}",
+            fx.describe()
+        );
+    }
+    let kept = fx.file_on(&fx.root, &fx.review_ref(2), "feature-c.txt");
+    assert!(
+        kept.contains("feedback on c"),
+        "{what}: the review branch lost its feedback ({kept:?})\n{}",
+        fx.describe()
+    );
+    if fx.remote_tip(&aliases[2]) != tips_before[2] {
+        let published = fx.file_on(
+            &fx.remote,
+            &format!("refs/heads/{}", aliases[2]),
+            "feature-c.txt",
+        );
+        assert!(
+            published.contains("feedback on c"),
+            "{what}: the top PR branch moved without the feedback\n{}",
+            fx.describe()
+        );
+    }
+    fx.assert_forge_routed_everything(what, &forge);
+}
+
+/// A PR is closed (not merged) on the forge while feedback on its branch is
+/// held. The feedback is committed to the review branch, and must not be
+/// pushed onto the closed PR's branch.
+#[test]
+fn pr_closed_on_the_forge_while_feedback_is_in_flight() {
+    let what = "PR closed on forge";
+    let (fx, forge) = Fixture::with_forge(&["feature/a", "feature/b", "feature/c"]);
+    fx.submit_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    fx.wait_settled_on(first.trim(), "before the close");
+    let (_, alias_b) = fx.open_pr_row(1);
+    let tip_b = fx.remote_tip(&alias_b);
+    let number_b = forge.pr_for(&alias_b).number;
+
+    let mut held = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    forge.with_pr(number_b, |pr| pr.open = false);
+    // The daemon only learns of a close when it next checks the forge (a
+    // submission pass does); until then it rightly still treats the PR as open.
+    fx.submit_stack();
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+    std::thread::sleep(PARK_WAIT * 4);
+
+    // Whether feedback should still publish the review branch under its own
+    // name once its PR is closed is an open product question (see
+    // RACES_FOLLOWUP.local.md); what must hold either way is that the closed
+    // PR is not resubmitted and the feedback is not dropped.
+    let _ = tip_b;
+    let open: Vec<u64> = forge
+        .state
+        .lock()
+        .unwrap()
+        .prs
+        .iter()
+        .filter(|p| p.open)
+        .map(|p| p.number)
+        .collect();
+    assert!(
+        !open.contains(&number_b) && open.len() == 2,
+        "{what}: a closed PR was reopened or resubmitted: {open:?}\n{}",
+        fx.describe()
+    );
+    let kept = fx.file_on(&fx.root, &fx.review_ref(1), "feature-b.txt");
+    assert!(
+        kept.contains("feedback on b"),
+        "{what}: the review branch lost its feedback ({kept:?})\n{}",
+        fx.describe()
+    );
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_forge_routed_everything(what, &forge);
+}
+
+/// A reviewer reorders the stack on the forge and then puts it back (A→B→A)
+/// while a feedback round is held. The final order wins and no commit is lost.
+#[test]
+fn two_forge_reorders_back_to_back_while_feedback_is_in_flight() {
+    let what = "back-to-back forge reorders";
+    let (fx, forge) = Fixture::with_forge(&["feature/a", "feature/b", "feature/c"]);
+    fx.submit_stack();
+    let unexpected: Unexpected = Arc::default();
+    let daemon = DaemonPump::start(&fx);
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    fx.wait_settled_on(first.trim(), "before the reorders");
+    let (_, alias_a) = fx.open_pr_row(0);
+    let (_, alias_b) = fx.open_pr_row(1);
+    let (_, alias_c) = fx.open_pr_row(2);
+    let (number_b, number_c) = (forge.pr_for(&alias_b).number, forge.pr_for(&alias_c).number);
+
+    let mut held = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    let reorder = || {
+        ralphus_daemon::pr::check_and_apply_forge_reorder(
+            &fx.store,
+            &NoAgentExpected,
+            &fx.id,
+            &daemon.sem,
+            &daemon.cancellations,
+        )
+    };
+    // a, c, b ...
+    forge.with_pr(number_c, |pr| {
+        pr.base = alias_a.clone();
+        pr.updated_at = "2099-01-01T00:00:00Z".to_string();
+    });
+    forge.with_pr(number_b, |pr| {
+        pr.base = alias_c.clone();
+        pr.updated_at = "2099-01-01T00:00:00Z".to_string();
+    });
+    reorder();
+    // ... and straight back to a, b, c.
+    forge.with_pr(number_b, |pr| {
+        pr.base = alias_a.clone();
+        pr.updated_at = "2099-01-02T00:00:00Z".to_string();
+    });
+    forge.with_pr(number_c, |pr| {
+        pr.base = alias_b.clone();
+        pr.updated_at = "2099-01-02T00:00:00Z".to_string();
+    });
+    reorder();
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+    for _ in 0..8 {
+        reorder();
+        std::thread::sleep(SETTLE_POLL);
+    }
+
+    fx.wait_settled_on(first.trim(), what);
+    let order: Vec<String> = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .branches
+        .iter()
+        .map(|b| b.branch.clone())
+        .collect();
+    assert_eq!(
+        order,
+        ["feature/a", "feature/b", "feature/c"],
+        "{what}: {}",
+        fx.describe()
+    );
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_forge_routed_everything(what, &forge);
+    fx.assert_everything_published(what, &[(1, "feature-b.txt", "feedback on b")], &[]);
+}
