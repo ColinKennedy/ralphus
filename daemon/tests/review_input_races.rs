@@ -5682,23 +5682,31 @@ fn disabling_a_branch_with_a_held_feedback_round_then_reenabling() {
     std::thread::sleep(PARK_WAIT);
     arrange(&fx, &daemon, "feature/b", false);
     held.finish();
+    // Each phase is waited for by what it produces, not by "the review is idle
+    // on the new base": that is already true before either rebuild starts, and
+    // two overlapping merges then settle in an order that varies by machine.
+    let wait_for_top = |what_for: &str, want_b: bool| {
+        let deadline = Instant::now() + Duration::from_secs(180);
+        loop {
+            let status = fx.store.lock().get_guardian(&fx.id).unwrap().status;
+            let top_has_b = fx
+                .try_review_ref(2)
+                .is_some_and(|rev| fx.files_on(&fx.root, &rev).contains("feature-b.txt"));
+            if status == "in_review" && top_has_b == want_b {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{what}: never {what_for}\n{}",
+                fx.describe()
+            );
+            std::thread::sleep(SETTLE_POLL);
+        }
+    };
+    wait_for_top("rebuilt without the disabled branch", false);
     fx.wait_built_on(&upstream, "while disabled");
     arrange(&fx, &daemon, "feature/b", true);
-    // The review is already idle on the new base, so "built on upstream" is
-    // true before the re-enable's rebuild even starts: wait for b's work to
-    // reappear above it first.
-    let deadline = Instant::now() + Duration::from_secs(120);
-    while !fx
-        .try_review_ref(2)
-        .is_some_and(|rev| fx.files_on(&fx.root, &rev).contains("feature-b.txt"))
-    {
-        assert!(
-            Instant::now() < deadline,
-            "{what}: b never came back into the stack\n{}",
-            fx.describe()
-        );
-        std::thread::sleep(SETTLE_POLL);
-    }
+    wait_for_top("rebuilt with the re-enabled branch", true);
     fx.wait_built_on(&upstream, what);
     fx.assert_no_unexpected_agent_calls(what, &unexpected);
     fx.assert_review_branches(
