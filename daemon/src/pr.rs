@@ -13097,7 +13097,30 @@ mod tests {
             "branch a (the anchor) must be left untouched"
         );
         let remote_b = g(&remote_dir, &["rev-parse", "pr-b"]).trim().to_string();
-        assert_ne!(remote_b, ghost_b, "branch b must have been rebuilt");
+        let view = store.lock().get_guardian(&gid).unwrap();
+        let local_b = g(
+            &root,
+            &[
+                "rev-parse",
+                view.branches[1].review_branch.as_deref().unwrap(),
+            ],
+        )
+        .trim()
+        .to_string();
+        assert_ne!(
+            remote_b,
+            ghost_b,
+            "branch b must have been rebuilt (local b={local_b} status={} detail={:?} \
+             last_pushed={:?} sha_a={sha_a} log={})",
+            view.branches[1].merge_status,
+            view.branches[1].detail,
+            store
+                .lock()
+                .get_pull_request(&pr_b)
+                .unwrap()
+                .last_pushed_sha,
+            g(&root, &["log", "--format=%h %p %s", "-4", &local_b]).replace('\n', " | "),
+        );
         assert!(
             Command::new("git")
                 .current_dir(&root)

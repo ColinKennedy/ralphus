@@ -14368,7 +14368,8 @@ fn drive_rebase(
                     crate::rlog!(
                         INFO,
                         "ralphus [guardian] review {id} rerere-autoupdate fast-path \
-                         branch={feature:?} (staged by rerere, no agent needed)"
+                         branch={feature:?} (staged by rerere, no agent needed); rebase \
+                         stopped with: {e}"
                     );
                     let guard = store.lock();
                     let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
@@ -14381,7 +14382,7 @@ fn drive_rebase(
                         cell_id: None,
                         task: None,
                         log_path: None,
-                        payload: serde_json::json!({"branch": feature}),
+                        payload: serde_json::json!({"branch": feature, "rebase_error": e}),
                         admin_only: false,
                     });
                 }
