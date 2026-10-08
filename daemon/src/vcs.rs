@@ -31,7 +31,7 @@
 
 use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 /// The VCS kind assumed when a project's kind is unknown or unregistered.
@@ -162,7 +162,9 @@ impl GitVcs {
     /// reason `std::process::Command::output()` normally does this itself;
     /// this hand-rolls it only because `output()` has no timeout variant.
     fn exec_raw(root: &Path, args: &[&str]) -> Result<std::process::Output, String> {
-        let mut child = Command::new("git")
+        // One OS process instead of two or three for read-only subcommands
+        // on Windows; see `ralphus_core::git_spawn`.
+        let mut child = ralphus_core::git_spawn::command(args)
             .args(args)
             .current_dir(root)
             // Harmless for the read-only callers in this impl block, and
@@ -457,6 +459,7 @@ pub fn for_project_root(store: &crate::store::Store, root: &Path) -> Result<Box<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     #[test]
     fn git_is_the_only_implemented_kind() {

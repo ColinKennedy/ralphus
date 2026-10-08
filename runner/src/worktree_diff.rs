@@ -15,7 +15,6 @@
 //! count), and untracked files are counted by reading them.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -32,8 +31,10 @@ pub const WORKTREE_DIFF_SOURCE: &str = "worktree-diff";
 /// `WORKTREE_DIFF_MESSAGE`.
 pub const WORKTREE_DIFF_MESSAGE: &str = "diff changed";
 
-/// First poll interval, and the interval a change snaps back to.
-const MIN_INTERVAL: Duration = Duration::from_millis(500);
+/// First poll interval, and the interval a change snaps back to. Each poll
+/// is two git processes, and an agent that is editing keeps the interval at
+/// this floor, so it sets the watcher's process rate while a cell is busy.
+const MIN_INTERVAL: Duration = Duration::from_secs(2);
 /// Backoff ceiling while the worktree is quiet.
 const MAX_INTERVAL: Duration = Duration::from_secs(8);
 /// Untracked files larger than this are counted as zero lines rather than read.
@@ -104,7 +105,7 @@ fn git(root: &Path, args: &[&str]) -> Option<String> {
 /// As [`git`], but keeps why the command failed (spawn error, or the exit
 /// status plus the head of its stderr) for the watcher's failure event.
 fn git_detailed(root: &Path, args: &[&str]) -> Result<String, String> {
-    let out = Command::new("git")
+    let out = ralphus_core::git_spawn::command(args)
         .args(args)
         .current_dir(root)
         // A background poll must never wait on, or hold, the repo's index lock.
@@ -156,12 +157,34 @@ pub fn summarize(root: &Path, baseline: &str) -> Option<DiffSummary> {
 
 /// As [`summarize`], but keeps the failing git command's error.
 fn summarize_detailed(root: &Path, baseline: &str) -> Result<DiffSummary, String> {
-    let numstat = git_detailed(root, &["diff", "--numstat", "--no-renames", baseline])?;
-    let status = git_detailed(root, &["diff", "--name-status", "--no-renames", baseline])?;
+    // `--numstat --summary` gives per-file line counts plus a
+    // ` create mode ...` / ` delete mode ...` line per added/removed file, so
+    // one diff covers both. No external diff driver or textconv filter can
+    // affect numstat output, and ruling them out keeps the call spawn-free.
+    let diff = git_detailed(
+        root,
+        &[
+            "diff",
+            "--numstat",
+            "--summary",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-textconv",
+            baseline,
+        ],
+    )?;
     let untracked = git_detailed(root, &["ls-files", "--others", "--exclude-standard", "-z"])?;
 
     let mut summary = DiffSummary::default();
-    for line in numstat.lines() {
+    for line in diff.lines() {
+        if let Some(rest) = line.strip_prefix(' ') {
+            if rest.starts_with("create mode ") {
+                summary.files_added += 1;
+            } else if rest.starts_with("delete mode ") {
+                summary.files_removed += 1;
+            }
+            continue;
+        }
         let mut parts = line.splitn(3, '\t');
         summary.files_changed += 1;
         // Binary files report `-`: counted as a changed file, zero lines.
@@ -173,13 +196,6 @@ fn summarize_detailed(root: &Path, baseline: &str) -> Result<DiffSummary, String
             .next()
             .and_then(|n| n.parse::<u64>().ok())
             .unwrap_or(0);
-    }
-    for line in status.lines() {
-        match line.chars().next() {
-            Some('A') => summary.files_added += 1,
-            Some('D') => summary.files_removed += 1,
-            _ => {}
-        }
     }
     for rel in untracked.split('\0').filter(|p| !p.is_empty()) {
         summary.files_changed += 1;
@@ -332,6 +348,7 @@ impl Drop for WorktreeWatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     use std::sync::{Arc, Mutex};
 
     fn run(root: &Path, args: &[&str]) {
