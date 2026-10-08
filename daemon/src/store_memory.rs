@@ -381,6 +381,39 @@ impl StoreMemory {
         Some(position)
     }
 
+    /// Claim the exclusive right to rewrite `guardian_id`'s review stack (a
+    /// full or staged merge, a PR pull), unless a restack or another rebuild is
+    /// running or any branch's worktree is leased. Shares the restack's
+    /// `running` slot, so it excludes restacks and worktree leases both ways;
+    /// released by [`Self::finish_restack`].
+    pub fn try_claim_stack_rebuild(&self, guardian_id: &str) -> bool {
+        let mut state = self.restack.lock();
+        if state.running.contains(guardian_id)
+            || state.leases.keys().any(|(gid, _)| gid == guardian_id)
+        {
+            return false;
+        }
+        state.running.insert(guardian_id.to_string());
+        true
+    }
+
+    /// Whether any branch of `guardian_id` has its worktree leased -- a
+    /// feedback round or unattended PR fix is editing it.
+    #[must_use]
+    pub fn has_worktree_leases(&self, guardian_id: &str) -> bool {
+        self.restack
+            .lock()
+            .leases
+            .keys()
+            .any(|(gid, _)| gid == guardian_id)
+    }
+
+    /// The lowest queued restack position for `guardian_id`, if any.
+    #[must_use]
+    pub fn pending_restack(&self, guardian_id: &str) -> Option<i64> {
+        self.restack.lock().requests.get(guardian_id).copied()
+    }
+
     pub fn finish_restack(&self, guardian_id: &str) {
         self.restack.lock().running.remove(guardian_id);
     }

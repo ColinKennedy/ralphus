@@ -423,6 +423,13 @@ jobs:
       # where the mix came from. RALPHUS_REPLAY_SECONDS lengthens the window.
       - name: Rust recorded-workload replay
         run: cargo nextest run -p ralphus-daemon --test workload_replay --run-ignored only --test-threads 1
+      # Seeded stress over the review-input races: rounds of random
+      # concurrent feedback rounds / PR fixes on random branches racing real
+      # upstream pushes through the daemon's own maintenance -- see
+      # daemon/tests/review_input_races.rs. The deterministic race scenarios
+      # run in the default suite; only this multi-minute stress run lives here.
+      - name: Rust review-input race stress
+        run: cargo nextest run -p ralphus-daemon --test review_input_races --run-ignored only
       # WS-D.8: the submit path's worst store-lock hold. Not #[ignore]d -- it
       # runs in the default suite too -- but repeated here so a regression is
       # attributed to the perf job rather than looking like an unrelated flake.

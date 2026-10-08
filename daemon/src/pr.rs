@@ -1850,19 +1850,42 @@ fn qualify_forge_base(current_base: &str, remote: &str, forge_base: &str) -> Str
     }
 }
 
+/// The remote tip a [`guard_against_clobber`] check approved overwriting --
+/// the lease [`push_ref`] force-pushes against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PushLease(Option<String>);
+
+impl PushLease {
+    /// A remote branch known to sit at `sha`.
+    pub(crate) fn at(sha: &str) -> Self {
+        Self(Some(sha.to_string()))
+    }
+}
+
+/// Force-push `local` (a ref or SHA) to `refs/heads/{alias}` on `remote`,
+/// leased on `expected`: the push only lands if the remote branch is still
+/// exactly where the clobber check saw it (or still absent). A reviewer push
+/// that lands between that check and this push makes the push fail rather
+/// than silently overwriting the reviewer's commits -- the next maintenance
+/// sweep then pulls them in first.
 fn push_ref(
     root: &Path,
     remote: &str,
-    local_ref: &str,
+    local: &str,
     alias: &str,
+    expected: &PushLease,
 ) -> std::result::Result<(), String> {
+    let lease = format!(
+        "--force-with-lease=refs/heads/{alias}:{}",
+        expected.0.as_deref().unwrap_or_default()
+    );
     git(
         root,
         &[
             "push",
             remote,
-            "--force",
-            &format!("{local_ref}:refs/heads/{alias}"),
+            &lease,
+            &format!("{local}:refs/heads/{alias}"),
         ],
     )
     .map(|_| ())
@@ -1966,13 +1989,18 @@ pub(crate) fn cancel_superseded_ci_after_push(
 /// the remote tip un-ancestored. Ancestry is therefore checked only as a
 /// fallback, backed in turn by a patch-id comparison for a remote whose commits
 /// were all replayed into `local_ref` under new SHAs.
+///
+/// On success returns the remote tip it checked, which the caller must hand to
+/// [`push_ref`] as the push's lease: the check and the push are separate
+/// network round-trips, and only the lease makes a reviewer push landing
+/// between them fail the push instead of being overwritten.
 fn guard_against_clobber(
     root: &Path,
     remote: &str,
     alias: &str,
     local_ref: &str,
     last_pushed: Option<&str>,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<PushLease, String> {
     let fetched = guardian_merge::with_private_fetch(
         alias,
         &["clobber", remote, alias],
@@ -1980,8 +2008,29 @@ fn guard_against_clobber(
         |dest| git(root, &["rev-parse", dest]),
     );
     let remote_sha = match fetched {
-        // No remote branch yet (or it's unreachable) -- nothing to clobber.
-        Err(_) => return Ok(()),
+        // The fetch failed: the branch doesn't exist yet, or the remote can't
+        // be read. Either way the push is leased on the branch not existing,
+        // so it can create a new branch but never overwrite one this check
+        // couldn't see.
+        Err(fetch_err) => {
+            let listed = git(
+                root,
+                &[
+                    "ls-remote",
+                    "--heads",
+                    remote,
+                    &format!("refs/heads/{alias}"),
+                ],
+            )
+            .unwrap_or_default();
+            return match listed.split_whitespace().next() {
+                None => Ok(PushLease(None)),
+                Some(sha) => Err(format!(
+                    "remote branch '{alias}' exists at {sha} but could not be fetched \
+                     before pushing: {fetch_err}"
+                )),
+            };
+        }
         // The fetch succeeded, so a ref that won't resolve is an error, not
         // proof there is nothing to clobber.
         Ok(resolved) => resolved.map_err(|e| {
@@ -1989,8 +2038,9 @@ fn guard_against_clobber(
         })?,
     };
     let remote_sha = remote_sha.trim();
+    let tip = PushLease::at(remote_sha);
     if last_pushed == Some(remote_sha) {
-        return Ok(());
+        return Ok(tip);
     }
     if git(
         root,
@@ -1998,7 +2048,7 @@ fn guard_against_clobber(
     )
     .is_ok()
     {
-        return Ok(());
+        return Ok(tip);
     }
     // `git cherry <upstream> <head>` marks each commit on `head` with `-` when
     // `upstream` already holds a patch-equivalent commit and `+` when it does
@@ -2006,7 +2056,7 @@ fn guard_against_clobber(
     // lacks -- only the pre-restack spelling of work it already has.
     if let Ok(cherry) = git(root, &["cherry", local_ref, remote_sha]) {
         if !cherry.lines().any(|l| l.starts_with('+')) {
-            return Ok(());
+            return Ok(tip);
         }
     }
     Err(format!(
@@ -2617,7 +2667,9 @@ fn append_insights_to_review_commit(
     let commit_tree_args: Vec<&str> = commit_tree_args.iter().map(String::as_str).collect();
     let new_sha = git(root, &commit_tree_args)?.trim().to_string();
     git(root, &["update-ref", &full_ref, &new_sha, &old_sha])?;
-    push_ref(root, remote_name, review_ref, alias)?;
+    // The caller has just pushed `old_sha` to `alias`; lease on it so a
+    // reviewer push made while the insights were being generated survives.
+    push_ref(root, remote_name, &new_sha, alias, &PushLease::at(&old_sha))?;
     Ok(Some(new_sha))
 }
 
@@ -4656,28 +4708,61 @@ pub fn sync_open_pr_branches(store: &crate::store_lock::StoreHandle, id: &str) {
         if pr.last_pushed_sha.as_deref() == Some(local_sha.as_str()) {
             continue; // already in sync -- nothing moved this branch since
         }
-        if let Err(e) = guard_against_clobber(
+        // Check and push the SHA read above, never the ref name: a restack
+        // or feedback round can move the ref between the check and the push,
+        // and the push must publish exactly what the check approved.
+        let lease = match guard_against_clobber(
             &root,
             remote_name,
             &pr.branch_alias,
-            &local_ref,
+            &local_sha,
             pr.last_pushed_sha.as_deref(),
         ) {
-            crate::rlog!(
-                WARNING,
-                "ralphus [pr] review {id} pr branch sync skipped pr={} alias={}: {e}",
-                pr.id,
-                pr.branch_alias
-            );
-            continue;
-        }
-        if let Err(e) = push_ref(&root, remote_name, &local_ref, &pr.branch_alias) {
+            Ok(lease) => lease,
+            Err(e) => {
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [pr] review {id} pr branch sync skipped pr={} alias={}: {e}",
+                    pr.id,
+                    pr.branch_alias
+                );
+                crate::cartographer::Note::new("pr")
+                    .level(crate::logging::LogLevel::WARNING)
+                    .guardian(id)
+                    .emit(
+                        &store.lock(),
+                        "pr branch sync skipped: remote has commits the review branch lacks",
+                        serde_json::json!({
+                            "pr_id": pr.id,
+                            "alias": pr.branch_alias,
+                            "local_sha": local_sha,
+                            "error": e,
+                        }),
+                    );
+                continue;
+            }
+        };
+        if let Err(e) = push_ref(&root, remote_name, &local_sha, &pr.branch_alias, &lease) {
             crate::rlog!(
                 WARNING,
                 "ralphus [pr] review {id} pr branch sync push failed pr={} alias={}: {e}",
                 pr.id,
                 pr.branch_alias
             );
+            crate::cartographer::Note::new("pr")
+                .level(crate::logging::LogLevel::WARNING)
+                .guardian(id)
+                .emit(
+                    &store.lock(),
+                    "pr branch sync push rejected (remote moved since the clobber check, or push failed)",
+                    serde_json::json!({
+                        "pr_id": pr.id,
+                        "alias": pr.branch_alias,
+                        "local_sha": local_sha,
+                        "lease": lease.0,
+                        "error": e,
+                    }),
+                );
             continue;
         }
         let result = store.lock().update_pull_request_ex(
@@ -5045,6 +5130,15 @@ fn claim_guardian_for_forge_reorder(store: &crate::store_lock::StoreHandle, id: 
 /// bottom-right toast; a plain (nothing was running) reorder is applied
 /// silently other than the usual Cartographer log. Returns whether a reorder
 /// was detected and applied.
+/// Whether a detected forge reorder may cancel the review's in-flight work to
+/// apply itself. A merge or rebuild can simply be redone on the new order,
+/// but a feedback round or unattended PR fix (a held worktree lease) carries
+/// a request that cancelling would drop -- the reorder waits for the next
+/// check instead.
+fn forge_reorder_may_interrupt(store: &crate::store_lock::StoreHandle, id: &str) -> bool {
+    !store.lock().guardian_has_worktree_leases(id)
+}
+
 pub fn check_and_apply_forge_reorder(
     store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
@@ -5077,6 +5171,19 @@ pub fn check_and_apply_forge_reorder(
     let cancel_key = format!("guardian:{id}");
     let mut claimed = claim_guardian_for_forge_reorder(store, id);
     let mut interrupted_local = false;
+    if !claimed && !forge_reorder_may_interrupt(store, id) {
+        crate::rlog!(
+            INFO,
+            "ralphus [pr] review {id} forge drift detected while a feedback round or PR fix \
+             is editing a branch; deferring to the next check"
+        );
+        crate::cartographer::Note::new("pr").guardian(id).emit(
+            &store.lock(),
+            "forge reorder deferred: a feedback round or PR fix is in flight",
+            serde_json::json!({"order": drift.order, "base": drift.base}),
+        );
+        return false;
+    }
     if !claimed && cancellations.is_active(&cancel_key) {
         cancellations.cancel(&cancel_key);
         for _ in 0..50 {
@@ -6932,26 +7039,38 @@ fn submit_stacked_branch_pr(
     // refusing outright. This is the one push site every PR-creation path
     // (whole-stack submit, explicit per-branch submit, resubmission after an
     // unlink) funnels through, so every caller gets the reconciliation.
-    if let Err(clobber_err) = guard_against_clobber(root, remote_name, &alias, &review_ref, None) {
-        crate::rlog!(
-            WARNING,
-            "ralphus [pr] review {id} branch {branch_id} alias {alias} diverged from \
-             {remote_name} ({clobber_err}); reconciling before push"
-        );
-        guardian_merge::pull_pr_commits(store, runner, id, branch_id, remote_name, &alias, None)
+    let resolve_local = || git(root, &["rev-parse", &review_ref]).map(|s| s.trim().to_string());
+    let mut local_sha = resolve_local()?;
+    let lease = match guard_against_clobber(root, remote_name, &alias, &local_sha, None) {
+        Ok(lease) => lease,
+        Err(clobber_err) => {
+            crate::rlog!(
+                WARNING,
+                "ralphus [pr] review {id} branch {branch_id} alias {alias} diverged from \
+                 {remote_name} ({clobber_err}); reconciling before push"
+            );
+            guardian_merge::pull_pr_commits(
+                store,
+                runner,
+                id,
+                branch_id,
+                remote_name,
+                &alias,
+                None,
+            )
             .map_err(|e| {
                 format!("could not reconcile remote branch '{alias}' before pushing: {e}")
             })?;
-        guard_against_clobber(root, remote_name, &alias, &review_ref, None)?;
-    }
-    push_ref(root, remote_name, &review_ref, &alias)?;
+            local_sha = resolve_local()?;
+            guard_against_clobber(root, remote_name, &alias, &local_sha, None)?
+        }
+    };
+    push_ref(root, remote_name, &local_sha, &alias, &lease)?;
     // RAL-<new>: re-pushed below (mutated, not re-declared) if the `None`
     // arm folds the reviewer-relevant insight list into the tip commit --
     // that rewrites the commit this sha names, so `pushed_sha`/CI
     // cancellation must track whichever push actually happened last.
-    let mut pushed_sha = git(root, &["rev-parse", &review_ref])
-        .map(|s| s.trim().to_string())
-        .ok();
+    let mut pushed_sha = Some(local_sha);
     if let Some(sha) = pushed_sha.as_deref() {
         cancel_superseded_ci_after_push(
             store,
@@ -9419,9 +9538,16 @@ pub fn pull_pr_commits(
     }
     .ok_or_else(|| "no review ref to push after pulling PR commits".to_string())?;
 
-    push_ref(&root, &remote_name, &local_ref, &pr.branch_alias)?;
-    if let Ok(sha) = git(&root, &["rev-parse", &local_ref]) {
-        let sha = sha.trim();
+    // The pull and its downstream restack can take minutes (conflict
+    // resolution runs an agent), and a reviewer can push again meanwhile.
+    // Re-check against the live remote and lease on what was checked, so such
+    // a push fails this one instead of being overwritten; the next sync pass
+    // pulls it in.
+    let local_sha = git(&root, &["rev-parse", &local_ref])?.trim().to_string();
+    let lease = guard_against_clobber(&root, &remote_name, &pr.branch_alias, &local_sha, None)?;
+    push_ref(&root, &remote_name, &local_sha, &pr.branch_alias, &lease)?;
+    {
+        let sha = local_sha.as_str();
         let result = store.lock().update_pull_request_ex(
             pr_id,
             None,
@@ -9883,11 +10009,12 @@ fn action_pr_feedback_inner(
                 .review_branch
                 .clone()
                 .ok_or_else(|| "no review ref to push after applying feedback".to_string())?;
-            guard_against_clobber(
+            let local_sha = git(&root, &["rev-parse", &local_ref])?.trim().to_string();
+            let lease = guard_against_clobber(
                 &root,
                 &remote_name,
                 &pr.branch_alias,
-                &local_ref,
+                &local_sha,
                 pr.last_pushed_sha.as_deref(),
             )?;
             // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
@@ -9896,9 +10023,9 @@ fn action_pr_feedback_inner(
                 "ralphus [pr] pr {pr_id} pushing updated branch back alias={} remote={remote_name}",
                 pr.branch_alias
             );
-            push_ref(&root, &remote_name, &local_ref, &pr.branch_alias)?;
-            if let Ok(sha) = git(&root, &["rev-parse", &local_ref]) {
-                let sha = sha.trim();
+            push_ref(&root, &remote_name, &local_sha, &pr.branch_alias, &lease)?;
+            {
+                let sha = local_sha.as_str();
                 let result = store.lock().update_pull_request_ex(
                     pr_id,
                     None,
@@ -11755,6 +11882,68 @@ mod tests {
         let _ = std::fs::remove_dir_all(&clone_dir);
     }
 
+    /// The clobber check and the push are separate round-trips. A reviewer
+    /// push landing between them must make the daemon's push fail -- it is
+    /// leased on the tip the check approved -- rather than be overwritten.
+    #[test]
+    fn push_ref_refuses_a_reviewer_push_landing_after_the_clobber_check() {
+        let root = tmp_dir("lease-root");
+        g(&root, &["init", "--initial-branch", "main"]);
+        gwrite(&root, "base.txt", "base\n");
+        g(&root, &["add", "."]);
+        g(&root, &["commit", "--message", "base"]);
+        let remote_dir = tmp_dir("lease-remote");
+        g(&remote_dir, &["init", "--bare"]);
+        let remote = remote_dir.to_str().unwrap();
+        g(&root, &["push", remote, "main:refs/heads/pr-x"]);
+
+        // The daemon has a new local commit and the check approves pushing it.
+        gwrite(&root, "daemon.txt", "daemon\n");
+        g(&root, &["add", "."]);
+        g(&root, &["commit", "--message", "daemon change"]);
+        let lease = guard_against_clobber(&root, remote, "pr-x", "main", None).unwrap();
+
+        // A reviewer pushes before the daemon's push goes out.
+        let clone_dir = tmp_dir("lease-clone");
+        let _ = std::fs::remove_dir_all(&clone_dir);
+        g(
+            clone_dir.parent().unwrap(),
+            &[
+                "clone",
+                remote,
+                clone_dir.file_name().unwrap().to_str().unwrap(),
+            ],
+        );
+        g(&clone_dir, &["checkout", "pr-x"]);
+        gwrite(&clone_dir, "reviewer.txt", "fix\n");
+        g(&clone_dir, &["add", "."]);
+        g(&clone_dir, &["commit", "--message", "reviewer fix"]);
+        g(&clone_dir, &["push", "origin", "pr-x"]);
+        let reviewer_sha = g(&clone_dir, &["rev-parse", "HEAD"]).trim().to_string();
+
+        assert!(
+            push_ref(&root, remote, "main", "pr-x", &lease).is_err(),
+            "a push leased on the pre-reviewer tip must be rejected"
+        );
+        assert_eq!(
+            g(&remote_dir, &["rev-parse", "refs/heads/pr-x"]).trim(),
+            reviewer_sha,
+            "the reviewer's commit must still be the PR branch tip"
+        );
+
+        // A branch the check saw as absent is leased as "must not exist".
+        let absent = guard_against_clobber(&root, remote, "pr-new", "main", None).unwrap();
+        g(&clone_dir, &["push", "origin", "pr-x:refs/heads/pr-new"]);
+        assert!(
+            push_ref(&root, remote, "main", "pr-new", &absent).is_err(),
+            "a branch created after the check must not be overwritten"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote_dir);
+        let _ = std::fs::remove_dir_all(&clone_dir);
+    }
+
     /// Two branches of one repo reconcile against a shared `.git`: a sibling
     /// fetch (and a foreign write to `FETCH_HEAD`) landing between this branch's
     /// fetch and its resolve must not change the SHA it reads, and none of the
@@ -13492,6 +13681,29 @@ mod tests {
         assert_eq!(store.lock().get_guardian(&gid).unwrap().status, "merging");
         // Already claimed -- a second attempt loses the race.
         assert!(!claim_guardian_for_forge_reorder(&store, &gid));
+    }
+
+    /// A forge reorder may cancel an in-flight merge to redo it on the new
+    /// order, but never a feedback round or PR fix still editing a branch:
+    /// cancelling it would drop the reviewer's request.
+    #[test]
+    fn forge_reorder_never_interrupts_an_in_flight_feedback_round() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let gid = store
+            .lock()
+            .create_guardian("demo", "main", "/repo")
+            .unwrap();
+        assert!(forge_reorder_may_interrupt(&store, &gid));
+        assert!(
+            store
+                .lock()
+                .try_acquire_guardian_worktree_lease(&gid, "branch-1", "feedback")
+        );
+        assert!(!forge_reorder_may_interrupt(&store, &gid));
+        store
+            .lock()
+            .release_guardian_worktree_lease(&gid, "branch-1", "feedback");
+        assert!(forge_reorder_may_interrupt(&store, &gid));
     }
 
     #[test]
