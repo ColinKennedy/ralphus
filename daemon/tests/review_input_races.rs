@@ -892,6 +892,10 @@ fn ci_failure() -> ralphus_daemon::forge::PrFailure {
         job_url: None,
         log_text: None,
         checks: vec![],
+        generation: None,
+        pending_count: 0,
+        passing_checks: vec![],
+        in_progress_checks: vec![],
     }
 }
 
