@@ -96,7 +96,7 @@
        * @property {string} gid
        * @property {string} scope - "build" | "manual_checks" | "branch"
        * @property {string} branchId - Empty unless `scope` is "branch".
-       * @property {string} title - Human-readable scope label, e.g. "test actions".
+       * @property {string} title - Human-readable scope label, e.g. "user actions".
        * @property {{[key: string]: string}} inherited
        * @property {EnvScopeDraft} sd
        */
@@ -747,14 +747,14 @@
         } else if (scope === "manual_checks") {
           envEditDraft = {
             gid, scope, branchId: "",
-            title: "manual checks",
+            title: "auto actions",
             inherited: review.combined_env || {},
             sd: envScopeDraftFromOwn(review.manual_checks_env_overrides || {}),
           };
         } else {
           envEditDraft = {
             gid, scope: "build", branchId: "",
-            title: "manual-check preparation and test actions",
+            title: "action preparation and user actions",
             inherited: review.combined_env || {},
             sd: envScopeDraftFromOwn(review.build_env_overrides || {}),
           };
@@ -937,14 +937,14 @@
             <div><h3 class="section">rebase</h3>
               <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Overrides the project default for this review only: when its upstream branch moves, don't automatically rebuild/rebase this review's stack onto the new tip. Use for a review whose auto-rebase keeps getting in the way (e.g. one under heavy manual conflict resolution). You can still start a merge/rebase manually at any time, individually or via the review list's bulk Merge/Rebase action, regardless of this setting. Applies on Save.">
                 <input type="checkbox" ${draft.skipBaseUpdates ? "checked" : ""} onchange="onEditSkipBaseUpdates(this.checked)">skip automatic base-branch rebasing</label>
-              <div class="hint">Manual-check preparation is declared in task TOML and runs automatically before its controls unlock.</div></div>
+              <div class="hint">Action preparation is declared in task TOML and runs automatically before its controls unlock.</div></div>
             <div ${grp("rebuild")}><h3 class="section" data-tip="${esc(REBUILD_ON_TIP)}">rebuild preparation when</h3>
               ${renderRebuildOnFieldsHtml("review", draft.rebuildOn, draft.rebuildOnEffective, "use the project default", "Follow the project's default for when preparation is rebuilt (set in the project's Review Settings; every trigger when nothing sets one). Untick to give this review its own policy. Applies on Save.", "onEditRebuildOnInherit", "onEditRebuildOnTrigger")}</div>
-            <div ${grp("manual-checks")}><h3 class="section">manual checks</h3>
-              <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Overrides the project default for this review only: don't ask an agent to generate manual checks from the diff on any merge, rebase, or fix. Manual checks declared in the task file are unaffected. Applies on Save.">
-                <input type="checkbox" ${draft.skipManualChecks ? "checked" : ""} onchange="onEditSkipManualChecks(this.checked)">skip manual-check generation</label>
-              <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Overrides the project default for this review only: run each manual check automatically once its build commands succeed (a check with no build commands runs as soon as it is ready). Only checks whose inputs all have defaults run; each check runs once per machine per build, in a visible terminal. A check's own auto_run in the task file wins over this. Applies on Save.">
-                <input type="checkbox" ${draft.autoRun ? "checked" : ""} onchange="onEditAutoRun(this.checked)">auto-run manual checks after build</label></div>
+            <div ${grp("manual-checks")}><h3 class="section">auto actions</h3>
+              <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Overrides the project default for this review only: don't ask an agent to generate auto actions from the diff on any merge, rebase, or fix. User actions from the task file are unaffected. Applies on Save.">
+                <input type="checkbox" ${draft.skipManualChecks ? "checked" : ""} onchange="onEditSkipManualChecks(this.checked)">skip auto action generation</label>
+              <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Overrides the project default for this review only: run each action automatically once its build commands succeed (one with no build commands runs as soon as it is ready). Only actions whose inputs all have defaults run; each runs once per machine per build, in a visible terminal. An action's own auto_run in the task file wins over this. Applies on Save.">
+                <input type="checkbox" ${draft.autoRun ? "checked" : ""} onchange="onEditAutoRun(this.checked)">auto-run actions after build</label></div>
             <div ${grp("followup")}><h3 class="section">follow-up</h3>
               <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Overrides the global [followup] default for this review only: when it merges, offer to turn the follow-up work its agents deferred (deferred prophecies) into a new squad. On unless the global config turns it off. Applies on Save.">
                 <input type="checkbox" ${draft.followupEnabled ? "checked" : ""} onchange="onEditFollowupEnabled(this.checked)">offer follow-up work when this review merges</label>

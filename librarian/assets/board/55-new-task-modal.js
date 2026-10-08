@@ -1045,7 +1045,7 @@
           const parts = [];
           if (ntSimple.proofs) parts.push("proof steps");
           if (ntSimple.reviewMode === "explicit" && ntSimple.generateAutoBuild) parts.push("preparation steps");
-          if (ntSimple.reviewMode === "explicit" && ntSimple.generateManualChecks) parts.push("manual checks");
+          if (ntSimple.reviewMode === "explicit" && ntSimple.generateManualChecks) parts.push("user actions");
           return `<p style="color:var(--muted);font-size:13px">Generating ${parts.join(" and ")}… this calls the selected agent, so it may take a little while.</p>`;
         }
         if (ntSimple.confirmStep) {
@@ -1057,10 +1057,10 @@
               })}`
             : "";
           const checksSection = ntSimple.reviewMode === "explicit" && ntSimple.generateManualChecks
-            ? `<h4 style="margin:10px 0 4px">Manual checks</h4>${ntListWidgetHtml(ntSimple.checkItems, "checks", {
+            ? `<h4 style="margin:10px 0 4px">User actions</h4>${ntListWidgetHtml(ntSimple.checkItems, "checks", {
                 labelPlaceholder: "label", valuePlaceholder: "what to check",
-                addLabel: "Add a manual check button reviewers will see on this review.",
-                labelTip: "The manual check's button label.", valueTip: "What a reviewer should check or try.",
+                addLabel: "Add a user action button reviewers will see on this review.",
+                labelTip: "The user action's button label.", valueTip: "What a reviewer should check or try.",
               })}`
             : "";
           const buildsSection = ntSimple.reviewMode === "explicit" && ntSimple.generateAutoBuild
@@ -1130,7 +1130,7 @@
           ${ntSimple.proofItems.length
             ? `<div style="margin-top:6px">${ntListWidgetHtml(ntSimple.proofItems, "proofs", { labelPlaceholder: "id", valuePlaceholder: "shell command", addLabel: "Add a proof step by hand.", labelTip: "A short id for this proof step.", valueTip: "The shell command this proof step runs." })}</div>`
             : `<button class="btn" style="margin-top:6px" onclick="ntListAdd('proofs')" data-tip="Add a proof step by hand, without generating one.">+ Add a proof step by hand</button>`}
-          <label style="display:block;font-size:12px;color:var(--muted);margin-top:10px" data-tip="Whether/how this task gets reviewed.\n&quot;Auto Review&quot; (the default) pools the work cell into Triage — the daemon's Arbiter classifies it and a review is created automatically once its pool threshold or schedule fires, no triage type needed from you.\n&quot;Add a Review&quot; creates an explicit review up front, letting you configure manual checks and preparation steps now.\n&quot;No Review&quot; skips review entirely.">
+          <label style="display:block;font-size:12px;color:var(--muted);margin-top:10px" data-tip="Whether/how this task gets reviewed.\n&quot;Auto Review&quot; (the default) pools the work cell into Triage — the daemon's Arbiter classifies it and a review is created automatically once its pool threshold or schedule fires, no triage type needed from you.\n&quot;Add a Review&quot; creates an explicit review up front, letting you configure user actions and preparation steps now.\n&quot;No Review&quot; skips review entirely.">
             Review
             <select style="${NT_INPUT_STYLE}" onchange="ntSimple.reviewMode=this.value;renderNewTaskModal()">
               <option value="auto" ${ntSimple.reviewMode === "auto" ? "selected" : ""}>Auto Review</option>
@@ -1143,14 +1143,14 @@
             <input type="checkbox" ${ntSimple.generateAutoBuild ? "checked" : ""} onchange="ntSimple.generateAutoBuild=this.checked;renderNewTaskModal()"> Generate preparation steps
           </label>
           ${ntSimple.buildItems.length
-            ? `<div style="margin-top:6px">${ntListWidgetHtml(ntSimple.buildItems, "builds", { singleField: true, valuePlaceholder: "shell command", addLabel: "Add a preparation step by hand.", valueTip: "This command runs before manual-check controls become ready." })}</div>`
+            ? `<div style="margin-top:6px">${ntListWidgetHtml(ntSimple.buildItems, "builds", { singleField: true, valuePlaceholder: "shell command", addLabel: "Add a preparation step by hand.", valueTip: "This command runs before the review's actions become ready." })}</div>`
             : `<button class="btn" style="margin-top:6px" onclick="ntListAdd('builds')" data-tip="Add a preparation step by hand, without generating one.">+ Add a preparation step by hand</button>`}
-          <label style="display:block;font-size:12px;color:var(--muted);margin-top:10px" data-tip="When checked, the selected agent/model is asked to propose manual check button(s) reviewers can run against this project's codebase before you submit, shown to you for edit/removal first. You can also add manual checks by hand regardless of this checkbox.">
-            <input type="checkbox" ${ntSimple.generateManualChecks ? "checked" : ""} onchange="ntSimple.generateManualChecks=this.checked;renderNewTaskModal()"> Generate manual checks
+          <label style="display:block;font-size:12px;color:var(--muted);margin-top:10px" data-tip="When checked, the selected agent/model is asked to propose user action button(s) reviewers can run against this project's codebase before you submit, shown to you for edit/removal first. You can also add user actions by hand regardless of this checkbox.">
+            <input type="checkbox" ${ntSimple.generateManualChecks ? "checked" : ""} onchange="ntSimple.generateManualChecks=this.checked;renderNewTaskModal()"> Generate user actions
           </label>
           ${ntSimple.checkItems.length
-            ? `<div style="margin-top:6px">${ntListWidgetHtml(ntSimple.checkItems, "checks", { labelPlaceholder: "label", valuePlaceholder: "what to check", addLabel: "Add a manual check by hand.", labelTip: "The manual check's button label.", valueTip: "What a reviewer should check or try." })}</div>`
-            : `<button class="btn" style="margin-top:6px" onclick="ntListAdd('checks')" data-tip="Add a manual check by hand, without generating one.">+ Add a manual check by hand</button>`}
+            ? `<div style="margin-top:6px">${ntListWidgetHtml(ntSimple.checkItems, "checks", { labelPlaceholder: "label", valuePlaceholder: "what to check", addLabel: "Add a user action by hand.", labelTip: "The user action's button label.", valueTip: "What a reviewer should check or try." })}</div>`
+            : `<button class="btn" style="margin-top:6px" onclick="ntListAdd('checks')" data-tip="Add a user action by hand, without generating one.">+ Add a user action by hand</button>`}
           ` : ""}`;
       }
       /**

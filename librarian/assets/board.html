@@ -16,7 +16,7 @@
           <button id="tab-squads" class="tab active" onclick="showTab('squads', true)" data-tip="Squads — view submitted squads, their cells, the dependency graph, and proof steps.">👥 Squads</button>
           <button id="tab-tasks" class="tab" onclick="showTab('tasks', true)" data-tip="Tasks — a flat list of every task across every squad, with cost, review/PR state, and watch status.">📋 Tasks</button>
           <button id="tab-queue" class="tab" onclick="showTab('queue', true)" data-tip="Queue — reorder pending work by priority.\nDrag ready-to-run cells and proof steps into the order you want them picked up; set a status of 'ignored' to unblock downstream work.\nOrder is a best-effort hint honored when a compute slot frees.">🚦 Queue</button>
-          <button id="tab-reviews" class="tab" onclick="showTab('reviews', true)" data-tip="Reviews — manage Guardian reviews: branch stacking, automated rebase, conflict resolution, prepared manual checks, and approval.">👀 Reviews</button>
+          <button id="tab-reviews" class="tab" onclick="showTab('reviews', true)" data-tip="Reviews — manage Guardian reviews: branch stacking, automated rebase, conflict resolution, prepared actions, and approval.">👀 Reviews</button>
           <button id="tab-waypoints" class="tab" onclick="showTab('waypoints', true)" data-tip="Waypoints (RAL-400) — cross-squad coordination join points.\nA waypoint blocks or advises a roster of squads/reviews until the work it's watching for actually lands, then delivers feedback and records bearings (completed-work chronicle entries).">🧭 Waypoints</button>
           <button id="tab-resources" class="tab" onclick="showTab('resources', true)" data-tip="Resources — live CPU, RAM, and GPU usage per running cell. Useful for spotting runaway processes.">📊 Resources</button>
           <button id="tab-cartographer" class="tab" onclick="showTab('cartographer', true)" data-tip="Logs — the unified, chronological, structured event log across the whole system.\nFilter by source, scope, level, squad/cell/guardian id, or time range; click a squad/review id to jump straight to it.">📜 Logs</button>
@@ -115,7 +115,7 @@
           <div class="row" style="justify-content:space-between">
             <b>Reviews</b>
             <span class="row" style="gap:4px">
-              <button class="newtask" onclick="openCreateReview()" data-tip="Create a new Guardian review — set up a branch stack, prepare its manual checks, and approve it for deployment.">＋ Create</button>
+              <button class="newtask" onclick="openCreateReview()" data-tip="Create a new Guardian review — set up a branch stack, prepare its actions, and approve it for deployment.">＋ Create</button>
             </span>
           </div>
           <input type="text" id="review-filter" placeholder="filter by review id / name…" oninput="onReviewFilter(this.value)" data-tip="Filter reviews by review ID or name. Only matching reviews appear in the list." />

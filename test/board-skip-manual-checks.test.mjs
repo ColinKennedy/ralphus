@@ -28,7 +28,7 @@ test("the review Setup modal seeds skipManualChecks from the effective value and
   assert.match(draft, /skipManualChecks, originalSkipManualChecks: skipManualChecks/);
   const render = functionSource("renderReviewEditModal");
   assert.match(render, /onEditSkipManualChecks\(this\.checked\)/);
-  assert.match(render, /skip manual-check generation/);
+  assert.match(render, /skip auto action generation/);
   const save = functionSource("saveReviewEditDetails");
   assert.match(save, /if \(draft\.skipManualChecks !== draft\.originalSkipManualChecks\) body\.skip_manual_checks = draft\.skipManualChecks/);
 });
@@ -54,7 +54,7 @@ test("the project Review Settings modal seeds, renders, and saves skip_manual_ch
 test("both skip-manual-checks controls carry a tooltip", () => {
   for (const name of ["renderReviewEditModal", "renderProjectReviewSettingsModal"]) {
     const render = functionSource(name);
-    const at = render.indexOf("skip manual-check generation");
+    const at = render.indexOf("skip auto action generation");
     assert.notEqual(at, -1, `${name} renders the control`);
     const label = render.lastIndexOf("<label", at);
     assert.match(render.slice(label, at), /data-tip="[^"]+"/, `${name}: the label has a data-tip`);
