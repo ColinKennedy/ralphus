@@ -75,6 +75,8 @@ test("the list says what happens at merge and toggles keep/ignore per follow-up"
   assert.match(html, /When this review merges, each follow-up below becomes a new task/);
   assert.match(html, /data-click="ignoreFollowup" data-guardian-id="g1" data-prophecy-id="7"/);
   assert.match(html, /data-click="unignoreFollowup" data-guardian-id="g1" data-prophecy-id="8"/);
+  assert.match(html, />Ignore<\/button>/);
+  assert.match(html, />Re-enable<\/button>/);
   assert.match(html, /tidy &lt;b&gt;docs&lt;\/b&gt;/);
   assert.match(html, /do it/);
 });

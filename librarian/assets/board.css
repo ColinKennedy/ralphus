@@ -692,9 +692,10 @@
       .fu-title { flex: 1; font-weight: 600; line-height: 1.4; overflow-wrap: anywhere; }
       .fu-meta { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
       .fu-chip { background: var(--panel); border: 1px solid var(--border-soft); color: var(--muted); border-radius: 6px; padding: 1px 8px; font-size: 12px; max-width: 100%; overflow-wrap: anywhere; }
-      .fu-toggle { flex: none; border-radius: 20px; padding: 2px 11px; font-size: 12px; border: 1px solid var(--done-b); background: var(--done-a); color: var(--done); }
-      .fu-toggle.off { border-color: var(--amber-b); background: var(--amber-a); color: var(--ignored); }
-      .fu-toggle.static { cursor: default; }
+      .fu-btn { flex: none; padding: 2px 10px; font-size: 12px; }
+      .fu-chip.fu-ignored { color: var(--ignored); border-color: var(--amber-b); background: var(--amber-a); }
+      .fu-status { flex: none; border-radius: 20px; padding: 2px 11px; font-size: 12px; border: 1px solid var(--done-b); background: var(--done-a); color: var(--done); }
+      .fu-status.off { border-color: var(--amber-b); background: var(--amber-a); color: var(--ignored); }
       .fu-context { margin-top: 10px; font-size: 12.5px; }
       .fu-context summary { cursor: pointer; color: var(--muted); }
       .fu-prompt { margin-top: 6px; padding: 8px 10px; background: var(--bg); border: 1px solid var(--border-soft); border-radius: 8px; color: var(--muted); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 180px; overflow-y: auto; }

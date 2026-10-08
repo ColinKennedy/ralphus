@@ -1733,7 +1733,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
       /**
        * One follow-up as a card: the deferred note, where it came from (the
        * branch and task of the cell that deferred it, not a cell URI), and a
-       * keep/ignore toggle. The originating cell's prompt sits behind a
+       * button to ignore or re-enable it. The originating cell's prompt sits behind a
        * disclosure so a long list stays scannable.
        * @param {string} gid - The review id.
        * @param {PendingFollowupItem} it - The follow-up.
@@ -1750,17 +1750,18 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         const agent = it.agent
           ? `<span class="fu-chip" data-tip="The agent${it.model ? " and model" : ""} the follow-up task would start on.">${esc(it.agent)}${it.model ? ` · ${esc(it.model)}` : ""}</span>`
           : "";
-        const state = it.ignored ? "off" : "";
-        const label = it.ignored ? "⊘ Ignored" : "✓ Keeping";
-        const toggle = frozen
-          ? `<span class="fu-toggle ${state} static" data-tip="${it.ignored ? "This note was left out of the offer made when the review merged." : "This note was included in the offer made when the review merged."}">${it.ignored ? "⊘ Ignored" : "✓ Offered"}</span>`
-          : `<button class="fu-toggle ${state}" data-click="${it.ignored ? "unignoreFollowup" : "ignoreFollowup"}" data-guardian-id="${esc(gid)}" data-prophecy-id="${it.prophecy_id}" data-tip="${it.ignored ? "This note is left out of the follow-ups made when the review merges.\nClick to keep it." : "This note becomes a new task when the review merges.\nClick to ignore it instead."}">${label}</button>`;
+        const status = it.ignored
+          ? `<span class="fu-chip fu-ignored" data-tip="This note is left out of the follow-ups made when the review merges.">Ignored</span>`
+          : "";
+        const action = frozen
+          ? `<span class="fu-status ${it.ignored ? "off" : ""}" data-tip="${it.ignored ? "This note was left out of the offer made when the review merged." : "This note was included in the offer made when the review merged."}">${it.ignored ? "Ignored" : "Offered"}</span>`
+          : `<button class="btn fu-btn" data-click="${it.ignored ? "unignoreFollowup" : "ignoreFollowup"}" data-guardian-id="${esc(gid)}" data-prophecy-id="${it.prophecy_id}" data-tip="${it.ignored ? "Offer this note again when the review merges.\nClick to re-enable it." : "Leave this note out of the follow-ups made when the review merges.\nYou can re-enable it later."}">${it.ignored ? "Re-enable" : "Ignore"}</button>`;
         const prompt = it.prompt
           ? `<details class="fu-context"><summary data-tip="The prompt of the cell that deferred this note.">Show the context it was written in</summary><div class="fu-prompt mono">${esc(it.prompt)}</div></details>`
           : "";
         return `<div class="fu-card ${it.ignored ? "ignored" : ""}" data-tip="${esc(`Deferred by ${it.entity_uri}`)}">`
-          + `<div class="fu-head"><div class="fu-title">${esc(it.body)}</div>${toggle}</div>`
-          + `<div class="fu-meta">${branch}${task}${agent}</div>${prompt}</div>`;
+          + `<div class="fu-head"><div class="fu-title">${esc(it.body)}</div>${action}</div>`
+          + `<div class="fu-meta">${status}${branch}${task}${agent}</div>${prompt}</div>`;
       }
       /**
        * Renders the follow-up list modal body: a plain-language intro, then
