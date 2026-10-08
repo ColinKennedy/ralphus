@@ -1782,6 +1782,11 @@ impl Drop for WaypointHaltGuard<'_> {
 /// subprocess spawn, not just a syscall.
 const TMUX_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// How often the poll loop captures the pane for its "current screen"
+/// snapshot and completion safety net once the cell's transcript is
+/// delivering events (see the poll loop for when it captures every poll).
+const PANE_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(5);
+
 /// How many lines the per-poll `capture_pane` pulls for the board's live and
 /// frozen "current screen" snapshot, since RAL-397 Phase 2D moved event and
 /// completion-sentinel detection off pane scrollback onto the `.raw`
@@ -2747,6 +2752,7 @@ impl SubprocessRunner {
             .maximum_budget_usd
             .map(|_| crate::config::load_budget_config().poll_interval());
         let mut last_tmux_poll = Instant::now();
+        let mut last_pane_capture: Option<Instant> = None;
         let mut first_tick = true;
         let result = loop {
             if cancel.is_cancelled() {
@@ -2954,6 +2960,26 @@ impl SubprocessRunner {
                 // still catching up or the `.raw` file never materialized (a
                 // best-effort `pipe_pane` that silently failed) — so completion
                 // detection never becomes dependent on the transcript alone.
+                //
+                // Each capture is a `tmux` client process, so while the
+                // transcript is flowing it runs every
+                // `PANE_SNAPSHOT_INTERVAL` rather than every poll: events,
+                // the sentinel and liveness already come from the transcript.
+                // It still runs every poll whenever the pane is the event
+                // source or the transcript has produced nothing yet, while a
+                // missing-session strike is pending (so death is confirmed
+                // as fast as before), and once more when the transcript
+                // reports completion, so the frozen final screen is current.
+                let capture_due = pane_event_fallback
+                    || !transcript_ever_produced_bytes
+                    || done
+                    || missing_session_strikes > 0
+                    || last_pane_capture.is_none_or(|at| at.elapsed() >= PANE_SNAPSHOT_INTERVAL);
+                if !capture_due {
+                    std::thread::sleep(budget_poll_interval.unwrap_or(TMUX_POLL_INTERVAL));
+                    continue;
+                }
+                last_pane_capture = Some(Instant::now());
                 let capture_lines = if pane_event_fallback {
                     FALLBACK_EVENT_CAPTURE_LINES
                 } else {
