@@ -12922,6 +12922,10 @@ mod tests {
     ) {
         let root = tmp_dir(&format!("{tag}-root"));
         g(&root, &["init", "--initial-branch", "main"]);
+        // The daemon's own rebases commit in this repo; a CI runner has no
+        // global git identity to fall back on.
+        g(&root, &["config", "user.name", "t"]);
+        g(&root, &["config", "user.email", "t@t"]);
         gwrite(&root, "base.txt", "base\n");
         g(&root, &["add", "."]);
         g(&root, &["commit", "--message", "base"]);

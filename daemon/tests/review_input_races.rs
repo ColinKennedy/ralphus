@@ -1149,9 +1149,9 @@ const SETTLE_POLL: Duration = Duration::from_millis(150);
 /// (fetch every maintained review's base from its remote) and
 /// `review_maintenance` (pull reviewer commits into review branches, rebuild
 /// on a base shift, restack after a manual push, publish PR branches, repair
-/// the stack) -- every [`PUMP_INTERVAL`] instead of every 60 s / 5 s. Nothing
-/// in it is faked; it spawns its own workers and, for any agent call, the
-/// real runner, which none of these scenarios should need.
+/// the stack) -- every [`PUMP_INTERVAL`] instead of every 60 s / 5 s. The
+/// sweep itself is the real one (via `review_maintenance_with`); only the
+/// agent runner its workers would call is replaced, by [`NoAgentExpected`].
 ///
 /// `review_maintenance` keeps in-process "already running" sets keyed by
 /// review id, and every test's review is the first in its own store, so
@@ -1162,6 +1162,20 @@ struct DaemonPump {
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
+/// The agent runner the daemon's own sweep gets in these tests: none of the
+/// scenarios should need an agent (every writer edits its own file), so any
+/// call fails loudly -- and, unlike the production runner, it needs no
+/// `ralphus-runner` binary installed to pass the merge's resolver preflight.
+struct NoAgentExpected;
+impl Runner for NoAgentExpected {
+    fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+        RunnerResult::failure(format!(
+            "unexpected agent call from the daemon's maintenance: {}",
+            spec.cell_id
+        ))
+    }
+}
+
 impl DaemonPump {
     fn start(fx: &Fixture) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
@@ -1169,9 +1183,16 @@ impl DaemonPump {
         let handle = std::thread::spawn(move || {
             let sem = Arc::new(Semaphore::new(4));
             let cancellations = ralphus_daemon::cancel::Cancellations::new();
+            let runners: ralphus_daemon::guardian_merge::RunnerFactory =
+                Arc::new(|_| Arc::new(NoAgentExpected) as Arc<dyn Runner>);
             while !flag.load(Ordering::SeqCst) {
                 ralphus_daemon::guardian_merge::poll_base_branch_freshness_once(&store);
-                ralphus_daemon::guardian_merge::review_maintenance(&store, &sem, &cancellations);
+                ralphus_daemon::guardian_merge::review_maintenance_with(
+                    &store,
+                    &sem,
+                    &cancellations,
+                    &runners,
+                );
                 std::thread::sleep(PUMP_INTERVAL);
             }
         });

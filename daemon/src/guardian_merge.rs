@@ -8975,6 +8975,28 @@ pub fn review_maintenance(
     sem: &Arc<Semaphore>,
     cancellations: &Cancellations,
 ) {
+    let runners: RunnerFactory = Arc::new(|store: &crate::store_lock::StoreHandle| {
+        Arc::new(crate::remote_runner::MachineRouter::from_env(Arc::clone(
+            store,
+        ))) as Arc<dyn Runner>
+    });
+    review_maintenance_with(store, sem, cancellations, &runners);
+}
+
+/// Builds the [`Runner`] each [`review_maintenance_with`] worker uses for
+/// agent calls (conflict resolution, PR fixes, proofs).
+pub type RunnerFactory =
+    Arc<dyn Fn(&crate::store_lock::StoreHandle) -> Arc<dyn Runner> + Send + Sync>;
+
+/// [`review_maintenance`] with the agent runner supplied by `runners` instead
+/// of the environment's (`RALPHUS_RUNNER_CMD`) -- so the daemon's real sweep
+/// can be driven end to end where no runner binary is installed.
+pub fn review_maintenance_with(
+    store: &crate::store_lock::StoreHandle,
+    sem: &Arc<Semaphore>,
+    cancellations: &Cancellations,
+    runners: &RunnerFactory,
+) {
     // RAL-520: a post-merge phase only stays `running` past its natural end
     // when the daemon died mid-run (the worker records its own outcome), so
     // mark such leftovers failed -- advisory only -- and let the board's
@@ -9009,10 +9031,11 @@ pub fn review_maintenance(
         let store = Arc::clone(store);
         let sem = Arc::clone(sem);
         let cancellations = cancellations.clone();
+        let runners = Arc::clone(runners);
         std::thread::spawn(move || {
             // Released when this worker exits, by any path.
             let _claim = claim;
-            let runner = crate::remote_runner::MachineRouter::from_env(Arc::clone(&store));
+            let runner = runners(&store);
             // RAL-213: register/remove around the merge this may trigger, same
             // shape as `scheduler::tick`'s squad-level wrapping, so a guardian
             // -settings change made while this reopen is rebuilding can stop it.
@@ -9021,7 +9044,7 @@ pub fn review_maintenance(
                 cancellations: cancellations.clone(),
                 key: format!("guardian:{id}"),
             };
-            reopen_straggler(&store, &runner, &id, &sem, &token);
+            reopen_straggler(&store, runner.as_ref(), &id, &sem, &token);
         });
     }
 
@@ -9052,10 +9075,11 @@ pub fn review_maintenance(
         };
         let store = Arc::clone(store);
         let cancellations = cancellations.clone();
+        let runners = Arc::clone(runners);
         std::thread::spawn(move || {
             let _claim = claim;
-            let runner = crate::remote_runner::MachineRouter::from_env(Arc::clone(&store));
-            crate::ci_watch::poll_open_pr_ci_status(&store, &runner, &cancellations, &id);
+            let runner = runners(&store);
+            crate::ci_watch::poll_open_pr_ci_status(&store, runner.as_ref(), &cancellations, &id);
         });
     }
 
@@ -9074,13 +9098,12 @@ pub fn review_maintenance(
         let store = Arc::clone(store);
         let sem = Arc::clone(sem);
         let cancellations = cancellations.clone();
+        let runners = Arc::clone(runners);
         std::thread::spawn(move || {
             // Released when this worker exits, including via the early return
             // on the PR-commit-sync error path below.
             let _claim = claim;
-            let runner: Arc<dyn Runner> = Arc::new(crate::remote_runner::MachineRouter::from_env(
-                Arc::clone(&store),
-            ));
+            let runner = runners(&store);
             // RAL-213: one token covers both the base-shift rebuild and (if
             // that didn't run) the manual-push restack below -- either may
             // trigger a merge for this guardian id.
