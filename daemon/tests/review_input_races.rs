@@ -3437,7 +3437,7 @@ impl FakeGitHub {
                 json_reply(serde_json::json!({"number": 1, "pull_requests": open}), 200)
             }
             (Post, ["actions", "runs", id, "force-cancel"]) => {
-                if let Some(id) = id.parse::<i64>().ok() {
+                if let Ok(id) = id.parse::<i64>() {
                     st.cancelled_runs.push(id);
                     for run in st.runs.iter_mut().filter(|r| r.0 == id) {
                         run.3 = "completed".to_string();
