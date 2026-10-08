@@ -10831,6 +10831,29 @@ impl Store {
         .ok_or(StoreError::NotFound)
     }
 
+    /// Whether a cell has reached a final state (`done`, `failed`,
+    /// `cancelled` or `ignored`) -- i.e. no tmux session is running for it
+    /// until something restarts it.
+    pub(crate) fn cell_is_final_conn(
+        conn: &Connection,
+        squad_id: &str,
+        task_idx: i64,
+        cell_idx: i64,
+    ) -> Result<bool> {
+        let state = conn
+            .query_row(
+                "SELECT state FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
+                params![squad_id, task_idx, cell_idx],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound)?;
+        Ok(matches!(
+            state.as_str(),
+            "done" | "failed" | "cancelled" | "ignored"
+        ))
+    }
+
     /// A cell's primary intent text for the RAL-412 semantic-ordering
     /// request: its `prompt` when it has one, otherwise its `command` — the
     /// same prompt-or-command fallback `submit` uses when it queues a cell

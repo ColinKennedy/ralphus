@@ -120,9 +120,9 @@
             ? "Historical record (read-only) — cell ended"
             : "Live terminal (read-only)";
         const headTip = detached
-          ? "This tmux cell was cleanly stopped so a real interactive agent session could take over — not a hang. What's shown is the daemon's persisted record of the stopped process's last captured output, not live output; the live conversation now continues in a separate terminal outside this board.\nRead-only — there was never anything to send to here.\nUse 'Open Agent' to reattach a terminal to that live session, or 'Resume Automation' once done with it — this box switches back to auto-refreshing live output within a poll tick or two once headless execution resumes."
+          ? "This tmux cell was cleanly stopped so a real interactive agent session could take over — not a hang. What's shown is the daemon's persisted record of the stopped process's last captured output, not live output; the live conversation now continues in a separate terminal outside this board.\nRead-only — there was never anything to send to here.\nUse 'Open Agent' to reattach a terminal to that live session, or 'Resume Automation' once done with it — this box switches back to auto-refreshing live output within about 15 seconds once headless execution resumes."
           : ended
-            ? "This tmux cell has ended. What's shown is the daemon's persisted record of the pane's last captured output, not live output.\nRead-only — there was never anything to send to here.\nIf a new terminal comes up for this same step — the agent reattaching, or you restarting the cell or proof step — this box switches back to auto-refreshing live output within a poll tick or two on its own. You never need to navigate away and back."
+            ? "This tmux cell has ended. What's shown is the daemon's persisted record of the pane's last captured output, not live output.\nRead-only — there was never anything to send to here.\nIf a new terminal comes up for this same step — the agent reattaching, or you restarting the cell or proof step — this box switches back to auto-refreshing live output within about 15 seconds on its own. You never need to navigate away and back."
             : "Live output from the agent's tmux pane.\nAuto-refreshes every 2 seconds. Read-only — nothing typed here reaches the agent.\nSwitches to a read-only historical record once the underlying tmux cell ends.";
         // RAL-170: last-activity label, seeded from cached state (if any) so
         // it doesn't blank out on every full re-render -- fetchPeek patches
@@ -864,6 +864,10 @@
           });
         });
       }
+      /** How many 2 s poll ticks an ended Live View box waits between polls. */
+      const PEEK_ENDED_POLL_EVERY = 8;
+      /** Poll ticks since load, for pacing ended boxes. */
+      let peekPollTick = 0;
       // RAL-167: on its own dedicated interval (see the bottom of this
       // script), independent of the main SSE-driven tick() -- live-terminal
       // content isn't Cartographer-backed, so push can't drive it. Refreshes
@@ -874,13 +878,20 @@
        * @returns {Promise<void>}
        */
       async function pollOpenPeeks() {
+        // A hidden tab shows nothing, and every box poll can cost the daemon a
+        // tmux process; the visibilitychange handler refreshes on return.
+        if (document.hidden) return;
         // Replacing a pre's text destroys any in-progress text selection inside it
         // (e.g. the user copying a line from the terminal transcript) even though
         // the rest of the page's periodic re-render is already skipped for the same
         // reason — see userIsSelecting()/RAL-7. Skip this tick entirely and pick back
         // up once the selection is released.
         if (userIsSelecting()) return;
-        const keys = Object.keys(peekOpen).filter((k) => peekOpen[k]);
+        // An ended box only polls to notice a restart reviving it, which can
+        // wait: every PEEK_ENDED_POLL_EVERY-th tick instead of every tick.
+        peekPollTick += 1;
+        const endedDue = peekPollTick % PEEK_ENDED_POLL_EVERY === 0;
+        const keys = Object.keys(peekOpen).filter((k) => peekOpen[k] && (endedDue || !peekEnded[k]));
         // Concurrent, not sequential (RAL-397 made each box's fetchPeek() issue
         // up to two round trips instead of one -- with N open boxes, a
         // sequential for/await loop compounded that into 2N+ round trips paid
