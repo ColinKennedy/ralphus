@@ -127,6 +127,7 @@ where one exists.
 | POST | `/api/guardians/{id}/branches/arrange` | [Reorder + rebase atomically](#post-apiguardiansidbranchesarrange) |
 | POST | `/api/guardians/{id}/sync-pr` | [Check the forge for a stack reorder, on demand](#post-apiguardiansidsync-pr) |
 | POST | `/api/guardians/{id}/branches/{branch_id}/feedback` | Feedback on one branch → resolver re-attempt |
+| GET | `/api/guardians/{id}/branches/{branch_id}/runs` | [Per-branch agent runs](#get-apiguardiansidbranchesbranch_idruns) |
 | GET | `/api/guardians/{id}/branches/{branch_id}/messages` | [Per-branch feedback thread](#get-apiguardiansidbranchesbranch_idmessages) |
 | GET | `/api/guardians/{id}/base-branches` | Candidate base branches (same remote) |
 | POST | `/api/guardians/{id}/base` | Change base branch + rebuild |
@@ -2593,6 +2594,29 @@ review spanning several projects honours each project's setting independently.
 The change is persisted and applied on the next `merge`/rebuild (like the other
 per-review opt-out toggles). Returns `200` with the updated guardian view, whose
 `squash_projects` array lists the project roots with squash enabled.
+
+### `GET /api/guardians/{id}/branches/{branch_id}/runs`
+One review branch's agent runs (RAL-587) -- rebase conflict resolution, final
+proof and feedback revisions -- paired and attributed, oldest first:
+```json
+{ "runs": [ { "id": "rebase-42", "kind": "rebase", "label": "rebase onto main · 2 conflicts",
+  "start_at_ms": 1783120000000, "end_at_ms": 1783120090000, "elapsed_ms": 90000,
+  "outcome": "resolved", "agent": "claude-code", "task": "resolve",
+  "cell_id": "resolve-branch-000000000001-1783120000000", "prompt": "...", "start_recorded": true } ] }
+```
+`kind` is `rebase`, `proof` or `feedback`. `outcome` is `running` while the run
+is open (`end_at_ms`/`elapsed_ms` are `null`), `interrupted` when a newer run
+of the same kind started before it ended, otherwise `resolved` /
+`resolved, nothing to commit` / `failed` (rebase), `passed` / `failed`
+(proof), `committed` / `no change committed` (feedback). A retry inside one
+resolve pass is part of the same run. An end row with no start row yields a
+run with `start_recorded: false` and a label ending `(start not recorded)`;
+its start and end are that row's time. `agent`/`prompt`/`cell_id` are `null`
+when the row did not record them. Rows are attributed by the stable
+`branch_id` in the lifecycle payload, falling back to the branch name and then
+the position for rows written before `branch_id` was recorded. `404` for an
+unknown review or branch. The read is not subject to the Cartographer page
+limit.
 
 ### `GET /api/guardians/{id}/branches/{branch_id}/messages`
 One review branch's read-only feedback thread (RAL-272), oldest first:

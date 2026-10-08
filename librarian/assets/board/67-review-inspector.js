@@ -36,23 +36,30 @@
        */
       const liveSub = {};
       /**
-       * One thing that ran for a branch -- a rebase pass, a final proof, a
-       * feedback revision, a PR submit, a post-merge gate. Derived from the
-       * review's Cartographer rows rather than stored anywhere: the daemon
-       * records each of these as events, and a run is the span between its
-       * start and end row.
+       * One agent run on a branch -- a rebase pass, a final proof, a feedback
+       * revision -- as the daemon pairs and attributes it
+       * (`GET /api/guardians/{id}/branches/{bid}/runs`).
        * @typedef {object} BranchRun
-       * @property {string} id - Stable within one render, for the picker.
+       * @property {string} id - Stable run id, for the picker.
        * @property {string} kind - rebase | proof | feedback.
        * @property {string} label - What the pass was doing.
-       * @property {number} atMs - When the run started.
-       * @property {string} outcome - resolved / passed / failed / committed …
-       * @property {string} who - The agent that ran it.
-       * @property {number} elapsedMs - Measured duration, or 0 when the emitter reports none. Never estimated.
+       * @property {number} start_at_ms - When the run started (the end row's time when the start was not recorded).
+       * @property {number|null} end_at_ms - When it ended, or null while it is still running.
+       * @property {number} elapsed_ms - Measured duration, or 0 while running.
+       * @property {string} outcome - running / resolved / passed / failed / committed / interrupted ...
+       * @property {string} agent - The agent that ran it.
        * @property {string} [task] - The daemon task that owns this pass's transcript.
-       * @property {string} [cellId] - The unique resolver cell that owns this pass.
+       * @property {string} [cell_id] - The unique resolver cell that owns this pass.
        * @property {string} [prompt] - The dispatched instruction, when retained by the daemon.
+       * @property {boolean} start_recorded - False when only the run's end row exists.
        */
+      /**
+       * Each branch's runs, keyed `gid|bid`; undefined until first fetched.
+       * @type {Record<string, BranchRun[]>}
+       */
+      const branchRunsCache = {};
+      /** @type {Set<string>} Run fetches in flight, so a repaint never starts a second. */
+      const branchRunsLoading = new Set();
       /** @type {boolean} True while the log dock is expanded. */
       let reviewDockOpen = false;
       /**
@@ -682,108 +689,37 @@
         }
       }
       /**
-       * Whether a Cartographer row is attributable to a branch, by payload
-       * (`ref` / `branch_id` ids, `branch` name, optionally the stack
-       * `position`) -- not by message text.
-       * @param {CartographerRow} r - One Cartographer event.
-       * @param {GuardianBranch} b - The branch.
-       * @param {boolean} byPosition - Also match the stack ordinal (last resort).
-       * @returns {boolean}
+       * Fetches a branch's runs from the daemon and repaints. Called when the
+       * Live tab first needs them and again on the branch's SSE state change --
+       * never on a display toggle.
+       * @param {string} gid - The review id.
+       * @param {string} bid - The branch id.
+       * @returns {Promise<void>}
        */
-      function rowBelongsToBranch(r, b, byPosition) {
-        const p = r.payload || {};
-        return p.ref === b.id || p.branch === b.branch || p.branch_id === b.id
-          || (byPosition && p.position !== undefined && p.position === b.position);
+      async function loadBranchRuns(gid, bid) {
+        const key = `${gid}|${bid}`;
+        if (branchRunsLoading.has(key)) return;
+        branchRunsLoading.add(key);
+        try {
+          const r = await fetch(`/api/guardians/${encodeURIComponent(gid)}/branches/${encodeURIComponent(bid)}/runs`);
+          /** @type {{runs?: BranchRun[]}} */
+          const data = r.ok ? await r.json() : {};
+          branchRunsCache[key] = data.runs || [];
+        } catch {
+          branchRunsCache[key] = branchRunsCache[key] || [];
+        } finally {
+          branchRunsLoading.delete(key);
+        }
+        renderReviewInspector();
       }
       /**
-       * Every agent session this branch ran, oldest first.
-       *
-       * "What was it doing at that time" is not a question about rebase
-       * attempts alone -- a branch rebases, proves, and revises against
-       * feedback, and any of those is a point someone wants to walk back to.
-       * The daemon records each as a Cartographer event, so a run is the span
-       * between its start and end rows; this reads rows the board already has
-       * for the review rather than asking for anything new.
-       *
-       * Only passes that ran under a pane are listed. A PR submit goes out over
-       * the forge's REST API and preparation commands run as plain commands, so
-       * neither ever had a transcript -- an entry for one could only ever say
-       * "nothing to show here", which is a walk-back stop that cannot be walked
-       * to. Both stay recorded elsewhere: preparation in its readiness section,
-       * both of them in the logs drawer.
-       * @param {GuardianView} g - The review.
-       * @param {GuardianBranch} b - The branch.
+       * A branch's runs, oldest first; empty until the first fetch lands.
+       * @param {string} gid - The review id.
+       * @param {string} bid - The branch id.
        * @returns {BranchRun[]}
        */
-      function branchRuns(g, b) {
-        const rows = reviewDockEvents[g.id];
-        if (!rows) return [];
-        /** @type {BranchRun[]} */
-        const runs = [];
-        const resolver = resolverOf(g);
-        // Branch attribution is not uniform across emitters: status transitions
-        // key on `payload.ref` (a branch id), the rebase/proof passes on
-        // `payload.branch` (a branch *name*), the PR and feedback-posting rows
-        // on `payload.branch_id`, and the feedback pass itself on
-        // `payload.position` (a stack ordinal -- which a reorder can move, so
-        // it is matched last and only when nothing better identifies the row).
-        const mine = rows.filter((r) => rowBelongsToBranch(r, b, true));
-        const ordered = mine.slice().sort((x, y) => x.at_ms - y.at_ms);
-        /**
-         * Closes the most recent still-running run of a kind.
-         * @param {string} kind - Which kind to close.
-         * @param {string} outcome - The outcome to record.
-         * @param {number} [ms] - Measured duration, when the emitter reports one.
-         * @returns {void}
-         */
-        const close = (kind, outcome, ms) => {
-          const open = [...runs].reverse().find((x) => x.kind === kind && x.outcome === "running");
-          if (!open) return;
-          open.outcome = outcome;
-          if (ms) open.elapsedMs = ms;
-        };
-        for (const r of ordered) {
-          const msg = r.message || "";
-          const p = r.payload || {};
-          if (msg.startsWith("conflicts starting")) {
-            const found = p.found ? ` · ${p.found} conflict${p.found === 1 ? "" : "s"}` : "";
-            runs.push({
-              id: `rebase-${r.id}`, kind: "rebase",
-              label: `rebase onto ${g.base_branch || "upstream"}${found}`,
-              atMs: r.at_ms, outcome: "running", elapsedMs: 0,
-              who: String(p.agent || resolver), task: String(r.task || p.task || "resolver"),
-              cellId: typeof r.cell_id === "string" ? r.cell_id : (typeof p.cell_id === "string" ? p.cell_id : undefined),
-              prompt: typeof p.prompt === "string" ? p.prompt : undefined,
-            });
-          } else if (msg.startsWith("conflicts resolved")) {
-            close("rebase", p.committed ? "resolved" : "resolved, nothing to commit");
-          } else if (msg.startsWith("conflicts failed")) {
-            close("rebase", "failed");
-          } else if (msg.startsWith("final proof starting")) {
-            runs.push({
-              id: `proof-${r.id}`, kind: "proof", label: "final proof",
-              atMs: r.at_ms, outcome: "running", elapsedMs: 0, who: resolver,
-              task: String(r.task || p.task || "resolver-proof"),
-              cellId: typeof r.cell_id === "string" ? r.cell_id : (typeof p.cell_id === "string" ? p.cell_id : undefined),
-              prompt: typeof p.prompt === "string" ? p.prompt : undefined,
-            });
-          } else if (msg.startsWith("final proof done")) {
-            close("proof", p.passed ? "passed" : "failed");
-          } else if (msg.startsWith("feedback applying")) {
-            runs.push({
-              id: `fb-${r.id}`, kind: "feedback", label: "feedback revision",
-              atMs: r.at_ms, outcome: "running", elapsedMs: 0, who: resolver,
-              task: String(r.task || p.task || "feedback"),
-              cellId: typeof r.cell_id === "string" ? r.cell_id : (typeof p.cell_id === "string" ? p.cell_id : undefined),
-              prompt: typeof p.prompt === "string" ? p.prompt : undefined,
-            });
-          } else if (msg.startsWith("feedback done")) {
-            close("feedback", p.committed ? "committed" : "no change committed");
-          }
-        }
-        // One timeline, in the order things actually happened.
-        runs.sort((x, y) => x.atMs - y.atMs);
-        return runs;
+      function branchRunsOf(gid, bid) {
+        return branchRunsCache[`${gid}|${bid}`] || [];
       }
       /**
        * Formats a run's "05:12:30 · passed" metadata line.
@@ -791,13 +727,14 @@
        * @returns {string}
        */
       function runMeta(run) {
-        const t = run.atMs
-          ? new Date(run.atMs).toLocaleTimeString([], { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" })
+        const t = run.start_at_ms
+          ? new Date(run.start_at_ms).toLocaleTimeString([], { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" })
           : "";
         // Duration only where the daemon measured one -- a gate's elapsed_ms.
         // Nothing here is derived from wall-clock guesses.
-        const dur = run.elapsedMs ? ` · ${fmtDurationMs(run.elapsedMs)}` : "";
-        return (run.outcome ? `${t} · ${run.outcome}` : t) + dur;
+        const dur = run.elapsed_ms ? ` · ${fmtDurationMs(run.elapsed_ms)}` : "";
+        const note = run.start_recorded === false ? " · start not recorded" : "";
+        return (run.outcome ? `${t} · ${run.outcome}` : t) + dur + note;
       }
       /**
        * Formats a measured duration the way the rest of the board does.
@@ -832,7 +769,7 @@
         const g = guardians.find((x) => x.id === selectedGuardian);
         const b = g && g.branches ? g.branches.find((x) => x.id === bid) : null;
         if (!g || !b) return;
-        const runs = branchRuns(g, b);
+        const runs = branchRunsOf(g.id, b.id);
         if (!runs.length) return;
         liveRunIdx[bid] = Math.max(0, Math.min(runs.length - 1, curRunIdx(runs, bid) + dir));
         renderReviewInspector();
@@ -877,14 +814,13 @@
         if (!b.worktree) {
           return `<div class="empty">No worktree yet — a resolver session starts when this branch begins rebasing.</div>`;
         }
-        // The run list is derived from the review's event rows, which the log
-        // drawer also reads -- one fetch per review, on the first thing that
-        // needs it, rather than one per tab.
-        if (reviewDockEvents[g.id] === undefined) loadReviewDockEvents(g.id);
-        const runs = branchRuns(g, b);
+        // The daemon pairs and attributes the runs; fetched once when this tab
+        // first renders, then refetched only on the branch's SSE state change.
+        if (branchRunsCache[`${g.id}|${b.id}`] === undefined) loadBranchRuns(g.id, b.id);
+        const runs = branchRunsOf(g.id, b.id);
         const ri = curRunIdx(runs, b.id);
         const run = ri >= 0 ? runs[ri] : null;
-        const key = `guardian|${g.id}|${b.id}${run && run.task && run.cellId ? `|${run.task}|${run.cellId}` : ""}`;
+        const key = `guardian|${g.id}|${b.id}${run && run.task && run.cell_id ? `|${run.task}|${run.cell_id}` : ""}`;
         // The key names the shown run, so it changes as runs load or are
         // stepped through; whichever one is on screen is the one polled.
         if (!peekOpen[key]) {
@@ -994,7 +930,7 @@
               data-tip="Attach a real, interactive terminal to this session.\nShows the runner's own log/event stream, not the agent's conversation.">Open terminal</button>` : ""}
             <button class="btn" style="padding:3px 8px;font-size:11.5px" data-click="scopeReviewDockToBranch" data-guardian-id="${esc(g.id)}" data-branch-id="${esc(b.id)}"
               data-tip="Open this branch's log drawer alongside the transcript.">Logs</button>
-            <span class="rg-sub">${run ? esc(run.who) : ""}</span>
+            <span class="rg-sub">${run ? esc(run.agent || resolverOf(g)) : ""}</span>
           </div>`;
         const shown = peekContent[key];
         return `<div style="position:relative"><div class="runterm" id="peek-pre-${peekCssKey(key)}" style="height:${peekPaneHeight}px" tabindex="0" data-key="${esc(key)}"
@@ -1050,7 +986,7 @@
        * @returns {string}
        */
       function livePromptView(g, b, run) {
-        const scrollKey = `${g.id}:${b.id}:prompt:${run ? `${run.task || ""}/${run.cellId || ""}/${run.label}` : ""}`;
+        const scrollKey = `${g.id}:${b.id}:prompt:${run ? `${run.task || ""}/${run.cell_id || ""}/${run.label}` : ""}`;
         if (run && run.prompt) {
           return `${reviewPromptBox(scrollKey, run.prompt)}
             <div class="hint">The instruction dispatched to this run.</div>`;
@@ -1171,6 +1107,17 @@
           : `<div class="empty">Nothing logged for this scope yet.</div>`;
       }
       /**
+       * Whether a log row's payload names a branch (`ref` / `branch_id` id or
+       * `branch` name) -- the drawer's per-branch filter.
+       * @param {CartographerRow} r - One Cartographer event.
+       * @param {GuardianBranch} b - The branch.
+       * @returns {boolean}
+       */
+      function rowNamesBranch(r, b) {
+        const p = r.payload || {};
+        return p.ref === b.id || p.branch === b.branch || p.branch_id === b.id;
+      }
+      /**
        * The dock's rows for one scope, drawn from the Cartographer events the
        * board has already loaded for this review.
        * @param {GuardianView} g - The review.
@@ -1205,7 +1152,7 @@
         /** @type {Map<number, CartographerRow>} */
         const byId = new Map();
         for (const r of raw) {
-          if (rowBelongsToBranch(r, b, false) || (r.message || "").includes(b.branch)) byId.set(r.id, r);
+          if (rowNamesBranch(r, b) || (r.message || "").includes(b.branch)) byId.set(r.id, r);
         }
         for (const r of reviewDockBranchEvents[`${g.id}|${b.id}`] || []) {
           if (reviewDockHideDebug && (r.level || "").toUpperCase() === "DEBUG") continue;
@@ -2007,26 +1954,11 @@
        */
       async function loadReviewDockEvents(gid) {
         try {
-          // Two windows, merged. The newest 200 rows of every kind feed the
-          // drawer, but a long-lived review has thousands of poller/PR/CI rows
-          // that bury the run lifecycle rows (`conflicts starting`, `final proof
-          // starting`, `feedback applying`), so a branch's earlier runs vanished
-          // from the Live tab. The `guardian`-source rows are the only ones
-          // branchRuns() reads and are sparse, so fetch them separately.
-          const base = `/api/guardians/${encodeURIComponent(gid)}/cartographer`;
-          const [recent, lifecycle] = await Promise.all([
-            fetch(`${base}?limit=200&sort=desc`),
-            fetch(`${base}?source=guardian&limit=1000&sort=desc`),
-          ]);
-          if (!recent.ok) { reviewDockEvents[gid] = []; afterReviewDockEvents(); return; }
+          const res = await fetch(`/api/guardians/${encodeURIComponent(gid)}/cartographer?limit=200&sort=desc`);
+          if (!res.ok) { reviewDockEvents[gid] = []; afterReviewDockEvents(); return; }
           /** @type {{rows: CartographerRow[], total: number}} */
-          const data = await recent.json();
-          /** @type {CartographerRow[]} */
-          const extra = lifecycle.ok ? ((await lifecycle.json()).rows || []) : [];
-          /** @type {Map<number, CartographerRow>} */
-          const byId = new Map();
-          for (const row of [...(data.rows || []), ...extra]) byId.set(row.id, row);
-          reviewDockEvents[gid] = [...byId.values()].sort((x, y) => x.at_ms - y.at_ms || x.id - y.id);
+          const data = await res.json();
+          reviewDockEvents[gid] = (data.rows || []).slice().sort((x, y) => x.at_ms - y.at_ms || x.id - y.id);
         } catch {
           reviewDockEvents[gid] = [];
         }
@@ -2035,10 +1967,8 @@
       /**
        * Repaints everything derived from the review's event rows once they land.
        *
-       * The dock is no longer their only consumer: the Live tab's walk-back is
-       * derived from the same rows, and it is usually what triggers the fetch.
-       * Repainting only the dock left that tab showing "no runs" until some
-       * unrelated event happened to re-render the inspector.
+       * The log drawer and the inspector's tabs both read them, and either may
+       * be what triggered the fetch, so both repaint.
        * @returns {void}
        */
       function afterReviewDockEvents() {

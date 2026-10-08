@@ -643,6 +643,10 @@
           // manual click away and back.
           await pollReviews();
           if (selectedGuardian && guardianIds.has(selectedGuardian)) await refreshExpandedBranchMessages(selectedGuardian);
+          // The Live tab's runs come from the daemon, so a state change on the open branch re-reads them.
+          if (selectedGuardian && inspectorTab === "live" && inspectorBranchId && branchRunsCache[`${selectedGuardian}|${inspectorBranchId}`] !== undefined) {
+            loadBranchRuns(selectedGuardian, inspectorBranchId);
+          }
         } else if (tab === "queue" && (hasSquadChange || kinds.has("squad")) && (queueUI.autoUpdate || !queueLoaded)) {
           // `hasSquadChange` covers a row that carries a squad id but was
           // classified "guardian" because it also carries a guardian id.

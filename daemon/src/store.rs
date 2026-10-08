@@ -1987,6 +1987,9 @@ impl Store {
             -- two scans per page, growing with every row the daemon has ever
             -- logged. `at_ms` rides along because every such feed orders by it.
             CREATE INDEX IF NOT EXISTS idx_carto_scope_at ON cartographer_events(scope, at_ms);
+            CREATE INDEX IF NOT EXISTS idx_carto_branch_lifecycle
+                ON cartographer_events(guardian_id, at_ms)
+                WHERE source = 'guardian' AND scope = 'branch';
             -- WS-D.2: partial rather than full. `squad_id`/`cell_id`/`task`
             -- are NULL on ~99% of rows, and Cartographer inserts are the
             -- daemon's highest-volume write; see the WS-D.2 migration block
@@ -3932,6 +3935,9 @@ impl Store {
             "ALTER TABLE waypoints ADD COLUMN updated_at_ms INTEGER NOT NULL DEFAULT 0",
             "CREATE INDEX IF NOT EXISTS idx_waypoints_state ON waypoints(state)",
             "CREATE INDEX IF NOT EXISTS idx_carto_scope_at ON cartographer_events(scope, at_ms)",
+            "CREATE INDEX IF NOT EXISTS idx_carto_branch_lifecycle
+                 ON cartographer_events(guardian_id, at_ms)
+                 WHERE source = 'guardian' AND scope = 'branch'",
             // RAL-509: persist the transient fork-side upstream branch name for
             // dual_root_pr targets once allocated.
             "ALTER TABLE guardians ADD COLUMN dual_root_stack_branch TEXT",

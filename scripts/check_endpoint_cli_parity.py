@@ -240,6 +240,7 @@ ENDPOINT_TO_CLI: dict[str, list[str]] = {
     "POST /api/guardians/{id}/branches/{branch_id}/dismiss_reenable": ["review dismiss-reenable"],
     "POST /api/guardians/{id}/branches/{branch_id}/move": ["review move-branch"],
     "POST /api/guardians/{id}/branches/{branch_id}/link_cell": ["review link-cell"],
+    "GET /api/guardians/{id}/branches/{branch_id}/runs": ["review branch runs"],
     "POST /api/guardians/{id}/branches/{branch_id}/env": ["review env"],
     "POST /api/guardians/{id}/build-env": ["review build-env"],
     "GET /api/guardians/{id}/branches/{branch_id}/env": ["review env"],

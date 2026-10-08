@@ -345,6 +345,7 @@ the daemon's hourly Free-tier background sweep
 | `review link-cell <selector#branch> <cell_selector>` | Link a cell/task to an already-attached branch, so its readiness follows that cell finishing instead of staying `pending` forever (RAL-392) |
 | `review reorder <selector> <b1,b2,...> [--disable b,b] [--enable b,b]` | Reorder branches + rebase, atomically |
 | `review branch enable\|disable <selector#branch>` | Enable/disable one branch + rebase |
+| `review branch runs <selector#branch>` | List a branch's rebase / final-proof / feedback agent runs, oldest first (read-only) |
 | `review merge <selector>` | Start/continue the stacked rebase |
 | `review sync-pr <selector>` | Check the forge (GitHub or GitLab) for a stack reorder made outside ralphus and apply it if found (RAL-273) |
 | `review restart-merge <selector>` | Cancel an in-progress rebase, start fresh |
@@ -800,6 +801,7 @@ use; see `READ_ONLY_NOTE`.
         - branch  {Enable/disable one review branch.}
             - disable selector [uri]  {Disable a branch and kick off the rebase.}
             - enable selector [uri]  {Enable a branch and kick off the rebase.}
+            - (read-only-safe) runs selector [uri]  {List a branch's rebase, final-proof and feedback agent runs, oldest first.}
             - terminal selector [uri] --mode [open|readonly]  {Print the command to resume a branch's conflict-resolver conversation locally.}
         - build-env selector [uri] --clear [key...] --set [key=value...] --unset [key...]  {Set/unset/clear this review's build/check-gate step environment overrides.}
         - cancel selector [uri]  {Cancel a review.}

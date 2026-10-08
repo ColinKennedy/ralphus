@@ -319,6 +319,15 @@ const REVIEW_BRANCH_CHILDREN: &[HelpNode] = &[
         &[],
     ),
     node(
+        "runs",
+        &["selector [str]"],
+        &[],
+        "List a branch's rebase, final-proof and feedback agent runs, oldest first.",
+        false,
+        true, // ("review", "branch", "runs")
+        &[],
+    ),
+    node(
         "terminal",
         &["selector [str]"],
         &["--mode [open|readonly]"],
