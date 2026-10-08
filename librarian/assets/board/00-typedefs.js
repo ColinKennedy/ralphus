@@ -414,7 +414,7 @@
        */
       /**
        * `GET /api/guardians/{id}/followup/items`: the counts plus the items.
-       * @typedef {FollowupSummary & {items: PendingFollowupItem[]}} PendingFollowups
+       * @typedef {FollowupSummary & {items: PendingFollowupItem[], offer_status?: string|null, offer_squad_id?: string|null}} PendingFollowups
        */
       /**
        * @typedef {object} GuardianView
