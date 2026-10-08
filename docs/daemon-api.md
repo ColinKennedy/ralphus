@@ -3137,12 +3137,31 @@ for this PR, e.g. `"deferred_no_worktree"` (this PR's branch has no review
 worktree yet — a still-collecting stack whose restack hasn't reached it),
 `"deferred_upstream_failing"` (a ready-but-failing sibling earlier in the
 stack is fixed first, so downstream fixes aren't wasted work), `"deferred_backoff"`,
-`"exhausted"`, `"auto_fix_dispatching"`, or `"auto_fix_passed"`/`"auto_fix_failed"`
+`"exhausted"`, `"exhausted_awaiting_ci"` (the attempt budget is spent but the
+latest CI generation has unfinished checks or has not yet sat settled long
+enough for the progress refund check, so the exhausted notice is held back;
+bounded by the 2-hour CI watch window), `"auto_fix_dispatching"`, or `"auto_fix_passed"`/`"auto_fix_failed"`
 once the resolver has run. It is cleared back to `null` whenever `ci_status`
 turns `"passing"`. Unlike `auto_fix_error`, this is populated for every
 outcome the poll reaches — including a merely-deferred one, not just a
 terminal failure — so a PR that never got auto-fixed still has a legible
 reason on the board/CLI rather than only a DEBUG Cartographer row.
+
+Auto-fix attempts are refunded for real progress (RAL-578, RAL-591). Each CI
+poll reports a *generation key* (GitHub head SHA, GitLab pipeline id), the
+failing check names, and whether every check of that generation has finished
+(*settled*). When a new generation settles — and stays settled for 30 seconds,
+since the forge lists only runs that already exist — and its failing set is a
+strict subset of the previous *settled* generation's, one attempt is refunded
+(never below 0), the retry backoff is cleared and any exhausted-notice marker
+is dropped so the next poll tick can claim the restored attempt. A generation
+is evaluated once, so re-running CI on the same SHA or pipeline never refunds,
+and a failing set that grows or stays equal never refunds. While the newest
+generation is unsettled, an exhausted budget reports
+`auto_fix_last_outcome: "exhausted_awaiting_ci"` and the mailbox notice is held
+back until a settled poll shows no refund (or the 2-hour watch window ends).
+Both CI polls page through the forge's results, so a failure beyond the first
+100 check runs / failed jobs is still seen.
 
 The standing poll (`ci_watch::poll_open_pr_ci_status`) is the *only* path
 that dispatches auto-fix, and it now also runs for a review whose guardian

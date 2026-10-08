@@ -177,6 +177,10 @@ pub struct PrComment {
 /// count silently under-reported.
 const PER_PAGE: u32 = 100;
 
+/// Upper bound on pages followed when listing a PR's check-runs / a pipeline's
+/// failed jobs, so a misbehaving forge cannot loop a poll forever.
+const MAX_CI_PAGES: u32 = 20;
+
 /// Which comment endpoint [`ForgeClient::list_pr_comments_conditional`]
 /// polls (RAL-366). GitHub splits PR feedback across two REST resources --
 /// general conversation (`/issues/{n}/comments`) and inline review comments
@@ -267,7 +271,7 @@ pub struct FailedCheck {
 /// (RAL-375): a failed required check, or the forge's own merge-conflict
 /// verdict. Deliberately not narrower ("did CI pass") -- `crate::ci_watch`
 /// polls for anything that would stop this PR from merging or rebasing.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PrFailure {
     /// Human-readable description of what's blocking, e.g. "check 'build'
     /// failed", "3 checks failed: 'build', 'lint', 'test'", or "merge
@@ -291,6 +295,33 @@ pub struct PrFailure {
     /// uses this to list every failing job's URL for the auto-fix agent
     /// up front, rather than making it re-derive that from a single summary.
     pub checks: Vec<FailedCheck>,
+    /// Which CI run this snapshot belongs to (RAL-591): GitHub's PR head SHA,
+    /// GitLab's pipeline id. A fix push changes it; a plain re-run of the same
+    /// commit/pipeline does not, so `Store::set_pr_failing_checks` refunds
+    /// auto-fix attempts only across a change. `None` for verdicts with no CI
+    /// run behind them (a merge-conflict verdict).
+    pub generation: Option<String>,
+    /// How many check-runs/jobs of this generation had not finished when
+    /// polled. The poll reports `Failing` on the first failed check even
+    /// while others still run, so `checks` may be a partial view until this
+    /// reaches 0 (see [`Self::settled`]). The forge lists only runs that
+    /// already exist, so 0 is necessary but not sufficient for "final";
+    /// `crate::pr::REFUND_SETTLE_MS` covers runs created late.
+    pub pending_count: usize,
+    /// Names of the check-runs/jobs that completed without failing. GitHub
+    /// only: GitLab's poll lists failed jobs alone, so this stays empty there.
+    pub passing_checks: Vec<String>,
+    /// Names of the check-runs/jobs not yet completed. GitHub only, like
+    /// `passing_checks`; GitLab reports `failed` only for a finished pipeline.
+    pub in_progress_checks: Vec<String>,
+}
+
+impl PrFailure {
+    /// Whether every check of this generation had finished when polled.
+    #[must_use]
+    pub fn settled(&self) -> bool {
+        self.pending_count == 0
+    }
 }
 
 /// Build a [`PrFailure`] from every individually failing check/job found in
@@ -317,6 +348,7 @@ fn build_pr_failure(checks: Vec<FailedCheck>, noun: &str) -> PrFailure {
         job_url,
         log_text,
         checks,
+        ..Default::default()
     }
 }
 
@@ -1133,6 +1165,7 @@ impl ForgeClient {
                     job_url: None,
                     log_text: None,
                     checks: vec![],
+                    ..Default::default()
                 }));
             }
             // RAL-<new>: this poll's doc comment above has always claimed
@@ -1156,17 +1189,25 @@ impl ForgeClient {
             return Ok(PrCiState::Pending);
         };
 
-        let checks_url = format!(
-            "{}/repos/{}/commits/{sha}/check-runs",
-            self.api_base, self.repo_path
-        );
-        let checks = self.get(
-            http_agent()
-                .get(&checks_url)
-                .set("Authorization", &format!("Bearer {token}"))
-                .set("Accept", "application/vnd.github+json"),
-        )?;
-        let runs = checks["check_runs"].as_array().cloned().unwrap_or_default();
+        let runs = self.github_check_runs(sha, token)?;
+        let run_name =
+            |run: &serde_json::Value| run["name"].as_str().unwrap_or("check").to_string();
+        let in_progress_checks: Vec<String> = runs
+            .iter()
+            .filter(|r| r["status"].as_str() != Some("completed"))
+            .map(run_name)
+            .collect();
+        let passing_checks: Vec<String> = runs
+            .iter()
+            .filter(|r| {
+                r["status"].as_str() == Some("completed")
+                    && matches!(
+                        r["conclusion"].as_str().unwrap_or_default(),
+                        "success" | "neutral" | "skipped"
+                    )
+            })
+            .map(run_name)
+            .collect();
         let failing: Vec<FailedCheck> = runs
             .iter()
             .filter(|run| {
@@ -1189,7 +1230,13 @@ impl ForgeClient {
             })
             .collect();
         if !failing.is_empty() {
-            return Ok(PrCiState::Failing(build_pr_failure(failing, "check")));
+            return Ok(PrCiState::Failing(PrFailure {
+                generation: Some(sha.to_string()),
+                pending_count: in_progress_checks.len(),
+                passing_checks,
+                in_progress_checks,
+                ..build_pr_failure(failing, "check")
+            }));
         }
         if runs
             .iter()
@@ -1229,9 +1276,14 @@ impl ForgeClient {
                     job_url: None,
                     log_text: None,
                     checks: vec![],
+                    ..Default::default()
                 }
             } else {
-                build_pr_failure(failing, "status")
+                PrFailure {
+                    generation: Some(sha.to_string()),
+                    passing_checks: passing_checks.clone(),
+                    ..build_pr_failure(failing, "status")
+                }
             }));
         }
         // GitHub's combined-status endpoint defaults `state` to `"pending"`
@@ -1281,6 +1333,7 @@ impl ForgeClient {
                 job_url: None,
                 log_text: None,
                 checks: vec![],
+                ..Default::default()
             }));
         }
 
@@ -1300,23 +1353,17 @@ impl ForgeClient {
                         job_url: mr["pipeline"]["web_url"].as_str().map(str::to_string),
                         log_text: None,
                         checks: vec![],
+                        ..Default::default()
                     }));
                 };
-                let jobs_url = format!(
-                    "{}/projects/{}/pipelines/{pipeline_id}/jobs?scope[]=failed",
-                    self.api_base, self.repo_path
-                );
-                let jobs = self
-                    .get(http_agent().get(&jobs_url).set("PRIVATE-TOKEN", token))
-                    .ok()
-                    .and_then(|v| v.as_array().cloned())
-                    .unwrap_or_default();
+                let jobs = self.gitlab_failed_jobs(pipeline_id, token);
                 if jobs.is_empty() {
                     return Ok(PrCiState::Failing(PrFailure {
                         reason: "pipeline failed".to_string(),
                         job_url: mr["pipeline"]["web_url"].as_str().map(str::to_string),
                         log_text: None,
                         checks: vec![],
+                        ..Default::default()
                     }));
                 }
                 // One `gitlab_job_trace` call per failed job -- deliberately
@@ -1339,17 +1386,77 @@ impl ForgeClient {
                         }
                     })
                     .collect();
-                Ok(PrCiState::Failing(build_pr_failure(checks, "job")))
+                Ok(PrCiState::Failing(PrFailure {
+                    generation: Some(pipeline_id.to_string()),
+                    ..build_pr_failure(checks, "job")
+                }))
             }
             "canceled" | "skipped" => Ok(PrCiState::Failing(PrFailure {
                 reason: format!("pipeline {pipeline_status}"),
                 job_url: mr["pipeline"]["web_url"].as_str().map(str::to_string),
                 log_text: None,
                 checks: vec![],
+                ..Default::default()
             })),
             // "running" | "pending" | "created" | "waiting_for_resource" | "preparing" | ...
             _ => Ok(PrCiState::Pending),
         }
+    }
+
+    /// Every check-run on `sha`, across all pages. GitHub defaults to 30 per
+    /// page, so an unpaginated read could report `Passing` while a failure
+    /// sat on page 2. Stops once `total_count` runs are collected, or -- when
+    /// the response carries no `total_count` -- on the first short page.
+    fn github_check_runs(&self, sha: &str, token: &str) -> Result<Vec<serde_json::Value>, String> {
+        let mut runs: Vec<serde_json::Value> = Vec::new();
+        for page in 1..=MAX_CI_PAGES {
+            let url = format!(
+                "{}/repos/{}/commits/{sha}/check-runs?per_page={PER_PAGE}&page={page}",
+                self.api_base, self.repo_path
+            );
+            let body = self.get(
+                http_agent()
+                    .get(&url)
+                    .set("Authorization", &format!("Bearer {token}"))
+                    .set("Accept", "application/vnd.github+json"),
+            )?;
+            let items = body["check_runs"].as_array().cloned().unwrap_or_default();
+            let got = items.len();
+            runs.extend(items);
+            let done = match body["total_count"].as_u64() {
+                Some(total) => runs.len() as u64 >= total,
+                None => got < PER_PAGE as usize,
+            };
+            if done || got == 0 {
+                break;
+            }
+        }
+        Ok(runs)
+    }
+
+    /// Every failed job of a GitLab pipeline, across all pages (GitLab's
+    /// default page size is 20). A fetch error yields whatever was read so far.
+    fn gitlab_failed_jobs(&self, pipeline_id: i64, token: &str) -> Vec<serde_json::Value> {
+        let mut jobs: Vec<serde_json::Value> = Vec::new();
+        for page in 1..=MAX_CI_PAGES {
+            let url = format!(
+                "{}/projects/{}/pipelines/{pipeline_id}/jobs?scope[]=failed&per_page={PER_PAGE}&page={page}",
+                self.api_base, self.repo_path
+            );
+            let Some(items) = self
+                .get(http_agent().get(&url).set("PRIVATE-TOKEN", token))
+                .ok()
+                .and_then(|v| v.as_array().cloned())
+            else {
+                break;
+            };
+            let got = items.len();
+            jobs.extend(items);
+            if got < PER_PAGE as usize {
+                break;
+            }
+        }
+        jobs
     }
 
     /// Checks that the pipeline represents the MR's current source head or
@@ -4298,7 +4405,10 @@ mod tests {
             )
             .unwrap();
             let req = server.recv();
-            assert_eq!(req.url(), "/repos/acme/widget/commits/keep/check-runs");
+            assert_eq!(
+                req.url(),
+                "/repos/acme/widget/commits/keep/check-runs?per_page=100&page=1"
+            );
             req.respond(
                 tiny_http::Response::from_string(
                     r#"{"check_runs": [{"name": "build", "status": "completed", "conclusion": "success"}]}"#,
@@ -6206,6 +6316,7 @@ mod tests {
                 job_url: None,
                 log_text: None,
                 checks: vec![],
+                ..Default::default()
             })
         );
         mock.finish();
@@ -6224,7 +6335,10 @@ mod tests {
             )
             .unwrap();
             let req = server.recv();
-            assert_eq!(req.url(), "/repos/acme/widget/commits/deadbeef/check-runs");
+            assert_eq!(
+                req.url(),
+                "/repos/acme/widget/commits/deadbeef/check-runs?per_page=100&page=1"
+            );
             req.respond(
                 tiny_http::Response::from_string(
                     r#"{"check_runs": [{"name": "build", "status": "completed", "conclusion": "failure", "details_url": "https://ci.example/job/1", "output": {"text": "error: build failed\nsee above"}}]}"#,
@@ -6247,6 +6361,8 @@ mod tests {
                     log_text: Some("error: build failed\nsee above".to_string()),
                     failing_step: None,
                 }],
+                generation: Some("deadbeef".to_string()),
+                ..Default::default()
             })
         );
         mock.finish();
@@ -6265,7 +6381,10 @@ mod tests {
             )
             .unwrap();
             let req = server.recv();
-            assert_eq!(req.url(), "/repos/acme/widget/commits/deadbeef/check-runs");
+            assert_eq!(
+                req.url(),
+                "/repos/acme/widget/commits/deadbeef/check-runs?per_page=100&page=1"
+            );
             req.respond(
                 tiny_http::Response::from_string(
                     r#"{"check_runs": [
@@ -6300,6 +6419,9 @@ mod tests {
                         failing_step: None,
                     },
                 ],
+                generation: Some("deadbeef".to_string()),
+                passing_checks: vec!["lint".to_string()],
+                ..Default::default()
             }),
             "the passing 'lint' run must be excluded, and both failing runs -- not just the first -- \
              must be captured"
@@ -6330,6 +6452,125 @@ mod tests {
         let client = mock.client(ForgeKind::GitHub, "acme/widget");
         assert_eq!(client.check_pr_ci_status(4).unwrap(), PrCiState::Pending);
         mock.finish();
+    }
+
+    /// Serves a 130-run check-run list over two pages (100 + 30), with `last`
+    /// substituted for the final run, and returns the poll's verdict.
+    fn github_two_page_check_runs(last: &str) -> PrCiState {
+        github_two_page_check_runs_with_first("", last)
+    }
+
+    /// [`github_two_page_check_runs`] with `first` (when non-empty) replacing
+    /// the first run on page one.
+    fn github_two_page_check_runs_with_first(first: &str, last: &str) -> PrCiState {
+        let first = first.to_string();
+        let last = last.to_string();
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"mergeable_state": "unstable", "head": {"sha": "deadbeef"}}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+            let ok = r#"{"name": "ok", "status": "completed", "conclusion": "success"}"#;
+            let req = server.recv();
+            assert_eq!(
+                req.url(),
+                "/repos/acme/widget/commits/deadbeef/check-runs?per_page=100&page=1"
+            );
+            let mut page1 = vec![ok; 100];
+            if !first.is_empty() {
+                page1[0] = first.as_str();
+            }
+            let page1 = page1.join(",");
+            req.respond(
+                tiny_http::Response::from_string(format!(
+                    r#"{{"total_count": 130, "check_runs": [{page1}]}}"#
+                ))
+                .with_status_code(200),
+            )
+            .unwrap();
+            let req = server.recv();
+            assert_eq!(
+                req.url(),
+                "/repos/acme/widget/commits/deadbeef/check-runs?per_page=100&page=2"
+            );
+            let mut page2 = vec![ok; 29];
+            page2.push(last.as_str());
+            req.respond(
+                tiny_http::Response::from_string(format!(
+                    r#"{{"total_count": 130, "check_runs": [{}]}}"#,
+                    page2.join(",")
+                ))
+                .with_status_code(200),
+            )
+            .unwrap();
+            // Only reached when everything completed: the legacy status call.
+            if let Some(req) = server.requests().next() {
+                req.respond(
+                    tiny_http::Response::from_string(r#"{"state": "success", "total_count": 0}"#)
+                        .with_status_code(200),
+                )
+                .unwrap();
+            }
+        });
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
+        let state = client.check_pr_ci_status(4).unwrap();
+        mock.finish();
+        state
+    }
+
+    #[test]
+    fn check_pr_ci_status_reports_a_github_failure_that_is_only_on_page_two() {
+        let state = github_two_page_check_runs(
+            r#"{"name": "late", "status": "completed", "conclusion": "failure"}"#,
+        );
+        match state {
+            PrCiState::Failing(f) => {
+                assert_eq!(f.reason, "check 'late' failed");
+                assert_eq!(f.generation.as_deref(), Some("deadbeef"));
+                assert!(f.settled(), "every run completed");
+                assert!(f.in_progress_checks.is_empty());
+                assert_eq!(f.passing_checks.len(), 129);
+            }
+            other => panic!("expected Failing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_pr_ci_status_reports_a_failing_github_generation_with_pending_runs_as_unsettled() {
+        let state = github_two_page_check_runs_with_first(
+            r#"{"name": "slow", "status": "in_progress", "conclusion": null}"#,
+            r#"{"name": "late", "status": "completed", "conclusion": "failure"}"#,
+        );
+        match state {
+            PrCiState::Failing(f) => {
+                assert_eq!(f.generation.as_deref(), Some("deadbeef"));
+                assert_eq!(f.pending_count, 1);
+                assert!(!f.settled());
+                assert_eq!(f.in_progress_checks, vec!["slow".to_string()]);
+                assert_eq!(f.passing_checks.len(), 128);
+            }
+            other => panic!("expected Failing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_pr_ci_status_reports_pending_for_a_github_run_in_progress_only_on_page_two() {
+        let state = github_two_page_check_runs(
+            r#"{"name": "late", "status": "in_progress", "conclusion": null}"#,
+        );
+        assert_eq!(state, PrCiState::Pending);
+    }
+
+    #[test]
+    fn check_pr_ci_status_reports_passing_when_all_paginated_github_runs_succeed() {
+        let state = github_two_page_check_runs(
+            r#"{"name": "late", "status": "completed", "conclusion": "success"}"#,
+        );
+        assert_eq!(state, PrCiState::Passing);
     }
 
     #[test]
@@ -6377,7 +6618,10 @@ mod tests {
             )
             .unwrap();
             let req = server.recv();
-            assert_eq!(req.url(), "/repos/acme/widget/commits/oldsha/check-runs");
+            assert_eq!(
+                req.url(),
+                "/repos/acme/widget/commits/oldsha/check-runs?per_page=100&page=1"
+            );
             req.respond(
                 tiny_http::Response::from_string(
                     r#"{"check_runs": [{"name": "build", "status": "completed", "conclusion": "failure"}]}"#,
@@ -6395,7 +6639,10 @@ mod tests {
             )
             .unwrap();
             let req = server.recv();
-            assert_eq!(req.url(), "/repos/acme/widget/commits/newsha/check-runs");
+            assert_eq!(
+                req.url(),
+                "/repos/acme/widget/commits/newsha/check-runs?per_page=100&page=1"
+            );
             req.respond(
                 tiny_http::Response::from_string(
                     r#"{"check_runs": [{"name": "build", "status": "in_progress", "conclusion": null}]}"#,
@@ -6540,6 +6787,7 @@ mod tests {
                 job_url: None,
                 log_text: None,
                 checks: vec![],
+                ..Default::default()
             })
         );
         mock.finish();
@@ -6707,7 +6955,7 @@ mod tests {
             let req = server.recv();
             assert_eq!(
                 req.url(),
-                "/projects/group%2Fproj/pipelines/55/jobs?scope[]=failed"
+                "/projects/group%2Fproj/pipelines/55/jobs?scope[]=failed&per_page=100&page=1"
             );
             req.respond(
                 tiny_http::Response::from_string(
@@ -6737,6 +6985,8 @@ mod tests {
                     log_text: Some("FAIL: assertion failed\n".to_string()),
                     failing_step: None,
                 }],
+                generation: Some("55".to_string()),
+                ..Default::default()
             })
         );
         mock.finish();
@@ -6757,7 +7007,7 @@ mod tests {
             let req = server.recv();
             assert_eq!(
                 req.url(),
-                "/projects/group%2Fproj/pipelines/55/jobs?scope[]=failed"
+                "/projects/group%2Fproj/pipelines/55/jobs?scope[]=failed&per_page=100&page=1"
             );
             req.respond(
                 tiny_http::Response::from_string(
@@ -6802,6 +7052,8 @@ mod tests {
                         failing_step: None,
                     },
                 ],
+                generation: Some("55".to_string()),
+                ..Default::default()
             }),
             "both failed jobs -- not just the first -- must be captured, each with its own trace"
         );

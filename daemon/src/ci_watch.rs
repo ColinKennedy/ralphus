@@ -506,8 +506,10 @@ fn run_watch(store: &crate::store_lock::StoreHandle, guardian_id: &str, branch_i
     }
 }
 
-/// RAL-578: persist this poll's failing check names and refund an auto-fix
-/// attempt when the set strictly shrank since the last claimed attempt.
+/// RAL-578/RAL-591: persist this poll's failing check names with its
+/// generation key and settled flag; the store refunds an auto-fix attempt when
+/// a newly settled generation's set strictly shrank against the settled
+/// baseline.
 fn record_failing_checks(
     store: &crate::store_lock::StoreHandle,
     guardian_id: &str,
@@ -515,7 +517,12 @@ fn record_failing_checks(
     failure: &PrFailure,
 ) {
     let names: Vec<String> = failure.checks.iter().map(|c| c.name.clone()).collect();
-    let result = store.lock().set_pr_failing_checks(&pr.id, &names);
+    let result = store.lock().set_pr_failing_checks(
+        &pr.id,
+        &names,
+        failure.generation.as_deref(),
+        failure.settled(),
+    );
     warn_on_pr_store_error(
         store,
         guardian_id,
@@ -613,6 +620,23 @@ fn enqueue_ci_failure_notice(
             serde_json::json!({"outcome": "mailbox_enqueue_failed", "error": e.to_string()}),
         );
     }
+}
+
+/// RAL-591: whether an exhausted auto-fix budget should wait for CI before
+/// being reported. While the latest CI generation is still running (or has not
+/// sat settled long enough for the refund check), partial progress may yet
+/// restore an attempt, so the "exhausted" notice is held back -- bounded by
+/// [`MAX_WATCH_DURATION`] from the last attempt so a CI that never settles
+/// still reaches a human.
+fn exhausted_awaiting_ci(
+    store: &crate::store_lock::StoreHandle,
+    pr: &PullRequestView,
+    now: i64,
+) -> bool {
+    let within_fallback = pr
+        .auto_fix_attempted_at_ms
+        .is_some_and(|at| now.saturating_sub(at) < MAX_WATCH_DURATION.as_millis() as i64);
+    within_fallback && store.lock().pr_refund_pending(&pr.id, now).unwrap_or(false)
 }
 
 /// Tell a human that this PR's unattended CI-fix campaign is exhausted.
@@ -1460,9 +1484,15 @@ pub fn dispatch_pr_auto_fix_cancellable(
                     "attempts": attempts,
                 }),
             );
-            let result = store.lock().set_pr_auto_fix_outcome(&pr.id, "exhausted");
+            let awaiting_ci = exhausted_awaiting_ci(store, pr, now_ms());
+            let outcome = if awaiting_ci {
+                "exhausted_awaiting_ci"
+            } else {
+                "exhausted"
+            };
+            let result = store.lock().set_pr_auto_fix_outcome(&pr.id, outcome);
             warn_on_pr_store_error(store, &guardian.id, pr, "set_pr_auto_fix_outcome", result);
-            if pr.auto_fix_exhausted_notified_at_ms.is_none() {
+            if !awaiting_ci && pr.auto_fix_exhausted_notified_at_ms.is_none() {
                 enqueue_auto_fix_exhausted_notice(store, guardian, pr, failure);
             }
             return;
@@ -2045,6 +2075,7 @@ mod tests {
             job_url: None,
             log_text: None,
             checks: vec![],
+            ..Default::default()
         })
     }
 
@@ -2381,5 +2412,111 @@ mod tests {
             !downstream.dispatch,
             "once upstream is ready and still failing, it must resume blocking downstream"
         );
+    }
+
+    fn exhausted_pr(store: &crate::store_lock::StoreHandle) -> String {
+        let guard = store.lock();
+        let gid = guard
+            .create_guardian("r", "main", &std::env::temp_dir().to_string_lossy())
+            .unwrap();
+        guard.add_guardian_branch(&gid, "a").unwrap();
+        let bid = guard.get_guardian(&gid).unwrap().branches[0].id.clone();
+        guard
+            .create_pull_request(
+                &gid,
+                Some(&bid),
+                "github",
+                "acme/w",
+                "a",
+                "main",
+                "A",
+                "",
+                Some(1),
+                None,
+            )
+            .unwrap()
+    }
+
+    fn set_checks(
+        store: &crate::store_lock::StoreHandle,
+        id: &str,
+        set: &[&str],
+        generation: &str,
+        settled: bool,
+        now: i64,
+    ) -> bool {
+        let names: Vec<String> = set.iter().map(|s| s.to_string()).collect();
+        store
+            .lock()
+            .set_pr_failing_checks_at(id, &names, Some(generation), settled, now, 0)
+            .unwrap()
+    }
+
+    #[test]
+    fn exhausted_notice_waits_for_ci_then_refund_restores_the_attempt() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = exhausted_pr(&store);
+        let t0 = now_ms();
+        set_checks(&store, &id, &["a", "b"], "g0", true, t0);
+        assert_eq!(
+            store.lock().claim_pr_auto_fix_attempt(&id, 1, 0).unwrap(),
+            AutoFixClaim::Claimed { attempt: 1 }
+        );
+        // The fix push yields one failure plus two checks still running.
+        set_checks(&store, &id, &["a"], "g1", false, t0 + 1);
+        assert_eq!(
+            store.lock().claim_pr_auto_fix_attempt(&id, 1, 0).unwrap(),
+            AutoFixClaim::Exhausted { attempts: 1 }
+        );
+        let pr = store.lock().get_pull_request(&id).unwrap();
+        assert!(
+            exhausted_awaiting_ci(&store, &pr, t0 + 2),
+            "an unsettled generation must hold the exhausted notice back"
+        );
+        // The pending checks pass: the settled poll refunds, and the next
+        // tick claims the restored attempt.
+        assert!(set_checks(&store, &id, &["a"], "g1", true, t0 + 3));
+        let pr = store.lock().get_pull_request(&id).unwrap();
+        assert!(!exhausted_awaiting_ci(&store, &pr, t0 + 4));
+        assert_eq!(
+            store.lock().claim_pr_auto_fix_attempt(&id, 1, 0).unwrap(),
+            AutoFixClaim::Claimed { attempt: 1 }
+        );
+    }
+
+    #[test]
+    fn exhausted_notice_is_sent_once_a_settled_poll_shows_no_refund() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = exhausted_pr(&store);
+        let t0 = now_ms();
+        set_checks(&store, &id, &["a"], "g0", true, t0);
+        store.lock().claim_pr_auto_fix_attempt(&id, 1, 0).unwrap();
+        set_checks(&store, &id, &["a", "b"], "g1", false, t0 + 1);
+        let pr = store.lock().get_pull_request(&id).unwrap();
+        assert!(exhausted_awaiting_ci(&store, &pr, t0 + 2));
+        // Settles with a larger failing set: evaluated, no refund, notify.
+        assert!(!set_checks(&store, &id, &["a", "b"], "g1", true, t0 + 3));
+        assert!(!exhausted_awaiting_ci(&store, &pr, t0 + 4));
+    }
+
+    #[test]
+    fn exhausted_notice_wait_is_bounded_by_the_watch_duration() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = exhausted_pr(&store);
+        let t0 = now_ms();
+        set_checks(&store, &id, &["a"], "g0", true, t0);
+        store.lock().claim_pr_auto_fix_attempt(&id, 1, 0).unwrap();
+        set_checks(&store, &id, &["a"], "g1", false, t0 + 1);
+        let pr = store.lock().get_pull_request(&id).unwrap();
+        let attempted = pr.auto_fix_attempted_at_ms.unwrap();
+        let limit = MAX_WATCH_DURATION.as_millis() as i64;
+        assert!(exhausted_awaiting_ci(&store, &pr, attempted + limit - 1));
+        assert!(!exhausted_awaiting_ci(&store, &pr, attempted + limit));
     }
 }
