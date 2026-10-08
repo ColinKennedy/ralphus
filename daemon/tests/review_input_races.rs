@@ -3224,6 +3224,8 @@ struct ForgeState {
     failing_heads: std::collections::HashSet<String>,
     /// Requests the fake has no route for (`METHOD path`).
     unrouted: Vec<String>,
+    /// The next this-many `/pulls` requests fail with a 503.
+    fail_pulls: u32,
 }
 
 /// A stateful fake of the GitHub REST endpoints the daemon calls for a PR
@@ -3310,6 +3312,10 @@ impl FakeGitHub {
         let req: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
         let mut st = state.lock().unwrap();
         let number = |s: &str| s.parse::<u64>().ok();
+        if parts.first() == Some(&"pulls") && st.fail_pulls > 0 {
+            st.fail_pulls -= 1;
+            return json_reply(serde_json::json!({"message": "unavailable"}), 503);
+        }
         use tiny_http::Method::{Get, Patch, Post};
         match (method, parts.as_slice()) {
             (Get, []) => json_reply(
@@ -4185,4 +4191,595 @@ fn two_forge_reorders_back_to_back_while_feedback_is_in_flight() {
     fx.assert_no_unexpected_agent_calls(what, &unexpected);
     fx.assert_forge_routed_everything(what, &forge);
     fx.assert_everything_published(what, &[(1, "feature-b.txt", "feedback on b")], &[]);
+}
+
+// ---------------------------------------------------------------------------
+// Section 1 (continued): submission, comment, CI and reorder races.
+// ---------------------------------------------------------------------------
+
+fn stack_request() -> Vec<ralphus_daemon::pr::PrRequest> {
+    vec![ralphus_daemon::pr::PrRequest {
+        branch_id: None,
+        branch_alias: None,
+        title: Some("stack".to_string()),
+        description: Some("stack".to_string()),
+        use_worktree_branch_name: None,
+        draft: None,
+    }]
+}
+
+impl Fixture {
+    fn open_forge_prs(forge: &FakeGitHub) -> usize {
+        forge
+            .state
+            .lock()
+            .unwrap()
+            .prs
+            .iter()
+            .filter(|p| p.open)
+            .count()
+    }
+
+    fn branch_order(&self) -> Vec<String> {
+        self.store
+            .lock()
+            .get_guardian(&self.id)
+            .unwrap()
+            .branches
+            .iter()
+            .map(|b| b.branch.clone())
+            .collect()
+    }
+
+    /// Wait until the branch order is `want`, driving `step` meanwhile.
+    fn wait_for_order(&self, want: &[&str], what: &str, step: &dyn Fn()) {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let order = self.branch_order();
+            if order == want {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{what}: order never became {want:?}: {order:?}\n{}",
+                self.describe()
+            );
+            step();
+            std::thread::sleep(SETTLE_POLL);
+        }
+    }
+}
+
+/// Two submissions of the same stack at once (an auto-submit and a manual
+/// click): the forge's duplicate-head 422 must be adopted, never a second PR.
+#[test]
+fn simultaneous_submissions_open_one_pr_per_branch() {
+    let what = "simultaneous submissions";
+    let (fx, forge) = Fixture::with_forge(&["feature/a", "feature/b", "feature/c"]);
+    let submit = || {
+        let (store, id) = (Arc::clone(&fx.store), fx.id.clone());
+        std::thread::spawn(move || {
+            ralphus_daemon::pr::submit_pull_requests(
+                &store,
+                &NoAgentExpected,
+                &id,
+                stack_request(),
+                "tester",
+                false,
+            )
+        })
+    };
+    let (first, second) = (submit(), submit());
+    let _ = (first.join().unwrap(), second.join().unwrap());
+
+    assert_eq!(
+        Fixture::open_forge_prs(&forge),
+        3,
+        "{what}: one forge PR per branch\n{}",
+        fx.describe()
+    );
+    let rows = fx
+        .store
+        .lock()
+        .list_pull_requests_for_guardian(&fx.id)
+        .unwrap()
+        .into_iter()
+        .filter(|pr| pr.state == "open")
+        .count();
+    assert_eq!(rows, 3, "{what}: one open PR row per branch");
+    fx.assert_forge_routed_everything(what, &forge);
+}
+
+/// A branch appended to the review while the stack is rebasing gets its PR
+/// through a later submission without disturbing the others.
+#[test]
+fn submitting_a_newly_appended_branch_while_the_stack_rebases() {
+    let what = "submit appended branch";
+    let (fx, forge) = Fixture::with_forge(&["feature/a", "feature/b", "feature/c"]);
+    fx.submit_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let mut held = Held::new("feature-a.txt", "feedback on a", &unexpected).feedback(&fx, 0);
+    let upstream = fx.push_upstream("upstream1.txt");
+    fx.append_branch_for_race("feature/d");
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+    // The new branch has no PR yet, so the review is not "published" until
+    // the submission below; wait for the build itself.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let view = fx.store.lock().get_guardian(&fx.id).unwrap();
+        if view.status == "in_review"
+            && view.base_commit.as_deref().map(str::trim) == Some(upstream.as_str())
+            && view.branches.len() == 4
+            && view.branches[3].merge_status == "done"
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what}: new branch never built
+{}",
+            fx.describe()
+        );
+        std::thread::sleep(SETTLE_POLL);
+    }
+    fx.submit_stack();
+    fx.wait_settled_on(&upstream, what);
+    assert_eq!(
+        Fixture::open_forge_prs(&forge),
+        4,
+        "{what}\n{}",
+        fx.describe()
+    );
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_forge_routed_everything(what, &forge);
+    fx.assert_everything_published(
+        what,
+        &[(0, "feature-a.txt", "feedback on a")],
+        &["upstream1.txt"],
+    );
+}
+
+/// Two PR-comment feedback actions on the same PR at once (double click, two
+/// users): the one comment is applied exactly once.
+#[test]
+fn two_comment_feedback_actions_on_one_pr_apply_the_comment_once() {
+    let what = "double comment feedback";
+    let (fx, forge) = Fixture::with_forge(&["feature/a", "feature/b", "feature/c"]);
+    fx.submit_stack();
+    let unexpected: Unexpected = Arc::default();
+    let daemon = DaemonPump::start(&fx);
+    let (pr_b, alias_b) = fx.open_pr_row(1);
+    let number_b = forge.pr_for(&alias_b).number;
+    forge.with_pr(number_b, |pr| {
+        pr.comments.push((7001, "please change b".to_string()))
+    });
+    let action = |line: &'static str| {
+        let (store, cancellations, pr_id) = (
+            Arc::clone(&fx.store),
+            daemon.cancellations.clone(),
+            pr_b.clone(),
+        );
+        let runner = WriterRunner::new("feature-b.txt", line, None, &unexpected);
+        std::thread::spawn(move || {
+            ralphus_daemon::pr::action_pr_feedback(
+                &store,
+                &runner,
+                &cancellations,
+                &pr_id,
+                Some("tester"),
+            )
+        })
+    };
+    let (one, two) = (action("comment edit one"), action("comment edit two"));
+    let (one, two) = (one.join().unwrap(), two.join().unwrap());
+    let applied: usize = [one, two].iter().filter_map(|r| r.as_ref().ok()).sum();
+    assert_eq!(
+        applied, 1,
+        "{what}: the comment must be applied exactly once"
+    );
+
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    fx.wait_settled_on(first.trim(), what);
+    let content = fx.file_on(&fx.root, &fx.review_ref(1), "feature-b.txt");
+    let edits = ["comment edit one", "comment edit two"]
+        .iter()
+        .filter(|l| content.contains(*l))
+        .count();
+    assert_eq!(edits, 1, "{what}: {content:?}\n{}", fx.describe());
+    fx.assert_forge_routed_everything(what, &forge);
+}
+
+/// PR-comment feedback on a PR the forge no longer has open must not panic
+/// or apply the comment onto the stack.
+#[test]
+fn pr_comment_feedback_on_a_closed_pr_is_not_applied() {
+    let what = "comment feedback on closed PR";
+    let (fx, forge) = Fixture::with_forge(&["feature/a", "feature/b", "feature/c"]);
+    fx.submit_stack();
+    let unexpected: Unexpected = Arc::default();
+    let daemon = DaemonPump::start(&fx);
+    let (pr_b, alias_b) = fx.open_pr_row(1);
+    let number_b = forge.pr_for(&alias_b).number;
+    forge.with_pr(number_b, |pr| {
+        pr.comments.push((7001, "please change b".to_string()));
+        pr.open = false;
+    });
+    let runner = WriterRunner::new("feature-b.txt", "late comment edit", None, &unexpected);
+    let _ = ralphus_daemon::pr::action_pr_feedback(
+        &fx.store,
+        &runner,
+        &daemon.cancellations,
+        &pr_b,
+        Some("tester"),
+    );
+    std::thread::sleep(PARK_WAIT);
+    let content = fx.file_on(&fx.root, &fx.review_ref(1), "feature-b.txt");
+    assert!(
+        !content.contains("late comment edit")
+            || fx
+                .file_on(&fx.root, &fx.review_ref(2), "feature-b.txt")
+                .contains("late comment edit"),
+        "{what}: applied to branch b but not carried to c\n{}",
+        fx.describe()
+    );
+    fx.assert_forge_routed_everything(what, &forge);
+}
+
+/// The forge reports a failure for an *old* head SHA after the branch has
+/// moved on: the fix is already in, so no auto-fix may be dispatched.
+#[test]
+fn ci_failure_on_a_stale_sha_does_not_dispatch_a_fix() {
+    let what = "stale CI SHA";
+    let (fx, forge) = Fixture::with_forge(&["feature/a", "feature/b", "feature/c"]);
+    fx.submit_stack();
+    fx.store
+        .lock()
+        .set_guardian_auto_fix_pr_errors(&fx.id, Some(true))
+        .unwrap();
+    let unexpected: Unexpected = Arc::default();
+    let (_, alias_c) = fx.open_pr_row(2);
+    let old_head = fx.remote_tip(&alias_c);
+    let mut held = Held::new("feature-c.txt", "feedback on c", &unexpected).feedback(&fx, 2);
+    held.finish();
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    let fixer = Arc::new(WriterRunner::new(
+        "feature-c.txt",
+        "needless fix",
+        None,
+        &unexpected,
+    ));
+    let started = Arc::clone(&fixer.started);
+    let _daemon = DaemonPump::start_with(
+        &fx,
+        Arc::new(move |_| Arc::clone(&fixer) as Arc<dyn Runner>),
+    );
+    fx.wait_settled_on(first.trim(), what);
+    assert_ne!(
+        fx.remote_tip(&alias_c),
+        old_head,
+        "{what}: head did not move"
+    );
+    forge.state.lock().unwrap().failing_heads.insert(old_head);
+    std::thread::sleep(PARK_WAIT * 4);
+    assert!(
+        !started.load(Ordering::SeqCst),
+        "{what}: a fix was dispatched for a stale head\n{}",
+        fx.describe()
+    );
+    fx.assert_forge_routed_everything(what, &forge);
+}
+
+/// Both the middle and the top PR fail CI while auto-fix is on: the earlier
+/// PR must be fixed first (the later one is deferred), and its fix reaches
+/// the top PR. The top PR's own head then changes, so the forge's failure for
+/// the old head is stale and needs no fix of its own.
+#[test]
+fn auto_fix_fixes_the_earlier_failing_pr_first() {
+    let what = "two failing PRs";
+    let (fx, forge) = Fixture::with_forge(&["feature/a", "feature/b", "feature/c"]);
+    fx.submit_stack();
+    fx.store
+        .lock()
+        .set_guardian_auto_fix_pr_errors(&fx.id, Some(true))
+        .unwrap();
+    for p in [1, 2] {
+        let (_, alias) = fx.open_pr_row(p);
+        forge
+            .state
+            .lock()
+            .unwrap()
+            .failing_heads
+            .insert(fx.remote_tip(&alias));
+    }
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    let fixer = Arc::new(BranchFixRunner::default());
+    let runner = Arc::clone(&fixer);
+    let _daemon = DaemonPump::start_with(
+        &fx,
+        Arc::new(move |_| Arc::clone(&runner) as Arc<dyn Runner>),
+    );
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while fixer.fixed.lock().unwrap().is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "{what}: fixes never ran: {:?}\n{}",
+            fixer.fixed.lock().unwrap(),
+            fx.describe()
+        );
+        std::thread::sleep(SETTLE_POLL);
+    }
+    fx.wait_settled_on(first.trim(), what);
+    let fixed = fixer.fixed.lock().unwrap().clone();
+    assert_eq!(
+        fixed.first().map(String::as_str),
+        Some("fix-feature-b-review.txt"),
+        "{what}: the earlier PR must be fixed first: {fixed:?}"
+    );
+    for file in &fixed {
+        let on_c = fx.files_on(&fx.remote, &fx.pr_ref(2));
+        assert!(on_c.contains(file.as_str()), "{what}: top PR lost {file}");
+    }
+    fx.assert_forge_routed_everything(what, &forge);
+}
+
+/// A resolver that fixes whichever branch it runs in by committing a file
+/// named after that branch, recording each branch it fixed.
+#[derive(Default)]
+struct BranchFixRunner {
+    fixed: std::sync::Mutex<Vec<String>>,
+}
+
+impl Runner for BranchFixRunner {
+    fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+        let cwd = PathBuf::from(&spec.cwd);
+        if spec.cell_id.ends_with("-commit") {
+            let dirty = !git(&cwd, &["status", "--porcelain"]).trim().is_empty();
+            if dirty {
+                git(&cwd, &["add", "--all"]);
+                git(&cwd, &["commit", "-m", "auto fix"]);
+            }
+            return ok_result("committed", Some(dirty));
+        }
+        let branch = git(&cwd, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        let file = format!("fix-{}.txt", branch.trim().replace('/', "-"));
+        write(&cwd, &file, "fixed\n");
+        self.fixed.lock().unwrap().push(file);
+        ok_result("fixed\nRALPHUS_PROOF: PASS", Some(true))
+    }
+}
+
+/// A forge reorder (a, c, b) and an upstream push arrive together while a
+/// feedback round is held: the rebuild must take both, in the forge's order.
+#[test]
+fn forge_reorder_and_base_change_together_while_feedback_is_in_flight() {
+    let what = "forge reorder + base change";
+    let (fx, forge) = Fixture::with_forge(&["feature/a", "feature/b", "feature/c"]);
+    fx.submit_stack();
+    let unexpected: Unexpected = Arc::default();
+    let daemon = DaemonPump::start(&fx);
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    fx.wait_settled_on(first.trim(), "before");
+    let (_, alias_a) = fx.open_pr_row(0);
+    let (_, alias_b) = fx.open_pr_row(1);
+    let (_, alias_c) = fx.open_pr_row(2);
+    let (number_b, number_c) = (forge.pr_for(&alias_b).number, forge.pr_for(&alias_c).number);
+
+    let mut held = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    let upstream = fx.push_upstream("upstream1.txt");
+    forge.with_pr(number_c, |pr| {
+        pr.base = alias_a.clone();
+        pr.updated_at = "2099-01-01T00:00:00Z".to_string();
+    });
+    forge.with_pr(number_b, |pr| {
+        pr.base = alias_c.clone();
+        pr.updated_at = "2099-01-01T00:00:00Z".to_string();
+    });
+    let reorder = || {
+        ralphus_daemon::pr::check_and_apply_forge_reorder(
+            &fx.store,
+            &NoAgentExpected,
+            &fx.id,
+            &daemon.sem,
+            &daemon.cancellations,
+        )
+    };
+    reorder();
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+    fx.wait_for_order(&["feature/a", "feature/c", "feature/b"], what, &|| {
+        let _ = reorder();
+    });
+    fx.wait_settled_on(&upstream, what);
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_forge_routed_everything(what, &forge);
+    fx.assert_everything_published(
+        what,
+        &[(2, "feature-b.txt", "feedback on b")],
+        &["upstream1.txt"],
+    );
+}
+
+/// A local reorder (the board's drag) lands while a forge reorder is pending
+/// and feedback is held: whichever order wins, no commit may be lost.
+#[test]
+fn forge_reorder_racing_a_local_reorder_loses_no_commit() {
+    let what = "forge vs local reorder";
+    let (fx, forge) = Fixture::with_forge(&["feature/a", "feature/b", "feature/c"]);
+    fx.submit_stack();
+    let unexpected: Unexpected = Arc::default();
+    let daemon = DaemonPump::start(&fx);
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    fx.wait_settled_on(first.trim(), "before");
+    let (_, alias_a) = fx.open_pr_row(0);
+    let (_, alias_b) = fx.open_pr_row(1);
+    let (_, alias_c) = fx.open_pr_row(2);
+    let (number_b, number_c) = (forge.pr_for(&alias_b).number, forge.pr_for(&alias_c).number);
+
+    let mut held = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    forge.with_pr(number_c, |pr| {
+        pr.base = alias_a.clone();
+        pr.updated_at = "2099-01-01T00:00:00Z".to_string();
+    });
+    forge.with_pr(number_b, |pr| {
+        pr.base = alias_c.clone();
+        pr.updated_at = "2099-01-01T00:00:00Z".to_string();
+    });
+    // The user drags b to the bottom locally and starts a merge.
+    fx.store
+        .lock()
+        .reorder_guardian_branches(
+            &fx.id,
+            &[
+                "feature/b".to_string(),
+                "feature/a".to_string(),
+                "feature/c".to_string(),
+            ],
+        )
+        .unwrap();
+    ralphus_daemon::guardian_merge::start_merge(
+        Arc::clone(&fx.store),
+        Arc::new(NoAgentExpected),
+        &fx.id,
+        Arc::clone(&daemon.sem),
+        daemon.cancellations.clone(),
+    );
+    let reorder = || {
+        ralphus_daemon::pr::check_and_apply_forge_reorder(
+            &fx.store,
+            &NoAgentExpected,
+            &fx.id,
+            &daemon.sem,
+            &daemon.cancellations,
+        )
+    };
+    reorder();
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+    for _ in 0..10 {
+        reorder();
+        std::thread::sleep(SETTLE_POLL);
+    }
+    fx.wait_settled_on(first.trim(), what);
+    // Whatever the final order, b's feedback is on b and everything above it.
+    let order = fx.branch_order();
+    let b_at = order.iter().position(|b| b == "feature/b").unwrap();
+    for p in b_at..order.len() {
+        let content = fx.file_on(&fx.root, &fx.review_ref(p), "feature-b.txt");
+        assert!(
+            content.contains("feedback on b"),
+            "{what}: branch {p} of {order:?} lost b's feedback\n{}",
+            fx.describe()
+        );
+    }
+    for b in ["feature-a.txt", "feature-b.txt", "feature-c.txt"] {
+        let top = fx.files_on(&fx.root, &fx.review_ref(order.len() - 1));
+        assert!(top.contains(b), "{what}: top branch lost {b}");
+    }
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_forge_routed_everything(what, &forge);
+}
+
+/// Forge API trouble: the first PR requests of a submission fail with 503
+/// while feedback is in flight. The submission may fail, but a retry must
+/// converge on exactly one PR per branch and no commit is lost.
+#[test]
+fn forge_5xx_during_submission_converges_on_retry() {
+    let what = "forge 5xx";
+    let (fx, forge) = Fixture::with_forge(&["feature/a", "feature/b", "feature/c"]);
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let mut held = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    forge.state.lock().unwrap().fail_pulls = 4;
+    let failed = ralphus_daemon::pr::submit_pull_requests(
+        &fx.store,
+        &NoAgentExpected,
+        &fx.id,
+        stack_request(),
+        "tester",
+        false,
+    );
+    held.finish();
+    let _ = failed;
+    forge.state.lock().unwrap().fail_pulls = 0;
+    let mut attempts = 0;
+    while Fixture::open_forge_prs(&forge) < 3 {
+        attempts += 1;
+        assert!(attempts < 10, "{what}: never converged\n{}", fx.describe());
+        let _ = ralphus_daemon::pr::submit_pull_requests(
+            &fx.store,
+            &NoAgentExpected,
+            &fx.id,
+            stack_request(),
+            "tester",
+            false,
+        );
+        std::thread::sleep(SETTLE_POLL);
+    }
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    fx.wait_settled_on(first.trim(), what);
+    assert_eq!(Fixture::open_forge_prs(&forge), 3, "{what}: duplicate PRs");
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_forge_routed_everything(what, &forge);
+    fx.assert_everything_published(what, &[(1, "feature-b.txt", "feedback on b")], &[]);
+}
+
+impl Fixture {
+    /// Add a new task branch (one file named after it) to the review, ready
+    /// to be built onto the stack.
+    fn append_branch_for_race(&self, name: &str) {
+        let file = format!("{}.txt", name.replace('/', "-"));
+        git(&self.root, &["checkout", "-q", "-b", name, "main"]);
+        write(&self.root, &file, "content\n");
+        git(&self.root, &["add", "."]);
+        git(&self.root, &["commit", "-m", &format!("add {name}")]);
+        git(&self.root, &["checkout", "-q", "main"]);
+        self.store
+            .lock()
+            .add_guardian_branch(&self.id, name)
+            .unwrap();
+        let view = self.store.lock().get_guardian(&self.id).unwrap();
+        let bid = view.branches[view.branches.len() - 1].id.clone();
+        self.store
+            .lock()
+            .set_branch_status(&self.id, &bid, MergeStatus::Ready, None)
+            .unwrap();
+    }
 }
