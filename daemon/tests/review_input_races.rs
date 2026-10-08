@@ -1685,6 +1685,13 @@ fn spawn_auto_fix(
         Arc::clone(runner),
     );
     std::thread::spawn(move || {
+        // Each driven fix stands for a fresh CI failure: reset the PR's
+        // attempt budget and retry backoff, or a second fix on the same PR
+        // within the backoff window is (correctly) deferred and never runs.
+        store
+            .lock()
+            .clear_pr_auto_fix_attempted(&pr_id)
+            .expect("reset the PR's auto-fix budget");
         let guardian = store.lock().get_guardian(&id).unwrap();
         let pr = store.lock().get_pull_request(&pr_id).unwrap();
         ralphus_daemon::ci_watch::dispatch_pr_auto_fix(
