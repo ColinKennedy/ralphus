@@ -1081,8 +1081,16 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         // (only set once the campaign has fully stopped) does not cover.
         // Suppressed once `auto_fix_error` is already shown so a permanently
         // stopped PR doesn't show two overlapping badges.
+        // RAL-591: "exhausted_awaiting_ci" means the attempt budget is spent
+        // but the newest CI run has not finished, so partial progress may still
+        // restore an attempt before anyone is told it is exhausted.
+        const awaitingCi = p.auto_fix_last_outcome === "exhausted_awaiting_ci";
+        const autoFixOutcomeLabel = awaitingCi ? "waiting for CI to finish" : p.auto_fix_last_outcome;
+        const autoFixOutcomeTip = awaitingCi
+          ? "Automatic CI fixing has used its attempts, but the latest CI run is still in progress.\nWhy: if the run finishes with fewer failing checks than before, an attempt is restored and fixing resumes; otherwise this becomes exhausted and a notice is sent."
+          : "Latest unattended CI auto-fix outcome for this PR/MR.\nWhy: explains whether/why an automatic fix attempt ran for the most recent CI failure, even when nothing else here indicates a reason.";
         const autoFixOutcome = p.state === "open" && p.auto_fix_last_outcome && !p.auto_fix_error
-          ? `<div class="row" style="margin-top:4px"><span class="badge" style="color:var(--muted);border-color:var(--border);font-size:11px" data-tip="Latest unattended CI auto-fix outcome for this PR/MR.\nWhy: explains whether/why an automatic fix attempt ran for the most recent CI failure, even when nothing else here indicates a reason.">auto-fix: ${esc(p.auto_fix_last_outcome)}</span></div>`
+          ? `<div class="row" style="margin-top:4px"><span class="badge" style="color:var(--muted);border-color:var(--border);font-size:11px" data-tip="${esc(autoFixOutcomeTip)}">auto-fix: ${esc(autoFixOutcomeLabel)}</span></div>`
           : "";
         const ciTip = p.state === "open" && p.ci_status
           ? ` data-tip="CI/CD status: ${esc(p.ci_status)}. Right-click to refresh its status or pull in feedback."`

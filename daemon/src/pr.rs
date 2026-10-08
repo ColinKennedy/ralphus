@@ -51,6 +51,12 @@ use crate::guardian::{BranchView, GuardianView, MergeStatus};
 use crate::guardian_merge::{self, git};
 use crate::runner::{Runner, RunnerSpec};
 use crate::server::Reply;
+
+/// How long a generation's failing snapshot must have been settled (every
+/// check finished) before its auto-fix refund is decided (RAL-591) -- the
+/// forge lists only runs that already exist, so one zero-pending poll can
+/// precede late-created runs. Modeled on `ci_watch::SUCCESS_SETTLE_DURATION`.
+pub const REFUND_SETTLE_MS: i64 = 30_000;
 use crate::store::{Result, Store, StoreError, now_ms};
 
 // ---------------------------------------------------------------------------
@@ -1047,8 +1053,12 @@ impl Store {
              SET ci_status=?, ci_failure_job_url=?, updated_at_ms=?,
                  auto_fix_attempted_at_ms = CASE WHEN ?='passing' THEN NULL ELSE auto_fix_attempted_at_ms END,
                  auto_fix_attempt_count = CASE WHEN ?='passing' THEN 0 ELSE auto_fix_attempt_count END,
-                 auto_fix_claimed_checks = CASE WHEN ?='passing' THEN NULL ELSE auto_fix_claimed_checks END,
+                 auto_fix_baseline_checks = CASE WHEN ?='passing' THEN NULL ELSE auto_fix_baseline_checks END,
+                 auto_fix_baseline_generation = CASE WHEN ?='passing' THEN NULL ELSE auto_fix_baseline_generation END,
+                 auto_fix_refund_evaluated_generation = CASE WHEN ?='passing' THEN NULL ELSE auto_fix_refund_evaluated_generation END,
                  ci_failing_checks = CASE WHEN ?='passing' THEN NULL ELSE ci_failing_checks END,
+                 ci_failing_generation = CASE WHEN ?='passing' THEN NULL ELSE ci_failing_generation END,
+                 ci_settled_since_ms = CASE WHEN ?='passing' THEN NULL ELSE ci_settled_since_ms END,
                  auto_fix_next_attempt_at_ms = CASE WHEN ?='passing' THEN NULL ELSE auto_fix_next_attempt_at_ms END,
                  auto_fix_error = CASE WHEN ?='passing' THEN NULL ELSE auto_fix_error END,
                  auto_fix_exhausted_notified_at_ms = CASE WHEN ?='passing' THEN NULL ELSE auto_fix_exhausted_notified_at_ms END,
@@ -1058,6 +1068,10 @@ impl Store {
                 status,
                 job_url,
                 now_ms(),
+                status,
+                status,
+                status,
+                status,
                 status,
                 status,
                 status,
@@ -1138,43 +1152,162 @@ impl Store {
         }
     }
 
-    /// RAL-578: persist the failing check names from the latest poll and
-    /// refund one auto-fix attempt when that set is a strict subset of the set
-    /// recorded at the last claimed attempt (real progress). The count never
-    /// drops below 0, and the claimed set is rebased onto the shrunk set so a
-    /// flapping check cannot be refunded twice for the same progress. Returns
-    /// whether an attempt was refunded.
-    pub fn set_pr_failing_checks(&self, id: &str, names: &[String]) -> Result<bool> {
+    /// RAL-578/RAL-591: persist the failing check names from the latest poll
+    /// together with the poll's generation key (GitHub head SHA, GitLab
+    /// pipeline id) and whether every check of that generation has finished
+    /// (`settled`), and refund one auto-fix attempt when a *new* generation
+    /// settles with a strict subset of the previous generation's settled
+    /// failing set -- real progress. See [`Self::set_pr_failing_checks_at`]
+    /// for the rules. Returns whether an attempt was refunded.
+    pub fn set_pr_failing_checks(
+        &self,
+        id: &str,
+        names: &[String],
+        generation: Option<&str>,
+        settled: bool,
+    ) -> Result<bool> {
+        self.set_pr_failing_checks_at(id, names, generation, settled, now_ms(), REFUND_SETTLE_MS)
+    }
+
+    /// [`Self::set_pr_failing_checks`] with an explicit clock and settle
+    /// window. The whole read-decide-write runs in this one call so the
+    /// watcher and the standing poll cannot both refund the same progress.
+    ///
+    /// * The row keeps the latest snapshot (`ci_failing_checks`,
+    ///   `ci_failing_generation`) and, when that snapshot is settled, the
+    ///   instant it first was (`ci_settled_since_ms`). `Pending` polls never
+    ///   reach here: a failing check outranks pending ones in the forge poll,
+    ///   so the poll that finishes the last pending check arrives as a
+    ///   settled `Failing`.
+    /// * When a poll introduces a new generation, the previous generation's
+    ///   snapshot becomes the refund *baseline* if it had settled; an
+    ///   unsettled previous generation leaves the older baseline in place.
+    /// * A generation is evaluated once, the first time its snapshot has been
+    ///   settled for `settle_ms` (the forge lists only runs that already
+    ///   exist, so a single zero-pending poll can precede late-created runs).
+    ///   The attempt is refunded iff the count is above 0, a baseline exists
+    ///   from a different generation, and the current failing set is a strict
+    ///   subset of it. A re-run on the same generation is never re-evaluated,
+    ///   and a failing set that grows never refunds.
+    /// * A refund also drops the backoff deadline and the exhausted-notice
+    ///   marker so the next poll tick can claim the restored attempt.
+    pub fn set_pr_failing_checks_at(
+        &self,
+        id: &str,
+        names: &[String],
+        generation: Option<&str>,
+        settled: bool,
+        now: i64,
+        settle_ms: i64,
+    ) -> Result<bool> {
+        type Row = (
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
+        type Names = std::collections::BTreeSet<String>;
         let pr = self.get_pull_request(id)?;
-        let current: std::collections::BTreeSet<&str> = names.iter().map(String::as_str).collect();
+        let current: Names = names.iter().cloned().collect();
         let json = serde_json::to_string(&current).unwrap_or_else(|_| "[]".to_string());
-        let claimed: Option<std::collections::BTreeSet<String>> = self
-            .conn
-            .query_row(
-                "SELECT auto_fix_claimed_checks FROM guardian_pull_requests WHERE id=?",
-                params![id],
-                |r| r.get::<_, Option<String>>(0),
-            )?
-            .and_then(|s| serde_json::from_str(&s).ok());
-        let refund = pr.auto_fix_attempt_count > 0
-            && claimed.as_ref().is_some_and(|claimed| {
-                current.len() < claimed.len() && current.iter().all(|n| claimed.contains(*n))
+        let (
+            prev_checks,
+            prev_generation,
+            prev_settled_since,
+            baseline_json,
+            baseline_generation,
+            evaluated_generation,
+        ): Row = self.conn.query_row(
+            "SELECT ci_failing_checks, ci_failing_generation, ci_settled_since_ms,
+                    auto_fix_baseline_checks, auto_fix_baseline_generation,
+                    auto_fix_refund_evaluated_generation
+             FROM guardian_pull_requests WHERE id=?",
+            params![id],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
+        )?;
+        let parse = |s: &Option<String>| -> Option<Names> {
+            s.as_deref().and_then(|s| serde_json::from_str(s).ok())
+        };
+        let new_generation = generation.is_some() && prev_generation.as_deref() != generation;
+
+        let mut baseline = parse(&baseline_json);
+        let mut baseline_gen = baseline_generation;
+        if new_generation && prev_settled_since.is_some() && prev_generation.is_some() {
+            if let Some(prev) = parse(&prev_checks) {
+                baseline = Some(prev);
+                baseline_gen = prev_generation.clone();
+            }
+        }
+
+        let settled_since = match (generation, settled) {
+            (Some(_), true) if new_generation => Some(now),
+            (Some(_), true) => prev_settled_since.or(Some(now)),
+            _ => None,
+        };
+        let evaluate = generation.is_some()
+            && evaluated_generation.as_deref() != generation
+            && settled_since.is_some_and(|since| now.saturating_sub(since) >= settle_ms);
+        let refund = evaluate
+            && pr.auto_fix_attempt_count > 0
+            && baseline_gen.as_deref() != generation
+            && baseline.as_ref().is_some_and(|baseline| {
+                current.len() < baseline.len() && current.iter().all(|n| baseline.contains(n))
             });
+        let evaluated_generation = if evaluate {
+            generation.map(str::to_string)
+        } else {
+            evaluated_generation
+        };
+        let baseline_json = baseline
+            .as_ref()
+            .and_then(|b| serde_json::to_string(b).ok());
+
+        self.conn.execute(
+            "UPDATE guardian_pull_requests
+             SET ci_failing_checks=?, ci_failing_generation=COALESCE(?, ci_failing_generation),
+                 ci_settled_since_ms=?, auto_fix_baseline_checks=?,
+                 auto_fix_baseline_generation=?, auto_fix_refund_evaluated_generation=?
+             WHERE id=?",
+            params![
+                json,
+                generation,
+                settled_since,
+                baseline_json,
+                baseline_gen,
+                evaluated_generation,
+                id
+            ],
+        )?;
         if refund {
+            let refunded_to = pr.auto_fix_attempt_count - 1;
             self.conn.execute(
                 "UPDATE guardian_pull_requests
-                 SET ci_failing_checks=?, auto_fix_claimed_checks=?,
-                     auto_fix_attempt_count=MAX(auto_fix_attempt_count-1, 0),
+                 SET auto_fix_attempt_count=MAX(auto_fix_attempt_count-1, 0),
+                     auto_fix_next_attempt_at_ms=NULL,
                      auto_fix_exhausted_notified_at_ms=NULL,
+                     auto_fix_last_outcome = CASE
+                         WHEN auto_fix_last_outcome IN ('exhausted', 'exhausted_awaiting_ci')
+                         THEN NULL ELSE auto_fix_last_outcome END,
                      updated_at_ms=?
                  WHERE id=?",
-                params![json, json, now_ms(), id],
+                params![now, id],
             )?;
-            let refunded_to = pr.auto_fix_attempt_count - 1;
-            let claimed_len = claimed.as_ref().map_or(0, |c| c.len());
+            let baseline_len = baseline.as_ref().map_or(0, |b| b.len());
+            let generation_label = generation.unwrap_or("-");
             crate::rlog!(
                 INFO,
-                "ralphus [pr] pr={id} auto-fix attempt refunded: failing checks shrank {claimed_len} -> {} (attempts now {refunded_to})",
+                "ralphus [pr] pr={id} auto-fix attempt refunded: generation {generation_label} settled with failing checks {baseline_len} -> {} (attempts now {refunded_to})",
                 current.len()
             );
             let mut note = crate::cartographer::Note::new("pr").scope("branch");
@@ -1182,7 +1315,7 @@ impl Store {
             note.emit(
                 self,
                 format!(
-                    "pr auto-fix attempt refunded pr={id} failing checks {claimed_len} -> {} attempts={refunded_to}",
+                    "pr auto-fix attempt refunded pr={id} generation={generation_label} failing checks {baseline_len} -> {} attempts={refunded_to}",
                     current.len()
                 ),
                 serde_json::json!({
@@ -1190,17 +1323,38 @@ impl Store {
                     "pr_number": pr.pr_number,
                     "branch_id": pr.branch_id,
                     "outcome": "auto_fix_refunded",
+                    "generation": generation,
+                    "baseline_generation": baseline_gen,
                     "failing_checks": current,
                     "attempts": refunded_to,
                 }),
             );
-        } else {
-            self.conn.execute(
-                "UPDATE guardian_pull_requests SET ci_failing_checks=? WHERE id=?",
-                params![json, id],
-            )?;
         }
         Ok(refund)
+    }
+
+    /// Whether the refund decision for `id`'s current failing snapshot is
+    /// still open (RAL-591): the snapshot's generation has unfinished checks,
+    /// or it settled less than [`REFUND_SETTLE_MS`] ago and has not yet been
+    /// evaluated. `false` when nothing is awaited -- no snapshot, no
+    /// generation key (a conflict verdict), or the generation was already
+    /// evaluated -- so an exhausted notice is never held back for no reason.
+    pub fn pr_refund_pending(&self, id: &str, now: i64) -> Result<bool> {
+        let (generation, settled_since, evaluated): (Option<String>, Option<i64>, Option<String>) =
+            self.conn.query_row(
+                "SELECT ci_failing_generation, ci_settled_since_ms,
+                        auto_fix_refund_evaluated_generation
+                 FROM guardian_pull_requests WHERE id=?",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+        Ok(match generation {
+            None => false,
+            Some(g) if evaluated.as_deref() == Some(g.as_str()) => false,
+            Some(_) => {
+                settled_since.is_none_or(|since| now.saturating_sub(since) < REFUND_SETTLE_MS)
+            }
+        })
     }
 
     /// Atomically reserve one unattended auto-fix attempt, respecting the
@@ -1237,7 +1391,6 @@ impl Store {
         self.conn.execute(
             "UPDATE guardian_pull_requests
              SET auto_fix_attempted_at_ms=?, auto_fix_attempt_count=?,
-                 auto_fix_claimed_checks=ci_failing_checks,
                  auto_fix_next_attempt_at_ms=?, auto_fix_error=NULL, updated_at_ms=?
              WHERE id=?",
             params![now, attempt, now.saturating_add(delay), now, id],
@@ -1672,7 +1825,8 @@ impl Store {
         let n = self.conn.execute(
             "UPDATE guardian_pull_requests
              SET auto_fix_attempted_at_ms=NULL, auto_fix_attempt_count=0,
-                 auto_fix_claimed_checks=NULL,
+                 auto_fix_baseline_checks=NULL, auto_fix_baseline_generation=NULL,
+                 auto_fix_refund_evaluated_generation=NULL,
                  auto_fix_next_attempt_at_ms=NULL, auto_fix_error=NULL,
                  auto_fix_exhausted_notified_at_ms=NULL,
                  auto_fix_last_outcome = CASE WHEN auto_fix_last_outcome='exhausted' THEN NULL ELSE auto_fix_last_outcome END,
@@ -1697,7 +1851,8 @@ impl Store {
         Ok(self.conn.execute(
             "UPDATE guardian_pull_requests
              SET auto_fix_attempted_at_ms=NULL, auto_fix_attempt_count=0,
-                 auto_fix_claimed_checks=NULL,
+                 auto_fix_baseline_checks=NULL, auto_fix_baseline_generation=NULL,
+                 auto_fix_refund_evaluated_generation=NULL,
                  auto_fix_next_attempt_at_ms=NULL, auto_fix_error=NULL,
                  auto_fix_exhausted_notified_at_ms=NULL, auto_fix_last_outcome=NULL,
                  updated_at_ms=?
@@ -13941,6 +14096,12 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
+    /// One poll's snapshot at clock `now` with a zero settle window.
+    fn poll(s: &Store, id: &str, set: &[&str], generation: &str, settled: bool, now: i64) -> bool {
+        s.set_pr_failing_checks_at(id, &names(set), Some(generation), settled, now, 0)
+            .unwrap()
+    }
+
     #[test]
     fn auto_fix_refunds_an_attempt_when_failing_checks_shrink_on_both_forges() {
         for forge in ["github", "gitlab"] {
@@ -13950,8 +14111,9 @@ mod tests {
             // Five sequential errors, each fixed in turn: more fixes than the
             // ceiling of 3 allows without refunds.
             let mut failing = vec!["a", "b", "c", "d", "e"];
+            let mut generation = 0;
             s.set_pr_ci_status(&id, "failing", None).unwrap();
-            s.set_pr_failing_checks(&id, &names(&failing)).unwrap();
+            poll(&s, &id, &failing, &format!("g{generation}"), true, 1);
             loop {
                 match s.claim_pr_auto_fix_attempt(&id, 3, 0).unwrap() {
                     AutoFixClaim::Claimed { attempt } => attempts.push(attempt),
@@ -13961,8 +14123,9 @@ mod tests {
                 if failing.is_empty() {
                     break;
                 }
+                generation += 1;
                 s.set_pr_ci_status(&id, "failing", None).unwrap();
-                assert!(s.set_pr_failing_checks(&id, &names(&failing)).unwrap());
+                assert!(poll(&s, &id, &failing, &format!("g{generation}"), true, 1));
             }
             assert_eq!(attempts, vec![1; 5], "{forge}");
         }
@@ -13972,45 +14135,124 @@ mod tests {
     fn auto_fix_does_not_refund_equal_grown_or_disjoint_check_sets() {
         let s = store();
         let id = refund_test_pr(&s, "github");
-        s.set_pr_failing_checks(&id, &names(&["a", "b"])).unwrap();
+        poll(&s, &id, &["a", "b"], "g0", true, 1);
         s.claim_pr_auto_fix_attempt(&id, 3, 0).unwrap();
-        for set in [&["a", "b"][..], &["a", "b", "c"], &["c", "d"], &["c"]] {
-            assert!(!s.set_pr_failing_checks(&id, &names(set)).unwrap());
+        for (n, set) in [&["a", "b"][..], &["a", "b", "c"], &["c", "d"]]
+            .iter()
+            .enumerate()
+        {
+            assert!(!poll(&s, &id, set, &format!("g{}", n + 1), true, 1));
         }
         assert_eq!(s.get_pull_request(&id).unwrap().auto_fix_attempt_count, 1);
-        // Flapping back to a subset-of-nothing-new does not refund twice.
-        assert!(s.set_pr_failing_checks(&id, &names(&["a"])).unwrap());
-        assert!(!s.set_pr_failing_checks(&id, &names(&["a"])).unwrap());
-        assert!(!s.set_pr_failing_checks(&id, &names(&["a", "b"])).unwrap());
-        assert!(!s.set_pr_failing_checks(&id, &names(&["a"])).unwrap());
+    }
+
+    #[test]
+    fn auto_fix_never_refunds_twice_for_one_generation() {
+        let s = store();
+        let id = refund_test_pr(&s, "github");
+        poll(&s, &id, &["a", "b"], "g0", true, 1);
+        s.claim_pr_auto_fix_attempt(&id, 3, 0).unwrap();
+        assert!(poll(&s, &id, &["a"], "g1", true, 2));
+        // The same generation polled again (a re-run on the same SHA) is
+        // already evaluated.
+        assert!(!poll(&s, &id, &["a"], "g1", true, 3));
+        assert!(!poll(&s, &id, &[], "g1", true, 4));
+        assert_eq!(s.get_pull_request(&id).unwrap().auto_fix_attempt_count, 0);
+    }
+
+    #[test]
+    fn auto_fix_does_not_refund_an_unsettled_generation_until_it_settles() {
+        let s = store();
+        let id = refund_test_pr(&s, "gitlab");
+        poll(&s, &id, &["a", "b"], "g0", true, 1);
+        s.claim_pr_auto_fix_attempt(&id, 3, 0).unwrap();
+        // One failure plus two still-pending checks: the failure subset is
+        // not yet progress.
+        assert!(!poll(&s, &id, &["a"], "g1", false, 2));
+        assert!(!poll(&s, &id, &["a"], "g1", false, 3));
+        assert_eq!(s.get_pull_request(&id).unwrap().auto_fix_attempt_count, 1);
+        assert!(s.pr_refund_pending(&id, 3).unwrap());
+        // The pending checks pass: the same set, now settled, refunds against
+        // the previous settled generation.
+        assert!(poll(&s, &id, &["a"], "g1", true, 4));
+        assert_eq!(s.get_pull_request(&id).unwrap().auto_fix_attempt_count, 0);
+        assert!(!s.pr_refund_pending(&id, 4).unwrap());
+    }
+
+    #[test]
+    fn auto_fix_refund_waits_out_the_settle_window() {
+        let s = store();
+        let id = refund_test_pr(&s, "github");
+        let at = |set: &[&str], generation: &str, now: i64| {
+            s.set_pr_failing_checks_at(&id, &names(set), Some(generation), true, now, 30_000)
+                .unwrap()
+        };
+        at(&["a", "b"], "g0", 0);
+        s.claim_pr_auto_fix_attempt(&id, 3, 0).unwrap();
+        assert!(!at(&["a"], "g1", 1_000));
+        assert!(!at(&["a"], "g1", 20_000));
+        assert!(s.pr_refund_pending(&id, 20_000).unwrap());
+        assert!(at(&["a"], "g1", 31_000));
+        assert!(!s.pr_refund_pending(&id, 31_000).unwrap());
+    }
+
+    #[test]
+    fn auto_fix_unsettled_intermediate_generation_keeps_the_settled_baseline() {
+        let s = store();
+        let id = refund_test_pr(&s, "github");
+        poll(&s, &id, &["a", "b"], "g0", true, 1);
+        s.claim_pr_auto_fix_attempt(&id, 3, 0).unwrap();
+        // g1 never settles (superseded by a new push), so g0 stays the
+        // baseline for g2.
+        assert!(!poll(&s, &id, &["a", "b", "c"], "g1", false, 2));
+        assert!(poll(&s, &id, &["a"], "g2", true, 3));
+    }
+
+    #[test]
+    fn auto_fix_without_a_generation_never_refunds() {
+        let s = store();
+        let id = refund_test_pr(&s, "github");
+        poll(&s, &id, &["a", "b"], "g0", true, 1);
+        s.claim_pr_auto_fix_attempt(&id, 3, 0).unwrap();
+        assert!(
+            !s.set_pr_failing_checks_at(&id, &names(&["a"]), None, true, 5, 0)
+                .unwrap()
+        );
+        assert_eq!(s.get_pull_request(&id).unwrap().auto_fix_attempt_count, 1);
     }
 
     #[test]
     fn auto_fix_refund_floors_at_zero_and_passing_clears_the_sets() {
         let s = store();
         let id = refund_test_pr(&s, "gitlab");
-        s.set_pr_failing_checks(&id, &names(&["a", "b"])).unwrap();
-        assert!(!s.set_pr_failing_checks(&id, &names(&["a"])).unwrap());
+        poll(&s, &id, &["a", "b"], "g0", true, 1);
+        assert!(!poll(&s, &id, &["a"], "g1", true, 2));
         assert_eq!(s.get_pull_request(&id).unwrap().auto_fix_attempt_count, 0);
         s.claim_pr_auto_fix_attempt(&id, 3, 0).unwrap();
-        s.set_pr_failing_checks(&id, &names(&["a"])).unwrap();
+        poll(&s, &id, &["a"], "g2", true, 3);
         s.set_pr_ci_status(&id, "passing", None).unwrap();
         assert_eq!(s.get_pull_request(&id).unwrap().auto_fix_attempt_count, 0);
-        s.set_pr_failing_checks(&id, &names(&["a", "b"])).unwrap();
-        assert!(!s.set_pr_failing_checks(&id, &names(&["a"])).unwrap());
+        poll(&s, &id, &["a", "b"], "g3", true, 4);
+        assert!(!poll(&s, &id, &["a"], "g4", true, 5));
     }
 
     #[test]
-    fn auto_fix_refund_unblocks_an_exhausted_pr() {
+    fn auto_fix_refund_unblocks_an_exhausted_pr_and_clears_backoff() {
         let s = store();
         let id = refund_test_pr(&s, "github");
-        s.set_pr_failing_checks(&id, &names(&["a", "b"])).unwrap();
-        s.claim_pr_auto_fix_attempt(&id, 1, 0).unwrap();
+        poll(&s, &id, &["a", "b"], "g0", true, 1);
+        // A long backoff after the single allowed attempt.
+        s.claim_pr_auto_fix_attempt(&id, 1, 3_600_000).unwrap();
         assert_eq!(
-            s.claim_pr_auto_fix_attempt(&id, 1, 0).unwrap(),
+            s.claim_pr_auto_fix_attempt(&id, 1, 3_600_000).unwrap(),
             AutoFixClaim::Exhausted { attempts: 1 }
         );
-        assert!(s.set_pr_failing_checks(&id, &names(&["a"])).unwrap());
+        s.set_pr_auto_fix_outcome(&id, "exhausted_awaiting_ci")
+            .unwrap();
+        assert!(poll(&s, &id, &["a"], "g1", true, 2));
+        let pr = s.get_pull_request(&id).unwrap();
+        assert!(pr.auto_fix_next_attempt_at_ms.is_none());
+        assert!(pr.auto_fix_last_outcome.is_none());
         assert_eq!(
             s.claim_pr_auto_fix_attempt(&id, 1, 0).unwrap(),
             AutoFixClaim::Claimed { attempt: 1 }

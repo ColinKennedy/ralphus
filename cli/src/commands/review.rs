@@ -3088,7 +3088,8 @@ fn render_pr_list(rows: &Value) {
             format!("branch {}", r["branch_id"])
         };
         // RAL-509: surface the last auto-fix outcome (e.g.
-        // "deferred_no_worktree", "deferred_backoff", "auto_fix_passed") so a
+        // "deferred_no_worktree", "deferred_backoff", "exhausted_awaiting_ci",
+        // "auto_fix_passed") so a
         // failing PR that auto-fix deliberately skipped is legible from the
         // CLI, not just a DEBUG Cartographer row.
         let auto_fix_label = r["auto_fix_last_outcome"]

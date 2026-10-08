@@ -3733,12 +3733,23 @@ impl Store {
             "ALTER TABLE guardian_pull_requests ADD COLUMN auto_fix_attempt_count INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE guardian_pull_requests ADD COLUMN auto_fix_next_attempt_at_ms INTEGER",
             "ALTER TABLE guardian_pull_requests ADD COLUMN auto_fix_error TEXT",
-            // RAL-578: JSON arrays of failing check names -- `ci_failing_checks`
-            // is the latest poll's set, `auto_fix_claimed_checks` the set at
-            // the last claimed auto-fix attempt. A strict shrink from the
-            // latter refunds one attempt (`Store::set_pr_failing_checks`).
+            // RAL-578: JSON array of failing check names from the latest
+            // poll. `auto_fix_claimed_checks` is no longer read or written
+            // (RAL-591 replaced it with the baseline columns below).
             "ALTER TABLE guardian_pull_requests ADD COLUMN ci_failing_checks TEXT",
             "ALTER TABLE guardian_pull_requests ADD COLUMN auto_fix_claimed_checks TEXT",
+            // RAL-591: generation-keyed refund state (`Store::set_pr_failing_checks_at`).
+            // `ci_failing_generation` keys `ci_failing_checks` (GitHub head
+            // SHA / GitLab pipeline id); `ci_settled_since_ms` is when that
+            // snapshot first had no unfinished checks. The baseline is the
+            // last settled failing set of an earlier generation, and
+            // `auto_fix_refund_evaluated_generation` the generation whose
+            // refund was already decided, so each generation refunds at most once.
+            "ALTER TABLE guardian_pull_requests ADD COLUMN ci_failing_generation TEXT",
+            "ALTER TABLE guardian_pull_requests ADD COLUMN ci_settled_since_ms INTEGER",
+            "ALTER TABLE guardian_pull_requests ADD COLUMN auto_fix_baseline_checks TEXT",
+            "ALTER TABLE guardian_pull_requests ADD COLUMN auto_fix_baseline_generation TEXT",
+            "ALTER TABLE guardian_pull_requests ADD COLUMN auto_fix_refund_evaluated_generation TEXT",
             // RAL-476: the user who submitted this squad, resolved once at
             // submit time (explicit TOML `submitter`, else the acting
             // request's identity) -- see `server::resolve_submitter`.
