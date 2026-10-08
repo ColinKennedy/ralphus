@@ -208,6 +208,19 @@
         peekPreLastText.set(el, text);
         el.innerHTML = transcriptHtml(text);
       }
+      /**
+       * Assigns a peek `<pre>`'s scrollTop only when it would actually move.
+       * Writing `scrollTop` — even to the value it already has — cancels the
+       * browser's in-flight wheel/touch momentum or smooth scroll, which is
+       * what made a log scroll stall midway whenever a poll tick landed
+       * mid-gesture.
+       * @param {HTMLElement} pre
+       * @param {number} top
+       * @returns {void}
+       */
+      function setPeekScrollTop(pre, top) {
+        if (Math.abs(pre.scrollTop - top) >= 1) pre.scrollTop = top;
+      }
       /** @type {WeakMap<Element, string>} The text last written into each peek `<pre>`. */
       const peekPreLastText = new WeakMap();
       /**
@@ -395,18 +408,19 @@
           // regardless of where it was scrolled: its content is a different
           // log now, so the old offset means nothing.
           if (pinned || next.headerChanged) {
-            pre.scrollTop = pre.scrollHeight;
+            setPeekScrollTop(pre, pre.scrollHeight);
           } else if (freshLoad) {
             // Not bottom-pinned, but this is the first render into a rebuilt
             // or just-reopened `<pre>` (RAL-471) — its scrollTop otherwise
             // defaults to 0 and would silently strand the reader at the top
             // instead of their saved mid-log position.
             const target = peekScrollRestoreTarget(saved, pre.scrollHeight);
-            if (target !== null) pre.scrollTop = target;
+            if (target !== null) setPeekScrollTop(pre, target);
           } else if (before === pre) {
             // Scrolled up and the same node: the text swap must not move the
-            // reader, so re-assert the offset they had before it.
-            pre.scrollTop = heldTop;
+            // reader, so re-assert the offset they had before it — but only
+            // if the swap actually moved it (an unchanged poll writes nothing).
+            setPeekScrollTop(pre, heldTop);
           }
           savePeekScrollState(key, pre);
           updatePeekJumpVisibility(key);
@@ -516,7 +530,10 @@
           renderPeekTape(key);
           const preAfter = document.getElementById(`peek-pre-${cssKey}`);
           if (preAfter) {
-            preAfter.scrollTop = prevTop + (preAfter.scrollHeight - prevHeight);
+            // Only compensate for the height the prepend actually added; a
+            // chunk that rendered to nothing leaves the viewport untouched.
+            const added = preAfter.scrollHeight - prevHeight;
+            if (added !== 0) setPeekScrollTop(preAfter, prevTop + added);
             savePeekScrollState(key, preAfter);
           }
         } finally {
@@ -598,7 +615,7 @@
           const key = pre.dataset.key;
           if (!key) return;
           const target = peekScrollRestoreTarget(peekScrollState[key], pre.scrollHeight);
-          if (target !== null) pre.scrollTop = target;
+          if (target !== null) setPeekScrollTop(pre, target);
           updatePeekJumpVisibility(key);
         });
       }
