@@ -194,7 +194,7 @@
        */
       function openWaypointProjectFilterMenu(e) {
         e.preventDefault(); e.stopPropagation();
-        closeProjectFilterMenu(); ttCloseProjectFilterMenu(); triageCloseProjectFilterMenu();
+        closeProjectFilterMenu(); ttCloseProjectFilterMenu();
         const existing = document.getElementById("waypoint-project-filter-menu");
         if (existing) { existing.remove(); return; }
         const menu = document.createElement("div");

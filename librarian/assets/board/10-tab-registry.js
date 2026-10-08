@@ -19,35 +19,46 @@
       let triageSchedules = [];
       /** @type {TriageCandidateView[]} every cell that opted into Triage and hasn't been linked to a review yet, across every squad */
       let triageCandidates = [];
+      /** @type {"flow"|"cfg"} Flow (live pool state) or Configuration (type registry + schedules). */
+      let triageView = "flow";
+      /** Triage types the toolbar's Type dropdown hides; empty shows every type. */
+      const triageHiddenTypes = new Set();
+      /** The toolbar's case-insensitive task/cell name search. */
+      let triageQuery = "";
+      /** Whether the Excluded (proof failed) stage is listed at all. */
+      let triageShowExcluded = false;
       /**
-       * Default (empty) filters for the Triage tab's candidate list.
-       * @returns {{type: string, projects: Set<string>, q: string}}
+       * The project rail's focus: `proj` null is every project; `sub` null is
+       * the whole project, "" its own (no-subproject) pool, else one subproject.
+       * @type {{proj: string|null, sub: string|null}}
        */
-      function defaultTriageCandidateFilters() { return { type: "", projects: new Set(), q: "" }; }
-      /** Client-side filters for the Triage tab's candidate list -- an empty type and an empty projects set each mean "no filter" (all types / all projects); `q` is a case-insensitive substring. */
-      let triageCandidateFilters = defaultTriageCandidateFilters();
-      /** Message from the last failed Triage action, shown inline above the tab's tables. */
+      let triageFocus = { proj: null, sub: null };
+      /** Projects collapsed in the unfocused overview. */
+      const triageCollapsedProjects = new Set();
+      /** @type {string|null} the details pane's pool, keyed `triagePreviewKey(project, type)` */
+      let triageSelKey = null;
+      /** Drained starts collapsed (it only grows), and fetches its reviews only once opened. */
+      let triageDrainedOpen = false;
+      /** @type {GuardianIndexEntry[]|null} Arbiter-created reviews for the Drained stage; null until first opened. */
+      let triageDrained = null;
+      /** Whether the Excluded stage (when shown) is expanded. */
+      let triageExcludedOpen = true;
+      /** @type {TriagePaneEditDraft|null} the details pane's edit-mode draft, or null when not editing. */
+      let triagePaneEdit = null;
+      /**
+       * The Configuration view's add-schedule form, kept here so a periodic
+       * re-render never drops what is being picked or typed.
+       * @type {TriageScheduleForm}
+       */
+      let triageSchedForm = { project: "", sub: "", type: "", cron: "", anchor: "", every: "1" };
+      /** Message from the last failed Triage action, shown inline in the flow and the details pane. */
       let triageError = "";
       /**
-       * RAL-421: live "what would confirming do?" previews for the Triage
-       * tab's pool-threshold editor -- keyed `JSON.stringify([project, triageType])`,
-       * present only after the human clicks Preview on a row and cleared on
-       * Confirm/Cancel (or when the row disappears from the pool list). The
-       * daemon serves the estimate from its pool state at request time, so
-       * it is rough by design; the Confirm handler posts exactly the
-       * previewed `proposed_threshold` rather than re-reading the input.
-       * @type {{[key: string]: TriagePoolThresholdPreview}}
-       */
-      let triageThresholdPreviews = {};
-      /**
-       * RAL-449: pending manual-drain confirmations for the Triage tab's
-       * pool table -- keyed the same way as `triageThresholdPreviews`,
-       * present only after the human clicks "Drain now" on a row and
-       * cleared on Confirm/Cancel (or when the row disappears from the pool
-       * list). Populated straight from the row's already-known pool state
-       * (no round trip needed -- unlike a threshold preview, there is
-       * nothing to compute server-side: draining now always takes every
-       * currently eligible candidate).
+       * RAL-449: pending manual-drain confirmations for the details pane's
+       * "Drain now" -- keyed `triagePreviewKey(project, triageType)`, present
+       * only after the human clicks "Drain now" and cleared on
+       * Confirm/Cancel. Populated straight from the pool's already-known
+       * state (draining now always takes every currently eligible candidate).
        * @type {{[key: string]: TriagePoolDrainConfirm}}
        */
       let triageDrainConfirms = {};

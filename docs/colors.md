@@ -351,6 +351,19 @@ provenance signal ("the Arbiter made this, not a human"), just attached to a
 different field, so it reuses `--arbiter` rather than adding a second
 purple-ish variable for what is semantically the same concept.
 
+### Triage tab pools — existing roles only (RAL-318)
+The Triage tab spends color only where it carries meaning, and adds no new
+variable. A triage **type name** renders in `--arbiter` (the same Triage
+provenance role as the badge above). Each pool carries one small state dot:
+`--done` when it is at or over its count threshold (its full batches are
+ready to drain), `--queued` while it is filling (its cells are literally the
+daemon's `queued` candidates), and `--ignored` — the only caution color — when
+it has no count threshold and no cron schedule, so nothing will ever drain it
+automatically. The same three hues mark the matching words in the summary
+line and project headers. Selection (the rail item, the selected pool card,
+the active Flow/Configuration segment) is `--accent`, as everywhere else;
+cards and rows are otherwise plain `--panel` surfaces with no tinted fills.
+
 ### Inherited resolved value — italic text only (no new color)
 A detail-pane field whose displayed value is a resolved fallback from a parent
 scope (for example, a cell `agent` inherited from its task, or a proof

@@ -818,6 +818,58 @@
        * @property {string[]} triage_types
        */
       /**
+       * Derived state of one Triage pool (`triagePoolMath`). A count threshold
+       * drains in threshold-sized batches, so `ready` is the cells sitting in
+       * full batches and `remainder` is what stays pooled.
+       * @typedef {object} TriagePoolMath
+       * @property {number|null} threshold
+       * @property {number} fullBatches
+       * @property {number} ready
+       * @property {number} remainder
+       * @property {boolean} isReady - at or over its count threshold
+       * @property {boolean} stalled - no count threshold and no cron schedule
+       */
+      /**
+       * A parsed `cron` crate expression (`triageParseCron`): the allowed
+       * values of each field; `dow` runs 1-7 from Sunday; `year` is null when
+       * the expression has no year field.
+       * @typedef {object} TriageCronSpec
+       * @property {Set<number>} sec
+       * @property {Set<number>} min
+       * @property {Set<number>} hour
+       * @property {Set<number>} dom
+       * @property {Set<number>} mon
+       * @property {Set<number>} dow
+       * @property {Set<number>|null} year
+       */
+      /**
+       * One cron schedule as edited in the Triage details pane; `id` is null
+       * for a schedule that doesn't exist yet. Fields hold the raw input text.
+       * @typedef {object} TriageScheduleDraft
+       * @property {number|null} id
+       * @property {string} cron
+       * @property {string} every
+       * @property {string} anchor - YYYY-MM-DD (UTC)
+       */
+      /**
+       * The Triage Configuration view's add-schedule form; every field holds
+       * the raw control value ("" when nothing is picked or typed yet).
+       * @typedef {object} TriageScheduleForm
+       * @property {string} project - a registered project name
+       * @property {string} sub - optional subproject
+       * @property {string} type - a registered triage type
+       * @property {string} cron
+       * @property {string} anchor - YYYY-MM-DD (UTC)
+       * @property {string} every
+       */
+      /**
+       * The Triage details pane's edit-mode draft for one pool.
+       * @typedef {object} TriagePaneEditDraft
+       * @property {string} key - `triagePreviewKey(project, triageType)`
+       * @property {string} threshold - raw threshold text; "" means no count trigger
+       * @property {TriageScheduleDraft[]} scheds
+       */
+      /**
        * @typedef {object} ProjectView
        * @property {string} name
        * @property {string} description

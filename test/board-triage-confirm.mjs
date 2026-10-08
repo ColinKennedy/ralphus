@@ -1,13 +1,12 @@
-// Loads the RAL-421 preview/confirm threshold-editor logic out of the board
-// chunk files (librarian/assets/board/) so it can be exercised under
-// `node --test` with no browser and no build step.
+// Loads the RAL-421 threshold-preview helpers and the RAL-449 "Drain now"
+// handlers out of the board chunk files (librarian/assets/board/) so they can
+// be exercised under `node --test` with no browser and no build step.
 //
 // Same slice-the-real-source approach as ./board-tasks-poll.mjs -- the
 // regions are the shipped code itself, so these tests can't silently drift
 // from what the librarian serves. Two regions: the pure preview helpers
-// (key + summary + confirm-line markup) and the Triage-tab's
-// preview/confirm/cancel handlers (the second editor entry point, the
-// Projects-tab popup, uses the same helpers and the same request shapes).
+// (key + summary + confirm-line markup, used by the Projects-tab popup) and
+// the Triage tab's Drain-now request/confirm/cancel handlers.
 
 import { boardScript } from "./board-source.mjs";
 
@@ -51,16 +50,14 @@ export const DRAINING_PREVIEW = {
 export const DRAINABLE_POOL = { project: "proj", triage_type: "bug", count: 7, threshold: 3 };
 
 /**
- * Builds the sandboxed preview/confirm pair: `previewPoolThreshold`,
- * `confirmPoolThreshold`, `cancelPoolThresholdPreview`, the RAL-449 manual
- * drain trio (`requestDrainTriagePool`, `confirmDrainTriagePool`,
- * `cancelDrainTriagePool`), plus the pure helpers (`triagePreviewKey`,
+ * Builds the sandbox: the RAL-449 manual drain trio
+ * (`requestDrainTriagePool`, `confirmDrainTriagePool`,
+ * `cancelDrainTriagePool`) plus the pure helpers (`triagePreviewKey`,
  * `triageThresholdPreviewEffect`, `triageThresholdConfirmLine`,
- * `triageDrainConfirmLine`). Every fetch is stubbed to resolve immediately;
- * the first call records the request so the test can assert URL, method,
- * and body, then returns `previewJson` for the `/preview` path,
- * `drainJson` for the `/drain` path, and `confirmJson` for the threshold
- * confirm path.
+ * `triageDrainConfirmLine`). Every fetch is stubbed to resolve immediately
+ * and is recorded so the test can assert URL, method, and body; it returns
+ * `drainJson` for the `/drain` path, `previewJson` for a `/preview` path,
+ * and `confirmJson` otherwise.
  * @param {{previewJson?: object, confirmJson?: object, drainJson?: object, pools?: object[]}} [opts]
  */
 export function makeTriageConfirm({
@@ -95,15 +92,12 @@ export function makeTriageConfirm({
     "deps",
     `const { esc, fetch, renderTriage, pollTriage, responseError } = deps;
      var triageError = "";
-     var triageThresholdPreviews = {};
      var triagePools = deps.pools;
      var triageDrainConfirms = {};
+     var triageSelKey = null;
      ${sliceRegion(REGIONS.preview)}
      ${sliceRegion(REGIONS.tabHandlers)}
      return {
-       previewPoolThreshold,
-       confirmPoolThreshold,
-       cancelPoolThresholdPreview,
        requestDrainTriagePool,
        confirmDrainTriagePool,
        cancelDrainTriagePool,
@@ -112,19 +106,11 @@ export function makeTriageConfirm({
        triageThresholdConfirmLine,
        triageDrainConfirmLine,
        triageError: () => triageError,
-       previews: () => triageThresholdPreviews,
        drainConfirms: () => triageDrainConfirms,
+       selKey: () => triageSelKey,
      };`,
   );
   const api = factory(deps);
   api.calls = calls;
   return api;
-}
-
-/** A fake event whose target row carries one threshold input. */
-export function makeRowEvent(rawValue) {
-  const input = { value: rawValue };
-  const row = { querySelector: (sel) => (sel === ".pool-threshold-input" ? input : null) };
-  const target = { closest: (sel) => (sel === "tr" ? row : null) };
-  return { target, input };
 }

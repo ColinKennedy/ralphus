@@ -294,9 +294,11 @@
       CLICK_HANDLERS.removeTriageType = (e, ds) => removeTriageType(ds.name || "");
       CLICK_HANDLERS.removePreset = (e, ds) => removePreset(ds.name || "");
       CLICK_HANDLERS.editPreset = (e, ds) => editPreset(ds.name || "");
-      CLICK_HANDLERS.previewPoolThreshold = (e, ds) => previewPoolThreshold(e, ds.project || "", ds.triageType || "");
-      CLICK_HANDLERS.confirmPoolThreshold = (e, ds) => confirmPoolThreshold(ds.project || "", ds.triageType || "");
-      CLICK_HANDLERS.cancelPoolThresholdPreview = (e, ds) => cancelPoolThresholdPreview(ds.project || "", ds.triageType || "");
+      CLICK_HANDLERS.selectTriagePool = (e, ds) => selectTriagePool(ds.project || "", ds.triageType || "");
+      CLICK_HANDLERS.editTriagePoolTriggers = (e, ds) => { closeTriagePoolMenu(); editTriagePoolTriggers(ds.project || "", ds.triageType || ""); };
+      CLICK_HANDLERS.setTriageFocus = (e, ds) => setTriageFocus(ds.proj ?? null, ds.sub ?? null);
+      CLICK_HANDLERS.toggleTriageProject = (e, ds) => toggleTriageProject(ds.proj || "");
+      CLICK_HANDLERS.toggleTriageStage = (e, ds) => { void toggleTriageStage(ds.stage || ""); };
       CLICK_HANDLERS.requestDrainTriagePool = (e, ds) => requestDrainTriagePool(e, ds.project || "", ds.triageType || "");
       CLICK_HANDLERS.confirmDrainTriagePool = (e, ds) => confirmDrainTriagePool(ds.project || "", ds.triageType || "");
       CLICK_HANDLERS.cancelDrainTriagePool = (e, ds) => cancelDrainTriagePool(ds.project || "", ds.triageType || "");

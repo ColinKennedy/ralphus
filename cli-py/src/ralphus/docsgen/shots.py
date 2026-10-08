@@ -231,7 +231,7 @@ def _triage_overview(page: Page) -> None:
         librarian_server(daemon_url) as base_url,
     ):
         _goto(page, base_url, "#/triage")
-        page.wait_for_selector("#triage .proj-table")
+        page.wait_for_selector("#triage .tri-page")
         _shoot(page, "triage-overview")
 
 
