@@ -3240,6 +3240,10 @@ struct ForgeState {
     unrouted: Vec<String>,
     /// The next this-many `/pulls` requests fail with a 503.
     fail_pulls: u32,
+    /// Workflow runs: `(id, branch, head sha, status)`.
+    runs: Vec<(i64, String, String, String)>,
+    /// Run ids the daemon force-cancelled.
+    cancelled_runs: Vec<i64>,
 }
 
 /// A stateful fake of the GitHub REST endpoints the daemon calls for a PR
@@ -3432,10 +3436,33 @@ impl FakeGitHub {
                     .collect();
                 json_reply(serde_json::json!({"number": 1, "pull_requests": open}), 200)
             }
+            (Post, ["actions", "runs", id, "force-cancel"]) => {
+                if let Some(id) = id.parse::<i64>().ok() {
+                    st.cancelled_runs.push(id);
+                    for run in st.runs.iter_mut().filter(|r| r.0 == id) {
+                        run.3 = "completed".to_string();
+                    }
+                }
+                json_reply(serde_json::json!({}), 200)
+            }
             (Post, ["stacks", _, _]) | (Post, ["actions", "runs", _, _]) => {
                 json_reply(serde_json::json!({}), 200)
             }
-            (Get, ["actions", "runs"]) => json_reply(serde_json::json!({"workflow_runs": []}), 200),
+            (Get, ["actions", "runs"]) => {
+                let branch = query
+                    .split('&')
+                    .find_map(|kv| kv.strip_prefix("branch="))
+                    .map(|b| b.replace("%2F", "/"));
+                let runs: Vec<serde_json::Value> = st
+                    .runs
+                    .iter()
+                    .filter(|r| branch.as_deref().is_none_or(|b| r.1 == b))
+                    .map(|(id, _, sha, status)| {
+                        serde_json::json!({"id": id, "head_sha": sha, "status": status})
+                    })
+                    .collect();
+                json_reply(serde_json::json!({"workflow_runs": runs}), 200)
+            }
             (Get, ["actions", "jobs", _]) => json_reply(serde_json::json!({"steps": []}), 200),
             (Get, ["contents", ..]) => json_reply(serde_json::json!({"message": "Not Found"}), 404),
             _ => {
@@ -5879,4 +5906,186 @@ fn two_queued_feedback_rounds_on_one_branch_are_both_recorded_for_crash_recovery
         "{what}: a completed round left its pending record behind"
     );
     fx.assert_no_unexpected_agent_calls(what, &unexpected);
+}
+
+// ---------------------------------------------------------------------------
+// More forge races: superseded-CI cancellation, reopened PRs, hammered syncs.
+// ---------------------------------------------------------------------------
+
+/// A feedback push supersedes the branch's running CI: the stale run is
+/// force-cancelled, and a run for the newest head is never touched.
+#[test]
+fn superseded_ci_cancel_hits_only_the_stale_run() {
+    let what = "superseded CI cancel";
+    let (fx, forge) = Fixture::with_forge(&["feature/a", "feature/b", "feature/c"]);
+    fx.submit_stack();
+    let unexpected: Unexpected = Arc::default();
+    let (_, alias_c) = fx.open_pr_row(2);
+    let stale = fx.remote_tip(&alias_c);
+    forge
+        .state
+        .lock()
+        .unwrap()
+        .runs
+        .push((101, alias_c.clone(), stale, "in_progress".to_string()));
+
+    let mut round = Held::new("feature-c.txt", "feedback on c", &unexpected).feedback(&fx, 2);
+    round.finish();
+    let newest = fx.remote_tip(&alias_c);
+    // A run for the newest head registers right after the push, then the base
+    // moves and the daemon republishes while that run is still going.
+    forge.state.lock().unwrap().runs.push((
+        202,
+        alias_c.clone(),
+        newest,
+        "in_progress".to_string(),
+    ));
+    assert_eq!(
+        forge.state.lock().unwrap().cancelled_runs,
+        [101],
+        "{what}: the stale run must be cancelled exactly once, the new one never\n{}",
+        fx.describe()
+    );
+    let _daemon = DaemonPump::start(&fx);
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    fx.wait_settled_on(first.trim(), what);
+    std::thread::sleep(PARK_WAIT * 2);
+    assert!(
+        !forge.state.lock().unwrap().cancelled_runs.contains(&202),
+        "{what}: the run for the newest head was cancelled\n{}",
+        fx.describe()
+    );
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_forge_routed_everything(what, &forge);
+}
+
+/// A PR is closed on the forge and then reopened while feedback is held and
+/// the base moves: no duplicate PR appears and no commit is lost.
+#[test]
+fn pr_closed_then_reopened_on_the_forge_keeps_one_pr_and_the_feedback() {
+    let what = "PR closed then reopened";
+    let (fx, forge) = Fixture::with_forge(&["feature/a", "feature/b", "feature/c"]);
+    fx.submit_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    fx.wait_settled_on(first.trim(), "before the close");
+    let (_, alias_b) = fx.open_pr_row(1);
+    let number_b = forge.pr_for(&alias_b).number;
+
+    let mut held = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    forge.with_pr(number_b, |pr| pr.open = false);
+    let _ = ralphus_daemon::pr::submit_pull_requests(
+        &fx.store,
+        &NoAgentExpected,
+        &fx.id,
+        stack_request(),
+        "tester",
+        false,
+    );
+    let upstream = fx.push_upstream("upstream1.txt");
+    forge.with_pr(number_b, |pr| pr.open = true);
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+    std::thread::sleep(PARK_WAIT * 3);
+
+    let heads: Vec<String> = forge
+        .state
+        .lock()
+        .unwrap()
+        .prs
+        .iter()
+        .filter(|p| p.open)
+        .map(|p| p.head.clone())
+        .collect();
+    let mut unique = heads.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        heads.len(),
+        unique.len(),
+        "{what}: two open PRs share a head: {heads:?}"
+    );
+    assert!(
+        fx.text_anywhere(&fx.review_ref(1), "feedback on b"),
+        "{what}: the feedback was lost (upstream {upstream:.9})\n{}",
+        fx.describe()
+    );
+    assert!(
+        fx.text_anywhere(&fx.review_ref(2), "feedback on b"),
+        "{what}: the branch above lost the feedback\n{}",
+        fx.describe()
+    );
+    fx.assert_forge_routed_everything(what, &forge);
+}
+
+/// "Sync PR" is hammered (from several threads, repeatedly) while feedback is
+/// held and the base moves. The forge matches the stack, so nothing may be
+/// reordered, republished from a stale view, or lost.
+#[test]
+fn hammered_sync_pr_during_a_race_changes_nothing_it_should_not() {
+    let what = "hammered sync-pr";
+    let (fx, forge) = Fixture::with_forge(&["feature/a", "feature/b", "feature/c"]);
+    fx.submit_stack();
+    let unexpected: Unexpected = Arc::default();
+    let daemon = DaemonPump::start(&fx);
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    fx.wait_settled_on(first.trim(), "before the hammering");
+
+    let mut held = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    let upstream = fx.push_upstream("upstream1.txt");
+    let hammer: Vec<_> = (0..4)
+        .map(|_| {
+            let (store, id) = (Arc::clone(&fx.store), fx.id.clone());
+            let (sem, cancellations) = (Arc::clone(&daemon.sem), daemon.cancellations.clone());
+            std::thread::spawn(move || {
+                for _ in 0..6 {
+                    ralphus_daemon::pr::check_and_apply_forge_reorder(
+                        &store,
+                        &NoAgentExpected,
+                        &id,
+                        &sem,
+                        &cancellations,
+                    );
+                    ralphus_daemon::pr::resync_pr_bases_synchronously(&store, &id).ok();
+                }
+            })
+        })
+        .collect();
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+    for thread in hammer {
+        thread.join().expect("sync thread");
+    }
+    fx.wait_settled_on(&upstream, what);
+    assert_eq!(
+        fx.branch_order(),
+        ["feature/a", "feature/b", "feature/c"],
+        "{what}: a no-op sync reordered the stack"
+    );
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_forge_routed_everything(what, &forge);
+    fx.assert_everything_published(
+        what,
+        &[(1, "feature-b.txt", "feedback on b")],
+        &["upstream1.txt"],
+    );
 }
