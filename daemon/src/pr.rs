@@ -5246,7 +5246,24 @@ pub fn check_and_apply_forge_reorder(
         } else {
             false
         };
-        if drift.order_changed && guard.reorder_guardian_branches(id, &drift.order).is_err() {
+        // `drift.order` holds branch ids; the reorder takes branch names.
+        // Passing ids matched no branch, so the reorder was a silent no-op
+        // that the next check detected (and rebuilt for) again, forever.
+        let order_names: Vec<String> = guard
+            .get_guardian(id)
+            .map(|g| {
+                drift
+                    .order
+                    .iter()
+                    .filter_map(|bid| g.branches.iter().find(|b| &b.id == bid))
+                    .map(|b| b.branch.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if drift.order_changed
+            && (order_names.len() != drift.order.len()
+                || guard.reorder_guardian_branches(id, &order_names).is_err())
+        {
             crate::rlog!(ERROR, "ralphus [pr] review {id} forge reorder apply failed");
             let _ = guard.set_guardian_status(
                 id,
@@ -7049,7 +7066,7 @@ fn submit_stacked_branch_pr(
                 "ralphus [pr] review {id} branch {branch_id} alias {alias} diverged from \
                  {remote_name} ({clobber_err}); reconciling before push"
             );
-            guardian_merge::pull_pr_commits(
+            let pulled = guardian_merge::pull_pr_commits(
                 store,
                 runner,
                 id,
@@ -7062,7 +7079,9 @@ fn submit_stacked_branch_pr(
                 format!("could not reconcile remote branch '{alias}' before pushing: {e}")
             })?;
             local_sha = resolve_local()?;
-            guard_against_clobber(root, remote_name, &alias, &local_sha, None)?
+            // The tip just pulled in is now part of the review branch, even
+            // where conflict resolution reshaped its commits.
+            guard_against_clobber(root, remote_name, &alias, &local_sha, pulled.as_deref())?
         }
     };
     push_ref(root, remote_name, &local_sha, &alias, &lease)?;
@@ -9519,9 +9538,9 @@ pub fn pull_pr_commits(
         &pr.branch_alias,
         pr.last_pushed_sha.as_deref(),
     )?;
-    if !pulled {
+    let Some(pulled_tip) = pulled else {
         return Ok(false);
-    }
+    };
 
     let updated = store
         .lock()
@@ -9542,9 +9561,18 @@ pub fn pull_pr_commits(
     // resolution runs an agent), and a reviewer can push again meanwhile.
     // Re-check against the live remote and lease on what was checked, so such
     // a push fails this one instead of being overwritten; the next sync pass
-    // pulls it in.
+    // pulls it in. The tip just pulled in counts as the review branch's own
+    // even where conflict resolution reshaped its commits -- otherwise the
+    // guard sees "unique" commits on the PR, refuses, and every later pass
+    // pulls the same tip again without ever publishing.
     let local_sha = git(&root, &["rev-parse", &local_ref])?.trim().to_string();
-    let lease = guard_against_clobber(&root, &remote_name, &pr.branch_alias, &local_sha, None)?;
+    let lease = guard_against_clobber(
+        &root,
+        &remote_name,
+        &pr.branch_alias,
+        &local_sha,
+        Some(&pulled_tip),
+    )?;
     push_ref(&root, &remote_name, &local_sha, &pr.branch_alias, &lease)?;
     {
         let sha = local_sha.as_str();

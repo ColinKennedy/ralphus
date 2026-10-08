@@ -9064,7 +9064,10 @@ fn pull_pr_commits_rebases_reviewer_pushed_commits_and_restacks_downstream() {
         Some(&last_synced_sha),
     )
     .expect("pull_pr_commits should succeed");
-    assert!(pulled, "reviewer's commit should have been pulled");
+    assert!(
+        pulled.is_some(),
+        "reviewer's commit should have been pulled"
+    );
 
     let after = store.lock().get_guardian(&id).unwrap();
     assert_eq!(after.status, "in_review", "detail: {:?}", after.detail);
@@ -9145,7 +9148,7 @@ fn pull_pr_commits_is_a_noop_when_already_up_to_date() {
         Some(&synced),
     )
     .expect("pull_pr_commits should succeed");
-    assert!(!pulled, "nothing new on the PR branch to pull");
+    assert!(pulled.is_none(), "nothing new on the PR branch to pull");
 
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&remote_dir);
