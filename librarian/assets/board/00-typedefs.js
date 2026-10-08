@@ -406,6 +406,10 @@
        * @property {string} entity_uri - the owner (`cell:...`) that deferred it.
        * @property {string} body - the deferred note.
        * @property {string|null} [prompt] - the originating cell's prompt, truncated.
+       * @property {string|null} [agent] - the agent the originating cell ran.
+       * @property {string|null} [model] - the model the originating cell ran.
+       * @property {string|null} [branch] - the review branch of the originating cell.
+       * @property {string|null} [task_name] - the task the originating cell belongs to.
        * @property {boolean} ignored
        */
       /**
