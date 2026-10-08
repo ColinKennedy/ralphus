@@ -666,14 +666,71 @@ impl std::fmt::Display for FeedbackPushError {
     }
 }
 
+/// Whether a review in `status` is closed to new feedback: its PRs merged
+/// (or deployed), or the review cancelled. A feedback commit there would be
+/// pushed to a PR branch nobody will merge again -- and would revive the
+/// review's status -- so the request is refused instead of silently lost.
+/// `approved` is not closed: its PRs can still be open and take changes.
+fn review_is_closed(status: &str) -> bool {
+    matches!(status, "merged" | "deployed" | "cancelled")
+}
+
+/// Record `sha` as what branch `branch_id`'s open PR (published as `alias`)
+/// was last pushed to.
+fn record_branch_pr_pushed_sha(
+    store: &crate::store_lock::StoreHandle,
+    id: &str,
+    branch_id: &str,
+    alias: &str,
+    sha: &str,
+) {
+    let guard = store.lock();
+    let Ok(prs) = guard.list_pull_requests_for_guardian(id) else {
+        return;
+    };
+    for pr in prs.iter().filter(|pr| {
+        pr.state == "open" && pr.branch_id.as_deref() == Some(branch_id) && pr.branch_alias == alias
+    }) {
+        let _ = guard.update_pull_request_ex(
+            &pr.id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some(sha)),
+            None,
+        );
+    }
+}
+
+/// The remote branch name of `branch_id`'s open per-branch PR, if it has one.
+fn open_branch_pr_alias(
+    store: &crate::store_lock::StoreHandle,
+    id: &str,
+    branch_id: &str,
+) -> Option<String> {
+    store
+        .lock()
+        .list_pull_requests_for_guardian(id)
+        .ok()?
+        .into_iter()
+        .find(|pr| pr.state == "open" && pr.branch_id.as_deref() == Some(branch_id))
+        .map(|pr| pr.branch_alias)
+}
+
 pub(crate) fn push_feedback_branch(
     wt: &Workspace,
     local_branch: &str,
     force: bool,
     explicit_remote: Option<&str>,
+    explicit_remote_branch: Option<&str>,
 ) -> std::result::Result<String, FeedbackPushError> {
     let (remote, remote_branch) = if let Some(explicit_remote) = explicit_remote {
-        (explicit_remote.to_string(), local_branch.to_string())
+        (
+            explicit_remote.to_string(),
+            explicit_remote_branch.unwrap_or(local_branch).to_string(),
+        )
     } else {
         match wt.git(&["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]) {
             Ok(upstream) => {
@@ -805,6 +862,7 @@ fn reconcile_remote_feedback_commits(
     wt: &Workspace,
     remote: &str,
     remote_branch: &str,
+    local_branch: &str,
     feature: &str,
     is_final_branch: bool,
     cancel: &CancelToken,
@@ -831,7 +889,7 @@ fn reconcile_remote_feedback_commits(
         "--empty=drop",
         "--no-fork-point",
         &base_sha,
-        remote_branch,
+        local_branch,
     ];
     let gate = ProofGate::resolve(store, id, is_final_branch);
     let reconciled = match wt.git(&rebase_args) {
@@ -1713,16 +1771,20 @@ fn guard_against_rebase_step_content_loss(
 
 /// RAL-330: whether `REBASE_HEAD`'s own patch (against its true parent) is
 /// empty — i.e. this step genuinely has nothing left to contribute, the
-/// legitimate case `--empty=drop`/`--skip` exist for. `true` when there is no
-/// `REBASE_HEAD` to check (preserves [`advance_rebase`]'s prior behavior for
-/// a state this function was never meant to gate).
+/// legitimate case `--empty=drop`/`--skip` exist for.
+///
+/// A pick that applied cleanly but could not be committed (no committer
+/// identity, a failing commit hook) pauses the rebase *without* writing
+/// `REBASE_HEAD`, its changes staged in the index. With no `REBASE_HEAD`, the
+/// step is empty only when nothing is staged against `HEAD` -- otherwise a
+/// `--skip` would discard that commit.
 fn rebase_head_commit_is_empty(wt: &Workspace) -> bool {
-    match wt.git(&["rev-parse", "REBASE_HEAD"]) {
-        Ok(sha) => {
+    match wt.git(&["rev-parse", "--verify", "--quiet", "REBASE_HEAD"]) {
+        Ok(sha) if !sha.trim().is_empty() => {
             let sha = sha.trim();
             diff_numstat(wt, &[&format!("{sha}^"), sha]).is_empty()
         }
-        Err(_) => true,
+        _ => wt.git(&["diff", "--cached", "--quiet", "HEAD"]).is_ok(),
     }
 }
 
@@ -2408,14 +2470,36 @@ fn load_guardian_for_worker(
 /// Persist a review status transition on behalf of a merge worker. A failed
 /// write leaves the board showing a stale status while the worker carries on,
 /// so it is recorded as a WARNING rather than dropped.
+/// Whether a store error is a transient SQLite lock/busy condition worth
+/// retrying, rather than a refusal or a real failure.
+fn is_transient_store_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("locked") || message.contains("busy")
+}
+
 fn write_merge_status(
     store: &crate::store_lock::StoreHandle,
     id: &str,
     status: GuardianStatus,
     detail: Option<&str>,
 ) {
+    // A review whose final status write is lost stays `merging` for good --
+    // every later rebuild, pull and restack refuses to claim it -- so a
+    // transient lock/busy error is retried (lock released in between) before
+    // giving up.
+    let mut attempt = 0;
+    let result = loop {
+        let result = store.lock().set_guardian_status(id, status, detail);
+        match &result {
+            Err(e) if attempt < 5 && is_transient_store_error(&e.to_string()) => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(100 * attempt));
+            }
+            _ => break result,
+        }
+    };
     let guard = store.lock();
-    if let Err(e) = guard.set_guardian_status(id, status, detail) {
+    if let Err(e) = result {
         crate::cartographer::Note::new("guardian")
             .level(crate::logging::LogLevel::WARNING)
             .scope("guardian")
@@ -2702,10 +2786,15 @@ fn resolve_conflicts_with_agent(
     let mut current_commit_session_id: Option<String> = None;
     // A pass has a permanent cell identity, keeping its transcript distinct.
     let run_cell_id = format!("resolver-{branch_id}-{}", crate::store::now_ms());
+    let conflicted_now = conflicted_files(wt);
+    let replaying = wt
+        .git(&["log", "-1", "--format=%h %s", "REBASE_HEAD"])
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
     crate::rlog!(
         INFO,
         "ralphus [guardian] review {id} conflicts starting branch={branch:?} found={found} \
-         agent={agent:?} model={model:?}"
+         files={conflicted_now:?} replaying={replaying:?} agent={agent:?} model={model:?}"
     );
     {
         let guard = store.lock();
@@ -3611,6 +3700,295 @@ fn branch_wt_dir(
     wt_base.join(format!("wt-{short}"))
 }
 
+/// What a rebuild replays for one review branch, from [`restack_source`].
+struct RestackSource {
+    /// The commit the review branch is reset to before the rebase.
+    source: String,
+    /// The rebase boundary: commits in `upstream..source` are replayed onto
+    /// the branch's revised predecessor.
+    upstream: String,
+    /// The review branch's tip before this rebuild touched it, if it had one
+    /// -- the old upstream of the next branch in the stack.
+    old_tip: Option<String>,
+    /// When the old review range is carried forward: the task-branch tip it
+    /// was built from, if the task branch has gained commits since. Those
+    /// commits (`new_since..feature`) are replayed on top by [`stack_pick`].
+    new_since: Option<String>,
+    /// Why this source was chosen, for the rebuild's log.
+    reason: &'static str,
+}
+
+impl RestackSource {
+    /// Whether the old review range is carried forward (as opposed to the
+    /// branch being rebuilt from its task-branch tip).
+    fn carries(&self) -> bool {
+        self.old_tip.as_deref() == Some(self.source.as_str())
+    }
+
+    /// Record this branch's carry decision on stderr and in Cartographer. A
+    /// fallback that discards an existing review branch is a WARNING: any
+    /// commit that lived only on it is gone from the rebuilt branch.
+    fn log(
+        &self,
+        store: &crate::store_lock::StoreHandle,
+        id: &str,
+        branch_id: &str,
+        feature: &str,
+    ) {
+        let discards = !self.carries() && self.old_tip.is_some();
+        let level = if discards {
+            crate::logging::LogLevel::WARNING
+        } else {
+            crate::logging::LogLevel::INFO
+        };
+        let message = if self.carries() {
+            "review branch carried forward"
+        } else if discards {
+            "review branch rebuilt from task tip; review-only commits not carried"
+        } else {
+            "review branch built from task tip"
+        };
+        let line = format!(
+            "ralphus [guardian] review {id} {message} branch={feature:?} reason={} \
+             source={} upstream={} old_tip={:?} new_since={:?}",
+            self.reason, self.source, self.upstream, self.old_tip, self.new_since
+        );
+        if discards {
+            crate::rlog!(WARNING, "{line}");
+        } else {
+            crate::rlog!(INFO, "{line}");
+        }
+        crate::cartographer::Note::new("guardian")
+            .level(level)
+            .guardian(id)
+            .scope("branch")
+            .emit(
+                &store.lock(),
+                message,
+                serde_json::json!({
+                    "branch_id": branch_id,
+                    "branch": feature,
+                    "reason": self.reason,
+                    "source": self.source,
+                    "upstream": self.upstream,
+                    "old_tip": self.old_tip,
+                    "new_since": self.new_since,
+                }),
+            );
+    }
+}
+
+/// Private ref recording the task-branch tip review branch `branch_id` was
+/// last built from, so a later rebuild that carries the review branch forward
+/// can tell which task commits are new. Lives in the shared ref namespace, so
+/// every worktree of the project sees it.
+fn branch_source_ref(id: &str, branch_id: &str) -> String {
+    format!("refs/ralphus/source/{id}/{branch_id}")
+}
+
+fn resolve_commit(root: &Workspace, rev: &str) -> Option<String> {
+    root.git(&[
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        &format!("{rev}^{{commit}}"),
+    ])
+    .ok()
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty())
+}
+
+/// Decide how a rebuild rebuilds review branch `branch_id` (old tip
+/// `old_tip`) onto its revised predecessor.
+///
+/// A review branch carries more than its task branch's commits: reviewer
+/// feedback, unattended PR fixes, commits pulled from the PR, manual commits,
+/// and conflict resolutions from earlier builds all live only on the review
+/// branch. So when the branch's old tip is still stacked on `old_upstream`
+/// (the tip it was stacked on before the change that triggered this rebuild),
+/// the whole old range `old_upstream..old_tip` is carried forward, plus any
+/// task commits added since that build ([`RestackSource::new_since`]).
+///
+/// It falls back to replaying the task branch (`base_sha..feature`) from
+/// scratch only when there is nothing to carry -- the branch was never built,
+/// or its old upstream is unknown or no longer below it -- or when the task
+/// branch was rewritten since the last build, so the review branch's copy of
+/// the task's commits is no longer the task's work.
+fn restack_source(
+    root: &Workspace,
+    id: &str,
+    branch_id: &str,
+    old_tip: Option<String>,
+    feature: &str,
+    base_sha: &str,
+    old_upstream: Option<&str>,
+) -> RestackSource {
+    let from_feature = |old_tip: Option<String>, reason: &'static str| RestackSource {
+        source: feature.to_string(),
+        upstream: base_sha.to_string(),
+        old_tip,
+        new_since: None,
+        reason,
+    };
+    let Some(tip) = old_tip.as_deref() else {
+        return from_feature(old_tip, "never built");
+    };
+    let Some(up) = old_upstream else {
+        return from_feature(old_tip, "old upstream unknown");
+    };
+    if !is_ancestor(root, up, tip) {
+        return from_feature(old_tip, "old upstream not below the old review tip");
+    }
+    let built_from = resolve_commit(root, &branch_source_ref(id, branch_id));
+    let feature_tip = resolve_commit(root, feature);
+    let new_since = match (built_from, feature_tip) {
+        (Some(built), Some(now)) if built == now => None,
+        (Some(built), Some(now)) => {
+            if !is_ancestor(root, &built, &now) {
+                return from_feature(old_tip, "task branch rewritten since the last build");
+            }
+            Some(built)
+        }
+        _ => None,
+    };
+    RestackSource {
+        source: tip.to_string(),
+        upstream: up.to_string(),
+        old_tip: old_tip.clone(),
+        new_since,
+        reason: "old review range still stacked",
+    }
+}
+
+/// Last-resort old upstream for a built review branch none of whose stack
+/// neighbours' old tips is below it (its history no longer lines up with
+/// the recorded stack): where it forks from the base. Carrying from there may
+/// replay commits the base or a predecessor already has -- they drop out as
+/// empty -- but it never discards the branch's review-only commits, which a
+/// task-tip rebuild would. Logged at WARNING, since it means the stack's
+/// recorded history had drifted.
+fn fork_point_upstream(
+    store: &crate::store_lock::StoreHandle,
+    id: &str,
+    root: &Workspace,
+    branch: &str,
+    old_tip: &str,
+    base: &str,
+) -> Option<String> {
+    let fork = root
+        .git(&["merge-base", old_tip, base])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    crate::rlog!(
+        WARNING,
+        "ralphus [guardian] review {id} branch={branch:?} old tip {old_tip} is not stacked on any \
+         recorded old tip; carrying it from its fork point with the base {fork}"
+    );
+    crate::cartographer::Note::new("guardian")
+        .level(crate::logging::LogLevel::WARNING)
+        .guardian(id)
+        .scope("branch")
+        .emit(
+            &store.lock(),
+            "review branch carried from its fork point with the base (stack history drifted)",
+            serde_json::json!({"branch": branch, "old_tip": old_tip, "fork_point": fork}),
+        );
+    Some(fork)
+}
+
+/// The old upstream of a review branch whose stack may have been reshaped
+/// (reordered, extended, a branch disabled): the nearest of `candidates` --
+/// the old base and every other branch's old review tip -- that its old tip
+/// `old_tip` is stacked on. `None` when no candidate is below it, or no single
+/// one is nearest.
+fn nearest_old_upstream(root: &Workspace, old_tip: &str, candidates: &[String]) -> Option<String> {
+    let below: Vec<&String> = candidates
+        .iter()
+        .filter(|c| c.as_str() != old_tip && is_ancestor(root, c, old_tip))
+        .collect();
+    below
+        .iter()
+        .find(|c| below.iter().all(|other| is_ancestor(root, other, c)))
+        .map(|c| (*c).clone())
+}
+
+/// The pre-change tip of the branch a restack starts from: its recorded
+/// `review_head` baseline (RAL-92). Every path that moves a review branch and
+/// then restacks downstream (feedback, auto-fix, a manual push, a PR pull)
+/// does so before re-baselining, so the baseline is normally still the tip
+/// the downstream branches were stacked on -- [`restack_first_upstream`]
+/// covers the case where it was re-baselined anyway.
+fn restack_seed_upstream(
+    store: &crate::store_lock::StoreHandle,
+    id: &str,
+    branch_id: Option<&str>,
+) -> Option<String> {
+    branch_id.and_then(|bid| store.lock().get_branch_review_head(id, bid).ok().flatten())
+}
+
+/// The old upstream of a branch a restack rebuilds (old tip `old_tip`): the
+/// nearest of `candidates` -- its predecessor's tip before this restack and
+/// the predecessor's recorded pre-change baseline -- and where `old_tip`
+/// forks from the predecessor's new tip (`new_upstream_tip`).
+///
+/// Several branches can have changed since the stack was last built (an
+/// upstream feedback round, a downstream one, a PR fix, each queueing its
+/// restack behind the others' leases). The predecessor's pre-restack tip then
+/// already carries its own new commits, so it is not below `old_tip`; its
+/// baseline still is. The fork point covers a baseline that was already moved
+/// to the new tip, as long as the change only added commits.
+fn restack_old_upstream(
+    root: &Workspace,
+    candidates: Vec<String>,
+    old_tip: Option<&str>,
+    new_upstream_tip: &str,
+) -> Option<String> {
+    let old_tip = old_tip?;
+    let fork_point = root
+        .git(&["merge-base", old_tip, new_upstream_tip])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let candidates: Vec<String> = candidates.into_iter().chain(fork_point).collect();
+    // Every candidate is the predecessor's: one equal to `old_tip` means this
+    // branch added nothing over it (an empty branch, or one whose work landed
+    // upstream) -- an empty range, not a reason to reach further down.
+    if candidates.iter().any(|c| c == old_tip) {
+        return Some(old_tip.to_string());
+    }
+    nearest_old_upstream(root, old_tip, &candidates)
+}
+
+/// The old upstream a restack replays branch `branch` (old tip `old_tip`)
+/// from -- see [`restack_old_upstream`] -- given its predecessor's tip before
+/// the restack (`pred_old_tip`), the predecessor's id (for its recorded
+/// baseline) and new tip (`prev_ref`). A built branch that matches none of
+/// them is carried from its fork point with the base
+/// ([`fork_point_upstream`]) rather than rebuilt from its task tip, which
+/// would drop its review-only commits.
+#[allow(clippy::too_many_arguments)]
+fn restack_branch_upstream(
+    store: &crate::store_lock::StoreHandle,
+    id: &str,
+    root: &Workspace,
+    branch: &str,
+    old_tip: Option<&str>,
+    pred_old_tip: Option<&str>,
+    pred_id: Option<&str>,
+    prev_ref: &str,
+    base_sha: &str,
+) -> Option<String> {
+    let candidates: Vec<String> = pred_old_tip
+        .map(str::to_string)
+        .into_iter()
+        .chain(restack_seed_upstream(store, id, pred_id))
+        .collect();
+    restack_old_upstream(root, candidates, old_tip, prev_ref).or_else(|| {
+        old_tip.and_then(|tip| fork_point_upstream(store, id, root, branch, tip, base_sha))
+    })
+}
+
 /// Re-stack every branch whose `position > from_position` onto the review branch
 /// at `from_position` (which is assumed to already have the desired HEAD). Runs
 /// check gates on each branch; finalises the combined worktree at the end.
@@ -3741,12 +4119,20 @@ pub(crate) fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
     // re-stack subset below) -- a re-stack starting mid-stack must still recognize
     // the true final branch even when it isn't touched by this particular pass.
     let final_id = final_branch_id(&branches).map(str::to_string);
-    let mut prev_ref = branches
-        .iter()
-        .find(|b| b.position == from_position)
+    let from_branch = branches.iter().find(|b| b.position == from_position);
+    let mut prev_ref = from_branch
         .map(|b| review_ref_of_ordered(id, b))
         .unwrap_or_default();
-    for ob in branches.iter().filter(|b| b.position > from_position) {
+    // Each rebuilt branch's predecessor: its id (for its recorded baseline)
+    // and its tip from before this restack (`None` for the restacked-from
+    // branch, which has already moved).
+    let mut pred_id: Option<String> = from_branch.map(|b| b.id.clone());
+    let mut pred_old_tip: Option<String> = None;
+    // Disabled branches are out of the stack: never rebuilt, never stacked on.
+    for ob in branches
+        .iter()
+        .filter(|b| b.enabled && b.position > from_position)
+    {
         let squash = proj_by_branch
             .get(&ob.branch)
             .is_some_and(|p| squash_set.contains(p));
@@ -3771,15 +4157,50 @@ pub(crate) fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
         };
         let wt_j = branch_wt_dir(wt_base, &short_names, &ob.branch);
         let wt_j_str = wt_j.root().to_string_lossy().to_string();
-        if let Err(e) = worktree_add_or_reset(root, &rev, &wt_j, &ob.branch) {
+        let old_tip = resolve_commit(root, &rev);
+        let old_upstream = restack_branch_upstream(
+            store,
+            id,
+            root,
+            &ob.branch,
+            old_tip.as_deref(),
+            pred_old_tip.as_deref(),
+            pred_id.as_deref(),
+            &prev_ref,
+            &base_sha,
+        );
+        let carry = restack_source(
+            root,
+            id,
+            &ob.id,
+            old_tip,
+            &ob.branch,
+            &base_sha,
+            old_upstream.as_deref(),
+        );
+        carry.log(store, id, &ob.id, &ob.branch);
+        pred_old_tip = carry.old_tip.clone();
+        pred_id = Some(ob.id.clone());
+        if let Err(e) = worktree_add_or_reset(root, &rev, &wt_j, &carry.source) {
             fail_branch(store, id, &ob.id, &ob.branch, &e, set_status);
             return;
         }
         let _ = store.lock().set_branch_review(id, &ob.id, &rev, &wt_j_str);
         let gate = ProofGate::resolve(store, id, Some(&ob.id) == final_id.as_ref());
         if stack_pick(
-            store, runner, id, &ob.id, &ob.branch, &base_sha, &prev_ref, &rev, &wt_j, squash,
-            &gate, cancel,
+            store,
+            runner,
+            id,
+            &ob.id,
+            &ob.branch,
+            &carry.upstream,
+            carry.new_since.as_deref(),
+            &prev_ref,
+            &rev,
+            &wt_j,
+            squash,
+            &gate,
+            cancel,
         )
         .is_err()
         {
@@ -3834,6 +4255,67 @@ impl GuardianRestackClaim {
 impl Drop for GuardianRestackClaim {
     fn drop(&mut self) {
         self.store.lock().finish_guardian_restack(&self.guardian_id);
+    }
+}
+
+/// Wait for the exclusive right to rewrite review `id`'s stack (`what` names
+/// the operation, for the log), returning the claim that holds it. `None`
+/// only when `cancel` trips first.
+///
+/// A rebuild force-resets branch worktrees, so it must never start while a
+/// feedback round or unattended PR fix is still editing one -- it waits for
+/// every worktree lease to be released, and holding the claim keeps new
+/// leases (and restacks) out until it is dropped. The guardian's status is
+/// not that interlock: a feedback round that finishes hands the review back
+/// to `in_review` while a round on another branch may still be running.
+fn wait_for_stack_rebuild_claim(
+    store: &crate::store_lock::StoreHandle,
+    id: &str,
+    what: &str,
+    cancel: &CancelToken,
+) -> Option<GuardianRestackClaim> {
+    let started = std::time::Instant::now();
+    let mut log = PollLogThrottle::new(LEASE_WAIT_LOG_INTERVAL);
+    let mut polls: u64 = 0;
+    loop {
+        if store.lock().try_claim_guardian_stack_rebuild(id) {
+            if polls > 0 {
+                let waited_ms = started.elapsed().as_millis() as u64;
+                crate::rlog!(
+                    INFO,
+                    "ralphus [guardian] review {id} {what} proceeding after waiting \
+                     {waited_ms}ms for in-flight branch work"
+                );
+                crate::cartographer::Note::new("guardian")
+                    .guardian(id)
+                    .emit(
+                        &store.lock(),
+                        format!("{what} proceeding: in-flight branch work finished"),
+                        serde_json::json!({"waited_ms": waited_ms, "polls": polls}),
+                    );
+            }
+            return Some(GuardianRestackClaim::new(Arc::clone(store), id));
+        }
+        if cancel.is_cancelled() {
+            return None;
+        }
+        polls += 1;
+        if log.due() {
+            let waited_ms = started.elapsed().as_millis() as u64;
+            crate::rlog!(
+                INFO,
+                "ralphus [guardian] review {id} {what} waiting for in-flight branch work \
+                 (feedback, PR fix or restack) waited_ms={waited_ms}"
+            );
+            crate::cartographer::Note::new("guardian")
+                .guardian(id)
+                .emit(
+                    &store.lock(),
+                    format!("{what} deferred: waiting for in-flight branch work"),
+                    serde_json::json!({"waited_ms": waited_ms, "polls": polls}),
+                );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
 
@@ -4970,6 +5452,32 @@ pub fn start_feedback(
         Ok(g) => g,
         Err(e) => return reply(404, &error_body("not_found", &e.to_string())),
     };
+    if review_is_closed(&guardian.status) {
+        let guard = store.lock();
+        crate::cartographer::Note::new("guardian")
+            .level(crate::logging::LogLevel::WARNING)
+            .scope("branch")
+            .guardian(id)
+            .emit(
+                &guard,
+                format!(
+                    "review {id} feedback rejected: review is {}",
+                    guardian.status
+                ),
+                serde_json::json!({"branch_id": branch_id, "outcome": "review_closed"}),
+            );
+        return reply(
+            409,
+            &error_body(
+                "review_closed",
+                &format!(
+                    "this review is {} -- its PRs no longer take changes; reopen it (or start \
+                     a new review) before giving feedback",
+                    guardian.status
+                ),
+            ),
+        );
+    }
     let feature = match guardian.branches.iter().find(|b| b.id == branch_id) {
         Some(b) if b.worktree.is_some() => b.branch.clone(),
         Some(_) => {
@@ -5367,14 +5875,25 @@ fn all_enabled_branches_terminal(store: &crate::store_lock::StoreHandle, id: &st
     let Ok(g) = store.lock().get_guardian(id) else {
         return false;
     };
-    g.branches.iter().filter(|b| b.enabled).all(|b| {
-        b.merge_status == MergeStatus::Done.as_str()
-            || b.merge_status == MergeStatus::ConflictResolved.as_str()
-    })
+    g.branches
+        .iter()
+        .filter(|b| b.enabled)
+        .all(|b| branch_is_built(&b.merge_status))
 }
 
-/// Whether the first enabled branch that is NOT yet rebase-complete (`done` /
-/// `conflict_resolved`) is in the `ready` state — i.e. another staged pass
+/// Whether a branch's stack build is complete: rebased (`done`), rebased
+/// after conflict resolution (`conflict_resolved`), or found to have nothing
+/// left to add because its work already landed upstream (`merged`). A merged
+/// branch is still a finished part of the stack -- treating it as unbuilt
+/// left a review whose branch landed upstream stuck in `collecting`.
+fn branch_is_built(merge_status: &str) -> bool {
+    merge_status == MergeStatus::Done.as_str()
+        || merge_status == MergeStatus::ConflictResolved.as_str()
+        || merge_status == MergeStatus::Merged.as_str()
+}
+
+/// Whether the first enabled branch that is NOT yet built
+/// ([`branch_is_built`]) is in the `ready` state — i.e. another staged pass
 /// would build at least one branch immediately. Used to coalesce a branch that
 /// became `ready` mid-pass.
 fn next_not_built_is_ready(store: &crate::store_lock::StoreHandle, id: &str) -> bool {
@@ -5383,10 +5902,10 @@ fn next_not_built_is_ready(store: &crate::store_lock::StoreHandle, id: &str) -> 
     };
     let mut branches: Vec<_> = g.branches.iter().filter(|b| b.enabled).collect();
     branches.sort_by_key(|b| b.position);
-    match branches.into_iter().find(|b| {
-        b.merge_status != MergeStatus::Done.as_str()
-            && b.merge_status != MergeStatus::ConflictResolved.as_str()
-    }) {
+    match branches
+        .into_iter()
+        .find(|b| !branch_is_built(&b.merge_status))
+    {
         Some(b) => b.merge_status == MergeStatus::Ready.as_str(),
         None => false,
     }
@@ -5417,9 +5936,27 @@ fn staged_build_signature(
     parts.join("|")
 }
 
-/// The branch-config suffix of [`staged_build_signature`], kept separate so a
-/// pass can distinguish a base-only change from a reordered/added/removed
-/// branch set. Only a base-only rebuild may replay prior resolved review tips.
+/// How many of project `proj`'s branches had a review tip in the previous
+/// build (the full merge's `old_review` snapshot).
+fn old_review_count(
+    old_review: &std::collections::HashMap<(String, String), String>,
+    proj: &str,
+) -> usize {
+    old_review.keys().filter(|(p, _)| p == proj).count()
+}
+
+/// Whether a stored [`staged_build_signature`] was built from exactly the
+/// branch configuration `branch_signature` describes (only the base may
+/// differ).
+fn signature_has_branch_config(signature: &str, branch_signature: &str) -> bool {
+    signature == branch_signature
+        || signature
+            .strip_suffix(branch_signature)
+            .is_some_and(|prefix| prefix.ends_with('|'))
+}
+
+/// The branch-config suffix of [`staged_build_signature`]: every enabled
+/// branch, in stack order.
 fn staged_branch_signature(enabled_branches: &[crate::guardian::BranchView]) -> String {
     let mut ordered: Vec<&crate::guardian::BranchView> =
         enabled_branches.iter().filter(|b| b.enabled).collect();
@@ -5434,13 +5971,6 @@ fn staged_branch_signature(enabled_branches: &[crate::guardian::BranchView]) -> 
         .join("|")
 }
 
-fn signature_has_branch_config(signature: &str, branch_signature: &str) -> bool {
-    signature == branch_signature
-        || signature
-            .strip_suffix(branch_signature)
-            .is_some_and(|prefix| prefix.ends_with('|'))
-}
-
 /// One incremental pass: rebase the contiguous ready prefix of each project,
 /// reusing a still-valid `Done` prefix when the recorded signature matches the
 /// current one, rebuilding it (from the base) when it doesn't. Stops at the
@@ -5453,6 +5983,9 @@ fn staged_merge_pass(
     id: &str,
     cancel: &CancelToken,
 ) -> StagedPassOutcome {
+    let Some(_stack_claim) = wait_for_stack_rebuild_claim(store, id, "staged merge", cancel) else {
+        return StagedPassOutcome::Cancelled;
+    };
     let guardian = match store.lock().get_guardian(id) {
         Ok(g) => g,
         Err(_) => return StagedPassOutcome::Ok { built_any: false },
@@ -5508,18 +6041,12 @@ fn staged_merge_pass(
         .cloned()
         .collect();
     let current_sig = staged_build_signature(&project_order, &base_shas, &enabled_branches);
-    let branch_sig = staged_branch_signature(&enabled_branches);
     let stored_sig = store.lock().guardian_build_signature(id).unwrap_or(None);
     // Resume only when the recorded config/base matches the current one; a
     // mismatch (base moved, branch reordered/added/removed/enabled/disabled)
     // forces a rebuild of the previously-`Done` prefix so a stale tip is never
     // treated as valid.
     let resume = stored_sig.as_deref() == Some(current_sig.as_str());
-    let base_only_rebuild = !resume
-        && !branch_sig.is_empty()
-        && stored_sig
-            .as_deref()
-            .is_some_and(|sig| signature_has_branch_config(sig, &branch_sig));
 
     // Unambiguous last branch in the stack for `ProofScope::FinalBranch`.
     let final_id = final_branch_id(
@@ -5565,33 +6092,39 @@ fn staged_merge_pass(
         } else {
             (base_sha.clone(), 0usize)
         };
-        // A base-only signature change invalidates the prefix, but the existing
-        // review refs still contain any conflict resolutions from the prior
-        // build. Validate the complete old stack chain before using any of it;
-        // branch-config changes deliberately rebuild from feature tips instead.
-        let carry_chain = if base_only_rebuild {
-            let old_base = guardian.base_commits.get(proj).cloned().or_else(|| {
-                (proj == &guardian.git_root)
-                    .then(|| guardian.base_commit.clone())
-                    .flatten()
-            });
-            old_base.and_then(|mut old_upstream| {
-                let mut chain = Vec::with_capacity(proj_branches.len());
-                for bv in proj_branches {
-                    let rev = review_ref_of(id, bv);
-                    let old_tip = root.git(&["rev-parse", "--verify", &rev]).ok()?;
-                    let old_tip = old_tip.trim().to_string();
-                    if !is_ancestor(&root, &old_upstream, &old_tip) {
-                        return None;
-                    }
-                    chain.push((old_tip.clone(), old_upstream));
-                    old_upstream = old_tip;
-                }
-                Some(chain)
+        // A rebuild invalidates the prefix, but the existing review refs still
+        // hold everything that lives only on them: conflict resolutions from
+        // the prior build, reviewer feedback, PR fixes, pulled and manual
+        // commits. Snapshot every branch's old tip (enabled or not) before
+        // this pass rewrites any of them, so each branch can carry its own old
+        // range forward from the nearest old tip it was stacked on -- however
+        // the stack was reshaped (base moved, branch appended, reordered,
+        // disabled).
+        let old_base = guardian.base_commits.get(proj).cloned().or_else(|| {
+            (proj == &guardian.git_root)
+                .then(|| guardian.base_commit.clone())
+                .flatten()
+        });
+        let old_tips: std::collections::HashMap<String, String> = guardian
+            .branches
+            .iter()
+            .filter(|b| b.project.clone().unwrap_or_else(|| git_root.clone()) == *proj)
+            .filter_map(|b| resolve_commit(&root, &review_ref_of(id, b)).map(|t| (b.id.clone(), t)))
+            .collect();
+        // Each branch's recorded pre-change baseline too: a branch whose
+        // feedback commit landed after the stack was last built (its restack
+        // still queued) has moved past what the branches above it are stacked
+        // on, but its baseline has not.
+        let baselines: Vec<(String, String)> = guardian
+            .branches
+            .iter()
+            .filter(|b| b.project.clone().unwrap_or_else(|| git_root.clone()) == *proj)
+            .filter_map(|b| {
+                restack_seed_upstream(store, id, Some(&b.id))
+                    .filter(|sha| resolve_commit(&root, sha).is_some())
+                    .map(|sha| (b.id.clone(), sha))
             })
-        } else {
-            None
-        };
+            .collect();
         let short_names = branch_short_names(store, id, Some(proj.as_str()));
         let squash = guardian.squash_projects.iter().any(|p| p == proj);
         for (idx, bv) in proj_branches.iter().enumerate() {
@@ -5633,14 +6166,52 @@ fn staged_merge_pass(
             };
             let wt = branch_wt_dir(&wt_base, &short_names, &bv.branch);
             let wt_str = wt.root().to_string_lossy().to_string();
-            let (source_ref, upstream) = carry_chain
-                .as_ref()
-                .and_then(|chain| chain.get(idx))
-                .map_or_else(
-                    || (bv.branch.as_str(), base_sha.as_str()),
-                    |(old_tip, old_upstream)| (old_tip.as_str(), old_upstream.as_str()),
-                );
-            if let Err(e) = worktree_add_or_reset(&root, &rev, &wt, source_ref) {
+            let old_tip = old_tips.get(&bv.id).cloned();
+            let old_upstream = old_tip.as_deref().and_then(|tip| {
+                // A branch that added nothing (empty, or its work landed
+                // upstream) has the same old tip as a branch beneath it or
+                // the old base: an empty range. Only a *lower* branch's tip
+                // counts -- a branch above with the same tip is the empty one.
+                let below: std::collections::HashSet<&str> = guardian
+                    .branches
+                    .iter()
+                    .filter(|b| b.position < bv.position)
+                    .map(|b| b.id.as_str())
+                    .collect();
+                let lower_tip_matches = old_base.as_deref() == Some(tip)
+                    || old_tips
+                        .iter()
+                        .chain(baselines.iter().map(|(bid, sha)| (bid, sha)))
+                        .any(|(bid, sha)| below.contains(bid.as_str()) && sha == tip);
+                if lower_tip_matches {
+                    return Some(tip.to_string());
+                }
+                let candidates: Vec<String> = old_base
+                    .iter()
+                    .cloned()
+                    .chain(
+                        old_tips
+                            .iter()
+                            .chain(baselines.iter().map(|(bid, sha)| (bid, sha)))
+                            .filter(|(bid, _)| **bid != bv.id)
+                            .map(|(_, t)| t.clone()),
+                    )
+                    .collect();
+                nearest_old_upstream(&root, tip, &candidates)
+                    .or_else(|| fork_point_upstream(store, id, &root, &bv.branch, tip, &base_sha))
+            });
+            let carry = restack_source(
+                &root,
+                id,
+                &bv.id,
+                old_tip,
+                &bv.branch,
+                &base_sha,
+                old_upstream.as_deref(),
+            );
+            carry.log(store, id, &bv.id, &bv.branch);
+            let upstream = carry.upstream.as_str();
+            if let Err(e) = worktree_add_or_reset(&root, &rev, &wt, &carry.source) {
                 fail_branch(store, id, &bv.id, &bv.branch, &e, &set_status);
                 failed_projects.push(proj.clone());
                 continue 'projects;
@@ -5655,8 +6226,19 @@ fn staged_merge_pass(
             // branch's tip — preserved on resume, the last rebuilt branch on a
             // rebuild).
             if stack_pick(
-                store, runner, id, &bv.id, &bv.branch, upstream, &prev_ref, &rev, &wt, squash,
-                &gate, cancel,
+                store,
+                runner,
+                id,
+                &bv.id,
+                &bv.branch,
+                upstream,
+                carry.new_since.as_deref(),
+                &prev_ref,
+                &rev,
+                &wt,
+                squash,
+                &gate,
+                cancel,
             )
             .is_err()
             {
@@ -5672,7 +6254,15 @@ fn staged_merge_pass(
                 failed_projects.push(proj.clone());
                 continue 'projects;
             }
-            if note_if_branch_is_empty(store, id, &bv.id, &bv.branch, &root, upstream) {
+            if built_branch_is_empty(
+                store,
+                id,
+                &bv.id,
+                &bv.branch,
+                &root,
+                &carry,
+                carry.carries(),
+            ) {
                 fail_branch(
                     store,
                     id,
@@ -5744,9 +6334,7 @@ fn staged_resume_point(
     let mut prev_ref = base_sha.to_string();
     let mut start = 0usize;
     for (i, bv) in proj_branches.iter().enumerate() {
-        let terminal = bv.merge_status == MergeStatus::Done.as_str()
-            || bv.merge_status == MergeStatus::ConflictResolved.as_str();
-        if !terminal {
+        if !branch_is_built(&bv.merge_status) {
             break;
         }
         let rev = review_ref_of(id, bv);
@@ -5909,9 +6497,18 @@ pub fn run_merge_cancellable(
     id: &str,
     cancel: &CancelToken,
 ) {
+    // Claimed before the guardian is read, so the merge plans from the state
+    // any in-flight feedback round it waited on left behind.
+    let Some(_stack_claim) = wait_for_stack_rebuild_claim(store, id, "merge", cancel) else {
+        log_merge_cancelled(store, id);
+        return;
+    };
     let Some(guardian) = load_guardian_for_worker(store, id, "merge") else {
         return;
     };
+    // What the previous build was built from -- read before this merge
+    // records its own.
+    let stored_signature = store.lock().guardian_build_signature(id).unwrap_or(None);
     let _git_operation =
         git_review_operation_guard(Path::new(&guardian.git_root), guardian.machine.as_deref());
     // RAL-193: every call is its own merge/rebase attempt -- bump the
@@ -6012,6 +6609,18 @@ pub fn run_merge_cancellable(
         .max_by_key(|b| b.position)
         .map(|b| b.id.clone());
 
+    // Every branch's recorded pre-change `review_head` baseline, read before
+    // the reset below clears it: a branch that moved since the stack was last
+    // built (a feedback round or PR fix whose downstream restack this merge
+    // preempted) is still what the branches above it are stacked on, so its
+    // baseline bounds their carried ranges.
+    let baselines: std::collections::HashMap<String, String> = branches
+        .iter()
+        .filter_map(|b| {
+            restack_seed_upstream(store, id, Some(&b.id)).map(|sha| (b.id.clone(), sha))
+        })
+        .collect();
+
     // RAL-54: reset all enabled branches to Pending before starting, so the board
     // never shows stale terminal statuses (Done, Failed) from a prior build while
     // the new merge is in progress. Done before the per-branch loop so the reset
@@ -6076,6 +6685,10 @@ pub fn run_merge_cancellable(
     }
     let mut old_review: std::collections::HashMap<(String, String), String> =
         std::collections::HashMap::new();
+    // Every old review tip per project (enabled and disabled branches), the
+    // candidates a branch's old upstream is chosen from.
+    let mut old_tips_by_proj: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
 
     // Pin every commit we may carry forward under `refs/ralphus/carry/<id>/…`
     // BEFORE cleanup deletes the `guardian/<id>/*` branches, so a carried commit
@@ -6096,11 +6709,56 @@ pub fn run_merge_cancellable(
             carry.pin(proot.root(), id, "base", sha);
         }
         for ob in proj_branches {
-            let rev = review_ref_of(id, ob);
+            // A shared-worktree review keeps every branch on its one combined
+            // ref; the per-branch refs are left over from any earlier
+            // per-branch build, not this stack.
+            let rev = if guardian.skip_worktrees {
+                combined_review_ref_of(&guardian)
+            } else {
+                review_ref_of(id, ob)
+            };
             if let Ok(sha) = proot.git(&["rev-parse", "--verify", &rev]) {
                 let sha = sha.trim().to_string();
                 carry.pin(proot.root(), id, &ob.position.to_string(), &sha);
+                old_tips_by_proj
+                    .entry(proj.clone())
+                    .or_default()
+                    .push(sha.clone());
                 old_review.insert((proj.clone(), ob.branch.clone()), sha);
+            }
+        }
+        // Every branch's recorded pre-change baseline is a candidate too (see
+        // the staged pass): a branch whose own new commits haven't been
+        // restacked into the branches above it yet has moved past what they
+        // are stacked on.
+        for ob in guardian.branches.iter().filter(|b| {
+            b.project
+                .clone()
+                .unwrap_or_else(|| guardian.git_root.clone())
+                == *proj
+        }) {
+            if let Some(sha) = baselines
+                .get(&ob.id)
+                .cloned()
+                .filter(|sha| resolve_commit(&proot, sha).is_some())
+            {
+                carry.pin(proot.root(), id, &format!("baseline-{}", ob.position), &sha);
+                old_tips_by_proj.entry(proj.clone()).or_default().push(sha);
+            }
+        }
+        // A disabled branch is rebuilt by no one, but its old tip still
+        // bounds the branches that were stacked on it: without it, the branch
+        // above would carry the disabled branch's commits along with its own.
+        for ob in guardian.branches.iter().filter(|b| {
+            !b.enabled
+                && b.project
+                    .clone()
+                    .unwrap_or_else(|| guardian.git_root.clone())
+                    == *proj
+        }) {
+            if let Some(sha) = resolve_commit(&proot, &review_ref_of(id, ob)) {
+                carry.pin(proot.root(), id, &format!("disabled-{}", ob.position), &sha);
+                old_tips_by_proj.entry(proj.clone()).or_default().push(sha);
             }
         }
     }
@@ -6132,6 +6790,8 @@ pub fn run_merge_cancellable(
             );
     }
 
+    let mut built_bases: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for (proj, proj_branches) in &project_branches {
         if cancel.is_cancelled() {
             log_merge_cancelled(store, id);
@@ -6151,6 +6811,7 @@ pub fn run_merge_cancellable(
                 return;
             }
         };
+        built_bases.insert(proj.clone(), base_sha.clone());
         let _ = store
             .lock()
             .set_guardian_project_base_commit(id, proj, &base_sha);
@@ -6164,6 +6825,40 @@ pub fn run_merge_cancellable(
         if guardian.skip_worktrees {
             // RAL-91: squash applies per-project in the shared-worktree path too.
             let squash = guardian.squash_projects.iter().any(|p| p == proj);
+            // Carry the old combined branch forward when the previous build
+            // was this same shared stack and only the base has moved: every
+            // branch's review ref was that one combined tip, the stored build
+            // signature has this exact branch configuration, and the old tip
+            // is still stacked on the old base.
+            let old_combined: Option<String> = {
+                let tips: std::collections::HashSet<&String> = proj_branches
+                    .iter()
+                    .filter_map(|b| old_review.get(&(proj.clone(), b.branch.clone())))
+                    .collect();
+                (tips.len() == 1 && proj_branches.len() == old_review_count(&old_review, proj))
+                    .then(|| tips.into_iter().next().cloned())
+                    .flatten()
+            };
+            let branches_unchanged = stored_signature.as_deref().is_some_and(|sig| {
+                signature_has_branch_config(sig, &staged_branch_signature(proj_branches))
+            });
+            crate::rlog!(
+                INFO,
+                "ralphus [guardian] review {id} shared carry check project={proj} old_tip={:?} \
+                 old_review={} branches={} unchanged={branches_unchanged} old_base={:?}",
+                old_combined,
+                old_review_count(&old_review, proj),
+                proj_branches.len(),
+                old_base_by_proj.get(proj)
+            );
+            let shared_carry = match (old_combined, old_base_by_proj.get(proj)) {
+                (Some(tip), Some(old_base))
+                    if branches_unchanged && is_ancestor(&root, old_base, &tip) =>
+                {
+                    Some((tip, old_base.clone()))
+                }
+                _ => None,
+            };
             let ordered: Vec<crate::guardian::OrderedBranch> = proj_branches
                 .iter()
                 .map(|b| crate::guardian::OrderedBranch {
@@ -6186,6 +6881,7 @@ pub fn run_merge_cancellable(
                 squash,
                 &set_status,
                 final_branch_id.as_deref(),
+                shared_carry,
                 cancel,
             );
             // On failure, set_status was already called inside run_merge_shared.
@@ -6204,11 +6900,10 @@ pub fn run_merge_cancellable(
         let squash = guardian.squash_projects.iter().any(|p| p == proj);
 
         // Per-branch worktree path: stack each branch on top of the previous.
-        // `prev_ref` is the NEW stack tip each branch rebases onto; `prev_old` is
-        // the matching tip from the PREVIOUS build (the old base for the first
-        // branch), used to carry a prior resolution forward.
+        // `prev_ref` is the NEW stack tip each branch rebases onto; each
+        // branch's old range is bounded by the nearest old tip it was stacked
+        // on (see the carry-forward below).
         let mut prev_ref = base_sha.clone();
-        let mut prev_old: Option<String> = old_base_by_proj.get(proj).cloned();
         // RAL-211: short worktree-directory names for this project's branches
         // -- see `branch_short_names`'s doc comment for the stability
         // requirement this depends on.
@@ -6250,23 +6945,59 @@ pub fn run_merge_cancellable(
                 fail_branch(store, id, &ob.id, &ob.branch, &e, &set_status);
                 return;
             }
-            // Carry-forward: when this branch has a prior resolved review commit
-            // whose old upstream is still an ancestor of it, point the review
-            // branch at that commit and rebase ITS own (already conflict-resolved)
-            // changes onto the new stack tip — passing the old upstream as the
-            // rebase boundary. The replay then conflicts only on genuine new base
-            // deltas, so a previously-resolved conflict is not resolved again.
-            // Any mismatch (no prior commit, broken chain, checkout failure) falls
-            // back to `base_sha` — the from-feature-tip behaviour.
+            // Carry-forward: when this branch has a prior review commit, point
+            // the review branch at it and rebase ITS own commits (already
+            // conflict-resolved, plus any review-only ones) onto the new stack
+            // tip -- bounded by the nearest old tip it was stacked on (the old
+            // base, or any branch's old tip, disabled ones included). The
+            // replay then conflicts only on genuine new base deltas, so a
+            // previously-resolved conflict is not resolved again. No prior
+            // commit, a rewritten task branch or a checkout failure falls back
+            // to `base_sha` -- the from-feature-tip behaviour.
             let this_old = old_review.get(&(proj.clone(), ob.branch.clone())).cloned();
-            let upstream = match (&this_old, &prev_old) {
-                (Some(src), Some(up))
-                    if is_ancestor(&root, up, src)
-                        && wt.git(&["checkout", "-B", &rev, src]).is_ok() =>
-                {
-                    up.clone()
+            let old_upstream = this_old.as_deref().and_then(|tip| {
+                // Same-tip as a branch beneath (or the old base): this branch
+                // added nothing -- an empty range (see the staged pass).
+                let lower_tip_matches = old_base_by_proj.get(proj).map(String::as_str) == Some(tip)
+                    || guardian
+                        .branches
+                        .iter()
+                        .filter(|b| b.position < ob.position)
+                        .any(|b| {
+                            old_review
+                                .get(&(proj.clone(), b.branch.clone()))
+                                .map(String::as_str)
+                                == Some(tip)
+                                || baselines.get(&b.id).map(String::as_str) == Some(tip)
+                        });
+                if lower_tip_matches {
+                    return Some(tip.to_string());
                 }
-                _ => base_sha.clone(),
+                let candidates: Vec<String> = old_base_by_proj
+                    .get(proj)
+                    .into_iter()
+                    .chain(old_tips_by_proj.get(proj).into_iter().flatten())
+                    .cloned()
+                    .collect();
+                nearest_old_upstream(&root, tip, &candidates)
+                    .or_else(|| fork_point_upstream(store, id, &root, &ob.branch, tip, &base_sha))
+            });
+            let carry = restack_source(
+                &root,
+                id,
+                &ob.id,
+                this_old.clone(),
+                &ob.branch,
+                &base_sha,
+                old_upstream.as_deref(),
+            );
+            carry.log(store, id, &ob.id, &ob.branch);
+            let carried = carry.source != ob.branch
+                && wt.git(&["checkout", "-B", &rev, &carry.source]).is_ok();
+            let (upstream, new_since) = if carried {
+                (carry.upstream.clone(), carry.new_since.clone())
+            } else {
+                (base_sha.clone(), None)
             };
             let _ = store.lock().set_branch_review(id, &ob.id, &rev, &wt_str);
             let gate = ProofGate::resolve(
@@ -6279,8 +7010,19 @@ pub fn run_merge_cancellable(
                 return;
             }
             if stack_pick(
-                store, runner, id, &ob.id, &ob.branch, &upstream, &prev_ref, &rev, &wt, squash,
-                &gate, cancel,
+                store,
+                runner,
+                id,
+                &ob.id,
+                &ob.branch,
+                &upstream,
+                new_since.as_deref(),
+                &prev_ref,
+                &rev,
+                &wt,
+                squash,
+                &gate,
+                cancel,
             )
             .is_err()
             {
@@ -6294,7 +7036,12 @@ pub fn run_merge_cancellable(
                 fail_branch(store, id, &ob.id, &ob.branch, &e, &set_status);
                 return;
             }
-            if note_if_branch_is_empty(store, id, &ob.id, &ob.branch, &root, &upstream) {
+            let empty = if carried {
+                built_branch_is_empty(store, id, &ob.id, &ob.branch, &root, &carry, true)
+            } else {
+                note_if_branch_is_empty(store, id, &ob.id, &ob.branch, &root, &upstream)
+            };
+            if empty {
                 // A task may legitimately produce no changes, but a branch in a
                 // review stack is there to contribute something -- an empty one
                 // means the review would approve work it does not contain.
@@ -6308,9 +7055,6 @@ pub fn run_merge_cancellable(
                 );
                 return;
             }
-            // The next branch extracts its own OLD commits relative to THIS
-            // branch's old resolved tip, independent of the carry decision above.
-            prev_old = this_old;
             prev_ref = rev;
         }
 
@@ -6334,9 +7078,135 @@ pub fn run_merge_cancellable(
     // failure; see `run_commit_checks` for why gates run *during* the merge
     // still fail it.
     snapshot_review_heads(store, id);
+    // Record what this build was built from, exactly as a staged pass does.
+    // Without it the next base shift cannot tell that only the base moved,
+    // so it rebuilds every branch from its task tip -- discarding the
+    // feedback, auto-fix and pulled commits that live only on review branches.
+    {
+        let order: Vec<String> = project_branches.iter().map(|(p, _)| p.clone()).collect();
+        let enabled: Vec<crate::guardian::BranchView> = project_branches
+            .iter()
+            .flat_map(|(_, bs)| bs.iter().cloned())
+            .collect();
+        let signature = staged_build_signature(&order, &built_bases, &enabled);
+        let _ = store.lock().set_guardian_build_signature(id, &signature);
+    }
     queue_final_summary_regen(store, id);
     set_status(GuardianStatus::InReview, None);
     maybe_spawn_post_merge(store, id);
+}
+
+/// Carry a shared-worktree review's whole combined branch forward onto a new
+/// base: replay its old range (`old_base..old_tip` -- every task's commits
+/// with their earlier conflict resolutions, plus every feedback, PR-fix and
+/// pulled commit made on the shared branch) onto `base_sha`, then each
+/// task's commits added since the last build. `Err` means a branch failed
+/// (already recorded).
+#[allow(clippy::too_many_arguments)]
+fn carry_shared_stack<F: Fn(GuardianStatus, Option<&str>)>(
+    store: &crate::store_lock::StoreHandle,
+    runner: &dyn Runner,
+    id: &str,
+    root: &Workspace,
+    wt: &Workspace,
+    combined_branch: &str,
+    wt_str: &str,
+    base_sha: &str,
+    old_tip: &str,
+    old_base: &str,
+    branches: &[crate::guardian::OrderedBranch],
+    final_branch_id: Option<&str>,
+    set_status: &F,
+    cancel: &CancelToken,
+) -> Result<(), ()> {
+    let Some(first) = branches.first() else {
+        return Ok(());
+    };
+    if let Err(e) = worktree_add_or_reset(root, combined_branch, wt, old_tip) {
+        set_status(GuardianStatus::MergeFailed, Some(&e));
+        return Err(());
+    }
+    for ob in branches {
+        let guard = store.lock();
+        let _ = guard.set_branch_status(id, &ob.id, MergeStatus::InProgress, None);
+        let _ = guard.set_branch_review(id, &ob.id, combined_branch, wt_str);
+    }
+    crate::rlog!(
+        INFO,
+        "ralphus [guardian] review {id} shared review branch carried forward \
+         old_tip={old_tip} old_base={old_base} new_base={base_sha}"
+    );
+    crate::cartographer::Note::new("guardian")
+        .guardian(id)
+        .emit(
+            &store.lock(),
+            "shared review branch carried forward",
+            serde_json::json!({"old_tip": old_tip, "old_base": old_base, "new_base": base_sha}),
+        );
+    let gate = ProofGate::resolve(
+        store,
+        id,
+        branches.last().map(|b| b.id.as_str()) == final_branch_id,
+    );
+    let outcome = match drive_rebase(
+        store,
+        id,
+        &first.id,
+        runner,
+        &first.branch,
+        wt,
+        base_sha,
+        old_base,
+        combined_branch,
+        &gate,
+        cancel,
+    ) {
+        Ok((outcome, _)) => outcome,
+        Err(e) => {
+            if cancel.is_cancelled() {
+                return Err(());
+            }
+            let _ = wt.git(&["checkout", "--force", combined_branch]);
+            fail_branch(store, id, &first.id, &first.branch, &e, set_status);
+            return Err(());
+        }
+    };
+    let resolved = matches!(outcome, RebaseOutcome::Resolved(_));
+    for ob in branches {
+        let built_from = resolve_commit(root, &branch_source_ref(id, &ob.id));
+        let feature_tip = resolve_commit(wt, &ob.branch);
+        if let (Some(built), Some(now)) = (&built_from, &feature_tip) {
+            if built != now && is_ancestor(root, built, now) {
+                if let Err(e) = replay_new_task_commits(
+                    store,
+                    runner,
+                    id,
+                    &ob.id,
+                    &ob.branch,
+                    wt,
+                    built,
+                    combined_branch,
+                    &gate,
+                    cancel,
+                ) {
+                    if !cancel.is_cancelled() {
+                        fail_branch(store, id, &ob.id, &ob.branch, &e, set_status);
+                    }
+                    return Err(());
+                }
+            }
+        }
+        if let Some(tip) = feature_tip {
+            let _ = wt.git(&["update-ref", &branch_source_ref(id, &ob.id), &tip]);
+        }
+        let status = if resolved {
+            MergeStatus::ConflictResolved
+        } else {
+            MergeStatus::Done
+        };
+        promote_branch_terminal(store, id, &ob.id, status, None, None);
+    }
+    Ok(())
 }
 
 /// CCTL-156 skip-worktrees path: rebase every branch, in order, onto a single
@@ -6356,6 +7226,7 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
     squash: bool,
     set_status: &F,
     final_branch_id: Option<&str>,
+    carry_from: Option<(String, String)>,
     cancel: &CancelToken,
 ) {
     let combined_branch = match claim_combined_review_ref_by_id(store, root, id) {
@@ -6367,11 +7238,36 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
     };
     let wt = wt_base.join("review");
     let wt_str = wt.root().to_string_lossy().to_string();
-    if let Err(e) = worktree_add_or_reset(root, &combined_branch, &wt, base_sha) {
+    let carried = carry_from.is_some();
+    if let Some((old_tip, old_base)) = carry_from {
+        if carry_shared_stack(
+            store,
+            runner,
+            id,
+            root,
+            &wt,
+            &combined_branch,
+            &wt_str,
+            base_sha,
+            &old_tip,
+            &old_base,
+            branches,
+            final_branch_id,
+            set_status,
+            cancel,
+        )
+        .is_err()
+        {
+            return;
+        }
+    } else if let Err(e) = worktree_add_or_reset(root, &combined_branch, &wt, base_sha) {
         set_status(GuardianStatus::MergeFailed, Some(&e));
         return;
     }
-    for ob in branches {
+    // A carried stack already holds every branch; otherwise rebuild each one
+    // onto the combined branch from its task tip.
+    let fresh_branches: &[crate::guardian::OrderedBranch] = if carried { &[] } else { branches };
+    for ob in fresh_branches {
         if cancel.is_cancelled() {
             log_merge_cancelled(store, id);
             return;
@@ -6462,6 +7358,11 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
                     detail.as_deref(),
                     session_id.as_deref(),
                 );
+                // Record the task tip this build contains, so a later carried
+                // rebuild can tell which task commits are new.
+                if let Some(tip) = resolve_commit(&wt, &ob.branch) {
+                    let _ = wt.git(&["update-ref", &branch_source_ref(id, &ob.id), &tip]);
+                }
             }
             Err(e) => {
                 // RAL-213: a cancelled merge is already logged by `drive_rebase`'s
@@ -6970,7 +7871,10 @@ fn run_feedback_pass(
             return FeedbackOutcome::default();
         }
     };
-    if cancel.is_cancelled() || guardian.status == GuardianStatus::MergeStopped.as_str() {
+    if cancel.is_cancelled()
+        || guardian.status == GuardianStatus::MergeStopped.as_str()
+        || review_is_closed(&guardian.status)
+    {
         fail_message();
         return FeedbackOutcome::default();
     }
@@ -7448,53 +8352,69 @@ fn run_feedback_pass(
             if cancel.is_cancelled() {
                 stop_feedback!();
             }
-            let push_result =
-                match push_feedback_branch(&wt, &review_branch, !squash, push_remote.as_deref()) {
-                    Ok(sha) => Ok(sha),
-                    Err(FeedbackPushError::RemoteDiverged) => match push_remote.as_deref() {
-                        Some(remote) => match reconcile_remote_feedback_commits(
-                            store,
-                            id,
-                            branch_id,
-                            runner,
+            // The branch's open PR may be published under an alias other than
+            // the review branch's own name (`separate_pr_branch`, an explicit
+            // alias, a legacy internal review ref) -- the feedback must land
+            // on the branch the PR actually shows.
+            let remote_branch =
+                open_branch_pr_alias(store, id, branch_id).unwrap_or_else(|| review_branch.clone());
+            let push_result = match push_feedback_branch(
+                &wt,
+                &review_branch,
+                !squash,
+                push_remote.as_deref(),
+                Some(&remote_branch),
+            ) {
+                Ok(sha) => Ok(sha),
+                Err(FeedbackPushError::RemoteDiverged) => match push_remote.as_deref() {
+                    Some(remote) => match reconcile_remote_feedback_commits(
+                        store,
+                        id,
+                        branch_id,
+                        runner,
+                        &wt,
+                        remote,
+                        &remote_branch,
+                        &review_branch,
+                        &feature,
+                        is_final_branch,
+                        cancel,
+                    ) {
+                        Ok(()) if cancel.is_cancelled() => {
+                            stop_feedback!();
+                        }
+                        Ok(()) => push_feedback_branch(
                             &wt,
-                            remote,
                             &review_branch,
-                            &feature,
-                            is_final_branch,
-                            cancel,
-                        ) {
-                            Ok(()) if cancel.is_cancelled() => {
-                                stop_feedback!();
-                            }
-                            Ok(()) => push_feedback_branch(
-                                &wt,
-                                &review_branch,
-                                false,
-                                push_remote.as_deref(),
-                            )
-                            .map_err(|push_e| {
-                                format!(
-                                    "rebasing feedback onto the reviewer's commits succeeded but \
+                            false,
+                            push_remote.as_deref(),
+                            Some(&remote_branch),
+                        )
+                        .map_err(|push_e| {
+                            format!(
+                                "rebasing feedback onto the reviewer's commits succeeded but \
                                      the re-push still failed: {push_e}"
-                                )
-                            }),
-                            Err(reconcile_err) => Err(reconcile_err),
-                        },
-                        None => Err(FeedbackPushError::RemoteDiverged.to_string()),
+                            )
+                        }),
+                        Err(reconcile_err) => Err(reconcile_err),
                     },
-                    Err(e) => Err(e.to_string()),
-                };
+                    None => Err(FeedbackPushError::RemoteDiverged.to_string()),
+                },
+                Err(e) => Err(e.to_string()),
+            };
             match push_result {
                 Ok(sha) => {
                     pushed = true;
                     pushed_sha = Some(sha.clone());
+                    // The PR now shows exactly what this round pushed: record
+                    // it, so the next sync recognizes the commit as the
+                    // daemon's own rather than a reviewer's to pull back in.
+                    record_branch_pr_pushed_sha(store, id, branch_id, &remote_branch, &sha);
                     // RAL-510: `push_remote` is always `Some` on this path (see
                     // the comments above), which means `push_feedback_branch`
-                    // took its `explicit_remote` branch and pushed the local
-                    // `review_branch` name verbatim to the remote -- so the
-                    // remote branch this force-push just superseded CI on is
-                    // `review_branch` itself, not some derived alias.
+                    // took its `explicit_remote` branch and pushed to
+                    // `remote_branch` -- the remote branch this force-push just
+                    // superseded CI on.
                     if let Some(remote_name) = push_remote.as_deref() {
                         let identity =
                             crate::forge::effective_forge_identity(None, owner.as_deref());
@@ -7510,7 +8430,7 @@ fn run_feedback_pass(
                                 id,
                                 guardian.auto_cancel_outdated_pr_pipelines.unwrap_or(true),
                                 Some(&client),
-                                &review_branch,
+                                &remote_branch,
                                 &sha,
                             ),
                             Err(e) => {
@@ -7731,7 +8651,11 @@ fn run_feedback_pass(
         }
     }
 
-    if attempt_commit && !committed {
+    // A round that committed nothing has nothing of its own to restack -- but
+    // another branch's round may have queued its restack behind this one's
+    // lease, and nobody else will claim it, so fall through and run it.
+    let restack_queued = store.lock().pending_guardian_restack(id).is_some();
+    if attempt_commit && !committed && !restack_queued {
         // RAL-92: the worktree was dirty but nothing genuine ended up
         // committed, so the review-branch tips are unchanged; re-baseline
         // anyway to keep manual-push detection consistent. (A fixer run that
@@ -7819,10 +8743,19 @@ fn run_feedback_pass(
         .max_by_key(|b| b.position)
         .map(|b| b.id.clone());
     // Downstream branches in the same project, in position order.
+    // Disabled branches are out of the stack: a restack neither rebuilds nor
+    // waits on them (a disabled, never-built branch is still `pending`, which
+    // the still-collecting halt below would otherwise stop at for good).
+    // A shared-worktree review (`skip_worktrees`) has no per-branch stack at
+    // all: every branch already sits on the one combined branch this round
+    // just committed to, so there is nothing downstream to rebuild -- and a
+    // per-branch rebuild here would split the branches across private refs.
     let downstream: Vec<_> = all_branches
         .iter()
         .filter(|b| {
-            b.position > restack_position
+            !guardian.skip_worktrees
+                && b.enabled
+                && b.position > restack_position
                 && b.project.as_deref().unwrap_or(&guardian.git_root) == branch_project
         })
         .collect();
@@ -7833,11 +8766,28 @@ fn run_feedback_pass(
     // see `branch_short_names`'s doc comment for the stability requirement
     // this depends on.
     let short_names = branch_short_names(store, id, Some(branch_project.as_str()));
-    let mut prev_ref = branch
+    // The claim coalesces every queued restack request, so it can start below
+    // this branch (another branch's feedback finished earlier and queued its
+    // restack behind this one's lease). The stack is rebuilt on top of the
+    // branch at the claimed position -- never on this branch, which may itself
+    // be one of the downstream branches the claimed restack has to rebuild.
+    let seed_branch = all_branches
+        .iter()
+        .find(|b| {
+            b.position == restack_position
+                && b.project.as_deref().unwrap_or(&guardian.git_root) == branch_project
+        })
+        .unwrap_or(branch);
+    let mut prev_ref = seed_branch
         .review_branch
         .clone()
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| review_ref_of(id, branch));
+        .unwrap_or_else(|| review_ref_of(id, seed_branch));
+    // Each rebuilt branch's predecessor: its id (for its recorded baseline)
+    // and its tip from before this restack (`None` for the seed branch,
+    // which has already moved).
+    let mut pred_id: Option<String> = Some(seed_branch.id.clone());
+    let mut pred_old_tip: Option<String> = None;
     // RAL-509: a downstream branch that hasn't finished collecting yet (still
     // `pending`, never marked ready) must not be forced through a build just
     // because an upstream sibling's feedback/auto-fix landed -- halt the
@@ -7875,9 +8825,34 @@ fn run_feedback_pass(
         };
         let wt_j = branch_wt_dir(&wt_base, &short_names, &ob.branch);
         let wt_j_str = wt_j.root().to_string_lossy().to_string();
-        // Reset the review branch to the feature tip; drive_rebase replays its
-        // own commits onto the revised upstream (`prev_ref`).
-        if let Err(e) = worktree_add_or_reset(&root, &rev, &wt_j, &ob.branch) {
+        // Reset the review branch to what it replays (its old tip, so its own
+        // review-only commits survive, else the feature tip); drive_rebase
+        // replays those commits onto the revised upstream (`prev_ref`).
+        let old_tip = resolve_commit(&root, &rev);
+        let old_upstream = restack_branch_upstream(
+            store,
+            id,
+            &root,
+            &ob.branch,
+            old_tip.as_deref(),
+            pred_old_tip.as_deref(),
+            pred_id.as_deref(),
+            &prev_ref,
+            &base_sha,
+        );
+        let carry = restack_source(
+            &root,
+            id,
+            &ob.id,
+            old_tip,
+            &ob.branch,
+            &base_sha,
+            old_upstream.as_deref(),
+        );
+        carry.log(store, id, &ob.id, &ob.branch);
+        pred_old_tip = carry.old_tip.clone();
+        pred_id = Some(ob.id.clone());
+        if let Err(e) = worktree_add_or_reset(&root, &rev, &wt_j, &carry.source) {
             fail_branch(store, id, &ob.id, &ob.branch, &e, &set_status);
             return outcome;
         }
@@ -7893,8 +8868,19 @@ fn run_feedback_pass(
         // shares this feedback application's own live `cancel` token rather
         // than a token that never trips.
         if stack_pick(
-            store, runner, id, &ob.id, &ob.branch, &base_sha, &prev_ref, &rev, &wt_j, squash,
-            &gate, cancel,
+            store,
+            runner,
+            id,
+            &ob.id,
+            &ob.branch,
+            &carry.upstream,
+            carry.new_since.as_deref(),
+            &prev_ref,
+            &rev,
+            &wt_j,
+            squash,
+            &gate,
+            cancel,
         )
         .is_err()
         {
@@ -7945,16 +8931,17 @@ fn run_feedback_pass(
     outcome
 }
 
-/// Fetch `alias` from `remote` and rebase branch `branch_id`'s own unique
-/// commits (since `last_synced_sha`, or their merge-base with the fetched tip
-/// when `last_synced_sha` is unknown or stale) onto the fetched PR-branch tip
-/// (RAL-190) — driving the agent through any conflicts exactly like a normal
-/// stack rebase, so a reviewer's direct push to the open PR branch flows back
-/// into the review worktree instead of being silently discarded on the next
-/// force-push. On success, restacks everything downstream of this branch
-/// (same restack [`rebase_on_manual_push`] performs after a detected manual
-/// push) and re-baselines. Returns `Ok(false)` when the fetched tip was
-/// already contained in the branch's history — nothing to pull.
+/// Fetch `alias` from `remote` and replay the PR branch's own new commits
+/// (since `last_synced_sha`, or the PR tip's merge-base with the review
+/// branch when `last_synced_sha` is unknown or stale) onto branch
+/// `branch_id`'s review branch (RAL-190) — driving the agent through any
+/// conflicts exactly like a normal stack rebase, so a reviewer's direct push
+/// to the open PR branch flows back into the review worktree instead of being
+/// silently discarded on the next force-push. On success, restacks everything
+/// downstream of this branch (same restack [`rebase_on_manual_push`] performs
+/// after a detected manual push) and re-baselines. Returns the PR tip that was
+/// pulled in, or `Ok(None)` when it was already contained in the branch's
+/// history — nothing to pull.
 ///
 /// Delegated to from `crate::pr::pull_pr_commits`, which owns fetching the
 /// PR row, calling this, and pushing the merged result back to the remote
@@ -7979,7 +8966,7 @@ pub fn pull_pr_commits(
     remote: &str,
     alias: &str,
     last_synced_sha: Option<&str>,
-) -> std::result::Result<bool, String> {
+) -> std::result::Result<Option<String>, String> {
     let guardian = store.lock().get_guardian(id).map_err(|e| e.to_string())?;
     let branch = guardian
         .branches
@@ -8020,11 +9007,22 @@ pub fn pull_pr_commits(
         .git(&["merge-base", "--is-ancestor", &fetched, &current_tip])
         .is_ok()
     {
-        return Ok(false);
+        return Ok(None);
     }
 
+    // The PR's own new commits start after what the daemon last published to
+    // it -- when that commit still exists and is below the PR tip (a reviewer
+    // force-push can rewrite it away). Otherwise fall back to where the PR
+    // tip forks from the review branch.
     let base_for_rebase = match last_synced_sha {
-        Some(sha) if root.git(&["cat-file", "--exists", sha]).is_ok() => sha.to_string(),
+        Some(sha)
+            if root
+                .git(&["cat-file", "-e", &format!("{sha}^{{commit}}")])
+                .is_ok()
+                && is_ancestor(&root, sha, &fetched) =>
+        {
+            sha.to_string()
+        }
         _ => root
             .git(&["merge-base", &current_tip, &fetched])
             .map_err(|e| format!("no common history with fetched PR branch: {e}"))?
@@ -8087,20 +9085,52 @@ pub fn pull_pr_commits(
     let gate = ProofGate::resolve(store, id, Some(branch_id) == final_branch_id.as_deref());
     // RAL-213: pulling reviewer-pushed PR commits is a separate flow from a
     // guardian-settings-triggered merge restart -- see
-    // `run_merge_cancellable`'s doc comment.
-    match drive_rebase(
-        store,
-        id,
-        branch_id,
-        runner,
-        &branch.branch,
-        &wt,
-        &fetched,
-        &base_for_rebase,
-        &review_ref,
-        &gate,
-        &CancelToken::never(),
-    ) {
+    // `run_merge_cancellable`'s doc comment. The replay rewrites this
+    // branch's worktree, so it holds the stack claim (no feedback round may
+    // be editing it); the claim is released before the downstream restack,
+    // which takes its own.
+    //
+    // Only the PR's own new commits (`base_for_rebase..fetched`, the
+    // reviewer's pushes) are replayed, on top of the review branch as it is
+    // now -- never the review branch onto the fetched tip. Since the PR was
+    // last published the review branch may have been rebuilt (onto a moved
+    // base, under new feedback); rebasing that onto the reviewer's
+    // older-based tip would replay the new base's commits as ordinary commits
+    // and unstack the branch from the review's base.
+    let rebased = {
+        let _stack_claim =
+            wait_for_stack_rebuild_claim(store, id, "PR commit pull", &CancelToken::never());
+        let scratch = format!("ralphus-pull/{id}/{branch_id}");
+        let replayed = wt
+            .git(&["rev-parse", &review_ref])
+            .map(|s| s.trim().to_string())
+            .and_then(|onto| {
+                wt.git(&["branch", "--force", &scratch, &fetched])?;
+                drive_rebase(
+                    store,
+                    id,
+                    branch_id,
+                    runner,
+                    &branch.branch,
+                    &wt,
+                    &onto,
+                    &base_for_rebase,
+                    &scratch,
+                    &gate,
+                    &CancelToken::never(),
+                )
+            })
+            .and_then(|outcome| {
+                wt.git(&["checkout", "-B", &review_ref, &scratch])
+                    .map(|_| outcome)
+            });
+        if replayed.is_err() {
+            let _ = wt.git(&["checkout", "--force", &review_ref]);
+        }
+        let _ = wt.git(&["branch", "-D", &scratch]);
+        replayed
+    };
+    match rebased {
         Ok(_) => {
             let wt_base = root.at(worktree_dir(&branch_project, id));
             restack_from_position(
@@ -8114,7 +9144,7 @@ pub fn pull_pr_commits(
                 &set_status,
                 &CancelToken::never(),
             );
-            Ok(true)
+            Ok(Some(fetched))
         }
         Err(e) => {
             set_status(
@@ -8297,6 +9327,28 @@ pub fn review_maintenance(
     sem: &Arc<Semaphore>,
     cancellations: &Cancellations,
 ) {
+    let runners: RunnerFactory = Arc::new(|store: &crate::store_lock::StoreHandle| {
+        Arc::new(crate::remote_runner::MachineRouter::from_env(Arc::clone(
+            store,
+        ))) as Arc<dyn Runner>
+    });
+    review_maintenance_with(store, sem, cancellations, &runners);
+}
+
+/// Builds the [`Runner`] each [`review_maintenance_with`] worker uses for
+/// agent calls (conflict resolution, PR fixes, proofs).
+pub type RunnerFactory =
+    Arc<dyn Fn(&crate::store_lock::StoreHandle) -> Arc<dyn Runner> + Send + Sync>;
+
+/// [`review_maintenance`] with the agent runner supplied by `runners` instead
+/// of the environment's (`RALPHUS_RUNNER_CMD`) -- so the daemon's real sweep
+/// can be driven end to end where no runner binary is installed.
+pub fn review_maintenance_with(
+    store: &crate::store_lock::StoreHandle,
+    sem: &Arc<Semaphore>,
+    cancellations: &Cancellations,
+    runners: &RunnerFactory,
+) {
     // RAL-520: a post-merge phase only stays `running` past its natural end
     // when the daemon died mid-run (the worker records its own outcome), so
     // mark such leftovers failed -- advisory only -- and let the board's
@@ -8331,10 +9383,11 @@ pub fn review_maintenance(
         let store = Arc::clone(store);
         let sem = Arc::clone(sem);
         let cancellations = cancellations.clone();
+        let runners = Arc::clone(runners);
         std::thread::spawn(move || {
             // Released when this worker exits, by any path.
             let _claim = claim;
-            let runner = crate::remote_runner::MachineRouter::from_env(Arc::clone(&store));
+            let runner = runners(&store);
             // RAL-213: register/remove around the merge this may trigger, same
             // shape as `scheduler::tick`'s squad-level wrapping, so a guardian
             // -settings change made while this reopen is rebuilding can stop it.
@@ -8343,7 +9396,7 @@ pub fn review_maintenance(
                 cancellations: cancellations.clone(),
                 key: format!("guardian:{id}"),
             };
-            reopen_straggler(&store, &runner, &id, &sem, &token);
+            reopen_straggler(&store, runner.as_ref(), &id, &sem, &token);
         });
     }
 
@@ -8374,10 +9427,11 @@ pub fn review_maintenance(
         };
         let store = Arc::clone(store);
         let cancellations = cancellations.clone();
+        let runners = Arc::clone(runners);
         std::thread::spawn(move || {
             let _claim = claim;
-            let runner = crate::remote_runner::MachineRouter::from_env(Arc::clone(&store));
-            crate::ci_watch::poll_open_pr_ci_status(&store, &runner, &cancellations, &id);
+            let runner = runners(&store);
+            crate::ci_watch::poll_open_pr_ci_status(&store, runner.as_ref(), &cancellations, &id);
         });
     }
 
@@ -8396,13 +9450,12 @@ pub fn review_maintenance(
         let store = Arc::clone(store);
         let sem = Arc::clone(sem);
         let cancellations = cancellations.clone();
+        let runners = Arc::clone(runners);
         std::thread::spawn(move || {
             // Released when this worker exits, including via the early return
             // on the PR-commit-sync error path below.
             let _claim = claim;
-            let runner: Arc<dyn Runner> = Arc::new(crate::remote_runner::MachineRouter::from_env(
-                Arc::clone(&store),
-            ));
+            let runner = runners(&store);
             // RAL-213: one token covers both the base-shift rebuild and (if
             // that didn't run) the manual-push restack below -- either may
             // trigger a merge for this guardian id.
@@ -9357,11 +10410,70 @@ fn notify_base_shift_budget_exhausted(
     }
 }
 
+/// Replay the task commits `since..feature_branch` on top of review branch
+/// `rev` in `wt` -- the commits a task gained after the review branch was last
+/// built, which a carried-forward review range doesn't contain. The task
+/// branch itself is never moved: the replay runs on a private scratch branch
+/// that `rev` is then reset to.
+#[allow(clippy::too_many_arguments)]
+fn replay_new_task_commits(
+    store: &crate::store_lock::StoreHandle,
+    runner: &dyn Runner,
+    id: &str,
+    branch_id: &str,
+    feature_branch: &str,
+    wt: &Workspace,
+    since: &str,
+    rev: &str,
+    gate: &ProofGate,
+    cancel: &CancelToken,
+) -> std::result::Result<(RebaseOutcome, Option<String>), String> {
+    let scratch = format!("ralphus-replay/{id}/{branch_id}");
+    let onto = wt.git(&["rev-parse", rev])?.trim().to_string();
+    wt.git(&["branch", "--force", &scratch, feature_branch])?;
+    let replayed = drive_rebase(
+        store,
+        id,
+        branch_id,
+        runner,
+        feature_branch,
+        wt,
+        &onto,
+        since,
+        &scratch,
+        gate,
+        cancel,
+    );
+    let result = match replayed {
+        Ok(outcome) => wt.git(&["checkout", "-B", rev, &scratch]).map(|_| outcome),
+        Err(e) => {
+            let _ = wt.git(&["checkout", "--force", rev]);
+            Err(e)
+        }
+    };
+    let _ = wt.git(&["branch", "-D", &scratch]);
+    if result.is_ok() {
+        crate::cartographer::Note::new("guardian")
+            .guardian(id)
+            .scope("branch")
+            .emit(
+                &store.lock(),
+                "replayed new task commits onto carried-forward review branch",
+                serde_json::json!({"branch_id": branch_id, "branch": feature_branch, "since": since}),
+            );
+    }
+    result
+}
+
 /// Rebase `feature_branch`'s own commits (`base_sha..feature`) onto `newbase` in
 /// the worktree `wt` — which must already be checked out on the review branch
-/// `rev` (created at the feature tip) — resolving conflicts with the agent, and
-/// record the branch's merge status. On failure it marks the branch + guardian
-/// failed and returns `Err`.
+/// `rev` (created at the feature tip, or at a carried-forward old review tip
+/// whose range starts at `base_sha`) — resolving conflicts with the agent, and
+/// record the branch's merge status. When `new_since` is set, the task commits
+/// `new_since..feature_branch` are replayed on top afterwards (see
+/// [`replay_new_task_commits`]). On success the task-branch tip the review
+/// branch now contains is recorded at [`branch_source_ref`]. On failure it
+/// marks the branch + guardian failed and returns `Err`.
 #[allow(clippy::too_many_arguments)]
 fn stack_pick(
     store: &crate::store_lock::StoreHandle,
@@ -9370,6 +10482,7 @@ fn stack_pick(
     branch_id: &str,
     feature_branch: &str,
     base_sha: &str,
+    new_since: Option<&str>,
     newbase: &str,
     rev: &str,
     wt: &Workspace,
@@ -9380,7 +10493,8 @@ fn stack_pick(
     let set_status = |s: GuardianStatus, d: Option<&str>| {
         write_merge_status(store, id, s, d);
     };
-    match drive_rebase(
+    let feature_tip = resolve_commit(wt, feature_branch);
+    let rebased = drive_rebase(
         store,
         id,
         branch_id,
@@ -9392,8 +10506,31 @@ fn stack_pick(
         rev,
         gate,
         cancel,
-    ) {
+    )
+    .and_then(|first| match new_since {
+        None => Ok(first),
+        Some(since) => replay_new_task_commits(
+            store,
+            runner,
+            id,
+            branch_id,
+            feature_branch,
+            wt,
+            since,
+            rev,
+            gate,
+            cancel,
+        )
+        .map(|second| match (&first.0, &second.0) {
+            (_, RebaseOutcome::Resolved(_)) | (_, RebaseOutcome::CleanProofed(_)) => second,
+            _ => first,
+        }),
+    });
+    match rebased {
         Ok((outcome, session_id)) => {
+            if let Some(tip) = feature_tip.as_deref() {
+                let _ = wt.git(&["update-ref", &branch_source_ref(id, branch_id), tip]);
+            }
             // Readiness only says the source cell has finished. Once the
             // rebase produces this review ref, it must still contribute a
             // diff over its predecessor before it can become terminal or
@@ -11814,6 +12951,47 @@ pub(crate) fn branch_diff_is_empty(
     vcs.differs(root, upstream, head).map(|differs| !differs)
 }
 
+/// The post-build empty check for a branch built from `carry` (`carried`:
+/// whether its old review range was carried forward rather than rebuilt from
+/// the task tip).
+///
+/// A branch rebuilt from its task tip keeps the plain task-vs-boundary check
+/// ([`note_if_branch_is_empty`]). A carried branch is empty only if *both*
+/// its old review range added nothing (no feedback, PR-fix or pulled commits
+/// of its own) *and* its task committed nothing since it forked off the
+/// stack -- a task that committed nothing whose branch got all its content
+/// from feedback is not empty, and a task whose work already landed upstream
+/// is `merged` (decided by [`stack_pick`]), not empty.
+fn built_branch_is_empty(
+    store: &crate::store_lock::StoreHandle,
+    id: &str,
+    branch_id: &str,
+    feature: &str,
+    root: &Workspace,
+    carry: &RestackSource,
+    carried: bool,
+) -> bool {
+    if !carried {
+        return note_if_branch_is_empty(store, id, branch_id, feature, root, &carry.upstream);
+    }
+    let range_empty = carry.source == carry.upstream
+        || matches!(
+            branch_diff_is_empty(store, root.root(), &carry.upstream, &carry.source),
+            Ok(true)
+        );
+    if !range_empty || carry.new_since.is_some() {
+        let _ = store.lock().set_branch_empty(id, branch_id, false);
+        return false;
+    }
+    let Ok(fork) = root
+        .git(&["merge-base", feature, &carry.source])
+        .map(|s| s.trim().to_string())
+    else {
+        return false;
+    };
+    note_if_branch_is_empty(store, id, branch_id, feature, root, &fork)
+}
+
 fn note_if_branch_is_empty(
     store: &crate::store_lock::StoreHandle,
     guardian_id: &str,
@@ -13606,7 +14784,8 @@ fn drive_rebase(
                     crate::rlog!(
                         INFO,
                         "ralphus [guardian] review {id} rerere-autoupdate fast-path \
-                         branch={feature:?} (staged by rerere, no agent needed)"
+                         branch={feature:?} (staged by rerere, no agent needed); rebase \
+                         stopped with: {e}"
                     );
                     let guard = store.lock();
                     let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
@@ -13619,7 +14798,7 @@ fn drive_rebase(
                         cell_id: None,
                         task: None,
                         log_path: None,
-                        payload: serde_json::json!({"branch": feature}),
+                        payload: serde_json::json!({"branch": feature, "rebase_error": e}),
                         admin_only: false,
                     });
                 }
@@ -17130,6 +18309,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    #[test]
+    fn advance_rebase_keeps_a_clean_pick_that_could_not_be_committed() {
+        // With no committer identity a pick that applies cleanly cannot be
+        // committed: the rebase pauses with the pick staged and no
+        // `REBASE_HEAD`. That is not an empty step -- `--skip` would drop the
+        // commit -- so the error must surface with the rebase left paused.
+        let (base, repo, _fwt) = make_repo("advance-rebase-no-identity");
+        std::fs::write(repo.join("main.txt"), "main\n").unwrap();
+        g(&repo, &["add", "main.txt"]);
+        g(&repo, &["commit", "--message", "main edit"]);
+        g(&repo, &["checkout", "-b", "side", "HEAD~1"]);
+        std::fs::write(repo.join("side.txt"), "side\n").unwrap();
+        g(&repo, &["add", "side.txt"]);
+        g(&repo, &["commit", "--message", "side edit"]);
+        let no_identity = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .env_remove("GIT_COMMITTER_NAME")
+                .env_remove("GIT_AUTHOR_NAME")
+                .status()
+                .unwrap()
+        };
+        assert!(no_identity(&["config", "user.name", ""]).success());
+        assert!(
+            !no_identity(&["rebase", "main"]).success(),
+            "the pick must fail to commit"
+        );
+        assert!(
+            !repo.join(".git").join("REBASE_HEAD").exists(),
+            "precondition: git pauses this stop without REBASE_HEAD"
+        );
+
+        let wt = Workspace::local(&repo);
+        assert!(!rebase_head_commit_is_empty(&wt), "the pick is staged");
+        let error = advance_rebase(&wt).expect_err("a failing --continue must be reported");
+        assert!(rebase_in_progress(&wt), "the rebase stays paused");
+        let staged = wt
+            .git(&["diff", "--cached", "--name-only", "HEAD"])
+            .unwrap_or_default();
+        assert!(
+            staged.contains("side.txt"),
+            "the pick must not be skipped: {error}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     fn make_repo(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
         let base = tmp_dir(tag);
         let repo = base.join("repo");
@@ -19566,6 +20792,7 @@ mod tests {
             &branch_id,
             "feature/a",
             &old_base,
+            None,
             &new_base,
             rev,
             &Workspace::local(&wt),

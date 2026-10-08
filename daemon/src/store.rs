@@ -1203,6 +1203,24 @@ impl Store {
         self.memory.try_claim_restack(guardian_id)
     }
 
+    /// Claim the exclusive right to rewrite `guardian_id`'s whole review stack
+    /// -- see [`crate::store_memory::StoreMemory::try_claim_stack_rebuild`].
+    /// Released by [`Store::finish_guardian_restack`].
+    pub(crate) fn try_claim_guardian_stack_rebuild(&self, guardian_id: &str) -> bool {
+        self.memory.try_claim_stack_rebuild(guardian_id)
+    }
+
+    /// Whether a feedback round or unattended PR fix is editing one of
+    /// `guardian_id`'s branch worktrees (holds its worktree lease).
+    pub(crate) fn guardian_has_worktree_leases(&self, guardian_id: &str) -> bool {
+        self.memory.has_worktree_leases(guardian_id)
+    }
+
+    /// The lowest queued restack position for `guardian_id`, if any.
+    pub(crate) fn pending_guardian_restack(&self, guardian_id: &str) -> Option<i64> {
+        self.memory.pending_restack(guardian_id)
+    }
+
     /// Mark `guardian_id`'s claimed restack finished, allowing a new restack
     /// claim or worktree lease acquisition.
     pub(crate) fn finish_guardian_restack(&self, guardian_id: &str) {

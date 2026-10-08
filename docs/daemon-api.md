@@ -2643,7 +2643,11 @@ registered user (`400 unknown_user` otherwise) — it defaults to the resolved
 submitter when omitted. There is deliberately no `submitted_by` request
 field: the submitter always comes from the authenticated request context
 (`X-Ralphus-User` / `[daemon].default_user`) and can never be set by request
-data. The reviewer's feedback text is persisted immediately (`role:
+data. A branch with no review worktree yet is refused with
+`409 not_ready`, and a review that is already `merged`, `deployed` or
+`cancelled` with `409 review_closed` -- its PRs no longer take changes, so
+the feedback would otherwise be committed where it never lands. The
+reviewer's feedback text is persisted immediately (`role:
 "reviewer"`), and a short conversational acknowledgment from the guardian
 follows in the background (`role: "guardian"`), generated via
 `chat_client::call_direct`. The board shows this thread only once a branch's

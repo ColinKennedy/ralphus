@@ -1330,7 +1330,12 @@ impl MergeProgress {
         let total = branches.len();
         let done = branches
             .iter()
-            .filter(|b| matches!(b.merge_status.as_str(), "done" | "conflict_resolved"))
+            .filter(|b| {
+                matches!(
+                    b.merge_status.as_str(),
+                    "done" | "conflict_resolved" | "merged"
+                )
+            })
             .count();
         let failed = branches
             .iter()
@@ -5607,7 +5612,10 @@ impl Store {
     /// resolution, or terminal-mode computation. `projects` is still derived
     /// from `guardian_branches` (the same source `list_guardians` uses), just
     /// via one direct aggregate instead of building a full branch view per
-    /// row.
+    /// row: every enabled branch's project root, a branch with no project of
+    /// its own counting as the review's `git_root` -- so a multi-project
+    /// review still fetches the primary repo its unprojected branches live in.
+    /// Repeats are left in; the poll dedups its fetch targets.
     ///
     /// Takes a connection rather than `&self` because the poll runs it on the
     /// read pool: the shared hydration context below reads every review
@@ -5618,8 +5626,9 @@ impl Store {
     ) -> Result<Vec<crate::guardian_merge::GuardianBaseFetchInfo>> {
         let mut stmt = conn.prepare(
             "SELECT g.status, g.base_branch, g.git_root, g.machine,
-                    (SELECT GROUP_CONCAT(gb.project, char(31)) FROM guardian_branches gb
-                     WHERE gb.guardian_id = g.id AND gb.enabled = 1 AND gb.project IS NOT NULL),
+                    (SELECT GROUP_CONCAT(COALESCE(gb.project, g.git_root), char(31))
+                     FROM guardian_branches gb
+                     WHERE gb.guardian_id = g.id AND gb.enabled = 1),
                     g.id, g.owner, g.dual_root_pr
              FROM guardians g",
         )?;
@@ -6045,7 +6054,12 @@ impl Store {
         let enabled_branches: Vec<&BranchView> = branches.iter().filter(|b| b.enabled).collect();
         let enabled_done = enabled_branches
             .iter()
-            .filter(|b| matches!(b.merge_status.as_str(), "done" | "conflict_resolved"))
+            .filter(|b| {
+                matches!(
+                    b.merge_status.as_str(),
+                    "done" | "conflict_resolved" | "merged"
+                )
+            })
             .count();
         let enabled_failed = enabled_branches
             .iter()

@@ -423,6 +423,15 @@ jobs:
       # where the mix came from. RALPHUS_REPLAY_SECONDS lengthens the window.
       - name: Rust recorded-workload replay
         run: cargo nextest run -p ralphus-daemon --test workload_replay --run-ignored only --test-threads 1
+      # Seeded stress over the review-input races: rounds of random
+      # concurrent feedback rounds / PR fixes on random branches racing real
+      # upstream pushes through the daemon's own maintenance -- see
+      # daemon/tests/review_input_races.rs. The deterministic race scenarios
+      # run in the default suite; only this multi-minute stress run lives here.
+      # The ~15-minute eight-branch soak (`soak_*`) runs in its own
+      # `review-race-soak` job instead, in parallel with this one.
+      - name: Rust review-input race stress
+        run: cargo nextest run -p ralphus-daemon --test review_input_races --run-ignored only -E 'not test(/^soak_/)'
       # WS-D.8: the submit path's worst store-lock hold. Not #[ignore]d -- it
       # runs in the default suite too -- but repeated here so a regression is
       # attributed to the perf job rather than looking like an unrelated flake.
@@ -464,6 +473,23 @@ jobs:
       - name: Python board cold-load perf tests
         run: uv run pytest -m heavy --reruns 2 --reruns-delay 3
         working-directory: cli-py
+
+  # The ~15-minute eight-branch review-input race soak, as its own job so it
+  # runs in parallel with every other check rather than lengthening one of
+  # them. `#[ignore]`d in the default suite -- see
+  # daemon/tests/review_input_races.rs (`soak_*`).
+  review-race-soak:
+    name: Review-input race soak (8 branches)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+      - name: Rust review-input race soak
+        run: cargo nextest run -p ralphus-daemon --test review_input_races --run-ignored only -E 'test(/^soak_/)'
 
   bench-patience:
     name: Bench patience comment lint
