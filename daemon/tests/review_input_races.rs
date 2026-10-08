@@ -1817,38 +1817,59 @@ impl Fixture {
             return;
         }
         git(&clone, &["commit", "-m", message]);
-        let mut pushed = false;
-        for _ in 0..10 {
-            let status = std::process::Command::new("git")
-                .args(["push", "-q", "origin", &alias])
-                .current_dir(&clone)
-                .status()
-                .expect("run git push");
-            if status.success() {
-                pushed = true;
-                break;
-            }
-            let rebased = std::process::Command::new("git")
-                .args(["pull", "-q", "--rebase", "origin", &alias])
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
                 .current_dir(&clone)
                 .env("GIT_EDITOR", "true")
-                .status()
-                .expect("run git pull");
-            while !rebased.success()
-                && !git(&clone, &["diff", "--name-only", "--diff-filter=U"])
-                    .trim()
-                    .is_empty()
-            {
-                union_resolve(&clone);
-                git(&clone, &["add", "--all"]);
-                let _ = std::process::Command::new("git")
-                    .args(["rebase", "--continue"])
-                    .current_dir(&clone)
-                    .env("GIT_EDITOR", "true")
-                    .status();
+                .output()
+                .expect("run git")
+        };
+        let rebasing = || {
+            clone.join(".git").join("rebase-merge").exists()
+                || clone.join(".git").join("rebase-apply").exists()
+        };
+        // The daemon republishes PR branches on its 0.1 s sweep, so on a slow
+        // runner a push can lose several times in a row: keep rebasing onto
+        // the new tip and retrying, backing off, for a bounded time.
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let mut attempt: u64 = 0;
+        let mut last_error = String::new();
+        let pushed = loop {
+            let push = run(&["push", "-q", "origin", &alias]);
+            if push.status.success() {
+                break true;
             }
-        }
-        assert!(pushed, "reviewer push to {alias} kept being rejected");
+            last_error = String::from_utf8_lossy(&push.stderr).trim().to_string();
+            if Instant::now() >= deadline {
+                break false;
+            }
+            attempt += 1;
+            std::thread::sleep(Duration::from_millis(50 * attempt.min(10)));
+            let _ = run(&["pull", "-q", "--rebase", "origin", &alias]);
+            // Drive any stopped rebase to the end: resolve conflicts by
+            // keeping both sides; a step with nothing left to apply (the
+            // daemon already pulled that change in) is skipped.
+            while rebasing() {
+                let conflicted = git(&clone, &["diff", "--name-only", "--diff-filter=U"]);
+                if conflicted.trim().is_empty() {
+                    let staged = run(&["diff", "--cached", "--quiet"]);
+                    if staged.status.success() {
+                        let _ = run(&["rebase", "--skip"]);
+                        continue;
+                    }
+                } else {
+                    union_resolve(&clone);
+                }
+                git(&clone, &["add", "--all"]);
+                let _ = run(&["rebase", "--continue"]);
+            }
+        };
+        assert!(
+            pushed,
+            "reviewer push to {alias} kept being rejected for 120 s ({attempt} retries); \
+             last error: {last_error}"
+        );
         let _ = std::fs::remove_dir_all(&clone);
     }
 
