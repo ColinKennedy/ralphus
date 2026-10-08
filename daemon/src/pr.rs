@@ -2955,6 +2955,7 @@ pub fn resync_pr_bases(
 /// `fork_client`/`fork_remote_name` are always `None` when the project has no
 /// registered fork, in which case every method below degrades to today's
 /// single-client behavior.
+#[derive(Clone)]
 struct PrRepoRouting {
     parent_client: Option<crate::forge::ForgeClient>,
     parent_remote_name: String,
@@ -3088,7 +3089,66 @@ pub(crate) fn project_clone_url_for_root(
 /// project that does use that convention, so a guardian with no owner (or an
 /// owner with no fork of its own) still resolves the same fork a
 /// project-wide default would have named.
+///
+/// Resolution costs several git subprocesses (remote/config lookups) and a
+/// few store reads, and the review maintenance pass asks for the same
+/// answer once per PR from several call sites every few seconds, so results
+/// are memoized for [`ROUTING_CACHE_TTL`]. Edits to projects, forks and
+/// stored forge tokens clear the memo ([`invalidate_pr_routing_cache`]).
 fn resolve_pr_repo_routing(
+    store: &crate::store_lock::StoreHandle,
+    root: &Path,
+    base_branch: &str,
+    forge_cfg: &crate::config::ForgeConfig,
+    owner: Option<&str>,
+) -> PrRepoRouting {
+    let key = (
+        root.to_path_buf(),
+        base_branch.to_string(),
+        format!("{forge_cfg:?}"),
+        owner.map(str::to_string),
+    );
+    let now = std::time::Instant::now();
+    if let Some((at, routing)) = routing_cache().lock().get(&key) {
+        if now.duration_since(*at) < ROUTING_CACHE_TTL {
+            return routing.clone();
+        }
+    }
+    let routing = resolve_pr_repo_routing_uncached(store, root, base_branch, forge_cfg, owner);
+    let mut cache = routing_cache().lock();
+    cache.retain(|_, (at, _)| now.duration_since(*at) < ROUTING_CACHE_TTL);
+    cache.insert(key, (now, routing.clone()));
+    routing
+}
+
+/// How long a resolved [`PrRepoRouting`] is reused. Long enough to cover
+/// several review maintenance passes, short enough that a remote edited
+/// outside ralphus is picked up promptly. Zero in unit tests, which rewrite
+/// remotes and fork rows between resolutions inside one process.
+const ROUTING_CACHE_TTL: std::time::Duration = if cfg!(test) {
+    std::time::Duration::ZERO
+} else {
+    std::time::Duration::from_secs(15)
+};
+
+type RoutingCacheKey = (std::path::PathBuf, String, String, Option<String>);
+
+fn routing_cache()
+-> &'static parking_lot::Mutex<HashMap<RoutingCacheKey, (std::time::Instant, PrRepoRouting)>> {
+    static CACHE: std::sync::OnceLock<
+        parking_lot::Mutex<HashMap<RoutingCacheKey, (std::time::Instant, PrRepoRouting)>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// Forget every memoized [`PrRepoRouting`], so the next resolution re-reads
+/// projects, forks, tokens and remotes. Called after any write that can
+/// change one of those.
+pub(crate) fn invalidate_pr_routing_cache() {
+    routing_cache().lock().clear();
+}
+
+fn resolve_pr_repo_routing_uncached(
     store: &crate::store_lock::StoreHandle,
     root: &Path,
     base_branch: &str,

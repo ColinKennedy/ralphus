@@ -1159,6 +1159,17 @@ fn route_for_user(
 ) -> Reply {
     let (path_only, query) = path.split_once('?').unwrap_or((path, ""));
     let segs: Vec<&str> = path_only.trim_matches('/').split('/').collect();
+    // Project, fork and stored-forge-token writes change how a PR's forge
+    // remote and client resolve; drop the memoized routing so the next
+    // resolution sees them.
+    if method != "GET"
+        && matches!(
+            segs.as_slice(),
+            ["api", "projects", ..] | ["api", "users", _, "forge-tokens", ..]
+        )
+    {
+        crate::pr::invalidate_pr_routing_cache();
+    }
     match (method, segs.as_slice()) {
         ("GET", ["api", "daemon"]) => health(daemon),
         // ralphus[ignore-endpoint-cli]: daemon lifecycle is the `ralphus-daemon` binary's own verb (`ralphus-daemon stop`), not a task-file CLI command
