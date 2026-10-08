@@ -9081,3 +9081,91 @@ fn a_by_hand_commit_and_a_reviewer_push_to_the_same_branch_both_survive() {
         &[],
     );
 }
+
+// ---------------------------------------------------------------------------
+// Post-merge jobs (RAL-520): the manual-checks generation runs in a worker of
+// its own after a merge settles, and must not interfere with the next round.
+// ---------------------------------------------------------------------------
+
+/// The agent behind manual-checks generation: signals when it starts, holds
+/// until released, then answers with one check. Any other agent call is
+/// recorded as unexpected.
+struct HeldManualChecks {
+    started: Arc<AtomicBool>,
+    release: Arc<AtomicBool>,
+    unexpected: Unexpected,
+}
+
+impl Runner for HeldManualChecks {
+    fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+        if spec.task == "manual_commands" {
+            self.started.store(true, Ordering::SeqCst);
+            let deadline = Instant::now() + Duration::from_secs(120);
+            while !self.release.load(Ordering::SeqCst) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            return ok_result("[\"echo check\"]", None);
+        }
+        self.unexpected
+            .lock()
+            .unwrap()
+            .push(format!("unexpected call {} ({})", spec.cell_id, spec.task));
+        RunnerResult::failure("unexpected agent call")
+    }
+}
+
+/// A settled review's manual-checks generation is held mid-run while a
+/// feedback round starts on the same review and the base moves. The worker
+/// must stand down or finish without blocking the round, and the round, the
+/// rebuild and every commit must be unaffected.
+#[test]
+fn post_merge_checks_running_while_the_next_feedback_round_starts_lose_nothing() {
+    let what = "post-merge checks vs feedback";
+    let fx = Fixture::with_upstream(&["feature/a", "feature/b", "feature/c"]);
+    fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    fx.wait_settled_on(first.trim(), "before the race");
+
+    let started = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let checks = {
+        let (store, id) = (Arc::clone(&fx.store), fx.id.clone());
+        let runner = HeldManualChecks {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+            unexpected: Arc::clone(&unexpected),
+        };
+        std::thread::spawn(move || {
+            ralphus_daemon::guardian_merge::run_guardian_post_merge(
+                &store,
+                &runner,
+                &id,
+                ralphus_daemon::guardian_merge::PostMergeJobs::ALL,
+            );
+        })
+    };
+    wait_for(&started, "the manual-checks generation");
+
+    let mut held = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    let upstream = fx.push_upstream("upstream1.txt");
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+    release.store(true, Ordering::SeqCst);
+    checks.join().expect("post-merge worker");
+
+    fx.wait_settled_on(&upstream, what);
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_everything_published(
+        what,
+        &[(1, "feature-b.txt", "feedback on b")],
+        &["upstream1.txt"],
+    );
+}
