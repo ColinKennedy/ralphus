@@ -5791,3 +5791,92 @@ fn crash_during_pr_submission_is_adopted_not_duplicated() {
     );
     fx.assert_forge_routed_everything(what, &forge);
 }
+
+// ---------------------------------------------------------------------------
+// Queued feedback rounds and a crash.
+// ---------------------------------------------------------------------------
+
+/// Two feedback rounds are queued on one branch (the second waits on the
+/// first's worktree lease). Each must be durably recorded as pending, so a
+/// crash at that moment lets recovery re-apply both; finishing the first round
+/// must not clear the second's record.
+#[test]
+fn two_queued_feedback_rounds_on_one_branch_are_both_recorded_for_crash_recovery() {
+    let what = "two queued rounds";
+    let fx = Fixture::with_upstream(&["feature/a", "feature/b"]);
+    fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let mut first = Held::new("feature-b.txt", "first round edit", &unexpected).feedback(&fx, 1);
+    let second_release = Arc::new(AtomicBool::new(false));
+    let second_runner = Arc::new(WriterRunner::new(
+        "feature-b.txt",
+        "second round edit",
+        Some(Arc::clone(&second_release)),
+        &unexpected,
+    ));
+    let second = {
+        let (store, id, bid, runner) = (
+            Arc::clone(&fx.store),
+            fx.id.clone(),
+            fx.branch_ids[1].clone(),
+            Arc::clone(&second_runner),
+        );
+        std::thread::spawn(move || {
+            run_feedback(
+                &store,
+                runner.as_ref(),
+                &id,
+                &bid,
+                "second round text",
+                None,
+                false,
+                &CancelToken::never(),
+            );
+        })
+    };
+    std::thread::sleep(PARK_WAIT);
+
+    // A crash right now: both rounds are on record.
+    let texts: Vec<String> = fx
+        .store
+        .lock()
+        .branches_with_pending_feedback()
+        .unwrap()
+        .into_iter()
+        .map(|(_, _, text)| text)
+        .collect();
+    assert_eq!(
+        texts,
+        ["please change this", "second round text"],
+        "{what}: both queued rounds must be recorded before either finishes"
+    );
+
+    // The first round finishing must leave the second round's record alone.
+    first.finish();
+    wait_for(&second_runner.started, "the second round");
+    let texts: Vec<String> = fx
+        .store
+        .lock()
+        .branches_with_pending_feedback()
+        .unwrap()
+        .into_iter()
+        .map(|(_, _, text)| text)
+        .collect();
+    assert_eq!(
+        texts,
+        ["second round text"],
+        "{what}: finishing the first round dropped the second round's record"
+    );
+
+    second_release.store(true, Ordering::SeqCst);
+    second.join().expect("second round thread");
+    assert!(
+        fx.store
+            .lock()
+            .branches_with_pending_feedback()
+            .unwrap()
+            .is_empty(),
+        "{what}: a completed round left its pending record behind"
+    );
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+}

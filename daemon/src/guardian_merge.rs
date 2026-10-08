@@ -7912,7 +7912,9 @@ fn run_feedback_pass(
             let _ = store
                 .lock()
                 .release_guardian_worktree_lease(id, branch_id, &lease_owner);
-            let _ = store.lock().clear_branch_pending_feedback(id, branch_id);
+            let _ = store
+                .lock()
+                .clear_branch_pending_feedback_entry(id, branch_id, feedback);
             fail_message();
             return FeedbackOutcome::default();
         }};
@@ -7968,7 +7970,9 @@ fn run_feedback_pass(
             let _ = store
                 .lock()
                 .release_guardian_worktree_lease(id, branch_id, &lease_owner);
-            let _ = store.lock().clear_branch_pending_feedback(id, branch_id);
+            let _ = store
+                .lock()
+                .clear_branch_pending_feedback_entry(id, branch_id, feedback);
             fail_message();
             return FeedbackOutcome::default();
         }
@@ -7977,7 +7981,9 @@ fn run_feedback_pass(
         let _ = store
             .lock()
             .release_guardian_worktree_lease(id, branch_id, &lease_owner);
-        let _ = store.lock().clear_branch_pending_feedback(id, branch_id);
+        let _ = store
+            .lock()
+            .clear_branch_pending_feedback_entry(id, branch_id, feedback);
         fail_message();
         return FeedbackOutcome::default();
     };
@@ -8002,7 +8008,9 @@ fn run_feedback_pass(
         let _ = store
             .lock()
             .release_guardian_worktree_lease(id, branch_id, &lease_owner);
-        let _ = store.lock().clear_branch_pending_feedback(id, branch_id);
+        let _ = store
+            .lock()
+            .clear_branch_pending_feedback_entry(id, branch_id, feedback);
         set_status(
             GuardianStatus::MergeFailed,
             Some("no review worktree yet; run the merge first"),
@@ -8069,7 +8077,9 @@ fn run_feedback_pass(
             let _ = store
                 .lock()
                 .release_guardian_worktree_lease(id, branch_id, &lease_owner);
-            let _ = store.lock().clear_branch_pending_feedback(id, branch_id);
+            let _ = store
+                .lock()
+                .clear_branch_pending_feedback_entry(id, branch_id, feedback);
             set_status(
                 GuardianStatus::MergeFailed,
                 Some(&format!("unresolvable resolver agent: {message}")),
@@ -8567,7 +8577,9 @@ fn run_feedback_pass(
     // not a crash -- clear the durable pending-feedback record set at the
     // top of this function so startup recovery doesn't try to reapply
     // feedback that already ran to completion.
-    let _ = store.lock().clear_branch_pending_feedback(id, branch_id);
+    let _ = store
+        .lock()
+        .clear_branch_pending_feedback_entry(id, branch_id, feedback);
     // RAL-<new>: a feedback revision can push a real new commit onto the
     // branch's review ref, so it needs the same auto-submit hook every other
     // route to a terminal status fires via `promote_branch_terminal` --
