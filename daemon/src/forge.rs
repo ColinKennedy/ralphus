@@ -1337,20 +1337,29 @@ impl ForgeClient {
             }));
         }
 
-        let Some(pipeline_status) = mr["pipeline"]["status"].as_str() else {
+        // `head_pipeline` is the MR's latest pipeline for its source head.
+        // The older `pipeline` field stays null when that pipeline was created
+        // by the branch push that preceded the MR -- which is how ralphus
+        // always submits -- so it is only the fallback.
+        let pipeline = if mr["head_pipeline"].is_object() {
+            &mr["head_pipeline"]
+        } else {
+            &mr["pipeline"]
+        };
+        let Some(pipeline_status) = pipeline["status"].as_str() else {
             // No pipeline has run against this MR yet.
             return Ok(PrCiState::Pending);
         };
-        if !self.gitlab_pipeline_is_current_for_mr(number, &mr, &mr["pipeline"], token) {
+        if !self.gitlab_pipeline_is_current_for_mr(number, &mr, pipeline, token) {
             return Ok(PrCiState::Pending);
         }
         match pipeline_status {
             "success" => Ok(PrCiState::Passing),
             "failed" => {
-                let Some(pipeline_id) = mr["pipeline"]["id"].as_i64() else {
+                let Some(pipeline_id) = pipeline["id"].as_i64() else {
                     return Ok(PrCiState::Failing(PrFailure {
                         reason: "pipeline failed".to_string(),
-                        job_url: mr["pipeline"]["web_url"].as_str().map(str::to_string),
+                        job_url: pipeline["web_url"].as_str().map(str::to_string),
                         log_text: None,
                         checks: vec![],
                         ..Default::default()
@@ -1360,7 +1369,7 @@ impl ForgeClient {
                 if jobs.is_empty() {
                     return Ok(PrCiState::Failing(PrFailure {
                         reason: "pipeline failed".to_string(),
-                        job_url: mr["pipeline"]["web_url"].as_str().map(str::to_string),
+                        job_url: pipeline["web_url"].as_str().map(str::to_string),
                         log_text: None,
                         checks: vec![],
                         ..Default::default()
@@ -1393,7 +1402,7 @@ impl ForgeClient {
             }
             "canceled" | "skipped" => Ok(PrCiState::Failing(PrFailure {
                 reason: format!("pipeline {pipeline_status}"),
-                job_url: mr["pipeline"]["web_url"].as_str().map(str::to_string),
+                job_url: pipeline["web_url"].as_str().map(str::to_string),
                 log_text: None,
                 checks: vec![],
                 ..Default::default()
@@ -6988,6 +6997,48 @@ mod tests {
                 generation: Some("55".to_string()),
                 ..Default::default()
             })
+        );
+        mock.finish();
+    }
+
+    #[test]
+    fn check_pr_ci_status_reads_gitlab_head_pipeline_when_pipeline_is_null() {
+        // GitLab leaves `pipeline` null when the MR's pipeline was created by
+        // the branch push before the MR existed; `head_pipeline` carries it.
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
+            assert_eq!(req.url(), "/projects/group%2Fproj/merge_requests/9");
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"merge_status": "can_be_merged", "sha": "head-sha", "pipeline": null, "head_pipeline": {"id": 55, "ref": "feature", "sha": "head-sha", "status": "failed", "web_url": "https://gitlab.example/pipelines/55"}}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+            let req = server.recv();
+            assert_eq!(
+                req.url(),
+                "/projects/group%2Fproj/pipelines/55/jobs?scope[]=failed&per_page=100&page=1"
+            );
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"[{"id": 77, "name": "test", "web_url": "https://gitlab.example/jobs/77"}]"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+            let req = server.recv();
+            assert_eq!(req.url(), "/projects/group%2Fproj/jobs/77/trace");
+            req.respond(
+                tiny_http::Response::from_string("FAIL: assertion failed\n").with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = mock.client(ForgeKind::GitLab, "group%2Fproj");
+        let state = client.check_pr_ci_status(9).unwrap();
+        assert!(
+            matches!(&state, PrCiState::Failing(f) if f.generation.as_deref() == Some("55")),
+            "{state:?}"
         );
         mock.finish();
     }
