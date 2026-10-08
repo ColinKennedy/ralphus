@@ -213,7 +213,14 @@
         const [kind, ...rest] = key.split("|");
         if (kind === "cell") { const [squadId, ti, si] = rest; return `/api/squads/${squadId}/cells/${ti}/${si}/pane?lines=500`; }
         if (kind === "proof") { const [squadId, ti, scope, si, vi] = rest; return `/api/squads/${squadId}/proofs/${ti}/${scope}/${si}/${vi}/pane?lines=500`; }
-        if (kind === "guardian") { const [gid, branchId] = rest; return `/api/guardians/${gid}/branches/${branchId}/pane?lines=500`; }
+        if (kind === "guardian") {
+          // A run-scoped key probes that run's own session; the branch-level
+          // default cannot name a feedback run (its cell id is per-run), so
+          // without this the box reads "ended" while the run is still live.
+          const [gid, branchId, task, cellId] = rest;
+          const run = task && cellId ? `&task=${encodeURIComponent(task)}&cell_id=${encodeURIComponent(cellId)}` : "";
+          return `/api/guardians/${gid}/branches/${branchId}/pane?lines=500${run}`;
+        }
         if (kind === "guardian-manual") { const [gid] = rest; return `/api/guardians/${gid}/manual-checks/pane?lines=500`; }
         return null;
       }
