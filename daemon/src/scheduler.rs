@@ -5335,9 +5335,9 @@ fn proof_context_status(state: Option<&str>) -> &'static str {
 /// cover), not something a task/cell can opt out of.
 ///
 /// Only proof kinds the scheduler actually executes count ("command",
-/// "prompt") — "brain"/"approval"/"unknown" are deferred and never run (see
-/// `run_proofs`'s `"brain" | "approval" | "unknown" => continue` arm), so
-/// naming them here would promise a check that never happens. Returns `None`
+/// "prompt") — "unknown" is deferred and never runs (see
+/// `run_proofs`'s `"unknown" => continue` arm), so
+/// naming it here would promise a check that never happens. Returns `None`
 /// when there is nothing to mention, so a cell with no qualifying cell-scope
 /// proofs is unaffected.
 fn cell_proof_awareness_context(specs: &[crate::store::ProofSpecRow]) -> Option<String> {
@@ -5372,8 +5372,7 @@ fn cell_proof_awareness_context(specs: &[crate::store::ProofSpecRow]) -> Option<
 }
 
 /// Run the `command` and `prompt` proof steps of one scope, updating each
-/// step's state. `all_ok` is false if any of them fails. Other proof kinds
-/// (`brain` / `approval`) are still deferred and left pending.
+/// step's state. `all_ok` is false if any of them fails.
 ///
 /// `agent` proofs run through the same [`Runner`] as cells do — a
 /// [`RunnerSpec`] is built with `proof: true`, `prompt` set to the step's
@@ -5825,7 +5824,7 @@ fn run_proofs(
                 };
                 // RAL-488 interview Q1: resolved once per proof step rather
                 // than hoisted to `run_proofs`'s top, since the vast majority
-                // of proof steps are `prompt`/`brain`/`approval` kinds that
+                // of proof steps are `prompt` kinds that
                 // never touch remediation at all.
                 let vcs = crate::remediation::resolve_vcs_for_remediation(store, cwd);
                 let result: RunnerResult = crate::remediation::run_command_with_remediation(
@@ -5987,12 +5986,12 @@ fn run_proofs(
                 let usage = crate::store::RecordedUsage::from(&result);
                 (passed, output, result.agent_session_id, usage)
             }
-            "brain" | "approval" | "unknown" => continue, // deferred (intentional; not yet built)
+            "unknown" => continue, // deferred (intentional; nothing to run)
             other => {
                 // Not producible by any currently-supported schema path (see
                 // `core/src/schema.rs::ProofStep` and `insert_proof`) — most
                 // likely stale data left behind by a since-renamed/removed proof
-                // kind. Left to fall into the `continue` above like brain/approval,
+                // kind. Left to fall into the `continue` above like "unknown",
                 // this stayed `pending` forever, which `effective_cell_state`
                 // folds into a cell that reads "running" indefinitely even
                 // though the squad itself has already finished. Fail it instead so
@@ -9475,7 +9474,6 @@ mod tests {
 
     const TASK_PROMPT_PROOF: &str = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\".\"\ncommand=\"do\"\nagent=\"ollama\"\nmodel=\"qwen3:8b\"\n[[task.proof]]\nid=\"check\"\nprompt=\"check it\"\n";
     const TASK_PROMPT_PROOF_MODEL_OVERRIDE: &str = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\".\"\ncommand=\"do\"\nagent=\"ollama\"\nmodel=\"qwen3:8b\"\n[[task.proof]]\nprompt=\"check it\"\nmodel=\"qwen2:1b\"\n";
-    const TASK_BRAIN_PROOF: &str = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\".\"\ncommand=\"do\"\n[[task.proof]]\nbrain=\"check it\"\n";
 
     #[test]
     fn prompt_proof_pass_keeps_squad_done_and_records_output() {
@@ -9747,24 +9745,11 @@ mod tests {
     }
 
     #[test]
-    fn brain_proof_kind_stays_pending_and_does_not_block_the_squad() {
-        // Regression: brain/approval proofs are still deferred, unlike
-        // prompt proofs now that they're implemented.
-        let (store, id) = store_with(TASK_BRAIN_PROOF);
-        let runner: Arc<dyn Runner> = Arc::new(FakeRunner { fail_on: None });
-        execute_squad(&store, runner.as_ref(), &id);
-        let guard = store.lock();
-        assert_eq!(guard.squad_state(&id).unwrap(), SquadState::Done);
-        let squad = guard.get_squad(&id).unwrap();
-        assert_eq!(squad.tasks[0].proof[0].state, "pending");
-    }
-
-    #[test]
     fn proof_with_unrecognized_kind_fails_instead_of_staying_pending_forever() {
         // Regression: a proof row whose `kind` isn't producible by any
         // currently-supported schema path (e.g. stale data from a since-
         // renamed/removed kind) used to fall into the same `continue` as
-        // brain/approval and sit at `pending` forever, which
+        // "unknown" and sit at `pending` forever, which
         // `effective_cell_state` folds into a cell that displays
         // "running" indefinitely even though the squad has already finished.
         let (store, id) = store_with(ONE_CELL);

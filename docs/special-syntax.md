@@ -258,7 +258,7 @@ values into any of the *same entity's own* fields still unset:
   skipped**, not an error — e.g. a task-level `extends` naming a preset that
   sets `system_prompt` simply has nothing to stamp there, and a `command`
   cell is never given a `prompt`.
-  The one exception is a preset `pass_score` on a `command`/`brain` proof
+  The one exception is a preset `pass_score` on a `command` proof
   step: it is skipped, but the submit response carries a warning.
 - **A name may be hierarchical.** `roles/reviewer` is referenced as
   `<<ralphus:presets/roles/reviewer>>`. The `/` is only part of the name —

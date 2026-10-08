@@ -31,7 +31,7 @@
        * @typedef {object} ProofView
        * @property {AppraisalView} [appraisal] - RAL-575: latest appraisal of a scored prompt proof step; absent for unscored steps and until one is recorded.
        * @property {string|null} id
-       * @property {string} kind - "command" | "prompt" | "brain" | "approval"
+       * @property {string} kind - "command" | "prompt"
        * @property {string} state - "pending" | "running" | "done" | "failed" | "cancelled"
        * @property {number} duration_ms - Completed active duration plus any active interval at response time.
        * @property {number} active_duration_intervals - Active intervals contributing to live duration updates.

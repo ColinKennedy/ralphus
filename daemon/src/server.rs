@@ -8463,8 +8463,6 @@ struct EditBody {
     #[serde(default)]
     command: Option<String>,
     #[serde(default)]
-    brain: Option<String>,
-    #[serde(default)]
     auto_compact_threshold: Option<String>,
     #[serde(default)]
     maximum_context: Option<String>,
@@ -8582,7 +8580,7 @@ fn reject_unsupported_maximum_tool_output_tokens(agent: &str) -> Option<Reply> {
 }
 
 /// Edit a squad's label, a task's name/project/model, a cell's fields, or a
-/// proof step's agent/model/command/prompt/brain (RAL-290).
+/// proof step's agent/model/command/prompt (RAL-290).
 ///
 /// A `squad` edit (the label only) is purely cosmetic -- it isn't tied to any
 /// node in the dependency graph or to the content executed, so it does not
@@ -8846,16 +8844,15 @@ fn edit_squad(daemon: &Daemon, id: &str, body: &str) -> Reply {
                     return reply;
                 }
             }
-            // Keep command/prompt/brain a strict one-of: whichever the
+            // Keep command/prompt a strict one-of: whichever the
             // caller supplies replaces the step's (kind, spec) pair
             // outright -- extends the cell edit's prompt XOR command rule
-            // to three kinds. Precedence (command, then brain, then prompt)
+            // to two kinds. Precedence (command, then prompt)
             // mirrors `insert_proof`'s own kind derivation.
             let body = req
                 .command
                 .as_deref()
                 .map(crate::store::ProofBody::Command)
-                .or_else(|| req.brain.as_deref().map(crate::store::ProofBody::Brain))
                 .or_else(|| req.prompt.as_deref().map(crate::store::ProofBody::Prompt));
             let edit = crate::store::ProofEdit {
                 agent: new_agent,
@@ -25322,7 +25319,7 @@ remediation_attempts=1
     }
 
     #[test]
-    fn edit_proof_command_prompt_brain_stay_one_of_only_when_explicitly_supplied() {
+    fn edit_proof_command_prompt_stay_one_of_only_when_explicitly_supplied() {
         const ONE_CELL: &str = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\".\"\ncommand=\"x\"\nremediation_attempts=1\n\
             [[task.cell.proof]]\ncommand=\"check\"\nremediation_attempts=1\n";
         let d = daemon();
@@ -25339,18 +25336,18 @@ remediation_attempts=1
         assert!(r.body.contains("\"kind\":\"prompt\""), "{}", r.body);
         assert!(r.body.contains("\"spec\":\"check it over\""), "{}", r.body);
 
-        // Supplying `brain` alone switches it again.
+        // Supplying `command` alone switches it again.
         let body = serde_json::json!({
             "kind": "proof", "task_idx": 0, "proof_scope": "cell", "cell_idx": 0,
-            "proof_idx": 0, "brain": "think it over",
+            "proof_idx": 0, "command": "think it over",
         })
         .to_string();
         let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &body);
         assert_eq!(r.status, 200, "{}", r.body);
-        assert!(r.body.contains("\"kind\":\"brain\""), "{}", r.body);
+        assert!(r.body.contains("\"kind\":\"command\""), "{}", r.body);
         assert!(r.body.contains("\"spec\":\"think it over\""), "{}", r.body);
 
-        // Omitting all three leaves the step's kind/spec exactly as they were.
+        // Omitting both leaves the step's kind/spec exactly as they were.
         let body = serde_json::json!({
             "kind": "proof", "task_idx": 0, "proof_scope": "cell", "cell_idx": 0,
             "proof_idx": 0, "model": "gpt-5",
@@ -25358,7 +25355,7 @@ remediation_attempts=1
         .to_string();
         let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &body);
         assert_eq!(r.status, 200, "{}", r.body);
-        assert!(r.body.contains("\"kind\":\"brain\""), "{}", r.body);
+        assert!(r.body.contains("\"kind\":\"command\""), "{}", r.body);
         assert!(r.body.contains("\"spec\":\"think it over\""), "{}", r.body);
     }
 

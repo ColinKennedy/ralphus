@@ -354,7 +354,6 @@ const PROOF_KEYS: &[&str] = &[
     "command",
     "mode",
     "remediation_attempts",
-    "brain",
     "prompt",
     "pass_score",
     "agent",
@@ -365,7 +364,6 @@ const PROOF_KEYS: &[&str] = &[
     "budget_tokens",
     "timeout_minutes",
     "maximum_timeout_seconds",
-    "requires_approval",
     "restart_on",
     "environment",
     "extends",
@@ -468,7 +466,7 @@ fn check_positive_number(
 
 /// Validates a proof step's `pass_score`: an integer in
 /// [`crate::schema::PASS_SCORE_MIN`]..=[`crate::schema::PASS_SCORE_MAX`], and
-/// only on a `prompt` proof (a `command` or `brain` step has no appraisal to
+/// only on a `prompt` proof (a `command` step has no appraisal to
 /// score).
 fn check_pass_score(ctx: &mut Ctx, table: &toml::Table, path: &str, header: Option<u32>) {
     check_type(ctx, table, "pass_score", Ty::Int, path, header);
@@ -490,7 +488,7 @@ fn check_pass_score(ctx: &mut Ctx, table: &toml::Table, path: &str, header: Opti
             line,
         );
     }
-    if table.contains_key("command") || table.contains_key("brain") {
+    if table.contains_key("command") {
         ctx.error(
             &format!("{path}.pass_score"),
             ErrorKind::InvalidValue,
@@ -3336,7 +3334,7 @@ fn validate_proof_array(
             .collect();
         check_environment(ctx, &proof_chain, &vpath, None);
 
-        let kinds = ["command", "brain", "prompt"];
+        let kinds = ["command", "prompt"];
         let set: Vec<&str> = kinds
             .iter()
             .copied()
@@ -3348,7 +3346,7 @@ fn validate_proof_array(
             0 => ctx.error(
                 &vpath,
                 ErrorKind::MissingRequired,
-                "proof step requires exactly one of: command, brain, prompt",
+                "proof step requires exactly one of: command, prompt",
                 None,
             ),
             1 => {}
@@ -3365,7 +3363,6 @@ fn validate_proof_array(
         check_command_mode(ctx, table, table.contains_key("command"), &vpath, None);
         check_pass_score(ctx, table, &vpath, None);
 
-        check_type(ctx, table, "requires_approval", Ty::Bool, &vpath, None);
         check_type(ctx, table, "budget_tokens", Ty::Int, &vpath, None);
         check_type(ctx, table, "timeout_minutes", Ty::Int, &vpath, None);
         // RAL-308: see the matching comment in `validate_tasks` -- the
@@ -4527,7 +4524,7 @@ auto_run=false
                 .any(|e| e.kind == ErrorKind::MissingRequired && e.message.contains("exactly one"))
         );
 
-        let many = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.cell.proof]]\ncommand=\"c\"\nbrain=\"b\"\n";
+        let many = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.cell.proof]]\ncommand=\"c\"\nprompt=\"b\"\n";
         assert!(
             validate_toml(many)
                 .errors
@@ -6476,20 +6473,16 @@ placement = "copy"
     }
 
     #[test]
-    fn pass_score_on_command_or_brain_proof_is_rejected() {
-        for body in [
-            "command=\"true\"\npass_score=5",
-            "brain=\"look\"\npass_score=5",
-        ] {
-            let r = validate_toml(&pass_score_src(body));
-            assert!(
-                r.errors
-                    .iter()
-                    .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("pass_score")),
-                "{body}: {:?}",
-                r.errors
-            );
-        }
+    fn pass_score_on_command_proof_is_rejected() {
+        let body = "command=\"true\"\npass_score=5";
+        let r = validate_toml(&pass_score_src(body));
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("pass_score")),
+            "{body}: {:?}",
+            r.errors
+        );
     }
 
     #[test]

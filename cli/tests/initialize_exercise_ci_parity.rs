@@ -29,7 +29,6 @@ const LLM_MARKERS: &[&str] = &[
     "openai",
     "\"prompt\"",
     "prompt =",
-    "brain",
 ];
 
 fn cli_dir() -> PathBuf {

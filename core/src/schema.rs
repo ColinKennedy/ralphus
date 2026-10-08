@@ -1938,7 +1938,7 @@ pub struct WaypointDef {
     pub affected: Vec<String>,
 }
 
-/// One proof step. Exactly one of `command` / `brain` / `prompt` must be set.
+/// One proof step. Exactly one of `command` / `prompt` must be set.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProofStep {
     /// Proof step ID (for `restart_on` / proof-level dependencies).
@@ -1964,9 +1964,6 @@ pub struct ProofStep {
     /// `budget_tokens`/`timeout_minutes` rather than a separate budget.
     #[serde(default)]
     pub remediation_attempts: Option<u32>,
-    /// Prompt routed to the local brain (deferred in ralphus MVP).
-    #[serde(default)]
-    pub brain: Option<String>,
     /// Headless AI proof-step prompt. Runs using this step's own `agent`
     /// override when set, falling back to the owning cell's/task's resolved
     /// backend program otherwise, with this step's own `model` as a further
@@ -2023,9 +2020,6 @@ pub struct ProofStep {
     /// alone (it is still bound by its owning cell's and task's caps).
     #[serde(default)]
     pub maximum_timeout_seconds: Option<u64>,
-    /// Whether the step needs human approval.
-    #[serde(default)]
-    pub requires_approval: bool,
     /// Other proof steps that, when they fire, re-run this cell's proof
     /// cursor from the start. Grammar: `task/cell/proof?on=pass|fail|both`,
     /// with wildcards `task/*` and `task/cell/*`.

@@ -1,9 +1,7 @@
 //! Proof-step execution.
 //!
 //! `command` proof steps (fmt/lint/test) run as shell commands — exit code
-//! is the verdict. `agent` provers need a model; `brain` and `approval`
-//! provers are deferred (left pending) until their respective backends
-//! land.
+//! is the verdict. `prompt` proof steps run an agent and read its verdict.
 //!
 //! This module's direct, un-wrapped subprocess execution is used by Guardian
 //! review check gates (`daemon/src/guardian_merge.rs`), which have no live
