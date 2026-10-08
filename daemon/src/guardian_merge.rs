@@ -9332,7 +9332,28 @@ pub fn review_maintenance(
             store,
         ))) as Arc<dyn Runner>
     });
-    review_maintenance_with(store, sem, cancellations, &runners);
+    review_maintenance_staggered(
+        store,
+        sem,
+        cancellations,
+        &runners,
+        crate::scheduler::REVIEW_MAINT_INTERVAL / 2,
+    );
+}
+
+/// The window [`review_maintenance`] spreads its per-review workers across.
+/// Each review starts at a stable offset inside it, derived from its id, so
+/// several reviews' git and forge traffic (one fetch per open PR each) no
+/// longer lands in the same instant every tick.
+fn maintenance_offset(id: &str, spread: std::time::Duration) -> std::time::Duration {
+    use std::hash::{Hash as _, Hasher as _};
+    let spread_ms = u64::try_from(spread.as_millis()).unwrap_or(u64::MAX);
+    if spread_ms == 0 {
+        return std::time::Duration::ZERO;
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    id.hash(&mut hasher);
+    std::time::Duration::from_millis(hasher.finish() % spread_ms)
 }
 
 /// Builds the [`Runner`] each [`review_maintenance_with`] worker uses for
@@ -9348,6 +9369,24 @@ pub fn review_maintenance_with(
     sem: &Arc<Semaphore>,
     cancellations: &Cancellations,
     runners: &RunnerFactory,
+) {
+    review_maintenance_staggered(
+        store,
+        sem,
+        cancellations,
+        runners,
+        std::time::Duration::ZERO,
+    );
+}
+
+/// [`review_maintenance_with`], starting each review's worker after its
+/// [`maintenance_offset`] within `spread`.
+fn review_maintenance_staggered(
+    store: &crate::store_lock::StoreHandle,
+    sem: &Arc<Semaphore>,
+    cancellations: &Cancellations,
+    runners: &RunnerFactory,
+    spread: std::time::Duration,
 ) {
     // RAL-520: a post-merge phase only stays `running` past its natural end
     // when the daemon died mid-run (the worker records its own outcome), so
@@ -9451,10 +9490,12 @@ pub fn review_maintenance_with(
         let sem = Arc::clone(sem);
         let cancellations = cancellations.clone();
         let runners = Arc::clone(runners);
+        let offset = maintenance_offset(&id, spread);
         std::thread::spawn(move || {
             // Released when this worker exits, including via the early return
             // on the PR-commit-sync error path below.
             let _claim = claim;
+            std::thread::sleep(offset);
             let runner = runners(&store);
             // RAL-213: one token covers both the base-shift rebuild and (if
             // that didn't run) the manual-push restack below -- either may
@@ -16979,6 +17020,25 @@ mod tests {
         assert!(
             filter_by_idle_cadence(&pairs).is_empty(),
             "a merge_failed guardian must not pass through twice inside the idle interval"
+        );
+    }
+
+    #[test]
+    fn maintenance_offsets_are_stable_bounded_and_spread_across_reviews() {
+        let spread = std::time::Duration::from_millis(2500);
+        let offsets: Vec<_> = (0..20)
+            .map(|i| maintenance_offset(&format!("guardian-{i:012}"), spread))
+            .collect();
+        assert!(offsets.iter().all(|o| *o < spread));
+        assert_eq!(
+            maintenance_offset("guardian-000000000001", spread),
+            maintenance_offset("guardian-000000000001", spread),
+        );
+        let distinct: HashSet<_> = offsets.iter().collect();
+        assert!(distinct.len() > 10, "offsets should differ between reviews");
+        assert_eq!(
+            maintenance_offset("guardian-1", std::time::Duration::ZERO),
+            std::time::Duration::ZERO
         );
     }
 
