@@ -8856,3 +8856,147 @@ fn submission_right_after_a_forge_merge_does_not_refile_merged_work() {
 fn submission_right_after_a_forge_merge_does_not_refile_merged_work_on_gitlab() {
     submission_right_after_a_forge_merge_does_not_refile_merged_work_on("gitlab");
 }
+
+// ---------------------------------------------------------------------------
+// Live-matrix parity: commits made by hand in a review worktree (the live
+// matrix's A inputs), alone and racing feedback and reviewer pushes.
+// ---------------------------------------------------------------------------
+
+impl Fixture {
+    /// A reviewer commits `line` to `file` by hand in branch `position`'s
+    /// review worktree. With `push`, they also push it to the branch's PR
+    /// branch themselves (`git push origin HEAD:<alias>`).
+    fn worktree_commit(&self, position: usize, file: &str, line: &str, push: bool) {
+        let worktree = PathBuf::from(
+            self.store.lock().get_guardian(&self.id).unwrap().branches[position]
+                .worktree
+                .clone()
+                .expect("the branch's review worktree"),
+        );
+        append_line(&worktree, file, line);
+        git(&worktree, &["add", "--all"]);
+        git(
+            &worktree,
+            &["commit", "-q", "-m", &format!("by hand: {line}")],
+        );
+        if push {
+            let alias = self.pr_ref(position);
+            git(
+                &worktree,
+                &["push", "-q", "origin", &format!("HEAD:{alias}")],
+            );
+        }
+    }
+}
+
+/// A0: an unpushed commit made by hand in a review worktree is restacked onto
+/// the branches above and published to every PR from there up.
+#[test]
+fn a_by_hand_commit_in_a_review_worktree_reaches_the_prs_above() {
+    let what = "A0";
+    let fx = Fixture::with_upstream(&["feature/a", "feature/b", "feature/c"]);
+    fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    fx.wait_settled_on(first.trim(), "before the commit");
+    fx.worktree_commit(0, "by-hand.txt", "by hand on a", false);
+    std::thread::sleep(PARK_WAIT * 3);
+    fx.wait_settled_on(first.trim(), what);
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_everything_published(what, &[(0, "by-hand.txt", "by hand on a")], &[]);
+}
+
+/// A1P: the same commit, pushed to the PR branch by the reviewer themselves.
+#[test]
+fn a_by_hand_commit_pushed_to_the_pr_branch_is_kept_and_restacked() {
+    let what = "A1P";
+    let fx = Fixture::with_upstream(&["feature/a", "feature/b", "feature/c"]);
+    fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    fx.wait_settled_on(first.trim(), "before the commit");
+    fx.worktree_commit(1, "by-hand.txt", "by hand on b", true);
+    std::thread::sleep(PARK_WAIT * 3);
+    fx.wait_settled_on(first.trim(), what);
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_everything_published(what, &[(1, "by-hand.txt", "by hand on b")], &[]);
+}
+
+/// AC: a by-hand commit on one branch races a held feedback round on another.
+#[test]
+fn a_by_hand_commit_racing_feedback_on_the_branch_above_keeps_both() {
+    let what = "AC";
+    let fx = Fixture::with_upstream(&["feature/a", "feature/b", "feature/c"]);
+    fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    fx.wait_settled_on(first.trim(), "before the race");
+    let mut held = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    fx.worktree_commit(0, "by-hand.txt", "by hand on a", false);
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+    std::thread::sleep(PARK_WAIT * 3);
+    fx.wait_settled_on(first.trim(), what);
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_everything_published(
+        what,
+        &[
+            (0, "by-hand.txt", "by hand on a"),
+            (1, "feature-b.txt", "feedback on b"),
+        ],
+        &[],
+    );
+}
+
+/// AB0: a by-hand commit and a reviewer's push on the *same* branch, so the PR
+/// branch and the review branch diverge: both commits must end up on both.
+#[test]
+fn a_by_hand_commit_and_a_reviewer_push_to_the_same_branch_both_survive() {
+    let what = "AB0";
+    let fx = Fixture::with_upstream(&["feature/a", "feature/b", "feature/c"]);
+    fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start_resolving(&fx, &unexpected);
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    fx.wait_settled_on(first.trim(), "before the race");
+    fx.worktree_commit(0, "by-hand.txt", "by hand on a", false);
+    fx.push_to_pr(0, "reviewer-a.txt");
+    std::thread::sleep(PARK_WAIT * 3);
+    fx.wait_settled_on(first.trim(), what);
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_everything_published(
+        what,
+        &[
+            (0, "by-hand.txt", "by hand on a"),
+            (0, "reviewer-a.txt", "reviewer"),
+        ],
+        &[],
+    );
+}

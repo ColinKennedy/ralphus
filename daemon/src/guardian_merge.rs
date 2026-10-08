@@ -4218,10 +4218,11 @@ pub(crate) fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
             // enabled-branch set actually changed since the last one (a plain
             // re-stack never does), and debounced when it did.
             queue_final_summary_regen(store, id);
-            // RAL-92: re-baseline every branch's review-branch tip now that the
-            // stack has settled, so the restacked downstream branches are not
-            // mistaken for a manual push on the next maintenance sweep.
-            snapshot_review_heads(store, id);
+            // RAL-92: re-baseline the restacked branches' review-branch tips now
+            // that the stack has settled, so they are not mistaken for a manual
+            // push on the next maintenance sweep. Branches below
+            // `from_position` were not written here and keep their baseline.
+            snapshot_review_heads_from(store, id, from_position);
             set_status(GuardianStatus::InReview, None);
             // The check gates and manual-checks generation are post-merge work
             // against the settled stack: hand them to the independent worker
@@ -8679,7 +8680,7 @@ fn run_feedback_pass(
         // never dirtied the worktree at all falls through to the restack
         // below unchanged, same as before this function existed -- that
         // restack is a harmless no-op when this branch truly didn't change.)
-        snapshot_review_heads(store, id);
+        snapshot_review_heads_from(store, id, position);
         set_status(GuardianStatus::InReview, None);
         return outcome;
     }
@@ -8918,7 +8919,7 @@ fn run_feedback_pass(
         // rather than `InReview`; the still-pending branch's eventual
         // `run_merge_staged` pass resumes from `prev_ref` (this branch's
         // updated tip) via `staged_resume_point`.
-        snapshot_review_heads(store, id);
+        snapshot_review_heads_from(store, id, restack_position);
         set_status(
             GuardianStatus::Collecting,
             Some("waiting for a still-collecting downstream branch"),
@@ -8934,8 +8935,10 @@ fn run_feedback_pass(
             queue_final_summary_regen(store, id);
             // RAL-92: re-baseline after applying feedback so the new tips (the
             // edited branch and its restacked downstream) are the reference for
-            // future manual-push detection.
-            snapshot_review_heads(store, id);
+            // future manual-push detection. Branches below the restack's start
+            // were not written by it, so a by-hand commit made on one of them
+            // while this round ran is still seen as a manual push next sweep.
+            snapshot_review_heads_from(store, id, restack_position);
             set_status(GuardianStatus::InReview, None);
             // The check gates and manual-checks generation are post-merge work
             // against the settled stack: hand them to the independent worker
@@ -9698,11 +9701,30 @@ fn current_review_heads(
 /// *reviewer's* subsequent move of a review-branch ref reads as a manual push —
 /// never the daemon's own write.
 fn snapshot_review_heads(store: &crate::store_lock::StoreHandle, id: &str) {
+    snapshot_review_heads_from(store, id, 0);
+}
+
+/// [`snapshot_review_heads`] for the branches at `from_position` and above only.
+///
+/// A restack that starts at `from_position` writes nothing below it, so it must
+/// not vouch for those branches' tips: a reviewer's commit made by hand on a
+/// lower branch while the restack (or the feedback round that queued it) was in
+/// flight is not the daemon's own write. Re-baselining it would make the next
+/// idle sweep read it as already accounted for, and the branches above it would
+/// never be rebuilt onto it.
+fn snapshot_review_heads_from(
+    store: &crate::store_lock::StoreHandle,
+    id: &str,
+    from_position: i64,
+) {
     let guardian = match store.lock().get_guardian(id) {
         Ok(g) => g,
         Err(_) => return,
     };
-    for (_position, branch_id, sha) in current_review_heads(store, &guardian) {
+    for (position, branch_id, sha) in current_review_heads(store, &guardian) {
+        if position < from_position {
+            continue;
+        }
         let guard = store.lock();
         let _ = guard.set_branch_review_head(id, &branch_id, &sha);
     }
