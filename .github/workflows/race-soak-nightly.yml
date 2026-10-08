@@ -1,0 +1,49 @@
+name: Race soak (nightly)
+
+# The review-input race tests (daemon/tests/review_input_races.rs) pin specific
+# interleavings. This job runs the randomly seeded, time-boxed soak instead:
+# it picks a fresh seed each night, runs seeded rounds of concurrent writers
+# (feedback, PR fixes, reviewer pushes, upstream moves) for the time box, and
+# prints `RACE SOAK SEED: <n>` up front. A failure is replayed locally with
+# `RALPHUS_RACE_SEED=<n> RALPHUS_RACE_NIGHTLY=1 cargo nextest run -p
+# ralphus-daemon --test review_input_races --run-ignored only -E
+# 'test(soak_randomly_seeded_time_boxed)'`.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "Soak time box in seconds"
+        required: false
+        default: "3000"
+      seed:
+        description: "Replay this seed (leave empty for a fresh one)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  race-soak:
+    name: Randomly seeded race soak
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+      - name: Run the seeded soak
+        env:
+          RALPHUS_RACE_NIGHTLY: "1"
+          RALPHUS_RACE_SOAK_SECONDS: ${{ inputs.seconds || '3000' }}
+          RALPHUS_RACE_SEED: ${{ inputs.seed }}
+        run: >
+          cargo nextest run -p ralphus-daemon --test review_input_races
+          --run-ignored only --no-capture
+          -E 'test(soak_randomly_seeded_time_boxed)'

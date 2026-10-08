@@ -6674,11 +6674,15 @@ pub(crate) fn refresh_dual_root_upstream_branch(
         return;
     };
     let user = owner.unwrap_or("");
-    let Some(fork) = store
-        .lock()
-        .resolve_fork(&project_name, user)
-        .ok()
-        .flatten()
+    // The owner's own row, else the project-wide default row (`user=""`) --
+    // the same order `resolve_pr_repo_routing` and `resolve_feedback_fork_remote`
+    // use. Without the fallback a review whose owner has no personal fork row
+    // (but whose project has a default one, which is what filed its PRs on the
+    // fork) never had its transient upstream branch refreshed.
+    let Some(fork) = Some(user)
+        .filter(|u| !u.is_empty())
+        .and_then(|u| store.lock().resolve_fork(&project_name, u).ok().flatten())
+        .or_else(|| store.lock().resolve_fork(&project_name, "").ok().flatten())
     else {
         return;
     };

@@ -479,7 +479,7 @@ jobs:
   # them. `#[ignore]`d in the default suite -- see
   # daemon/tests/review_input_races.rs (`soak_*`).
   review-race-soak:
-    name: Review-input race soak (8 branches)
+    name: Review-input race soak
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
