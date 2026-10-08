@@ -2978,9 +2978,11 @@ cell counts, and the merge-time offer snapshot uses the same rule. `200` with
 yet), `off` (follow-up is switched off for the review), `offered` (the offer
 row exists, so the list is final), `count` (not ignored), `total`, and `items`
 (`prophecy_id`, `entity_uri` of the originating cell, `body`, `prompt`,
-`agent`, `model`, `attempt`, `ignored`, `created_at_ms`). `GET
+`agent`, `model`, `attempt`, `ignored`, `created_at_ms`, plus `branch` (the
+review branch of the originating cell) and `task_name`, both `null` once the
+cell is gone). `GET
 /api/guardians/{id}` carries the same counts, minus `items`, as
-`pending_followups`, which is what the board's **Deferred follow-ups** button
+`pending_followups`, which is what the board's **Follow-ups** menu item
 shows.
 
 ### `POST /api/guardians/{id}/followup/ignore`

@@ -72,6 +72,15 @@ pub struct FollowupItem {
     pub model: Option<String>,
 }
 
+/// What the cell that wrote a deferral was running, as far as it still exists.
+struct CellContext {
+    prompt: Option<String>,
+    agent: String,
+    model: Option<String>,
+    branch: Option<String>,
+    task_name: String,
+}
+
 /// One row of `followup_offers`.
 #[derive(Debug, Clone, Serialize)]
 pub struct FollowupOfferView {
@@ -119,6 +128,11 @@ pub struct PendingFollowupItem {
     /// Whether the user ignored it; ignored items are left out of the offer.
     pub ignored: bool,
     pub created_at_ms: i64,
+    /// The review branch the writing cell belongs to, so the board can name
+    /// where a follow-up came from rather than showing the cell's URI.
+    pub branch: Option<String>,
+    /// The name of the task the writing cell belongs to.
+    pub task_name: Option<String>,
 }
 
 /// A review's pending follow-ups: what the board's button shows.
@@ -198,12 +212,9 @@ impl Store {
         Ok(depth.unwrap_or(0))
     }
 
-    /// The prompt, agent and model of the cell named by a prophecy's
-    /// `entity_uri`, when that cell still exists.
-    fn cell_context_for_uri(
-        &self,
-        entity_uri: &str,
-    ) -> Option<(Option<String>, String, Option<String>)> {
+    /// The prompt, agent, model, review branch and task name of the cell
+    /// named by a prophecy's `entity_uri`, when that cell still exists.
+    fn cell_context_for_uri(&self, entity_uri: &str) -> Option<CellContext> {
         let crate::entity_uri::EntityUri::Cell {
             squad_id,
             task_idx,
@@ -217,7 +228,24 @@ impl Store {
             .ok()?
             .into_iter()
             .find(|c| c.task_idx == task_idx && c.idx == cell_idx)?;
-        Some((cell.prompt, cell.agent, cell.model))
+        let branch = self
+            .conn
+            .query_row(
+                "SELECT review_branch FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
+                params![squad_id, task_idx, cell_idx],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .flatten();
+        Some(CellContext {
+            prompt: cell.prompt,
+            agent: cell.agent,
+            model: cell.model,
+            branch,
+            task_name: cell.task_name,
+        })
     }
 
     /// The `deferred` prophecies `guardian_id`'s review would offer: for each
@@ -244,14 +272,16 @@ impl Store {
                     ignored: ignored.contains(&p.id),
                     attempt: p.attempt,
                     created_at_ms: p.created_at_ms,
+                    branch: context.as_ref().and_then(|c| c.branch.clone()),
+                    task_name: context.as_ref().map(|c| c.task_name.clone()),
                     item: FollowupItem {
                         prophecy_id: p.id,
                         prompt: context
                             .as_ref()
-                            .and_then(|(prompt, _, _)| prompt.as_deref())
+                            .and_then(|c| c.prompt.as_deref())
                             .map(|prompt| truncate_chars(prompt, MAX_PROMPT_CHARS)),
-                        agent: context.as_ref().map(|(_, agent, _)| agent.clone()),
-                        model: context.and_then(|(_, _, model)| model),
+                        agent: context.as_ref().map(|c| c.agent.clone()),
+                        model: context.as_ref().and_then(|c| c.model.clone()),
                         entity_uri: p.entity_uri,
                         body: p.body,
                     },
@@ -1206,6 +1236,46 @@ mod tests {
             offered,
             vec!["new a", "only b"],
             "snapshot uses the same rule"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_pending_item_names_the_branch_and_task_of_its_cell() {
+        let mut s = store();
+        let root = temp_root("branch");
+        seed_guardian(&s, "g1", &root);
+        let file: ralphus_core::schema::TaskFile = toml::from_str(
+            r#"
+[[task]]
+name = "Add feature"
+[[task.cell]]
+cwd = "/repo"
+prompt = "add feature.txt"
+"#,
+        )
+        .expect("valid toml");
+        let squad_id = s.insert_squad(&file, None, false).unwrap();
+        s.set_cell_review_branch(&squad_id, 0, 0, "feat/readme")
+            .unwrap();
+        let owner = format!("cell:{squad_id}:0:0");
+        defer_as(&s, "g1", &owner, 0, "document it");
+        defer_as(&s, "g1", "guardian:gone", 0, "orphan");
+
+        let items = s.pending_followup_items("g1").unwrap();
+        let with_cell = items
+            .iter()
+            .find(|i| i.item.body == "document it")
+            .expect("the cell-owned deferral");
+        assert_eq!(with_cell.branch.as_deref(), Some("feat/readme"));
+        assert_eq!(with_cell.task_name.as_deref(), Some("Add feature"));
+        let orphan = items
+            .iter()
+            .find(|i| i.item.body == "orphan")
+            .expect("the guardian-owned deferral");
+        assert_eq!(
+            (orphan.branch.as_deref(), orphan.task_name.as_deref()),
+            (None, None)
         );
         let _ = std::fs::remove_dir_all(&root);
     }

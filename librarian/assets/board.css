@@ -681,6 +681,25 @@
       .modal-bg { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: flex; align-items: center; justify-content: center; z-index: 50; }
       .modal { position: relative; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; width: 560px; max-width: 92vw; padding: 18px; }
       .modal h2 { margin: 0 0 12px; font-size: 16px; }
+      /* Follow-ups modal (RAL-582): one card per deferred note. */
+      .fu-modal { width: 640px; max-width: 94vw; }
+      .fu-intro { margin: 0 0 14px; color: var(--muted); font-size: 13px; line-height: 1.5; }
+      .fu-list { display: flex; flex-direction: column; gap: 10px; max-height: 60vh; overflow-y: auto; padding-right: 2px; }
+      .fu-card { background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
+      .fu-card.ignored { opacity: .65; }
+      .fu-card.ignored .fu-title { text-decoration: line-through; color: var(--muted); }
+      .fu-head { display: flex; align-items: flex-start; gap: 12px; }
+      .fu-title { flex: 1; font-weight: 600; line-height: 1.4; overflow-wrap: anywhere; }
+      .fu-meta { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+      .fu-chip { background: var(--panel); border: 1px solid var(--border-soft); color: var(--muted); border-radius: 6px; padding: 1px 8px; font-size: 12px; max-width: 100%; overflow-wrap: anywhere; }
+      .fu-toggle { flex: none; border-radius: 20px; padding: 2px 11px; font-size: 12px; border: 1px solid var(--done-b); background: var(--done-a); color: var(--done); }
+      .fu-toggle.off { border-color: var(--amber-b); background: var(--amber-a); color: var(--ignored); }
+      .fu-toggle.static { cursor: default; }
+      .fu-context { margin-top: 10px; font-size: 12.5px; }
+      .fu-context summary { cursor: pointer; color: var(--muted); }
+      .fu-prompt { margin-top: 6px; padding: 8px 10px; background: var(--bg); border: 1px solid var(--border-soft); border-radius: 8px; color: var(--muted); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 180px; overflow-y: auto; }
+      .fu-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 14px; }
+      .fu-count { color: var(--muted); font-size: 12.5px; }
       /* RAL-472: text/log popups' copy-to-clipboard button, pinned to the upper-right corner. */
       .modal .corner { position: absolute; top: 14px; right: 14px; }
       .modal textarea { width: 100%; height: 200px; background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: 8px; padding: 10px; font-family: ui-monospace, monospace; }

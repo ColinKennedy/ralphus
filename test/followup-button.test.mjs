@@ -1,5 +1,5 @@
-// Coverage for RAL-582's "Deferred follow-ups" button and list on a review:
-// the button's disabled / "follow-ups off" / badge states, and that the
+// Coverage for RAL-582's "Follow-ups" menu item and list on a review:
+// the item's disabled / "off" / badge states, the list's cards, and that the
 // ignore and un-ignore actions post the prophecy id to the daemon and refresh
 // the review's summary from the answer.
 
@@ -24,63 +24,86 @@ function functionSource(name) {
 
 const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
-const button = new Function("esc", `${functionSource("followupButtonHtml")}; return followupButtonHtml;`)(esc);
-const list = new Function("esc", `${functionSource("followupListHtml")}; return followupListHtml;`)(esc);
+const menuItem = new Function("esc", `${functionSource("followupMenuItem")}; return followupMenuItem;`)(esc);
+const list = new Function(
+  "esc",
+  `${functionSource("followupCardHtml")}; ${functionSource("followupListHtml")}; return followupListHtml;`,
+)(esc);
 
 const summary = (o) => ({ enabled: true, off: false, offered: false, count: 0, total: 0, ...o });
 
-test("the button is absent until the review detail carries a summary", () => {
-  assert.equal(button({ id: "g1" }), "");
+test("the menu item is absent until the review detail carries a summary", () => {
+  assert.equal(menuItem({ id: "g1" }), "");
 });
 
-test("the button is disabled when there are no deferred follow-ups", () => {
-  const html = button({ id: "g1", pending_followups: summary({}) });
-  assert.match(html, /<button[^>]* disabled /);
+test("the menu item is disabled when there are no deferred follow-ups", () => {
+  const html = menuItem({ id: "g1", pending_followups: summary({}) });
+  assert.match(html, /class="ctx-disabled"/);
+  assert.doesNotMatch(html, /data-click/);
   assert.match(html, /data-tip="[^"]+"/);
 });
 
-test("the button shows the pending count as a badge and opens the list", () => {
-  const html = button({ id: "g1", pending_followups: summary({ count: 3, total: 4 }) });
-  assert.doesNotMatch(html, / disabled /);
+test("the menu item shows the pending count as a badge and opens the list", () => {
+  const html = menuItem({ id: "g1", pending_followups: summary({ count: 3, total: 4 }) });
+  assert.doesNotMatch(html, /ctx-disabled/);
   assert.match(html, /<span class="badge">3<\/span>/);
   assert.match(html, /data-click="openFollowupList" data-guardian-id="g1"/);
 });
 
-test("the button stays enabled when every note is ignored so they can be un-ignored", () => {
-  const html = button({ id: "g1", pending_followups: summary({ count: 0, total: 2 }) });
-  assert.doesNotMatch(html, / disabled /);
+test("the menu item stays enabled when every note is ignored so they can be un-ignored", () => {
+  const html = menuItem({ id: "g1", pending_followups: summary({ count: 0, total: 2 }) });
+  assert.doesNotMatch(html, /ctx-disabled/);
   assert.match(html, /<span class="badge">0<\/span>/);
 });
 
-test("the button reads follow-ups off when the review has follow-ups disabled", () => {
-  const html = button({ id: "g1", pending_followups: summary({ enabled: false, off: true, count: 2, total: 2 }) });
-  assert.match(html, /follow-ups off/);
-  assert.match(html, / disabled /);
+test("the menu item reads off when the review has follow-ups disabled", () => {
+  const html = menuItem({ id: "g1", pending_followups: summary({ enabled: false, off: true, count: 2, total: 2 }) });
+  assert.match(html, /Follow-ups <span class="hint">off<\/span>/);
+  assert.match(html, /ctx-disabled/);
   assert.doesNotMatch(html, /openFollowupList/);
 });
 
-test("the list offers Ignore on live items and Un-ignore on ignored ones", () => {
+test("the list says what happens at merge and toggles keep/ignore per follow-up", () => {
   const data = {
     ...summary({ count: 1, total: 2 }),
     items: [
-      { prophecy_id: 7, entity_uri: "cell:squad-1/0/0", body: "tidy <b>docs</b>", prompt: "do it", ignored: false },
-      { prophecy_id: 8, entity_uri: "cell:squad-1/0/1", body: "later", prompt: null, ignored: true },
+      { prophecy_id: 7, entity_uri: "cell:squad-1:0:0", body: "tidy <b>docs</b>", prompt: "do it", ignored: false, branch: "feat/readme", task_name: "Add feature", agent: "claude-code", model: "sonnet" },
+      { prophecy_id: 8, entity_uri: "cell:squad-1:0:1", body: "later", prompt: null, ignored: true },
     ],
   };
   const html = list("g1", data);
+  assert.match(html, /When this review merges, each follow-up below becomes a new task/);
   assert.match(html, /data-click="ignoreFollowup" data-guardian-id="g1" data-prophecy-id="7"/);
   assert.match(html, /data-click="unignoreFollowup" data-guardian-id="g1" data-prophecy-id="8"/);
   assert.match(html, /tidy &lt;b&gt;docs&lt;\/b&gt;/);
-  assert.match(html, /cell:squad-1\/0\/0/);
   assert.match(html, /do it/);
+});
+
+test("a card names its branch and task rather than showing the cell URI", () => {
+  const data = {
+    ...summary({ count: 2, total: 2 }),
+    items: [
+      { prophecy_id: 7, entity_uri: "cell:squad-1:0:0", body: "a", ignored: false, branch: "feat/readme", task_name: "Add feature", agent: "claude-code", model: "sonnet" },
+      { prophecy_id: 8, entity_uri: "cell:squad-1:0:1", body: "b", ignored: false, branch: null, task_name: null },
+    ],
+  };
+  const html = list("g1", data);
+  assert.match(html, />⎇ feat\/readme</);
+  assert.match(html, />Add feature</);
+  assert.match(html, />claude-code · sonnet</);
+  assert.match(html, />branch unknown</);
+  // The URI is only a tooltip, never visible card text.
+  assert.doesNotMatch(html, />cell:squad-1/);
 });
 
 test("the list has no actions once the offer snapshot is final", () => {
   const data = {
     ...summary({ offered: true, enabled: false, count: 1, total: 1 }),
-    items: [{ prophecy_id: 7, entity_uri: "cell:squad-1/0/0", body: "x", ignored: false }],
+    items: [{ prophecy_id: 7, entity_uri: "cell:squad-1:0:0", body: "x", ignored: false }],
   };
-  assert.doesNotMatch(list("g1", data), /data-click="(un)?ignoreFollowup"/);
+  const html = list("g1", data);
+  assert.doesNotMatch(html, /data-click="(un)?ignoreFollowup"/);
+  assert.match(html, /already merged and made its follow-up offer/);
 });
 
 test("ignoring posts the prophecy id and un-ignoring uses the unignore route", () => {

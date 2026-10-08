@@ -14613,7 +14613,7 @@ fn guardian_get(daemon: &Daemon, id: &str) -> Reply {
             if g.status == "collecting" {
                 daemon.summary_queue_handle().promote(id);
             }
-            // The board's "Deferred follow-ups" button reads this summary off
+            // The board's "Follow-ups" menu item reads this summary off
             // the review view, so it refreshes with every review poll.
             let pending = daemon.lock().pending_followups_summary(id).ok();
             let mut value = serde_json::to_value(&g).unwrap_or_default();

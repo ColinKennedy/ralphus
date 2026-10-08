@@ -593,7 +593,7 @@
         const logsItem = `<div data-click="toggleReviewDock" data-guardian-id="${esc(id)}" data-tip="Open the log drawer docked at the bottom of this review.\nIt follows whatever you select — the whole review, one branch, or one command — and stays open while you work instead of covering the page.">☰ Logs</div>`;
         const setupItem = `<div data-click="openEditReviewDetails" data-guardian-id="${esc(id)}" data-tip="Edit this review's settings — name, upstream branch, resolver, proof scope, build/squash options, PR settings.\nEnvironment overrides live on each section's ⋯, next to the commands they govern.\nNothing takes effect until you click Save; Save applies every change in a single request and triggers at most one rebase.">✎ Setup</div>`;
         menu.innerHTML = `<div class="ctx-group">review</div>`
-          + logsItem + setupItem + approveItem + submitItem + syncItem + stopItem
+          + logsItem + setupItem + followupMenuItem(g) + approveItem + submitItem + syncItem + stopItem
           + `<div class="ctx-sep"></div><div class="ctx-group">stack</div>`
           + stacksItem + cancelItem;
         document.body.appendChild(menu);
@@ -1710,46 +1710,72 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           + `<span class="sc-k">${esc(label)}</span><b>${value}</b></button>`;
       }
       /**
-       * The "Deferred follow-ups" button above a review's rows (RAL-582): the
-       * count of pending, not-ignored deferrals as a badge. Disabled with
-       * nothing pending, and reads "follow-ups off" when this review's
-       * follow-up setting is off.
+       * The "Follow-ups" item in a review's ⋯ menu (RAL-582): the count of
+       * pending, not-ignored deferrals as a badge. Disabled with nothing
+       * deferred, and reads "off" when this review's follow-up setting is off.
        * @param {GuardianView} g - The review.
        * @returns {string}
        */
-      function followupButtonHtml(g) {
+      function followupMenuItem(g) {
         const p = g.pending_followups;
         if (!p) return "";
-        const gid = esc(g.id);
         if (p.off) {
-          return `<button class="btn setup-edit" disabled data-tip="Follow-ups are switched off for this review, so its deferred notes will not be offered when it merges.
-Turn them on in this review's setup.">Deferred follow-ups: follow-ups off</button>`;
+          return `<div class="ctx-disabled" data-tip="Follow-ups are switched off for this review, so notes agents deferred will not be offered when it merges.\nTurn them on in this review's setup.">↪ Follow-ups <span class="hint">off</span></div>`;
+        }
+        if (p.total === 0) {
+          return `<div class="ctx-disabled" data-tip="Nothing is pending: no agent deferred any work while building this review.">↪ Follow-ups</div>`;
         }
         const tip = p.offered
           ? "This review already made its follow-up offer at merge; the list is final.\nClick to see what was deferred."
-          : p.count > 0
-            ? "Work agents deferred while this review's cells ran.\nClick to see each note and ignore the ones that should not be offered when the review merges."
-            : "Nothing is pending: no cell deferred any work.";
-        const disabled = p.total === 0;
-        return `<button class="btn setup-edit" ${disabled ? "disabled " : ""}data-click="openFollowupList" data-guardian-id="${gid}" data-tip="${esc(tip)}">`
-          + `Deferred follow-ups <span class="badge">${p.count}</span></button>`;
+          : "Work agents deferred while this review was built.\nWhen the review merges, each one you keep becomes a new task.\nClick to keep or ignore each note.";
+        return `<div data-click="openFollowupList" data-guardian-id="${esc(g.id)}" data-tip="${esc(tip)}">↪ Follow-ups <span class="badge">${p.count}</span></div>`;
       }
       /**
-       * Renders the follow-up list modal body.
+       * One follow-up as a card: the deferred note, where it came from (the
+       * branch and task of the cell that deferred it, not a cell URI), and a
+       * keep/ignore toggle. The originating cell's prompt sits behind a
+       * disclosure so a long list stays scannable.
+       * @param {string} gid - The review id.
+       * @param {PendingFollowupItem} it - The follow-up.
+       * @param {boolean} frozen - Whether the merge-time offer already exists.
+       * @returns {string}
+       */
+      function followupCardHtml(gid, it, frozen) {
+        const branch = it.branch
+          ? `<span class="fu-chip mono" data-tip="The review branch whose work deferred this note.">⎇ ${esc(it.branch)}</span>`
+          : `<span class="fu-chip" data-tip="The cell that deferred this note is gone, so its branch is no longer known.">branch unknown</span>`;
+        const task = it.task_name
+          ? `<span class="fu-chip" data-tip="The task whose agent deferred this note.">${esc(it.task_name)}</span>`
+          : "";
+        const agent = it.agent
+          ? `<span class="fu-chip" data-tip="The agent${it.model ? " and model" : ""} the follow-up task would start on.">${esc(it.agent)}${it.model ? ` · ${esc(it.model)}` : ""}</span>`
+          : "";
+        const state = it.ignored ? "off" : "";
+        const label = it.ignored ? "⊘ Ignored" : "✓ Keeping";
+        const toggle = frozen
+          ? `<span class="fu-toggle ${state} static" data-tip="${it.ignored ? "This note was left out of the offer made when the review merged." : "This note was included in the offer made when the review merged."}">${it.ignored ? "⊘ Ignored" : "✓ Offered"}</span>`
+          : `<button class="fu-toggle ${state}" data-click="${it.ignored ? "unignoreFollowup" : "ignoreFollowup"}" data-guardian-id="${esc(gid)}" data-prophecy-id="${it.prophecy_id}" data-tip="${it.ignored ? "This note is left out of the follow-ups made when the review merges.\nClick to keep it." : "This note becomes a new task when the review merges.\nClick to ignore it instead."}">${label}</button>`;
+        const prompt = it.prompt
+          ? `<details class="fu-context"><summary data-tip="The prompt of the cell that deferred this note.">Show the context it was written in</summary><div class="fu-prompt mono">${esc(it.prompt)}</div></details>`
+          : "";
+        return `<div class="fu-card ${it.ignored ? "ignored" : ""}" data-tip="${esc(`Deferred by ${it.entity_uri}`)}">`
+          + `<div class="fu-head"><div class="fu-title">${esc(it.body)}</div>${toggle}</div>`
+          + `<div class="fu-meta">${branch}${task}${agent}</div>${prompt}</div>`;
+      }
+      /**
+       * Renders the follow-up list modal body: a plain-language intro, then
+       * one card per follow-up.
        * @param {string} gid
        * @param {PendingFollowups} data
        * @returns {string}
        */
       function followupListHtml(gid, data) {
-        const frozen = data.offered;
-        const rows = data.items.map((it) => {
-          const act = frozen ? "" : `<button class="btn" data-click="${it.ignored ? "unignoreFollowup" : "ignoreFollowup"}" data-guardian-id="${esc(gid)}" data-prophecy-id="${it.prophecy_id}" data-tip="${it.ignored ? "Offer this note again when the review merges." : "Leave this note out of the follow-up offer made when the review merges."}">${it.ignored ? "Un-ignore" : "Ignore"}</button>`;
-          const prompt = it.prompt ? `<div class="hint mono" data-tip="The prompt of the cell that deferred this note.">${esc(it.prompt)}</div>` : "";
-          return `<div class="kv-row" style="${it.ignored ? "opacity:0.55" : ""}"><div style="flex:1">`
-            + `<div>${esc(it.body)}</div>`
-            + `<div class="hint mono" data-tip="The cell that deferred this note.">${esc(it.entity_uri)}</div>${prompt}</div>${act}</div>`;
-        }).join("");
-        return rows || `<div class="empty">No deferred follow-ups.</div>`;
+        const intro = data.offered
+          ? "This review has already merged and made its follow-up offer, so this list is final."
+          : "When this review merges, each follow-up below becomes a new task in a follow-up squad. Keep the ones you want built and ignore the rest.";
+        const cards = data.items.map((it) => followupCardHtml(gid, it, data.offered)).join("");
+        return `<p class="fu-intro">${intro}</p>`
+          + (cards ? `<div class="fu-list">${cards}</div>` : `<div class="empty">No deferred follow-ups.</div>`);
       }
       /**
        * Opens the deferred follow-ups list for a review.
@@ -1769,10 +1795,11 @@ Turn them on in this review's setup.">Deferred follow-ups: follow-ups off</butto
        * @returns {void}
        */
       function renderFollowupModal(gid, data) {
-        byId("modal-root").innerHTML = `<div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal" style="width:640px;max-width:94vw">
-          <h2 data-tip="Notes work agents deferred during this review. Ignored notes are left out of the follow-up offer made when the review merges.">Deferred follow-ups</h2>
+        const tally = data.offered ? "" : `<span class="fu-count" data-tip="How many of the notes below will become tasks when this review merges.">${data.count} of ${data.total} will be offered</span>`;
+        byId("modal-root").innerHTML = `<div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal fu-modal">
+          <h2 data-tip="Notes work agents deferred during this review. Ignored notes are left out of the follow-up offer made when the review merges.">Follow-ups</h2>
           ${followupListHtml(gid, data)}
-          <div class="btn-row" style="margin-top:12px;justify-content:flex-end"><button class="btn" onclick="closeModal()" data-tip="Close this list.">Close</button></div>
+          <div class="fu-foot">${tally}<button class="btn" onclick="closeModal()" data-tip="Close this list.">Close</button></div>
         </div></div>`;
       }
       /**
@@ -1849,7 +1876,7 @@ Turn them on in this review's setup.">Deferred follow-ups: follow-ups off</butto
           + `<span class="setup-chip ident hc-anchor" data-card="gCombinedWorktree" data-guardian-id="${esc(g.id)}">`
           + `<span class="sc-k">review branch</span><b>${esc(g.review_branch || "—")}</b></span>`
           + `</div>`
-          + `${followupButtonHtml(g)}</div>`;
+          + `</div>`;
       }
 
       /**
