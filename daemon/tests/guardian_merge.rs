@@ -1490,6 +1490,7 @@ fn auto_fix_dispatch_folds_into_stack_and_restacks_downstream() {
         job_url: None,
         log_text: None,
         checks: vec![],
+        ..Default::default()
     };
     let runner = AutoFixRunner::new();
     let client = test_forge_client();
@@ -1621,6 +1622,7 @@ fn auto_fix_during_collection_folds_into_stack_once_the_straggler_lands() {
         job_url: None,
         log_text: None,
         checks: vec![],
+        ..Default::default()
     };
     let runner = AutoFixRunner::new();
     let client = test_forge_client();
@@ -1739,6 +1741,7 @@ fn auto_fix_dispatch_posts_an_attributed_feedback_message() {
         job_url: None,
         log_text: None,
         checks: vec![],
+        ..Default::default()
     };
     let runner = AutoFixRunner::new();
     let client = test_forge_client();
@@ -1838,6 +1841,7 @@ fn auto_fix_dispatch_appends_discourage_tests_guidance_when_review_override_set(
         job_url: None,
         log_text: None,
         checks: vec![],
+        ..Default::default()
     };
     let runner = AutoFixRunner::new();
     let client = test_forge_client();
@@ -1939,6 +1943,7 @@ fn auto_fix_dispatch_appends_discourage_tests_guidance_from_project_default_when
         job_url: None,
         log_text: None,
         checks: vec![],
+        ..Default::default()
     };
     let runner = AutoFixRunner::new();
     let client = test_forge_client();
@@ -2040,6 +2045,7 @@ fn auto_fix_dispatch_writes_ci_failure_log_into_branch_worktree() {
         job_url: None,
         log_text: Some("line1\nline2\nline3\n".to_string()),
         checks: vec![],
+        ..Default::default()
     };
     let runner = AutoFixRunner::new();
     let client = test_forge_client();
@@ -2145,6 +2151,7 @@ fn auto_fix_dispatch_gives_every_failing_check_its_own_log_file_and_prompt_parag
                 failing_step: None,
             },
         ],
+        ..Default::default()
     };
     let runner = AutoFixRunner::new();
     let client = test_forge_client();
