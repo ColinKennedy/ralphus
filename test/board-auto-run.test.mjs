@@ -48,7 +48,7 @@ test("the project Review Settings modal seeds, renders, and saves auto_run only 
 test("both auto-run controls carry a tooltip", () => {
   for (const name of ["renderReviewEditModal", "renderProjectReviewSettingsModal"]) {
     const render = functionSource(name);
-    const at = render.indexOf("auto-run manual checks after build");
+    const at = render.indexOf("auto-run actions after build");
     assert.notEqual(at, -1, `${name} renders the control`);
     const label = render.lastIndexOf("<label", at);
     assert.match(render.slice(label, at), /data-tip="[^"]+"/, `${name}: the label has a data-tip`);

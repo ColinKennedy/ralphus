@@ -1316,26 +1316,26 @@
       const REVIEW_SECTION_MENUS = {
         summary: { label: "change summary", note: "Written from git log as branches become ready, then replaced by an agent-written summary." },
         branches: { label: "branch stack", note: "The rebase stack, in order. Each branch rebases onto the one above it." },
-        actions: { label: "test actions", note: "Declared by the task author in [[review.action]] blocks." },
-        manual: { label: "manual checks", note: "Written by the resolver agent against this stack's changes. Advisory — they never block approval." },
+        actions: { label: "user actions", note: "Written by you in the task file, as [[review.action]] blocks." },
+        manual: { label: "auto actions", note: "Written by the AI from this stack's changes. Advisory — they never block approval." },
       };
       /**
        * Which env scope each runnable section edits.
        *
-       * `edit` is the writable scope. Test actions use the preparation/build
-       * environment; generated manual checks have their own override layer.
+       * `edit` is the writable scope. User actions use the preparation/build
+       * environment; auto actions have their own override layer.
        * @type {{[kind: string]: {edit: string, label: string, tip: string}}}
        */
       const ENV_SCOPE_FOR_SECTION = {
         manual: {
           edit: "manual_checks",
-          label: "manual checks",
-          tip: "Edit the environment overrides applied when the suggested manual checks run.\nThis scope is the manual-checks step's own — nothing else in the review uses it.",
+          label: "auto actions",
+          tip: "Edit the environment overrides applied when the auto actions run.\nNothing else in the review uses this scope.",
         },
         actions: {
           edit: "build",
-          label: "test actions",
-          tip: "Edit the environment overrides used by preparation and authored test actions.",
+          label: "user actions",
+          tip: "Edit the environment overrides used by preparation and user actions.",
         },
       };
       /**
@@ -1386,7 +1386,7 @@
           items.push(`<div data-click="openSectionEnv" data-guardian-id="${esc(gid)}" data-kind="${esc(kind)}" data-tip="${esc(ENV_SCOPE_FOR_SECTION[kind].tip)}">⚙ Environment overrides…</div>`);
         }
         if (kind === "manual") {
-          items.push(`<div data-click="runAllManualChecks" data-guardian-id="${esc(gid)}" data-tip="Run every suggested manual check, each in the built review worktree.">▶ Run all</div>`);
+          items.push(`<div data-click="runAllManualChecks" data-guardian-id="${esc(gid)}" data-tip="Run every auto action, each in the built review worktree.">▶ Run all</div>`);
           items.push(`<div data-click="regenManualChecks" data-guardian-id="${esc(gid)}" data-tip="Ask the resolver agent to write these checks again against the stack's current changes.\nRuns in the background and never blocks Approve or Merge / rebase.">↻ Regenerate</div>`);
         }
         if (kind === "summary") {

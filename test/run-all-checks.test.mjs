@@ -1,4 +1,4 @@
-// Coverage for the review sections' "Run all": both manual checks and test
+// Coverage for the review sections' "Run all": both auto actions and user
 // actions launch every ready check through the per-row path, so each launched
 // row tracks its own status, duration and output. `runnableCheckIndexes` is
 // sliced from the real board chunks between the RALPHUS-RUN-ALL markers.
@@ -44,14 +44,14 @@ test("nothing runnable yields no indexes", () => {
   assert.deepEqual(runnableCheckIndexes([{ command: "x", preparation_state: "failed" }]), []);
 });
 
-test("manual checks' Run all launches each row through runCheck, not the bulk route", () => {
+test("auto actions' Run all launches each row through runCheck, not the bulk route", () => {
   const body = functionBody("runAllManualChecks");
   assert.match(body, /runnableCheckIndexes\(g\.manual_commands/);
   assert.match(body, /runCheck\("manual", id, i\)/);
   assert.doesNotMatch(body, /guardianAction\(/, "a bulk request marks no row launched, so no row would track its run");
 });
 
-test("test actions' Run all uses the same selection", () => {
+test("user actions' Run all uses the same selection", () => {
   const body = functionBody("runAllActionHints");
   assert.match(body, /runnableCheckIndexes\(g\.action_hints/);
   assert.match(body, /runCheck\("action", id, i\)/);

@@ -1290,7 +1290,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           enabled: true,
           tip: resuming
             ? "Resume the stopped rebase from where it left off — rebuilds the review stack from the first remaining worktree.\nA review left stopped mid-rebase is paused, not cancelled: branches and worktrees are kept.\nThis also gives each open PR one fresh automatic CI-fix attempt."
-            : "Start the Guardian: rebase each branch onto the prior in the stack, resolve conflicts with the AI agent, and prepare manual checks.\nThis also gives each open PR one fresh automatic CI-fix attempt.\nOnly available when status is collecting, in_review, merge_stopped, or merge_failed.",
+            : "Start the Guardian: rebase each branch onto the prior in the stack, resolve conflicts with the AI agent, and prepare actions.\nThis also gives each open PR one fresh automatic CI-fix attempt.\nOnly available when status is collecting, in_review, merge_stopped, or merge_failed.",
         };
       }
 
@@ -1467,7 +1467,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
               + hcRow("upstream", esc(g.base_branch || "—"), "mono")
               + hcRow("branches", `${(g.branches || []).filter((b) => b.enabled !== false).length} enabled of ${(g.branches || []).length}`),
             )
-            + hcNote("The whole stack rebased into one tree — the checkout prepared for manual checks."),
+            + hcNote("The whole stack rebased into one tree — the checkout prepared for actions."),
           foot: `<button class="btn" data-tip="Copy this worktree's absolute path." data-copy="${esc(g.combined_worktree)}" onclick="copyText(event)">Copy path</button>`,
         };
       });
@@ -1575,7 +1575,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         const TIPS = {
           collecting: "Waiting on the task cells that produce this review's branches.",
           merging: "Rebasing the stack. Branches rebase concurrently, so this can be live while other stages are too.",
-          in_review: "The stack is readable and can be approved. Manual-check preparation runs here without blocking it.",
+          in_review: "The stack is readable and can be approved. Action preparation runs here without blocking it.",
           approved: "Approved, whether or not its PR stack has merged.",
           deployed: "Shipped.",
         };
@@ -1826,14 +1826,14 @@ Turn them on in this review's setup.">Deferred follow-ups: follow-ups off</butto
           + setupChip(g.id, "onto", esc(g.base_branch || "—"),
             `Upstream branch. Every branch in this review rebases onto ${g.base_branch || "it"}, each on top of the one before it.\nChanging it rebuilds the whole stack.`)
           + setupChip(g.id, "resolver", esc(resolverOf(g)) + model,
-            "The agent that resolves rebase conflicts, writes the change summary, and generates the suggested manual checks.")
+            "The agent that resolves rebase conflicts, writes the change summary, and generates the auto actions.")
           + setupChip(g.id, "proof", esc(proof),
             `How often the dedicated LLM proof pass runs${g.proof_scope ? "" : " — currently the project default"}.`)
           + setupChip(g.id, "squash", esc(squashText),
             "Whether each task branch collapses to a single commit in the review worktree.\nScope is per git project, so a multi-project review sets it independently.")
           + (g.effective_rebuild_on === undefined ? "" : setupChip(g.id, "rebuild", esc(rebuildOnChipText(g.effective_rebuild_on)),
             `When this review's prepared build is torn down and built again${g.rebuild_on === null || g.rebuild_on === undefined ? " — currently the project default" : ""}.\nA rebuild runs each action's teardown hooks, resets its build root, then re-runs its preparation.`))
-          + `<span class="setup-chip ident" data-tip="Manual-check preparation status. Preparation is advisory and never blocks approval.">`
+          + `<span class="setup-chip ident" data-tip="Action preparation status. Preparation is advisory and never blocks approval.">`
           + `<span class="sc-k">preparation</span><b>${esc(preparationText)}</b></span>`
           + setupChip(g.id, "worktrees", g.skip_worktrees ? "shared" : "per-branch",
             g.skip_worktrees
@@ -1964,7 +1964,7 @@ Turn them on in this review's setup.">Deferred follow-ups: follow-ups off</butto
           : preparationState === "failed"
             ? `Preparation failed: ${esc(g.post_merge_detail || "See review logs for details.")}`
             : preparationState === "running"
-              ? "Preparing manual checks now. Run buttons unlock when every action is ready."
+              ? "Preparing actions now. Run buttons unlock when every action is ready."
               : "Waiting for the combined review checkout before preparation starts.";
         const preparationClass = preparationState === "failed" ? "warn" : "";
         // RAL-410 moved skip-per-branch-worktrees, squash,
@@ -2016,25 +2016,25 @@ Turn them on in this review's setup.">Deferred follow-ups: follow-ups off</butto
               ? `<div class="warn" style="margin:8px 0 4px">Some branches are not yet ready (still running or never submitted). Merge / rebase will offer to continue with just the ready branches.</div>`
               : "";
           })()}
-          <h3 class="section" data-tip="Preparation runs automatically before you arrive. It builds the combined review, expands prompt actions, and places declared artifacts so manual checks launch immediately.">manual-check preparation</h3>
-          <div class="${preparationClass}" data-tip="Preparation is advisory and never blocks approval. A failure keeps its details visible and disables only the affected manual action.">${preparationText}</div>
+          <h3 class="section" data-tip="Preparation runs automatically before you arrive. It builds the combined review, expands prompt actions, and places declared files so user and auto actions launch immediately.">action preparation</h3>
+          <div class="${preparationClass}" data-tip="Preparation is advisory and never blocks approval. A failure keeps its details visible and disables only the affected action.">${preparationText}</div>
           ${g.detail ? `<div class="warn">${detailSummary(g.detail, "Review detail")}</div>` : ""}
           ${(() => {
-            // RAL-77: user-declared test actions from [[review.action]] in TOML.
+            // RAL-77: user actions, declared as [[review.action]] in TOML.
             const hints = g.action_hints || [];
             // An absent section reads as "not applicable to this review", which
-            // is wrong: every review *could* have test actions, they just have
+            // is wrong: every review *could* have user actions, they just have
             // to be declared in the task file. Saying so -- and saying where --
             // is the difference between a missing feature and a missing input.
             if (hints.length === 0) {
-              return `<h3 class="section" data-tip="User-declared test actions from the task TOML [[review.action]] blocks.\nLabelled buttons give reviewers one-click access to targeted manual checks.">test actions <span class="k" style="text-transform:none;letter-spacing:0">— none</span>${sectionMenuBtn(g.id, "actions")}</h3>
+              return `<h3 class="section" data-tip="User actions: checks you write yourself in the task file, as [[review.action]] blocks.\nThey stay the same on every rebase.">user actions <span class="k" style="text-transform:none;letter-spacing:0">— none</span>${sectionMenuBtn(g.id, "actions")}</h3>
                 ${reviewRunGroup(
                   reviewRunControl(g, "actions", false, "▶ Run all",
-                    "There are no test actions to run. They are authored, not generated — add [[review.action]] blocks to the task file and each becomes a one-click check here."),
-                  `None declared. Test actions are authored in <span class="mono">[[review.action]]</span> blocks in the task file — unlike manual checks below, which the resolver agent writes for you.`,
+                    "No user actions to run. Add [[review.action]] blocks to the task file and each shows up here as a one-click check."),
+                  `None declared. User actions are the checks you write yourself, as <span class="mono">[[review.action]]</span> blocks in the task file. The auto actions below are written by the AI.`,
                   "")}`;
             }
-            // Same command-list shape as manual checks. A
+            // Same command-list shape as auto actions. A
             // labelled button alone hid what the action would actually run,
             // which for a one-click check against someone else's branch is
             // exactly the thing you want to read before pressing it.
@@ -2065,7 +2065,7 @@ Turn them on in this review's setup.">Deferred follow-ups: follow-ups off</butto
                   <button class="section-menu" data-click="openReviewCommandMenu" data-guardian-id="${esc(g.id)}" data-key="${esc(key)}" data-cmd="${esc(cmdText)}" data-tip="Actions for this check — its logs, its environment, copy it.">⋯</button>
                 </div>${commandFullBlock(key, cmdText, { g, check: h, kind: "action", i })}`;
             }).join("");
-            return `<h3 class="section" data-tip="User-declared test actions from the task TOML [[review.action]] blocks.\nAuthored by the task author, not generated — each runs in the built review worktree.\nLabelled buttons give reviewers one-click access to targeted manual checks.">test actions${sectionMenuBtn(g.id, "actions")}</h3>
+            return `<h3 class="section" data-tip="User actions: checks you write yourself in the task file, as [[review.action]] blocks.\nThey stay the same on every rebase and run in the built review.\nAdvisory — they never block Approve or Merge / rebase.">user actions${sectionMenuBtn(g.id, "actions")}</h3>
               ${reviewRunGroup(
                 reviewRunControl(g, "actions", hints.some((h) => h.preparation_state === "ready" && h.command && !(h.inputs && h.inputs.length)), "▶ Run all",
                   "Run every ready action, each from its already-prepared location.\nActions needing input are skipped — run those from their own row.") + rebuildNowControl(g),
@@ -2093,12 +2093,12 @@ Turn them on in this review's setup.">Deferred follow-ups: follow-ups off</butto
               return `<div data-click="runCheck" data-kind="manual" data-guardian-id="${esc(g.id)}" data-i="${i}" style="padding:6px 12px;cursor:pointer;font-size:12px;font-family:monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:360px" data-tip="Run: ${esc(cmdText)}\nLaunches in the built review worktree.${needsInput ? "\nUses this review's current values for its parameters — edit them from the row's + in the section below." : ""}" onmouseover="this.style.background='var(--panel-2)'" onmouseout="this.style.background=''">${esc(cmdText)}</div>`;
             }).join("");
             const gateTip = isReady
-              ? `Run all ${cmds.length} suggested manual check command(s) in a new terminal window.\nEach launches in the built review worktree.`
+              ? `Run all ${cmds.length} auto action(s), each in a new terminal window.\nEach launches in the built review worktree.`
               : state === "generating"
-                ? "Preparing manual checks now — commands, builds, and declared artifact placement complete before this button enables."
+                ? "Preparing auto actions now — this button enables once their builds and files are in place."
                 : state === "failed"
                   ? "Preparation failed. The recorded detail and logs explain what to repair; approval remains available."
-                  : "Manual checks are waiting for the combined review checkout before preparation starts.";
+                  : "Auto actions are waiting for the combined review checkout before preparation starts.";
             const label = isReady ? "▶ Run all" : (state === "generating" ? "▶ Preparing…" : "▶ Run all");
             const runControl = reviewRunControl(g, "manual", isReady && !!cmds.length, label, gateTip);
             // What the section says about itself while it has nothing to show.
@@ -2109,8 +2109,8 @@ Turn them on in this review's setup.">Deferred follow-ups: follow-ups off</butto
               ? `The stage is being set now: commands, builds, and artifacts are prepared before the controls unlock.`
               : state === "failed"
                 ? `Preparation failed, but this advisory result never blocks approval. See the review detail and logs for remediation.`
-                : `Waiting for the combined review checkout. No manual-check control unlocks until its prerequisites are ready.`;
-            return `<h3 class="section" data-tip="Shell commands suggested by the resolver agent to manually verify these changes.\nSuggested against this stack's changes and advisory — they never block Approve or Merge / rebase.\nGenerated once when the review branch is rebuilt (or when the rebuilt stack's changes change), and re-generated on demand from this section's ⋯ menu.">manual checks${sectionMenuBtn(g.id, "manual")}</h3>
+                : `Waiting for the combined review checkout. No auto action unlocks until it is ready.`;
+            return `<h3 class="section" data-tip="Auto actions: checks the AI writes from this review's changes.\nThey can change when the stack's changes change; regenerate them from the ⋯ menu.\nAdvisory — they never block Approve or Merge / rebase.">auto actions${sectionMenuBtn(g.id, "manual")}</h3>
               ${isReady && cmds.length
                 ? reviewRunGroup(
                   runControl + rebuildNowControl(g),
@@ -3152,7 +3152,7 @@ Turn them on in this review's setup.">Deferred follow-ups: follow-ups off</butto
         if (!g) return;
         const runnable = runnableCheckIndexes(g.manual_commands || []);
         if (!runnable.length) {
-          notify("info", "No manual checks are ready to run.");
+          notify("info", "No auto actions are ready to run.");
           return;
         }
         for (const i of runnable) await runCheck("manual", id, i);
@@ -3174,7 +3174,7 @@ Turn them on in this review's setup.">Deferred follow-ups: follow-ups off</butto
         const el = /** @type {HTMLInputElement|null} */ (document.getElementById(`manual-focus-${id}`));
         const focus = el && typeof el.value === "string" ? el.value.trim() : "";
         const resp = await guardianAction(`/api/guardians/${id}/manual-checks/regenerate`, focus ? { focus } : {});
-        if (resp && resp.ok) notify("info", "Manual-checks regeneration requested — it runs in the background.");
+        if (resp && resp.ok) notify("info", "Auto action regeneration requested — it runs in the background.");
         pendingMergeActions.delete(`${id}:regen`);
         tick();
       }
@@ -3216,7 +3216,7 @@ Turn them on in this review's setup.">Deferred follow-ups: follow-ups off</butto
         if (!g) return;
         const runnable = runnableCheckIndexes(g.action_hints || []);
         if (!runnable.length) {
-          notify("info", "No test actions are ready to run.");
+          notify("info", "No user actions are ready to run.");
           return;
         }
         for (const i of runnable) await runCheck("action", id, i);
