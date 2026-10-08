@@ -1665,7 +1665,8 @@ impl ForgeClient {
     ) -> Result<CancelSummary, String> {
         let url = format!("{}/repos/{}/actions/runs", self.api_base, self.repo_path);
         let resp = self.get(
-            ureq::get(&url)
+            http_agent()
+                .get(&url)
                 .query("branch", branch)
                 .set("Authorization", &format!("Bearer {token}"))
                 .set("Accept", "application/vnd.github+json"),
@@ -1692,7 +1693,8 @@ impl ForgeClient {
                 "{}/repos/{}/actions/runs/{run_id}/force-cancel",
                 self.api_base, self.repo_path
             );
-            match ureq::post(&cancel_url)
+            match http_agent()
+                .post(&cancel_url)
                 .set("Authorization", &format!("Bearer {token}"))
                 .set("Accept", "application/vnd.github+json")
                 .set("Content-Type", "application/json")
@@ -1721,7 +1723,8 @@ impl ForgeClient {
     ) -> Result<CancelSummary, String> {
         let url = format!("{}/projects/{}/pipelines", self.api_base, self.repo_path);
         let resp = self.get(
-            ureq::get(&url)
+            http_agent()
+                .get(&url)
                 .query("ref", branch)
                 .set("PRIVATE-TOKEN", token),
         )?;
@@ -1745,7 +1748,7 @@ impl ForgeClient {
                 self.api_base, self.repo_path
             );
             self.send(
-                ureq::post(&cancel_url).set("PRIVATE-TOKEN", token),
+                http_agent().post(&cancel_url).set("PRIVATE-TOKEN", token),
                 &serde_json::json!({}),
             )?;
             cancelled.push(pipeline_id);
