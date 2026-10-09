@@ -20,6 +20,9 @@ use crate::store::Store;
 use crate::store::{CellRow, NodeState};
 use crate::tmux::Tmux;
 
+mod direct;
+pub(crate) use direct::{is_active as direct_session_active, live_tail as direct_live_tail};
+
 /// Prefix the runner subprocess writes to stderr before a JSON-encoded
 /// [`RunnerEvent`], so its structured events reach Cartographer without
 /// touching stdout (reserved for the `CellSpec`/`CellResult` contract).
@@ -2176,7 +2179,11 @@ impl Runner for SubprocessRunner {
     /// `command`-kind spec ran as a raw child process instead, with no live
     /// view available for it.
     fn run_cancellable(&self, spec: &RunnerSpec, cancel: &CancelToken) -> RunnerResult {
-        self.run_via_tmux(spec, cancel)
+        if direct::use_direct(spec) {
+            self.run_direct(spec, cancel)
+        } else {
+            self.run_via_tmux(spec, cancel)
+        }
     }
 
     fn preflight_agent(

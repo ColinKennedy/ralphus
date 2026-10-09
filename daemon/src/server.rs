@@ -10500,11 +10500,29 @@ fn capture_pane_reply(
     let lines: u32 = query_param(query, "lines")
         .and_then(|s| s.parse().ok())
         .unwrap_or(2000);
+    let name = crate::tmux::session_name(squad_id, task, cell_id);
+    // A cell running without tmux has no pane: its live view is the tail of
+    // the transcript its output is teed into.
+    if crate::runner::direct_session_active(&name) {
+        let content = crate::runner::direct_live_tail(&name, lines as usize).unwrap_or_default();
+        return json(
+            200,
+            &PaneResponse {
+                active: true,
+                content: strip_ralphus_pane_markers(&ralphus_core::redact::redact_secrets(
+                    &content,
+                )),
+                last_activity_ms: daemon
+                    .store_handle()
+                    .lock_free_memory()
+                    .live_activity_ms(&name),
+            },
+        );
+    }
     let tmux = match crate::tmux::Tmux::resolve() {
         Ok(t) => t,
         Err(e) => return error(500, "tmux_error", &e.to_string(), vec![]),
     };
-    let name = crate::tmux::session_name(squad_id, task, cell_id);
     match tmux.capture_pane(&name, lines) {
         Ok(content) => json(
             200,

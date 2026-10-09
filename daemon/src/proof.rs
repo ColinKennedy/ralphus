@@ -38,11 +38,11 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// before the child has had a chance to spawn anything of its own, which in
 /// practice just means "as soon as possible after spawn".
 #[cfg(windows)]
-struct ProcessTree(Option<win32job::Job>);
+pub(crate) struct ProcessTree(Option<win32job::Job>);
 
 #[cfg(windows)]
 impl ProcessTree {
-    fn confine(child: &Child) -> Self {
+    pub(crate) fn confine(child: &Child) -> Self {
         use std::os::windows::io::AsRawHandle;
         let job = (|| -> Result<win32job::Job, win32job::JobError> {
             let job = win32job::Job::create()?;
@@ -69,7 +69,7 @@ impl ProcessTree {
     /// Kill every process in the tree. `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
     /// means closing the job's only handle (via `Drop`) terminates every
     /// process assigned to it.
-    fn kill(&mut self, child: &mut Child) {
+    pub(crate) fn kill(&mut self, child: &mut Child) {
         self.0 = None;
         // Belt-and-suspenders: if job confinement failed above, still kill
         // the direct child so at least the shell itself stops.
@@ -78,7 +78,7 @@ impl ProcessTree {
 }
 
 #[cfg(unix)]
-struct ProcessTree;
+pub(crate) struct ProcessTree;
 
 #[cfg(unix)]
 impl ProcessTree {
@@ -93,7 +93,7 @@ impl ProcessTree {
     /// Signal the whole process group `prepare_command` placed the child
     /// into, not just the child itself, so a shell's already-spawned
     /// children die with it instead of being orphaned.
-    fn kill(&mut self, child: &mut Child) {
+    pub(crate) fn kill(&mut self, child: &mut Child) {
         // `child.id()` is the pid of a process we spawned with its own
         // process group (`process_group(0)`), so its pgid equals its pid;
         // `killpg` targets that whole group per `kill(2)`. `unsafe_code =
@@ -120,7 +120,7 @@ impl ProcessTree {
 }
 
 #[cfg(unix)]
-fn prepare_command(cmd: &mut Command) {
+pub(crate) fn prepare_command(cmd: &mut Command) {
     use std::os::unix::process::CommandExt;
     // A fresh process group (pgid == the child's own pid) isolates it from
     // this daemon process's group, so `ProcessTree::kill`'s `kill(-pgid, ...)`
@@ -129,7 +129,7 @@ fn prepare_command(cmd: &mut Command) {
 }
 
 #[cfg(windows)]
-fn prepare_command(_cmd: &mut Command) {}
+pub(crate) fn prepare_command(_cmd: &mut Command) {}
 
 /// Run a `command` proof step in `cwd`. Returns true when the command exits 0.
 ///
