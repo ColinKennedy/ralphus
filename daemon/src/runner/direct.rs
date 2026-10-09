@@ -787,6 +787,19 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_runner_program_fails_at_once_instead_of_timing_out() {
+        let runner = SubprocessRunner::new("definitely-not-a-real-program-xyz");
+        let mut spec = command_spec("direct-test-missing-program");
+        spec.timeout_sec = Some(30);
+        let started = Instant::now();
+        let result = runner.run_direct(&spec, &CancelToken::new());
+        assert!(!result.is_done());
+        let error = result.error.unwrap_or_default();
+        assert!(error.contains("could not start"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
     fn a_headless_run_past_its_deadline_times_out() {
         let (runner, dir) = stub_runner("timeout", 30);
         let mut spec = command_spec("direct-test-timeout");
