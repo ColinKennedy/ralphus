@@ -2291,11 +2291,11 @@ fn upstream_rebase_carries_every_branchs_review_only_commits() {
     let _daemon = DaemonPump::start(&fx);
 
     let mut fb0 = Held::new("feature-a.txt", "feedback on a", &unexpected).feedback(&fx, 0);
-    let t0 = Instant::now(); eprintln!("T start"); fb0.finish(); eprintln!("T fb0 {:?}", t0.elapsed());
+    fb0.finish();
     let mut fix1 =
         Held::new("feature-b.txt", "auto-fix on b", &unexpected).auto_fix(&fx, &pr_ids[1]);
-    fix1.finish(); eprintln!("T fix1 {:?}", t0.elapsed());
-    fx.push_to_pr(2, "reviewer-c.txt"); eprintln!("T push {:?}", t0.elapsed());
+    fix1.finish();
+    fx.push_to_pr(2, "reviewer-c.txt");
     let first = fx
         .store
         .lock()
@@ -2305,7 +2305,7 @@ fn upstream_rebase_carries_every_branchs_review_only_commits() {
         .unwrap_or_default();
     fx.wait_settled_on(first.trim(), "before the upstream move");
 
-    eprintln!("T settled1 {:?}", t0.elapsed()); let upstream = fx.push_upstream("upstream1.txt");
+    let upstream = fx.push_upstream("upstream1.txt");
     fx.wait_settled_on(&upstream, "after the upstream move");
     fx.assert_no_unexpected_agent_calls("upstream move", &unexpected);
     fx.assert_everything_published(
