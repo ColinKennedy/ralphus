@@ -144,7 +144,8 @@ process, so the crate's in-process `LIVE_TMUX_TEST_LOCK` cannot isolate a normal
 local run from either source of contention.
 
 The per-PR `psmux-integration` job in `.github/workflows/ci.yml` builds the
-vendored `vendor/psmux` git submodule (RAL-347, pinned to `v3.3.8`) from
+vendored `vendor/psmux` git submodule (RAL-347; ralphus's psmux fork, `v3.3.8`
+plus the changes listed in [`vendor/AGENTS.md`](../vendor/AGENTS.md)) from
 source, gives it a job-private `PSMUX_DATA_DIR`, and runs the ignored
 `live_tmux_*` tests serially against that build. `.github/workflows/psmux-stress.yml`
 runs the same tests concurrently, against the same vendored build, on a

@@ -1,3 +1,4 @@
 [submodule "vendor/psmux"]
 	path = vendor/psmux
-	url = https://github.com/psmux/psmux.git
+	url = https://github.com/ColinKennedy/psmux.git
+	branch = ralphus

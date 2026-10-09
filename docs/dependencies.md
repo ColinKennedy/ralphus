@@ -119,8 +119,11 @@ the full investigation (not committed — local working notes).
 If you're building with `--features ralphus-daemon/embedded-tmux` (the
 recommended, vendored path — see the warning above and
 `docs/tmux-embedding.md`), none of the below applies: the embedded build is
-already pinned to `v3.3.8`. The following is only for the discouraged
-`PATH`/`RALPHUS_TMUX_CMD` path.
+already pinned to ralphus's psmux fork (`v3.3.8` plus the changes listed in
+`vendor/AGENTS.md`). The following is only for the discouraged
+`PATH`/`RALPHUS_TMUX_CMD` path. A stock psmux there works; ralphus detects
+that it lacks the fork's `pipe-max-bytes` option and keeps its own capped
+transcript helper instead.
 
 Check your version:
 
