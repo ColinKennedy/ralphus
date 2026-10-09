@@ -1340,6 +1340,19 @@ impl Fixture {
                     out.push_str(&format!("\n      remote-move | {line}"));
                 }
             }
+            // How the local review branch moved, newest first, with the
+            // operation that moved it.
+            if let Some(rev) = b.review_branch.as_deref() {
+                if let Ok(o) = std::process::Command::new("git")
+                    .args(["reflog", "show", "--format=%h %gs", "-n", "14", rev])
+                    .current_dir(&self.root)
+                    .output()
+                {
+                    for line in String::from_utf8_lossy(&o.stdout).lines() {
+                        out.push_str(&format!("\n      local-move | {line}"));
+                    }
+                }
+            }
             // What is on the branch, newest first (tolerant, like `local`).
             if let Some(rev) = b.review_branch.as_deref() {
                 if let Ok(o) = std::process::Command::new("git")
