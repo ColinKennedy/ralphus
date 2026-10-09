@@ -1782,6 +1782,14 @@ impl Drop for WaypointHaltGuard<'_> {
 /// subprocess spawn, not just a syscall.
 const TMUX_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Whether each tmux attempt starts the `powershell` exit-code watcher
+/// ([`crate::tmux::watch_for_exit`]) so an unexplained session death reports
+/// the server's exit code. Off unless `RALPHUS_TMUX_EXIT_DIAGNOSTICS` is set
+/// to a non-empty value other than `0`.
+fn tmux_exit_diagnostics_enabled() -> bool {
+    std::env::var("RALPHUS_TMUX_EXIT_DIAGNOSTICS").is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
 /// How often the poll loop captures the pane for its "current screen"
 /// snapshot and completion safety net once the cell's transcript is
 /// delivering events (see the poll loop for when it captures every poll).
@@ -2651,10 +2659,14 @@ impl SubprocessRunner {
         // mystery -- see PSMUX_CRASH_NOTES.local.md), this is the one way to
         // learn whether its process actually crashed (a real Windows
         // exception code) or exited cleanly, without needing admin rights.
-        // `None` (PID lookup failed, or non-Windows) just means no exit-code
-        // detail is available later -- never fatal to the session itself.
+        // It costs a `powershell` process kept alive for the whole attempt,
+        // so it only runs when `RALPHUS_TMUX_EXIT_DIAGNOSTICS` is set.
+        // `None` (disabled, PID lookup failed, or non-Windows) just means no
+        // exit-code detail is available later -- never fatal to the session.
         let server_pid = crate::tmux::find_server_pid(session_name);
-        let exit_watch = server_pid.map(crate::tmux::watch_for_exit);
+        let exit_watch = server_pid
+            .filter(|_| tmux_exit_diagnostics_enabled())
+            .map(crate::tmux::watch_for_exit);
         // Register the same PID for the resource-usage view (RAL-11) so a
         // tmux-wrapped session (every cell/proof step, since RAL-151)
         // still shows up there — the raw-child-process path this used to
