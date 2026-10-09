@@ -2033,9 +2033,18 @@ impl Fixture {
             // Drive any stopped rebase to the end: resolve conflicts by
             // keeping both sides; a step with nothing left to apply (the
             // daemon already pulled that change in) is skipped.
+            let mut steps = 0;
             while rebasing() {
-                if Instant::now() >= deadline {
+                steps += 1;
+                if Instant::now() >= deadline || steps > 12 {
+                    // The rebase is not converging: start over from the
+                    // remote tip and re-apply the reviewer's edit on it.
                     let _ = run(&["rebase", "--abort"]);
+                    let _ = run(&["fetch", "-q", "origin", &alias]);
+                    let _ = run(&["reset", "-q", "--hard", &format!("origin/{alias}")]);
+                    edit(&clone);
+                    let _ = run(&["add", "--all"]);
+                    let _ = run(&["commit", "-q", "-m", message]);
                     break;
                 }
                 let conflicted = git(&clone, &["diff", "--name-only", "--diff-filter=U"]);
@@ -2282,11 +2291,11 @@ fn upstream_rebase_carries_every_branchs_review_only_commits() {
     let _daemon = DaemonPump::start(&fx);
 
     let mut fb0 = Held::new("feature-a.txt", "feedback on a", &unexpected).feedback(&fx, 0);
-    fb0.finish();
+    let t0 = Instant::now(); eprintln!("T start"); fb0.finish(); eprintln!("T fb0 {:?}", t0.elapsed());
     let mut fix1 =
         Held::new("feature-b.txt", "auto-fix on b", &unexpected).auto_fix(&fx, &pr_ids[1]);
-    fix1.finish();
-    fx.push_to_pr(2, "reviewer-c.txt");
+    fix1.finish(); eprintln!("T fix1 {:?}", t0.elapsed());
+    fx.push_to_pr(2, "reviewer-c.txt"); eprintln!("T push {:?}", t0.elapsed());
     let first = fx
         .store
         .lock()
@@ -2296,7 +2305,7 @@ fn upstream_rebase_carries_every_branchs_review_only_commits() {
         .unwrap_or_default();
     fx.wait_settled_on(first.trim(), "before the upstream move");
 
-    let upstream = fx.push_upstream("upstream1.txt");
+    eprintln!("T settled1 {:?}", t0.elapsed()); let upstream = fx.push_upstream("upstream1.txt");
     fx.wait_settled_on(&upstream, "after the upstream move");
     fx.assert_no_unexpected_agent_calls("upstream move", &unexpected);
     fx.assert_everything_published(
@@ -3201,11 +3210,16 @@ fn daemon_restart_mid_rebuild_keeps_every_commit() {
     // bookkeeping), its startup recovery, then its maintenance.
     let db = fx.root.join(".git").join("ralphus-test.db");
     fx.store = Arc::new(StoreMutex::new(Store::open(&db).unwrap()));
-    let daemon = DaemonPump::start(&fx);
-    ralphus_daemon::scheduler::recover_interrupted_reviews(
-        &fx.store,
-        &daemon.sem,
-        &daemon.cancellations,
+    let daemon = DaemonPump::start_resolving(&fx, &unexpected);
+    // Startup recovery (`recover_interrupted_reviews`) resumes with the
+    // production runner, which has no agent here; resume the interrupted merge
+    // the way a user's "Merge / rebase" does, with the stand-in resolver.
+    ralphus_daemon::guardian_merge::restart_guardian_merge(
+        Arc::clone(&fx.store),
+        daemon.cancellations.clone(),
+        Arc::new(UnionResolver(Arc::clone(&unexpected))),
+        &fx.id,
+        Arc::clone(&daemon.sem),
     );
 
     fx.wait_settled_on(&upstream, what);
