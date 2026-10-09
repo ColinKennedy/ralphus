@@ -22,8 +22,9 @@
 //! `direct` forces this one, and unset lets [`use_direct`] decide.
 
 use super::*;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::io::{Read as _, Write as _};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 /// How often the attempt loop checks the child's exit status and the stop
@@ -63,21 +64,24 @@ fn runner_mode() -> RunnerMode {
 }
 
 /// Whether `spec` runs as a plain child process rather than in a tmux pane.
-pub(super) fn use_direct(spec: &RunnerSpec) -> bool {
+pub(super) fn use_direct(_spec: &RunnerSpec) -> bool {
     match runner_mode() {
         RunnerMode::Tmux => false,
         RunnerMode::Direct => true,
-        // `command` cells and proof steps have no agent to take over, so the
-        // pane only ever served as a place to watch them from.
-        RunnerMode::Auto => spec.prompt.is_none() && spec.command.is_some(),
+        // The runner is headless for every kind of spec, so no cell needs a
+        // pane to run in.
+        RunnerMode::Auto => true,
     }
 }
 
-/// Session names (see [`crate::tmux::session_name`]) of cells currently
-/// running through this path, so the Live View endpoints can tell "running
-/// headless" from "no such session".
-fn active() -> &'static Mutex<HashSet<String>> {
-    static ACTIVE: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Mutex::default);
+/// Cells currently running through this path, keyed by session name (see
+/// [`crate::tmux::session_name`]), each with the flag that asks its run loop to
+/// stop. The Live View endpoints use the keys to tell "running headless" from
+/// "no such session"; the cancel and status-change paths that used to kill a
+/// tmux session by name use the flags.
+fn active() -> &'static Mutex<HashMap<String, Arc<AtomicBool>>> {
+    static ACTIVE: LazyLock<Mutex<HashMap<String, Arc<AtomicBool>>>> =
+        LazyLock::new(Mutex::default);
     &ACTIVE
 }
 
@@ -86,25 +90,58 @@ fn active() -> &'static Mutex<HashSet<String>> {
 pub(crate) fn is_active(session_name: &str) -> bool {
     active()
         .lock()
-        .is_ok_and(|names| names.contains(session_name))
+        .is_ok_and(|names| names.contains_key(session_name))
+}
+
+/// Asks the run named `session_name` to stop. `true` when one was running.
+pub(crate) fn request_stop(session_name: &str) -> bool {
+    request_stop_matching(|name| name == session_name) > 0
+}
+
+/// Asks every run whose session name starts with any of `prefixes` to stop,
+/// returning how many were running.
+pub(crate) fn request_stop_with_any_prefix(prefixes: &[String]) -> usize {
+    request_stop_matching(|name| prefixes.iter().any(|p| name.starts_with(p.as_str())))
+}
+
+fn request_stop_matching(matches: impl Fn(&str) -> bool) -> usize {
+    let Ok(names) = active().lock() else {
+        return 0;
+    };
+    names
+        .iter()
+        .filter(|(name, _)| matches(name))
+        .map(|(_, flag)| flag.store(true, Ordering::SeqCst))
+        .count()
 }
 
 /// Marks a cell active for as long as it lives.
-struct ActiveGuard(String);
+struct ActiveGuard {
+    name: String,
+    stop: Arc<AtomicBool>,
+}
 
 impl ActiveGuard {
     fn new(session_name: &str) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
         if let Ok(mut names) = active().lock() {
-            names.insert(session_name.to_string());
+            names.insert(session_name.to_string(), Arc::clone(&stop));
         }
-        Self(session_name.to_string())
+        Self {
+            name: session_name.to_string(),
+            stop,
+        }
+    }
+
+    fn stop_requested(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
     }
 }
 
 impl Drop for ActiveGuard {
     fn drop(&mut self) {
         if let Ok(mut names) = active().lock() {
-            names.remove(&self.0);
+            names.remove(&self.name);
         }
     }
 }
@@ -240,7 +277,7 @@ impl SubprocessRunner {
         let session_name = crate::tmux::session_name(&spec.squad_id, &spec.task, &spec.cell_id);
         let spec_path = io_dir.join(format!("{session_name}.spec.json"));
         let result_path = io_dir.join(format!("{session_name}.result.json"));
-        let _active = ActiveGuard::new(&session_name);
+        let active_guard = ActiveGuard::new(&session_name);
 
         let detach_token = self.detachments.as_ref().map(|d| d.register(&session_name));
         let _detach_guard = self.detachments.as_ref().map(|d| DetachGuard {
@@ -282,6 +319,7 @@ impl SubprocessRunner {
             &result_path,
             &started,
             deadline,
+            &active_guard,
         );
         crate::rlog!(
             INFO,
@@ -311,6 +349,7 @@ impl SubprocessRunner {
         result_path: &std::path::Path,
         started: &Instant,
         deadline: Option<Duration>,
+        active: &ActiveGuard,
     ) -> RunnerResult {
         let _ = std::fs::remove_file(result_path);
         let payload = match serde_json::to_string(spec) {
@@ -449,6 +488,10 @@ impl SubprocessRunner {
                     spec.cell_id
                 );
                 note("direct run killed: cancelled");
+                decided = Some(RunnerResult::failure("cancelled"));
+            } else if active.stop_requested() {
+                tree.kill(&mut child);
+                note("direct run killed: stop requested");
                 decided = Some(RunnerResult::failure("cancelled"));
             } else if detach.is_some_and(crate::cancel::DetachToken::is_cancelled) {
                 tree.kill(&mut child);

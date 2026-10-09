@@ -11089,7 +11089,7 @@ fn resume_automation(daemon: &Daemon, id: &str, ti: &str, si: &str) -> Reply {
         Err(e) => return error(500, "tmux_error", &e.to_string(), vec![]),
     };
     let session_name = crate::tmux::session_name(id, &task, &cell_id);
-    if tmux.has_session(&session_name) {
+    if tmux.has_session(&session_name) || crate::runner::direct_session_active(&session_name) {
         return error(
             409,
             "still_running",
@@ -11733,7 +11733,12 @@ fn actioning_session(id: &str, branch_id: &str) -> (&'static str, String) {
     let task = crate::guardian_merge::FEEDBACK_TASK;
     let commit_live = crate::tmux::Tmux::resolve()
         .map(|t| t.has_session(&crate::tmux::session_name(&squad, task, &commit_cell)))
-        .unwrap_or(false);
+        .unwrap_or(false)
+        || crate::runner::direct_session_active(&crate::tmux::session_name(
+            &squad,
+            task,
+            &commit_cell,
+        ));
     (
         task,
         pick_actioning_cell(commit_live, feedback_cell, commit_cell),
@@ -12141,7 +12146,7 @@ fn detach_and_open_agent(
     let session_name = crate::tmux::session_name(squad_id, task, cell_id);
     daemon.detachments_handle().cancel(&session_name);
     let deadline = std::time::Instant::now() + DETACH_WAIT_TIMEOUT;
-    while tmux.has_session(&session_name) {
+    while tmux.has_session(&session_name) || crate::runner::direct_session_active(&session_name) {
         if std::time::Instant::now() >= deadline {
             return error(
                 503,
@@ -12781,10 +12786,13 @@ fn which_program(name: &str) -> Option<String> {
 /// deterministic `ralphus_<squad_id>_...` cell-name prefix and kills it
 /// immediately, regardless of whether the token mechanism is working.
 fn kill_squad_tmux_sessions(squad_id: &str) -> usize {
+    let prefix = format!("ralphus_{squad_id}_");
+    let headless =
+        crate::runner::direct_request_stop_with_any_prefix(std::slice::from_ref(&prefix));
     let Ok(tmux) = crate::tmux::Tmux::resolve() else {
-        return 0;
+        return headless;
     };
-    tmux.kill_sessions_with_prefix(&format!("ralphus_{squad_id}_"))
+    headless + tmux.kill_sessions_with_prefix(&prefix)
 }
 
 /// The cascade counterpart to [`kill_squad_tmux_sessions`]: kills every live
@@ -12796,14 +12804,15 @@ fn kill_squad_tmux_sessions(squad_id: &str) -> usize {
 /// before this ran (and used to do so synchronously on the request thread —
 /// see [`cancel`]'s doc comment for why it doesn't anymore).
 fn kill_squads_tmux_sessions(squad_ids: &[String]) -> usize {
-    let Ok(tmux) = crate::tmux::Tmux::resolve() else {
-        return 0;
-    };
     let prefixes: Vec<String> = squad_ids
         .iter()
         .map(|id| format!("ralphus_{id}_"))
         .collect();
-    tmux.kill_sessions_with_any_prefix(&prefixes)
+    let headless = crate::runner::direct_request_stop_with_any_prefix(&prefixes);
+    let Ok(tmux) = crate::tmux::Tmux::resolve() else {
+        return headless;
+    };
+    headless + tmux.kill_sessions_with_any_prefix(&prefixes)
 }
 
 /// The guardian-cell counterpart to [`kill_squad_tmux_sessions`]: kills
@@ -12814,10 +12823,13 @@ fn kill_squads_tmux_sessions(squad_ids: &[String]) -> usize {
 /// `ralphus_{squad_id}_` scoping `kill_squad_tmux_sessions` uses applies here
 /// with that formatted id in place of a plain squad id.
 fn kill_guardian_tmux_sessions(guardian_id: &str) -> usize {
+    let prefix = format!("ralphus_guardian-{guardian_id}_");
+    let headless =
+        crate::runner::direct_request_stop_with_any_prefix(std::slice::from_ref(&prefix));
     let Ok(tmux) = crate::tmux::Tmux::resolve() else {
-        return 0;
+        return headless;
     };
-    tmux.kill_sessions_with_prefix(&format!("ralphus_guardian-{guardian_id}_"))
+    headless + tmux.kill_sessions_with_prefix(&prefix)
 }
 
 #[derive(Serialize)]
@@ -13442,9 +13454,7 @@ fn stop_targets_for_status_change(
 /// store touch inside the loop takes its own short-lived one, so no subprocess
 /// ever runs with the lock held.
 fn capture_and_stop_nodes(store: &StoreHandle, squad_id: &str, reqs: &[SetStatusBody]) {
-    let Ok(tmux) = crate::tmux::Tmux::resolve() else {
-        return;
-    };
+    let tmux = crate::tmux::Tmux::resolve().ok();
     let targets = {
         let guard = store.lock();
         let mut seen = HashSet::new();
@@ -13459,7 +13469,14 @@ fn capture_and_stop_nodes(store: &StoreHandle, squad_id: &str, reqs: &[SetStatus
         targets
     };
     for target in targets {
-        if !tmux.has_session(&target.pane_name) {
+        // A cell running without tmux has no pane: its checkpoint is the
+        // tail of its transcript, and stopping it is a flag its run loop
+        // honors.
+        let headless = crate::runner::direct_session_active(&target.pane_name);
+        let pane = tmux
+            .as_ref()
+            .filter(|t| !headless && t.has_session(&target.pane_name));
+        if !headless && pane.is_none() {
             continue;
         }
         // psmux can briefly reject `capture-pane` immediately after its
@@ -13467,14 +13484,20 @@ fn capture_and_stop_nodes(store: &StoreHandle, squad_id: &str, reqs: &[SetStatus
         // the terminal kill preserves the checkpoint without delaying a pane
         // that was genuinely empty.
         let mut capture = None;
-        for attempt in 0..3 {
-            match tmux.capture_pane(&target.pane_name, 2000) {
-                Ok(content) => {
-                    capture = Some(content);
-                    break;
+        if headless {
+            capture = crate::runner::direct_live_tail(&target.pane_name, 2000);
+        } else if let Some(tmux) = pane {
+            for attempt in 0..3 {
+                match tmux.capture_pane(&target.pane_name, 2000) {
+                    Ok(content) => {
+                        capture = Some(content);
+                        break;
+                    }
+                    Err(_) if attempt < 2 => {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    Err(_) => break,
                 }
-                Err(_) if attempt < 2 => std::thread::sleep(std::time::Duration::from_millis(100)),
-                Err(_) => break,
             }
         }
         if let Some(content) = capture {
@@ -13522,7 +13545,11 @@ fn capture_and_stop_nodes(store: &StoreHandle, squad_id: &str, reqs: &[SetStatus
                 drop(guard);
             }
         }
-        let _ = tmux.kill_session(&target.pane_name);
+        if headless {
+            crate::runner::direct_request_stop(&target.pane_name);
+        } else if let Some(tmux) = pane {
+            let _ = tmux.kill_session(&target.pane_name);
+        }
     }
 }
 

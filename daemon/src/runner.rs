@@ -21,7 +21,11 @@ use crate::store::{CellRow, NodeState};
 use crate::tmux::Tmux;
 
 mod direct;
-pub(crate) use direct::{is_active as direct_session_active, live_tail as direct_live_tail};
+pub(crate) use direct::{
+    is_active as direct_session_active, live_tail as direct_live_tail,
+    request_stop as direct_request_stop,
+    request_stop_with_any_prefix as direct_request_stop_with_any_prefix,
+};
 
 /// Prefix the runner subprocess writes to stderr before a JSON-encoded
 /// [`RunnerEvent`], so its structured events reach Cartographer without
