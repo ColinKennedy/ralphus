@@ -2037,13 +2037,21 @@ impl Fixture {
             return;
         }
         git(&clone, &["commit", "-m", message]);
+        let trace = std::cell::RefCell::new(Vec::<String>::new());
         let run = |args: &[&str]| {
-            std::process::Command::new("git")
+            let output = std::process::Command::new("git")
                 .args(args)
                 .current_dir(&clone)
                 .env("GIT_EDITOR", "true")
                 .output()
-                .expect("run git")
+                .expect("run git");
+            trace.borrow_mut().push(format!(
+                "git {args:?} -> {:?} {} {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+            output
         };
         let rebasing = || {
             clone.join(".git").join("rebase-merge").exists()
@@ -2117,7 +2125,8 @@ impl Fixture {
         assert!(
             recent.lines().any(|subject| subject == message),
             "the reviewer's commit {message:?} is not on the branch it pushed to {alias}; \
-             the helper dropped it:\n{recent}"
+             the helper dropped it:\n{recent}\ngit calls:\n{}",
+            trace.borrow().join("\n")
         );
         let _ = std::fs::remove_dir_all(&clone);
     }
