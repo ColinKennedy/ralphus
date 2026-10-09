@@ -167,6 +167,12 @@ impl GitVcs {
         if let Some(output) = crate::vcs_refs::try_rev_parse(root, args) {
             return Ok(output);
         }
+        // `remote get-url` / `config --get` answers are reused while the
+        // config files they depend on are unchanged (see `crate::vcs_refs`).
+        if let Some(output) = crate::vcs_refs::cached_config_read(root, args) {
+            return Ok(output);
+        }
+        let config_stamp = crate::vcs_refs::config_read_stamp(root, args);
         // One OS process instead of two or three for read-only subcommands
         // on Windows; see `ralphus_core::git_spawn`.
         let mut command = ralphus_core::git_spawn::command(args);
@@ -236,11 +242,15 @@ impl GitVcs {
             }
         };
 
-        Ok(std::process::Output {
+        let output = std::process::Output {
             status,
             stdout: stdout_thread.join().unwrap_or_default(),
             stderr: stderr_thread.join().unwrap_or_default(),
-        })
+        };
+        if let Some(stamp) = config_stamp {
+            crate::vcs_refs::remember_config_read(root, args, stamp, &output);
+        }
+        Ok(output)
     }
 }
 
