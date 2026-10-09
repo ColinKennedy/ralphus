@@ -282,6 +282,24 @@ impl std::fmt::Display for TmuxError {
     }
 }
 
+/// Whether psmux's `pipe-pane` takes `cat >> "<path>"` as a literal direct
+/// file sink for `path` (vendored psmux `util::parse_cat_file_sink` and
+/// `refuse_file_sink_path`): no quote characters, nothing PowerShell or tmux
+/// would expand (`$`, backtick, `#`), and a local drive path rather than a
+/// UNC or device path. Anything else would reach PowerShell, where `cat` is
+/// `Get-Content` and records nothing.
+fn file_sink_path_is_literal(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    !path.is_empty()
+        && !path.contains(['"', '\'', '$', '`', '#'])
+        && !path.starts_with("\\\\")
+        && !path.starts_with("//")
+        && bytes.len() > 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
+}
+
 /// The error the tmux CLI reports for a session with no server, used when
 /// the in-process client finds the same condition.
 fn no_server(name: &str) -> TmuxError {
@@ -1262,6 +1280,12 @@ impl Tmux {
             // `TerminalLogConfig` already loaded just above for the pane
             // history-limit rather than reloading it.
             let max_bytes = terminal_log_config.max_transcript_bytes_per_attempt();
+            if self.start_file_sink_transcript(name, path, max_bytes) {
+                // The direct file sink is armed inside the server before
+                // pipe-pane replies, so there is no sink-startup race to wait
+                // out (see the settle below for the helper-process sink).
+                return self.launch_payload(name, cwd, &base, &full);
+            }
             let target = build_pipe_target(
                 program,
                 &[
@@ -1302,17 +1326,77 @@ impl Tmux {
             // margin, not a measured minimum.
             std::thread::sleep(PIPE_SINK_SETTLE_DELAY);
         }
+        self.launch_payload(name, cwd, &base, &full)
+    }
+
+    /// Start `name`'s transcript with psmux's in-server direct file sink
+    /// (`pipe-pane -o 'cat >> "<path>"'`) capped by its `pipe-max-bytes`
+    /// option, instead of a `ralphus-runner pipe-sink` helper that psmux
+    /// starts inside a PowerShell wrapper (three processes per session).
+    /// Returns whether that worked; `false` leaves the caller to start the
+    /// helper sink, which keeps the transcript and its cap either way.
+    ///
+    /// Only on Windows (psmux), and only when every precondition holds: the
+    /// in-process client is in use, the path is one psmux's
+    /// `parse_cat_file_sink` takes literally (otherwise psmux hands the
+    /// command to PowerShell, where `cat` is `Get-Content` and writes nothing),
+    /// and this psmux reports back the cap just set (a psmux without
+    /// `pipe-max-bytes` would silently write an uncapped file).
+    fn start_file_sink_transcript(
+        &self,
+        name: &str,
+        path: &std::path::Path,
+        max_bytes: u64,
+    ) -> bool {
+        if !cfg!(target_os = "windows") || !self.native() || max_bytes == 0 {
+            return false;
+        }
+        let path_text = path.to_string_lossy();
+        if !file_sink_path_is_literal(&path_text) {
+            return false;
+        }
+        let cap = max_bytes.to_string();
+        if self.set_option(name, "pipe-max-bytes", &cap).is_err() {
+            return false;
+        }
+        // Not `show-options`: a psmux without the option stores any unknown
+        // name as a user option and echoes it back. This read-only format is
+        // answered only by a psmux that actually applies the cap.
+        match crate::psmux_client::query(name, "display-message -p #{pipe-max-bytes-effective}") {
+            Ok(reply) if reply.trim() == cap => {}
+            _ => return false,
+        }
+        if let Some(parent) = path.parent() {
+            if std::fs::create_dir_all(parent).is_err() {
+                return false;
+            }
+        }
+        self.pipe_pane(name, &format!("cat >> \"{path_text}\""))
+            .is_ok()
+    }
+
+    /// Start the session's payload: typed into the pane's shell on Windows
+    /// (psmux's `respawn-pane` does not execute a positional command), or
+    /// respawned as the pane's process elsewhere. Kills the session if that
+    /// fails so a failed start never leaks it.
+    fn launch_payload(
+        &self,
+        name: &str,
+        cwd: &str,
+        base: &str,
+        full: &str,
+    ) -> Result<(), TmuxError> {
         let started = if cfg!(target_os = "windows") {
             let line = format!(
                 "send-keys {} Enter",
-                crate::psmux_client::quote_arg_if_needed(&base)
+                crate::psmux_client::quote_arg_if_needed(base)
             );
             self.native_command(name, &line).map_or_else(
-                || self.run(&["send-keys", "-t", name, base.as_str(), "Enter"]),
+                || self.run(&["send-keys", "-t", name, base, "Enter"]),
                 |r| r.map(|()| String::new()),
             )
         } else {
-            self.run(&["respawn-pane", "-k", "-t", name, "-c", cwd, full.as_str()])
+            self.run(&["respawn-pane", "-k", "-t", name, "-c", cwd, full])
         };
         if let Err(e) = started {
             self.kill_session_logging_failure(name);
@@ -2194,6 +2278,27 @@ mod tests {
             split_command("C:\\Users\\me\\tmux.exe"),
             ("C:\\Users\\me\\tmux.exe".to_string(), Vec::<String>::new())
         );
+    }
+
+    #[test]
+    fn file_sink_only_takes_plain_local_drive_paths() {
+        assert!(file_sink_path_is_literal(
+            r"C:\Users\me\.ralphus\terminal_logs\ralphus_squad-1_t_c\0000.raw"
+        ));
+        assert!(file_sink_path_is_literal("C:/Users/me/x.raw"));
+        for path in [
+            "",
+            r"\\server\share\x.raw",
+            "//server/share/x.raw",
+            r"C:\a b\it's.raw",
+            r"C:\$env\x.raw",
+            r"C:\a#b\x.raw",
+            r#"C:\a"b\x.raw"#,
+            "C:\\a`b\\x.raw",
+            "relative/x.raw",
+        ] {
+            assert!(!file_sink_path_is_literal(path), "{path}");
+        }
     }
 
     #[test]

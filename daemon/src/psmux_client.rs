@@ -202,6 +202,14 @@ pub fn capture_pane(name: &str, lines: u32) -> Result<String, Error> {
     request(name, &format!("capture-pane -p -S -{lines}"), false)
 }
 
+/// A command that returns text (`show-options -v <name>`), reply as sent.
+///
+/// # Errors
+/// As [`capture_pane`].
+pub fn query(name: &str, line: &str) -> Result<String, Error> {
+    request(name, line, false)
+}
+
 /// A fire-and-forget command (`set-option`, `send-keys`, `clear-history`,
 /// `kill-session`), confirmed executed by the barrier.
 ///
