@@ -2090,11 +2090,17 @@ impl Fixture {
                 }
                 let conflicted = git(&clone, &["diff", "--name-only", "--diff-filter=U"]);
                 if conflicted.trim().is_empty() {
-                    let staged = run(&["diff", "--cached", "--quiet"]);
-                    if staged.status.success() {
-                        let _ = run(&["rebase", "--skip"]);
+                    // A pick the rebase stopped before applying must be
+                    // applied, not skipped: only a pick that is empty once
+                    // applied (the daemon already holds the change) is dropped.
+                    if run(&["rebase", "--continue"]).status.success() {
                         continue;
                     }
+                    let staged = run(&["diff", "--cached", "--quiet"]);
+                    if rebasing() && staged.status.success() {
+                        let _ = run(&["rebase", "--skip"]);
+                    }
+                    continue;
                 } else {
                     union_resolve(&clone);
                 }
@@ -2106,6 +2112,12 @@ impl Fixture {
             pushed,
             "reviewer push to {alias} kept being rejected for 120 s ({attempt} retries); \
              last error: {last_error}"
+        );
+        let recent = git(&clone, &["log", "-n", "12", "--format=%s"]);
+        assert!(
+            recent.lines().any(|subject| subject == message),
+            "the reviewer's commit {message:?} is not on the branch it pushed to {alias}; \
+             the helper dropped it:\n{recent}"
         );
         let _ = std::fs::remove_dir_all(&clone);
     }
