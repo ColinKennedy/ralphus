@@ -1347,13 +1347,20 @@ impl Tmux {
         }
         self.run(&["kill-session", "-t", name])?;
         const KILL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
-        const POLL_INTERVAL: Duration = Duration::from_millis(50);
+        // Each probe is a `tmux` client process, so the wait backs off
+        // (25, 50, 100, 200, 400, 400... ms): a quick teardown is still seen
+        // within a probe or two, and a slow one costs ~7 probes instead of
+        // the ~40 a fixed 50 ms interval spent across the same budget.
+        const FIRST_POLL: Duration = Duration::from_millis(25);
+        const MAX_POLL: Duration = Duration::from_millis(400);
         let started = Instant::now();
+        let mut poll = FIRST_POLL;
         while self.has_session(name) {
             if started.elapsed() >= KILL_CONFIRM_TIMEOUT {
                 break;
             }
-            std::thread::sleep(POLL_INTERVAL);
+            std::thread::sleep(poll);
+            poll = (poll * 2).min(MAX_POLL);
         }
         // RAL-321: drop this session's confining job (if
         // `new_detached_session_with_command` managed to create one at spawn

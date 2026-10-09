@@ -1159,6 +1159,17 @@ fn route_for_user(
 ) -> Reply {
     let (path_only, query) = path.split_once('?').unwrap_or((path, ""));
     let segs: Vec<&str> = path_only.trim_matches('/').split('/').collect();
+    // Project, fork and stored-forge-token writes change how a PR's forge
+    // remote and client resolve; drop the memoized routing so the next
+    // resolution sees them.
+    if method != "GET"
+        && matches!(
+            segs.as_slice(),
+            ["api", "projects", ..] | ["api", "users", _, "forge-tokens", ..]
+        )
+    {
+        crate::pr::invalidate_pr_routing_cache();
+    }
     match (method, segs.as_slice()) {
         ("GET", ["api", "daemon"]) => health(daemon),
         // ralphus[ignore-endpoint-cli]: daemon lifecycle is the `ralphus-daemon` binary's own verb (`ralphus-daemon stop`), not a task-file CLI command
@@ -11119,11 +11130,30 @@ fn cell_pane(daemon: &Daemon, id: &str, ti: &str, si: &str, query: &str) -> Repl
             vec![],
         );
     };
-    let (cell_id, task) =
-        match daemon.with_read_snapshot(|c| pane_cell_and_task(c, id, task_idx, cell_idx)) {
-            Ok(v) => v,
-            Err(e) => return store_error(&e),
-        };
+    let ((cell_id, task), is_final) = match daemon.with_read_snapshot(|c| {
+        Ok((
+            pane_cell_and_task(c, id, task_idx, cell_idx)?,
+            Store::cell_is_final_conn(c, id, task_idx, cell_idx)?,
+        ))
+    }) {
+        Ok(v) => v,
+        Err(e) => return store_error(&e),
+    };
+    // The board keeps polling an ended cell's box every 2 s so it can revive
+    // on a restart. A cell in a final state with no live activity has no
+    // session to capture, so answer from the stored snapshot without
+    // spawning a `tmux capture-pane` that can only fail; a restart moves the
+    // cell out of its final state and live capture resumes.
+    let name = crate::tmux::session_name(id, &task, &cell_id);
+    if is_final
+        && daemon
+            .store_handle()
+            .lock_free_memory()
+            .live_activity_ms(&name)
+            .is_none()
+    {
+        return inactive_pane_reply(&name);
+    }
     capture_pane_reply(daemon, id, &task, &cell_id, query)
 }
 

@@ -84,6 +84,7 @@ pub mod triage;
 pub mod user_forge_tokens;
 pub mod users;
 pub mod vcs;
+pub mod vcs_refs;
 pub mod watchdog;
 pub mod watches;
 pub mod waypoints;

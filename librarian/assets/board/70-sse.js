@@ -777,6 +777,7 @@
       document.addEventListener("visibilitychange", () => {
         if (document.visibilityState !== "visible") return;
         tick();
+        void pollOpenPeeks();
         if (!currentEventSource || currentEventSource.readyState === EventSource.CLOSED) {
           connectEventStream();
         }

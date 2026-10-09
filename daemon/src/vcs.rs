@@ -31,7 +31,7 @@
 
 use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 /// The VCS kind assumed when a project's kind is unknown or unregistered.
@@ -162,7 +162,25 @@ impl GitVcs {
     /// reason `std::process::Command::output()` normally does this itself;
     /// this hand-rolls it only because `output()` has no timeout variant.
     fn exec_raw(root: &Path, args: &[&str]) -> Result<std::process::Output, String> {
-        let mut child = Command::new("git")
+        // A plain ref lookup is a file read; answer it without a process when
+        // the answer is exact (see `crate::vcs_refs`).
+        if let Some(output) = crate::vcs_refs::try_rev_parse(root, args) {
+            return Ok(output);
+        }
+        // `remote get-url` / `config --get` answers are reused while the
+        // config files they depend on are unchanged (see `crate::vcs_refs`).
+        if let Some(output) = crate::vcs_refs::cached_config_read(root, args) {
+            return Ok(output);
+        }
+        // Ancestry between two fixed commits never changes.
+        if let Some(output) = crate::vcs_refs::cached_ancestry(root, args) {
+            return Ok(output);
+        }
+        let config_stamp = crate::vcs_refs::config_read_stamp(root, args);
+        // One OS process instead of two or three for read-only subcommands
+        // on Windows; see `ralphus_core::git_spawn`.
+        let mut command = ralphus_core::git_spawn::command(args);
+        command
             .args(args)
             .current_dir(root)
             // Harmless for the read-only callers in this impl block, and
@@ -170,7 +188,20 @@ impl GitVcs {
             // shared here rather than duplicated so there is only one spawn
             // site to audit.
             .env("GIT_EDITOR", "true")
-            .env("GIT_SEQUENCE_EDITOR", "true")
+            .env("GIT_SEQUENCE_EDITOR", "true");
+        // fetch/commit/merge/rebase otherwise start `git maintenance run
+        // --auto` as extra processes after every call -- outside the
+        // exclusive guard `guardian_merge::run_periodic_git_maintenance`
+        // holds for exactly that work, which it already runs on its own
+        // schedule. An explicit gc/maintenance call keeps the repo's own
+        // settings.
+        if !args.iter().any(|a| matches!(*a, "gc" | "maintenance")) {
+            command
+                .env("GIT_CONFIG_COUNT", "1")
+                .env("GIT_CONFIG_KEY_0", "maintenance.auto")
+                .env("GIT_CONFIG_VALUE_0", "false");
+        }
+        let mut child = command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -215,11 +246,16 @@ impl GitVcs {
             }
         };
 
-        Ok(std::process::Output {
+        let output = std::process::Output {
             status,
             stdout: stdout_thread.join().unwrap_or_default(),
             stderr: stderr_thread.join().unwrap_or_default(),
-        })
+        };
+        if let Some(stamp) = config_stamp {
+            crate::vcs_refs::remember_config_read(root, args, stamp, &output);
+        }
+        crate::vcs_refs::remember_ancestry(root, args, &output);
+        Ok(output)
     }
 }
 
@@ -457,6 +493,7 @@ pub fn for_project_root(store: &crate::store::Store, root: &Path) -> Result<Box<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     #[test]
     fn git_is_the_only_implemented_kind() {

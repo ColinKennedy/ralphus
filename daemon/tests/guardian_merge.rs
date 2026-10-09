@@ -1971,7 +1971,7 @@ fn auto_fix_dispatch_appends_discourage_tests_guidance_from_project_default_when
 /// the prompt) -- and still folds its fix into the stack exactly as the
 /// no-log case above.
 #[test]
-fn auto_fix_dispatch_writes_ci_failure_log_into_branch_worktree() {
+fn auto_fix_dispatch_writes_ci_failure_log_into_branch_git_dir_not_working_tree() {
     let root = temp_repo();
     init_repo(&root);
     let remote_dir = temp_repo();
@@ -2053,9 +2053,20 @@ fn auto_fix_dispatch_writes_ci_failure_log_into_branch_worktree() {
         &store, &runner, &guardian, &pr, &failure, &client,
     );
 
-    let log_path = Path::new(&worktree).join(".ralphus-ci-failure.log");
+    // The log lives in the worktree's git dir, never in its working tree, so
+    // nothing can commit it into the PR.
+    let git_dir = std::path::PathBuf::from(
+        git(Path::new(&worktree), &["rev-parse", "--absolute-git-dir"]).trim(),
+    );
+    let log_path = git_dir.join(".ralphus-ci-failure.log");
     let log_contents = std::fs::read_to_string(&log_path).expect("ci failure log written");
     assert_eq!(log_contents, "line1\nline2\nline3\n");
+    assert!(
+        !Path::new(&worktree)
+            .join(".ralphus-ci-failure.log")
+            .exists(),
+        "the CI failure log must not be written into the working tree"
+    );
 
     let view = store.lock().get_guardian(&id).unwrap();
     let rev0 = view.branches[0].review_branch.clone().unwrap();
@@ -2159,18 +2170,17 @@ fn auto_fix_dispatch_gives_every_failing_check_its_own_log_file_and_prompt_parag
         &store, &runner, &guardian, &pr, &failure, &client,
     );
 
-    let build_log =
-        std::fs::read_to_string(Path::new(&worktree).join(".ralphus-ci-failure-build.log"))
-            .expect("build check's own log file written");
+    let git_dir = std::path::PathBuf::from(
+        git(Path::new(&worktree), &["rev-parse", "--absolute-git-dir"]).trim(),
+    );
+    let build_log = std::fs::read_to_string(git_dir.join(".ralphus-ci-failure-build.log"))
+        .expect("build check's own log file written");
     assert_eq!(build_log, "build broke\n");
-    let test_log =
-        std::fs::read_to_string(Path::new(&worktree).join(".ralphus-ci-failure-test.log"))
-            .expect("test check's own log file written");
+    let test_log = std::fs::read_to_string(git_dir.join(".ralphus-ci-failure-test.log"))
+        .expect("test check's own log file written");
     assert_eq!(test_log, "test failed\n");
     assert!(
-        !Path::new(&worktree)
-            .join(".ralphus-ci-failure.log")
-            .exists(),
+        !git_dir.join(".ralphus-ci-failure.log").exists(),
         "the single-failure filename must not be used once there is more than one failing check"
     );
 

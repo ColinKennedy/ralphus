@@ -907,6 +907,17 @@ impl ForgeClient {
     /// silently does nothing). Logs the outbound call (start/done/error) via
     /// `rlog!`.
     pub fn get_pull_request_state(&self, number: i64) -> Result<String, String> {
+        self.get_pull_request_state_and_head(number)
+            .map(|(state, _)| state)
+    }
+
+    /// [`Self::get_pull_request_state`] plus the PR/MR's current source-head
+    /// commit SHA, which both forges return in the same response (GitHub's
+    /// `head.sha`, GitLab's `sha`); `None` when the response carries none.
+    pub fn get_pull_request_state_and_head(
+        &self,
+        number: i64,
+    ) -> Result<(String, Option<String>), String> {
         // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
         crate::rlog!(
             DEBUG,
@@ -917,7 +928,7 @@ impl ForgeClient {
         let result = self.get_pull_request_state_inner(number);
         match &result {
             // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
-            Ok(state) => crate::rlog!(
+            Ok((state, _)) => crate::rlog!(
                 DEBUG,
                 "ralphus [forge] get pr state done kind={} repo={} number={number} state={state}",
                 self.kind.as_str(),
@@ -934,7 +945,10 @@ impl ForgeClient {
         result
     }
 
-    fn get_pull_request_state_inner(&self, number: i64) -> Result<String, String> {
+    fn get_pull_request_state_inner(
+        &self,
+        number: i64,
+    ) -> Result<(String, Option<String>), String> {
         let token = self.require_token()?;
         match self.kind {
             ForgeKind::GitHub => {
@@ -945,10 +959,11 @@ impl ForgeClient {
                         .set("Authorization", &format!("Bearer {token}"))
                         .set("Accept", "application/vnd.github+json"),
                 )?;
+                let head = resp["head"]["sha"].as_str().map(str::to_string);
                 if resp["merged"].as_bool().unwrap_or(false) {
-                    return Ok("merged".to_string());
+                    return Ok(("merged".to_string(), head));
                 }
-                Ok(resp["state"].as_str().unwrap_or("open").to_string())
+                Ok((resp["state"].as_str().unwrap_or("open").to_string(), head))
             }
             ForgeKind::GitLab => {
                 let url = format!(
@@ -956,10 +971,15 @@ impl ForgeClient {
                     self.api_base, self.repo_path
                 );
                 let resp = self.get(http_agent().get(&url).set("PRIVATE-TOKEN", token))?;
-                Ok(match resp["state"].as_str().unwrap_or("opened") {
+                let head = resp["sha"]
+                    .as_str()
+                    .or_else(|| resp["diff_refs"]["head_sha"].as_str())
+                    .map(str::to_string);
+                let state = match resp["state"].as_str().unwrap_or("opened") {
                     "opened" => "open".to_string(),
                     other => other.to_string(),
-                })
+                };
+                Ok((state, head))
             }
         }
     }
@@ -1337,20 +1357,29 @@ impl ForgeClient {
             }));
         }
 
-        let Some(pipeline_status) = mr["pipeline"]["status"].as_str() else {
+        // `head_pipeline` is the MR's latest pipeline for its source head.
+        // The older `pipeline` field stays null when that pipeline was created
+        // by the branch push that preceded the MR -- which is how ralphus
+        // always submits -- so it is only the fallback.
+        let pipeline = if mr["head_pipeline"].is_object() {
+            &mr["head_pipeline"]
+        } else {
+            &mr["pipeline"]
+        };
+        let Some(pipeline_status) = pipeline["status"].as_str() else {
             // No pipeline has run against this MR yet.
             return Ok(PrCiState::Pending);
         };
-        if !self.gitlab_pipeline_is_current_for_mr(number, &mr, &mr["pipeline"], token) {
+        if !self.gitlab_pipeline_is_current_for_mr(number, &mr, pipeline, token) {
             return Ok(PrCiState::Pending);
         }
         match pipeline_status {
             "success" => Ok(PrCiState::Passing),
             "failed" => {
-                let Some(pipeline_id) = mr["pipeline"]["id"].as_i64() else {
+                let Some(pipeline_id) = pipeline["id"].as_i64() else {
                     return Ok(PrCiState::Failing(PrFailure {
                         reason: "pipeline failed".to_string(),
-                        job_url: mr["pipeline"]["web_url"].as_str().map(str::to_string),
+                        job_url: pipeline["web_url"].as_str().map(str::to_string),
                         log_text: None,
                         checks: vec![],
                         ..Default::default()
@@ -1360,7 +1389,7 @@ impl ForgeClient {
                 if jobs.is_empty() {
                     return Ok(PrCiState::Failing(PrFailure {
                         reason: "pipeline failed".to_string(),
-                        job_url: mr["pipeline"]["web_url"].as_str().map(str::to_string),
+                        job_url: pipeline["web_url"].as_str().map(str::to_string),
                         log_text: None,
                         checks: vec![],
                         ..Default::default()
@@ -1393,7 +1422,7 @@ impl ForgeClient {
             }
             "canceled" | "skipped" => Ok(PrCiState::Failing(PrFailure {
                 reason: format!("pipeline {pipeline_status}"),
-                job_url: mr["pipeline"]["web_url"].as_str().map(str::to_string),
+                job_url: pipeline["web_url"].as_str().map(str::to_string),
                 log_text: None,
                 checks: vec![],
                 ..Default::default()
@@ -1656,7 +1685,8 @@ impl ForgeClient {
     ) -> Result<CancelSummary, String> {
         let url = format!("{}/repos/{}/actions/runs", self.api_base, self.repo_path);
         let resp = self.get(
-            ureq::get(&url)
+            http_agent()
+                .get(&url)
                 .query("branch", branch)
                 .set("Authorization", &format!("Bearer {token}"))
                 .set("Accept", "application/vnd.github+json"),
@@ -1683,7 +1713,8 @@ impl ForgeClient {
                 "{}/repos/{}/actions/runs/{run_id}/force-cancel",
                 self.api_base, self.repo_path
             );
-            match ureq::post(&cancel_url)
+            match http_agent()
+                .post(&cancel_url)
                 .set("Authorization", &format!("Bearer {token}"))
                 .set("Accept", "application/vnd.github+json")
                 .set("Content-Type", "application/json")
@@ -1712,7 +1743,8 @@ impl ForgeClient {
     ) -> Result<CancelSummary, String> {
         let url = format!("{}/projects/{}/pipelines", self.api_base, self.repo_path);
         let resp = self.get(
-            ureq::get(&url)
+            http_agent()
+                .get(&url)
                 .query("ref", branch)
                 .set("PRIVATE-TOKEN", token),
         )?;
@@ -1736,7 +1768,7 @@ impl ForgeClient {
                 self.api_base, self.repo_path
             );
             self.send(
-                ureq::post(&cancel_url).set("PRIVATE-TOKEN", token),
+                http_agent().post(&cancel_url).set("PRIVATE-TOKEN", token),
                 &serde_json::json!({}),
             )?;
             cancelled.push(pipeline_id);
@@ -6988,6 +7020,48 @@ mod tests {
                 generation: Some("55".to_string()),
                 ..Default::default()
             })
+        );
+        mock.finish();
+    }
+
+    #[test]
+    fn check_pr_ci_status_reads_gitlab_head_pipeline_when_pipeline_is_null() {
+        // GitLab leaves `pipeline` null when the MR's pipeline was created by
+        // the branch push before the MR existed; `head_pipeline` carries it.
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
+            assert_eq!(req.url(), "/projects/group%2Fproj/merge_requests/9");
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"merge_status": "can_be_merged", "sha": "head-sha", "pipeline": null, "head_pipeline": {"id": 55, "ref": "feature", "sha": "head-sha", "status": "failed", "web_url": "https://gitlab.example/pipelines/55"}}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+            let req = server.recv();
+            assert_eq!(
+                req.url(),
+                "/projects/group%2Fproj/pipelines/55/jobs?scope[]=failed&per_page=100&page=1"
+            );
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"[{"id": 77, "name": "test", "web_url": "https://gitlab.example/jobs/77"}]"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+            let req = server.recv();
+            assert_eq!(req.url(), "/projects/group%2Fproj/jobs/77/trace");
+            req.respond(
+                tiny_http::Response::from_string("FAIL: assertion failed\n").with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = mock.client(ForgeKind::GitLab, "group%2Fproj");
+        let state = client.check_pr_ci_status(9).unwrap();
+        assert!(
+            matches!(&state, PrCiState::Failing(f) if f.generation.as_deref() == Some("55")),
+            "{state:?}"
         );
         mock.finish();
     }

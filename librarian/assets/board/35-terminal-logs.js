@@ -874,12 +874,21 @@
        * @returns {Promise<void>}
        */
       async function pollOpenPeeks() {
+        // A hidden tab shows nothing, and every box poll can cost the daemon a
+        // tmux process; the visibilitychange handler refreshes on return.
+        if (document.hidden) return;
         // Replacing a pre's text destroys any in-progress text selection inside it
         // (e.g. the user copying a line from the terminal transcript) even though
         // the rest of the page's periodic re-render is already skipped for the same
         // reason — see userIsSelecting()/RAL-7. Skip this tick entirely and pick back
         // up once the selection is released.
         if (userIsSelecting()) return;
+        // Ended boxes poll every tick too, so a restart revives them within a
+        // tick or two. The daemon answers an ended cell from its stored
+        // snapshot without touching tmux, so this costs only an HTTP request
+        // and a database read per box. If that ever adds up, throttle ended
+        // boxes here (e.g. poll them every Nth tick) at the price of a slower
+        // revive; deliberately not throttled for now.
         const keys = Object.keys(peekOpen).filter((k) => peekOpen[k]);
         // Concurrent, not sequential (RAL-397 made each box's fetchPeek() issue
         // up to two round trips instead of one -- with N open boxes, a
