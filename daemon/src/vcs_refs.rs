@@ -319,7 +319,15 @@ fn lookup(git_dir: &Path, common: &Path, full: &str, depth: u8) -> Lookup {
                 Lookup::Unsure
             }
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        // `NotADirectory`: a parent component is a file, e.g. the
+        // `refs/remotes/origin/main/HEAD` candidate when
+        // `refs/remotes/origin/main` is a loose ref (Unix reports ENOTDIR).
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
             if !full.starts_with("refs/") {
                 return Lookup::Missing;
             }
