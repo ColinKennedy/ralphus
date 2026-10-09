@@ -4478,7 +4478,7 @@ mod tests {
     /// RAL-241: a minimal spec for exercising `check_stall_escalation`
     /// directly — no tmux/subprocess involved, since that method only reads
     /// `spec`'s entity fields and talks to the attached `Store`.
-    fn stall_test_spec() -> RunnerSpec {
+    pub(super) fn stall_test_spec() -> RunnerSpec {
         RunnerSpec {
             squad_id: "squad-000000000001".to_string(),
             task: "build".to_string(),

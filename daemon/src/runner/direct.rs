@@ -671,6 +671,126 @@ impl SubprocessRunner {
 mod tests {
     use super::*;
 
+    /// A stand-in for `ralphus-runner`: honors `send <spec> --result-file
+    /// <path>`, prints one line, optionally lingers, then writes a `done`
+    /// result. Returns the runner built around it.
+    fn stub_runner(tag: &str, linger_secs: u32) -> (SubprocessRunner, std::path::PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("ralphus-direct-stub-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let result_json = r#"{\"status\":\"done\",\"tokens_in\":1,\"tokens_out\":2}"#;
+        let (path, body) = if cfg!(windows) {
+            let linger = if linger_secs > 0 {
+                format!("ping -n {} 127.0.0.1 >nul\r\n", linger_secs + 1)
+            } else {
+                String::new()
+            };
+            (
+                dir.join("stub.cmd"),
+                format!(
+                    "@echo off\r\necho stub-output-line\r\n{linger}>\"%~4\" echo {}\r\n",
+                    result_json.replace('\\', "")
+                ),
+            )
+        } else {
+            (
+                dir.join("stub.sh"),
+                format!(
+                    "#!/bin/sh\necho stub-output-line\nsleep {linger_secs}\nprintf '%s' '{}' > \"$4\"\n",
+                    result_json.replace('\\', "")
+                ),
+            )
+        };
+        std::fs::write(&path, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        (SubprocessRunner::new(&path.to_string_lossy()), dir)
+    }
+
+    fn command_spec(cell_id: &str) -> RunnerSpec {
+        let mut spec = super::super::tests::stall_test_spec();
+        spec.cell_id = cell_id.to_string();
+        spec.prompt = None;
+        spec.command = Some("true".to_string());
+        spec
+    }
+
+    fn transcript_of(spec: &RunnerSpec) -> String {
+        let session = crate::tmux::session_name(&spec.squad_id, &spec.task, &spec.cell_id);
+        std::fs::read_to_string(crate::terminal_log::raw_transcript_path(&session, 0))
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_headless_run_completes_and_tees_its_output_into_the_transcript() {
+        let (runner, dir) = stub_runner("ok", 0);
+        let spec = command_spec("direct-test-ok");
+        let result = runner.run_direct(&spec, &CancelToken::new());
+        assert!(result.is_done(), "{result:?}");
+        assert_eq!((result.tokens_in, result.tokens_out), (1, 2));
+        assert!(transcript_of(&spec).contains("stub-output-line"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cancelling_stops_a_headless_run_promptly() {
+        let (runner, dir) = stub_runner("cancel", 30);
+        let spec = command_spec("direct-test-cancel");
+        let cancel = CancelToken::new();
+        let trigger = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(700));
+            trigger.cancel();
+        });
+        let started = Instant::now();
+        let result = runner.run_direct(&spec, &cancel);
+        assert_eq!(result.error.as_deref(), Some("cancelled"), "{result:?}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stop_request_by_session_name_stops_a_headless_run() {
+        let (runner, dir) = stub_runner("stop", 30);
+        let spec = command_spec("direct-test-stop");
+        let session = crate::tmux::session_name(&spec.squad_id, &spec.task, &spec.cell_id);
+        let stopper = std::thread::spawn(move || {
+            for _ in 0..100 {
+                if is_active(&session) {
+                    std::thread::sleep(Duration::from_millis(500));
+                    return request_stop(&session);
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            false
+        });
+        let started = Instant::now();
+        let result = runner.run_direct(&spec, &CancelToken::new());
+        assert!(stopper.join().unwrap(), "the run was never seen as active");
+        assert_eq!(result.error.as_deref(), Some("cancelled"), "{result:?}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_headless_run_past_its_deadline_times_out() {
+        let (runner, dir) = stub_runner("timeout", 30);
+        let mut spec = command_spec("direct-test-timeout");
+        spec.timeout_sec = Some(1);
+        let started = Instant::now();
+        let result = runner.run_direct(&spec, &CancelToken::new());
+        assert_eq!(
+            result.error.as_deref(),
+            Some("timed out after 1s"),
+            "{result:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn capped_sink_stops_at_the_cap_and_marks_once() {
         let dir = std::env::temp_dir().join(format!("ralphus-direct-sink-{}", std::process::id()));

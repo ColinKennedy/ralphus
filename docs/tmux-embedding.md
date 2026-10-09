@@ -1,11 +1,34 @@
 # Embedding tmux (RAL-102, vendorized in RAL-347)
 
-ralphus routes every agent invocation (task cells, `prompt`-kind proof
-steps, Guardian merge/resolver cells) through a detached tmux session
-instead of a raw child process, so the board can show a live, pollable view
-of what the agent is doing. See `daemon/src/tmux.rs` for the wrapper and
-`daemon/src/runner.rs`'s `SubprocessRunner::run_via_tmux` for how a session
-is launched and its result collected back.
+## Headless by default
+
+Cells, proof steps and the review's resolver/feedback/summary runs are
+**headless**: `ralphus-runner send` drives the agent over piped stdio, so
+nothing needs a terminal. `daemon/src/runner/direct.rs` spawns it as a plain
+child process, tees its stdout and stderr into the cell's capped `.raw`
+transcript (the file a `pipe-pane` sink used to write), and takes completion
+from the child's exit status and its result file. Event forwarding, stall
+detection, terminal logs and the board's Live View all read that transcript,
+so a running cell's Live View is the live tail of its transcript, not a
+rendered screen. Cancelling, detaching, timing out and a cost cap kill the
+child's whole process tree (`crate::proof::ProcessTree`: a Job Object on
+Windows, a process group on Unix).
+
+`RALPHUS_RUNNER_MODE=tmux` restores the older path, where each run lives in a
+detached tmux session; `direct` forces the headless path for every spec. The
+rest of this document describes that tmux machinery, which is still used by
+**Open Agent**: detaching a running cell stops its headless run, then
+`<cell>-resume` is a tmux session running the agent's own `--resume
+<agent_session_id>`, so a human can take over and "Resume Automation" hands the
+same conversation back to a headless run.
+
+## The tmux path
+
+When a run does go through tmux (`RALPHUS_RUNNER_MODE=tmux`, or an Open Agent
+resume session), the agent runs in a detached tmux session so the board can
+show a live, pollable view of what it is doing. See `daemon/src/tmux.rs` for
+the wrapper and `daemon/src/runner.rs`'s `SubprocessRunner::run_via_tmux` for
+how a session is launched and its result collected back.
 
 On Windows this is [psmux](https://github.com/psmux/psmux), a native
 Windows tmux alternative — not real tmux, and not a drop-in (see "Why
