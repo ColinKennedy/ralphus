@@ -10,8 +10,17 @@
 //! Opening a different review [`SummaryQueue::promote`]s its pending job to
 //! High rather than running a second, synchronous computation.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
+
+/// A [`Priority::Low`] request for a guardian recomputed less than this long
+/// ago is dropped. Low requests come from the board's list endpoints, which
+/// re-ask on every refresh (several times a minute per open tab) whether or
+/// not anything changed; events that do change a summary (a branch becoming
+/// ready) and the user opening a review use `High`/`promote`, which are never
+/// throttled.
+const LOW_PRIORITY_MIN_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Priority {
@@ -26,6 +35,9 @@ struct Inner {
     /// `promote` be idempotent instead of piling up duplicate entries for a
     /// guardian that's already waiting to be recomputed.
     queued: HashSet<String>,
+    /// When each guardian's last recompute finished, for
+    /// [`LOW_PRIORITY_MIN_INTERVAL`].
+    last_done: HashMap<String, Instant>,
     shutdown: bool,
 }
 
@@ -45,6 +57,7 @@ impl SummaryQueue {
                 high: VecDeque::new(),
                 low: VecDeque::new(),
                 queued: HashSet::new(),
+                last_done: HashMap::new(),
                 shutdown: false,
             }),
             cv: Condvar::new(),
@@ -60,6 +73,14 @@ impl SummaryQueue {
     /// meanwhile.
     pub fn enqueue(&self, id: &str, priority: Priority) {
         let mut inner = self.inner.lock().expect("summary queue mutex poisoned");
+        if priority == Priority::Low
+            && inner
+                .last_done
+                .get(id)
+                .is_some_and(|at| at.elapsed() < LOW_PRIORITY_MIN_INTERVAL)
+        {
+            return;
+        }
         if inner.queued.contains(id) {
             if priority == Priority::High {
                 if let Some(pos) = inner.low.iter().position(|x| x == id) {
@@ -121,6 +142,16 @@ impl SummaryQueue {
         }
     }
 
+    /// Record that `id`'s recompute just finished.
+    fn mark_done(&self, id: &str) {
+        let mut inner = self.inner.lock().expect("summary queue mutex poisoned");
+        let now = Instant::now();
+        inner
+            .last_done
+            .retain(|_, at| now.duration_since(*at) < LOW_PRIORITY_MIN_INTERVAL);
+        inner.last_done.insert(id.to_string(), now);
+    }
+
     /// Stop the queue once everything already queued has been popped — lets
     /// [`worker_loop`] return instead of blocking forever. Existing entries
     /// still drain first; this does not discard queued work.
@@ -137,6 +168,7 @@ impl SummaryQueue {
 pub fn worker_loop(queue: &SummaryQueue, store: &crate::store_lock::StoreHandle) {
     while let Some(id) = queue.pop() {
         crate::guardian_merge::recompute_preliminary_summary(store, &id);
+        queue.mark_done(&id);
     }
 }
 
@@ -158,6 +190,22 @@ pub fn spawn_workers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_recent_recompute_drops_low_but_not_high_or_promote() {
+        let q = SummaryQueue::new();
+        q.mark_done("a");
+        q.enqueue("a", Priority::Low);
+        q.enqueue("b", Priority::Low);
+        assert_eq!(q.pop().as_deref(), Some("b"));
+        q.enqueue("a", Priority::High);
+        assert_eq!(q.pop().as_deref(), Some("a"));
+        q.mark_done("a");
+        q.promote("a");
+        assert_eq!(q.pop().as_deref(), Some("a"));
+        q.shutdown();
+        assert_eq!(q.pop(), None);
+    }
 
     #[test]
     fn enqueue_dedups_same_id() {
