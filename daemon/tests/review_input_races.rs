@@ -2034,6 +2034,10 @@ impl Fixture {
             // keeping both sides; a step with nothing left to apply (the
             // daemon already pulled that change in) is skipped.
             while rebasing() {
+                if Instant::now() >= deadline {
+                    let _ = run(&["rebase", "--abort"]);
+                    break;
+                }
                 let conflicted = git(&clone, &["diff", "--name-only", "--diff-filter=U"]);
                 if conflicted.trim().is_empty() {
                     let staged = run(&["diff", "--cached", "--quiet"]);
