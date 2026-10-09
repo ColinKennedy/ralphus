@@ -86,7 +86,7 @@ impl ProcessTree {
     /// spawn (see `prepare_command`), not on the spawned `Child` — so this is
     /// a no-op constructor kept only to give both platforms the same call
     /// shape at the use site.
-    fn confine(_child: &Child) -> Self {
+    pub(crate) fn confine(_child: &Child) -> Self {
         Self
     }
 
