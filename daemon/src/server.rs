@@ -10737,7 +10737,13 @@ fn attach_tmux_terminal(squad_id: &str, task: &str, cell_id: &str) -> Reply {
 /// [`prune_stale_readonly_viewer_copies`] can freely delete old copies from
 /// that directory without ever touching the persisted record.
 fn open_readonly_snapshot_terminal(session_name: &str) -> Reply {
-    let Some(content) = crate::tmux::read_pane_snapshot(session_name) else {
+    // A cell running without tmux has no pane snapshot yet: its record is the
+    // transcript it is writing right now.
+    let headless_tail = crate::runner::direct_session_active(session_name)
+        .then(|| crate::runner::direct_live_tail(session_name, 2000))
+        .flatten();
+    let Some(content) = headless_tail.or_else(|| crate::tmux::read_pane_snapshot(session_name))
+    else {
         return error(
             409,
             "no_tmux_session",
