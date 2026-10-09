@@ -478,7 +478,6 @@ impl SubprocessRunner {
         let mut decided: Option<RunnerResult> = None;
         let mut exited = false;
         while decided.is_none() && !exited {
-            let note = |message: &str| self.emit_direct_note(spec, message, session_name);
             if cancel.is_cancelled() {
                 tree.kill(&mut child);
                 crate::rlog!(
@@ -487,22 +486,26 @@ impl SubprocessRunner {
                     spec.squad_id,
                     spec.cell_id
                 );
-                note("direct run killed: cancelled");
+                self.emit_direct_note(spec, "direct run killed: cancelled", session_name);
                 decided = Some(RunnerResult::failure("cancelled"));
             } else if active.stop_requested() {
                 tree.kill(&mut child);
-                note("direct run killed: stop requested");
+                self.emit_direct_note(spec, "direct run killed: stop requested", session_name);
                 decided = Some(RunnerResult::failure("cancelled"));
             } else if detach.is_some_and(crate::cancel::DetachToken::is_cancelled) {
                 tree.kill(&mut child);
-                note("direct run killed: detached for manual takeover");
+                self.emit_direct_note(
+                    spec,
+                    "direct run killed: detached for manual takeover",
+                    session_name,
+                );
                 decided = Some(RunnerResult::detached(
                     current_usage,
                     resumable_agent_session_id.clone(),
                 ));
             } else if waypoint_halt.is_some_and(crate::cancel::WaypointHaltToken::is_cancelled) {
                 tree.kill(&mut child);
-                note("direct run killed: waypoint halt");
+                self.emit_direct_note(spec, "direct run killed: waypoint halt", session_name);
                 decided = Some(RunnerResult::waypoint_halted(
                     current_usage,
                     resumable_agent_session_id.clone(),
@@ -524,7 +527,7 @@ impl SubprocessRunner {
                             .map(|state| state.summary)
                     })
                     .unwrap_or_default();
-                note("direct run killed: stopped by Arbiter");
+                self.emit_direct_note(spec, "direct run killed: stopped by Arbiter", session_name);
                 decided = Some(RunnerResult::arbiter_stopped(
                     current_usage,
                     format!(
@@ -540,7 +543,7 @@ impl SubprocessRunner {
                     spec.squad_id,
                     spec.cell_id
                 );
-                note("direct run killed: timed out");
+                self.emit_direct_note(spec, "direct run killed: timed out", session_name);
                 decided = Some(RunnerResult::failure(format!("timed out after {secs}s")));
             } else if spec
                 .maximum_budget_usd
@@ -555,7 +558,7 @@ impl SubprocessRunner {
                     spec.squad_id,
                     spec.cell_id
                 );
-                note("direct run killed: cost limit exceeded");
+                self.emit_direct_note(spec, "direct run killed: cost limit exceeded", session_name);
                 decided = Some(RunnerResult::cost_exceeded(current_usage, cap));
             } else if let Some(reason) = self.maximum_timeout_exceeded(spec, started.elapsed()) {
                 tree.kill(&mut child);
@@ -565,7 +568,11 @@ impl SubprocessRunner {
                     spec.squad_id,
                     spec.cell_id
                 );
-                note("direct run killed: maximum_timeout_seconds exceeded");
+                self.emit_direct_note(
+                    spec,
+                    "direct run killed: maximum_timeout_seconds exceeded",
+                    session_name,
+                );
                 decided = Some(RunnerResult::maximum_timeout_exceeded(
                     current_usage,
                     reason,
@@ -603,7 +610,11 @@ impl SubprocessRunner {
                         spec.cell_id,
                         sample.last_line,
                     );
-                    note("direct run killed: thinking-repetition stall detected");
+                    self.emit_direct_note(
+                        spec,
+                        "direct run killed: thinking-repetition stall detected",
+                        session_name,
+                    );
                     decided = Some(RunnerResult::thinking_stalled(
                         current_usage,
                         resumable_agent_session_id.clone(),
