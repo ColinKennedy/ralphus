@@ -169,7 +169,8 @@ impl GitVcs {
         }
         // One OS process instead of two or three for read-only subcommands
         // on Windows; see `ralphus_core::git_spawn`.
-        let mut child = ralphus_core::git_spawn::command(args)
+        let mut command = ralphus_core::git_spawn::command(args);
+        command
             .args(args)
             .current_dir(root)
             // Harmless for the read-only callers in this impl block, and
@@ -177,7 +178,20 @@ impl GitVcs {
             // shared here rather than duplicated so there is only one spawn
             // site to audit.
             .env("GIT_EDITOR", "true")
-            .env("GIT_SEQUENCE_EDITOR", "true")
+            .env("GIT_SEQUENCE_EDITOR", "true");
+        // fetch/commit/merge/rebase otherwise start `git maintenance run
+        // --auto` as extra processes after every call -- outside the
+        // exclusive guard `guardian_merge::run_periodic_git_maintenance`
+        // holds for exactly that work, which it already runs on its own
+        // schedule. An explicit gc/maintenance call keeps the repo's own
+        // settings.
+        if !args.iter().any(|a| matches!(*a, "gc" | "maintenance")) {
+            command
+                .env("GIT_CONFIG_COUNT", "1")
+                .env("GIT_CONFIG_KEY_0", "maintenance.auto")
+                .env("GIT_CONFIG_VALUE_0", "false");
+        }
+        let mut child = command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
