@@ -282,6 +282,12 @@ impl std::fmt::Display for TmuxError {
     }
 }
 
+/// The error the tmux CLI reports for a session with no server, used when
+/// the in-process client finds the same condition.
+fn no_server(name: &str) -> TmuxError {
+    TmuxError(format!("no server running on session '{name}'"))
+}
+
 impl std::error::Error for TmuxError {}
 
 /// Deterministic, collision-avoiding tmux session name for a runner
@@ -912,6 +918,12 @@ impl Tmux {
         let child = Command::new(&self.program)
             .args(&self.prefix_args)
             .args(args)
+            // The server this starts inherits the environment. psmux otherwise
+            // pre-spawns a spare "warm" shell (and may start a standby server)
+            // after creating the session so the *next* interactive session
+            // opens faster; ralphus never uses either, and each is a
+            // PowerShell plus conhost per session. Real tmux ignores it.
+            .env("PSMUX_NO_WARM", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -931,10 +943,86 @@ impl Tmux {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
+    /// Whether commands for an existing session go to the psmux server
+    /// in-process ([`crate::psmux_client`]) rather than through a spawned
+    /// client. Only for a bare program (a multi-word `RALPHUS_TMUX_CMD` such
+    /// as `wsl.exe tmux` is real tmux, which speaks a different protocol).
+    fn native(&self) -> bool {
+        self.prefix_args.is_empty() && crate::psmux_client::enabled()
+    }
+
+    /// Send a fire-and-forget command line (`set-option ...`, `send-keys
+    /// ...`) to `name` in-process, or `None` when the caller must use the CLI.
+    fn native_command(&self, name: &str, line: &str) -> Option<Result<(), TmuxError>> {
+        if !self.native() {
+            return None;
+        }
+        match crate::psmux_client::command(name, line) {
+            Ok(()) => Some(Ok(())),
+            Err(crate::psmux_client::Error::NoServer) => Some(Err(no_server(name))),
+            Err(crate::psmux_client::Error::Refused(msg)) => Some(Err(TmuxError(msg))),
+            Err(crate::psmux_client::Error::Unavailable(_)) => None,
+        }
+    }
+
+    /// `kill-session -t <name>`. In-process it does what psmux's own CLI does
+    /// (`main.rs`'s kill-session arm): send the kill, give the server 150 ms,
+    /// and repeat until the session no longer answers or 5 s pass, then
+    /// remove the stale port file. The CLI is used when the in-process path
+    /// is unavailable.
+    fn send_kill_session(&self, name: &str) -> Result<(), TmuxError> {
+        if !self.native() {
+            return self.run(&["kill-session", "-t", name]).map(|_| ());
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match crate::psmux_client::command(name, "kill-session") {
+                Ok(()) | Err(crate::psmux_client::Error::Refused(_)) => {}
+                Err(crate::psmux_client::Error::NoServer) => break,
+                Err(crate::psmux_client::Error::Unavailable(_)) => {
+                    return self.run(&["kill-session", "-t", name]).map(|_| ());
+                }
+            }
+            std::thread::sleep(Duration::from_millis(150));
+            match crate::psmux_client::has_session(name) {
+                Some(false) => break,
+                Some(true) => {}
+                None => return self.run(&["kill-session", "-t", name]).map(|_| ()),
+            }
+            if Instant::now() >= deadline {
+                return Err(TmuxError(format!(
+                    "kill-session: session '{name}' still present after 5s"
+                )));
+            }
+        }
+        if let Some(dir) = crate::psmux_client::data_dir() {
+            let _ = std::fs::remove_file(dir.join(format!("{name}.port")));
+        }
+        Ok(())
+    }
+
     /// Whether a session with this exact name currently exists.
     #[must_use]
     pub fn has_session(&self, name: &str) -> bool {
+        if self.native() {
+            if let Some(exists) = crate::psmux_client::has_session(name) {
+                return exists;
+            }
+        }
         self.run(&["has-session", "-t", name]).is_ok()
+    }
+
+    /// `set-option -t <name> <option> <value>`.
+    fn set_option(&self, name: &str, option: &str, value: &str) -> Result<(), TmuxError> {
+        let line = format!(
+            "set-option {} {}",
+            crate::psmux_client::quote_arg_if_needed(option),
+            crate::psmux_client::quote_arg_if_needed(value)
+        );
+        self.native_command(name, &line).unwrap_or_else(|| {
+            self.run(&["set-option", "-t", name, option, value])
+                .map(|_| ())
+        })
     }
 
     /// Names of all currently-registered sessions starting with `prefix`.
@@ -1095,10 +1183,20 @@ impl Tmux {
         // `kill_session` can later kill this session's whole real process
         // tree, not just free its name — see the module doc comment.
         self.run_confined(&ns_refs, name)?;
+        // The in-process client finds the server through `<data dir>/<name>.port`;
+        // if the server just created put it anywhere else, the client's idea of
+        // the data dir is wrong, so stop using it rather than misreport every
+        // later session as missing.
+        if self.native() && !crate::psmux_client::port_file_exists(name) {
+            crate::psmux_client::disable(&format!(
+                "no port file for {name} under {:?} after new-session",
+                crate::psmux_client::data_dir()
+            ));
+        }
         // Best-effort: without this, tmux discards a dead pane's content
         // immediately, which would race the daemon's own sentinel-based
         // completion detection.
-        if let Err(e) = self.run(&["set-option", "-t", name, "remain-on-exit", "on"]) {
+        if let Err(e) = self.set_option(name, "remain-on-exit", "on") {
             // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
             crate::rlog!(
                 WARNING,
@@ -1149,13 +1247,7 @@ impl Tmux {
         // ceiling this ticket exists to remove — and leaves no breadcrumb when
         // the OOM comes back. The session itself is still usable, so this
         // warns rather than aborting the start.
-        if let Err(e) = self.run(&[
-            "set-option",
-            "-t",
-            name,
-            "history-limit",
-            history_limit.as_str(),
-        ]) {
+        if let Err(e) = self.set_option(name, "history-limit", history_limit.as_str()) {
             // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
             crate::rlog!(
                 WARNING,
@@ -1211,7 +1303,14 @@ impl Tmux {
             std::thread::sleep(PIPE_SINK_SETTLE_DELAY);
         }
         let started = if cfg!(target_os = "windows") {
-            self.run(&["send-keys", "-t", name, base.as_str(), "Enter"])
+            let line = format!(
+                "send-keys {} Enter",
+                crate::psmux_client::quote_arg_if_needed(&base)
+            );
+            self.native_command(name, &line).map_or_else(
+                || self.run(&["send-keys", "-t", name, base.as_str(), "Enter"]),
+                |r| r.map(|()| String::new()),
+            )
         } else {
             self.run(&["respawn-pane", "-k", "-t", name, "-c", cwd, full.as_str()])
         };
@@ -1233,10 +1332,15 @@ impl Tmux {
     /// # Errors
     /// Returns an error if either underlying `send-keys` call fails.
     pub fn send_keys_literal(&self, name: &str, text: &str) -> Result<(), TmuxError> {
-        self.run(&["send-keys", "-t", name, "-l", text])?;
+        let literal = format!(
+            "send-keys -l {}",
+            crate::psmux_client::quote_arg_if_needed(text)
+        );
+        self.native_command(name, &literal)
+            .unwrap_or_else(|| self.run(&["send-keys", "-t", name, "-l", text]).map(|_| ()))?;
         std::thread::sleep(Duration::from_millis(100));
-        self.run(&["send-keys", "-t", name, "Enter"])?;
-        Ok(())
+        self.native_command(name, "send-keys Enter")
+            .unwrap_or_else(|| self.run(&["send-keys", "-t", name, "Enter"]).map(|_| ()))
     }
 
     /// Capture the last `lines` lines of `name`'s pane content, without
@@ -1256,6 +1360,14 @@ impl Tmux {
     /// # Errors
     /// Returns an error if the session does not exist or tmux fails.
     pub fn capture_pane(&self, name: &str, lines: u32) -> Result<String, TmuxError> {
+        if self.native() {
+            match crate::psmux_client::capture_pane(name, lines) {
+                Ok(raw) => return Ok(trim_trailing_blank_pane_lines(&raw)),
+                Err(crate::psmux_client::Error::NoServer) => return Err(no_server(name)),
+                Err(crate::psmux_client::Error::Refused(msg)) => return Err(TmuxError(msg)),
+                Err(crate::psmux_client::Error::Unavailable(_)) => {}
+            }
+        }
         self.run(&["capture-pane", "-p", "-t", name, "-S", &format!("-{lines}")])
             .map(|raw| trim_trailing_blank_pane_lines(&raw))
     }
@@ -1291,8 +1403,29 @@ impl Tmux {
     /// # Errors
     /// Returns an error if the session does not exist or tmux fails.
     pub fn pipe_pane(&self, name: &str, target: &str) -> Result<(), TmuxError> {
+        let line = format!(
+            "pipe-pane -o {}",
+            crate::psmux_client::quote_arg_if_needed(target)
+        );
+        if let Some(result) = self.native_checked(name, &line) {
+            return result;
+        }
         self.run(&["pipe-pane", "-o", "-t", name, target])
             .map(|_| ())
+    }
+
+    /// Send a command whose refusal is an `ERROR` reply (`pipe-pane`) to
+    /// `name` in-process, or `None` when the caller must use the CLI.
+    fn native_checked(&self, name: &str, line: &str) -> Option<Result<(), TmuxError>> {
+        if !self.native() {
+            return None;
+        }
+        match crate::psmux_client::checked_command(name, line) {
+            Ok(()) => Some(Ok(())),
+            Err(crate::psmux_client::Error::NoServer) => Some(Err(no_server(name))),
+            Err(crate::psmux_client::Error::Refused(msg)) => Some(Err(TmuxError(msg))),
+            Err(crate::psmux_client::Error::Unavailable(_)) => None,
+        }
     }
 
     /// Stop any pipe-pane tee previously started on `name` (a bare `pipe-pane`
@@ -1303,7 +1436,9 @@ impl Tmux {
     /// session that's already gone (or a build with no active pipe) is not an
     /// error, since every caller uses this for best-effort cleanup symmetry.
     pub fn stop_pipe_pane(&self, name: &str) {
-        let _ = self.run(&["pipe-pane", "-t", name]);
+        if self.native_checked(name, "pipe-pane").is_none() {
+            let _ = self.run(&["pipe-pane", "-t", name]);
+        }
     }
 
     /// Clear `name`'s in-memory scrollback buffer, freeing whatever RAM the
@@ -1315,7 +1450,9 @@ impl Tmux {
     /// invoke this once the content being cleared is already known-persisted
     /// elsewhere (the pipe-pane transcript, per Phase 2).
     pub fn clear_history(&self, name: &str) {
-        let _ = self.run(&["clear-history", "-t", name]);
+        if self.native_command(name, "clear-history").is_none() {
+            let _ = self.run(&["clear-history", "-t", name]);
+        }
     }
 
     /// Kill `name` if it exists. Idempotent: a session that's already gone is
@@ -1345,7 +1482,7 @@ impl Tmux {
             confine::kill(name);
             return Ok(());
         }
-        self.run(&["kill-session", "-t", name])?;
+        self.send_kill_session(name)?;
         const KILL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
         // Each probe is a `tmux` client process, so the wait backs off
         // (25, 50, 100, 200, 400, 400... ms): a quick teardown is still seen
