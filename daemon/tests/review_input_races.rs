@@ -2467,7 +2467,7 @@ fn stress_upstream_rebases_with_random_concurrent_writers() {
 
 /// The same soak on an eight-branch stack, for longer.
 #[test]
-#[ignore = "~15-minute soak; runs every PR in its own CI job, review-race-soak"]
+#[ignore = "~15-minute soak; runs in the nightly race workflow"]
 fn soak_eight_branch_stack_with_random_concurrent_writers() {
     random_concurrent_writers_soak(
         &[
@@ -6101,7 +6101,7 @@ fn single_branch_review_keeps_feedback_through_an_upstream_rebase() {
 /// A 20-branch stack with feedback on a low, a middle and the top branch and
 /// an upstream move: the coalesced restack keeps all of them.
 #[test]
-#[ignore = "~8-minute soak; runs every PR in its own CI job, review-race-soak"]
+#[ignore = "~8-minute soak; runs in the nightly race workflow"]
 fn soak_twenty_branch_stack_keeps_feedback_through_an_upstream_rebase() {
     let what = "twenty branches";
     let names: Vec<String> = (0..20).map(|i| format!("feature/b{i:02}")).collect();
@@ -7915,7 +7915,7 @@ fn permutations_enumerates_every_order() {
 /// and an upstream push: *every one* of the 3! release orders must keep every
 /// edit. Each order is a fresh review.
 #[test]
-#[ignore = "runs 6 full scenarios (~5 minutes); runs in the review-race-soak CI job"]
+#[ignore = "runs 6 full scenarios (~5 minutes); runs in the nightly race workflow"]
 fn soak_every_release_order_of_three_held_writers_keeps_every_commit() {
     for order in permutations(3) {
         let what = format!("release order {order:?}");
@@ -8006,7 +8006,7 @@ fn conflicting_writers_soak(rounds: usize, seed: u64) {
 }
 
 #[test]
-#[ignore = "multi-minute stress run; runs in the review-race-soak CI job"]
+#[ignore = "multi-minute stress run; runs in the nightly race workflow"]
 fn soak_conflicting_writers_across_four_branches() {
     conflicting_writers_soak(3, 0x1234_5678_9ABC_DEF1);
 }
@@ -8965,7 +8965,7 @@ fn mixed_inputs_soak(rounds: usize, seed: u64) {
 }
 
 #[test]
-#[ignore = "multi-minute mixed-input stress run; runs in the review-race-soak CI job"]
+#[ignore = "multi-minute mixed-input stress run; runs in the nightly race workflow"]
 fn soak_mixed_inputs_across_four_branches() {
     mixed_inputs_soak(4, 0x0DDB_1A5E_5BAD_5EED);
 }

@@ -1,13 +1,20 @@
-name: Race soak (nightly)
+name: Review-input races (nightly)
 
-# The review-input race tests (daemon/tests/review_input_races.rs) pin specific
-# interleavings. This job runs the randomly seeded, time-boxed soak instead:
-# it picks a fresh seed each night, runs seeded rounds of concurrent writers
-# (feedback, PR fixes, reviewer pushes, upstream moves) for the time box, and
-# prints `RACE SOAK SEED: <n>` up front. A failure is replayed locally with
-# `RALPHUS_RACE_SEED=<n> RALPHUS_RACE_NIGHTLY=1 cargo nextest run
-# -P review-races -p ralphus-daemon --run-ignored only -E
-# 'test(soak_randomly_seeded_time_boxed)'`.
+# The review-input race suite (daemon/tests/review_input_races.rs) is ~150
+# real-git scenarios and takes ~30 minutes on a hosted Windows runner, so it
+# does not run on pull requests: `.config/nextest.toml` keeps it out of every
+# default `cargo nextest run`, and this workflow is the only place CI runs it.
+# It runs on a nightly schedule, and on demand from the Actions tab
+# ("Run workflow", pick a branch) when a change touches review / PR / guardian
+# code and wants the suite before merging.
+#
+# Two jobs:
+#   * `races`: every deterministic scenario, on Ubuntu and Windows.
+#   * `race-soak`: the randomly seeded, time-boxed soak. It picks a fresh seed
+#     each night and prints `RACE SOAK SEED: <n>` up front. A failure is
+#     replayed locally with `RALPHUS_RACE_SEED=<n> RALPHUS_RACE_NIGHTLY=1
+#     cargo nextest run -P review-races -p ralphus-daemon --run-ignored only
+#     -E 'test(soak_randomly_seeded_time_boxed)'`.
 
 on:
   schedule:
@@ -27,6 +34,38 @@ permissions:
   contents: read
 
 jobs:
+  races:
+    name: Review-input races (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+      # RALPHUS_GUARD_HOLD_PANIC_MS: integration test binaries use a 2,000 ms
+      # store-guard hold limit by default, which a busy shared runner can cross
+      # with no blocking I/O under the lock. This suite runs dozens of real-git
+      # daemons at once, and on windows-latest a WAL checkpoint alone has taken
+      # over 10 s, so the limit is higher still.
+      # --no-fail-fast: report every failing scenario in one run.
+      - name: Review-input race suite
+        env:
+          RALPHUS_GUARD_HOLD_PANIC_MS: "30000"
+        run: cargo nextest run -P review-races -p ralphus-daemon --no-fail-fast
+      # Seeded stress rounds (the `#[ignore]`d tests other than the soak): random
+      # concurrent feedback rounds / PR fixes racing real upstream pushes.
+      - name: Review-input race stress
+        env:
+          RALPHUS_GUARD_HOLD_PANIC_MS: "30000"
+        run: cargo nextest run -P review-races -p ralphus-daemon --run-ignored only --no-fail-fast -E 'not test(/^soak_/)'
+
   race-soak:
     name: Randomly seeded race soak
     runs-on: ubuntu-latest
@@ -38,6 +77,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
+      # The fixed ~15-minute eight-branch soak (the other `soak_*` tests).
+      - name: Run the fixed soaks
+        run: cargo nextest run -P review-races -p ralphus-daemon --run-ignored only -E 'test(/^soak_/) and not test(soak_randomly_seeded_time_boxed)'
       - name: Run the seeded soak
         env:
           RALPHUS_RACE_NIGHTLY: "1"
