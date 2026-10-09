@@ -5795,7 +5795,11 @@ fn disabling_a_branch_with_a_held_feedback_round_then_reenabling() {
         std::thread::sleep(SETTLE_POLL);
     }
     fx.wait_built_on(&upstream, what);
-    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    // Re-enabling carries the branch from its fork point with the base (the
+    // WARNING safety net, no data lost) -- allowed here, as in
+    // `disable_then_reenable_a_middle_branch_mid_race`, and nowhere else.
+    fx.assert_no_replayed_commits(what, &unexpected);
+    fx.assert_no_carry_fallbacks(what, false);
     fx.assert_review_branches(
         what,
         &[(1, "feature-b.txt", "feedback on b")],
