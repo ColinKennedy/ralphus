@@ -205,6 +205,7 @@ impl Fixture {
         init_repo(&root);
         let remote = temp_dir();
         git(&remote, &["init", "--bare"]);
+        git(&remote, &["config", "core.logAllRefUpdates", "true"]);
         git(
             &root,
             &["remote", "add", "origin", remote.to_str().unwrap()],
@@ -1322,6 +1323,23 @@ impl Fixture {
                 "\n  [{p}] {} {} detail={:?} local={local:.9} remote={remote:.9}",
                 b.branch, b.merge_status, b.detail
             ));
+            // Every move of the PR branch on the remote, newest first.
+            if let Ok(o) = std::process::Command::new("git")
+                .args([
+                    "reflog",
+                    "show",
+                    "--format=%h %gd %gs",
+                    "-n",
+                    "12",
+                    &self.pr_ref(p),
+                ])
+                .current_dir(self.pr_repo())
+                .output()
+            {
+                for line in String::from_utf8_lossy(&o.stdout).lines() {
+                    out.push_str(&format!("\n      remote-move | {line}"));
+                }
+            }
             // What is on the branch, newest first (tolerant, like `local`).
             if let Some(rev) = b.review_branch.as_deref() {
                 if let Ok(o) = std::process::Command::new("git")
@@ -1355,6 +1373,10 @@ impl Fixture {
                     "skipped",
                     "restack",
                     "lease",
+                    "manual push",
+                    "pull",
+                    "reviewer",
+                    "clobber",
                 ]
                 .iter()
                 .any(|k| r.message.contains(k))
@@ -1366,13 +1388,15 @@ impl Fixture {
                         .unwrap_or_default()
                 };
                 out.push_str(&format!(
-                    "\n  log: {}{}{}{}{}{}",
+                    "\n  log: {}{}{}{}{}{}{}{}",
                     row.message,
                     short("branch"),
                     short("reason"),
                     short("source"),
                     short("upstream"),
                     short("old_tip"),
+                    short("old"),
+                    short("new"),
                 ));
             }
         }
@@ -2021,6 +2045,10 @@ impl Fixture {
         let pushed = loop {
             let push = run(&["push", "-q", "origin", &alias]);
             if push.status.success() {
+                eprintln!(
+                    "reviewer pushed {alias} at {} after {attempt} retries",
+                    git(&clone, &["rev-parse", "--short", "HEAD"]).trim()
+                );
                 break true;
             }
             last_error = String::from_utf8_lossy(&push.stderr).trim().to_string();
