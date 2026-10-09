@@ -71,6 +71,66 @@ fn config_key(root: &Path, args: &[&str]) -> ConfigCacheKey {
     )
 }
 
+/// The two full commit SHAs of a `merge-base --is-ancestor <a> <b>` call.
+/// Whether one commit is an ancestor of another never changes, so a definite
+/// answer for a pair of full SHAs is reusable forever.
+fn ancestry_pair<'a>(args: &[&'a str]) -> Option<(&'a str, &'a str)> {
+    match args {
+        ["merge-base", "--is-ancestor", a, b] if is_full_sha(a) && is_full_sha(b) => Some((a, b)),
+        _ => None,
+    }
+}
+
+/// (repository common dir, ancestor SHA, descendant SHA).
+type AncestryKey = (PathBuf, String, String);
+
+/// Definite `--is-ancestor` answers (exit 0 or 1) per repository common dir.
+fn ancestry_cache() -> &'static parking_lot::Mutex<HashMap<AncestryKey, bool>> {
+    static CACHE: std::sync::OnceLock<parking_lot::Mutex<HashMap<AncestryKey, bool>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// Upper bound on remembered ancestry answers; the map is cleared when full.
+const ANCESTRY_CACHE_MAX: usize = 50_000;
+
+/// A remembered `merge-base --is-ancestor <sha> <sha>` answer for `root`'s
+/// repository.
+#[must_use]
+pub fn cached_ancestry(root: &Path, args: &[&str]) -> Option<Output> {
+    let (a, b) = ancestry_pair(args)?;
+    let (_, common) = git_dirs(root)?;
+    let is_ancestor = *ancestry_cache()
+        .lock()
+        .get(&(common, a.to_string(), b.to_string()))?;
+    Some(Output {
+        status: exit_status(u32::from(!is_ancestor)),
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    })
+}
+
+/// Remember git's definite answer (exit 0 or 1) to an `--is-ancestor` call
+/// on two full SHAs; errors (e.g. an unknown object) are never remembered.
+pub fn remember_ancestry(root: &Path, args: &[&str], output: &Output) {
+    let Some((a, b)) = ancestry_pair(args) else {
+        return;
+    };
+    let is_ancestor = match output.status.code() {
+        Some(0) => true,
+        Some(1) => false,
+        _ => return,
+    };
+    let Some((_, common)) = git_dirs(root) else {
+        return;
+    };
+    let mut cache = ancestry_cache().lock();
+    if cache.len() >= ANCESTRY_CACHE_MAX {
+        cache.clear();
+    }
+    cache.insert((common, a.to_string(), b.to_string()), is_ancestor);
+}
+
 /// A remembered answer to a config read (see the module doc), if every file
 /// it depends on is unchanged and it is younger than [`CONFIG_CACHE_TTL`].
 #[must_use]
@@ -552,6 +612,31 @@ mod tests {
         );
         assert!(config_read_stamp(&root, &["remote", "-v"]).is_none());
         assert!(config_read_stamp(&root, &["config", "--get-regexp", "x"]).is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn definite_ancestry_answers_between_full_shas_are_remembered() {
+        let root = repo("ancestry");
+        let first = String::from_utf8(git(&root, &["rev-parse", "HEAD"]).stdout).unwrap();
+        std::fs::write(root.join("b.txt"), "b").expect("write");
+        assert!(git(&root, &["add", "b.txt"]).status.success());
+        assert!(git(&root, &["commit", "-q", "-m", "two"]).status.success());
+        let second = String::from_utf8(git(&root, &["rev-parse", "HEAD"]).stdout).unwrap();
+        let (first, second) = (first.trim(), second.trim());
+
+        for (a, b) in [(first, second), (second, first)] {
+            let args = ["merge-base", "--is-ancestor", a, b];
+            assert!(cached_ancestry(&root, &args).is_none());
+            let real = git(&root, &args);
+            remember_ancestry(&root, &args, &real);
+            let cached = cached_ancestry(&root, &args).expect("remembered");
+            assert_eq!(cached.status.success(), real.status.success(), "{a}..{b}");
+        }
+        // Names, not SHAs, are never remembered: what they point at moves.
+        let named = ["merge-base", "--is-ancestor", "HEAD", "main"];
+        remember_ancestry(&root, &named, &git(&root, &named));
+        assert!(cached_ancestry(&root, &named).is_none());
         let _ = std::fs::remove_dir_all(root);
     }
 

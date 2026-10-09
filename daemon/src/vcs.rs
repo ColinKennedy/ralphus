@@ -172,6 +172,10 @@ impl GitVcs {
         if let Some(output) = crate::vcs_refs::cached_config_read(root, args) {
             return Ok(output);
         }
+        // Ancestry between two fixed commits never changes.
+        if let Some(output) = crate::vcs_refs::cached_ancestry(root, args) {
+            return Ok(output);
+        }
         let config_stamp = crate::vcs_refs::config_read_stamp(root, args);
         // One OS process instead of two or three for read-only subcommands
         // on Windows; see `ralphus_core::git_spawn`.
@@ -250,6 +254,7 @@ impl GitVcs {
         if let Some(stamp) = config_stamp {
             crate::vcs_refs::remember_config_read(root, args, stamp, &output);
         }
+        crate::vcs_refs::remember_ancestry(root, args, &output);
         Ok(output)
     }
 }
