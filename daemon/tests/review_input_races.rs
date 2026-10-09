@@ -2456,7 +2456,7 @@ fn random_concurrent_writers_soak(features: &[&str], rounds: usize, seed: u64) {
 }
 
 #[test]
-#[ignore = "multi-minute stress run; runs every PR in the CI perf-tests job"]
+#[ignore = "multi-minute stress run; runs in the nightly race workflow"]
 fn stress_upstream_rebases_with_random_concurrent_writers() {
     random_concurrent_writers_soak(
         &["feature/a", "feature/b", "feature/c", "feature/d"],
