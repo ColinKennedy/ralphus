@@ -2042,6 +2042,10 @@ impl Fixture {
             let output = std::process::Command::new("git")
                 .args(args)
                 .current_dir(&clone)
+                .env("GIT_AUTHOR_NAME", "ralphus")
+                .env("GIT_AUTHOR_EMAIL", "ralphus@example.com")
+                .env("GIT_COMMITTER_NAME", "ralphus")
+                .env("GIT_COMMITTER_EMAIL", "ralphus@example.com")
                 .env("GIT_EDITOR", "true")
                 .output()
                 .expect("run git");
@@ -3266,6 +3270,10 @@ fn daemon_restart_mid_rebuild_keeps_every_commit() {
     let _ = std::process::Command::new("git")
         .args(["rebase", "--exec", "exit 1", "origin/main"])
         .current_dir(&worktree)
+        .env("GIT_AUTHOR_NAME", "ralphus")
+        .env("GIT_AUTHOR_EMAIL", "ralphus@example.com")
+        .env("GIT_COMMITTER_NAME", "ralphus")
+        .env("GIT_COMMITTER_EMAIL", "ralphus@example.com")
         .output();
 
     // The restarted daemon: a fresh store handle (no leases, no running-merge
@@ -6626,6 +6634,10 @@ fn crash_mid_conflict_resolution_is_finished_by_the_restarted_daemon() {
     let _ = std::process::Command::new("git")
         .args(["rebase", "origin/main"])
         .current_dir(&worktree)
+        .env("GIT_AUTHOR_NAME", "ralphus")
+        .env("GIT_AUTHOR_EMAIL", "ralphus@example.com")
+        .env("GIT_COMMITTER_NAME", "ralphus")
+        .env("GIT_COMMITTER_EMAIL", "ralphus@example.com")
         .output();
 
     let db = fx.root.join(".git").join("ralphus-test.db");
