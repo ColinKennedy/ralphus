@@ -5759,7 +5759,41 @@ fn disabling_a_branch_with_a_held_feedback_round_then_reenabling() {
     wait_for_top("rebuilt without the disabled branch", false);
     fx.wait_built_on(&upstream, "while disabled");
     arrange(&fx, &daemon, "feature/b", true);
-    wait_for_top("rebuilt with the re-enabled branch", true);
+    // The merge the re-enable starts is refused while the daemon is busy with
+    // another claim (the board reports it and the user clicks "Merge / rebase"
+    // again). Do the same: re-issue it until the re-enabled branch sits on the
+    // rebuilt base and the top branch has it, then check nothing was lost.
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let mut last_click = Instant::now();
+    loop {
+        let on_base = |position: usize| {
+            fx.try_review_ref(position)
+                .is_some_and(|rev| fx.files_on(&fx.root, &rev).contains("upstream1.txt"))
+        };
+        let top_has_b = fx
+            .try_review_ref(2)
+            .is_some_and(|rev| fx.files_on(&fx.root, &rev).contains("feature-b.txt"));
+        let status = fx.store.lock().get_guardian(&fx.id).unwrap().status;
+        if status == "in_review" && top_has_b && on_base(1) && on_base(2) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what}: the re-enabled branch never landed on the rebuilt base\n{}",
+            fx.describe()
+        );
+        if status == "in_review" && last_click.elapsed() > Duration::from_secs(8) {
+            ralphus_daemon::guardian_merge::start_merge(
+                Arc::clone(&fx.store),
+                Arc::new(NoAgentExpected),
+                &fx.id,
+                Arc::clone(&daemon.sem),
+                daemon.cancellations.clone(),
+            );
+            last_click = Instant::now();
+        }
+        std::thread::sleep(SETTLE_POLL);
+    }
     fx.wait_built_on(&upstream, what);
     fx.assert_no_unexpected_agent_calls(what, &unexpected);
     fx.assert_review_branches(
