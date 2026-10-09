@@ -162,6 +162,11 @@ impl GitVcs {
     /// reason `std::process::Command::output()` normally does this itself;
     /// this hand-rolls it only because `output()` has no timeout variant.
     fn exec_raw(root: &Path, args: &[&str]) -> Result<std::process::Output, String> {
+        // A plain ref lookup is a file read; answer it without a process when
+        // the answer is exact (see `crate::vcs_refs`).
+        if let Some(output) = crate::vcs_refs::try_rev_parse(root, args) {
+            return Ok(output);
+        }
         // One OS process instead of two or three for read-only subcommands
         // on Windows; see `ralphus_core::git_spawn`.
         let mut child = ralphus_core::git_spawn::command(args)
