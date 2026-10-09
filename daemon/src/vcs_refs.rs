@@ -84,22 +84,30 @@ fn is_plain_ref_name(name: &str) -> bool {
         && !(name.len() >= 4 && name.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
+/// The per-worktree git dir of the checkout whose top is `root`: `root/.git`
+/// when that is a directory, or the target of a linked worktree's
+/// `gitdir:` file. Files kept there belong to the checkout but are never
+/// part of its working tree, so nothing can stage or commit them.
+#[must_use]
+pub fn worktree_git_dir(root: &Path) -> Option<PathBuf> {
+    let dot_git = root.join(".git");
+    if dot_git.is_dir() {
+        return Some(dot_git);
+    }
+    let text = std::fs::read_to_string(&dot_git).ok()?;
+    let path = PathBuf::from(text.strip_prefix("gitdir:")?.trim());
+    Some(if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    })
+}
+
 /// The repository's per-worktree git dir and its common dir, for a `root`
 /// that is the top of a checkout (`root/.git` is a directory or a `gitdir:`
 /// file). `None` for anything else, or a reftable repository.
 fn git_dirs(root: &Path) -> Option<(PathBuf, PathBuf)> {
-    let dot_git = root.join(".git");
-    let git_dir = if dot_git.is_dir() {
-        dot_git
-    } else {
-        let text = std::fs::read_to_string(&dot_git).ok()?;
-        let path = PathBuf::from(text.strip_prefix("gitdir:")?.trim());
-        if path.is_absolute() {
-            path
-        } else {
-            root.join(path)
-        }
-    };
+    let git_dir = worktree_git_dir(root)?;
     let common = match std::fs::read_to_string(git_dir.join("commondir")) {
         Ok(text) => {
             let path = PathBuf::from(text.trim());

@@ -1185,11 +1185,20 @@ const LARGE_LOG_LINE_THRESHOLD: usize = 500;
 /// -- unchanged from before per-check breakdown existed. With more than one,
 /// each gets its own `.ralphus-ci-failure-<name>.log` so no failing check's
 /// log clobbers another's.
+///
+/// The file goes in the worktree's own git dir, not its working tree: a log
+/// in the working tree is an untracked file that a later worktree recovery
+/// "rescue" commit, or the agent's own `git add`, pushes into the PR -- where
+/// it quotes the failing line back at the CI check that failed on it. The
+/// agent is given the absolute path either way. Falls back to the working
+/// tree only when the git dir cannot be found.
 fn ci_failure_log_path(worktree: &str, check_name: &str, only_one: bool) -> PathBuf {
+    let dir = crate::vcs_refs::worktree_git_dir(Path::new(worktree))
+        .unwrap_or_else(|| PathBuf::from(worktree));
     if only_one {
-        PathBuf::from(worktree).join(".ralphus-ci-failure.log")
+        dir.join(".ralphus-ci-failure.log")
     } else {
-        PathBuf::from(worktree).join(format!(
+        dir.join(format!(
             ".ralphus-ci-failure-{}.log",
             sanitize_path_segment(check_name)
         ))
