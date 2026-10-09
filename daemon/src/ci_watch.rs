@@ -1824,19 +1824,10 @@ fn run_pr_fix(
         message_seq,
         true,
     );
-    if let Some(sha) = outcome.pushed_sha.as_deref().filter(|_| outcome.pushed) {
-        let result = store.lock().update_pull_request_ex(
-            &pr.id,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(Some(sha)),
-            None,
-        );
-        warn_on_pr_store_error(store, &guardian.id, pr, "update_pull_request_ex", result);
-    }
+    // The push's own `last_pushed_sha` is recorded by `run_feedback` at push
+    // time. Writing `outcome.pushed_sha` here, after the round has returned,
+    // could overwrite a newer SHA that a sync re-push recorded in the
+    // meantime and make that re-push's remote tip look like a reviewer's.
     // `require_proof: true` above means `proof_passed` is only ever `None`
     // when `run_feedback` bailed out before the resolver agent ran at all
     // (e.g. a concurrent merge/rebuild had the branch's worktree torn down
