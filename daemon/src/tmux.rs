@@ -282,24 +282,6 @@ impl std::fmt::Display for TmuxError {
     }
 }
 
-/// Whether psmux's `pipe-pane` takes `cat >> "<path>"` as a literal direct
-/// file sink for `path` (vendored psmux `util::parse_cat_file_sink` and
-/// `refuse_file_sink_path`): no quote characters, nothing PowerShell or tmux
-/// would expand (`$`, backtick, `#`), and a local drive path rather than a
-/// UNC or device path. Anything else would reach PowerShell, where `cat` is
-/// `Get-Content` and records nothing.
-fn file_sink_path_is_literal(path: &str) -> bool {
-    let bytes = path.as_bytes();
-    !path.is_empty()
-        && !path.contains(['"', '\'', '$', '`', '#'])
-        && !path.starts_with("\\\\")
-        && !path.starts_with("//")
-        && bytes.len() > 2
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && matches!(bytes[2], b'\\' | b'/')
-}
-
 /// The error the tmux CLI reports for a session with no server, used when
 /// the in-process client finds the same condition.
 fn no_server(name: &str) -> TmuxError {
@@ -1330,18 +1312,18 @@ impl Tmux {
     }
 
     /// Start `name`'s transcript with psmux's in-server direct file sink
-    /// (`pipe-pane -o 'cat >> "<path>"'`) capped by its `pipe-max-bytes`
-    /// option, instead of a `ralphus-runner pipe-sink` helper that psmux
-    /// starts inside a PowerShell wrapper (three processes per session).
+    /// (`pipe-pane -o -F <path>`, ralphus's psmux fork) capped by its
+    /// `pipe-max-bytes` option, instead of a `ralphus-runner pipe-sink`
+    /// helper that psmux starts inside a PowerShell wrapper (three processes
+    /// per session). `-F` takes the path literally, so any filename works.
     /// Returns whether that worked; `false` leaves the caller to start the
     /// helper sink, which keeps the transcript and its cap either way.
     ///
-    /// Only on Windows (psmux), and only when every precondition holds: the
-    /// in-process client is in use, the path is one psmux's
-    /// `parse_cat_file_sink` takes literally (otherwise psmux hands the
-    /// command to PowerShell, where `cat` is `Get-Content` and writes nothing),
-    /// and this psmux reports back the cap just set (a psmux without
-    /// `pipe-max-bytes` would silently write an uncapped file).
+    /// Only on Windows (psmux), only with the in-process client, and only
+    /// when this psmux reports back the cap just set (a psmux without
+    /// `pipe-max-bytes` would otherwise write an uncapped file). A path psmux
+    /// refuses for the direct sink (UNC, device, remote drive) answers with
+    /// an error, which also falls back.
     fn start_file_sink_transcript(
         &self,
         name: &str,
@@ -1352,9 +1334,6 @@ impl Tmux {
             return false;
         }
         let path_text = path.to_string_lossy();
-        if !file_sink_path_is_literal(&path_text) {
-            return false;
-        }
         let cap = max_bytes.to_string();
         if self.set_option(name, "pipe-max-bytes", &cap).is_err() {
             return false;
@@ -1371,8 +1350,11 @@ impl Tmux {
                 return false;
             }
         }
-        self.pipe_pane(name, &format!("cat >> \"{path_text}\""))
-            .is_ok()
+        let line = format!(
+            "pipe-pane -o -F {}",
+            crate::psmux_client::quote_arg_if_needed(&path_text)
+        );
+        self.native_checked(name, &line).is_some_and(|r| r.is_ok())
     }
 
     /// Start the session's payload: typed into the pane's shell on Windows
@@ -2278,27 +2260,6 @@ mod tests {
             split_command("C:\\Users\\me\\tmux.exe"),
             ("C:\\Users\\me\\tmux.exe".to_string(), Vec::<String>::new())
         );
-    }
-
-    #[test]
-    fn file_sink_only_takes_plain_local_drive_paths() {
-        assert!(file_sink_path_is_literal(
-            r"C:\Users\me\.ralphus\terminal_logs\ralphus_squad-1_t_c\0000.raw"
-        ));
-        assert!(file_sink_path_is_literal("C:/Users/me/x.raw"));
-        for path in [
-            "",
-            r"\\server\share\x.raw",
-            "//server/share/x.raw",
-            r"C:\a b\it's.raw",
-            r"C:\$env\x.raw",
-            r"C:\a#b\x.raw",
-            r#"C:\a"b\x.raw"#,
-            "C:\\a`b\\x.raw",
-            "relative/x.raw",
-        ] {
-            assert!(!file_sink_path_is_literal(path), "{path}");
-        }
     }
 
     #[test]

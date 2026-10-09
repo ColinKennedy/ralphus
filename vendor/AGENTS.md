@@ -28,4 +28,4 @@ submodule out: `git update-index --cacheinfo 160000,<full-sha>,vendor/psmux`.
 
 | Feature branch | Change | Used by |
 |---|---|---|
-| `ralphus-pipe-max-bytes` | `pipe-max-bytes` server option: a byte cap (with one truncation marker) for `pipe-pane`'s in-server direct file sink (`cat >> file`) | `daemon/src/tmux.rs` `start_file_sink_transcript` |
+| `ralphus-pipe-max-bytes` | `pipe-max-bytes` server option: a byte cap (with one truncation marker) for `pipe-pane`'s in-server direct file sink; read-only `#{pipe-max-bytes-effective}` format reporting the applied cap; `pipe-pane -F <path>`, a direct file sink that takes the path literally (any filename; UNC/device/remote paths are still refused) | `daemon/src/tmux.rs` `start_file_sink_transcript` |
