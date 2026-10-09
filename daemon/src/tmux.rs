@@ -918,6 +918,12 @@ impl Tmux {
         let child = Command::new(&self.program)
             .args(&self.prefix_args)
             .args(args)
+            // The server this starts inherits the environment. psmux otherwise
+            // pre-spawns a spare "warm" shell (and may start a standby server)
+            // after creating the session so the *next* interactive session
+            // opens faster; ralphus never uses either, and each is a
+            // PowerShell plus conhost per session. Real tmux ignores it.
+            .env("PSMUX_NO_WARM", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
