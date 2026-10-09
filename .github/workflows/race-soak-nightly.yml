@@ -13,7 +13,7 @@ name: Review-input races (nightly)
 #   * `race-soak`: the randomly seeded, time-boxed soak. It picks a fresh seed
 #     each night and prints `RACE SOAK SEED: <n>` up front. A failure is
 #     replayed locally with `RALPHUS_RACE_SEED=<n> RALPHUS_RACE_NIGHTLY=1
-#     cargo nextest run -P review-races -p ralphus-daemon --run-ignored only
+#     cargo nextest run -P review-races -p ralphus-daemon --features race-suite --run-ignored only
 #     -E 'test(soak_randomly_seeded_time_boxed)'`.
 
 on:
@@ -58,13 +58,13 @@ jobs:
       - name: Review-input race suite
         env:
           RALPHUS_GUARD_HOLD_PANIC_MS: "30000"
-        run: cargo nextest run -P review-races -p ralphus-daemon --no-fail-fast
+        run: cargo nextest run -P review-races -p ralphus-daemon --features race-suite --no-fail-fast
       # Seeded stress rounds (the `#[ignore]`d tests other than the soak): random
       # concurrent feedback rounds / PR fixes racing real upstream pushes.
       - name: Review-input race stress
         env:
           RALPHUS_GUARD_HOLD_PANIC_MS: "30000"
-        run: cargo nextest run -P review-races -p ralphus-daemon --run-ignored only --no-fail-fast -E 'not test(/^soak_/)'
+        run: cargo nextest run -P review-races -p ralphus-daemon --features race-suite --run-ignored only --no-fail-fast -E 'not test(/^soak_/)'
 
   race-soak:
     name: Randomly seeded race soak
@@ -79,13 +79,13 @@ jobs:
         uses: taiki-e/install-action@nextest
       # The fixed ~15-minute eight-branch soak (the other `soak_*` tests).
       - name: Run the fixed soaks
-        run: cargo nextest run -P review-races -p ralphus-daemon --run-ignored only -E 'test(/^soak_/) and not test(soak_randomly_seeded_time_boxed)'
+        run: cargo nextest run -P review-races -p ralphus-daemon --features race-suite --run-ignored only -E 'test(/^soak_/) and not test(soak_randomly_seeded_time_boxed)'
       - name: Run the seeded soak
         env:
           RALPHUS_RACE_NIGHTLY: "1"
           RALPHUS_RACE_SOAK_SECONDS: ${{ inputs.seconds || '3000' }}
           RALPHUS_RACE_SEED: ${{ inputs.seed }}
         run: >
-          cargo nextest run -P review-races -p ralphus-daemon
+          cargo nextest run -P review-races -p ralphus-daemon --features race-suite
           --run-ignored only --no-capture
           -E 'test(soak_randomly_seeded_time_boxed)'

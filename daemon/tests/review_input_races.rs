@@ -8,10 +8,10 @@
 //! push is involved, on the remote ref a PR would show.
 //!
 //! **Not part of the default test run.** ~140 real-git scenarios (~25
-//! CPU-minutes) are excluded from every plain `cargo nextest run`, including
-//! `--workspace --all-targets`, by `.config/nextest.toml`'s `default-filter`.
+//! CPU-minutes) are excluded from every plain `cargo test` and `cargo nextest run`, including
+//! `--workspace --all-targets`: the test target requires the `race-suite` feature.
 //! Run them only on purpose, through their own profile:
-//! `cargo nextest run -P review-races -p ralphus-daemon [-E 'test(name)']`
+//! `cargo nextest run -P review-races -p ralphus-daemon --features race-suite [-E 'test(name)']`
 //! (add `--run-ignored only` for the `soak_*` tests).
 
 mod common;

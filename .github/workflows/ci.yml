@@ -59,6 +59,11 @@ jobs:
       - name: Clippy
         if: matrix.suite == 'full'
         run: cargo "+${{ matrix.toolchain }}" clippy --all-targets -- -D warnings
+      # The race suite's test target is behind the `race-suite` feature, so the
+      # `--all-targets` pass above skips it; lint (and compile) it explicitly.
+      - name: Clippy (review-input race suite)
+        if: matrix.suite == 'full'
+        run: cargo "+${{ matrix.toolchain }}" clippy -p ralphus-daemon --test review_input_races --features race-suite -- -D warnings
       # PR_SLOWNESS.local.md: nextest schedules each test as its own process
       # instead of cargo test's default, which matters a lot here since most
       # of the daemon suite is real-git-subprocess-heavy (measured ~80%

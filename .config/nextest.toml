@@ -1,7 +1,8 @@
 # The review-input race suite (daemon/tests/review_input_races.rs) is ~140
 # real-git scenarios (~25 CPU-minutes) and is deliberately NOT part of the
 # default run: a plain `cargo nextest run [--workspace] [--all-targets]` skips
-# it. It runs only under its own profile, `-P review-races` (the nightly race
+# it. It also needs `--features race-suite` (the test target requires it, so even
+# plain `cargo test` skips it). It runs only under `-P review-races` (the nightly race
 # workflow, `.github/workflows/race-soak-nightly.yml`, and anyone who means to
 # run it). Agents: do not run it unless asked to.
 [profile.default]

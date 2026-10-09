@@ -76,10 +76,10 @@ alternatives to reach for are in
   the same for `ralphus-librarian`) instead. See `.agent/gotchas.md`.
 - **Do not run the review-input race suite unless asked.**
   `daemon/tests/review_input_races.rs` (~140 real-git scenarios, ~25
-  CPU-minutes) is excluded from every default `cargo nextest run` --
+  CPU-minutes) is excluded from `cargo test` and every `cargo nextest run` --
   including `--workspace --all-targets` -- by `.config/nextest.toml`'s
-  `default-filter`. It is reachable only through its own profile:
-  `cargo nextest run -P review-races -p ralphus-daemon [-E 'test(name)']`
+  its test target requires the `race-suite` feature. It is reachable only through that feature and its own profile:
+  `cargo nextest run -P review-races -p ralphus-daemon --features race-suite [-E 'test(name)']`
   (add `--run-ignored only` for the `soak_*` tests). Run a single scenario
   that way when you change review/PR/guardian code it covers; never the whole
   file mid-edit.
