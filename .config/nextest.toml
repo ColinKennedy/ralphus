@@ -25,3 +25,15 @@ threads-required = "num-cpus"
 [[profile.default.overrides]]
 filter = "test(cancelling_a_review_stops_an_in_flight_feedback_agent)"
 threads-required = "num-cpus"
+
+# RAL-604: per-test process counting. Only used by `ralphus-proccount collect`
+# (see docs/proc-counts.md); the wrapper counts every process a test execs.
+[scripts.wrapper.proc-count]
+command = { command-line = "scripts/proc-count-wrap.sh", relative-to = "workspace-root" }
+
+[profile.proc-count]
+retries = 0
+
+[[profile.proc-count.scripts]]
+filter = "all()"
+run-wrapper = "proc-count"
