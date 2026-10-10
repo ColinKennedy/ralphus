@@ -1,4 +1,4 @@
-﻿      // ---- Shared type definitions (JSDoc-only; see docs/daemon-api.md for the
+      // ---- Shared type definitions (JSDoc-only; see docs/daemon-api.md for the
       // authoritative wire shapes). Checked via `npm run typecheck` (tsc --checkJs
       // over the extracted <script> body) — see tsconfig.board.json. ----
       /**
@@ -434,7 +434,7 @@
        * @property {string} [review_type]
        * @property {string} [review_branch]
        * @property {string} [combined_worktree]
-       * @property {string} [checks_state] - "ready" | "generating" | "waiting" | "failed"
+       * @property {string} [checks_state] - "ready" | "generating" | "waiting" | "failed" | "no_actions" | "hung"
        * @property {GuardianCheck[]} [manual_commands]
        * @property {string} [manual_commands_agent]
        * @property {string} [manual_commands_model]
