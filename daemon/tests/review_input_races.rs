@@ -6,6 +6,13 @@
 //! guardian entry points with fake resolver agents, and asserts that each
 //! input's commit is still on the branch afterwards -- locally *and*, where a
 //! push is involved, on the remote ref a PR would show.
+//!
+//! **Not part of the default test run.** ~140 real-git scenarios (~25
+//! CPU-minutes) are excluded from every plain `cargo test` and `cargo nextest run`, including
+//! `--workspace --all-targets`: the test target requires the `race-suite` feature.
+//! Run them only on purpose, through their own profile:
+//! `cargo nextest run -P review-races -p ralphus-daemon --features race-suite [-E 'test(name)']`
+//! (add `--run-ignored only` for the `soak_*` tests).
 
 mod common;
 
@@ -23,7 +30,40 @@ use ralphus_daemon::scheduler::Semaphore;
 use ralphus_daemon::store::Store;
 use ralphus_daemon::store_lock::StoreMutex;
 
+/// These tests must not depend on the machine they run on: the daemon reads a
+/// global `config.toml` (`$RALPHUS_CONFIG_HOME`, else `~/.config/ralphus`) and
+/// project `.ralphus.toml` files found from the working directory, and a
+/// developer's own `default_user`, forge settings or review defaults would
+/// otherwise change what a test exercises. The workspace forbids `unsafe`, so
+/// the environment cannot be edited in-process (`set_var` is unsafe); instead
+/// the first test to touch the filesystem re-executes this very test binary,
+/// with the same arguments, an empty config home and an empty working
+/// directory, and exits with the child's status. The child skips this step.
+fn ensure_hermetic_environment() {
+    if std::env::var_os("RALPHUS_RACE_HERMETIC").is_some() {
+        return;
+    }
+    let home = std::env::temp_dir().join(format!("ralphus-races-hermetic-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).expect("mkdir hermetic config home");
+    let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args(std::env::args().skip(1))
+        .env("RALPHUS_RACE_HERMETIC", "1")
+        .env("RALPHUS_CONFIG_HOME", &home)
+        // No real agent runner: a developer's PATH may have `ralphus-runner`, a
+        // CI box does not, and these tests must behave the same on both. Any
+        // path that falls through to the production runner fails loudly.
+        .env("RALPHUS_RUNNER_CMD", "ralphus-runner-absent-in-race-tests")
+        .env_remove("RALPHUS_CONFIGURATION_PATH")
+        .current_dir(&home)
+        .status()
+        .expect("re-run the test binary hermetically");
+    let _ = std::fs::remove_dir_all(&home);
+    std::process::exit(status.code().unwrap_or(1));
+}
+
 fn temp_dir() -> PathBuf {
+    ensure_hermetic_environment();
     static N: AtomicU32 = AtomicU32::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!("ralphus-races-{}-{n}", std::process::id()));
@@ -128,6 +168,8 @@ impl Runner for NoopRunner {
 struct Fixture {
     root: PathBuf,
     remote: PathBuf,
+    /// The bare fork the PR branches are pushed to, in fork-routed reviews.
+    fork: Option<PathBuf>,
     store: Arc<StoreMutex>,
     id: String,
     branch_ids: Vec<String>,
@@ -152,10 +194,18 @@ impl Fixture {
     }
 
     fn build(features: &[&str], base: &str) -> Self {
+        Self::build_with(features, base, false)
+    }
+
+    /// [`Self::build`], optionally as a review that predates readable
+    /// review-branch names (RAL-378): its branches use the internal
+    /// `guardian/<id>/...` refs.
+    fn build_with(features: &[&str], base: &str, legacy_names: bool) -> Self {
         let root = temp_dir();
         init_repo(&root);
         let remote = temp_dir();
         git(&remote, &["init", "--bare"]);
+        git(&remote, &["config", "core.logAllRefUpdates", "true"]);
         git(
             &root,
             &["remote", "add", "origin", remote.to_str().unwrap()],
@@ -194,6 +244,20 @@ impl Fixture {
             }
             id
         };
+        if legacy_names {
+            let db = rusqlite::Connection::open(root.join(".git").join("ralphus-test.db"))
+                .expect("open the test database");
+            db.execute(
+                "UPDATE guardians SET readable_review_branch=0 WHERE id=?1",
+                [&id],
+            )
+            .unwrap();
+            db.execute(
+                "UPDATE guardian_branches SET readable_review_branch=0 WHERE guardian_id=?1",
+                [&id],
+            )
+            .unwrap();
+        }
         run_merge(&store, &NoopRunner, &id);
         let view = store.lock().get_guardian(&id).unwrap();
         // A stack holding an empty task branch fails its first build on it
@@ -205,6 +269,7 @@ impl Fixture {
         Self {
             root,
             remote,
+            fork: None,
             store,
             id,
             branch_ids,
@@ -212,10 +277,20 @@ impl Fixture {
     }
 
     fn review_ref(&self, position: usize) -> String {
-        self.store.lock().get_guardian(&self.id).unwrap().branches[position]
+        self.try_review_ref(position).expect("review branch built")
+    }
+
+    /// The branch's review ref, or `None` while it has none (not built yet, or
+    /// cleared by a restart).
+    fn try_review_ref(&self, position: usize) -> Option<String> {
+        self.store
+            .lock()
+            .get_guardian(&self.id)
+            .unwrap()
+            .branches
+            .get(position)?
             .review_branch
             .clone()
-            .expect("review branch built")
     }
 
     fn files_on(&self, repo: &Path, rev: &str) -> String {
@@ -240,6 +315,17 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.root);
         let _ = std::fs::remove_dir_all(&self.remote);
+        if let Some(fork) = &self.fork {
+            let _ = std::fs::remove_dir_all(fork);
+        }
+    }
+}
+
+impl Fixture {
+    /// The bare repository the PR branches live in: the fork in a fork-routed
+    /// review, else the upstream itself.
+    fn pr_repo(&self) -> &Path {
+        self.fork.as_deref().unwrap_or(&self.remote)
     }
 }
 
@@ -948,9 +1034,12 @@ impl Fixture {
     }
 
     fn remote_tip(&self, alias: &str) -> String {
-        git(&self.remote, &["rev-parse", &format!("refs/heads/{alias}")])
-            .trim()
-            .to_string()
+        git(
+            self.pr_repo(),
+            &["rev-parse", &format!("refs/heads/{alias}")],
+        )
+        .trim()
+        .to_string()
     }
 }
 
@@ -1076,6 +1165,9 @@ impl Runner for UnionResolver {
 impl Runner for WriterRunner {
     fn run(&self, spec: &RunnerSpec) -> RunnerResult {
         let cwd = PathBuf::from(&spec.cwd);
+        if spec.cell_id.starts_with("resolver-proof-") {
+            return ok_result("RALPHUS_PROOF: PASS", Some(true));
+        }
         if self.resolves_conflicts && is_conflict_resolution(spec) {
             union_resolve(&cwd);
             return ok_result("resolved by keeping both sides", None);
@@ -1143,7 +1235,12 @@ impl Fixture {
                 if !enabled.contains(&p) {
                     return String::new();
                 }
-                let alias = format!("pr-{p}");
+                // Sibling reviews share the upstream, so their PR aliases must not collide.
+                let alias = if self.id == "guardian-000000000001" {
+                    format!("pr-{p}")
+                } else {
+                    format!("{}-pr-{p}", self.id)
+                };
                 let pr_id = self.open_pr(p, &alias);
                 let tip = self.remote_tip(&alias);
                 self.store
@@ -1218,7 +1315,7 @@ impl Fixture {
                 .unwrap_or_default();
             let remote = std::process::Command::new("git")
                 .args(["rev-parse", &self.pr_ref(p)])
-                .current_dir(&self.remote)
+                .current_dir(self.pr_repo())
                 .output()
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                 .unwrap_or_default();
@@ -1226,6 +1323,95 @@ impl Fixture {
                 "\n  [{p}] {} {} detail={:?} local={local:.9} remote={remote:.9}",
                 b.branch, b.merge_status, b.detail
             ));
+            // Every move of the PR branch on the remote, newest first.
+            if let Ok(o) = std::process::Command::new("git")
+                .args([
+                    "reflog",
+                    "show",
+                    "--format=%h %gd %gs",
+                    "-n",
+                    "12",
+                    &self.pr_ref(p),
+                ])
+                .current_dir(self.pr_repo())
+                .output()
+            {
+                for line in String::from_utf8_lossy(&o.stdout).lines() {
+                    out.push_str(&format!("\n      remote-move | {line}"));
+                }
+            }
+            // How the local review branch moved, newest first, with the
+            // operation that moved it.
+            if let Some(rev) = b.review_branch.as_deref() {
+                if let Ok(o) = std::process::Command::new("git")
+                    .args(["reflog", "show", "--format=%h %gs", "-n", "14", rev])
+                    .current_dir(&self.root)
+                    .output()
+                {
+                    for line in String::from_utf8_lossy(&o.stdout).lines() {
+                        out.push_str(&format!("\n      local-move | {line}"));
+                    }
+                }
+            }
+            // What is on the branch, newest first (tolerant, like `local`).
+            if let Some(rev) = b.review_branch.as_deref() {
+                if let Ok(o) = std::process::Command::new("git")
+                    .args(["log", "--format=%h %s", "-n", "6", rev])
+                    .current_dir(&self.root)
+                    .output()
+                {
+                    for line in String::from_utf8_lossy(&o.stdout).lines() {
+                        out.push_str(&format!("\n      | {line}"));
+                    }
+                }
+            }
+        }
+        // The rebuild decisions the daemon logged, oldest first.
+        if let Ok(page) = self.store.lock().cartographer_query(
+            &ralphus_daemon::cartographer::CartographerFilter {
+                guardian_id: Some(self.id.clone()),
+                limit: 200,
+                ascending: true,
+                ..Default::default()
+            },
+        ) {
+            for row in page.rows.iter().filter(|r| {
+                [
+                    "carried",
+                    "rebuilt",
+                    "built from",
+                    "executing",
+                    "deferred",
+                    "not claimable",
+                    "skipped",
+                    "restack",
+                    "lease",
+                    "manual push",
+                    "pull",
+                    "reviewer",
+                    "clobber",
+                ]
+                .iter()
+                .any(|k| r.message.contains(k))
+            }) {
+                let short = |key: &str| {
+                    row.payload[key]
+                        .as_str()
+                        .map(|s| format!(" {key}={s:.9}"))
+                        .unwrap_or_default()
+                };
+                out.push_str(&format!(
+                    "\n  log: {}{}{}{}{}{}{}{}",
+                    row.message,
+                    short("branch"),
+                    short("reason"),
+                    short("source"),
+                    short("upstream"),
+                    short("old_tip"),
+                    short("old"),
+                    short("new"),
+                ));
+            }
         }
         out
     }
@@ -1250,15 +1436,29 @@ impl Fixture {
         if view.status != "in_review" {
             return false;
         }
+        // One `for-each-ref` per repo instead of two `rev-parse`s per branch:
+        // on long stacks the per-branch spawns dominate a poll.
+        let tips = |repo: &Path| -> std::collections::HashMap<String, String> {
+            git(repo, &["for-each-ref", "--format=%(refname) %(objectname)"])
+                .lines()
+                .filter_map(|l| l.split_once(' '))
+                .map(|(r, s)| (r.to_string(), s.to_string()))
+                .collect()
+        };
+        let (local_tips, remote_tips) = (tips(&self.root), tips(self.pr_repo()));
+        let lookup = |map: &std::collections::HashMap<String, String>, rev: &str| {
+            map.get(rev)
+                .or_else(|| map.get(&format!("refs/heads/{rev}")))
+                .cloned()
+        };
         self.published_positions().into_iter().all(|p| {
-            let local = git(&self.root, &["rev-parse", &self.review_ref(p)]);
-            let remote = std::process::Command::new("git")
-                .args(["rev-parse", &self.pr_ref(p)])
-                .current_dir(&self.remote)
-                .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-                .unwrap_or_default();
-            local.trim() == remote.trim()
+            // A user restart clears a branch's review ref until it is rebuilt.
+            let Some(review_ref) = self.try_review_ref(p) else {
+                return false;
+            };
+            let local = lookup(&local_tips, &review_ref);
+            let remote = lookup(&remote_tips, &self.pr_ref(p));
+            local.is_some() && local == remote
         })
     }
 }
@@ -1330,9 +1530,18 @@ impl DaemonPump {
     }
 
     fn start_with(fx: &Fixture, runners: ralphus_daemon::guardian_merge::RunnerFactory) -> Self {
+        Self::start_with_permits(fx, 4, runners)
+    }
+
+    /// [`Self::start_with`] with `permits` concurrent merge workers allowed.
+    fn start_with_permits(
+        fx: &Fixture,
+        permits: i64,
+        runners: ralphus_daemon::guardian_merge::RunnerFactory,
+    ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let (store, flag) = (Arc::clone(&fx.store), Arc::clone(&stop));
-        let sem = Arc::new(Semaphore::new(4));
+        let sem = Arc::new(Semaphore::new(permits));
         let cancellations = ralphus_daemon::cancel::Cancellations::new();
         let (pump_sem, pump_cancellations) = (Arc::clone(&sem), cancellations.clone());
         let handle = std::thread::spawn(move || {
@@ -1397,12 +1606,16 @@ impl Fixture {
     /// `upstream` and has stayed idle with every PR branch published for
     /// [`SETTLE_STABLE_POLLS`] consecutive polls.
     fn wait_settled_on(&self, upstream: &str, what: &str) {
-        let deadline = Instant::now() + Duration::from_secs(300);
+        // Rebuilding a long stack is linear in its length: allow for it.
+        let branches = self.branch_ids.len() as u64;
+        let deadline = Instant::now() + Duration::from_secs(300 + 40 * branches.saturating_sub(8));
         let mut stable = 0;
         while stable < SETTLE_STABLE_POLLS {
             assert!(
                 Instant::now() < deadline,
-                "{what}: review never settled on upstream {upstream:.9}: {}",
+                "{what}: review never settled on upstream {upstream:.9} \
+                 (stable polls {stable}, quiescent {}): {}",
+                self.quiescent(),
                 self.describe()
             );
             let on_upstream = self
@@ -1448,9 +1661,9 @@ impl Fixture {
         for p in self.enabled_positions() {
             let local = self.review_ref(p);
             let remote = self.pr_ref(p);
-            let mut targets = vec![(&self.root, local.as_str(), "review branch")];
+            let mut targets = vec![(self.root.as_path(), local.as_str(), "review branch")];
             if published.contains(&p) {
-                targets.push((&self.remote, remote.as_str(), "PR branch"));
+                targets.push((self.pr_repo(), remote.as_str(), "PR branch"));
             }
             for (repo, rev, which) in targets {
                 for &(from, file, line) in edits {
@@ -1798,7 +2011,10 @@ impl Fixture {
     /// meanwhile is rebased onto the new tip (any conflict resolved by
     /// keeping both sides) and retried.
     fn reviewer_push(&self, position: usize, message: &str, amend: bool, edit: &dyn Fn(&Path)) {
-        let alias = format!("pr-{position}");
+        let alias = self
+            .pr_ref(position)
+            .trim_start_matches("refs/heads/")
+            .to_string();
         let clone = temp_dir();
         let _ = std::fs::remove_dir_all(&clone);
         git(
@@ -1808,7 +2024,7 @@ impl Fixture {
                 "-q",
                 "--branch",
                 &alias,
-                self.remote.to_str().unwrap(),
+                self.pr_repo().to_str().unwrap(),
                 clone.file_name().unwrap().to_str().unwrap(),
             ],
         );
@@ -1821,13 +2037,25 @@ impl Fixture {
             return;
         }
         git(&clone, &["commit", "-m", message]);
+        let trace = std::cell::RefCell::new(Vec::<String>::new());
         let run = |args: &[&str]| {
-            std::process::Command::new("git")
+            let output = std::process::Command::new("git")
                 .args(args)
                 .current_dir(&clone)
+                .env("GIT_AUTHOR_NAME", "ralphus")
+                .env("GIT_AUTHOR_EMAIL", "ralphus@example.com")
+                .env("GIT_COMMITTER_NAME", "ralphus")
+                .env("GIT_COMMITTER_EMAIL", "ralphus@example.com")
                 .env("GIT_EDITOR", "true")
                 .output()
-                .expect("run git")
+                .expect("run git");
+            trace.borrow_mut().push(format!(
+                "git {args:?} -> {:?} {} {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+            output
         };
         let rebasing = || {
             clone.join(".git").join("rebase-merge").exists()
@@ -1842,6 +2070,10 @@ impl Fixture {
         let pushed = loop {
             let push = run(&["push", "-q", "origin", &alias]);
             if push.status.success() {
+                eprintln!(
+                    "reviewer pushed {alias} at {} after {attempt} retries",
+                    git(&clone, &["rev-parse", "--short", "HEAD"]).trim()
+                );
                 break true;
             }
             last_error = String::from_utf8_lossy(&push.stderr).trim().to_string();
@@ -1854,14 +2086,33 @@ impl Fixture {
             // Drive any stopped rebase to the end: resolve conflicts by
             // keeping both sides; a step with nothing left to apply (the
             // daemon already pulled that change in) is skipped.
+            let mut steps = 0;
             while rebasing() {
+                steps += 1;
+                if Instant::now() >= deadline || steps > 12 {
+                    // The rebase is not converging: start over from the
+                    // remote tip and re-apply the reviewer's edit on it.
+                    let _ = run(&["rebase", "--abort"]);
+                    let _ = run(&["fetch", "-q", "origin", &alias]);
+                    let _ = run(&["reset", "-q", "--hard", &format!("origin/{alias}")]);
+                    edit(&clone);
+                    let _ = run(&["add", "--all"]);
+                    let _ = run(&["commit", "-q", "-m", message]);
+                    break;
+                }
                 let conflicted = git(&clone, &["diff", "--name-only", "--diff-filter=U"]);
                 if conflicted.trim().is_empty() {
-                    let staged = run(&["diff", "--cached", "--quiet"]);
-                    if staged.status.success() {
-                        let _ = run(&["rebase", "--skip"]);
+                    // A pick the rebase stopped before applying must be
+                    // applied, not skipped: only a pick that is empty once
+                    // applied (the daemon already holds the change) is dropped.
+                    if run(&["rebase", "--continue"]).status.success() {
                         continue;
                     }
+                    let staged = run(&["diff", "--cached", "--quiet"]);
+                    if rebasing() && staged.status.success() {
+                        let _ = run(&["rebase", "--skip"]);
+                    }
+                    continue;
                 } else {
                     union_resolve(&clone);
                 }
@@ -1874,15 +2125,57 @@ impl Fixture {
             "reviewer push to {alias} kept being rejected for 120 s ({attempt} retries); \
              last error: {last_error}"
         );
+        let recent = git(&clone, &["log", "-n", "12", "--format=%s"]);
+        assert!(
+            recent.lines().any(|subject| subject == message),
+            "the reviewer's commit {message:?} is not on the branch it pushed to {alias}; \
+             the helper dropped it:\n{recent}\ngit calls:\n{}",
+            trace.borrow().join("\n")
+        );
         let _ = std::fs::remove_dir_all(&clone);
     }
 
     fn assert_no_unexpected_agent_calls(&self, what: &str, unexpected: &Unexpected) {
+        self.assert_no_replayed_commits(what, unexpected);
+        self.assert_no_carry_fallbacks(what, true);
+    }
+
+    /// No rebuild needed an agent (a replayed commit would have conflicted).
+    fn assert_no_replayed_commits(&self, what: &str, unexpected: &Unexpected) {
         let calls = unexpected.lock().unwrap().clone();
         assert!(
             calls.is_empty(),
             "{what}: a rebuild replayed commits it should not have (agent calls: {calls:?})"
         );
+    }
+
+    /// The rebuild never fell back to a task-tip rebuild (review-only commits
+    /// not carried) or, when `forbid_fork_point`, a fork-point carry: both are
+    /// logged as WARNINGs and mean the stack history drifted from what the
+    /// carry logic expected.
+    fn assert_no_carry_fallbacks(&self, what: &str, forbid_fork_point: bool) {
+        let mut needles = vec!["review-only commits not carried"];
+        if forbid_fork_point {
+            needles.push("from its fork point with the base");
+        }
+        for needle in needles {
+            let page = self
+                .store
+                .lock()
+                .cartographer_query(&ralphus_daemon::cartographer::CartographerFilter {
+                    guardian_id: Some(self.id.clone()),
+                    q: Some(needle.to_string()),
+                    limit: 5,
+                    ..Default::default()
+                })
+                .expect("query the cartographer log");
+            assert_eq!(
+                page.total,
+                0,
+                "{what}: the rebuild logged {needle:?}: {:?}",
+                page.rows.iter().map(|r| &r.message).collect::<Vec<_>>()
+            );
+        }
     }
 }
 
@@ -2163,7 +2456,7 @@ fn random_concurrent_writers_soak(features: &[&str], rounds: usize, seed: u64) {
 }
 
 #[test]
-#[ignore = "multi-minute stress run; runs every PR in the CI perf-tests job"]
+#[ignore = "multi-minute stress run; runs in the nightly race workflow"]
 fn stress_upstream_rebases_with_random_concurrent_writers() {
     random_concurrent_writers_soak(
         &["feature/a", "feature/b", "feature/c", "feature/d"],
@@ -2174,7 +2467,7 @@ fn stress_upstream_rebases_with_random_concurrent_writers() {
 
 /// The same soak on an eight-branch stack, for longer.
 #[test]
-#[ignore = "~15-minute soak; runs every PR in its own CI job, review-race-soak"]
+#[ignore = "~15-minute soak; runs in the nightly race workflow"]
 fn soak_eight_branch_stack_with_random_concurrent_writers() {
     random_concurrent_writers_soak(
         &[
@@ -2243,9 +2536,9 @@ impl Fixture {
         for p in self.enabled_positions() {
             let local = self.review_ref(p);
             let remote = self.pr_ref(p);
-            let mut targets = vec![(&self.root, local.as_str(), "review branch")];
+            let mut targets = vec![(self.root.as_path(), local.as_str(), "review branch")];
             if published.contains(&p) {
-                targets.push((&self.remote, remote.as_str(), "PR branch"));
+                targets.push((self.pr_repo(), remote.as_str(), "PR branch"));
             }
             for (repo, rev, which) in targets {
                 let content = self.file_on(repo, rev, file);
@@ -2660,9 +2953,9 @@ impl Fixture {
         for p in self.enabled_positions() {
             let local = self.review_ref(p);
             let remote = self.pr_ref(p);
-            let mut targets = vec![(&self.root, local.as_str(), "review branch")];
+            let mut targets = vec![(self.root.as_path(), local.as_str(), "review branch")];
             if published.contains(&p) {
-                targets.push((&self.remote, remote.as_str(), "PR branch"));
+                targets.push((self.pr_repo(), remote.as_str(), "PR branch"));
             }
             for (repo, rev, which) in targets {
                 let files = self.files_on(repo, rev);
@@ -2905,7 +3198,10 @@ fn disable_then_reenable_a_middle_branch_mid_race() {
 
     arrange(&fx, &daemon, "feature/b", true);
     fx.wait_settled_on(&upstream, what);
-    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    // Re-enabling a branch carries it from its fork point with the base (the
+    // WARNING safety net, not a data loss): allowed here, nowhere else.
+    fx.assert_no_replayed_commits(what, &unexpected);
+    fx.assert_no_carry_fallbacks(what, false);
     fx.assert_everything_published(
         what,
         &[
@@ -2974,17 +3270,26 @@ fn daemon_restart_mid_rebuild_keeps_every_commit() {
     let _ = std::process::Command::new("git")
         .args(["rebase", "--exec", "exit 1", "origin/main"])
         .current_dir(&worktree)
+        .env("GIT_AUTHOR_NAME", "ralphus")
+        .env("GIT_AUTHOR_EMAIL", "ralphus@example.com")
+        .env("GIT_COMMITTER_NAME", "ralphus")
+        .env("GIT_COMMITTER_EMAIL", "ralphus@example.com")
         .output();
 
     // The restarted daemon: a fresh store handle (no leases, no running-merge
     // bookkeeping), its startup recovery, then its maintenance.
     let db = fx.root.join(".git").join("ralphus-test.db");
     fx.store = Arc::new(StoreMutex::new(Store::open(&db).unwrap()));
-    let daemon = DaemonPump::start(&fx);
-    ralphus_daemon::scheduler::recover_interrupted_reviews(
-        &fx.store,
-        &daemon.sem,
-        &daemon.cancellations,
+    let daemon = DaemonPump::start_resolving(&fx, &unexpected);
+    // Startup recovery (`recover_interrupted_reviews`) resumes with the
+    // production runner, which has no agent here; resume the interrupted merge
+    // the way a user's "Merge / rebase" does, with the stand-in resolver.
+    ralphus_daemon::guardian_merge::restart_guardian_merge(
+        Arc::clone(&fx.store),
+        daemon.cancellations.clone(),
+        Arc::new(UnionResolver(Arc::clone(&unexpected))),
+        &fx.id,
+        Arc::clone(&daemon.sem),
     );
 
     fx.wait_settled_on(&upstream, what);
@@ -3207,6 +3512,10 @@ fn multi_project_review_keeps_feedback_in_both_projects_through_upstream_rebases
 /// One pull request on the [`FakeGitHub`].
 #[derive(Clone)]
 struct FakePr {
+    /// The repository this PR is filed in (`owner/name`).
+    repo: String,
+    /// The repository the head branch lives in (a fork for a cross-repository PR).
+    head_repo: String,
     number: u64,
     head: String,
     base: String,
@@ -3224,6 +3533,20 @@ struct ForgeState {
     failing_heads: std::collections::HashSet<String>,
     /// Requests the fake has no route for (`METHOD path`).
     unrouted: Vec<String>,
+    /// The next this-many `/pulls` requests fail with a 503.
+    fail_pulls: u32,
+    /// Workflow runs: `(id, branch, head sha, status)`.
+    runs: Vec<(i64, String, String, String)>,
+    /// Run ids the daemon force-cancelled.
+    cancelled_runs: Vec<i64>,
+    /// Whether the PRs are registered in a native stack (GitHub refuses to
+    /// change a stacked PR's base).
+    stacked: bool,
+    /// How many native stacks have been created.
+    stacks_created: u64,
+    /// The bare repository behind each `owner/name` the fake serves (the
+    /// parent `acme/w` is added at start; a fork test adds its own).
+    bares: std::collections::HashMap<String, PathBuf>,
 }
 
 /// A stateful fake of the GitHub REST endpoints the daemon calls for a PR
@@ -3250,6 +3573,11 @@ impl FakeGitHub {
             .expect("ip listener")
             .to_string();
         let state: Arc<std::sync::Mutex<ForgeState>> = Arc::default();
+        state
+            .lock()
+            .unwrap()
+            .bares
+            .insert("acme/w".to_string(), bare.to_path_buf());
         let stop = Arc::new(AtomicBool::new(false));
         let (thread_state, flag, bare) =
             (Arc::clone(&state), Arc::clone(&stop), bare.to_path_buf());
@@ -3270,6 +3598,14 @@ impl FakeGitHub {
             stop,
             handle: Some(handle),
         }
+    }
+
+    /// The bare repository behind `repo`, else `fallback`.
+    fn bare_of(st: &ForgeState, repo: &str, fallback: &Path) -> PathBuf {
+        st.bares
+            .get(repo)
+            .cloned()
+            .unwrap_or_else(|| fallback.to_path_buf())
     }
 
     fn pr_json(bare: &Path, pr: &FakePr) -> serde_json::Value {
@@ -3294,6 +3630,232 @@ impl FakeGitHub {
         })
     }
 
+    /// The GitLab REST v4 routes for the same stack of PRs (merge requests):
+    /// `/projects/acme%2Fw/...`. A merge request's `iid` is the fake PR's
+    /// number; `opened`/`closed`/`merged` map onto `open`/`merged`.
+    fn route_gitlab(
+        state: &std::sync::Mutex<ForgeState>,
+        bare: &Path,
+        method: &tiny_http::Method,
+        path: &str,
+        query: &str,
+        body: &str,
+    ) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
+        use tiny_http::Method::{Get, Post, Put};
+        let parts: Vec<&str> = path.trim_start_matches('/').split('/').skip(2).collect();
+        let req: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+        let mut st = state.lock().unwrap();
+        let number = |s: &str| s.parse::<u64>().ok();
+        if parts.first() == Some(&"merge_requests") && st.fail_pulls > 0 {
+            st.fail_pulls -= 1;
+            return json_reply(serde_json::json!({"message": "unavailable"}), 503);
+        }
+        let mr_json = |st: &ForgeState, pr: &FakePr| -> serde_json::Value {
+            let sha = Self::head_sha(bare, &pr.head);
+            let pipeline = if st.failing_heads.contains(&sha) {
+                serde_json::json!({"id": pr.number * 100, "status": "failed", "sha": sha,
+                    "ref": pr.head, "web_url": "http://fake/pipeline"})
+            } else {
+                serde_json::json!({"id": pr.number * 100, "status": "success", "sha": sha,
+                    "ref": pr.head, "web_url": "http://fake/pipeline"})
+            };
+            serde_json::json!({
+                "iid": pr.number,
+                "web_url": format!("http://fake/-/merge_requests/{}", pr.number),
+                "state": if pr.merged { "merged" } else if pr.open { "opened" } else { "closed" },
+                "draft": false,
+                "source_branch": pr.head,
+                "target_branch": pr.base,
+                "title": format!("MR {}", pr.number),
+                "description": "",
+                "updated_at": pr.updated_at,
+                "sha": sha,
+                "merge_status": "can_be_merged",
+                "pipeline": pipeline,
+            })
+        };
+        match (method, parts.as_slice()) {
+            (Get, []) => json_reply(
+                serde_json::json!({"id": 1, "path_with_namespace": "acme/w"}),
+                200,
+            ),
+            (Get, ["merge_requests"]) => {
+                let source = query
+                    .split('&')
+                    .find_map(|kv| kv.strip_prefix("source_branch="))
+                    .map(|h| h.replace("%2F", "/"));
+                let found: Vec<serde_json::Value> = st
+                    .prs
+                    .iter()
+                    .filter(|pr| pr.open && source.as_deref().is_none_or(|s| pr.head == s))
+                    .map(|pr| mr_json(&st, pr))
+                    .collect();
+                json_reply(serde_json::Value::Array(found), 200)
+            }
+            (Post, ["merge_requests"]) => {
+                let head = req["source_branch"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                if st.prs.iter().any(|pr| pr.open && pr.head == head) {
+                    return json_reply(
+                        serde_json::json!({"message": ["Another open merge request already exists"]}),
+                        409,
+                    );
+                }
+                let base_name = req["target_branch"].as_str().unwrap_or("main");
+                if Self::adds_nothing_to(bare, bare, &head, base_name) {
+                    return json_reply(
+                        serde_json::json!({"message": ["Cannot create a merge request: no changes between the branches"]}),
+                        422,
+                    );
+                }
+                let pr = FakePr {
+                    repo: "acme/w".to_string(),
+                    head_repo: "acme/w".to_string(),
+                    number: st.prs.len() as u64 + 1,
+                    head,
+                    base: req["target_branch"].as_str().unwrap_or("main").to_string(),
+                    open: true,
+                    merged: false,
+                    updated_at: "2000-01-01T00:00:00Z".to_string(),
+                    comments: Vec::new(),
+                };
+                let reply = mr_json(&st, &pr);
+                st.prs.push(pr);
+                json_reply(reply, 201)
+            }
+            (Get | Put, ["merge_requests", n]) => {
+                let Some(index) = number(n).and_then(|n| st.prs.iter().position(|p| p.number == n))
+                else {
+                    return json_reply(serde_json::json!({"message": "404 Not Found"}), 404);
+                };
+                if *method == Put {
+                    let pr = &mut st.prs[index];
+                    if let Some(base) = req["target_branch"].as_str() {
+                        pr.base = base.to_string();
+                    }
+                    if req["state_event"].as_str() == Some("close") {
+                        pr.open = false;
+                    }
+                }
+                let reply = mr_json(&st, &st.prs[index]);
+                json_reply(reply, 200)
+            }
+            (Get, ["merge_requests", n, "notes"]) => {
+                let notes: Vec<serde_json::Value> = number(n)
+                    .and_then(|n| st.prs.iter().find(|p| p.number == n))
+                    .map(|pr| {
+                        pr.comments
+                            .iter()
+                            .map(|(id, body)| {
+                                serde_json::json!({
+                                    "id": id,
+                                    "author": {"username": "reviewer"},
+                                    "body": body,
+                                    "created_at": "2026-01-01T00:00:00Z",
+                                    "system": false,
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                json_reply(serde_json::Value::Array(notes), 200)
+            }
+            (Post, ["merge_requests", n, "notes"]) => {
+                if let Some(pr) = number(n).and_then(|n| st.prs.iter_mut().find(|p| p.number == n))
+                {
+                    let id = 9000 + pr.comments.len() as u64;
+                    pr.comments
+                        .push((id, req["body"].as_str().unwrap_or_default().to_string()));
+                }
+                json_reply(serde_json::json!({}), 201)
+            }
+            (Get, ["merge_requests", _, "merge_ref"]) => {
+                json_reply(serde_json::json!({"message": "404 Not Found"}), 404)
+            }
+            (Get, ["pipelines"]) => {
+                let branch = query
+                    .split('&')
+                    .find_map(|kv| kv.strip_prefix("ref="))
+                    .map(|b| b.replace("%2F", "/"));
+                let pipelines: Vec<serde_json::Value> = st
+                    .runs
+                    .iter()
+                    .filter(|r| branch.as_deref().is_none_or(|b| r.1 == b))
+                    .map(|(id, _, sha, status)| {
+                        serde_json::json!({"id": id, "sha": sha, "status": status})
+                    })
+                    .collect();
+                json_reply(serde_json::Value::Array(pipelines), 200)
+            }
+            (Post, ["pipelines", id, "cancel"]) => {
+                if let Ok(id) = id.parse::<i64>() {
+                    st.cancelled_runs.push(id);
+                    for run in st.runs.iter_mut().filter(|r| r.0 == id) {
+                        run.3 = "canceled".to_string();
+                    }
+                }
+                json_reply(serde_json::json!({}), 200)
+            }
+            (Get, ["pipelines", _, "jobs"]) => json_reply(
+                serde_json::json!([{"id": 9, "name": "build", "web_url": "http://fake/job/9"}]),
+                200,
+            ),
+            (Get, ["jobs", _, "trace"]) => {
+                tiny_http::Response::from_string("error: build failed").with_status_code(200)
+            }
+            (Get, ["repository", ..]) => json_reply(serde_json::json!({"message": "404"}), 404),
+            _ => {
+                st.unrouted.push(format!("{method} {path}?{query}"));
+                json_reply(serde_json::json!({"message": "404 Not Found"}), 404)
+            }
+        }
+    }
+
+    /// Whether `head` (in `head_bare`) adds nothing to `base` (in `bare`): every
+    /// commit it has is already in the base. Real forges refuse to open a PR/MR
+    /// in that case ("No commits between ...").
+    fn adds_nothing_to(bare: &Path, head_bare: &Path, head: &str, base: &str) -> bool {
+        let head_sha = Self::head_sha(head_bare, head);
+        if head_sha.is_empty() {
+            return false;
+        }
+        // The head's objects may live in another repository: fetch them into
+        // `bare` only when it differs (a cross-repository PR).
+        if head_bare != bare {
+            let _ = std::process::Command::new("git")
+                .args([
+                    "fetch",
+                    "-q",
+                    &head_bare.display().to_string(),
+                    &format!("refs/heads/{head}:refs/fake-forge/head"),
+                ])
+                .current_dir(bare)
+                .output();
+        }
+        std::process::Command::new("git")
+            .args([
+                "merge-base",
+                "--is-ancestor",
+                &head_sha,
+                &format!("refs/heads/{base}"),
+            ])
+            .current_dir(bare)
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
+    /// The tip of `refs/heads/<head>` on the bare upstream (empty if unborn).
+    fn head_sha(bare: &Path, head: &str) -> String {
+        std::process::Command::new("git")
+            .args(["rev-parse", &format!("refs/heads/{head}")])
+            .current_dir(bare)
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default()
+    }
+
     fn route(
         state: &std::sync::Mutex<ForgeState>,
         bare: &Path,
@@ -3302,20 +3864,40 @@ impl FakeGitHub {
         body: &str,
     ) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
         let (path, query) = url.split_once('?').unwrap_or((url, ""));
-        let parts: Vec<&str> = path
-            .trim_start_matches('/')
-            .split('/')
-            .skip(3) // repos/acme/w
-            .collect();
+        if path.trim_start_matches('/').starts_with("projects/") {
+            return Self::route_gitlab(state, bare, method, path, query, body);
+        }
+        let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+        let repo = format!(
+            "{}/{}",
+            segments.get(1).copied().unwrap_or_default(),
+            segments.get(2).copied().unwrap_or_default()
+        );
+        let parts: Vec<&str> = segments.iter().skip(3).copied().collect(); // repos/acme/w
         let req: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
         let mut st = state.lock().unwrap();
         let number = |s: &str| s.parse::<u64>().ok();
+        if parts.first() == Some(&"pulls") && st.fail_pulls > 0 {
+            st.fail_pulls -= 1;
+            return json_reply(serde_json::json!({"message": "unavailable"}), 503);
+        }
         use tiny_http::Method::{Get, Patch, Post};
         match (method, parts.as_slice()) {
-            (Get, []) => json_reply(
-                serde_json::json!({"full_name": "acme/w", "fork": false}),
-                200,
-            ),
+            (Get, []) => {
+                if repo == "acme/w" {
+                    json_reply(
+                        serde_json::json!({"full_name": "acme/w", "fork": false}),
+                        200,
+                    )
+                } else {
+                    json_reply(
+                        serde_json::json!({"full_name": repo, "fork": true,
+                            "parent": {"full_name": "acme/w"},
+                            "source": {"full_name": "acme/w"}}),
+                        200,
+                    )
+                }
+            }
             (Get, ["pulls"]) => {
                 let head = query
                     .split('&')
@@ -3324,19 +3906,48 @@ impl FakeGitHub {
                 let found: Vec<serde_json::Value> = st
                     .prs
                     .iter()
-                    .filter(|pr| pr.open && head.as_deref().is_none_or(|h| pr.head == h))
-                    .map(|pr| Self::pr_json(bare, pr))
+                    .filter(|pr| {
+                        pr.repo == repo && pr.open && head.as_deref().is_none_or(|h| pr.head == h)
+                    })
+                    .map(|pr| Self::pr_json(&Self::bare_of(&st, &pr.head_repo, bare), pr))
                     .collect();
                 json_reply(serde_json::Value::Array(found), 200)
             }
             (Post, ["pulls"]) => {
-                let head = req["head"].as_str().unwrap_or_default();
-                let head = head.rsplit(':').next().unwrap_or(head).to_string();
-                if st.prs.iter().any(|pr| pr.open && pr.head == head) {
+                let full_head = req["head"].as_str().unwrap_or_default();
+                let head = full_head
+                    .rsplit(':')
+                    .next()
+                    .unwrap_or(full_head)
+                    .to_string();
+                // `owner:branch` names a head in that owner's fork of this repo.
+                let head_repo = match full_head.split_once(':') {
+                    Some((owner, _)) => format!(
+                        "{owner}/{}",
+                        repo.split_once('/').map_or("", |(_, name)| name)
+                    ),
+                    None => repo.clone(),
+                };
+                if st
+                    .prs
+                    .iter()
+                    .any(|pr| pr.repo == repo && pr.open && pr.head == head)
+                {
                     return json_reply(serde_json::json!({"message": "exists"}), 422);
                 }
+                let base_name = req["base"].as_str().unwrap_or("main");
+                let repo_bare = Self::bare_of(&st, &repo, bare);
+                let head_bare = Self::bare_of(&st, &head_repo, bare);
+                if Self::adds_nothing_to(&repo_bare, &head_bare, &head, base_name) {
+                    return json_reply(
+                        serde_json::json!({"message": "Validation Failed: No commits between the base and the head"}),
+                        422,
+                    );
+                }
                 let pr = FakePr {
-                    number: st.prs.len() as u64 + 1,
+                    repo: repo.clone(),
+                    head_repo,
+                    number: st.prs.iter().filter(|p| p.repo == repo).count() as u64 + 1,
                     head,
                     base: req["base"].as_str().unwrap_or("main").to_string(),
                     open: true,
@@ -3344,29 +3955,39 @@ impl FakeGitHub {
                     updated_at: "2000-01-01T00:00:00Z".to_string(),
                     comments: Vec::new(),
                 };
-                let reply = Self::pr_json(bare, &pr);
+                let reply = Self::pr_json(&Self::bare_of(&st, &pr.head_repo, bare), &pr);
                 st.prs.push(pr);
                 json_reply(reply, 201)
             }
             (Get | Patch, ["pulls", n]) => {
-                let Some(pr) = number(n).and_then(|n| st.prs.iter_mut().find(|p| p.number == n))
+                let stacked = st.stacked;
+                let Some(index) = number(n)
+                    .and_then(|n| st.prs.iter().position(|p| p.repo == repo && p.number == n))
                 else {
                     return json_reply(serde_json::json!({"message": "Not Found"}), 404);
                 };
+                let head_bare = Self::bare_of(&st, &st.prs[index].head_repo, bare);
+                let pr = &mut st.prs[index];
                 if *method == Patch {
                     if let Some(base) = req["base"].as_str() {
+                        if stacked && pr.base != base {
+                            return json_reply(
+                                serde_json::json!({"message": "Cannot change the base of a pull request that is part of a stack"}),
+                                422,
+                            );
+                        }
                         pr.base = base.to_string();
                     }
                     if req["state"].as_str() == Some("closed") {
                         pr.open = false;
                     }
                 }
-                let reply = Self::pr_json(bare, pr);
+                let reply = Self::pr_json(&head_bare, pr);
                 json_reply(reply, 200)
             }
             (Get, ["issues", n, "comments"]) => {
                 let comments: Vec<serde_json::Value> = number(n)
-                    .and_then(|n| st.prs.iter().find(|p| p.number == n))
+                    .and_then(|n| st.prs.iter().find(|p| p.repo == repo && p.number == n))
                     .map(|pr| {
                         pr.comments
                             .iter()
@@ -3382,6 +4003,16 @@ impl FakeGitHub {
                     })
                     .unwrap_or_default();
                 json_reply(serde_json::Value::Array(comments), 200)
+            }
+            (Post, ["issues", n, "comments"]) => {
+                if let Some(pr) = number(n)
+                    .and_then(|n| st.prs.iter_mut().find(|p| p.repo == repo && p.number == n))
+                {
+                    let id = 9000 + pr.comments.len() as u64;
+                    pr.comments
+                        .push((id, req["body"].as_str().unwrap_or_default().to_string()));
+                }
+                json_reply(serde_json::json!({}), 201)
             }
             (Get, ["pulls", _, "comments"]) => json_reply(serde_json::json!([]), 200),
             (Get, ["commits", sha, "check-runs"]) => {
@@ -3402,20 +4033,51 @@ impl FakeGitHub {
                 serde_json::json!({"state": "success", "total_count": 0, "statuses": []}),
                 200,
             ),
-            (Post, ["stacks"]) => json_reply(serde_json::json!({"number": 1}), 201),
+            (Post, ["stacks"]) => {
+                st.stacked = true;
+                st.stacks_created += 1;
+                json_reply(serde_json::json!({"number": st.stacks_created}), 201)
+            }
+            (Post, ["stacks", _, "unstack"]) => {
+                st.stacked = false;
+                json_reply(serde_json::json!({}), 200)
+            }
             (Get, ["stacks", _]) => {
                 let open: Vec<serde_json::Value> = st
                     .prs
                     .iter()
-                    .filter(|p| p.open)
+                    .filter(|p| p.repo == repo && p.open)
                     .map(|p| serde_json::json!({"number": p.number}))
                     .collect();
                 json_reply(serde_json::json!({"number": 1, "pull_requests": open}), 200)
             }
+            (Post, ["actions", "runs", id, "force-cancel"]) => {
+                if let Ok(id) = id.parse::<i64>() {
+                    st.cancelled_runs.push(id);
+                    for run in st.runs.iter_mut().filter(|r| r.0 == id) {
+                        run.3 = "completed".to_string();
+                    }
+                }
+                json_reply(serde_json::json!({}), 200)
+            }
             (Post, ["stacks", _, _]) | (Post, ["actions", "runs", _, _]) => {
                 json_reply(serde_json::json!({}), 200)
             }
-            (Get, ["actions", "runs"]) => json_reply(serde_json::json!({"workflow_runs": []}), 200),
+            (Get, ["actions", "runs"]) => {
+                let branch = query
+                    .split('&')
+                    .find_map(|kv| kv.strip_prefix("branch="))
+                    .map(|b| b.replace("%2F", "/"));
+                let runs: Vec<serde_json::Value> = st
+                    .runs
+                    .iter()
+                    .filter(|r| branch.as_deref().is_none_or(|b| r.1 == b))
+                    .map(|(id, _, sha, status)| {
+                        serde_json::json!({"id": id, "head_sha": sha, "status": status})
+                    })
+                    .collect();
+                json_reply(serde_json::json!({"workflow_runs": runs}), 200)
+            }
             (Get, ["actions", "jobs", _]) => json_reply(serde_json::json!({"steps": []}), 200),
             (Get, ["contents", ..]) => json_reply(serde_json::json!({"message": "Not Found"}), 404),
             _ => {
@@ -3438,13 +4100,40 @@ impl FakeGitHub {
     }
 
     fn with_pr(&self, number: u64, edit: impl FnOnce(&mut FakePr)) {
+        self.with_pr_in("acme/w", number, edit);
+    }
+
+    /// Edit PR `number` of repository `repo`.
+    #[allow(dead_code)]
+    fn with_pr_in(&self, repo: &str, number: u64, edit: impl FnOnce(&mut FakePr)) {
         let mut st = self.state.lock().unwrap();
         let pr = st
             .prs
             .iter_mut()
-            .find(|p| p.number == number)
+            .find(|p| p.repo == repo && p.number == number)
             .expect("fake PR");
         edit(pr);
+    }
+
+    /// Serve `repo` (an `owner/name`) from the bare repository at `bare`.
+    fn add_repo(&self, repo: &str, bare: &Path) {
+        self.state
+            .lock()
+            .unwrap()
+            .bares
+            .insert(repo.to_string(), bare.to_path_buf());
+    }
+
+    /// The open PRs filed in `repo`.
+    fn open_prs_in(&self, repo: &str) -> Vec<FakePr> {
+        self.state
+            .lock()
+            .unwrap()
+            .prs
+            .iter()
+            .filter(|p| p.repo == repo && p.open)
+            .cloned()
+            .collect()
     }
 }
 
@@ -3463,6 +4152,12 @@ impl Fixture {
     /// transport real git against the bare upstream, and `.ralphus.toml`
     /// points the daemon's forge client at the fake. No PRs are open yet.
     fn with_forge(features: &[&str]) -> (Self, FakeGitHub) {
+        Self::with_forge_kind(features, "github")
+    }
+
+    /// [`Self::with_forge`] for either forge: `kind` is `"github"` or
+    /// `"gitlab"`, and the fake serves that forge's REST routes.
+    fn with_forge_kind(features: &[&str], kind: &str) -> (Self, FakeGitHub) {
         let fx = Self::with_upstream(features);
         let forge = FakeGitHub::start(&fx.remote);
         let shim = fx.root.join(".git").join("ssh-shim.sh");
@@ -3493,7 +4188,7 @@ impl Fixture {
         std::fs::write(
             fx.root.join(".ralphus.toml"),
             format!(
-                "[forge]\nkind = \"github\"\napi_base = \"http://{}\"\ntoken_env = \"CARGO_MANIFEST_DIR\"\n",
+                "[forge]\nkind = \"{kind}\"\napi_base = \"http://{}\"\ntoken_env = \"CARGO_MANIFEST_DIR\"\n",
                 forge.addr
             ),
         )
@@ -3555,10 +4250,9 @@ impl Fixture {
 /// The first submission of a review's PR stack races a held feedback round
 /// and an upstream rebase: every branch must get its PR, and every PR branch
 /// must end up with the feedback and the upstream commit.
-#[test]
-fn first_pr_submission_racing_feedback_and_an_upstream_rebase() {
+fn first_pr_submission_racing_feedback_and_an_upstream_rebase_on(kind: &str) {
     let what = "first submission race";
-    let (fx, forge) = Fixture::with_forge(&["feature/a", "feature/b", "feature/c"]);
+    let (fx, forge) = Fixture::with_forge_kind(&["feature/a", "feature/b", "feature/c"], kind);
     let unexpected: Unexpected = Arc::default();
     let _daemon = DaemonPump::start(&fx);
 
@@ -3586,7 +4280,23 @@ fn first_pr_submission_racing_feedback_and_an_upstream_rebase() {
     };
     std::thread::sleep(PARK_WAIT);
     held.finish();
-    let submitted = submitting.join().expect("submit thread");
+    let mut submitted = submitting.join().expect("submit thread");
+    // The held round and the submission both create the same new remote branch;
+    // whichever loses git's atomic ref creation ("reference already exists")
+    // fails that submission. A user retries, and the retry must converge.
+    for _ in 0..3 {
+        if submitted.is_ok() {
+            break;
+        }
+        submitted = ralphus_daemon::pr::submit_pull_requests(
+            &fx.store,
+            &NoAgentExpected,
+            &fx.id,
+            stack_request(),
+            "tester",
+            false,
+        );
+    }
     assert!(submitted.is_ok(), "{what}: submit failed: {submitted:?}");
 
     fx.wait_settled_on(&upstream, what);
@@ -3614,14 +4324,23 @@ fn first_pr_submission_racing_feedback_and_an_upstream_rebase() {
     );
 }
 
+#[test]
+fn first_pr_submission_racing_feedback_and_an_upstream_rebase() {
+    first_pr_submission_racing_feedback_and_an_upstream_rebase_on("github");
+}
+
+#[test]
+fn first_pr_submission_racing_feedback_and_an_upstream_rebase_on_gitlab() {
+    first_pr_submission_racing_feedback_and_an_upstream_rebase_on("gitlab");
+}
+
 /// The bottom PR is merged on the forge (its commits land on upstream `main`)
 /// while a feedback round on the top branch is in flight. The review must mark
 /// that branch merged and keep the rest of the stack -- with the feedback --
 /// published on the new base.
-#[test]
-fn bottom_pr_merged_on_the_forge_while_feedback_is_in_flight() {
+fn bottom_pr_merged_on_the_forge_while_feedback_is_in_flight_on(kind: &str) {
     let what = "bottom PR merged on forge";
-    let (fx, forge) = Fixture::with_forge(&["feature/a", "feature/b", "feature/c"]);
+    let (fx, forge) = Fixture::with_forge_kind(&["feature/a", "feature/b", "feature/c"], kind);
     fx.submit_stack();
     let unexpected: Unexpected = Arc::default();
     let _daemon = DaemonPump::start(&fx);
@@ -3681,12 +4400,21 @@ fn bottom_pr_merged_on_the_forge_while_feedback_is_in_flight() {
     fx.assert_everything_published(what, &[(2, "feature-c.txt", "feedback on c")], &[]);
 }
 
+#[test]
+fn bottom_pr_merged_on_the_forge_while_feedback_is_in_flight() {
+    bottom_pr_merged_on_the_forge_while_feedback_is_in_flight_on("github");
+}
+
+#[test]
+fn bottom_pr_merged_on_the_forge_while_feedback_is_in_flight_on_gitlab() {
+    bottom_pr_merged_on_the_forge_while_feedback_is_in_flight_on("gitlab");
+}
+
 /// Feedback pulled from a PR comment (`action_pr_feedback`) lands while a
 /// feedback round on the branch above is held and the base moves.
-#[test]
-fn pr_comment_feedback_racing_feedback_and_an_upstream_rebase() {
+fn pr_comment_feedback_racing_feedback_and_an_upstream_rebase_on(kind: &str) {
     let what = "PR-comment feedback race";
-    let (fx, forge) = Fixture::with_forge(&["feature/a", "feature/b", "feature/c"]);
+    let (fx, forge) = Fixture::with_forge_kind(&["feature/a", "feature/b", "feature/c"], kind);
     fx.submit_stack();
     let unexpected: Unexpected = Arc::default();
     let daemon = DaemonPump::start(&fx);
@@ -3732,14 +4460,23 @@ fn pr_comment_feedback_racing_feedback_and_an_upstream_rebase() {
     );
 }
 
+#[test]
+fn pr_comment_feedback_racing_feedback_and_an_upstream_rebase() {
+    pr_comment_feedback_racing_feedback_and_an_upstream_rebase_on("github");
+}
+
+#[test]
+fn pr_comment_feedback_racing_feedback_and_an_upstream_rebase_on_gitlab() {
+    pr_comment_feedback_racing_feedback_and_an_upstream_rebase_on("gitlab");
+}
+
 /// The forge reports a failing check on the top PR while a feedback round on
 /// the branch below is held and the base moves. The daemon's own maintenance
 /// dispatches the unattended fix (its agent stands in for the LLM), and the
 /// fix, the feedback and the upstream commit must all reach every PR.
-#[test]
-fn forge_reported_ci_failure_is_auto_fixed_while_feedback_and_an_upstream_race() {
+fn forge_reported_ci_failure_is_auto_fixed_while_feedback_and_an_upstream_race_on(kind: &str) {
     let what = "forge CI failure auto-fix race";
-    let (fx, forge) = Fixture::with_forge(&["feature/a", "feature/b", "feature/c"]);
+    let (fx, forge) = Fixture::with_forge_kind(&["feature/a", "feature/b", "feature/c"], kind);
     fx.submit_stack();
     fx.store
         .lock()
@@ -3784,14 +4521,23 @@ fn forge_reported_ci_failure_is_auto_fixed_while_feedback_and_an_upstream_race()
     );
 }
 
+#[test]
+fn forge_reported_ci_failure_is_auto_fixed_while_feedback_and_an_upstream_race() {
+    forge_reported_ci_failure_is_auto_fixed_while_feedback_and_an_upstream_race_on("github");
+}
+
+#[test]
+fn forge_reported_ci_failure_is_auto_fixed_while_feedback_and_an_upstream_race_on_gitlab() {
+    forge_reported_ci_failure_is_auto_fixed_while_feedback_and_an_upstream_race_on("gitlab");
+}
+
 /// A reviewer reorders the stack on the forge (re-pointing PR bases: a, c, b)
 /// while a feedback round on b is held. The reorder must wait for the round,
 /// then rebuild in the forge's order with b's feedback on b's PR and not on
 /// c's.
-#[test]
-fn forge_reorder_racing_an_in_flight_feedback_round() {
+fn forge_reorder_racing_an_in_flight_feedback_round_on(kind: &str) {
     let what = "forge reorder race";
-    let (fx, forge) = Fixture::with_forge(&["feature/a", "feature/b", "feature/c"]);
+    let (fx, forge) = Fixture::with_forge_kind(&["feature/a", "feature/b", "feature/c"], kind);
     fx.submit_stack();
     let unexpected: Unexpected = Arc::default();
     let daemon = DaemonPump::start(&fx);
@@ -3863,5 +4609,4801 @@ fn forge_reorder_racing_an_in_flight_feedback_round() {
         !c_files.contains("feature-b.txt"),
         "{what}: c's PR (now below b) still carries b's commits\n{}",
         fx.describe()
+    );
+}
+
+#[test]
+fn forge_reorder_racing_an_in_flight_feedback_round() {
+    forge_reorder_racing_an_in_flight_feedback_round_on("github");
+}
+
+#[test]
+fn forge_reorder_racing_an_in_flight_feedback_round_on_gitlab() {
+    forge_reorder_racing_an_in_flight_feedback_round_on("gitlab");
+}
+
+// ---------------------------------------------------------------------------
+// More forge-side stack events racing in-flight feedback.
+// ---------------------------------------------------------------------------
+
+impl Fixture {
+    /// "Merge" the PR at position `p` on the forge: its branch (with everything
+    /// below it) lands on upstream `main` and the fake PR flips to merged.
+    /// Returns the new upstream tip.
+    fn merge_pr_on_forge(&self, forge: &FakeGitHub, p: usize) -> String {
+        let (_, alias) = self.open_pr_row(p);
+        let number = forge.pr_for(&alias).number;
+        let clone = temp_dir();
+        let _ = std::fs::remove_dir_all(&clone);
+        git(
+            clone.parent().unwrap(),
+            &[
+                "clone",
+                "-q",
+                "--branch",
+                "main",
+                self.remote.to_str().unwrap(),
+                clone.file_name().unwrap().to_str().unwrap(),
+            ],
+        );
+        git(
+            &clone,
+            &[
+                "merge",
+                "--no-ff",
+                "-m",
+                &format!("Merge PR {p}"),
+                &format!("origin/{alias}"),
+            ],
+        );
+        git(&clone, &["push", "-q", "origin", "main"]);
+        let sha = git(&clone, &["rev-parse", "HEAD"]).trim().to_string();
+        let _ = std::fs::remove_dir_all(&clone);
+        forge.with_pr(number, |pr| {
+            pr.open = false;
+            pr.merged = true;
+        });
+        sha
+    }
+
+    fn merge_statuses(&self) -> Vec<String> {
+        self.store
+            .lock()
+            .get_guardian(&self.id)
+            .unwrap()
+            .branches
+            .iter()
+            .map(|b| b.merge_status.clone())
+            .collect()
+    }
+}
+
+/// The middle PR is merged on the forge (carrying the bottom one's commits
+/// with it) while a feedback round on the top branch is in flight: both
+/// merged branches must be recognised, and the top PR keeps its feedback on
+/// the new base.
+fn middle_pr_merged_on_the_forge_while_feedback_is_in_flight_on(kind: &str) {
+    let what = "middle PR merged on forge";
+    let (fx, forge) = Fixture::with_forge_kind(&["feature/a", "feature/b", "feature/c"], kind);
+    fx.submit_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    fx.wait_settled_on(first.trim(), "before the merge");
+
+    let mut held = Held::new("feature-c.txt", "feedback on c", &unexpected).feedback(&fx, 2);
+    let upstream = fx.merge_pr_on_forge(&forge, 1);
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+
+    fx.wait_settled_on(&upstream, what);
+    let statuses = fx.merge_statuses();
+    assert_eq!(
+        statuses[..2],
+        ["merged", "merged"],
+        "{what}: {statuses:?}\n{}",
+        fx.describe()
+    );
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_forge_routed_everything(what, &forge);
+    fx.assert_everything_published(what, &[(2, "feature-c.txt", "feedback on c")], &[]);
+}
+
+#[test]
+fn middle_pr_merged_on_the_forge_while_feedback_is_in_flight() {
+    middle_pr_merged_on_the_forge_while_feedback_is_in_flight_on("github");
+}
+
+#[test]
+fn middle_pr_merged_on_the_forge_while_feedback_is_in_flight_on_gitlab() {
+    middle_pr_merged_on_the_forge_while_feedback_is_in_flight_on("gitlab");
+}
+
+/// Every PR in the stack is merged on the forge while a feedback round on the
+/// top branch is held. No late push may revive a merged PR branch.
+fn every_pr_merged_on_the_forge_while_feedback_is_in_flight_on(kind: &str) {
+    let what = "all PRs merged on forge";
+    let (fx, forge) = Fixture::with_forge_kind(&["feature/a", "feature/b", "feature/c"], kind);
+    fx.submit_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    fx.wait_settled_on(first.trim(), "before the merge");
+    let aliases: Vec<String> = (0..3).map(|p| fx.open_pr_row(p).1).collect();
+    let tips_before: Vec<String> = aliases.iter().map(|a| fx.remote_tip(a)).collect();
+
+    let mut held = Held::new("feature-c.txt", "feedback on c", &unexpected).feedback(&fx, 2);
+    let upstream = fx.merge_pr_on_forge(&forge, 2);
+    for number in 1..=3 {
+        forge.with_pr(number, |pr| {
+            pr.open = false;
+            pr.merged = true;
+        });
+    }
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+    // Not `wait_settled_on`: the top branch's review commit is never pushed
+    // (its PR is merged), which that helper treats as unsettled.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let view = fx.store.lock().get_guardian(&fx.id).unwrap();
+        if view.status == "in_review"
+            && view.base_commit.is_some_and(|b| b.trim() == upstream)
+            && fx.merge_statuses()[..2].iter().all(|s| s == "merged")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what}: never settled\n{}",
+            fx.describe()
+        );
+        std::thread::sleep(SETTLE_POLL);
+    }
+    std::thread::sleep(PARK_WAIT * 4);
+    let statuses = fx.merge_statuses();
+    assert!(
+        statuses[..2].iter().all(|s| s == "merged"),
+        "{what}: merged branches not recognised: {statuses:?}\n{}",
+        fx.describe()
+    );
+    // The fully merged branches must not be revived. The top branch's late
+    // feedback commit is new, unmerged work, so it may be published again --
+    // under a fresh PR -- but then it must carry the feedback.
+    for p in 0..2 {
+        assert_eq!(
+            fx.remote_tip(&aliases[p]),
+            tips_before[p],
+            "{what}: a late push moved merged PR branch {p}\n{}",
+            fx.describe()
+        );
+    }
+    let kept = fx.file_on(&fx.root, &fx.review_ref(2), "feature-c.txt");
+    assert!(
+        kept.contains("feedback on c"),
+        "{what}: the review branch lost its feedback ({kept:?})\n{}",
+        fx.describe()
+    );
+    if fx.remote_tip(&aliases[2]) != tips_before[2] {
+        let published = fx.file_on(
+            &fx.remote,
+            &format!("refs/heads/{}", aliases[2]),
+            "feature-c.txt",
+        );
+        assert!(
+            published.contains("feedback on c"),
+            "{what}: the top PR branch moved without the feedback\n{}",
+            fx.describe()
+        );
+    }
+    fx.assert_forge_routed_everything(what, &forge);
+}
+
+#[test]
+fn every_pr_merged_on_the_forge_while_feedback_is_in_flight() {
+    every_pr_merged_on_the_forge_while_feedback_is_in_flight_on("github");
+}
+
+#[test]
+fn every_pr_merged_on_the_forge_while_feedback_is_in_flight_on_gitlab() {
+    every_pr_merged_on_the_forge_while_feedback_is_in_flight_on("gitlab");
+}
+
+/// A PR is closed (not merged) on the forge while feedback on its branch is
+/// held. The feedback is committed to the review branch, and must not be
+/// pushed onto the closed PR's branch.
+fn pr_closed_on_the_forge_while_feedback_is_in_flight_on(kind: &str) {
+    let what = "PR closed on forge";
+    let (fx, forge) = Fixture::with_forge_kind(&["feature/a", "feature/b", "feature/c"], kind);
+    fx.submit_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    fx.wait_settled_on(first.trim(), "before the close");
+    let (_, alias_b) = fx.open_pr_row(1);
+    let tip_b = fx.remote_tip(&alias_b);
+    let number_b = forge.pr_for(&alias_b).number;
+
+    let mut held = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    forge.with_pr(number_b, |pr| pr.open = false);
+    // The daemon only learns of a close when it next checks the forge (a
+    // submission pass does); until then it rightly still treats the PR as open.
+    fx.submit_stack();
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+    std::thread::sleep(PARK_WAIT * 4);
+
+    // Whether feedback should still publish the review branch under its own
+    // name once its PR is closed is an open product question (see
+    // RACES_FOLLOWUP.local.md); what must hold either way is that the closed
+    // PR is not resubmitted and the feedback is not dropped.
+    let _ = tip_b;
+    let open: Vec<u64> = forge
+        .state
+        .lock()
+        .unwrap()
+        .prs
+        .iter()
+        .filter(|p| p.open)
+        .map(|p| p.number)
+        .collect();
+    assert!(
+        !open.contains(&number_b) && open.len() == 2,
+        "{what}: a closed PR was reopened or resubmitted: {open:?}\n{}",
+        fx.describe()
+    );
+    let kept = fx.file_on(&fx.root, &fx.review_ref(1), "feature-b.txt");
+    assert!(
+        kept.contains("feedback on b"),
+        "{what}: the review branch lost its feedback ({kept:?})\n{}",
+        fx.describe()
+    );
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_forge_routed_everything(what, &forge);
+}
+
+#[test]
+fn pr_closed_on_the_forge_while_feedback_is_in_flight() {
+    pr_closed_on_the_forge_while_feedback_is_in_flight_on("github");
+}
+
+#[test]
+fn pr_closed_on_the_forge_while_feedback_is_in_flight_on_gitlab() {
+    pr_closed_on_the_forge_while_feedback_is_in_flight_on("gitlab");
+}
+
+/// A reviewer reorders the stack on the forge and then puts it back (A→B→A)
+/// while a feedback round is held. The final order wins and no commit is lost.
+fn two_forge_reorders_back_to_back_while_feedback_is_in_flight_on(kind: &str) {
+    let what = "back-to-back forge reorders";
+    let (fx, forge) = Fixture::with_forge_kind(&["feature/a", "feature/b", "feature/c"], kind);
+    fx.submit_stack();
+    let unexpected: Unexpected = Arc::default();
+    let daemon = DaemonPump::start(&fx);
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    fx.wait_settled_on(first.trim(), "before the reorders");
+    let (_, alias_a) = fx.open_pr_row(0);
+    let (_, alias_b) = fx.open_pr_row(1);
+    let (_, alias_c) = fx.open_pr_row(2);
+    let (number_b, number_c) = (forge.pr_for(&alias_b).number, forge.pr_for(&alias_c).number);
+
+    let mut held = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    let reorder = || {
+        ralphus_daemon::pr::check_and_apply_forge_reorder(
+            &fx.store,
+            &NoAgentExpected,
+            &fx.id,
+            &daemon.sem,
+            &daemon.cancellations,
+        )
+    };
+    // a, c, b ...
+    forge.with_pr(number_c, |pr| {
+        pr.base = alias_a.clone();
+        pr.updated_at = "2099-01-01T00:00:00Z".to_string();
+    });
+    forge.with_pr(number_b, |pr| {
+        pr.base = alias_c.clone();
+        pr.updated_at = "2099-01-01T00:00:00Z".to_string();
+    });
+    reorder();
+    // ... and straight back to a, b, c.
+    forge.with_pr(number_b, |pr| {
+        pr.base = alias_a.clone();
+        pr.updated_at = "2099-01-02T00:00:00Z".to_string();
+    });
+    forge.with_pr(number_c, |pr| {
+        pr.base = alias_b.clone();
+        pr.updated_at = "2099-01-02T00:00:00Z".to_string();
+    });
+    reorder();
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+    for _ in 0..8 {
+        reorder();
+        std::thread::sleep(SETTLE_POLL);
+    }
+
+    fx.wait_settled_on(first.trim(), what);
+    let order: Vec<String> = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .branches
+        .iter()
+        .map(|b| b.branch.clone())
+        .collect();
+    assert_eq!(
+        order,
+        ["feature/a", "feature/b", "feature/c"],
+        "{what}: {}",
+        fx.describe()
+    );
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_forge_routed_everything(what, &forge);
+    fx.assert_everything_published(what, &[(1, "feature-b.txt", "feedback on b")], &[]);
+}
+
+#[test]
+fn two_forge_reorders_back_to_back_while_feedback_is_in_flight() {
+    two_forge_reorders_back_to_back_while_feedback_is_in_flight_on("github");
+}
+
+#[test]
+fn two_forge_reorders_back_to_back_while_feedback_is_in_flight_on_gitlab() {
+    two_forge_reorders_back_to_back_while_feedback_is_in_flight_on("gitlab");
+}
+
+// ---------------------------------------------------------------------------
+// Section 1 (continued): submission, comment, CI and reorder races.
+// ---------------------------------------------------------------------------
+
+fn stack_request() -> Vec<ralphus_daemon::pr::PrRequest> {
+    vec![ralphus_daemon::pr::PrRequest {
+        branch_id: None,
+        branch_alias: None,
+        title: Some("stack".to_string()),
+        description: Some("stack".to_string()),
+        use_worktree_branch_name: None,
+        draft: None,
+    }]
+}
+
+impl Fixture {
+    fn open_forge_prs(forge: &FakeGitHub) -> usize {
+        forge
+            .state
+            .lock()
+            .unwrap()
+            .prs
+            .iter()
+            .filter(|p| p.open)
+            .count()
+    }
+
+    fn branch_order(&self) -> Vec<String> {
+        self.store
+            .lock()
+            .get_guardian(&self.id)
+            .unwrap()
+            .branches
+            .iter()
+            .map(|b| b.branch.clone())
+            .collect()
+    }
+
+    /// Wait until the branch order is `want`, driving `step` meanwhile.
+    fn wait_for_order(&self, want: &[&str], what: &str, step: &dyn Fn()) {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let order = self.branch_order();
+            if order == want {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{what}: order never became {want:?}: {order:?}\n{}",
+                self.describe()
+            );
+            step();
+            std::thread::sleep(SETTLE_POLL);
+        }
+    }
+}
+
+/// Two submissions of the same stack at once (an auto-submit and a manual
+/// click): the forge's duplicate-head 422 must be adopted, never a second PR.
+fn simultaneous_submissions_open_one_pr_per_branch_on(kind: &str) {
+    let what = "simultaneous submissions";
+    let (fx, forge) = Fixture::with_forge_kind(&["feature/a", "feature/b", "feature/c"], kind);
+    let submit = || {
+        let (store, id) = (Arc::clone(&fx.store), fx.id.clone());
+        std::thread::spawn(move || {
+            ralphus_daemon::pr::submit_pull_requests(
+                &store,
+                &NoAgentExpected,
+                &id,
+                stack_request(),
+                "tester",
+                false,
+            )
+        })
+    };
+    let (first, second) = (submit(), submit());
+    let _ = (first.join().unwrap(), second.join().unwrap());
+
+    assert_eq!(
+        Fixture::open_forge_prs(&forge),
+        3,
+        "{what}: one forge PR per branch\n{}",
+        fx.describe()
+    );
+    let rows = fx
+        .store
+        .lock()
+        .list_pull_requests_for_guardian(&fx.id)
+        .unwrap()
+        .into_iter()
+        .filter(|pr| pr.state == "open")
+        .count();
+    assert_eq!(rows, 3, "{what}: one open PR row per branch");
+    fx.assert_forge_routed_everything(what, &forge);
+}
+
+#[test]
+fn simultaneous_submissions_open_one_pr_per_branch() {
+    simultaneous_submissions_open_one_pr_per_branch_on("github");
+}
+
+#[test]
+fn simultaneous_submissions_open_one_pr_per_branch_on_gitlab() {
+    simultaneous_submissions_open_one_pr_per_branch_on("gitlab");
+}
+
+/// A branch appended to the review while the stack is rebasing gets its PR
+/// through a later submission without disturbing the others.
+fn submitting_a_newly_appended_branch_while_the_stack_rebases_on(kind: &str) {
+    let what = "submit appended branch";
+    let (fx, forge) = Fixture::with_forge_kind(&["feature/a", "feature/b", "feature/c"], kind);
+    fx.submit_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let mut held = Held::new("feature-a.txt", "feedback on a", &unexpected).feedback(&fx, 0);
+    let upstream = fx.push_upstream("upstream1.txt");
+    fx.append_branch_for_race("feature/d");
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+    // The new branch has no PR yet, so the review is not "published" until
+    // the submission below; wait for the build itself.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let view = fx.store.lock().get_guardian(&fx.id).unwrap();
+        if view.status == "in_review"
+            && view.base_commit.as_deref().map(str::trim) == Some(upstream.as_str())
+            && view.branches.len() == 4
+            && view.branches[3].merge_status == "done"
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what}: new branch never built
+{}",
+            fx.describe()
+        );
+        std::thread::sleep(SETTLE_POLL);
+    }
+    fx.submit_stack();
+    fx.wait_settled_on(&upstream, what);
+    assert_eq!(
+        Fixture::open_forge_prs(&forge),
+        4,
+        "{what}\n{}",
+        fx.describe()
+    );
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_forge_routed_everything(what, &forge);
+    fx.assert_everything_published(
+        what,
+        &[(0, "feature-a.txt", "feedback on a")],
+        &["upstream1.txt"],
+    );
+}
+
+#[test]
+fn submitting_a_newly_appended_branch_while_the_stack_rebases() {
+    submitting_a_newly_appended_branch_while_the_stack_rebases_on("github");
+}
+
+#[test]
+fn submitting_a_newly_appended_branch_while_the_stack_rebases_on_gitlab() {
+    submitting_a_newly_appended_branch_while_the_stack_rebases_on("gitlab");
+}
+
+/// Two PR-comment feedback actions on the same PR at once (double click, two
+/// users): the one comment is applied exactly once.
+fn two_comment_feedback_actions_on_one_pr_apply_the_comment_once_on(kind: &str) {
+    let what = "double comment feedback";
+    let (fx, forge) = Fixture::with_forge_kind(&["feature/a", "feature/b", "feature/c"], kind);
+    fx.submit_stack();
+    let unexpected: Unexpected = Arc::default();
+    let daemon = DaemonPump::start(&fx);
+    let (pr_b, alias_b) = fx.open_pr_row(1);
+    let number_b = forge.pr_for(&alias_b).number;
+    forge.with_pr(number_b, |pr| {
+        pr.comments.push((7001, "please change b".to_string()))
+    });
+    let action = |line: &'static str| {
+        let (store, cancellations, pr_id) = (
+            Arc::clone(&fx.store),
+            daemon.cancellations.clone(),
+            pr_b.clone(),
+        );
+        let runner = WriterRunner::new("feature-b.txt", line, None, &unexpected);
+        std::thread::spawn(move || {
+            ralphus_daemon::pr::action_pr_feedback(
+                &store,
+                &runner,
+                &cancellations,
+                &pr_id,
+                Some("tester"),
+            )
+        })
+    };
+    let (one, two) = (action("comment edit one"), action("comment edit two"));
+    let (one, two) = (one.join().unwrap(), two.join().unwrap());
+    let applied: usize = [one, two].iter().filter_map(|r| r.as_ref().ok()).sum();
+    assert_eq!(
+        applied, 1,
+        "{what}: the comment must be applied exactly once"
+    );
+
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    fx.wait_settled_on(first.trim(), what);
+    let content = fx.file_on(&fx.root, &fx.review_ref(1), "feature-b.txt");
+    let edits = ["comment edit one", "comment edit two"]
+        .iter()
+        .filter(|l| content.contains(*l))
+        .count();
+    assert_eq!(edits, 1, "{what}: {content:?}\n{}", fx.describe());
+    fx.assert_forge_routed_everything(what, &forge);
+}
+
+#[test]
+fn two_comment_feedback_actions_on_one_pr_apply_the_comment_once() {
+    two_comment_feedback_actions_on_one_pr_apply_the_comment_once_on("github");
+}
+
+#[test]
+fn two_comment_feedback_actions_on_one_pr_apply_the_comment_once_on_gitlab() {
+    two_comment_feedback_actions_on_one_pr_apply_the_comment_once_on("gitlab");
+}
+
+/// PR-comment feedback on a PR the forge no longer has open must not panic
+/// or apply the comment onto the stack.
+#[test]
+fn pr_comment_feedback_on_a_closed_pr_is_not_applied() {
+    let what = "comment feedback on closed PR";
+    let (fx, forge) = Fixture::with_forge(&["feature/a", "feature/b", "feature/c"]);
+    fx.submit_stack();
+    let unexpected: Unexpected = Arc::default();
+    let daemon = DaemonPump::start(&fx);
+    let (pr_b, alias_b) = fx.open_pr_row(1);
+    let number_b = forge.pr_for(&alias_b).number;
+    forge.with_pr(number_b, |pr| {
+        pr.comments.push((7001, "please change b".to_string()));
+        pr.open = false;
+    });
+    let runner = WriterRunner::new("feature-b.txt", "late comment edit", None, &unexpected);
+    let _ = ralphus_daemon::pr::action_pr_feedback(
+        &fx.store,
+        &runner,
+        &daemon.cancellations,
+        &pr_b,
+        Some("tester"),
+    );
+    std::thread::sleep(PARK_WAIT);
+    let content = fx.file_on(&fx.root, &fx.review_ref(1), "feature-b.txt");
+    assert!(
+        !content.contains("late comment edit")
+            || fx
+                .file_on(&fx.root, &fx.review_ref(2), "feature-b.txt")
+                .contains("late comment edit"),
+        "{what}: applied to branch b but not carried to c\n{}",
+        fx.describe()
+    );
+    fx.assert_forge_routed_everything(what, &forge);
+}
+
+/// The forge reports a failure for an *old* head SHA after the branch has
+/// moved on: the fix is already in, so no auto-fix may be dispatched.
+fn ci_failure_on_a_stale_sha_does_not_dispatch_a_fix_on(kind: &str) {
+    let what = "stale CI SHA";
+    let (fx, forge) = Fixture::with_forge_kind(&["feature/a", "feature/b", "feature/c"], kind);
+    fx.submit_stack();
+    fx.store
+        .lock()
+        .set_guardian_auto_fix_pr_errors(&fx.id, Some(true))
+        .unwrap();
+    let unexpected: Unexpected = Arc::default();
+    let (_, alias_c) = fx.open_pr_row(2);
+    let old_head = fx.remote_tip(&alias_c);
+    let mut held = Held::new("feature-c.txt", "feedback on c", &unexpected).feedback(&fx, 2);
+    held.finish();
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    let fixer = Arc::new(WriterRunner::new(
+        "feature-c.txt",
+        "needless fix",
+        None,
+        &unexpected,
+    ));
+    let started = Arc::clone(&fixer.started);
+    let _daemon = DaemonPump::start_with(
+        &fx,
+        Arc::new(move |_| Arc::clone(&fixer) as Arc<dyn Runner>),
+    );
+    fx.wait_settled_on(first.trim(), what);
+    assert_ne!(
+        fx.remote_tip(&alias_c),
+        old_head,
+        "{what}: head did not move"
+    );
+    forge.state.lock().unwrap().failing_heads.insert(old_head);
+    std::thread::sleep(PARK_WAIT * 4);
+    assert!(
+        !started.load(Ordering::SeqCst),
+        "{what}: a fix was dispatched for a stale head\n{}",
+        fx.describe()
+    );
+    fx.assert_forge_routed_everything(what, &forge);
+}
+
+#[test]
+fn ci_failure_on_a_stale_sha_does_not_dispatch_a_fix() {
+    ci_failure_on_a_stale_sha_does_not_dispatch_a_fix_on("github");
+}
+
+#[test]
+fn ci_failure_on_a_stale_sha_does_not_dispatch_a_fix_on_gitlab() {
+    ci_failure_on_a_stale_sha_does_not_dispatch_a_fix_on("gitlab");
+}
+
+/// Both the middle and the top PR fail CI while auto-fix is on: the earlier
+/// PR must be fixed first (the later one is deferred), and its fix reaches
+/// the top PR. The top PR's own head then changes, so the forge's failure for
+/// the old head is stale and needs no fix of its own.
+fn auto_fix_fixes_the_earlier_failing_pr_first_on(kind: &str) {
+    let what = "two failing PRs";
+    let (fx, forge) = Fixture::with_forge_kind(&["feature/a", "feature/b", "feature/c"], kind);
+    fx.submit_stack();
+    fx.store
+        .lock()
+        .set_guardian_auto_fix_pr_errors(&fx.id, Some(true))
+        .unwrap();
+    for p in [1, 2] {
+        let (_, alias) = fx.open_pr_row(p);
+        forge
+            .state
+            .lock()
+            .unwrap()
+            .failing_heads
+            .insert(fx.remote_tip(&alias));
+    }
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    let fixer = Arc::new(BranchFixRunner::default());
+    let runner = Arc::clone(&fixer);
+    let _daemon = DaemonPump::start_with(
+        &fx,
+        Arc::new(move |_| Arc::clone(&runner) as Arc<dyn Runner>),
+    );
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while fixer.fixed.lock().unwrap().is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "{what}: fixes never ran: {:?}\n{}",
+            fixer.fixed.lock().unwrap(),
+            fx.describe()
+        );
+        std::thread::sleep(SETTLE_POLL);
+    }
+    fx.wait_settled_on(first.trim(), what);
+    let fixed = fixer.fixed.lock().unwrap().clone();
+    assert_eq!(
+        fixed.first().map(String::as_str),
+        Some("fix-feature-b-review.txt"),
+        "{what}: the earlier PR must be fixed first: {fixed:?}"
+    );
+    for file in &fixed {
+        let on_c = fx.files_on(&fx.remote, &fx.pr_ref(2));
+        assert!(on_c.contains(file.as_str()), "{what}: top PR lost {file}");
+    }
+    fx.assert_forge_routed_everything(what, &forge);
+}
+
+#[test]
+fn auto_fix_fixes_the_earlier_failing_pr_first() {
+    auto_fix_fixes_the_earlier_failing_pr_first_on("github");
+}
+
+#[test]
+fn auto_fix_fixes_the_earlier_failing_pr_first_on_gitlab() {
+    auto_fix_fixes_the_earlier_failing_pr_first_on("gitlab");
+}
+
+/// A resolver that fixes whichever branch it runs in by committing a file
+/// named after that branch, recording each branch it fixed.
+#[derive(Default)]
+struct BranchFixRunner {
+    fixed: std::sync::Mutex<Vec<String>>,
+}
+
+impl Runner for BranchFixRunner {
+    fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+        let cwd = PathBuf::from(&spec.cwd);
+        if spec.cell_id.ends_with("-commit") {
+            let dirty = !git(&cwd, &["status", "--porcelain"]).trim().is_empty();
+            if dirty {
+                git(&cwd, &["add", "--all"]);
+                git(&cwd, &["commit", "-m", "auto fix"]);
+            }
+            return ok_result("committed", Some(dirty));
+        }
+        let branch = git(&cwd, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        let file = format!("fix-{}.txt", branch.trim().replace('/', "-"));
+        write(&cwd, &file, "fixed\n");
+        self.fixed.lock().unwrap().push(file);
+        ok_result("fixed\nRALPHUS_PROOF: PASS", Some(true))
+    }
+}
+
+/// A forge reorder (a, c, b) and an upstream push arrive together while a
+/// feedback round is held: the rebuild must take both, in the forge's order.
+fn forge_reorder_and_base_change_together_while_feedback_is_in_flight_on(kind: &str) {
+    let what = "forge reorder + base change";
+    let (fx, forge) = Fixture::with_forge_kind(&["feature/a", "feature/b", "feature/c"], kind);
+    fx.submit_stack();
+    let unexpected: Unexpected = Arc::default();
+    let daemon = DaemonPump::start(&fx);
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    fx.wait_settled_on(first.trim(), "before");
+    let (_, alias_a) = fx.open_pr_row(0);
+    let (_, alias_b) = fx.open_pr_row(1);
+    let (_, alias_c) = fx.open_pr_row(2);
+    let (number_b, number_c) = (forge.pr_for(&alias_b).number, forge.pr_for(&alias_c).number);
+
+    let mut held = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    let upstream = fx.push_upstream("upstream1.txt");
+    forge.with_pr(number_c, |pr| {
+        pr.base = alias_a.clone();
+        pr.updated_at = "2099-01-01T00:00:00Z".to_string();
+    });
+    forge.with_pr(number_b, |pr| {
+        pr.base = alias_c.clone();
+        pr.updated_at = "2099-01-01T00:00:00Z".to_string();
+    });
+    let reorder = || {
+        ralphus_daemon::pr::check_and_apply_forge_reorder(
+            &fx.store,
+            &NoAgentExpected,
+            &fx.id,
+            &daemon.sem,
+            &daemon.cancellations,
+        )
+    };
+    reorder();
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+    fx.wait_for_order(&["feature/a", "feature/c", "feature/b"], what, &|| {
+        let _ = reorder();
+    });
+    fx.wait_settled_on(&upstream, what);
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_forge_routed_everything(what, &forge);
+    fx.assert_everything_published(
+        what,
+        &[(2, "feature-b.txt", "feedback on b")],
+        &["upstream1.txt"],
+    );
+}
+
+#[test]
+fn forge_reorder_and_base_change_together_while_feedback_is_in_flight() {
+    forge_reorder_and_base_change_together_while_feedback_is_in_flight_on("github");
+}
+
+#[test]
+fn forge_reorder_and_base_change_together_while_feedback_is_in_flight_on_gitlab() {
+    forge_reorder_and_base_change_together_while_feedback_is_in_flight_on("gitlab");
+}
+
+/// A local reorder (the board's drag) lands while a forge reorder is pending
+/// and feedback is held: whichever order wins, no commit may be lost.
+fn forge_reorder_racing_a_local_reorder_loses_no_commit_on(kind: &str) {
+    let what = "forge vs local reorder";
+    let (fx, forge) = Fixture::with_forge_kind(&["feature/a", "feature/b", "feature/c"], kind);
+    fx.submit_stack();
+    let unexpected: Unexpected = Arc::default();
+    let daemon = DaemonPump::start(&fx);
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    fx.wait_settled_on(first.trim(), "before");
+    let (_, alias_a) = fx.open_pr_row(0);
+    let (_, alias_b) = fx.open_pr_row(1);
+    let (_, alias_c) = fx.open_pr_row(2);
+    let (number_b, number_c) = (forge.pr_for(&alias_b).number, forge.pr_for(&alias_c).number);
+
+    let mut held = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    forge.with_pr(number_c, |pr| {
+        pr.base = alias_a.clone();
+        pr.updated_at = "2099-01-01T00:00:00Z".to_string();
+    });
+    forge.with_pr(number_b, |pr| {
+        pr.base = alias_c.clone();
+        pr.updated_at = "2099-01-01T00:00:00Z".to_string();
+    });
+    // The user drags b to the bottom locally and starts a merge.
+    fx.store
+        .lock()
+        .reorder_guardian_branches(
+            &fx.id,
+            &[
+                "feature/b".to_string(),
+                "feature/a".to_string(),
+                "feature/c".to_string(),
+            ],
+        )
+        .unwrap();
+    ralphus_daemon::guardian_merge::start_merge(
+        Arc::clone(&fx.store),
+        Arc::new(NoAgentExpected),
+        &fx.id,
+        Arc::clone(&daemon.sem),
+        daemon.cancellations.clone(),
+    );
+    let reorder = || {
+        ralphus_daemon::pr::check_and_apply_forge_reorder(
+            &fx.store,
+            &NoAgentExpected,
+            &fx.id,
+            &daemon.sem,
+            &daemon.cancellations,
+        )
+    };
+    reorder();
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+    for _ in 0..10 {
+        reorder();
+        std::thread::sleep(SETTLE_POLL);
+    }
+    fx.wait_settled_on(first.trim(), what);
+    // Whatever the final order, b's feedback is on b and everything above it.
+    let order = fx.branch_order();
+    let b_at = order.iter().position(|b| b == "feature/b").unwrap();
+    for p in b_at..order.len() {
+        let content = fx.file_on(&fx.root, &fx.review_ref(p), "feature-b.txt");
+        assert!(
+            content.contains("feedback on b"),
+            "{what}: branch {p} of {order:?} lost b's feedback\n{}",
+            fx.describe()
+        );
+    }
+    for b in ["feature-a.txt", "feature-b.txt", "feature-c.txt"] {
+        let top = fx.files_on(&fx.root, &fx.review_ref(order.len() - 1));
+        assert!(top.contains(b), "{what}: top branch lost {b}");
+    }
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_forge_routed_everything(what, &forge);
+}
+
+#[test]
+fn forge_reorder_racing_a_local_reorder_loses_no_commit() {
+    forge_reorder_racing_a_local_reorder_loses_no_commit_on("github");
+}
+
+#[test]
+fn forge_reorder_racing_a_local_reorder_loses_no_commit_on_gitlab() {
+    forge_reorder_racing_a_local_reorder_loses_no_commit_on("gitlab");
+}
+
+/// Forge API trouble: the first PR requests of a submission fail with 503
+/// while feedback is in flight. The submission may fail, but a retry must
+/// converge on exactly one PR per branch and no commit is lost.
+fn forge_5xx_during_submission_converges_on_retry_on(kind: &str) {
+    let what = "forge 5xx";
+    let (fx, forge) = Fixture::with_forge_kind(&["feature/a", "feature/b", "feature/c"], kind);
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let mut held = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    forge.state.lock().unwrap().fail_pulls = 4;
+    let failed = ralphus_daemon::pr::submit_pull_requests(
+        &fx.store,
+        &NoAgentExpected,
+        &fx.id,
+        stack_request(),
+        "tester",
+        false,
+    );
+    held.finish();
+    let _ = failed;
+    forge.state.lock().unwrap().fail_pulls = 0;
+    let mut attempts = 0;
+    while Fixture::open_forge_prs(&forge) < 3 {
+        attempts += 1;
+        assert!(attempts < 10, "{what}: never converged\n{}", fx.describe());
+        let _ = ralphus_daemon::pr::submit_pull_requests(
+            &fx.store,
+            &NoAgentExpected,
+            &fx.id,
+            stack_request(),
+            "tester",
+            false,
+        );
+        std::thread::sleep(SETTLE_POLL);
+    }
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    fx.wait_settled_on(first.trim(), what);
+    assert_eq!(Fixture::open_forge_prs(&forge), 3, "{what}: duplicate PRs");
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_forge_routed_everything(what, &forge);
+    fx.assert_everything_published(what, &[(1, "feature-b.txt", "feedback on b")], &[]);
+}
+
+#[test]
+fn forge_5xx_during_submission_converges_on_retry() {
+    forge_5xx_during_submission_converges_on_retry_on("github");
+}
+
+#[test]
+fn forge_5xx_during_submission_converges_on_retry_on_gitlab() {
+    forge_5xx_during_submission_converges_on_retry_on("gitlab");
+}
+
+impl Fixture {
+    /// Add a new task branch (one file named after it) to the review, ready
+    /// to be built onto the stack.
+    fn append_branch_for_race(&self, name: &str) {
+        let file = format!("{}.txt", name.replace('/', "-"));
+        git(&self.root, &["checkout", "-q", "-b", name, "main"]);
+        write(&self.root, &file, "content\n");
+        git(&self.root, &["add", "."]);
+        git(&self.root, &["commit", "-m", &format!("add {name}")]);
+        git(&self.root, &["checkout", "-q", "main"]);
+        self.store
+            .lock()
+            .add_guardian_branch(&self.id, name)
+            .unwrap();
+        let view = self.store.lock().get_guardian(&self.id).unwrap();
+        let bid = view.branches[view.branches.len() - 1].id.clone();
+        self.store
+            .lock()
+            .set_branch_status(&self.id, &bid, MergeStatus::Ready, None)
+            .unwrap();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sections 3-5: stack shape changes, user actions and review settings
+// mid-race.
+// ---------------------------------------------------------------------------
+
+impl Fixture {
+    /// Wait until the review is idle on `upstream` with every enabled branch
+    /// built, without comparing PR branches (some branches have no PR).
+    fn wait_built_on(&self, upstream: &str, what: &str) {
+        let deadline = Instant::now() + Duration::from_secs(300);
+        let mut stable = 0;
+        while stable < SETTLE_STABLE_POLLS {
+            let view = self.store.lock().get_guardian(&self.id).unwrap();
+            let built = view.branches.iter().filter(|b| b.enabled).all(|b| {
+                matches!(
+                    b.merge_status.as_str(),
+                    "done" | "merged" | "conflict_resolved"
+                )
+            });
+            let settled = view.status == "in_review"
+                && built
+                && view.base_commit.as_deref().map(str::trim) == Some(upstream);
+            stable = if settled { stable + 1 } else { 0 };
+            assert!(
+                Instant::now() < deadline,
+                "{what}: never built on upstream {upstream:.9}: {}",
+                self.describe()
+            );
+            std::thread::sleep(SETTLE_POLL);
+        }
+    }
+
+    /// Assert on the local review branches only: every `(position, file,
+    /// line)` edit is on branch `p >= position`, and each upstream file is on
+    /// every branch.
+    fn assert_review_branches(
+        &self,
+        what: &str,
+        edits: &[(usize, &str, &str)],
+        upstream_files: &[&str],
+    ) {
+        for p in self.enabled_positions() {
+            let rev = self.review_ref(p);
+            for &(from, file, line) in edits {
+                if p >= from {
+                    let content = self.file_on(&self.root, &rev, file);
+                    assert!(
+                        content.contains(line),
+                        "{what}: review branch {p} lost {line:?} ({file}: {content:?})\n{}",
+                        self.describe()
+                    );
+                }
+            }
+            let files = self.files_on(&self.root, &rev);
+            for f in upstream_files {
+                assert!(
+                    files.contains(f),
+                    "{what}: review branch {p} is missing {f}\n{}",
+                    self.describe()
+                );
+            }
+        }
+    }
+
+    /// Commit `file` onto an existing task branch (a cell still working).
+    fn add_task_commit(&self, branch: &str, file: &str) {
+        git(&self.root, &["checkout", "-q", branch]);
+        write(&self.root, file, "more task work\n");
+        git(&self.root, &["add", "."]);
+        git(&self.root, &["commit", "-m", &format!("task work: {file}")]);
+        git(&self.root, &["checkout", "-q", "main"]);
+    }
+}
+
+/// A branch is appended while a base-shift rebuild is parked behind a held
+/// feedback round: the newcomer is built onto the rebased stack and nothing
+/// existing is dropped.
+#[test]
+fn branch_appended_while_a_base_shift_rebuild_is_parked() {
+    let what = "append while parked";
+    let fx = Fixture::with_upstream(&["feature/a", "feature/b", "feature/c"]);
+    fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let mut settled = Held::new("feature-a.txt", "feedback on a", &unexpected).feedback(&fx, 0);
+    settled.finish();
+    let mut held = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    let upstream = fx.push_upstream("upstream1.txt");
+    std::thread::sleep(PARK_WAIT);
+    fx.append_branch_for_race("feature/d");
+    held.finish();
+
+    fx.wait_built_on(&upstream, what);
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_review_branches(
+        what,
+        &[
+            (0, "feature-a.txt", "feedback on a"),
+            (1, "feature-b.txt", "feedback on b"),
+            (3, "feature-d.txt", "content"),
+        ],
+        &["upstream1.txt"],
+    );
+}
+
+/// Task commits land on several branches at once (cells still running) while
+/// a feedback round is held and the base moves: every task commit, the
+/// feedback and the upstream commit end up on the right branches.
+#[test]
+fn new_task_commits_on_several_branches_while_feedback_and_upstream_race() {
+    let what = "task commits on several branches";
+    let fx = Fixture::with_upstream(&["feature/a", "feature/b", "feature/c"]);
+    fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let mut held = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    fx.add_task_commit("feature/a", "more-a.txt");
+    fx.add_task_commit("feature/c", "more-c.txt");
+    let upstream = fx.push_upstream("upstream1.txt");
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+
+    fx.wait_built_on(&upstream, what);
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_review_branches(
+        what,
+        &[(1, "feature-b.txt", "feedback on b")],
+        &["upstream1.txt"],
+    );
+    let files_c = fx.files_on(&fx.root, &fx.review_ref(2));
+    for f in ["more-a.txt", "more-c.txt"] {
+        assert!(
+            files_c.contains(f),
+            "{what}: top branch lost task file {f}\n{}",
+            fx.describe()
+        );
+    }
+}
+
+/// A task branch is amended after the review was built and has feedback: the
+/// feedback must survive the next rebuild even though the old task tip is no
+/// longer an ancestor of the branch.
+#[test]
+fn task_branch_amended_after_build_keeps_feedback_through_a_rebuild() {
+    let what = "amended task branch";
+    let fx = Fixture::with_upstream(&["feature/a", "feature/b", "feature/c"]);
+    fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let mut settled = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    settled.finish();
+
+    git(&fx.root, &["checkout", "-q", "feature/c"]);
+    write(&fx.root, "amended-c.txt", "amended\n");
+    git(&fx.root, &["add", "."]);
+    git(&fx.root, &["commit", "-q", "--amend", "--no-edit"]);
+    git(&fx.root, &["checkout", "-q", "main"]);
+    let upstream = fx.push_upstream("upstream1.txt");
+
+    fx.wait_built_on(&upstream, what);
+    fx.assert_review_branches(
+        what,
+        &[(1, "feature-b.txt", "feedback on b")],
+        &["upstream1.txt"],
+    );
+}
+
+/// The branch being disabled is the one with a feedback round in flight.
+/// After it is re-enabled, its feedback is on it and every branch above.
+#[test]
+fn disabling_a_branch_with_a_held_feedback_round_then_reenabling() {
+    let what = "disable held branch";
+    let fx = Fixture::with_upstream(&["feature/a", "feature/b", "feature/c"]);
+    fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let daemon = DaemonPump::start(&fx);
+    let mut held = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    let upstream = fx.push_upstream("upstream1.txt");
+    std::thread::sleep(PARK_WAIT);
+    arrange(&fx, &daemon, "feature/b", false);
+    held.finish();
+    // Each phase is waited for by what it produces, not by "the review is idle
+    // on the new base": that is already true before either rebuild starts, and
+    // two overlapping merges then settle in an order that varies by machine.
+    let wait_for_top = |what_for: &str, want_b: bool| {
+        let deadline = Instant::now() + Duration::from_secs(180);
+        loop {
+            let status = fx.store.lock().get_guardian(&fx.id).unwrap().status;
+            let top_has_b = fx
+                .try_review_ref(2)
+                .is_some_and(|rev| fx.files_on(&fx.root, &rev).contains("feature-b.txt"));
+            if status == "in_review" && top_has_b == want_b {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{what}: never {what_for}\n{}",
+                fx.describe()
+            );
+            std::thread::sleep(SETTLE_POLL);
+        }
+    };
+    wait_for_top("rebuilt without the disabled branch", false);
+    fx.wait_built_on(&upstream, "while disabled");
+    arrange(&fx, &daemon, "feature/b", true);
+    // The merge the re-enable starts is refused while the daemon is busy with
+    // another claim (the board reports it and the user clicks "Merge / rebase"
+    // again). Do the same: re-issue it until the re-enabled branch sits on the
+    // rebuilt base and the top branch has it, then check nothing was lost.
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let mut last_click = Instant::now();
+    loop {
+        let on_base = |position: usize| {
+            fx.try_review_ref(position)
+                .is_some_and(|rev| fx.files_on(&fx.root, &rev).contains("upstream1.txt"))
+        };
+        let top_has_b = fx
+            .try_review_ref(2)
+            .is_some_and(|rev| fx.files_on(&fx.root, &rev).contains("feature-b.txt"));
+        let status = fx.store.lock().get_guardian(&fx.id).unwrap().status;
+        if status == "in_review" && top_has_b && on_base(1) && on_base(2) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what}: the re-enabled branch never landed on the rebuilt base\n{}",
+            fx.describe()
+        );
+        if status == "in_review" && last_click.elapsed() > Duration::from_secs(8) {
+            ralphus_daemon::guardian_merge::start_merge(
+                Arc::clone(&fx.store),
+                Arc::new(NoAgentExpected),
+                &fx.id,
+                Arc::clone(&daemon.sem),
+                daemon.cancellations.clone(),
+            );
+            last_click = Instant::now();
+        }
+        std::thread::sleep(SETTLE_POLL);
+    }
+    fx.wait_built_on(&upstream, what);
+    // Re-enabling carries the branch from its fork point with the base (the
+    // WARNING safety net, no data lost) -- allowed here, as in
+    // `disable_then_reenable_a_middle_branch_mid_race`, and nowhere else.
+    fx.assert_no_replayed_commits(what, &unexpected);
+    fx.assert_no_carry_fallbacks(what, false);
+    fx.assert_review_branches(
+        what,
+        &[(1, "feature-b.txt", "feedback on b")],
+        &["upstream1.txt"],
+    );
+}
+
+/// The user approves the review while a feedback round is in flight: the
+/// round's commit must not be dropped.
+#[test]
+fn approving_the_review_while_feedback_is_in_flight_keeps_the_feedback() {
+    let what = "approve mid-feedback";
+    let fx = Fixture::with_upstream(&["feature/a", "feature/b"]);
+    fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let mut held = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    let approved = fx.store.lock().approve_guardian(&fx.id);
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+    std::thread::sleep(PARK_WAIT * 3);
+    let content = fx.file_on(&fx.root, &fx.review_ref(1), "feature-b.txt");
+    assert!(
+        content.contains("feedback on b"),
+        "{what}: feedback dropped (approve result: {approved:?})\n{}",
+        fx.describe()
+    );
+}
+
+/// The review is deleted while a feedback round is held and the base moves:
+/// the held round must not recreate remote branches or panic the daemon.
+#[test]
+fn deleting_the_review_mid_race_recreates_no_remote_branch() {
+    let what = "delete mid-race";
+    let fx = Fixture::with_upstream(&["feature/a", "feature/b", "feature/c"]);
+    fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let mut held = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    let upstream = fx.push_upstream("upstream1.txt");
+    std::thread::sleep(PARK_WAIT);
+    let deleted = fx.store.lock().delete_guardian(&fx.id);
+    let refs_before = git(
+        &fx.remote,
+        &["for-each-ref", "--format=%(refname) %(objectname)"],
+    );
+    held.finish();
+    std::thread::sleep(PARK_WAIT * 4);
+    let refs_after = git(
+        &fx.remote,
+        &["for-each-ref", "--format=%(refname) %(objectname)"],
+    );
+    assert!(deleted.is_ok(), "{what}: delete failed: {deleted:?}");
+    assert_eq!(
+        refs_before, refs_after,
+        "{what}: a late push after deletion changed the remote (upstream {upstream:.9})"
+    );
+}
+
+/// The combined review branch is renamed while feedback is held and the base
+/// moves: the rebuild lands on the new name and nothing is lost.
+#[test]
+fn renaming_the_review_branch_mid_race_keeps_every_commit() {
+    let what = "rename mid-race";
+    let fx = Fixture::with_upstream(&["feature/a", "feature/b", "feature/c"]);
+    fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let mut held = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    let upstream = fx.push_upstream("upstream1.txt");
+    std::thread::sleep(PARK_WAIT);
+    let renamed = fx
+        .store
+        .lock()
+        .set_guardian_review_branch_name(&fx.id, "renamed-stack");
+    held.finish();
+    fx.wait_built_on(&upstream, what);
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_review_branches(
+        what,
+        &[(1, "feature-b.txt", "feedback on b")],
+        &["upstream1.txt"],
+    );
+    assert!(renamed.is_ok(), "{what}: rename failed: {renamed:?}");
+}
+
+/// Feedback submitted while the review's merge is stopped is applied once the
+/// merge resumes, and the stopped period loses nothing.
+#[test]
+fn feedback_while_the_merge_is_stopped_is_kept_after_resuming() {
+    let what = "feedback while stopped";
+    let fx = Fixture::with_upstream(&["feature/a", "feature/b", "feature/c"]);
+    fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let daemon = DaemonPump::start(&fx);
+    ralphus_daemon::guardian_merge::stop_guardian_merge(
+        Arc::clone(&fx.store),
+        daemon.cancellations.clone(),
+        &fx.id,
+    );
+    let mut stopped =
+        Held::new("feature-b.txt", "feedback while stopped", &unexpected).feedback(&fx, 1);
+    stopped.finish();
+    ralphus_daemon::guardian_merge::start_merge(
+        Arc::clone(&fx.store),
+        Arc::new(NoAgentExpected),
+        &fx.id,
+        Arc::clone(&daemon.sem),
+        daemon.cancellations.clone(),
+    );
+    let upstream = fx.push_upstream("upstream1.txt");
+    fx.wait_built_on(&upstream, what);
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_review_branches(
+        what,
+        &[(1, "feature-b.txt", "feedback while stopped")],
+        &["upstream1.txt"],
+    );
+}
+
+/// `skip_base_updates` is turned on while a base-shift rebuild is parked and
+/// off again later: nothing is lost while it is on, and the review catches up
+/// to the new base once it is off.
+#[test]
+fn skip_base_updates_toggled_mid_race_loses_nothing() {
+    let what = "skip_base_updates toggle";
+    let fx = Fixture::with_upstream(&["feature/a", "feature/b", "feature/c"]);
+    fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let mut held = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    let upstream = fx.push_upstream("upstream1.txt");
+    fx.store
+        .lock()
+        .set_guardian_skip_base_updates(&fx.id, Some(true))
+        .unwrap();
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+    std::thread::sleep(PARK_WAIT * 3);
+    fx.assert_review_branches(what, &[(1, "feature-b.txt", "feedback on b")], &[]);
+    fx.store
+        .lock()
+        .set_guardian_skip_base_updates(&fx.id, Some(false))
+        .unwrap();
+    fx.wait_built_on(&upstream, what);
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_review_branches(
+        what,
+        &[(1, "feature-b.txt", "feedback on b")],
+        &["upstream1.txt"],
+    );
+}
+
+/// `separate_pr_branch` is flipped while PRs are open and feedback is held:
+/// the feedback must still reach the PR heads.
+#[test]
+fn separate_pr_branch_toggled_while_prs_are_open_keeps_feedback() {
+    let what = "separate_pr_branch toggle";
+    let (fx, forge) = Fixture::with_forge(&["feature/a", "feature/b", "feature/c"]);
+    fx.submit_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    fx.wait_settled_on(first.trim(), "before the toggle");
+    let mut held = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    fx.store
+        .lock()
+        .set_guardian_separate_pr_branch(&fx.id, Some(true))
+        .unwrap();
+    let upstream = fx.push_upstream("upstream1.txt");
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+    fx.wait_settled_on(&upstream, what);
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_forge_routed_everything(what, &forge);
+    fx.assert_everything_published(
+        what,
+        &[(1, "feature-b.txt", "feedback on b")],
+        &["upstream1.txt"],
+    );
+}
+
+/// A review with a single branch has no downstream to restack: feedback and an
+/// upstream move still both land.
+#[test]
+fn single_branch_review_keeps_feedback_through_an_upstream_rebase() {
+    let what = "single branch";
+    let fx = Fixture::with_upstream(&["feature/a"]);
+    fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let mut held = Held::new("feature-a.txt", "feedback on a", &unexpected).feedback(&fx, 0);
+    let upstream = fx.push_upstream("upstream1.txt");
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+    fx.wait_settled_on(&upstream, what);
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_everything_published(
+        what,
+        &[(0, "feature-a.txt", "feedback on a")],
+        &["upstream1.txt"],
+    );
+}
+
+/// A 20-branch stack with feedback on a low, a middle and the top branch and
+/// an upstream move: the coalesced restack keeps all of them.
+#[test]
+#[ignore = "~8-minute soak; runs in the nightly race workflow"]
+fn soak_twenty_branch_stack_keeps_feedback_through_an_upstream_rebase() {
+    let what = "twenty branches";
+    let names: Vec<String> = (0..20).map(|i| format!("feature/b{i:02}")).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let fx = Fixture::with_upstream(&refs);
+    fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let mut low = Held::new("feature-b02.txt", "feedback low", &unexpected).feedback(&fx, 2);
+    let mut mid = Held::new("feature-b10.txt", "feedback mid", &unexpected).feedback(&fx, 10);
+    let mut top = Held::new("feature-b19.txt", "feedback top", &unexpected).feedback(&fx, 19);
+    let upstream = fx.push_upstream("upstream1.txt");
+    std::thread::sleep(PARK_WAIT);
+    mid.finish();
+    top.finish();
+    low.finish();
+    fx.wait_settled_on(&upstream, what);
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_everything_published(
+        what,
+        &[
+            (2, "feature-b02.txt", "feedback low"),
+            (10, "feature-b10.txt", "feedback mid"),
+            (19, "feature-b19.txt", "feedback top"),
+        ],
+        &["upstream1.txt"],
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Sections 6-8: upstream variants, git-level hazards and crash/restart
+// variants.
+// ---------------------------------------------------------------------------
+
+impl Fixture {
+    /// Clone upstream `main`, apply `edit`, commit it (`message`) and push.
+    /// With `amend`, the clone's tip is amended instead and force-pushed.
+    fn upstream_change(&self, message: &str, amend: bool, edit: &dyn Fn(&Path)) -> String {
+        let clone = temp_dir();
+        let _ = std::fs::remove_dir_all(&clone);
+        git(
+            clone.parent().unwrap(),
+            &[
+                "clone",
+                "-q",
+                "--branch",
+                "main",
+                self.remote.to_str().unwrap(),
+                clone.file_name().unwrap().to_str().unwrap(),
+            ],
+        );
+        edit(&clone);
+        git(&clone, &["add", "--all"]);
+        if amend {
+            git(&clone, &["commit", "-q", "--amend", "-m", message]);
+            git(&clone, &["push", "-q", "--force", "origin", "main"]);
+        } else {
+            git(&clone, &["commit", "-q", "-m", message]);
+            git(&clone, &["push", "-q", "origin", "main"]);
+        }
+        let sha = git(&clone, &["rev-parse", "HEAD"]).trim().to_string();
+        let _ = std::fs::remove_dir_all(&clone);
+        sha
+    }
+
+    /// How many lines of `file` on `rev` (in `repo`) equal `line`.
+    fn line_count(&self, repo: &Path, rev: &str, file: &str, line: &str) -> usize {
+        self.file_on(repo, rev, file)
+            .lines()
+            .filter(|l| l.trim() == line)
+            .count()
+    }
+
+    /// Whether any file on `rev` in the review repo contains `needle`.
+    fn text_anywhere(&self, rev: &str, needle: &str) -> bool {
+        // `git grep` exits 1 on "no match", which is an answer here, not an error.
+        std::process::Command::new("git")
+            .args(["grep", "-l", needle, rev])
+            .current_dir(&self.root)
+            .output()
+            .is_ok_and(|o| !o.stdout.is_empty())
+    }
+}
+
+/// An upstream squash-merge of the bottom branch (the same content under a
+/// different SHA) lands while feedback on the top branch is held. Nothing may
+/// conflict and nothing may be dropped.
+#[test]
+fn upstream_squash_merge_of_the_bottom_branch_keeps_feedback_above() {
+    let what = "upstream squash-merge";
+    let fx = Fixture::with_upstream(&["feature/a", "feature/b", "feature/c"]);
+    fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let mut held = Held::new("feature-c.txt", "feedback on c", &unexpected).feedback(&fx, 2);
+    let upstream = fx.upstream_change("squash of feature/a", false, &|clone| {
+        write(clone, "feature-feature-a.txt", "content\n");
+    });
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+    fx.wait_settled_on(&upstream, what);
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_review_branches(what, &[(2, "feature-c.txt", "feedback on c")], &[]);
+}
+
+/// Upstream rewrites its tip with identical content under a new SHA (a
+/// rebase of upstream history) while feedback is held: the review must not
+/// replay upstream commits or lose its own.
+#[test]
+fn upstream_rewrite_with_identical_content_does_not_replay_upstream_commits() {
+    let what = "upstream rewrite, same content";
+    let fx = Fixture::with_upstream(&["feature/a", "feature/b", "feature/c"]);
+    fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let first = fx.push_upstream("upstream1.txt");
+    fx.wait_settled_on(&first, "before the rewrite");
+    let mut held = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    let rewritten = fx.upstream_change("upstream1 (rebased)", true, &|_| {});
+    assert_ne!(first, rewritten, "{what}: the amend did not change the SHA");
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+    fx.wait_settled_on(&rewritten, what);
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_everything_published(
+        what,
+        &[(1, "feature-b.txt", "feedback on b")],
+        &["upstream1.txt"],
+    );
+    for p in 0..3 {
+        let count = git(&fx.root, &["log", "--format=%s", &fx.review_ref(p)])
+            .lines()
+            .filter(|l| l.contains("upstream1"))
+            .count();
+        assert_eq!(count, 1, "{what}: branch {p} replays the upstream commit");
+    }
+}
+
+/// A burst of upstream pushes lands while a rebuild is parked behind held
+/// feedback: the review rebuilds onto the last one with everything in place.
+#[test]
+fn burst_of_upstream_pushes_during_a_parked_rebuild() {
+    let what = "upstream burst";
+    let fx = Fixture::with_upstream(&["feature/a", "feature/b", "feature/c"]);
+    fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let mut held = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    let mut last = String::new();
+    for i in 0..5 {
+        last = fx.push_upstream(&format!("burst{i}.txt"));
+    }
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+    fx.wait_settled_on(&last, what);
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    let burst: Vec<String> = (0..5).map(|i| format!("burst{i}.txt")).collect();
+    let burst: Vec<&str> = burst.iter().map(String::as_str).collect();
+    fx.assert_everything_published(what, &[(1, "feature-b.txt", "feedback on b")], &burst);
+}
+
+/// Upstream reverts a commit it previously took while feedback is held.
+#[test]
+fn upstream_revert_while_feedback_is_in_flight_keeps_the_feedback() {
+    let what = "upstream revert";
+    let fx = Fixture::with_upstream(&["feature/a", "feature/b", "feature/c"]);
+    fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let first = fx.push_upstream("upstream1.txt");
+    fx.wait_settled_on(&first, "before the revert");
+    let mut held = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    let reverted = fx.upstream_change("revert upstream1", false, &|clone| {
+        std::fs::remove_file(clone.join("upstream1.txt")).unwrap();
+    });
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+    fx.wait_settled_on(&reverted, what);
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_review_branches(what, &[(1, "feature-b.txt", "feedback on b")], &[]);
+    fx.assert_file_nowhere(what, "upstream1.txt");
+}
+
+/// The base branch is deleted upstream and later restored while feedback is
+/// held: nothing in the review may be lost, and it recovers once the base is
+/// back.
+#[test]
+fn base_branch_deleted_then_restored_upstream_keeps_the_feedback() {
+    let what = "base branch deleted";
+    let fx = Fixture::with_upstream(&["feature/a", "feature/b", "feature/c"]);
+    fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let first = fx.push_upstream("upstream1.txt");
+    fx.wait_settled_on(&first, "before the delete");
+    let mut held = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    git(&fx.remote, &["update-ref", "-d", "refs/heads/main"]);
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+    std::thread::sleep(PARK_WAIT * 2);
+    assert!(
+        fx.text_anywhere(&fx.review_ref(1), "feedback on b"),
+        "{what}: feedback lost while the base was gone\n{}",
+        fx.describe()
+    );
+    git(&fx.remote, &["update-ref", "refs/heads/main", &first]);
+    let upstream = fx.push_upstream("upstream2.txt");
+    fx.wait_settled_on(&upstream, what);
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_everything_published(
+        what,
+        &[(1, "feature-b.txt", "feedback on b")],
+        &["upstream1.txt", "upstream2.txt"],
+    );
+}
+
+/// Upstream renames a file a feedback round is editing. The rebuild may need
+/// a person to resolve a rename/modify conflict, but the feedback line must
+/// stay reachable on the review branch either way.
+#[test]
+fn upstream_rename_racing_a_feedback_edit_never_loses_the_edit() {
+    let what = "rename vs edit";
+    let fx = Fixture::with_upstream(&["feature/a", "feature/b", "feature/c"]);
+    fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start_resolving(&fx, &unexpected);
+    // The round edits `base.txt`, a file from the base; upstream renames it.
+    let mut held = Held::resolving("base.txt", "feedback on base", &unexpected).feedback(&fx, 1);
+    let upstream = fx.upstream_change("rename base.txt", false, &|clone| {
+        std::fs::rename(clone.join("base.txt"), clone.join("renamed-base.txt")).unwrap();
+    });
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+    std::thread::sleep(PARK_WAIT * 6);
+    for p in 1..3 {
+        assert!(
+            fx.text_anywhere(&fx.review_ref(p), "feedback on base"),
+            "{what}: branch {p} lost the feedback (upstream {upstream:.9})\n{}",
+            fx.describe()
+        );
+    }
+}
+
+/// A resolver whose own git calls may fail (a locked index): it appends
+/// `line` to `feature-b.txt` and, as the commit step, tries to commit without
+/// panicking when git refuses.
+struct LockTolerantRunner {
+    line: &'static str,
+}
+
+impl Runner for LockTolerantRunner {
+    fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+        let cwd = PathBuf::from(&spec.cwd);
+        let attempt = |args: &[&str]| {
+            let _ = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&cwd)
+                .output();
+        };
+        if spec.cell_id.ends_with("-commit") {
+            attempt(&["add", "--all"]);
+            attempt(&["commit", "-m", &format!("edit: {}", self.line)]);
+            return ok_result("attempted commit", Some(true));
+        }
+        append_line(&cwd, "feature-b.txt", self.line);
+        ok_result("edited\nRALPHUS_PROOF: PASS", Some(true))
+    }
+}
+
+/// A stale `index.lock` in a branch's worktree makes a feedback round fail
+/// loudly -- the edit is not silently skipped -- and once the lock is gone a
+/// retried round lands.
+#[test]
+fn index_lock_in_a_review_worktree_fails_feedback_loudly_then_recovers() {
+    let what = "index.lock";
+    let fx = Fixture::with_upstream(&["feature/a", "feature/b"]);
+    fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let worktree = PathBuf::from(
+        fx.store.lock().get_guardian(&fx.id).unwrap().branches[1]
+            .worktree
+            .clone()
+            .expect("branch 1 worktree"),
+    );
+    let gitdir = PathBuf::from(git(&worktree, &["rev-parse", "--absolute-git-dir"]).trim());
+    let lock = gitdir.join("index.lock");
+    std::fs::write(&lock, "").unwrap();
+    // With the index locked the resolver's `git add`/`git commit` fail; the
+    // daemon must report that nothing was committed rather than claim success.
+    let locked = LockTolerantRunner {
+        line: "locked edit",
+    };
+    let outcome = run_feedback(
+        &fx.store,
+        &locked,
+        &fx.id,
+        &fx.branch_ids[1],
+        "please change this",
+        None,
+        false,
+        &CancelToken::never(),
+    );
+    assert!(
+        !outcome.committed,
+        "{what}: a round with a locked index claimed a commit\n{}",
+        fx.describe()
+    );
+    assert!(
+        !fx.text_anywhere(&fx.review_ref(1), "locked edit"),
+        "{what}: the edit slipped onto the review branch without a commit"
+    );
+    std::fs::remove_file(&lock).unwrap();
+    let retry = WriterRunner::new("feature-b.txt", "retried edit", None, &unexpected);
+    let outcome = run_feedback(
+        &fx.store,
+        &retry,
+        &fx.id,
+        &fx.branch_ids[1],
+        "please change this",
+        None,
+        false,
+        &CancelToken::never(),
+    );
+    assert!(
+        outcome.committed,
+        "{what}: the retry did not commit\n{}",
+        fx.describe()
+    );
+    assert!(
+        fx.text_anywhere(&fx.review_ref(1), "retried edit"),
+        "{what}"
+    );
+}
+
+/// Clearing the carry/source refs (a crash half-way through updating them)
+/// must make the next rebuild fall back safely, not drop review-only commits.
+#[test]
+fn missing_source_refs_do_not_drop_feedback_on_the_next_rebuild() {
+    let what = "missing source refs";
+    let fx = Fixture::with_upstream(&["feature/a", "feature/b", "feature/c"]);
+    fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let mut settled = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    settled.finish();
+    let refs = git(
+        &fx.root,
+        &["for-each-ref", "--format=%(refname)", "refs/ralphus/"],
+    );
+    for r in refs
+        .lines()
+        .filter(|l| l.contains("/source/") || l.contains("/carry/"))
+    {
+        git(&fx.root, &["update-ref", "-d", r.trim()]);
+    }
+    let upstream = fx.push_upstream("upstream1.txt");
+    fx.wait_settled_on(&upstream, what);
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_everything_published(
+        what,
+        &[(1, "feature-b.txt", "feedback on b")],
+        &["upstream1.txt"],
+    );
+}
+
+/// The daemon dies after a feedback commit was pushed but before the pushed
+/// SHA was recorded: the restarted daemon must not take its own push for a
+/// reviewer's, loop, or duplicate the commit.
+#[test]
+fn crash_after_push_before_recording_it_does_not_duplicate_the_commit() {
+    let what = "crash mid-push";
+    let mut fx = Fixture::with_upstream(&["feature/a", "feature/b", "feature/c"]);
+    let pr_ids = fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let before = fx.remote_tip("pr-1");
+    let mut round = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    round.finish();
+    fx.store
+        .lock()
+        .update_pull_request_ex(
+            &pr_ids[1],
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some(&before)),
+            None,
+        )
+        .unwrap();
+
+    let db = fx.root.join(".git").join("ralphus-test.db");
+    fx.store = Arc::new(StoreMutex::new(Store::open(&db).unwrap()));
+    let _daemon = DaemonPump::start(&fx);
+    let upstream = fx.push_upstream("upstream1.txt");
+    fx.wait_settled_on(&upstream, what);
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_everything_published(
+        what,
+        &[(1, "feature-b.txt", "feedback on b")],
+        &["upstream1.txt"],
+    );
+    for p in 1..3 {
+        let rev = fx.pr_ref(p);
+        let n = fx.line_count(&fx.remote, &rev, "feature-b.txt", "feedback on b");
+        assert_eq!(n, 1, "{what}: PR branch {p} has the feedback {n} times");
+    }
+}
+
+/// The daemon dies after committing feedback locally but before pushing it
+/// (the remote is a commit behind): the restarted daemon publishes it once.
+#[test]
+fn crash_after_commit_before_push_publishes_the_commit_once() {
+    let what = "crash before push";
+    let mut fx = Fixture::with_upstream(&["feature/a", "feature/b", "feature/c"]);
+    let pr_ids = fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let before = fx.remote_tip("pr-1");
+    let mut round = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    round.finish();
+    // Undo the push: the remote branch and the recorded pushed SHA are back
+    // where they were before the round.
+    git(&fx.remote, &["update-ref", "refs/heads/pr-1", &before]);
+    fx.store
+        .lock()
+        .update_pull_request_ex(
+            &pr_ids[1],
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some(&before)),
+            None,
+        )
+        .unwrap();
+
+    let db = fx.root.join(".git").join("ralphus-test.db");
+    fx.store = Arc::new(StoreMutex::new(Store::open(&db).unwrap()));
+    let _daemon = DaemonPump::start(&fx);
+    let upstream = fx.push_upstream("upstream1.txt");
+    fx.wait_settled_on(&upstream, what);
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_everything_published(
+        what,
+        &[(1, "feature-b.txt", "feedback on b")],
+        &["upstream1.txt"],
+    );
+    for p in 1..3 {
+        let rev = fx.pr_ref(p);
+        let n = fx.line_count(&fx.remote, &rev, "feature-b.txt", "feedback on b");
+        assert_eq!(n, 1, "{what}: PR branch {p} has the feedback {n} times");
+    }
+}
+
+/// The daemon dies mid-feedback: the branch's worktree holds an uncommitted
+/// half-edit and the round's durable pending-feedback record is still set.
+/// The restarted daemon's rebuild resets the worktree (the half-edit is not
+/// kept -- startup recovery re-runs the pending feedback instead), and must
+/// leave the review consistent: earlier feedback intact, the worktree clean,
+/// the pending record still there for recovery.
+#[test]
+fn crash_mid_feedback_leaves_a_consistent_review_and_the_pending_record() {
+    let what = "crash mid-feedback";
+    let mut fx = Fixture::with_upstream(&["feature/a", "feature/b", "feature/c"]);
+    fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let mut earlier = Held::new("feature-a.txt", "feedback on a", &unexpected).feedback(&fx, 0);
+    earlier.finish();
+    let worktree = PathBuf::from(
+        fx.store.lock().get_guardian(&fx.id).unwrap().branches[1]
+            .worktree
+            .clone()
+            .expect("branch 1 worktree"),
+    );
+    append_line(&worktree, "feature-b.txt", "half edit");
+    fx.store
+        .lock()
+        .set_branch_pending_feedback(&fx.id, &fx.branch_ids[1], "please change b")
+        .unwrap();
+
+    let db = fx.root.join(".git").join("ralphus-test.db");
+    fx.store = Arc::new(StoreMutex::new(Store::open(&db).unwrap()));
+    let _daemon = DaemonPump::start(&fx);
+    let upstream = fx.push_upstream("upstream1.txt");
+    fx.wait_settled_on(&upstream, what);
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_everything_published(
+        what,
+        &[(0, "feature-a.txt", "feedback on a")],
+        &["upstream1.txt"],
+    );
+    assert!(
+        git(&worktree, &["status", "--porcelain"]).trim().is_empty(),
+        "{what}: the worktree was left dirty"
+    );
+    let pending = fx.store.lock().branches_with_pending_feedback().unwrap();
+    assert_eq!(
+        pending.len(),
+        1,
+        "{what}: the pending-feedback record recovery needs was dropped"
+    );
+}
+
+/// The daemon dies with a rebase paused on conflict markers. The restarted
+/// daemon resolves it and ends with both sides on every PR.
+#[test]
+fn crash_mid_conflict_resolution_is_finished_by_the_restarted_daemon() {
+    let what = "crash mid-conflict";
+    let mut fx = Fixture::with_upstream(&["feature/a", "feature/b", "feature/c"]);
+    fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let upstream = fx.push_upstream_append("feature-b.txt", "upstream side");
+    ralphus_daemon::guardian_merge::poll_base_branch_freshness_once(&fx.store);
+    {
+        let guard = fx.store.lock();
+        guard
+            .set_guardian_status(&fx.id, GuardianStatus::Merging, None)
+            .unwrap();
+        guard
+            .set_branch_status(&fx.id, &fx.branch_ids[1], MergeStatus::InProgress, None)
+            .unwrap();
+    }
+    let worktree = PathBuf::from(
+        fx.store.lock().get_guardian(&fx.id).unwrap().branches[1]
+            .worktree
+            .clone()
+            .expect("branch 1 worktree"),
+    );
+    let _ = std::process::Command::new("git")
+        .args(["rebase", "origin/main"])
+        .current_dir(&worktree)
+        .env("GIT_AUTHOR_NAME", "ralphus")
+        .env("GIT_AUTHOR_EMAIL", "ralphus@example.com")
+        .env("GIT_COMMITTER_NAME", "ralphus")
+        .env("GIT_COMMITTER_EMAIL", "ralphus@example.com")
+        .output();
+
+    let db = fx.root.join(".git").join("ralphus-test.db");
+    fx.store = Arc::new(StoreMutex::new(Store::open(&db).unwrap()));
+    let daemon = DaemonPump::start_resolving(&fx, &unexpected);
+    // Startup recovery (`recover_interrupted_reviews`) resumes with the
+    // production runner, which has no agent here; resume the interrupted merge
+    // the way a user's "Merge / rebase" does, with the stand-in resolver.
+    ralphus_daemon::guardian_merge::restart_guardian_merge(
+        Arc::clone(&fx.store),
+        daemon.cancellations.clone(),
+        Arc::new(UnionResolver(Arc::clone(&unexpected))),
+        &fx.id,
+        Arc::clone(&daemon.sem),
+    );
+    fx.wait_settled_on(&upstream, what);
+    fx.assert_review_branches(
+        what,
+        &[(1, "feature-b.txt", "upstream side")],
+        &["feature-b.txt"],
+    );
+    for p in 1..3 {
+        let content = fx.file_on(&fx.remote, &fx.pr_ref(p), "feature-b.txt");
+        assert!(
+            !content.contains("<<<<<<<"),
+            "{what}: markers left on PR {p}: {content:?}"
+        );
+        assert!(
+            content.contains("upstream side"),
+            "{what}: PR {p} lost the upstream side"
+        );
+        assert!(
+            content.contains("content"),
+            "{what}: PR {p} lost the task side"
+        );
+    }
+}
+
+/// The daemon dies during PR submission: the forge has the PR but the recorded
+/// row is gone to `closed`. Resubmitting adopts the forge's PR rather than
+/// opening a second one.
+#[test]
+fn crash_during_pr_submission_is_adopted_not_duplicated() {
+    let what = "crash during submission";
+    let (fx, forge) = Fixture::with_forge(&["feature/a", "feature/b", "feature/c"]);
+    fx.submit_stack();
+    let (pr_b, _) = fx.open_pr_row(1);
+    fx.store
+        .lock()
+        .update_pull_request_ex(&pr_b, None, None, None, Some("closed"), None, None, None)
+        .unwrap();
+    let _ = ralphus_daemon::pr::submit_pull_requests(
+        &fx.store,
+        &NoAgentExpected,
+        &fx.id,
+        stack_request(),
+        "tester",
+        false,
+    );
+    assert_eq!(
+        Fixture::open_forge_prs(&forge),
+        3,
+        "{what}: a second forge PR was opened\n{}",
+        fx.describe()
+    );
+    fx.assert_forge_routed_everything(what, &forge);
+}
+
+// ---------------------------------------------------------------------------
+// Queued feedback rounds and a crash.
+// ---------------------------------------------------------------------------
+
+/// Two feedback rounds are queued on one branch (the second waits on the
+/// first's worktree lease). Each must be durably recorded as pending, so a
+/// crash at that moment lets recovery re-apply both; finishing the first round
+/// must not clear the second's record.
+#[test]
+fn two_queued_feedback_rounds_on_one_branch_are_both_recorded_for_crash_recovery() {
+    let what = "two queued rounds";
+    let fx = Fixture::with_upstream(&["feature/a", "feature/b"]);
+    fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let mut first = Held::new("feature-b.txt", "first round edit", &unexpected).feedback(&fx, 1);
+    let second_release = Arc::new(AtomicBool::new(false));
+    let second_runner = Arc::new(WriterRunner::new(
+        "feature-b.txt",
+        "second round edit",
+        Some(Arc::clone(&second_release)),
+        &unexpected,
+    ));
+    let second = {
+        let (store, id, bid, runner) = (
+            Arc::clone(&fx.store),
+            fx.id.clone(),
+            fx.branch_ids[1].clone(),
+            Arc::clone(&second_runner),
+        );
+        std::thread::spawn(move || {
+            run_feedback(
+                &store,
+                runner.as_ref(),
+                &id,
+                &bid,
+                "second round text",
+                None,
+                false,
+                &CancelToken::never(),
+            );
+        })
+    };
+    std::thread::sleep(PARK_WAIT);
+
+    // A crash right now: both rounds are on record.
+    let texts: Vec<String> = fx
+        .store
+        .lock()
+        .branches_with_pending_feedback()
+        .unwrap()
+        .into_iter()
+        .map(|(_, _, text)| text)
+        .collect();
+    assert_eq!(
+        texts,
+        ["please change this", "second round text"],
+        "{what}: both queued rounds must be recorded before either finishes"
+    );
+
+    // The first round finishing must leave the second round's record alone.
+    first.finish();
+    wait_for(&second_runner.started, "the second round");
+    let texts: Vec<String> = fx
+        .store
+        .lock()
+        .branches_with_pending_feedback()
+        .unwrap()
+        .into_iter()
+        .map(|(_, _, text)| text)
+        .collect();
+    assert_eq!(
+        texts,
+        ["second round text"],
+        "{what}: finishing the first round dropped the second round's record"
+    );
+
+    second_release.store(true, Ordering::SeqCst);
+    second.join().expect("second round thread");
+    assert!(
+        fx.store
+            .lock()
+            .branches_with_pending_feedback()
+            .unwrap()
+            .is_empty(),
+        "{what}: a completed round left its pending record behind"
+    );
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+}
+
+// ---------------------------------------------------------------------------
+// More forge races: superseded-CI cancellation, reopened PRs, hammered syncs.
+// ---------------------------------------------------------------------------
+
+/// A feedback push supersedes the branch's running CI: the stale run is
+/// force-cancelled, and a run for the newest head is never touched.
+fn superseded_ci_cancel_hits_only_the_stale_run_on(kind: &str) {
+    let what = "superseded CI cancel";
+    let (fx, forge) = Fixture::with_forge_kind(&["feature/a", "feature/b", "feature/c"], kind);
+    // GitHub calls a live workflow run `in_progress`, GitLab a live pipeline `running`.
+    let active = if kind == "gitlab" {
+        "running"
+    } else {
+        "in_progress"
+    };
+    fx.submit_stack();
+    let unexpected: Unexpected = Arc::default();
+    let (_, alias_c) = fx.open_pr_row(2);
+    let stale = fx.remote_tip(&alias_c);
+    forge
+        .state
+        .lock()
+        .unwrap()
+        .runs
+        .push((101, alias_c.clone(), stale, active.to_string()));
+
+    let mut round = Held::new("feature-c.txt", "feedback on c", &unexpected).feedback(&fx, 2);
+    round.finish();
+    let newest = fx.remote_tip(&alias_c);
+    // A run for the newest head registers right after the push, then the base
+    // moves and the daemon republishes while that run is still going.
+    forge
+        .state
+        .lock()
+        .unwrap()
+        .runs
+        .push((202, alias_c.clone(), newest, active.to_string()));
+    assert_eq!(
+        forge.state.lock().unwrap().cancelled_runs,
+        [101],
+        "{what}: the stale run must be cancelled exactly once, the new one never\n{}",
+        fx.describe()
+    );
+    let _daemon = DaemonPump::start(&fx);
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    fx.wait_settled_on(first.trim(), what);
+    std::thread::sleep(PARK_WAIT * 2);
+    assert!(
+        !forge.state.lock().unwrap().cancelled_runs.contains(&202),
+        "{what}: the run for the newest head was cancelled\n{}",
+        fx.describe()
+    );
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_forge_routed_everything(what, &forge);
+}
+
+#[test]
+fn superseded_ci_cancel_hits_only_the_stale_run() {
+    superseded_ci_cancel_hits_only_the_stale_run_on("github");
+}
+
+#[test]
+fn superseded_ci_cancel_hits_only_the_stale_run_on_gitlab() {
+    superseded_ci_cancel_hits_only_the_stale_run_on("gitlab");
+}
+
+/// A PR is closed on the forge and then reopened while feedback is held and
+/// the base moves: no duplicate PR appears and no commit is lost.
+fn pr_closed_then_reopened_on_the_forge_keeps_one_pr_and_the_feedback_on(kind: &str) {
+    let what = "PR closed then reopened";
+    let (fx, forge) = Fixture::with_forge_kind(&["feature/a", "feature/b", "feature/c"], kind);
+    fx.submit_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    fx.wait_settled_on(first.trim(), "before the close");
+    let (_, alias_b) = fx.open_pr_row(1);
+    let number_b = forge.pr_for(&alias_b).number;
+
+    let mut held = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    forge.with_pr(number_b, |pr| pr.open = false);
+    let _ = ralphus_daemon::pr::submit_pull_requests(
+        &fx.store,
+        &NoAgentExpected,
+        &fx.id,
+        stack_request(),
+        "tester",
+        false,
+    );
+    let upstream = fx.push_upstream("upstream1.txt");
+    forge.with_pr(number_b, |pr| pr.open = true);
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+    std::thread::sleep(PARK_WAIT * 3);
+
+    let heads: Vec<String> = forge
+        .state
+        .lock()
+        .unwrap()
+        .prs
+        .iter()
+        .filter(|p| p.open)
+        .map(|p| p.head.clone())
+        .collect();
+    let mut unique = heads.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        heads.len(),
+        unique.len(),
+        "{what}: two open PRs share a head: {heads:?}"
+    );
+    assert!(
+        fx.text_anywhere(&fx.review_ref(1), "feedback on b"),
+        "{what}: the feedback was lost (upstream {upstream:.9})\n{}",
+        fx.describe()
+    );
+    assert!(
+        fx.text_anywhere(&fx.review_ref(2), "feedback on b"),
+        "{what}: the branch above lost the feedback\n{}",
+        fx.describe()
+    );
+    fx.assert_forge_routed_everything(what, &forge);
+}
+
+#[test]
+fn pr_closed_then_reopened_on_the_forge_keeps_one_pr_and_the_feedback() {
+    pr_closed_then_reopened_on_the_forge_keeps_one_pr_and_the_feedback_on("github");
+}
+
+#[test]
+fn pr_closed_then_reopened_on_the_forge_keeps_one_pr_and_the_feedback_on_gitlab() {
+    pr_closed_then_reopened_on_the_forge_keeps_one_pr_and_the_feedback_on("gitlab");
+}
+
+/// "Sync PR" is hammered (from several threads, repeatedly) while feedback is
+/// held and the base moves. The forge matches the stack, so nothing may be
+/// reordered, republished from a stale view, or lost.
+fn hammered_sync_pr_during_a_race_changes_nothing_it_should_not_on(kind: &str) {
+    let what = "hammered sync-pr";
+    let (fx, forge) = Fixture::with_forge_kind(&["feature/a", "feature/b", "feature/c"], kind);
+    fx.submit_stack();
+    let unexpected: Unexpected = Arc::default();
+    let daemon = DaemonPump::start(&fx);
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    fx.wait_settled_on(first.trim(), "before the hammering");
+
+    let mut held = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    let upstream = fx.push_upstream("upstream1.txt");
+    let hammer: Vec<_> = (0..4)
+        .map(|_| {
+            let (store, id) = (Arc::clone(&fx.store), fx.id.clone());
+            let (sem, cancellations) = (Arc::clone(&daemon.sem), daemon.cancellations.clone());
+            std::thread::spawn(move || {
+                for _ in 0..6 {
+                    ralphus_daemon::pr::check_and_apply_forge_reorder(
+                        &store,
+                        &NoAgentExpected,
+                        &id,
+                        &sem,
+                        &cancellations,
+                    );
+                    ralphus_daemon::pr::resync_pr_bases_synchronously(&store, &id).ok();
+                }
+            })
+        })
+        .collect();
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+    for thread in hammer {
+        thread.join().expect("sync thread");
+    }
+    fx.wait_settled_on(&upstream, what);
+    assert_eq!(
+        fx.branch_order(),
+        ["feature/a", "feature/b", "feature/c"],
+        "{what}: a no-op sync reordered the stack"
+    );
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_forge_routed_everything(what, &forge);
+    fx.assert_everything_published(
+        what,
+        &[(1, "feature-b.txt", "feedback on b")],
+        &["upstream1.txt"],
+    );
+}
+
+#[test]
+fn hammered_sync_pr_during_a_race_changes_nothing_it_should_not() {
+    hammered_sync_pr_during_a_race_changes_nothing_it_should_not_on("github");
+}
+
+#[test]
+fn hammered_sync_pr_during_a_race_changes_nothing_it_should_not_on_gitlab() {
+    hammered_sync_pr_during_a_race_changes_nothing_it_should_not_on("gitlab");
+}
+
+// ---------------------------------------------------------------------------
+// Review settings and user actions, continued: proof gates, squash toggles,
+// base-shift retry budget, PR naming variants, stop during conflict
+// resolution, force-start, dependent reorders and moved branches.
+// ---------------------------------------------------------------------------
+
+/// A resolver for runs with proof gates on: every proof call is answered with
+/// `pass` (the proof verdict) and counted; anything else is unexpected.
+struct ProofRunner {
+    pass: bool,
+    proofs: AtomicU32,
+    unexpected: Unexpected,
+}
+
+impl Runner for ProofRunner {
+    fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+        if spec.cell_id.starts_with("resolver-proof-") {
+            self.proofs.fetch_add(1, Ordering::SeqCst);
+            return if self.pass {
+                ok_result("RALPHUS_PROOF: PASS", Some(true))
+            } else {
+                ok_result("RALPHUS_PROOF: FAIL", Some(false))
+            };
+        }
+        self.unexpected
+            .lock()
+            .unwrap()
+            .push(format!("unexpected non-proof call {}", spec.cell_id));
+        RunnerResult::failure("unexpected agent call")
+    }
+}
+
+/// With proof gates on (`each_branch`), a rebuild proves every branch while a
+/// feedback round is held. The proof verdict -- passing or failing -- must not
+/// drop a single commit.
+fn proof_gates_during_a_race(pass: bool) {
+    let what = if pass { "proof passes" } else { "proof fails" };
+    let fx = Fixture::with_upstream(&["feature/a", "feature/b", "feature/c"]);
+    fx.open_pr_stack();
+    fx.store
+        .lock()
+        .set_guardian_proof_scope(&fx.id, Some("each_branch"))
+        .unwrap();
+    let unexpected: Unexpected = Arc::default();
+    let runner = Arc::new(ProofRunner {
+        pass,
+        proofs: AtomicU32::new(0),
+        unexpected: Arc::clone(&unexpected),
+    });
+    let pump_runner = Arc::clone(&runner);
+    let _daemon = DaemonPump::start_with(
+        &fx,
+        Arc::new(move |_| Arc::clone(&pump_runner) as Arc<dyn Runner>),
+    );
+    let mut held = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    let upstream = fx.push_upstream("upstream1.txt");
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+    fx.wait_settled_on(&upstream, what);
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    assert!(
+        runner.proofs.load(Ordering::SeqCst) > 0,
+        "{what}: the rebuild never ran a proof, so the gate was not exercised"
+    );
+    fx.assert_everything_published(
+        what,
+        &[(1, "feature-b.txt", "feedback on b")],
+        &["upstream1.txt"],
+    );
+}
+
+#[test]
+fn passing_proof_gates_during_a_race_lose_nothing() {
+    proof_gates_during_a_race(true);
+}
+
+#[test]
+fn failing_proof_gates_during_a_race_lose_nothing() {
+    proof_gates_during_a_race(false);
+}
+
+/// Squash mode is switched on, then off, with review-only commits present:
+/// each rebuild keeps the feedback's content.
+#[test]
+fn toggling_squash_mode_with_feedback_present_keeps_the_feedback() {
+    let what = "squash toggle";
+    let fx = Fixture::with_upstream(&["feature/a", "feature/b", "feature/c"]);
+    fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let daemon = DaemonPump::start(&fx);
+    let mut round = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    round.finish();
+    for (enabled, file) in [(true, "upstream1.txt"), (false, "upstream2.txt")] {
+        fx.store
+            .lock()
+            .set_guardian_project_squash(&fx.id, fx.root.to_str().unwrap(), enabled)
+            .unwrap();
+        ralphus_daemon::guardian_merge::restart_guardian_merge(
+            Arc::clone(&fx.store),
+            daemon.cancellations.clone(),
+            Arc::new(NoAgentExpected),
+            &fx.id,
+            Arc::clone(&daemon.sem),
+        );
+        let upstream = fx.push_upstream(file);
+        fx.wait_settled_on(&upstream, what);
+        fx.assert_no_unexpected_agent_calls(what, &unexpected);
+        fx.assert_everything_published(what, &[(1, "feature-b.txt", "feedback on b")], &[file]);
+    }
+}
+
+/// Repeated conflicting upstream pushes exhaust the unattended base-shift
+/// budget; the review stops retrying but loses nothing, and a manual merge
+/// with a resolver then finishes with every commit.
+#[test]
+fn base_shift_retry_budget_exhaustion_loses_nothing_and_a_manual_merge_recovers() {
+    let what = "base-shift budget";
+    let fx = Fixture::with_upstream(&["feature/a", "feature/b", "feature/c"]);
+    fx.open_pr_stack();
+    fx.store
+        .lock()
+        .set_guardian_base_shift_maximum_rebuilds(&fx.id, Some(1))
+        .unwrap();
+    let unexpected: Unexpected = Arc::default();
+    let mut round = Held::new("feature-c.txt", "feedback on c", &unexpected).feedback(&fx, 2);
+    round.finish();
+    let daemon = DaemonPump::start(&fx);
+    let mut last = String::new();
+    for i in 0..3 {
+        last = fx.push_upstream_append("feature-b.txt", &format!("conflicting upstream {i}"));
+        std::thread::sleep(PARK_WAIT * 2);
+    }
+    // Unattended rebuilds cannot resolve the conflict (no agent): the review
+    // is not in review on the new base, but the feedback is still reachable.
+    assert!(
+        fx.text_anywhere(&fx.review_ref(2), "feedback on c"),
+        "{what}: feedback lost while the budget ran out\n{}",
+        fx.describe()
+    );
+    drop(daemon);
+
+    let resolver = Arc::new(UnionResolver(Arc::clone(&unexpected)));
+    let daemon = DaemonPump::start_with(
+        &fx,
+        Arc::new({
+            let resolver = Arc::clone(&resolver);
+            move |_| Arc::clone(&resolver) as Arc<dyn Runner>
+        }),
+    );
+    ralphus_daemon::guardian_merge::restart_guardian_merge(
+        Arc::clone(&fx.store),
+        daemon.cancellations.clone(),
+        Arc::clone(&resolver) as Arc<dyn Runner>,
+        &fx.id,
+        Arc::clone(&daemon.sem),
+    );
+    fx.wait_built_on(&last, what);
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_review_branches(
+        what,
+        &[(2, "feature-c.txt", "feedback on c")],
+        &["feature-b.txt"],
+    );
+}
+
+/// `match_pr_branch_name` (and the per-submission `use_worktree_branch_name`
+/// override) change the PR branch alias; the feedback must still reach each
+/// PR's branch, wherever it is named.
+fn pr_naming_variant_keeps_feedback(match_pr_branch_name: bool, per_submission: bool) {
+    let what = format!("match={match_pr_branch_name} per-submission={per_submission}");
+    let (fx, forge) = Fixture::with_forge(&["feature/a", "feature/b", "feature/c"]);
+    fx.store
+        .lock()
+        .set_guardian_match_pr_branch_name(&fx.id, Some(match_pr_branch_name))
+        .unwrap();
+    ralphus_daemon::pr::submit_pull_requests(
+        &fx.store,
+        &NoAgentExpected,
+        &fx.id,
+        vec![ralphus_daemon::pr::PrRequest {
+            branch_id: None,
+            branch_alias: None,
+            title: Some("stack".to_string()),
+            description: Some("stack".to_string()),
+            use_worktree_branch_name: per_submission.then_some(true),
+            draft: None,
+        }],
+        "tester",
+        false,
+    )
+    .unwrap_or_else(|e| panic!("{what}: submit failed: {e}\n{}", fx.describe()));
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    fx.wait_settled_on(first.trim(), "before the race");
+    let mut held = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    let upstream = fx.push_upstream("upstream1.txt");
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+    fx.wait_settled_on(&upstream, &what);
+    fx.assert_no_unexpected_agent_calls(&what, &unexpected);
+    fx.assert_forge_routed_everything(&what, &forge);
+    fx.assert_everything_published(
+        &what,
+        &[(1, "feature-b.txt", "feedback on b")],
+        &["upstream1.txt"],
+    );
+}
+
+#[test]
+fn matching_pr_branch_names_keep_feedback_on_the_prs() {
+    pr_naming_variant_keeps_feedback(true, false);
+}
+
+#[test]
+fn worktree_branch_names_chosen_per_submission_keep_feedback_on_the_prs() {
+    pr_naming_variant_keeps_feedback(false, true);
+}
+
+/// A resolver for the conflict path that signals when it starts and blocks
+/// until released, so a test can stop the merge while the agent is mid-run.
+struct GatedConflictResolver {
+    started: Arc<AtomicBool>,
+    release: Arc<AtomicBool>,
+    unexpected: Unexpected,
+}
+
+impl Runner for GatedConflictResolver {
+    fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+        if is_conflict_resolution(spec) {
+            self.started.store(true, Ordering::SeqCst);
+            let deadline = Instant::now() + Duration::from_secs(120);
+            while !self.release.load(Ordering::SeqCst) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            union_resolve(&PathBuf::from(&spec.cwd));
+            return ok_result("resolved by keeping both sides", None);
+        }
+        self.unexpected
+            .lock()
+            .unwrap()
+            .push(format!("unexpected non-resolver call {}", spec.cell_id));
+        RunnerResult::failure("unexpected agent call")
+    }
+}
+
+/// The merge is stopped while its conflict-resolution agent is mid-run, then
+/// resumed: the resumed merge finishes with both sides and no markers.
+#[test]
+fn stopping_the_merge_during_conflict_resolution_then_resuming_loses_nothing() {
+    let what = "stop mid-resolution";
+    let fx = Fixture::with_upstream(&["feature/a", "feature/b", "feature/c"]);
+    fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let mut round = Held::new("feature-c.txt", "feedback on c", &unexpected).feedback(&fx, 2);
+    round.finish();
+    let started = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let resolver = Arc::new(GatedConflictResolver {
+        started: Arc::clone(&started),
+        release: Arc::clone(&release),
+        unexpected: Arc::clone(&unexpected),
+    });
+    let daemon = DaemonPump::start_with(&fx, {
+        let resolver = Arc::clone(&resolver);
+        Arc::new(move |_| Arc::clone(&resolver) as Arc<dyn Runner>)
+    });
+    let upstream = fx.push_upstream_append("feature-b.txt", "upstream side");
+    wait_for(&started, "the conflict resolver");
+
+    let stopping = {
+        let (store, cancellations, id) = (
+            Arc::clone(&fx.store),
+            daemon.cancellations.clone(),
+            fx.id.clone(),
+        );
+        // Like the board's Stop button: a 409 ("still stopping") is retried.
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                let reply = ralphus_daemon::guardian_merge::stop_guardian_merge(
+                    Arc::clone(&store),
+                    cancellations.clone(),
+                    &id,
+                );
+                if reply.status == 200 || Instant::now() > deadline {
+                    return reply.status;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        })
+    };
+    std::thread::sleep(PARK_WAIT);
+    release.store(true, Ordering::SeqCst);
+    let stop_status = stopping.join().expect("stop thread");
+    let after_stop = fx.store.lock().get_guardian(&fx.id).unwrap().status;
+    assert_eq!(
+        (stop_status, after_stop.as_str()),
+        (200, "merge_stopped"),
+        "{what}: Stop never completed once the agent returned
+{}",
+        fx.describe()
+    );
+    ralphus_daemon::guardian_merge::start_merge(
+        Arc::clone(&fx.store),
+        Arc::clone(&resolver) as Arc<dyn Runner>,
+        &fx.id,
+        Arc::clone(&daemon.sem),
+        daemon.cancellations.clone(),
+    );
+    fx.wait_built_on(&upstream, what);
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_review_branches(
+        what,
+        &[
+            (1, "feature-b.txt", "upstream side"),
+            (2, "feature-c.txt", "feedback on c"),
+        ],
+        &[],
+    );
+    for p in 1..3 {
+        let content = fx.file_on(&fx.root, &fx.review_ref(p), "feature-b.txt");
+        assert!(
+            !content.contains("<<<<<<<"),
+            "{what}: markers on branch {p}"
+        );
+    }
+}
+
+/// Force-start (build what is ready, disable the stragglers) and then
+/// dismissing the straggler's re-enable prompt while maintenance runs: the
+/// straggler stays out and the ready branches are untouched.
+#[test]
+fn force_start_then_dismiss_reenable_leaves_the_stack_alone() {
+    let what = "force-start + dismiss";
+    let fx = Fixture::with_upstream(&["feature/a", "feature/b"]);
+    fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let mut round = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    round.finish();
+    let daemon = DaemonPump::start(&fx);
+    // A third branch whose task has not finished (never marked ready).
+    git(&fx.root, &["checkout", "-q", "-b", "feature/late", "main"]);
+    write(&fx.root, "feature-late.txt", "content\n");
+    git(&fx.root, &["add", "."]);
+    git(&fx.root, &["commit", "-m", "add feature/late"]);
+    git(&fx.root, &["checkout", "-q", "main"]);
+    fx.store
+        .lock()
+        .add_guardian_branch(&fx.id, "feature/late")
+        .unwrap();
+    let late_id = fx.store.lock().get_guardian(&fx.id).unwrap().branches[2]
+        .id
+        .clone();
+
+    // What force-start does to a branch whose task has not finished.
+    fx.store
+        .lock()
+        .set_branch_enabled_by_name(&fx.id, "feature/late", false)
+        .unwrap();
+    fx.store
+        .lock()
+        .dismiss_branch_reenable(&fx.id, &late_id)
+        .unwrap();
+    let upstream = fx.push_upstream("upstream1.txt");
+    std::thread::sleep(PARK_WAIT * 3);
+    fx.wait_built_on(&upstream, what);
+    let view = fx.store.lock().get_guardian(&fx.id).unwrap();
+    assert!(
+        !view.branches[2].enabled || view.branches[2].merge_status != "done",
+        "{what}: the dismissed straggler was built into the stack\n{}",
+        fx.describe()
+    );
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_review_branches(
+        what,
+        &[(1, "feature-b.txt", "feedback on b")],
+        &["upstream1.txt"],
+    );
+    drop(daemon);
+}
+
+/// Reordering a branch below one whose content its review-only commit edits:
+/// the rebuild must surface the conflict (or apply cleanly) -- never silently
+/// drop the review-only commit.
+#[test]
+fn reorder_below_a_branch_whose_file_a_review_commit_edits_never_drops_it() {
+    let what = "dependent reorder";
+    let fx = Fixture::with_upstream(&["feature/a", "feature/b", "feature/c"]);
+    fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    // Feedback on c edits feature-b.txt, a file branch b created.
+    let mut round = Held::new("feature-b.txt", "dependent edit", &unexpected).feedback(&fx, 2);
+    round.finish();
+    let daemon = DaemonPump::start(&fx);
+    fx.store
+        .lock()
+        .reorder_guardian_branches(
+            &fx.id,
+            &[
+                "feature/a".to_string(),
+                "feature/c".to_string(),
+                "feature/b".to_string(),
+            ],
+        )
+        .unwrap();
+    ralphus_daemon::guardian_merge::start_merge(
+        Arc::clone(&fx.store),
+        Arc::new(NoAgentExpected),
+        &fx.id,
+        Arc::clone(&daemon.sem),
+        daemon.cancellations.clone(),
+    );
+    // The conflict cannot be resolved without an agent: the rebuild must end
+    // (merge_failed or settled), not hang in `merging`.
+    let deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        let status = fx.store.lock().get_guardian(&fx.id).unwrap().status;
+        if status != "merging" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what}: the rebuild never finished
+{}",
+            fx.describe()
+        );
+        std::thread::sleep(SETTLE_POLL);
+    }
+    let view = fx.store.lock().get_guardian(&fx.id).unwrap();
+    let on_a_branch = (0..view.branches.len()).any(|p| {
+        view.branches[p]
+            .review_branch
+            .as_deref()
+            .is_some_and(|r| fx.text_anywhere(r, "dependent edit"))
+    });
+    assert!(
+        on_a_branch || view.status == "merge_failed",
+        "{what}: the review-only commit vanished without the conflict surfacing \
+         (status {})\n{}",
+        view.status,
+        fx.describe()
+    );
+}
+
+/// A branch cannot be moved to another review while a feedback round on it is
+/// in flight (the review is mid-rebase); the refusal must not disturb the
+/// round, and once the round is done the move goes through and the late state
+/// stays consistent.
+#[test]
+fn moving_a_branch_mid_feedback_is_refused_then_allowed_once_the_round_ends() {
+    let what = "move mid-feedback";
+    let fx = Fixture::with_upstream(&["feature/a", "feature/b", "feature/c"]);
+    fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let other = fx
+        .store
+        .lock()
+        .create_guardian("other", "origin/main", fx.root.to_str().unwrap())
+        .unwrap();
+    let mut held = Held::new("feature-c.txt", "feedback on c", &unexpected).feedback(&fx, 2);
+    let refused = fx
+        .store
+        .lock()
+        .move_guardian_branch(&fx.id, &fx.branch_ids[2], &other);
+    assert!(
+        refused.is_err(),
+        "{what}: a branch moved out from under an in-flight round
+{}",
+        fx.describe()
+    );
+    held.finish();
+    assert!(
+        fx.text_anywhere(&fx.review_ref(2), "feedback on c"),
+        "{what}: the refused move disturbed the round
+{}",
+        fx.describe()
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let moved = fx
+            .store
+            .lock()
+            .move_guardian_branch(&fx.id, &fx.branch_ids[2], &other);
+        if moved.is_ok() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what}: the move stayed refused after the round ended: {moved:?}
+{}",
+            fx.describe()
+        );
+        std::thread::sleep(SETTLE_POLL);
+    }
+    let view = fx.store.lock().get_guardian(&fx.id).unwrap();
+    assert_eq!(view.branches.len(), 2, "{what}: {}", fx.describe());
+}
+
+// ---------------------------------------------------------------------------
+// Native-stack restrictions and auto-fix attempt budgets.
+// ---------------------------------------------------------------------------
+
+/// GitHub refuses to move a stacked PR's base ("part of a stack"). A local
+/// reorder racing a held feedback round must dissolve the stack, repoint the
+/// bases, re-register the stack -- and lose no commit.
+#[test]
+fn local_reorder_with_a_native_stack_dissolves_and_restacks_while_feedback_is_in_flight() {
+    let what = "native stack reorder";
+    let (fx, forge) = Fixture::with_forge(&["feature/a", "feature/b", "feature/c"]);
+    fx.submit_stack();
+    assert!(
+        forge.state.lock().unwrap().stacked,
+        "{what}: the submission did not register a native stack\n{}",
+        fx.describe()
+    );
+    let unexpected: Unexpected = Arc::default();
+    let daemon = DaemonPump::start(&fx);
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    fx.wait_settled_on(first.trim(), "before the reorder");
+    let (_, alias_a) = fx.open_pr_row(0);
+    let (_, alias_b) = fx.open_pr_row(1);
+    let (_, alias_c) = fx.open_pr_row(2);
+
+    let mut held = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    fx.store
+        .lock()
+        .reorder_guardian_branches(
+            &fx.id,
+            &[
+                "feature/a".to_string(),
+                "feature/c".to_string(),
+                "feature/b".to_string(),
+            ],
+        )
+        .unwrap();
+    ralphus_daemon::guardian_merge::start_merge(
+        Arc::clone(&fx.store),
+        Arc::new(NoAgentExpected),
+        &fx.id,
+        Arc::clone(&daemon.sem),
+        daemon.cancellations.clone(),
+    );
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+    fx.wait_for_order(&["feature/a", "feature/c", "feature/b"], what, &|| {});
+    let resynced = ralphus_daemon::pr::resync_pr_bases_synchronously(&fx.store, &fx.id);
+    fx.wait_settled_on(first.trim(), what);
+
+    let state = forge.state.lock().unwrap();
+    let base_of = |alias: &str| {
+        state
+            .prs
+            .iter()
+            .find(|p| p.head == alias)
+            .map(|p| p.base.clone())
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        base_of(&alias_c),
+        alias_a,
+        "{what}: c's PR is not based on a ({resynced:?})\n{}",
+        fx.describe()
+    );
+    assert_eq!(
+        base_of(&alias_b),
+        alias_c,
+        "{what}: b's PR is not based on c ({resynced:?})\n{}",
+        fx.describe()
+    );
+    assert!(
+        state.stacked && state.stacks_created >= 2,
+        "{what}: the native stack was not re-registered after the base moves \
+         (stacked {}, created {})",
+        state.stacked,
+        state.stacks_created
+    );
+    drop(state);
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_forge_routed_everything(what, &forge);
+    fx.assert_everything_published(what, &[(2, "feature-b.txt", "feedback on b")], &[]);
+}
+
+/// A resolver that never fixes anything: it counts its resolver calls and
+/// leaves the worktree clean.
+struct IdleFixer {
+    calls: AtomicU32,
+}
+
+impl Runner for IdleFixer {
+    fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+        if spec.cell_id.ends_with("-commit") || spec.cell_id.starts_with("resolver-proof-") {
+            return ok_result("nothing to do", Some(false));
+        }
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        ok_result("could not find the problem", Some(false))
+    }
+}
+
+/// An unfixable failure keeps being reported while upstream pushes keep
+/// rebuilding the stack. The unattended fix must stop at its attempt budget --
+/// not retry once per rebuild forever.
+#[test]
+fn an_unfixable_failure_stops_at_the_auto_fix_attempt_budget_under_rebuilds() {
+    let what = "auto-fix budget";
+    let (fx, forge) = Fixture::with_forge(&["feature/a", "feature/b", "feature/c"]);
+    std::fs::write(
+        fx.root.join(".ralphus.toml"),
+        format!(
+            "[forge]\nkind = \"github\"\napi_base = \"http://{}\"\ntoken_env = \"CARGO_MANIFEST_DIR\"\n\
+             [review]\nauto_fix_max_attempts = 2\nauto_fix_retry_base_seconds = 1\n",
+            forge.addr
+        ),
+    )
+    .unwrap();
+    fx.submit_stack();
+    fx.store
+        .lock()
+        .set_guardian_auto_fix_pr_errors(&fx.id, Some(true))
+        .unwrap();
+    let (_, alias_c) = fx.open_pr_row(2);
+    // Every head of c's PR fails CI, whatever it is rebuilt to.
+    let fixer = Arc::new(IdleFixer {
+        calls: AtomicU32::new(0),
+    });
+    let pump_fixer = Arc::clone(&fixer);
+    let _daemon = DaemonPump::start_with(
+        &fx,
+        Arc::new(move |_| Arc::clone(&pump_fixer) as Arc<dyn Runner>),
+    );
+    for round in 0..4 {
+        forge
+            .state
+            .lock()
+            .unwrap()
+            .failing_heads
+            .insert(fx.remote_tip(&alias_c));
+        let upstream = fx.push_upstream(&format!("upstream{round}.txt"));
+        fx.wait_settled_on(&upstream, what);
+        std::thread::sleep(PARK_WAIT * 2);
+    }
+    let calls = fixer.calls.load(Ordering::SeqCst);
+    assert!(
+        (1..=2).contains(&calls),
+        "{what}: the unattended fix ran {calls} time(s) against a budget of 2\n{}",
+        fx.describe()
+    );
+    fx.assert_forge_routed_everything(what, &forge);
+}
+
+// ---------------------------------------------------------------------------
+// Git-level hazards: concurrent gc, binary files, a failing commit hook.
+// ---------------------------------------------------------------------------
+
+/// Runs `git gc --prune=now` on the review repo in a loop until dropped --
+/// the harshest thing a background maintenance job can do to commits that are
+/// only referenced by the daemon's pins (carry refs, source refs).
+struct GcStorm {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl GcStorm {
+    fn start(root: &Path) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (flag, root) = (Arc::clone(&stop), root.to_path_buf());
+        let handle = std::thread::spawn(move || {
+            while !flag.load(Ordering::SeqCst) {
+                let _ = std::process::Command::new("git")
+                    .args(["gc", "--prune=now", "--quiet"])
+                    .current_dir(&root)
+                    .output();
+                std::thread::sleep(Duration::from_millis(150));
+            }
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for GcStorm {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// `git gc --prune=now` runs continuously while feedback is held and the base
+/// moves: no review-only commit may be collected out from under the rebuild.
+#[test]
+fn concurrent_gc_during_a_race_collects_nothing_the_review_needs() {
+    let what = "gc storm";
+    let fx = Fixture::with_upstream(&["feature/a", "feature/b", "feature/c"]);
+    fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let mut earlier = Held::new("feature-a.txt", "feedback on a", &unexpected).feedback(&fx, 0);
+    earlier.finish();
+    let _gc = GcStorm::start(&fx.root);
+    let mut held = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    let upstream = fx.push_upstream("upstream1.txt");
+    std::thread::sleep(PARK_WAIT * 2);
+    held.finish();
+    fx.wait_settled_on(&upstream, what);
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_everything_published(
+        what,
+        &[
+            (0, "feature-a.txt", "feedback on a"),
+            (1, "feature-b.txt", "feedback on b"),
+        ],
+        &["upstream1.txt"],
+    );
+}
+
+/// A resolver that adds a binary file (bytes that are not UTF-8) as its edit.
+struct BinaryWriter {
+    file: &'static str,
+}
+
+impl Runner for BinaryWriter {
+    fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+        let cwd = PathBuf::from(&spec.cwd);
+        if spec.cell_id.starts_with("resolver-proof-") {
+            return ok_result("RALPHUS_PROOF: PASS", Some(true));
+        }
+        if spec.cell_id.ends_with("-commit") {
+            git(&cwd, &["add", "--all"]);
+            git(&cwd, &["commit", "-m", "binary feedback"]);
+            return ok_result("committed", Some(true));
+        }
+        std::fs::write(cwd.join(self.file), [0u8, 159, 146, 150, 0, 255]).unwrap();
+        ok_result("edited\nRALPHUS_PROOF: PASS", Some(true))
+    }
+}
+
+/// Feedback adds a binary file while upstream adds a different binary file:
+/// both survive the rebuild byte-for-byte.
+#[test]
+fn binary_feedback_and_a_binary_upstream_change_both_survive() {
+    let what = "binary files";
+    let fx = Fixture::with_upstream(&["feature/a", "feature/b", "feature/c"]);
+    fx.open_pr_stack();
+    let _daemon = DaemonPump::start(&fx);
+    let runner = BinaryWriter {
+        file: "feedback.bin",
+    };
+    let outcome = run_feedback(
+        &fx.store,
+        &runner,
+        &fx.id,
+        &fx.branch_ids[1],
+        "add the blob",
+        None,
+        false,
+        &CancelToken::never(),
+    );
+    assert!(outcome.committed, "{what}: binary feedback not committed");
+    let upstream = fx.upstream_change("add upstream blob", false, &|clone| {
+        std::fs::write(clone.join("upstream.bin"), [1u8, 0, 254, 0, 128]).unwrap();
+    });
+    fx.wait_settled_on(&upstream, what);
+    for p in 1..3 {
+        let files = fx.files_on(&fx.root, &fx.review_ref(p));
+        assert!(
+            files.contains("feedback.bin") && files.contains("upstream.bin"),
+            "{what}: branch {p} lost a binary file\n{files}"
+        );
+    }
+    let bytes = std::process::Command::new("git")
+        .args(["show", &format!("{}:feedback.bin", fx.review_ref(2))])
+        .current_dir(&fx.root)
+        .output()
+        .unwrap()
+        .stdout;
+    assert_eq!(bytes, [0u8, 159, 146, 150, 0, 255], "{what}: bytes changed");
+}
+
+/// A commit hook that fails while a conflict is resolved (the rebase's
+/// `--continue` makes a commit, so commit hooks run) must not make the
+/// rebuild silently drop the commit: the review reports the failure, and a
+/// later retry, with the hook passing again, finishes with both sides.
+#[test]
+fn a_failing_commit_hook_during_conflict_resolution_never_drops_a_commit() {
+    let what = "failing commit hook";
+    let fx = Fixture::with_upstream(&["feature/a", "feature/b", "feature/c"]);
+    fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let mut earlier = Held::new("feature-c.txt", "feedback on c", &unexpected).feedback(&fx, 2);
+    earlier.finish();
+
+    let marker = fx.root.join(".git").join("hook-fails");
+    let log = fx.root.join(".git").join("hook-log");
+    let hook = fx.root.join(".git").join("hooks").join("pre-commit");
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\necho ran >> '{}'\n[ -e '{}' ] && exit 1\nexit 0\n",
+            log.display().to_string().replace('\\', "/"),
+            marker.display().to_string().replace('\\', "/")
+        ),
+    )
+    .unwrap();
+    std::fs::write(&marker, "").unwrap();
+
+    let daemon = DaemonPump::start_resolving(&fx, &unexpected);
+    let upstream = fx.push_upstream_append("feature-b.txt", "upstream side");
+    std::thread::sleep(PARK_WAIT * 6);
+    // While the hook rejects commits, the feedback must still be reachable,
+    // and the rebuild must not have declared the upstream side merged in.
+    assert!(
+        fx.text_anywhere(&fx.review_ref(2), "feedback on c"),
+        "{what}: feedback lost while the hook was failing\n{}",
+        fx.describe()
+    );
+    let view = fx.store.lock().get_guardian(&fx.id).unwrap();
+    let hook_ran = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        view.status != "in_review"
+            || view.base_commit.as_deref().map(str::trim) != Some(upstream.as_str())
+            || fx
+                .file_on(&fx.root, &fx.review_ref(1), "feature-b.txt")
+                .contains("upstream side"),
+        "{what}: the review claims to be settled on the new base without the upstream side \
+         (hook ran {} time(s))\n{}",
+        hook_ran.lines().count(),
+        fx.describe()
+    );
+
+    std::fs::remove_file(&marker).unwrap();
+    ralphus_daemon::guardian_merge::restart_guardian_merge(
+        Arc::clone(&fx.store),
+        daemon.cancellations.clone(),
+        Arc::new(UnionResolver(Arc::clone(&unexpected))),
+        &fx.id,
+        Arc::clone(&daemon.sem),
+    );
+    fx.wait_built_on(&upstream, what);
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_review_branches(
+        what,
+        &[
+            (1, "feature-b.txt", "upstream side"),
+            (2, "feature-c.txt", "feedback on c"),
+        ],
+        &[],
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Sections 9-10: exhaustive release orders, conflicting-writer soaks, several
+// reviews on one repo, semaphore saturation and a seeded long soak.
+// ---------------------------------------------------------------------------
+
+/// Every permutation of `0..n`.
+fn permutations(n: usize) -> Vec<Vec<usize>> {
+    fn go(prefix: &mut Vec<usize>, left: &mut Vec<usize>, out: &mut Vec<Vec<usize>>) {
+        if left.is_empty() {
+            out.push(prefix.clone());
+            return;
+        }
+        for i in 0..left.len() {
+            let item = left.remove(i);
+            prefix.push(item);
+            go(prefix, left, out);
+            prefix.pop();
+            left.insert(i, item);
+        }
+    }
+    let mut out = Vec::new();
+    go(&mut Vec::new(), &mut (0..n).collect(), &mut out);
+    out
+}
+
+#[test]
+fn permutations_enumerates_every_order() {
+    let all = permutations(3);
+    assert_eq!(all.len(), 6);
+    let mut sorted = all.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), 6);
+}
+
+/// Three held writers (a feedback round, a PR fix and another feedback round)
+/// and an upstream push: *every one* of the 3! release orders must keep every
+/// edit. Each order is a fresh review.
+#[test]
+#[ignore = "runs 6 full scenarios (~5 minutes); runs in the nightly race workflow"]
+fn soak_every_release_order_of_three_held_writers_keeps_every_commit() {
+    for order in permutations(3) {
+        let what = format!("release order {order:?}");
+        let fx = Fixture::with_upstream(&["feature/a", "feature/b", "feature/c"]);
+        let pr_ids = fx.open_pr_stack();
+        let unexpected: Unexpected = Arc::default();
+        let _daemon = DaemonPump::start(&fx);
+        let mut writers = [
+            Held::new("feature-a.txt", "feedback on a", &unexpected).feedback(&fx, 0),
+            Held::new("feature-b.txt", "auto-fix on b", &unexpected).auto_fix(&fx, &pr_ids[1]),
+            Held::new("feature-c.txt", "feedback on c", &unexpected).feedback(&fx, 2),
+        ];
+        let upstream = fx.push_upstream("upstream1.txt");
+        std::thread::sleep(PARK_WAIT);
+        for &i in &order {
+            writers[i].finish();
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        fx.wait_settled_on(&upstream, &what);
+        fx.assert_no_unexpected_agent_calls(&what, &unexpected);
+        fx.assert_everything_published(
+            &what,
+            &[
+                (0, "feature-a.txt", "feedback on a"),
+                (1, "feature-b.txt", "auto-fix on b"),
+                (2, "feature-c.txt", "feedback on c"),
+            ],
+            &["upstream1.txt"],
+        );
+    }
+}
+
+/// A randomized soak whose writers *conflict*: every writer, reviewer push and
+/// upstream commit appends to the same file, so every restack and rebuild
+/// resolves conflicts. Each line must be in the file exactly once, on every
+/// branch at or above where it was written, after every round.
+fn conflicting_writers_soak(rounds: usize, seed: u64) {
+    let features = ["feature/a", "feature/b", "feature/c", "feature/d"];
+    let fx = Fixture::with_upstream(&features);
+    let pr_ids = fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start_resolving(&fx, &unexpected);
+    let mut seed = seed;
+    let mut next = move |n: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % n
+    };
+    let mut edits: Vec<(usize, String)> = Vec::new();
+    let mut upstream_lines: Vec<String> = vec!["base".to_string()];
+    for round in 0..rounds {
+        let mut positions: Vec<usize> = (0..features.len()).filter(|_| next(2) == 0).collect();
+        if positions.is_empty() {
+            positions.push(next(features.len() as u64) as usize);
+        }
+        let mut writers = Vec::new();
+        for &p in &positions {
+            let fix = next(2) == 0;
+            let line = format!(
+                "round {round} {} on {p}",
+                if fix { "fix" } else { "feedback" }
+            );
+            let held = Held::resolving("base.txt", &line, &unexpected);
+            writers.push(if fix {
+                held.auto_fix(&fx, &pr_ids[p])
+            } else {
+                held.feedback(&fx, p)
+            });
+            edits.push((p, line));
+        }
+        let upstream_line = format!("upstream round {round}");
+        let upstream = fx.push_upstream_append("base.txt", &upstream_line);
+        upstream_lines.push(upstream_line);
+        std::thread::sleep(Duration::from_millis(500 + 500 * next(4)));
+        while !writers.is_empty() {
+            let i = next(writers.len() as u64) as usize;
+            writers.remove(i).finish();
+            std::thread::sleep(Duration::from_millis(100 * next(5)));
+        }
+        let what = format!("conflicting soak round {round} (seed {seed:#x})");
+        fx.wait_settled_on(&upstream, &what);
+        fx.assert_no_unexpected_agent_calls(&what, &unexpected);
+        let edit_refs: Vec<(usize, &str)> = edits.iter().map(|(p, l)| (*p, l.as_str())).collect();
+        let upstream_refs: Vec<&str> = upstream_lines.iter().map(String::as_str).collect();
+        fx.assert_lines_exactly_once(&what, "base.txt", &edit_refs, &upstream_refs);
+    }
+}
+
+#[test]
+#[ignore = "multi-minute stress run; runs in the nightly race workflow"]
+fn soak_conflicting_writers_across_four_branches() {
+    conflicting_writers_soak(3, 0x1234_5678_9ABC_DEF1);
+}
+
+/// The soak seeds itself from the clock (or `RALPHUS_RACE_SEED`) and runs for
+/// `RALPHUS_RACE_SOAK_SECONDS` (default 300), printing the seed up front so any
+/// failure can be replayed with `RALPHUS_RACE_SEED=<seed>`. Meant for the
+/// nightly workflow (`race-soak-nightly.yml`, which sets
+/// `RALPHUS_RACE_NIGHTLY=1`); anywhere else it returns immediately, so the
+/// per-PR soak job that runs every `soak_*` test is not slowed by it.
+#[test]
+#[ignore = "randomly seeded, time-boxed soak for a nightly job"]
+fn soak_randomly_seeded_time_boxed() {
+    if std::env::var_os("RALPHUS_RACE_NIGHTLY").is_none() {
+        eprintln!("skipped: set RALPHUS_RACE_NIGHTLY=1 to run the time-boxed soak");
+        return;
+    }
+    let seed = std::env::var("RALPHUS_RACE_SEED")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(1, |d| d.as_nanos() as u64)
+                | 1
+        });
+    let seconds = std::env::var("RALPHUS_RACE_SOAK_SECONDS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(300);
+    eprintln!("RACE SOAK SEED: {seed} (replay with RALPHUS_RACE_SEED={seed})");
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    let mut round_seed = seed;
+    while Instant::now() < deadline {
+        round_seed = round_seed.wrapping_mul(6364136223846793005).wrapping_add(1) | 1;
+        eprintln!("RACE SOAK ROUND SEED: {round_seed}");
+        random_concurrent_writers_soak(
+            &["feature/a", "feature/b", "feature/c", "feature/d"],
+            2,
+            round_seed,
+        );
+    }
+}
+
+impl Fixture {
+    /// A second review in the same store and repository, with its own task
+    /// branches, built and in review. The returned fixture shares this one's
+    /// repo, upstream and store; it must not be dropped (the first fixture
+    /// owns the directories), so it is wrapped in `ManuallyDrop`.
+    fn sibling_review(&self, features: &[&str]) -> std::mem::ManuallyDrop<Fixture> {
+        for name in features {
+            git(&self.root, &["checkout", "-q", "-b", name, "main"]);
+            write(
+                &self.root,
+                &format!("{}.txt", name.replace('/', "-")),
+                "content\n",
+            );
+            git(&self.root, &["add", "."]);
+            git(&self.root, &["commit", "-m", &format!("add {name}")]);
+            git(&self.root, &["checkout", "-q", "main"]);
+        }
+        let id = {
+            let guard = self.store.lock();
+            let id = guard
+                .create_guardian("sibling", "origin/main", self.root.to_str().unwrap())
+                .unwrap();
+            for name in features {
+                guard.add_guardian_branch(&id, name).unwrap();
+            }
+            guard
+                .set_guardian_proof_scope(&id, Some("nothing"))
+                .unwrap();
+            id
+        };
+        run_merge(&self.store, &NoopRunner, &id);
+        let view = self.store.lock().get_guardian(&id).unwrap();
+        assert_eq!(view.status, "in_review", "{:?}", view.detail);
+        std::mem::ManuallyDrop::new(Fixture {
+            root: self.root.clone(),
+            remote: self.remote.clone(),
+            fork: self.fork.clone(),
+            store: Arc::clone(&self.store),
+            id,
+            branch_ids: view.branches.iter().map(|b| b.id.clone()).collect(),
+        })
+    }
+}
+
+/// Two reviews on one repository and one upstream, each with feedback held
+/// while the shared base moves: both rebuild onto it with their own feedback,
+/// and neither touches the other's branches.
+#[test]
+fn two_reviews_sharing_a_repo_and_upstream_each_keep_their_own_feedback() {
+    let what = "two reviews, one repo";
+    let first = Fixture::with_upstream(&["feature/a", "feature/b"]);
+    let second = first.sibling_review(&["feature/x", "feature/y"]);
+    first.open_pr_stack();
+    second.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&first);
+    let mut one = Held::new("feature-b.txt", "feedback in first", &unexpected).feedback(&first, 1);
+    let mut two =
+        Held::new("feature-y.txt", "feedback in second", &unexpected).feedback(&second, 1);
+    let upstream = first.push_upstream("upstream1.txt");
+    std::thread::sleep(PARK_WAIT);
+    two.finish();
+    one.finish();
+
+    first.wait_settled_on(&upstream, what);
+    second.wait_settled_on(&upstream, what);
+    first.assert_no_unexpected_agent_calls(what, &unexpected);
+    first.assert_everything_published(
+        what,
+        &[(1, "feature-b.txt", "feedback in first")],
+        &["upstream1.txt"],
+    );
+    second.assert_everything_published(
+        what,
+        &[(1, "feature-y.txt", "feedback in second")],
+        &["upstream1.txt"],
+    );
+    for p in 0..2 {
+        let files = first.files_on(&first.root, &first.review_ref(p));
+        assert!(
+            !files.contains("feature-x.txt") && !files.contains("feature-y.txt"),
+            "{what}: the first review's branch {p} picked up the second review's work"
+        );
+    }
+}
+
+/// More reviews than merge permits, all rebuilding after one upstream push:
+/// with a single permit they must rebuild one after another and every review
+/// keeps its feedback (no starvation, no deadlock).
+#[test]
+fn more_reviews_than_merge_permits_all_rebuild_and_keep_their_feedback() {
+    let what = "semaphore saturation";
+    let first = Fixture::with_upstream(&["feature/a", "feature/b"]);
+    let second = first.sibling_review(&["feature/x", "feature/y"]);
+    let third = second.sibling_review(&["feature/p", "feature/q"]);
+    first.open_pr_stack();
+    second.open_pr_stack();
+    third.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start_with_permits(
+        &first,
+        1,
+        Arc::new(|_| Arc::new(NoAgentExpected) as Arc<dyn Runner>),
+    );
+    let mut rounds = vec![
+        Held::new("feature-b.txt", "feedback one", &unexpected).feedback(&first, 1),
+        Held::new("feature-y.txt", "feedback two", &unexpected).feedback(&second, 1),
+        Held::new("feature-q.txt", "feedback three", &unexpected).feedback(&third, 1),
+    ];
+    let upstream = first.push_upstream("upstream1.txt");
+    std::thread::sleep(PARK_WAIT);
+    for round in &mut rounds {
+        round.finish();
+    }
+    for fx in [&first, &second, &third] {
+        fx.wait_settled_on(&upstream, what);
+    }
+    first.assert_no_unexpected_agent_calls(what, &unexpected);
+    first.assert_everything_published(
+        what,
+        &[(1, "feature-b.txt", "feedback one")],
+        &["upstream1.txt"],
+    );
+    second.assert_everything_published(
+        what,
+        &[(1, "feature-y.txt", "feedback two")],
+        &["upstream1.txt"],
+    );
+    third.assert_everything_published(
+        what,
+        &[(1, "feature-q.txt", "feedback three")],
+        &["upstream1.txt"],
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Fork routing (RAL-338): the project has a registered fork. The root branch's
+// PR is filed on the parent from the fork (`bob:alias`), every later branch's
+// PR lives on the fork, and every PR branch is pushed to the fork -- never to
+// the parent. The parent upstream moves independently.
+// ---------------------------------------------------------------------------
+
+impl Fixture {
+    /// Set the review's owner directly in the database (the store has no
+    /// setter: the owner is stamped once, from the submitter or the daemon's
+    /// default user).
+    fn set_owner(&self, owner: &str) {
+        let db = self.root.join(".git").join("ralphus-test.db");
+        rusqlite::Connection::open(db)
+            .expect("open the test database")
+            .execute(
+                "UPDATE guardians SET owner=?1 WHERE id=?2",
+                rusqlite::params![owner, self.id],
+            )
+            .expect("set the owner");
+    }
+
+    /// [`Self::with_forge`] plus a registered fork `bob/w`: a second bare
+    /// repository (cloned from the upstream), served by the same fake forge
+    /// and reached by the same `ssh://` shim, registered as the project's
+    /// fork for the submitting user and as the project-wide default.
+    fn with_fork(features: &[&str]) -> (Self, FakeGitHub) {
+        let (mut fx, forge) = Self::with_forge(features);
+        let fork = temp_dir();
+        let _ = std::fs::remove_dir_all(&fork);
+        git(
+            fork.parent().unwrap(),
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                fx.remote.to_str().unwrap(),
+                fork.file_name().unwrap().to_str().unwrap(),
+            ],
+        );
+        // The shim now serves whichever bare repository the URL names.
+        let shim = fx.root.join(".git").join("ssh-shim.sh");
+        std::fs::write(
+            &shim,
+            "#!/bin/sh\n# ssh stand-in: serve the bare repository the URL names.\n\
+             shift\ncmd=\"$*\"\nverb=${cmd%% *}\ncase \"$cmd\" in\n  *bob/w*) repo='FORK' ;;\n  \
+             *) repo='PARENT' ;;\nesac\nexec git \"${verb#git-}\" \"$repo\"\n"
+                .replace("FORK", &fork.display().to_string())
+                .replace("PARENT", &fx.remote.display().to_string()),
+        )
+        .unwrap();
+        forge.add_repo("bob/w", &fork);
+        fx.fork = Some(fork);
+        // The review's owner is whoever the machine's `[daemon] default_user`
+        // names (nobody, on a clean CI box): pin it so a developer's own
+        // config cannot change which fork row the maintenance paths resolve.
+        fx.set_owner("tester");
+        {
+            let guard = fx.store.lock();
+            guard
+                .register_project("demo", "fork demo", fx.root.to_str().unwrap(), "git")
+                .unwrap();
+            for user in ["tester", ""] {
+                guard
+                    .upsert_project_fork(
+                        "demo",
+                        user,
+                        "ssh://localhost/bob/w.git",
+                        "fork-bob",
+                        "bob",
+                    )
+                    .unwrap();
+            }
+        }
+        (fx, forge)
+    }
+}
+
+/// Fork-routed submission files the root PR on the parent (head `bob:alias`)
+/// and every other PR on the fork, with every PR branch pushed to the fork
+/// only.
+#[test]
+fn fork_routed_submission_files_the_root_on_the_parent_and_the_rest_on_the_fork() {
+    let what = "fork submission";
+    let (fx, forge) = Fixture::with_fork(&["feature/a", "feature/b", "feature/c"]);
+    fx.submit_stack();
+
+    let parent = forge.open_prs_in("acme/w");
+    let fork = forge.open_prs_in("bob/w");
+    assert_eq!(
+        (parent.len(), fork.len()),
+        (1, 2),
+        "{what}: the root PR belongs on the parent and the other two on the fork\n{}",
+        fx.describe()
+    );
+    assert_eq!(
+        parent[0].head_repo, "bob/w",
+        "{what}: the root's head lives on the fork"
+    );
+    let (_, alias_a) = fx.open_pr_row(0);
+    let (_, alias_b) = fx.open_pr_row(1);
+    assert_eq!(fork[0].base, alias_a, "{what}: b stacks on a");
+    assert_eq!(fork[0].head, alias_b);
+    for p in 0..3 {
+        let alias = fx.open_pr_row(p).1;
+        assert!(
+            !git(
+                &fx.remote,
+                &["for-each-ref", &format!("refs/heads/{alias}")]
+            )
+            .contains(&alias),
+            "{what}: PR branch {alias} was pushed to the parent"
+        );
+        assert!(
+            git(
+                fx.pr_repo(),
+                &["for-each-ref", &format!("refs/heads/{alias}")]
+            )
+            .contains(&alias),
+            "{what}: PR branch {alias} is missing from the fork"
+        );
+    }
+    fx.assert_forge_routed_everything(what, &forge);
+}
+
+/// A fork-routed review keeps feedback through an upstream (parent) move, and
+/// every PR branch on the fork carries it.
+#[test]
+fn fork_routed_review_keeps_feedback_through_a_parent_upstream_move() {
+    let what = "fork feedback + upstream";
+    let (fx, forge) = Fixture::with_fork(&["feature/a", "feature/b", "feature/c"]);
+    fx.submit_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    fx.wait_settled_on(first.trim(), "before the race");
+
+    let mut held = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    let upstream = fx.push_upstream("upstream1.txt");
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+    fx.wait_settled_on(&upstream, what);
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_forge_routed_everything(what, &forge);
+    fx.assert_everything_published(
+        what,
+        &[(1, "feature-b.txt", "feedback on b")],
+        &["upstream1.txt"],
+    );
+    assert_eq!(
+        (
+            forge.open_prs_in("acme/w").len(),
+            forge.open_prs_in("bob/w").len()
+        ),
+        (1, 2),
+        "{what}: the PR topology changed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Fork routing, continued: promotion, dual-root stack PRs.
+// ---------------------------------------------------------------------------
+
+impl Fixture {
+    /// Land the root branch on the parent's `main`, as merging its PR would:
+    /// its PR branch (which lives on the fork) is merged into a clone of the
+    /// parent and pushed; the root's parent-side PR is marked merged on the
+    /// forge. Returns the new parent tip.
+    fn merge_fork_root_on_forge(&self, forge: &FakeGitHub) -> String {
+        let (_, alias) = self.open_pr_row(0);
+        let number = forge
+            .open_prs_in("acme/w")
+            .into_iter()
+            .find(|p| p.head == alias)
+            .expect("the root PR on the parent")
+            .number;
+        let clone = temp_dir();
+        let _ = std::fs::remove_dir_all(&clone);
+        git(
+            clone.parent().unwrap(),
+            &[
+                "clone",
+                "-q",
+                "--branch",
+                "main",
+                self.remote.to_str().unwrap(),
+                clone.file_name().unwrap().to_str().unwrap(),
+            ],
+        );
+        git(
+            &clone,
+            &[
+                "fetch",
+                "-q",
+                self.pr_repo().to_str().unwrap(),
+                &format!("refs/heads/{alias}:refs/heads/from-fork"),
+            ],
+        );
+        git(
+            &clone,
+            &["merge", "--no-ff", "-m", "Merge the root PR", "from-fork"],
+        );
+        git(&clone, &["push", "-q", "origin", "main"]);
+        let sha = git(&clone, &["rev-parse", "HEAD"]).trim().to_string();
+        let _ = std::fs::remove_dir_all(&clone);
+        forge.with_pr_in("acme/w", number, |pr| {
+            pr.open = false;
+            pr.merged = true;
+        });
+        sha
+    }
+}
+
+/// The root PR (on the parent) is merged while a feedback round on the top
+/// branch is held. The next branch's fork-internal PR must be promoted to the
+/// new cross-repository root without a duplicate PR, and the feedback must
+/// reach every PR branch on the fork.
+#[test]
+fn fork_root_merged_promotes_the_next_branch_while_feedback_is_in_flight() {
+    let what = "fork root merged";
+    let (fx, forge) = Fixture::with_fork(&["feature/a", "feature/b", "feature/c"]);
+    fx.submit_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    fx.wait_settled_on(first.trim(), "before the merge");
+    let (_, alias_b) = fx.open_pr_row(1);
+
+    let mut held = Held::new("feature-c.txt", "feedback on c", &unexpected).feedback(&fx, 2);
+    let upstream = fx.merge_fork_root_on_forge(&forge);
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+    fx.wait_settled_on(&upstream, what);
+
+    // The deadline is generous: promotion happens on the next merge poll.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let parent = forge.open_prs_in("acme/w");
+        if parent.iter().any(|p| p.head == alias_b) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what}: b was never promoted to a root PR on the parent: {:?}\n{}",
+            parent.iter().map(|p| &p.head).collect::<Vec<_>>(),
+            fx.describe()
+        );
+        std::thread::sleep(SETTLE_POLL);
+    }
+    let on_fork: Vec<String> = forge
+        .open_prs_in("bob/w")
+        .into_iter()
+        .map(|p| p.head)
+        .collect();
+    assert!(
+        !on_fork.contains(&alias_b),
+        "{what}: the superseded fork-internal PR for b is still open: {on_fork:?}"
+    );
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_forge_routed_everything(what, &forge);
+    let files = fx.files_on(fx.pr_repo(), &fx.pr_ref(2));
+    assert!(
+        fx.file_on(fx.pr_repo(), &fx.pr_ref(2), "feature-c.txt")
+            .contains("feedback on c"),
+        "{what}: the top PR branch lost the feedback\n{files}\n{}",
+        fx.describe()
+    );
+}
+
+/// With `dual_root_pr` on, the root also gets a fork-internal stack PR
+/// against the review's own transient fork branch. Feedback and a parent
+/// upstream move keep every commit on every PR branch, and the transient
+/// branch follows the parent's tip.
+#[test]
+fn dual_root_stack_pr_follows_a_parent_upstream_move_with_feedback_in_flight() {
+    let what = "dual root";
+    let (fx, forge) = Fixture::with_fork(&["feature/a", "feature/b", "feature/c"]);
+    fx.store
+        .lock()
+        .set_guardian_dual_root_pr(&fx.id, Some(true))
+        .unwrap();
+    fx.submit_stack();
+    // From here on the review's owner has no personal fork row of its own, only
+    // the project-wide default one: the daemon-side refresh must still find it.
+    fx.set_owner("alice");
+    let parent = forge.open_prs_in("acme/w");
+    let fork = forge.open_prs_in("bob/w");
+    assert_eq!(
+        (parent.len(), fork.len()),
+        (1, 3),
+        "{what}: a root PR on the parent plus the root's stack PR, b and c on the fork\n{}",
+        fx.describe()
+    );
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    fx.wait_settled_on(first.trim(), "before the race");
+
+    let mut held = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    let upstream = fx.push_upstream("upstream1.txt");
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+    fx.wait_settled_on(&upstream, what);
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_forge_routed_everything(what, &forge);
+    fx.assert_everything_published(
+        what,
+        &[(1, "feature-b.txt", "feedback on b")],
+        &["upstream1.txt"],
+    );
+    // The transient fork branch tracks the parent's current base tip.
+    let transient = git(
+        fx.pr_repo(),
+        &[
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/heads/ralphus/review/",
+        ],
+    );
+    assert!(
+        transient.contains(&upstream),
+        "{what}: the transient fork branch does not follow the parent tip {upstream:.9}: \
+         {transient:?}\n{}",
+        fx.describe()
+    );
+}
+
+/// The fork-internal stack PR of a dual-root review is closed on the forge
+/// while feedback is held and the parent moves: nothing may be lost, the
+/// parent's root PR stays open, and no duplicate PR appears.
+#[test]
+fn dual_root_stack_pr_closed_on_the_forge_mid_race_loses_nothing() {
+    let what = "dual root stack PR closed";
+    let (fx, forge) = Fixture::with_fork(&["feature/a", "feature/b", "feature/c"]);
+    fx.store
+        .lock()
+        .set_guardian_dual_root_pr(&fx.id, Some(true))
+        .unwrap();
+    fx.submit_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    fx.wait_settled_on(first.trim(), "before the race");
+    let (_, alias_a) = fx.open_pr_row(0);
+
+    let mut held = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    // Close the fork-internal PR that stacks the root on the transient branch.
+    let stack_pr = forge
+        .open_prs_in("bob/w")
+        .into_iter()
+        .find(|p| p.head == alias_a)
+        .expect("the root's fork-internal stack PR");
+    forge.with_pr_in("bob/w", stack_pr.number, |pr| pr.open = false);
+    let upstream = fx.push_upstream("upstream1.txt");
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+    std::thread::sleep(PARK_WAIT * 4);
+
+    assert!(
+        forge
+            .open_prs_in("acme/w")
+            .iter()
+            .any(|p| p.head == alias_a),
+        "{what}: the parent's root PR disappeared\n{}",
+        fx.describe()
+    );
+    let heads: Vec<String> = forge
+        .open_prs_in("bob/w")
+        .into_iter()
+        .map(|p| p.head)
+        .collect();
+    let mut unique = heads.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        heads.len(),
+        unique.len(),
+        "{what}: duplicate fork PRs: {heads:?}"
+    );
+    for p in 1..3 {
+        assert!(
+            fx.text_anywhere(&fx.review_ref(p), "feedback on b"),
+            "{what}: branch {p} lost the feedback (upstream {upstream:.9})\n{}",
+            fx.describe()
+        );
+    }
+}
+
+/// A reviewer pushes straight to a fork PR branch while a feedback round on
+/// the same branch is held and the parent moves: the reviewer's commit, the
+/// feedback and the upstream commit all end up on every fork PR branch above.
+#[test]
+fn reviewer_push_to_a_fork_pr_branch_racing_feedback_and_a_parent_move() {
+    let what = "fork reviewer push";
+    let (fx, forge) = Fixture::with_fork(&["feature/a", "feature/b", "feature/c"]);
+    fx.submit_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    fx.wait_settled_on(first.trim(), "before the race");
+
+    let mut held = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    fx.push_to_pr(1, "reviewer-b.txt");
+    let upstream = fx.push_upstream("upstream1.txt");
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+    fx.wait_settled_on(&upstream, what);
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_forge_routed_everything(what, &forge);
+    fx.assert_everything_published(
+        what,
+        &[
+            (1, "feature-b.txt", "feedback on b"),
+            (1, "reviewer-b.txt", "reviewer"),
+        ],
+        &["upstream1.txt"],
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Review modes: legacy branch names, shared-worktree toggles, a user-changed
+// base branch, and a multi-project review where one project cannot rebuild.
+// ---------------------------------------------------------------------------
+
+/// A review that predates readable review-branch names (RAL-378) uses the
+/// internal refs; its PRs, feedback and rebuilds must work the same.
+#[test]
+fn a_review_with_legacy_branch_names_keeps_feedback_through_an_upstream_rebase() {
+    let what = "legacy branch names";
+    let fx = Fixture::build_with(
+        &["feature/a", "feature/b", "feature/c"],
+        "origin/main",
+        true,
+    );
+    fx.store
+        .lock()
+        .set_guardian_proof_scope(&fx.id, Some("nothing"))
+        .unwrap();
+    assert!(
+        !fx.review_ref(0).ends_with("-review"),
+        "{what}: the fixture did not produce a legacy-named review: {}",
+        fx.review_ref(0)
+    );
+    fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let mut held = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    let upstream = fx.push_upstream("upstream1.txt");
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+    fx.wait_settled_on(&upstream, what);
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_everything_published(
+        what,
+        &[(1, "feature-b.txt", "feedback on b")],
+        &["upstream1.txt"],
+    );
+}
+
+/// Shared-worktree mode is switched on with review-only commits on the
+/// branches: the per-branch feedback is carried onto the one combined branch.
+///
+/// The opposite switch (shared mode back off) is deliberately not asserted
+/// here: it rebuilds every branch from its task tip and the feedback commits
+/// end up on no ref -- a known gap recorded in RACES_FOLLOWUP.local.md, which
+/// needs a design decision before it can be fixed or pinned. This only checks
+/// that the switch back completes.
+#[test]
+fn switching_shared_worktree_mode_on_carries_the_feedback_onto_the_combined_branch() {
+    let what = "shared-worktree toggle";
+    let fx = Fixture::new(&["feature/a", "feature/b"]);
+    fx.feedback(1, "fb-b.txt");
+    fx.feedback(0, "fb-a.txt");
+
+    fx.store
+        .lock()
+        .set_guardian_skip_worktrees(&fx.id, true)
+        .unwrap();
+    run_merge(&fx.store, &NoopRunner, &fx.id);
+    let view = fx.store.lock().get_guardian(&fx.id).unwrap();
+    assert_eq!(view.status, "in_review", "{what} (on): {:?}", view.detail);
+    let combined = view.review_branch.clone().expect("combined review branch");
+    let files = fx.files_on(&fx.root, &combined);
+    for f in ["feature-a.txt", "feature-b.txt", "fb-a.txt", "fb-b.txt"] {
+        assert!(
+            files.contains(f),
+            "{what}: the combined branch lost {f} after switching shared mode on:\n{files}"
+        );
+    }
+    fx.assert_no_carry_fallbacks(what, true);
+
+    fx.store
+        .lock()
+        .set_guardian_skip_worktrees(&fx.id, false)
+        .unwrap();
+    run_merge(&fx.store, &NoopRunner, &fx.id);
+    let view = fx.store.lock().get_guardian(&fx.id).unwrap();
+    assert_eq!(view.status, "in_review", "{what} (off): {:?}", view.detail);
+}
+
+/// The user changes the review's base branch (`review upstream set`) while a
+/// feedback round is held: the rebuild lands on the new base with the
+/// feedback.
+#[test]
+fn changing_the_base_branch_while_feedback_is_held_rebuilds_onto_the_new_base() {
+    let what = "base branch changed";
+    let fx = Fixture::with_upstream(&["feature/a", "feature/b", "feature/c"]);
+    fx.open_pr_stack();
+    // A `release` branch upstream, one commit ahead of `main`.
+    let clone = temp_dir();
+    let _ = std::fs::remove_dir_all(&clone);
+    git(
+        clone.parent().unwrap(),
+        &[
+            "clone",
+            "-q",
+            "--branch",
+            "main",
+            fx.remote.to_str().unwrap(),
+            clone.file_name().unwrap().to_str().unwrap(),
+        ],
+    );
+    git(&clone, &["checkout", "-q", "-b", "release"]);
+    write(&clone, "release.txt", "release\n");
+    git(&clone, &["add", "release.txt"]);
+    git(&clone, &["commit", "-q", "-m", "release only"]);
+    git(&clone, &["push", "-q", "origin", "release"]);
+    let release = git(&clone, &["rev-parse", "HEAD"]).trim().to_string();
+    let _ = std::fs::remove_dir_all(&clone);
+    git(
+        &fx.root,
+        &[
+            "fetch",
+            "-q",
+            "origin",
+            "release:refs/remotes/origin/release",
+        ],
+    );
+
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let mut held = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    fx.store
+        .lock()
+        .set_guardian_base_branch(&fx.id, "origin/release")
+        .unwrap();
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+    fx.wait_settled_on(&release, what);
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_everything_published(
+        what,
+        &[(1, "feature-b.txt", "feedback on b")],
+        &["release.txt"],
+    );
+}
+
+/// In a two-project review, one project's upstream moves in a way that
+/// conflicts and no agent is available: that project cannot rebuild, but the
+/// other project's feedback and the conflicting project's own commits stay
+/// reachable, and a later merge with a resolver finishes both.
+#[test]
+fn a_multi_project_review_with_one_project_unable_to_rebuild_loses_nothing() {
+    let what = "multi-project partial failure";
+    let fx = Fixture::with_upstream(&["feature/a", "feature/b"]);
+    let (other, other_remote) = second_project();
+    fx.store
+        .lock()
+        .add_guardian_branch_with_project(&fx.id, "feature/x", Some(other.to_str().unwrap()))
+        .unwrap();
+    run_merge(&fx.store, &NoopRunner, &fx.id);
+    let view = fx.store.lock().get_guardian(&fx.id).unwrap();
+    assert_eq!(view.status, "in_review", "{}", fx.describe());
+    let unexpected: Unexpected = Arc::default();
+    let daemon = DaemonPump::start(&fx);
+
+    let mut feedback_b = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    fx.push_upstream("upstream1.txt");
+    // `feature-x.txt` is created by the task and by this upstream commit.
+    push_to_upstream(&other_remote, "feature-x.txt");
+    std::thread::sleep(PARK_WAIT);
+    feedback_b.finish();
+    std::thread::sleep(PARK_WAIT * 6);
+
+    let view = fx.store.lock().get_guardian(&fx.id).unwrap();
+    let b_ref = view.branches[1].review_branch.clone().unwrap();
+    assert!(
+        fx.file_on(&fx.root, &b_ref, "feature-b.txt")
+            .contains("feedback on b"),
+        "{what}: the healthy project lost its feedback\n{}",
+        fx.describe()
+    );
+    drop(daemon);
+
+    let resolver = Arc::new(UnionResolver(Arc::clone(&unexpected)));
+    let daemon = DaemonPump::start_with(&fx, {
+        let resolver = Arc::clone(&resolver);
+        Arc::new(move |_| Arc::clone(&resolver) as Arc<dyn Runner>)
+    });
+    ralphus_daemon::guardian_merge::restart_guardian_merge(
+        Arc::clone(&fx.store),
+        daemon.cancellations.clone(),
+        Arc::clone(&resolver) as Arc<dyn Runner>,
+        &fx.id,
+        Arc::clone(&daemon.sem),
+    );
+    let deadline = Instant::now() + Duration::from_secs(240);
+    loop {
+        let view = fx.store.lock().get_guardian(&fx.id).unwrap();
+        let x_ref = view.branches[2].review_branch.clone();
+        let x_ok = x_ref.as_deref().is_some_and(|rev| {
+            let content = fx.file_on(&other, rev, "feature-x.txt");
+            content.contains("upstream") && content.contains("content")
+        });
+        if view.status == "in_review" && x_ok {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what}: never recovered once a resolver was available\n{}",
+            fx.describe()
+        );
+        std::thread::sleep(SETTLE_POLL);
+    }
+    let view = fx.store.lock().get_guardian(&fx.id).unwrap();
+    let b_ref = view.branches[1].review_branch.clone().unwrap();
+    assert!(
+        fx.file_on(&fx.root, &b_ref, "feature-b.txt")
+            .contains("feedback on b"),
+        "{what}: feedback on b lost on recovery"
+    );
+    assert!(fx.files_on(&fx.root, &b_ref).contains("upstream1.txt"));
+    let _ = std::fs::remove_dir_all(&other);
+    let _ = std::fs::remove_dir_all(&other_remote);
+}
+
+/// Seeded soak mixing every input kind the headless harness can drive: held
+/// feedback and PR fixes, reviewer pushes, an upstream push *or* a force-pushed
+/// upstream rewrite, and a user "Merge / rebase" restart landing mid-round.
+/// After each round every edit still live must be on every branch above where
+/// it was made, every surviving upstream file must be on all of them, and a
+/// dropped upstream file must be on none.
+fn mixed_inputs_soak(rounds: usize, seed: u64) {
+    let features = ["feature/a", "feature/b", "feature/c", "feature/d"];
+    let fx = Fixture::with_upstream(&features);
+    let pr_ids = fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let daemon = DaemonPump::start(&fx);
+    let n = features.len() as u64;
+    let mut seed = seed;
+    let mut next = move |n: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % n
+    };
+    let mut edits: Vec<(usize, String, String)> = Vec::new();
+    let mut upstream_files: Vec<String> = Vec::new();
+    for round in 0..rounds {
+        let mut positions: Vec<usize> = (0..features.len()).filter(|_| next(2) == 0).collect();
+        if positions.is_empty() {
+            positions.push(next(n) as usize);
+        }
+        eprintln!("SOAK round {round}: writers on {positions:?}");
+        let mut writers = Vec::new();
+        for &p in &positions {
+            let file = format!("{}.txt", features[p].replace('/', "-"));
+            let fix = next(2) == 0;
+            let line = format!(
+                "round {round} {} on {p}",
+                if fix { "fix" } else { "feedback" }
+            );
+            let held = Held::new(&file, &line, &unexpected);
+            writers.push(if fix {
+                held.auto_fix(&fx, &pr_ids[p])
+            } else {
+                held.feedback(&fx, p)
+            });
+            edits.push((p, file, line));
+        }
+        for _ in 0..next(2) {
+            let p = next(n) as usize;
+            let file = format!("reviewer-r{round}-{}.txt", edits.len());
+            eprintln!("SOAK round {round}: reviewer pushes {file} to PR {p}");
+            fx.push_to_pr(p, &file);
+            edits.push((p, file, "reviewer".to_string()));
+        }
+        // Either a plain upstream push, or (after the first round) a rewrite
+        // that drops the previous upstream commit for a replacement.
+        let (upstream, dropped) = if round > 0 && next(3) == 0 {
+            let replacement = format!("upstream{round}.txt");
+            eprintln!("SOAK round {round}: upstream REWRITE -> {replacement}");
+            let tip = fx.force_push_upstream(1, Some(&replacement));
+            let dropped = upstream_files.pop();
+            upstream_files.push(replacement);
+            (tip, dropped)
+        } else {
+            let file = format!("upstream{round}.txt");
+            eprintln!("SOAK round {round}: upstream push {file}");
+            let tip = fx.push_upstream(&file);
+            upstream_files.push(file);
+            (tip, None)
+        };
+        std::thread::sleep(Duration::from_millis(500 + 500 * next(3)));
+        // A user's "Merge / rebase" lands while the writers are still held.
+        let restart = next(2) == 0;
+        eprintln!("SOAK round {round}: restart merge = {restart}");
+        let restarting = restart.then(|| {
+            let (store, cancellations, sem, id) = (
+                Arc::clone(&fx.store),
+                daemon.cancellations.clone(),
+                Arc::clone(&daemon.sem),
+                fx.id.clone(),
+            );
+            std::thread::spawn(move || {
+                ralphus_daemon::guardian_merge::restart_guardian_merge(
+                    store,
+                    cancellations,
+                    Arc::new(NoAgentExpected),
+                    &id,
+                    sem,
+                );
+            })
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        while !writers.is_empty() {
+            let i = next(writers.len() as u64) as usize;
+            writers.remove(i).finish();
+            std::thread::sleep(Duration::from_millis(100 * next(4)));
+        }
+        if let Some(thread) = restarting {
+            thread.join().expect("restart thread");
+        }
+        let what = format!("mixed soak round {round}");
+        fx.wait_settled_on(&upstream, &what);
+        fx.assert_no_unexpected_agent_calls(&what, &unexpected);
+        let edit_refs: Vec<(usize, &str, &str)> = edits
+            .iter()
+            .map(|(p, f, l)| (*p, f.as_str(), l.as_str()))
+            .collect();
+        let upstream_refs: Vec<&str> = upstream_files.iter().map(String::as_str).collect();
+        fx.assert_everything_published(&what, &edit_refs, &upstream_refs);
+        if let Some(gone) = dropped {
+            fx.assert_file_nowhere(&what, &gone);
+        }
+    }
+}
+
+#[test]
+#[ignore = "multi-minute mixed-input stress run; runs in the nightly race workflow"]
+fn soak_mixed_inputs_across_four_branches() {
+    mixed_inputs_soak(4, 0x0DDB_1A5E_5BAD_5EED);
+}
+
+/// The daemon restarts while another process holds the database's write lock
+/// (a backup, a `sqlite3` shell, a slow neighbour): startup recovery and the
+/// first maintenance sweeps hit `database is locked`. Once the lock clears,
+/// the rebuild must finish with every commit -- a busy store is a delay, never
+/// a dropped review-only commit or a review stuck in `merging`.
+#[test]
+fn daemon_restart_while_the_store_is_busy_still_recovers_every_commit() {
+    let what = "restart with a busy store";
+    let mut fx = Fixture::with_upstream(&["feature/a", "feature/b", "feature/c"]);
+    fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    for (p, file) in [(0, "feature-a.txt"), (1, "feature-b.txt")] {
+        let mut round = Held::new(file, &format!("feedback on {p}"), &unexpected).feedback(&fx, p);
+        round.finish();
+    }
+    let upstream = fx.push_upstream("upstream1.txt");
+
+    // What a daemon killed mid-rebuild leaves behind.
+    ralphus_daemon::guardian_merge::poll_base_branch_freshness_once(&fx.store);
+    {
+        let guard = fx.store.lock();
+        guard
+            .set_guardian_status(&fx.id, GuardianStatus::Merging, None)
+            .unwrap();
+        guard
+            .set_branch_status(&fx.id, &fx.branch_ids[1], MergeStatus::InProgress, None)
+            .unwrap();
+    }
+
+    // A foreign connection takes the write lock for a few seconds.
+    let db = fx.root.join(".git").join("ralphus-test.db");
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let holder = {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            let conn = rusqlite::Connection::open(db).expect("open the database");
+            conn.execute_batch("BEGIN EXCLUSIVE;").expect("lock it");
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_secs(4));
+            conn.execute_batch("COMMIT;").expect("release it");
+        })
+    };
+    locked_rx.recv().unwrap();
+
+    fx.store = Arc::new(StoreMutex::new(Store::open(&db).unwrap_or_else(|e| {
+        // Opening may itself be refused while the lock is held: wait it out.
+        std::thread::sleep(Duration::from_secs(5));
+        Store::open(&db).unwrap_or_else(|_| panic!("could not reopen the store: {e}"))
+    })));
+    let daemon = DaemonPump::start(&fx);
+    ralphus_daemon::scheduler::recover_interrupted_reviews(
+        &fx.store,
+        &daemon.sem,
+        &daemon.cancellations,
+    );
+    holder.join().expect("lock holder");
+
+    fx.wait_settled_on(&upstream, what);
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_everything_published(
+        what,
+        &[
+            (0, "feature-a.txt", "feedback on 0"),
+            (1, "feature-b.txt", "feedback on 1"),
+        ],
+        &["upstream1.txt"],
+    );
+}
+
+/// A reviewer pushes straight to a PR branch; later a user clicks "Merge /
+/// rebase" (a restart merge) while a feedback round is held and the base
+/// moves. `settled_first` waits for the daemon to pull the reviewer's commit
+/// into the review branch before the restart; otherwise the restart lands
+/// right on the heels of the push. Either way the reviewer's commit must
+/// survive on the review branch and the PR branch.
+fn restart_merge_after_a_reviewer_push(settled_first: bool) {
+    let what = if settled_first {
+        "restart after a pulled reviewer push"
+    } else {
+        "restart right after a reviewer push"
+    };
+    let fx = Fixture::with_upstream(&["feature/a", "feature/b", "feature/c"]);
+    fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let daemon = DaemonPump::start(&fx);
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    fx.wait_settled_on(first.trim(), "before the push");
+
+    fx.push_to_pr(0, "reviewer-a.txt");
+    if settled_first {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while !fx
+            .file_on(&fx.root, &fx.review_ref(0), "reviewer-a.txt")
+            .contains("reviewer")
+        {
+            assert!(
+                Instant::now() < deadline,
+                "{what}: the daemon never pulled the reviewer's commit\n{}",
+                fx.describe()
+            );
+            std::thread::sleep(SETTLE_POLL);
+        }
+    }
+
+    let mut held = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    let upstream = fx.push_upstream("upstream1.txt");
+    let restarting = {
+        let (store, cancellations, sem, id) = (
+            Arc::clone(&fx.store),
+            daemon.cancellations.clone(),
+            Arc::clone(&daemon.sem),
+            fx.id.clone(),
+        );
+        std::thread::spawn(move || {
+            ralphus_daemon::guardian_merge::restart_guardian_merge(
+                store,
+                cancellations,
+                Arc::new(NoAgentExpected),
+                &id,
+                sem,
+            );
+        })
+    };
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+    restarting.join().expect("restart thread");
+
+    fx.wait_settled_on(&upstream, what);
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_everything_published(
+        what,
+        &[
+            (0, "reviewer-a.txt", "reviewer"),
+            (1, "feature-b.txt", "feedback on b"),
+        ],
+        &["upstream1.txt"],
+    );
+}
+
+#[test]
+fn restart_merge_keeps_a_reviewer_commit_the_daemon_already_pulled() {
+    restart_merge_after_a_reviewer_push(true);
+}
+
+#[test]
+fn restart_merge_keeps_a_reviewer_commit_pushed_just_before_it() {
+    restart_merge_after_a_reviewer_push(false);
+}
+
+/// A PR is merged on the forge and a submission pass runs before the daemon
+/// has fetched the new base (no maintenance pump here: the daemon is "not
+/// there yet"). The merged branches' work is already upstream, so the pass
+/// must not file fresh PRs for them.
+fn submission_right_after_a_forge_merge_does_not_refile_merged_work_on(kind: &str) {
+    let what = "submit right after a forge merge";
+    let (fx, forge) = Fixture::with_forge_kind(&["feature/a", "feature/b", "feature/c"], kind);
+    fx.submit_stack();
+    let created_before = forge.state.lock().unwrap().prs.len();
+    assert_eq!(created_before, 3, "{what}: setup");
+    // PR b (with a's commits under it) merges: both branches' work is upstream.
+    fx.merge_pr_on_forge(&forge, 1);
+
+    let result = ralphus_daemon::pr::submit_pull_requests(
+        &fx.store,
+        &NoAgentExpected,
+        &fx.id,
+        stack_request(),
+        "tester",
+        false,
+    );
+    let created_after = forge.state.lock().unwrap().prs.len();
+    assert_eq!(
+        created_after,
+        created_before,
+        "{what}: a submission pass filed {} new PR(s) for work that already landed upstream \
+         (result: {:?}); forge PRs now: {:?}\n{}",
+        created_after - created_before,
+        result.as_ref().map(|prs| prs.len()),
+        forge
+            .state
+            .lock()
+            .unwrap()
+            .prs
+            .iter()
+            .map(|p| (p.number, p.head.clone(), p.base.clone(), p.open, p.merged))
+            .collect::<Vec<_>>(),
+        fx.describe()
+    );
+}
+
+#[test]
+fn submission_right_after_a_forge_merge_does_not_refile_merged_work() {
+    submission_right_after_a_forge_merge_does_not_refile_merged_work_on("github");
+}
+
+#[test]
+fn submission_right_after_a_forge_merge_does_not_refile_merged_work_on_gitlab() {
+    submission_right_after_a_forge_merge_does_not_refile_merged_work_on("gitlab");
+}
+
+// ---------------------------------------------------------------------------
+// Live-matrix parity: commits made by hand in a review worktree (the live
+// matrix's A inputs), alone and racing feedback and reviewer pushes.
+// ---------------------------------------------------------------------------
+
+impl Fixture {
+    /// A reviewer commits `line` to `file` by hand in branch `position`'s
+    /// review worktree. With `push`, they also push it to the branch's PR
+    /// branch themselves (`git push origin HEAD:<alias>`).
+    fn worktree_commit(&self, position: usize, file: &str, line: &str, push: bool) {
+        let worktree = PathBuf::from(
+            self.store.lock().get_guardian(&self.id).unwrap().branches[position]
+                .worktree
+                .clone()
+                .expect("the branch's review worktree"),
+        );
+        append_line(&worktree, file, line);
+        git(&worktree, &["add", "--all"]);
+        git(
+            &worktree,
+            &["commit", "-q", "-m", &format!("by hand: {line}")],
+        );
+        if push {
+            let alias = self.pr_ref(position);
+            git(
+                &worktree,
+                &["push", "-q", "origin", &format!("HEAD:{alias}")],
+            );
+        }
+    }
+}
+
+/// A0: an unpushed commit made by hand in a review worktree is restacked onto
+/// the branches above and published to every PR from there up.
+#[test]
+fn a_by_hand_commit_in_a_review_worktree_reaches_the_prs_above() {
+    let what = "A0";
+    let fx = Fixture::with_upstream(&["feature/a", "feature/b", "feature/c"]);
+    fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    fx.wait_settled_on(first.trim(), "before the commit");
+    fx.worktree_commit(0, "by-hand.txt", "by hand on a", false);
+    std::thread::sleep(PARK_WAIT * 3);
+    fx.wait_settled_on(first.trim(), what);
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_everything_published(what, &[(0, "by-hand.txt", "by hand on a")], &[]);
+}
+
+/// A1P: the same commit, pushed to the PR branch by the reviewer themselves.
+#[test]
+fn a_by_hand_commit_pushed_to_the_pr_branch_is_kept_and_restacked() {
+    let what = "A1P";
+    let fx = Fixture::with_upstream(&["feature/a", "feature/b", "feature/c"]);
+    fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    fx.wait_settled_on(first.trim(), "before the commit");
+    fx.worktree_commit(1, "by-hand.txt", "by hand on b", true);
+    std::thread::sleep(PARK_WAIT * 3);
+    fx.wait_settled_on(first.trim(), what);
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_everything_published(what, &[(1, "by-hand.txt", "by hand on b")], &[]);
+}
+
+/// AC: a by-hand commit on one branch races a held feedback round on another.
+#[test]
+fn a_by_hand_commit_racing_feedback_on_the_branch_above_keeps_both() {
+    let what = "AC";
+    let fx = Fixture::with_upstream(&["feature/a", "feature/b", "feature/c"]);
+    fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    fx.wait_settled_on(first.trim(), "before the race");
+    let mut held = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    fx.worktree_commit(0, "by-hand.txt", "by hand on a", false);
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+    std::thread::sleep(PARK_WAIT * 3);
+    fx.wait_settled_on(first.trim(), what);
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_everything_published(
+        what,
+        &[
+            (0, "by-hand.txt", "by hand on a"),
+            (1, "feature-b.txt", "feedback on b"),
+        ],
+        &[],
+    );
+}
+
+/// AB0: a by-hand commit and a reviewer's push on the *same* branch, so the PR
+/// branch and the review branch diverge: both commits must end up on both.
+#[test]
+fn a_by_hand_commit_and_a_reviewer_push_to_the_same_branch_both_survive() {
+    let what = "AB0";
+    let fx = Fixture::with_upstream(&["feature/a", "feature/b", "feature/c"]);
+    fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start_resolving(&fx, &unexpected);
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    fx.wait_settled_on(first.trim(), "before the race");
+    fx.worktree_commit(0, "by-hand.txt", "by hand on a", false);
+    fx.push_to_pr(0, "reviewer-a.txt");
+    std::thread::sleep(PARK_WAIT * 3);
+    fx.wait_settled_on(first.trim(), what);
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_everything_published(
+        what,
+        &[
+            (0, "by-hand.txt", "by hand on a"),
+            (0, "reviewer-a.txt", "reviewer"),
+        ],
+        &[],
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Post-merge jobs (RAL-520): the manual-checks generation runs in a worker of
+// its own after a merge settles, and must not interfere with the next round.
+// ---------------------------------------------------------------------------
+
+/// The agent behind manual-checks generation: signals when it starts, holds
+/// until released, then answers with one check. Any other agent call is
+/// recorded as unexpected.
+struct HeldManualChecks {
+    started: Arc<AtomicBool>,
+    release: Arc<AtomicBool>,
+    unexpected: Unexpected,
+}
+
+impl Runner for HeldManualChecks {
+    fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+        if spec.task == "manual_commands" {
+            self.started.store(true, Ordering::SeqCst);
+            let deadline = Instant::now() + Duration::from_secs(120);
+            while !self.release.load(Ordering::SeqCst) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            return ok_result("[\"echo check\"]", None);
+        }
+        self.unexpected
+            .lock()
+            .unwrap()
+            .push(format!("unexpected call {} ({})", spec.cell_id, spec.task));
+        RunnerResult::failure("unexpected agent call")
+    }
+}
+
+/// A settled review's manual-checks generation is held mid-run while a
+/// feedback round starts on the same review and the base moves. The worker
+/// must stand down or finish without blocking the round, and the round, the
+/// rebuild and every commit must be unaffected.
+#[test]
+fn post_merge_checks_running_while_the_next_feedback_round_starts_lose_nothing() {
+    let what = "post-merge checks vs feedback";
+    let fx = Fixture::with_upstream(&["feature/a", "feature/b", "feature/c"]);
+    fx.open_pr_stack();
+    let unexpected: Unexpected = Arc::default();
+    let _daemon = DaemonPump::start(&fx);
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    fx.wait_settled_on(first.trim(), "before the race");
+
+    let started = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let checks = {
+        let (store, id) = (Arc::clone(&fx.store), fx.id.clone());
+        let runner = HeldManualChecks {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+            unexpected: Arc::clone(&unexpected),
+        };
+        std::thread::spawn(move || {
+            ralphus_daemon::guardian_merge::run_guardian_post_merge(
+                &store,
+                &runner,
+                &id,
+                ralphus_daemon::guardian_merge::PostMergeJobs::ALL,
+            );
+        })
+    };
+    wait_for(&started, "the manual-checks generation");
+
+    let mut held = Held::new("feature-b.txt", "feedback on b", &unexpected).feedback(&fx, 1);
+    let upstream = fx.push_upstream("upstream1.txt");
+    std::thread::sleep(PARK_WAIT);
+    held.finish();
+    release.store(true, Ordering::SeqCst);
+    checks.join().expect("post-merge worker");
+
+    fx.wait_settled_on(&upstream, what);
+    fx.assert_no_unexpected_agent_calls(what, &unexpected);
+    fx.assert_everything_published(
+        what,
+        &[(1, "feature-b.txt", "feedback on b")],
+        &["upstream1.txt"],
     );
 }

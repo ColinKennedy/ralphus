@@ -781,6 +781,10 @@ pub struct MessageView {
 /// column explicitly (RAL-318).
 pub const GUARDIAN_ORIGIN_EXPLICIT: &str = "explicit";
 
+/// Separates the rounds recorded in a branch's `pending_feedback` column (the
+/// ASCII record separator, which never occurs in feedback text).
+const PENDING_FEEDBACK_SEPARATOR: &str = "\u{1e}";
+
 /// [`GuardianView::origin`] value for a review the Arbiter created by
 /// draining a Triage pool once its count threshold or a cron schedule fired
 /// (RAL-318). See `crate::reviews::derive_triage_pools`.
@@ -4811,36 +4815,88 @@ impl Store {
     /// shutdown mid-run leaves a record startup recovery can find and
     /// reapply, instead of the feedback existing only as that function's own
     /// argument (gone the instant the process dies).
+    ///
+    /// A branch can have several rounds queued behind one another's
+    /// worktree lease, so the column holds a list of entries (separated by
+    /// [`PENDING_FEEDBACK_SEPARATOR`]); a round already recorded (startup
+    /// recovery re-running it) is not added twice.
     pub fn set_branch_pending_feedback(
         &self,
         guardian_id: &str,
         branch_id: &str,
         feedback: &str,
     ) -> Result<()> {
+        let mut entries = self.pending_feedback_entries(guardian_id, branch_id)?;
+        if entries.iter().any(|e| e == feedback) {
+            return Ok(());
+        }
+        entries.push(feedback.to_string());
+        self.write_pending_feedback(guardian_id, branch_id, &entries)
+    }
+
+    /// RAL-375: clear a branch's whole pending-feedback record.
+    pub fn clear_branch_pending_feedback(&self, guardian_id: &str, branch_id: &str) -> Result<()> {
+        self.write_pending_feedback(guardian_id, branch_id, &[])
+    }
+
+    /// Drop one round's pending-feedback entry, leaving any other round still
+    /// queued on the branch recorded. Called from every real exit path of
+    /// `guardian_merge::run_feedback` (success or a legitimate failure) --
+    /// only a literal crash mid-run leaves an entry set, which is exactly the
+    /// signal startup recovery looks for.
+    pub fn clear_branch_pending_feedback_entry(
+        &self,
+        guardian_id: &str,
+        branch_id: &str,
+        feedback: &str,
+    ) -> Result<()> {
+        let mut entries = self.pending_feedback_entries(guardian_id, branch_id)?;
+        if let Some(at) = entries.iter().position(|e| e == feedback) {
+            entries.remove(at);
+        }
+        self.write_pending_feedback(guardian_id, branch_id, &entries)
+    }
+
+    fn pending_feedback_entries(&self, guardian_id: &str, branch_id: &str) -> Result<Vec<String>> {
+        let stored: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT pending_feedback FROM guardian_branches WHERE guardian_id=? AND id=?",
+                params![guardian_id, branch_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(stored
+            .map(|text| {
+                text.split(PENDING_FEEDBACK_SEPARATOR)
+                    .filter(|e| !e.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    fn write_pending_feedback(
+        &self,
+        guardian_id: &str,
+        branch_id: &str,
+        entries: &[String],
+    ) -> Result<()> {
+        let stored = (!entries.is_empty()).then(|| entries.join(PENDING_FEEDBACK_SEPARATOR));
         self.conn.execute(
             "UPDATE guardian_branches SET pending_feedback=? WHERE guardian_id=? AND id=?",
-            params![feedback, guardian_id, branch_id],
+            params![stored, guardian_id, branch_id],
         )?;
         Ok(())
     }
 
-    /// RAL-375: clear a branch's pending-feedback record. Called from every
-    /// real exit path of `guardian_merge::run_feedback` (success or a
-    /// legitimate failure) -- only a literal crash mid-run leaves this set,
-    /// which is exactly the signal startup recovery looks for.
-    pub fn clear_branch_pending_feedback(&self, guardian_id: &str, branch_id: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE guardian_branches SET pending_feedback=NULL WHERE guardian_id=? AND id=?",
-            params![guardian_id, branch_id],
-        )?;
-        Ok(())
-    }
-
-    /// RAL-375: every branch with feedback still awaiting application, as
-    /// `(guardian_id, branch_id, feedback_text)`. Non-empty only after an
-    /// unclean shutdown interrupted `guardian_merge::run_feedback` mid-run;
-    /// startup recovery reapplies each one directly, since an ordinary
-    /// rebuild would otherwise silently discard it.
+    /// RAL-375: every feedback round still awaiting application, as
+    /// `(guardian_id, branch_id, feedback_text)` -- one row per round, so a
+    /// branch with several queued rounds appears several times. Non-empty
+    /// only after an unclean shutdown interrupted
+    /// `guardian_merge::run_feedback`; startup recovery reapplies each one
+    /// directly, since an ordinary rebuild would otherwise silently discard it.
     pub fn branches_with_pending_feedback(&self) -> Result<Vec<(String, String, String)>> {
         let mut stmt = self.conn.prepare(
             "SELECT guardian_id, id, pending_feedback FROM guardian_branches \
@@ -4855,7 +4911,15 @@ impl Store {
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
+        Ok(rows
+            .into_iter()
+            .flat_map(|(guardian, branch, text)| {
+                text.split(PENDING_FEEDBACK_SEPARATOR)
+                    .filter(|e| !e.is_empty())
+                    .map(|e| (guardian.clone(), branch.clone(), e.to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .collect())
     }
 
     /// RAL-317: set or clear this branch's one-shot auto-submit-PR-stack

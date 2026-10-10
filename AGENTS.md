@@ -74,6 +74,15 @@ alternatives to reach for are in
   librarian exe is locked from underneath it, so `--all-targets` doesn't just
   fail, it often hangs. Use `cargo nextest run -p ralphus-daemon --lib` (and
   the same for `ralphus-librarian`) instead. See `.agent/gotchas.md`.
+- **Do not run the review-input race suite unless asked.**
+  `daemon/tests/review_input_races.rs` (~140 real-git scenarios, ~25
+  CPU-minutes) is excluded from `cargo test` and every `cargo nextest run` --
+  including `--workspace --all-targets` -- by `.config/nextest.toml`'s
+  its test target requires the `race-suite` feature. It is reachable only through that feature and its own profile:
+  `cargo nextest run -P review-races -p ralphus-daemon --features race-suite [-E 'test(name)']`
+  (add `--run-ignored only` for the `soak_*` tests). Run a single scenario
+  that way when you change review/PR/guardian code it covers; never the whole
+  file mid-edit.
 - **Never launch a second daemon or tmux server from inside a ralphus cell or
   feedback pass** (dogfooding) — no `scripts/check-initialize-exercises.sh`, no
   `ralphus initialize <exercise>`. Its startup reap kills every `ralphus_`

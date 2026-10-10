@@ -27,6 +27,18 @@ secure-dist = ["ralphus-auth/secure-dist"]
 # populate daemon/assets/tmux/windows/tmux.exe before enabling. See
 # docs/tmux-embedding.md.
 embedded-tmux = []
+# Builds and runs `tests/review_input_races.rs`, ~150 real-git scenarios that
+# take ~30 minutes on a hosted runner. The test target requires this feature
+# (below), so `cargo test`, `cargo nextest run`, `--all-targets` and
+# `--workspace` all skip it; only naming the feature runs it. Enable it only
+# on purpose: `cargo nextest run -P review-races -p ralphus-daemon --features
+# race-suite`.
+race-suite = []
+
+[[test]]
+name = "review_input_races"
+path = "tests/review_input_races.rs"
+required-features = ["race-suite"]
 
 [dependencies]
 ralphus-auth = { path = "../auth" }
