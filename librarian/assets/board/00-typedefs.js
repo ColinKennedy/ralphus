@@ -81,6 +81,8 @@
        * @property {number} [maximum_context] - RAL-304: resolved context-window token limit, or absent for no cap. Only ever set for a backend with a real delivery mechanism (codex, pi) -- see `agent_supports_maximum_context`.
        * @property {number} [auto_compact_threshold] - RAL-304: resolved auto-compact trigger threshold in tokens, or absent for no explicit threshold. Accepted by a wider set of backends than `maximum_context` (codex, pi, and claude-code) -- see `agent_supports_auto_compact_threshold`.
        * @property {number} [maximum_tool_output_tokens] - RAL-333: resolved tool-output token cap (cell overrides task), or absent for no cap -- see `agent_supports_maximum_tool_output_tokens`.
+       * @property {string} [effort] - RAL-607: reasoning-effort level for the cell's agent (cell overrides task), or absent.
+       * @property {number} [temperature] - RAL-607: sampling temperature (Pi only; cell overrides task), or absent.
        * @property {string|null} [error]
        * @property {ProofView[]} [proof]
        * @property {string[]} [depends_on]

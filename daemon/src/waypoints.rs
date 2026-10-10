@@ -8356,6 +8356,8 @@ mod tests {
             auto_compact_threshold: None,
             maximum_context: None,
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             system_prompt: None,
         }
     }
