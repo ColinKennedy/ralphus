@@ -113,6 +113,7 @@ where one exists.
 |---|---|---|
 | GET | `/api/guardians` | List all reviews (returns a **bare JSON array**, not `{guardians:[...]}`) |
 | GET | `/api/guardian-index` | [Compact review list](#get-apiguardian-index) for the Reviews tab's sidebar (returns a **bare JSON array**) |
+| GET | `/api/guardian-branch-states` | [Per-branch `enabled`/`merge_status`](#get-apiguardian-branch-states) for a set of reviews — the sidebar's colored branch bars |
 | POST | `/api/guardians` | Create a review |
 | GET | `/api/guardians/{id}` | [One review's full detail](#get-apiguardiansid) |
 | GET | `/api/guardians/{id}/logs` | State-transition audit log (bare array) |
@@ -1797,6 +1798,16 @@ modified. A dependency that is already present is a no-op. Returns `200` with
 the updated squad. A self-reference or a reference that would create a cycle in
 the cross-squad dependency graph is a `409`; an unknown `id`/`target_id` is a
 `404`; a malformed body is a `400`.
+
+### `GET /api/guardian-branch-states`
+
+Query: `ids` — comma-separated review ids (at most 200; extras are ignored).
+Returns an object keyed by review id, each value the review's branches in
+stack order as `{"enabled": bool, "merge_status": string}`; a review with no
+branches, or an unknown id, is absent. The board's Reviews sidebar calls it for
+the rows currently visible to paint each row's colored branch bars, so it never
+needs a review's full detail (`GET /api/guardians/{id}`) just for that. Served
+from the read pool; `merge_status` is the same column the full view reports.
 
 ### `GET /api/guardian-index`
 

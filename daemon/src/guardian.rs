@@ -5251,6 +5251,39 @@ impl Store {
         Ok(rows)
     }
 
+    /// Every branch's `(enabled, merge_status)` for each of `guardian_ids`,
+    /// in stack order, keyed by guardian id -- the board sidebar's colored
+    /// branch bars read nothing else, so this skips the full per-guardian
+    /// hydration `get_guardian_conn` does. A guardian with no branch rows is
+    /// simply absent from the map.
+    pub(crate) fn guardian_branch_states_conn(
+        conn: &Connection,
+        guardian_ids: &[&str],
+    ) -> Result<std::collections::BTreeMap<String, Vec<(bool, String)>>> {
+        let mut out: std::collections::BTreeMap<String, Vec<(bool, String)>> =
+            std::collections::BTreeMap::new();
+        if guardian_ids.is_empty() {
+            return Ok(out);
+        }
+        let marks = vec!["?"; guardian_ids.len()].join(",");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT guardian_id, enabled, merge_status FROM guardian_branches
+             WHERE guardian_id IN ({marks}) ORDER BY guardian_id, position"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(guardian_ids.iter()), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1).map(|v| v != 0).unwrap_or(true),
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (gid, enabled, status) = row?;
+            out.entry(gid).or_default().push((enabled, status));
+        }
+        Ok(out)
+    }
+
     /// One guardian branch's live `merge_status` (RAL-428) -- the branch's
     /// current resolver phase, which decides which system prompt text the
     /// `GET /api/guardians/{id}/branches/{branch_id}/system-prompt` endpoint

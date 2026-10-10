@@ -1177,6 +1177,9 @@
       .spark i.s-done, .spark i.s-merged { background: var(--done); }
       .spark i.s-conflict_resolved { background: var(--queued); }
       .spark i.s-failed { background: var(--failed); }
+      .spark i.s-pending, .spark i.s-stopped { background: var(--pending); }
+      .spark i.s-actioning { background: var(--running); }
+      .spark i.s-closed { background: var(--cancelled); }
       .spark i.s-ready, .spark i.s-in_progress { background: var(--accent); }
       .spark i.s-proof_pending { background: var(--materializing); }
       .spark i.off { background: var(--border); opacity: .5; }

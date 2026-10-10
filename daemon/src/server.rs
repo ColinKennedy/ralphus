@@ -1973,6 +1973,8 @@ fn route_for_user(
         ("GET", ["api", "guardians"]) => guardian_list(daemon),
         // ralphus[ignore-endpoint-cli]: board Reviews tab lean-summary list poll; CLI `review list` uses GET /api/guardians instead
         ("GET", ["api", "guardian-index"]) => guardian_index(daemon),
+        // ralphus[ignore-endpoint-cli]: board Reviews sidebar's per-row branch bars; CLI `review list`/`review show` carry full branch detail already
+        ("GET", ["api", "guardian-branch-states"]) => guardian_branch_states(daemon, query),
         ("POST", ["api", "guardians"]) => guardian_create(daemon, user_header, body),
         ("GET", ["api", "guardians", id]) => guardian_get(daemon, id),
         ("GET", ["api", "guardians", id, "logs"]) => guardian_logs(daemon, id),
@@ -14581,6 +14583,53 @@ fn guardian_index(daemon: &Daemon) -> Reply {
                 })
                 .collect();
             json(200, &entries)
+        }
+        Err(e) => store_error(&e),
+    }
+}
+
+/// Most reviews one `GET /api/guardian-branch-states` call answers for; ids
+/// past this are ignored. The board asks only for the sidebar rows currently
+/// visible, so this just bounds a buggy or hostile caller.
+const GUARDIAN_BRANCH_STATES_MAX_IDS: usize = 200;
+
+/// One branch in a `GET /api/guardian-branch-states` response.
+#[derive(Serialize)]
+struct GuardianBranchState {
+    enabled: bool,
+    merge_status: String,
+}
+
+/// `GET /api/guardian-branch-states?ids=a,b,c` -- just `{enabled,
+/// merge_status}` per branch for the named reviews, keyed by review id, so the
+/// Reviews sidebar can paint each row's branch bars without fetching (or
+/// serializing) every review's full detail. Read-pool only.
+fn guardian_branch_states(daemon: &Daemon, query: &str) -> Reply {
+    let decoded = query_param(query, "ids")
+        .map(url_decode)
+        .unwrap_or_default();
+    let ids: Vec<&str> = decoded
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .take(GUARDIAN_BRANCH_STATES_MAX_IDS)
+        .collect();
+    match daemon.with_read_snapshot(|conn| Store::guardian_branch_states_conn(conn, &ids)) {
+        Ok(states) => {
+            let body: std::collections::BTreeMap<String, Vec<GuardianBranchState>> = states
+                .into_iter()
+                .map(|(gid, branches)| {
+                    let branches = branches
+                        .into_iter()
+                        .map(|(enabled, merge_status)| GuardianBranchState {
+                            enabled,
+                            merge_status,
+                        })
+                        .collect();
+                    (gid, branches)
+                })
+                .collect();
+            json(200, &body)
         }
         Err(e) => store_error(&e),
     }
@@ -29482,6 +29531,62 @@ remediation_attempts = 1
         // The full endpoint is unaffected by this one's existence.
         let full = route(&d, "GET", "/api/guardians", "");
         assert!(full.body.contains("\"skip_auto_build\""));
+    }
+
+    #[test]
+    fn guardian_branch_states_reports_each_branchs_live_status_for_the_named_reviews() {
+        let d = daemon();
+        let mut ids = Vec::new();
+        for name in ["one", "two"] {
+            let body = serde_json::json!({
+                "name": name, "base_branch": "main", "git_root": "/repo",
+            })
+            .to_string();
+            let created = route(&d, "POST", "/api/guardians", &body);
+            assert_eq!(created.status, 201, "{}", created.body);
+            let id: serde_json::Value = serde_json::from_str(&created.body).unwrap();
+            ids.push(id["id"].as_str().unwrap().to_string());
+        }
+        d.lock().add_guardian_branch(&ids[0], "a").unwrap();
+        d.lock().add_guardian_branch(&ids[0], "b").unwrap();
+        let first = d.lock().guardian_branches(&ids[0]).unwrap();
+        d.lock()
+            .set_branch_status(
+                &ids[0],
+                &first[0].id,
+                crate::guardian::MergeStatus::Done,
+                None,
+            )
+            .unwrap();
+        d.lock()
+            .set_branch_status(
+                &ids[0],
+                &first[1].id,
+                crate::guardian::MergeStatus::Failed,
+                Some("boom"),
+            )
+            .unwrap();
+
+        let resp = route(
+            &d,
+            "GET",
+            &format!("/api/guardian-branch-states?ids={},{}", ids[0], ids[1]),
+            "",
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let states: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        let one = states[&ids[0]].as_array().unwrap();
+        assert_eq!(one.len(), 2);
+        assert_eq!(one[0]["merge_status"], "done");
+        assert_eq!(one[1]["merge_status"], "failed");
+        assert_eq!(one[1]["enabled"], true);
+        // A review with no branches is absent, and nothing else is serialized.
+        assert!(states.get(&ids[1]).is_none());
+        assert!(!resp.body.contains("\"detail\""));
+
+        let none = route(&d, "GET", "/api/guardian-branch-states", "");
+        assert_eq!(none.status, 200);
+        assert_eq!(none.body, "{}");
     }
 
     #[test]
