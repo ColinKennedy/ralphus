@@ -474,7 +474,7 @@ mod tests {
             }
         );
         // The index must be untouched: the untracked file is still untracked.
-        let status = git(&dir, &["status", "--porcelain"]).unwrap();
+        let status = git_detailed(&dir, &["status", "--porcelain"]).unwrap();
         assert!(status.contains("?? new.txt"), "{status}");
         let _ = std::fs::remove_dir_all(&dir);
     }

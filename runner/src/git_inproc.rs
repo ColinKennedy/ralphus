@@ -180,6 +180,28 @@ enum Read<'a> {
     Subjects { range: &'a str, reverse: bool },
     /// `rev-list --count <range>`
     Count { range: &'a str },
+    /// `ls-tree -r -z --name-only <ref>`
+    LsTree { reference: &'a str },
+    /// `symbolic-ref [--quiet] [--short] <ref>`
+    SymbolicRef { reference: &'a str, short: bool },
+    /// `for-each-ref --format=%(refname[:short]) [<pattern>...]`
+    ForEachRef {
+        short: bool,
+        patterns: &'a [&'a str],
+    },
+}
+
+/// A single plain ref name (or `HEAD`): no revision syntax, no options.
+fn plain_name(part: &str) -> bool {
+    !part.is_empty()
+        && !part.starts_with('-')
+        && !part.starts_with('/')
+        && !part.ends_with('/')
+        && !part.contains("//")
+        && part
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+        && !part.contains("..")
 }
 
 /// A range of the shape `A..B` where both ends are plain ref names or hex
@@ -202,7 +224,7 @@ fn plain_range(s: &str) -> bool {
     }
 }
 
-fn parse<'a>(args: &[&'a str]) -> Option<Read<'a>> {
+fn parse<'a>(args: &'a [&'a str]) -> Option<Read<'a>> {
     match args {
         ["log", "--format=%s", range] if plain_range(range) => Some(Read::Subjects {
             range,
@@ -213,8 +235,40 @@ fn parse<'a>(args: &[&'a str]) -> Option<Read<'a>> {
             reverse: true,
         }),
         ["rev-list", "--count", range] if plain_range(range) => Some(Read::Count { range }),
+        ["ls-tree", "-r", "-z", "--name-only", reference] if plain_name(reference) => {
+            Some(Read::LsTree { reference })
+        }
+        ["symbolic-ref", rest @ ..] => {
+            let mut short = false;
+            let mut reference = None;
+            for arg in rest {
+                match *arg {
+                    "--quiet" | "-q" => {}
+                    "--short" => short = true,
+                    a if plain_name(a) && reference.replace(a).is_none() => {}
+                    _ => return None,
+                }
+            }
+            reference.map(|reference| Read::SymbolicRef { reference, short })
+        }
+        ["for-each-ref", format, patterns @ ..]
+            if matches!(*format, "--format=%(refname)" | "--format=%(refname:short)")
+                && patterns.iter().all(|p| ref_pattern(p)) =>
+        {
+            Some(Read::ForEachRef {
+                short: *format == "--format=%(refname:short)",
+                patterns,
+            })
+        }
         _ => None,
     }
+}
+
+/// A `for-each-ref` pattern this module matches exactly: a literal ref
+/// prefix, or one ending in a single `/*`.
+fn ref_pattern(p: &str) -> bool {
+    let body = p.strip_suffix("/*").unwrap_or(p);
+    body.starts_with("refs/") && plain_name(body) && !body.contains('*')
 }
 
 /// One commit's `%s`, or `None` when git might print something different:
@@ -250,14 +304,24 @@ fn clean_subject(commit: &git2::Commit<'_>) -> Option<String> {
 pub fn try_read(root: &Path, args: &[&str]) -> Option<String> {
     let request = parse(args)?;
     let repo = Repo::open(root).ok()?;
+    match request {
+        Read::LsTree { reference } => return repo.ls_tree(reference),
+        Read::SymbolicRef { reference, short } => return repo.symbolic_ref(reference, short),
+        Read::ForEachRef { short, patterns } => return repo.for_each_ref(short, patterns),
+        Read::Subjects { .. } | Read::Count { .. } => {}
+    }
     if !repo.history_is_plain() {
         return None;
     }
-    let range = match request {
-        Read::Subjects { range, .. } | Read::Count { range } => range,
+    let (Read::Subjects { range, .. } | Read::Count { range }) = request else {
+        return None;
     };
     let mut walk = repo.repo.revwalk().ok()?;
-    walk.set_sorting(Sort::TIME).ok()?;
+    // Children before parents, newest first among unrelated commits. Time
+    // alone breaks ties arbitrarily for commits made in the same second,
+    // where git prints the child first; the range is linear, so the
+    // topological order is the only valid one.
+    walk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME).ok()?;
     walk.push_range(range).ok()?;
 
     match request {
@@ -288,6 +352,131 @@ pub fn try_read(root: &Path, args: &[&str]) -> Option<String> {
             }
             Some(out)
         }
+        _ => None,
+    }
+}
+
+impl Repo {
+    /// `git ls-tree -r -z --name-only <reference>`: every blob and submodule
+    /// path in the tree, NUL-terminated, in tree order.
+    fn ls_tree(&self, reference: &str) -> Option<String> {
+        // `ls-tree` reads through `refs/replace`.
+        if !self.history_is_plain() {
+            return None;
+        }
+        let tree = self
+            .repo
+            .revparse_single(reference)
+            .ok()?
+            .peel_to_tree()
+            .ok()?;
+        let mut out = String::new();
+        let mut valid = true;
+        tree.walk(git2::TreeWalkMode::PreOrder, |dir, entry| {
+            if entry.kind() == Some(git2::ObjectType::Tree) {
+                return git2::TreeWalkResult::Ok;
+            }
+            match entry.name() {
+                Some(name) => {
+                    out.push_str(dir);
+                    out.push_str(name);
+                    out.push('\0');
+                    git2::TreeWalkResult::Ok
+                }
+                None => {
+                    valid = false;
+                    git2::TreeWalkResult::Abort
+                }
+            }
+        })
+        .ok()?;
+        valid.then_some(out)
+    }
+
+    /// The name `git` prints for `full` with `--short` /
+    /// `%(refname:short)`: the shortest form git's own ref-resolution rules
+    /// map back to the same ref. `None` when that depends on anything this
+    /// module does not model (an ambiguous short name, another namespace, a
+    /// remote's `HEAD`).
+    fn shorten(&self, full: &str) -> Option<String> {
+        // `git`'s `ref_rev_parse_rules`, in order; the match is the first
+        // rule `full` fits, and every earlier rule must not name a ref.
+        let (prefix_rule, short) = if let Some(s) = full.strip_prefix("refs/tags/") {
+            (2, s)
+        } else if let Some(s) = full.strip_prefix("refs/heads/") {
+            (3, s)
+        } else if let Some(s) = full.strip_prefix("refs/remotes/") {
+            if s.ends_with("/HEAD") {
+                return None;
+            }
+            (4, s)
+        } else {
+            return None;
+        };
+        let earlier = [
+            short.to_string(),
+            format!("refs/{short}"),
+            format!("refs/tags/{short}"),
+            format!("refs/heads/{short}"),
+        ];
+        for candidate in earlier.iter().take(prefix_rule) {
+            match self.repo.find_reference(candidate) {
+                Ok(_) => return None,
+                // libgit2 reports a one-level lowercase name (`main`) as an
+                // invalid spec rather than a missing ref.
+                Err(e)
+                    if matches!(
+                        e.code(),
+                        git2::ErrorCode::NotFound | git2::ErrorCode::InvalidSpec
+                    ) => {}
+                Err(_) => return None,
+            }
+        }
+        Some(short.to_string())
+    }
+
+    /// `git symbolic-ref [--quiet] [--short] <reference>` for a symbolic ref.
+    fn symbolic_ref(&self, reference: &str, short: bool) -> Option<String> {
+        let found = self.repo.find_reference(reference).ok()?;
+        let target = found.symbolic_target()?.to_string();
+        let shown = if short {
+            self.shorten(&target)?
+        } else {
+            target
+        };
+        Some(format!("{shown}\n"))
+    }
+
+    /// `git for-each-ref --format=%(refname[:short]) [<pattern>...]`: refs
+    /// sorted by name, filtered to those a pattern matches literally (whole
+    /// name, or up to a `/`) or by a trailing `/*`.
+    fn for_each_ref(&self, short: bool, patterns: &[&str]) -> Option<String> {
+        let mut names = Vec::new();
+        for reference in self.repo.references().ok()? {
+            let reference = reference.ok()?;
+            let name = reference.name()?.to_string();
+            // Per-worktree namespaces differ between libgit2 and git.
+            if name.starts_with("refs/worktree/") || name.starts_with("refs/bisect/") {
+                return None;
+            }
+            // A ref that does not resolve is skipped by git with a warning.
+            reference.resolve().ok()?;
+            let wanted = patterns.is_empty()
+                || patterns.iter().any(|p| match p.strip_suffix("/*") {
+                    Some(prefix) => name.starts_with(&format!("{prefix}/")),
+                    None => name == *p || name.starts_with(&format!("{p}/")),
+                });
+            if wanted {
+                names.push(name);
+            }
+        }
+        names.sort();
+        let mut out = String::new();
+        for name in names {
+            out.push_str(&if short { self.shorten(&name)? } else { name });
+            out.push('\n');
+        }
+        Some(out)
     }
 }
 
@@ -463,6 +652,156 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(dir2);
+    }
+
+    /// Both answers must be identical, and ours must exist.
+    fn same_as_git(dir: &Path, args: &[&str]) {
+        let ours = try_read(dir, args).unwrap_or_else(|| panic!("not answered: {args:?}"));
+        assert_eq!(ours, git_out(dir, args), "{args:?}");
+    }
+
+    #[test]
+    fn ls_tree_matches_git() {
+        let dir = temp_repo("lstree");
+        std::fs::create_dir_all(dir.join("a/b c")).unwrap();
+        std::fs::create_dir_all(dir.join("z")).unwrap();
+        std::fs::write(dir.join("a/b c/deep file.txt"), "x").unwrap();
+        std::fs::write(dir.join("a/top.txt"), "x").unwrap();
+        std::fs::write(dir.join("a.txt"), "x").unwrap();
+        std::fs::write(dir.join("zeta.txt"), "x").unwrap();
+        std::fs::write(dir.join("z/ünïcode.txt"), "x").unwrap();
+        run(&dir, &["add", "."]);
+        run(&dir, &["commit", "-q", "-m", "tree"]);
+        same_as_git(&dir, &["ls-tree", "-r", "-z", "--name-only", "HEAD"]);
+        same_as_git(&dir, &["ls-tree", "-r", "-z", "--name-only", "main"]);
+        // Unknown ref and unsupported flags go to git.
+        assert!(try_read(&dir, &["ls-tree", "-r", "-z", "--name-only", "nope"]).is_none());
+        assert!(try_read(&dir, &["ls-tree", "-r", "--name-only", "HEAD"]).is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn symbolic_ref_matches_git() {
+        let dir = temp_repo("symref");
+        run(&dir, &["checkout", "-q", "-b", "feature/x"]);
+        same_as_git(&dir, &["symbolic-ref", "HEAD"]);
+        same_as_git(&dir, &["symbolic-ref", "--short", "HEAD"]);
+        same_as_git(&dir, &["symbolic-ref", "--quiet", "--short", "HEAD"]);
+        // A remote's HEAD symref, full form.
+        run(&dir, &["remote", "add", "origin", "file:///nowhere"]);
+        run(&dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        run(
+            &dir,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        same_as_git(&dir, &["symbolic-ref", "refs/remotes/origin/HEAD"]);
+        // Detached HEAD: git's error/exit code is its business.
+        run(&dir, &["checkout", "-q", "--detach"]);
+        assert!(try_read(&dir, &["symbolic-ref", "--quiet", "--short", "HEAD"]).is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_ambiguous_short_branch_name_is_left_to_git() {
+        let dir = temp_repo("ambig");
+        run(&dir, &["checkout", "-q", "-b", "dup"]);
+        run(&dir, &["tag", "dup"]);
+        // `refs/tags/dup` shadows `refs/heads/dup`: git prints `heads/dup`.
+        assert!(try_read(&dir, &["symbolic-ref", "--short", "HEAD"]).is_none());
+        assert!(
+            try_read(
+                &dir,
+                &["for-each-ref", "--format=%(refname:short)", "refs/heads"]
+            )
+            .is_none()
+        );
+        // The non-short forms are unaffected.
+        same_as_git(&dir, &["symbolic-ref", "HEAD"]);
+        same_as_git(&dir, &["for-each-ref", "--format=%(refname)", "refs/heads"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn for_each_ref_matches_git_for_prefixes_globs_and_packed_refs() {
+        let dir = temp_repo("foreach");
+        for name in [
+            "guardian/g1/wt-a",
+            "guardian/g1/review",
+            "guardian/g12/wt-b",
+            "other",
+        ] {
+            run(&dir, &["branch", name]);
+        }
+        run(&dir, &["tag", "v1"]);
+        run(&dir, &["update-ref", "refs/ralphus/carry/g1/0", "HEAD"]);
+        run(&dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        for pack in [false, true] {
+            if pack {
+                run(&dir, &["pack-refs", "--all"]);
+            }
+            same_as_git(&dir, &["for-each-ref", "--format=%(refname)", "refs/heads"]);
+            same_as_git(&dir, &["for-each-ref", "--format=%(refname)"]);
+            same_as_git(
+                &dir,
+                &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+            );
+            same_as_git(
+                &dir,
+                &[
+                    "for-each-ref",
+                    "--format=%(refname:short)",
+                    "refs/heads/guardian/g1",
+                ],
+            );
+            same_as_git(
+                &dir,
+                &[
+                    "for-each-ref",
+                    "--format=%(refname:short)",
+                    "refs/heads/guardian/g1",
+                    "refs/heads/guardian/g1/*",
+                    "refs/heads/other",
+                ],
+            );
+            same_as_git(
+                &dir,
+                &[
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    "refs/ralphus/carry/g1",
+                ],
+            );
+            same_as_git(
+                &dir,
+                &[
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    "refs/heads/nothing-here",
+                ],
+            );
+            same_as_git(
+                &dir,
+                &["for-each-ref", "--format=%(refname:short)", "refs/remotes"],
+            );
+            same_as_git(
+                &dir,
+                &["for-each-ref", "--format=%(refname:short)", "refs/tags"],
+            );
+        }
+        // Unsupported shapes go to git.
+        for args in [
+            &["for-each-ref", "--format=%(objectname)", "refs/heads"][..],
+            &["for-each-ref", "--format=%(refname)", "refs/heads/*/x"],
+            &["for-each-ref", "--format=%(refname)", "heads"],
+            &["for-each-ref", "--sort=-refname", "--format=%(refname)"],
+        ] {
+            assert!(try_read(&dir, args).is_none(), "{args:?}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
