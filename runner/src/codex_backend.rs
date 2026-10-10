@@ -549,6 +549,8 @@ fn drive_thread_events(
 
     let mut agent_session_id: Option<String> = None;
     let mut latest_agent_message = String::new();
+    // RAL-595: markers from every `agent_message`, not just the last one.
+    let mut prophecies = crate::prophecy::ProphecyScanner::new();
     // RAL-352: completed `turn.completed` events -- one per user/assistant
     // exchange (each response event is both sides of the exchange).
     // `turn.failed`/`error`/`item.completed` never increment it.
@@ -601,10 +603,7 @@ fn drive_thread_events(
                         // The model's own reply -- the whole point of the
                         // live tmux pane is to let a human read this.
                         if let Some(text) = item["text"].as_str() {
-                            if !text.is_empty() {
-                                latest_agent_message = text.to_string();
-                                print_line(text);
-                            }
+                            record_agent_message(text, &mut latest_agent_message, &mut prophecies);
                         }
                     }
                     Some("command_execution") => {
@@ -743,6 +742,7 @@ fn drive_thread_events(
             // compacts".
             compaction_input_tokens: 0,
             compaction_count: 0,
+            prophecies: prophecies.markers(),
         });
     }
 
@@ -789,7 +789,23 @@ fn drive_thread_events(
         // compacts".
         compaction_input_tokens: 0,
         compaction_count: 0,
+        prophecies: prophecies.markers(),
     })
+}
+
+/// Handles one completed `agent_message`: files its `RALPHUS_PROPHECY:`
+/// markers (RAL-595, whichever turn of the run it is), keeps it as the
+/// run's latest reply and mirrors it to the live pane.
+fn record_agent_message(
+    text: &str,
+    latest: &mut String,
+    prophecies: &mut crate::prophecy::ProphecyScanner,
+) {
+    prophecies.scan_and_emit("codex", text);
+    if !text.is_empty() {
+        *latest = text.to_string();
+        print_line(text);
+    }
 }
 
 fn format_tool_event(command: &str, status: &str) -> String {
@@ -877,6 +893,22 @@ fn wait_for_child(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_marker_in_a_non_final_agent_message_is_kept() {
+        let mut latest = String::new();
+        let mut scanner = crate::prophecy::ProphecyScanner::new();
+        super::record_agent_message(
+            "found it\nRALPHUS_PROPHECY: hazard: leaves a race\n",
+            &mut latest,
+            &mut scanner,
+        );
+        super::record_agent_message("done", &mut latest, &mut scanner);
+        assert_eq!(latest, "done");
+        let markers = scanner.markers();
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].kind, "hazard");
+    }
+
     use super::*;
 
     #[test]

@@ -659,6 +659,7 @@ fn drive_stream_json(
             rate_limit_retry_after: None,
             compaction_input_tokens: state.compaction_input_tokens,
             compaction_count: state.compaction_count,
+            prophecies: state.prophecies.markers(),
         });
     }
 
@@ -704,6 +705,7 @@ fn drive_stream_json(
         rate_limit_retry_after: None,
         compaction_input_tokens: state.compaction_input_tokens,
         compaction_count: state.compaction_count,
+        prophecies: state.prophecies.markers(),
     })
 }
 
@@ -772,6 +774,9 @@ struct ParseState {
     /// this after every event and stops (kills the child) rather than
     /// waiting for stdout EOF.
     compaction_thrash: Option<crate::thrash::ThrashDetail>,
+    /// RAL-595: every `RALPHUS_PROPHECY:` marker found in assistant text, as
+    /// each turn arrives and in the untruncated terminal `result` text.
+    prophecies: crate::prophecy::ProphecyScanner,
 }
 
 /// Handles one parsed stream-json line, updating `state` and printing to the
@@ -892,6 +897,15 @@ fn process_event(
             }
             if let Some(blocks) = event["message"]["content"].as_array() {
                 for block in blocks {
+                    // RAL-595: scan every assistant turn's text whether or not
+                    // it was already streamed to the pane -- the marker must
+                    // be filed from the turn it was written in, not only from
+                    // the final message.
+                    if block["type"].as_str() == Some("text") {
+                        if let Some(text) = block["text"].as_str() {
+                            state.prophecies.scan_and_emit("claude-code", text);
+                        }
+                    }
                     match block["type"].as_str() {
                         Some("text") if !already_streamed => {
                             if let Some(text) = block["text"].as_str() {
@@ -1021,6 +1035,9 @@ fn process_event(
                 .or_else(|| event["cost_usd"].as_f64())
                 .unwrap_or(0.0);
             let text = event["result"].as_str().unwrap_or_default();
+            // RAL-595: scan before the tail truncation below drops a marker
+            // that sits earlier than the last 2000 characters.
+            state.prophecies.scan_and_emit("claude-code", text);
             state.result_summary = tail(text, RESULT_SUMMARY_TAIL_CHARS);
             let normalized = text.to_ascii_lowercase();
             let no_usage = state.tokens_in == 0
@@ -1592,6 +1609,66 @@ mod tests {
         assert!((state.cost_usd - 0.56).abs() < f64::EPSILON);
         assert_eq!(state.result_summary, "all done");
         assert!(state.saw_result);
+    }
+
+    #[test]
+    fn process_event_scans_markers_in_every_assistant_turn_but_not_tool_output() {
+        let mut state = ParseState::default();
+        let ws = test_workspace();
+        let feed = |state: &mut ParseState, event: serde_json::Value| {
+            process_event(&event, state, &ws, None, DEFAULT_TOOL_ARG_TRUNCATE_CHARS);
+        };
+        feed(
+            &mut state,
+            serde_json::json!({
+                "type":"assistant",
+                "message":{"content":[
+                    {"type":"text","text":"noted\nRALPHUS_PROPHECY: hazard: leaves a race\n"},
+                    {"type":"tool_use","name":"Bash","input":{"command":"ls"}}
+                ]}
+            }),
+        );
+        feed(
+            &mut state,
+            serde_json::json!({
+                "type":"user",
+                "message":{"content":[
+                    {"type":"tool_result","content":"RALPHUS_PROPHECY: discovery: from tool output"}
+                ]}
+            }),
+        );
+        feed(
+            &mut state,
+            serde_json::json!({
+                "type":"assistant",
+                "message":{"content":[{"type":"text","text":"done"}]}
+            }),
+        );
+        let markers = state.prophecies.markers();
+        assert_eq!(markers.len(), 1, "{markers:?}");
+        assert_eq!(markers[0].kind, "hazard");
+    }
+
+    #[test]
+    fn process_event_scans_a_marker_outside_the_truncated_result_tail() {
+        let mut state = ParseState::default();
+        let ws = test_workspace();
+        let text = format!(
+            "RALPHUS_PROPHECY: decision: chose X\n{}",
+            "filler line\n".repeat(400)
+        );
+        assert!(text.len() > RESULT_SUMMARY_TAIL_CHARS);
+        process_event(
+            &serde_json::json!({"type":"result","usage":{"input_tokens":1,"output_tokens":1},"result":text}),
+            &mut state,
+            &ws,
+            None,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+        assert!(!state.result_summary.contains("RALPHUS_PROPHECY"));
+        let markers = state.prophecies.markers();
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].body, "chose X");
     }
 
     #[test]
