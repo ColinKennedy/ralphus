@@ -222,6 +222,8 @@
             <div class="squad-actions"><button class="btn squadbtn" data-click="openReviewMenu" data-guardian-id="${esc(g.id)}" data-tip="Review actions — rename, hide, cancel, or delete this review.">⋯</button></div>
           </div>
           <div class="meta">${pill(g.status)}${reviewSparkbar(g)}</div></div>`).join("");
+        // The rows are on screen already; their colored bars fill in afterwards.
+        refreshReviewBranchStates();
       }
       /**
        * A review's branch stack as a row of segments, one per branch, coloured
@@ -233,11 +235,14 @@
        * @returns {string}
        */
       function reviewSparkbar(g) {
-        const branches = g.branches || null;
+        // The live per-branch states win over `g.branches`: that snapshot is
+        // only refreshed for the *selected* review, so an earlier-opened one
+        // would keep showing the statuses it had when it was last open.
+        const branches = reviewBranchStates.get(g.id) || g.branches || null;
         const total = branches ? branches.length : (g.branch_count || 0);
         if (!total) return `<span class="spark-count">no branches</span>`;
         if (!branches) {
-          return `<span class="spark-count" data-tip="This review's branch detail loads when you open it.">${total} branches</span>`;
+          return `<span class="spark-count" data-tip="The colored branch bars for this review are loading.">${total} branches</span>`;
         }
         const done = branches.filter((b) => b.enabled !== false
           && ["done", "merged", "conflict_resolved"].includes(b.merge_status || "")).length;
@@ -248,6 +253,46 @@
         }).join("");
         return `<span class="spark" data-tip="${esc(`${done} of ${enabled} enabled branch(es) merged. Each segment is one branch, coloured by its state.`)}">${segs}</span>`
           + `<span class="spark-count">${done}/${enabled}</span>`;
+      }
+      /**
+       * Latest `GET /api/guardian-branch-states` answer per review, kept apart
+       * from `guardians[]` so the lean-index poll can never overwrite it.
+       * @type {Map<string, BranchState[]>}
+       */
+      const reviewBranchStates = new Map();
+      /** Set by `pollReviews` once a poll has landed: the next `renderReviews` must re-fetch the visible rows' branch states instead of trusting the ones in memory. */
+      let reviewBranchStatesStale = false;
+      /** Monotonic sequence over branch-state fetches -- a response that is no longer the newest is dropped. */
+      let reviewBranchStatesSeq = 0;
+      /** Most review ids asked for in one branch-states request; mirrors the daemon's cap. */
+      const REVIEW_BRANCH_STATES_MAX_IDS = 200;
+      /**
+       * Fills in the colored branch bars for the rows the sidebar is showing
+       * right now, after the list has already painted. Fetches only when a
+       * visible review has no states yet or a poll has marked them stale, so
+       * the re-render this triggers (when something actually changed) does not
+       * fetch again. A failed fetch leaves the bars as they were.
+       * @returns {void}
+       */
+      function refreshReviewBranchStates() {
+        const ids = visibleGuardians().map((g) => g.id).slice(0, REVIEW_BRANCH_STATES_MAX_IDS);
+        if (!ids.length) return;
+        if (!reviewBranchStatesStale && ids.every((id) => reviewBranchStates.has(id))) return;
+        reviewBranchStatesStale = false;
+        const seq = ++reviewBranchStatesSeq;
+        fetch(`/api/guardian-branch-states?ids=${encodeURIComponent(ids.join(","))}`)
+          .then((r) => (r.ok ? r.json() : null))
+          .then((/** @type {{[id: string]: BranchState[]}|null} */ states) => {
+            if (!states || seq !== reviewBranchStatesSeq) return;
+            let changed = false;
+            for (const id of ids) {
+              const next = states[id] || [];
+              if (JSON.stringify(reviewBranchStates.get(id)) !== JSON.stringify(next)) changed = true;
+              reviewBranchStates.set(id, next);
+            }
+            if (changed) renderReviews();
+          })
+          .catch(() => {});
       }
       /**
        * Handles a click on a review row: plain select, ctrl/cmd toggle, or

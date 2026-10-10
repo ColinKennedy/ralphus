@@ -417,6 +417,13 @@
        * @typedef {FollowupSummary & {items: PendingFollowupItem[], offer_status?: string|null, offer_squad_id?: string|null}} PendingFollowups
        */
       /**
+       * One branch of a review as `GET /api/guardian-branch-states` reports
+       * it -- only what the sidebar's colored bars need.
+       * @typedef {object} BranchState
+       * @property {boolean} enabled
+       * @property {string} merge_status
+       */
+      /**
        * @typedef {object} GuardianView
        * @property {string} id
        * @property {string} name

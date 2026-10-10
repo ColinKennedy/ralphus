@@ -1144,6 +1144,9 @@
             if (selectionWithin(detail)) return; // keep the user's in-pane selection intact
             preserveUserState(detail, renderReviewDetail);
           }
+          // A poll means something may have changed: the visible rows' branch
+          // bars re-fetch (after this render) rather than reuse what's cached.
+          reviewBranchStatesStale = true;
           renderIfNotSelecting();
           // Keep every expanded branch's feedback thread fresh (RAL-272) so a
           // guardian's async acknowledgment appears without a manual refresh,
