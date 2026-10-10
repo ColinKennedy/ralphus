@@ -907,6 +907,43 @@
         notify("info", "Refreshed PR status.");
         tick();
       }
+      /** Minimum gap between open-triggered refreshes of the same PR, to spare the forge's rate limit. */
+      const PR_OPEN_REFRESH_COOLDOWN_MS = 30000;
+      /** @type {Record<string, number>} */
+      const prOpenRefreshAt = {};
+      /**
+       * Silent, fire-and-forget status refresh fired when a PR link is opened
+       * (left-click, middle-click, Ctrl/Cmd-click). Never awaited by the
+       * navigation, never toasts, and is skipped inside a per-PR cooldown.
+       * @param {string} prId
+       * @returns {void}
+       */
+      function refreshPrStatusOnOpen(prId) {
+        if (!prId) return;
+        const now = Date.now();
+        if (now - (prOpenRefreshAt[prId] || 0) < PR_OPEN_REFRESH_COOLDOWN_MS) return;
+        prOpenRefreshAt[prId] = now;
+        post(`/api/pull-requests/${prId}/refresh-ci`)
+          .then((resp) => { if (resp.ok) tick(); })
+          .catch(() => {});
+      }
+      /**
+       * Capture-phase listener for `click` / `auxclick`: any element carrying
+       * `data-pr-id` and `data-pr-open="1"` is an openable PR link. Only the
+       * primary and middle buttons count, so right-click (which opens the
+       * status menu) never double-triggers.
+       * @param {MouseEvent} e
+       * @returns {void}
+       */
+      function onPrLinkActivated(e) {
+        if (e.button !== 0 && e.button !== 1) return;
+        const target = /** @type {HTMLElement} */ (e.target);
+        const el = /** @type {HTMLElement|null} */ (target.closest("[data-pr-id][data-pr-open]"));
+        if (!el || el.dataset.prOpen !== "1") return;
+        refreshPrStatusOnOpen(el.dataset.prId || "");
+      }
+      document.addEventListener("click", onPrLinkActivated, true);
+      document.addEventListener("auxclick", onPrLinkActivated, true);
       /**
        * "Action feedback" menu item (RAL-<new>): pulls this PR's un-actioned
        * forge comments into the owning review worktree right now, instead of
