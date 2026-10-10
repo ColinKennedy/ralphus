@@ -109,6 +109,7 @@
         stepBranchRun: (e, ds) => stepBranchRun(ds.branchId || "", Number(ds.dir)),
         jumpToLatestRun: (e, ds) => jumpToLatestRun(ds.branchId || ""),
         setLiveSub: (e, ds) => setLiveSub(ds.branchId || "", ds.sub || "terminal"),
+        agentLogShowEarlier: (e, ds) => agentLogShowEarlier(ds.key || ""),
         stepFeedbackReply: (e, ds) => stepFeedbackReply(ds.key || "", Number(ds.to)),
         regenerateSummary: (e, ds) => regenerateSummary(ds.guardianId || ""),
         // The inspector's Live tab draws these as pill toggles whose on/off
