@@ -727,13 +727,12 @@ impl Repo {
             (2, s)
         } else if let Some(s) = full.strip_prefix("refs/heads/") {
             (3, s)
-        } else if let Some(s) = full.strip_prefix("refs/remotes/") {
+        } else {
+            let s = full.strip_prefix("refs/remotes/")?;
             if s.ends_with("/HEAD") {
                 return None;
             }
             (4, s)
-        } else {
-            return None;
         };
         let earlier = [
             short.to_string(),
