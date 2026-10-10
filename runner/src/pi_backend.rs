@@ -2160,9 +2160,29 @@ pub const THINKING_MARKER: &str = "RALPHUS_THINKING: ";
 /// RAL-434: emits one line of model thinking tagged with [`THINKING_MARKER`]
 /// -- see [`handle_thinking_event`].
 #[allow(clippy::print_stdout)]
-fn print_thinking_line(line: &str) {
+pub(crate) fn print_thinking_line(line: &str) {
     println!("{THINKING_MARKER}{line}");
     let _ = std::io::stdout().flush();
+}
+
+/// RAL-598: stands in for a thinking block the backend reported as a
+/// literal empty string (e.g. redacted reasoning), so the transcript still
+/// shows that the model reasoned.
+pub(crate) const EMPTY_THINKING_PLACEHOLDER: &str = "(thinking content not provided)";
+
+/// RAL-598: emits a whole thinking block as [`THINKING_MARKER`]-tagged
+/// lines, for backends that deliver reasoning as one finished piece of text
+/// rather than streamed deltas. A literal empty string prints
+/// [`EMPTY_THINKING_PLACEHOLDER`]; anything else is shown as the backend
+/// provided it.
+pub(crate) fn print_thinking_block(text: &str) {
+    if text.is_empty() {
+        print_thinking_line(EMPTY_THINKING_PLACEHOLDER);
+        return;
+    }
+    for line in text.lines() {
+        print_thinking_line(line);
+    }
 }
 
 #[cfg(test)]

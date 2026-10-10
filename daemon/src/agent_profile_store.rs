@@ -672,7 +672,7 @@ mod tests {
             .unwrap();
         let profile = store.get_agent_profile("q").unwrap().unwrap();
         assert_eq!(profile.thinking_capable, None);
-        assert!(!profile.effective_thinking_capable());
+        assert!(profile.effective_thinking_capable());
     }
 
     #[test]

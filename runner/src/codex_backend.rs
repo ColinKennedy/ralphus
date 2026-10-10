@@ -230,6 +230,10 @@ impl ModelBackend for CodexBackend {
     fn supports_maximum_tool_output_tokens(&self) -> bool {
         true
     }
+
+    fn supports_thinking(&self) -> bool {
+        true
+    }
 }
 
 /// The `-c developer_instructions=<value>` right-hand side.
@@ -610,6 +614,13 @@ fn drive_thread_events(
                         let command = item["command"].as_str().unwrap_or("");
                         let status = item["status"].as_str().unwrap_or("");
                         eprintln!("{}", format_tool_event(command, status));
+                    }
+                    Some("reasoning") => {
+                        // RAL-598: Codex's reasoning item carries the
+                        // model's (summary) reasoning text.
+                        crate::pi_backend::print_thinking_block(
+                            item["text"].as_str().unwrap_or(""),
+                        );
                     }
                     Some("error") => {
                         let message = item["message"].as_str().unwrap_or("");
