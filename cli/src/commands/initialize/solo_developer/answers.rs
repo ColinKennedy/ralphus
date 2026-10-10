@@ -196,6 +196,8 @@ fn slot<'a>(setup: &'a mut InitializeSoloDeveloperOptions, key: &str) -> Option<
         "setup_mcp" => Slot::Bool(&mut setup.setup_mcp),
         "mcp_host" => Slot::List(&mut setup.mcp_hosts),
         "agent_logins" => Slot::Text(&mut setup.agent_logins),
+        "install_skills" => Slot::Text(&mut setup.install_skills),
+        "force_skills" => Slot::Bool(&mut setup.force_skills),
         "register_project" => Slot::Bool(&mut setup.register_project),
         "project_name" => Slot::Text(&mut setup.project_name),
         "project_is_fork" => Slot::Bool(&mut setup.project_is_fork),
@@ -406,9 +408,11 @@ fn unasked_default(key: &str) -> toml::Value {
         "tmux_program" | "project_fork_url" | "project_description" | "fork_url" => {
             Text(String::new())
         }
-        "setup_mcp" | "project_is_fork" | "require_forks" | "create_admin" => Boolean(false),
+        "setup_mcp" | "project_is_fork" | "require_forks" | "create_admin" | "force_skills" => {
+            Boolean(false)
+        }
         "mcp_host" => Array(Vec::new()),
-        "agent_logins" => Text("none".to_string()),
+        "agent_logins" | "install_skills" => Text("none".to_string()),
         "register_project"
         | "review_auto_submit_pr_stack"
         | "setup_forge_token"
@@ -664,6 +668,41 @@ mod tests {
         );
         assert!(second.forge_token.is_none());
         // Every setting is covered, so a second render is the same file.
+        reset();
+        let mut third = InitializeSoloDeveloperOptions::default();
+        load(&text, &mut third).unwrap();
+        let again = render(&mut third);
+        let values = |text: &str| {
+            text.lines()
+                .filter(|line| line.starts_with("value = ") || line.starts_with('['))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(values(&text), values(&again));
+    }
+
+    #[test]
+    fn skills_settings_round_trip() {
+        reset();
+        let mut first = InitializeSoloDeveloperOptions {
+            yes: true,
+            install_skills: Some("claude-code,codex".to_string()),
+            force_skills: Some(true),
+            ..Default::default()
+        };
+        record_str(
+            &super::super::INSTALL_SKILLS,
+            "claude-code,codex",
+            Source::Prompt,
+        );
+        record_bool(&super::super::FORCE_SKILLS, true, Source::Prompt);
+        let text = render(&mut first);
+
+        let mut second = InitializeSoloDeveloperOptions::default();
+        load(&text, &mut second).unwrap();
+        assert_eq!(second.install_skills.as_deref(), Some("claude-code,codex"));
+        assert_eq!(second.force_skills, Some(true));
+
         reset();
         let mut third = InitializeSoloDeveloperOptions::default();
         load(&text, &mut third).unwrap();
