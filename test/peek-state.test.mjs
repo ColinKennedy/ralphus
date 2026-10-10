@@ -118,7 +118,7 @@ test("RAL-186: a restarted step's live view revives on the first active poll", (
   assert.equal(
     revived.headerChanged,
     true,
-    "ended -> live must force a re-render too: peekBox() is the only thing that " +
+    "ended -> live must force a re-render too: liveViewWidget() is the only thing that " +
       "produces the 'Historical record (read-only)' banner, dot and tooltip, so " +
       "without this the box stays visually stuck until the user navigates away and back",
   );
@@ -257,4 +257,18 @@ test("peekScrollRestoreTarget: a mid-log save past a shorter reloaded log is lef
   // clamps to the max legal offset -- passing the raw saved value through
   // unmodified is correct, not a bug.
   assert.equal(peekScrollRestoreTarget({ top: 9999, atBottom: false }, 500), 9999);
+});
+
+test("splitPeekAttempt separates an attempt pin from a cell/proof key", () => {
+  assert.deepEqual(peek.splitPeekAttempt("cell|sq|1|2|a3"), { base: "cell|sq|1|2", attempt: 3 });
+  assert.deepEqual(peek.splitPeekAttempt("proof|sq|1|cell|2|0|a12"), { base: "proof|sq|1|cell|2|0", attempt: 12 });
+  assert.deepEqual(peek.splitPeekAttempt("cell|sq|1|2"), { base: "cell|sq|1|2", attempt: null });
+  assert.deepEqual(peek.splitPeekAttempt("guardian|g|b|t|a1"), { base: "guardian|g|b|t|a1", attempt: null });
+});
+
+test("a pinned key reads the attempt's transcript and never probes a live pane", () => {
+  assert.equal(peek.peekUrlFor("cell|sq|1|2|a3"), null);
+  assert.equal(peek.peekTranscriptUrlFor("cell|sq|1|2|a3"), "/api/squads/sq/cells/1/2/pane-transcript?attempt=3");
+  assert.equal(peek.peekTranscriptUrlFor("cell|sq|1|2"), "/api/squads/sq/cells/1/2/pane-transcript");
+  assert.equal(peek.systemPromptUrlFor("cell|sq|1|2|a3"), peek.systemPromptUrlFor("cell|sq|1|2"));
 });

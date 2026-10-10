@@ -205,11 +205,33 @@
        */
       function peekCssKey(key) { return key.replace(/[^a-zA-Z0-9_-]/g, "_"); }
       /**
+       * Splits a squad cell/proof peek key into the step's key and the
+       * persisted attempt it names. A trailing `|a<N>` part pins the key to
+       * attempt N of that step (the shared live-view widget's way of showing an
+       * earlier run); a key without it follows the step's current session.
+       * Review keys never carry the suffix -- their runs are named by task and
+       * cell id instead.
+       * @param {string} key
+       * @returns {{base: string, attempt: number|null}}
+       */
+      function splitPeekAttempt(key) {
+        const parts = key.split("|");
+        const baseLen = parts[0] === "cell" ? 4 : parts[0] === "proof" ? 6 : 0;
+        const last = parts[parts.length - 1];
+        if (baseLen && parts.length === baseLen + 1 && /^a\d+$/.test(last)) {
+          return { base: parts.slice(0, baseLen).join("|"), attempt: Number(last.slice(1)) };
+        }
+        return { base: key, attempt: null };
+      }
+      /**
        * Resolves a peek key to the daemon API URL for its live tmux pane content.
+       * An attempt-pinned key has no live pane to probe -- it is a finished
+       * record -- so it resolves to null and liveness falls back to the tape.
        * @param {string} key
        * @returns {string|null}
        */
       function peekUrlFor(key) {
+        if (splitPeekAttempt(key).attempt !== null) return null;
         const [kind, ...rest] = key.split("|");
         if (kind === "cell") { const [squadId, ti, si] = rest; return `/api/squads/${squadId}/cells/${ti}/${si}/pane?lines=500`; }
         if (kind === "proof") { const [squadId, ti, scope, si, vi] = rest; return `/api/squads/${squadId}/proofs/${ti}/${scope}/${si}/${vi}/pane?lines=500`; }
@@ -234,9 +256,11 @@
        * @returns {string|null}
        */
       function peekTranscriptUrlFor(key) {
-        const [kind, ...rest] = key.split("|");
-        if (kind === "cell") { const [squadId, ti, si] = rest; return `/api/squads/${squadId}/cells/${ti}/${si}/pane-transcript`; }
-        if (kind === "proof") { const [squadId, ti, scope, si, vi] = rest; return `/api/squads/${squadId}/proofs/${ti}/${scope}/${si}/${vi}/pane-transcript`; }
+        const { base, attempt } = splitPeekAttempt(key);
+        const pin = attempt === null ? "" : `?attempt=${attempt}`;
+        const [kind, ...rest] = base.split("|");
+        if (kind === "cell") { const [squadId, ti, si] = rest; return `/api/squads/${squadId}/cells/${ti}/${si}/pane-transcript${pin}`; }
+        if (kind === "proof") { const [squadId, ti, scope, si, vi] = rest; return `/api/squads/${squadId}/proofs/${ti}/${scope}/${si}/${vi}/pane-transcript${pin}`; }
         if (kind === "guardian") {
           const [gid, branchId, task, cellId] = rest;
           const run = task && cellId ? `?task=${encodeURIComponent(task)}&cell_id=${encodeURIComponent(cellId)}` : "";
@@ -256,7 +280,7 @@
        * @returns {string|null}
        */
       function systemPromptUrlFor(key) {
-        const [kind, ...rest] = key.split("|");
+        const [kind, ...rest] = splitPeekAttempt(key).base.split("|");
         if (kind === "cell") { const [squadId, ti, si] = rest; return `/api/squads/${squadId}/cells/${ti}/${si}/system-prompt`; }
         if (kind === "proof") { const [squadId, ti, scope, si, vi] = rest; return `/api/squads/${squadId}/proofs/${ti}/${scope}/${si}/${vi}/system-prompt`; }
         if (kind === "guardian") { const [gid, branchId] = rest; return `/api/guardians/${gid}/branches/${branchId}/system-prompt`; }
@@ -312,7 +336,7 @@
        * RAL-186: the flip must be reported in *both* directions. A restarted
        * cell/proof brings a new tape up under the same (index-derived) key, and
        * the "Historical record (read-only)" banner, grey dot and tooltip are
-       * only produced by a full `peekBox()` render — so reviving must report
+       * only produced by a full widget render — so reviving must report
        * `headerChanged` just as ending does, or the box stays visually stuck
        * on its stale historical banner until the user navigates away and back.
        * @param {PeekPaneState} prev
@@ -943,6 +967,7 @@
           delete peekMissingStrikes[key];
           delete peekLastActivity[key];
           delete peekSystemPrompt[key]; // RAL-428: refetch the System Prompt tab on the next open
+          dropSquadLive(key);
           // peekScrollState is deliberately kept (RAL-471): scroll position
           // should survive an explicit collapse/reopen of the same box, not
           // just navigating away and back.
@@ -1078,8 +1103,8 @@
        * This is the third and fourth layers of the "Show Thinking" precedence
        * chain (RAL-516) — the first two, whether the checkbox is rendered at
        * all, are `thinking_capable_for_agent`
-       * (`daemon/src/agent_profiles.rs`) and `peekBox`'s `canThink`
-       * (`board/35-terminal-logs.js`); see
+       * (`daemon/src/agent_profiles.rs`) and the live-view widget's
+       * `canThink` (`board/36-live-widget.js`); see
        * `test/board-thinking-precedence.test.mjs` for coverage of these two.
        * @param {string} key
        * @returns {boolean}
@@ -1103,30 +1128,6 @@
         renderPeekTape(key);
       }
       // RALPHUS-SHOW-THINKING:END
-      /**
-       * Switches which tab a peek box shows — "terminal" (the default,
-       * transcript-tape live view, RAL-397 Phase 2G-A) or "prompt" (the
-       * step's exact system prompt, RAL-428). Only admins ever get the tab
-       * buttons that reach this handler; a stale "prompt" selection from a
-       * demoted admin falls back to the terminal tab anyway (see `peekBox`).
-       * The choice is per-key session state (`peekTab[key]`, retained across
-       * open/close like Show Debug Messages, cleared on reload); the active
-       * tab re-renders the owning pane in place. First visit to the prompt
-       * tab fetches the text lazily (idempotent thereafter — an effective
-       * system prompt is fixed at dispatch time, so it is never refetched
-       * while the box stays open, mirroring the attempt-history list).
-       * Switching back to terminal leaves the tape polling untouched; the
-       * next poll tick repopulates terminal content in place.
-       * @param {string} key
-       * @param {"terminal"|"prompt"} tab
-       * @returns {void}
-       */
-      function switchPeekTab(key, tab) {
-        if (tab !== "terminal" && tab !== "prompt") tab = "terminal";
-        peekTab[key] = tab;
-        if (tab === "prompt") void ensurePeekSystemPrompt(key);
-        rerenderOwningPane();
-      }
       /**
        * Ensures peek key `key`'s System Prompt tab text has been fetched
        * once (idempotent — a loaded or failed state is never refetched, since
