@@ -5527,7 +5527,7 @@ fn proof_execution_context(
         specs[..position]
             .iter()
             .enumerate()
-            .map(|(prior_position, (prior_idx, prior_id, ..))| {
+            .map(|(prior_position, (prior_idx, prior_id, kind, spec, ..))| {
                 let state = guard
                     .proof_state(squad_id, task_idx, scope, cell_idx, *prior_idx)
                     .ok()
@@ -5535,21 +5535,13 @@ fn proof_execution_context(
                 (
                     proof_context_name(prior_id.as_deref(), prior_position),
                     proof_context_status(state.as_deref()),
+                    (kind == "command").then(|| spec.clone()),
                 )
             })
             .collect::<Vec<_>>()
     };
     let current = proof_context_name(current_id, position);
-    let earlier_text = if earlier.is_empty() {
-        "There are no earlier proofs in this scope.".to_string()
-    } else {
-        let rows = earlier
-            .iter()
-            .map(|(name, status)| format!("- `{name}`: {status}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        format!("Earlier proof results:\n{rows}")
-    };
+    let earlier_text = earlier_proofs_text(&earlier);
 
     format!(
         "## Ralphus proof execution context\n\n\
@@ -5564,6 +5556,57 @@ fn proof_execution_context(
         position + 1,
         specs.len(),
     )
+}
+
+/// Longest prior `command` proof (in characters) quoted verbatim in a proof
+/// prompt; anything longer is cut and marked with [`COMMAND_CLIP_MARKER`].
+const PRIOR_PROOF_COMMAND_MAX_CHARS: usize = 150;
+const COMMAND_CLIP_MARKER: &str = "… [clipped]";
+
+/// Collapse a command to one line and clip it to
+/// [`PRIOR_PROOF_COMMAND_MAX_CHARS`] characters (never splitting a character).
+fn clip_prior_command(command: &str) -> String {
+    let one_line = command
+        .trim()
+        .replace("\r\n", " ")
+        .replace(['\n', '\r', '`'], " ");
+    if one_line.chars().count() <= PRIOR_PROOF_COMMAND_MAX_CHARS {
+        return one_line;
+    }
+    let cut: String = one_line
+        .chars()
+        .take(PRIOR_PROOF_COMMAND_MAX_CHARS)
+        .collect();
+    format!("{}{COMMAND_CLIP_MARKER}", cut.trim_end())
+}
+
+/// Render the earlier-proofs section: `(name, status, command)` per proof,
+/// where `command` is `Some` only for `command` proofs (prompt proofs are
+/// listed by name only).
+fn earlier_proofs_text(earlier: &[(String, &'static str, Option<String>)]) -> String {
+    if earlier.is_empty() {
+        return "There are no earlier proofs in this scope.".to_string();
+    }
+    let rows = earlier
+        .iter()
+        .map(|(name, status, command)| match command {
+            Some(command) => format!(
+                "- `{name}`: {status} — ran command: `{}`",
+                clip_prior_command(command)
+            ),
+            None => format!("- `{name}`: {status}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut text = format!("Earlier proof results:\n{rows}");
+    if earlier.iter().any(|(.., command)| command.is_some()) {
+        text.push_str(
+            "\n\nDo not re-run the commands above: they already ran for an earlier proof. \
+             Do not run any other tests of the same class either (for example, if an earlier \
+             proof was a Rust proof and this one is not, do not run Rust tests at all).",
+        );
+    }
+    text
 }
 
 /// The declined-work section for a cell-scope proof that extends a judge
@@ -6456,6 +6499,62 @@ mod tests {
     use super::*;
     use crate::runner::{RunnerResult, RunnerSpec};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn earlier_proofs_text_no_prior_proofs() {
+        assert_eq!(
+            earlier_proofs_text(&[]),
+            "There are no earlier proofs in this scope."
+        );
+    }
+
+    #[test]
+    fn earlier_proofs_text_short_command_is_quoted_with_no_rerun_guidance() {
+        let text = earlier_proofs_text(&[(
+            "fmt".to_string(),
+            "PASS",
+            Some("cargo fmt --all -- --check".to_string()),
+        )]);
+        assert!(text.contains("- `fmt`: PASS — ran command: `cargo fmt --all -- --check`"));
+        assert!(text.contains("Do not re-run the commands above"));
+        assert!(text.contains("same class"));
+        assert!(!text.contains("[clipped]"));
+    }
+
+    #[test]
+    fn earlier_proofs_text_clips_long_commands_on_a_char_boundary() {
+        let long = "é".repeat(PRIOR_PROOF_COMMAND_MAX_CHARS + 40);
+        let text = earlier_proofs_text(&[("t".to_string(), "PASS", Some(long))]);
+        let expected = format!(
+            "`{}{COMMAND_CLIP_MARKER}`",
+            "é".repeat(PRIOR_PROOF_COMMAND_MAX_CHARS)
+        );
+        assert!(text.contains(&expected));
+        let exact = "x".repeat(PRIOR_PROOF_COMMAND_MAX_CHARS);
+        assert_eq!(clip_prior_command(&exact), exact);
+    }
+
+    #[test]
+    fn earlier_proofs_text_mixed_command_and_prompt() {
+        let text = earlier_proofs_text(&[
+            (
+                "fmt".to_string(),
+                "PASS",
+                Some("cargo fmt\n--check".to_string()),
+            ),
+            ("review".to_string(), "PASS", None),
+        ]);
+        assert!(text.contains("- `fmt`: PASS — ran command: `cargo fmt --check`"));
+        assert!(text.contains("- `review`: PASS\n") || text.contains("- `review`: PASS"));
+        assert!(!text.contains("`review`: PASS — ran command"));
+        assert!(text.contains("Do not re-run"));
+    }
+
+    #[test]
+    fn earlier_proofs_text_prompt_only_has_no_rerun_guidance() {
+        let text = earlier_proofs_text(&[("review".to_string(), "PASS", None)]);
+        assert!(!text.contains("Do not re-run"));
+    }
 
     /// RAL-524: startup feedback recovery defers to an explicit user stop.
     /// A `merge_stopped` review's queued feedback stays queued (applied once
