@@ -120,6 +120,14 @@ const AGENT_LOGINS: InitializeSetting = InitializeSetting {
     prompt: "agent logins",
     flag: "--agent-logins",
 };
+const INSTALL_SKILLS: InitializeSetting = InitializeSetting {
+    prompt: "install skills",
+    flag: "--install-skills",
+};
+const FORCE_SKILLS: InitializeSetting = InitializeSetting {
+    prompt: "force skills",
+    flag: "--force-skills",
+};
 const REGISTER_PROJECT: InitializeSetting = InitializeSetting {
     prompt: "register project",
     flag: "--register-project",
@@ -207,6 +215,8 @@ const INTERACTIVE_SETTINGS: &[&InitializeSetting] = &[
     &SETUP_MCP,
     &MCP_HOST,
     &AGENT_LOGINS,
+    &INSTALL_SKILLS,
+    &FORCE_SKILLS,
     &REGISTER_PROJECT,
     &PROJECT_NAME,
     &PROJECT_IS_FORK,
@@ -254,6 +264,8 @@ pub struct InitializeSoloDeveloperOptions {
     /// Backends to log in to (`claude,codex`, `all`, `none`); pre-answers the
     /// agent-logins prompt.
     pub agent_logins: Option<String>,
+    pub install_skills: Option<String>,
+    pub force_skills: Option<bool>,
     pub register_project: Option<bool>,
     pub project_name: Option<String>,
     pub project_is_fork: Option<bool>,
@@ -287,6 +299,8 @@ impl std::fmt::Debug for InitializeSoloDeveloperOptions {
             .field("setup_mcp", &self.setup_mcp)
             .field("mcp_hosts", &self.mcp_hosts)
             .field("agent_logins", &self.agent_logins)
+            .field("install_skills", &self.install_skills)
+            .field("force_skills", &self.force_skills)
             .field("register_project", &self.register_project)
             .field("project_name", &self.project_name)
             .field("project_is_fork", &self.project_is_fork)
@@ -326,6 +340,8 @@ impl InitializeSoloDeveloperOptions {
             || self.setup_mcp.is_some()
             || !self.mcp_hosts.is_empty()
             || self.agent_logins.is_some()
+            || self.install_skills.is_some()
+            || self.force_skills.is_some()
             || self.register_project.is_some()
             || self.project_name.is_some()
             || self.project_is_fork.is_some()
@@ -2116,7 +2132,7 @@ mod tests {
     #[test]
     fn interactive_settings_have_unique_prompt_and_flag_contracts() {
         assert!(interactive_settings_are_valid());
-        assert_eq!(INTERACTIVE_SETTINGS.len(), 25);
+        assert_eq!(INTERACTIVE_SETTINGS.len(), 27);
     }
 
     #[test]
