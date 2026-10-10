@@ -196,6 +196,72 @@
       }
       initSplitters();
 
+      const DOCK_H_KEY = "ralphus-review-dock-h";
+      const DOCK_H_DEF = 300;
+      const DOCK_H_MIN = 120;
+      const DOCK_H_STEP = 24;
+      /**
+       * The log drawer's ceiling: nearly the whole review column, leaving a
+       * strip of the stack visible above it.
+       * @returns {number}
+       */
+      function dockMaxH() {
+        const main = document.querySelector(".review-main");
+        return Math.max(DOCK_H_MIN, (main ? main.getBoundingClientRect().height : window.innerHeight) - 80);
+      }
+      /**
+       * Applies and (optionally) persists the log drawer height, clamped to its bounds.
+       * @param {number} h
+       * @param {boolean} save
+       * @returns {number} the clamped height
+       */
+      function setDockH(h, save) {
+        const v = Math.round(Math.max(DOCK_H_MIN, Math.min(dockMaxH(), h)));
+        document.documentElement.style.setProperty("--review-dock-h", v + "px");
+        if (save) {
+          try { localStorage.setItem(DOCK_H_KEY, String(v)); } catch (_e) { /* storage unavailable */ }
+        }
+        return v;
+      }
+      /**
+       * Wires mouse/touch (pointer) and keyboard resizing on the review log drawer's top-edge handle.
+       * @returns {void}
+       */
+      function initDockResize() {
+        const el = document.getElementById("review-dock-resize");
+        if (!el) return;
+        try {
+          const saved = parseFloat(localStorage.getItem(DOCK_H_KEY) ?? "");
+          if (!Number.isNaN(saved)) setDockH(saved, false);
+        } catch (_e) { /* storage unavailable */ }
+        const curH = () => parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--review-dock-h")) || DOCK_H_DEF;
+        el.addEventListener("click", (e) => e.stopPropagation());
+        el.addEventListener("pointerdown", (e) => {
+          e.preventDefault();
+          const startY = e.clientY;
+          const startH = curH();
+          el.classList.add("dragging");
+          el.setPointerCapture(e.pointerId);
+          const move = (/** @type {PointerEvent} */ m) => { setDockH(startH + (startY - m.clientY), false); };
+          const up = () => {
+            el.classList.remove("dragging");
+            el.removeEventListener("pointermove", move);
+            el.removeEventListener("pointerup", up);
+            el.removeEventListener("pointercancel", up);
+            setDockH(curH(), true);
+          };
+          el.addEventListener("pointermove", move);
+          el.addEventListener("pointerup", up);
+          el.addEventListener("pointercancel", up);
+        });
+        el.addEventListener("keydown", (e) => {
+          if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
+          e.preventDefault();
+          setDockH(curH() + (e.key === "ArrowUp" ? DOCK_H_STEP : -DOCK_H_STEP), true);
+        });
+      }
+      initDockResize();
+
       // ---------- tabs ----------
       const TABS = ["squads", "tasks", "queue", "reviews", "waypoints", "resources", "cartographer", "projects", "machines", "triage", "presets", "users", "secrets", "worktree-retirement", "health", "agents", "prefs"];
       /**
