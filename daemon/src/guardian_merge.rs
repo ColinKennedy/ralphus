@@ -7331,6 +7331,12 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
                 // before treating it as a real failure.
                 let post_rebase_is_empty = review_ref_has_no_changes(&wt, &combined_branch, "HEAD");
                 if post_rebase_is_empty
+                    && hold_branch_for_unfinished_task(store, id, &ob.id, &ob.branch, set_status)
+                {
+                    let _ = wt.git(&["checkout", "--force", &combined_branch]);
+                    return;
+                }
+                if post_rebase_is_empty
                     && note_if_branch_is_empty(store, id, &ob.id, &ob.branch, &wt, base_sha)
                 {
                     fail_branch(
@@ -10632,6 +10638,17 @@ fn stack_pick(
             // before treating it as a real failure.
             let post_rebase_is_empty = review_ref_has_no_changes(wt, newbase, rev);
             if post_rebase_is_empty
+                && hold_branch_for_unfinished_task(
+                    store,
+                    id,
+                    branch_id,
+                    feature_branch,
+                    &set_status,
+                )
+            {
+                return Err(());
+            }
+            if post_rebase_is_empty
                 && note_if_branch_is_empty(store, id, branch_id, feature_branch, wt, base_sha)
             {
                 fail_branch(
@@ -12979,6 +12996,75 @@ const EMPTY_BRANCH_DETAIL: &str = "branch is empty: it adds no changes over the 
      Its task most likely never committed its work -- check that cell, then re-run it. \
      If this branch is meant to be empty, disable it to drop it from the stack.";
 
+/// Detail for a branch held back by [`hold_branch_for_unfinished_task`].
+const TASK_UNFINISHED_DETAIL: &str = "waiting for its task to finish: the branch has no commits of its own yet. \
+     Re-run its failed task (or let a running one finish) and the review rebuilds automatically; \
+     disable the branch to drop it from the stack instead.";
+
+/// A clean rebase that left nothing over the stack beneath it reads as
+/// "already merged upstream" ([`clean_rebase_status`]) -- but only when the
+/// branch's task actually finished. A task that failed or is still running
+/// has simply not committed yet: its branch is still at the fork point, or
+/// carries nothing but the commits of the tasks it depends on, which the
+/// stack beneath it already contains. Returns whether that is the case for
+/// `branch`, in which case it has been put back to `pending` and the review
+/// to `merge_failed` with a reason, and the caller must stop building.
+///
+/// `pending` is what lets the review recover on its own: the straggler sweep
+/// ([`crate::store::Store::guardians_with_ready_stragglers`]) reopens a
+/// `merge_failed` review as soon as a `pending` branch's task is `done`.
+fn hold_branch_for_unfinished_task<F: Fn(GuardianStatus, Option<&str>)>(
+    store: &crate::store_lock::StoreHandle,
+    id: &str,
+    branch_id: &str,
+    branch: &str,
+    set_status: &F,
+) -> bool {
+    let unfinished = {
+        let guard = store.lock();
+        match guard.branch_task_unfinished(id, branch) {
+            Ok(unfinished) => unfinished,
+            Err(e) => {
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [guardian] review {id} cannot check whether branch {branch}'s task finished: {e}"
+                );
+                false
+            }
+        }
+    };
+    if !unfinished {
+        return false;
+    }
+    crate::rlog!(
+        WARNING,
+        "ralphus [guardian] review {id} branch {branch} adds nothing and its task has not finished; holding it pending"
+    );
+    {
+        let guard = store.lock();
+        let _ = guard.set_branch_status(
+            id,
+            branch_id,
+            MergeStatus::Pending,
+            Some(TASK_UNFINISHED_DETAIL),
+        );
+        crate::cartographer::Note::new("guardian")
+            .guardian(id)
+            .scope("branch")
+            .level(crate::logging::LogLevel::WARNING)
+            .emit(
+                &guard,
+                format!("review branch {branch} held: its task has not finished"),
+                serde_json::json!({"branch": branch, "branch_id": branch_id}),
+            );
+    }
+    set_status(
+        GuardianStatus::MergeFailed,
+        Some(&format!("branch {branch}: {TASK_UNFINISHED_DETAIL}")),
+    );
+    true
+}
+
 /// Flag a branch whose *own, pre-rebase* commits added nothing over `upstream`
 /// (RAL-190). Returns whether it is empty.
 ///
@@ -14285,9 +14371,10 @@ enum RebaseOutcome {
 /// (no conflicts, no dedicated proof call). By the time this is called,
 /// `note_if_branch_is_empty` has already run against the *original*
 /// pre-rebase branch and returned `false` (the caller returns early via
-/// `fail_branch` otherwise) -- so `post_rebase_is_empty` here can only mean
-/// the branch's real commits are already present on `newbase`, not that the
-/// task never committed (RAL-193 covers that distinction). RAL-480 promotes
+/// `fail_branch` otherwise), and [`hold_branch_for_unfinished_task`] has
+/// confirmed the branch's task finished -- so `post_rebase_is_empty` here can
+/// only mean the branch's real commits are already present on `newbase`, not
+/// that the task never committed (RAL-193 covers that distinction). RAL-480 promotes
 /// that case from a `Done` branch carrying an "(already merged?)" guess in
 /// its free-text `detail` to an explicit, independently-visible `Merged`
 /// status.
@@ -20946,6 +21033,133 @@ mod tests {
             !due.contains(&id),
             "a merged branch must never queue an auto-submit sweep (RAL-480)"
         );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn stack_pick_holds_an_empty_branch_whose_task_has_not_finished() {
+        // Reproduces guardian-000000000206: a manual "Merge / rebase" ran
+        // while some tasks' cells had failed (an expired agent login). Those
+        // branches had no commits of their own -- only the commits of the
+        // tasks they depend on, which the stack beneath them already held --
+        // so each rebase came out empty and was reported "already merged
+        // upstream". A branch whose task has not finished has not merged
+        // anything; it has not committed yet.
+        let (base, repo, _fwt) = make_repo("stack-pick-unfinished-task");
+        let old_base = git(&repo, &["rev-parse", "main"])
+            .unwrap()
+            .trim()
+            .to_string();
+        // The stack beneath already contains feature/a's only commit, as the
+        // review's lower branch held the commit of the task feature/a forked
+        // from.
+        g(&repo, &["merge", "--no-edit", "feature/a"]);
+        let new_base = git(&repo, &["rev-parse", "main"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let rev = "guardian/test/wt-feature-a";
+        let wt = base.join("review-wt");
+        g(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                rev,
+                wt.to_str().unwrap(),
+                "feature/a",
+            ],
+        );
+
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let (id, squad_id) = {
+            let mut guard = store.lock();
+            let squad_id =
+                insert_cell_for_branch(&mut guard, "feature/a", crate::store::NodeState::Failed);
+            guard
+                .set_task_state(&squad_id, 0, crate::store::NodeState::Failed)
+                .unwrap();
+            let id = guard
+                .create_guardian("r", "main", repo.to_str().unwrap())
+                .unwrap();
+            guard.add_guardian_branch(&id, "feature/a").unwrap();
+            (id, squad_id)
+        };
+        let branch_id = store.lock().get_guardian(&id).unwrap().branches[0]
+            .id
+            .clone();
+
+        struct MustNotRunRunner;
+        impl Runner for MustNotRunRunner {
+            fn run(&self, _: &RunnerSpec) -> RunnerResult {
+                panic!("a clean rebase must never call the runner");
+            }
+        }
+        let gate = ProofGate {
+            scope: "nothing".to_string(),
+            skip_auto_clean: false,
+            is_final_branch: false,
+        };
+
+        let result = stack_pick(
+            &store,
+            &MustNotRunRunner,
+            &id,
+            &branch_id,
+            "feature/a",
+            &old_base,
+            None,
+            &new_base,
+            rev,
+            &Workspace::local(&wt),
+            false,
+            &gate,
+            &CancelToken::never(),
+        );
+
+        assert!(
+            result.is_err(),
+            "the build must stop at a branch whose task has not finished"
+        );
+        let guardian = store.lock().get_guardian(&id).unwrap();
+        let branch = guardian.branches[0].clone();
+        assert_eq!(
+            branch.merge_status,
+            crate::guardian::MergeStatus::Pending.as_str(),
+            "an unfinished task's empty branch must be held pending, never reported merged"
+        );
+        assert_eq!(branch.detail.as_deref(), Some(TASK_UNFINISHED_DETAIL));
+        assert_eq!(
+            guardian.status.as_str(),
+            GuardianStatus::MergeFailed.as_str()
+        );
+        let due = store.lock().take_due_auto_submits(i64::MAX / 2, 0).unwrap();
+        assert!(
+            !due.contains(&id),
+            "a held branch has no work to submit and must not queue an auto-submit"
+        );
+
+        // Once the task is re-run and finishes, the straggler sweep must find
+        // this review and promote the held branch, so it rebuilds on its own.
+        {
+            let guard = store.lock();
+            assert!(guard.guardians_with_ready_stragglers().unwrap().is_empty());
+            guard
+                .set_cell_state(&squad_id, 0, 0, crate::store::NodeState::Done)
+                .unwrap();
+            guard
+                .set_task_state(&squad_id, 0, crate::store::NodeState::Done)
+                .unwrap();
+            assert_eq!(
+                guard.guardians_with_ready_stragglers().unwrap(),
+                vec![id.clone()]
+            );
+            assert_eq!(guard.mark_ready_branches_with_done_cells(&id).unwrap(), 1);
+        }
 
         let _ = std::fs::remove_dir_all(&base);
     }

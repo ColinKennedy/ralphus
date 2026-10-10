@@ -2086,6 +2086,42 @@ impl Store {
         Ok(n)
     }
 
+    /// Whether `branch` of `guardian_id` has a linked task that has not
+    /// finished: it has at least one contributing cell, and either one of
+    /// those cells or its owning task is not `done`. This is exactly the
+    /// negation of [`Self::mark_ready_branches_with_done_cells`]'s promotion
+    /// condition (same guardian scoping), so a branch held back on it is
+    /// promoted again by the straggler sweep the moment its task finishes.
+    ///
+    /// A branch with no linked cell at all has nothing to wait for and is
+    /// never unfinished.
+    pub fn branch_task_unfinished(&self, guardian_id: &str, branch: &str) -> Result<bool> {
+        let unfinished = self.conn.query_row(
+            "SELECT EXISTS (
+                 SELECT 1 FROM cells s
+                 WHERE s.review_branch = ?2
+                   AND (s.review_guardian_id = ?1 OR s.review_guardian_id IS NULL)
+             ) AND (
+                 EXISTS (
+                     SELECT 1 FROM cells s
+                     WHERE s.review_branch = ?2
+                       AND (s.review_guardian_id = ?1 OR s.review_guardian_id IS NULL)
+                       AND s.state != 'done'
+                 )
+                 OR EXISTS (
+                     SELECT 1 FROM cells s
+                     JOIN tasks t ON t.squad_id = s.squad_id AND t.idx = s.task_idx
+                     WHERE s.review_branch = ?2
+                       AND (s.review_guardian_id = ?1 OR s.review_guardian_id IS NULL)
+                       AND t.state != 'done'
+                 )
+             )",
+            params![guardian_id, branch],
+            |r| r.get::<_, bool>(0),
+        )?;
+        Ok(unfinished)
+    }
+
     /// Link an existing cell/task to a guardian's branch after the fact
     /// (RAL-392): stamps `cells.review_branch`/`review_guardian_id` the same
     /// way [`crate::reviews::derive_reviews`] does at submit time, for a
@@ -10459,6 +10495,32 @@ mod tests {
             .unwrap();
         store.set_cell_state(&squad_id, 0, 0, cell_state).unwrap();
         squad_id
+    }
+
+    #[test]
+    fn branch_task_unfinished_mirrors_straggler_readiness() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        assert!(
+            !store.branch_task_unfinished(&id, "manual").unwrap(),
+            "a branch with no linked cell has nothing to wait for"
+        );
+
+        insert_cell_for_branch(&mut store, "running", NodeState::Running);
+        assert!(store.branch_task_unfinished(&id, "running").unwrap());
+
+        // RAL-442: a finished cell whose task then failed (e.g. the
+        // no-commits finalizer) has not delivered either.
+        insert_cell_for_branch_with_task_state(
+            &mut store,
+            "task-failed",
+            NodeState::Done,
+            NodeState::Failed,
+        );
+        assert!(store.branch_task_unfinished(&id, "task-failed").unwrap());
+
+        insert_cell_for_branch(&mut store, "done", NodeState::Done);
+        assert!(!store.branch_task_unfinished(&id, "done").unwrap());
     }
 
     #[test]
