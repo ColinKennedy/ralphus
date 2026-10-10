@@ -93,6 +93,11 @@ pub struct BackendOutcome {
     /// cell. `None` for every other outcome, including an unrecognized or
     /// delay-less rate limit (treated as a genuine failure, not guessed at).
     pub rate_limit_retry_after: Option<std::time::Duration>,
+    /// RAL-595: every distinct `RALPHUS_PROPHECY:` marker the backend saw in
+    /// assistant text over this invocation, not only the final message. Each
+    /// was already emitted live as a `prophecy` event; this is the typed
+    /// at-exit copy `execute.rs` accumulates across rounds.
+    pub prophecies: Vec<crate::prophecy::ProphecyMarker>,
 }
 
 /// Options common to every backend's `run` call, bundled to keep the trait's

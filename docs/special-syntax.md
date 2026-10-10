@@ -463,8 +463,15 @@ tool guidance, but without the waypoint section (`waypoint_context` false). The 
   scope. The bullet-count and "not a changelog" framing are prompt
   conventions, not parser-enforced shapes; only the marker line is parsed.
 - **`RALPHUS_PROPHECY: <kind>: <note>`** — an append-only design note from
-  a prompt cell. Every standalone marker line is carried in the runner
-  result, rather than only the last one; `<kind>` is one of `discovery`,
+  a prompt cell. Every standalone marker line in any assistant turn is
+  scanned as that turn arrives (including a closing message longer than the
+  2000-character summary tail, and every `RALPHUS_STILL_WORKING:` round),
+  emitted as a live `prophecy` `RALPHUS_EVENT` (payload `{kind, body}`) and
+  also carried in the runner result as a backstop, so a marker survives a
+  failure, timeout, cancel or compaction-thrash kill. Text in tool output or
+  an echoed prompt is never scanned. A marker repeated verbatim (whitespace
+  aside) within one attempt is stored once; the attempt number is the cell's
+  restart count, and views show the latest attempt's notes; `<kind>` is one of `discovery`,
   `decision`, `hazard`, `deferred`, or `unconfirmed`. `deferred` is
   strictly *follow-up work someone should do later*; a note about what the
   agent could not run, check or verify is `unconfirmed`, and a known risk
@@ -607,6 +614,11 @@ Rules and risks:
 Three sentinels exist for code that *hosts* a ralphus runner, not for task
 files or cell replies:
 
+- **`RALPHUS_EVENT` message `prophecy`** — emitted by a backend the moment a
+  new `RALPHUS_PROPHECY:` marker appears in an assistant turn. The daemon's
+  `forward_runner_event` files it against the cell
+  (`daemon/src/runner.rs::PROPHECY_MESSAGE` mirrors
+  `runner/src/prophecy.rs::PROPHECY_MESSAGE`); payload `{"kind","body"}`.
 - **`RALPHUS_EVENT: {"level":"info",…}`** — stderr marker lines the runner
   subprocess (and a machine provider reaching a remote host) emits so live
   usage events reach the daemon's Cartographer event log. If you build a
