@@ -5,7 +5,7 @@
   "scripts": {
     "lint": "node scripts/generate-board-globals.mjs && eslint \"librarian/assets/board/**/*.js\"",
     "typecheck": "tsc -p tsconfig.board.json",
-    "knip": "node scripts/knip-board.mjs",
+    "knip": "node scripts/generate-board-globals.mjs && node scripts/knip-board.mjs",
     "test": "node --test \"test/*.test.mjs\""
   },
   "devDependencies": {
