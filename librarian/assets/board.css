@@ -694,6 +694,20 @@
       }
       .subtab:hover { color: var(--text); }
       .subtab.on { color: var(--accent); background: var(--accent-a); font-weight: 650; }
+      /* Agent Log widgets (RAL-603, experimental) */
+      .alog { max-height: 460px; overflow: auto; border: 1px solid var(--border); border-radius: 7px; background: var(--bg); padding: 6px; }
+      .alog-w { border: 1px solid var(--border-soft); border-radius: 6px; background: var(--panel); margin-bottom: 5px; font-size: 11px; }
+      .alog-w.error { border-color: var(--failed-b); }
+      .alog-w > summary { display: flex; align-items: center; gap: 8px; padding: 4px 8px; cursor: pointer; list-style: none; }
+      .alog-w > summary::-webkit-details-marker { display: none; }
+      .alog-tool { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-weight: 650; }
+      .alog-sub { color: var(--accent); background: var(--accent-a); border-radius: 10px; padding: 0 7px; font-size: 10px; }
+      .alog-prev { flex: 1; min-width: 0; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, "Cascadia Code", Consolas, monospace; }
+      .alog-st { font-size: 10px; color: var(--faint); }
+      .alog-st.ok { color: var(--done); }
+      .alog-st.error { color: var(--turn-error); }
+      .alog-lbl { padding: 2px 8px 0; font-size: 10px; color: var(--faint); text-transform: uppercase; letter-spacing: .04em; }
+      .alog-pre { margin: 2px 8px 6px; padding: 6px 8px; background: var(--terminal-bg); color: var(--text); border-radius: 5px; max-height: 240px; overflow: auto; white-space: pre-wrap; word-break: break-word; font-size: 10.5px; font-family: ui-monospace, "Cascadia Code", Consolas, monospace; }
       .runterm {
         background: var(--terminal-bg); border: 1px solid var(--border); border-radius: 7px;
         font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
