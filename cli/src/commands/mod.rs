@@ -471,6 +471,8 @@ fn parse_initialize_solo_developer(
         setup_mcp: parse_initialize_bool(scanner, "--setup-mcp")?,
         mcp_hosts: scanner.take_repeated("--mcp-host")?,
         agent_logins: scanner.take_value("--agent-logins")?,
+        install_skills: scanner.take_value("--install-skills")?,
+        force_skills: parse_initialize_bool(scanner, "--force-skills")?,
         register_project: parse_initialize_bool(scanner, "--register-project")?,
         project_name: scanner.take_value("--project-name")?,
         project_is_fork: parse_initialize_bool(scanner, "--project-is-fork")?,
