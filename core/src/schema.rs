@@ -2264,10 +2264,10 @@ pub fn agent_supports_maximum_tool_output_tokens(agent: &str) -> bool {
 /// its regular output (or emits none at all) with nothing for the board to
 /// tell apart (RAL-516).
 ///
-/// Only Pi tags a `RALPHUS_THINKING: ` marker line
-/// (`runner::pi_backend::THINKING_MARKER`) today. Claude Code, Codex, the
-/// native/`anthropic`/`ollama` backends, and `raw`/harness cells emit
-/// nothing the board can classify as thinking, so this declares them
+/// Pi, Claude Code, and Codex tag a `RALPHUS_THINKING: ` marker line
+/// (`runner::pi_backend::THINKING_MARKER`) from reasoning their CLIs
+/// report. The native/`anthropic`/`ollama` backends and `raw`/harness cells
+/// emit nothing the board can classify as thinking, so this declares them
 /// incapable by default -- an agent-profile's own `thinking_capable`
 /// override (`daemon::agent_profiles::AgentProfile`) can still mark a custom
 /// profile capable without changing this default, e.g. a profile pointed at
@@ -2279,7 +2279,10 @@ pub fn agent_supports_maximum_tool_output_tokens(agent: &str) -> bool {
 /// in sync by hand.
 #[must_use]
 pub fn agent_supports_thinking(agent: &str) -> bool {
-    matches!(agent, "pi")
+    matches!(
+        agent,
+        "pi" | "claude-code" | "claude-cli" | "codex" | "codex-cli"
+    )
 }
 
 /// Whether `[[waypoint]].model` is required, forbidden, or unconstrained
@@ -2930,18 +2933,11 @@ mod tests {
     }
 
     #[test]
-    fn thinking_supported_only_by_pi() {
-        assert!(agent_supports_thinking("pi"));
-        for agent in [
-            "claude",
-            "anthropic",
-            "ollama",
-            "claude-code",
-            "claude-cli",
-            "codex",
-            "codex-cli",
-            "raw",
-        ] {
+    fn thinking_supported_only_by_reasoning_cli_backends() {
+        for agent in ["pi", "claude-code", "claude-cli", "codex", "codex-cli"] {
+            assert!(agent_supports_thinking(agent), "{agent}");
+        }
+        for agent in ["claude", "anthropic", "ollama", "raw"] {
             assert!(!agent_supports_thinking(agent), "{agent}");
         }
     }

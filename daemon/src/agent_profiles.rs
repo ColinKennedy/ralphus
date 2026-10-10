@@ -1191,8 +1191,8 @@ mod tests {
     fn thinking_capable_for_agent_uses_the_builtin_backend_default_when_bare() {
         let db_profiles = std::collections::HashMap::new();
         assert!(thinking_capable_for_agent("pi", &db_profiles));
-        assert!(!thinking_capable_for_agent("claude-code", &db_profiles));
-        assert!(!thinking_capable_for_agent("codex", &db_profiles));
+        assert!(thinking_capable_for_agent("claude-code", &db_profiles));
+        assert!(thinking_capable_for_agent("codex", &db_profiles));
     }
 
     #[test]
@@ -1210,7 +1210,7 @@ mod tests {
         db_profiles.insert("my-pi".to_string(), db_profile("pi", None));
         db_profiles.insert("my-codex".to_string(), db_profile("codex", None));
         assert!(thinking_capable_for_agent("my-pi", &db_profiles));
-        assert!(!thinking_capable_for_agent("my-codex", &db_profiles));
+        assert!(thinking_capable_for_agent("my-codex", &db_profiles));
     }
 
     #[test]
