@@ -361,6 +361,10 @@ impl ModelBackend for ClaudeCodeBackend {
     fn supports_maximum_tool_output_tokens(&self) -> bool {
         true
     }
+
+    fn supports_thinking(&self) -> bool {
+        true
+    }
 }
 
 /// The `--resume <id>` / `--session-id <id>` argument pair for a claude-code
@@ -760,6 +764,17 @@ struct ParseState {
     /// rendered that way, so the `assistant` handling doesn't print the same
     /// text twice.
     printed_text_delta: bool,
+    /// RAL-598: a streamed `thinking` content block is open; its partial
+    /// line is buffered in [`Self::thinking_line`] until a newline or the
+    /// block's end.
+    in_thinking_block: bool,
+    thinking_line: String,
+    /// RAL-598: the open thinking block has already emitted some text.
+    thinking_block_had_text: bool,
+    /// RAL-598: thinking was already streamed as `thinking_delta`s for the
+    /// turn the next `assistant` event completes, so its `thinking` block
+    /// must not be printed a second time.
+    streamed_thinking: bool,
     /// RAL-292: the most recent `Bash` tool call's rendered args, launched
     /// with `run_in_background: true`, that hasn't yet been followed by a
     /// `BashOutput`/`KillShell` call checking on it. Still `Some` once the
@@ -795,6 +810,27 @@ fn process_event(
     match event["type"].as_str() {
         Some("stream_event") => {
             let inner = &event["event"];
+            match inner["type"].as_str() {
+                Some("content_block_start")
+                    if inner["content_block"]["type"].as_str() == Some("thinking") =>
+                {
+                    open_thinking_block(state);
+                }
+                Some("content_block_stop") => finish_thinking_block(state),
+                Some("content_block_delta")
+                    if inner["delta"]["type"].as_str() == Some("thinking_delta") =>
+                {
+                    open_thinking_block(state);
+                    if let Some(text) = inner["delta"]["thinking"].as_str() {
+                        for line in split_thinking_lines(&mut state.thinking_line, text) {
+                            crate::pi_backend::print_thinking_line(&line);
+                            state.thinking_block_had_text = true;
+                        }
+                        state.thinking_block_had_text |= !text.is_empty();
+                    }
+                }
+                _ => {}
+            }
             if inner["type"].as_str() == Some("content_block_delta") {
                 if let Some(text) = inner["delta"]["text"].as_str() {
                     if !text.is_empty() {
@@ -891,6 +927,7 @@ fn process_event(
             // (the response event represents both sides).
             state.turns += 1;
             let already_streamed = state.printed_text_delta;
+            let thinking_streamed = std::mem::take(&mut state.streamed_thinking);
             if state.printed_text_delta {
                 finish_delta_line();
                 state.printed_text_delta = false;
@@ -912,6 +949,11 @@ fn process_event(
                                 if !text.is_empty() {
                                     print_line(text);
                                 }
+                            }
+                        }
+                        Some("thinking") if !thinking_streamed => {
+                            if let Some(text) = block["thinking"].as_str() {
+                                crate::pi_backend::print_thinking_block(text);
                             }
                         }
                         Some("tool_use") => {
@@ -1192,6 +1234,50 @@ fn print_header(model: Option<&str>, workspace: &Workspace) {
         model.unwrap_or("default"),
         workspace.root().display()
     );
+}
+
+/// RAL-598: opens a streamed thinking block, first closing any half-written
+/// plain-text delta line so the thinking marker stays a line prefix.
+fn open_thinking_block(state: &mut ParseState) {
+    if state.in_thinking_block {
+        return;
+    }
+    state.in_thinking_block = true;
+    state.streamed_thinking = true;
+    state.thinking_block_had_text = false;
+    if state.printed_text_delta {
+        finish_delta_line();
+        state.printed_text_delta = false;
+    }
+}
+
+/// RAL-598: closes an open streamed thinking block, flushing its buffered
+/// partial line. A block that streamed nothing at all (an empty string)
+/// prints the placeholder instead.
+fn finish_thinking_block(state: &mut ParseState) {
+    if !state.in_thinking_block {
+        return;
+    }
+    if !state.thinking_line.is_empty() {
+        crate::pi_backend::print_thinking_line(&std::mem::take(&mut state.thinking_line));
+    } else if !state.thinking_block_had_text {
+        crate::pi_backend::print_thinking_block("");
+    }
+    state.in_thinking_block = false;
+}
+
+/// RAL-598: splits `delta` into the thinking lines it completes, carrying
+/// the unterminated tail over in `buffer`.
+fn split_thinking_lines(buffer: &mut String, delta: &str) -> Vec<String> {
+    let mut complete = Vec::new();
+    for c in delta.chars() {
+        if c == '\n' {
+            complete.push(std::mem::take(buffer));
+        } else {
+            buffer.push(c);
+        }
+    }
+    complete
 }
 
 /// Prints one line of Claude's own streamed text output to the live tmux
@@ -2428,5 +2514,34 @@ mod tests {
         let ws = test_workspace();
         let dir = isolated_claude_config_dir(&options, &ws).expect("isolated dir");
         assert!(dir.to_string_lossy().contains("claude-code"));
+    }
+}
+
+#[cfg(test)]
+mod thinking_tests {
+    use super::*;
+
+    #[test]
+    fn split_thinking_lines_carries_the_unterminated_tail() {
+        let mut buffer = String::new();
+        assert_eq!(split_thinking_lines(&mut buffer, "one\ntw"), vec!["one"]);
+        assert_eq!(split_thinking_lines(&mut buffer, "o\n"), vec!["two"]);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn thinking_deltas_mark_the_turn_as_streamed() {
+        let mut state = ParseState::default();
+        let event = serde_json::json!({"type": "stream_event", "event": {
+            "type": "content_block_delta",
+            "delta": {"type": "thinking_delta", "thinking": "hmm"}}});
+        let workspace = Workspace::create(std::env::temp_dir()).unwrap();
+        process_event(&event, &mut state, &workspace, None, 100);
+        assert!(state.in_thinking_block && state.streamed_thinking);
+        assert_eq!(state.thinking_line, "hmm");
+        let stop =
+            serde_json::json!({"type": "stream_event", "event": {"type": "content_block_stop"}});
+        process_event(&stop, &mut state, &workspace, None, 100);
+        assert!(!state.in_thinking_block && state.thinking_line.is_empty());
     }
 }
