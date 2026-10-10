@@ -3853,7 +3853,9 @@ pub fn start_resync_pr_bases(store: crate::store_lock::StoreHandle, id: &str) {
 /// anything changed (marked merged, or a PR was dropped) -- callers use this to
 /// know the guardian's status may no longer be what they last read.
 pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool {
-    let Ok(guardian) = store.lock().get_guardian(id) else {
+    let Ok(guardian) =
+        store.with_read_snapshot(|conn| crate::store::Store::get_guardian_conn(conn, id))
+    else {
         return false;
     };
     if crate::guardian::GuardianStatus::is_terminal_status(&guardian.status) {
@@ -5723,7 +5725,9 @@ pub fn poll_pr_base_drift(
     store: &crate::store_lock::StoreHandle,
     id: &str,
 ) -> std::result::Result<usize, String> {
-    let guardian = store.lock().get_guardian(id).map_err(|e| e.to_string())?;
+    let guardian = store
+        .with_read_snapshot(|conn| crate::store::Store::get_guardian_conn(conn, id))
+        .map_err(|e| e.to_string())?;
     if crate::guardian::GuardianStatus::is_terminal_status(&guardian.status) {
         return Ok(0);
     }
@@ -9570,8 +9574,7 @@ fn fetch_remote_pr_tip(
         .get_pull_request(pr_id)
         .map_err(|e| e.to_string())?;
     let guardian = store
-        .lock()
-        .get_guardian(&pr.guardian_id)
+        .with_read_snapshot(|conn| crate::store::Store::get_guardian_conn(conn, &pr.guardian_id))
         .map_err(|e| e.to_string())?;
     let root = PathBuf::from(&guardian.git_root);
     let forge_cfg = crate::config::resolve_forge(&root);
@@ -9994,7 +9997,9 @@ pub fn sync_remote_pr_commits(
     runner: &dyn Runner,
     id: &str,
 ) -> std::result::Result<usize, String> {
-    let guardian = store.lock().get_guardian(id).map_err(|e| e.to_string())?;
+    let guardian = store
+        .with_read_snapshot(|conn| crate::store::Store::get_guardian_conn(conn, id))
+        .map_err(|e| e.to_string())?;
     if guardian.status.as_str() != "in_review" {
         return Ok(0);
     }
@@ -10045,8 +10050,9 @@ pub fn sync_remote_pr_commits(
     for (pr, remote_sha) in pr_ids.iter().zip(remote_tips) {
         let remote_sha = remote_sha?;
         let guardian = store
-            .lock()
-            .get_guardian(&pr.guardian_id)
+            .with_read_snapshot(|conn| {
+                crate::store::Store::get_guardian_conn(conn, &pr.guardian_id)
+            })
             .map_err(|e| e.to_string())?;
         let root = PathBuf::from(&guardian.git_root);
         let local_ref = if let Some(bid) = &pr.branch_id {

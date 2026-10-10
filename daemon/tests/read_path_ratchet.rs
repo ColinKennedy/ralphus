@@ -49,15 +49,42 @@ const MUST_STAY_POOLED: &[&str] = &[
     "health",
 ];
 
-fn server_source() -> String {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/server.rs");
+/// Background review-maintenance workers that must hydrate reviews through the
+/// read pool, as `(source file, fn name)`.
+///
+/// They run on every maintenance tick for every review in review, and
+/// `Store::get_guardian` reads the review's project config from disk. Under the
+/// writer lock that read held the store for 3.6s on a cold dev-daemon start and
+/// tripped the debug guard-hold panic at `sync_remote_pr_commits`' first line;
+/// `fetch_remote_pr_tip` runs it once per open PR, concurrently, so the holds
+/// queue behind each other.
+const MAINTENANCE_WORKERS_OFF_THE_LOCK: &[(&str, &str)] = &[
+    ("src/pr.rs", "sync_remote_pr_commits"),
+    ("src/pr.rs", "fetch_remote_pr_tip"),
+    ("src/pr.rs", "check_pr_merges"),
+    ("src/pr.rs", "poll_pr_base_drift"),
+    ("src/ci_watch.rs", "poll_open_pr_ci_status"),
+    ("src/ci_watch.rs", "run_watch"),
+];
+
+fn source(relative: &str) -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
-/// The body of `fn name(...)`, by brace matching from its signature.
+fn server_source() -> String {
+    source("src/server.rs")
+}
+
+/// The body of `fn name(...)` declared at the start of a line, with or without
+/// a visibility, by brace matching from its signature.
 fn body_of(src: &str, name: &str) -> Option<String> {
-    let needle = format!("\nfn {name}(");
-    let at = src.find(&needle)?;
+    let needle = format!("fn {name}(");
+    let at = src.match_indices(&needle).map(|(i, _)| i).find(|&i| {
+        let line_start = src[..i].rfind('\n').map_or(0, |n| n + 1);
+        let prefix = src[line_start..i].trim();
+        prefix.is_empty() || prefix.starts_with("pub")
+    })?;
     let open = src[at..].find('{')? + at;
     let mut depth = 0usize;
     for (offset, ch) in src[open..].char_indices() {
@@ -170,6 +197,63 @@ fn the_pooled_get_handler_count_only_goes_up() {
              remove."
         );
     }
+}
+
+/// Whether a body hydrates a review through the writer connection.
+/// `Store::get_guardian` always reads through it; the pooled form is
+/// `Store::get_guardian_conn` under `with_read_snapshot`.
+fn hydrates_review_under_the_lock(body: &str) -> bool {
+    body.contains(".get_guardian(")
+}
+
+#[test]
+fn review_maintenance_workers_hydrate_reviews_off_the_store_lock() {
+    for (file, name) in MAINTENANCE_WORKERS_OFF_THE_LOCK {
+        let src = source(file);
+        let body = body_of(&src, name)
+            .unwrap_or_else(|| panic!("`{name}` not found in {file}; update this list"));
+        assert!(
+            !hydrates_review_under_the_lock(&body),
+            "`{name}` ({file}) calls `.get_guardian(` -- a hydrated review read \
+             on the writer connection, which reads project config from disk \
+             under the store lock on every maintenance tick. Use \
+             `store.with_read_snapshot(|conn| Store::get_guardian_conn(conn, id))`."
+        );
+        assert!(
+            is_pooled(&body),
+            "`{name}` ({file}) no longer reads through the read pool at all"
+        );
+    }
+}
+
+#[test]
+fn the_maintenance_scan_flags_a_locked_hydration() {
+    // A self-test: if `body_of` stopped finding `pub` fns or the detector
+    // stopped matching, the test above would pass by checking nothing.
+    let fake = "
+pub fn locked_worker(store: &StoreHandle, id: &str) -> bool {
+    let Ok(guardian) = store.lock().get_guardian(id) else { return false };
+    true
+}
+pub(crate) fn split_worker(store: &StoreHandle, id: &str) {
+    let guardian = store
+        .lock()
+        .get_guardian(id);
+}
+fn pooled_worker(store: &StoreHandle, id: &str) {
+    let guardian = store.with_read_snapshot(|conn| Store::get_guardian_conn(conn, id));
+}
+";
+    for locked in ["locked_worker", "split_worker"] {
+        let body = body_of(fake, locked).expect("body_of missed a `pub` fn");
+        assert!(
+            hydrates_review_under_the_lock(&body),
+            "`{locked}` was not flagged"
+        );
+    }
+    let pooled = body_of(fake, "pooled_worker").expect("body_of missed a private fn");
+    assert!(!hydrates_review_under_the_lock(&pooled));
+    assert!(is_pooled(&pooled));
 }
 
 #[test]
