@@ -24,10 +24,10 @@ from ralphus.proccount.storage import CountRecord, load_records, save_records, u
 
 __all__ = ["main", "read_run_dir", "reduce_runs"]
 
-DATA_DIR_NAME = "proc_counts"
-PROFILE = "proc-count"
-WRAPPER_RELPATH = Path("scripts") / "proc-count-wrap.sh"
-NEXTEST_CONFIG_RELPATH = Path(".config") / "nextest.toml"
+_DATA_DIR_NAME = "proc_counts"
+_PROFILE = "proc-count"
+_WRAPPER_RELPATH = Path("scripts") / "proc-count-wrap.sh"
+_NEXTEST_CONFIG_RELPATH = Path(".config") / "nextest.toml"
 
 
 def read_run_dir(directory: Path) -> dict[str, int]:
@@ -89,7 +89,7 @@ def _run_once(build_root: Path, tests: list[TaggedTest], out_dir: Path) -> None:
             "nextest",
             "run",
             "--profile",
-            PROFILE,
+            _PROFILE,
             "--workspace",
             "--all-targets",
             "--no-fail-fast",
@@ -106,7 +106,7 @@ def _run_once(build_root: Path, tests: list[TaggedTest], out_dir: Path) -> None:
 
 def _collect(args: argparse.Namespace) -> int:
     root = _repo_root()
-    data_dir = root / DATA_DIR_NAME
+    data_dir = root / _DATA_DIR_NAME
     tests = load_manifest(data_dir / "tags.toml")
     if not tests:
         sys.stderr.write("proc_counts/tags.toml lists no tests\n")
@@ -126,7 +126,7 @@ def _collect(args: argparse.Namespace) -> int:
         worktree = Path(tempfile.mkdtemp(prefix="proc-count-")) / "tree"
         _git(root, "worktree", "add", "--detach", str(worktree), commit)
         build_root = worktree
-        for rel in (WRAPPER_RELPATH, NEXTEST_CONFIG_RELPATH):
+        for rel in (_WRAPPER_RELPATH, _NEXTEST_CONFIG_RELPATH):
             (worktree / rel).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(root / rel, worktree / rel)
     try:
@@ -158,7 +158,7 @@ def _collect(args: argparse.Namespace) -> int:
 
 
 def _graph(_args: argparse.Namespace) -> int:
-    data_dir = _repo_root() / DATA_DIR_NAME
+    data_dir = _repo_root() / _DATA_DIR_NAME
     write_graphs(
         data_dir, load_records(data_dir / "records.json"), load_manifest(data_dir / "tags.toml")
     )

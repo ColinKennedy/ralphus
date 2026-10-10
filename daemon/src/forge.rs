@@ -3161,7 +3161,7 @@ pub fn check_repository_url(
 }
 
 /// Parse a git remote URL into `(host, path)` -- the logic lives in
-/// [`ralphus_core::git_remote`] so `ralphus initialize server` normalizes
+/// [`ralphus_core::git_remote`] so `ralphus initialize solo-developer` normalizes
 /// URLs identically.
 ///
 /// `pub(crate)` (RAL-338) so `project_forks`/`pr.rs` can reuse it to derive a

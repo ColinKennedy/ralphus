@@ -204,9 +204,9 @@ Ask concretely: name the candidate value shapes (an enum's literal list, a
 numeric bound, "no validation") rather than asking "should this be
 validated?" in the abstract.
 
-## Keep `initialize server` interactive and one-shot setup in parity
+## Keep `initialize solo-developer` interactive and one-shot setup in parity
 
-`ralphus initialize server` serves both a first-time user at a terminal and a
+`ralphus initialize solo-developer` serves both a first-time user at a terminal and a
 scripted first-time installation. Treat its prompts and its flags as two
 interfaces to the same setup choices:
 

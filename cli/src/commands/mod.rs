@@ -216,13 +216,13 @@ pub enum Command {
     InitializeGit {
         path: Option<String>,
     },
-    /// `ralphus initialize server` (RAL-501): the interactive, hidden new
+    /// `ralphus initialize solo-developer` (RAL-501): the interactive, hidden new
     /// installation walkthrough -- deliberately absent from
     /// `help_map.rs`/generated help/the MCP tool surface (see
-    /// `initialize/server.rs`'s module doc), reached only via the
+    /// `initialize/solo_developer.rs`'s module doc), reached only via the
     /// `resolved_path` exception in `help_map.rs`.
-    InitializeServer {
-        setup: Box<initialize::server::InitializeServerOptions>,
+    InitializeSoloDeveloper {
+        setup: Box<initialize::solo_developer::InitializeSoloDeveloperOptions>,
     },
     /// Set up an isolated daemon and submit a waypoint exercise suite.
     InitializeWaypoint {
@@ -323,14 +323,14 @@ pub fn parse_args(args: &[String]) -> Command {
                     let path = inner.take_value("--path").ok().flatten();
                     Command::InitializeGit { path }
                 }
-                Some("server") => {
+                Some("solo-developer") => {
                     let mut inner = Scanner::new(&tail[1..]);
-                    match parse_initialize_server(&mut inner) {
-                        Ok(setup) if inner.remaining().is_empty() => Command::InitializeServer {
+                    match parse_initialize_solo_developer(&mut inner) {
+                        Ok(setup) if inner.remaining().is_empty() => Command::InitializeSoloDeveloper {
                             setup: Box::new(setup),
                         },
                         Ok(_) => Command::UsageError(
-                            "initialize server: unexpected argument".to_string(),
+                            "initialize solo-developer: unexpected argument".to_string(),
                         ),
                         Err(error) => Command::UsageError(error.0),
                     }
@@ -415,7 +415,7 @@ fn parse_forge_host(scanner: &mut Scanner) -> Result<Option<String>, UsageError>
     scanner
         .take_value("--forge-host")?
         .map_or(Ok(None), |host| {
-            initialize::server::validate_forge_host(&host)
+            initialize::solo_developer::validate_forge_host(&host)
                 .map(|()| Some(host))
                 .map_err(|error| UsageError(format!("--forge-host: {error}")))
         })
@@ -458,10 +458,10 @@ fn parse_exercise_options(
     })
 }
 
-fn parse_initialize_server(
+fn parse_initialize_solo_developer(
     scanner: &mut Scanner,
-) -> Result<initialize::server::InitializeServerOptions, UsageError> {
-    Ok(initialize::server::InitializeServerOptions {
+) -> Result<initialize::solo_developer::InitializeSoloDeveloperOptions, UsageError> {
+    Ok(initialize::solo_developer::InitializeSoloDeveloperOptions {
         yes: scanner.take_bool("--yes"),
         answers_file: scanner
             .take_value("--answers-file")?
@@ -562,7 +562,9 @@ pub fn dispatch(cmd: Command, opts: &GlobalOpts) -> i32 {
         Command::Queue(c) => queue::dispatch(c, opts),
         Command::Mcp(c) => mcp::dispatch(c),
         Command::InitializeGit { path } => misc::cmd_initialize_git(path),
-        Command::InitializeServer { setup } => initialize::server::dispatch(opts, *setup),
+        Command::InitializeSoloDeveloper { setup } => {
+            initialize::solo_developer::dispatch(opts, *setup)
+        }
         Command::InitializeWaypoint { options } => {
             initialize::exercise::run_logged("waypoint", || {
                 initialize::waypoint::dispatch(&options)
@@ -665,10 +667,10 @@ mod tests {
     }
 
     #[test]
-    fn initialize_server_parses_every_non_interactive_answer() {
+    fn initialize_solo_developer_parses_every_non_interactive_answer() {
         match parse_args(&v(&[
             "initialize",
-            "server",
+            "solo-developer",
             "--install-tmux",
             "no",
             "--tmux-program",
@@ -720,7 +722,7 @@ mod tests {
             "--agent-logins",
             "claude,codex",
         ])) {
-            Command::InitializeServer { setup } => {
+            Command::InitializeSoloDeveloper { setup } => {
                 assert_eq!(setup.agent_logins.as_deref(), Some("claude,codex"));
                 assert_eq!(setup.install_tmux, Some(false));
                 assert_eq!(setup.mcp_hosts, ["claude"]);
@@ -747,26 +749,36 @@ mod tests {
     }
 
     #[test]
-    fn initialize_server_rejects_invalid_boolean_answer() {
-        match parse_args(&v(&["initialize", "server", "--create-admin", "perhaps"])) {
+    fn initialize_solo_developer_rejects_invalid_boolean_answer() {
+        match parse_args(&v(&[
+            "initialize",
+            "solo-developer",
+            "--create-admin",
+            "perhaps",
+        ])) {
             Command::UsageError(message) => assert!(message.contains("expected yes or no")),
             other => panic!("unexpected: {other:?}"),
         }
     }
 
     #[test]
-    fn initialize_server_rejects_invalid_sample_mode() {
-        match parse_args(&v(&["initialize", "server", "--sample-mode", "shell"])) {
+    fn initialize_solo_developer_rejects_invalid_sample_mode() {
+        match parse_args(&v(&[
+            "initialize",
+            "solo-developer",
+            "--sample-mode",
+            "shell",
+        ])) {
             Command::UsageError(message) => assert!(message.contains("expected agent or raw")),
             other => panic!("unexpected: {other:?}"),
         }
     }
 
     #[test]
-    fn initialize_server_rejects_invalid_forge_provider() {
+    fn initialize_solo_developer_rejects_invalid_forge_provider() {
         match parse_args(&v(&[
             "initialize",
-            "server",
+            "solo-developer",
             "--forge-provider",
             "bitbucket",
         ])) {
@@ -776,9 +788,14 @@ mod tests {
     }
 
     #[test]
-    fn initialize_server_accepts_a_bare_forge_host() {
-        match parse_args(&v(&["initialize", "server", "--forge-host", "gitlab.com"])) {
-            Command::InitializeServer { setup } => {
+    fn initialize_solo_developer_accepts_a_bare_forge_host() {
+        match parse_args(&v(&[
+            "initialize",
+            "solo-developer",
+            "--forge-host",
+            "gitlab.com",
+        ])) {
+            Command::InitializeSoloDeveloper { setup } => {
                 assert_eq!(setup.forge_host.as_deref(), Some("gitlab.com"));
             }
             other => panic!("unexpected: {other:?}"),
@@ -786,9 +803,9 @@ mod tests {
     }
 
     #[test]
-    fn initialize_server_rejects_forge_host_urls_and_www_prefixes() {
+    fn initialize_solo_developer_rejects_forge_host_urls_and_www_prefixes() {
         for host in ["https://gitlab.com", "http://gitlab.com", "www.gitlab.com"] {
-            match parse_args(&v(&["initialize", "server", "--forge-host", host])) {
+            match parse_args(&v(&["initialize", "solo-developer", "--forge-host", host])) {
                 Command::UsageError(message) => assert!(message.contains("bare hostname")),
                 other => panic!("unexpected: {other:?}"),
             }
@@ -796,10 +813,10 @@ mod tests {
     }
 
     #[test]
-    fn initialize_server_rejects_non_https_project_fork_url() {
+    fn initialize_solo_developer_rejects_non_https_project_fork_url() {
         match parse_args(&v(&[
             "initialize",
-            "server",
+            "solo-developer",
             "--project-fork-url",
             "git@github.com:owner/repo.git",
         ])) {
