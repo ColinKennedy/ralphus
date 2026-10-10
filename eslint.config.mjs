@@ -16,6 +16,9 @@
 // comment with @param/@returns tags. It intentionally does NOT require JSDoc
 // on inline arrow-function callbacks (e.g. .map((x) => ...)) — annotating
 // every one of those would be noise, not signal.
+// Import eslint and typescript to register them as used dependencies for knip.
+import "eslint";
+import "typescript";
 import jsdoc from "eslint-plugin-jsdoc";
 import globals from "globals";
 import { readFileSync } from "node:fs";
