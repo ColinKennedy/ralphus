@@ -10,9 +10,9 @@
 //! the same way `ralphus mcp initialize` rejects one (see `mcp.rs`).
 //! Boolean answer flags take `yes` or `no`: `--install-tmux`,
 //! `--setup-mcp`, `--register-project`, `--review-auto-submit-pr-stack`,
-//! `--require-forks`, `--create-admin`, `--setup-forge-token`, `--submit-sample`.
+//! `--require-forks`, `--force-skills`, `--create-admin`, `--setup-forge-token`, `--submit-sample`.
 //! The value flags are `--tmux-program`, repeatable
-//! `--mcp-host`, `--agent-logins` (`claude,codex`, `all`, or `none`), `--project-name`, `--project-description`, `--project-is-fork`,
+//! `--mcp-host`, `--agent-logins` (`claude,codex`, `all`, or `none`), `--install-skills` (`claude-code,codex,pi`, `all`, or `none`), `--project-name`, `--project-description`, `--project-is-fork`,
 //! `--project-fork-url`, `--project-url`,
 //! `--fork-user`, `--fork-url`, `--forge-provider`,
 //! `--forge-host`, `--forge-token`, `--admin-name`,
@@ -44,6 +44,7 @@ use std::io::{IsTerminal as _, Write as _};
 use std::path::PathBuf;
 
 mod answers;
+mod skills;
 
 use crate::args::GlobalOpts;
 use crate::client::ProjectReviewSettingsPatch;
@@ -51,8 +52,9 @@ use crate::health::CheckResult;
 use answers::Source;
 use ralphus_core::git_remote::{default_upstream_remote, find_remote_for_url};
 use ralphus_runner::login_probe::{LoginProbe, LoginState, LoginStatus, StatusRun, login_probes};
+use ralphus_runner::skills_install::skills_harnesses;
 
-const TOTAL_STEPS: u32 = 10;
+const TOTAL_STEPS: u32 = 11;
 const WINDOWS_MINIMUM_TMUX_VERSION: (u32, u32, u32) = (3, 3, 8);
 const SAMPLE_LABEL_PREFIX: &str = "ralphus initialize solo-developer: hello world";
 
@@ -125,7 +127,7 @@ const INSTALL_SKILLS: InitializeSetting = InitializeSetting {
     flag: "--install-skills",
 };
 const FORCE_SKILLS: InitializeSetting = InitializeSetting {
-    prompt: "force skills",
+    prompt: "overwrite modified skills",
     flag: "--force-skills",
 };
 const REGISTER_PROJECT: InitializeSetting = InitializeSetting {
@@ -264,7 +266,11 @@ pub struct InitializeSoloDeveloperOptions {
     /// Backends to log in to (`claude,codex`, `all`, `none`); pre-answers the
     /// agent-logins prompt.
     pub agent_logins: Option<String>,
+    /// Harnesses to install the ralphus skills for (`claude-code,codex,pi`,
+    /// `all`, `none`); pre-answers the install-skills prompt.
     pub install_skills: Option<String>,
+    /// Whether a modified, already-installed skill may be replaced (its old
+    /// contents are kept as `SKILL.md.bak`); pre-answers the overwrite prompt.
     pub force_skills: Option<bool>,
     pub register_project: Option<bool>,
     pub project_name: Option<String>,
@@ -393,6 +399,9 @@ pub fn dispatch(opts: &GlobalOpts, mut setup: InitializeSoloDeveloperOptions) ->
 
     step.begin("Check agent logins (Claude Code, Codex)");
     let logins = step_agent_logins(opts, &setup);
+
+    step.begin("Install the ralphus skills (optional)");
+    step_skills(&setup);
 
     step.begin("Register this repository as a project (optional)");
     let pending_project = step_project(opts, &setup);
@@ -755,6 +764,85 @@ fn command_available(program: &str) -> bool {
         .arg("--version")
         .output()
         .is_ok_and(|output| output.status.success())
+}
+
+// ---- skills ---------------------------------------------------------------
+
+fn step_skills(setup: &InitializeSoloDeveloperOptions) {
+    let harnesses = skills_harnesses();
+    let names: Vec<&str> = harnesses
+        .iter()
+        .map(|harness| harness.backend_name())
+        .collect();
+    let answer = prompt(
+        &INSTALL_SKILLS,
+        &format!(
+            "  install the /ralphus-submit and /ralphus-feedback skills for which harnesses? ({}, all, or none)",
+            names.join(", ")
+        ),
+        "none",
+        setup.install_skills.as_ref(),
+        setup.yes,
+    );
+    let (chosen, unknown) = skills::select_harnesses(&answer, &harnesses);
+    for name in unknown {
+        println!("  ignoring \"{name}\": not a known harness");
+    }
+    if chosen.is_empty() {
+        println!("  skipped: no skills installed");
+        return;
+    }
+    // Asked at most once, and only when a modified skill is actually found.
+    let mut overwrite: Option<bool> = None;
+    for index in chosen {
+        let harness = harnesses[index];
+        let name = harness.display_name();
+        let Some(dir) = harness.skills_dir() else {
+            println!("  {name}: could not determine its skills directory; skipping");
+            continue;
+        };
+        for skill in skills::SKILLS {
+            let mut decide = |path: &std::path::Path| {
+                *overwrite.get_or_insert_with(|| {
+                    let allowed = prompt_yes_no(
+                        &FORCE_SKILLS,
+                        &format!(
+                            "  {} differs from the shipped skill; overwrite modified skills (old copies are kept as SKILL.md.bak)?",
+                            path.display()
+                        ),
+                        false,
+                        setup.force_skills,
+                        setup.yes,
+                    );
+                    if !allowed && setup.yes && setup.force_skills.is_none() {
+                        println!("  pass --force-skills yes to replace modified skills");
+                    }
+                    allowed
+                })
+            };
+            match skills::install_into(&dir, skill, &mut decide) {
+                Ok(skills::Outcome::Installed(path)) => {
+                    println!("  {name}: installed {}", path.display());
+                }
+                Ok(skills::Outcome::Unchanged(path)) => {
+                    println!("  {name}: up to date {}", path.display());
+                }
+                Ok(skills::Outcome::Skipped(path)) => {
+                    println!("  {name}: kept your modified {}", path.display());
+                }
+                Ok(skills::Outcome::Replaced { path, backup }) => {
+                    println!(
+                        "  {name}: replaced {} (previous copy at {})",
+                        path.display(),
+                        backup.display()
+                    );
+                }
+                Err(error) => {
+                    println!("  {name}: could not install {}: {error}", skill.name);
+                }
+            }
+        }
+    }
 }
 
 // ---- agent logins ---------------------------------------------------------------

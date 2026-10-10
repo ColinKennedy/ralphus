@@ -26,6 +26,7 @@ pub mod providers;
 pub mod ripgrep;
 pub mod shell_label;
 pub mod shellcmd;
+pub mod skills_install;
 pub mod spec;
 pub mod thrash;
 pub mod tools;

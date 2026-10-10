@@ -18,6 +18,7 @@ use crate::cli_agent_common::{live_session_path, write_live_session_id, write_pr
 use crate::mcp_init::{self, McpInitializationPlan, McpInitializer, McpSetupCommand};
 use crate::shell_label::{exec_command_label, format_tool_input};
 use crate::shellcmd::{self, Env};
+use crate::skills_install::SkillsHarness;
 use crate::tools::Workspace;
 
 /// How often [`spawn_stdin_closer`]'s thread polls for the visible turn's
@@ -47,6 +48,24 @@ impl ClaudeCodeBackend {
         self.program_override.clone().unwrap_or_else(|| {
             std::env::var("RALPHUS_CLAUDE_COMMAND").unwrap_or_else(|_| DEFAULT_PROGRAM.to_string())
         })
+    }
+}
+
+impl SkillsHarness for ClaudeCodeBackend {
+    fn backend_name(&self) -> &'static str {
+        "claude-code"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Claude Code"
+    }
+
+    fn skills_dir(&self) -> Option<PathBuf> {
+        let config_dir = std::env::var_os("CLAUDE_CONFIG_DIR")
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| crate::agent_isolation::home_dir().map(|home| home.join(".claude")))?;
+        Some(config_dir.join("skills"))
     }
 }
 

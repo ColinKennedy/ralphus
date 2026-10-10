@@ -163,12 +163,12 @@ list of candidates.
 | `task show-tutor` | Print the Task TOML schema reference |
 | `queue list [--all]` / `reorder <paths...>` / `set-position <paths...> --to N [--relative]` / `set-status <path> <state>` | Inspect/reorder the squad queue by priority |
 | `initialize git [--path]` | Enable git rerere in a repository |
-| `initialize solo-developer [--yes] [--agent-logins claude,codex\|all\|none] ...` | Guided first-run solo-developer setup. See [Initialize solo-developer](#initialize-solo-developer) below |
+| `initialize solo-developer [--yes] [--agent-logins claude,codex\|all\|none] [--install-skills claude-code,codex,pi\|all\|none] [--force-skills yes\|no] ...` | Guided first-run solo-developer setup. See [Initialize solo-developer](#initialize-solo-developer) below |
 
 ### Initialize solo-developer
 
-`ralphus initialize solo-developer` walks a fresh machine through ten steps (each
-printed as `Step N of 10`), ending with a health run and a sample squad. Every
+`ralphus initialize solo-developer` walks a fresh machine through eleven steps (each
+printed as `Step N of 11`), ending with a health run and a sample squad. Every
 interactive answer has a matching flag, and `--yes` accepts defaults without
 prompting.
 
@@ -187,6 +187,18 @@ login probes as `ralphus check health`:
   command is printed and the step waits for Enter (or `s` to skip the re-check).
 - Non-interactive runs, and `--yes` without `--agent-logins`, never block and
   never spawn a login: the command is printed for you to run later.
+
+The **Skills** step installs the `/ralphus-submit` and `/ralphus-feedback`
+skills (shipped inside the CLI, so they match the installed version) for the
+harnesses you pick: `claude-code`, `codex`, `pi`, a comma list, `all` or `none`
+(`--install-skills` supplies the same answer without a prompt; the default is
+`none`). Each lands at `<harness skills dir>/<skill>/SKILL.md` (`~/.claude/skills`,
+`~/.codex/skills`, `~/.pi/agent/skills`, or under `CLAUDE_CONFIG_DIR` /
+`CODEX_HOME` / `PI_CODING_AGENT_DIR` when set). Re-running is safe: an identical
+file is left alone, and a modified one is kept unless you agree to overwrite it
+(prompt, or `--force-skills yes|no`); an overwrite saves the old file as
+`SKILL.md.bak`. With `--yes` and no `--force-skills`, modified skills are kept
+and a notice says so.
 
 The sample-squad step defaults to a logged-in backend and warns if you pick a
 logged-out one. The final health run includes both login checks.
