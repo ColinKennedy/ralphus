@@ -221,6 +221,7 @@
         // The rewrite above recreated any live `.runterm` at scrollTop 0.
         restorePeekScrollPositions();
         restorePromptBoxScroll();
+        restoreAgentLogScroll();
       }
       /**
        * @typedef {object} InspectorUiSnapshot
@@ -896,7 +897,7 @@
           </div>`;
 
         // 4 - which view, seated directly on what it switches
-        const subs = [["terminal", "Terminal"], ["prompt", "Prompt"], ["system", "System Prompt"]];
+        const subs = [["terminal", "Terminal"], ["prompt", "Prompt"], ["system", "System Prompt"], ["agentlog", "Agent Log (experimental)"]];
         const tabs = `<div class="subtabs">${subs.map((s) => `<button class="subtab ${sub === s[0] ? "on" : ""}" `
           + `data-click="setLiveSub" data-branch-id="${esc(b.id)}" data-sub="${s[0]}" `
           + `data-tip="${esc(LIVE_SUB_TIP[s[0]])}">${s[1]}</button>`).join("")}</div>`;
@@ -905,12 +906,14 @@
         // The system prompt is per branch, not per run: `setLiveSub` fetches it under the branch-level key.
         if (sub === "system") return top + liveSystemPromptView(g, `guardian|${g.id}|${b.id}`);
         if (sub === "prompt") return top + livePromptView(g, b, run);
+        if (sub === "agentlog") return top + liveAgentLogView(key);
         return top + liveTerminalView(g, b, key, run, onNewestTape);
       }
       /** @type {{[sub: string]: string}} What each Live sub-view shows. */
       const LIVE_SUB_TIP = {
         terminal: "The run's captured terminal output.\nThe newest run streams; an earlier one is the daemon's persisted record of it.",
         prompt: "The instruction this run's agent was given — the task it was asked to do, as opposed to the standing rules it works under.",
+        agentlog: "Experimental. The run's tool calls as collapsible widgets with their input and output, filterable by tool, status and text.\nRebuilt from the terminal text, so it is as complete as that text is. Secrets are masked.",
         system: "The exact system prompt this run's agent received: ralphus's hidden instructions plus the resolver's authored prompt.\nRead-only reference — changing it means changing the resolver settings.\nAdmin-only view.",
       };
       /**
