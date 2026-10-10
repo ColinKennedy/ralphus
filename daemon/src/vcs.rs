@@ -172,6 +172,10 @@ impl GitVcs {
         if let Some(output) = crate::vcs_refs::try_git_path(root, args) {
             return Ok(output);
         }
+        // The registered worktrees are directories under `.git/worktrees`.
+        if let Some(output) = crate::vcs_refs::try_worktree_list(root, args) {
+            return Ok(output);
+        }
         // `log --format=%s A..B` and `rev-list --count A..B` over plain
         // history are answered in-process; anything else, or anything libgit2
         // cannot reproduce exactly, falls through to real git (see
