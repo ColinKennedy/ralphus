@@ -160,9 +160,10 @@ export default {
   // The chunk and vendor files are inlined into the compiled shell above and
   // are never imported by anything — without this knip would report them as
   // unused files. The shell itself is the entry and must NOT be covered by
-  // this ignore. Generated process-count graph outputs (RAL-604) are also
-  // ignored since they're artifacts committed to the repo but not referenced
-  // by any code.
+<<<<<<< HEAD
+  // this ignore.
+  // proc_counts/ (RAL-604) is generated output: HTML graphs rendered from
+  // stored benchmark data, never imported by the JavaScript source.
   ignore: [
     "librarian/assets/board/**",
     "librarian/assets/vendor/**",

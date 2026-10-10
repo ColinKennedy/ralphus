@@ -15,6 +15,7 @@ use crate::cli_agent_common::{live_session_path, write_live_session_id};
 use crate::mcp_init::{self, McpFileEdit, McpFileEditMode, McpInitializationPlan, McpInitializer};
 use crate::shell_label::exec_command_label;
 use crate::shellcmd::{self, Env};
+use crate::skills_install::SkillsHarness;
 use crate::tools::Workspace;
 
 const DEFAULT_PROGRAM: &str = "codex";
@@ -29,6 +30,24 @@ impl CodexBackend {
         self.program_override.clone().unwrap_or_else(|| {
             std::env::var("RALPHUS_CODEX_COMMAND").unwrap_or_else(|_| DEFAULT_PROGRAM.to_string())
         })
+    }
+}
+
+impl SkillsHarness for CodexBackend {
+    fn backend_name(&self) -> &'static str {
+        "codex"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Codex"
+    }
+
+    fn skills_dir(&self) -> Option<PathBuf> {
+        let config_dir = std::env::var_os("CODEX_HOME")
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| crate::agent_isolation::home_dir().map(|home| home.join(".codex")))?;
+        Some(config_dir.join("skills"))
     }
 }
 

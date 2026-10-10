@@ -5,6 +5,10 @@
 # plain `cargo test` skips it). It runs only under `-P review-races` (the nightly race
 # workflow, `.github/workflows/race-soak-nightly.yml`, and anyone who means to
 # run it). Agents: do not run it unless asked to.
+
+[experimental]
+wrapper-scripts = true
+
 [profile.default]
 default-filter = "not binary(review_input_races)"
 
