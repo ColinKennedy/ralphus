@@ -3446,6 +3446,61 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// RAL-600: a submitted `[[review.action]]` `auto_run` reaches the stored
+    /// review, and once the action (and its `prepare` build) is ready only the
+    /// flagged action is planned to start by itself.
+    #[test]
+    fn submitted_action_auto_run_is_stored_and_only_flagged_actions_auto_run() {
+        let root = temp_repo();
+        git(&root, &["init", "--initial-branch", "main"]);
+        std::fs::write(root.join("base.txt"), "base\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "base"]);
+
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        store
+            .lock()
+            .register_project("proj", "", &root.to_string_lossy(), "git")
+            .unwrap();
+        let src = link_review_toml(
+            "[[review.action]]\nlabel=\"auto\"\ncommand=\"echo auto\"\nauto_run=true\n\
+             [[review.action.prepare]]\ncommand=\"echo build\"\n\
+             [[review.action]]\nlabel=\"manual\"\ncommand=\"echo manual\"\n",
+        );
+        let file: ralphus_core::schema::TaskFile = toml::from_str(&src).unwrap();
+        let guardians =
+            derive_reviews_with_prefetch(&store, "squad-1", &file, &HashMap::new()).unwrap();
+        assert_eq!(guardians.len(), 1);
+
+        let g = store.lock().get_guardian(&guardians[0]).unwrap();
+        assert_eq!(g.action_hints.len(), 2);
+        assert_eq!(g.action_hints[0].auto_run, Some(true));
+        assert_eq!(g.action_hints[0].prepare.len(), 1);
+        assert_eq!(g.action_hints[1].auto_run, None);
+
+        // Preparation finished: both actions are ready, but only the flagged
+        // one starts without a person.
+        let mut ready = g.action_hints.clone();
+        for hint in &mut ready {
+            hint.preparation_state = Some("ready".to_string());
+        }
+        store
+            .lock()
+            .set_guardian_action_hints(&guardians[0], &ready)
+            .unwrap();
+        let g = store.lock().get_guardian(&guardians[0]).unwrap();
+        assert_eq!(
+            crate::auto_run::plan(&g).runnable,
+            vec![crate::auto_run::CheckRef {
+                kind: "action",
+                index: 0
+            }]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // ── RAL-293: worktree_has_commits_ahead_of_upstream ──────────────────
 
     #[test]
