@@ -96,7 +96,7 @@
       .brand { display: flex; align-items: center; gap: 14px; font-weight: 600; }
       .logo { color: var(--accent); letter-spacing: .5px; }
       .tabs { display: flex; gap: 4px; }
-      .tab { background: none; border: none; color: var(--muted); font-weight: 500; padding: 6px 12px; border-radius: 6px; }
+      .tab { background: none; border: none; color: var(--muted); font-weight: 500; padding: 6px 12px; border-radius: 6px; display: inline-block; line-height: normal; text-decoration: none; cursor: pointer; }
       .tab:hover, .tab.active { color: var(--text); background: var(--panel-2); }
       .status-right { display: flex; align-items: center; gap: 14px; color: var(--muted); font-size: 13px; }
       .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; flex: none; }
@@ -107,6 +107,7 @@
       .running-menu div { padding: 6px 8px; border-radius: 6px; cursor: pointer; }
       .running-menu div:hover { background: var(--panel-2); }
       .icon-btn { background: none; border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 3px 8px; }
+      a.icon-btn { display: inline-block; line-height: normal; text-decoration: none; cursor: pointer; }
       .copy-btn { background: none; border: 1px solid var(--border); color: var(--muted); border-radius: 5px; padding: 0 6px; font-size: 12px; line-height: 1.7; vertical-align: middle; }
       .copy-btn:hover { color: var(--text); }
       .copy-btn.copied { color: var(--done); border-color: var(--done); }
