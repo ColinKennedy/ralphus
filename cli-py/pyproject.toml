@@ -26,6 +26,8 @@ ralphus-docs-helpmap = "ralphus.docsgen.helpmap_docs:main"
 # harness) as SVG/HTML graphs. This package no longer runs or times any test
 # itself -- see docs/bench-harness.md.
 ralphus-bench-graph = "ralphus.bench.graphs:main"
+# RAL-604: per-test process-count collection + graph (proc_counts/); see docs/proc-counts.md.
+ralphus-proccount = "ralphus.proccount.collect:main"
 
 [build-system]
 requires = ["hatchling"]
