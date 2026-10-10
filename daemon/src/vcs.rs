@@ -188,6 +188,12 @@ impl GitVcs {
         if let Some(output) = crate::vcs_refs::cached_config_read(root, args) {
             return Ok(output);
         }
+        // A config value the repository itself defines, read in-process when
+        // the cache above has expired (it only lives 30 s, and the polls that
+        // ask repeat less often than that); see `ralphus_runner::git_inproc`.
+        if let Some(answer) = ralphus_runner::git_inproc::try_config_read(root, args) {
+            return Ok(crate::vcs_refs::answer_output(answer.stdout, answer.code));
+        }
         // Ancestry between two fixed commits never changes.
         if let Some(output) = crate::vcs_refs::cached_ancestry(root, args) {
             return Ok(output);

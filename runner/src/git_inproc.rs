@@ -356,6 +356,112 @@ pub fn try_read(root: &Path, args: &[&str]) -> Option<String> {
     }
 }
 
+/// What a read printed and how it exited.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Answer {
+    pub stdout: String,
+    pub code: i32,
+}
+
+/// A config key made only of the characters section/variable names use, with
+/// at least one `.` (`remote.origin.url`).
+fn plain_config_key(key: &str) -> bool {
+    key.contains('.')
+        && !key.starts_with('.')
+        && !key.ends_with('.')
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '/'))
+}
+
+/// Whether a system-level git config (which libgit2 may not locate the way
+/// git does) could rewrite URLs: any readable well-known system config that
+/// mentions `insteadOf`.
+fn system_config_may_rewrite_urls() -> bool {
+    let mut candidates: Vec<std::path::PathBuf> = vec![
+        "C:/Program Files/Git/etc/gitconfig".into(),
+        "C:/Program Files (x86)/Git/etc/gitconfig".into(),
+        "C:/ProgramData/Git/config".into(),
+        "/etc/gitconfig".into(),
+        "/usr/local/etc/gitconfig".into(),
+        "/opt/homebrew/etc/gitconfig".into(),
+    ];
+    if let Some(path) = std::env::var_os("GIT_CONFIG_SYSTEM") {
+        candidates.push(path.into());
+    }
+    candidates.iter().any(|path| {
+        std::fs::read_to_string(path)
+            .is_ok_and(|text| text.to_ascii_lowercase().contains("insteadof"))
+    })
+}
+
+/// Answer `git config --get <key>` or `git remote get-url <name>` from the
+/// repository's own config (worktree level, then local), without a process.
+///
+/// Only a value found at those levels is answered: they are the highest
+/// non-environment scopes, so nothing lower can override it, and libgit2
+/// reads them exactly. A missing key (which could live in a lower scope that
+/// libgit2 locates differently from git), an `insteadOf` rewrite, a multiple
+/// value, or any error returns `None` ("run git").
+#[must_use]
+pub fn try_config_read(root: &Path, args: &[&str]) -> Option<Answer> {
+    let (key, remote) = match args {
+        ["config", "--get", key] if plain_config_key(key) => ((*key).to_string(), false),
+        ["remote", "get-url", name]
+            if !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')) =>
+        {
+            (format!("remote.{name}.url"), true)
+        }
+        _ => return None,
+    };
+    let repo = Repo::open(root).ok()?;
+    let config = repo.repo.config().ok()?;
+    // `remote get-url` applies `url.<base>.insteadOf`: a rewrite happens only
+    // when the URL starts with one of those values. Collect them, and let git
+    // answer if any could apply (or if a system config, which libgit2 may not
+    // locate the way git does, mentions `insteadOf` at all).
+    let mut rewrite_prefixes = Vec::new();
+    if remote {
+        if system_config_may_rewrite_urls() {
+            return None;
+        }
+        let mut rewrites = config.entries(Some("^url\\..*\\.insteadof$")).ok()?;
+        while let Some(entry) = rewrites.next() {
+            rewrite_prefixes.push(entry.ok()?.value()?.to_string());
+        }
+    }
+    for level in [git2::ConfigLevel::Worktree, git2::ConfigLevel::Local] {
+        let Ok(scoped) = config.open_level(level) else {
+            continue;
+        };
+        let mut values = scoped.multivar(&key, None).ok()?;
+        let mut found = Vec::new();
+        while let Some(entry) = values.next() {
+            found.push(entry.ok()?.value()?.to_string());
+        }
+        match found.as_slice() {
+            [] => {}
+            [only] => {
+                if rewrite_prefixes
+                    .iter()
+                    .any(|prefix| !prefix.is_empty() && only.starts_with(prefix.as_str()))
+                {
+                    return None;
+                }
+                return Some(Answer {
+                    stdout: format!("{only}\n"),
+                    code: 0,
+                });
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
 impl Repo {
     /// `git ls-tree -r -z --name-only <reference>`: every blob and submodule
     /// path in the tree, NUL-terminated, in tree order.
@@ -802,6 +908,124 @@ mod tests {
             assert!(try_read(&dir, args).is_none(), "{args:?}");
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A config answer must equal git's stdout and exit code.
+    fn config_same_as_git(dir: &Path, args: &[&str]) {
+        let ours = try_config_read(dir, args).unwrap_or_else(|| panic!("not answered: {args:?}"));
+        assert_eq!(ours.code, 0, "{args:?}");
+        assert_eq!(ours.stdout, git_out(dir, args), "{args:?}");
+    }
+
+    #[test]
+    fn config_get_and_remote_get_url_match_git() {
+        let dir = temp_repo("config");
+        run(
+            &dir,
+            &["remote", "add", "origin", "git@gitlab.com:acme/w.git"],
+        );
+        run(
+            &dir,
+            &["remote", "add", "fork-a_b.c", "https://example.com/x/y.git"],
+        );
+        run(&dir, &["config", "branch.main.remote", "origin"]);
+        run(
+            &dir,
+            &[
+                "config",
+                "ralphus.note",
+                "has spaces and \"quotes\" and \\ slash",
+            ],
+        );
+        config_same_as_git(&dir, &["remote", "get-url", "origin"]);
+        config_same_as_git(&dir, &["remote", "get-url", "fork-a_b.c"]);
+        config_same_as_git(&dir, &["config", "--get", "remote.origin.url"]);
+        config_same_as_git(&dir, &["config", "--get", "branch.main.remote"]);
+        config_same_as_git(&dir, &["config", "--get", "ralphus.note"]);
+        // Section and variable names are case-insensitive in git.
+        config_same_as_git(&dir, &["config", "--get", "Remote.origin.URL"]);
+        // Missing keys and unknown remotes are git's to report.
+        assert!(try_config_read(&dir, &["config", "--get", "remote.nope.url"]).is_none());
+        assert!(try_config_read(&dir, &["remote", "get-url", "nope"]).is_none());
+        // Not a shape this answers.
+        assert!(try_config_read(&dir, &["config", "--get-all", "remote.origin.url"]).is_none());
+        assert!(try_config_read(&dir, &["config", "--get", "nodots"]).is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn multiple_values_and_url_rewrites_are_left_to_git() {
+        let dir = temp_repo("config-odd");
+        run(
+            &dir,
+            &["remote", "add", "origin", "git@gitlab.com:acme/w.git"],
+        );
+        run(
+            &dir,
+            &[
+                "config",
+                "--add",
+                "remote.origin.fetch",
+                "+refs/heads/x:refs/remotes/origin/x",
+            ],
+        );
+        assert!(try_config_read(&dir, &["config", "--get", "remote.origin.fetch"]).is_none());
+        config_same_as_git(&dir, &["remote", "get-url", "origin"]);
+        run(
+            &dir,
+            &[
+                "config",
+                "url.https://gitlab.com/.insteadOf",
+                "git@gitlab.com:",
+            ],
+        );
+        // get-url would print the rewritten URL: git decides.
+        assert!(try_config_read(&dir, &["remote", "get-url", "origin"]).is_none());
+        // A plain config read is not rewritten, so it is still answered.
+        config_same_as_git(&dir, &["config", "--get", "remote.origin.url"]);
+        // A remote no rewrite rule matches is answered even though rules exist.
+        run(
+            &dir,
+            &["remote", "add", "other", "https://example.com/z.git"],
+        );
+        config_same_as_git(&dir, &["remote", "get-url", "other"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_worktree_level_value_overrides_the_local_one_like_git() {
+        let dir = temp_repo("config-wt");
+        run(&dir, &["config", "extensions.worktreeConfig", "true"]);
+        run(&dir, &["config", "ralphus.who", "local"]);
+        let linked = dir.with_file_name(format!(
+            "{}-linked",
+            dir.file_name().unwrap().to_string_lossy()
+        ));
+        run(
+            &dir,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "side",
+                linked.to_str().unwrap(),
+            ],
+        );
+        run(
+            &linked,
+            &["config", "--worktree", "ralphus.who", "worktree"],
+        );
+        config_same_as_git(&linked, &["config", "--get", "ralphus.who"]);
+        config_same_as_git(&dir, &["config", "--get", "ralphus.who"]);
+        assert_eq!(
+            try_config_read(&linked, &["config", "--get", "ralphus.who"])
+                .unwrap()
+                .stdout,
+            "worktree\n"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(linked);
     }
 
     #[test]

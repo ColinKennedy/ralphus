@@ -544,6 +544,17 @@ pub fn try_worktree_list(root: &Path, args: &[&str]) -> Option<Output> {
     Some(success_output(out))
 }
 
+/// A process result with `stdout` and exit `code`, for answers produced
+/// without running git.
+#[must_use]
+pub fn answer_output(stdout: String, code: i32) -> Output {
+    Output {
+        status: exit_status(u32::try_from(code).unwrap_or(1)),
+        stdout: stdout.into_bytes(),
+        stderr: Vec::new(),
+    }
+}
+
 /// A successful process result carrying `stdout`, for answers produced
 /// without running git.
 #[must_use]
