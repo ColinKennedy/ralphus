@@ -20,6 +20,13 @@ use crate::store::Store;
 use crate::store::{CellRow, NodeState};
 use crate::tmux::Tmux;
 
+mod direct;
+pub(crate) use direct::{
+    is_active as direct_session_active, live_tail as direct_live_tail,
+    request_stop as direct_request_stop,
+    request_stop_with_any_prefix as direct_request_stop_with_any_prefix,
+};
+
 /// Prefix the runner subprocess writes to stderr before a JSON-encoded
 /// [`RunnerEvent`], so its structured events reach Cartographer without
 /// touching stdout (reserved for the `CellSpec`/`CellResult` contract).
@@ -1646,6 +1653,10 @@ pub struct SubprocessRunner {
     /// them terminally cancelled.
     waypoint_halts: Option<crate::cancel::WaypointHalts>,
     arbiter_stops: Option<crate::cancel::ArbiterStops>,
+    /// Pins every run to the tmux path whatever `RALPHUS_RUNNER_MODE` says,
+    /// so the tests of that path keep exercising it. Always `false` in
+    /// production.
+    force_tmux: bool,
 }
 
 impl SubprocessRunner {
@@ -1662,7 +1673,15 @@ impl SubprocessRunner {
             detachments: None,
             waypoint_halts: None,
             arbiter_stops: None,
+            force_tmux: false,
         }
+    }
+
+    /// Pins this runner to the tmux path; see the `force_tmux` field.
+    #[cfg(test)]
+    fn forced_tmux(mut self) -> Self {
+        self.force_tmux = true;
+        self
     }
 
     /// Resolve the runner command from `RALPHUS_RUNNER_CMD`, defaulting to
@@ -2176,7 +2195,11 @@ impl Runner for SubprocessRunner {
     /// `command`-kind spec ran as a raw child process instead, with no live
     /// view available for it.
     fn run_cancellable(&self, spec: &RunnerSpec, cancel: &CancelToken) -> RunnerResult {
-        self.run_via_tmux(spec, cancel)
+        if !self.force_tmux && direct::use_direct(spec) {
+            self.run_direct(spec, cancel)
+        } else {
+            self.run_via_tmux(spec, cancel)
+        }
     }
 
     fn preflight_agent(
@@ -4467,7 +4490,7 @@ mod tests {
     /// RAL-241: a minimal spec for exercising `check_stall_escalation`
     /// directly — no tmux/subprocess involved, since that method only reads
     /// `spec`'s entity fields and talks to the attached `Store`.
-    fn stall_test_spec() -> RunnerSpec {
+    pub(super) fn stall_test_spec() -> RunnerSpec {
         RunnerSpec {
             squad_id: "squad-000000000001".to_string(),
             task: "build".to_string(),
@@ -5666,6 +5689,7 @@ prompt = "make it build"
             detachments: None,
             waypoint_halts: None,
             arbiter_stops: None,
+            force_tmux: true,
         };
         #[cfg(not(target_os = "windows"))]
         let runner = SubprocessRunner {
@@ -5676,6 +5700,7 @@ prompt = "make it build"
             detachments: None,
             waypoint_halts: None,
             arbiter_stops: None,
+            force_tmux: true,
         };
         let row = CellRow {
             task_idx: 0,
@@ -5764,7 +5789,7 @@ prompt = "make it build"
         crate::tmux::sweep_dead_test_sessions_once();
         let run_id = crate::tmux::unique_test_tag("run-1");
         let _cleanup = crate::tmux::KillSessionOnDrop(crate::tmux::session_name(&run_id, "t", "s"));
-        let runner = SubprocessRunner::new("definitely-not-a-real-program-xyz");
+        let runner = SubprocessRunner::new("definitely-not-a-real-program-xyz").forced_tmux();
         let row = CellRow {
             task_idx: 0,
             idx: 0,
@@ -5958,6 +5983,7 @@ prompt = "make it build"
             detachments: None,
             waypoint_halts: None,
             arbiter_stops: None,
+            force_tmux: true,
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         let spec = RunnerSpec::for_proof(
@@ -6013,6 +6039,7 @@ prompt = "make it build"
             detachments: None,
             waypoint_halts: None,
             arbiter_stops: None,
+            force_tmux: true,
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         let spec = RunnerSpec::for_command_proof(
@@ -6065,6 +6092,7 @@ prompt = "make it build"
             detachments: None,
             waypoint_halts: None,
             arbiter_stops: None,
+            force_tmux: true,
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         // Backstop only — see the identical note on
@@ -6143,7 +6171,7 @@ prompt = "make it build"
             task: "build".to_string(),
             cell_id: "missing-session".to_string(),
         };
-        let runner = SubprocessRunner::new("definitely-not-a-real-program-xyz");
+        let runner = SubprocessRunner::new("definitely-not-a-real-program-xyz").forced_tmux();
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         let spec = RunnerSpec::for_command_proof(
             &run_id,
@@ -6184,6 +6212,7 @@ prompt = "make it build"
             detachments: None,
             waypoint_halts: None,
             arbiter_stops: None,
+            force_tmux: true,
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         let spec = RunnerSpec::for_proof(
@@ -6241,6 +6270,7 @@ prompt = "make it build"
             detachments: None,
             waypoint_halts: None,
             arbiter_stops: None,
+            force_tmux: true,
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         let spec = RunnerSpec::for_proof(
@@ -6304,6 +6334,7 @@ prompt = "make it build"
             detachments: None,
             waypoint_halts: None,
             arbiter_stops: None,
+            force_tmux: true,
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         let spec = RunnerSpec::for_proof(
@@ -6392,6 +6423,7 @@ prompt = "make it build"
             detachments: Some(detachments.clone()),
             waypoint_halts: None,
             arbiter_stops: None,
+            force_tmux: true,
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         let spec = RunnerSpec::for_proof(
@@ -6486,6 +6518,7 @@ prompt = "make it build"
             detachments: None,
             waypoint_halts: None,
             arbiter_stops: None,
+            force_tmux: true,
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         let spec = RunnerSpec {
@@ -6631,6 +6664,7 @@ prompt = "make it build"
             detachments: None,
             waypoint_halts: None,
             arbiter_stops: None,
+            force_tmux: true,
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         let spec = RunnerSpec {
@@ -6737,6 +6771,7 @@ prompt = "make it build"
             detachments: None,
             waypoint_halts: None,
             arbiter_stops: None,
+            force_tmux: true,
         };
         runner
             .preflight_runner_executable(None)

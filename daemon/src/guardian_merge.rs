@@ -5029,7 +5029,8 @@ fn wait_for_merge_worker_stop(cancellations: &Cancellations, key: &str) -> bool 
     true
 }
 
-/// Terminate every tmux-backed agent session belonging to this review.
+/// Terminate every agent session (headless or tmux-backed) belonging to this
+/// review.
 ///
 /// The cancellation token remains the ordinary cooperative stop path. This is
 /// the immediate path for an agent already inside a blocking invocation: on
@@ -5038,9 +5039,10 @@ fn wait_for_merge_worker_stop(cancellations: &Cancellations, key: &str) -> bool 
 /// removing the tmux session name.
 pub(crate) fn kill_guardian_agent_sessions(store: &crate::store_lock::StoreHandle, id: &str) {
     let prefix = format!("ralphus_guardian-{id}_");
-    let count = crate::tmux::Tmux::resolve()
-        .map(|tmux| tmux.kill_sessions_with_prefix(&prefix))
-        .unwrap_or(0);
+    let count = crate::runner::direct_request_stop_with_any_prefix(std::slice::from_ref(&prefix))
+        + crate::tmux::Tmux::resolve()
+            .map(|tmux| tmux.kill_sessions_with_prefix(&prefix))
+            .unwrap_or(0);
     if count == 0 {
         return;
     }
