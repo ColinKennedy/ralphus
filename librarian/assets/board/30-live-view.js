@@ -20,7 +20,7 @@
       // needs its own reachability plan for the relay port, same as it would
       // for `ralphus cell remote-terminal` run from a third machine.
 
-      /** @typedef {{term: any, ws: WebSocket, squadId: string, ti: number, si: number}} RemoteTerminalSession */
+      /** @typedef {{term: any, ws: WebSocket, squadId: string, ti: number, si: number, themeObserver: MutationObserver}} RemoteTerminalSession */
       /** @type {RemoteTerminalSession|null} the one remote-terminal modal open at a time -- only one can be, since it's a modal */
       let remoteTerminalSession = null;
 
@@ -64,6 +64,29 @@
       }
 
       /**
+       * Builds an xterm.js `theme` object from the active theme's terminal
+       * CSS variables (docs/colors.md "Terminal surface"). xterm takes literal
+       * color strings, so the resolved values are read at call time.
+       * @returns {{[k: string]: string}}
+       */
+      function xtermThemeFromCss() {
+        const cs = getComputedStyle(document.documentElement);
+        const v = (/** @type {string} */ name) => cs.getPropertyValue(name).trim();
+        const names = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"];
+        /** @type {{[k: string]: string}} */
+        const theme = {
+          background: v("--terminal-bg"), foreground: v("--terminal-fg"),
+          cursor: v("--terminal-cursor"), cursorAccent: v("--terminal-bg"),
+          selectionBackground: v("--terminal-selection"),
+        };
+        for (const n of names) {
+          theme[n] = v(`--ansi-${n}`);
+          theme[`bright${n[0].toUpperCase()}${n.slice(1)}`] = v(`--ansi-bright-${n}`);
+        }
+        return theme;
+      }
+
+      /**
        * Mints a terminal-relay ticket and opens the remote-terminal modal,
        * connecting an xterm.js instance to it over WebSocket. See the
        * "Remote Open Agent terminal relay" block comment above for the full
@@ -94,11 +117,9 @@
         const container = /** @type {HTMLElement} */ (byId("remote-terminal-container"));
         const XTerm = /** @type {any} */ (window).Terminal;
         const XTermFitAddon = /** @type {any} */ (window).FitAddon;
-        // xterm.js's own theme option takes a literal color string, not CSS --
-        // read `--terminal-bg`'s resolved value so this still has one source
-        // of truth (docs/colors.md) instead of a second hardcoded hex.
-        const terminalBg = getComputedStyle(document.documentElement).getPropertyValue("--terminal-bg").trim();
-        const term = new XTerm({ convertEol: true, cursorBlink: true, theme: { background: terminalBg } });
+        const term = new XTerm({ convertEol: true, cursorBlink: true, theme: xtermThemeFromCss() });
+        const themeObserver = new MutationObserver(() => { term.options.theme = xtermThemeFromCss(); });
+        themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
         const fit = new XTermFitAddon.FitAddon();
         term.loadAddon(fit);
         term.open(container);
@@ -110,7 +131,7 @@
         });
         const ws = new WebSocket(`${proto}//${location.hostname}:${data.port}${data.path}?${params}`);
         ws.binaryType = "arraybuffer";
-        remoteTerminalSession = { term, ws, squadId, ti, si };
+        remoteTerminalSession = { term, ws, squadId, ti, si, themeObserver };
         ws.onmessage = (ev) => {
           if (typeof ev.data === "string") {
             term.write(ev.data);
@@ -134,6 +155,7 @@
        */
       function closeRemoteTerminal() {
         if (remoteTerminalSession) {
+          remoteTerminalSession.themeObserver.disconnect();
           try { remoteTerminalSession.ws.close(); } catch (_) { /* already closed */ }
           try { remoteTerminalSession.term.dispose(); } catch (_) { /* already disposed */ }
           remoteTerminalSession = null;

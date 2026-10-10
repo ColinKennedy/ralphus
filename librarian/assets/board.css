@@ -17,7 +17,13 @@
         --detached: #d2a8ff;
         --delayed: #79c0ff;
         --arbiter: #7c3aed;
-        --terminal-bg: #000000;
+        --terminal-bg: #000000; --terminal-fg: #b9c4d0; --terminal-cursor: #ffffff;
+        --terminal-selection: rgba(255,255,255,.3);
+        --ansi-black: #2e3436; --ansi-red: #cc0000; --ansi-green: #4e9a06; --ansi-yellow: #c4a000;
+        --ansi-blue: #3465a4; --ansi-magenta: #75507b; --ansi-cyan: #06989a; --ansi-white: #d3d7cf;
+        --ansi-bright-black: #555753; --ansi-bright-red: #ef2929; --ansi-bright-green: #8ae234;
+        --ansi-bright-yellow: #fce94f; --ansi-bright-blue: #729fcf; --ansi-bright-magenta: #ad7fa8;
+        --ansi-bright-cyan: #34e2e2; --ansi-bright-white: #eeeeec;
         /* A third text weight below --muted, for metadata that must stay
            readable without competing with the value it annotates (a run's
            timestamp beside its command, a position counter beside its label). */
@@ -51,6 +57,14 @@
         --queued-a: rgba(130,80,223,.08); --queued-b: rgba(130,80,223,.28);
         --amber-a: rgba(154,103,0,.08); --amber-b: rgba(154,103,0,.28);
         --turn-error: #cf222e; --turn-warn: #9a6700;
+        /* Terminal palette on a light ground; every ANSI slot is >= 4.5:1 on --terminal-bg. */
+        --terminal-bg: #f6f8fa; --terminal-fg: #1f2328; --terminal-cursor: #1f2328;
+        --terminal-selection: rgba(9,105,218,.25);
+        --ansi-black: #24292f; --ansi-red: #cf222e; --ansi-green: #116329; --ansi-yellow: #7d4e00;
+        --ansi-blue: #0969da; --ansi-magenta: #8250df; --ansi-cyan: #1b7c83; --ansi-white: #57606a;
+        --ansi-bright-black: #46505a; --ansi-bright-red: #a40e26; --ansi-bright-green: #1a7f37;
+        --ansi-bright-yellow: #633c01; --ansi-bright-blue: #0550ae; --ansi-bright-magenta: #6639ba;
+        --ansi-bright-cyan: #136c75; --ansi-bright-white: #3d444d;
       }
       * { box-sizing: border-box; }
       body { margin: 0; background: var(--bg); color: var(--text);
@@ -702,7 +716,7 @@
         background: var(--terminal-bg); border: 1px solid var(--border); border-radius: 7px;
         font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
         font-size: 10.5px; line-height: 1.62; padding: 9px 10px;
-        overflow: auto; color: #b9c4d0; white-space: pre-wrap; word-break: break-word;
+        overflow: auto; color: var(--terminal-fg); white-space: pre-wrap; word-break: break-word;
       }
       .runterm.past { border-color: var(--amber-b); }
       .promptbox {
