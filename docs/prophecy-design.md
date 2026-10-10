@@ -490,6 +490,17 @@ follow-up offer acts on). The `kind` column is plain `TEXT` with no `CHECK`,
 so no migration was needed; rows written before the split keep whatever kind
 they had.
 
+**Widened again: `refused`.** An agent that explicitly declines part of its
+prompt records `refused: <refused portion>; <why>`. It is not `deferred`
+(nobody is asked to do it later) and not `unconfirmed` (the agent did decide).
+It is diagnostic only and never changes an outcome. The scheduler hands a
+cell's `refused` prophecies to its proof steps that extend a `roles/judge/*`
+preset, as a capped "## Declined work" section of the proof prompt. The
+injection is keyed on a `receives_refusals` flag stored with the proof, since
+the preset name is not retained after submit-time expansion. The cell's
+prophecies are all written with attempt `0` today, so "latest attempt" is
+the whole cell.
+
 ### 11.2 Does a prophecy survive its squad's deletion?
 
 Ghosts cascade-delete. If a prophecy does too, deleting a squad silently strips

@@ -5566,6 +5566,34 @@ fn proof_execution_context(
     )
 }
 
+/// The declined-work section for a cell-scope proof that extends a judge
+/// preset, built from its cell's `refused` prophecies; `None` for any other
+/// proof or when nothing was refused. Diagnostic context only -- it has no
+/// bearing on the cell's or proof's outcome.
+fn declined_work_for_proof(
+    store: &crate::store_lock::StoreHandle,
+    squad_id: &str,
+    task_idx: i64,
+    scope: &str,
+    cell_idx: i64,
+    idx: i64,
+    cell_sid: Option<&str>,
+) -> Option<String> {
+    if scope != "cell" || cell_sid.is_none() {
+        return None;
+    }
+    let guard = store.lock();
+    if !guard
+        .proof_receives_refusals(squad_id, task_idx, scope, cell_idx, idx)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let uri = crate::ghost::cell_uri(squad_id, task_idx, cell_idx);
+    let prophecies = guard.list_prophecies_for_entity(&uri).unwrap_or_default();
+    crate::prophecy::declined_work_section(&prophecies)
+}
+
 fn proof_context_name(id: Option<&str>, position: usize) -> String {
     id.map(str::to_string)
         .unwrap_or_else(|| format!("proof-{}", position + 1))
@@ -6144,6 +6172,12 @@ fn run_proofs(
                     proof_id.as_deref(),
                 );
                 let mut prompt = format!("{spec}\n\n{proof_context}");
+                if let Some(declined) = declined_work_for_proof(
+                    store, squad_id, task_idx, scope, cell_idx, idx, cell_sid,
+                ) {
+                    prompt.push_str("\n\n");
+                    prompt.push_str(&declined);
+                }
                 if let Some(guidance) = restart_guidance.as_deref() {
                     prompt.push_str("\n\nHuman guidance for this restarted proof:\n\n");
                     prompt.push_str(guidance);
@@ -6619,6 +6653,63 @@ mod tests {
         assert_eq!(recorded[0].kind, "hazard");
         assert_eq!(recorded[0].body, "left a race condition unresolved");
         assert_eq!(recorded[0].squad_id.as_deref(), Some(id.as_str()));
+    }
+
+    /// A cell that declines part of its prompt (a `refused` prophecy) and
+    /// proofs that record the prompt they were dispatched with.
+    struct RefusingCellRunner {
+        proof_prompts: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Runner for RefusingCellRunner {
+        fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+            let mut result = ProphecyRunner { markers: vec![] }.run(spec);
+            if spec.proof {
+                self.proof_prompts
+                    .lock()
+                    .unwrap()
+                    .push(spec.prompt.clone().unwrap_or_default());
+                result.proofed = Some(true);
+            } else {
+                result.prophecies = vec![crate::runner::RunnerProphecyMarker {
+                    kind: "refused".to_string(),
+                    body: "drop the audit table; it would destroy data".to_string(),
+                }];
+            }
+            result
+        }
+    }
+
+    #[test]
+    fn refused_prophecy_reaches_judge_proof_only_and_does_not_change_outcome() {
+        let toml = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\".\"\nprompt=\"do the work\"\n\
+                    [[task.cell.proof]]\nid=\"judge\"\nprompt=\"assess it\"\n\
+                    extends=[\"<<ralphus:presets/roles/judge/security>>\"]\n\
+                    [[task.cell.proof]]\nid=\"plain\"\nprompt=\"check it\"\n\
+                    extends=[\"<<ralphus:presets/other>>\"]\n";
+        let (store, id) = store_with(toml);
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        execute_squad(
+            &store,
+            &RefusingCellRunner {
+                proof_prompts: Arc::clone(&prompts),
+            },
+            &id,
+        );
+        let prompts = prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 2);
+        assert!(prompts[0].starts_with("assess it"), "{}", prompts[0]);
+        assert!(prompts[0].contains("## Declined work"), "{}", prompts[0]);
+        assert!(
+            prompts[0].contains("drop the audit table; it would destroy data"),
+            "{}",
+            prompts[0]
+        );
+        assert!(!prompts[1].contains("Declined work"), "{}", prompts[1]);
+        let uri = crate::ghost::cell_uri(&id, 0, 0);
+        let recorded = store.lock().list_prophecies_for_entity(&uri).unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].kind, "refused");
     }
 
     /// RAL-288 Stage 6: records whatever `resume_agent_session_id` (and, for
