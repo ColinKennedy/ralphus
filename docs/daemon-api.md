@@ -1350,7 +1350,7 @@ other keys are read:
 |---|---|---|
 | `squad` | — | `label` |
 | `task` | `task_idx` | `name`, `project`, `model` |
-| `cell` | `task_idx`, `cell_idx` | `cwd`, `agent`, `model`, `prompt`, `command`, `auto_compact_threshold`, `maximum_tool_output_tokens`, `system_prompt` |
+| `cell` | `task_idx`, `cell_idx` | `cwd`, `agent`, `model`, `prompt`, `command`, `auto_compact_threshold`, `maximum_tool_output_tokens`, `effort`, `temperature`, `system_prompt` |
 | `proof` | `task_idx`, `proof_scope`, `cell_idx`, `proof_idx` | `agent`, `model`, `command`, `prompt`, `maximum_tool_output_tokens` |
 
 Every editable key is optional and uses the same three-state convention: the
@@ -1371,6 +1371,16 @@ be **positive** — `0` and negatives are rejected with `400`, mirroring
 `core::validate`'s `check_positive_number` at submit time so an edit cannot
 store a value a task file would have been rejected for. A non-numeric value is
 likewise a `400`.
+
+A `cell` edit also accepts `effort` (RAL-607; a string, `null` clears) and
+`temperature` (a finite number from 0.0 to 2.0, `null` clears). `effort` maps to
+Claude Code `--effort` (`low`, `medium`, `high`, `xhigh`, `max`), Codex
+`model_reasoning_effort` (any non-empty string) and Pi `--thinking` (`off`,
+`minimal`, `low`, `medium`, `high`, `xhigh`, `max`); `temperature` is Pi only
+(`models.json` `samplingParams`). Either is rejected with `400` when the cell's
+effective agent does not support it, or the level is outside that agent's
+closed set. A changed value restarts the cell with resume like a model/agent
+edit; resubmitting identical values is a no-op. Cell views report both fields.
 
 `maximum_tool_output_tokens` is additionally rejected with `400` when the agent
 that would run the node has no delivery mechanism for it (RAL-333) — accepted

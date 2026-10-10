@@ -208,6 +208,8 @@ const TASK_KEYS: &[&str] = &[
     "maximum_context",
     "auto_compact_threshold",
     "maximum_tool_output_tokens",
+    "effort",
+    "temperature",
     "max_retries",
     "priority",
     "timeout_minutes",
@@ -242,6 +244,8 @@ const CELL_KEYS: &[&str] = &[
     "maximum_context",
     "auto_compact_threshold",
     "maximum_tool_output_tokens",
+    "effort",
+    "temperature",
     "timeout_minutes",
     "maximum_timeout_seconds",
     "priority",
@@ -937,6 +941,10 @@ fn validate_tasks(value: Option<&toml::Value>, ctx: &mut Ctx) {
         );
         check_positive_number(ctx, table, "maximum_tool_output_tokens", &path, header);
         check_maximum_tool_output_tokens(ctx, table, &[], &path, header);
+        check_type(ctx, table, "effort", Ty::Str, &path, header);
+        check_effort(ctx, table, &[], &path, header);
+        check_type(ctx, table, "temperature", Ty::Float, &path, header);
+        check_temperature(ctx, table, &[], &path, header);
         check_type(ctx, table, "max_retries", Ty::Int, &path, header);
         check_type(ctx, table, "priority", Ty::Int, &path, header);
         check_type(ctx, table, "timeout_minutes", Ty::Int, &path, header);
@@ -1205,6 +1213,10 @@ fn validate_cells(
         );
         check_positive_number(ctx, table, "maximum_tool_output_tokens", &path, header);
         check_maximum_tool_output_tokens(ctx, table, task_agents, &path, header);
+        check_type(ctx, table, "effort", Ty::Str, &path, header);
+        check_effort(ctx, table, task_agents, &path, header);
+        check_type(ctx, table, "temperature", Ty::Float, &path, header);
+        check_temperature(ctx, table, task_agents, &path, header);
         check_type(ctx, table, "timeout_minutes", Ty::Int, &path, header);
         // RAL-308: see the matching comment in `validate_tasks` -- the
         // range-validation policy for this field is still pending.
@@ -1929,6 +1941,134 @@ fn check_maximum_tool_output_tokens(
                     "'maximum_tool_output_tokens' is only supported for the \
                      'codex'/'pi'/'claude-code' agents right now, not '{agent}'. Remove this \
                      setting, or switch to one of those agents."
+                ),
+                line,
+            );
+        }
+    }
+}
+
+/// Enforce the `effort` rules (RAL-607): the agent must have a delivery
+/// mechanism ([`agent_supports_effort`](crate::schema::agent_supports_effort)),
+/// and for agents with a closed vocabulary
+/// ([`effort_levels_for_agent`](crate::schema::effort_levels_for_agent)) the
+/// value must be one of its levels. Codex and custom profiles take any
+/// non-empty string (a custom profile is deferred to the daemon like the
+/// other backend-gated fields).
+fn check_effort(
+    ctx: &mut Ctx,
+    table: &toml::Table,
+    task_agents: &[&str],
+    path: &str,
+    header: Option<u32>,
+) {
+    let Some(value) = table.get("effort") else {
+        return;
+    };
+    // A wrong type was already reported by `check_type`.
+    let Some(level) = value.as_str() else {
+        return;
+    };
+
+    let mut names = agent_names_in_table(table).unwrap_or_else(|| task_agents.to_vec());
+    if names.is_empty() {
+        names.push(crate::schema::DEFAULT_AGENT);
+    }
+    if level.trim().is_empty() {
+        let line = ctx.key_line(header, "effort");
+        ctx.error(
+            &format!("{path}.effort"),
+            ErrorKind::InvalidValue,
+            "'effort' must be a non-empty string",
+            line,
+        );
+        return;
+    }
+    for agent in names
+        .iter()
+        .copied()
+        .filter(|a| crate::schema::RESERVED_AGENT_NAMES.contains(a))
+    {
+        if !crate::schema::agent_supports_effort(agent) {
+            let line = ctx.key_line(header, "effort");
+            ctx.error(
+                &format!("{path}.effort"),
+                ErrorKind::InvalidValue,
+                format!(
+                    "'effort' is only supported for the 'codex'/'pi'/'claude-code' agents \
+                     right now, not '{agent}'. Remove this setting, or switch to one of those \
+                     agents."
+                ),
+                line,
+            );
+        } else if let Some(levels) = crate::schema::effort_levels_for_agent(agent)
+            && !levels.contains(&level)
+        {
+            let line = ctx.key_line(header, "effort");
+            ctx.error(
+                &format!("{path}.effort"),
+                ErrorKind::InvalidValue,
+                format!(
+                    "'effort' \"{level}\" is not valid for the '{agent}' agent; expected one of: {}",
+                    levels.join(", ")
+                ),
+                line,
+            );
+        }
+    }
+}
+
+/// Enforce the `temperature` rules (RAL-607): finite and within
+/// [`TEMPERATURE_RANGE`](crate::schema::TEMPERATURE_RANGE), and only for an
+/// agent with a delivery mechanism
+/// ([`agent_supports_temperature`](crate::schema::agent_supports_temperature),
+/// Pi only).
+fn check_temperature(
+    ctx: &mut Ctx,
+    table: &toml::Table,
+    task_agents: &[&str],
+    path: &str,
+    header: Option<u32>,
+) {
+    let Some(value) = table.get("temperature") else {
+        return;
+    };
+    let number = match value {
+        toml::Value::Float(f) => Some(*f),
+        toml::Value::Integer(i) => Some(*i as f64),
+        _ => None,
+    };
+    // A wrong type was already reported by `check_type`.
+    let Some(number) = number else { return };
+
+    let (lo, hi) = crate::schema::TEMPERATURE_RANGE;
+    if !number.is_finite() || number < lo || number > hi {
+        let line = ctx.key_line(header, "temperature");
+        ctx.error(
+            &format!("{path}.temperature"),
+            ErrorKind::InvalidValue,
+            format!("'temperature' must be a number between {lo} and {hi}"),
+            line,
+        );
+    }
+
+    let mut names = agent_names_in_table(table).unwrap_or_else(|| task_agents.to_vec());
+    if names.is_empty() {
+        names.push(crate::schema::DEFAULT_AGENT);
+    }
+    for agent in names
+        .iter()
+        .copied()
+        .filter(|a| crate::schema::RESERVED_AGENT_NAMES.contains(a))
+    {
+        if !crate::schema::agent_supports_temperature(agent) {
+            let line = ctx.key_line(header, "temperature");
+            ctx.error(
+                &format!("{path}.temperature"),
+                ErrorKind::InvalidValue,
+                format!(
+                    "'temperature' is only supported for the 'pi' agent right now, not \
+                     '{agent}'. Remove this setting, or switch to that agent."
                 ),
                 line,
             );
@@ -5578,6 +5718,95 @@ project = "ralphus"
         let src = "[[task]]\nname=\"t\"\nagent=\"codex\"\nmaximum_tool_output_tokens=50000\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    fn effort_src(agent: &str, effort: &str) -> String {
+        format!(
+            "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"{agent}\"\neffort=\"{effort}\"\n"
+        )
+    }
+
+    #[test]
+    fn effort_accepts_each_agents_vocabulary() {
+        for (agent, level) in [
+            ("claude-code", "xhigh"),
+            ("claude-code", "max"),
+            ("pi", "off"),
+            ("pi", "minimal"),
+            ("codex", "anything-the-model-advertises"),
+        ] {
+            let r = validate_toml(&effort_src(agent, level));
+            assert!(r.is_ok(), "{agent}/{level}: {:?}", r.errors);
+        }
+    }
+
+    #[test]
+    fn effort_rejects_levels_outside_a_closed_vocabulary() {
+        for (agent, level) in [("claude-code", "off"), ("pi", "turbo")] {
+            let r = validate_toml(&effort_src(agent, level));
+            assert!(
+                r.errors
+                    .iter()
+                    .any(|e| e.kind == ErrorKind::InvalidValue && e.path.contains("effort")),
+                "{agent}/{level}: {:?}",
+                r.errors
+            );
+        }
+    }
+
+    #[test]
+    fn effort_rejected_for_unsupported_agent_and_empty_value() {
+        let r = validate_toml(&effort_src("ollama", "high"));
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.path.contains("effort") && e.message.contains("ollama")),
+            "{:?}",
+            r.errors
+        );
+        let r = validate_toml(&effort_src("codex", " "));
+        assert!(
+            r.errors.iter().any(|e| e.path.contains("effort")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn effort_at_task_level_is_checked_against_the_task_agent() {
+        let ok = "[[task]]\nname=\"t\"\nagent=\"pi\"\neffort=\"high\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        assert!(validate_toml(ok).is_ok());
+        let bad = "[[task]]\nname=\"t\"\nagent=\"ollama\"\neffort=\"high\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        assert!(!validate_toml(bad).is_ok());
+    }
+
+    #[test]
+    fn temperature_valid_for_pi_only_and_bounded() {
+        let src = |agent: &str, t: &str| {
+            format!(
+                "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"{agent}\"\ntemperature={t}\n"
+            )
+        };
+        for t in ["0", "0.0", "0.7", "2.0", "1"] {
+            let r = validate_toml(&src("pi", t));
+            assert!(r.is_ok(), "pi/{t}: {:?}", r.errors);
+        }
+        for t in ["-0.1", "2.1", "nan", "inf"] {
+            let r = validate_toml(&src("pi", t));
+            assert!(
+                r.errors.iter().any(|e| e.path.contains("temperature")),
+                "pi/{t}: {:?}",
+                r.errors
+            );
+        }
+        let r = validate_toml(&src("claude-code", "0.5"));
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.path.contains("temperature") && e.message.contains("claude-code")),
+            "{:?}",
+            r.errors
+        );
     }
 
     #[test]

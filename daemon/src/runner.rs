@@ -194,6 +194,16 @@ pub struct RunnerSpec {
     /// means no cap.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub maximum_tool_output_tokens: Option<u64>,
+    /// Reasoning effort (RAL-607), delivered through the harness's own
+    /// mechanism -- see `ralphus_core::schema::agent_supports_effort`. `None`
+    /// leaves the harness default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Sampling temperature (RAL-607), Pi only -- see
+    /// `ralphus_core::schema::agent_supports_temperature`. `None` leaves the
+    /// provider default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
     /// True when this spec is an `agent`-kind proof step rather than a
     /// normal cell: the runner wraps `prompt` with verdict-reporting
     /// instructions and returns a `proofed` result instead of just "ran".
@@ -781,6 +791,8 @@ impl RunnerSpec {
             maximum_tool_output_tokens: row
                 .maximum_tool_output_tokens
                 .and_then(|v| u64::try_from(v).ok()),
+            effort: row.effort.clone(),
+            temperature: row.temperature,
             proof: false,
             trace_context: None,
             resume_agent_session_id: None,
@@ -912,6 +924,8 @@ impl RunnerSpec {
             maximum_context: None,
             auto_compact_threshold: None,
             maximum_tool_output_tokens,
+            effort: None,
+            temperature: None,
             proof: true,
             trace_context: None,
             resume_agent_session_id: None,
@@ -994,6 +1008,8 @@ impl RunnerSpec {
             // Command-kind proof steps never reach a `ModelBackend`, so there
             // is no tool-output cap to configure here either.
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             proof: true,
             trace_context: None,
             resume_agent_session_id: None,
@@ -4409,6 +4425,8 @@ mod tests {
             maximum_context: None,
             auto_compact_threshold: None,
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             upstream: None,
             machine: None,
             share_session: false,
@@ -4450,6 +4468,8 @@ mod tests {
             maximum_context: None,
             auto_compact_threshold: None,
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             upstream: None,
             machine: None,
             share_session: false,
@@ -4490,6 +4510,8 @@ mod tests {
             maximum_context: Some(100_000),
             auto_compact_threshold: Some(80_000),
             maximum_tool_output_tokens: Some(40_000),
+            effort: None,
+            temperature: None,
             upstream: None,
             machine: None,
             share_session: false,
@@ -4530,6 +4552,8 @@ mod tests {
             maximum_context: None,
             auto_compact_threshold: None,
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             upstream: None,
             machine: None,
             share_session: false,
@@ -4571,6 +4595,8 @@ mod tests {
             maximum_context: None,
             auto_compact_threshold: None,
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             proof: false,
             trace_context: None,
             resume_agent_session_id: None,
@@ -4821,6 +4847,8 @@ mod tests {
             maximum_context: None,
             auto_compact_threshold: None,
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             upstream: None,
             machine: None,
             share_session: false,
@@ -4891,6 +4919,8 @@ mod tests {
             maximum_context: None,
             auto_compact_threshold: None,
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             upstream: None,
             machine: None,
             share_session: false,
@@ -4928,6 +4958,8 @@ mod tests {
             maximum_context: None,
             auto_compact_threshold: None,
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             upstream: None,
             machine: None,
             share_session: false,
@@ -5025,6 +5057,8 @@ mod tests {
             maximum_context: None,
             auto_compact_threshold: None,
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             upstream: None,
             machine: None,
             share_session: false,
@@ -5071,6 +5105,8 @@ mod tests {
             maximum_context: None,
             auto_compact_threshold: None,
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             upstream: None,
             machine: None,
             share_session: false,
@@ -5111,6 +5147,8 @@ mod tests {
             maximum_context: None,
             auto_compact_threshold: None,
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             upstream: None,
             machine: None,
             share_session: false,
@@ -5157,6 +5195,8 @@ mod tests {
             maximum_context: None,
             auto_compact_threshold: None,
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             upstream: None,
             machine: None,
             share_session: false,
@@ -5793,6 +5833,8 @@ prompt = "make it build"
             maximum_context: None,
             auto_compact_threshold: None,
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             upstream: None,
             machine: None,
             share_session: false,
@@ -5881,6 +5923,8 @@ prompt = "make it build"
             maximum_context: None,
             auto_compact_threshold: None,
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             upstream: None,
             machine: None,
             share_session: false,
@@ -6601,6 +6645,8 @@ prompt = "make it build"
             maximum_context: None,
             auto_compact_threshold: None,
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             proof: false,
             trace_context: None,
             resume_agent_session_id: None,
@@ -6747,6 +6793,8 @@ prompt = "make it build"
             maximum_context: None,
             auto_compact_threshold: None,
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             proof: false,
             trace_context: None,
             resume_agent_session_id: None,
