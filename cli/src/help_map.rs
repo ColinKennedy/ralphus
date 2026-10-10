@@ -3319,7 +3319,7 @@ fn resolved_path(args: &[String], strict: bool) -> Result<Vec<&str>, InvocationE
             return Ok(path);
         }
         let Some(child) = node.children.iter().find(|child| child.name == candidate) else {
-            // RAL-501: `ralphus initialize server` is a hidden, interactive
+            // RAL-501: `ralphus initialize solo-developer` is a hidden, interactive
             // setup command deliberately absent from INITIALIZE_CHILDREN (so
             // it never appears in `--help`, `show help-map`, or the
             // help-map-derived MCP tool surface) but still directly
@@ -3327,7 +3327,7 @@ fn resolved_path(args: &[String], strict: bool) -> Result<Vec<&str>, InvocationE
             // erroring -- lets it reach `dispatch`; `find_registered_node`
             // still returns `None` for this path, so `validate_invocation`
             // requires no registered flags for it below.
-            if path.as_slice() == ["initialize"] && candidate == "server" {
+            if path.as_slice() == ["initialize"] && candidate == "solo-developer" {
                 path.push(candidate);
                 break;
             }

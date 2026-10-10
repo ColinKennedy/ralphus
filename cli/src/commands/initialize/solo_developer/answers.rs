@@ -1,4 +1,4 @@
-//! The `initialize server` answers file (RAL-576): every setting the run
+//! The `initialize solo-developer` answers file (RAL-576): every setting the run
 //! resolved, with the value used and where it came from, written as TOML at
 //! the end of the run and replayable with `--answers-file <path>`.
 //!
@@ -11,7 +11,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use super::{INTERACTIVE_SETTINGS, InitializeServerOptions, InitializeSetting};
+use super::{INTERACTIVE_SETTINGS, InitializeSetting, InitializeSoloDeveloperOptions};
 
 const VERSION: i64 = 1;
 const REDACTED: &str = "<redacted>";
@@ -189,7 +189,7 @@ enum Slot<'a> {
     List(&'a mut Vec<String>),
 }
 
-fn slot<'a>(setup: &'a mut InitializeServerOptions, key: &str) -> Option<Slot<'a>> {
+fn slot<'a>(setup: &'a mut InitializeSoloDeveloperOptions, key: &str) -> Option<Slot<'a>> {
     Some(match key {
         "install_tmux" => Slot::Bool(&mut setup.install_tmux),
         "tmux_program" => Slot::Text(&mut setup.tmux_program),
@@ -279,7 +279,10 @@ fn typed_value(
 
 /// Reads `path` and fills every option a flag left unset. Flags win; keys not
 /// covered by the file are left for the prompts or defaults.
-pub(super) fn load_into(path: &Path, setup: &mut InitializeServerOptions) -> Result<(), String> {
+pub(super) fn load_into(
+    path: &Path,
+    setup: &mut InitializeSoloDeveloperOptions,
+) -> Result<(), String> {
     let text = std::fs::read_to_string(path)
         .map_err(|error| format!("could not read answers file {}: {error}", path.display()))?;
     let table: toml::Table = text
@@ -436,7 +439,7 @@ fn unasked_default(key: &str) -> toml::Value {
 }
 
 /// The value a flag or the loaded file supplied for `key`, if any.
-fn supplied_value(setup: &mut InitializeServerOptions, key: &str) -> Option<toml::Value> {
+fn supplied_value(setup: &mut InitializeSoloDeveloperOptions, key: &str) -> Option<toml::Value> {
     if key == "forge_token" {
         return setup
             .forge_token
@@ -453,9 +456,9 @@ fn supplied_value(setup: &mut InitializeServerOptions, key: &str) -> Option<toml
 
 /// Fills every setting the run never asked about with the value that applied
 /// (a supplied one, else the default), then renders the file.
-pub(super) fn render(setup: &mut InitializeServerOptions) -> String {
+pub(super) fn render(setup: &mut InitializeSoloDeveloperOptions) -> String {
     let mut out = format!(
-        "# ralphus initialize server answers (replay with `--answers-file <this file>`)\n\
+        "# ralphus initialize solo-developer answers (replay with `--answers-file <this file>`)\n\
          # Some values (tmux paths, MCP hosts, project names/URLs) are specific to the\n\
          # machine that produced this file; the forge token is never stored.\n\
          version = {VERSION}\n"
@@ -507,7 +510,7 @@ fn answers_dir() -> PathBuf {
     ralphus_daemon::config::global_config_path()
         .and_then(|path| path.parent().map(Path::to_path_buf))
         .unwrap_or_else(std::env::temp_dir)
-        .join("initialize-server")
+        .join("initialize-solo-developer")
 }
 
 /// Writes the timestamped file plus a stable `answers-latest.toml` copy;
@@ -544,14 +547,14 @@ mod tests {
         path
     }
 
-    fn load(text: &str, setup: &mut InitializeServerOptions) -> Result<(), String> {
+    fn load(text: &str, setup: &mut InitializeSoloDeveloperOptions) -> Result<(), String> {
         reset();
         load_into(&temp_file("load", text), setup)
     }
 
     #[test]
     fn flag_beats_file_and_file_fills_the_rest() {
-        let mut setup = InitializeServerOptions {
+        let mut setup = InitializeSoloDeveloperOptions {
             admin_name: Some("From Flag".to_string()),
             ..Default::default()
         };
@@ -570,7 +573,7 @@ mod tests {
     fn unknown_key_names_the_key_and_line() {
         let error = load(
             "version = 1\n\n[bogus_key]\nvalue = 1\n",
-            &mut InitializeServerOptions::default(),
+            &mut InitializeSoloDeveloperOptions::default(),
         )
         .unwrap_err();
         assert!(
@@ -581,7 +584,7 @@ mod tests {
 
     #[test]
     fn malformed_file_and_missing_version_are_errors() {
-        let mut setup = InitializeServerOptions::default();
+        let mut setup = InitializeSoloDeveloperOptions::default();
         assert!(
             load("version = [", &mut setup)
                 .unwrap_err()
@@ -601,7 +604,7 @@ mod tests {
 
     #[test]
     fn redacted_token_placeholder_means_not_provided() {
-        let mut setup = InitializeServerOptions::default();
+        let mut setup = InitializeSoloDeveloperOptions::default();
         load("version = 1\nforge_token = \"<redacted>\"\n", &mut setup).unwrap();
         assert!(setup.forge_token.is_none());
     }
@@ -629,7 +632,7 @@ mod tests {
     #[test]
     fn rendered_file_round_trips_and_never_contains_the_token() {
         reset();
-        let mut first = InitializeServerOptions {
+        let mut first = InitializeSoloDeveloperOptions {
             yes: true,
             admin_name: Some("Ada".to_string()),
             forge_token: Some("ghp_supersecret".to_string()),
@@ -650,7 +653,7 @@ mod tests {
         );
         assert!(text.contains("# not asked in this run"));
 
-        let mut second = InitializeServerOptions::default();
+        let mut second = InitializeSoloDeveloperOptions::default();
         load(&text, &mut second).unwrap();
         assert_eq!(second.admin_name.as_deref(), Some("Ada"));
         assert_eq!(second.review_resolver_agent.as_deref(), Some("codex"));
@@ -662,7 +665,7 @@ mod tests {
         assert!(second.forge_token.is_none());
         // Every setting is covered, so a second render is the same file.
         reset();
-        let mut third = InitializeServerOptions::default();
+        let mut third = InitializeSoloDeveloperOptions::default();
         load(&text, &mut third).unwrap();
         let again = render(&mut third);
         let values = |text: &str| {

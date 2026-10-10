@@ -163,11 +163,11 @@ list of candidates.
 | `task show-tutor` | Print the Task TOML schema reference |
 | `queue list [--all]` / `reorder <paths...>` / `set-position <paths...> --to N [--relative]` / `set-status <path> <state>` | Inspect/reorder the squad queue by priority |
 | `initialize git [--path]` | Enable git rerere in a repository |
-| `initialize server [--yes] [--agent-logins claude,codex\|all\|none] ...` | Guided first-run server setup. See [Initialize server](#initialize-server) below |
+| `initialize solo-developer [--yes] [--agent-logins claude,codex\|all\|none] ...` | Guided first-run solo-developer setup. See [Initialize solo-developer](#initialize-solo-developer) below |
 
-### Initialize server
+### Initialize solo-developer
 
-`ralphus initialize server` walks a fresh machine through ten steps (each
+`ralphus initialize solo-developer` walks a fresh machine through ten steps (each
 printed as `Step N of 10`), ending with a health run and a sample squad. Every
 interactive answer has a matching flag, and `--yes` accepts defaults without
 prompting.

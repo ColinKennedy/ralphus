@@ -18,7 +18,7 @@ use ralphus_cli::commands::initialize::EXERCISES;
 /// written, and its review merge is a git fast-forward in the daemon's own
 /// checkout, so it can follow neither the no-agent rule nor `--remote`. Its
 /// stub agent is a renamed copy of the CLI binary, so it still calls no model.
-const NON_EXERCISE_MODULES: &[&str] = &["mod", "exercise", "server", "followup"];
+const NON_EXERCISE_MODULES: &[&str] = &["mod", "exercise", "solo_developer", "followup"];
 
 /// Substrings that would mean an exercise reaches for a model or agent.
 const LLM_MARKERS: &[&str] = &[
