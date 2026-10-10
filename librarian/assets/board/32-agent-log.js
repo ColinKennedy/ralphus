@@ -216,11 +216,11 @@
         agentLogScroll[el.dataset.key || ""] = el.scrollTop;
       }
       /**
-       * Re-applies remembered scroll offsets after a live-view widget repainted.
+       * Re-applies remembered scroll offsets after the inspector repainted.
        * @returns {void}
        */
       function restoreAgentLogScroll() {
-        document.querySelectorAll(".alog[data-key]").forEach((el0) => {
+        document.querySelectorAll("#review-inspector .alog[data-key]").forEach((el0) => {
           const el = /** @type {HTMLElement} */ (el0);
           const top = agentLogScroll[el.dataset.key || ""];
           if (top) el.scrollTop = top;
