@@ -175,6 +175,30 @@ pub fn run(
     config: &EffectiveConfig,
 ) -> Result<(String, i64), String> {
     let target = uri::parse(uri).map_err(|e| e.to_string())?;
+    let script = run_script(payload_json, config, RUN_EXIT_MARKER, false)?;
+    let raw = ssh_command(&target, &script, config, None)?;
+    split_run_output(&raw)
+}
+
+/// Validate a `run` request and build the shell script that runs it: `cd` to
+/// the workspace, run the command with stderr merged into stdout, and print
+/// its exit code after `marker` on a line of its own.
+///
+/// `detach_stdin` redirects the command's stdin from `/dev/null`. A one-shot
+/// `ssh` has no stdin script to protect, but a [`crate::channel`] feeds many
+/// scripts to one long-lived remote shell through its stdin, so a command
+/// that read stdin would swallow the next request.
+///
+/// # Errors
+/// A malformed request, a `cwd` outside the configured remote root, a
+/// `program` other than git or one authored shell command, or an invalid
+/// environment key.
+pub(crate) fn run_script(
+    payload_json: &str,
+    config: &EffectiveConfig,
+    marker: &str,
+    detach_stdin: bool,
+) -> Result<String, String> {
     let req: RunRequest = serde_json::from_str(payload_json)
         .map_err(|e| format!("could not parse the run request on stdin: {e}"))?;
     require_absolute_posix_path(&req.cwd)?;
@@ -214,13 +238,11 @@ pub fn run(
             shell_quote_single(&req.args[0])
         )
     };
-    let script = format!(
-        "cd {cwd} && {{ {invocation}; }} 2>&1; printf '\\n{marker}%s\\n' \"$?\"",
+    let stdin = if detach_stdin { " </dev/null" } else { "" };
+    Ok(format!(
+        "cd {cwd} && {{ {invocation}; }}{stdin} 2>&1; printf '\\n{marker}%s\\n' \"$?\"",
         cwd = shell_quote_single(&req.cwd),
-        marker = RUN_EXIT_MARKER,
-    );
-    let raw = ssh_command(&target, &script, config, None)?;
-    split_run_output(&raw)
+    ))
 }
 
 fn split_run_output(raw: &str) -> Result<(String, i64), String> {
