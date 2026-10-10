@@ -912,20 +912,25 @@
        * copies exactly what's visible.
        * @param {MouseEvent} e
        * @param {string} key
+       * @param {string} scope - The live-view widget the button belongs to (selects which sub-view's text is copied).
        * @returns {Promise<void>}
        */
-      async function copyPeekText(e, key) {
+      async function copyPeekText(e, key, scope) {
         e.stopPropagation();
         const btn = /** @type {HTMLElement} */ (e.currentTarget);
-        // RAL-232/RAL-397: copy whatever is currently visible, same as this box's own text.
-        // RAL-428: admins can switch this box to the System Prompt tab, and the
-        // copy control always copies the *active* tab's content — the prompt
-        // text when that tab is showing (never a "Loading…"/error placeholder:
+        // Copies whatever the widget is showing: the System Prompt or Prompt
+        // text on those sub-views (never a "Loading…"/error placeholder --
         // peekPromptText returns null in those states and "" is copied), the
-        // terminal transcript otherwise. Same active-tab condition `peekBox`
-        // renders with, so what's copied always matches what's on screen.
-        const promptTab = currentUserIsAdmin && peekTab[key] === "prompt";
-        const text = promptTab ? (peekPromptText(peekSystemPrompt[key]) ?? "") : (peekContent[key] || "");
+        // terminal transcript otherwise.
+        const sub = liveSub[scope] || "terminal";
+        const ctx = liveWidgets[scope];
+        let text = peekContent[key] || "";
+        if (sub === "system" && ctx) {
+          text = currentUserIsAdmin ? (peekPromptText(peekSystemPrompt[ctx.systemKey]) ?? "") : "";
+        } else if (sub === "prompt") {
+          const box = btn.closest(".peek-head")?.parentElement?.querySelector(".promptbox");
+          text = box ? (box.textContent || "") : "";
+        }
         try {
           if (navigator.clipboard && window.isSecureContext) await navigator.clipboard.writeText(text);
           else { const ta = document.createElement("textarea"); ta.value = text; ta.style.cssText = "position:fixed;opacity:0"; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); ta.remove(); }

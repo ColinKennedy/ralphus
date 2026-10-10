@@ -70,7 +70,6 @@ function loadFunctions(names, contextExtras = {}) {
     loadRunPaths: () => {},
     terminalMenuItem: () => "",
     terminalMenuHtml: () => "",
-    peekBox: () => "",
     cartoLevelPill: (level) => `<level:${level}>`,
     cartoRefChip: (row) => row.run_id || "—",
     cartoRowCopyBtn: (id) => `<copy:${id}>`,

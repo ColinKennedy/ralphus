@@ -2223,11 +2223,13 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
                         </div>${commandFullBlock(key, cmdText, { g, check: cmd, kind: "manual", i })}`;
                     }).join(""), false, headAttrs)
                 : reviewRunGroup(runControl, waitingNote, "", false, headAttrs)}
-              ${peekBox(peekKey, g.manual_checks_started_at_ms, null, g.manual_checks_finished_at_ms)}
+              ${squadLiveSlot(squadLiveCtx({ baseKey: peekKey, title: "auto actions generation", canThink: true, promptText: "", promptHint: "", withAttempts: false, currentMeta: g.manual_checks_finished_at_ms ? "finished" : "running", closeKey: peekKey }))}
               `;
           })()}`;
         attachPeekResizeHandlers();
         restorePeekScrollPositions(); // RAL-471: the innerHTML rewrite above just destroyed/recreated any peek `<pre>` nodes, dropping their scroll position
+        restorePromptBoxScroll();
+        restoreAgentLogScroll();
         // The inspector and the dock are siblings of this pane, not children of
         // it, so they re-render alongside rather than being rebuilt by the
         // innerHTML above -- which is what lets the inspector keep its own tab

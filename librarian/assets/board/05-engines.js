@@ -87,7 +87,6 @@
         confirmBulkCancelSquads: (e, ds) => confirmBulkCancelSquads(ds.squadIds || ""),
         toggleTerminalMenu: (e, ds) => toggleTerminalMenu(ds.key || ""),
         togglePeek: (e, ds) => togglePeek(ds.key || ""),
-        togglePeekStopProp: (e, ds) => { togglePeek(ds.key || ""); e.stopPropagation(); },
         openAgentProofTerminalMenuItem: (e, ds) => { closeTerminalMenu(ds.key || ""); openAgentProofTerminal(ds.squadId || "", Number(ds.ti), ds.scope || "", Number(ds.si), Number(ds.vi)); },
         openProofTerminalMenuItem: (e, ds) => { closeTerminalMenu(ds.key || ""); openProofTerminal(ds.squadId || "", Number(ds.ti), ds.scope || "", Number(ds.si), Number(ds.vi)); },
         toggleHistoryMenuItem: (e, ds) => { closeTerminalMenu(ds.key || ""); toggleHistory(ds.key || ""); },
@@ -97,32 +96,28 @@
         openTerminalMenuItem: (e, ds) => { closeTerminalMenu(ds.key || ""); openTerminal(ds.squadId || "", Number(ds.ti), Number(ds.si)); },
         openGuardianBranchTerminalMenuItem: (e, ds) => { closeTerminalMenu(ds.key || ""); openGuardianBranchTerminal(ds.gid || "", ds.bid || "", ds.mode || ""); },
         openGuardianManualChecksTerminalMenuItem: (e, ds) => { closeTerminalMenu(ds.key || ""); openGuardianManualChecksTerminal(ds.gid || "", ds.mode || ""); },
-        copyPeekText: (e, ds) => copyPeekText(e, ds.key || ""),
-        // RAL-428: peek box tab buttons (Terminal / System Prompt). Never
-        // reaches a non-admin — the buttons only render for admins (see
-        // `peekBox`), and `switchPeekTab` itself clamps stray values.
-        switchPeekTab: (e, ds) => switchPeekTab(ds.key || "", /** @type {"terminal"|"prompt"} */ (ds.tab || "terminal")),
+        copyPeekText: (e, ds) => copyPeekText(e, ds.key || "", ds.scope || ""),
         peekScrollToBottom: (e, ds) => peekScrollToBottom(ds.key || ""),
         closeHistoryAttempt: (e, ds) => closeHistoryAttempt(ds.key || ""),
         viewHistoryAttempt: (e, ds) => viewHistoryAttempt(ds.key || "", Number(ds.attempt)),
         toggleHistory: (e, ds) => toggleHistory(ds.key || ""),
-        stepBranchRun: (e, ds) => stepBranchRun(ds.branchId || "", Number(ds.dir)),
-        jumpToLatestRun: (e, ds) => jumpToLatestRun(ds.branchId || ""),
-        setLiveSub: (e, ds) => setLiveSub(ds.branchId || "", ds.sub || "terminal"),
+        stepLiveRun: (e, ds) => stepLiveRun(ds.scope || "", Number(ds.dir)),
+        jumpToLatestLiveRun: (e, ds) => jumpToLatestLiveRun(ds.scope || ""),
+        setLiveSub: (e, ds) => setLiveSub(ds.scope || "", ds.sub || "terminal"),
         agentLogShowEarlier: (e, ds) => agentLogShowEarlier(ds.key || ""),
         stepFeedbackReply: (e, ds) => stepFeedbackReply(ds.key || "", Number(ds.to)),
         regenerateSummary: (e, ds) => regenerateSummary(ds.guardianId || ""),
-        // The inspector's Live tab draws these as pill toggles whose on/off
+        // The live-view widget draws these as pill toggles whose on/off
         // state is read at render time, so flipping the underlying flag has to
-        // re-render that pane -- `toggleShow*` only repaints the tape, which
+        // repaint that widget -- `toggleShow*` only repaints the tape, which
         // left the pill looking untouched and the control looking dead.
         toggleShowDebugMessagesBtn: (e, ds) => {
           toggleShowDebugMessages(ds.key || "", !peekShowsDebug(ds.key || ""));
-          renderReviewInspector();
+          repaintLive(ds.scope || "");
         },
         toggleShowThinkingBtn: (e, ds) => {
           toggleShowThinking(ds.key || "", !peekShowsThinking(ds.key || ""));
-          renderReviewInspector();
+          repaintLive(ds.scope || "");
         },
         doPickStatus: (e, ds) => doPickStatus(ds.state || ""),
         selectAddDependencyTarget: (e, ds) => selectAddDependencyTarget(ds.squadId || ""),
