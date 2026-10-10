@@ -14,6 +14,7 @@ pub mod cli_agent_common;
 pub mod codex_backend;
 pub mod config;
 pub mod execute;
+pub mod git_inproc;
 pub mod harness_backend;
 pub mod hostos;
 pub mod llm_client;

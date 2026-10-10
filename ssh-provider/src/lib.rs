@@ -5,8 +5,8 @@
 //!
 //! **`exec`, `status`, `stream`, `cancel`, `job-cleanup`, `ping`,
 //! `provision`, `run`, `read-file`, `write-file`, `remove-path`, and
-//! `cleanup` are implemented; only `channel` (an optional connection-reuse
-//! optimization) is not.** Configured targets use durable asynchronous jobs
+//! `cleanup`, and `channel` (one persistent `ssh` session serving many `run`s
+//! -- see [`channel`]) are implemented.** Configured targets use durable asynchronous jobs
 //! under their remote root -- see [`job`]. A legacy invocation without
 //! target configuration keeps the synchronous path that syncs a local
 //! worktree and blocks on `ralphus-runner` -- see [`exec::run`]. `provision`
@@ -32,6 +32,7 @@
 #![allow(clippy::print_stdout)]
 
 pub mod capabilities;
+pub mod channel;
 pub mod cleanup;
 pub mod config;
 pub mod exec;
@@ -80,12 +81,8 @@ pub fn redacted(text: &str) -> String {
 
 /// Verbs this provider does not implement -- see the crate docs on scope.
 /// Listed explicitly so an operator gets a pointed explanation instead of a
-/// generic "unknown verb". `channel` (RAL-185 D7 connection reuse) is a pure
-/// performance optimization every provider may skip per the documented
-/// contract -- `run` falls back to a one-shot spawn per call when a provider
-/// does not support it, so there is no functionality gap, only an
-/// unexploited one. `retire` (automatic stale-worktree retirement) is optional
-/// too, and its "does not implement" reply is what the daemon reads as this
-/// provider opting out -- a bare "unknown verb" would instead be recorded as a
-/// failed retirement on every daily sweep.
-pub const UNIMPLEMENTED_VERBS: &[&str] = &["channel", "retire"];
+/// generic "unknown verb". `retire` (automatic stale-worktree retirement) is
+/// optional, and its "does not implement" reply is what the daemon reads as
+/// this provider opting out -- a bare "unknown verb" would instead be recorded
+/// as a failed retirement on every daily sweep.
+pub const UNIMPLEMENTED_VERBS: &[&str] = &["retire"];

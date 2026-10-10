@@ -167,10 +167,37 @@ impl GitVcs {
         if let Some(output) = crate::vcs_refs::try_rev_parse(root, args) {
             return Ok(output);
         }
+        // Where a per-worktree state file lives is a function of the
+        // checkout's layout (see `crate::vcs_refs`).
+        if let Some(output) = crate::vcs_refs::try_git_path(root, args) {
+            return Ok(output);
+        }
+        // Questions answered by the checkout's layout alone (git dir, common
+        // dir, top level, hooks dir).
+        if let Some(output) = crate::vcs_refs::try_rev_parse_layout(root, args) {
+            return Ok(output);
+        }
+        // The registered worktrees are directories under `.git/worktrees`.
+        if let Some(output) = crate::vcs_refs::try_worktree_list(root, args) {
+            return Ok(output);
+        }
+        // `log --format=%s A..B` and `rev-list --count A..B` over plain
+        // history are answered in-process; anything else, or anything libgit2
+        // cannot reproduce exactly, falls through to real git (see
+        // `ralphus_runner::git_inproc`).
+        if let Some(stdout) = ralphus_runner::git_inproc::try_read(root, args) {
+            return Ok(crate::vcs_refs::success_output(stdout));
+        }
         // `remote get-url` / `config --get` answers are reused while the
         // config files they depend on are unchanged (see `crate::vcs_refs`).
         if let Some(output) = crate::vcs_refs::cached_config_read(root, args) {
             return Ok(output);
+        }
+        // A config value the repository itself defines, read in-process when
+        // the cache above has expired (it only lives 30 s, and the polls that
+        // ask repeat less often than that); see `ralphus_runner::git_inproc`.
+        if let Some(answer) = ralphus_runner::git_inproc::try_config_read(root, args) {
+            return Ok(crate::vcs_refs::answer_output(answer.stdout, answer.code));
         }
         // Ancestry between two fixed commits never changes.
         if let Some(output) = crate::vcs_refs::cached_ancestry(root, args) {
