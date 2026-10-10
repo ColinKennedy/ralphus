@@ -92,11 +92,19 @@ pub(crate) fn serve_with(
     let mut child = session
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("could not start the channel session: {e}"))?;
     let mut shell_in = child.stdin.take().ok_or("channel session has no stdin")?;
     let shell_out = child.stdout.take().ok_or("channel session has no stdout")?;
+    let shell_err = child.stderr.take().ok_or("channel session has no stderr")?;
+    // What `ssh` said on stderr (a refused key, a host-key mismatch, ...): kept
+    // so a session that dies explains why instead of just ending.
+    let stderr_reader = std::thread::spawn(move || {
+        let mut text = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut BufReader::new(shell_err), &mut text);
+        String::from_utf8_lossy(&text).into_owned()
+    });
     // Output is read on its own thread so a dead session ends the wait.
     let (lines, output) = mpsc::channel::<Vec<u8>>();
     std::thread::spawn(move || {
@@ -158,8 +166,18 @@ pub(crate) fn serve_with(
     // EOF on the session's stdin ends the remote `sh`, which ends `ssh`.
     drop(shell_in);
     let _ = child.kill();
-    let _ = child.wait();
-    outcome
+    let status = child.wait().ok().and_then(|s| s.code());
+    let said = stderr_reader.join().unwrap_or_default();
+    outcome.map_err(|message| {
+        if said.trim().is_empty() {
+            message
+        } else {
+            format!(
+                "{message}: {}",
+                ssh::interpret_failure("ssh", status, &said)
+            )
+        }
+    })
 }
 
 fn send(replies: &mut impl Write, line: &str) -> Result<(), String> {
