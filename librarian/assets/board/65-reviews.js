@@ -1101,7 +1101,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        */
       function prCard(p) {
         const link = p.pr_url
-          ? `<a href="${esc(p.pr_url)}" target="_blank" rel="noopener" class="mono" style="color:var(--accent)" data-tip="Open this pull/merge request on ${esc(p.forge)}.">#${p.pr_number ?? "?"}</a>`
+          ? `<a href="${esc(p.pr_url)}" target="_blank" rel="noopener" class="mono" style="color:var(--accent)" data-pr-id="${esc(p.id)}" data-pr-open="${p.state === "open" && p.pr_number != null ? "1" : "0"}" data-tip="Open this pull/merge request on ${esc(p.forge)}. Opening it also refreshes its status.">#${p.pr_number ?? "?"}</a>`
           : `<span class="mono">${esc(p.branch_alias)}</span>`;
         const sync = prSyncStatus[p.id];
         let drift = "";
@@ -1250,7 +1250,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           : dual
             ? " This is the PR that actually gets merged; the other badge alongside it is a stack-only PR kept just for visual chaining."
             : "";
-        return `<a href="${esc(pr.pr_url)}" target="_blank" rel="noopener" class="badge mono" style="color:${color};border-color:${color}" onclick="event.stopPropagation()" data-ctx="openPrMenu" data-pr-id="${esc(pr.id)}" data-pr-open="${canQueryForge ? "1" : "0"}" data-tip="Open this branch's pull/merge request on ${esc(pr.forge)}.${ciNote}${kindNote} Right-click to refresh its status or pull in feedback.">${esc(pr.forge)} #${pr.pr_number ?? "?"}</a>`;
+        return `<a href="${esc(pr.pr_url)}" target="_blank" rel="noopener" class="badge mono" style="color:${color};border-color:${color}" onclick="event.stopPropagation()" data-ctx="openPrMenu" data-pr-id="${esc(pr.id)}" data-pr-open="${canQueryForge ? "1" : "0"}" data-tip="Open this branch's pull/merge request on ${esc(pr.forge)}.${ciNote}${kindNote} Opening it also refreshes its status. Right-click to refresh its status or pull in feedback.">${esc(pr.forge)} #${pr.pr_number ?? "?"}</a>`;
       }
       /**
        * Renders compact clickable link(s) to this branch's most relevant
