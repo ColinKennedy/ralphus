@@ -455,9 +455,20 @@ fn run_agent_with_stall_recovery(
         if !attempt.is_thinking_stalled() || cancel.is_cancelled() {
             return attempt;
         }
+        // A stalled manual-check generation is surfaced on the review as
+        // `checks_state == "hung"` until the retry produces output or ends.
+        let manual_review = (spec.task == MANUAL_COMMANDS_TASK)
+            .then(|| spec.squad_id.strip_prefix("guardian-").map(str::to_string))
+            .flatten();
+        if let Some(gid) = &manual_review {
+            crate::guardian::set_manual_checks_stalled(gid, true);
+        }
         match crate::scheduler::handle_thinking_stall_attempt(store, spec, &attempt) {
             crate::scheduler::ThinkingStallOutcome::Retry => continue,
             crate::scheduler::ThinkingStallOutcome::Terminate(message) => {
+                if let Some(gid) = &manual_review {
+                    crate::guardian::set_manual_checks_stalled(gid, false);
+                }
                 let mut terminal = attempt;
                 terminal.status = "failed".to_string();
                 terminal.error = Some(message);
@@ -11480,7 +11491,7 @@ fn post_merge_jobs_inner(
     // silent -- a missing generated command list is better than failing a
     // declared manual action over an unavailable agent.
     if generate_manual && !cancel.is_cancelled() {
-        if let Err(e) = generate_manual_commands(
+        let generated = generate_manual_commands(
             store,
             runner,
             id,
@@ -11489,11 +11500,33 @@ fn post_merge_jobs_inner(
             &tip,
             Some(&pm_ws),
             cancel,
-        ) {
+        );
+        crate::guardian::set_manual_checks_stalled(id, false);
+        if let Err(e) = generated {
             crate::rlog!(
                 WARNING,
                 "ralphus [guardian] review {id} manual-commands generation failed: {e}"
             );
+            if !cancel.is_cancelled() {
+                let guard = store.lock();
+                let entity_uri = format!("guardian:{id}");
+                let _ = guard.enqueue_error_mailbox_message(
+                    crate::mailbox::MailboxPriority::High,
+                    &format!("Auto action generation failed for review {id}: {e}"),
+                    &crate::mailbox::Remediation::ManualInterventionRequired {
+                        guidance: format!(
+                            "open the review's Auto Actions live view to see what the agent \
+                             did, then use the review's ⋯ menu → Regenerate on the Auto \
+                             Actions section to run the computation again (review {id})"
+                        ),
+                    },
+                    None,
+                    None,
+                    None,
+                    Some(&entity_uri),
+                    None,
+                );
+            }
         }
         if outcome.is_ok() {
             let env = store
@@ -16153,6 +16186,7 @@ fn generate_manual_commands(
     // RAL-259: the manual-checks generation agent is beginning to run — stamp
     // the guardian-level Live-View start time (plain overwrite, so a
     // regeneration always shows the latest generation's start).
+    crate::guardian::set_manual_checks_stalled(id, false);
     let _ = store.lock().stamp_guardian_manual_checks_started_at(id);
     // This agent run is the single longest phase of a merge -- routinely ten
     // minutes on a real stack. Announce it before blocking on it, so a board

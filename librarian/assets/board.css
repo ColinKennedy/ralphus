@@ -861,6 +861,7 @@
       .branch-detail { margin: 2px 0 6px 22px; }
       .badge { font-size: 11px; padding: 1px 6px; border-radius: 6px; border: 1px solid var(--border); }
       .badge.warn2 { color: var(--queued); border-color: var(--queued); }
+      .badge.hung { color: var(--ignored); border-color: var(--ignored); }
       .badge.bad { color: var(--failed); border-color: var(--failed); }
       .badge.empty { color: var(--empty); border-color: var(--empty); }
       .badge.live { color: var(--running); border-color: var(--running); }

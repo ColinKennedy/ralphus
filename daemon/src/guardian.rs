@@ -14,6 +14,35 @@ use serde::{Deserialize, Serialize};
 
 use crate::store::{ProofView, Result, Store, StoreError};
 
+/// Reviews whose manual-checks generation agent tripped the thinking-stall
+/// detector during its current generation. Process-local and read from
+/// connection-only view hydration (which has no `Store` to reach
+/// `StoreMemory` through); a daemon restart drops it, which is right since
+/// the stalled agent died with the process.
+static MANUAL_CHECKS_STALLED: parking_lot::Mutex<Option<std::collections::HashSet<String>>> =
+    parking_lot::Mutex::new(None);
+
+/// Marks (`stalled = true`) or clears review `id`'s manual-checks generation
+/// as having stalled. Cleared when a new generation starts.
+pub(crate) fn set_manual_checks_stalled(id: &str, stalled: bool) {
+    let mut set = MANUAL_CHECKS_STALLED.lock();
+    let set = set.get_or_insert_with(Default::default);
+    if stalled {
+        set.insert(id.to_string());
+    } else {
+        set.remove(id);
+    }
+}
+
+/// Whether review `id`'s manual-checks generation stalled and has not been
+/// restarted since.
+fn manual_checks_stalled(id: &str) -> bool {
+    MANUAL_CHECKS_STALLED
+        .lock()
+        .as_ref()
+        .is_some_and(|set| set.contains(id))
+}
+
 /// Return type of [`Store::proof_steps_for_review_branch`]:
 /// `(cell_proofs, task_proofs, cell_system_prompt)`.
 pub type BranchProofInfo = (Vec<ProofView>, Vec<ProofView>, Option<String>);
@@ -1191,7 +1220,10 @@ pub struct GuardianView {
     /// cleanly and the manual-checks LLM call is expected to be in flight --
     /// see `generate_manual_commands`'s call sites, always after the stack
     /// fully rebuilds), or `"waiting"` (branches are still being collected or
-    /// rebased, so generation has not started).
+    /// rebased, so generation has not started), `"no_actions"` (generation
+    /// completed and produced zero auto actions), `"failed"`, or `"hung"`
+    /// (the generation agent tripped the thinking-stall detector and has not
+    /// been restarted -- see `guardian_merge::run_agent_with_stall_recovery`).
     pub checks_state: &'static str,
     /// RAL-203: this review's own environment-variable overrides for the
     /// finalize-time build/check-gate step (`final_checks`, run against the
@@ -6129,23 +6161,30 @@ impl Store {
             .iter()
             .filter(|b| b.merge_status == "failed")
             .count();
-        let checks_state: &'static str = if row.post_merge_status.as_deref() == Some("ok") {
-            "ready"
-        } else if row.post_merge_status.as_deref() == Some("failed") {
-            "failed"
-        } else if row.post_merge_status.as_deref() == Some("running") {
-            "generating"
-        } else if !manual_commands.is_empty() {
-            "ready"
-        } else if row.status == "merging"
-            && !enabled_branches.is_empty()
-            && enabled_done == enabled_branches.len()
-            && enabled_failed == 0
-        {
-            "generating"
-        } else {
-            "waiting"
-        };
+        let checks_state: &'static str =
+            if manual_commands.is_empty() && manual_checks_stalled(&row.id) {
+                "hung"
+            } else if row.post_merge_status.as_deref() == Some("ok") {
+                if manual_commands.is_empty() && row.manual_checks_finished_at_ms.is_some() {
+                    "no_actions"
+                } else {
+                    "ready"
+                }
+            } else if row.post_merge_status.as_deref() == Some("failed") {
+                "failed"
+            } else if row.post_merge_status.as_deref() == Some("running") {
+                "generating"
+            } else if !manual_commands.is_empty() {
+                "ready"
+            } else if row.status == "merging"
+                && !enabled_branches.is_empty()
+                && enabled_done == enabled_branches.len()
+                && enabled_failed == 0
+            {
+                "generating"
+            } else {
+                "waiting"
+            };
         let input_resolutions = Self::guardian_input_resolutions_conn(conn, &row.id)?;
 
         // RAL-203: the combined worktree has no upstream task cell of its
@@ -7923,6 +7962,28 @@ mod tests {
             .unwrap();
         let g = store.get_guardian(&id).unwrap();
         assert_eq!(g.checks_state, "ready");
+    }
+
+    #[test]
+    fn checks_state_reports_no_actions_and_hung() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "feat").unwrap();
+
+        // Generation ran to completion and produced nothing.
+        let started = store.start_guardian_post_merge(&id).unwrap();
+        store.stamp_guardian_manual_checks_started_at(&id).unwrap();
+        store.stamp_guardian_manual_checks_finished_at(&id).unwrap();
+        store
+            .finish_guardian_post_merge(&id, started, true, None)
+            .unwrap();
+        assert_eq!(store.get_guardian(&id).unwrap().checks_state, "no_actions");
+
+        // A stalled generation is "hung" until a new one starts.
+        set_manual_checks_stalled(&id, true);
+        assert_eq!(store.get_guardian(&id).unwrap().checks_state, "hung");
+        set_manual_checks_stalled(&id, false);
+        assert_eq!(store.get_guardian(&id).unwrap().checks_state, "no_actions");
     }
 
     // ── RAL-164: structured GuardianCheck + input_values persistence ────────

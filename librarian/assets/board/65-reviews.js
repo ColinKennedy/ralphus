@@ -1,4 +1,4 @@
-﻿      // ---------- structured check inputs (RAL-164) ----------
+      // ---------- structured check inputs (RAL-164) ----------
       // A GuardianCheck (either an AI-synthesized manual check or a
       // user-declared [[review.action]] hint) may declare named `inputs`
       // (e.g. a port number) referenced in its command as `{name}`
@@ -1622,6 +1622,44 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         return root.split(/[\\/]/).filter(Boolean).pop() || "—";
       }
       /**
+       * The hoverable badge on the Auto Actions header that says why the
+       * section has no runnable commands right now, or what the last
+       * computation did. The "waiting for the combined review checkout"
+       * badge appears only while the checkout is genuinely not ready.
+       * @param {GuardianView} g - The review.
+       * @param {string} state - The review's `checks_state`.
+       * @param {boolean} noActions - Whether the computation finished with nothing to run.
+       * @returns {string}
+       */
+      function autoActionsStateBadge(g, state, noActions) {
+        const started = g.manual_checks_started_at_ms;
+        const finished = g.manual_checks_finished_at_ms;
+        let when = "";
+        if (started) {
+          when = `\nRan at ${new Date(started).toLocaleString()}`;
+          if (finished && finished >= started) when += `, took ${Math.max(1, Math.round((finished - started) / 1000))}s`;
+          when += ".";
+        }
+        /** @type {(cls: string, text: string, tip: string) => string} */
+        const badge = (cls, text, tip) => `<span class="badge ${cls}" data-tip="${esc(tip)}">${esc(text)}</span>`;
+        if (state === "hung") {
+          return badge("hung", "hung", `The agent computing auto actions has stalled — it stopped producing new output.${when}\nOpen the live view (click this bar) to see what it was doing; Regenerate from the ⋯ menu to run it again.`);
+        }
+        if (state === "generating") {
+          return badge("live", "computing…", `The agent is computing auto actions now.${when}\nOpen the live view (click this bar) to watch it. Controls unlock when it finishes.`);
+        }
+        if (state === "failed") {
+          return badge("bad", "failed", `Preparing auto actions failed. This advisory result never blocks approval.${when}\nOpen the live view (click this bar) and the review logs for what went wrong.`);
+        }
+        if (noActions) {
+          return badge("empty", "no actions", `The computation finished and found nothing worth running for this review's changes.${when}\nOpen the live view (click this bar) to see what the agent looked at.`);
+        }
+        if (state === "waiting") {
+          return badge("warn2", "waiting for checkout", "Waiting for the combined review checkout: every enabled branch must finish rebuilding first.\nNo auto action unlocks until it is ready.");
+        }
+        return "";
+      }
+      /**
        * The frame every runnable section wears: a header carrying the section's
        * run control and what its commands promise, then its rows.
        *
@@ -1634,15 +1672,16 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        * @param {string} note - One line on what these commands are and when they run.
        * @param {string} rows - The section's command rows, or "".
        * @param {boolean} [dim] - Render muted, for a section whose commands are currently skipped.
+       * @param {string} [headAttrs] - Extra attributes for the header bar (e.g. a `data-click` that makes the whole bar clickable).
        * @returns {string}
        */
-      function reviewRunGroup(control, note, rows, dim) {
+      function reviewRunGroup(control, note, rows, dim, headAttrs) {
         // An empty note renders nothing at all rather than an empty span: what
         // a section *is* belongs in its heading's tooltip, so these notes are
         // reserved for state that changes (why a run is unavailable right now),
         // and a standing description no longer takes a line of the pane.
         return `<div class="rungroup"${dim ? ' style="opacity:.5"' : ""}>
-            <div class="rg-head rg-run">${control}${note ? `<span class="rg-note">${note}</span>` : ""}</div>
+            <div class="rg-head rg-run"${headAttrs ? ` ${headAttrs}` : ""}>${control}${note ? `<span class="rg-note">${note}</span>` : ""}</div>
             ${rows}
           </div>`;
       }
@@ -2161,11 +2200,10 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
             // It used to be a lone disabled button labelled "Waiting on
             // branches…" with a stray Live View button beside it, which read
             // as a different, older widget than the populated case.
-            const waitingNote = state === "generating"
-              ? `The stage is being set now: commands, builds, and artifacts are prepared before the controls unlock.`
-              : state === "failed"
-                ? `Preparation failed, but this advisory result never blocks approval. See the review detail and logs for remediation.`
-                : `Waiting for the combined review checkout. No auto action unlocks until it is ready.`;
+            const peekKey = `guardian-manual|${g.id}`;
+            const noActions = state === "no_actions" || (isReady && !cmds.length);
+            const waitingNote = autoActionsStateBadge(g, state, noActions);
+            const headAttrs = `data-click="togglePeek" data-key="${esc(peekKey)}" style="cursor:pointer" data-tip="${esc(peekOpen[peekKey] ? "Hide the live view of the agent that computes auto actions." : "Open the live view of the agent that computes auto actions: what it did, when it ran, and how it ended.")}"`;
             return `<h3 class="section" data-tip="Auto actions: checks the AI writes from this review's changes.\nThey can change when the stack's changes change; regenerate them from the ⋯ menu.\nAdvisory — they never block Approve or Merge / rebase.">auto actions${sectionMenuBtn(g.id, "manual")}</h3>
               ${isReady && cmds.length
                 ? reviewRunGroup(
@@ -2183,8 +2221,9 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
                           <button class="cmd-expand" data-click="toggleReviewCommandFull" data-key="${esc(key)}" data-tip="${needsInput ? "Show this command in full, with its values filled in and editable beneath it." : "Show or hide this command in full beneath its row."}">${commandFullOpen[key] ? "−" : "+"}</button>
                           <button class="section-menu" data-click="openReviewCommandMenu" data-guardian-id="${esc(g.id)}" data-key="${esc(key)}" data-cmd="${esc(cmdText)}" data-tip="Actions for this check — its logs, its environment, copy it.">⋯</button>
                         </div>${commandFullBlock(key, cmdText, { g, check: cmd, kind: "manual", i })}`;
-                    }).join(""))
-                : reviewRunGroup(runControl, waitingNote, "")}
+                    }).join(""), false, headAttrs)
+                : reviewRunGroup(runControl, waitingNote, "", false, headAttrs)}
+              ${peekBox(peekKey, g.manual_checks_started_at_ms, null, g.manual_checks_finished_at_ms)}
               `;
           })()}`;
         attachPeekResizeHandlers();
