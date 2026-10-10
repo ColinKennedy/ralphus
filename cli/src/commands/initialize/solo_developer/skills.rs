@@ -134,15 +134,15 @@ mod tests {
     #[test]
     fn shipped_skills_have_frontmatter_and_no_personal_content() {
         for skill in SKILLS {
+            // A Windows checkout with autocrlf stores these files with CRLF.
+            let contents = skill.contents.replace("\r\n", "\n");
             assert!(
-                skill
-                    .contents
-                    .starts_with(&format!("---\nname: {}\n", skill.name)),
+                contents.starts_with(&format!("---\nname: {}\n", skill.name)),
                 "{}",
                 skill.name
             );
             for personal in ["staging", "gpt-5.6", "haiku", "C:\\", "/home/"] {
-                assert!(!skill.contents.contains(personal), "{personal}");
+                assert!(!contents.contains(personal), "{personal}");
             }
         }
     }
