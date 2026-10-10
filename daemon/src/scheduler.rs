@@ -4035,52 +4035,34 @@ fn run_cell_worker(
         }
     }
 
-    // Prophecy transport phase 2 (docs/prophecy-design.md §6.1): the at-exit
-    // backstop -- every `RALPHUS_PROPHECY:` marker the runner found crosses
-    // the provider boundary inside this same `exec` reply, mirroring the
-    // ghost handling just above. `attempt` is `0` for every write here: there
-    // is no per-cell restart counter in the schema today (a real
-    // improvement, out of scope for this phase), so a restarted cell's
-    // prophecies are not yet distinguished by attempt number the way the
-    // design intends -- they still each get their own row (append-only),
-    // just without a meaningfully distinct `attempt` value yet.
+    // Prophecy transport (docs/prophecy-design.md §6.1): the at-exit
+    // backstop -- every `RALPHUS_PROPHECY:` marker the runner collected over
+    // the run crosses the provider boundary inside this same `exec` reply,
+    // mirroring the ghost handling just above. Markers already delivered
+    // live as `prophecy` events dedupe against these on the store's unique
+    // key, so this only fills in whatever the live path missed.
     if !result.prophecies.is_empty() {
-        let uri = crate::ghost::cell_uri(squad_id, row.task_idx, row.idx);
         let revision = crate::ghost::current_revision(row.cwd.as_deref().unwrap_or_default());
         let guard = store.lock();
+        let target = crate::prophecy::CellProphecyTarget {
+            task_idx: row.task_idx,
+            idx: row.idx,
+            cwd: row.cwd.clone(),
+            attempt: guard.cell_restart_count(squad_id, row.task_idx, row.idx),
+        };
         for marker in &result.prophecies {
-            let Ok(kind) = marker.kind.parse::<crate::prophecy::ProphecyKind>() else {
-                crate::cartographer::Note::new("prophecy")
-                    .level(crate::logging::LogLevel::WARNING)
-                    .scope("cell")
-                    .squad(squad_id)
-                    .cell(&row.cell_id)
-                    .task(&row.task_name)
-                    .emit(
-                        &guard,
-                        format!(
-                            "prophecy marker dropped: unknown kind {:?} cell={squad_id}/{}",
-                            marker.kind, row.cell_id
-                        ),
-                        serde_json::json!({ "kind": marker.kind, "body_len": marker.body.len() }),
-                    );
-                continue;
-            };
-            // `add_prophecy` already emits its own Cartographer row (and the
-            // log line that rides along with it) on success -- nothing
-            // further to log here.
             store_ok(
                 &guard,
                 squad_id,
                 "add_prophecy",
-                guard.add_prophecy(
-                    &uri,
-                    0,
-                    kind,
-                    &marker.body,
+                guard.record_cell_prophecy_marker(
+                    squad_id,
+                    &row.task_name,
+                    &row.cell_id,
+                    &target,
                     revision.as_deref(),
-                    Some(squad_id),
-                    None,
+                    &marker.kind,
+                    &marker.body,
                 ),
             );
         }

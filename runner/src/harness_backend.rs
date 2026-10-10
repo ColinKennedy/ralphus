@@ -1,10 +1,12 @@
 //! Generic external-harness `ModelBackend` (e.g. `aider`), ported from
 //! `cli/src/ralphus/runner/harness_backend.py`. No stream parsing -- the
-//! whole prompt is a trailing argv token and the whole stdout/stderr is
-//! captured at once. `append_system_prompt`/`resume_agent_session_id` are
+//! whole prompt is a trailing argv token and stdout/stderr are captured in
+//! full, stdout being scanned line by line as it arrives for prophecy markers. `append_system_prompt`/`resume_agent_session_id` are
 //! accepted for trait-shape compatibility but unused: there is no portable
 //! flag a generic harness is guaranteed to understand for either.
 
+use std::collections::HashSet;
+use std::io::{BufRead, BufReader};
 use std::process::Command;
 use std::time::Duration;
 
@@ -67,7 +69,7 @@ impl ModelBackend for HarnessBackend {
         );
 
         let timeout = Duration::from_secs(options.timeout_sec.unwrap_or(DEFAULT_TIMEOUT_SECS));
-        let output = wait_with_timeout(child, timeout).map_err(|e| {
+        let (output, prophecies) = wait_with_timeout(child, timeout, prompt).map_err(|e| {
             crate::cli_agent_common::emit_child_lifecycle(
                 "harness",
                 "agent process failed",
@@ -97,6 +99,7 @@ impl ModelBackend for HarnessBackend {
 
         Ok(BackendOutcome {
             summary: tail(&stdout, SUMMARY_TAIL_CHARS),
+            prophecies,
             // RAL-352: one external harness invocation is one exchanged
             // message -- there is no finer-grained conversational structure
             // to observe, and it is an agent backend, not a command.
@@ -138,14 +141,69 @@ fn tail(text: &str, limit: usize) -> String {
     }
 }
 
+/// Reads `reader` line by line, handing each complete line to `on_line` as it
+/// arrives, and returns every byte read. A line is scanned the moment it is
+/// written, not after the process exits, so a marker survives a later timeout
+/// or kill.
+fn read_streaming(mut reader: impl BufRead, mut on_line: impl FnMut(&str)) -> Vec<u8> {
+    let mut all = Vec::new();
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                on_line(&String::from_utf8_lossy(&line));
+                all.extend_from_slice(&line);
+            }
+        }
+    }
+    all
+}
+
+/// Scans a harness's stdout line by line for `RALPHUS_PROPHECY:` markers.
+/// Lines the harness merely echoes back from `prompt` are skipped, so an
+/// example marker in the prompt is never recorded as the agent's own.
+fn scan_stdout_line(
+    scanner: &mut crate::prophecy::ProphecyScanner,
+    prompt_lines: &HashSet<String>,
+    line: &str,
+) {
+    if prompt_lines.contains(line.trim()) {
+        return;
+    }
+    scanner.scan_and_emit("harness", line);
+}
+
 fn wait_with_timeout(
     mut child: std::process::Child,
     timeout: Duration,
-) -> std::io::Result<std::process::Output> {
+    prompt: &str,
+) -> std::io::Result<(std::process::Output, Vec<crate::prophecy::ProphecyMarker>)> {
+    let prompt_lines: HashSet<String> = prompt
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdout_thread = std::thread::spawn(move || {
+        let mut scanner = crate::prophecy::ProphecyScanner::new();
+        let bytes = stdout.map_or_else(Vec::new, |s| {
+            read_streaming(BufReader::new(s), |line| {
+                scan_stdout_line(&mut scanner, &prompt_lines, line);
+            })
+        });
+        (bytes, scanner.markers())
+    });
+    let stderr_thread = std::thread::spawn(move || {
+        stderr.map_or_else(Vec::new, |s| read_streaming(BufReader::new(s), |_| {}))
+    });
+
     let start = std::time::Instant::now();
-    loop {
-        if let Some(_status) = child.try_wait()? {
-            return child.wait_with_output();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
         }
         if start.elapsed() >= timeout {
             crate::cli_agent_common::kill_child(
@@ -153,18 +211,78 @@ fn wait_with_timeout(
                 &mut child,
                 &format!("timed out after {}s", timeout.as_secs()),
             );
+            // Closing the pipes ends the reader threads; markers they found
+            // were already emitted live.
+            let _ = stdout_thread.join();
+            let _ = stderr_thread.join();
             return Err(std::io::Error::other(format!(
                 "timed out after {}s",
                 timeout.as_secs()
             )));
         }
         std::thread::sleep(Duration::from_millis(50));
-    }
+    };
+    let (stdout, prophecies) = stdout_thread.join().unwrap_or_default();
+    let stderr = stderr_thread.join().unwrap_or_default();
+    Ok((
+        std::process::Output {
+            status,
+            stdout,
+            stderr,
+        },
+        prophecies,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn markers_are_scanned_as_each_line_arrives_and_not_from_the_echoed_prompt() {
+        let prompt = "do the thing\nRALPHUS_PROPHECY: discovery: example from the prompt";
+        let prompt_lines: HashSet<String> = prompt.lines().map(|l| l.trim().to_string()).collect();
+        let stdout = format!(
+            "{prompt}\nworking\nRALPHUS_PROPHECY: hazard: found a race\nmore work\nRALPHUS_PROPHECY: hazard: found a race\n"
+        );
+        let mut scanner = crate::prophecy::ProphecyScanner::new();
+        let mut seen_lines = 0;
+        let bytes = read_streaming(stdout.as_bytes(), |line| {
+            seen_lines += 1;
+            scan_stdout_line(&mut scanner, &prompt_lines, line);
+        });
+        assert_eq!(bytes, stdout.as_bytes());
+        assert_eq!(seen_lines, 6);
+        let markers = scanner.markers();
+        assert_eq!(
+            markers.len(),
+            1,
+            "echoed prompt and repeats are not recorded"
+        );
+        assert_eq!(markers[0].body, "found a race");
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn run_returns_markers_written_before_the_final_line() {
+        let dir =
+            std::env::temp_dir().join(format!("ralphus-harness-proph-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = Workspace::create(&dir).unwrap();
+        let backend = HarnessBackend {
+            program: "echo".to_string(),
+        };
+        let out = backend
+            .run(
+                "RALPHUS_PROPHECY: decision: chose X",
+                &ws,
+                &RunOptions::default(),
+            )
+            .unwrap();
+        // `echo` just reflects its argument, i.e. the prompt, which must not count.
+        assert!(out.prophecies.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn tail_keeps_trailing_chars_when_over_limit() {

@@ -61,6 +61,12 @@ const LIVE_USAGE_MESSAGE: &str = "live usage";
 const WORKTREE_DIFF_SOURCE: &str = "worktree-diff";
 const WORKTREE_DIFF_MESSAGE: &str = "diff changed";
 
+/// RAL-595: the runner's per-marker `RALPHUS_PROPHECY:` push (payload
+/// `{kind, body}`), mirrored from `runner/src/prophecy.rs::PROPHECY_MESSAGE`.
+/// [`forward_runner_event`] files it as a prophecy against the emitting cell
+/// the moment it is found, so a run that later dies keeps its insights.
+const PROPHECY_MESSAGE: &str = "prophecy";
+
 /// One structured event forwarded from the runner subprocess over the
 /// `RALPHUS_EVENT:` stderr marker (RAL-98). `squad_id`/`cell_id`/`task` fall
 /// back to the owning [`RunnerSpec`] when the event itself omits them.
@@ -465,27 +471,7 @@ const GHOST_SYSTEM_PROMPT: &str = "Operational logging note, not a request to ch
      but did not fix, and open questions. This is not a changelog. If there \
      is truly nothing worth flagging, write 'RALPHUS_GHOST: (nothing to \
      report)'.";
-const PROPHECY_SYSTEM_PROMPT: &str = "Operational logging note, not a request to change your behavior: this \
-     ralphus task run also keeps a separate, durable record read later by a \
-     human in the eventual pull request -- not by the next agent, and not \
-     merged into anything. Whenever you learn something the code diff itself \
-     cannot show, write one standalone line of the exact form \
-     'RALPHUS_PROPHECY: <kind>: <note>', where <kind> is exactly one of: \
-     discovery (something you learned about the code or the problem), \
-     decision (a choice you made among alternatives, and why), hazard (a \
-     known risk you noticed and are leaving behind), deferred (follow-up \
-     work someone should do later, worded as a task a person could pick up \
-     -- never a note that you could not run or check something, never work \
-     that already has a ticket, and never 'nothing more is needed'), or \
-     unconfirmed (something you could not verify or do not know: a test or \
-     check you could not run, behavior you did not exercise, an assumption \
-     you left untested). When a note is about what you could not check, use \
-     unconfirmed, not deferred. Write as many of these as are \
-     genuinely useful, anywhere in your reply, not only at the end -- unlike \
-     the handoff note above, this is not a single end-of-reply section. This \
-     is not a changelog and not a summary of what you did: only write one \
-     when there is a real insight a human reading the diff would not \
-     otherwise get. If there is nothing like that, write none at all.";
+const PROPHECY_SYSTEM_PROMPT: &str = "Operational logging note, not a request to change your behavior: this      ralphus task run also keeps a separate, durable record read later by a      human in the eventual pull request -- not by the next agent, and not      merged into anything. Whenever you learn something the code diff itself      cannot show, write one standalone line of the exact form      'RALPHUS_PROPHECY: <kind>: <note>' in the very turn you learn it, before      your next tool call. Do not save notes for the end: your context may be      compacted, or the run cut short, and an insight you have not written      down by then is lost. <kind> is exactly one of: discovery (something      you learned about the code or the problem), decision (a choice you made      among alternatives, and why), hazard (a known risk you noticed and are      leaving behind), deferred (follow-up work someone should do later,      worded as a task a person could pick up -- never a note that you could      not run or check something, never work that already has a ticket, and      never 'nothing more is needed'), or unconfirmed (something you could      not verify or do not know: a test, lint, build or browser check you      skipped or could not run, behavior you did not exercise, an assumption      you left untested). When a note is about what you could not check, use      unconfirmed, not deferred. Write as many of these as are genuinely      useful. This is entirely separate from the end-of-reply handoff section      above: write each line as you go, and do not restate them at the end.      This is not a changelog and not a summary of what you did: only write      one when there is a real insight a human reading the diff would not      otherwise get. If there is nothing like that, write none at all.";
 const ASYNC_SYSTEM_PROMPT: &str = "## Conclusion\nThis is a single, non-interactive invocation — no \
      human will check back on you or answer follow-up questions, though \
      Ralphus may re-invoke you synchronously to continue. Never use an \
@@ -3657,6 +3643,13 @@ pub(crate) fn forward_runner_event(
         }
     };
     redact_event(&mut event);
+    if event.message == PROPHECY_MESSAGE {
+        record_prophecy_event(store, squad_id, cell_id, task, &event);
+        return ForwardedEvent {
+            is_activity_signal: true,
+            ..ForwardedEvent::default()
+        };
+    }
     let is_activity_signal = event.message != LIVE_USAGE_MESSAGE;
     let level = event
         .level
@@ -3804,6 +3797,54 @@ pub(crate) fn forward_runner_event(
     }
 }
 
+/// RAL-595: file one live `prophecy` event against the cell it came from.
+/// The revision stamp shells out to git, so the store lock is released
+/// around it. An event that does not resolve to a cell row (a proof step, a
+/// resolver invocation) or lacks a `kind`/`body` is ignored.
+fn record_prophecy_event(
+    store: &crate::store_lock::StoreHandle,
+    squad_id: &str,
+    cell_id: &str,
+    task: &str,
+    event: &RunnerEvent,
+) {
+    let squad_id = event.squad_id.as_deref().unwrap_or(squad_id);
+    let cell_id = event.cell_id.as_deref().unwrap_or(cell_id);
+    let task = event.task.as_deref().unwrap_or(task);
+    let (Some(kind), Some(body)) = (
+        event.payload.get("kind").and_then(|v| v.as_str()),
+        event.payload.get("body").and_then(|v| v.as_str()),
+    ) else {
+        return;
+    };
+    let Some(target) = store.lock().cell_prophecy_target(squad_id, task, cell_id) else {
+        return;
+    };
+    let revision = crate::ghost::current_revision(target.cwd.as_deref().unwrap_or_default());
+    let guard = store.lock();
+    if let Err(e) = guard.record_cell_prophecy_marker(
+        squad_id,
+        task,
+        cell_id,
+        &target,
+        revision.as_deref(),
+        kind,
+        body,
+    ) {
+        crate::cartographer::Note::new("prophecy")
+            .level(crate::logging::LogLevel::WARNING)
+            .scope("cell")
+            .squad(squad_id)
+            .cell(cell_id)
+            .task(task)
+            .emit(
+                &guard,
+                format!("could not record live prophecy: {e}"),
+                serde_json::json!({ "error": e.to_string() }),
+            );
+    }
+}
+
 fn redact_event(event: &mut RunnerEvent) {
     fn text(value: &mut String) {
         let registered = crate::redact::redact_all(value);
@@ -3946,6 +3987,27 @@ mod tests {
         let plain = effective_proof_system_prompt(None, true);
         assert!(plain.contains("RALPHUS_PROOF: PASS"));
         assert!(!plain.contains("RALPHUS_APPRAISAL:"));
+    }
+
+    #[test]
+    fn prophecy_prompt_matches_the_runner_byte_for_byte() {
+        fn prophecy_const(src: &str) -> String {
+            src.lines()
+                .skip_while(|l| !l.starts_with("const PROPHECY_SYSTEM_PROMPT"))
+                .scan(false, |done, l| {
+                    if *done {
+                        return None;
+                    }
+                    *done = l.ends_with("\";");
+                    Some(l)
+                })
+                .collect::<Vec<_>>()
+                .join(" | ")
+        }
+        let from_runner = prophecy_const(include_str!("../../runner/src/execute.rs"));
+        let from_daemon = prophecy_const(include_str!("runner.rs"));
+        assert!(!from_runner.is_empty());
+        assert_eq!(from_runner, from_daemon);
     }
 
     #[test]

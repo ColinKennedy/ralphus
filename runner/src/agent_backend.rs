@@ -177,7 +177,10 @@ impl ModelBackend for AgentBackend {
             }
         };
 
+        let mut scanner = crate::prophecy::ProphecyScanner::new();
+        scanner.scan_and_emit("llm-invoke", &result.text);
         Ok(BackendOutcome {
+            prophecies: scanner.markers(),
             summary: result.text,
             // RAL-352: one run() call is one user-prompt -> final-answer
             // exchange, however many tool-loop iterations it contained --

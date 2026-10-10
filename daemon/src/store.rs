@@ -3922,6 +3922,16 @@ impl Store {
             // waypoint -- see `CellView::waypoint_halted_at_ms`. NULL means
             // not halted.
             "ALTER TABLE cells ADD COLUMN waypoint_halted_at_ms INTEGER",
+            // RAL-595: how many times this cell has been re-queued to run
+            // again (restart, orphan recovery, retry-failed). Stamped onto a
+            // cell's prophecies as their `attempt`, so a re-run's insights
+            // supersede the earlier attempt's in reviews and PR bodies.
+            "ALTER TABLE cells ADD COLUMN restart_count INTEGER NOT NULL DEFAULT 0",
+            // RAL-595: whitespace-normalized body a prophecy is deduplicated
+            // on. NULL on rows written before this column existed, which a
+            // unique index treats as distinct, so old data never conflicts.
+            "ALTER TABLE prophecies ADD COLUMN body_key TEXT",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_prophecies_dedupe ON prophecies(entity_uri, attempt, kind, body_key)",
             // RAL-400: `1` when this affected entry was auto-enrolled by the
             // daemon (submit-time scope overlap, or the survey sweep's own
             // discovery) rather than declared explicitly by a human/agent.
@@ -9438,7 +9448,7 @@ impl Store {
             params![squad_id],
         )?;
         let cells = self.conn.execute(
-            "UPDATE cells SET state='pending', error=NULL, started_at_ms=NULL, finished_at_ms=NULL, completed_active_duration_ms=0, active_started_at_ms=NULL, env_out_of_date=0 WHERE squad_id=?",
+            "UPDATE cells SET state='pending', restart_count=restart_count+1, error=NULL, started_at_ms=NULL, finished_at_ms=NULL, completed_active_duration_ms=0, active_started_at_ms=NULL, env_out_of_date=0 WHERE squad_id=?",
             params![squad_id],
         )?;
         let proofs = self.conn.execute(
@@ -9495,7 +9505,7 @@ impl Store {
                 admin_only: false,
             });
             self.conn.execute(
-                "UPDATE cells SET state='pending', error=NULL, active_started_at_ms=NULL
+                "UPDATE cells SET state='pending', restart_count=restart_count+1, error=NULL, active_started_at_ms=NULL
                  WHERE squad_id=? AND state='running'",
                 params![id],
             )?;
@@ -10067,6 +10077,18 @@ impl Store {
         })
     }
 
+    /// RAL-595: how many times a cell has been re-queued; `0` for a cell
+    /// that has only ever run once (or does not exist).
+    pub fn cell_restart_count(&self, squad_id: &str, task_idx: i64, idx: i64) -> i64 {
+        self.conn
+            .query_row(
+                "SELECT restart_count FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
+                params![squad_id, task_idx, idx],
+                |r| r.get(0),
+            )
+            .unwrap_or(0)
+    }
+
     /// Restart a single cell: reset it and every cell downstream of it
     /// within the squad to Pending, put the squad (and each affected task) back to
     /// Pending, and dirty every squad that depends on this one (RAL-19). Upstream
@@ -10084,7 +10106,7 @@ impl Store {
 
         for s in &impact.cells {
             self.conn.execute(
-                "UPDATE cells SET state='pending', error=NULL, started_at_ms=NULL, finished_at_ms=NULL, completed_active_duration_ms=0, active_started_at_ms=NULL, env_out_of_date=0 WHERE squad_id=? AND task_idx=? AND idx=?",
+                "UPDATE cells SET state='pending', restart_count=restart_count+1, error=NULL, started_at_ms=NULL, finished_at_ms=NULL, completed_active_duration_ms=0, active_started_at_ms=NULL, env_out_of_date=0 WHERE squad_id=? AND task_idx=? AND idx=?",
                 params![squad_id, s.task_idx, s.idx],
             )?;
             self.conn.execute(
@@ -10241,7 +10263,7 @@ impl Store {
 
         for s in &impact.cells {
             self.conn.execute(
-                "UPDATE cells SET state='pending', error=NULL, env_out_of_date=0 WHERE squad_id=? AND task_idx=? AND idx=?",
+                "UPDATE cells SET state='pending', restart_count=restart_count+1, error=NULL, env_out_of_date=0 WHERE squad_id=? AND task_idx=? AND idx=?",
                 params![squad_id, s.task_idx, s.idx],
             )?;
             self.conn.execute(
@@ -11727,7 +11749,7 @@ impl Store {
                 continue;
             }
             self.conn.execute(
-                "UPDATE cells SET state='pending', error=NULL WHERE squad_id=? AND task_idx=? AND idx=?",
+                "UPDATE cells SET state='pending', restart_count=restart_count+1, error=NULL WHERE squad_id=? AND task_idx=? AND idx=?",
                 params![squad_id, task_idx, idx],
             )?;
             self.conn.execute(
