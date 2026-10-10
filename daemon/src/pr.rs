@@ -2229,12 +2229,15 @@ fn commit_range_for(
     guardian: &GuardianView,
     position: i64,
 ) -> Option<(String, String)> {
+    // Walk down past enabled predecessors that have no review ref yet, so a
+    // stacked branch never falls back to the base and inherits their commits.
     let prev = guardian
         .branches
         .iter()
         .filter(|b| b.position < position && b.enabled)
-        .max_by_key(|b| b.position)
-        .and_then(|b| b.review_branch.clone())
+        .filter_map(|b| b.review_branch.as_ref().map(|r| (b.position, r)))
+        .max_by_key(|(p, _)| *p)
+        .map(|(_, r)| r.clone())
         .unwrap_or_else(|| base_sha.to_string());
     let tip = guardian
         .branches
@@ -2276,6 +2279,7 @@ fn branch_change_context(
         ],
     )
     .unwrap_or_default();
+    let commits = strip_bot_trailer(&commits);
     if commits.trim().is_empty() {
         return None;
     }
@@ -2286,17 +2290,35 @@ fn branch_change_context(
     Some((commits, diff_stat, patch))
 }
 
-fn fallback_pr_description(commits: &str, template: Option<&str>) -> String {
-    let subjects = commits
+/// The exact trailer ralphus adds to its own commits; it is noise to a PR
+/// reader, so it is removed from commit text before it reaches the writer
+/// agent or the fallback description. Other trailers are kept.
+const BOT_TRAILER: &str = "Co-authored-by: ralphus-bot <ralphus-bot@users.noreply.github.com>";
+
+fn strip_bot_trailer(commits: &str) -> String {
+    commits
         .lines()
-        .filter_map(|line| line.strip_prefix("subject: "))
-        .map(|subject| format!("- {subject}"))
+        .filter(|line| line.trim() != BOT_TRAILER)
         .collect::<Vec<_>>()
-        .join("\n");
-    match (template, subjects.is_empty()) {
-        (Some(template), false) => insert_after_first_heading(template, &subjects),
+        .join("\n")
+}
+
+/// Description used when the writer agent yields nothing usable: the branch's
+/// complete commit text inside a `{git-commit}` fenced block, placed in the
+/// template (if any) the same way an agent-written description would be.
+fn fallback_pr_description(commits: &str, template: Option<&str>) -> String {
+    let commits = commits.trim();
+    let body = if commits.is_empty() {
+        String::new()
+    } else {
+        let longest_run = commits.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+        let fence = "`".repeat((longest_run + 1).max(3));
+        format!("{fence}{{git-commit}}\n{commits}\n{fence}")
+    };
+    match (template, body.is_empty()) {
+        (Some(template), false) => insert_after_first_heading(template, &body),
         (Some(template), true) => template.to_string(),
-        (None, _) => subjects,
+        (None, _) => body,
     }
 }
 
@@ -2388,7 +2410,7 @@ fn parse_suggested_pr(text: &str) -> Option<(String, String, Vec<i64>)> {
 /// `guardian_merge::generate_final_summary` uses for the change summary.
 /// `template`, if given (see `ForgeClient::fetch_pr_template`), is folded into
 /// the prompt so the repo's PR template is honoured. Falls back to a plain
-/// branch-name title and a deterministic list of this branch's commit subjects
+/// branch-name title and a `{git-commit}` block of this branch's full commit text
 /// when the agent call fails. The review-wide change summary is never used for
 /// an individual PR. `trace_context`
 /// (the owning `pr.submit_pull_requests`/`pr.action_feedback` span, if any) is
@@ -2528,7 +2550,8 @@ fn synthesize_pr_text(
          Respond in EXACTLY this plain-text format and nothing else -- no JSON, no \
          escaping, no code fence around the whole response, no commentary before or \
          after it:\n\n\
-         TITLE: <a single concise line, under 72 characters>\n\
+         TITLE: <a single concise imperative-mood line, under 72 characters, \
+         summarizing all of the unique commits>\n\
          {prophecy_format_note}\
          ===DESCRIPTION===\n\
          <the complete PR description, written as literal markdown -- its own \
@@ -20065,7 +20088,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         let description = fallback_pr_description(commits, Some(template));
 
         let overview_pos = description.find("## Overview").unwrap();
-        let body_pos = description.find("- add widget support").unwrap();
+        let body_pos = description.find("```{git-commit}").unwrap();
         let how_to_run_pos = description.find("## How To Run").unwrap();
         let checklist_pos = description.find("## Checklist").unwrap();
         assert!(
@@ -20087,8 +20110,46 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         );
         assert_eq!(
             description,
-            "no headings here\n\n## Branch changes\n\n- add widget support"
+            "no headings here\n\n## Branch changes\n\n```{git-commit}\n\
+             commit abc\nsubject: add widget support\n\nbody\n---\n```"
         );
+    }
+
+    #[test]
+    fn strip_bot_trailer_removes_only_the_exact_ralphus_bot_trailer() {
+        let text = "commit abc\nsubject: x\n\nbody\n\n\
+             Co-authored-by: ralphus-bot <ralphus-bot@users.noreply.github.com>\n\
+             Co-authored-by: Human <h@example.com>\n---";
+        let cleaned = strip_bot_trailer(text);
+        assert!(!cleaned.contains("ralphus-bot"), "{cleaned}");
+        assert!(cleaned.contains("Co-authored-by: Human"), "{cleaned}");
+    }
+
+    #[test]
+    fn commit_range_walks_past_an_enabled_predecessor_without_a_review_ref() {
+        let store = store();
+        let gid = store.create_guardian("walk", "main", "/tmp/x").unwrap();
+        for b in ["a", "b", "c"] {
+            store.add_guardian_branch(&gid, b).unwrap();
+        }
+        let ids = store
+            .get_guardian(&gid)
+            .unwrap()
+            .branches
+            .iter()
+            .map(|b| b.id.clone())
+            .collect::<Vec<_>>();
+        // `a` has a ref, `b` (enabled) has none, `c` is the branch under test.
+        store
+            .set_branch_review(&gid, &ids[0], "review/a", "wa")
+            .unwrap();
+        store
+            .set_branch_review(&gid, &ids[2], "review/c", "wc")
+            .unwrap();
+        let guardian = store.get_guardian(&gid).unwrap();
+        let (prev, tip) = commit_range_for("BASE", &guardian, 2).unwrap();
+        assert_eq!(prev, "review/a");
+        assert_eq!(tip, "review/c");
     }
 
     struct CapturingFailureRunner(Mutex<Option<RunnerSpec>>);
@@ -20177,7 +20238,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
                 "commit abc\nsubject: add this branch behavior\n\nbody\n---\n",
                 None,
             ),
-            "- add this branch behavior"
+            "```{git-commit}\ncommit abc\nsubject: add this branch behavior\n\nbody\n---\n```"
         );
 
         let spec = runner.0.lock().unwrap().clone().unwrap();
