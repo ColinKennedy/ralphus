@@ -218,7 +218,7 @@ any board change.
 (in `board.html`) or dynamically generated in a JS template string (in a
 chunk). The engine uses event delegation on `mouseover`/`mouseout` and
 renders a fixed-position dark-themed popover near the cursor. Multi-line
-content: use `\n` in the attribute value.
+content: use `\n` in the attribute value — the engine converts literal backslash-n to real newlines when rendering.
 
 **Required tooltip content:**
 1. **Why** — the purpose of the element (what it does and why it matters).
