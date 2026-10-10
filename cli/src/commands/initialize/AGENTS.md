@@ -6,7 +6,7 @@ The `ralphus initialize ...` commands. Two kinds live here:
   Each starts its own throwaway daemon through `exercise.rs` (`Exercise`),
   builds a fixture, drives it live, and prints what it proved. The canonical
   list is `EXERCISES` in `mod.rs`.
-- **`server`** — the interactive, one-shot new-server setup. Not an exercise;
+- **`solo-developer`** — the interactive, one-shot new-machine solo-developer setup. Not an exercise;
   its prompt/flag symmetry rules are in
   [`.agent/agent-conduct.md`](../../../../.agent/agent-conduct.md).
 
@@ -86,14 +86,14 @@ All of the following hold for **every** exercise, with no exceptions:
 
 ## The answers file (RAL-576)
 
-`ralphus initialize server` writes an answers file at the end of each run,
+`ralphus initialize solo-developer` writes an answers file at the end of each run,
 recording every setting's final value and the source it came from (flag,
 file, prompt, environment, or default). The file is TOML, lives next to the
 global ralphus config (`~/.config/ralphus/answers-latest.toml` + a
 timestamped backup), and can be replayed with `--answers-file <path>`:
 
 ```bash
-ralphus initialize server --answers-file ~/.config/ralphus/answers-latest.toml [flags]
+ralphus initialize solo-developer --answers-file ~/.config/ralphus/answers-latest.toml [flags]
 ```
 
 **Precedence**: flag > answers file > interactive prompt/default. A loaded
