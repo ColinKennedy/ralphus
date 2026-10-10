@@ -762,7 +762,7 @@ pub fn draft_followup_toml(
 /// remote, and anything else is a branch on `origin`.
 fn split_remote(root: &Path, name: &str) -> (String, String) {
     if let Some((head, rest)) = name.split_once('/') {
-        let is_remote = Command::new("git")
+        let is_remote = ralphus_core::git_spawn::command(&["remote"])
             .arg("-C")
             .arg(root)
             .args(["remote"])
@@ -785,7 +785,7 @@ fn split_remote(root: &Path, name: &str) -> (String, String) {
 fn branch_exists(root: &Path, name: &str) -> bool {
     let (remote, branch) = split_remote(root, name);
     let git = |args: &[&str]| {
-        Command::new("git")
+        ralphus_core::git_spawn::command(args)
             .arg("-C")
             .arg(root)
             .args(args)

@@ -425,6 +425,50 @@ pub fn try_rev_parse(root: &Path, args: &[&str]) -> Option<Output> {
     }
 }
 
+/// A successful process result carrying `stdout`, for answers produced
+/// without running git.
+#[must_use]
+pub fn success_output(stdout: String) -> Output {
+    Output {
+        status: exit_status(0),
+        stdout: stdout.into_bytes(),
+        stderr: Vec::new(),
+    }
+}
+
+/// Per-worktree state files and directories `rev-parse --git-path` can place
+/// without consulting config. `hooks` is excluded on purpose: `core.hooksPath`
+/// redirects it.
+const GIT_PATH_NAMES: &[&str] = &[
+    "rebase-merge",
+    "rebase-apply",
+    "MERGE_HEAD",
+    "CHERRY_PICK_HEAD",
+    "REBASE_HEAD",
+    "REVERT_HEAD",
+];
+
+/// Answer `git rev-parse --git-path <name>` for one of [`GIT_PATH_NAMES`]
+/// from the checkout's layout, the way git prints it: `.git/<name>` for a
+/// checkout whose `.git` is a directory, and the absolute path under the
+/// linked worktree's admin directory otherwise. `None` means "run git".
+#[must_use]
+pub fn try_git_path(root: &Path, args: &[&str]) -> Option<Output> {
+    let ["rev-parse", "--git-path", name] = args else {
+        return None;
+    };
+    if !GIT_PATH_NAMES.contains(name) {
+        return None;
+    }
+    let (git_dir, _common) = git_dirs(root)?;
+    let stdout = if root.join(".git").is_dir() {
+        format!(".git/{name}\n")
+    } else {
+        format!("{}/{name}\n", git_dir.to_string_lossy().replace('\\', "/"))
+    };
+    Some(success_output(stdout))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -646,6 +690,76 @@ mod tests {
         remember_ancestry(&root, &named, &git(&root, &named));
         assert!(cached_ancestry(&root, &named).is_none());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn same_path(a: &str, b: &str) -> bool {
+        let canon = |s: &str| {
+            std::fs::canonicalize(s)
+                .or_else(|_| {
+                    let p = Path::new(s);
+                    std::fs::canonicalize(p.parent().unwrap_or(p))
+                        .map(|d| d.join(p.file_name().unwrap_or_default()))
+                })
+                .unwrap_or_else(|_| PathBuf::from(s))
+        };
+        canon(a) == canon(b)
+    }
+
+    #[test]
+    fn git_path_matches_git_for_a_main_checkout_and_a_linked_worktree() {
+        let root = repo("gitpath");
+        for name in GIT_PATH_NAMES {
+            let args = ["rev-parse", "--git-path", name];
+            let ours = try_git_path(&root, &args).expect("answered");
+            let real = git(&root, &args);
+            assert_eq!(
+                String::from_utf8_lossy(&ours.stdout).trim(),
+                String::from_utf8_lossy(&real.stdout).trim(),
+                "main checkout {name}"
+            );
+        }
+
+        let linked = root.with_file_name(format!(
+            "{}-linked",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        assert!(
+            git(
+                &root,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "side",
+                    linked.to_str().unwrap()
+                ]
+            )
+            .status
+            .success()
+        );
+        for name in GIT_PATH_NAMES {
+            let args = ["rev-parse", "--git-path", name];
+            let ours = try_git_path(&linked, &args).expect("answered");
+            let real = git(&linked, &args);
+            let (ours, real) = (
+                String::from_utf8_lossy(&ours.stdout).trim().to_string(),
+                String::from_utf8_lossy(&real.stdout).trim().to_string(),
+            );
+            assert!(Path::new(&ours).is_absolute(), "{ours}");
+            assert!(same_path(&ours, &real), "linked {name}: {ours} vs {real}");
+        }
+
+        // Names git resolves through config, or that are not per-worktree
+        // state files, are left to git.
+        assert!(try_git_path(&root, &["rev-parse", "--git-path", "hooks"]).is_none());
+        assert!(try_git_path(&root, &["rev-parse", "--git-path", "objects"]).is_none());
+        // A directory that is not the top of a checkout is left to git.
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert!(try_git_path(&sub, &["rev-parse", "--git-path", "rebase-merge"]).is_none());
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(linked);
     }
 
     #[test]

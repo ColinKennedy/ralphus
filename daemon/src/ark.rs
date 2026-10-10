@@ -114,7 +114,7 @@ fn containing_worktree<'a>(cwd: &str, registered: &'a HashMap<String, PathBuf>) 
 }
 
 fn git(root: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
+    let output = ralphus_core::git_spawn::command(args)
         .arg("-C")
         .arg(root)
         .args(args)

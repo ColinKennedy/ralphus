@@ -32,8 +32,10 @@ pub const WORKTREE_DIFF_SOURCE: &str = "worktree-diff";
 pub const WORKTREE_DIFF_MESSAGE: &str = "diff changed";
 
 /// First poll interval, and the interval a change snaps back to. Each poll
-/// is two git processes, and an agent that is editing keeps the interval at
-/// this floor, so it sets the watcher's process rate while a cell is busy.
+/// is answered in-process by libgit2; when it cannot be (see
+/// [`crate::git_inproc`]) it is two git processes, and an agent that is
+/// editing keeps the interval at this floor, so it sets the watcher's process
+/// rate while a cell is busy.
 const MIN_INTERVAL: Duration = Duration::from_secs(2);
 /// Backoff ceiling while the worktree is quiet.
 const MAX_INTERVAL: Duration = Duration::from_secs(8);
@@ -98,10 +100,6 @@ impl Backoff {
     }
 }
 
-fn git(root: &Path, args: &[&str]) -> Option<String> {
-    git_detailed(root, args).ok()
-}
-
 /// As [`git`], but keeps why the command failed (spawn error, or the exit
 /// status plus the head of its stderr) for the watcher's failure event.
 fn git_detailed(root: &Path, args: &[&str]) -> Result<String, String> {
@@ -128,7 +126,20 @@ fn git_detailed(root: &Path, args: &[&str]) -> Result<String, String> {
 /// The commit `HEAD` points at, or `None` when `root` is not a git worktree.
 #[must_use]
 pub fn head_commit(root: &Path) -> Option<String> {
-    git(root, &["rev-parse", "--verify", "HEAD"]).map(|s| s.trim().to_string())
+    head_commit_detailed(root).ok()
+}
+
+/// As [`head_commit`], but keeps why git could not answer. Asks libgit2
+/// first and only spawns git when libgit2 cannot answer (see
+/// [`crate::git_inproc`]).
+fn head_commit_detailed(root: &Path) -> Result<String, String> {
+    if let Some(head) = crate::git_inproc::Repo::open(root)
+        .ok()
+        .and_then(|repo| repo.head_commit().ok())
+    {
+        return Ok(head);
+    }
+    git_detailed(root, &["rev-parse", "--verify", "HEAD"]).map(|s| s.trim().to_string())
 }
 
 fn count_lines(path: &Path) -> u64 {
@@ -157,6 +168,43 @@ pub fn summarize(root: &Path, baseline: &str) -> Option<DiffSummary> {
 
 /// As [`summarize`], but keeps the failing git command's error.
 fn summarize_detailed(root: &Path, baseline: &str) -> Result<DiffSummary, String> {
+    let mut repo = crate::git_inproc::Repo::open(root).ok();
+    summarize_polled(&mut repo, root, baseline)
+}
+
+/// One poll: libgit2 through the watcher's long-lived `repo` handle, or a
+/// `git` subprocess when there is no handle or libgit2 cannot answer. A
+/// handle that fails is dropped so a repository libgit2 cannot read costs one
+/// failed attempt, not one per poll.
+fn summarize_polled(
+    repo: &mut Option<crate::git_inproc::Repo>,
+    root: &Path,
+    baseline: &str,
+) -> Result<DiffSummary, String> {
+    if let Some(open) = repo.as_ref() {
+        match open.changes_since(baseline) {
+            Ok(changes) => {
+                let mut summary = DiffSummary {
+                    files_changed: changes.files_changed,
+                    files_added: changes.files_added,
+                    files_removed: changes.files_removed,
+                    lines_added: changes.lines_added,
+                    lines_removed: changes.lines_removed,
+                };
+                for rel in &changes.untracked {
+                    summary.files_changed += 1;
+                    summary.files_added += 1;
+                    summary.lines_added += count_lines(&root.join(rel));
+                }
+                return Ok(summary);
+            }
+            Err(_) => *repo = None,
+        }
+    }
+    summarize_subprocess(root, baseline)
+}
+
+fn summarize_subprocess(root: &Path, baseline: &str) -> Result<DiffSummary, String> {
     // `--numstat --summary` gives per-file line counts plus a
     // ` create mode ...` / ` delete mode ...` line per added/removed file, so
     // one diff covers both. No external diff driver or textconv filter can
@@ -247,8 +295,8 @@ impl WorktreeWatcher {
         max: Duration,
         emit: impl Fn(&str, &DiffSummary) + Send + 'static,
     ) -> Option<Self> {
-        let baseline = match git_detailed(root, &["rev-parse", "--verify", "HEAD"]) {
-            Ok(head) => head.trim().to_string(),
+        let baseline = match head_commit_detailed(root) {
+            Ok(head) => head,
             Err(error) => {
                 cartographer::emit(
                     WORKTREE_DIFF_SOURCE,
@@ -269,8 +317,11 @@ impl WorktreeWatcher {
             // reported once when it starts and once when it clears, not per
             // poll.
             let mut failing = false;
+            // One libgit2 handle for the watcher's whole life; `None` when
+            // libgit2 cannot read this repository (polls then spawn git).
+            let mut repo = crate::git_inproc::Repo::open(&root).ok();
             let mut poll = |last: &mut DiffSummary| -> bool {
-                match summarize_detailed(&root, &baseline) {
+                match summarize_polled(&mut repo, &root, &baseline) {
                     Ok(now) => {
                         if failing {
                             failing = false;
@@ -456,6 +507,51 @@ mod tests {
         let last = seen.last().expect("one event");
         assert_eq!(last.files_changed, 1);
         assert_eq!(last.lines_removed, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn in_process_and_subprocess_summaries_agree() {
+        let dir = temp_repo("ab");
+        let base = head_commit(&dir).unwrap();
+        // Edit, delete, binary, committed-after-baseline, untracked, ignored.
+        std::fs::write(dir.join("a.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+        std::fs::write(dir.join("gone.txt"), "g\n").unwrap();
+        run(&dir, &["add", "gone.txt"]);
+        run(&dir, &["commit", "-q", "-m", "gone"]);
+        std::fs::remove_file(dir.join("gone.txt")).unwrap();
+        std::fs::write(dir.join("bin.dat"), [0u8, 1, 2, 0]).unwrap();
+        run(&dir, &["add", "bin.dat"]);
+        std::fs::create_dir_all(dir.join("x/y")).unwrap();
+        std::fs::write(dir.join("x/y/new.txt"), "n1\nn2\nn3\n").unwrap();
+        std::fs::write(dir.join(".gitignore"), "*.tmp\n").unwrap();
+        std::fs::write(dir.join("skip.tmp"), "ignored\n").unwrap();
+
+        let mut repo = crate::git_inproc::Repo::open(&dir).ok();
+        assert!(repo.is_some(), "libgit2 should open a plain checkout");
+        let in_process = summarize_polled(&mut repo, &dir, &base).unwrap();
+        assert!(repo.is_some(), "a successful poll keeps the handle");
+        let subprocess = summarize_subprocess(&dir, &base).unwrap();
+        assert_eq!(in_process, subprocess);
+        assert!(in_process.files_changed >= 4, "{in_process:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_handle_that_cannot_answer_is_dropped_and_git_is_used() {
+        let dir = temp_repo("drop");
+        let base = head_commit(&dir).unwrap();
+        let mut repo = crate::git_inproc::Repo::open(&dir).ok();
+        // Not a commit libgit2 can find: the handle is discarded and the
+        // subprocess path produces the (failing) answer.
+        let bogus = "0123456789012345678901234567890123456789";
+        assert!(summarize_polled(&mut repo, &dir, bogus).is_err());
+        assert!(repo.is_none());
+        // With no handle the subprocess path still works.
+        assert_eq!(
+            summarize_polled(&mut repo, &dir, &base).unwrap(),
+            DiffSummary::default()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
