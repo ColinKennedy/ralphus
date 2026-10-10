@@ -16,6 +16,7 @@ use crate::mcp_init::{
 };
 use crate::shell_label::{exec_command_label, format_tool_input};
 use crate::shellcmd::{self, Env};
+use crate::skills_install::SkillsHarness;
 use crate::tools::Workspace;
 
 const DEFAULT_PROGRAM: &str = "pi";
@@ -51,6 +52,26 @@ impl PiBackend {
             return program;
         }
         shellcmd::find_program(&program).unwrap_or(program)
+    }
+}
+
+impl SkillsHarness for PiBackend {
+    fn backend_name(&self) -> &'static str {
+        "pi"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Pi"
+    }
+
+    fn skills_dir(&self) -> Option<PathBuf> {
+        let agent_dir = std::env::var_os("PI_CODING_AGENT_DIR")
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                crate::agent_isolation::home_dir().map(|home| home.join(".pi").join("agent"))
+            })?;
+        Some(agent_dir.join("skills"))
     }
 }
 
