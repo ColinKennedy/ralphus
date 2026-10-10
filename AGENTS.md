@@ -147,6 +147,7 @@ Eleven Rust workspace members; `cli-py/` is a Python project kept only for `docs
 - `daemon/src/cartographer.rs` — Cartographer: the unified, structured, cross-system event log — see [`.agent/logging-policy.md`](.agent/logging-policy.md).
 - `daemon/src/logging.rs` — the `rlog!` file/stderr sink (RAL-83); see [`.agent/logging-policy.md`](.agent/logging-policy.md).
 - `daemon/src/terminal_log.rs` — durable, per-attempt tmux pane transcript capture (RAL-154); see the tmux/psmux gotcha in [`.agent/gotchas.md`](.agent/gotchas.md).
+- `runner/src/git_inproc.rs` — read-only git answered in-process with libgit2 instead of a `git` subprocess: the runner's live diff watcher (`worktree_diff.rs`) and, through `GitVcs::exec_raw`'s early return, `log --format=%s A..B` / `rev-list --count A..B`. Every path falls back to real git when libgit2 cannot answer exactly; `RALPHUS_GIT_INPROC=0` disables it. Mutations/network/hooks/credentials never go through it — see [`.agent/gotchas.md`](.agent/gotchas.md).
 - `daemon/src/entity_uri.rs` — RAL-155: the single-string, index-based `EntityUri` grammar, mirrored in `cli/src/entity_uri.rs`.
 - `daemon/src/timeline.rs` — RAL-155: `build_squad_timeline` merges a whole squad's Cartographer rows with inlined terminal-log excerpts. Backs `GET /api/squads/{id}/timeline` and the board's "⏱ Timeline" button.
 - `auth/src/lib.rs` — Ed25519 license check (`check_license()`; compiles away without `secure-dist`) — see `auth/AGENTS.md`.
