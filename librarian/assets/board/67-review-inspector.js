@@ -727,118 +727,23 @@
         // The daemon pairs and attributes the runs; fetched once when this tab
         // first renders, then refetched only on the branch's SSE state change.
         if (branchRunsCache[`${g.id}|${b.id}`] === undefined) loadBranchRuns(g.id, b.id);
-        const runs = branchRunsOf(g.id, b.id);
-        const ri = curRunIdx(runs, b.id);
-        const run = ri >= 0 ? runs[ri] : null;
-        const key = `guardian|${g.id}|${b.id}${run && run.task && run.cell_id ? `|${run.task}|${run.cell_id}` : ""}`;
-        // The key names the shown run, so it changes as runs load or are
-        // stepped through; whichever one is on screen is the one polled.
-        if (!peekOpen[key]) {
-          peekOpen[key] = true;
-          setTimeout(() => fetchPeek(key, true), 0);
-        }
-        const isLatest = ri === runs.length - 1;
-        const sub = liveSub[b.id] || "terminal";
-        const ended = !!peekEnded[key];
-        // Only the newest pass that used a tmux pane has content the live view
-        // still holds: the pane is reused, so an earlier pass's text is no
-        // longer in it. "Am I looking at live content" therefore keys on the
-        // Whether the pane still holds this run's text at all, separate from
-        // whether that text is still moving: the pane is reused between passes,
-        // so only the newest one's output is still in it. A finished session's
-        // record is not "historical" in the sense the walk-back note means --
-        // it is this run's own output, just no longer growing, and the liveness
-        // dot and the pane's own banner already say so.
-        const onNewestTape = !!run && ri === runs.length - 1;
-        const live = onNewestTape && !ended;
-
-        // 1 - who am I looking at, and is it still moving
-        const identity = `<div class="peek-head" style="margin-bottom:8px">
-            <span class="peek-dot${live ? "" : " ended"}"></span>
-            <span class="mono" style="font-size:11px">${esc(resolverOf(g))} · ${esc(b.branch)}</span>
-            <span style="flex:1"></span>
-            <span class="rg-sub" style="font-size:11px;color:var(--faint)">${live ? "streaming" : (isLatest ? "session ended" : "historical")}</span>
-            <button class="copy-btn" data-click="copyPeekText" data-key="${esc(key)}" data-tip="Copy what this tab is currently showing.">⧉</button>
-          </div>`;
-
-        // 2 - which run
-        const histBar = runs.length && run ? `<div class="histbar${onNewestTape ? "" : " past"}">
-            <button class="hnav" data-click="stepBranchRun" data-branch-id="${esc(b.id)}" data-dir="-1" ${ri <= 0 ? "disabled" : ""}
-              data-tip="Step back to the previous run on this branch.">&#9664;</button>
-            <button class="hpick" data-click="scopeReviewDockToBranch" data-guardian-id="${esc(g.id)}" data-branch-id="${esc(b.id)}"
-              data-tip="Every agent session this branch ran — rebases, final proofs, feedback revisions.\nOpens the log drawer, where each run's own rows are listed alongside non-agent operations such as PR submission.">
-              <span class="hkind ${esc(run.kind)}">${esc(run.kind)}</span>
-              <span class="hlabel mono">${esc(run.label)}</span>
-              <span class="hmeta">${esc(runMeta(run))}</span>
-              <span class="hcount num">${ri + 1}/${runs.length}</span> &#9662;</button>
-            <button class="hnav" data-click="stepBranchRun" data-branch-id="${esc(b.id)}" data-dir="1" ${ri >= runs.length - 1 ? "disabled" : ""}
-              data-tip="Step forward to the next run on this branch.">&#9654;</button>
-            ${isLatest ? "" : `<button class="btn" style="padding:3px 8px;font-size:11px" data-click="jumpToLatestRun" data-branch-id="${esc(b.id)}"
-              data-tip="Jump back to the newest run — the one still streaming.">&#8677; Latest</button>`}
-          </div>
-          ${onNewestTape ? "" : `<div class="histnote">You are walked back to ${esc(run.label)}
-            from ${esc(runMeta(run))} — an earlier pass than the one the pane below holds.</div>`}`
-          : `<div class="histbar"><span class="hpick" data-tip="Sessions appear here as the daemon records them — a rebase pass, a final proof, a feedback revision.\nThis branch has not run one yet.">
-              <span class="hkind">no runs</span><span class="hmeta">no agent session recorded for this branch yet</span></span></div>`;
-
-        // 3 - how it is rendered. Terminal-only controls, but they stay put on
-        //     the prompt views rather than vanishing: appearing and disappearing
-        //     on every tab swap reflows the pane. aria-disabled, not `disabled`,
-        //     so the tooltip explaining why still fires.
-        const showDebug = peekShowsDebug(key);
-        const showThinking = peekShowsThinking(key);
-        const canThink = g.resolver_thinking_capable !== false;
-        const dead = sub !== "terminal";
-        const deadTip = "Applies to the Terminal view.\nSwitch to Terminal to use it.";
-        const ctl = `<div class="peek-ctl">
-            <button class="tgl ${showDebug ? "on" : ""}${dead ? " off" : ""}" ${dead ? 'aria-disabled="true"' : ""}
-              data-click="toggleShowDebugMessagesBtn" data-key="${esc(key)}"
-              data-tip="${dead ? deadTip : "Show ralphus's own diagnostic/telemetry events inline, where they happened.\nOff by default so routine monitoring shows what the agent did.\nThis only changes what is rendered here — the daemon's logs always keep everything."}">
-              <span class="bx"></span>Debug messages</button>
-            <input class="typefilter${dead ? " dead" : ""}" placeholder="Filter types (e.g. read glob or -usage)"
-              value="${esc(peekTypeFilterInput[key] || "")}" ${dead ? "disabled" : ""}
-              oninput="setPeekTypeFilter('${esc(key)}',this.value)" aria-label="Filter log types"
-              data-tip="${dead ? `${deadTip}\n${LIVE_VIEW_TYPE_FILTER_TIP}` : LIVE_VIEW_TYPE_FILTER_TIP}">
-            ${canThink ? `<button class="tgl ${showThinking ? "on" : ""}${dead ? " off" : ""}" ${dead ? 'aria-disabled="true"' : ""}
-              data-click="toggleShowThinkingBtn" data-key="${esc(key)}"
-              data-tip="${dead ? deadTip : "Show the model's own reasoning expanded inline.\nOff folds each block to a single &lt;thinking…&gt; line.\nPurely a display choice — the reasoning is always captured, so toggling re-renders text already loaded without refetching."}">
-              <span class="bx"></span>Thinking</button>` : ""}
-          </div>`;
-
-        // 4 - which view, seated directly on what it switches
-        const subs = [["terminal", "Terminal"], ["prompt", "Prompt"], ["system", "System Prompt"], ["agentlog", "Agent Log (experimental)"]];
-        const tabs = `<div class="subtabs">${subs.map((s) => `<button class="subtab ${sub === s[0] ? "on" : ""}" `
-          + `data-click="setLiveSub" data-branch-id="${esc(b.id)}" data-sub="${s[0]}" `
-          + `data-tip="${esc(LIVE_SUB_TIP[s[0]])}">${s[1]}</button>`).join("")}</div>`;
-
-        const top = identity + histBar + ctl + tabs;
-        // The system prompt is per branch, not per run: `setLiveSub` fetches it under the branch-level key.
-        if (sub === "system") return top + liveSystemPromptView(g, `guardian|${g.id}|${b.id}`);
-        if (sub === "prompt") return top + livePromptView(g, b, run);
-        if (sub === "agentlog") return top + liveAgentLogView(key);
-        return top + liveTerminalView(g, b, key, run, onNewestTape);
-      }
-      /** @type {{[sub: string]: string}} What each Live sub-view shows. */
-      const LIVE_SUB_TIP = {
-        terminal: "The run's captured terminal output.\nThe newest run streams; an earlier one is the daemon's persisted record of it.",
-        prompt: "The instruction this run's agent was given — the task it was asked to do, as opposed to the standing rules it works under.",
-        agentlog: "Experimental. The run's tool calls as collapsible widgets with their input and output, filterable by tool, status and text.\nRebuilt from the terminal text, so it is as complete as that text is. Secrets are masked.",
-        system: "The exact system prompt this run's agent received: ralphus's hidden instructions plus the resolver's authored prompt.\nRead-only reference — changing it means changing the resolver settings.\nAdmin-only view.",
-      };
-      /**
-       * The Live tab's Terminal view: the run's captured output, framed, with
-       * the controls that act on it underneath.
-       * @param {GuardianView} g - The review.
-       * @param {GuardianBranch} b - The branch.
-       * @param {string} key - The peek key.
-       * @param {BranchRun|null} run - The run being shown.
-       * @param {boolean} isLatest - Whether that run is the newest one that used
-       *   a tmux pane, and so the only one whose text the live view still holds.
-       * @returns {string}
-       */
-      function liveTerminalView(g, b, key, run, isLatest) {
-        const foot = `<div class="run-foot">
-            ${isLatest ? `<button class="btn" style="padding:3px 8px;font-size:11.5px" data-click="openGuardianBranchTerminalMenuItem" data-key="${esc(key)}" data-gid="${esc(g.id)}" data-bid="${esc(b.id)}" data-mode="open"
+        const btnStyle = "padding:3px 8px;font-size:11.5px";
+        return liveViewWidget({
+          scope: b.id,
+          title: `${resolverOf(g)} · ${b.branch}`,
+          runs: branchRunsOf(g.id, b.id),
+          repaint: renderReviewInspector,
+          canThink: g.resolver_thinking_capable !== false,
+          keyFor: (run) => `guardian|${g.id}|${b.id}${run && run.task && run.cell_id ? `|${run.task}|${run.cell_id}` : ""}`,
+          systemKey: `guardian|${g.id}|${b.id}`,
+          closeKey: "",
+          pickerAttrs: `data-click="scopeReviewDockToBranch" data-guardian-id="${esc(g.id)}" data-branch-id="${esc(b.id)}"`,
+          pickerTip: "Every agent session this branch ran — rebases, final proofs, feedback revisions.\nOpens the log drawer, where each run's own rows are listed alongside non-agent operations such as PR submission.",
+          noRunsText: "no agent session recorded for this branch yet",
+          noRunsTip: "Sessions appear here as the daemon records them — a rebase pass, a final proof, a feedback revision.\nThis branch has not run one yet.",
+          promptView: (run) => livePromptView(g, b, run),
+          terminalFoot: (run, key, isLatest) => `<div class="run-foot">
+            ${isLatest ? `<button class="btn" style="${btnStyle}" data-click="openGuardianBranchTerminalMenuItem" data-key="${esc(key)}" data-gid="${esc(g.id)}" data-bid="${esc(b.id)}" data-mode="open"
               data-tip="Attach a real, interactive terminal to this session.\nShows the runner's own log/event stream, not the agent's conversation.">Open terminal</button>` : ""}
             <button class="btn" style="${btnStyle}" data-click="scopeReviewDockToBranch" data-guardian-id="${esc(g.id)}" data-branch-id="${esc(b.id)}"
               data-tip="Open this branch's log drawer alongside the transcript.">Logs</button>
