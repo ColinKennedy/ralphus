@@ -544,6 +544,92 @@ pub fn try_worktree_list(root: &Path, args: &[&str]) -> Option<Output> {
     Some(success_output(out))
 }
 
+/// `/`-separated absolute form of `path`, the way git prints it.
+fn absolute_display(path: &Path) -> Option<String> {
+    std::fs::canonicalize(path).ok().map(|p| slash(&p))
+}
+
+/// Whether any config file git would read for `root` could set
+/// `core.hooksPath` (or pull in another file that might): the repo's own
+/// `config`/`config.worktree`, the global and XDG files, and the usual system
+/// locations. Conservative -- any mention of `hookspath` or an `[include`
+/// counts.
+fn hooks_path_may_be_configured(git_dir: &Path, common: &Path) -> bool {
+    // Config injected through the environment (`GIT_CONFIG_COUNT`, `git -c`)
+    // outranks every file and is invisible here.
+    if ralphus_runner::git_inproc::config_env_override() {
+        return true;
+    }
+    let mut files = vec![common.join("config"), git_dir.join("config.worktree")];
+    if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
+        let home = PathBuf::from(home);
+        files.push(home.join(".gitconfig"));
+        files.push(home.join(".config").join("git").join("config"));
+    }
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        files.push(PathBuf::from(xdg).join("git").join("config"));
+    }
+    for path in [
+        "C:/Program Files/Git/etc/gitconfig",
+        "C:/Program Files (x86)/Git/etc/gitconfig",
+        "C:/ProgramData/Git/config",
+        "/etc/gitconfig",
+        "/usr/local/etc/gitconfig",
+        "/opt/homebrew/etc/gitconfig",
+    ] {
+        files.push(PathBuf::from(path));
+    }
+    for var in ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"] {
+        if let Some(path) = std::env::var_os(var) {
+            files.push(PathBuf::from(path));
+        }
+    }
+    files.iter().any(|file| {
+        std::fs::read_to_string(file).is_ok_and(|text| {
+            let text = text.to_ascii_lowercase();
+            text.contains("hookspath") || text.contains("[include")
+        })
+    })
+}
+
+/// Answer the `rev-parse` questions that are a function of the checkout's
+/// on-disk layout -- `--git-common-dir`, `--git-dir`, `--show-toplevel`,
+/// `--is-inside-work-tree`, `--git-path hooks` -- for a `root` that is the top
+/// of a checkout, formatted the way git prints them from that directory.
+/// `--git-path hooks` is left to git whenever any config file might set
+/// `core.hooksPath`. `None` means "run git".
+#[must_use]
+pub fn try_rev_parse_layout(root: &Path, args: &[&str]) -> Option<Output> {
+    let (git_dir, common) = git_dirs(root)?;
+    let main = root.join(".git").is_dir();
+    let stdout = match args {
+        ["rev-parse", "--path-format=absolute", "--git-common-dir"] => {
+            format!("{}\n", absolute_display(&common)?)
+        }
+        ["rev-parse", "--git-dir"] => {
+            if main {
+                ".git\n".to_string()
+            } else {
+                format!("{}\n", absolute_display(&git_dir)?)
+            }
+        }
+        ["rev-parse", "--show-toplevel"] => format!("{}\n", absolute_display(root)?),
+        ["rev-parse", "--is-inside-work-tree"] => "true\n".to_string(),
+        ["rev-parse", "--git-path", "hooks"] => {
+            if hooks_path_may_be_configured(&git_dir, &common) {
+                return None;
+            }
+            if main {
+                ".git/hooks\n".to_string()
+            } else {
+                format!("{}/hooks\n", absolute_display(&common)?)
+            }
+        }
+        _ => return None,
+    };
+    Some(success_output(stdout))
+}
+
 /// A process result with `stdout` and exit `code`, for answers produced
 /// without running git.
 #[must_use]
@@ -910,6 +996,56 @@ mod tests {
     }
 
     #[test]
+    fn layout_questions_match_git_for_a_main_checkout_and_a_linked_worktree() {
+        let root = repo("layout");
+        let linked = add_worktree(&root, "l", &["-b", "layout-side"]);
+        let forms: [&[&str]; 5] = [
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            &["rev-parse", "--git-dir"],
+            &["rev-parse", "--show-toplevel"],
+            &["rev-parse", "--is-inside-work-tree"],
+            &["rev-parse", "--git-path", "hooks"],
+        ];
+        for from in [&root, &linked] {
+            for args in forms {
+                let ours = try_rev_parse_layout(from, args).expect("answered");
+                let real = git(from, args);
+                assert_eq!(
+                    String::from_utf8_lossy(&ours.stdout),
+                    String::from_utf8_lossy(&real.stdout),
+                    "{args:?} from {}",
+                    from.display()
+                );
+            }
+        }
+        // A directory that is not the top of a checkout is git's to answer.
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert!(try_rev_parse_layout(&sub, forms[0]).is_none());
+        // Other shapes are not this answer.
+        assert!(try_rev_parse_layout(&root, &["rev-parse", "HEAD"]).is_none());
+        assert!(try_rev_parse_layout(&root, &["rev-parse", "--git-path", "objects"]).is_none());
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(linked);
+    }
+
+    #[test]
+    fn a_configured_hooks_path_sends_the_hooks_question_to_git() {
+        let root = repo("hooks-path");
+        let args = ["rev-parse", "--git-path", "hooks"];
+        assert!(try_rev_parse_layout(&root, &args).is_some());
+        assert!(
+            git(&root, &["config", "core.hooksPath", "custom-hooks"])
+                .status
+                .success()
+        );
+        assert!(try_rev_parse_layout(&root, &args).is_none());
+        // The questions that do not depend on config are still answered.
+        assert!(try_rev_parse_layout(&root, &["rev-parse", "--git-dir"]).is_some());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn worktree_list_matches_git_byte_for_byte() {
         let root = repo("wtlist");
         let args = ["worktree", "list", "--porcelain"];
@@ -1003,6 +1139,28 @@ mod tests {
         let real = git(&root, &args);
         let real_ms = started.elapsed().as_millis();
         eprintln!("in-process {ours_ms} ms, git {real_ms} ms");
+        // The layout questions, from the repository and from a real linked worktree.
+        let mut tops = vec![root.clone()];
+        if let Ok(extra) = std::env::var("RALPHUS_PARITY_LINKED") {
+            tops.push(PathBuf::from(extra));
+        }
+        for top in tops {
+            for form in [
+                &["rev-parse", "--path-format=absolute", "--git-common-dir"][..],
+                &["rev-parse", "--git-dir"],
+                &["rev-parse", "--show-toplevel"],
+                &["rev-parse", "--is-inside-work-tree"],
+                &["rev-parse", "--git-path", "hooks"],
+            ] {
+                let ours = try_rev_parse_layout(&top, form).expect("answered");
+                assert_eq!(
+                    String::from_utf8_lossy(&ours.stdout),
+                    String::from_utf8_lossy(&git(&top, form).stdout),
+                    "{form:?} from {}",
+                    top.display()
+                );
+            }
+        }
         match ours {
             None => eprintln!("fell back to git (an unusual worktree is registered)"),
             Some(ours) => assert_eq!(

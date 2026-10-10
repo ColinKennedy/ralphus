@@ -40,6 +40,21 @@ pub fn enabled() -> bool {
     })
 }
 
+/// Whether git config is being injected through the environment
+/// (`GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`, or the older
+/// `GIT_CONFIG_PARAMETERS` that `git -c` sets). That is git's highest-priority
+/// config scope and libgit2 does not read it, so every in-process answer that
+/// depends on config -- and the layout answer for the hooks directory -- steps
+/// aside and lets real git (which does read it) answer.
+#[must_use]
+pub fn config_env_override() -> bool {
+    env_overrides_config(|name| std::env::var_os(name).is_some())
+}
+
+fn env_overrides_config(is_set: impl Fn(&str) -> bool) -> bool {
+    is_set("GIT_CONFIG_COUNT") || is_set("GIT_CONFIG_PARAMETERS")
+}
+
 /// What changed in a worktree relative to a baseline commit.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Changes {
@@ -77,6 +92,9 @@ impl Repo {
     pub fn open(root: &Path) -> Result<Self, String> {
         if !enabled() {
             return Err("in-process git is disabled (RALPHUS_GIT_INPROC=0)".to_string());
+        }
+        if config_env_override() {
+            return Err("git config is overridden through the environment".to_string());
         }
         let repo = Repository::open(root).map_err(|e| format!("libgit2 open: {e}"))?;
         if repo.is_bare() {
@@ -189,6 +207,45 @@ enum Read<'a> {
         short: bool,
         patterns: &'a [&'a str],
     },
+    /// `rev-parse --abbrev-ref HEAD`
+    AbbrevHead,
+    /// `rev-parse [--abbrev-ref] [--symbolic-full-name] [<branch>]@{upstream}`
+    Upstream {
+        branch: Option<&'a str>,
+        short: bool,
+    },
+    /// `status --porcelain`
+    StatusPorcelain,
+}
+
+/// `[--abbrev-ref] [--symbolic-full-name] [<branch>]@{upstream|u}` (the part
+/// of a `rev-parse` command line after `rev-parse`).
+fn parse_upstream<'a>(rest: &[&'a str]) -> Option<Read<'a>> {
+    let (spec, flags) = rest.split_last()?;
+    if flags.is_empty() {
+        return None;
+    }
+    let mut short = false;
+    for flag in flags {
+        match *flag {
+            "--abbrev-ref" => short = true,
+            "--symbolic-full-name" => {}
+            _ => return None,
+        }
+    }
+    let branch = match *spec {
+        "@{upstream}" | "@{u}" => None,
+        other => {
+            let name = other
+                .strip_suffix("@{upstream}")
+                .or_else(|| other.strip_suffix("@{u}"))?;
+            if !plain_name(name) {
+                return None;
+            }
+            Some(name)
+        }
+    };
+    Some(Read::Upstream { branch, short })
 }
 
 /// A single plain ref name (or `HEAD`): no revision syntax, no options.
@@ -225,7 +282,14 @@ fn plain_range(s: &str) -> bool {
 }
 
 fn parse<'a>(args: &'a [&'a str]) -> Option<Read<'a>> {
+    if let ["rev-parse", rest @ ..] = args {
+        if let Some(upstream) = parse_upstream(rest) {
+            return Some(upstream);
+        }
+    }
     match args {
+        ["rev-parse", "--abbrev-ref", "HEAD"] => Some(Read::AbbrevHead),
+        ["status", "--porcelain"] => Some(Read::StatusPorcelain),
         ["log", "--format=%s", range] if plain_range(range) => Some(Read::Subjects {
             range,
             reverse: false,
@@ -308,6 +372,9 @@ pub fn try_read(root: &Path, args: &[&str]) -> Option<String> {
         Read::LsTree { reference } => return repo.ls_tree(reference),
         Read::SymbolicRef { reference, short } => return repo.symbolic_ref(reference, short),
         Read::ForEachRef { short, patterns } => return repo.for_each_ref(short, patterns),
+        Read::AbbrevHead => return repo.abbrev_head(),
+        Read::Upstream { branch, short } => return repo.upstream(branch, short),
+        Read::StatusPorcelain => return repo.status_porcelain(),
         Read::Subjects { .. } | Read::Count { .. } => {}
     }
     if !repo.history_is_plain() {
@@ -395,6 +462,150 @@ fn system_config_may_rewrite_urls() -> bool {
     })
 }
 
+/// Config files outside the repository that git would read: global, XDG and
+/// the usual system locations (libgit2 locates the system one differently
+/// from git, so these are read as text).
+fn outside_config_files() -> Vec<std::path::PathBuf> {
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
+        let home = std::path::PathBuf::from(home);
+        files.push(home.join(".gitconfig"));
+        files.push(home.join(".config").join("git").join("config"));
+    }
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        files.push(std::path::PathBuf::from(xdg).join("git").join("config"));
+    }
+    for path in [
+        "C:/Program Files/Git/etc/gitconfig",
+        "C:/Program Files (x86)/Git/etc/gitconfig",
+        "C:/ProgramData/Git/config",
+        "/etc/gitconfig",
+        "/usr/local/etc/gitconfig",
+        "/opt/homebrew/etc/gitconfig",
+    ] {
+        files.push(path.into());
+    }
+    for var in ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"] {
+        if let Some(path) = std::env::var_os(var) {
+            files.push(path.into());
+        }
+    }
+    files
+}
+
+/// Whether a global/XDG/system config file mentions `[remote ` or pulls in
+/// another file: then a remote could be defined outside the repository.
+fn outside_config_may_define_remotes() -> bool {
+    outside_config_files().iter().any(|file| {
+        std::fs::read_to_string(file).is_ok_and(|text| {
+            let text = text.to_ascii_lowercase();
+            text.contains("[remote ") || text.contains("[include")
+        })
+    })
+}
+
+/// Every `name = value` the repository defines itself (local, then worktree
+/// level), in file order. `None` for a value-less key or any read error.
+fn repo_level_entries(config: &git2::Config) -> Option<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    for level in [git2::ConfigLevel::Local, git2::ConfigLevel::Worktree] {
+        let Ok(scoped) = config.open_level(level) else {
+            continue;
+        };
+        let mut entries = scoped.entries(None).ok()?;
+        while let Some(entry) = entries.next() {
+            let entry = entry.ok()?;
+            out.push((entry.name()?.to_string(), entry.value()?.to_string()));
+        }
+    }
+    Some(out)
+}
+
+/// `git remote -v` for remotes with one URL (and at most one push URL), none
+/// of which an `insteadOf` rule could rewrite: `name\turl (fetch)` then
+/// `name\turl (push)`, remotes ordered by name.
+fn remote_verbose(root: &Path) -> Option<Answer> {
+    let repo = Repo::open(root).ok()?;
+    if outside_config_may_define_remotes() || system_config_may_rewrite_urls() {
+        return None;
+    }
+    let config = repo.repo.config().ok()?;
+    let mut rewrite_prefixes = Vec::new();
+    let mut rewrites = config.entries(Some("^url\\..*\\.(push)?insteadof$")).ok()?;
+    while let Some(entry) = rewrites.next() {
+        rewrite_prefixes.push(entry.ok()?.value()?.to_string());
+    }
+    let mut remotes: std::collections::BTreeMap<String, (Vec<String>, Vec<String>, bool)> =
+        std::collections::BTreeMap::new();
+    for (name, value) in repo_level_entries(&config)? {
+        let Some(rest) = name.strip_prefix("remote.") else {
+            continue;
+        };
+        let (remote, variable) = rest.rsplit_once('.')?;
+        let slot = remotes.entry(remote.to_string()).or_default();
+        match variable {
+            "url" => slot.0.push(value),
+            "pushurl" => slot.1.push(value),
+            _ => slot.2 = true,
+        }
+    }
+    let mut out = String::new();
+    for (name, (urls, push_urls, _)) in &remotes {
+        let [url] = urls.as_slice() else {
+            return None;
+        };
+        if push_urls.len() > 1 {
+            return None;
+        }
+        let push = push_urls.first().unwrap_or(url);
+        if [url, push].iter().any(|u| {
+            rewrite_prefixes
+                .iter()
+                .any(|prefix| !prefix.is_empty() && u.starts_with(prefix.as_str()))
+        }) {
+            return None;
+        }
+        out.push_str(&format!("{name}\t{url} (fetch)\n{name}\t{push} (push)\n"));
+    }
+    Some(Answer {
+        stdout: out,
+        code: 0,
+    })
+}
+
+/// `git config --get-regexp <pattern>` for the few `remote.<name>.<variable>`
+/// patterns ralphus asks, each matched by variable name rather than by a
+/// regex engine. No match is git's exit 1 with no output.
+fn config_regexp(root: &Path, pattern: &str) -> Option<Answer> {
+    let variables: &[&str] = match pattern {
+        "^remote\\..*\\.url$" => &["url"],
+        "^remote\\..*\\.glab-resolved(-base|-head)?$" => {
+            &["glab-resolved", "glab-resolved-base", "glab-resolved-head"]
+        }
+        "^remote\\..*\\.gh-resolved$" => &["gh-resolved"],
+        _ => return None,
+    };
+    let repo = Repo::open(root).ok()?;
+    if outside_config_may_define_remotes() {
+        return None;
+    }
+    let config = repo.repo.config().ok()?;
+    let mut out = String::new();
+    for (name, value) in repo_level_entries(&config)? {
+        let Some(rest) = name.strip_prefix("remote.") else {
+            continue;
+        };
+        if rest
+            .rsplit_once('.')
+            .is_some_and(|(_, variable)| variables.contains(&variable))
+        {
+            out.push_str(&format!("{name} {value}\n"));
+        }
+    }
+    let code = i32::from(out.is_empty());
+    Some(Answer { stdout: out, code })
+}
+
 /// Answer `git config --get <key>` or `git remote get-url <name>` from the
 /// repository's own config (worktree level, then local), without a process.
 ///
@@ -405,6 +616,11 @@ fn system_config_may_rewrite_urls() -> bool {
 /// value, or any error returns `None` ("run git").
 #[must_use]
 pub fn try_config_read(root: &Path, args: &[&str]) -> Option<Answer> {
+    match args {
+        ["remote", "-v"] => return remote_verbose(root),
+        ["config", "--get-regexp", pattern] => return config_regexp(root, pattern),
+        _ => {}
+    }
     let (key, remote) = match args {
         ["config", "--get", key] if plain_config_key(key) => ((*key).to_string(), false),
         ["remote", "get-url", name]
@@ -539,6 +755,154 @@ impl Repo {
             }
         }
         Some(short.to_string())
+    }
+
+    /// `git rev-parse --abbrev-ref HEAD`: the checked-out branch's short name,
+    /// or `HEAD` when detached.
+    fn abbrev_head(&self) -> Option<String> {
+        if self.repo.head_detached().ok()? {
+            return Some("HEAD\n".to_string());
+        }
+        let head = self.repo.head().ok()?;
+        let name = head.name()?.to_string();
+        Some(format!("{}\n", self.shorten(&name)?))
+    }
+
+    /// `git rev-parse [--abbrev-ref] [--symbolic-full-name] [<branch>]@{upstream}`:
+    /// the branch's configured upstream, short or fully qualified. A branch
+    /// with no upstream (git's error) is left to git.
+    fn upstream(&self, branch: Option<&str>, short: bool) -> Option<String> {
+        let local = match branch {
+            Some(name) => self.repo.find_branch(name, git2::BranchType::Local).ok()?,
+            None => {
+                let head = self.repo.head().ok()?;
+                if !head.is_branch() {
+                    return None;
+                }
+                git2::Branch::wrap(head)
+            }
+        };
+        let full = local.upstream().ok()?.get().name()?.to_string();
+        let shown = if short { self.shorten(&full)? } else { full };
+        Some(format!("{shown}\n"))
+    }
+
+    /// `git status --porcelain` (v1), for the plain cases: no renames,
+    /// conflicts, submodules or paths git would quote. Anything else, or a
+    /// config key libgit2 does not honour (`status.showUntrackedFiles`,
+    /// `status.renames`), is left to git.
+    ///
+    /// Every production caller only asks whether the output is empty (is the
+    /// worktree dirty?), so this exists to save a process, not to produce
+    /// the listing.
+    ///
+    /// REVERT THIS if it turns out to cause noticeable latency: delete the
+    /// `Read::StatusPorcelain` arms in `parse` and `try_read` (or set
+    /// `RALPHUS_GIT_INPROC=0`). Measured on Windows against the `git status`
+    /// the daemon runs today (a process launch included): 248 ms vs 216 ms in
+    /// this repo (huge, dirty), 141 ms vs 161 ms in a large clean checkout,
+    /// 71 ms vs 33 ms in a small repo -- i.e. -40 ms to +20 ms per call. The
+    /// callers are cell start with an upstream chain (`reviews::rebase_onto`),
+    /// the review merge/restack loop (`guardian_merge::drive_rebase`,
+    /// `worktree_has_changes`), the start and end of a feedback/auto-fix pass,
+    /// and the hourly ark sweep; none runs on a board request or under the
+    /// store lock.
+    fn status_porcelain(&self) -> Option<String> {
+        if self.repo.workdir()?.join(".gitmodules").exists() {
+            return None;
+        }
+        let config = self.repo.config().ok()?;
+        for key in [
+            "status.showuntrackedfiles",
+            "status.renames",
+            "status.relativepaths",
+        ] {
+            if config.get_entry(key).is_ok() {
+                return None;
+            }
+        }
+        let mut options = StatusOptions::new();
+        options
+            .show(StatusShow::IndexAndWorkdir)
+            .include_untracked(true)
+            .recurse_untracked_dirs(false)
+            .include_ignored(false)
+            .include_unmodified(false)
+            .renames_head_to_index(true)
+            .renames_index_to_workdir(true);
+        let statuses = self.repo.statuses(Some(&mut options)).ok()?;
+
+        let mut tracked: Vec<(Vec<u8>, String)> = Vec::new();
+        let mut untracked: Vec<(Vec<u8>, String)> = Vec::new();
+        let (mut index_added, mut index_deleted) = (false, false);
+        for entry in statuses.iter() {
+            let status = entry.status();
+            if status.is_ignored() || status.is_conflicted() {
+                return None;
+            }
+            if status.intersects(Status::INDEX_RENAMED | Status::WT_RENAMED) {
+                return None;
+            }
+            let path = entry.path_bytes().to_vec();
+            // git C-quotes anything outside plain printable ASCII (and spaces).
+            if !path
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-/+@,=%~".contains(b))
+            {
+                return None;
+            }
+            let shown = String::from_utf8(path.clone()).ok()?;
+            // A file removed from the index but still on disk is one libgit2
+            // entry (`INDEX_DELETED | WT_NEW`) and two lines in git's output:
+            // the staged delete, and the now-untracked file.
+            if status.contains(Status::WT_NEW) {
+                untracked.push((path.clone(), format!("?? {shown}\n")));
+                if !status.intersects(Status::INDEX_DELETED) {
+                    continue;
+                }
+            }
+            let x = if status.contains(Status::INDEX_NEW) {
+                index_added = true;
+                'A'
+            } else if status.contains(Status::INDEX_MODIFIED) {
+                'M'
+            } else if status.contains(Status::INDEX_DELETED) {
+                index_deleted = true;
+                'D'
+            } else if status.contains(Status::INDEX_TYPECHANGE) {
+                'T'
+            } else {
+                ' '
+            };
+            let y = if status.contains(Status::WT_MODIFIED) {
+                'M'
+            } else if status.contains(Status::WT_DELETED) {
+                'D'
+            } else if status.contains(Status::WT_TYPECHANGE) {
+                'T'
+            } else {
+                ' '
+            };
+            if x == ' ' && y == ' ' {
+                return None;
+            }
+            tracked.push((path, format!("{x}{y} {shown}\n")));
+        }
+        // An added file next to a deleted one may be a rename git would
+        // detect with its own similarity rules.
+        if index_added && index_deleted {
+            return None;
+        }
+        // git lists tracked changes first, then untracked, each by path.
+        tracked.sort();
+        untracked.sort();
+        Some(
+            tracked
+                .into_iter()
+                .chain(untracked)
+                .map(|(_, line)| line)
+                .collect(),
+        )
     }
 
     /// `git symbolic-ref [--quiet] [--short] <reference>` for a symbolic ref.
@@ -954,6 +1318,91 @@ mod tests {
     }
 
     #[test]
+    fn remote_verbose_matches_git() {
+        let dir = temp_repo("remote-v");
+        // No remotes: empty output.
+        config_same_as_git(&dir, &["remote", "-v"]);
+        run(
+            &dir,
+            &["remote", "add", "zeta", "https://example.com/z.git"],
+        );
+        run(
+            &dir,
+            &["remote", "add", "origin", "git@gitlab.com:acme/w.git"],
+        );
+        run(
+            &dir,
+            &["remote", "add", "fork-a_b.c", "https://example.com/f.git"],
+        );
+        run(
+            &dir,
+            &[
+                "remote",
+                "set-url",
+                "--push",
+                "origin",
+                "git@gitlab.com:acme/push.git",
+            ],
+        );
+        config_same_as_git(&dir, &["remote", "-v"]);
+        // Two fetch URLs: ordering rules are git's.
+        run(
+            &dir,
+            &[
+                "remote",
+                "set-url",
+                "--add",
+                "zeta",
+                "https://example.com/z2.git",
+            ],
+        );
+        assert!(try_config_read(&dir, &["remote", "-v"]).is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn config_get_regexp_matches_git_including_no_match() {
+        let dir = temp_repo("regexp");
+        let forms = [
+            "^remote\\..*\\.url$",
+            "^remote\\..*\\.glab-resolved(-base|-head)?$",
+            "^remote\\..*\\.gh-resolved$",
+        ];
+        // Nothing configured: git exits 1 with no output.
+        for pattern in forms {
+            let ours = try_config_read(&dir, &["config", "--get-regexp", pattern]).unwrap();
+            assert_eq!((ours.stdout.as_str(), ours.code), ("", 1), "{pattern}");
+        }
+        run(
+            &dir,
+            &["remote", "add", "origin", "git@gitlab.com:acme/w.git"],
+        );
+        run(
+            &dir,
+            &["remote", "add", "fork.dotted", "https://example.com/f.git"],
+        );
+        run(
+            &dir,
+            &["config", "remote.origin.glab-resolved", "gitlab.com/acme/w"],
+        );
+        run(
+            &dir,
+            &["config", "remote.origin.glab-resolved-base", "main"],
+        );
+        run(
+            &dir,
+            &["config", "remote.origin.glab-resolved-head", "side"],
+        );
+        run(&dir, &["config", "remote.fork.dotted.gh-resolved", "x/y"]);
+        for pattern in forms {
+            config_same_as_git(&dir, &["config", "--get-regexp", pattern]);
+        }
+        // Patterns outside the list are not this answer.
+        assert!(try_config_read(&dir, &["config", "--get-regexp", "^core\\."]).is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn multiple_values_and_url_rewrites_are_left_to_git() {
         let dir = temp_repo("config-odd");
         run(
@@ -1026,6 +1475,141 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(linked);
+    }
+
+    #[test]
+    fn environment_injected_config_disables_the_config_dependent_answers() {
+        assert!(!env_overrides_config(|_| false));
+        assert!(env_overrides_config(|name| name == "GIT_CONFIG_COUNT"));
+        assert!(env_overrides_config(|name| name == "GIT_CONFIG_PARAMETERS"));
+        assert!(!env_overrides_config(|name| name == "GIT_CONFIG_NOSYSTEM"));
+    }
+
+    #[test]
+    fn upstream_and_abbrev_head_match_git() {
+        let dir = temp_repo("upstream");
+        // A remote-tracking upstream (the remote needs its fetch refspec to
+        // map the branch, as in git) and a local-branch upstream.
+        run(&dir, &["remote", "add", "origin", "file:///nowhere"]);
+        run(&dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        run(&dir, &["config", "branch.main.remote", "origin"]);
+        run(&dir, &["config", "branch.main.merge", "refs/heads/main"]);
+        run(&dir, &["branch", "side"]);
+        run(&dir, &["branch", "--set-upstream-to=main", "side"]);
+        for args in [
+            &[
+                "rev-parse",
+                "--abbrev-ref",
+                "--symbolic-full-name",
+                "@{upstream}",
+            ][..],
+            &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+            &["rev-parse", "--symbolic-full-name", "@{upstream}"],
+            &["rev-parse", "--abbrev-ref", "@{upstream}"],
+            &[
+                "rev-parse",
+                "--abbrev-ref",
+                "--symbolic-full-name",
+                "main@{u}",
+            ],
+            &[
+                "rev-parse",
+                "--abbrev-ref",
+                "--symbolic-full-name",
+                "side@{upstream}",
+            ],
+            &["rev-parse", "--symbolic-full-name", "side@{u}"],
+            &["rev-parse", "--abbrev-ref", "HEAD"],
+        ] {
+            same_as_git(&dir, args);
+        }
+        // No upstream configured: git's error to report.
+        assert!(
+            try_read(
+                &dir,
+                &[
+                    "rev-parse",
+                    "--abbrev-ref",
+                    "--symbolic-full-name",
+                    "nope@{u}"
+                ]
+            )
+            .is_none()
+        );
+        run(&dir, &["checkout", "-q", "side"]);
+        same_as_git(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        run(&dir, &["checkout", "-q", "--detach"]);
+        same_as_git(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        assert!(
+            try_read(
+                &dir,
+                &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]
+            )
+            .is_none()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn status_porcelain_matches_git_across_states() {
+        let dir = temp_repo("status");
+        let status = ["status", "--porcelain"];
+        // Clean.
+        same_as_git(&dir, &status);
+        assert_eq!(try_read(&dir, &status).unwrap(), "");
+        // Worktree edit, staged edit, both, staged new, deleted, untracked file
+        // and directory, nested repo, ignored file.
+        std::fs::write(dir.join("b.txt"), "b\n").unwrap();
+        std::fs::write(dir.join("c.txt"), "c\n").unwrap();
+        std::fs::write(dir.join("d.txt"), "d\n").unwrap();
+        run(&dir, &["add", "."]);
+        run(&dir, &["commit", "-q", "-m", "more"]);
+        std::fs::write(dir.join("a.txt"), "one\ntwo\nthree\n").unwrap(); // worktree edit
+        std::fs::write(dir.join("b.txt"), "b2\n").unwrap();
+        run(&dir, &["add", "b.txt"]); // staged edit
+        std::fs::write(dir.join("c.txt"), "c2\n").unwrap();
+        run(&dir, &["add", "c.txt"]);
+        std::fs::write(dir.join("c.txt"), "c3\n").unwrap(); // staged + worktree edit
+        std::fs::remove_file(dir.join("d.txt")).unwrap(); // worktree delete
+        std::fs::write(dir.join("new.txt"), "n\n").unwrap();
+        run(&dir, &["add", "new.txt"]); // staged new
+        std::fs::write(dir.join("zeta.txt"), "z\n").unwrap(); // untracked
+        std::fs::create_dir_all(dir.join("adir/sub")).unwrap();
+        std::fs::write(dir.join("adir/sub/x.txt"), "x\n").unwrap(); // untracked dir
+        std::fs::write(dir.join(".gitignore"), "*.log\n").unwrap();
+        std::fs::write(dir.join("skip.log"), "ignored\n").unwrap();
+        same_as_git(&dir, &status);
+        // A staged add next to a staged delete might be a rename git would
+        // detect itself: left to git.
+        run(&dir, &["rm", "-q", "--cached", "a.txt"]);
+        assert!(try_read(&dir, &status).is_none(), "possible rename");
+        let _ = std::fs::remove_dir_all(dir);
+
+        // A staged delete on its own (the file stays on disk, so git also
+        // lists it as untracked) is two lines for one libgit2 entry.
+        let dir = temp_repo("status-staged-delete");
+        run(&dir, &["rm", "-q", "--cached", "a.txt"]);
+        same_as_git(&dir, &status);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn status_porcelain_leaves_renames_odd_paths_and_special_config_to_git() {
+        let dir = temp_repo("status-odd");
+        let status = ["status", "--porcelain"];
+        // A rename: git reports `R`, libgit2's heuristics may differ.
+        run(&dir, &["mv", "a.txt", "renamed.txt"]);
+        assert!(try_read(&dir, &status).is_none(), "rename");
+        run(&dir, &["reset", "-q", "--hard"]);
+        same_as_git(&dir, &status);
+        // A path git would quote.
+        std::fs::write(dir.join("has space.txt"), "x").unwrap();
+        assert!(try_read(&dir, &status).is_none(), "quoted path");
+        std::fs::remove_file(dir.join("has space.txt")).unwrap();
+        // Config libgit2 does not honour.
+        run(&dir, &["config", "status.showUntrackedFiles", "no"]);
+        assert!(try_read(&dir, &status).is_none(), "status config");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -172,6 +172,11 @@ impl GitVcs {
         if let Some(output) = crate::vcs_refs::try_git_path(root, args) {
             return Ok(output);
         }
+        // Questions answered by the checkout's layout alone (git dir, common
+        // dir, top level, hooks dir).
+        if let Some(output) = crate::vcs_refs::try_rev_parse_layout(root, args) {
+            return Ok(output);
+        }
         // The registered worktrees are directories under `.git/worktrees`.
         if let Some(output) = crate::vcs_refs::try_worktree_list(root, args) {
             return Ok(output);
