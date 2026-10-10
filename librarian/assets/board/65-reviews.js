@@ -2013,6 +2013,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           return;
         }
         reviewDetailLoading = null;
+        applyPendingInspectorHash(g);
         // RAL-14: reorder is allowed while the review is still open — not once it
         // is merged/approved/deployed (those branches are considered merged/shipped).
         const canReorder = !["merged", "approved", "cancelled", "deployed"].includes(g.status);

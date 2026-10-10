@@ -1,4 +1,4 @@
-﻿      // ---------- center graph ----------
+      // ---------- center graph ----------
       /**
        * Renders the center dependency-graph pane for the selected squad.
        * @returns {void}
@@ -681,6 +681,7 @@
         // live-terminal peek box keeps its own atBottom-aware restore --
         // see preservePaneScroll's comment for why that's a separate helper.
         preservePaneScroll(reviewDetailScrollEl(), renderReviewDetail);
+        syncHash(true);
       }
       /**
        * Navigates to the Squads tab and selects a squad.
