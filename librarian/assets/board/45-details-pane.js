@@ -247,6 +247,8 @@
         if (!setDetailsHtml(el, html)) return;
         attachPeekResizeHandlers();
         restorePeekScrollPositions(); // RAL-471: the innerHTML rewrite above just destroyed/recreated any peek `<pre>` nodes, dropping their scroll position
+        restorePromptBoxScroll();
+        restoreAgentLogScroll();
         // The markup above carries a stale duration for anything still
         // running; fill in the live values immediately rather than leaving
         // them wrong until the next one-second tick.
@@ -858,11 +860,6 @@
           : "";
         const terminalBtns = (() => {
           const scope = si === -1 ? "task" : "cell";
-          const liveViewCapable = v.kind === "prompt" || v.kind === "command";
-          if (!liveViewCapable) {
-            const tip = "Terminal access is not available — this proof step has no execution backend to show a live view for.";
-            return `<div class="btn-row"><span data-tip="${tip}"><button class="btn primary" disabled style="pointer-events:none">Show Live View</button></span></div>`;
-          }
           // RAL-102/RAL-151: every command/prompt proof step runs inside
           // tmux, so the dropdown is available for either kind — "not
           // currently live" is handled gracefully at click/peek time, not by
@@ -871,7 +868,16 @@
           // shell command), so it's omitted outright for command-kind
           // rather than shown disabled.
           const key = `proof|${r.id}|${ti}|${scope}|${si}|${vi}`;
-          const previewBtn = `<button class="btn primary" data-click="togglePeek" data-key="${esc(key)}" style="border-radius:6px 0 0 6px" data-tip="Peek at this proof step's live tmux pane — auto-refreshing, read-only.\nNothing you do here is ever sent to the agent.\nShows 'terminal session has ended' once the proof step isn't running.">${peekOpen[key] ? "Hide Live View" : "Show Live View"}</button>`;
+          const live = squadLiveCtx({
+            baseKey: key,
+            title: `proof ${vi} · ${v.kind === "command" ? "command" : (v.agent || "agent")}`,
+            canThink: v.thinking_capable !== false,
+            promptText: v.spec || "",
+            promptHint: v.kind === "command" ? "The command this proof step runs." : "The instruction dispatched to this proof step's agent.",
+            withAttempts: true,
+            currentMeta: v.state || "",
+            closeKey: key,
+          });
           const openAgentItem = v.kind === "prompt"
             ? openAgentMenuItem(key, "openAgentProofTerminalMenuItem",
                 { squadId: r.id, ti, scope, si, vi },
@@ -884,7 +890,7 @@
             + terminalMenuItem(key, "View Attempt History",
                 "toggleHistoryMenuItem", {},
                 "List every durably-persisted terminal-log attempt for this proof step, including past reattaches.\nWho/when: the pane died or reattached and you need to see what happened right before, after the live view is gone.\nEach attempt's log survives pane death and daemon restarts.");
-          return `<div class="btn-row" style="position:relative;gap:0">${previewBtn}${terminalMenuHtml(key, items)}</div>${peekBox(key, null, null, null, v.thinking_capable)}${historyBox(key)}`;
+          return `<div class="btn-row" style="position:relative;gap:0">${squadLiveOpenBtn(key, "this proof step")}${terminalMenuHtml(key, items)}</div>${squadLiveSlot(live)}${historyBox(key)}`;
         })();
         return `<div class="dhead"><span class="k">✓ proof step</span></div>
           <div class="kv-row"><span class="k">id</span><span class="v mono">${esc(v.id || "—")}</span></div>
@@ -1160,7 +1166,16 @@
             // so it's omitted outright for a command cell rather than
             // shown disabled.
             const key = `cell|${r.id}|${sel.taskIdx}|${sel.cellIdx}`;
-            const previewBtn = `<button class="btn primary" data-click="togglePeek" data-key="${esc(key)}" style="border-radius:6px 0 0 6px" data-tip="Peek at this cell's live tmux pane — auto-refreshing, read-only.\nNothing you do here is ever sent to the agent.\nShows 'terminal session has ended' once the cell isn't running.">${peekOpen[key] ? "Hide Live View" : "Show Live View"}</button>`;
+            const live = squadLiveCtx({
+              baseKey: key,
+              title: `cell ${sel.taskIdx}.${sel.cellIdx} · ${s.agent || "command"}`,
+              canThink: s.thinking_capable !== false,
+              promptText: (s.command || s.prompt || ""),
+              promptHint: s.command ? "The command this cell runs." : "The instruction dispatched to this cell's agent.",
+              withAttempts: true,
+              currentMeta: s.state || "",
+              closeKey: key,
+            });
             // Open Agent spawns a window on the *daemon's own desktop* — it
             // has no way to reach a remote cell's conversation, so a remote
             // cell gets "Remote Terminal" (the WebSocket relay) instead of
@@ -1189,7 +1204,7 @@
               + terminalMenuItem(key, "View Attempt History",
                   "toggleHistoryMenuItem", {},
                   "List every durably-persisted terminal-log attempt for this cell, including past reattaches.\nWho/when: the pane died or reattached and you need to see what happened right before, after the live view is gone.\nEach attempt's log survives pane death and daemon restarts.");
-            return `<div class="btn-row" style="position:relative;gap:0">${previewBtn}${terminalMenuHtml(key, items)}</div>${peekBox(key, s.started_at_ms, s.detached_at_ms, s.finished_at_ms, s.thinking_capable)}${historyBox(key)}`;
+            return `<div class="btn-row" style="position:relative;gap:0">${squadLiveOpenBtn(key, "this cell")}${terminalMenuHtml(key, items)}</div>${squadLiveSlot(live)}${historyBox(key)}`;
           })()}`;
       }
       // CCTL-115: render each command line elided in a fixed-height box; a

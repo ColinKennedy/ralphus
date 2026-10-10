@@ -4383,7 +4383,7 @@ tables of its own:
 
 - **`ralphus history <ID>` (no `--live`)** — a one-shot, non-blocking
   snapshot. If the id's tmux session is currently live, this is the same
-  `.../pane` content the board's "Show Live View" reads (see `GET
+  `.../pane` content the board's Live view reads (see `GET
   .../cells/{ti}/{si}/pane` / `GET .../proofs/{task_idx}/{scope}/{cell_idx}/{proof_idx}/pane`
   above). Once the tmux session is gone, `.../pane` itself may still return a
   persisted last-pane-content snapshot (RAL-102 follow-up —
@@ -4433,7 +4433,7 @@ alongside `active`/`content`:
 `last_activity_ms` is the Unix-epoch-milliseconds time the daemon last
 observed *fresh* pane output (strictly more lines than the previous poll)
 for this session — `null` once the session has ended or before it has
-produced any output yet. The board's Live View ("peek box") uses it to show
+produced any output yet. The board's Live View (the live-view widget) uses it to show
 an absolute "last activity" timestamp and to distinguish a quiet-but-healthy
 long-running command (e.g. a `cargo test` pass inside a Guardian
 quality-check) from one that has silently stopped producing output.
@@ -4529,7 +4529,7 @@ it's not on disk).
   partially survive at the edge — an inherent limitation of range-based
   redaction on top of substring-based scrubbing).
 
-**Wired into the board UI** (Phase 2G-A): the Live View peek box is driven
+**Wired into the board UI** (Phase 2G-A): the Live View widget is driven
 from this endpoint as a byte-addressed "tape" rather than stitched onto the
 line-based `GET .../pane`, which sidesteps the coordinate-space problem
 instead of solving it — the two endpoints still share no common offset space,
