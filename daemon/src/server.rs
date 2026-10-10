@@ -8644,18 +8644,18 @@ fn reject_invalid_effort(agent: &str, effort: &str) -> Option<Reply> {
             vec![],
         ));
     }
-    if let Some(levels) = ralphus_core::schema::effort_levels_for_agent(agent)
-        && !levels.contains(&effort)
-    {
-        return Some(error(
-            400,
-            "bad_request",
-            &format!(
-                "effort: '{effort}' is not a valid level for '{agent}' (expected one of: {})",
-                levels.join(", ")
-            ),
-            vec![],
-        ));
+    if let Some(levels) = ralphus_core::schema::effort_levels_for_agent(agent) {
+        if !levels.contains(&effort) {
+            return Some(error(
+                400,
+                "bad_request",
+                &format!(
+                    "effort: '{effort}' is not a valid level for '{agent}' (expected one of: {})",
+                    levels.join(", ")
+                ),
+                vec![],
+            ));
+        }
     }
     None
 }

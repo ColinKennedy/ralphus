@@ -2001,19 +2001,19 @@ fn check_effort(
                 ),
                 line,
             );
-        } else if let Some(levels) = crate::schema::effort_levels_for_agent(agent)
-            && !levels.contains(&level)
-        {
-            let line = ctx.key_line(header, "effort");
-            ctx.error(
-                &format!("{path}.effort"),
-                ErrorKind::InvalidValue,
-                format!(
-                    "'effort' \"{level}\" is not valid for the '{agent}' agent; expected one of: {}",
-                    levels.join(", ")
-                ),
-                line,
-            );
+        } else if let Some(levels) = crate::schema::effort_levels_for_agent(agent) {
+            if !levels.contains(&level) {
+                let line = ctx.key_line(header, "effort");
+                ctx.error(
+                    &format!("{path}.effort"),
+                    ErrorKind::InvalidValue,
+                    format!(
+                        "'effort' \"{level}\" is not valid for the '{agent}' agent; expected one of: {}",
+                        levels.join(", ")
+                    ),
+                    line,
+                );
+            }
         }
     }
 }
