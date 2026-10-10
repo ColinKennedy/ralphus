@@ -28,19 +28,29 @@ on worktrees are not "touching the daemon" and are fine.
 
 When ralphus itself is driving the work (a cell, a proof step, or a Guardian
 feedback/auto-fix pass developing ralphus), do not run anything that starts
-another daemon: `scripts/check-initialize-exercises.sh`, `ralphus initialize
-<exercise>` (every guided exercise starts its own throwaway daemon), or a
-hand-launched `ralphus-daemon serve` on another port.
+another daemon sharing the host's psmux instance: `scripts/check-initialize-exercises.sh`,
+`ralphus initialize <exercise>` (every guided exercise starts its own throwaway
+daemon), or a hand-launched `ralphus-daemon serve` on another port.
 
 Every daemon start calls `tmux::reap_orphaned_sessions_at_startup`
 (`daemon/src/tmux.rs`), which force-kills every `ralphus_`-prefixed tmux
-server **machine-wide** -- not only the new daemon's own. The host daemon's
-live sessions go with it, including the pane your agent is running in. The
-symptom is a branch/cell that fails with `runner produced no result file ...
-os error 2` and a pane tail ending in `tmux server process exit code:
-unknown`, repeating on every retry because the retry re-runs the same
-command. The isolated state root and port the exercise uses do not help: the
-reap is not scoped by them.
+server **in the daemon's own psmux instance** -- the servers whose
+`PSMUX_DATA_DIR` equals the daemon's (unset equals unset). It is *not* scoped by
+state root, database or port. A daemon that leaves `PSMUX_DATA_DIR` unset shares
+the default instance with the host daemon, so its live sessions go with it,
+including the pane your agent is running in. The symptom is a branch/cell that
+fails with `runner produced no result file ... os error 2` and a pane tail
+ending in `tmux server process exit code: unknown`, repeating on every retry
+because the retry re-runs the same command.
+
+A daemon with its own `PSMUX_DATA_DIR` cannot reach the host's sessions
+(verified 2026-10-10: three starts of an isolated daemon on port 7899 with
+`PSMUX_DATA_DIR=~/.ralphus/psmux-7899` left the host daemon's live tmux session
+running). `scripts/build-debug.sh --daemon-port N` and the initialize exercises
+set one; a hand-launched `ralphus-daemon serve` does not unless you export it.
+The rule above therefore stands for any daemon you cannot show has a private
+`PSMUX_DATA_DIR` -- and when you do start one on purpose, snapshot the
+`ralphus_` tmux PIDs before and after. See [`gotchas.md`](gotchas.md).
 
 Do this instead:
 

@@ -5,8 +5,8 @@
 use std::io::Read;
 
 use ralphus_ssh_provider::{
-    UNIMPLEMENTED_VERBS, capabilities, cleanup, exec, fileops, job, materialize, ping, protocol,
-    provision, terminal,
+    UNIMPLEMENTED_VERBS, capabilities, channel, cleanup, exec, fileops, job, materialize, ping,
+    protocol, provision, terminal,
 };
 
 struct Args {
@@ -353,6 +353,17 @@ fn main() {
                     report_failure(&args.verb, &args.uri, &e);
                     protocol::reply_err(e);
                 }
+            }
+        }
+        "channel" => {
+            // Newline-delimited requests on stdin, one reply line each on
+            // stdout, until stdin closes. A transport failure ends the verb
+            // without a reply, which the daemon reads as "fall back to a
+            // one-shot spawn".
+            let config = exec_config(&args);
+            if let Err(e) = channel::serve(&args.uri, &config) {
+                report_failure(&args.verb, &args.uri, &e);
+                std::process::exit(1);
             }
         }
         "cleanup" => {

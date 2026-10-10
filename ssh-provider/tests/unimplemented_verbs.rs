@@ -23,14 +23,3 @@ fn retire_is_declined_in_the_form_the_daemon_reads_as_an_opt_out() {
     let error = value["error"].as_str().unwrap_or_default();
     assert!(error.contains("does not implement"), "{error}");
 }
-
-#[test]
-fn channel_is_declined_the_same_way() {
-    let value = reply("channel");
-    assert!(
-        value["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("does not implement")
-    );
-}

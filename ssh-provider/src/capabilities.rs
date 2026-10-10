@@ -36,6 +36,7 @@ const SUPPORTED_OPS: &[&str] = &[
     "cleanup",
     "capabilities",
     "terminal",
+    "channel",
 ];
 
 /// Run `capabilities`: best-effort OS/arch probe plus static/derived facts
@@ -126,10 +127,7 @@ mod tests {
         assert!(ops.iter().any(|v| v == "run"));
         assert!(ops.iter().any(|v| v == "terminal"));
         assert!(ops.iter().any(|v| v == "materialize"));
-        assert!(
-            !ops.iter().any(|v| v == "channel"),
-            "channel is not implemented"
-        );
+        assert!(ops.iter().any(|v| v == "channel"));
     }
 
     #[test]

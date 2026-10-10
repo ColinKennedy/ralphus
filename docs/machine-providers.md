@@ -613,18 +613,30 @@ reaches any host you already have SSH access to — no agent to install, no
 port to open, no second daemon to keep alive. It is the first real (not
 throwaway-example) provider in the repo.
 
-> **Status: every verb except `channel` and `retire` is implemented** —
+> **Status: every verb except `retire` is implemented** —
 > `exec`, `status`, `stream`, `cancel`, `job-cleanup`, `provision`, `run`,
 > `read-file`, `write-file`, `remove-path`, `materialize`, `cleanup`,
-> `terminal`, `ping`, and `capabilities`. Configured targets use durable
+> `terminal`, `ping`, `capabilities`, and `channel`. Configured targets use durable
 > asynchronous execution; legacy invocations without a matching target policy
 > preserve the synchronous `exec` result path. `provision` (RAL-355 Phase 4)
 > durably clones/fetches a project and creates a `git worktree` per task
 > branch under the machine's configured `remote_root` (see the
-> "Configuration" and "target" glossary entry). `channel` and `retire` reply
-> "does not implement" — both are optional, and for `retire` that exact reply
-> is what the daemon records as this provider opting out of automatic
-> worktree retirement.
+> "Configuration" and "target" glossary entry). `retire` replies "does not
+> implement" — it is optional, and that exact reply is what the daemon records
+> as this provider opting out of automatic worktree retirement.
+>
+> **`channel` keeps one `ssh` session open for a whole merge.** The verb runs
+> `ssh <target> -- sh` once and feeds each `run` request to the remote shell as
+> a script (the same quoting and root-scoping as the one-shot `run`, with the
+> command's stdin detached so it cannot swallow the next request), reading each
+> command's exit code from a per-request marker line. That replaces a provider
+> process, an `ssh` process and a handshake per command with one of each per
+> machine — which matters on a Windows daemon host, where OpenSSH has no
+> `ControlMaster`. Turn it on by registering the provider with `--channel`
+> (`ralphus machine register --scheme ssh --program ralphus-ssh-provider
+> --channel`); a dead session ends the verb without a reply and the daemon
+> falls back to a one-shot spawn for that command. Commands in one session run
+> in one remote shell, one at a time, each starting with an absolute `cd`.
 
 ### The `<uri>` forms
 

@@ -649,13 +649,25 @@ impl ProviderRunner {
                 }
             ));
         }
-        let mut resp: ProviderResponse = serde_json::from_str(trimmed).map_err(|e| {
+        let resp: ProviderResponse = serde_json::from_str(trimmed).map_err(|e| {
             format!(
                 "machine provider {:?} returned unparseable JSON: {e} ({})",
                 self.scheme,
                 redact_remote_text(&truncate(trimmed, 300))
             )
         })?;
+        self.check_response(verb, resp)
+    }
+
+    /// The checks every provider reply gets, whether it came from a one-shot
+    /// spawn or a channel: secrets redacted, the contract version accepted,
+    /// and an `ok: false` reply turned into an error rather than read as an
+    /// empty success.
+    fn check_response(
+        &self,
+        verb: &str,
+        mut resp: ProviderResponse,
+    ) -> Result<ProviderResponse, String> {
         redact_provider_response(&mut resp);
         // A provider declaring the wrong contract version is refused rather
         // than trusted -- the whole point of versioning it (1.13).
@@ -1501,9 +1513,10 @@ impl ProviderRunner {
     pub fn run_vcs(&self, req: &RunRequest, spec: &RunnerSpec) -> Result<String, String> {
         let payload = serde_json::to_string(req)
             .map_err(|e| format!("could not serialize run request: {e}"))?;
-        let resp = self
-            .run_via_channel(&payload)
-            .map_or_else(|| self.invoke(VERB_RUN, &payload, spec), Ok)?;
+        let resp = match self.run_via_channel(&payload) {
+            Some(resp) => self.check_response(VERB_RUN, resp)?,
+            None => self.invoke(VERB_RUN, &payload, spec)?,
+        };
         match resp.exit_code {
             Some(0) | None => Ok(resp.stdout.unwrap_or_default()),
             Some(code) => Err(format!(
@@ -2760,6 +2773,48 @@ else:
         assert_eq!(b, c);
         assert!(a.starts_with("pid="), "{a}");
         crate::channel::close("chantest", "A");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_channel_reply_of_ok_false_is_an_error_not_an_empty_success() {
+        // A provider that rejects a request over the channel (a `cwd` outside
+        // its remote root, say) gets the same treatment as a one-shot spawn
+        // that rejects it: the command fails, with the provider's reason.
+        let dir = std::env::temp_dir().join(format!("ral185-rrchanerr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let py = dir.join("reject.py");
+        std::fs::write(
+            &py,
+            [
+                "import sys",
+                "for line in sys.stdin:",
+                "    if not line.strip():",
+                "        continue",
+                r#"    print('{"ok":false,"protocol_version":1,"error":"cwd is outside the remote root"}', flush=True)"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let provider = ProviderRunner::new(
+            "python",
+            vec![py.to_string_lossy().into_owned()],
+            "chanerr",
+            "A",
+        )
+        .with_channel(true);
+        let req = RunRequest {
+            cwd: "/elsewhere".to_string(),
+            program: "git".to_string(),
+            args: vec!["status".to_string()],
+            env: BTreeMap::new(),
+        };
+        let err = provider
+            .run_vcs(&req, &spec(Some("chanerr:A")))
+            .expect_err("a rejected request must not look like success");
+        assert!(err.contains("cwd is outside the remote root"), "{err}");
+        crate::channel::close("chanerr", "A");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

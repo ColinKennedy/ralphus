@@ -4,7 +4,6 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 
 use rusqlite::{OptionalExtension, params};
@@ -114,7 +113,7 @@ fn containing_worktree<'a>(cwd: &str, registered: &'a HashMap<String, PathBuf>) 
 }
 
 fn git(root: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
+    let output = ralphus_core::git_spawn::command(args)
         .arg("-C")
         .arg(root)
         .args(args)
@@ -643,6 +642,7 @@ fn sweep_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_DIR: AtomicU64 = AtomicU64::new(0);

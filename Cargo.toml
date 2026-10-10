@@ -123,18 +123,23 @@ cron = "=0.15.0"
 # crate's raw-mode support genuinely needs the platform backend each
 # provides, and only one binary in the workspace depends on it at all.
 crossterm = "0.28"
-# Test-only (`ralphus-daemon`'s `[dev-dependencies]`): in-process repo
-# scaffolding for the guardian_merge/worktrees/pr fixture-heavy tests
-# (PR_SLOWNESS.local.md) -- building a temp repo's base commits/branches/local
+# libgit2, used two ways. (1) `ralphus-daemon`'s `[dev-dependencies]`:
+# in-process repo scaffolding for the guardian_merge/worktrees/pr
+# fixture-heavy tests -- building a temp repo's base commits/branches/local
 # "remote" through libgit2 avoids one real `git.exe` process spawn per
 # fixture step, which is what actually costs time on Windows (measured
-# ~230ms/spawn regardless of git's own work). NOT a production dependency:
-# the daemon's real git operations stay on real `git` subprocesses
-# (`daemon/src/vcs.rs`) for behavioral fidelity (rerere, worktree quirks,
-# credential/hook handling) that libgit2 does not reproduce identically.
+# ~230ms/spawn regardless of git's own work). (2) `ralphus-runner`'s
+# `[dependencies]` (`runner/src/git_inproc.rs`, also linked into the daemon):
+# a few hot read-only questions -- the live diff watcher's change summary and
+# `log`/`rev-list --count` over a linear range -- are answered in-process
+# instead of spawning git, with a subprocess fallback for anything libgit2
+# cannot answer exactly and a `RALPHUS_GIT_INPROC=0` kill switch. Every
+# mutation, fetch/push, and anything that needs hooks, rerere, filters or
+# credential helpers stays on real `git` subprocesses (`daemon/src/vcs.rs`)
+# for behavioral fidelity libgit2 does not reproduce.
 # `default-features = false` drops the `ssh`/`https` remote-transport
-# backends (and their libssh2/OpenSSL builds) since every fixture repo is
-# local-only; local `clone`/`push`/`fetch` between paths needs neither.
+# backends (and their libssh2/OpenSSL builds): nothing here talks to a
+# remote through libgit2.
 git2 = { version = "0.19", default-features = false }
 
 # Keep the dev profile fast to compile (this project's whole reason for the
