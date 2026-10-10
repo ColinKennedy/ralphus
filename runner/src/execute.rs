@@ -410,6 +410,15 @@ fn check_context_limit_support(spec: &CellSpec, backend: &dyn ModelBackend) -> R
             spec.agent
         ));
     }
+    if spec.effort.is_some() && !backend.supports_effort() {
+        return Err(format!("agent {:?} does not support effort", spec.agent));
+    }
+    if spec.temperature.is_some() && !backend.supports_temperature() {
+        return Err(format!(
+            "agent {:?} does not support temperature",
+            spec.agent
+        ));
+    }
     Ok(())
 }
 
@@ -517,6 +526,8 @@ fn run_with_backend(
             thrash_max_compactions: spec.thrash_max_compactions,
             thrash_min_turn_gap: spec.thrash_min_turn_gap,
             maximum_tool_output_tokens: spec.maximum_tool_output_tokens,
+            effort: spec.effort.as_deref(),
+            temperature: spec.temperature,
             allow_personal_settings: spec.allow_personal_settings,
             allow_personal_memory: spec.allow_personal_memory,
             retry_attempt: spec.retry_attempt,
@@ -656,6 +667,8 @@ fn run_with_backend(
                 thrash_max_compactions: spec.thrash_max_compactions,
                 thrash_min_turn_gap: spec.thrash_min_turn_gap,
                 maximum_tool_output_tokens: spec.maximum_tool_output_tokens,
+                effort: spec.effort.as_deref(),
+                temperature: spec.temperature,
                 allow_personal_settings: spec.allow_personal_settings,
                 allow_personal_memory: spec.allow_personal_memory,
                 retry_attempt: spec.retry_attempt,
@@ -1694,6 +1707,8 @@ RALPHUS_BEARING: accepted: renamed every call site"
             thrash_max_compactions: None,
             thrash_min_turn_gap: None,
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             allow_personal_settings: false,
             allow_personal_memory: false,
             retry_attempt: 0,
@@ -2027,6 +2042,8 @@ RALPHUS_APPRAISAL: {{\"score\": {score}, \"summary\": \"s\"}}"
             thrash_max_compactions: None,
             thrash_min_turn_gap: None,
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             allow_personal_settings: false,
             allow_personal_memory: false,
             retry_attempt: 0,

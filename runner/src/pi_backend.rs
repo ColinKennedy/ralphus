@@ -295,6 +295,11 @@ impl ModelBackend for PiBackend {
             options.auto_compact_threshold,
             options.maximum_tool_output_tokens,
         )?;
+        apply_temperature_setting(
+            known_config_dir.as_deref(),
+            options.model,
+            options.temperature,
+        )?;
 
         let program = self.launch_program();
         let compound = crate::cli_agent_common::launcher_requires_shell(&program);
@@ -403,6 +408,14 @@ impl ModelBackend for PiBackend {
     }
 
     fn supports_maximum_tool_output_tokens(&self) -> bool {
+        true
+    }
+
+    fn supports_effort(&self) -> bool {
+        true
+    }
+
+    fn supports_temperature(&self) -> bool {
         true
     }
 
@@ -545,6 +558,93 @@ fn apply_context_settings_in(
         write_compaction_reserve_tokens(dir, v)?;
     }
     Ok(())
+}
+
+/// RAL-607: delivers `RunOptions::temperature` as
+/// `providers.<provider>.modelOverrides.<model-id>.samplingParams.temperature`
+/// in `models.json`. Like the context-window override it needs a
+/// `"<provider>/<model-id>"` model and a resolved config directory. Pi only
+/// applies sampling params for OpenAI-compatible APIs (Ollama included); other
+/// providers ignore or suppress them, so a warning is logged when the
+/// provider is not one known to honor the setting.
+fn apply_temperature_setting(
+    dir: Option<&Path>,
+    model: Option<&str>,
+    temperature: Option<f64>,
+) -> Result<(), BackendError> {
+    let Some(temperature) = temperature else {
+        return Ok(());
+    };
+    let dir = dir.ok_or_else(|| {
+        BackendError("pi: temperature requires PI_CODING_AGENT_DIR to be set".to_string())
+    })?;
+    let (provider, model_id) = split_provider_model(model).ok_or_else(|| {
+        BackendError(
+            "pi: temperature requires the cell's `model` to be \"<provider>/<model-id>\" so              the override can target pi's models.json"
+                .to_string(),
+        )
+    })?;
+    if !provider_honors_sampling_params(provider) {
+        let message = format!(
+            "pi: temperature is set for provider '{provider}', which may not be an              OpenAI-compatible API; pi can silently ignore it there"
+        );
+        eprintln!("{message}");
+        crate::cartographer::emit(
+            "pi",
+            &message,
+            "warning",
+            crate::cartographer::EventContext::default(),
+            serde_json::json!({ "provider": provider, "temperature": temperature }),
+        );
+    }
+    write_model_temperature(dir, provider, model_id, temperature)
+}
+
+/// Whether `provider` is a Pi provider known to be OpenAI-compatible and so
+/// honor `samplingParams` (RAL-607). Best effort: an unrecognized provider
+/// may still be OpenAI-compatible, so callers only warn.
+fn provider_honors_sampling_params(provider: &str) -> bool {
+    matches!(
+        provider,
+        "openai"
+            | "ollama"
+            | "openrouter"
+            | "lmstudio"
+            | "llama.cpp"
+            | "vllm"
+            | "groq"
+            | "together"
+            | "deepseek"
+            | "mistral"
+            | "xai"
+            | "cerebras"
+            | "fireworks"
+    )
+}
+
+/// Merges `providers.<provider>.modelOverrides.<model_id>.samplingParams.temperature`
+/// into `dir`'s `models.json`, preserving every other key (RAL-607).
+fn write_model_temperature(
+    dir: &Path,
+    provider: &str,
+    model_id: &str,
+    temperature: f64,
+) -> Result<(), BackendError> {
+    let path = dir.join("models.json");
+    let mut root = read_json_object(&path)?;
+    let sampling = nested_object(
+        &mut root,
+        &path,
+        &[
+            "providers",
+            provider,
+            "modelOverrides",
+            model_id,
+            "samplingParams",
+        ],
+    )?;
+    sampling.insert("temperature".to_string(), Value::from(temperature));
+    write_json_object(&path, &root)
 }
 
 /// Splits a `"<provider>/<model-id>"` string into its two halves, requiring
@@ -702,6 +802,10 @@ fn build_args(
     if let Some(model) = options.model {
         args.push("--model".to_string());
         args.push(model.to_string());
+    }
+    if let Some(level) = options.effort {
+        args.push("--thinking".to_string());
+        args.push(level.to_string());
     }
     if let Some(path) = system_prompt_file {
         args.push("--append-system-prompt".to_string());
@@ -2278,6 +2382,47 @@ mod tests {
         assert_eq!(args[1], guard.display().to_string());
         assert!(args.contains(&"--approve".to_string()));
         assert!(args.contains(&"-p".to_string()));
+    }
+
+    #[test]
+    fn build_args_emits_thinking_for_effort() {
+        let guard = Path::new("C:/state/pi-extensions/ralphus-pi-workspace-guard-test.mjs");
+        let args = build_args(
+            &RunOptions {
+                effort: Some("high"),
+                ..Default::default()
+            },
+            None,
+            guard,
+        );
+        assert!(args.windows(2).any(|w| w == ["--thinking", "high"]));
+        let none = build_args(&RunOptions::default(), None, guard);
+        assert!(!none.iter().any(|a| a == "--thinking"));
+    }
+
+    #[test]
+    fn apply_temperature_setting_writes_sampling_params() {
+        let dir = temp_settings_dir("temperature-write");
+        apply_temperature_setting(Some(&dir), Some("ollama/qwen3"), Some(0.25)).unwrap();
+        let text = std::fs::read_to_string(dir.join("models.json")).unwrap();
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            v["providers"]["ollama"]["modelOverrides"]["qwen3"]["samplingParams"]["temperature"],
+            0.25
+        );
+    }
+
+    #[test]
+    fn apply_temperature_setting_is_a_noop_when_unset() {
+        assert!(apply_temperature_setting(None, None, None).is_ok());
+    }
+
+    #[test]
+    fn apply_temperature_setting_requires_provider_qualified_model() {
+        let dir = temp_settings_dir("temperature-nomodel");
+        let err = apply_temperature_setting(Some(&dir), Some("qwen3"), Some(0.5)).unwrap_err();
+        assert!(err.0.contains("<provider>/<model-id>"));
+        assert!(!dir.join("models.json").exists());
     }
 
     /// RAL-385: the prompt is piped to stdin, never passed as an argument --

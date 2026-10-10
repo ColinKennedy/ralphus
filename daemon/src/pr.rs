@@ -2564,6 +2564,8 @@ fn synthesize_pr_text(
         maximum_context: None,
         auto_compact_threshold: None,
         maximum_tool_output_tokens: None,
+        effort: None,
+        temperature: None,
         proof: false,
         trace_context: trace_context.map(str::to_string),
         resume_agent_session_id: None,

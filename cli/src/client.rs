@@ -1654,6 +1654,8 @@ impl DaemonClient {
         auto_compact_threshold: Option<&str>,
         maximum_context: Option<&str>,
         maximum_tool_output_tokens: Option<&str>,
+        effort: Option<&str>,
+        temperature: Option<&str>,
         system_prompt: Option<&str>,
     ) -> Result<Value, DaemonError> {
         let mut body = json!({"kind": "cell", "task_idx": task_idx, "cell_idx": cell_idx});
@@ -1677,6 +1679,8 @@ impl DaemonClient {
             "maximum_tool_output_tokens",
             maximum_tool_output_tokens.map(str::to_string),
         );
+        set_if_some(&mut body, "effort", effort.map(str::to_string));
+        set_if_some(&mut body, "temperature", temperature.map(str::to_string));
         set_if_some(
             &mut body,
             "system_prompt",

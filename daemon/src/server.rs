@@ -8482,6 +8482,10 @@ struct EditBody {
     #[serde(default)]
     maximum_tool_output_tokens: Option<String>,
     #[serde(default)]
+    effort: Option<String>,
+    #[serde(default)]
+    temperature: Option<String>,
+    #[serde(default)]
     system_prompt: Option<String>,
 }
 
@@ -8592,6 +8596,85 @@ fn reject_unsupported_maximum_tool_output_tokens(agent: &str) -> Option<Reply> {
     None
 }
 
+/// Decodes a `temperature` edit from the request body: `None` -- untouched;
+/// `Some(None)` -- present but empty, clear it; `Some(Some(t))` -- a finite
+/// number within `core`'s `TEMPERATURE_RANGE`. `Err` carries the message for a
+/// non-numeric or out-of-range value, matching `core::validate`'s submit-time
+/// rule.
+fn nullable_temperature_edit(
+    v: Option<&String>,
+) -> std::result::Result<Option<Option<f64>>, String> {
+    match v.map(|s| non_empty(Some(s))) {
+        None => Ok(None),
+        Some(None) => Ok(Some(None)),
+        Some(Some(s)) => {
+            let (min, max) = ralphus_core::schema::TEMPERATURE_RANGE;
+            match s.parse::<f64>() {
+                Ok(t) if t.is_finite() && (min..=max).contains(&t) => Ok(Some(Some(t))),
+                Ok(t) => Err(format!(
+                    "temperature: must be a finite number between {min} and {max}, got {t}"
+                )),
+                Err(_) => Err(format!("temperature: invalid number '{s}'")),
+            }
+        }
+    }
+}
+
+/// Reject an `effort` edit up front when the agent that would run the edited
+/// cell has no delivery mechanism for it, or (for an agent with a closed
+/// vocabulary) the level isn't one of its accepted values (RAL-607),
+/// mirroring `core::validate`'s submit-time rule.
+///
+/// A custom agent profile name (not in `RESERVED_AGENT_NAMES`) is deferred the
+/// way `core` defers it: resolving a profile's backend needs the cwd/config
+/// this edit path doesn't have on hand.
+fn reject_invalid_effort(agent: &str, effort: &str) -> Option<Reply> {
+    if !ralphus_core::schema::RESERVED_AGENT_NAMES.contains(&agent) {
+        return None;
+    }
+    if !ralphus_core::schema::agent_supports_effort(agent) {
+        return Some(error(
+            400,
+            "bad_request",
+            &format!(
+                "'effort' is only supported for the 'claude-code'/'codex'/'pi' agents right now, not '{agent}'"
+            ),
+            vec![],
+        ));
+    }
+    if let Some(levels) = ralphus_core::schema::effort_levels_for_agent(agent)
+        && !levels.contains(&effort)
+    {
+        return Some(error(
+            400,
+            "bad_request",
+            &format!(
+                "effort: '{effort}' is not a valid level for '{agent}' (expected one of: {})",
+                levels.join(", ")
+            ),
+            vec![],
+        ));
+    }
+    None
+}
+
+/// Reject a `temperature` edit up front when the agent that would run the
+/// edited cell is not Pi (RAL-607). Custom agent profile names are deferred
+/// like [`reject_invalid_effort`].
+fn reject_unsupported_temperature(agent: &str) -> Option<Reply> {
+    if ralphus_core::schema::RESERVED_AGENT_NAMES.contains(&agent)
+        && !ralphus_core::schema::agent_supports_temperature(agent)
+    {
+        return Some(error(
+            400,
+            "bad_request",
+            &format!("'temperature' is only supported for the 'pi' agent right now, not '{agent}'"),
+            vec![],
+        ));
+    }
+    None
+}
+
 /// Edit a squad's label, a task's name/project/model, a cell's fields, or a
 /// proof step's agent/model/command/prompt (RAL-290).
 ///
@@ -8644,6 +8727,8 @@ fn cell_edit_is_noop(current: &crate::store::CellRow, edit: &crate::store::CellE
         && edit
             .maximum_tool_output_tokens
             .is_none_or(|v| v == current.maximum_tool_output_tokens)
+        && edit.effort.is_none_or(|v| v == current.effort.as_deref())
+        && edit.temperature.is_none_or(|v| v == current.temperature)
         && edit
             .system_prompt
             .is_none_or(|v| v == current.system_prompt.as_deref())
@@ -8709,6 +8794,11 @@ fn edit_squad(daemon: &Daemon, id: &str, body: &str) -> Reply {
                 Ok(v) => v,
                 Err(msg) => return error(400, "bad_request", &msg, vec![]),
             };
+            let temperature = match nullable_temperature_edit(req.temperature.as_ref()) {
+                Ok(v) => v,
+                Err(msg) => return error(400, "bad_request", &msg, vec![]),
+            };
+            let effort = nullable_field_edit(req.effort.as_ref());
             let system_prompt = nullable_field_edit(req.system_prompt.as_ref());
             let new_agent = non_empty(req.agent.as_ref());
             // Reject up front (mirroring `core::validate::check_system_prompt`'s
@@ -8770,6 +8860,32 @@ fn edit_squad(daemon: &Daemon, id: &str, body: &str) -> Reply {
                     return reply;
                 }
             }
+            // Same up-front rejection for `effort`/`temperature` (RAL-607);
+            // clearing either back out needs no check.
+            if let Some(Some(level)) = effort {
+                let effective_agent = match new_agent {
+                    Some(a) => a.to_string(),
+                    None => match daemon.lock().get_cell_agent(id, req.task_idx, req.cell_idx) {
+                        Ok(a) => a,
+                        Err(e) => return store_error(&e),
+                    },
+                };
+                if let Some(reply) = reject_invalid_effort(&effective_agent, level) {
+                    return reply;
+                }
+            }
+            if let Some(Some(_)) = temperature {
+                let effective_agent = match new_agent {
+                    Some(a) => a.to_string(),
+                    None => match daemon.lock().get_cell_agent(id, req.task_idx, req.cell_idx) {
+                        Ok(a) => a,
+                        Err(e) => return store_error(&e),
+                    },
+                };
+                if let Some(reply) = reject_unsupported_temperature(&effective_agent) {
+                    return reply;
+                }
+            }
             let edit = crate::store::CellEdit {
                 cwd: nullable_field_edit(req.cwd.as_ref()),
                 agent: new_agent,
@@ -8779,6 +8895,8 @@ fn edit_squad(daemon: &Daemon, id: &str, body: &str) -> Reply {
                 auto_compact_threshold,
                 maximum_context,
                 maximum_tool_output_tokens,
+                effort,
+                temperature,
                 system_prompt,
             };
             // Computed before the write below so it reflects the PRE-edit
@@ -24807,6 +24925,120 @@ agent=\"codex\"
         let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &clear);
         assert_eq!(r.status, 200, "{}", r.body);
         assert!(!r.body.contains("maximum_context"), "{}", r.body);
+    }
+
+    #[test]
+    fn edit_cell_effort_and_temperature_set_and_clear() {
+        let d = daemon();
+        let toml = "[[task]]
+name=\"t\"
+[[task.cell]]
+cwd=\"/r\"
+prompt=\"p\"
+agent=\"pi\"
+";
+        route(&d, "POST", "/api/squads", &submit_body(toml));
+        let set = serde_json::json!({
+            "kind": "cell", "task_idx": 0, "cell_idx": 0,
+            "effort": "high", "temperature": "0.7"
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &set);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("\"effort\":\"high\""), "{}", r.body);
+        assert!(r.body.contains("\"temperature\":0.7"), "{}", r.body);
+
+        let clear = serde_json::json!({
+            "kind": "cell", "task_idx": 0, "cell_idx": 0, "effort": "", "temperature": ""
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &clear);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(!r.body.contains("\"effort\""), "{}", r.body);
+        assert!(!r.body.contains("\"temperature\""), "{}", r.body);
+    }
+
+    #[test]
+    fn edit_cell_effort_and_temperature_rejected_for_unsupported_agent() {
+        // GOOD's cell resolves to the default "claude", which supports neither.
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        for (field, value) in [("effort", "high"), ("temperature", "0.5")] {
+            let body = serde_json::json!({
+                "kind": "cell", "task_idx": 0, "cell_idx": 0, field: value
+            })
+            .to_string();
+            let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &body);
+            assert_eq!(r.status, 400, "{field}: {}", r.body);
+            assert!(r.body.contains(field), "{}", r.body);
+        }
+    }
+
+    #[test]
+    fn edit_cell_effort_and_temperature_reject_invalid_values() {
+        let d = daemon();
+        let toml = "[[task]]
+name=\"t\"
+[[task.cell]]
+cwd=\"/r\"
+prompt=\"p\"
+agent=\"pi\"
+";
+        route(&d, "POST", "/api/squads", &submit_body(toml));
+        for (field, value) in [
+            ("effort", "turbo"),
+            ("temperature", "3"),
+            ("temperature", "-0.1"),
+            ("temperature", "hot"),
+            ("temperature", "NaN"),
+        ] {
+            let body = serde_json::json!({
+                "kind": "cell", "task_idx": 0, "cell_idx": 0, field: value
+            })
+            .to_string();
+            let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &body);
+            assert_eq!(r.status, 400, "{field}={value}: {}", r.body);
+        }
+    }
+
+    #[test]
+    fn cell_edit_is_noop_covers_effort_and_temperature() {
+        let d = daemon();
+        let toml = "[[task]]
+name=\"t\"
+agent=\"pi\"
+effort=\"low\"
+[[task.cell]]
+cwd=\"/r\"
+prompt=\"p\"
+temperature=0.5
+";
+        let r = route(&d, "POST", "/api/squads", &submit_body(toml));
+        assert_eq!(r.status, 201, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        let squad_id = v["squad_id"].as_str().unwrap().to_string();
+        let current = d.lock().cells_of(&squad_id).unwrap().remove(0);
+        assert_eq!(current.effort.as_deref(), Some("low"));
+        assert_eq!(current.temperature, Some(0.5));
+        let mut edit = crate::store::CellEdit {
+            cwd: None,
+            agent: None,
+            model: None,
+            prompt: None,
+            command: None,
+            auto_compact_threshold: None,
+            maximum_context: None,
+            maximum_tool_output_tokens: None,
+            effort: Some(Some("low")),
+            temperature: Some(Some(0.5)),
+            system_prompt: None,
+        };
+        assert!(cell_edit_is_noop(&current, &edit));
+        edit.effort = Some(Some("high"));
+        assert!(!cell_edit_is_noop(&current, &edit));
+        edit.effort = None;
+        edit.temperature = Some(None);
+        assert!(!cell_edit_is_noop(&current, &edit));
     }
 
     #[test]
