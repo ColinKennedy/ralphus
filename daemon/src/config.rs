@@ -400,22 +400,55 @@ pub struct ReviewConfig {
     pub retry_after_unknown_default_seconds: Option<u64>,
 }
 
+/// The paragraph of [`DEFAULT_AUTO_FIX_PROMPT_TEMPLATE`] that lets the agent
+/// decide which slow tests to run. Kept as its own constant so it can be
+/// swapped for [`STRICT_AUTO_FIX_TESTING_PARAGRAPH`] when the review
+/// discourages tests.
+pub const PERMISSIVE_AUTO_FIX_TESTING_PARAGRAPH: &str = "Prefer fixing fast checks first: run and fix any linters/formatters on the current machine before reaching for heavier/slower test suites. Only run a heavy test suite once the fast checks are clean; you are trusted to use judgment about which slow tests, if any, are actually necessary to confirm the fix.";
+
+/// RAL-619: replaces [`PERMISSIVE_AUTO_FIX_TESTING_PARAGRAPH`] when
+/// [`ReviewConfig::discourage_tests_during_auto_pull_request_fixes`] is
+/// effective. Language-neutral on purpose.
+pub const STRICT_AUTO_FIX_TESTING_PARAGRAPH: &str = "Run only cheap checks on the current machine: automatic formatters, linters, and static-analysis or type-checking tools. Do not run test suites locally, however small they seem. As soon as those cheap checks are clean, commit and push immediately. The tests run on the pull request's own CI; if they fail, the failure log is sent back to you in a later round.";
+
 /// RAL-395: the built-in fallback prompt template for auto-fixing a failing
 /// PR/MR, used when neither a per-review override nor a project-level
 /// `.ralphus.toml [review] auto_fix_prompt_template` is set. The "current
 /// machine" phrasing (not "locally") is deliberate: the fix may run on a
 /// remote machine.
-pub const DEFAULT_AUTO_FIX_PROMPT_TEMPLATE: &str = "We found 1-or-more errors in this PR {insert URL here}, please fix. Keep in mind that we want this code to continue to work:\n\nPrefer fixing fast checks first: run and fix any linters/formatters on the current machine before reaching for heavier/slower test suites. Only run a heavy test suite once the fast checks are clean; you are trusted to use judgment about which slow tests, if any, are actually necessary to confirm the fix.\n\n<<prompt>>";
+pub const DEFAULT_AUTO_FIX_PROMPT_TEMPLATE: &str = "We found 1-or-more errors in this PR {insert URL here}, please fix. Keep in mind that we want this code to continue to work:
 
-/// RAL-505: appended to a PR-fix prompt when
-/// [`ReviewConfig::discourage_tests_during_auto_pull_request_fixes`] is
-/// effective, in place of the more permissive "use judgment about slow
-/// tests" language `DEFAULT_AUTO_FIX_PROMPT_TEMPLATE` (and any per-review
-/// `auto_fix_prompt_template` override) already carries. This is a pure
-/// addition to the PR-fix prompt only -- it never touches the PR workflow's
-/// own proof/CI validation, and it has no bearing on any other agent work
-/// (e.g. command-remediation prompts).
-pub const DISCOURAGE_TESTS_DURING_AUTO_PR_FIX_GUIDANCE: &str = "\n\nDo not run a broad or expensive test suite to verify this fix -- prefer automatic formatters, linters, and static-analysis tools only. Comprehensive validation happens separately, through the pull request's own checks.";
+Prefer fixing fast checks first: run and fix any linters/formatters on the current machine before reaching for heavier/slower test suites. Only run a heavy test suite once the fast checks are clean; you are trusted to use judgment about which slow tests, if any, are actually necessary to confirm the fix.
+
+<<prompt>>";
+
+/// RAL-505 / RAL-619: appended to a PR-fix template that carries its own
+/// testing wording (a per-review or project `auto_fix_prompt_template`) when
+/// the discourage-tests setting is effective. States that it overrides any
+/// earlier test guidance. Pure addition to the PR-fix prompt only.
+pub const DISCOURAGE_TESTS_DURING_AUTO_PR_FIX_GUIDANCE: &str = "
+
+Test guidance (overrides any earlier instruction about running tests): run only cheap checks -- automatic formatters, linters, and static-analysis or type-checking tools. Do not run test suites locally. Once those checks are clean, commit and push immediately. The tests run on the pull request's own CI, and any failure is sent back to you in a later round.";
+
+/// Builds the auto-fix prompt template for a PR/MR. With `discourage_tests`
+/// off the result is `custom` (or the default) unchanged. With it on, the
+/// default's permissive testing paragraph is replaced by the strict one, and
+/// a custom template without that paragraph gets the override guidance
+/// appended.
+pub fn auto_fix_prompt_template(custom: Option<&str>, discourage_tests: bool) -> String {
+    let template = custom.unwrap_or(DEFAULT_AUTO_FIX_PROMPT_TEMPLATE);
+    if !discourage_tests {
+        return template.to_string();
+    }
+    if template.contains(PERMISSIVE_AUTO_FIX_TESTING_PARAGRAPH) {
+        template.replace(
+            PERMISSIVE_AUTO_FIX_TESTING_PARAGRAPH,
+            STRICT_AUTO_FIX_TESTING_PARAGRAPH,
+        )
+    } else {
+        format!("{template}{DISCOURAGE_TESTS_DURING_AUTO_PR_FIX_GUIDANCE}")
+    }
+}
 
 /// Default ceiling for an unattended PR/MR CI-fix campaign.
 pub const DEFAULT_AUTO_FIX_MAX_ATTEMPTS: u32 = 3;
@@ -3365,6 +3398,40 @@ pub(crate) fn reset_cors_cache_for_test() {
 mod tests {
     use super::*;
     use crate::forge::ForgeKind;
+
+    #[test]
+    fn auto_fix_template_unchanged_when_tests_not_discouraged() {
+        assert_eq!(
+            auto_fix_prompt_template(None, false),
+            DEFAULT_AUTO_FIX_PROMPT_TEMPLATE
+        );
+        assert_eq!(auto_fix_prompt_template(Some("custom"), false), "custom");
+    }
+
+    #[test]
+    fn auto_fix_default_template_swaps_permissive_paragraph_when_discouraged() {
+        let out = auto_fix_prompt_template(None, true);
+        assert!(!out.contains("use judgment"));
+        assert!(!out.contains(PERMISSIVE_AUTO_FIX_TESTING_PARAGRAPH));
+        assert!(out.contains(STRICT_AUTO_FIX_TESTING_PARAGRAPH));
+        assert!(out.contains("commit and push immediately"));
+        assert!(out.contains("<<prompt>>") && out.contains("{insert URL here}"));
+    }
+
+    #[test]
+    fn auto_fix_custom_template_gets_override_guidance_when_discouraged() {
+        let out = auto_fix_prompt_template(
+            Some(
+                "Fix {insert URL here}
+
+<<prompt>>",
+            ),
+            true,
+        );
+        assert!(out.starts_with("Fix {insert URL here}"));
+        assert!(out.ends_with(DISCOURAGE_TESTS_DURING_AUTO_PR_FIX_GUIDANCE));
+        assert!(out.contains("overrides any earlier"));
+    }
 
     #[test]
     fn project_shared_store_root_uses_logical_name() {
