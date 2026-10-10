@@ -4,7 +4,6 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 
 use rusqlite::{OptionalExtension, params};
@@ -643,6 +642,7 @@ fn sweep_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_DIR: AtomicU64 = AtomicU64::new(0);

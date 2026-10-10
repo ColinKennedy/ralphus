@@ -25,7 +25,6 @@
 //! remote's default branch when that branch no longer exists.
 
 use std::path::Path;
-use std::process::Command;
 
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -939,6 +938,7 @@ fn submit_followup_squad(
 mod tests {
     use super::*;
     use crate::config::FollowupConfig;
+    use std::process::Command;
 
     fn item(body: &str, prompt: Option<&str>) -> FollowupItem {
         FollowupItem {
