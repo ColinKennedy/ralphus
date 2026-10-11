@@ -382,24 +382,26 @@ model against real traffic before any prompt work exists.
 - [x] Scan the agent's final reply for every standalone `RALPHUS_PROPHECY:`
       line; match exact-form lines only, per the `RALPHUS_TMUX_DONE` precedent
       (§4.3) — `runner/src/prophecy.rs::parse_prophecies`
-- [~] Forward it as a runner event; let `forward_runner_event` attribute it —
-      **not implemented**. The genuinely "mid-work" per-turn variant of this
-      (scanning each streaming assistant turn and emitting `RALPHUS_EVENT:`
-      immediately, the way live-usage snapshots already do per backend) would
-      need its own hook duplicated across `claude_code_backend.rs`/
-      `codex_backend.rs`/`pi_backend.rs`/`harness_backend.rs`'s own streaming
-      loops — out of scope for this pass. What *is* implemented (the next
-      item) is explicitly sanctioned by §4 as a standalone primary transport,
-      not merely a fallback, so this is a real gap to revisit, not a
-      correctness hole.
+- [x] Forward it as a runner event; let `forward_runner_event` attribute it —
+      every backend scans each assistant turn as it arrives
+      (`runner/src/prophecy.rs::ProphecyScanner`; claude-code, codex and pi per
+      event, the generic harness per stdout line, the native backend on its
+      final text) and emits a `prophecy` event per new marker;
+      `daemon/src/runner.rs::record_prophecy_event` files it. Markers are no
+      longer limited to the final reply, which context compaction, a long
+      closing message or a killed run could lose.
 - [x] Add a `prophecies` field to `RunnerResult` so the at-exit set crosses the
       provider boundary as a typed contract, mirroring `ghost` (§6.1) — wired
       end-to-end: `runner/src/spec.rs::CellResult.prophecies` →
       `daemon/src/runner.rs::RunnerResult.prophecies` →
-      `scheduler.rs::run_cell_worker` calls `Store::add_prophecy` per marker
-      (attempt is hardcoded `0` for every write here — there is no per-cell
-      restart counter in the schema yet, a follow-on improvement, not
-      blocking)
+      `scheduler.rs::run_cell_worker` files each marker as a backstop for the
+      live events. Writes are deduplicated by a unique index on
+      `(entity_uri, attempt, kind, body_key)` (`body_key` is the
+      whitespace-normalized body), so the live copy and the at-exit copy
+      collapse to one row. `attempt` is the cell's `restart_count`, bumped
+      whenever the cell is re-queued, and the views show only the latest
+      attempt's prophecies; a fresh-run re-audit of capture coverage is a
+      separate follow-up.
 - [x] `docs/special-syntax.md` entry for the marker — the file did not exist
       at all before this phase; created with the full existing marker
       inventory, not just the new one
@@ -412,7 +414,9 @@ model against real traffic before any prompt work exists.
       `runner/src/execute.rs` — `PROPHECY_SYSTEM_PROMPT`, mirrored
       byte-identically into `daemon/src/runner.rs` per that pair's existing
       sync convention, appended for normal prompt cells only (never proof
-      steps, matching ghost's own scope)
+      steps, matching ghost's own scope). The wording tells the agent to emit
+      each marker in the turn it learns the fact, not at the end, and keeps the
+      marker separate from the end-of-reply handoff section.
 
 *This is where the discipline is won or lost. Ghost is the evidence it works.*
 

@@ -921,6 +921,7 @@ fn drive_json_events(
         }
         return Ok(BackendOutcome {
             summary: tail(&state.latest_assistant_message, SUMMARY_TAIL_CHARS),
+            prophecies: state.prophecies.markers(),
             turns: state.turns,
             tokens_in: state.tokens_in,
             tokens_out: state.tokens_out,
@@ -961,6 +962,7 @@ fn drive_json_events(
         if let Some(delay) = parse_retryable_rate_limit(&error) {
             return Ok(BackendOutcome {
                 summary: tail(&state.latest_assistant_message, SUMMARY_TAIL_CHARS),
+                prophecies: state.prophecies.markers(),
                 turns: state.turns,
                 tokens_in: state.tokens_in,
                 tokens_out: state.tokens_out,
@@ -1007,6 +1009,7 @@ fn drive_json_events(
             );
             return Ok(BackendOutcome {
                 summary: tail(&state.latest_assistant_message, SUMMARY_TAIL_CHARS),
+                prophecies: state.prophecies.markers(),
                 turns: state.turns,
                 tokens_in: state.tokens_in,
                 tokens_out: state.tokens_out,
@@ -1059,6 +1062,7 @@ fn drive_json_events(
             );
             return Ok(BackendOutcome {
                 summary: tail(&state.latest_assistant_message, SUMMARY_TAIL_CHARS),
+                prophecies: state.prophecies.markers(),
                 turns: state.turns,
                 tokens_in: state.tokens_in,
                 tokens_out: state.tokens_out,
@@ -1094,6 +1098,7 @@ fn drive_json_events(
 
     Ok(BackendOutcome {
         summary: tail(&state.latest_assistant_message, SUMMARY_TAIL_CHARS),
+        prophecies: state.prophecies.markers(),
         turns: state.turns,
         tokens_in: state.tokens_in,
         tokens_out: state.tokens_out,
@@ -1115,6 +1120,10 @@ fn drive_json_events(
 struct ParseState {
     agent_session_id: Option<String>,
     latest_assistant_message: String,
+    /// RAL-595: every `RALPHUS_PROPHECY:` marker found in an assistant
+    /// message (`message_end`, plus the closing `agent_end` replay, which
+    /// the scanner dedupes), not just the last one.
+    prophecies: crate::prophecy::ProphecyScanner,
     /// RAL-352: completed assistant `message_end` events -- one per
     /// user/assistant exchange (each response event is both sides of the
     /// exchange). System/session/compaction events never increment it, and
@@ -1557,6 +1566,7 @@ fn process_event(
                 // message (the response event represents both sides).
                 state.turns += 1;
                 let text = extract_message_text(&event["message"]);
+                state.prophecies.scan_and_emit("pi", &text);
                 if !text.is_empty() {
                     state.latest_assistant_message = text;
                 }
@@ -1576,6 +1586,7 @@ fn process_event(
                     .find(|m| m["role"].as_str() == Some("assistant"))
             }) {
                 let text = extract_message_text(last);
+                state.prophecies.scan_and_emit("pi", &text);
                 if !text.is_empty() {
                     state.latest_assistant_message = text;
                 }
@@ -2470,6 +2481,38 @@ mod tests {
         assert!((state.cost_usd - 0.56).abs() < f64::EPSILON);
         assert_eq!(state.latest_assistant_message, "hello world");
         assert!(state.saw_terminal_event);
+    }
+
+    #[test]
+    fn process_event_scans_markers_in_non_final_assistant_messages_and_skips_thinking() {
+        let mut state = ParseState::default();
+        let root = Path::new(".");
+        for event in [
+            serde_json::json!({
+                "type":"message_end",
+                "message":{"role":"assistant","content":[
+                    {"type":"thinking","thinking":"RALPHUS_PROPHECY: discovery: private thought"},
+                    {"type":"text","text":"RALPHUS_PROPHECY: hazard: leaves a race"}
+                ]}
+            }),
+            serde_json::json!({
+                "type":"message_end",
+                "message":{"role":"toolResult","content":[{"type":"text","text":"RALPHUS_PROPHECY: decision: tool output"}]}
+            }),
+            serde_json::json!({
+                "type":"message_end",
+                "message":{"role":"assistant","content":[{"type":"text","text":"all done"}]}
+            }),
+            serde_json::json!({
+                "type":"agent_end",
+                "messages":[{"role":"assistant","content":[{"type":"text","text":"all done"}]}]
+            }),
+        ] {
+            process_event(&event, &mut state, root, DEFAULT_TOOL_ARG_TRUNCATE_CHARS);
+        }
+        let markers = state.prophecies.markers();
+        assert_eq!(markers.len(), 1, "{markers:?}");
+        assert_eq!(markers[0].body, "leaves a race");
     }
 
     #[test]

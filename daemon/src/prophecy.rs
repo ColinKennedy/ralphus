@@ -84,6 +84,16 @@ impl std::str::FromStr for ProphecyKind {
     }
 }
 
+/// Where a cell's prophecies are filed: its position, working directory (for
+/// the revision stamp) and current attempt (RAL-595).
+#[derive(Debug, Clone)]
+pub struct CellProphecyTarget {
+    pub task_idx: i64,
+    pub idx: i64,
+    pub cwd: Option<String>,
+    pub attempt: i64,
+}
+
 /// One row of the `prophecies` table, as returned to API/internal consumers.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProphecyView {
@@ -185,10 +195,19 @@ impl Default for ProphecyFilter {
     }
 }
 
+/// The key a prophecy is deduplicated on: its body with all whitespace runs
+/// collapsed, so a marker re-wrapped or re-indented on restatement still
+/// matches the first write.
+fn dedupe_key(body: &str) -> String {
+    body.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 impl Store {
     /// Append one prophecy. Never merges/overwrites an existing row for the
     /// same `entity_uri` -- unlike [`Store::upsert_ghost`], this table is
-    /// append-only by design (§3: "Attempt 1…N stay distinct").
+    /// append-only by design (§3: "Attempt 1…N stay distinct"). The one
+    /// exception is an exact repeat (same entity, attempt, kind and
+    /// whitespace-normalized body): it returns the existing row unchanged.
     ///
     /// Also emits a Cartographer row (module doc comment) so the write shows
     /// up in the squad timeline for free, without needing every call site to
@@ -205,9 +224,15 @@ impl Store {
         guardian_id: Option<&str>,
     ) -> Result<ProphecyView> {
         let now = now_ms();
-        self.conn.execute(
-            "INSERT INTO prophecies(entity_uri, attempt, kind, body, revision, squad_id, guardian_id, created_at_ms)
-             VALUES (?,?,?,?,?,?,?,?)",
+        let body_key = dedupe_key(body);
+        // RAL-595: the same insight reaches the daemon more than once (an
+        // inline marker restated in the closing message, the live event
+        // plus the at-exit backstop). `INSERT OR IGNORE` against the unique
+        // (entity, attempt, kind, body_key) index collapses those into the
+        // first row.
+        let inserted = self.conn.execute(
+            "INSERT OR IGNORE INTO prophecies(entity_uri, attempt, kind, body, revision, squad_id, guardian_id, created_at_ms, body_key)
+             VALUES (?,?,?,?,?,?,?,?,?)",
             params![
                 entity_uri,
                 attempt,
@@ -216,9 +241,18 @@ impl Store {
                 revision,
                 squad_id,
                 guardian_id,
-                now
+                now,
+                body_key
             ],
         )?;
+        if inserted == 0 {
+            let id: i64 = self.conn.query_row(
+                "SELECT id FROM prophecies WHERE entity_uri=? AND attempt=? AND kind=? AND body_key=?",
+                params![entity_uri, attempt, kind.as_str(), body_key],
+                |r| r.get(0),
+            )?;
+            return Ok(self.get_prophecy(id)?.expect("conflicting row exists"));
+        }
         let id = self.conn.last_insert_rowid();
         let view = self.get_prophecy(id)?.expect("just written");
         let mut note = crate::cartographer::Note::new("prophecy").scope("prophecy");
@@ -260,6 +294,110 @@ impl Store {
             .query_map(params![entity_uri], map_prophecy_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows.into_iter().map(ProphecyView::from).collect())
+    }
+
+    /// Resolve the cell a runner event belongs to (`squad_id` + the owning
+    /// task's name + the cell's `sid`) into what a prophecy write needs.
+    /// `None` when the triple is not a cell row (a proof step or Guardian
+    /// resolver invocation shares the event-forwarding path).
+    pub fn cell_prophecy_target(
+        &self,
+        squad_id: &str,
+        task_name: &str,
+        cell_sid: &str,
+    ) -> Option<CellProphecyTarget> {
+        self.conn
+            .query_row(
+                "SELECT task_idx, idx, cwd, restart_count FROM cells
+                 WHERE squad_id=? AND sid=? AND task_idx=(SELECT idx FROM tasks WHERE squad_id=? AND name=?)",
+                params![squad_id, cell_sid, squad_id, task_name],
+                |r| {
+                    Ok(CellProphecyTarget {
+                        task_idx: r.get(0)?,
+                        idx: r.get(1)?,
+                        cwd: r.get(2)?,
+                        attempt: r.get(3)?,
+                    })
+                },
+            )
+            .ok()
+    }
+
+    /// Record one runner-reported `RALPHUS_PROPHECY:` marker against a cell.
+    /// Shared by the live `prophecy` event and the at-exit
+    /// `RunnerResult.prophecies` backstop so both apply the same
+    /// unknown-kind policy (a Cartographer warning, not a failure) and the
+    /// same dedupe.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_cell_prophecy_marker(
+        &self,
+        squad_id: &str,
+        task_name: &str,
+        cell_id: &str,
+        target: &CellProphecyTarget,
+        revision: Option<&str>,
+        kind: &str,
+        body: &str,
+    ) -> Result<()> {
+        let Ok(parsed) = kind.parse::<ProphecyKind>() else {
+            crate::cartographer::Note::new("prophecy")
+                .level(crate::logging::LogLevel::WARNING)
+                .scope("cell")
+                .squad(squad_id)
+                .cell(cell_id)
+                .task(task_name)
+                .emit(
+                    self,
+                    format!(
+                        "prophecy marker dropped: unknown kind {kind:?} cell={squad_id}/{cell_id}"
+                    ),
+                    serde_json::json!({ "kind": kind, "body_len": body.len() }),
+                );
+            return Ok(());
+        };
+        let uri = crate::ghost::cell_uri(squad_id, target.task_idx, target.idx);
+        self.add_prophecy(
+            &uri,
+            target.attempt,
+            parsed,
+            body,
+            revision,
+            Some(squad_id),
+            None,
+        )?;
+        Ok(())
+    }
+
+    /// The prophecies of the cell `entity_uri`'s current attempt only, oldest
+    /// first (RAL-595): a re-run supersedes the earlier attempt's insights.
+    /// The current attempt is the cell's `restart_count`; for a cell whose
+    /// row is gone (its squad was deleted) it falls back to the highest
+    /// attempt recorded for the URI.
+    pub fn list_latest_attempt_prophecies_for_cell(
+        &self,
+        entity_uri: &str,
+    ) -> Result<Vec<ProphecyView>> {
+        let mut rows = self.list_prophecies_for_entity(entity_uri)?;
+        let current = entity_uri
+            .strip_prefix("cell:")
+            .and_then(|rest| {
+                let mut parts = rest.rsplitn(3, ':');
+                let idx = parts.next()?.parse::<i64>().ok()?;
+                let task_idx = parts.next()?.parse::<i64>().ok()?;
+                let squad_id = parts.next()?;
+                self.conn
+                    .query_row(
+                        "SELECT restart_count FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
+                        params![squad_id, task_idx, idx],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .ok()
+            })
+            .or_else(|| rows.iter().map(|p| p.attempt).max());
+        if let Some(current) = current {
+            rows.retain(|p| p.attempt == current);
+        }
+        Ok(rows)
     }
 
     /// Filtered, paginated, newest-first query -- backs
@@ -340,7 +478,7 @@ impl Store {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         for uri in cell_uris {
-            direct.extend(self.list_prophecies_for_entity(&uri)?);
+            direct.extend(self.list_latest_attempt_prophecies_for_cell(&uri)?);
         }
         direct.sort_by_key(|p| p.created_at_ms);
         Ok(direct)
@@ -431,6 +569,61 @@ mod tests {
         assert_eq!(p.revision.as_deref(), Some("abc123"));
         let fetched = s.get_prophecy(p.id).unwrap().unwrap();
         assert_eq!(fetched.entity_uri, "cell:squad-1:0:0");
+    }
+
+    #[test]
+    fn a_repeated_marker_in_one_attempt_yields_one_row() {
+        let s = store();
+        seed_squad(&s, "squad-1");
+        let add = |attempt: i64, body: &str| {
+            s.add_prophecy(
+                "cell:squad-1:0:0",
+                attempt,
+                ProphecyKind::Hazard,
+                body,
+                None,
+                Some("squad-1"),
+                None,
+            )
+            .unwrap()
+        };
+        let first = add(0, "leaves a race");
+        let again = add(0, "leaves   a race");
+        assert_eq!(
+            first.id, again.id,
+            "the live copy and the at-exit copy collapse"
+        );
+        let later_attempt = add(1, "leaves a race");
+        assert_ne!(first.id, later_attempt.id, "a restart files its own row");
+        assert_eq!(
+            s.list_prophecies_for_entity("cell:squad-1:0:0")
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn views_show_only_the_latest_attempts_prophecies() {
+        let s = store();
+        seed_squad(&s, "squad-1");
+        for (attempt, body) in [(0, "stale"), (1, "current")] {
+            s.add_prophecy(
+                "cell:squad-1:0:0",
+                attempt,
+                ProphecyKind::Discovery,
+                body,
+                None,
+                Some("squad-1"),
+                None,
+            )
+            .unwrap();
+        }
+        let shown = s
+            .list_latest_attempt_prophecies_for_cell("cell:squad-1:0:0")
+            .unwrap();
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].body, "current");
     }
 
     #[test]
