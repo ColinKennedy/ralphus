@@ -231,6 +231,19 @@
         (/** @type {any} */ (window).RalphusTiming || { timeNav: (/** @type {any} */ _, /** @type {any} */ fn) => fn() }).timeNav(name, tick);
       }
       /**
+       * Click handler for the tab anchors (and the header Preferences link):
+       * an unmodified primary click switches tabs in place; ctrl/cmd/shift/alt
+       * or non-primary clicks fall through so the browser opens the `href`.
+       * @param {MouseEvent} ev
+       * @param {string} name
+       * @returns {boolean} false when the click was handled in place
+       */
+      function tabLinkClick(ev, name) {
+        if (ev.button !== 0 || ev.ctrlKey || ev.metaKey || ev.shiftKey || ev.altKey) return true;
+        showTab(name, true);
+        return false;
+      }
+      /**
        * Shows or hides the admin-only tab buttons (RAL-332) to match
        * `currentUserIsAdmin`. A UI-level convenience only -- the daemon
        * enforces the real gate server-side on every endpoint those tabs use.
