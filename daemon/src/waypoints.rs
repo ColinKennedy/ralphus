@@ -1794,7 +1794,6 @@ impl Store {
             ) {
                 Ok(()) => {}
                 Err(StoreError::InvalidTransition(why)) => {
-                    // ralphus[ignore-rlog-pair]: enrollment skip is a constraint violation; the caller logs any enrollment in Cartographer
                     crate::rlog!(
                         WARNING,
                         "ralphus [waypoints] skipping enrollment of squad {squad_id} on \
