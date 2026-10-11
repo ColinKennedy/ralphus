@@ -3091,6 +3091,15 @@ The reverse of `ignore`, with the same body, response and errors.
 
 ### `POST /api/guardians/{id}/followup/accept`
 
+Body `{"prophecy_id": 12}` accepts that one item; `{}` accepts every item not
+yet accepted. Each accept makes its own squad, and the offer becomes `accepted`
+once all of its items have one. **Before the review has merged** there is no
+offer yet, so `{"prophecy_id": n}` only records the acceptance (`200`, the
+`GET .../followup/items` body, the item's `accepted` true) and the item is
+submitted as soon as the merge makes the offer; ignoring the item withdraws it.
+On acceptance the daemon also sends a mailbox message saying the earlier offer
+message needs no action for those items.
+
 Accepts an open offer. The daemon drafts one squad — a task per deferred item,
 its prompt the deferred note plus the original prompt as context, started on
 the same agent and model — and submits it through the ordinary submit path, so

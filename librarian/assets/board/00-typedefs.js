@@ -413,6 +413,8 @@
        * @property {string|null} [branch] - the review branch of the originating cell.
        * @property {string|null} [task_name] - the task the originating cell belongs to.
        * @property {boolean} ignored
+       * @property {string|null} [squad_id] - the follow-up squad accepting it created.
+       * @property {boolean} [accepted] - accepted: its squad exists, or it is submitted when the review merges.
        */
       /**
        * `GET /api/guardians/{id}/followup/items`: the counts plus the items.

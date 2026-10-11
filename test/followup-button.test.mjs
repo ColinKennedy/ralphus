@@ -115,3 +115,36 @@ test("ignoring posts the prophecy id and un-ignoring uses the unignore route", (
   assert.match(script, /CLICK_HANDLERS\.ignoreFollowup = .*setFollowupIgnored\(.*, true\)/);
   assert.match(script, /CLICK_HANDLERS\.unignoreFollowup = .*setFollowupIgnored\(.*, false\)/);
 });
+
+test("every card offers Accept, before the merge and after the offer", () => {
+  const item = { prophecy_id: 7, entity_uri: "cell:squad-1:0:0", body: "x", ignored: false };
+  const before = list("g1", { ...summary({ count: 1, total: 1 }), items: [item] });
+  assert.match(before, /data-click="acceptFollowup" data-guardian-id="g1" data-prophecy-id="7"/);
+  assert.match(before, /create a follow-up Task that completes this offer/);
+  assert.match(before, /the moment the review merges/);
+
+  const offered = list("g1", {
+    ...summary({ offered: true, enabled: false, count: 1, total: 1 }),
+    offer_status: "offered",
+    items: [item],
+  });
+  assert.match(offered, /data-click="acceptFollowup" data-guardian-id="g1" data-prophecy-id="7"/);
+  assert.doesNotMatch(offered, /the moment the review merges/);
+});
+
+test("an accepted card drops Accept and shows the squad link or an Accepted chip", () => {
+  const base = { prophecy_id: 7, entity_uri: "cell:squad-1:0:0", body: "x", ignored: false };
+  const waiting = list("g1", { ...summary({ count: 1, total: 1 }), items: [{ ...base, accepted: true }] });
+  assert.doesNotMatch(waiting, /data-click="acceptFollowup"/);
+  assert.match(waiting, /<button class="btn fu-btn" disabled [^>]*>Accepted<\/button>/);
+
+  const made = list("g1", {
+    ...summary({ offered: true, enabled: false, count: 1, total: 1 }),
+    offer_status: "offered",
+    items: [{ ...base, accepted: true, squad_id: "squad-9" }],
+  });
+  assert.doesNotMatch(made, /data-click="acceptFollowup"/);
+  assert.match(made, /data-squad-id="squad-9"/);
+  assert.match(made, /<button class="btn fu-btn" disabled [^>]*>Accepted<\/button>/);
+  assert.doesNotMatch(made, /Accepted<\/button>.*data-click="acceptFollowup"/);
+});

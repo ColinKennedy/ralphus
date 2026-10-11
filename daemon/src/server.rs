@@ -2215,7 +2215,7 @@ fn route_for_user(
             guardian_followup_set_ignored(daemon, id, body, false)
         }
         ("POST", ["api", "guardians", id, "followup", "accept"]) => {
-            guardian_followup_accept(daemon, id)
+            guardian_followup_accept(daemon, id, body)
         }
         ("POST", ["api", "guardians", id, "followup", "decline"]) => {
             guardian_followup_decline(daemon, id)
@@ -17618,9 +17618,32 @@ fn guardian_followup_set_ignored(daemon: &Daemon, id: &str, body: &str, ignored:
 }
 
 /// `POST /api/guardians/{id}/followup/accept`: drafts the follow-up squad and
-/// its waypoint from the offer.
-fn guardian_followup_accept(daemon: &Daemon, id: &str) -> Reply {
-    match crate::followup::accept_offer(daemon, id) {
+/// its waypoint from the offer, or from the one item `{"prophecy_id": n}`
+/// names.
+fn guardian_followup_accept(daemon: &Daemon, id: &str, body: &str) -> Reply {
+    let req = if body.trim().is_empty() {
+        FollowupIgnoreBody::default()
+    } else {
+        match serde_json::from_str::<FollowupIgnoreBody>(body) {
+            Ok(r) => r,
+            Err(_) => return error(400, "bad_request", "invalid body", vec![]),
+        }
+    };
+    // Before the merge there is no offer to accept: accepting an item then
+    // records the intent, and the item is submitted when the offer is made.
+    if let Some(prophecy_id) = req.prophecy_id {
+        let store = daemon.lock();
+        if matches!(store.get_followup_offer(id), Ok(None)) {
+            if let Err(e) = store.preaccept_followup(id, prophecy_id) {
+                return store_error(&e);
+            }
+            return match store.pending_followups(id) {
+                Ok(items) => json(200, &items),
+                Err(e) => store_error(&e),
+            };
+        }
+    }
+    match crate::followup::accept_offer(daemon, id, req.prophecy_id) {
         Ok(result) => json(201, &result),
         Err(crate::followup::AcceptError::Store(e)) => store_error(&e),
         Err(crate::followup::AcceptError::Rejected { status, message }) => {
@@ -19713,6 +19736,9 @@ pub fn serve<A: ToSocketAddrs>(
     // ralphus entirely -- still gets pulled back into this guardian's branch
     // order instead of silently drifting forever.
     crate::pr::spawn_pr_base_drift_poller(daemon.store_handle());
+    // Follow-ups a user accepted before their review merged become squads as
+    // soon as the merge makes the offer.
+    crate::followup::spawn_preaccepted_worker(Arc::clone(&daemon));
     // RAL-308: the same PID registry the local runner reports its spawned
     // subprocesses into (`with_registry` above), so the CPU-flat stall sweep
     // sees every live cell/proof subprocess without a separate tracking path.
