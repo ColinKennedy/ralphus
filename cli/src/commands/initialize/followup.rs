@@ -40,8 +40,22 @@ const STUB_AGENT_PROFILE: &str = "followup-stub";
 /// How long any one step waits before the exercise gives up.
 const STEP_TIMEOUT: Duration = Duration::from_secs(180);
 
-/// The command proof on the original cell. The follow-up squad must carry it.
+/// The raw command proof on the original cell. The follow-up squad must carry it.
 const ORIGINAL_PROOF: &str = "git rev-parse HEAD";
+
+/// The remediating command proof on the original cell: it keeps its default
+/// mode and carries a retry budget, which the follow-up must keep too.
+const REMEDIATING_PROOF: &str = "git rev-parse --verify HEAD";
+
+/// How many remediation attempts the remediating proof is given.
+const REMEDIATION_ATTEMPTS: i64 = 2;
+
+/// The scored prompt proof on the original cell. The stub agent answers it with
+/// an appraisal, and the follow-up must carry the prompt and its threshold.
+const PROMPT_PROOF: &str = "Appraise whether the work on this branch is complete.";
+
+/// The score the prompt proof needs to pass.
+const PASS_SCORE: i64 = 5;
 
 /// What the stub agent says it deferred in the original work.
 const DEFERRED_NOTE: &str = "document feature.txt in the README";
@@ -192,10 +206,35 @@ fn run(options: &ExerciseOptions) -> Result<(), String> {
     )?;
     expect(
         squad_view.to_string().contains(ORIGINAL_PROOF),
-        "the follow-up cell inherited the original cell's proof",
+        "the follow-up cell inherited the original cell's raw command proof",
         &squad_view,
     )?;
-    step("the follow-up squad has no review of its own and kept the original proof");
+    // The API does not report a proof's mode, attempt budget or pass score, so
+    // they are checked by what they cause. A remediating command with no
+    // `remediation_attempts` would have been rejected when the squad was
+    // submitted; the scored prompt proof is taught the appraisal marker, where
+    // an unscored one is taught the plain verdict marker.
+    expect(
+        find_proof(&squad_view, "spec", REMEDIATING_PROOF)
+            .is_some_and(|proof| proof["kind"] == "command"),
+        "the follow-up kept the remediating command proof",
+        &squad_view["tasks"][0]["cells"][0]["proof"],
+    )?;
+    let scored = find_proof(&squad_view, "spec", PROMPT_PROOF);
+    expect(
+        scored.is_some_and(|proof| {
+            proof["kind"] == "prompt"
+                && proof["system_prompt"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("RALPHUS_APPRAISAL"))
+        }),
+        "the follow-up kept the prompt proof and its pass score",
+        &scored,
+    )?;
+    step(
+        "the follow-up squad has no review of its own and kept the raw, remediating and \
+         scored prompt proofs",
+    );
 
     let again = client.guardian_followup_accept(&review);
     expect(
@@ -226,6 +265,20 @@ fn run(options: &ExerciseOptions) -> Result<(), String> {
     expect_done(&exercise, &followup)?;
     step("the follow-up squad ran to completion");
 
+    // Each inherited proof ran, and the scored one passed on the stub's
+    // appraisal alone: without its threshold it would have had no verdict.
+    let finished = client.squad(&followup).map_err(|e| e.to_string())?;
+    let states: Vec<&str> = finished["tasks"][0]["cells"][0]["proof"]
+        .as_array()
+        .map(|proofs| proofs.iter().filter_map(|p| p["state"].as_str()).collect())
+        .unwrap_or_default();
+    expect(
+        states.len() == 3 && states.iter().all(|state| *state == "done"),
+        "all three inherited proofs ran and passed in the follow-up",
+        &states,
+    )?;
+    step("the follow-up's raw, remediating and scored proofs all passed");
+
     // 6. The follow-up's cell drained the Arbiter's pool into an automatic
     //    review: the daemon, not the follow-up's own task file, built it.
     let pooled_review = wait_for_review(client, &[review.as_str()])?;
@@ -252,6 +305,20 @@ fn run(options: &ExerciseOptions) -> Result<(), String> {
     Ok(())
 }
 
+/// The first object anywhere under `value` whose `key` field is exactly `text`.
+fn find_proof<'a>(value: &'a Value, key: &str, text: &str) -> Option<&'a Value> {
+    match value {
+        Value::Object(map) => {
+            if map.get(key).and_then(Value::as_str) == Some(text) {
+                return Some(value);
+            }
+            map.values().find_map(|child| find_proof(child, key, text))
+        }
+        Value::Array(items) => items.iter().find_map(|child| find_proof(child, key, text)),
+        _ => None,
+    }
+}
+
 fn expect(condition: bool, what: &str, context: &dyn std::fmt::Debug) -> Result<(), String> {
     if condition {
         Ok(())
@@ -267,6 +334,10 @@ fn original_toml(project: &str) -> String {
          prompt = \"Add feature.txt. (The exercise's stub agent ignores this text.)\"\n\
          agent = {STUB_AGENT_PROFILE:?}\nreview = \"<<ralphus:new-review/original>>\"\n\n\
          [[task.cell.proof]]\ncommand = {ORIGINAL_PROOF:?}\nmode = \"raw\"\n\n\
+         [[task.cell.proof]]\ncommand = {REMEDIATING_PROOF:?}\n\
+         remediation_attempts = {REMEDIATION_ATTEMPTS}\nagent = {STUB_AGENT_PROFILE:?}\n\n\
+         [[task.cell.proof]]\nprompt = {PROMPT_PROOF:?}\npass_score = {PASS_SCORE}\n\
+         agent = {STUB_AGENT_PROFILE:?}\n\n\
          [[review]]\nid = \"ralphus:new-review/original\"\nupstream = \"main\"\n\
          proof_scope = \"nothing\"\nskip_manual_checks = true\n"
     )
@@ -305,6 +376,15 @@ pub fn invoked_as_exercise_agent() -> bool {
 #[must_use]
 pub fn run_exercise_agent(args: &[String]) -> i32 {
     let prompt = args.last().map(String::as_str).unwrap_or_default();
+    // A scored prompt proof asks for an appraisal rather than for work.
+    if prompt.contains(PROMPT_PROOF) || prompt.contains("RALPHUS_APPRAISAL") {
+        println!(
+            "RALPHUS_APPRAISAL: {{\"score\": {}, \"summary\": \"the stub agent approves\", \
+             \"sections\": []}}",
+            PASS_SCORE + 3
+        );
+        return 0;
+    }
     let followup = prompt.contains("follow-up work");
     let file = if followup {
         "followup.txt"
