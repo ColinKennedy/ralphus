@@ -400,8 +400,13 @@ model against real traffic before any prompt work exists.
       whitespace-normalized body), so the live copy and the at-exit copy
       collapse to one row. `attempt` is the cell's `restart_count`, bumped
       whenever the cell is re-queued, and the views show only the latest
-      attempt's prophecies; a fresh-run re-audit of capture coverage is a
-      separate follow-up.
+      attempt's prophecies. The fresh-run re-audit of capture coverage is
+      `scripts/audit_prophecy_coverage.py` (read-only, against `tasks.db` and the
+      terminal transcripts). On the dev DB for cells since 2026-10 it found 108
+      of 199 work cells and 17 of 182 commit cells with a prophecy, 33 markers
+      mid-run against 195 in the last 20 transcript lines (the pre-change audit
+      found none mid-run), and 26 transcript markers with no matching row. It
+      is indicative only: it matches `_work` transcripts to cells by squad id.
 - [x] `docs/special-syntax.md` entry for the marker — the file did not exist
       at all before this phase; created with the full existing marker
       inventory, not just the new one
