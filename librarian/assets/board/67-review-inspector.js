@@ -1,4 +1,4 @@
-﻿      // ---- Reviews tab: branch inspector + log dock ----
+      // ---- Reviews tab: branch inspector + log dock ----
       //
       // Two surfaces that used to be buried inside the review's single
       // scrolling column:
@@ -41,7 +41,7 @@
        * @property {string} [cell_id] - The unique resolver cell that owns this pass.
        * @property {string} [prompt] - The dispatched instruction, when retained by the daemon.
        * @property {boolean} start_recorded - False when only the run's end row exists.
-       * @property {string} [meta] - Replaces the computed time/outcome line when a caller supplies its own.
+       * @property {string} [meta] - Cached formatted metadata line (timestamp, duration, outcome).
        */
       /**
        * Each branch's runs, keyed `gid|bid`; undefined until first fetched.
@@ -85,7 +85,7 @@
        * @returns {void}
        */
       function selectInspectorBranch(branchId) {
-        inspectorBranchId = branchId;
+        inspectorBranchId = branchId || null;
         if (!reviewDockSticky) reviewDockScope = branchId;
         // Switching branches while watching is still watching: the newly
         // selected branch attaches too, rather than showing a collapsed pane
@@ -93,6 +93,54 @@
         if (inspectorTab === "live" && !attachInspectorLive(branchId)) renderReviewInspector();
         else if (inspectorTab !== "live") renderReviewInspector();
         renderReviewDock();
+      }
+      /**
+       * The inspector and log-drawer state as the URL should carry it.
+       * @returns {InspectorHashState}
+       */
+      function currentInspectorHashState() {
+        const bid = inspectorBranchId;
+        const run = bid ? liveRunIdx[bid] : undefined;
+        // A command-scoped drawer has no branch id to name, so it links as the whole review.
+        const scopedToBranch = reviewDockScope !== "review" && reviewDockScope !== selectedCommandKey;
+        return {
+          branchId: bid,
+          tab: inspectorTab,
+          runIdx: run === undefined ? null : run,
+          liveSub: bid ? liveSub[bid] || "terminal" : "terminal",
+          dockOpen: reviewDockOpen,
+          dockScope: scopedToBranch ? reviewDockScope : "review",
+        };
+      }
+      /**
+       * Applies inspector state parsed from the URL once the open review's
+       * branches are loaded. An unknown branch falls back to no selection;
+       * restoring a tab does what opening it by hand does and nothing more.
+       * @param {GuardianView} g - The open review, with its branches loaded.
+       * @returns {void}
+       */
+      function applyPendingInspectorHash(g) {
+        const want = pendingInspectorHash;
+        if (!want || !g.branches) return;
+        pendingInspectorHash = null;
+        const b = want.branchId ? g.branches.find((x) => x.id === want.branchId) : null;
+        inspectorBranchId = b ? b.id : null;
+        selectedBranch[g.id] = b ? b.branch : null;
+        inspectorTab = b ? want.tab : "overview";
+        if (b) {
+          if (inspectorTab === "live") inspectorLiveAttached[b.id] = true;
+          if (inspectorTab === "appraisals") delete branchAppraisals[`${g.id}:${b.id}`];
+          if (want.runIdx === null) delete liveRunIdx[b.id]; else liveRunIdx[b.id] = want.runIdx;
+          liveSub[b.id] = want.liveSub;
+          if (inspectorTab === "live" && want.liveSub === "system") {
+            ensurePeekSystemPrompt(`guardian|${g.id}|${b.id}`).then(() => renderReviewInspector());
+          }
+        }
+        const scopeOk = want.dockScope === "review" || g.branches.some((x) => x.id === want.dockScope);
+        reviewDockScope = want.dockOpen && scopeOk ? want.dockScope : (b ? b.id : "review");
+        reviewDockCommand = "";
+        if (want.dockOpen !== reviewDockOpen) toggleReviewDock();
+        syncHash();
       }
       /**
        * Attaches one branch's live pane and starts its first fetch. Returns
@@ -121,8 +169,12 @@
         // Opening the Live tab IS the request to watch, so it attaches and
         // shows the pane -- a second "Show Live View" click bought nothing,
         // since nothing had loaded before the tab was opened either way.
+        // Opening the Live tab IS the request to watch, so it attaches and
+        // shows the pane -- a second "Show Live View" click bought nothing,
+        // since nothing had loaded before the tab was opened either way.
         const bid = inspectorBranchId;
         if (tab === "appraisals" && bid) delete branchAppraisals[`${selectedGuardian}:${bid}`];
+        syncHash();
         if (tab === "live" && bid && attachInspectorLive(bid)) return;
         renderReviewInspector();
       }
@@ -133,6 +185,7 @@
        */
       function toggleReviewDock() {
         reviewDockOpen = !reviewDockOpen;
+        syncHash();
         renderReviewDock();
         if (reviewDockTimer) { clearInterval(reviewDockTimer); reviewDockTimer = null; }
         if (reviewDockOpen) {
@@ -164,6 +217,7 @@
           renderReviewDock();
           if (reviewDockEvents[gid] === undefined) loadReviewDockEvents(gid);
         }
+        syncHash();
       }
 
       /**
@@ -208,7 +262,6 @@
         // The rewrite above recreated any live `.runterm` at scrollTop 0.
         restorePeekScrollPositions();
         restorePromptBoxScroll();
-        restoreAgentLogScroll();
       }
       /**
        * @typedef {object} InspectorUiSnapshot
@@ -710,6 +763,87 @@
         return branchRunsCache[`${gid}|${bid}`] || [];
       }
       /**
+       * Formats a run's "05:12:30 · passed" metadata line.
+       * @param {BranchRun} run - The run.
+       * @returns {string}
+       */
+      function inspectorRunMeta(run) {
+        const t = run.start_at_ms
+          ? new Date(run.start_at_ms).toLocaleTimeString([], { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" })
+          : "";
+        // Duration only where the daemon measured one -- a gate's elapsed_ms.
+        // Nothing here is derived from wall-clock guesses.
+        const dur = run.elapsed_ms ? ` · ${inspectorFmtDurationMs(run.elapsed_ms)}` : "";
+        const note = run.start_recorded === false ? " · start not recorded" : "";
+        return (run.outcome ? `${t} · ${run.outcome}` : t) + dur + note;
+      }
+      /**
+       * Formats a measured duration the way the rest of the board does.
+       * @param {number} ms - Milliseconds.
+       * @returns {string}
+       */
+      function inspectorFmtDurationMs(ms) {
+        const secs = Math.round(ms / 1000);
+        if (secs < 60) return `${secs}s`;
+        return `${Math.floor(secs / 60)}m ${secs % 60}s`;
+      }
+      /**
+       * Which run index the Live tab is showing for a branch, clamped to the
+       * list it actually has (runs grow as the branch works).
+       * @param {BranchRun[]} runs - The branch's runs.
+       * @param {string} bid - The branch id.
+       * @returns {number}
+       */
+      function inspectorCurRunIdx(runs, bid) {
+        if (!runs.length) return -1;
+        const want = liveRunIdx[bid];
+        if (want === undefined) return runs.length - 1;
+        return Math.max(0, Math.min(runs.length - 1, want));
+      }
+      /**
+       * Steps the Live tab one run backwards or forwards.
+       * @param {string} bid - The branch id.
+       * @param {number} dir - -1 for the previous run, 1 for the next.
+       * @returns {void}
+       */
+      function stepBranchRun(bid, dir) {
+        const g = guardians.find((x) => x.id === selectedGuardian);
+        const b = g && g.branches ? g.branches.find((x) => x.id === bid) : null;
+        if (!g || !b) return;
+        const runs = branchRunsOf(g.id, b.id);
+        if (!runs.length) return;
+        liveRunIdx[bid] = Math.max(0, Math.min(runs.length - 1, inspectorCurRunIdx(runs, bid) + dir));
+        syncHash();
+        renderReviewInspector();
+      }
+      /**
+       * Jumps the Live tab back to the newest run -- the live one.
+       * @param {string} bid - The branch id.
+       * @returns {void}
+       */
+      function jumpToLatestRun(bid) {
+        delete liveRunIdx[bid];
+        syncHash();
+        renderReviewInspector();
+      }
+      /**
+       * Switches the Live tab's sub-view.
+       * @param {string} bid - The branch id.
+       * @param {string} sub - terminal | prompt | system.
+       * @returns {void}
+       */
+      function inspectorSetLiveSub(bid, sub) {
+        liveSub[bid] = sub;
+        syncHash();
+        renderReviewInspector();
+        if (sub === "system") {
+          const g = guardians.find((x) => x.id === selectedGuardian);
+          // Fetched on first open and dropped on leaving, like every other
+          // lazily-loaded pane -- reopening refetches rather than caching.
+          if (g) ensurePeekSystemPrompt(`guardian|${g.id}|${bid}`).then(() => renderReviewInspector());
+        }
+      }
+      /**
        * Live: walk back through every run this branch had, and read whichever
        * one you land on. Nothing attaches until this tab is opened -- a branch
        * row never renders a terminal, so the cost is paid once, on the click.
@@ -727,31 +861,122 @@
         // The daemon pairs and attributes the runs; fetched once when this tab
         // first renders, then refetched only on the branch's SSE state change.
         if (branchRunsCache[`${g.id}|${b.id}`] === undefined) loadBranchRuns(g.id, b.id);
-        const btnStyle = "padding:3px 8px;font-size:11.5px";
-        return liveViewWidget({
-          scope: b.id,
-          title: `${resolverOf(g)} · ${b.branch}`,
-          runs: branchRunsOf(g.id, b.id),
-          repaint: renderReviewInspector,
-          canThink: g.resolver_thinking_capable !== false,
-          keyFor: (run) => `guardian|${g.id}|${b.id}${run && run.task && run.cell_id ? `|${run.task}|${run.cell_id}` : ""}`,
-          systemKey: `guardian|${g.id}|${b.id}`,
-          closeKey: "",
-          pickerAttrs: `data-click="scopeReviewDockToBranch" data-guardian-id="${esc(g.id)}" data-branch-id="${esc(b.id)}"`,
-          pickerTip: "Every agent session this branch ran — rebases, final proofs, feedback revisions.\nOpens the log drawer, where each run's own rows are listed alongside non-agent operations such as PR submission.",
-          noRunsText: "no agent session recorded for this branch yet",
-          noRunsTip: "Sessions appear here as the daemon records them — a rebase pass, a final proof, a feedback revision.\nThis branch has not run one yet.",
-          promptView: (run) => livePromptView(g, b, run),
-          terminalFoot: (run, key, isLatest) => `<div class="run-foot">
-            ${isLatest ? `<button class="btn" style="${btnStyle}" data-click="openGuardianBranchTerminalMenuItem" data-key="${esc(key)}" data-gid="${esc(g.id)}" data-bid="${esc(b.id)}" data-mode="open"
+        const runs = branchRunsOf(g.id, b.id);
+        const ri = inspectorCurRunIdx(runs, b.id);
+        const run = ri >= 0 ? runs[ri] : null;
+        const key = `guardian|${g.id}|${b.id}${run && run.task && run.cell_id ? `|${run.task}|${run.cell_id}` : ""}`;
+        // The key names the shown run, so it changes as runs load or are
+        // stepped through; whichever one is on screen is the one polled.
+        if (!peekOpen[key]) {
+          peekOpen[key] = true;
+          setTimeout(() => fetchPeek(key, true), 0);
+        }
+        const isLatest = ri === runs.length - 1;
+        const sub = liveSub[b.id] || "terminal";
+        const ended = !!peekEnded[key];
+        // Only the newest pass that used a tmux pane has content the live view
+        // still holds: the pane is reused, so an earlier pass's text is no
+        // longer in it. "Am I looking at live content" therefore keys on the
+        // Whether the pane still holds this run's text at all, separate from
+        // whether that text is still moving: the pane is reused between passes,
+        // so only the newest one's output is still in it. A finished session's
+        // record is not "historical" in the sense the walk-back note means --
+        // it is this run's own output, just no longer growing, and the liveness
+        // dot and the pane's own banner already say so.
+        const onNewestTape = !!run && ri === runs.length - 1;
+        const live = onNewestTape && !ended;
+
+        // 1 - who am I looking at, and is it still moving
+        const identity = `<div class="peek-head" style="margin-bottom:8px">
+            <span class="peek-dot${live ? "" : " ended"}"></span>
+            <span class="mono" style="font-size:11px">${esc(resolverOf(g))} · ${esc(b.branch)}</span>
+            <span style="flex:1"></span>
+            <span class="rg-sub" style="font-size:11px;color:var(--faint)">${live ? "streaming" : (isLatest ? "session ended" : "historical")}</span>
+            <button class="copy-btn" data-click="copyPeekText" data-key="${esc(key)}" data-tip="Copy what this tab is currently showing.">⧉</button>
+          </div>`;
+
+        // 2 - which run
+        const histBar = runs.length && run ? `<div class="histbar${onNewestTape ? "" : " past"}">
+            <button class="hnav" data-click="stepBranchRun" data-branch-id="${esc(b.id)}" data-dir="-1" ${ri <= 0 ? "disabled" : ""}
+              data-tip="Step back to the previous run on this branch.">&#9664;</button>
+            <button class="hpick" data-click="scopeReviewDockToBranch" data-guardian-id="${esc(g.id)}" data-branch-id="${esc(b.id)}"
+              data-tip="Every agent session this branch ran — rebases, final proofs, feedback revisions.\nOpens the log drawer, where each run's own rows are listed alongside non-agent operations such as PR submission.">
+              <span class="hkind ${esc(run.kind)}">${esc(run.kind)}</span>
+              <span class="hlabel mono">${esc(run.label)}</span>
+              <span class="hmeta">${esc(inspectorRunMeta(run))}</span>
+              <span class="hcount num">${ri + 1}/${runs.length}</span> &#9662;</button>
+            <button class="hnav" data-click="stepBranchRun" data-branch-id="${esc(b.id)}" data-dir="1" ${ri >= runs.length - 1 ? "disabled" : ""}
+              data-tip="Step forward to the next run on this branch.">&#9654;</button>
+            ${isLatest ? "" : `<button class="btn" style="padding:3px 8px;font-size:11px" data-click="jumpToLatestRun" data-branch-id="${esc(b.id)}"
+              data-tip="Jump back to the newest run — the one still streaming.">&#8677; Latest</button>`}
+          </div>
+          ${onNewestTape ? "" : `<div class="histnote">You are walked back to ${esc(run.label)}
+            from ${esc(inspectorRunMeta(run))} — an earlier pass than the one the pane below holds.</div>`}`
+          : `<div class="histbar"><span class="hpick" data-tip="Sessions appear here as the daemon records them — a rebase pass, a final proof, a feedback revision.\nThis branch has not run one yet.">
+              <span class="hkind">no runs</span><span class="hmeta">no agent session recorded for this branch yet</span></span></div>`;
+
+        // 3 - how it is rendered. Terminal-only controls, but they stay put on
+        //     the prompt views rather than vanishing: appearing and disappearing
+        //     on every tab swap reflows the pane. aria-disabled, not `disabled`,
+        //     so the tooltip explaining why still fires.
+        const showDebug = peekShowsDebug(key);
+        const showThinking = peekShowsThinking(key);
+        const canThink = g.resolver_thinking_capable !== false;
+        const dead = sub !== "terminal";
+        const deadTip = "Applies to the Terminal view.\nSwitch to Terminal to use it.";
+        const ctl = `<div class="peek-ctl">
+            <button class="tgl ${showDebug ? "on" : ""}${dead ? " off" : ""}" ${dead ? 'aria-disabled="true"' : ""}
+              data-click="toggleShowDebugMessagesBtn" data-key="${esc(key)}"
+              data-tip="${dead ? deadTip : "Show ralphus's own diagnostic/telemetry events inline, where they happened.\nOff by default so routine monitoring shows what the agent did.\nThis only changes what is rendered here — the daemon's logs always keep everything."}">
+              <span class="bx"></span>Debug messages</button>
+            <input class="typefilter${dead ? " dead" : ""}" placeholder="Filter types (e.g. read glob or -usage)"
+              value="${esc(peekTypeFilterInput[key] || "")}" ${dead ? "disabled" : ""}
+              oninput="setPeekTypeFilter('${esc(key)}',this.value)" aria-label="Filter log types"
+              data-tip="${dead ? `${deadTip}\n${LIVE_VIEW_TYPE_FILTER_TIP}` : LIVE_VIEW_TYPE_FILTER_TIP}">
+            ${canThink ? `<button class="tgl ${showThinking ? "on" : ""}${dead ? " off" : ""}" ${dead ? 'aria-disabled="true"' : ""}
+              data-click="toggleShowThinkingBtn" data-key="${esc(key)}"
+              data-tip="${dead ? deadTip : "Show the model's own reasoning expanded inline.\nOff folds each block to a single &lt;thinking…&gt; line.\nPurely a display choice — the reasoning is always captured, so toggling re-renders text already loaded without refetching."}">
+              <span class="bx"></span>Thinking</button>` : ""}
+          </div>`;
+
+        // 4 - which view, seated directly on what it switches
+        const subs = [["terminal", "Terminal"], ["prompt", "Prompt"], ["system", "System Prompt"]];
+        const tabs = `<div class="subtabs">${subs.map((s) => `<button class="subtab ${sub === s[0] ? "on" : ""}" `
+          + `data-click="inspectorSetLiveSub" data-branch-id="${esc(b.id)}" data-sub="${s[0]}" `
+          + `data-tip="${esc(LIVE_SUB_TIP[s[0]])}">${s[1]}</button>`).join("")}</div>`;
+
+        const top = identity + histBar + ctl + tabs;
+        // The system prompt is per branch, not per run: `setLiveSub` fetches it under the branch-level key.
+        if (sub === "system") return top + inspectorLiveSystemPromptView(g, `guardian|${g.id}|${b.id}`);
+        if (sub === "prompt") return top + livePromptView(g, b, run);
+        return top + inspectorLiveTerminalView(g, b, key, run, onNewestTape);
+      }
+      /**
+       * The Live tab's Terminal view: the run's captured output, framed, with
+       * the controls that act on it underneath.
+       * @param {GuardianView} g - The review.
+       * @param {GuardianBranch} b - The branch.
+       * @param {string} key - The peek key.
+       * @param {BranchRun|null} run - The run being shown.
+       * @param {boolean} isLatest - Whether that run is the newest one that used
+       *   a tmux pane, and so the only one whose text the live view still holds.
+       * @returns {string}
+       */
+      function inspectorLiveTerminalView(g, b, key, run, isLatest) {
+        const foot = `<div class="run-foot">
+            ${isLatest ? `<button class="btn" style="padding:3px 8px;font-size:11.5px" data-click="openGuardianBranchTerminalMenuItem" data-key="${esc(key)}" data-gid="${esc(g.id)}" data-bid="${esc(b.id)}" data-mode="open"
               data-tip="Attach a real, interactive terminal to this session.\nShows the runner's own log/event stream, not the agent's conversation.">Open terminal</button>` : ""}
-            <button class="btn" style="${btnStyle}" data-click="scopeReviewDockToBranch" data-guardian-id="${esc(g.id)}" data-branch-id="${esc(b.id)}"
+            <button class="btn" style="padding:3px 8px;font-size:11.5px" data-click="scopeReviewDockToBranch" data-guardian-id="${esc(g.id)}" data-branch-id="${esc(b.id)}"
               data-tip="Open this branch's log drawer alongside the transcript.">Logs</button>
             <span class="rg-sub">${run ? esc(run.agent || resolverOf(g)) : ""}</span>
-          </div>`,
-          systemFoot: `<div class="run-foot"><button class="btn" style="${btnStyle}" data-click="openEditReviewDetails" data-guardian-id="${esc(g.id)}" data-focus="resolver"
-            data-tip="The authored half of this prompt comes from the resolver agent and model. Change those in review setup.">Resolver settings</button></div>`,
-        });
+          </div>`;
+        const shown = peekContent[key];
+        return `<div style="position:relative"><div class="runterm" id="peek-pre-${peekCssKey(key)}" style="height:${peekPaneHeight}px" tabindex="0" data-key="${esc(key)}"
+            onscroll="onPeekScroll(this.dataset.key)" onkeydown="handlePeekKeydown(event,this.dataset.key)"
+            data-tip="Scroll through this run's output.\nClick here then press Ctrl+End to jump to the latest, or Ctrl+Home for the start.">${shown !== undefined ? transcriptHtml(shown) : "Loading…"}</div>
+          <button id="peek-jump-${peekCssKey(key)}" class="peek-jump-btn" style="display:none" data-click="peekScrollToBottom" data-key="${esc(key)}" data-tip="Jump to the latest output.\nAppears once you've scrolled up from the bottom — also triggerable with Ctrl+End while the terminal is focused.">↓ Jump to latest</button></div>${foot}
+          <div class="hint">Read-only — nothing typed here reaches the agent. Every run's text is
+          captured separately, so walking back survives a restart.</div>`;
       }
       /**
        * The Live tab's Prompt view: the instruction this run's agent was given.
@@ -788,6 +1013,27 @@
                 was told is on the System Prompt tab; a feedback revision may still show the reviewer's own text
                 here.</div></div>
           </div>`;
+      }
+      /**
+       * The Live tab's System Prompt view.
+       * @param {GuardianView} g - The review.
+       * @param {string} key - The peek key.
+       * @returns {string}
+       */
+      function inspectorLiveSystemPromptView(g, key) {
+        if (!currentUserIsAdmin) {
+          return `<div class="absent-run">
+              <div class="abody"><div class="at">Admin-only view</div>
+                <div class="as">The effective system prompt is shown to administrators only.</div></div>
+            </div>`;
+        }
+        const ps = peekSystemPrompt[key];
+        const body = ps === undefined || ps === "loading" ? "Loading…" : peekPromptDisplay(ps);
+        return `${reviewPromptBox(`${g.id}:${key}:system`, body)}
+          <div class="run-foot"><button class="btn" style="padding:3px 8px;font-size:11.5px" data-click="openEditReviewDetails" data-guardian-id="${esc(g.id)}" data-focus="resolver"
+            data-tip="The authored half of this prompt comes from the resolver agent and model. Change those in review setup.">Resolver settings</button></div>
+          <div class="hint">Read-only — the effective system prompt actually appended to this agent
+          invocation: ralphus's hidden instructions plus the resolver's authored prompt.</div>`;
       }
 
       /**
@@ -1210,6 +1456,7 @@
         closeSquadMenu();
         inspectorBranchId = bid;
         if (!reviewDockSticky) reviewDockScope = bid;
+        syncHash(true);
         setInspectorTab(tab);
         renderReviewDock();
       }
@@ -1226,6 +1473,7 @@
         if (!reviewDockOpen) toggleReviewDock();
         else renderReviewDock();
         if (reviewDockEvents[gid] === undefined) loadReviewDockEvents(gid);
+        syncHash();
       }
 
       // ---- Command rows as selections ----
@@ -1544,6 +1792,7 @@
         }
         renderReviewDetail();
         renderReviewDock();
+        syncHash();
       }
       /**
        * Scopes the log drawer to one command and opens it. An explicit ask
@@ -1562,6 +1811,7 @@
         else renderReviewDock();
         if (reviewDockEvents[gid] === undefined) loadReviewDockEvents(gid);
         renderReviewDetail();
+        syncHash();
       }
       /**
        * Expands or collapses one command's full text beneath its row. The row

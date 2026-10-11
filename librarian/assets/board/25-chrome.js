@@ -1,4 +1,4 @@
-﻿      // ---------- theme ----------
+      // ---------- theme ----------
       // RAL-257: the toggle swaps inline SVG icons instead of a Unicode glyph.
       // Each icon uses `currentColor`, so it inherits the .icon-btn
       // `color: var(--text)` and stays legible in either theme: the flashbang
@@ -309,6 +309,7 @@
        * @property {{q: string|null, status: string[]|null, projects: string[]|null}} [waypointHashFilters] raw Waypoints sidebar filters from the hash, applied by the Waypoints chunk (`applyWaypointHashFilters`) rather than here — that chunk loads after the first `parseHash()` call. A `null` field means the parameter was absent.
        * @property {string|null} [sel] legacy `kind:ti:si[:vi]` selector
        * @property {ParsedUri|null} [uri] RAL-188 selection, when the hash carried one
+       * @property {InspectorHashState} [inspector] Reviews-tab branch/detail-tab/log-drawer state
        */
       /**
        * Splits a raw hash into `[everything-before-sel, sel-value-or-null]`.
@@ -331,6 +332,81 @@
         const parts = [qs, selUri ? `sel=${selUri}` : ""].filter(Boolean);
         return parts.length ? `${base}?${parts.join("&")}` : base;
       }
+      // RALPHUS-REVIEW-INSPECTOR-HASH:BEGIN
+      /** Detail-pane tabs a `itab=` value may name. */
+      const INSPECTOR_HASH_TABS = ["overview", "worktree", "feedback", "live", "appraisals"];
+      /** Live sub-views an `lsub=` value may name. */
+      const INSPECTOR_HASH_LIVE_SUBS = ["terminal", "prompt", "system"];
+      /**
+       * The Reviews tab's branch-inspector and log-drawer state as the URL carries it.
+       * @typedef {object} InspectorHashState
+       * @property {string|null} branchId - Selected branch id, or null for none.
+       * @property {string} tab - One of INSPECTOR_HASH_TABS.
+       * @property {number|null} runIdx - Live run walked back to, or null for the newest.
+       * @property {string} liveSub - One of INSPECTOR_HASH_LIVE_SUBS.
+       * @property {boolean} dockOpen - Whether the log drawer is expanded.
+       * @property {string} dockScope - "review", or a branch id.
+       */
+      /**
+       * The state a hash without inspector params means.
+       * @returns {InspectorHashState}
+       */
+      function defaultInspectorHashState() {
+        return { branchId: null, tab: "overview", runIdx: null, liveSub: "terminal", dockOpen: false, dockScope: "review" };
+      }
+      /**
+       * Writes the non-default inspector state into `p` as plain query params:
+       * `branch`, `itab`, `run`, `lsub`, `dock`, `dscope`. Tab-specific params
+       * are only written where the tab makes them meaningful.
+       * @param {URLSearchParams} p
+       * @param {InspectorHashState} s
+       * @returns {void}
+       */
+      function encodeInspectorHash(p, s) {
+        if (s.branchId) {
+          p.set("branch", s.branchId);
+          if (s.tab !== "overview") p.set("itab", s.tab);
+          if (s.tab === "live") {
+            if (s.runIdx !== null) p.set("run", String(s.runIdx));
+            if (s.liveSub !== "terminal") p.set("lsub", s.liveSub);
+          }
+        }
+        if (s.dockOpen) {
+          p.set("dock", "1");
+          if (s.dockScope !== "review") p.set("dscope", s.dockScope);
+        }
+      }
+      /**
+       * Reads inspector state back out of `p`, falling back to defaults for
+       * any missing, unknown, or inapplicable value (a tab with no branch, a
+       * run/sub-view on a non-Live tab).
+       * @param {URLSearchParams} p
+       * @returns {InspectorHashState}
+       */
+      function decodeInspectorHash(p) {
+        const s = defaultInspectorHashState();
+        const branch = p.get("branch");
+        if (branch) {
+          s.branchId = branch;
+          const t = p.get("itab");
+          if (t && INSPECTOR_HASH_TABS.includes(t)) s.tab = t;
+          if (s.tab === "live") {
+            const run = p.get("run");
+            if (run !== null && /^\d+$/.test(run)) s.runIdx = Number(run);
+            const sub = p.get("lsub");
+            if (sub && INSPECTOR_HASH_LIVE_SUBS.includes(sub)) s.liveSub = sub;
+          }
+        }
+        if (p.get("dock") === "1") {
+          s.dockOpen = true;
+          const scope = p.get("dscope");
+          if (scope) s.dockScope = scope;
+        }
+        return s;
+      }
+      // RALPHUS-REVIEW-INSPECTOR-HASH:END
+      /** @type {InspectorHashState|null} inspector state parsed from the hash, waiting for the open review's detail to load */
+      let pendingInspectorHash = null;
       /** @type {ParsedHash|null} the hash-derived route waiting to be applied once its data has loaded */
       let pendingHash = null;
       /**
@@ -403,6 +479,7 @@
           const selUri = guardian
             ? `ralphus:${URI_SEGMENT_SEPARATOR_TOKEN}${uriSegment("REVIEW", guardian.name || guardian.id, 0)}${URI_QUERY_OPEN_TOKEN}id${URI_QUERY_ASSIGN_TOKEN}${uriEncodeQueryValue(guardian.id)}`
             : "";
+          encodeInspectorHash(p, pendingInspectorHash || currentInspectorHashState());
           const base = selectedGuardian && !guardian ? `#/reviews/${selectedGuardian}` : "#/reviews";
           url = hashWithSel(base, p.toString(), selUri);
         } else if (tab === "tasks") {
@@ -479,7 +556,7 @@
           // half and is resolved against the loaded list in `pollReviews`.
           const uri = looksLikeUri(selValue) ? parseRalphusUri(/** @type {string} */ (selValue)) : null;
           const reviewName = uri && uri.segments[0] ? uri.segments[0].name : null;
-          return { tab: "reviews", guardianId: (uri && uri.query.id) || path.split("/")[1] || null, uri, sel: reviewName };
+          return { tab: "reviews", guardianId: (uri && uri.query.id) || path.split("/")[1] || null, uri, sel: reviewName, inspector: decodeInspectorHash(p) };
         }
         if (raw.startsWith("resources")) return { tab: "resources" };
         if (raw.startsWith("queue")) return { tab: "queue" };

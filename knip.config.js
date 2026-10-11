@@ -119,6 +119,11 @@ function compileHtml(text, _filePath) {
   // The pure task-tab test loader exports these helpers dynamically.
   referenced.add("ttFmtTurns");
   referenced.add("ttGroupAggregateWithGeneration");
+  // Review inspector Live tab run navigation, dispatched by data-click attributes.
+  referenced.add("stepBranchRun");
+  referenced.add("jumpToLatestRun");
+  // Review inspector Live sub-view switcher, dispatched by data-click attributes.
+  referenced.add("inspectorSetLiveSub");
 
   const exportedScript = contents
     .replace(TOPLEVEL_FN_RE, (_m, indent, async, name) => `${indent}export ${async || ""}function ${name}(`)
