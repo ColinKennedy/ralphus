@@ -16803,6 +16803,7 @@ fn waypoint_create(daemon: &Daemon, body: &str) -> Reply {
     }
     for (kind, entry_id, note) in &parsed_roster {
         if let Err(e) = store.add_roster_entry(&id, *kind, entry_id, note.as_deref()) {
+            let _ = store.discard_waypoint(&id);
             return store_error(&e);
         }
     }
@@ -16811,6 +16812,7 @@ fn waypoint_create(daemon: &Daemon, body: &str) -> Reply {
     let waypoint_halts = daemon.waypoint_halts_handle();
     for (kind, entry_id, mode) in &parsed_affected {
         if let Err(e) = store.add_affected_entry(&id, *kind, entry_id, *mode) {
+            let _ = store.discard_waypoint(&id);
             return store_error(&e);
         }
         crate::waypoints::signal_explicit_block_halt(
