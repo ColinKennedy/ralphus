@@ -121,6 +121,19 @@ impl StoreMutex {
         {
             let mut holder = HOLDER.lock();
             if waited >= SLOW_WAIT_LOG_THRESHOLD {
+                // RAL-596: non-blocking queue push (see `daemon_health`), so
+                // it is safe with the store lock held.
+                crate::daemon_health::emit(
+                    crate::daemon_health::HealthEvent::error(
+                        "daemon.store_lock.slow_wait",
+                        format!("waited {}ms for the store lock", waited.as_millis()),
+                    )
+                    .attr(
+                        "waited_ms",
+                        i64::try_from(waited.as_millis()).unwrap_or(i64::MAX),
+                    )
+                    .attr("site", format!("{}:{}", loc.file(), loc.line())),
+                );
                 if let Some(prev) = *holder {
                     let held_ms = now.saturating_sub(prev.acquired_at_ms);
                     crate::rlog!(
@@ -247,6 +260,10 @@ impl std::ops::DerefMut for StoreGuard<'_> {
 /// (log + Cartographer row, and a panic in dev/test builds).
 const GUARD_HOLD_WARN_MS: u128 = 100;
 
+/// A hold at least this long (ms) is also exported as a `daemon.store_lock.long_hold`
+/// OpenTelemetry span (RAL-596); shorter holds are log-only.
+const GUARD_HOLD_OTEL_MS: u128 = 1000;
+
 /// Panic threshold for the guard watchdog, in milliseconds; `0` disables
 /// panicking (release builds log instead). Overridable via
 /// `RALPHUS_GUARD_HOLD_PANIC_MS` (set it very large to disable panicking).
@@ -330,6 +347,18 @@ impl Drop for StoreGuard<'_> {
             return;
         }
         GUARD_HOLD_WARN_COUNT.fetch_add(1, Ordering::Relaxed);
+        // RAL-596: only holds of a second or more are daemon-health events;
+        // the 100 ms band stays log-only.
+        if held_ms >= GUARD_HOLD_OTEL_MS {
+            crate::daemon_health::emit(
+                crate::daemon_health::HealthEvent::error(
+                    "daemon.store_lock.long_hold",
+                    format!("store lock held for {held_ms}ms"),
+                )
+                .attr("held_ms", i64::try_from(held_ms).unwrap_or(i64::MAX))
+                .attr("site", format!("{}:{}", self.site.file(), self.site.line())),
+            );
+        }
         let detail = format!(
             "store guard held for {held_ms}ms (acquired at {}:{})",
             self.site.file(),

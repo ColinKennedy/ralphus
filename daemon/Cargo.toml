@@ -58,6 +58,8 @@ base64 = { workspace = true }
 chrono = { workspace = true }
 cron.workspace = true
 getrandom = { workspace = true }
+# `disk` feeds the low-free-space health probe (RAL-596).
+sysinfo = { version = "0.36.1", default-features = false, features = ["system", "disk"] }
 sha2.workspace = true
 
 [dev-dependencies]
@@ -67,7 +69,6 @@ git2 = { workspace = true }
 rusqlite = { workspace = true, features = ["trace"] }
 
 [target."cfg(windows)".dependencies]
-sysinfo = { version = "0.36.1", default-features = false, features = ["system"] }
 win32job = "2.0.3"
 
 [target."cfg(unix)".dependencies]
