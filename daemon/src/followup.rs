@@ -1277,6 +1277,13 @@ fn branch_exists(root: &Path, name: &str) -> bool {
 /// into, or the remote's default branch when that branch is gone.
 #[must_use]
 pub fn resolve_followup_base(git_root: &Path, merged_into: &str) -> String {
+    // Git abbreviates a remote-tracking ref as `remotes/<remote>/<branch>`
+    // when a local branch shares the short name, so a review's recorded base
+    // can arrive in that form; the follow-up needs the plain `<remote>/<branch>`.
+    let merged_into = merged_into
+        .strip_prefix("refs/remotes/")
+        .or_else(|| merged_into.strip_prefix("remotes/"))
+        .unwrap_or(merged_into);
     if !merged_into.is_empty() && branch_exists(git_root, merged_into) {
         merged_into.to_string()
     } else {
@@ -2410,6 +2417,33 @@ mode = "raw"
         );
         assert_eq!(
             resolve_followup_base(&root, "origin/gone"),
+            DEFAULT_UPSTREAM
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&origin);
+    }
+
+    #[test]
+    fn a_remotes_prefixed_merge_target_keeps_its_remote_instead_of_falling_back() {
+        let origin = temp_root("remotesorigin");
+        run_git(&origin, &["init", "-q", "-b", "staging"]);
+        run_git(&origin, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        let root = temp_root("remotesclone");
+        run_git(&root, &["init", "-q", "-b", "main"]);
+        run_git(&root, &["remote", "add", "alt", &origin.to_string_lossy()]);
+
+        // `git rev-parse --abbrev-ref @{upstream}` yields this form when a
+        // local branch is also named `alt/staging`.
+        assert_eq!(
+            resolve_followup_base(&root, "remotes/alt/staging"),
+            "alt/staging"
+        );
+        assert_eq!(
+            resolve_followup_base(&root, "refs/remotes/alt/staging"),
+            "alt/staging"
+        );
+        assert_eq!(
+            resolve_followup_base(&root, "remotes/alt/gone"),
             DEFAULT_UPSTREAM
         );
         let _ = std::fs::remove_dir_all(&root);
