@@ -32,6 +32,7 @@ uv run pytest                       # run one: uv run pytest -k name
 | `test_bench_graphs.py` | SVG/HTML rendering from stored records |
 | `test_bench_gitinfo.py` | Git commit/dirty-state detection |
 | `test_bench_stats.py` | Stats-bundle computation (mean/median/stddev/IQR/outliers) |
+| `test_proccount.py` | RAL-604 process-count tags manifest, run reduction (lowest of N, failures dropped), record upsert, graph (`docs/proc-counts.md`) |
 
 None of these need live external services — that's a hard requirement (see
 the Ollama-test authoring rule in [[../daemon/AGENTS|daemon/AGENTS.md]], which

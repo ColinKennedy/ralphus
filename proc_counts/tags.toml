@@ -1,0 +1,17 @@
+# Tagged tests whose process counts are tracked (RAL-604; docs/proc-counts.md).
+# `id` is "<nextest binary id> <test name>"; each test carries exactly one tag.
+# Distinct behaviours are separate tests.
+
+# Command proofs (daemon-side `run_command_proof*`).
+[[test]]
+id = "ralphus-daemon proof::tests::passing_command_is_true"
+tag = "proof-command"
+
+[[test]]
+id = "ralphus-daemon proof::tests::capture_returns_output"
+tag = "proof-command"
+
+# Command cells (runner-side `run_command`).
+[[test]]
+id = "ralphus-runner execute::tests::run_command_reports_exit_code_and_output"
+tag = "cell-command"
