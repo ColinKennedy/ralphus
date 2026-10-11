@@ -149,6 +149,11 @@ pub(crate) struct ReadConnPool {
     /// back to the always-correct `StoreMutex` path rather than blocking
     /// forever on a pool that will never hand out a connection.
     total: usize,
+    /// Whether the pooled connections share a cache with the writer (the
+    /// in-memory test database). SQLite's shared-cache mode locks tables
+    /// instead of snapshotting them, so a pooled reader and the writer can
+    /// block or fail each other -- unlike WAL, where readers never do.
+    shared_cache: bool,
     free: Mutex<Vec<Connection>>,
     available: Condvar,
 }
@@ -172,9 +177,15 @@ impl ReadConnPool {
         }
         Arc::new(Self {
             total: free.len(),
+            shared_cache: matches!(location, DbLocation::Memory(_)),
             free: Mutex::new(free),
             available: Condvar::new(),
         })
+    }
+
+    /// Whether readers here share a cache with the writer; see the field.
+    pub(crate) fn is_shared_cache(&self) -> bool {
+        self.shared_cache
     }
 
     /// Check out a connection, blocking until one is free. Returns `None`
@@ -277,6 +288,7 @@ mod tests {
     fn acquire_returns_none_when_every_open_attempt_failed() {
         let pool = Arc::new(ReadConnPool {
             total: 0,
+            shared_cache: false,
             free: Mutex::new(Vec::new()),
             available: Condvar::new(),
         });

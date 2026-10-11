@@ -2346,8 +2346,16 @@ impl Store {
     /// preliminary, git-log-only change summary from the task's own worktree
     /// before any review worktree has been built for that branch.
     pub fn cell_cwd_for_branch(&self, branch: &str) -> Result<Option<String>> {
-        let cwd: Option<Option<String>> = self
-            .conn
+        Self::cell_cwd_for_branch_conn(&self.conn, branch)
+    }
+
+    /// [`Self::cell_cwd_for_branch`] against any connection, so the read pool
+    /// can serve it without the writer lock.
+    pub(crate) fn cell_cwd_for_branch_conn(
+        conn: &Connection,
+        branch: &str,
+    ) -> Result<Option<String>> {
+        let cwd: Option<Option<String>> = conn
             .query_row(
                 "SELECT cwd FROM cells WHERE review_branch=? ORDER BY rowid DESC LIMIT 1",
                 params![branch],
@@ -5732,7 +5740,15 @@ impl Store {
     /// for 3+ seconds under load, stalling every other daemon operation
     /// behind it.
     pub(crate) fn list_guardian_status_pairs(&self) -> Result<Vec<(String, String)>> {
-        let mut stmt = self.conn.prepare("SELECT id, status FROM guardians")?;
+        Self::list_guardian_status_pairs_conn(&self.conn)
+    }
+
+    /// [`Self::list_guardian_status_pairs`] against any connection, so the
+    /// read pool can serve it without the writer lock.
+    pub(crate) fn list_guardian_status_pairs_conn(
+        conn: &Connection,
+    ) -> Result<Vec<(String, String)>> {
+        let mut stmt = conn.prepare("SELECT id, status FROM guardians")?;
         let rows = stmt
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<std::result::Result<Vec<_>, _>>()?;

@@ -59,7 +59,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
 use crate::chat_client::{self, ChatMessage};
@@ -71,6 +71,22 @@ use crate::triage::SubprojectResolution;
 /// Unwraps a store result whose failure a waypoint sweep or notification
 /// tolerates (skipping, defaulting, or carrying on), recording the failure as
 /// a WARNING `waypoints` row first so it is not lost.
+/// [`log_swallowed`] for a result read off the store lock: the lock is taken
+/// only when there is a failure to record.
+fn log_swallowed_pooled<T>(
+    store: &crate::store_lock::StoreHandle,
+    context: &str,
+    result: StoreResult<T>,
+) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(e) => {
+            let guard = store.lock();
+            log_swallowed::<T>(&guard, context, Err(e))
+        }
+    }
+}
+
 fn log_swallowed<T>(store: &Store, context: &str, result: StoreResult<T>) -> Option<T> {
     match result {
         Ok(value) => Some(value),
@@ -671,9 +687,13 @@ impl Store {
     /// `pool_key_for_path`/registered-project lookup" -- so this restores the
     /// documented design. `TaskView::project` is left alone everywhere it is
     /// used for display.
-    fn scope_project_key(&self, cwd: Option<&str>, display_project: &str) -> String {
+    fn scope_project_key_conn(
+        conn: &Connection,
+        cwd: Option<&str>,
+        display_project: &str,
+    ) -> String {
         cwd.filter(|c| !c.trim().is_empty())
-            .and_then(|c| self.project_name_for_path(c))
+            .and_then(|c| Store::project_name_for_path_conn(conn, c))
             .unwrap_or_else(|| display_project.to_string())
     }
 
@@ -689,8 +709,20 @@ impl Store {
     /// # Errors
     /// Propagates any SQLite failure.
     pub fn squad_scope_by_project(&self, squad_id: &str) -> StoreResult<BTreeMap<String, Scope>> {
-        let resolved = Store::subprojects_by_cell(&self.conn, squad_id)?;
-        let mut stmt = self.conn.prepare(
+        Self::squad_scope_by_project_conn(&self.conn, squad_id)
+    }
+
+    /// [`Self::squad_scope_by_project`] against any connection, so the read
+    /// pool can serve it without the writer lock.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub(crate) fn squad_scope_by_project_conn(
+        conn: &Connection,
+        squad_id: &str,
+    ) -> StoreResult<BTreeMap<String, Scope>> {
+        let resolved = Store::subprojects_by_cell(conn, squad_id)?;
+        let mut stmt = conn.prepare(
             "SELECT t.idx, t.project, c.idx, c.cwd
              FROM tasks t JOIN cells c ON c.squad_id = t.squad_id AND c.task_idx = t.idx
              WHERE t.squad_id = ? ORDER BY t.idx, c.idx",
@@ -718,7 +750,10 @@ impl Store {
             let display = project
                 .clone()
                 .unwrap_or_else(|| crate::store::fallback_project_identifier(cwd.as_deref()));
-            task_key.insert(*task_idx, self.scope_project_key(cwd.as_deref(), &display));
+            task_key.insert(
+                *task_idx,
+                Self::scope_project_key_conn(conn, cwd.as_deref(), &display),
+            );
         }
 
         let mut by_project: BTreeMap<String, Vec<SubprojectResolution>> = BTreeMap::new();
@@ -756,7 +791,19 @@ impl Store {
         &self,
         guardian_id: &str,
     ) -> StoreResult<BTreeMap<String, Scope>> {
-        let mut stmt = self.conn.prepare(
+        Self::review_scope_by_project_conn(&self.conn, guardian_id)
+    }
+
+    /// [`Self::review_scope_by_project`] against any connection, so the read
+    /// pool can serve it without the writer lock.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub(crate) fn review_scope_by_project_conn(
+        conn: &Connection,
+        guardian_id: &str,
+    ) -> StoreResult<BTreeMap<String, Scope>> {
+        let mut stmt = conn.prepare(
             "SELECT DISTINCT s.squad_id, s.task_idx, s.idx FROM cells s
              WHERE s.review_guardian_id = ?
                 OR (
@@ -786,8 +833,8 @@ impl Store {
 
         let mut by_project: BTreeMap<String, Vec<SubprojectResolution>> = BTreeMap::new();
         for (squad_id, cells) in per_squad {
-            let squad = self.get_squad(&squad_id)?;
-            let resolved = Store::subprojects_by_cell(&self.conn, &squad_id)?;
+            let squad = Store::get_squad_conn(conn, &squad_id)?;
+            let resolved = Store::subprojects_by_cell(conn, &squad_id)?;
             for (task_idx, idx) in cells {
                 // Same registered-project keying as `squad_scope_by_project`:
                 // both sides of the overlap test must agree on what a project
@@ -799,7 +846,7 @@ impl Store {
                         || "unassigned".to_string(),
                         |t| {
                             let cwd = t.cells.iter().find_map(|c| c.cwd.as_deref());
-                            self.scope_project_key(cwd, &t.project)
+                            Self::scope_project_key_conn(conn, cwd, &t.project)
                         },
                     );
                 let resolution = match resolved.get(&(task_idx, idx)) {
@@ -831,11 +878,27 @@ impl Store {
         &self,
         waypoint_id: &str,
     ) -> StoreResult<BTreeMap<String, Scope>> {
+        Self::waypoint_scope_by_project_conn(&self.conn, waypoint_id)
+    }
+
+    /// [`Self::waypoint_scope_by_project`] against any connection, so the read
+    /// pool can serve it without the writer lock.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub(crate) fn waypoint_scope_by_project_conn(
+        conn: &Connection,
+        waypoint_id: &str,
+    ) -> StoreResult<BTreeMap<String, Scope>> {
         let mut merged: BTreeMap<String, Scope> = BTreeMap::new();
-        for entry in self.list_affected_entries(waypoint_id)? {
+        for entry in Self::list_affected_entries_conn(conn, waypoint_id)? {
             let entry_scope = match entry.kind {
-                WaypointEntryKind::Squad => self.squad_scope_by_project(&entry.entry_id)?,
-                WaypointEntryKind::Review => self.review_scope_by_project(&entry.entry_id)?,
+                WaypointEntryKind::Squad => {
+                    Self::squad_scope_by_project_conn(conn, &entry.entry_id)?
+                }
+                WaypointEntryKind::Review => {
+                    Self::review_scope_by_project_conn(conn, &entry.entry_id)?
+                }
             };
             for (project, scope) in entry_scope {
                 merged
@@ -861,7 +924,21 @@ impl Store {
         &self,
         waypoint_id: &str,
     ) -> StoreResult<Vec<SurveyCandidate>> {
-        let waypoint_scopes = self.waypoint_scope_by_project(waypoint_id)?;
+        Self::waypoint_survey_candidates_conn(&self.conn, waypoint_id)
+    }
+
+    /// [`Self::waypoint_survey_candidates`] against any connection, so the
+    /// read pool can serve it without the writer lock. The sweep walks every
+    /// non-terminal squad and review and computes each one's scope, which is
+    /// seconds of work on a long-lived store.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub(crate) fn waypoint_survey_candidates_conn(
+        conn: &Connection,
+        waypoint_id: &str,
+    ) -> StoreResult<Vec<SurveyCandidate>> {
+        let waypoint_scopes = Self::waypoint_scope_by_project_conn(conn, waypoint_id)?;
         if waypoint_scopes.is_empty() {
             return Ok(Vec::new());
         }
@@ -873,7 +950,7 @@ impl Store {
         // creates such rows to hold the gate closed until a verdict exists,
         // so they must stay surveyable or their NULL verdict would block
         // forever.
-        let mut stmt = self.conn.prepare(
+        let mut stmt = conn.prepare(
             "SELECT kind, entry_id FROM waypoint_affected
              WHERE waypoint_id=? AND NOT (auto_enrolled=1 AND survey_verdict IS NULL)",
         )?;
@@ -900,7 +977,7 @@ impl Store {
 
         let mut candidates = Vec::new();
 
-        let mut stmt = self.conn.prepare("SELECT id, state FROM squads")?;
+        let mut stmt = conn.prepare("SELECT id, state FROM squads")?;
         let squad_rows = stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -911,7 +988,7 @@ impl Store {
             if is_terminal || is_affecteded(WaypointEntryKind::Squad, &squad_id) {
                 continue;
             }
-            if overlaps(&self.squad_scope_by_project(&squad_id)?) {
+            if overlaps(&Self::squad_scope_by_project_conn(conn, &squad_id)?) {
                 candidates.push(SurveyCandidate {
                     kind: WaypointEntryKind::Squad,
                     entry_id: squad_id,
@@ -919,13 +996,13 @@ impl Store {
             }
         }
 
-        for (guardian_id, status) in self.list_guardian_status_pairs()? {
+        for (guardian_id, status) in Store::list_guardian_status_pairs_conn(conn)? {
             if GuardianStatus::is_terminal_status(&status)
                 || is_affecteded(WaypointEntryKind::Review, &guardian_id)
             {
                 continue;
             }
-            if overlaps(&self.review_scope_by_project(&guardian_id)?) {
+            if overlaps(&Self::review_scope_by_project_conn(conn, &guardian_id)?) {
                 candidates.push(SurveyCandidate {
                     kind: WaypointEntryKind::Review,
                     entry_id: guardian_id,
@@ -941,9 +1018,16 @@ impl Store {
     /// # Errors
     /// Propagates any SQLite failure.
     pub fn list_open_waypoint_ids(&self) -> StoreResult<Vec<String>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id FROM waypoints WHERE state='open'")?;
+        Self::list_open_waypoint_ids_conn(&self.conn)
+    }
+
+    /// [`Self::list_open_waypoint_ids`] against any connection, so the read
+    /// pool can serve it without the writer lock.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub(crate) fn list_open_waypoint_ids_conn(conn: &Connection) -> StoreResult<Vec<String>> {
+        let mut stmt = conn.prepare("SELECT id FROM waypoints WHERE state='open'")?;
         let rows = stmt
             .query_map([], |r| r.get(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1142,7 +1226,19 @@ impl Store {
     /// # Errors
     /// Propagates any SQLite failure.
     pub fn list_affected_entries(&self, waypoint_id: &str) -> StoreResult<Vec<AffectedEntryView>> {
-        let mut stmt = self.conn.prepare(
+        Self::list_affected_entries_conn(&self.conn, waypoint_id)
+    }
+
+    /// [`Self::list_affected_entries`] against any connection, so the read pool
+    /// can serve it without the writer lock.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub(crate) fn list_affected_entries_conn(
+        conn: &Connection,
+        waypoint_id: &str,
+    ) -> StoreResult<Vec<AffectedEntryView>> {
+        let mut stmt = conn.prepare(
             "SELECT waypoint_id, kind, entry_id, mode, survey_verdict, survey_rationale, delivery_status, stand_down_at_ms, created_at_ms, updated_at_ms, stale_at_ms, bearing_decision, bearing_decided_at_ms
              FROM waypoint_affected WHERE waypoint_id=? ORDER BY created_at_ms, entry_id",
         )?;
@@ -3201,26 +3297,25 @@ pub fn run_pending_surveys(
     waypoint_halts: &crate::cancel::WaypointHalts,
     runner: &Arc<dyn Runner>,
 ) {
-    let waypoint_ids = {
-        let guard = store.lock();
-        log_swallowed(
-            &guard,
-            "list open waypoints",
-            guard.list_open_waypoint_ids(),
-        )
-        .unwrap_or_default()
-    };
+    // The candidate walk computes a scope for every live squad and review, so it
+    // reads through the pool: under the writer lock it held the store for
+    // seconds on a long-lived database. The lock is taken only to log a failure.
+    let waypoint_ids = log_swallowed_pooled(
+        store,
+        "list open waypoints",
+        store.with_read_snapshot(Store::list_open_waypoint_ids_conn),
+    )
+    .unwrap_or_default();
     let mut budget = SURVEY_MAX_PER_SWEEP;
     for waypoint_id in waypoint_ids {
-        let candidates = {
-            let guard = store.lock();
-            log_swallowed(
-                &guard,
-                &format!("waypoint {waypoint_id} list survey candidates"),
-                guard.waypoint_survey_candidates(&waypoint_id),
-            )
-            .unwrap_or_default()
-        };
+        let candidates = log_swallowed_pooled(
+            store,
+            &format!("waypoint {waypoint_id} list survey candidates"),
+            store.with_read_snapshot(|conn| {
+                Store::waypoint_survey_candidates_conn(conn, &waypoint_id)
+            }),
+        )
+        .unwrap_or_default();
         let total = candidates.len();
         // A candidate whose survey is still running from an earlier sweep is
         // skipped without spending budget: a model call slower than the sweep
