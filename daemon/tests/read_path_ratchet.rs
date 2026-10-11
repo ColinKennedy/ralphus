@@ -69,6 +69,8 @@ const MAINTENANCE_WORKERS_OFF_THE_LOCK: &[(&str, &str)] = &[
     ("src/pr.rs", "sync_open_pr_branches"),
     ("src/pr.rs", "verify_and_repair_stack_ancestry"),
     ("src/pr.rs", "detect_forge_reorder"),
+    ("src/pr.rs", "reconcile_ci_deferral"),
+    ("src/pr.rs", "reconcile_ci_deferral_if_stack_changed"),
     ("src/pr.rs", "refresh_pr_forge_cache_for_guardian"),
     ("src/pr.rs", "compute_sync_status_inner"),
     // The survey sweep scores every live squad and review per open waypoint;

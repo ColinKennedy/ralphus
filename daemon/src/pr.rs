@@ -3834,32 +3834,43 @@ fn defers_full_ci(mode: &str, index: usize, count: usize) -> bool {
 /// stack members the review's `ci_deferral` mode defers, and take it off every
 /// other one, on the forge. The stack is the review's open `parent`-kind PRs/
 /// MRs in branch order, bottom to top -- the same membership
-/// [`resync_pr_bases`] chains together. Each label call is idempotent, so this
-/// asserts the desired end state without reading the current labels.
+/// [`resync_pr_bases`] chains together. Each member's current labels are read
+/// first, and only a member whose label differs from the desired one is
+/// touched. For that member the CI runs already in flight are recorded, the
+/// label is changed, and once that succeeds exactly the recorded runs are
+/// cancelled -- they ran under the old scope -- while a run the change itself
+/// starts is left alone. Where the forge does not re-run CI on a label change
+/// by itself, a new run is then requested (see
+/// [`crate::forge::ForgeClient::rerun_pull_request_ci`]).
 ///
 /// Every member is attempted even if an earlier one failed; the errors come
-/// back together. Returns how many members now carry the label.
+/// back together. A failed CI listing, cancel or re-run is logged, not
+/// returned. Returns how many members now carry the label.
 pub fn reconcile_ci_deferral(
     store: &crate::store_lock::StoreHandle,
     id: &str,
 ) -> std::result::Result<usize, String> {
     use ralphus_core::schema::DEFER_FULL_CI_LABEL;
-    let guardian = store.lock().get_guardian(id).map_err(|e| e.to_string())?;
+    let guardian = store
+        .with_read_snapshot_or_lock_when_shared_cache(|conn| {
+            crate::store::Store::get_guardian_conn(conn, id)
+        })
+        .map_err(|e| e.to_string())?;
     if crate::guardian::GuardianStatus::is_terminal_status(&guardian.status) {
+        CI_DEFERRAL_SEEN.lock().expect("poisoned").remove(id);
         return Ok(0);
     }
     let prs = store
         .lock()
         .list_pull_requests_for_guardian(id)
         .map_err(|e| e.to_string())?;
-    let by_branch = open_prs_by_branch(&prs);
-    let mut ordered_branches: Vec<_> = guardian.branches.iter().filter(|b| b.enabled).collect();
-    ordered_branches.sort_by_key(|b| b.position);
-    let members: Vec<&PullRequestView> = ordered_branches
-        .iter()
-        .filter_map(|b| by_branch.get(b.id.as_str()).copied())
-        .collect();
+    let members = ci_deferral_members(&guardian, &prs);
+    let signature = ci_deferral_signature(&guardian.effective_ci_deferral, &members);
     if members.is_empty() {
+        CI_DEFERRAL_SEEN
+            .lock()
+            .expect("poisoned")
+            .insert(id.to_string(), signature);
         return Ok(0);
     }
 
@@ -3874,6 +3885,9 @@ pub fn reconcile_ci_deferral(
     );
     let mode = guardian.effective_ci_deferral.as_str();
     let mut deferred = 0usize;
+    let mut changed = 0usize;
+    let mut cancelled_runs = 0usize;
+    let mut reruns = 0usize;
     let mut errors = Vec::new();
     for (index, pr) in members.iter().enumerate() {
         let Some(number) = pr.pr_number else {
@@ -3887,9 +3901,72 @@ pub fn reconcile_ci_deferral(
             continue;
         };
         let present = defers_full_ci(mode, index, members.len());
+        // Only a PR/MR whose label really changes is written to, and only that
+        // one has its CI touched: this runs on every submission and reorder,
+        // and most of those leave most labels as they were.
+        let ci_state = match client.get_pull_request_ci_state(number) {
+            Ok(state) => state,
+            Err(e) => {
+                errors.push(format!("pr {}: {e}", pr.id));
+                continue;
+            }
+        };
+        let has_label = ci_state
+            .labels
+            .iter()
+            .any(|label| label == DEFER_FULL_CI_LABEL);
+        if has_label == present {
+            deferred += usize::from(present);
+            continue;
+        }
+        // The CI runs in flight right now were started under the old scope, so
+        // they are out of date the moment the label changes. Record them
+        // *before* the change: whatever the change itself starts is newer and
+        // must survive. Best-effort -- a token that cannot list runs must not
+        // block the label change.
+        let stale_runs = match ci_state.head_sha.as_deref() {
+            Some(sha) => client.list_active_ci_runs(sha).unwrap_or_else(|e| {
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [pr] review {id} could not list active CI on pr {}: {e}",
+                    pr.id
+                );
+                Vec::new()
+            }),
+            None => Vec::new(),
+        };
         match client.set_pull_request_label(number, DEFER_FULL_CI_LABEL, present) {
-            Ok(()) => deferred += usize::from(present),
-            Err(e) => errors.push(format!("pr {}: {e}", pr.id)),
+            Ok(()) => {
+                deferred += usize::from(present);
+                changed += 1;
+            }
+            Err(e) => {
+                errors.push(format!("pr {}: {e}", pr.id));
+                continue;
+            }
+        }
+        // Only after the label is really on (or off) are the stale runs killed.
+        match client.cancel_ci_runs(&stale_runs) {
+            Ok(cancelled) => cancelled_runs += cancelled.len(),
+            Err(e) => crate::rlog!(
+                WARNING,
+                "ralphus [pr] review {id} could not cancel stale CI on pr {}: {e}",
+                pr.id
+            ),
+        }
+        // GitHub re-runs a workflow that listens for label changes by itself.
+        // GitLab does not, so ask it for a new pipeline -- after the stale ones
+        // are cancelled, so the new one is not among them. This is
+        // best-effort: a project without merge request pipelines has nothing
+        // to re-run, and that must not fail the settings change that caused it.
+        match client.rerun_pull_request_ci(number) {
+            Ok(true) => reruns += 1,
+            Ok(false) => {}
+            Err(e) => crate::rlog!(
+                WARNING,
+                "ralphus [pr] review {id} could not re-run CI on pr {} after a label change: {e}",
+                pr.id
+            ),
         }
     }
     {
@@ -3912,16 +3989,117 @@ pub fn reconcile_ci_deferral(
                 "mode": mode,
                 "members": members.len(),
                 "deferred": deferred,
+                "changed": changed,
+                "stale_ci_cancelled": cancelled_runs,
+                "ci_reruns": reruns,
                 "errors": errors,
             }),
             admin_only: false,
         });
     }
     if errors.is_empty() {
+        // The stack as it stood when every member was found right: a later
+        // look only has to act if this changes.
+        CI_DEFERRAL_SEEN
+            .lock()
+            .expect("poisoned")
+            .insert(id.to_string(), signature);
         Ok(deferred)
     } else {
         Err(errors.join("; "))
     }
+}
+
+/// The stack [`reconcile_ci_deferral`] labels: the review's open `parent`-kind
+/// PRs/MRs on enabled branches, in branch order, bottom to top.
+fn ci_deferral_members<'a>(
+    guardian: &GuardianView,
+    prs: &'a [PullRequestView],
+) -> Vec<&'a PullRequestView> {
+    let by_branch = open_prs_by_branch(prs);
+    let mut ordered_branches: Vec<_> = guardian.branches.iter().filter(|b| b.enabled).collect();
+    ordered_branches.sort_by_key(|b| b.position);
+    ordered_branches
+        .iter()
+        .filter_map(|b| by_branch.get(b.id.as_str()).copied())
+        .collect()
+}
+
+/// A string that changes exactly when the labels a review needs could change:
+/// its mode, or which PRs/MRs are in its stack and in what order.
+fn ci_deferral_signature(mode: &str, members: &[&PullRequestView]) -> String {
+    let stack: Vec<String> = members
+        .iter()
+        .map(|pr| format!("{}#{}", pr.id, pr.pr_number.unwrap_or_default()))
+        .collect();
+    format!("{mode}|{}", stack.join(","))
+}
+
+/// For each review, [`ci_deferral_signature`] as of the last time
+/// [`reconcile_ci_deferral`] found every label right. A signature that differs
+/// from this means the stack was changed by something other than a label sync
+/// -- a reorder, a branch enabled or disabled, a PR/MR merged, closed or
+/// dropped, a new one opened -- and the labels need another look.
+static CI_DEFERRAL_SEEN: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Re-label a review's PRs/MRs if its stack is not the one they were last
+/// labelled for, whatever changed it, and do nothing -- no forge call -- if it
+/// is. Meant to be cheap enough for a periodic sweep: it reads only local
+/// state. The first look at a review after the daemon starts only records its
+/// stack, since nothing is known to have changed. A failed sync is logged and
+/// retried on the next change.
+pub fn reconcile_ci_deferral_if_stack_changed(store: &crate::store_lock::StoreHandle, id: &str) {
+    let Ok(guardian) = store.with_read_snapshot_or_lock_when_shared_cache(|conn| {
+        crate::store::Store::get_guardian_conn(conn, id)
+    }) else {
+        return;
+    };
+    if crate::guardian::GuardianStatus::is_terminal_status(&guardian.status) {
+        CI_DEFERRAL_SEEN.lock().expect("poisoned").remove(id);
+        return;
+    }
+    let Ok(prs) = store.lock().list_pull_requests_for_guardian(id) else {
+        return;
+    };
+    let signature = {
+        let members = ci_deferral_members(&guardian, &prs);
+        ci_deferral_signature(&guardian.effective_ci_deferral, &members)
+    };
+    {
+        let mut seen = CI_DEFERRAL_SEEN.lock().expect("poisoned");
+        match seen.get(id) {
+            Some(last) if *last == signature => return,
+            Some(_) => {}
+            None => {
+                seen.insert(id.to_string(), signature);
+                return;
+            }
+        }
+    }
+    crate::rlog!(
+        INFO,
+        "ralphus [pr] review {id} stack changed since its CI-deferral labels were set: re-labelling"
+    );
+    if let Err(e) = reconcile_ci_deferral(store, id) {
+        // Remember the new shape anyway, so a forge that keeps failing is not
+        // asked again on every sweep; the next real change tries again.
+        CI_DEFERRAL_SEEN
+            .lock()
+            .expect("poisoned")
+            .insert(id.to_string(), signature);
+        crate::rlog!(
+            WARNING,
+            "ralphus [pr] review {id} ci deferral label sync failed: {e}"
+        );
+    }
+}
+
+/// [`reconcile_ci_deferral_if_stack_changed`] in the background, for a request
+/// that has just changed the stack and must not wait on forge calls.
+pub fn start_reconcile_ci_deferral(store: crate::store_lock::StoreHandle, id: &str) {
+    let id = id.to_string();
+    std::thread::spawn(move || reconcile_ci_deferral_if_stack_changed(&store, &id));
 }
 
 /// Kick off [`resync_pr_bases`] in the background — called after a reorder,
@@ -14345,78 +14523,235 @@ mod tests {
         assert_eq!(rows("head+tip", 3), [false, false, false]);
     }
 
-    /// Flip a three-PR stack through every mode against a mock forge that
-    /// keeps real per-PR label state, asserting which PRs/MRs carry the defer
-    /// label after each flip, and that the flips touch nothing but labels: the
-    /// PRs' bases and the branch order are exactly what they were.
-    fn ci_deferral_flip_scenario(forge: &str) {
-        use std::collections::{BTreeMap, BTreeSet};
-        use std::sync::Mutex;
+    /// One CI run -- a GitHub workflow run or a GitLab pipeline -- on the mock
+    /// stack forge. Its commit is always `sha-<pr number>`.
+    struct MockCiRun {
+        id: i64,
+        number: i64,
+        active: bool,
+    }
 
+    /// Everything the mock stack forge remembers: each PR/MR's labels, its CI
+    /// runs, every request it served, and the state-changing events in order.
+    #[derive(Default)]
+    struct StackForgeState {
+        labels: std::collections::BTreeMap<i64, std::collections::BTreeSet<String>>,
+        runs: Vec<MockCiRun>,
+        next_run: i64,
+        calls: Vec<String>,
+        events: Vec<String>,
+    }
+
+    impl StackForgeState {
+        /// Start a new, active run on `number`'s commit (ids from 1000, so
+        /// they never collide with the runs a test seeds below that).
+        fn start_run(&mut self, number: i64) {
+            self.next_run += 1;
+            let id = 1000 + self.next_run;
+            self.runs.push(MockCiRun {
+                id,
+                number,
+                active: true,
+            });
+            self.events.push(format!("new-run {id} for {number}"));
+        }
+
+        fn cancel_run(&mut self, id: i64) {
+            let run = self.runs.iter_mut().find(|r| r.id == id).unwrap();
+            run.active = false;
+            self.events.push(format!("cancel {id}"));
+        }
+
+        /// A label change. GitHub starts a run of a workflow that listens for
+        /// `labeled`/`unlabeled` by itself; GitLab never does.
+        fn change_label(&mut self, number: i64, label: &str, add: bool, github: bool) {
+            let set = self.labels.entry(number).or_default();
+            if add {
+                set.insert(label.to_string());
+            } else {
+                set.remove(label);
+            }
+            self.events.push(format!(
+                "label {number} {}",
+                if add { "add" } else { "remove" }
+            ));
+            if github {
+                self.start_run(number);
+            }
+        }
+
+        fn deferred_numbers(&self) -> Vec<i64> {
+            self.labels
+                .iter()
+                .filter(|(_, set)| set.contains(ralphus_core::schema::DEFER_FULL_CI_LABEL))
+                .map(|(number, _)| *number)
+                .collect()
+        }
+
+        fn event_position(&self, event: &str) -> usize {
+            self.events
+                .iter()
+                .position(|e| e == event)
+                .unwrap_or_else(|| panic!("no event {event:?} in {:?}", self.events))
+        }
+    }
+
+    /// A mock forge serving the endpoints the CI-deferral reconcile uses --
+    /// reading a PR/MR's labels and head commit, listing and cancelling CI
+    /// runs, changing a label, and (GitLab) creating a pipeline -- backed by
+    /// `state`. Any other request panics, so an unexpected mutation (a base
+    /// retarget, say) fails the test.
+    fn start_stack_forge(
+        is_github: bool,
+        state: Arc<std::sync::Mutex<StackForgeState>>,
+    ) -> MockForge {
         let label = ralphus_core::schema::DEFER_FULL_CI_LABEL;
-        let labels: Arc<Mutex<BTreeMap<i64, BTreeSet<String>>>> = Arc::default();
-        let calls: Arc<Mutex<Vec<String>>> = Arc::default();
-        let (handler_labels, handler_calls) = (Arc::clone(&labels), Arc::clone(&calls));
-        let is_github = forge == "github";
-        let mock = MockForge::start(move |server| {
+        MockForge::start(move |server| {
             for mut req in server.requests() {
                 let method = req.method().clone();
                 let url = req.url().to_string();
                 let mut body = String::new();
                 req.as_reader().read_to_string(&mut body).unwrap();
-                handler_calls
-                    .lock()
-                    .unwrap()
-                    .push(format!("{method} {url}"));
-                let mut state = handler_labels.lock().unwrap();
-                if is_github {
-                    let parts: Vec<&str> = url.split('/').collect();
-                    let at = parts.iter().position(|p| *p == "issues").unwrap();
-                    let number: i64 = parts[at + 1].parse().unwrap();
-                    match method {
-                        tiny_http::Method::Post => {
+                let (path, query) = url.split_once('?').unwrap_or((url.as_str(), ""));
+                let segments: Vec<&str> = path.split('/').collect();
+                let num = |s: &str| -> i64 { s.parse().unwrap() };
+                let query_sha_number = || -> i64 {
+                    let sha = query
+                        .split('&')
+                        .find_map(|kv| kv.strip_prefix("head_sha=").or(kv.strip_prefix("sha=")))
+                        .unwrap_or_else(|| panic!("no commit in query {query:?}"));
+                    num(sha.strip_prefix("sha-").unwrap())
+                };
+                let mut st = state.lock().unwrap();
+                st.calls.push(format!("{method} {url}"));
+                let runs_json = |st: &StackForgeState, number: i64| -> Vec<serde_json::Value> {
+                    st.runs
+                        .iter()
+                        .filter(|r| r.number == number)
+                        .map(|r| {
+                            if is_github {
+                                serde_json::json!({
+                                    "id": r.id,
+                                    "head_sha": format!("sha-{number}"),
+                                    "status": if r.active { "in_progress" } else { "completed" },
+                                })
+                            } else {
+                                serde_json::json!({
+                                    "id": r.id,
+                                    "sha": format!("sha-{number}"),
+                                    "status": if r.active { "running" } else { "canceled" },
+                                })
+                            }
+                        })
+                        .collect()
+                };
+                let names = |st: &StackForgeState, number: i64| -> Vec<String> {
+                    st.labels
+                        .get(&number)
+                        .map(|set| set.iter().cloned().collect())
+                        .unwrap_or_default()
+                };
+                let reply = if is_github {
+                    // /repos/acme/widget/<rest...>
+                    match (&method, &segments[4..]) {
+                        (tiny_http::Method::Get, ["pulls", n]) => {
+                            let number = num(n);
+                            serde_json::json!({
+                                "labels": names(&st, number)
+                                    .into_iter()
+                                    .map(|name| serde_json::json!({ "name": name }))
+                                    .collect::<Vec<_>>(),
+                                "head": { "sha": format!("sha-{number}") },
+                            })
+                        }
+                        (tiny_http::Method::Get, ["actions", "runs"]) => {
+                            serde_json::json!({ "workflow_runs": runs_json(&st, query_sha_number()) })
+                        }
+                        (tiny_http::Method::Post, ["actions", "runs", id, "force-cancel"]) => {
+                            st.cancel_run(num(id));
+                            serde_json::json!({})
+                        }
+                        (tiny_http::Method::Post, ["issues", n, "labels"]) => {
                             let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
                             for added in payload["labels"].as_array().unwrap() {
-                                state
-                                    .entry(number)
-                                    .or_default()
-                                    .insert(added.as_str().unwrap().to_string());
+                                assert_eq!(added.as_str(), Some(label));
+                                st.change_label(num(n), label, true, true);
                             }
+                            serde_json::json!({})
                         }
-                        tiny_http::Method::Delete => {
-                            assert!(url.ends_with("/labels/ralphus%3Adefer-full-ci"), "{url}");
-                            state
-                                .entry(number)
-                                .or_default()
-                                .remove("ralphus:defer-full-ci");
+                        (tiny_http::Method::Delete, ["issues", n, "labels", name]) => {
+                            assert_eq!(*name, "ralphus%3Adefer-full-ci");
+                            st.change_label(num(n), label, false, true);
+                            serde_json::json!({})
                         }
-                        other => panic!("unexpected {other} {url}"),
+                        other => panic!("unexpected request {other:?} {url}"),
                     }
                 } else {
-                    assert_eq!(method, tiny_http::Method::Put, "{url}");
-                    let number: i64 = url.rsplit('/').next().unwrap().parse().unwrap();
-                    let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
-                    let set = state.entry(number).or_default();
-                    match (
-                        payload["add_labels"].as_str(),
-                        payload["remove_labels"].as_str(),
-                    ) {
-                        (Some(added), None) => {
-                            set.insert(added.to_string());
+                    // /projects/acme%2Fwidget/<rest...>
+                    match (&method, &segments[3..]) {
+                        (tiny_http::Method::Get, ["merge_requests", n]) => {
+                            let number = num(n);
+                            serde_json::json!({
+                                "labels": names(&st, number),
+                                "sha": format!("sha-{number}"),
+                            })
                         }
-                        (None, Some(removed)) => {
-                            set.remove(removed);
+                        (tiny_http::Method::Get, ["pipelines"]) => {
+                            serde_json::Value::Array(runs_json(&st, query_sha_number()))
                         }
-                        _ => panic!("a label call must only add or remove labels: {body}"),
+                        (tiny_http::Method::Post, ["pipelines", id, "cancel"]) => {
+                            st.cancel_run(num(id));
+                            serde_json::json!({})
+                        }
+                        (tiny_http::Method::Post, ["merge_requests", n, "pipelines"]) => {
+                            st.start_run(num(n));
+                            serde_json::json!({})
+                        }
+                        (tiny_http::Method::Put, ["merge_requests", n]) => {
+                            let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+                            match (
+                                payload["add_labels"].as_str(),
+                                payload["remove_labels"].as_str(),
+                            ) {
+                                (Some(added), None) => {
+                                    assert_eq!(added, label);
+                                    st.change_label(num(n), label, true, false);
+                                }
+                                (None, Some(removed)) => {
+                                    assert_eq!(removed, label);
+                                    st.change_label(num(n), label, false, false);
+                                }
+                                _ => panic!("a PUT must only add or remove the label: {body}"),
+                            }
+                            serde_json::json!({})
+                        }
+                        other => panic!("unexpected request {other:?} {url}"),
                     }
-                }
-                drop(state);
-                req.respond(tiny_http::Response::from_string("{}").with_status_code(200))
-                    .unwrap();
+                };
+                drop(st);
+                req.respond(
+                    tiny_http::Response::from_string(reply.to_string()).with_status_code(200),
+                )
+                .unwrap();
             }
-        });
-        let addr = mock.addr();
+        })
+    }
 
+    /// A review of three open PRs/MRs (numbers 1-3, bottom to top, each based
+    /// on the one before) filed against a [`start_stack_forge`] mock, with one
+    /// CI run already in flight on each (ids 101-103).
+    fn three_pr_stack(
+        forge: &str,
+        state: &Arc<std::sync::Mutex<StackForgeState>>,
+    ) -> (
+        MockForge,
+        Arc<crate::store_lock::StoreMutex>,
+        String,
+        std::path::PathBuf,
+    ) {
+        let is_github = forge == "github";
+        let mock = start_stack_forge(is_github, Arc::clone(state));
+        let addr = mock.addr().to_string();
         let root = tmp_dir(&format!("ci-deferral-{forge}"));
         g(&root, &["init"]);
         let remote = if is_github {
@@ -14472,6 +14807,27 @@ mod tests {
                 )
                 .unwrap();
         }
+        {
+            let mut st = state.lock().unwrap();
+            for number in 1..=3 {
+                st.runs.push(MockCiRun {
+                    id: 100 + number,
+                    number,
+                    active: true,
+                });
+            }
+        }
+        (mock, store, gid, root)
+    }
+
+    /// Flip a three-PR stack through every mode against a mock forge that
+    /// keeps real per-PR label state, asserting which PRs/MRs carry the defer
+    /// label after each flip, and that the flips touch nothing but labels and
+    /// CI runs: the PRs' bases and the branch order are exactly what they were.
+    fn ci_deferral_flip_scenario(forge: &str) {
+        let is_github = forge == "github";
+        let state: Arc<std::sync::Mutex<StackForgeState>> = Arc::default();
+        let (mock, store, gid, root) = three_pr_stack(forge, &state);
         let stack_shape = |store: &Arc<crate::store_lock::StoreMutex>| {
             let guard = store.lock();
             let rows = guard.list_pull_requests_for_guardian(&gid).unwrap();
@@ -14491,15 +14847,6 @@ mod tests {
         };
         let shape_before = stack_shape(&store);
 
-        let deferred_numbers = || -> Vec<i64> {
-            labels
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|(_, set)| set.contains(label))
-                .map(|(number, _)| *number)
-                .collect()
-        };
         // (mode, PR numbers expected to carry the label afterwards)
         let flips: [(&str, Vec<i64>); 5] = [
             ("every", vec![]),
@@ -14515,7 +14862,11 @@ mod tests {
                 .unwrap();
             let deferred = reconcile_ci_deferral(&store, &gid).unwrap();
             assert_eq!(deferred, expected.len(), "{forge} {mode}");
-            assert_eq!(deferred_numbers(), expected, "{forge} {mode}");
+            assert_eq!(
+                state.lock().unwrap().deferred_numbers(),
+                expected,
+                "{forge} {mode}"
+            );
             assert_eq!(stack_shape(&store), shape_before, "{forge} {mode}");
         }
 
@@ -14557,21 +14908,218 @@ mod tests {
                 .set_guardian_ci_deferral(&gid, Some(mode))
                 .unwrap();
             reconcile_ci_deferral(&store, &gid).unwrap();
-            assert_eq!(deferred_numbers(), expected, "{forge} {mode} with 4 PRs");
+            assert_eq!(
+                state.lock().unwrap().deferred_numbers(),
+                expected,
+                "{forge} {mode} with 4 PRs"
+            );
         }
 
         mock.finish();
-        let calls = calls.lock().unwrap();
-        assert!(!calls.is_empty());
+        let st = state.lock().unwrap();
+        assert!(!st.calls.is_empty());
         assert!(
-            calls.iter().all(|call| if is_github {
-                call.contains("/issues/") && call.contains("/labels")
+            st.calls.iter().all(|call| if is_github {
+                !call.starts_with("PATCH")
             } else {
-                call.starts_with("PUT /projects/acme%2Fwidget/merge_requests/")
+                !call.contains("target_branch")
             }),
-            "label reconciles must call only label endpoints, got {calls:?}"
+            "label reconciles must never retarget a PR, got {:?}",
+            st.calls
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// After a label change succeeds, the CI runs that were already in flight
+    /// are cancelled -- they ran under the old scope -- while a run the change
+    /// itself starts survives, and a PR/MR whose label did not change keeps
+    /// its run.
+    fn ci_deferral_cancels_stale_ci_scenario(forge: &str) {
+        let is_github = forge == "github";
+        let state: Arc<std::sync::Mutex<StackForgeState>> = Arc::default();
+        let (mock, store, gid, root) = three_pr_stack(forge, &state);
+        let active = |st: &StackForgeState, number: i64| -> Vec<i64> {
+            st.runs
+                .iter()
+                .filter(|r| r.number == number && r.active)
+                .map(|r| r.id)
+                .collect()
+        };
+
+        // none -> top: PRs 1 and 2 gain the label, PR 3 is unchanged.
+        store
+            .lock()
+            .set_guardian_ci_deferral(&gid, Some("top"))
+            .unwrap();
+        reconcile_ci_deferral(&store, &gid).unwrap();
+        {
+            let st = state.lock().unwrap();
+            assert_eq!(st.deferred_numbers(), vec![1, 2], "{forge}");
+            for number in [1, 2] {
+                let stale = 100 + number;
+                assert!(
+                    !st.runs.iter().find(|r| r.id == stale).unwrap().active,
+                    "{forge}: the run in flight on PR {number} before the change is cancelled"
+                );
+                assert!(
+                    st.event_position(&format!("label {number} add"))
+                        < st.event_position(&format!("cancel {stale}")),
+                    "{forge}: a run is cancelled only after the label change succeeded"
+                );
+                let fresh = active(&st, number);
+                assert_eq!(fresh.len(), 1, "{forge}: PR {number} has one run left");
+                assert!(
+                    fresh[0] >= 1000,
+                    "{forge}: the surviving run on PR {number} is the one the change started"
+                );
+                if !is_github {
+                    assert!(
+                        st.event_position(&format!("cancel {stale}"))
+                            < st.event_position(&format!("new-run {} for {number}", fresh[0])),
+                        "{forge}: the new pipeline is requested after the stale one is cancelled"
+                    );
+                }
+            }
+            assert_eq!(
+                active(&st, 3),
+                vec![103],
+                "{forge}: PR 3's label did not change, so its run is left alone"
+            );
+        }
+
+        // Nothing changed, so reconciling again touches no run.
+        let events_before = state.lock().unwrap().events.clone();
+        reconcile_ci_deferral(&store, &gid).unwrap();
+        assert_eq!(
+            state.lock().unwrap().events,
+            events_before,
+            "{forge}: an unchanged stack changes no label and cancels no run"
+        );
+
+        // top -> bottom+top: only PR 1 changes (it loses the label); the run
+        // started by the first change is now stale and goes, a new one starts,
+        // and PR 2's run is untouched.
+        let pr2_run_before = active(&state.lock().unwrap(), 2);
+        store
+            .lock()
+            .set_guardian_ci_deferral(&gid, Some("bottom+top"))
+            .unwrap();
+        reconcile_ci_deferral(&store, &gid).unwrap();
+        {
+            let st = state.lock().unwrap();
+            assert_eq!(st.deferred_numbers(), vec![2], "{forge}");
+            assert_eq!(
+                active(&st, 2),
+                pr2_run_before,
+                "{forge}: PR 2 did not change, so its run survives"
+            );
+            let pr1 = active(&st, 1);
+            assert_eq!(pr1.len(), 1, "{forge}");
+            assert!(
+                pr1[0] > 1000 + 2,
+                "{forge}: PR 1 is left with a run newer than the one it replaced"
+            );
+        }
+
+        mock.finish();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A change to the review's stack that no label sync made -- a branch
+    /// disabled or enabled, a reorder, a PR/MR dropping out -- moves the labels
+    /// to the PRs/MRs that are now in the middle, and an unchanged stack costs
+    /// no forge call at all.
+    fn ci_deferral_follows_stack_changes_scenario(forge: &str) {
+        let state: Arc<std::sync::Mutex<StackForgeState>> = Arc::default();
+        let (mock, store, gid, root) = three_pr_stack(forge, &state);
+        let deferred = |state: &Arc<std::sync::Mutex<StackForgeState>>| {
+            state.lock().unwrap().deferred_numbers()
+        };
+
+        // The first look at a review since the daemon started records its
+        // stack and asks the forge nothing.
+        reconcile_ci_deferral_if_stack_changed(&store, &gid);
+        assert!(
+            state.lock().unwrap().calls.is_empty(),
+            "{forge}: the first look only records the stack"
+        );
+
+        store
+            .lock()
+            .set_guardian_ci_deferral(&gid, Some("top"))
+            .unwrap();
+        reconcile_ci_deferral(&store, &gid).unwrap();
+        assert_eq!(deferred(&state), vec![1, 2], "{forge}: top mode");
+
+        // Nothing changed: not one request.
+        let calls_before = state.lock().unwrap().calls.len();
+        reconcile_ci_deferral_if_stack_changed(&store, &gid);
+        assert_eq!(
+            state.lock().unwrap().calls.len(),
+            calls_before,
+            "{forge}: an unchanged stack is not looked at on the forge"
+        );
+
+        // Disable the top branch: the branch below it is the top now, so it
+        // loses the label (and runs full CI); the one under that keeps it.
+        store
+            .lock()
+            .set_branch_enabled_by_name(&gid, "c", false)
+            .unwrap();
+        reconcile_ci_deferral_if_stack_changed(&store, &gid);
+        assert_eq!(deferred(&state), vec![1], "{forge}: top branch disabled");
+
+        // Enable it again: PR 3 is the top, PR 2 goes back to deferring.
+        store
+            .lock()
+            .set_branch_enabled_by_name(&gid, "c", true)
+            .unwrap();
+        reconcile_ci_deferral_if_stack_changed(&store, &gid);
+        assert_eq!(deferred(&state), vec![1, 2], "{forge}: branch re-enabled");
+
+        // Reorder to c, a, b: PR 2 is now the top, and PR 3 the bottom.
+        let order: Vec<String> = ["c", "a", "b"].into_iter().map(String::from).collect();
+        store
+            .lock()
+            .reorder_guardian_branches(&gid, &order)
+            .unwrap();
+        reconcile_ci_deferral_if_stack_changed(&store, &gid);
+        assert_eq!(deferred(&state), vec![1, 3], "{forge}: reordered");
+
+        // The new bottom (PR 3) drops out of the stack: PR 1 becomes the
+        // bottom and PR 2 stays the top, so only PR 1 defers.
+        let pr3 = store
+            .lock()
+            .list_pull_requests_for_guardian(&gid)
+            .unwrap()
+            .into_iter()
+            .find(|pr| pr.pr_number == Some(3))
+            .unwrap();
+        store.lock().drop_pull_request(&pr3.id, "closed").unwrap();
+        reconcile_ci_deferral_if_stack_changed(&store, &gid);
+        let st = state.lock().unwrap();
+        assert!(
+            st.labels[&1].contains(ralphus_core::schema::DEFER_FULL_CI_LABEL),
+            "{forge}: PR 1 is in the middle of what is left"
+        );
+        assert!(
+            !st.labels[&2].contains(ralphus_core::schema::DEFER_FULL_CI_LABEL),
+            "{forge}: PR 2 is the top of what is left"
+        );
+        drop(st);
+
+        mock.finish();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ci_deferral_follows_stack_changes_on_github() {
+        ci_deferral_follows_stack_changes_scenario("github");
+    }
+
+    #[test]
+    fn ci_deferral_follows_stack_changes_on_gitlab() {
+        ci_deferral_follows_stack_changes_scenario("gitlab");
     }
 
     #[test]
@@ -14582,6 +15130,16 @@ mod tests {
     #[test]
     fn ci_deferral_flips_labels_on_a_gitlab_stack_without_touching_it() {
         ci_deferral_flip_scenario("gitlab");
+    }
+
+    #[test]
+    fn ci_deferral_cancels_stale_github_runs_after_a_label_change() {
+        ci_deferral_cancels_stale_ci_scenario("github");
+    }
+
+    #[test]
+    fn ci_deferral_cancels_stale_gitlab_pipelines_after_a_label_change() {
+        ci_deferral_cancels_stale_ci_scenario("gitlab");
     }
 
     #[test]

@@ -17550,6 +17550,10 @@ fn guardian_reorder(daemon: &Daemon, id: &str, body: &str) -> Reply {
         Err(e) => return store_error(&e),
     };
     drop(store);
+    // A reorder, or a branch enabled or disabled with it, can change which PR
+    // is the bottom and which is the top, so the CI-deferral labels follow --
+    // backgrounded since it makes forge calls.
+    crate::pr::start_reconcile_ci_deferral(daemon.store_handle(), id);
     // RAL-190: a reorder can change which branch precedes a stacked PR, so
     // its forge base needs to follow -- backgrounded since it makes network
     // calls (see pr::resync_pr_bases's doc comment).

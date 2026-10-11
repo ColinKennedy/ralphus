@@ -722,9 +722,20 @@ in a review's stack run the full CI suite; every other open member carries the
 skip its slow jobs. Changing it on a review (`POST .../settings` or `.../details`)
 re-labels the review's open PRs/MRs before the request returns -- a forge failure
 is a `502` with the value already saved -- and a later submission is labelled
-against the then-current setting. Changing the project default re-labels the
-project's reviews that have no override of their own, in the background. An
-unrecognised stored value behaves as `every`. `default_proof_scope` accepts the legacy `verify_scope` key name too
+against the then-current setting. Only a PR/MR whose label actually changes is
+touched: the CI runs in flight on its head commit are recorded first and, once
+the label change has succeeded, cancelled (they ran under the old scope), and
+GitLab, which never starts a pipeline for a label change, is asked for a new
+merge request pipeline. Those CI steps are best-effort and never fail the
+request. Changing the project default re-labels the project's reviews that have
+no override of their own, in the background. The labels also follow the stack:
+a reorder (with any branch enabled or disabled alongside it), an arrange, a
+force-start, a branch move and every submission re-label it, and the daemon's
+periodic review check re-labels a review whose stack of open PRs/MRs no longer
+matches the one it was last labelled for -- a PR/MR merged, closed or dropped
+included -- without any forge call when nothing changed. An unrecognised stored
+value behaves as `every`. How a repository's CI reads the label is in
+[`ci-deferral.md`](ci-deferral.md). `default_proof_scope` accepts the legacy `verify_scope` key name too
 (pre-dates the Verify→Proof rename, see the glossary). `id`/`name`/`upstream`/
 `action` have no project-default equivalent -- see
 `daemon/src/config.rs`'s `REVIEW_FIELD_PARITY` for why each is excluded.
