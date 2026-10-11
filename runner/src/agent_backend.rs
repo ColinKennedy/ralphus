@@ -5,6 +5,7 @@
 //! [`crate::codex_backend`]) or the generic [`crate::harness_backend`].
 
 use serde_json::{Value, json};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::backend::{BackendError, BackendOutcome, ModelBackend, RunOptions};
 use crate::llm_client::{self, ToolSpec};
@@ -140,13 +141,33 @@ impl ModelBackend for AgentBackend {
             }),
         );
         let started = std::time::Instant::now();
+        let tool_seq = AtomicU64::new(0);
         let result = llm_client::run_agent(
             &provider,
             &system_prompt,
             prompt,
             &tools,
             timeout,
-            |name, input| dispatch_tool(workspace, name, input),
+            |name, input| {
+                // The tool loop hands the callback no provider tool-use id,
+                // so the record id is a per-run sequence number.
+                let id = format!("native-{}", tool_seq.fetch_add(1, Ordering::Relaxed));
+                let tag = format!("tool.{name}");
+                crate::tool_record::emit(&crate::tool_record::call_record(
+                    &self.agent,
+                    &id,
+                    &tag,
+                    &input.to_string(),
+                ));
+                let output = dispatch_tool(workspace, name, input);
+                crate::tool_record::emit(&crate::tool_record::result_record(
+                    &self.agent,
+                    &id,
+                    &output,
+                    output.starts_with("error: "),
+                ));
+                output
+            },
         );
         let elapsed = started.elapsed().as_secs_f64();
         let result = match result {

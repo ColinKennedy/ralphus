@@ -1,14 +1,17 @@
       // ---------- widget-based agent log (RAL-603, experimental) ----------
-      // The runner flattens every tool call to a bracket-tagged text line
-      // (`[tool.Bash.git] Bash(...)`, then `[result] ...` / `[error] ...`), and
-      // that text tape is the only record there is, so the widgets are rebuilt
-      // from it. Results carry no tool-use id: a result belongs to the most
-      // recent call that has not had one yet. Args and results are already
-      // truncated by the runner, and Codex does not print command output at all.
+      // Each backend emits a structured `RALPHUS_TOOL: {json}` record per tool
+      // call and per result (runner/src/tool_record.rs): exact tool name, the
+      // provider's tool-use id, the full input and the full output. Those
+      // records are the source. A transcript written before the records existed
+      // has none, so it falls back to rebuilding the widgets from the
+      // bracket-tagged text tape (`[tool.Bash.git] Bash(...)`, then `[result]
+      // ...` / `[error] ...`), which is lossy: args and results are truncated,
+      // results pair to calls by order, and Codex output is absent.
       // RALPHUS-AGENT-LOG:BEGIN
       /**
        * @typedef {object} AgentLogEntry
        * @property {number} index - Position of the call in the log; stable as the log grows.
+       * @property {string} id - The provider's tool-use id, or "" for a text-tape entry.
        * @property {string} tool - The tool name (`Bash`, `exec`, `mcp`, ...).
        * @property {string} sub - The sub-command or sub-tool (`git`, `server.tool`), or "".
        * @property {string} tag - The full bracketed type, e.g. `tool.Bash.git`.
@@ -26,6 +29,8 @@
       const AGENT_LOG_SHELL_TOOLS = ["Bash", "bash", "powershell", "exec"];
       /** How many of the newest entries are drawn before "show earlier" is pressed. */
       const AGENT_LOG_PAGE = 150;
+      /** Marker of a structured tool record; matches runner/src/tool_record.rs::TOOL_MARKER. */
+      const AGENT_LOG_RECORD_PREFIX = "RALPHUS_TOOL: ";
       /**
        * Splits the printed arguments (`key="v", key2=v2`, values possibly
        * quoted and spanning lines) into named arguments sorted by name. A quote
@@ -94,11 +99,83 @@
         return text.trimStart().split("\n")[0].slice(0, 120);
       }
       /**
-       * Parses a tag-flattened log into one entry per tool call.
+       * Pretty-prints a JSON object/array input; anything else is returned as is.
+       * @param {string} text
+       * @returns {string}
+       */
+      function agentLogPrettyInput(text) {
+        if (!text.startsWith("{") && !text.startsWith("[")) return text;
+        try {
+          return JSON.stringify(JSON.parse(text), null, 2);
+        } catch (_e) {
+          return text;
+        }
+      }
+      /**
+       * Folds structured tool records into one entry per tool-use id. A call
+       * half opens the entry, a result half (same id) fills its output; a
+       * record carrying both fills both. Unparseable lines are skipped.
+       * @param {string[]} lines - Logical log lines, any of which may be a record.
+       * @returns {AgentLogEntry[]}
+       */
+      function parseAgentLogRecords(lines) {
+        /** @type {AgentLogEntry[]} */
+        const entries = [];
+        /** @type {Map<string, AgentLogEntry>} */
+        const byId = new Map();
+        for (const line of lines) {
+          const t = line.trimStart();
+          if (!t.startsWith(AGENT_LOG_RECORD_PREFIX)) continue;
+          /** @type {{id?: string, tool?: string, sub?: string, tag?: string, input?: string, output?: string, is_error?: boolean}} */
+          let rec;
+          try {
+            rec = JSON.parse(t.slice(AGENT_LOG_RECORD_PREFIX.length));
+          } catch (_e) {
+            continue;
+          }
+          const id = typeof rec.id === "string" ? rec.id : "";
+          let cur = id === "" ? undefined : byId.get(id);
+          if (cur === undefined) {
+            const tool = typeof rec.tool === "string" ? rec.tool : "";
+            if (tool === "" && typeof rec.output === "string") {
+              cur = [...entries].reverse().find((e) => e.id === "" && e.status === "pending");
+            }
+            if (cur === undefined) {
+              cur = { index: entries.length, id, tool: tool || "tool", sub: "", tag: "", input: "", args: [], output: "", status: "pending" };
+              entries.push(cur);
+              if (id !== "") byId.set(id, cur);
+            }
+          }
+          if (typeof rec.tool === "string" && rec.tool !== "") {
+            cur.tool = rec.tool;
+            cur.sub = typeof rec.sub === "string" ? rec.sub : "";
+            cur.tag = typeof rec.tag === "string" ? rec.tag : `tool.${rec.tool}`;
+          }
+          if (typeof rec.input === "string") cur.input = agentLogPrettyInput(rec.input);
+          if (typeof rec.output === "string") {
+            cur.output = rec.output;
+            cur.status = rec.is_error ? "error" : "ok";
+          }
+        }
+        return entries;
+      }
+      /**
+       * Builds one entry per tool call: from the structured records when the
+       * log has any, otherwise from the tag-flattened text.
        * @param {string} text - The scrubbed transcript text.
        * @returns {AgentLogEntry[]}
        */
       function parseAgentLog(text) {
+        const lines = text.split("\n");
+        if (lines.some((l) => l.trimStart().startsWith(AGENT_LOG_RECORD_PREFIX))) return parseAgentLogRecords(lines);
+        return parseAgentLogText(lines);
+      }
+      /**
+       * Parses a tag-flattened log into one entry per tool call.
+       * @param {string[]} lines - The scrubbed transcript lines.
+       * @returns {AgentLogEntry[]}
+       */
+      function parseAgentLogText(lines) {
         /** @type {AgentLogEntry[]} */
         const entries = [];
         /** @type {"input"|"output"|null} */
@@ -107,7 +184,7 @@
         let cur = null;
         /** @type {AgentLogEntry|null} */
         let awaiting = null;
-        for (const line of text.split("\n")) {
+        for (const line of lines) {
           const m = line.trimStart().match(/^\[([^\]]+)\]\s?(.*)$/);
           if (m === null) {
             if (cur !== null && section !== null) cur[section] += (cur[section] === "" ? "" : "\n") + line;
@@ -120,7 +197,7 @@
             let input = rest;
             const head = `${segs[1]}(`;
             if (input.startsWith(head) && input.endsWith(")")) input = input.slice(head.length, -1);
-            cur = { index: entries.length, tool: segs[1], sub: segs.slice(2).join("."), tag, input, args: [], output: "", status: "pending" };
+            cur = { index: entries.length, id: "", tool: segs[1], sub: segs.slice(2).join("."), tag, input, args: [], output: "", status: "pending" };
             entries.push(cur);
             awaiting = cur;
             section = "input";
@@ -186,7 +263,21 @@
       function agentLogSource(key) {
         const w = peekTape[key];
         if (w) {
-          return renderTapeLines(tapeCompleteLines(w, !!peekEnded[key]), false, false, parseLiveViewTypeFilter(""));
+          // Rows tmux wrapped are rejoined so a long record stays one line.
+          /** @type {string[]} */
+          const logical = [];
+          let carry = "";
+          for (const raw of tapeCompleteLines(w, !!peekEnded[key])) {
+            const clean = renderPaneLine(raw).replace(/\r$/, "");
+            if (tapeLineWrapped(raw)) {
+              carry += clean;
+              continue;
+            }
+            logical.push(carry + clean);
+            carry = "";
+          }
+          if (carry !== "") logical.push(carry);
+          return logical.join("\n");
         }
         const shown = peekContent[key];
         return shown === undefined ? null : shown;
@@ -201,7 +292,11 @@
         if (src === null) return null;
         const memo = agentLogParsed[key];
         if (memo && memo.src === src) return memo.entries;
-        const entries = parseAgentLog(redactAgentLog(src));
+        const entries = parseAgentLog(src);
+        for (const e of entries) {
+          e.input = redactAgentLog(e.input);
+          e.output = redactAgentLog(e.output);
+        }
         agentLogParsed[key] = { src, entries };
         return entries;
       }
@@ -221,7 +316,7 @@
           : e.args.map((a) => `<div class="alog-kv"><span class="alog-k" data-tip="The &quot;${esc(a.key)}&quot; argument of this call.">${esc(a.key)}</span><pre class="alog-pre">${esc(a.value)}</pre></div>`).join("");
         return `<details class="alog-w ${e.status}" data-idx="${e.index}" data-sig="${e.status}|${e.input.length}|${e.output.length}" ${open ? "open" : ""}
             ontoggle="agentLogToggled(this,'${esc(key).replace(/'/g, "&#39;")}')">
-          <summary data-tip="Click to expand or collapse this call's input and output.\nThe log is reconstructed from the terminal text, so long values may be truncated.">
+          <summary data-tip="Click to expand or collapse this call's input and output.\nValues come from the runner's structured tool records.">
             <span class="alog-tool" style="color:${color}">${esc(e.tool)}</span>${e.sub ? `<span class="alog-sub">${esc(e.sub)}</span>` : ""}
             <span class="alog-prev">${esc(preview)}</span>
             <span class="alog-st ${e.status}" data-tip="${esc(statusTip)}">${e.status === "pending" ? "…" : (e.status === "error" ? "error" : "ok")}</span>
@@ -272,8 +367,9 @@
           </div>`;
         return `${bar}<div class="alog" id="alog-${peekCssKey(key)}" data-key="${ek}" onscroll="agentLogScrolled(this)"
             data-tip="Scroll through the agent's tool calls.\nExpansion and scroll position survive live updates.">${agentLogListHtml(key, entries)}</div>
-          <div class="hint">Experimental — rebuilt from the terminal text, so arguments and results are truncated as the
-          runner printed them, results are paired to calls by order, and Codex command output is not logged. Secrets are masked.</div>`;
+          <div class="hint">Experimental — read from the runner's structured tool records (exact ids, full inputs and outputs).
+          A transcript from before those records existed is rebuilt from the terminal text instead, with truncated values.
+          Secrets are masked.</div>`;
       }
       /**
        * Remembers whether a widget is expanded.

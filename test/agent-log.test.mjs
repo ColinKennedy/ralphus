@@ -66,3 +66,22 @@ test("preview skips leading cd but expanded input keeps it", () => {
   const other = parseAgentLog("[tool.Read] Read(path=a)")[0];
   assert.equal(agentLogPreview(other), "path=a");
 });
+
+test("structured records merge call and result by tool-use id", () => {
+  const rec = (o) => `RALPHUS_TOOL: ${JSON.stringify(o)}`;
+  const e = parseAgentLog([
+    rec({ id: "a", tool: "Bash", sub: "git", tag: "tool.Bash.git", input: '{"command":"git status"}' }),
+    rec({ id: "b", tool: "Read", tag: "tool.Read", input: "{}" }),
+    rec({ id: "b", output: "contents", is_error: false }),
+    rec({ id: "a", output: "x".repeat(2000), is_error: true }),
+    rec({ id: "c", tool: "exec", sub: "cargo", tag: "tool.exec.cargo", input: "cargo test", output: "ok", is_error: false }),
+    "RALPHUS_TOOL: {broken",
+  ].join("\n"));
+  assert.equal(e.length, 3);
+  assert.equal(e[0].id, "a");
+  assert.equal(e[0].status, "error");
+  assert.equal(e[0].output.length, 2000);
+  assert.match(e[0].input, /"command": "git status"/);
+  assert.equal(e[1].output, "contents");
+  assert.equal(e[2].status, "ok");
+});

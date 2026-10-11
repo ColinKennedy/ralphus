@@ -10901,7 +10901,9 @@ fn strip_ralphus_pane_markers(text: &str) -> String {
     text.lines()
         .filter(|line| {
             let trimmed = line.trim_start();
-            !(trimmed.starts_with("RALPHUS_EVENT: ") || trimmed.starts_with("RALPHUS_TMUX_DONE"))
+            !(trimmed.starts_with("RALPHUS_EVENT: ")
+                || trimmed.starts_with("RALPHUS_TOOL: ")
+                || trimmed.starts_with("RALPHUS_TMUX_DONE"))
         })
         .map(unprefix_thinking_line)
         .collect::<Vec<_>>()
@@ -32043,6 +32045,18 @@ after"
         assert_eq!(
             strip_ralphus_pane_markers(text),
             "Claude Code · model=sonnet\n[tool] Bash(command=\"ls\")\nfinal assistant text"
+        );
+    }
+
+    #[test]
+    fn strip_ralphus_pane_markers_drops_structured_tool_records() {
+        let text = "[tool.Bash.ls] Bash(command=\"ls\")
+RALPHUS_TOOL: {\"id\":\"t1\"}
+next";
+        assert_eq!(
+            strip_ralphus_pane_markers(text),
+            "[tool.Bash.ls] Bash(command=\"ls\")
+next"
         );
     }
 

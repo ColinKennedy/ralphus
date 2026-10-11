@@ -1344,6 +1344,19 @@ fn handle_tool_call_event(
             let pending = state.pending_tool_calls.remove(&index).unwrap_or_default();
             let tool_call = &event["toolCall"];
             let name = tool_call["name"].as_str().or(pending.name.as_deref());
+            let arguments = &tool_call["arguments"];
+            let empty = arguments.as_object().is_none_or(|o| o.is_empty());
+            let input = if empty && !pending.raw.trim().is_empty() {
+                pending.raw.clone()
+            } else {
+                arguments.to_string()
+            };
+            crate::tool_record::emit(&crate::tool_record::call_record(
+                "pi",
+                tool_call["id"].as_str().unwrap_or(""),
+                &tool_type_code(name, arguments["command"].as_str()),
+                &input,
+            ));
             return Some(format_pi_tool_line(
                 name,
                 &tool_call["arguments"],
@@ -1666,6 +1679,14 @@ fn process_event(
             }
         }
         Some("message_end") => {
+            if event["message"]["role"].as_str() == Some("toolResult") {
+                crate::tool_record::emit(&crate::tool_record::result_record(
+                    "pi",
+                    event["message"]["toolCallId"].as_str().unwrap_or(""),
+                    &extract_text(&event["message"]["content"]),
+                    event["message"]["isError"].as_bool().unwrap_or(false),
+                ));
+            }
             if event["message"]["role"].as_str() == Some("assistant") {
                 // RAL-339: this fires once per assistant turn -- the natural
                 // "turns since previous compaction" tick.

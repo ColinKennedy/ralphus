@@ -997,6 +997,12 @@ fn process_event(
                             let tag = tool_type_code(name, block["input"]["command"].as_str());
                             let name = name.unwrap_or("tool");
                             eprintln!("[{tag}] {name}({args})");
+                            crate::tool_record::emit(&crate::tool_record::call_record(
+                                "claude-code",
+                                block["id"].as_str().unwrap_or(""),
+                                &tag,
+                                &block["input"].to_string(),
+                            ));
                             if name == "Bash"
                                 && block["input"]["run_in_background"].as_bool() == Some(true)
                             {
@@ -1082,6 +1088,12 @@ fn process_event(
                         continue;
                     }
                     let text = tool_result_text(&block["content"]);
+                    crate::tool_record::emit(&crate::tool_record::result_record(
+                        "claude-code",
+                        block["tool_use_id"].as_str().unwrap_or(""),
+                        &text,
+                        block["is_error"].as_bool().unwrap_or(false),
+                    ));
                     if text.is_empty() {
                         continue;
                     }

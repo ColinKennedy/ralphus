@@ -30,6 +30,7 @@ pub mod shellcmd;
 pub mod skills_install;
 pub mod spec;
 pub mod thrash;
+pub mod tool_record;
 pub mod tools;
 pub mod version_probe;
 pub mod worktree_diff;
