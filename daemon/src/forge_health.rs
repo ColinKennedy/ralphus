@@ -198,6 +198,7 @@ pub fn report_failure(store: &crate::store_lock::StoreHandle, report: &FailureRe
         Some(category),
     );
     if let Err(error) = result {
+        // ralphus[ignore-rlog-pair]: the store write itself failed, so there is no row to pair; the outage's earlier failure rows are the Cartographer record
         crate::rlog!(
             WARNING,
             "ralphus [forge] could not enqueue the {} {} access notice: {error}",

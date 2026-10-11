@@ -9335,6 +9335,15 @@ fn report_stuck_maintenance(store: &crate::store_lock::StoreHandle, id: &str) {
         age.as_secs() / 60
     );
     crate::rlog!(WARNING, "ralphus [guardian] review {id}: {message}");
+    crate::cartographer::Note::new("guardian")
+        .level(crate::logging::LogLevel::WARNING)
+        .scope("guardian")
+        .guardian(id)
+        .emit(
+            &store.lock(),
+            "maintenance pass running past the stuck threshold",
+            serde_json::json!({"running_minutes": age.as_secs() / 60}),
+        );
     let remediation = crate::mailbox::Remediation::ManualInterventionRequired {
         guidance: "look at this review's Cartographer rows to see what it last did; the pass \
                    holds only in-memory state, so restarting the daemon releases it"
@@ -9344,6 +9353,7 @@ fn report_stuck_maintenance(store: &crate::store_lock::StoreHandle, id: &str) {
         .lock()
         .enqueue_guardian_notice(id, &message, Some(&remediation));
     if let Err(error) = result {
+        // ralphus[ignore-rlog-pair]: the store write itself failed, so there is no row to pair; the stuck-pass row above is the Cartographer record
         crate::rlog!(
             WARNING,
             "ralphus [guardian] review {id} stuck-maintenance notice not enqueued: {error}"

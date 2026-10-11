@@ -9006,6 +9006,7 @@ fn notify_background_failure(
         Some(&remediation),
     );
     if let Err(notice_error) = result {
+        // ralphus[ignore-rlog-pair]: the store write itself failed, so there is no row to pair; the enqueue is itself the record of the failure it reports
         crate::rlog!(
             WARNING,
             "ralphus [pr] review {guardian_id} could not enqueue the {what} failure notice: \
