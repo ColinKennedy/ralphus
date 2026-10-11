@@ -774,14 +774,17 @@
       // connection is dead or to catch up once it's looked at again. Firing
       // an immediate reconcile plus a connection-health check the moment the
       // tab becomes visible closes that gap without waiting on the 60s timer.
-      document.addEventListener("visibilitychange", () => {
-        if (document.visibilityState !== "visible") return;
-        tick();
-        void pollOpenPeeks();
-        if (!currentEventSource || currentEventSource.readyState === EventSource.CLOSED) {
-          connectEventStream();
-        }
-      });
+      if (typeof document !== "undefined") {
+        document.addEventListener("visibilitychange", () => {
+          if (document.visibilityState !== "visible") { noteTabHidden(); return; }
+          tick();
+          void pollOpenPeeks();
+          refreshSelectedReviewPrsOnReturn();
+          if (!currentEventSource || currentEventSource.readyState === EventSource.CLOSED) {
+            connectEventStream();
+          }
+        });
+      }
       /**
        * Resolves a pending hash route's squad reference against the loaded squad
        * list: a squad id, or — for a hand-written RAL-188 URI that omitted the
