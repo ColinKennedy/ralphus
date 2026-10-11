@@ -1850,6 +1850,11 @@ impl DaemonClient {
         );
         set_if_some(
             &mut body,
+            "ci_deferral",
+            settings.ci_deferral.map(str::to_string),
+        );
+        set_if_some(
+            &mut body,
             "proof_skip_auto_clean",
             settings.proof_skip_auto_clean,
         );
@@ -2432,6 +2437,9 @@ pub struct GuardianSettings<'a> {
     pub base_branch: Option<&'a str>,
     pub auto_pr_feedback: Option<bool>,
     pub proof_scope: Option<&'a str>,
+    /// Which PRs/MRs in the review's stack run the full CI suite: `every`,
+    /// `tip` or `bottom+tip`. An empty string resets it to `every`.
+    pub ci_deferral: Option<&'a str>,
     pub proof_skip_auto_clean: Option<bool>,
     /// RAL-250: whether this review skips automatic base-branch auto-updates.
     pub skip_base_updates: Option<bool>,

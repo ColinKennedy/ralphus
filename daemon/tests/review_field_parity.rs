@@ -76,6 +76,10 @@ const REVIEW_DEF_ONLY_EXCLUSIONS: &[(&str, &str)] = &[
         "outside this review-default parity contract",
     ),
     (
+        "ci_deferral",
+        "chosen per review for its own stack; no project-wide default exists yet",
+    ),
+    (
         "auto_fix_prompt_template",
         "outside this review-default parity contract",
     ),
