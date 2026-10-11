@@ -2849,6 +2849,33 @@ impl Store {
         self.first_gating_waypoint(squad_id)
     }
 
+    /// Whether `squad_id` carries a squad-kind affected entry whose survey
+    /// verdict is explicitly `impacted` -- on `waypoint_id` when given, on any
+    /// waypoint otherwise. A missing verdict does not count: release decides
+    /// whether work must be redone, which needs a positive judgement, unlike
+    /// gating, which fails closed.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn squad_entry_impacted(
+        &self,
+        squad_id: &str,
+        waypoint_id: Option<&str>,
+    ) -> StoreResult<bool> {
+        let found: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM waypoint_affected
+                 WHERE kind = 'squad' AND entry_id = ?1 AND survey_verdict = 'impacted'
+                   AND (?2 IS NULL OR waypoint_id = ?2)
+                 LIMIT 1",
+                rusqlite::params![squad_id, waypoint_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
     /// Every squad currently held by an open `block`-mode waypoint, in two
     /// queries -- the set-based form of calling
     /// [`Self::squad_block_gating_waypoint`] once per squad.
@@ -4135,6 +4162,99 @@ pub fn run_pending_waypoint_resumes(
                     }),
                 );
             resumed_squads.insert(squad_id);
+        }
+    }
+    // A proof step a waypoint halt killed is parked as `halted`. Once the
+    // squad is no longer gated, an entry judged `impacted` re-runs its owning
+    // cell first (which rebases and carries the resume guidance through its
+    // ghost) and then the proofs from the start; any other halt was a stray
+    // one, so only the killed proof sequence re-runs, with no guidance.
+    let halted_proofs = {
+        let guard = store.lock();
+        log_swallowed(
+            &guard,
+            "list waypoint-halted proof sequences",
+            guard.halted_proof_sequences(),
+        )
+        .unwrap_or_default()
+    };
+    for seq in halted_proofs {
+        let guard = store.lock();
+        if log_swallowed(
+            &guard,
+            &format!(
+                "squad {} blocking-waypoint check before proof resume",
+                seq.squad_id
+            ),
+            guard.squad_block_gating_waypoint(&seq.squad_id),
+        )
+        .flatten()
+        .is_some()
+        {
+            continue;
+        }
+        let impacted = seq.scope == "cell"
+            && log_swallowed(
+                &guard,
+                &format!("squad {} impacted-verdict check", seq.squad_id),
+                guard.squad_entry_impacted(&seq.squad_id, seq.waypoint_id.as_deref()),
+            )
+            .unwrap_or(false);
+        if seq.scope == "cell" {
+            if impacted {
+                if matches!(
+                    guard.get_cell_agent_resume(&seq.squad_id, seq.task_idx, seq.cell_idx),
+                    Ok((_, _, Some(_)))
+                ) {
+                    log_swallowed(
+                        &guard,
+                        &format!("squad {} cell force-resume own session", seq.squad_id),
+                        guard.set_force_resume_own_session(
+                            &seq.squad_id,
+                            seq.task_idx,
+                            seq.cell_idx,
+                        ),
+                    );
+                }
+                log_swallowed(
+                    &guard,
+                    &format!("squad {} cell resume from waypoint halt", seq.squad_id),
+                    guard.resume_waypoint_halted_cell(&seq.squad_id, seq.task_idx, seq.cell_idx),
+                );
+            } else {
+                log_swallowed(
+                    &guard,
+                    &format!("squad {} clear stray cell waypoint halt", seq.squad_id),
+                    guard.clear_cell_waypoint_halted(&seq.squad_id, seq.task_idx, seq.cell_idx),
+                );
+            }
+        }
+        if log_swallowed(
+            &guard,
+            &format!("squad {} release halted proofs", seq.squad_id),
+            guard.release_halted_proofs(&seq.squad_id, seq.task_idx, &seq.scope, seq.cell_idx),
+        )
+        .is_some()
+        {
+            crate::cartographer::Note::new("waypoints")
+                .scope("waypoint")
+                .squad(&seq.squad_id)
+                .emit(
+                    &guard,
+                    format!(
+                        "squad {} {} proofs resumed: no waypoint blocks them any more",
+                        seq.squad_id, seq.scope
+                    ),
+                    serde_json::json!({
+                        "squad_id": seq.squad_id,
+                        "task_idx": seq.task_idx,
+                        "cell_idx": seq.cell_idx,
+                        "proof_scope": seq.scope,
+                        "waypoint_id": seq.waypoint_id,
+                        "impacted": impacted,
+                    }),
+                );
+            resumed_squads.insert(seq.squad_id.clone());
         }
     }
     for squad_id in resumed_squads {
