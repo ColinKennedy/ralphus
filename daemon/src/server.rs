@@ -17004,7 +17004,12 @@ fn waypoint_list(daemon: &Daemon, query: &str) -> Reply {
 /// the same shape a caller would get back from `GET /api/waypoints/{id}`.
 fn waypoint_detail(store: &Store, id: &str) -> crate::store::Result<WaypointDetail> {
     let view = store.get_waypoint(id)?;
-    let affected = store.list_affected_entries(id)?;
+    let mut affected = store.list_affected_entries(id)?;
+    if view.state != "open" {
+        for entry in &mut affected {
+            entry.derive_answer_state(false);
+        }
+    }
     let roster = store.list_roster_entries(id)?;
     let projects = waypoint_projects(store, id)?;
     let delivery_summary = DeliverySummary::from_affected(&affected);

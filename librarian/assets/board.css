@@ -1659,6 +1659,9 @@
       .wp-entry-actions { display: flex; align-items: center; gap: 4px; margin-left: auto;
         flex: none; opacity: 0; transition: opacity .1s; }
       .wp-entry:hover .wp-entry-actions, .wp-entry:focus-within .wp-entry-actions { opacity: 1; }
+      .wp-entry-lines { display: flex; gap: 12px; align-items: baseline; margin-top: 4px; font-size: 12px; color: var(--muted); min-width: 0; }
+      .wp-entry-error { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; color: var(--failed); }
+      .wp-entry-hint { flex: 0 0 auto; }
       .wp-entry-why { margin-top: 6px; font-size: 12px; color: var(--muted); }
       .wp-entry-why summary { cursor: pointer; }
 

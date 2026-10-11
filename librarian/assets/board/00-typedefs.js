@@ -1276,6 +1276,9 @@
        * @property {number|null} [bearing_decided_at_ms]
        * @property {number} created_at_ms
        * @property {number} updated_at_ms
+       * @property {"unjudged"|"halted_unjudged"|"impacted"|"not_impacted"} survey_state - what the survey concluded; `halted_unjudged` is a hold placed because the survey could not run, not a real verdict.
+       * @property {boolean} holding - whether the waypoint is holding this entry right now.
+       * @property {"awaiting_answer"|"unjudged"|"halted_unjudged"|"answered"|"released"} answer_state - what the entry owes the waypoint, computed by the daemon.
        */
 
       /**

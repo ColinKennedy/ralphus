@@ -368,7 +368,8 @@
       CLICK_HANDLERS.gotoEntityUri = (e, ds) => { e.preventDefault(); gotoEntityUri(ds.entityUri || ""); };
       CLICK_HANDLERS.removeAffectedEntry = (e, ds) => removeAffectedEntry(ds.waypointId || "", ds.entryId || "");
       CLICK_HANDLERS.toggleAffectedEntryMode = (e, ds) => toggleAffectedEntryMode(ds.waypointId || "", ds.entryId || "", ds.mode || "block");
-      CLICK_HANDLERS.closeWaypoint = (e, ds) => closeWaypoint(ds.waypointId || "");
+      CLICK_HANDLERS.showWaypointSurveyError = (e, ds) => showTextPopup("Survey could not run", ds.full || "");
+      CLICK_HANDLERS.closeWaypoint =(e, ds) => closeWaypoint(ds.waypointId || "");
       CLICK_HANDLERS.reopenWaypoint = (e, ds) => reopenWaypoint(ds.waypointId || "");
       CLICK_HANDLERS.openAddAffectedEntry = (e, ds) => openAddAffectedEntry(ds.waypointId || "");
       CLICK_HANDLERS.submitAddAffectedEntry = (e, ds) => submitAddAffectedEntry(ds.waypointId || "");
