@@ -23,6 +23,7 @@ pub mod chat_client;
 pub mod ci_watch;
 pub mod config;
 pub mod cpu_stall;
+pub mod daemon_health;
 pub mod delivery;
 pub mod entity_uri;
 pub mod env_view;

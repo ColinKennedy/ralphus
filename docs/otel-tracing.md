@@ -184,3 +184,33 @@ loop.
   — never to stdout (the daemon↔runner JSON contract) or stderr (the
   `ralphus [TYPE] ...` log format / `RALPHUS_EVENT:` marker). A
   `ConsoleSpanExporter` must never be introduced on any of these paths.
+
+## Daemon health signals (RAL-596)
+
+Besides request traces, the daemon emits spans about its own health, so an
+unattended daemon that is stalled, starved or dying shows up in the collector.
+They are emitted only when OpenTelemetry is enabled; otherwise `emit` is a
+no-op. Spans are queued on a bounded channel and exported from a dedicated
+thread (dropping when full), so a slow collector can never delay the store
+lock, the watchdog or the scheduler.
+
+| Span | When |
+|---|---|
+| `daemon.heartbeat` | every ~60s while the daemon is up |
+| `daemon.startup` / `daemon.shutdown` | startup finished (with `total_startup_ms`, `reaped`) / clean exit (`uptime_secs`) |
+| `daemon.startup_failed` | license, store open, port bind or token failure (`stage`), before exit |
+| `daemon.panic` | any thread panic (panic hook) |
+| `daemon.store_lock.slow_wait` | a store-lock acquire waited past the slow-wait threshold |
+| `daemon.store_lock.long_hold` | a guard was held for >= 1s |
+| `daemon.store_lock.stalled` / `recovered` | the watchdog could not take the lock within its 5s timeout / got it back |
+| `daemon.loop.stale` / `recovered` | the scheduler or health-sweep loop missed its allowed beat gap / beat again |
+| `daemon.loop.dead` | the scheduler thread returned or panicked |
+| `daemon.tmux.unavailable` / `recovered` | the 15-minute tmux probe (creates and kills a throwaway session) failed / succeeded again |
+| `daemon.tmux.startup_reap` | orphaned tmux processes were force-killed at startup |
+| `daemon.resource.low_disk` | free space under 10% (warn) or 5% (critical) on the db or state volume, checked every 15 minutes |
+
+Not detected today: SQLite busy/write failures and runaway thread counts —
+no such detection exists in the daemon, so no span was added.
+
+The disk probe uses `sysinfo`'s `disk` feature (now enabled on all
+platforms, previously only the process-table features on Windows).

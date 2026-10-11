@@ -19268,6 +19268,7 @@ pub fn serve<A: ToSocketAddrs>(
     // keep synchronous merges so their assertions stay hermetic.
     crate::guardian_merge::enable_post_merge_spawning();
     let store = Store::open(db_path).map_err(|e| {
+        crate::daemon_health::startup_failed("store_open", &e.to_string());
         // ralphus[ignore-rlog-pair]: the store failed to open, so there is no database to record this in
         crate::rlog!(
             ERROR,
@@ -19302,6 +19303,7 @@ pub fn serve<A: ToSocketAddrs>(
     let server = match tiny_http::Server::http(addr) {
         Ok(server) => server,
         Err(e) => {
+            crate::daemon_health::startup_failed("port_bind", &e.to_string());
             crate::cartographer::Note::new("daemon")
                 .level(crate::logging::LogLevel::ERROR)
                 .emit(
@@ -19413,6 +19415,7 @@ pub fn serve<A: ToSocketAddrs>(
     // pool -- see `tmux::reap_orphaned_sessions_at_startup`'s doc comment.
     let reap_started = Instant::now();
     let reaped = crate::tmux::reap_orphaned_sessions_at_startup();
+    crate::daemon_health::report_startup_reap(reaped);
     let reap_ms = reap_started.elapsed().as_millis();
     // RAL-234: this whole block (recovery + reap) runs after the port is
     // bound but before `run_http_loop` starts accepting/processing requests
@@ -19477,8 +19480,10 @@ pub fn serve<A: ToSocketAddrs>(
     // against the same value. Loaded before the scheduler/HTTP loop start so
     // a failure to persist it fails the whole startup rather than silently
     // serving an unauthenticated API.
-    let token = crate::token::load_or_create(&crate::token_path())
-        .map_err(|e| std::io::Error::other(format!("failed to load/create daemon token: {e}")))?;
+    let token = crate::token::load_or_create(&crate::token_path()).map_err(|e| {
+        crate::daemon_health::startup_failed("token", &e.to_string());
+        std::io::Error::other(format!("failed to load/create daemon token: {e}"))
+    })?;
     crate::rlog!(
         INFO,
         "ralphus [token] auth token ready at {}",
@@ -19576,6 +19581,7 @@ pub fn serve<A: ToSocketAddrs>(
     // `crate::watchdog`'s module doc comment for what the unwatched failure
     // looked like.
     crate::watchdog::spawn(daemon.store_handle(), daemon.watchdog_handle());
+    crate::daemon_health::spawn_periodic_probes(daemon.store_handle());
     let scheduler_store = daemon.store_handle();
     std::thread::spawn(move || {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -19602,6 +19608,13 @@ pub fn serve<A: ToSocketAddrs>(
                 format!("scheduler thread {reason}; no further squads will be scheduled until the daemon restarts"),
                 serde_json::json!({ "reason": reason }),
             );
+        crate::daemon_health::emit(
+            crate::daemon_health::HealthEvent::error(
+                "daemon.loop.dead",
+                format!("scheduler thread {reason}"),
+            )
+            .attr("loop", "scheduler"),
+        );
         if let Err(payload) = outcome {
             std::panic::resume_unwind(payload);
         }
@@ -19616,6 +19629,12 @@ pub fn serve<A: ToSocketAddrs>(
             "read_workers": READ_WORKERS,
             "write_workers": WRITE_WORKERS,
         }),
+    );
+
+    crate::daemon_health::emit(
+        crate::daemon_health::HealthEvent::ok("daemon.startup")
+            .attr("total_startup_ms", total_startup_ms as i64)
+            .attr("reaped", reaped as i64),
     );
 
     // tiny_http 0.12 treats any accept() error as fatal: its accept thread
@@ -19668,6 +19687,10 @@ pub fn serve<A: ToSocketAddrs>(
             startup_started.elapsed().as_secs()
         ),
         serde_json::json!({ "uptime_secs": startup_started.elapsed().as_secs() }),
+    );
+    crate::daemon_health::emit(
+        crate::daemon_health::HealthEvent::ok("daemon.shutdown")
+            .attr("uptime_secs", startup_started.elapsed().as_secs() as i64),
     );
     Ok(())
 }

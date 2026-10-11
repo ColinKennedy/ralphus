@@ -45,7 +45,157 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
+use crate::daemon_health::{HealthEvent, emit};
 use crate::store_lock::StoreHandle;
+
+/// A background loop whose liveness the watchdog tracks (RAL-596).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonLoop {
+    /// `scheduler::run_loop`, which also runs review maintenance, base-branch
+    /// freshness polling and the CPU-stall sweep inline.
+    Scheduler,
+    /// The `health_sweep` thread.
+    HealthSweep,
+}
+
+impl DaemonLoop {
+    const ALL: [Self; 2] = [Self::Scheduler, Self::HealthSweep];
+
+    fn index(self) -> usize {
+        match self {
+            Self::Scheduler => 0,
+            Self::HealthSweep => 1,
+        }
+    }
+
+    /// Stable label used in logs, spans and the health response.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Scheduler => "scheduler",
+            Self::HealthSweep => "health_sweep",
+        }
+    }
+}
+
+/// How long the scheduler loop may go between iterations before it is called
+/// stale. The loop ticks every 200 ms, so two minutes means a tick or one of
+/// its inline sweeps is wedged, not merely busy.
+pub const SCHEDULER_STALE_AFTER: Duration = Duration::from_secs(120);
+
+/// Slack added to a sleeping loop's own interval before it is called stale.
+pub const LOOP_STALE_GRACE: Duration = Duration::from_secs(120);
+
+/// Heartbeat state for one loop. Atomics only: stamping is on the scheduler
+/// thread's hot path and must never touch a lock.
+#[derive(Debug, Default)]
+struct Beat {
+    /// Unix-epoch ms of the last beat; `0` until the loop first runs.
+    last_ms: AtomicI64,
+    /// How long after `last_ms` the loop counts as stale, in ms.
+    allowed_ms: AtomicI64,
+    /// Whether the loop is currently reported stale.
+    stale: AtomicBool,
+}
+
+/// Heartbeats for every [`DaemonLoop`].
+#[derive(Debug, Default)]
+pub struct LoopBeats {
+    beats: [Beat; 2],
+}
+
+/// Point-in-time view of one loop's heartbeat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct LoopSnapshot {
+    /// Ms since the last beat; `None` before the loop first ran.
+    pub last_tick_age_ms: Option<i64>,
+    /// Whether the watchdog currently reports the loop stale.
+    pub stale: bool,
+}
+
+impl LoopBeats {
+    /// Stamp `which` alive; it is stale if not stamped again within `allowed`.
+    pub fn beat(&self, which: DaemonLoop, allowed: Duration, now_ms: i64) {
+        let b = &self.beats[which.index()];
+        b.allowed_ms.store(
+            i64::try_from(allowed.as_millis()).unwrap_or(i64::MAX),
+            Ordering::Relaxed,
+        );
+        b.last_ms.store(now_ms, Ordering::Relaxed);
+    }
+
+    /// Compare every beat with `now_ms`, returning the events for loops that
+    /// just went stale or just recovered. Loops that never beat are skipped.
+    pub fn check(&self, now_ms: i64) -> Vec<HealthEvent> {
+        let mut events = Vec::new();
+        for which in DaemonLoop::ALL {
+            let b = &self.beats[which.index()];
+            let last = b.last_ms.load(Ordering::Relaxed);
+            if last == 0 {
+                continue;
+            }
+            let age = now_ms.saturating_sub(last);
+            let allowed = b.allowed_ms.load(Ordering::Relaxed);
+            if age > allowed {
+                if !b.stale.swap(true, Ordering::Relaxed) {
+                    // ralphus[ignore-rlog-pair]: the watchdog must not take the store lock to write a row; the OTel span is the structured record
+                    crate::rlog!(
+                        ERROR,
+                        "ralphus [watchdog] {} loop has not ticked for {}s",
+                        which.label(),
+                        age / 1000
+                    );
+                    events.push(
+                        HealthEvent::error(
+                            "daemon.loop.stale",
+                            format!("{} has not ticked for {}s", which.label(), age / 1000),
+                        )
+                        .attr("loop", which.label())
+                        .attr("age_ms", age),
+                    );
+                }
+            } else if b.stale.swap(false, Ordering::Relaxed) {
+                // ralphus[ignore-rlog-pair]: the watchdog must not take the store lock to write a row; the OTel span is the structured record
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [watchdog] {} loop is ticking again",
+                    which.label()
+                );
+                events.push(HealthEvent::ok("daemon.loop.recovered").attr("loop", which.label()));
+            }
+        }
+        events
+    }
+
+    fn snapshot(&self, which: DaemonLoop, now_ms: i64) -> LoopSnapshot {
+        let b = &self.beats[which.index()];
+        let last = b.last_ms.load(Ordering::Relaxed);
+        LoopSnapshot {
+            last_tick_age_ms: (last > 0).then(|| now_ms.saturating_sub(last)),
+            stale: b.stale.load(Ordering::Relaxed),
+        }
+    }
+}
+
+static LOOP_BEATS: LoopBeats = LoopBeats {
+    beats: [
+        Beat {
+            last_ms: AtomicI64::new(0),
+            allowed_ms: AtomicI64::new(0),
+            stale: AtomicBool::new(false),
+        },
+        Beat {
+            last_ms: AtomicI64::new(0),
+            allowed_ms: AtomicI64::new(0),
+            stale: AtomicBool::new(false),
+        },
+    ],
+};
+
+/// Stamp a process loop alive (see [`LoopBeats::beat`]).
+pub fn loop_beat(which: DaemonLoop, allowed: Duration) {
+    LOOP_BEATS.beat(which, allowed, crate::store::now_ms());
+}
 
 /// How often the watchdog checks that the store lock is reachable.
 ///
@@ -99,6 +249,10 @@ pub struct WatchdogSnapshot {
     pub total_stalls: u64,
     /// Longest observed wait to reach the store, in ms.
     pub worst_wait_ms: u64,
+    /// Scheduler loop heartbeat.
+    pub scheduler: LoopSnapshot,
+    /// Health-sweep loop heartbeat.
+    pub health_sweep: LoopSnapshot,
 }
 
 impl WatchdogState {
@@ -135,6 +289,8 @@ impl WatchdogState {
             consecutive_stalls: self.consecutive_stalls.load(Ordering::Relaxed),
             total_stalls: self.total_stalls.load(Ordering::Relaxed),
             worst_wait_ms: self.worst_wait_ms.load(Ordering::Relaxed),
+            scheduler: LOOP_BEATS.snapshot(DaemonLoop::Scheduler, crate::store::now_ms()),
+            health_sweep: LOOP_BEATS.snapshot(DaemonLoop::HealthSweep, crate::store::now_ms()),
         }
     }
 }
@@ -171,10 +327,37 @@ pub fn check_once(store: &StoreHandle, state: &WatchdogState, timeout: Duration)
             }
             drop(guard);
             state.record_ok(waited);
+            if recovering {
+                emit(
+                    HealthEvent::ok("daemon.store_lock.recovered")
+                        .attr("failed_checks", i64::try_from(stalls).unwrap_or(i64::MAX))
+                        .attr(
+                            "waited_ms",
+                            i64::try_from(waited.as_millis()).unwrap_or(i64::MAX),
+                        ),
+                );
+            }
             true
         }
         None => {
             let stalls = state.record_stall();
+            emit(
+                HealthEvent::error(
+                    "daemon.store_lock.stalled",
+                    format!("store lock unreachable for {}ms", timeout.as_millis()),
+                )
+                .attr(
+                    "consecutive_stalls",
+                    i64::try_from(stalls).unwrap_or(i64::MAX),
+                )
+                .attr(
+                    "holder",
+                    crate::store_lock::store_lock_holder().map_or_else(
+                        || "none".to_string(),
+                        |(site, ms)| format!("{site} ({ms}ms)"),
+                    ),
+                ),
+            );
             // stderr only -- see the module doc comment. A Cartographer write
             // needs the lock this round just failed to get.
             match crate::store_lock::store_lock_holder() {
@@ -204,15 +387,38 @@ pub fn check_once(store: &StoreHandle, state: &WatchdogState, timeout: Duration)
 /// monitoring.
 pub fn spawn(store: StoreHandle, state: Arc<WatchdogState>) {
     std::thread::spawn(move || {
+        let started = std::time::Instant::now();
         // One immediate check, so a daemon that is already wedged at startup
         // says so now rather than after the first interval.
-        check_once(&store, &state, STALL_TIMEOUT);
+        let mut reachable = check_once(&store, &state, STALL_TIMEOUT);
+        let mut round: u64 = 0;
         loop {
+            // RAL-596: this thread also owns the daemon-up heartbeat and the
+            // loop-staleness check -- it is the one thread guaranteed not to
+            // park on the store lock.
+            for event in LOOP_BEATS.check(crate::store::now_ms()) {
+                emit(event);
+            }
+            if round % HEARTBEAT_EVERY_ROUNDS == 0 {
+                emit(
+                    HealthEvent::ok("daemon.heartbeat")
+                        .attr(
+                            "uptime_secs",
+                            i64::try_from(started.elapsed().as_secs()).unwrap_or(i64::MAX),
+                        )
+                        .attr("store_reachable", reachable),
+                );
+            }
             std::thread::sleep(CHECK_INTERVAL);
-            check_once(&store, &state, STALL_TIMEOUT);
+            reachable = check_once(&store, &state, STALL_TIMEOUT);
+            round += 1;
         }
     });
 }
+
+/// Watchdog rounds per daemon-up heartbeat span: every 60 s at the 10 s
+/// [`CHECK_INTERVAL`].
+const HEARTBEAT_EVERY_ROUNDS: u64 = 6;
 
 #[cfg(test)]
 mod tests {
@@ -299,5 +505,46 @@ mod tests {
         // The total is kept: a resolved stall still happened, and a health
         // response that forgets it hides the incident entirely.
         assert_eq!(snap.total_stalls, 3);
+    }
+
+    #[test]
+    fn a_loop_goes_stale_once_and_recovers_once() {
+        let beats = LoopBeats::default();
+        assert!(
+            beats.check(1_000_000).is_empty(),
+            "never-run loop is skipped"
+        );
+
+        beats.beat(DaemonLoop::Scheduler, Duration::from_secs(120), 1_000_000);
+        assert!(beats.check(1_100_000).is_empty(), "within the allowance");
+
+        let stale = beats.check(1_000_000 + 121_000);
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].name, "daemon.loop.stale");
+        assert!(stale[0].error.is_some());
+        assert!(
+            beats.check(1_000_000 + 200_000).is_empty(),
+            "a loop already reported stale is not re-reported"
+        );
+        assert!(beats.snapshot(DaemonLoop::Scheduler, 1_300_000).stale);
+
+        beats.beat(DaemonLoop::Scheduler, Duration::from_secs(120), 1_300_000);
+        let back = beats.check(1_300_001);
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].name, "daemon.loop.recovered");
+        assert!(!beats.snapshot(DaemonLoop::Scheduler, 1_300_001).stale);
+    }
+
+    #[test]
+    fn loops_are_tracked_independently() {
+        let beats = LoopBeats::default();
+        beats.beat(DaemonLoop::Scheduler, Duration::from_secs(120), 1_000_000);
+        beats.beat(
+            DaemonLoop::HealthSweep,
+            Duration::from_secs(7_320),
+            1_000_000,
+        );
+        let events = beats.check(1_000_000 + 130_000);
+        assert_eq!(events.len(), 1, "only the scheduler is past its allowance");
     }
 }

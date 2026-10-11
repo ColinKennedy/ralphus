@@ -681,6 +681,13 @@ pub fn spawn_health_sweep(state: HealthSweepState, store: StoreHandle) {
     std::thread::spawn(move || {
         loop {
             let cfg = crate::config::load_health_sweep_config();
+            // RAL-596: stamped before the (long) sleep with an allowance of
+            // one interval plus grace, so the watchdog only calls this loop
+            // stale if it fails to wake at all.
+            crate::watchdog::loop_beat(
+                crate::watchdog::DaemonLoop::HealthSweep,
+                cfg.poll_interval() + crate::watchdog::LOOP_STALE_GRACE,
+            );
             std::thread::sleep(cfg.poll_interval());
             if !cfg.enabled() {
                 continue;

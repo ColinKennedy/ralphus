@@ -611,6 +611,10 @@ pub fn run_loop(
         start_reviews(&store, ids, &sem, &cancellations);
     }
     loop {
+        crate::watchdog::loop_beat(
+            crate::watchdog::DaemonLoop::Scheduler,
+            crate::watchdog::SCHEDULER_STALE_AFTER,
+        );
         tick(&store, &runner, &sem, &cancellations, &summary_queue);
         if last_maintenance.elapsed() >= REVIEW_MAINT_INTERVAL {
             crate::guardian_merge::review_maintenance(&store, &sem, &cancellations);
