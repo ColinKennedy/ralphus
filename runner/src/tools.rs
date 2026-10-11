@@ -122,6 +122,29 @@ impl Workspace {
         command: &str,
         timeout_sec: Option<u64>,
     ) -> Result<CommandOutput, ToolError> {
+        self.run_shell(command, timeout_sec, false)
+    }
+
+    /// Like [`Self::run_bash`], but also echoes every output line to this
+    /// process's stderr as it is produced, so the live view (which shows the
+    /// runner's stderr) fills in while the command runs instead of only after
+    /// it exits. stdout lines are echoed as-is; stderr lines carry a
+    /// `[stderr] ` prefix so the two streams stay distinguishable. The
+    /// returned [`CommandOutput`] is the same as `run_bash`'s.
+    pub fn run_bash_live(
+        &self,
+        command: &str,
+        timeout_sec: Option<u64>,
+    ) -> Result<CommandOutput, ToolError> {
+        self.run_shell(command, timeout_sec, true)
+    }
+
+    fn run_shell(
+        &self,
+        command: &str,
+        timeout_sec: Option<u64>,
+        echo: bool,
+    ) -> Result<CommandOutput, ToolError> {
         let mut child = shell_command(command)
             .current_dir(&self.root)
             .stdout(std::process::Stdio::piped())
@@ -130,58 +153,94 @@ impl Workspace {
             .map_err(|e| ToolError(format!("could not spawn command: {e}")))?;
         let mut tree = ProcessTree::confine(&child);
 
-        let Some(secs) = timeout_sec else {
-            let output = child
-                .wait_with_output()
-                .map_err(|e| ToolError(format!("command failed: {e}")))?;
-            return Ok(command_output(&output));
-        };
+        // Both pipes are drained on their own threads for the whole run, so a
+        // chatty child never blocks on a full pipe and output can be echoed
+        // as it arrives.
+        let stdout_reader = child.stdout.take().map(|p| drain_lines(p, "", echo));
+        let stderr_reader = child
+            .stderr
+            .take()
+            .map(|p| drain_lines(p, "[stderr] ", echo));
 
-        let deadline = Duration::from_secs(secs);
         let start = std::time::Instant::now();
-        loop {
+        let status = loop {
             match child.try_wait() {
-                Ok(Some(_)) => {
-                    let output = child
-                        .wait_with_output()
-                        .map_err(|e| ToolError(format!("command failed: {e}")))?;
-                    return Ok(command_output(&output));
-                }
+                Ok(Some(status)) => break status,
                 Ok(None) => {
-                    if start.elapsed() >= deadline {
-                        crate::cartographer::emit(
-                            "runner",
-                            "command timed out; killing process tree",
-                            "warning",
-                            crate::cartographer::EventContext::default(),
-                            serde_json::json!({
-                                "pid": child.id(),
-                                "timeout_sec": secs,
-                                "command_len": command.len(),
-                            }),
-                        );
-                        tree.kill(&mut child);
-                        if let Err(e) = child.wait() {
+                    if let Some(secs) = timeout_sec {
+                        if start.elapsed() >= Duration::from_secs(secs) {
                             crate::cartographer::emit(
                                 "runner",
-                                "could not reap timed-out command",
+                                "command timed out; killing process tree",
                                 "warning",
                                 crate::cartographer::EventContext::default(),
-                                serde_json::json!({"pid": child.id(), "error": e.to_string()}),
+                                serde_json::json!({
+                                    "pid": child.id(),
+                                    "timeout_sec": secs,
+                                    "command_len": command.len(),
+                                }),
                             );
+                            tree.kill(&mut child);
+                            if let Err(e) = child.wait() {
+                                crate::cartographer::emit(
+                                    "runner",
+                                    "could not reap timed-out command",
+                                    "warning",
+                                    crate::cartographer::EventContext::default(),
+                                    serde_json::json!({"pid": child.id(), "error": e.to_string()}),
+                                );
+                            }
+                            return Ok(CommandOutput {
+                                exit_code: 124,
+                                stdout: String::new(),
+                                stderr: format!("command timed out after {secs}s"),
+                            });
                         }
-                        return Ok(CommandOutput {
-                            exit_code: 124,
-                            stdout: String::new(),
-                            stderr: format!("command timed out after {secs}s"),
-                        });
                     }
                     std::thread::sleep(Duration::from_millis(50));
                 }
                 Err(e) => return Err(ToolError(format!("command failed: {e}"))),
             }
-        }
+        };
+        let collect = |reader: Option<std::thread::JoinHandle<Vec<u8>>>| {
+            reader.and_then(|h| h.join().ok()).unwrap_or_default()
+        };
+        Ok(CommandOutput {
+            exit_code: status.code().unwrap_or(-1),
+            stdout: decode_lossy(&collect(stdout_reader)),
+            stderr: decode_lossy(&collect(stderr_reader)),
+        })
     }
+}
+
+/// Reads `pipe` to EOF on a new thread, returning every byte read. With
+/// `echo`, each completed line is also written to stderr behind `prefix` as
+/// soon as it arrives.
+fn drain_lines<R: std::io::Read + Send + 'static>(
+    pipe: R,
+    prefix: &'static str,
+    echo: bool,
+) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        use std::io::BufRead as _;
+        let mut reader = std::io::BufReader::new(pipe);
+        let mut all = Vec::new();
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            match reader.read_until(b'\n', &mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    if echo {
+                        let text = decode_lossy(&line);
+                        eprintln!("{prefix}{}", text.trim_end_matches(['\r', '\n']));
+                    }
+                    all.extend_from_slice(&line);
+                }
+            }
+        }
+        all
+    })
 }
 
 #[cfg(target_os = "windows")]
@@ -273,14 +332,6 @@ impl ProcessTree {
     }
 }
 
-fn command_output(output: &std::process::Output) -> CommandOutput {
-    CommandOutput {
-        exit_code: output.status.code().unwrap_or(-1),
-        stdout: decode_lossy(&output.stdout),
-        stderr: decode_lossy(&output.stderr),
-    }
-}
-
 /// Decodes subprocess output as UTF-8, replacing invalid sequences --
 /// mirrors Python's explicit `encoding="utf-8", errors="replace"` (needed
 /// because plain OS-locale decoding mangles UTF-8 punctuation on Windows).
@@ -357,5 +408,29 @@ mod tests {
             "hello"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn run_bash_live_returns_stdout_and_stderr_separately() {
+        let dir =
+            std::env::temp_dir().join(format!("ralphus-runner-test-live-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = Workspace::create(&dir).unwrap();
+        let out = ws
+            .run_bash_live("echo to-out && echo to-err 1>&2", None)
+            .unwrap();
+        assert!(out.ok(), "command failed: {}", out.stderr);
+        assert_eq!(out.stdout.trim(), "to-out");
+        assert_eq!(out.stderr.trim(), "to-err");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn drain_lines_returns_every_byte_including_unterminated_tail() {
+        let data: &'static [u8] = b"one\r\ntwo\nlast-no-newline";
+        let got = drain_lines(std::io::Cursor::new(data), "", true)
+            .join()
+            .unwrap();
+        assert_eq!(got, data);
     }
 }
