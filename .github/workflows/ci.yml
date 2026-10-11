@@ -8,7 +8,7 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-# RAL-260: python runs as a 3.11/3.12/3.13 + floating "3" matrix; rust runs its
+# RAL-260: python runs on 3.13 only; rust runs its
 # full suite on linux+windows plus a pinned 1.86 MSRV build-only leg. RAL-398
 # adds a macOS leg -- experimental, so build-only rather than the full suite
 # (see "Platform support" in README.md and docs/dependencies.md). RAL-441
@@ -333,31 +333,24 @@ jobs:
         run: uv run deadcode src tests
 
   python-test:
-    name: Python ${{ matrix.python-version }} (pytest)
+    name: Python 3.13 (pytest)
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: cli-py
     env:
-      # Make every `uv` step use the matrix's interpreter, not just whatever uv
-      # first finds that satisfies requires-python (>=3.11).
-      UV_PYTHON: ${{ matrix.python-version }}
+      # Make every `uv` step use 3.13, not just whatever uv first finds that
+      # satisfies requires-python.
+      UV_PYTHON: "3.13"
       # `rust-cache` can restore a release binary from an earlier commit, while
       # this job deliberately builds the debug CLI below for docsgen's tests.
       RALPHUS_CLI_BIN: ../target/debug/ralphus
-    strategy:
-      fail-fast: false
-      matrix:
-        # The versions cli-py/pyproject.toml's `requires-python = ">=3.11"` covers
-        # in practice, plus a floating "3" leg that always resolves to the
-        # newest available Python so CI stays forward-looking.
-        python-version: ["3.11", "3.12", "3.13", "3"]
     steps:
       - uses: actions/checkout@v4
-      - name: Install Python ${{ matrix.python-version }}
+      - name: Install Python 3.13
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.13"
       - name: Install uv
         uses: astral-sh/setup-uv@v6
         with:
