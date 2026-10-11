@@ -493,8 +493,11 @@
       .history-item:hover { background: var(--panel-2); }
       /* The head carries a banner, times, toggles and controls; in a narrow
          pane they wrap rather than pushing "Show Debug Messages" off the edge. */
-      #review-inspector .peek-head { flex-wrap: wrap; row-gap: 4px; }
-      #review-inspector .peek-head > span { flex-wrap: wrap; row-gap: 4px; }
+      .peek-head { flex-wrap: wrap; row-gap: 4px; }
+      .peek-head > span { flex-wrap: wrap; row-gap: 4px; }
+      /* A fixed-width details pane never scrolls sideways: opening the Live
+         view must not shift the pane past its splitter. */
+      .detail-pane { overflow-x: hidden; }
       /* A note explaining the control above it, not a statement in its own
          right -- so it reads at the muted register, never at body weight. */
       .hint { font-size: 12.5px; color: var(--muted); line-height: 1.45; margin-top: 6px; }
