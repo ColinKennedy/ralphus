@@ -16636,6 +16636,7 @@ struct WaypointListEntry {
     allow_advisory: bool,
     projects: Vec<String>,
     affected_count: usize,
+    roster_count: usize,
     /// Affected-entry counts by delivery status, so the sidebar can render each
     /// waypoint's progress without a second request per row.
     delivery_summary: DeliverySummary,
@@ -16925,6 +16926,10 @@ fn waypoint_list(daemon: &Daemon, query: &str) -> Reply {
         Ok(counts) => counts,
         Err(e) => return store_error(&e),
     };
+    let roster_counts = match store.waypoint_roster_counts() {
+        Ok(counts) => counts,
+        Err(e) => return store_error(&e),
+    };
     let mut ids = Vec::new();
     if state_filter.as_deref() != Some("closed") {
         match store.list_open_waypoint_ids() {
@@ -16979,6 +16984,7 @@ fn waypoint_list(daemon: &Daemon, query: &str) -> Reply {
             allow_advisory: view.allow_advisory,
             projects,
             affected_count,
+            roster_count: roster_counts.get(&id).copied().unwrap_or(0),
             delivery_summary,
             created_at_ms: view.created_at_ms,
             updated_at_ms: view.updated_at_ms,

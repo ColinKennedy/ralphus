@@ -312,6 +312,7 @@ pub const WAYPOINT_KEYS: &[&str] = &[
     "model",
     "allow_advisory",
     "affected",
+    "roster",
 ];
 /// RAL-395: the literal placeholder every `auto_fix_prompt_template` must
 /// contain -- shared between `[[review]]` submission validation
@@ -2517,61 +2518,93 @@ fn validate_waypoint_blocks(root: &toml::Table, value: Option<&toml::Value>, ctx
                             ctx.key_line(header, "affected"),
                         );
                     }
-                    for (i, entry) in items.iter().enumerate() {
-                        let epath = format!("{wpath}.affected[{i}]");
-                        let Some(s) = entry.as_str() else {
-                            ctx.error(
-                                &epath,
-                                ErrorKind::WrongType,
-                                "each 'affected' entry must be a string",
-                                None,
-                            );
-                            continue;
-                        };
-                        let Some(parsed) = crate::schema::parse_affected_entry_sentinel(s) else {
-                            ctx.error(
-                                &epath,
-                                ErrorKind::InvalidValue,
-                                "affected entry must be wrapped in \"<<...>>\" sentinel syntax, \
-                                 e.g. \"<<review:backend>>\", \"<<squad:squad-abc>>\", \
-                                 \"<<ralphus:new-review/<key>>>\", or \"<<ralphus:new-squad>>\"",
-                                None,
-                            );
-                            continue;
-                        };
-                        match parsed {
-                            crate::schema::AffectedEntryRef::ExistingReview(id)
-                                if id.starts_with("ralphus:") =>
-                            {
-                                if !review_ids.contains(id.as_str()) {
-                                    ctx.error(
-                                        &epath,
-                                        ErrorKind::InvalidValue,
-                                        format!(
-                                            "affected entry \"{s}\" names a same-file placeholder \
-                                             that does not match any [[review]].id in this \
-                                             submission"
-                                        ),
-                                        None,
-                                    );
-                                }
-                            }
-                            crate::schema::AffectedEntryRef::NewSquad if !has_task_group => {
-                                ctx.error(
-                                    &epath,
-                                    ErrorKind::InvalidValue,
-                                    "affected entry \"<<ralphus:new-squad>>\" requires at least \
-                                     one [[task]] in this submission",
-                                    None,
-                                );
-                            }
-                            crate::schema::AffectedEntryRef::ExistingReview(_)
-                            | crate::schema::AffectedEntryRef::ExistingSquad(_)
-                            | crate::schema::AffectedEntryRef::NewSquad => {}
-                        }
-                    }
+                    validate_waypoint_entries(
+                        ctx,
+                        items,
+                        "affected",
+                        &wpath,
+                        &review_ids,
+                        has_task_group,
+                    );
                 }
             },
+        }
+
+        if let Some(v) = table.get("roster") {
+            match v.as_array() {
+                None => check_type(ctx, table, "roster", Ty::StrArray, &wpath, header),
+                Some(items) => validate_waypoint_entries(
+                    ctx,
+                    items,
+                    "roster",
+                    &wpath,
+                    &review_ids,
+                    has_task_group,
+                ),
+            }
+        }
+    }
+}
+
+/// Validate the entries of a `[[waypoint]]` `affected` or `roster` list: each
+/// must be a string wrapped in a well-formed sentinel, and a same-file
+/// placeholder must resolve against this submission.
+fn validate_waypoint_entries(
+    ctx: &mut Ctx,
+    items: &[toml::Value],
+    key: &str,
+    wpath: &str,
+    review_ids: &HashSet<&str>,
+    has_task_group: bool,
+) {
+    for (i, entry) in items.iter().enumerate() {
+        let epath = format!("{wpath}.{key}[{i}]");
+        let Some(s) = entry.as_str() else {
+            ctx.error(
+                &epath,
+                ErrorKind::WrongType,
+                format!("each '{key}' entry must be a string"),
+                None,
+            );
+            continue;
+        };
+        let Some(parsed) = crate::schema::parse_affected_entry_sentinel(s) else {
+            ctx.error(
+                &epath,
+                ErrorKind::InvalidValue,
+                format!(
+                    "{key} entry must be wrapped in \"<<...>>\" sentinel syntax,                      e.g. \"<<ralphus:review/backend>>\", \"<<ralphus:squad/squad-abc>>\",                      \"<<ralphus:new-review/<key>>>\", or \"<<ralphus:new-squad>>\""
+                ),
+                None,
+            );
+            continue;
+        };
+        match parsed {
+            crate::schema::AffectedEntryRef::ExistingReview(id) if id.starts_with("ralphus:") => {
+                if !review_ids.contains(id.as_str()) {
+                    ctx.error(
+                        &epath,
+                        ErrorKind::InvalidValue,
+                        format!(
+                            "{key} entry \"{s}\" names a same-file placeholder                              that does not match any [[review]].id in this                              submission"
+                        ),
+                        None,
+                    );
+                }
+            }
+            crate::schema::AffectedEntryRef::NewSquad if !has_task_group => {
+                ctx.error(
+                    &epath,
+                    ErrorKind::InvalidValue,
+                    format!(
+                        "{key} entry \"<<ralphus:new-squad>>\" requires at least                          one [[task]] in this submission"
+                    ),
+                    None,
+                );
+            }
+            crate::schema::AffectedEntryRef::ExistingReview(_)
+            | crate::schema::AffectedEntryRef::ExistingSquad(_)
+            | crate::schema::AffectedEntryRef::NewSquad => {}
         }
     }
 }
@@ -3974,6 +4007,53 @@ prompt = "gate on review"
             .iter()
             .find(|e| e.kind == ErrorKind::MissingRequired && e.message.contains("affected"))
             .expect("an omitted affected must be rejected");
+    }
+
+    #[test]
+    fn waypoint_roster_accepts_namespaced_sentinels_and_rejects_bare_ids() {
+        let base = r#"
+[[task]]
+name = "build"
+[[task.cell]]
+cwd = "/repo"
+prompt = "make it build"
+[[task.cell.proof]]
+command = "cargo build"
+remediation_attempts = 3
+
+[[waypoint]]
+prompt = "wait"
+affected = ["<<ralphus:new-squad>>"]
+"#;
+        let ok = format!(
+            "{base}roster = [\"<<ralphus:review/guardian-1>>\", \"<<ralphus:squad/squad-1>>\", \"<<ralphus:new-squad>>\"]
+"
+        );
+        assert!(
+            validate_toml(&ok).errors.is_empty(),
+            "{:?}",
+            validate_toml(&ok).errors
+        );
+        let bare = format!(
+            "{base}roster = [\"guardian-1\"]
+"
+        );
+        assert!(
+            validate_toml(&bare)
+                .errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("roster"))
+        );
+        let dangling = format!(
+            "{base}roster = [\"<<ralphus:new-review/nope>>\"]
+"
+        );
+        assert!(
+            validate_toml(&dangling)
+                .errors
+                .iter()
+                .any(|e| e.message.contains("same-file placeholder"))
+        );
     }
 
     #[test]
