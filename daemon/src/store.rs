@@ -2845,6 +2845,7 @@ impl Store {
                 status         TEXT NOT NULL,
                 items          TEXT NOT NULL,
                 depth          INTEGER NOT NULL DEFAULT 0,
+                -- Deprecated: no longer written; may be removed in future.
                 waypoint_id    TEXT,
                 squad_id       TEXT,
                 created_at_ms  INTEGER NOT NULL,
@@ -2870,7 +2871,7 @@ impl Store {
                 created_at_ms INTEGER NOT NULL,
                 PRIMARY KEY (guardian_id, prophecy_id)
             );
-            -- The squad and waypoint each accepted item of an offer produced
+            -- The squad each accepted item of an offer produced
             -- (`crate::followup`). An item is accepted on its own, so the
             -- offer row cannot hold one squad id for the lot. An empty
             -- `squad_id` is a claim whose squad is still being created.
@@ -2878,6 +2879,7 @@ impl Store {
                 guardian_id   TEXT NOT NULL,
                 prophecy_id   INTEGER NOT NULL,
                 squad_id      TEXT NOT NULL,
+                -- Deprecated: no longer written; may be removed in future.
                 waypoint_id   TEXT NOT NULL DEFAULT '',
                 created_at_ms INTEGER NOT NULL,
                 PRIMARY KEY (guardian_id, prophecy_id)

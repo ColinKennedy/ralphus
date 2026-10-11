@@ -17745,8 +17745,8 @@ fn guardian_followup_set_ignored(daemon: &Daemon, id: &str, body: &str, ignored:
     }
 }
 
-/// `POST /api/guardians/{id}/followup/accept`: drafts the follow-up squad and
-/// its waypoint from the offer, or from the one item `{"prophecy_id": n}`
+/// `POST /api/guardians/{id}/followup/accept`: drafts the follow-up squad
+/// from the offer, or from the one item `{"prophecy_id": n}`
 /// names.
 fn guardian_followup_accept(daemon: &Daemon, id: &str, body: &str) -> Reply {
     let req = if body.trim().is_empty() {

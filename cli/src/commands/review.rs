@@ -2295,7 +2295,7 @@ fn dispatch_followup(cmd: ReviewFollowupCommand, opts: &GlobalOpts, client: &Dae
                     println!("  - {}", item["body"].as_str().unwrap_or_default());
                 }
                 if let Some(squad) = o["squad_id"].as_str().filter(|s| !s.is_empty()) {
-                    println!("  squad {squad}, waypoint {}", o["waypoint_id"]);
+                    println!("  squad {squad}");
                 }
             });
             Ok(())
@@ -2310,8 +2310,8 @@ fn dispatch_followup(cmd: ReviewFollowupCommand, opts: &GlobalOpts, client: &Dae
                     "held; start it with `ralphus squad activate`"
                 };
                 println!(
-                    "{selector}: follow-up squad {} created ({state}), explained by waypoint {}",
-                    r["squad_id"], r["waypoint_id"]
+                    "{selector}: follow-up squad {} created ({state})",
+                    r["squad_id"]
                 );
             });
             Ok(())

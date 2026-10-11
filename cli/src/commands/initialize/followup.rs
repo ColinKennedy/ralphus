@@ -4,9 +4,9 @@
 //! A real squad runs on an isolated daemon, its review merges, the merged
 //! review offers follow-up work for the `deferred` prophecy its cell wrote,
 //! the offer is accepted, and the follow-up squad the daemon drafts runs to
-//! completion under the waypoint that explains it. Everything but two things is
+//! completion. Everything but two things is
 //! the real system: the daemon, its SQLite store, the scheduler, the runner,
-//! git worktrees, the prophecy store, the waypoint store, and squad submission.
+//! git worktrees, the prophecy store, and squad submission.
 //!
 //! The two stand-ins:
 //!
@@ -168,7 +168,7 @@ fn run(options: &ExerciseOptions) -> Result<(), String> {
     step("the merge offered a follow-up for the deferred prophecy only");
 
     // 4. Accepting drafts a squad that starts at once (auto-start is on by
-    //    default) and a blocking waypoint.
+    //    default); it creates no waypoint.
     let accepted = client
         .guardian_followup_accept(&review)
         .map_err(|e| format!("accepting the offer failed: {e}"))?;
@@ -176,10 +176,11 @@ fn run(options: &ExerciseOptions) -> Result<(), String> {
         .as_str()
         .ok_or("accept named no squad")?
         .to_string();
-    let waypoint = accepted["waypoint_id"]
-        .as_str()
-        .ok_or("accept named no waypoint")?
-        .to_string();
+    expect(
+        accepted.get("waypoint_id").is_none(),
+        "accepting creates no waypoint",
+        &accepted,
+    )?;
     expect(
         accepted["base"]
             .as_str()
@@ -192,7 +193,7 @@ fn run(options: &ExerciseOptions) -> Result<(), String> {
         "the follow-up starts at once by default",
         &accepted,
     )?;
-    step("accepting created a follow-up squad and a waypoint");
+    step("accepting created a follow-up squad and no waypoint");
 
     // The follow-up has no review of its own to submit to, and its cell keeps
     // the proof of the work it follows up on.
@@ -243,25 +244,7 @@ fn run(options: &ExerciseOptions) -> Result<(), String> {
         &format!("{again:?}"),
     )?;
 
-    let detail = client.waypoint_get(&waypoint).map_err(|e| e.to_string())?;
-    expect(detail["state"] == "open", "the waypoint is open", &detail)?;
-    let roster = detail["roster"].as_array().cloned().unwrap_or_default();
-    expect(
-        roster.len() == 1 && roster[0]["entry_id"] == review.as_str(),
-        "the merged review is the waypoint's roster",
-        &detail,
-    )?;
-    let affected = detail["affected"].as_array().cloned().unwrap_or_default();
-    expect(
-        affected.len() == 1
-            && affected[0]["mode"] == "block"
-            && affected[0]["bearing_decision"] == "accepted",
-        "the follow-up squad is the waypoint's blocking, already-answered affected entry",
-        &detail,
-    )?;
-    step("the waypoint lists the review as roster and the squad as blocking");
-
-    // 5. The follow-up runs under the waypoint.
+    // 5. The follow-up runs to completion.
     expect_done(&exercise, &followup)?;
     step("the follow-up squad ran to completion");
 
