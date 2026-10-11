@@ -713,9 +713,29 @@ instead of falling through to a global, non-project-aware default:
 | `default_machine` | `machine` | the local machine |
 | `default_maximum_budget_usd` | `maximum_budget_usd` | unbounded |
 | `default_proof_scope` | `proof_scope` | `"each_branch"` |
+| `default_ci_deferral` | `ci_deferral` | `"every"` |
 
 An explicitly declared `[[review]]` value always wins over its project
-default. `default_proof_scope` accepts the legacy `verify_scope` key name too
+default. `ci_deferral` (`every` | `top` | `bottom+top`) decides which PRs/MRs
+in a review's stack run the full CI suite; every other open member carries the
+`ralphus:defer-full-ci` label, which the repository's CI configuration reads to
+skip its slow jobs. Changing it on a review (`POST .../settings` or `.../details`)
+re-labels the review's open PRs/MRs before the request returns -- a forge failure
+is a `502` with the value already saved -- and a later submission is labelled
+against the then-current setting. Only a PR/MR whose label actually changes is
+touched: the CI runs in flight on its head commit are recorded first and, once
+the label change has succeeded, cancelled (they ran under the old scope), and
+GitLab, which never starts a pipeline for a label change, is asked for a new
+merge request pipeline. Those CI steps are best-effort and never fail the
+request. Changing the project default re-labels the project's reviews that have
+no override of their own, in the background. The labels also follow the stack:
+a reorder (with any branch enabled or disabled alongside it), an arrange, a
+force-start, a branch move and every submission re-label it, and the daemon's
+periodic review check re-labels a review whose stack of open PRs/MRs no longer
+matches the one it was last labelled for -- a PR/MR merged, closed or dropped
+included -- without any forge call when nothing changed. An unrecognised stored
+value behaves as `every`. How a repository's CI reads the label is in
+[`ci-deferral.md`](ci-deferral.md). `default_proof_scope` accepts the legacy `verify_scope` key name too
 (pre-dates the Verify→Proof rename, see the glossary). `id`/`name`/`upstream`/
 `action` have no project-default equivalent -- see
 `daemon/src/config.rs`'s `REVIEW_FIELD_PARITY` for why each is excluded.
@@ -2206,7 +2226,7 @@ Field-by-field, this replaces:
 |---|---|
 | `name` | `POST .../rename` |
 | `base_branch` | `POST .../base` |
-| `resolver_agent`, `resolver_model`, `proof_scope`, `proof_skip_auto_clean`, `skip_worktrees`, `skip_base_updates`, `separate_pr_branch`, `match_pr_branch_name`, `auto_submit_pr_stack` | `POST .../settings` |
+| `resolver_agent`, `resolver_model`, `proof_scope`, `ci_deferral`, `proof_skip_auto_clean`, `skip_worktrees`, `skip_base_updates`, `separate_pr_branch`, `match_pr_branch_name`, `auto_submit_pr_stack` | `POST .../settings` |
 | `squash_projects` (full desired membership — every project in the list gets squash turned on, every other project on the review gets it turned off) | `POST .../squash` (one call per project) |
 | `build_env`, `manual_checks_env`, `branch_env` (keyed by branch id) | `POST .../build-env`, `POST .../manual-checks-env`, `POST .../branches/{id}/env` respectively — each an `{set, unset, clear}` object with the same three-way inherited-override shape those endpoints already use |
 

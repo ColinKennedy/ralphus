@@ -9670,6 +9670,8 @@ fn review_maintenance_staggered(
         std::thread::spawn(move || {
             let _claim = claim;
             let runner = runners(&store);
+            // PRs of a still-collecting review are already a stack to label.
+            crate::pr::reconcile_ci_deferral_if_stack_changed(&store, &id);
             crate::ci_watch::poll_open_pr_ci_status(&store, runner.as_ref(), &cancellations, &id);
         });
     }
@@ -9716,6 +9718,12 @@ fn review_maintenance_staggered(
             // themselves and naturally no-op once it's no longer
             // `in_review`/`merge_failed`, so no extra branching is needed here.
             check_merges_claimed(&store, &id);
+            // A PR/MR merged, closed or dropped -- or any other change to the
+            // stack that no request of ours made -- can move the bottom or the
+            // top, so the CI-deferral labels are checked here, before any pass
+            // below that returns early (a part-merged stack does). Local
+            // state only unless the stack really changed.
+            crate::pr::reconcile_ci_deferral_if_stack_changed(&store, &id);
             // RAL-395: standing CI-status poll (self-throttled per guardian,
             // see `ci_watch::STANDING_POLL_INTERVAL`) -- persists the result
             // for the board and dispatches auto-fix on a fresh failure when

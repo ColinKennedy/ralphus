@@ -35,6 +35,7 @@ MAPPING = {
     "machine": "default_machine",
     "maximum_budget_usd": "default_maximum_budget_usd",
     "proof_scope": "default_proof_scope",
+    "ci_deferral": "default_ci_deferral",
     "auto_submit_pr_stack": "auto_submit_pr_stack",
     "skip_worktrees": "skip_worktrees",
     "skip_base_updates": "skip_base_updates",

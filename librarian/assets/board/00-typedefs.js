@@ -472,6 +472,8 @@
        * @property {string|null} [proof_scope] - RAL-168: this review's own Proof-scope override ("each_branch"|"final_branch"|"nothing"), or null to inherit the project default.
        * @property {boolean|null} [proof_skip_auto_clean] - RAL-168: this review's own override for "each_branch"'s auto-clean-skip sub-option, or null to inherit the project default.
        * @property {string} [effective_proof_scope] - RAL-168: proof_scope resolved against the project default -- always "each_branch"|"final_branch"|"nothing".
+       * @property {string|null} [ci_deferral] - This review's own CI-deferral override ("every"|"top"|"bottom+top"), or null to inherit the project default.
+       * @property {string} [effective_ci_deferral] - ci_deferral resolved against the project and global defaults -- always "every"|"top"|"bottom+top".
        * @property {boolean} [effective_proof_skip_auto_clean] - RAL-168: proof_skip_auto_clean resolved against the project default.
        * @property {{[key: string]: string}} [combined_env] - RAL-203: the environment the combined worktree inherits by default -- the last enabled branch's own `resolved_env`. Shared baseline `build_env`/`manual_checks_env` each layer their own overrides on top of.
        * @property {{[key: string]: (string|null)}} [build_env_overrides] - RAL-203: this review's own env-override layer for the finalize-time build/check-gate step. A string value overrides the inherited one; `null` is a tombstone; an absent key is simply inherited.
@@ -899,6 +901,7 @@
        * @property {string|null|undefined} default_machine
        * @property {number|null|undefined} default_maximum_budget_usd
        * @property {string|null|undefined} default_proof_scope
+       * @property {string|null|undefined} default_ci_deferral
        * @property {boolean|null|undefined} verify_skip_auto_clean
        * @property {boolean|null|undefined} skip_worktrees
        * @property {boolean|null|undefined} skip_base_updates
@@ -928,6 +931,7 @@
        * @property {string|undefined} machine
        * @property {number|undefined} maximum_budget_usd
        * @property {string} proof_scope
+       * @property {string} ci_deferral
        * @property {boolean} skip_auto_clean
        * @property {boolean} skip_worktrees
        * @property {boolean} skip_base_updates

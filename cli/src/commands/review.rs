@@ -93,6 +93,9 @@ pub enum ReviewCommand {
         base_branch: Option<String>,
         auto_pr_feedback: Option<bool>,
         proof_scope: Option<String>,
+        /// Which PRs/MRs in the stack run the full CI suite (`every`, `top`,
+        /// `bottom+top`); an empty string resets it to `every`.
+        ci_deferral: Option<String>,
         skip_auto_clean: Option<bool>,
         skip_base_updates: Option<bool>,
         /// RAL-307: this review's own override for whether a newly
@@ -458,6 +461,7 @@ pub fn parse(args: &[String]) -> ReviewCommand {
             let base_branch = scanner.take_value("--base-branch").ok().flatten();
             let auto_pr_feedback = take_tri_bool(&mut scanner, "--auto-pr-feedback");
             let proof_scope = scanner.take_value("--proof-scope").ok().flatten();
+            let ci_deferral = scanner.take_value("--ci-deferral").ok().flatten();
             let skip_auto_clean = take_tri_bool(&mut scanner, "--skip-auto-clean");
             let skip_base_updates = take_tri_bool(&mut scanner, "--skip-base-updates");
             let match_pr_branch_name = take_tri_bool(&mut scanner, "--match-pr-branch-name");
@@ -498,6 +502,7 @@ pub fn parse(args: &[String]) -> ReviewCommand {
                 base_branch,
                 auto_pr_feedback,
                 proof_scope,
+                ci_deferral,
                 skip_auto_clean,
                 skip_base_updates,
                 match_pr_branch_name,
@@ -1528,6 +1533,7 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
             base_branch,
             auto_pr_feedback,
             proof_scope,
+            ci_deferral,
             skip_auto_clean,
             skip_base_updates,
             match_pr_branch_name,
@@ -1554,6 +1560,7 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
                 base_branch: base_branch.as_deref(),
                 auto_pr_feedback,
                 proof_scope: proof_scope.as_deref(),
+                ci_deferral: ci_deferral.as_deref(),
                 proof_skip_auto_clean: skip_auto_clean,
                 skip_base_updates,
                 match_pr_branch_name,
@@ -2832,6 +2839,20 @@ fn render_review_detail(g: &Value) {
             .to_string(),
     ));
     rows.push((
+        "ci_deferral",
+        match g["ci_deferral"].as_str() {
+            Some(v) if !v.is_empty() => format!("{v} (explicit)"),
+            _ => "(unset)".to_string(),
+        },
+    ));
+    rows.push((
+        "effective_ci_deferral",
+        g["effective_ci_deferral"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+    ));
+    rows.push((
         "proof_skip_auto_clean",
         match proof_skip_auto_clean {
             Some(v) => format!("{v} (explicit)"),
@@ -3299,6 +3320,27 @@ mod tests {
                 assert_eq!(skip_worktrees, Some(false));
                 assert_eq!(proof_scope.as_deref(), Some("each_branch"));
             }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_settings_ci_deferral_values() {
+        for mode in ["every", "top", "bottom+top", ""] {
+            match parse(&v(&["settings", "g1", "--ci-deferral", mode])) {
+                ReviewCommand::Settings {
+                    selector,
+                    ci_deferral,
+                    ..
+                } => {
+                    assert_eq!(selector, "g1");
+                    assert_eq!(ci_deferral.as_deref(), Some(mode));
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+        match parse(&v(&["settings", "g1"])) {
+            ReviewCommand::Settings { ci_deferral, .. } => assert_eq!(ci_deferral, None),
             other => panic!("unexpected: {other:?}"),
         }
     }

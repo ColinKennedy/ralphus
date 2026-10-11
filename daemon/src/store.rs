@@ -832,6 +832,11 @@ pub struct ProjectReviewSettings {
     pub default_maximum_budget_usd: Option<f64>,
     #[serde(default)]
     pub default_proof_scope: Option<String>,
+    /// Project default for which PRs/MRs in a review's stack run the full CI
+    /// suite (`every`/`top`/`bottom+top`). `None` inherits the file and
+    /// global layers, then `every`.
+    #[serde(default)]
+    pub default_ci_deferral: Option<String>,
     #[serde(default)]
     pub verify_skip_auto_clean: Option<bool>,
     #[serde(default)]
@@ -924,6 +929,7 @@ impl ProjectReviewSettings {
             auto_build: self.auto_build,
             summary_format: None,
             default_proof_scope: self.default_proof_scope,
+            default_ci_deferral: self.default_ci_deferral,
             proof_skip_auto_clean: self.verify_skip_auto_clean,
             default_resolver_agent: self.default_resolver_agent,
             default_resolver_model: self.default_resolver_model,
@@ -3914,6 +3920,10 @@ impl Store {
             // `None` inherits the project/global default, which resolves to
             // `true` (on by default).
             "ALTER TABLE guardians ADD COLUMN post_appraisals INTEGER",
+            // Per-review `ci_deferral` mode (`every`/`top`/`bottom+top`).
+            // NULL behaves as `every`: no PR/MR in the stack carries the
+            // defer-full-CI label.
+            "ALTER TABLE guardians ADD COLUMN ci_deferral TEXT",
             // RAL-521: per-review override for whether this review's manual
             // checks are computed once, when its review branches are first
             // created, and then reused through later merges, rebases, and
@@ -18584,6 +18594,7 @@ command = "e"
             default_machine: Some("local".to_string()),
             default_maximum_budget_usd: Some(5.0),
             default_proof_scope: Some("final_branch".to_string()),
+            default_ci_deferral: Some("bottom+top".to_string()),
             verify_skip_auto_clean: Some(true),
             skip_worktrees: Some(true),
             skip_base_updates: Some(false),

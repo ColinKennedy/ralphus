@@ -22,6 +22,7 @@ MAPPING = {
     "resolver_agent": "agent",
     "resolver_model": "model",
     "proof_scope": "proof_scope",
+    "ci_deferral": "ci_deferral",
     "proof_skip_auto_clean": "skip_auto_clean",
     "skip_base_updates": "skip_base_updates",
     "match_pr_branch_name": "match_pr_branch_name",

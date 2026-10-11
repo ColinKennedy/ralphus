@@ -1172,6 +1172,27 @@ pub const PROOF_SCOPE_VALUES: &[&str] = &[
     PROOF_SCOPE_NOTHING,
 ];
 
+/// Valid values for `[[review]] ci_deferral` and the CLI's `ralphus review
+/// settings --ci-deferral`: which PRs/MRs in a review's stack run the full CI
+/// suite. Every other PR/MR in the stack carries [`DEFER_FULL_CI_LABEL`], which
+/// the project's CI configuration reads to skip its expensive jobs. See
+/// [`ReviewDef::ci_deferral`].
+pub const CI_DEFERRAL_EVERY: &str = "every";
+pub const CI_DEFERRAL_TOP: &str = "top";
+pub const CI_DEFERRAL_BOTTOM_AND_TOP: &str = "bottom+top";
+
+/// Every accepted `ci_deferral` literal, in the order shown to a user.
+pub const CI_DEFERRAL_VALUES: &[&str] = &[
+    CI_DEFERRAL_EVERY,
+    CI_DEFERRAL_TOP,
+    CI_DEFERRAL_BOTTOM_AND_TOP,
+];
+
+/// The label a review puts on every PR/MR whose full CI run `ci_deferral`
+/// defers. A missing label means "run everything", so a project that never
+/// opts in, or a label someone removed, costs CI minutes rather than coverage.
+pub const DEFER_FULL_CI_LABEL: &str = "ralphus:defer-full-ci";
+
 /// Every accepted `summary_format` literal for a review change summary.
 pub const SUMMARY_FORMAT_VALUES: &[&str] = &["bullet", "prose"];
 
@@ -1710,6 +1731,14 @@ pub struct ReviewDef {
     /// `[[review]]` block to read it from.
     #[serde(default)]
     pub auto_fix_pr_errors: Option<bool>,
+    /// Which PRs/MRs in this review's stack run the full CI suite:
+    /// [`CI_DEFERRAL_EVERY`] (all of them), [`CI_DEFERRAL_TOP`] (only the top
+    /// of the stack) or [`CI_DEFERRAL_BOTTOM_AND_TOP`] (the bottom, which
+    /// targets the base branch, and the top). Every other PR/MR gets
+    /// [`DEFER_FULL_CI_LABEL`]. Unset means [`CI_DEFERRAL_EVERY`]. See
+    /// [`CI_DEFERRAL_VALUES`].
+    #[serde(default)]
+    pub ci_deferral: Option<String>,
     /// RAL-510: whether this review cancels a PR/MR's still-running CI
     /// pipelines whenever a newer commit is force-pushed onto the same
     /// branch, instead of letting superseded runs burn CI capacity to
