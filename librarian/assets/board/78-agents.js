@@ -1,4 +1,121 @@
-﻿      // ---- Agents tab (RAL-473: DB-backed agent profiles + built-in backend command overrides) ----
+﻿      // RALPHUS-AGENT-FILTER:BEGIN
+      // RAL-486: Pure agent-filter decision logic, shared by Squads and Tasks tabs.
+      // No DOM, fetch, or module-level state — testable in node without a browser.
+      /**
+       * Returns the distinct resolved agents a task uses: its cells' agents
+       * if it has cells, otherwise the task-level agent (the default), or an
+       * empty array if neither exists. Duplicates are collapsed.
+       * @param {TaskView|{agent?: string|null, cells?: {agent?: string}[]}} task
+       * @returns {string[]}
+       */
+      function taskAgentNames(task) {
+        if (!task) return [];
+        const cells = task.cells || [];
+        if (cells.length > 0) {
+          const agents = cells.map((c) => c.agent).filter((a) => a);
+          return [...new Set(agents)].sort();
+        }
+        return task.agent ? [task.agent] : [];
+      }
+      /**
+       * Returns every distinct agent across all tasks in a squad, sorted.
+       * @param {SquadView|{tasks?: TaskView[]}} squad
+       * @returns {string[]}
+       */
+      function squadAgentNames(squad) {
+        if (!squad || !squad.tasks) return [];
+        const agents = new Set();
+        squad.tasks.forEach((t) => {
+          taskAgentNames(t).forEach((a) => agents.add(a));
+        });
+        return [...agents].sort();
+      }
+      /**
+       * Builds a deduped, sorted option list from an array of agent names,
+       * dropping blanks. Used to fill filter dropdowns.
+       * @param {string[]} agents
+       * @returns {string[]}
+       */
+      function agentFilterOptions(agents) {
+        const unique = new Set(agents.filter((a) => a && a.trim()));
+        return [...unique].sort();
+      }
+      /**
+       * True if the squad has any task using any of the selected agents, or if
+       * any task has no agent at all (it can't be filtered out — no checkbox
+       * would explain hiding it).
+       * @param {SquadView|{tasks?: TaskView[]}} squad
+       * @param {Set<string>} selected
+       * @returns {boolean}
+       */
+      function squadMatchesAgentFilter(squad, selected) {
+        if (!squad || !squad.tasks || squad.tasks.length === 0) return true;
+        for (const t of squad.tasks) {
+          const agents = taskAgentNames(t);
+          if (agents.length === 0) return true;
+          if (selected && agents.some((a) => selected.has(a))) return true;
+        }
+        return false;
+      }
+      /**
+       * Returns a badge string like "2/5" when the selection narrows the view,
+       * or an empty string when all options are selected (no filter).
+       * @param {number} shownCount
+       * @param {number} availableCount
+       * @returns {string}
+       */
+      function agentFilterBadge(shownCount, availableCount) {
+        return shownCount < availableCount ? `${shownCount}/${availableCount}` : "";
+      }
+      /**
+       * Syncs the selected agent set when new agents appear. If the user has
+       * not made an explicit choice (`isExplicit` is false), adds any newly-seen
+       * agents to the selection. If they have chosen explicitly, keeps the
+       * selection as-is (even if empty — a deliberate "none" click).
+       * @param {boolean} isExplicit
+       * @param {Set<string>} selected
+       * @param {string[]} available
+       * @returns {Set<string>}
+       */
+      function syncedAgentSelection(isExplicit, selected, available) {
+        if (isExplicit) return selected;
+        const all = new Set(available);
+        const added = [...all].filter((a) => !selected.has(a));
+        added.forEach((a) => selected.add(a));
+        return selected;
+      }
+      // RALPHUS-AGENT-FILTER:END
+
+      /**
+       * Builds the HTML for an agent-filter dropdown menu opener (RAL-486). The
+       * dropdown's state and rendering are managed by renderStatusDropdown
+       * (shared with status/PR-status filters); this just wraps it with a
+       * consistent interface.
+       * @param {string} label
+       * @param {StatusDropdownConfig} config
+       * @returns {string}
+       */
+      function agentFilterHtml(label, config) {
+        const { id, itemNoun, selected, options } = config;
+        const badge = agentFilterBadge(selected.size, options.length);
+        const badgeHtml = badge ? ` <span class="chip">${esc(badge)}</span>` : "";
+        return `<button type="button" class="btn" id="${id}-opener" data-click="toggleAgentFilterMenu" data-tip="Filter by agent. Click to open the dropdown.">${esc(label)} ${selected.size > 0 ? `(${selected.size}/${options.length})` : `(${options.length})`}${badgeHtml}</button>`;
+      }
+      /**
+       * Toggles the agent filter menu open/closed.
+       * @param {Event} event
+       * @returns {void}
+       */
+      function toggleAgentFilterMenu(event) {
+        event.stopPropagation();
+        const button = /** @type {HTMLElement} */ (event.target).closest("button");
+        if (!button) return;
+        const menu = document.getElementById(`${button.id.replace("-opener", "-menu")}`);
+        if (!menu) return;
+        menu.classList.toggle("hidden");
+      }
+
+      // ---- Agents tab (RAL-473: DB-backed agent profiles + built-in backend command overrides) ----
 
       /** Every backend a profile's `backend` field may select — mirrors `agent_profiles::PROFILE_BACKENDS`. */
       const AGENT_PROFILE_BACKENDS = ["claude", "claude-code", "codex", "pi", "ollama", "anthropic", "raw"];
