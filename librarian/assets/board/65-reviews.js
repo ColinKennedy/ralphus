@@ -1847,10 +1847,16 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         const status = it.ignored
           ? `<span class="fu-chip fu-ignored" data-tip="This note is left out of the follow-ups made when the review merges.">Ignored</span>`
           : "";
-        const squad = frozen && !it.ignored ? followupSquadHtml(offerStatus, squadId) : "";
+        const squad = frozen && !it.ignored ? followupSquadHtml(offerStatus, it.squad_id || squadId) : "";
+        const acceptBtn = offerStatus === "declined" || it.accepted
+          ? ""
+          : `<button class="btn primary fu-btn" data-click="acceptFollowup" data-guardian-id="${esc(gid)}" data-prophecy-id="${it.prophecy_id}" data-tip="Pressing this will create a follow-up Task that completes this offer.${frozen ? "" : "\nThe review has not merged yet, so it is created the moment the review merges."}">Accept</button>`;
+        const acceptedChip = it.accepted && !it.squad_id
+          ? `<span class="fu-status" data-tip="${frozen ? "Accepted: the follow-up squad is being created." : "Accepted: the follow-up Task is created the moment this review merges.\nIgnoring the note withdraws the acceptance."}">Accepted</span>`
+          : "";
         const action = frozen
-          ? `<span class="fu-status ${it.ignored ? "off" : ""}" data-tip="${it.ignored ? "This note was left out of the offer made when the review merged." : "This note was included in the offer made when the review merged."}">${it.ignored ? "Ignored" : "Offered"}</span>`
-          : `<button class="btn fu-btn" data-click="${it.ignored ? "unignoreFollowup" : "ignoreFollowup"}" data-guardian-id="${esc(gid)}" data-prophecy-id="${it.prophecy_id}" data-tip="${it.ignored ? "Offer this note again when the review merges.\nClick to re-enable it." : "Leave this note out of the follow-ups made when the review merges.\nYou can re-enable it later."}">${it.ignored ? "Re-enable" : "Ignore"}</button>`;
+          ? `${acceptedChip}${acceptBtn}${it.ignored && !it.accepted ? `<span class="fu-status off" data-tip="This note was left out of the offer made when the review merged.">Ignored</span>` : ""}`
+          : `${acceptedChip}${acceptBtn}<button class="btn fu-btn" data-click="${it.ignored ? "unignoreFollowup" : "ignoreFollowup"}" data-guardian-id="${esc(gid)}" data-prophecy-id="${it.prophecy_id}" data-tip="${it.ignored ? "Offer this note again when the review merges.\nClick to re-enable it." : "Leave this note out of the follow-ups made when the review merges.\nYou can re-enable it later."}">${it.ignored ? "Re-enable" : "Ignore"}</button>`;
         const prompt = it.prompt
           ? `<details class="fu-context"><summary data-tip="The prompt of the cell that deferred this note.">Show the context it was written in</summary><div class="fu-prompt mono">${esc(it.prompt)}</div></details>`
           : "";
@@ -1875,7 +1881,8 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         if (offerStatus === "accepted") {
           return `<span class="fu-chip fu-ignored" data-tip="The offer was accepted but no squad was recorded, so creating it may have failed.\nCheck the review's mailbox messages, or accept the offer again.">Squad creation failed</span>`;
         }
-        return `<span class="fu-chip" data-tip="The offer has not been accepted yet, so no squad exists for this note.">Squad pending</span>`;
+        return `<span class="fu-chip" data-tip="The offer has not been accepted yet, so no squad exists for this note.
+Press Accept on the note to create it.">Squad pending</span>`;
       }
       /**
        * Renders the follow-up list modal body: a plain-language intro, then
@@ -1916,6 +1923,23 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           ${followupListHtml(gid, data)}
           <div class="fu-foot">${tally}<button class="btn" onclick="closeModal()" data-tip="Close this list.">Close</button></div>
         </div></div>`;
+      }
+      /**
+       * Accepts one follow-up. Once the review has merged the daemon creates
+       * its squad; before that it only records the acceptance, and the squad
+       * is created at merge. The list is reloaded either way.
+       * @param {string} gid
+       * @param {number} prophecyId
+       * @returns {Promise<void>}
+       */
+      async function acceptFollowupOffer(gid, prophecyId) {
+        let resp;
+        try {
+          resp = await post(`/api/guardians/${encodeURIComponent(gid)}/followup/accept`, { prophecy_id: prophecyId });
+        } catch (e) { notify("error", "daemon unreachable"); return; }
+        if (!resp.ok) { notify("error", await responseError(resp, "could not accept the follow-up")); return; }
+        notify("success", resp.status === 201 ? "Follow-up squad created." : "Accepted; it is created when the review merges.");
+        await openFollowupList(gid);
       }
       /**
        * Ignores or un-ignores one deferred note and refreshes the list and

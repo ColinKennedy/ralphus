@@ -132,6 +132,12 @@ pub struct PendingFollowupItem {
     pub branch: Option<String>,
     /// The name of the task the writing cell belongs to.
     pub task_name: Option<String>,
+    /// The follow-up squad accepting this item created; `None` until it is
+    /// accepted.
+    pub squad_id: Option<String>,
+    /// Whether the user accepted this item: its squad exists, or it was
+    /// accepted ahead of the merge and is submitted when the offer is made.
+    pub accepted: bool,
 }
 
 /// A review's pending follow-ups: what the board's button shows.
@@ -207,9 +213,13 @@ impl Store {
     pub fn followup_depth_of_review(&self, guardian_id: &str) -> Result<i64> {
         let depth: Option<i64> = self.conn.query_row(
             "SELECT MAX(o.depth) + 1 FROM followup_offers o
-             WHERE o.squad_id IS NOT NULL AND (
+             WHERE (o.squad_id IS NOT NULL AND (
                  o.squad_id IN (SELECT squad_id FROM guardians WHERE id=?1)
                  OR o.squad_id IN (SELECT squad_id FROM cells WHERE review_guardian_id=?1)
+             )) OR o.guardian_id IN (
+                 SELECT r.guardian_id FROM followup_item_results r
+                 WHERE r.squad_id IN (SELECT squad_id FROM guardians WHERE id=?1)
+                    OR r.squad_id IN (SELECT squad_id FROM cells WHERE review_guardian_id=?1)
              )",
             params![guardian_id],
             |r| r.get(0),
@@ -268,6 +278,8 @@ impl Store {
             *slot = (*slot).max(p.attempt);
         }
         let ignored = self.ignored_followup_ids(guardian_id)?;
+        let results = self.followup_item_squads(guardian_id)?;
+        let preaccepted = self.preaccepted_followup_ids(guardian_id)?;
         Ok(deferred
             .into_iter()
             .filter(|p| latest.get(&p.entity_uri) == Some(&p.attempt))
@@ -279,6 +291,8 @@ impl Store {
                     created_at_ms: p.created_at_ms,
                     branch: context.as_ref().and_then(|c| c.branch.clone()),
                     task_name: context.as_ref().map(|c| c.task_name.clone()),
+                    squad_id: results.get(&p.id).filter(|s| !s.is_empty()).cloned(),
+                    accepted: results.contains_key(&p.id) || preaccepted.contains(&p.id),
                     item: FollowupItem {
                         prophecy_id: p.id,
                         prompt: context
@@ -303,6 +317,76 @@ impl Store {
             .query_map(params![guardian_id], |r| r.get(0))?
             .collect::<std::result::Result<_, _>>()?;
         Ok(ids)
+    }
+
+    fn preaccepted_followup_ids(
+        &self,
+        guardian_id: &str,
+    ) -> Result<std::collections::HashSet<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT prophecy_id FROM followup_preaccepted WHERE guardian_id=?")?;
+        let ids = stmt
+            .query_map(params![guardian_id], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(ids)
+    }
+
+    /// Accepts one pending deferral before the review has merged. The offer
+    /// does not exist yet, so this only records the intent: when the merge
+    /// makes the offer, [`spawn_preaccepted_worker`] submits the item at once.
+    /// Accepting an ignored item un-ignores it. Refused once the offer exists
+    /// (accept it through [`accept_offer`] then). An id that is not one of the
+    /// review's pending deferrals is `NotFound`.
+    pub fn preaccept_followup(&self, guardian_id: &str, prophecy_id: i64) -> Result<()> {
+        if self.get_followup_offer(guardian_id)?.is_some() {
+            return Err(StoreError::InvalidTransition(
+                "this review's follow-up offer already exists; accept the item from the offer"
+                    .to_string(),
+            ));
+        }
+        let items = self.pending_followup_items(guardian_id)?;
+        if !items.iter().any(|i| i.item.prophecy_id == prophecy_id) {
+            return Err(StoreError::NotFound);
+        }
+        self.conn.execute(
+            "DELETE FROM followup_ignored WHERE guardian_id=? AND prophecy_id=?",
+            params![guardian_id, prophecy_id],
+        )?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO followup_preaccepted(guardian_id, prophecy_id, created_at_ms)
+             VALUES(?,?,?)",
+            params![guardian_id, prophecy_id, now_ms()],
+        )?;
+        crate::cartographer::Note::new("followup")
+            .scope("followup")
+            .guardian(guardian_id)
+            .emit(
+                self,
+                format!(
+                    "review {guardian_id}: deferred follow-up (prophecy {prophecy_id}) accepted \
+                     ahead of the merge"
+                ),
+                serde_json::json!({"prophecy_id": prophecy_id}),
+            );
+        Ok(())
+    }
+
+    /// Items accepted ahead of the merge whose offer now exists but whose
+    /// squad does not: `(review id, prophecy id)`, oldest offer first.
+    pub fn due_preaccepted_followups(&self) -> Result<Vec<(String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT p.guardian_id, p.prophecy_id FROM followup_preaccepted p
+             JOIN followup_offers o ON o.guardian_id=p.guardian_id AND o.status=?
+             LEFT JOIN followup_item_results r
+                 ON r.guardian_id=p.guardian_id AND r.prophecy_id=p.prophecy_id
+             WHERE r.prophecy_id IS NULL
+             ORDER BY o.created_at_ms, p.prophecy_id",
+        )?;
+        let rows = stmt
+            .query_map(params![STATUS_OFFERED], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(rows)
     }
 
     /// The items and button state of the review's pending follow-ups.
@@ -371,6 +455,10 @@ impl Store {
                     "INSERT OR IGNORE INTO followup_ignored(guardian_id, prophecy_id, created_at_ms)
                      VALUES(?,?,?)",
                     params![guardian_id, id, now_ms()],
+                )?;
+                self.conn.execute(
+                    "DELETE FROM followup_preaccepted WHERE guardian_id=? AND prophecy_id=?",
+                    params![guardian_id, id],
                 )?;
             } else {
                 self.conn.execute(
@@ -518,25 +606,78 @@ impl Store {
         self.answered_offer(guardian_id, changed, "declined")
     }
 
-    /// Claims an open offer for acceptance: flips `offered` to `accepted` in
-    /// one statement, so two concurrent accepts cannot both proceed. Pair
-    /// with [`Self::release_followup_claim`] if creating the squad fails.
-    pub fn claim_followup_offer(&self, guardian_id: &str) -> Result<FollowupOfferView> {
-        let changed = self.conn.execute(
-            "UPDATE followup_offers SET status=?, resolved_at_ms=? WHERE guardian_id=? AND status=?",
-            params![STATUS_ACCEPTED, now_ms(), guardian_id, STATUS_OFFERED],
+    /// The squad each accepted item of `guardian_id`'s offer created, by
+    /// prophecy id. An empty id is an item claimed but not yet created.
+    pub fn followup_item_squads(
+        &self,
+        guardian_id: &str,
+    ) -> Result<std::collections::HashMap<i64, String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT prophecy_id, squad_id FROM followup_item_results WHERE guardian_id=?",
         )?;
-        self.answered_offer(guardian_id, changed, "accepted")
+        let rows = stmt
+            .query_map(params![guardian_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(rows)
     }
 
-    /// Puts a claimed offer back to `offered` after its squad could not be
-    /// created, so the user can accept again.
-    pub fn release_followup_claim(&self, guardian_id: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE followup_offers SET status=?, resolved_at_ms=NULL, waypoint_id=NULL, squad_id=NULL
-             WHERE guardian_id=? AND status=?",
-            params![STATUS_OFFERED, guardian_id, STATUS_ACCEPTED],
+    /// Claims one item for acceptance. Returns `false` when it was already
+    /// claimed, so two concurrent accepts cannot both create its squad. Pair
+    /// with [`Self::release_followup_item`] if creating the squad fails.
+    pub fn claim_followup_item(&self, guardian_id: &str, prophecy_id: i64) -> Result<bool> {
+        let inserted = self.conn.execute(
+            "INSERT OR IGNORE INTO followup_item_results(guardian_id, prophecy_id, squad_id, created_at_ms)
+             VALUES(?,?,'',?)",
+            params![guardian_id, prophecy_id, now_ms()],
         )?;
+        Ok(inserted > 0)
+    }
+
+    /// Gives back a claim whose squad could not be created, so the item can
+    /// be accepted again.
+    pub fn release_followup_item(&self, guardian_id: &str, prophecy_id: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM followup_item_results WHERE guardian_id=? AND prophecy_id=? AND squad_id=''",
+            params![guardian_id, prophecy_id],
+        )?;
+        Ok(())
+    }
+
+    /// Records the squad and waypoint a claimed item produced, and marks the
+    /// whole offer `accepted` once every item in its snapshot has a squad.
+    pub fn record_followup_item_result(
+        &self,
+        guardian_id: &str,
+        prophecy_id: i64,
+        squad_id: &str,
+        waypoint_id: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE followup_item_results SET squad_id=?, waypoint_id=? WHERE guardian_id=? AND prophecy_id=?",
+            params![squad_id, waypoint_id, guardian_id, prophecy_id],
+        )?;
+        let Some(offer) = self.get_followup_offer(guardian_id)? else {
+            return Ok(());
+        };
+        let done = self.followup_item_squads(guardian_id)?;
+        let all = offer
+            .items
+            .iter()
+            .all(|i| done.get(&i.prophecy_id).is_some_and(|s| !s.is_empty()));
+        if all {
+            self.conn.execute(
+                "UPDATE followup_offers SET status=?, squad_id=?, waypoint_id=?, resolved_at_ms=?
+                 WHERE guardian_id=? AND status=?",
+                params![
+                    STATUS_ACCEPTED,
+                    squad_id,
+                    waypoint_id,
+                    now_ms(),
+                    guardian_id,
+                    STATUS_OFFERED
+                ],
+            )?;
+        }
         Ok(())
     }
 
@@ -556,20 +697,6 @@ impl Store {
             )));
         }
         Ok(offer)
-    }
-
-    /// Records the squad and waypoint an accepted offer created.
-    pub fn record_followup_result(
-        &self,
-        guardian_id: &str,
-        squad_id: &str,
-        waypoint_id: &str,
-    ) -> Result<()> {
-        self.conn.execute(
-            "UPDATE followup_offers SET squad_id=?, waypoint_id=? WHERE guardian_id=?",
-            params![squad_id, waypoint_id, guardian_id],
-        )?;
-        Ok(())
     }
 
     /// Creates the blocking waypoint that explains a follow-up squad: the
@@ -645,6 +772,28 @@ pub fn offer_message(guardian_id: &str, review_name: &str, items: &[FollowupItem
         "Run `ralphus review followup accept {guardian_id}` to draft a follow-up squad from \
          them, or `ralphus review followup decline {guardian_id}` to drop the offer."
     ));
+    out
+}
+
+/// The mailbox message saying an earlier [`offer_message`] was taken up, so a
+/// reader who still has that message open knows it needs no action.
+#[must_use]
+pub fn accepted_message(
+    guardian_id: &str,
+    review_name: &str,
+    items: &[FollowupItem],
+    squad_id: &str,
+) -> String {
+    let mut out = format!(
+        "The follow-up offer for review {guardian_id} ({review_name}) was accepted; squad \
+         {squad_id} was created for:\n"
+    );
+    for item in items {
+        out.push_str("- ");
+        out.push_str(&truncate_chars(&item.body, MAX_MESSAGE_NOTE_CHARS));
+        out.push('\n');
+    }
+    out.push_str("The earlier offer message needs no action for these items.");
     out
 }
 
@@ -859,33 +1008,195 @@ impl From<StoreError> for AcceptError {
 /// A failure before the squad exists puts the claim back so the user can try
 /// again; a failure after it leaves the offer accepted, since a second squad
 /// would duplicate the first.
+///
+/// `only` accepts a single item of the offer (by prophecy id); `None` accepts
+/// every item not yet accepted. Each accept makes its own squad, and the offer
+/// is `accepted` once all its items have one.
 pub(crate) fn accept_offer(
     daemon: &crate::server::Daemon,
     guardian_id: &str,
+    only: Option<i64>,
 ) -> std::result::Result<AcceptResult, AcceptError> {
     let (offer, guardian) = {
         let store = daemon.lock();
         let guardian = store.get_guardian(guardian_id)?;
-        let offer = store.claim_followup_offer(guardian_id)?;
+        let mut offer = store
+            .get_followup_offer(guardian_id)?
+            .ok_or(StoreError::NotFound)?;
+        if offer.status != STATUS_OFFERED {
+            return Err(StoreError::InvalidTransition(format!(
+                "review {guardian_id}'s follow-up offer is already {}, so it cannot be accepted",
+                offer.status
+            ))
+            .into());
+        }
+        if let Some(id) = only {
+            if !offer.items.iter().any(|i| i.prophecy_id == id) {
+                return Err(StoreError::NotFound.into());
+            }
+        }
+        let taken = store.followup_item_squads(guardian_id)?;
+        offer.items.retain(|i| {
+            only.is_none_or(|id| i.prophecy_id == id) && !taken.contains_key(&i.prophecy_id)
+        });
+        if offer.items.is_empty() {
+            return Err(StoreError::InvalidTransition(format!(
+                "review {guardian_id}'s follow-up item is already accepted"
+            ))
+            .into());
+        }
+        let mut claimed = Vec::new();
+        for item in &offer.items {
+            if store.claim_followup_item(guardian_id, item.prophecy_id)? {
+                claimed.push(item.prophecy_id);
+            } else {
+                for id in claimed {
+                    let _ = store.release_followup_item(guardian_id, id);
+                }
+                return Err(StoreError::InvalidTransition(format!(
+                    "review {guardian_id}'s follow-up item is already being accepted"
+                ))
+                .into());
+            }
+        }
         (offer, guardian)
     };
     let (squad_id, base, started) = match submit_followup_squad(daemon, &offer, &guardian) {
         Ok(created) => created,
         Err(e) => {
-            let _ = daemon.lock().release_followup_claim(guardian_id);
+            let store = daemon.lock();
+            for item in &offer.items {
+                let _ = store.release_followup_item(guardian_id, item.prophecy_id);
+            }
             return Err(e);
         }
     };
     let store = daemon.lock();
-    store.record_followup_result(guardian_id, &squad_id, "")?;
+    for item in &offer.items {
+        store.record_followup_item_result(guardian_id, item.prophecy_id, &squad_id, "")?;
+    }
     let waypoint_id = store.create_followup_waypoint(&guardian, &squad_id, &offer.items)?;
-    store.record_followup_result(guardian_id, &squad_id, &waypoint_id)?;
+    for item in &offer.items {
+        store.record_followup_item_result(
+            guardian_id,
+            item.prophecy_id,
+            &squad_id,
+            &waypoint_id,
+        )?;
+    }
+    // The offer message sent at merge is now out of date; say so where the
+    // same watchers will read it.
+    if let Err(e) = store.notify_watchers(
+        crate::monitor::NotifiableEventKind::ReviewFollowupOffered,
+        &format!("guardian:{guardian_id}"),
+        crate::mailbox::MailboxPriority::Normal,
+        &accepted_message(guardian_id, &guardian.name, &offer.items, &squad_id),
+        guardian.squad_id.as_deref(),
+    ) {
+        crate::cartographer::Note::new("followup")
+            .level(crate::logging::LogLevel::WARNING)
+            .scope("followup")
+            .guardian(guardian_id)
+            .emit(
+                &store,
+                format!("review {guardian_id}: could not send the offer-accepted notice: {e}"),
+                serde_json::json!({"error": e.to_string()}),
+            );
+    }
     Ok(AcceptResult {
         squad_id,
         waypoint_id,
         base,
         started,
     })
+}
+
+/// Name of the supervised thread that submits items accepted before the merge.
+pub const PREACCEPTED_THREAD: &str = "followup-preaccepted";
+
+/// How often that thread looks for newly made offers.
+const PREACCEPTED_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long an item whose submission failed is left alone before it is tried
+/// again; a rejection does not fix itself in seconds, and each try would send
+/// the failure notice again.
+const PREACCEPTED_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Submits every item accepted ahead of the merge whose offer now exists,
+/// skipping items in `failed` that failed less than [`PREACCEPTED_RETRY_AFTER`]
+/// ago. Returns how many squads it created.
+pub(crate) fn submit_preaccepted_once(
+    daemon: &crate::server::Daemon,
+    failed: &mut std::collections::HashMap<(String, i64), std::time::Instant>,
+) -> usize {
+    let due = match daemon.lock().due_preaccepted_followups() {
+        Ok(due) => due,
+        Err(_) => return 0,
+    };
+    let mut created = 0;
+    for (guardian_id, prophecy_id) in due {
+        let key = (guardian_id.clone(), prophecy_id);
+        if failed
+            .get(&key)
+            .is_some_and(|at| at.elapsed() < PREACCEPTED_RETRY_AFTER)
+        {
+            continue;
+        }
+        match accept_offer(daemon, &guardian_id, Some(prophecy_id)) {
+            Ok(_) => {
+                failed.remove(&key);
+                created += 1;
+            }
+            // Answered between the listing and the claim.
+            Err(AcceptError::Store(StoreError::InvalidTransition(_))) => {}
+            Err(e) => {
+                failed.insert(key, std::time::Instant::now());
+                let detail = match e {
+                    AcceptError::Rejected { message, .. } => message,
+                    AcceptError::Store(e) => e.to_string(),
+                };
+                let store = daemon.lock();
+                let _ = store.enqueue_error_mailbox_message_deduped(
+                    crate::mailbox::MailboxPriority::Normal,
+                    &format!(
+                        "review {guardian_id}: a follow-up you accepted before the merge could \
+                         not be submitted: {detail}"
+                    ),
+                    &crate::mailbox::Remediation::SuggestedCommand {
+                        command: format!("ralphus review followup accept {guardian_id}"),
+                        purpose: "submit the follow-up once the cause is fixed".to_string(),
+                    },
+                    None,
+                    None,
+                    None,
+                    Some(&format!("guardian:{guardian_id}")),
+                    Some("followup"),
+                );
+            }
+        }
+    }
+    created
+}
+
+/// Starts the thread that submits items accepted before their review merged,
+/// so they become squads as soon as the merge makes the offer.
+pub fn spawn_preaccepted_worker(daemon: std::sync::Arc<crate::server::Daemon>) {
+    crate::thread_health::spawn_supervised(
+        crate::thread_health::ThreadSpec {
+            name: PREACCEPTED_THREAD,
+            description: "Follow-ups accepted before a review merged are not submitted when it \
+                          merges.",
+            max_silence: None,
+        },
+        daemon.store_handle(),
+        std::sync::Arc::new(move || {
+            let mut failed = std::collections::HashMap::new();
+            loop {
+                submit_preaccepted_once(&daemon, &mut failed);
+                std::thread::sleep(PREACCEPTED_INTERVAL);
+            }
+        }),
+    );
 }
 
 /// Drafts and submits the squad; returns `(squad_id, base, started)`.
@@ -1368,41 +1679,117 @@ prompt = "add feature.txt"
     }
 
     #[test]
-    fn an_offer_can_be_claimed_only_once_and_released_on_failure() {
+    fn an_item_can_be_claimed_only_once_and_released_on_failure() {
         use crate::prophecy::ProphecyKind;
         let s = store();
         let root = temp_root("claim");
         seed_guardian(&s, "g1", &root);
-        defer(&s, "g1", ProphecyKind::Deferred, "later");
+        defer(&s, "g1", ProphecyKind::Deferred, "first");
+        defer(&s, "g1", ProphecyKind::Deferred, "second");
         merge(&s, "g1");
+        let offer = s.get_followup_offer("g1").unwrap().unwrap();
+        let (a, b) = (offer.items[0].prophecy_id, offer.items[1].prophecy_id);
 
-        assert_eq!(
-            s.claim_followup_offer("g1").unwrap().status,
-            STATUS_ACCEPTED
+        assert!(s.claim_followup_item("g1", a).unwrap());
+        assert!(
+            !s.claim_followup_item("g1", a).unwrap(),
+            "a second claim must not create a second squad"
         );
-        assert!(matches!(
-            s.claim_followup_offer("g1"),
-            Err(StoreError::InvalidTransition(_))
-        ));
-        assert!(matches!(
-            s.decline_followup_offer("g1"),
-            Err(StoreError::InvalidTransition(_))
-        ));
+        s.release_followup_item("g1", a).unwrap();
+        assert!(s.claim_followup_item("g1", a).unwrap());
 
-        s.release_followup_claim("g1").unwrap();
+        // One item answered leaves the offer open; the last one closes it.
+        s.record_followup_item_result("g1", a, "squad-a", "waypoint-a")
+            .unwrap();
         assert_eq!(
             s.get_followup_offer("g1").unwrap().unwrap().status,
             STATUS_OFFERED
         );
+        let items = s.pending_followup_items("g1").unwrap();
+        let squad_of = |id: i64| {
+            items
+                .iter()
+                .find(|i| i.item.prophecy_id == id)
+                .unwrap()
+                .squad_id
+                .clone()
+        };
+        assert_eq!(squad_of(a).as_deref(), Some("squad-a"));
+        assert_eq!(squad_of(b), None);
+
+        assert!(s.claim_followup_item("g1", b).unwrap());
+        s.record_followup_item_result("g1", b, "squad-b", "waypoint-b")
+            .unwrap();
         assert_eq!(
-            s.decline_followup_offer("g1").unwrap().status,
-            STATUS_DECLINED
+            s.get_followup_offer("g1").unwrap().unwrap().status,
+            STATUS_ACCEPTED
         );
         assert!(matches!(
-            s.claim_followup_offer("nope"),
-            Err(StoreError::NotFound)
+            s.decline_followup_offer("g1"),
+            Err(StoreError::InvalidTransition(_))
         ));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_item_accepted_before_the_merge_is_due_once_the_offer_exists() {
+        use crate::prophecy::ProphecyKind;
+        let s = store();
+        let root = temp_root("preaccept");
+        seed_guardian(&s, "g1", &root);
+        defer(&s, "g1", ProphecyKind::Deferred, "first");
+        defer(&s, "g1", ProphecyKind::Deferred, "second");
+        let items = s.pending_followup_items("g1").unwrap();
+        let (a, b) = (items[0].item.prophecy_id, items[1].item.prophecy_id);
+
+        s.set_followup_ignored("g1", Some(a), true).unwrap();
+        s.preaccept_followup("g1", a).unwrap();
+        let items = s.pending_followup_items("g1").unwrap();
+        assert!(
+            items[0].accepted && !items[0].ignored,
+            "accepting an ignored item un-ignores it"
+        );
+        assert!(!items[1].accepted);
+        assert!(
+            s.due_preaccepted_followups().unwrap().is_empty(),
+            "nothing is due before the offer exists"
+        );
+        assert!(matches!(
+            s.preaccept_followup("g1", 9999),
+            Err(StoreError::NotFound)
+        ));
+
+        // Ignoring it again withdraws the acceptance.
+        s.set_followup_ignored("g1", Some(a), true).unwrap();
+        assert!(!s.pending_followup_items("g1").unwrap()[0].accepted);
+        s.preaccept_followup("g1", a).unwrap();
+
+        merge(&s, "g1");
+        assert_eq!(
+            s.due_preaccepted_followups().unwrap(),
+            vec![("g1".to_string(), a)],
+            "only the accepted item is due, not its sibling {b}"
+        );
+        assert!(matches!(
+            s.preaccept_followup("g1", b),
+            Err(StoreError::InvalidTransition(_))
+        ));
+
+        s.claim_followup_item("g1", a).unwrap();
+        assert!(s.due_preaccepted_followups().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn accepted_message_names_the_squad_and_the_items() {
+        let msg = accepted_message(
+            "guardian-1",
+            "my review",
+            &[item("add the cache", None)],
+            "squad-9",
+        );
+        assert!(msg.contains("squad-9") && msg.contains("add the cache"));
+        assert!(msg.contains("accepted"));
     }
 
     #[test]

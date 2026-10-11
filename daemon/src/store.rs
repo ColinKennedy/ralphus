@@ -2855,6 +2855,27 @@ impl Store {
                 created_at_ms INTEGER NOT NULL,
                 PRIMARY KEY (guardian_id, prophecy_id)
             );
+            -- Deferred prophecies a user accepted before the review merged
+            -- (`crate::followup`). Once the merge makes the offer, each one is
+            -- submitted as its own follow-up squad without being asked again.
+            CREATE TABLE IF NOT EXISTS followup_preaccepted (
+                guardian_id   TEXT NOT NULL,
+                prophecy_id   INTEGER NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (guardian_id, prophecy_id)
+            );
+            -- The squad and waypoint each accepted item of an offer produced
+            -- (`crate::followup`). An item is accepted on its own, so the
+            -- offer row cannot hold one squad id for the lot. An empty
+            -- `squad_id` is a claim whose squad is still being created.
+            CREATE TABLE IF NOT EXISTS followup_item_results (
+                guardian_id   TEXT NOT NULL,
+                prophecy_id   INTEGER NOT NULL,
+                squad_id      TEXT NOT NULL,
+                waypoint_id   TEXT NOT NULL DEFAULT '',
+                created_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (guardian_id, prophecy_id)
+            );
             ",
         )?;
         // RAL-318: the built-in `unclassified` Triage type always exists and
