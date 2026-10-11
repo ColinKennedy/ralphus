@@ -2326,6 +2326,9 @@ fn route_for_user(
         ("POST", ["api", "waypoints", id, "affected", entry_id, "redo"]) => {
             waypoint_redo_affected_entry(daemon, id, entry_id)
         }
+        ("POST", ["api", "waypoints", id, "affected", entry_id, "override"]) => {
+            waypoint_override_affected_entry(daemon, id, entry_id, user_header)
+        }
         ("POST", ["api", "waypoints", id, "close"]) => waypoint_close(daemon, id),
         ("POST", ["api", "waypoints", id, "reopen"]) => waypoint_reopen(daemon, id),
         ("POST", ["api", "waypoints", id, "bearings"]) => waypoint_append_bearing(daemon, id, body),
@@ -17378,6 +17381,30 @@ fn waypoint_resurvey_preview(daemon: &Daemon, id: &str) -> Reply {
 fn waypoint_redo_affected_entry(daemon: &Daemon, id: &str, entry_id: &str) -> Reply {
     let store = daemon.lock();
     if let Err(e) = crate::waypoints::redo_affected_entry(&store, id, entry_id) {
+        return store_error(&e);
+    }
+    match waypoint_detail(&store, id) {
+        Ok(detail) => json(200, &detail),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `POST /api/waypoints/{id}/affected/{entry_id}/override` -- a human releases
+/// exactly one held entry and its halted work resumes
+/// (`crate::waypoints::override_affected_entry`). Recorded in the waypoint's
+/// delivery feed as "overridden by <person>".
+fn waypoint_override_affected_entry(
+    daemon: &Daemon,
+    id: &str,
+    entry_id: &str,
+    user_header: Option<&str>,
+) -> Reply {
+    let person = match current_user(daemon, user_header) {
+        Ok(user) => user.unwrap_or_else(|| "an unidentified user".to_string()),
+        Err(reply) => return reply,
+    };
+    let store = daemon.lock();
+    if let Err(e) = crate::waypoints::override_affected_entry(&store, id, entry_id, &person) {
         return store_error(&e);
     }
     match waypoint_detail(&store, id) {

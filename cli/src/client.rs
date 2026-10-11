@@ -2329,6 +2329,17 @@ impl DaemonClient {
         self.get(&format!("/api/waypoints/{waypoint_id}/resurvey-preview"))
     }
 
+    pub fn waypoint_override_affected_entry(
+        &self,
+        waypoint_id: &str,
+        entry_id: &str,
+    ) -> Result<Value, DaemonError> {
+        self.post(
+            &format!("/api/waypoints/{waypoint_id}/affected/{entry_id}/override"),
+            None,
+        )
+    }
+
     pub fn waypoint_redo_affected_entry(
         &self,
         waypoint_id: &str,

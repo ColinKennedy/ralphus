@@ -156,6 +156,9 @@ struct SurveyState {
     generations: HashMap<(String, String), u64>,
     /// `(waypoint_id, kind, entry_id)` of every survey currently running.
     in_flight: HashSet<(String, String, String)>,
+    /// Consecutive survey calls that errored, returned nothing or were
+    /// cancelled, keyed like `in_flight`. Reset by any call that yields a verdict.
+    failures: HashMap<(String, String, String), u32>,
 }
 
 /// Exclusive right to survey one candidate against one waypoint. Dropping it
@@ -293,6 +296,30 @@ impl StoreMemory {
             memory: std::sync::Arc::clone(self),
             key,
         })
+    }
+
+    /// Count one more failed survey call for the pair and return the new total.
+    pub fn record_survey_failure(&self, waypoint_id: &str, kind: &str, entry_id: &str) -> u32 {
+        let mut state = self.survey.lock();
+        let n = state
+            .failures
+            .entry((
+                waypoint_id.to_string(),
+                kind.to_string(),
+                entry_id.to_string(),
+            ))
+            .or_insert(0);
+        *n = n.saturating_add(1);
+        *n
+    }
+
+    /// Forget the pair's failed survey calls.
+    pub fn clear_survey_failures(&self, waypoint_id: &str, kind: &str, entry_id: &str) {
+        self.survey.lock().failures.remove(&(
+            waypoint_id.to_string(),
+            kind.to_string(),
+            entry_id.to_string(),
+        ));
     }
 
     /// How many times the work behind `(kind, entry_id)` has been edited. A
