@@ -22781,6 +22781,7 @@ mod tests {
             store
                 .set_cell_state("squad-000000000001", 0, 0, NodeState::Running)
                 .unwrap();
+            // allow-lock-io: 20ms bounded sleep to measure elapsed time for test assertion
             std::thread::sleep(Duration::from_millis(20));
             store
                 .set_cell_state("squad-000000000001", 0, 0, NodeState::Done)
@@ -23586,6 +23587,7 @@ mod tests {
         std::thread::scope(|scope| {
             let holder = scope.spawn(|| {
                 let _guard = d.lock();
+                // allow-lock-io: 3s intentional lock-hold for race condition test assertion
                 std::thread::sleep(std::time::Duration::from_secs(3));
             });
             // Give the holder thread a moment to actually acquire the lock
@@ -34612,7 +34614,8 @@ remediation_attempts=1
 
         // The same key submit-time pooling would use for a cell whose
         // worktree root is this project's path.
-        let expected_key = crate::triage::pool_key_for_path(&d.lock(), &dir);
+        let store = d.lock();
+        let expected_key = crate::triage::pool_key_for_path(&store, &dir);
         assert_eq!(expected_key, "proj");
 
         // Set the threshold via the raw path, exactly what the CLI's
