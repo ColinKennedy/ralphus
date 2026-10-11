@@ -119,6 +119,11 @@ function compileHtml(text, _filePath) {
   // The pure task-tab test loader exports these helpers dynamically.
   referenced.add("ttFmtTurns");
   referenced.add("ttGroupAggregateWithGeneration");
+  // Review inspector Live tab run navigation, dispatched by data-click attributes.
+  referenced.add("stepBranchRun");
+  referenced.add("jumpToLatestRun");
+  // Review inspector Live sub-view switcher, dispatched by data-click attributes.
+  referenced.add("inspectorSetLiveSub");
 
   const exportedScript = contents
     .replace(TOPLEVEL_FN_RE, (_m, indent, async, name) => `${indent}export ${async || ""}function ${name}(`)
@@ -158,14 +163,17 @@ export default {
   // JavaScript source. Keep their package/binary checks from depending on
   // whether the package manager materializes local bin shims in this
   // worktree.
-  ignoreBinaries: ["eslint", "tsc"],
-  ignoreDependencies: ["eslint"],
+  ignoreBinaries: [],
+  ignoreDependencies: [],
   // The chunk and vendor files are inlined into the compiled shell above and
   // are never imported by anything — without this knip would report them as
   // unused files. The shell itself is the entry and must NOT be covered by
   // this ignore.
+  // proc_counts/ (RAL-604) is generated output: HTML graphs rendered from
+  // stored benchmark data, never imported by the JavaScript source.
   ignore: [
     "librarian/assets/board/**",
     "librarian/assets/vendor/**",
+    "proc_counts/**",
   ],
 };

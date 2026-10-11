@@ -16,6 +16,7 @@ use crate::mcp_init::{
 };
 use crate::shell_label::{exec_command_label, format_tool_input};
 use crate::shellcmd::{self, Env};
+use crate::skills_install::SkillsHarness;
 use crate::tools::Workspace;
 
 const DEFAULT_PROGRAM: &str = "pi";
@@ -51,6 +52,26 @@ impl PiBackend {
             return program;
         }
         shellcmd::find_program(&program).unwrap_or(program)
+    }
+}
+
+impl SkillsHarness for PiBackend {
+    fn backend_name(&self) -> &'static str {
+        "pi"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Pi"
+    }
+
+    fn skills_dir(&self) -> Option<PathBuf> {
+        let agent_dir = std::env::var_os("PI_CODING_AGENT_DIR")
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                crate::agent_isolation::home_dir().map(|home| home.join(".pi").join("agent"))
+            })?;
+        Some(agent_dir.join("skills"))
     }
 }
 
@@ -274,6 +295,11 @@ impl ModelBackend for PiBackend {
             options.auto_compact_threshold,
             options.maximum_tool_output_tokens,
         )?;
+        apply_temperature_setting(
+            known_config_dir.as_deref(),
+            options.model,
+            options.temperature,
+        )?;
 
         let program = self.launch_program();
         let compound = crate::cli_agent_common::launcher_requires_shell(&program);
@@ -382,6 +408,14 @@ impl ModelBackend for PiBackend {
     }
 
     fn supports_maximum_tool_output_tokens(&self) -> bool {
+        true
+    }
+
+    fn supports_effort(&self) -> bool {
+        true
+    }
+
+    fn supports_temperature(&self) -> bool {
         true
     }
 
@@ -524,6 +558,93 @@ fn apply_context_settings_in(
         write_compaction_reserve_tokens(dir, v)?;
     }
     Ok(())
+}
+
+/// RAL-607: delivers `RunOptions::temperature` as
+/// `providers.<provider>.modelOverrides.<model-id>.samplingParams.temperature`
+/// in `models.json`. Like the context-window override it needs a
+/// `"<provider>/<model-id>"` model and a resolved config directory. Pi only
+/// applies sampling params for OpenAI-compatible APIs (Ollama included); other
+/// providers ignore or suppress them, so a warning is logged when the
+/// provider is not one known to honor the setting.
+fn apply_temperature_setting(
+    dir: Option<&Path>,
+    model: Option<&str>,
+    temperature: Option<f64>,
+) -> Result<(), BackendError> {
+    let Some(temperature) = temperature else {
+        return Ok(());
+    };
+    let dir = dir.ok_or_else(|| {
+        BackendError("pi: temperature requires PI_CODING_AGENT_DIR to be set".to_string())
+    })?;
+    let (provider, model_id) = split_provider_model(model).ok_or_else(|| {
+        BackendError(
+            "pi: temperature requires the cell's `model` to be \"<provider>/<model-id>\" so              the override can target pi's models.json"
+                .to_string(),
+        )
+    })?;
+    if !provider_honors_sampling_params(provider) {
+        let message = format!(
+            "pi: temperature is set for provider '{provider}', which may not be an              OpenAI-compatible API; pi can silently ignore it there"
+        );
+        eprintln!("{message}");
+        crate::cartographer::emit(
+            "pi",
+            &message,
+            "warning",
+            crate::cartographer::EventContext::default(),
+            serde_json::json!({ "provider": provider, "temperature": temperature }),
+        );
+    }
+    write_model_temperature(dir, provider, model_id, temperature)
+}
+
+/// Whether `provider` is a Pi provider known to be OpenAI-compatible and so
+/// honor `samplingParams` (RAL-607). Best effort: an unrecognized provider
+/// may still be OpenAI-compatible, so callers only warn.
+fn provider_honors_sampling_params(provider: &str) -> bool {
+    matches!(
+        provider,
+        "openai"
+            | "ollama"
+            | "openrouter"
+            | "lmstudio"
+            | "llama.cpp"
+            | "vllm"
+            | "groq"
+            | "together"
+            | "deepseek"
+            | "mistral"
+            | "xai"
+            | "cerebras"
+            | "fireworks"
+    )
+}
+
+/// Merges `providers.<provider>.modelOverrides.<model_id>.samplingParams.temperature`
+/// into `dir`'s `models.json`, preserving every other key (RAL-607).
+fn write_model_temperature(
+    dir: &Path,
+    provider: &str,
+    model_id: &str,
+    temperature: f64,
+) -> Result<(), BackendError> {
+    let path = dir.join("models.json");
+    let mut root = read_json_object(&path)?;
+    let sampling = nested_object(
+        &mut root,
+        &path,
+        &[
+            "providers",
+            provider,
+            "modelOverrides",
+            model_id,
+            "samplingParams",
+        ],
+    )?;
+    sampling.insert("temperature".to_string(), Value::from(temperature));
+    write_json_object(&path, &root)
 }
 
 /// Splits a `"<provider>/<model-id>"` string into its two halves, requiring
@@ -681,6 +802,10 @@ fn build_args(
     if let Some(model) = options.model {
         args.push("--model".to_string());
         args.push(model.to_string());
+    }
+    if let Some(level) = options.effort {
+        args.push("--thinking".to_string());
+        args.push(level.to_string());
     }
     if let Some(path) = system_prompt_file {
         args.push("--append-system-prompt".to_string());
@@ -900,6 +1025,7 @@ fn drive_json_events(
         }
         return Ok(BackendOutcome {
             summary: tail(&state.latest_assistant_message, SUMMARY_TAIL_CHARS),
+            prophecies: state.prophecies.markers(),
             turns: state.turns,
             tokens_in: state.tokens_in,
             tokens_out: state.tokens_out,
@@ -940,6 +1066,7 @@ fn drive_json_events(
         if let Some(delay) = parse_retryable_rate_limit(&error) {
             return Ok(BackendOutcome {
                 summary: tail(&state.latest_assistant_message, SUMMARY_TAIL_CHARS),
+                prophecies: state.prophecies.markers(),
                 turns: state.turns,
                 tokens_in: state.tokens_in,
                 tokens_out: state.tokens_out,
@@ -986,6 +1113,7 @@ fn drive_json_events(
             );
             return Ok(BackendOutcome {
                 summary: tail(&state.latest_assistant_message, SUMMARY_TAIL_CHARS),
+                prophecies: state.prophecies.markers(),
                 turns: state.turns,
                 tokens_in: state.tokens_in,
                 tokens_out: state.tokens_out,
@@ -1038,6 +1166,7 @@ fn drive_json_events(
             );
             return Ok(BackendOutcome {
                 summary: tail(&state.latest_assistant_message, SUMMARY_TAIL_CHARS),
+                prophecies: state.prophecies.markers(),
                 turns: state.turns,
                 tokens_in: state.tokens_in,
                 tokens_out: state.tokens_out,
@@ -1073,6 +1202,7 @@ fn drive_json_events(
 
     Ok(BackendOutcome {
         summary: tail(&state.latest_assistant_message, SUMMARY_TAIL_CHARS),
+        prophecies: state.prophecies.markers(),
         turns: state.turns,
         tokens_in: state.tokens_in,
         tokens_out: state.tokens_out,
@@ -1094,6 +1224,10 @@ fn drive_json_events(
 struct ParseState {
     agent_session_id: Option<String>,
     latest_assistant_message: String,
+    /// RAL-595: every `RALPHUS_PROPHECY:` marker found in an assistant
+    /// message (`message_end`, plus the closing `agent_end` replay, which
+    /// the scanner dedupes), not just the last one.
+    prophecies: crate::prophecy::ProphecyScanner,
     /// RAL-352: completed assistant `message_end` events -- one per
     /// user/assistant exchange (each response event is both sides of the
     /// exchange). System/session/compaction events never increment it, and
@@ -1536,6 +1670,7 @@ fn process_event(
                 // message (the response event represents both sides).
                 state.turns += 1;
                 let text = extract_message_text(&event["message"]);
+                state.prophecies.scan_and_emit("pi", &text);
                 if !text.is_empty() {
                     state.latest_assistant_message = text;
                 }
@@ -1555,6 +1690,7 @@ fn process_event(
                     .find(|m| m["role"].as_str() == Some("assistant"))
             }) {
                 let text = extract_message_text(last);
+                state.prophecies.scan_and_emit("pi", &text);
                 if !text.is_empty() {
                     state.latest_assistant_message = text;
                 }
@@ -2128,9 +2264,29 @@ pub const THINKING_MARKER: &str = "RALPHUS_THINKING: ";
 /// RAL-434: emits one line of model thinking tagged with [`THINKING_MARKER`]
 /// -- see [`handle_thinking_event`].
 #[allow(clippy::print_stdout)]
-fn print_thinking_line(line: &str) {
+pub(crate) fn print_thinking_line(line: &str) {
     println!("{THINKING_MARKER}{line}");
     let _ = std::io::stdout().flush();
+}
+
+/// RAL-598: stands in for a thinking block the backend reported as a
+/// literal empty string (e.g. redacted reasoning), so the transcript still
+/// shows that the model reasoned.
+pub(crate) const EMPTY_THINKING_PLACEHOLDER: &str = "(thinking content not provided)";
+
+/// RAL-598: emits a whole thinking block as [`THINKING_MARKER`]-tagged
+/// lines, for backends that deliver reasoning as one finished piece of text
+/// rather than streamed deltas. A literal empty string prints
+/// [`EMPTY_THINKING_PLACEHOLDER`]; anything else is shown as the backend
+/// provided it.
+pub(crate) fn print_thinking_block(text: &str) {
+    if text.is_empty() {
+        print_thinking_line(EMPTY_THINKING_PLACEHOLDER);
+        return;
+    }
+    for line in text.lines() {
+        print_thinking_line(line);
+    }
 }
 
 #[cfg(test)]
@@ -2226,6 +2382,47 @@ mod tests {
         assert_eq!(args[1], guard.display().to_string());
         assert!(args.contains(&"--approve".to_string()));
         assert!(args.contains(&"-p".to_string()));
+    }
+
+    #[test]
+    fn build_args_emits_thinking_for_effort() {
+        let guard = Path::new("C:/state/pi-extensions/ralphus-pi-workspace-guard-test.mjs");
+        let args = build_args(
+            &RunOptions {
+                effort: Some("high"),
+                ..Default::default()
+            },
+            None,
+            guard,
+        );
+        assert!(args.windows(2).any(|w| w == ["--thinking", "high"]));
+        let none = build_args(&RunOptions::default(), None, guard);
+        assert!(!none.iter().any(|a| a == "--thinking"));
+    }
+
+    #[test]
+    fn apply_temperature_setting_writes_sampling_params() {
+        let dir = temp_settings_dir("temperature-write");
+        apply_temperature_setting(Some(&dir), Some("ollama/qwen3"), Some(0.25)).unwrap();
+        let text = std::fs::read_to_string(dir.join("models.json")).unwrap();
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            v["providers"]["ollama"]["modelOverrides"]["qwen3"]["samplingParams"]["temperature"],
+            0.25
+        );
+    }
+
+    #[test]
+    fn apply_temperature_setting_is_a_noop_when_unset() {
+        assert!(apply_temperature_setting(None, None, None).is_ok());
+    }
+
+    #[test]
+    fn apply_temperature_setting_requires_provider_qualified_model() {
+        let dir = temp_settings_dir("temperature-nomodel");
+        let err = apply_temperature_setting(Some(&dir), Some("qwen3"), Some(0.5)).unwrap_err();
+        assert!(err.0.contains("<provider>/<model-id>"));
+        assert!(!dir.join("models.json").exists());
     }
 
     /// RAL-385: the prompt is piped to stdin, never passed as an argument --
@@ -2449,6 +2646,38 @@ mod tests {
         assert!((state.cost_usd - 0.56).abs() < f64::EPSILON);
         assert_eq!(state.latest_assistant_message, "hello world");
         assert!(state.saw_terminal_event);
+    }
+
+    #[test]
+    fn process_event_scans_markers_in_non_final_assistant_messages_and_skips_thinking() {
+        let mut state = ParseState::default();
+        let root = Path::new(".");
+        for event in [
+            serde_json::json!({
+                "type":"message_end",
+                "message":{"role":"assistant","content":[
+                    {"type":"thinking","thinking":"RALPHUS_PROPHECY: discovery: private thought"},
+                    {"type":"text","text":"RALPHUS_PROPHECY: hazard: leaves a race"}
+                ]}
+            }),
+            serde_json::json!({
+                "type":"message_end",
+                "message":{"role":"toolResult","content":[{"type":"text","text":"RALPHUS_PROPHECY: decision: tool output"}]}
+            }),
+            serde_json::json!({
+                "type":"message_end",
+                "message":{"role":"assistant","content":[{"type":"text","text":"all done"}]}
+            }),
+            serde_json::json!({
+                "type":"agent_end",
+                "messages":[{"role":"assistant","content":[{"type":"text","text":"all done"}]}]
+            }),
+        ] {
+            process_event(&event, &mut state, root, DEFAULT_TOOL_ARG_TRUNCATE_CHARS);
+        }
+        let markers = state.prophecies.markers();
+        assert_eq!(markers.len(), 1, "{markers:?}");
+        assert_eq!(markers[0].body, "leaves a race");
     }
 
     #[test]

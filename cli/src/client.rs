@@ -515,6 +515,7 @@ impl DaemonClient {
             body["clear_base_shift_maximum_rebuilds"] = json!(true);
         }
         set_if_some(&mut body, "default_proof_scope", patch.default_proof_scope);
+        set_if_some(&mut body, "default_ci_deferral", patch.default_ci_deferral);
         set_if_some(
             &mut body,
             "verify_skip_auto_clean",
@@ -780,6 +781,18 @@ impl DaemonClient {
     /// these backends' availability.
     pub fn health_report(&self) -> Result<Value, DaemonError> {
         self.get("/api/health/report")
+    }
+
+    /// `GET /api/health/threads`: live state of every supervised daemon
+    /// thread (scheduler, pollers, watchdog), for `ralphus check health`.
+    pub fn health_threads(&self) -> Result<Value, DaemonError> {
+        self.get("/api/health/threads")
+    }
+
+    /// `POST /api/health/threads/{name}/restart`: re-spawn a daemon thread
+    /// that has panicked or exited.
+    pub fn restart_thread(&self, name: &str) -> Result<Value, DaemonError> {
+        self.post(&format!("/api/health/threads/{name}/restart"), None)
     }
 
     pub fn get_machine(&self, scheme: &str) -> Result<Value, DaemonError> {
@@ -1654,6 +1667,8 @@ impl DaemonClient {
         auto_compact_threshold: Option<&str>,
         maximum_context: Option<&str>,
         maximum_tool_output_tokens: Option<&str>,
+        effort: Option<&str>,
+        temperature: Option<&str>,
         system_prompt: Option<&str>,
     ) -> Result<Value, DaemonError> {
         let mut body = json!({"kind": "cell", "task_idx": task_idx, "cell_idx": cell_idx});
@@ -1677,6 +1692,8 @@ impl DaemonClient {
             "maximum_tool_output_tokens",
             maximum_tool_output_tokens.map(str::to_string),
         );
+        set_if_some(&mut body, "effort", effort.map(str::to_string));
+        set_if_some(&mut body, "temperature", temperature.map(str::to_string));
         set_if_some(
             &mut body,
             "system_prompt",
@@ -1783,13 +1800,11 @@ impl DaemonClient {
         base_branch: &str,
         git_root: &str,
         checks: Option<&[String]>,
-        skip_auto_build: bool,
         skip_worktrees: bool,
         review_type: Option<&str>,
     ) -> Result<Value, DaemonError> {
         let mut body = json!({
             "name": name, "base_branch": base_branch, "git_root": git_root,
-            "skip_auto_build": skip_auto_build,
             "skip_worktrees": skip_worktrees,
         });
         set_if_some(&mut body, "checks", checks.map(|c| json!(c)));
@@ -1812,7 +1827,6 @@ impl DaemonClient {
         settings: &GuardianSettings<'_>,
     ) -> Result<Value, DaemonError> {
         let mut body = json!({});
-        set_if_some(&mut body, "skip_auto_build", settings.skip_auto_build);
         set_if_some(&mut body, "skip_worktrees", settings.skip_worktrees);
         set_if_some(
             &mut body,
@@ -1834,6 +1848,11 @@ impl DaemonClient {
             &mut body,
             "proof_scope",
             settings.proof_scope.map(str::to_string),
+        );
+        set_if_some(
+            &mut body,
+            "ci_deferral",
+            settings.ci_deferral.map(str::to_string),
         );
         set_if_some(
             &mut body,
@@ -2424,13 +2443,15 @@ impl Default for ProphecyFilters<'_> {
 /// Bundled optional fields for [`DaemonClient::guardian_settings`].
 #[derive(Debug, Clone, Default)]
 pub struct GuardianSettings<'a> {
-    pub skip_auto_build: Option<bool>,
     pub skip_worktrees: Option<bool>,
     pub resolver_agent: Option<&'a str>,
     pub resolver_model: Option<&'a str>,
     pub base_branch: Option<&'a str>,
     pub auto_pr_feedback: Option<bool>,
     pub proof_scope: Option<&'a str>,
+    /// Which PRs/MRs in the review's stack run the full CI suite: `every`,
+    /// `top` or `bottom+top`. An empty string resets it to `every`.
+    pub ci_deferral: Option<&'a str>,
     pub proof_skip_auto_clean: Option<bool>,
     /// RAL-250: whether this review skips automatic base-branch auto-updates.
     pub skip_base_updates: Option<bool>,
@@ -2517,6 +2538,9 @@ pub struct ProjectReviewSettingsPatch<'a> {
     /// it cannot serve as the clear sentinel).
     pub clear_base_shift_maximum_rebuilds: bool,
     pub default_proof_scope: Option<&'a str>,
+    /// Project default CI-deferral mode (`every`/`top`/`bottom+top`); an
+    /// empty string clears it back to inheriting.
+    pub default_ci_deferral: Option<&'a str>,
     pub verify_skip_auto_clean: Option<bool>,
     pub skip_worktrees: Option<bool>,
     pub skip_base_updates: Option<bool>,

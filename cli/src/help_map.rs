@@ -547,7 +547,6 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
         &[
             "--checks [list]",
             "--review-type [label]",
-            "--skip-auto-build",
             "--skip-worktrees",
         ],
         "Create a new review.",
@@ -732,13 +731,13 @@ root is reset and its prepare steps run again.",
             "--resolver-agent [name]",
             "--resolver-model [name]",
             "--separate-pr-branch/--no-separate-pr-branch",
-            "--skip-auto-build/--no-skip-auto-build",
             "--skip-auto-clean/--no-skip-auto-clean",
             "--skip-base-updates/--no-skip-base-updates",
             "--skip-manual-checks/--no-skip-manual-checks",
             "--auto-run/--no-auto-run",
             "--skip-worktrees/--no-skip-worktrees",
             "--proof-scope [each_branch|final_branch|nothing]",
+            "--ci-deferral [every|top|bottom+top]",
             "--rebuild-on [none|inherit|rebase|feedback|auto_fix...]",
             "--followup [on|off|inherit]",
             "--followup-auto-start [on|off|inherit]",
@@ -979,6 +978,16 @@ const CHECK_CHILDREN: &[HelpNode] = &[
         true,  // ("check", "catalog")
         &[],
     ),
+    // Mapped to POST /api/health/threads/{name}/restart in check_endpoint_cli_parity.py's manifest.
+    node(
+        "restart-thread",
+        &["name [str]"],
+        &["--json"],
+        "Restart a daemon background thread that has panicked or exited (scheduler, health-sweep, pr-base-drift-poller, store-watchdog) without restarting the daemon. `check health` reports each thread's state and names this command for any that is down. Refused for a thread that is still alive.",
+        false,
+        false, // mutating: re-spawns a thread
+        &[],
+    ),
 ];
 
 const INITIALIZE_CHILDREN: &[HelpNode] = &[
@@ -1167,7 +1176,7 @@ const PRESET_CHILDREN: &[HelpNode] = &[
         ],
         "Register (or update) a preset -- a named bundle of field defaults an \"extends\" \
          sentinel stamps into a task's, cell's, or proof step's own unset fields when the squad \
-         is submitted. A name may be hierarchical (roles/reviewer). prompt and system-prompt may \
+         is submitted. A name may be hierarchical (roles/judge/reviewer). prompt and system-prompt may \
          embed <<ralphus:linked-field/./prompt>> to splice in the entity's own prompt. \n         pass-score (1-10) is the score a prompt proof step must reach to pass.",
         false,
         false,
@@ -1358,6 +1367,7 @@ value for each (file config + database).",
             "--maximum-budget-usd [usd]",
             "--post-appraisals/--no-post-appraisals",
             "--proof-scope [each_branch|final_branch|nothing]",
+            "--ci-deferral [every|top|bottom+top]",
             "--rebuild-on [none|inherit|rebase|feedback|auto_fix...]",
             "--resolver-agent [name]",
             "--resolver-model [name]",
@@ -2034,11 +2044,13 @@ const CELL_CHILDREN: &[HelpNode] = &[
             "--auto-compact-threshold [tokens]",
             "--command [cmd]",
             "--cwd [path]",
+            "--effort [level]",
             "--maximum-context [tokens]",
             "--maximum-tool-output-tokens [tokens]",
             "--model [name]",
             "--prompt [text]",
             "--system-prompt [text]",
+            "--temperature [number]",
         ],
         "Edit a cell's fields.",
         false,
@@ -3328,7 +3340,7 @@ fn resolved_path(args: &[String], strict: bool) -> Result<Vec<&str>, InvocationE
             return Ok(path);
         }
         let Some(child) = node.children.iter().find(|child| child.name == candidate) else {
-            // RAL-501: `ralphus initialize server` is a hidden, interactive
+            // RAL-501: `ralphus initialize solo-developer` is a hidden, interactive
             // setup command deliberately absent from INITIALIZE_CHILDREN (so
             // it never appears in `--help`, `show help-map`, or the
             // help-map-derived MCP tool surface) but still directly
@@ -3336,7 +3348,7 @@ fn resolved_path(args: &[String], strict: bool) -> Result<Vec<&str>, InvocationE
             // erroring -- lets it reach `dispatch`; `find_registered_node`
             // still returns `None` for this path, so `validate_invocation`
             // requires no registered flags for it below.
-            if path.as_slice() == ["initialize"] && candidate == "server" {
+            if path.as_slice() == ["initialize"] && candidate == "solo-developer" {
                 path.push(candidate);
                 break;
             }

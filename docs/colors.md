@@ -52,7 +52,7 @@ role in the table below, then use it.
 | `--detached` | `#d2a8ff` | *(shared)* | semantic (a cell cleanly stopped mid-task for a real interactive agent session to take over, not Done/Failed/Cancelled, RAL-288) |
 | `--delayed` | `#79c0ff` | *(shared)* | semantic (a cell waiting out a recognized, retryable provider rate limit before automatically resuming, RAL-435) |
 | `--arbiter` | `#7c3aed` | *(shared)* | semantic (a review automatically created by the Arbiter/Triage subsystem rather than an authored `[[review]]`, RAL-318) |
-| `--terminal-bg` | `#000000` | *(shared)* | surface (the remote terminal relay's xterm.js panel background, RAL-355 Phase 10) |
+| `--terminal-bg` | `#000000` | `#f6f8fa` | surface (terminal background: Live tab transcript and remote xterm.js panel; full palette in "Terminal surface") |
 | `--roster-block` | `#e8590c` | *(shared)* | semantic (a unit of work a cross-squad waypoint affects in `block` mode — can halt in-flight cells, RAL-400) |
 | `--faint` | `#6e7681` | `#818b98` | chrome (tertiary text — metadata that annotates a value without competing with it) |
 | `--border-soft` | `#262c34` | `#e4e8ec` | chrome (divider *inside* one component, where `--border` would read as a seam between two separate things) |
@@ -405,16 +405,27 @@ two more badge concepts and deliberately adds no new variables for either:
   movement), and `--failed` for `failed` (a genuine failure, reusing the
   standard failure hue).
 
-### Terminal surface — `--terminal-bg` only (RAL-355 Phase 10)
-The remote Open Agent terminal relay's xterm.js panel always renders on a
-fixed near-black background (`--terminal-bg`), not `--bg`/`--panel` — a
-terminal pane conventionally stays dark regardless of the surrounding
-theme, the same way a real terminal emulator's background doesn't follow
-the host OS's light/dark setting, and xterm.js's own ANSI color rendering
-assumes a dark backdrop. Shared across both themes (not overridden in
-`[data-theme="light"]`) for that reason. Set via xterm.js's own `theme`
-option (a JS value, not CSS) by reading the CSS variable's resolved value
-at runtime, so there is still exactly one place this color is defined.
+### Terminal surface — terminals follow the theme (RAL-606)
+Terminals follow the theme. The Live tab's `.runterm` transcript box and the
+remote Open Agent terminal relay's xterm.js panel (RAL-355 Phase 10) both use
+the terminal palette, which has a dark set (`:root`) and a light override
+(`[data-theme="light"]`):
+
+| Variable | Role |
+|---|---|
+| `--terminal-bg` | terminal background (black in dark, `#f6f8fa` in light) |
+| `--terminal-fg` | default text |
+| `--terminal-cursor` | cursor |
+| `--terminal-selection` | selection fill (translucent) |
+| `--ansi-black` … `--ansi-white` | the 8 base ANSI colors |
+| `--ansi-bright-black` … `--ansi-bright-white` | the 8 bright ANSI colors |
+
+The dark values pin xterm.js's classic defaults so dark mode looks as it did
+before. The light ANSI values are chosen for at least 4.5:1 contrast against
+the light `--terminal-bg`. xterm.js's `theme` option takes literal strings, so
+`xtermThemeFromCss()` (`board/30-live-view.js`) reads the resolved variables,
+and a `MutationObserver` on `<html data-theme>` reassigns `term.options.theme`
+in place on toggle — scrollback and the WebSocket are untouched.
 
 ### Text & surfaces
 - Primary text: `--text`. Secondary/muted/disabled text: `--muted`.

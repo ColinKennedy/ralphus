@@ -1,4 +1,4 @@
-﻿      // ---------- Queue tab (RAL Queue) ----------
+      // ---------- Queue tab (RAL Queue) ----------
       /**
        * @typedef {object} QueueItem
        * @property {string} path
@@ -844,6 +844,7 @@
             }
             showTab("tasks");
           } else if (h.tab === "reviews") {
+            pendingInspectorHash = h.inspector || null;
             if (h.guardianId) { selectedGuardian = h.guardianId; revealedGuardianId = h.guardianId; }
             renderReviewStatusFilters();
             renderReviewResolverFilters();
@@ -893,6 +894,7 @@
         }
       });
       pendingHash = parseHash();
+      if (pendingHash && pendingHash.tab === "reviews") pendingInspectorHash = pendingHash.inspector || null;
       loadTaskTabPrefs();
       renderStatusFilters(); renderSortChips(); renderTtStatusFilters(); renderTtAgentFilter(); renderReviewStatusFilters(); renderReviewResolverFilters(); renderReviewOriginFilters(); renderReviewPrStatusFilter();
       if (pendingHash && pendingHash.tab === "reviews") { showTab("reviews"); }  // keep pendingHash for pollReviews to apply guardianId

@@ -524,7 +524,7 @@
           const extra = prPick.count > 1 ? ` +${prPick.count - 1}` : "";
           const ciNote = pr.state === "open" && pr.ci_status ? ` (CI: ${esc(pr.ci_status)})` : "";
           const canQueryForge = pr.state === "open" && pr.pr_number != null;
-          parts.push(`<span class="tt-badge pr-badge" style="color:${color};border-color:${color}" onclick="event.stopPropagation();ttOpenPr('${esc(pr.pr_url || "")}')" data-ctx="openPrMenu" data-pr-id="${esc(pr.id)}" data-pr-open="${canQueryForge ? "1" : "0"}" data-tip="PR ${esc(label)} — ${esc(pr.state)} on ${esc(pr.forge)}/${esc(pr.repo)}${ciNote}, earliest-submitted for this task.${prPick.count > 1 ? ` +${prPick.count - 1} more PR(s) on this task.` : ""}\nClick to open on the forge. Right-click to refresh its status or pull in feedback.">${esc(label)}${extra}</span>`);
+          parts.push(`<span class="tt-badge pr-badge" style="color:${color};border-color:${color}" onclick="event.stopPropagation();ttOpenPr('${esc(pr.pr_url || "")}')" data-ctx="openPrMenu" data-pr-id="${esc(pr.id)}" data-pr-open="${canQueryForge ? "1" : "0"}" data-tip="PR ${esc(label)} — ${esc(pr.state)} on ${esc(pr.forge)}/${esc(pr.repo)}${ciNote}, earliest-submitted for this task.${prPick.count > 1 ? ` +${prPick.count - 1} more PR(s) on this task.` : ""}\nClick to open on the forge (this also refreshes its status). Right-click to refresh its status or pull in feedback.">${esc(label)}${extra}</span>`);
         } else if (reviewBadge && (reviewBadge.review.status === "merged" || reviewBadge.review.status === "merging")) {
           parts.push(`<span class="tt-badge pr-placeholder" data-tip="Review &quot;${esc(reviewBadge.review.name)}&quot; is ${esc(reviewBadge.review.status)} but has no PR submitted yet.">no PR</span>`);
         }
@@ -1290,7 +1290,7 @@
           const branchRows = r.branches.map((b) => {
             const pr = row.prs.find((p) => p.branch_alias === b);
             const badge = pr
-              ? `<span class="tt-badge pr-badge" style="color:${cvar(ttPrColorVar(pr))};border-color:${cvar(ttPrColorVar(pr))}" onclick="ttOpenPr('${esc(pr.pr_url || "")}')" data-tip="Open PR on the forge.${pr.state === "open" && pr.ci_status ? ` CI: ${esc(pr.ci_status)}.` : ""}">${pr.pr_number ? "#" + pr.pr_number : esc(pr.state)}</span>`
+              ? `<span class="tt-badge pr-badge" style="color:${cvar(ttPrColorVar(pr))};border-color:${cvar(ttPrColorVar(pr))}" onclick="ttOpenPr('${esc(pr.pr_url || "")}')" data-pr-id="${esc(pr.id)}" data-pr-open="${pr.state === "open" && pr.pr_number != null ? "1" : "0"}" data-tip="Open PR on the forge (also refreshes its status).${pr.state === "open" && pr.ci_status ? ` CI: ${esc(pr.ci_status)}.` : ""}">${pr.pr_number ? "#" + pr.pr_number : esc(pr.state)}</span>`
               : (r.status === "merged" || r.status === "merging" ? `<span class="tt-badge pr-placeholder" data-tip="Merged/merging with no PR submitted yet.">no PR</span>` : "");
             return `<div style="display:flex;justify-content:space-between;gap:8px;padding:3px 0 3px 14px"><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap" data-tip="${esc(b)}">${esc(b)}</span>${badge}</div>`;
           }).join("");
@@ -1655,8 +1655,6 @@
       let hideThinkingDefault = false;
       /** @type {{[key: string]: boolean}} peek key -> per-pane override of whether the model's thinking/reasoning lines are expanded (RAL-434), set by toggling that pane's "Show Thinking" checkbox. Absent means "use !hideThinkingDefault." Session-only, like every other peek* map -- not persisted. */
       let peekShowThinking = {};
-      /** @type {{[key: string]: string}} peek key -> the peek box's selected tab (RAL-428): "terminal" (default, the transcript-tape live view) or "prompt" (the admin-only System Prompt tab). Absent means "terminal". Session-only, like every other peek* map -- not persisted; a non-admin never gets the tab buttons that set it, and `peekBox` falls back to terminal for a stale choice. */
-      let peekTab = {};
       /** @type {{[key: string]: (PromptTabState|"loading")|undefined}} peek key -> System Prompt tab state (RAL-428): a `PromptTabState` once fetched (the loaded text, or why there is none), the literal "loading" while a fetch is in flight, undefined until the tab is first opened. Deleted on close (see `togglePeek`) so the next open refetches. */
       let peekSystemPrompt = {};
       /** @type {{[key: string]: {top: number, atBottom: boolean}}} peek key -> last-known scroll offset of its terminal `<pre>`, and whether it was pinned to the bottom (RAL-471). `atBottom` is tracked as its own boolean rather than re-derived from `top` against a possibly-changed `scrollHeight` later -- see `peekScrollRestoreTarget`. Survives navigating away and back (the `<pre>` node gets destroyed/recreated but this doesn't) and, deliberately, an explicit close via `togglePeek` too, so collapsing and reopening the same box doesn't lose the reader's place. Session-only, like every other peek* map -- not persisted. */

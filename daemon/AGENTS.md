@@ -36,6 +36,17 @@ project to protect the path's meaning); once a project association exists,
 its name is the only thing the UI shows. `server.rs::squad_worktrees`
 (`CellPaths::project`) is the reference implementation.
 
+## Lazy worktree materialization (RAL-612)
+
+Submit claims worktree slots (branch + `w/<short>` + a `creating/<short>`
+marker) with no git work; `scheduler.rs` creates them in the background while
+ready cells start, and a cell whose worktree is still missing creates it itself
+via `worktrees::ensure_claimed_worktree` (single-flight with the background
+creator, restart-safe because the marker carries branch and upstream). See
+`.agent/gotchas.md` for the ownership rules. Race tests for this live in
+`worktrees.rs`'s test module (`concurrent_*`, `*_interrupted_by_restart`,
+`*_never_deleted`).
+
 ## Tmux cell process-tree confinement (RAL-321)
 
 On Windows, `tmux.rs`'s `confine` module assigns each cell's `new-session`
@@ -113,7 +124,7 @@ instead of hanging it, and requests after the handler has exited get a prompt
 | `workload_replay.rs` | WS-B.6: the captured production event mix replayed at its recorded rates | 3 `#[ignore]`d tests; runs in the `perf-tests` CI job. `RALPHUS_REPLAY_SECONDS` lengthens the window (the WS-G.5 soak knob) |
 | `submit_lock_hold.rs` | WS-D.8: the submit path's worst store-lock *hold* (`GET /api/daemon` → `guard_hold.max_ms`) | 1 always-run test. Asserts hold duration, not request latency: a submit may legitimately be slow, but it must not make every other request slow |
 | `simple_tab_submit.rs` | The board "+ New Squad" Simple tab: runs the real `ntSimpleBuildToml` under Node (`test/emit-simple-task-toml.mjs`) and feeds every generated TOML through the validator and `POST /api/squads` | 2 always-run tests; no model call. Needs `node` (present on CI runners; skips locally if absent, fails if `CI` is set) |
-| `read_path_ratchet.rs` | WS-E.4: how many `GET` handlers are served from the read pool rather than the writer lock | 2 always-run tests. A source scan, because which path a handler takes is not visible to a latency test until it happens to land behind a slow writer. Raise `MIN_POOLED_GET_HANDLERS` as handlers migrate; never lower it |
+| `read_path_ratchet.rs` | WS-E.4: how many `GET` handlers (and which background workers) read from the read pool rather than the writer lock | 4 always-run tests. A source scan, because which path a handler takes is not visible to a latency test until it happens to land behind a slow writer. Raise `MIN_POOLED_GET_HANDLERS` as handlers migrate; never lower it. Also pins the per-tick review-maintenance workers in `MAINTENANCE_WORKERS_OFF_THE_LOCK` (`pr.rs`/`ci_watch.rs`/`waypoints.rs`, incl. the waypoint survey sweep) to hydrating reviews through the read pool |
 
 **Live-Ollama tests are `#[ignore]`d by default** — a plain `cargo nextest run`/`cargo nextest run --all-targets` never runs them, so CI and the normal dev loop never depend on a local model. Run them explicitly with `--ignored`:
 ```bash

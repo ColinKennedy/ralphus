@@ -15,6 +15,7 @@ use crate::cli_agent_common::{live_session_path, write_live_session_id};
 use crate::mcp_init::{self, McpFileEdit, McpFileEditMode, McpInitializationPlan, McpInitializer};
 use crate::shell_label::exec_command_label;
 use crate::shellcmd::{self, Env};
+use crate::skills_install::SkillsHarness;
 use crate::tools::Workspace;
 
 const DEFAULT_PROGRAM: &str = "codex";
@@ -29,6 +30,24 @@ impl CodexBackend {
         self.program_override.clone().unwrap_or_else(|| {
             std::env::var("RALPHUS_CODEX_COMMAND").unwrap_or_else(|_| DEFAULT_PROGRAM.to_string())
         })
+    }
+}
+
+impl SkillsHarness for CodexBackend {
+    fn backend_name(&self) -> &'static str {
+        "codex"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Codex"
+    }
+
+    fn skills_dir(&self) -> Option<PathBuf> {
+        let config_dir = std::env::var_os("CODEX_HOME")
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| crate::agent_isolation::home_dir().map(|home| home.join(".codex")))?;
+        Some(config_dir.join("skills"))
     }
 }
 
@@ -211,6 +230,14 @@ impl ModelBackend for CodexBackend {
     fn supports_maximum_tool_output_tokens(&self) -> bool {
         true
     }
+
+    fn supports_effort(&self) -> bool {
+        true
+    }
+
+    fn supports_thinking(&self) -> bool {
+        true
+    }
 }
 
 /// The `-c developer_instructions=<value>` right-hand side.
@@ -257,8 +284,8 @@ fn toml_basic_string(value: &str) -> String {
 
 /// RAL-304/RAL-333: the `-c key=value` argument pairs that deliver
 /// `RunOptions::maximum_context`/`RunOptions::auto_compact_threshold`/
-/// `RunOptions::maximum_tool_output_tokens` to `codex` -- there is no dedicated
-/// flag for any of these, only config-override keys (mirrors
+/// `RunOptions::maximum_tool_output_tokens`/`RunOptions::effort` (RAL-607) to
+/// `codex` -- there is no dedicated flag for any of these, only config-override keys (mirrors
 /// `developer_instructions`'s precedent for `system_prompt`). Must be spliced
 /// into the arg list before `exec` -- see the caller's comment.
 fn context_limit_args(options: &RunOptions<'_>) -> Vec<String> {
@@ -274,6 +301,10 @@ fn context_limit_args(options: &RunOptions<'_>) -> Vec<String> {
     if let Some(v) = options.maximum_tool_output_tokens {
         args.push("-c".to_string());
         args.push(format!("tool_output_token_limit={v}"));
+    }
+    if let Some(v) = options.effort {
+        args.push("-c".to_string());
+        args.push(format!("model_reasoning_effort={}", toml_basic_string(v)));
     }
     args
 }
@@ -530,6 +561,8 @@ fn drive_thread_events(
 
     let mut agent_session_id: Option<String> = None;
     let mut latest_agent_message = String::new();
+    // RAL-595: markers from every `agent_message`, not just the last one.
+    let mut prophecies = crate::prophecy::ProphecyScanner::new();
     // RAL-352: completed `turn.completed` events -- one per user/assistant
     // exchange (each response event is both sides of the exchange).
     // `turn.failed`/`error`/`item.completed` never increment it.
@@ -582,16 +615,20 @@ fn drive_thread_events(
                         // The model's own reply -- the whole point of the
                         // live tmux pane is to let a human read this.
                         if let Some(text) = item["text"].as_str() {
-                            if !text.is_empty() {
-                                latest_agent_message = text.to_string();
-                                print_line(text);
-                            }
+                            record_agent_message(text, &mut latest_agent_message, &mut prophecies);
                         }
                     }
                     Some("command_execution") => {
                         let command = item["command"].as_str().unwrap_or("");
                         let status = item["status"].as_str().unwrap_or("");
                         eprintln!("{}", format_tool_event(command, status));
+                    }
+                    Some("reasoning") => {
+                        // RAL-598: Codex's reasoning item carries the
+                        // model's (summary) reasoning text.
+                        crate::pi_backend::print_thinking_block(
+                            item["text"].as_str().unwrap_or(""),
+                        );
                     }
                     Some("error") => {
                         let message = item["message"].as_str().unwrap_or("");
@@ -724,6 +761,7 @@ fn drive_thread_events(
             // compacts".
             compaction_input_tokens: 0,
             compaction_count: 0,
+            prophecies: prophecies.markers(),
         });
     }
 
@@ -770,7 +808,23 @@ fn drive_thread_events(
         // compacts".
         compaction_input_tokens: 0,
         compaction_count: 0,
+        prophecies: prophecies.markers(),
     })
+}
+
+/// Handles one completed `agent_message`: files its `RALPHUS_PROPHECY:`
+/// markers (RAL-595, whichever turn of the run it is), keeps it as the
+/// run's latest reply and mirrors it to the live pane.
+fn record_agent_message(
+    text: &str,
+    latest: &mut String,
+    prophecies: &mut crate::prophecy::ProphecyScanner,
+) {
+    prophecies.scan_and_emit("codex", text);
+    if !text.is_empty() {
+        *latest = text.to_string();
+        print_line(text);
+    }
 }
 
 fn format_tool_event(command: &str, status: &str) -> String {
@@ -858,6 +912,22 @@ fn wait_for_child(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_marker_in_a_non_final_agent_message_is_kept() {
+        let mut latest = String::new();
+        let mut scanner = crate::prophecy::ProphecyScanner::new();
+        super::record_agent_message(
+            "found it\nRALPHUS_PROPHECY: hazard: leaves a race\n",
+            &mut latest,
+            &mut scanner,
+        );
+        super::record_agent_message("done", &mut latest, &mut scanner);
+        assert_eq!(latest, "done");
+        let markers = scanner.markers();
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].kind, "hazard");
+    }
+
     use super::*;
 
     #[test]
@@ -1025,6 +1095,21 @@ mod tests {
             args.windows(2)
                 .any(|w| w == ["-c", "tool_output_token_limit=20000"])
         );
+    }
+
+    #[test]
+    fn context_limit_args_maps_effort_as_a_quoted_config_override() {
+        let options = RunOptions {
+            effort: Some("high"),
+            ..Default::default()
+        };
+        let args = context_limit_args(&options);
+        assert_eq!(args, ["-c", "model_reasoning_effort=\"high\""]);
+    }
+
+    #[test]
+    fn context_limit_args_omits_effort_when_unset() {
+        assert!(context_limit_args(&RunOptions::default()).is_empty());
     }
 
     // ── RAL-336 agent isolation ────────────────────────────────────────────

@@ -1,4 +1,4 @@
-﻿      // ---------- structured check inputs (RAL-164) ----------
+      // ---------- structured check inputs (RAL-164) ----------
       // A GuardianCheck (either an AI-synthesized manual check or a
       // user-declared [[review.action]] hint) may declare named `inputs`
       // (e.g. a port number) referenced in its command as `{name}`
@@ -1101,7 +1101,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        */
       function prCard(p) {
         const link = p.pr_url
-          ? `<a href="${esc(p.pr_url)}" target="_blank" rel="noopener" class="mono" style="color:var(--accent)" data-tip="Open this pull/merge request on ${esc(p.forge)}.">#${p.pr_number ?? "?"}</a>`
+          ? `<a href="${esc(p.pr_url)}" target="_blank" rel="noopener" class="mono" style="color:var(--accent)" data-pr-id="${esc(p.id)}" data-pr-open="${p.state === "open" && p.pr_number != null ? "1" : "0"}" data-tip="Open this pull/merge request on ${esc(p.forge)}. Opening it also refreshes its status.">#${p.pr_number ?? "?"}</a>`
           : `<span class="mono">${esc(p.branch_alias)}</span>`;
         const sync = prSyncStatus[p.id];
         let drift = "";
@@ -1250,7 +1250,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           : dual
             ? " This is the PR that actually gets merged; the other badge alongside it is a stack-only PR kept just for visual chaining."
             : "";
-        return `<a href="${esc(pr.pr_url)}" target="_blank" rel="noopener" class="badge mono" style="color:${color};border-color:${color}" onclick="event.stopPropagation()" data-ctx="openPrMenu" data-pr-id="${esc(pr.id)}" data-pr-open="${canQueryForge ? "1" : "0"}" data-tip="Open this branch's pull/merge request on ${esc(pr.forge)}.${ciNote}${kindNote} Right-click to refresh its status or pull in feedback.">${esc(pr.forge)} #${pr.pr_number ?? "?"}</a>`;
+        return `<a href="${esc(pr.pr_url)}" target="_blank" rel="noopener" class="badge mono" style="color:${color};border-color:${color}" onclick="event.stopPropagation()" data-ctx="openPrMenu" data-pr-id="${esc(pr.id)}" data-pr-open="${canQueryForge ? "1" : "0"}" data-tip="Open this branch's pull/merge request on ${esc(pr.forge)}.${ciNote}${kindNote} Opening it also refreshes its status. Right-click to refresh its status or pull in feedback.">${esc(pr.forge)} #${pr.pr_number ?? "?"}</a>`;
       }
       /**
        * Renders compact clickable link(s) to this branch's most relevant
@@ -1667,6 +1667,44 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         return root.split(/[\\/]/).filter(Boolean).pop() || "—";
       }
       /**
+       * The hoverable badge on the Auto Actions header that says why the
+       * section has no runnable commands right now, or what the last
+       * computation did. The "waiting for the combined review checkout"
+       * badge appears only while the checkout is genuinely not ready.
+       * @param {GuardianView} g - The review.
+       * @param {string} state - The review's `checks_state`.
+       * @param {boolean} noActions - Whether the computation finished with nothing to run.
+       * @returns {string}
+       */
+      function autoActionsStateBadge(g, state, noActions) {
+        const started = g.manual_checks_started_at_ms;
+        const finished = g.manual_checks_finished_at_ms;
+        let when = "";
+        if (started) {
+          when = `\nRan at ${new Date(started).toLocaleString()}`;
+          if (finished && finished >= started) when += `, took ${Math.max(1, Math.round((finished - started) / 1000))}s`;
+          when += ".";
+        }
+        /** @type {(cls: string, text: string, tip: string) => string} */
+        const badge = (cls, text, tip) => `<span class="badge ${cls}" data-tip="${esc(tip)}">${esc(text)}</span>`;
+        if (state === "hung") {
+          return badge("hung", "hung", `The agent computing auto actions has stalled — it stopped producing new output.${when}\nOpen the live view (click this bar) to see what it was doing; Regenerate from the ⋯ menu to run it again.`);
+        }
+        if (state === "generating") {
+          return badge("live", "computing…", `The agent is computing auto actions now.${when}\nOpen the live view (click this bar) to watch it. Controls unlock when it finishes.`);
+        }
+        if (state === "failed") {
+          return badge("bad", "failed", `Preparing auto actions failed. This advisory result never blocks approval.${when}\nOpen the live view (click this bar) and the review logs for what went wrong.`);
+        }
+        if (noActions) {
+          return badge("empty", "no actions", `The computation finished and found nothing worth running for this review's changes.${when}\nOpen the live view (click this bar) to see what the agent looked at.`);
+        }
+        if (state === "waiting") {
+          return badge("warn2", "waiting for checkout", "Waiting for the combined review checkout: every enabled branch must finish rebuilding first.\nNo auto action unlocks until it is ready.");
+        }
+        return "";
+      }
+      /**
        * The frame every runnable section wears: a header carrying the section's
        * run control and what its commands promise, then its rows.
        *
@@ -1679,15 +1717,16 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        * @param {string} note - One line on what these commands are and when they run.
        * @param {string} rows - The section's command rows, or "".
        * @param {boolean} [dim] - Render muted, for a section whose commands are currently skipped.
+       * @param {string} [headAttrs] - Extra attributes for the header bar (e.g. a `data-click` that makes the whole bar clickable).
        * @returns {string}
        */
-      function reviewRunGroup(control, note, rows, dim) {
+      function reviewRunGroup(control, note, rows, dim, headAttrs) {
         // An empty note renders nothing at all rather than an empty span: what
         // a section *is* belongs in its heading's tooltip, so these notes are
         // reserved for state that changes (why a run is unavailable right now),
         // and a standing description no longer takes a line of the pane.
         return `<div class="rungroup"${dim ? ' style="opacity:.5"' : ""}>
-            <div class="rg-head rg-run">${control}${note ? `<span class="rg-note">${note}</span>` : ""}</div>
+            <div class="rg-head rg-run"${headAttrs ? ` ${headAttrs}` : ""}>${control}${note ? `<span class="rg-note">${note}</span>` : ""}</div>
             ${rows}
           </div>`;
       }
@@ -1808,10 +1847,21 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         const status = it.ignored
           ? `<span class="fu-chip fu-ignored" data-tip="This note is left out of the follow-ups made when the review merges.">Ignored</span>`
           : "";
-        const squad = frozen && !it.ignored ? followupSquadHtml(offerStatus, squadId) : "";
+        const squad = frozen && !it.ignored ? followupSquadHtml(offerStatus, it.squad_id || squadId) : "";
+        const acceptBtn = (frozen && offerStatus !== "offered") || it.accepted
+          ? ""
+          : `<button class="btn primary fu-btn" data-click="acceptFollowup" data-guardian-id="${esc(gid)}" data-prophecy-id="${it.prophecy_id}" data-tip="Pressing this will create a follow-up Task that completes this offer.${frozen ? "" : "\nThe review has not merged yet, so it is created the moment the review merges."}">Accept</button>`;
+        const acceptedTip = it.squad_id
+          ? "Already accepted: the follow-up squad linked on this card was created from this note."
+          : frozen
+            ? "Already accepted: the follow-up squad is being created."
+            : "Already accepted: the follow-up Task is created the moment this review merges.\nIgnoring the note withdraws the acceptance.";
+        const acceptedChip = it.accepted
+          ? `<button class="btn fu-btn" disabled data-tip="${esc(acceptedTip)}">Accepted</button>`
+          : "";
         const action = frozen
-          ? `<span class="fu-status ${it.ignored ? "off" : ""}" data-tip="${it.ignored ? "This note was left out of the offer made when the review merged." : "This note was included in the offer made when the review merged."}">${it.ignored ? "Ignored" : "Offered"}</span>`
-          : `<button class="btn fu-btn" data-click="${it.ignored ? "unignoreFollowup" : "ignoreFollowup"}" data-guardian-id="${esc(gid)}" data-prophecy-id="${it.prophecy_id}" data-tip="${it.ignored ? "Offer this note again when the review merges.\nClick to re-enable it." : "Leave this note out of the follow-ups made when the review merges.\nYou can re-enable it later."}">${it.ignored ? "Re-enable" : "Ignore"}</button>`;
+          ? `${acceptedChip}${acceptBtn}${it.ignored && !it.accepted ? `<span class="fu-status off" data-tip="This note was left out of the offer made when the review merged.">Ignored</span>` : ""}`
+          : `${acceptedChip}${acceptBtn}<button class="btn fu-btn" data-click="${it.ignored ? "unignoreFollowup" : "ignoreFollowup"}" data-guardian-id="${esc(gid)}" data-prophecy-id="${it.prophecy_id}" data-tip="${it.ignored ? "Offer this note again when the review merges.\nClick to re-enable it." : "Leave this note out of the follow-ups made when the review merges.\nYou can re-enable it later."}">${it.ignored ? "Re-enable" : "Ignore"}</button>`;
         const prompt = it.prompt
           ? `<details class="fu-context"><summary data-tip="The prompt of the cell that deferred this note.">Show the context it was written in</summary><div class="fu-prompt mono">${esc(it.prompt)}</div></details>`
           : "";
@@ -1836,7 +1886,8 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         if (offerStatus === "accepted") {
           return `<span class="fu-chip fu-ignored" data-tip="The offer was accepted but no squad was recorded, so creating it may have failed.\nCheck the review's mailbox messages, or accept the offer again.">Squad creation failed</span>`;
         }
-        return `<span class="fu-chip" data-tip="The offer has not been accepted yet, so no squad exists for this note.">Squad pending</span>`;
+        return `<span class="fu-chip" data-tip="The offer has not been accepted yet, so no squad exists for this note.
+Press Accept on the note to create it.">Squad pending</span>`;
       }
       /**
        * Renders the follow-up list modal body: a plain-language intro, then
@@ -1877,6 +1928,23 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           ${followupListHtml(gid, data)}
           <div class="fu-foot">${tally}<button class="btn" onclick="closeModal()" data-tip="Close this list.">Close</button></div>
         </div></div>`;
+      }
+      /**
+       * Accepts one follow-up. Once the review has merged the daemon creates
+       * its squad; before that it only records the acceptance, and the squad
+       * is created at merge. The list is reloaded either way.
+       * @param {string} gid
+       * @param {number} prophecyId
+       * @returns {Promise<void>}
+       */
+      async function acceptFollowupOffer(gid, prophecyId) {
+        let resp;
+        try {
+          resp = await post(`/api/guardians/${encodeURIComponent(gid)}/followup/accept`, { prophecy_id: prophecyId });
+        } catch (e) { notify("error", "daemon unreachable"); return; }
+        if (!resp.ok) { notify("error", await responseError(resp, "could not accept the follow-up")); return; }
+        notify("success", resp.status === 201 ? "Follow-up squad created." : "Accepted; it is created when the review merges.");
+        await openFollowupList(gid);
       }
       /**
        * Ignores or un-ignores one deferred note and refreshes the list and
@@ -1934,6 +2002,8 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
             "The agent that resolves rebase conflicts, writes the change summary, and generates the auto actions.")
           + setupChip(g.id, "proof", esc(proof),
             `How often the dedicated LLM proof pass runs${g.proof_scope ? "" : " — currently the project default"}.`)
+          + setupChip(g.id, "ci", esc(ciDeferralChipText(g.effective_ci_deferral)),
+            `Which PRs/MRs in this review's stack run the full CI suite${g.ci_deferral ? "" : " — currently the project default"}.\nThe others carry the 'ralphus:defer-full-ci' label, which the repository's CI reads to skip its slow jobs.`)
           + setupChip(g.id, "squash", esc(squashText),
             "Whether each task branch collapses to a single commit in the review worktree.\nScope is per git project, so a multi-project review sets it independently.")
           + (g.effective_rebuild_on === undefined ? "" : setupChip(g.id, "rebuild", esc(rebuildOnChipText(g.effective_rebuild_on)),
@@ -1974,6 +2044,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           return;
         }
         reviewDetailLoading = null;
+        applyPendingInspectorHash(g);
         // RAL-14: reorder is allowed while the review is still open — not once it
         // is merged/approved/deployed (those branches are considered merged/shipped).
         const canReorder = !["merged", "approved", "cancelled", "deployed"].includes(g.status);
@@ -2206,11 +2277,10 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
             // It used to be a lone disabled button labelled "Waiting on
             // branches…" with a stray Live View button beside it, which read
             // as a different, older widget than the populated case.
-            const waitingNote = state === "generating"
-              ? `The stage is being set now: commands, builds, and artifacts are prepared before the controls unlock.`
-              : state === "failed"
-                ? `Preparation failed, but this advisory result never blocks approval. See the review detail and logs for remediation.`
-                : `Waiting for the combined review checkout. No auto action unlocks until it is ready.`;
+            const peekKey = `guardian-manual|${g.id}`;
+            const noActions = state === "no_actions" || (isReady && !cmds.length);
+            const waitingNote = autoActionsStateBadge(g, state, noActions);
+            const headAttrs = `data-click="togglePeek" data-key="${esc(peekKey)}" style="cursor:pointer" data-tip="${esc(peekOpen[peekKey] ? "Hide the live view of the agent that computes auto actions." : "Open the live view of the agent that computes auto actions: what it did, when it ran, and how it ended.")}"`;
             return `<h3 class="section" data-tip="Auto actions: checks the AI writes from this review's changes.\nThey can change when the stack's changes change; regenerate them from the ⋯ menu.\nAdvisory — they never block Approve or Merge / rebase.">auto actions${sectionMenuBtn(g.id, "manual")}</h3>
               ${isReady && cmds.length
                 ? reviewRunGroup(
@@ -2228,12 +2298,15 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
                           <button class="cmd-expand" data-click="toggleReviewCommandFull" data-key="${esc(key)}" data-tip="${needsInput ? "Show this command in full, with its values filled in and editable beneath it." : "Show or hide this command in full beneath its row."}">${commandFullOpen[key] ? "−" : "+"}</button>
                           <button class="section-menu" data-click="openReviewCommandMenu" data-guardian-id="${esc(g.id)}" data-key="${esc(key)}" data-cmd="${esc(cmdText)}" data-tip="Actions for this check — its logs, its environment, copy it.">⋯</button>
                         </div>${commandFullBlock(key, cmdText, { g, check: cmd, kind: "manual", i })}`;
-                    }).join(""))
-                : reviewRunGroup(runControl, waitingNote, "")}
+                    }).join(""), false, headAttrs)
+                : reviewRunGroup(runControl, waitingNote, "", false, headAttrs)}
+              ${squadLiveSlot(squadLiveCtx({ baseKey: peekKey, title: "auto actions generation", canThink: true, promptText: "", promptHint: "", withAttempts: false, currentMeta: g.manual_checks_finished_at_ms ? "finished" : "running", closeKey: peekKey }))}
               `;
           })()}`;
         attachPeekResizeHandlers();
         restorePeekScrollPositions(); // RAL-471: the innerHTML rewrite above just destroyed/recreated any peek `<pre>` nodes, dropping their scroll position
+        restorePromptBoxScroll();
+        restoreAgentLogScroll();
         // The inspector and the dock are siblings of this pane, not children of
         // it, so they re-render alongside rather than being rebuilt by the
         // innerHTML above -- which is what lets the inspector keep its own tab

@@ -1,22 +1,51 @@
 name: CI
 
+# Ralphus marks the PRs of a stacked review that need not run the slow jobs
+# with the `ralphus:defer-full-ci` label (see "CI deferral" in
+# docs/glossary.md); which PRs get it is the review's `ci_deferral` setting.
+# A labelled PR still runs every fast job -- fmt, clippy (so the workspace
+# compiles), the web lint/type/dead-code checks, the python lint, the
+# parity/rlog/bench lints and the docs checks. Only the jobs marked
+# "deferrable" below are skipped, and a PR without the label runs everything,
+# so a missing label or a typo costs minutes, never coverage.
+#
+# `labeled`/`unlabeled` re-run the workflow when ralphus flips the label, so a
+# change of setting takes effect without a new push. Any label change re-runs
+# CI; the concurrency group below cancels the run it supersedes.
 on:
   pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
 
 # Cancel superseded runs on the same ref to save CI minutes.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-# RAL-260: python runs as a 3.11/3.12/3.13 + floating "3" matrix; rust runs its
+# RAL-260: python runs on 3.13 only; rust runs its
 # full suite on linux+windows plus a pinned 1.86 MSRV build-only leg. RAL-398
 # adds a macOS leg -- experimental, so build-only rather than the full suite
 # (see "Platform support" in README.md and docs/dependencies.md). RAL-441
-# adds a debug x release build matrix across all three OSes (see the
-# `release-builds` job below) so release artifacts get the same early
-# validation as development builds.
+# adds release-build legs on linux and windows (see the `release-builds` job
+# below) so the packaging scripts get validated on every PR.
 
 jobs:
+  # Says, in the run's summary, which scope this run has. Always runs.
+  ci-scope:
+    name: CI scope
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report the CI scope
+        env:
+          DEFERRED: ${{ contains(github.event.pull_request.labels.*.name, 'ralphus:defer-full-ci') }}
+        run: |
+          if [ "$DEFERRED" = "true" ]; then
+            echo "### Slow jobs deferred" >> "$GITHUB_STEP_SUMMARY"
+            echo "This PR carries \`ralphus:defer-full-ci\`, so the full test suite, the release builds, the exercises, the psmux tests, the Python tests and the perf tests were skipped. Fast checks still ran. The full suite runs on the top PR of the stack." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### Full CI" >> "$GITHUB_STEP_SUMMARY"
+            echo "No \`ralphus:defer-full-ci\` label: every job runs." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   rust:
     name: Rust (fmt, clippy, test)
     strategy:
@@ -50,8 +79,11 @@ jobs:
       - name: Install Rust toolchain
         run: rustup toolchain install ${{ matrix.toolchain }} --profile minimal --component rustfmt,clippy
       - uses: Swatinem/rust-cache@v2
+      # Deferrable (skipped on a `ralphus:defer-full-ci` PR): the nextest
+      # install, the test run and doctests, and the build-only MSRV/macOS legs.
+      # fmt and clippy below always run.
       - name: Install cargo-nextest
-        if: matrix.suite == 'full'
+        if: matrix.suite == 'full' && !contains(github.event.pull_request.labels.*.name, 'ralphus:defer-full-ci')
         uses: taiki-e/install-action@nextest
       - name: Format check
         if: matrix.suite == 'full'
@@ -83,7 +115,7 @@ jobs:
       # as the perf job's store-contention step; genuine blocking I/O under
       # the lock (a subprocess, a sleep, a network call) still blows past it.
       - name: Test
-        if: matrix.suite == 'full'
+        if: matrix.suite == 'full' && !contains(github.event.pull_request.labels.*.name, 'ralphus:defer-full-ci')
         env:
           RALPHUS_GUARD_HOLD_PANIC_MS: "8000"
         # The review-input race suite (daemon/tests/review_input_races.rs) is
@@ -92,66 +124,52 @@ jobs:
         # `race-soak-nightly.yml`.
         run: cargo "+${{ matrix.toolchain }}" nextest run --workspace --all-targets
       - name: Doctests
-        if: matrix.suite == 'full'
+        if: matrix.suite == 'full' && !contains(github.event.pull_request.labels.*.name, 'ralphus:defer-full-ci')
         run: cargo "+${{ matrix.toolchain }}" test --doc --workspace
       # MSRV leg: just prove the workspace compiles at the oldest supported
       # toolchain. (Cargo's default resolver is not MSRV-aware, so this is the
       # only guard against a dependency silently bumping the floor.)
       - name: Build (MSRV verification)
-        if: matrix.suite == 'msrv'
+        if: matrix.suite == 'msrv' && !contains(github.event.pull_request.labels.*.name, 'ralphus:defer-full-ci')
         run: cargo "+${{ matrix.toolchain }}" build --workspace --all-targets
       # macOS leg (RAL-398): experimental support, so this only proves the
       # workspace builds -- no fmt/clippy/test/doctest suite, and no vendored
       # psmux (that feature is Windows-only and off by default). A deeper
       # macOS CI leg can follow once there's a real need to justify it.
       - name: Build (macOS smoke test)
-        if: matrix.suite == 'macos-min'
+        if: matrix.suite == 'macos-min' && !contains(github.event.pull_request.labels.*.name, 'ralphus:defer-full-ci')
         run: cargo "+${{ matrix.toolchain }}" build --workspace --all-targets
 
+  # Deferrable: skipped on a `ralphus:defer-full-ci` PR.
   release-builds:
-    name: Build (${{ matrix.os }}, ${{ matrix.config }})
+    name: Release build (${{ matrix.os }})
+    if: ${{ !contains(github.event.pull_request.labels.*.name, 'ralphus:defer-full-ci') }}
     strategy:
       fail-fast: false
       matrix:
-        # Debug then release, per OS (RAL-441): a plain `cargo build` proves
-        # the workspace still builds in the profile developers iterate in
-        # day to day, while the release leg runs the same packaging scripts
-        # used to cut a real release (scripts/build-release.sh on
-        # linux/macOS, scripts/build-release.cmd on Windows), so ship-ready
-        # bundling -- not just compilation -- gets covered on every OS. The
-        # Windows release leg also exercises the vendored psmux submodule
-        # build that scripts/build-release.cmd performs by default.
-        include:
-          - os: ubuntu-latest
-            config: debug
-          - os: ubuntu-latest
-            config: release
-          - os: windows-latest
-            config: debug
-          - os: windows-latest
-            config: release
-          - os: macos-latest
-            config: debug
-          - os: macos-latest
-            config: release
+        # Runs the same packaging scripts used to cut a real release
+        # (scripts/build-release.sh on linux, scripts/build-release.cmd on
+        # Windows) so ship-ready bundling -- not just compilation -- is
+        # covered. Debug builds are already exercised by the `rust` job
+        # (including its macOS smoke leg), so they are not repeated here. The
+        # Windows leg also exercises the vendored psmux submodule build that
+        # scripts/build-release.cmd performs by default.
+        os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
         with:
-          # Only the Windows release leg needs vendor/psmux checked out --
+          # Only the Windows leg needs vendor/psmux checked out --
           # scripts/build-release.cmd builds it by default (RAL-347).
-          submodules: ${{ matrix.os == 'windows-latest' && matrix.config == 'release' }}
+          submodules: ${{ matrix.os == 'windows-latest' }}
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal
       - uses: Swatinem/rust-cache@v2
-      - name: Debug build
-        if: matrix.config == 'debug'
-        run: cargo build --workspace --all-targets
       - name: Release build (scripts/build-release.sh)
-        if: matrix.config == 'release' && matrix.os != 'windows-latest'
+        if: matrix.os != 'windows-latest'
         run: bash scripts/build-release.sh
       - name: Release build (scripts\build-release.cmd)
-        if: matrix.config == 'release' && matrix.os == 'windows-latest'
+        if: matrix.os == 'windows-latest'
         shell: cmd
         run: scripts\build-release.cmd
 
@@ -163,8 +181,10 @@ jobs:
   # rather than by a new user. Ubuntu runs both variants; Windows runs the
   # remote variant only, because local cells need psmux, which only the
   # psmux-integration job builds.
+  # Deferrable: skipped on a `ralphus:defer-full-ci` PR.
   initialize-exercises:
     name: Initialize exercises (${{ matrix.os }})
+    if: ${{ !contains(github.event.pull_request.labels.*.name, 'ralphus:defer-full-ci') }}
     strategy:
       fail-fast: false
       matrix:
@@ -198,8 +218,10 @@ jobs:
           path: ${{ runner.temp }}/exercises
           retention-days: 7
 
+  # Deferrable: skipped on a `ralphus:defer-full-ci` PR.
   psmux-integration:
     name: Windows psmux integration
+    if: ${{ !contains(github.event.pull_request.labels.*.name, 'ralphus:defer-full-ci') }}
     runs-on: windows-latest
     env:
       # Only used by the "external tmux override" smoke test at the bottom of
@@ -332,32 +354,27 @@ jobs:
       - name: deadcode
         run: uv run deadcode src tests
 
+  # Deferrable: skipped on a `ralphus:defer-full-ci` PR.
   python-test:
-    name: Python ${{ matrix.python-version }} (pytest)
+    name: Python 3.13 (pytest)
+    if: ${{ !contains(github.event.pull_request.labels.*.name, 'ralphus:defer-full-ci') }}
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: cli-py
     env:
-      # Make every `uv` step use the matrix's interpreter, not just whatever uv
-      # first finds that satisfies requires-python (>=3.11).
-      UV_PYTHON: ${{ matrix.python-version }}
+      # Make every `uv` step use 3.13, not just whatever uv first finds that
+      # satisfies requires-python.
+      UV_PYTHON: "3.13"
       # `rust-cache` can restore a release binary from an earlier commit, while
       # this job deliberately builds the debug CLI below for docsgen's tests.
       RALPHUS_CLI_BIN: ../target/debug/ralphus
-    strategy:
-      fail-fast: false
-      matrix:
-        # The versions cli-py/pyproject.toml's `requires-python = ">=3.11"` covers
-        # in practice, plus a floating "3" leg that always resolves to the
-        # newest available Python so CI stays forward-looking.
-        python-version: ["3.11", "3.12", "3.13", "3"]
     steps:
       - uses: actions/checkout@v4
-      - name: Install Python ${{ matrix.python-version }}
+      - name: Install Python 3.13
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.13"
       - name: Install uv
         uses: astral-sh/setup-uv@v6
         with:
@@ -374,8 +391,10 @@ jobs:
       - name: pytest
         run: uv run pytest
 
+  # Deferrable: skipped on a `ralphus:defer-full-ci` PR.
   perf-tests:
     name: Board cold-load performance budget (RAL-414)
+    if: ${{ !contains(github.event.pull_request.labels.*.name, 'ralphus:defer-full-ci') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

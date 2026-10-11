@@ -14,6 +14,35 @@ use serde::{Deserialize, Serialize};
 
 use crate::store::{ProofView, Result, Store, StoreError};
 
+/// Reviews whose manual-checks generation agent tripped the thinking-stall
+/// detector during its current generation. Process-local and read from
+/// connection-only view hydration (which has no `Store` to reach
+/// `StoreMemory` through); a daemon restart drops it, which is right since
+/// the stalled agent died with the process.
+static MANUAL_CHECKS_STALLED: parking_lot::Mutex<Option<std::collections::HashSet<String>>> =
+    parking_lot::Mutex::new(None);
+
+/// Marks (`stalled = true`) or clears review `id`'s manual-checks generation
+/// as having stalled. Cleared when a new generation starts.
+pub(crate) fn set_manual_checks_stalled(id: &str, stalled: bool) {
+    let mut set = MANUAL_CHECKS_STALLED.lock();
+    let set = set.get_or_insert_with(Default::default);
+    if stalled {
+        set.insert(id.to_string());
+    } else {
+        set.remove(id);
+    }
+}
+
+/// Whether review `id`'s manual-checks generation stalled and has not been
+/// restarted since.
+fn manual_checks_stalled(id: &str) -> bool {
+    MANUAL_CHECKS_STALLED
+        .lock()
+        .as_ref()
+        .is_some_and(|set| set.contains(id))
+}
+
 /// Return type of [`Store::proof_steps_for_review_branch`]:
 /// `(cell_proofs, task_proofs, cell_system_prompt)`.
 pub type BranchProofInfo = (Vec<ProofView>, Vec<ProofView>, Option<String>);
@@ -833,11 +862,6 @@ pub struct GuardianView {
     pub conflicts_fixed: Option<i64>,
     /// Files whose conflict resolutions are staged and committed to the branch.
     pub conflicts_committed: Option<i64>,
-    /// When true, the finalize-time build/check step against the combined
-    /// worktree is skipped entirely: explicit `checks`, the project's
-    /// `.ralphus.toml [review] auto_build`, and the AI-inferred build command
-    /// (RAL-110) are all skipped. Independent of [`Self::effective_proof_scope`].
-    pub skip_auto_build: bool,
     /// The machine this review's worktrees, rebase and conflict resolution run
     /// on (RAL-185). `None` means the daemon's own host — every pre-RAL-185
     /// review, and any review that never declared one.
@@ -924,6 +948,14 @@ pub struct GuardianView {
     /// layer is unset. PR/commit rendering reads this; appraisals are stored
     /// and shown on the board regardless.
     pub effective_post_appraisals: bool,
+    /// This review's own `ci_deferral` mode (`every`/`top`/`bottom+top`, see
+    /// [`ralphus_core::schema::CI_DEFERRAL_VALUES`]). `None` means unset,
+    /// which behaves as `every`.
+    pub ci_deferral: Option<String>,
+    /// [`Self::ci_deferral`] resolved to one of the accepted literals --
+    /// `every` when unset or when the stored value is not recognised, so a
+    /// bad row costs CI minutes rather than coverage.
+    pub effective_ci_deferral: String,
     /// This review's own list of events (`rebase`, `feedback`, `auto_fix`)
     /// that tear down and rebuild its prepared build. `None` means "inherit the
     /// project/global default" (resolved into [`Self::effective_rebuild_on`]
@@ -1191,7 +1223,10 @@ pub struct GuardianView {
     /// cleanly and the manual-checks LLM call is expected to be in flight --
     /// see `generate_manual_commands`'s call sites, always after the stack
     /// fully rebuilds), or `"waiting"` (branches are still being collected or
-    /// rebased, so generation has not started).
+    /// rebased, so generation has not started), `"no_actions"` (generation
+    /// completed and produced zero auto actions), `"failed"`, or `"hung"`
+    /// (the generation agent tripped the thinking-stall detector and has not
+    /// been restarted -- see `guardian_merge::run_agent_with_stall_recovery`).
     pub checks_state: &'static str,
     /// RAL-203: this review's own environment-variable overrides for the
     /// finalize-time build/check-gate step (`final_checks`, run against the
@@ -2086,6 +2121,42 @@ impl Store {
         Ok(n)
     }
 
+    /// Whether `branch` of `guardian_id` has a linked task that has not
+    /// finished: it has at least one contributing cell, and either one of
+    /// those cells or its owning task is not `done`. This is exactly the
+    /// negation of [`Self::mark_ready_branches_with_done_cells`]'s promotion
+    /// condition (same guardian scoping), so a branch held back on it is
+    /// promoted again by the straggler sweep the moment its task finishes.
+    ///
+    /// A branch with no linked cell at all has nothing to wait for and is
+    /// never unfinished.
+    pub fn branch_task_unfinished(&self, guardian_id: &str, branch: &str) -> Result<bool> {
+        let unfinished = self.conn.query_row(
+            "SELECT EXISTS (
+                 SELECT 1 FROM cells s
+                 WHERE s.review_branch = ?2
+                   AND (s.review_guardian_id = ?1 OR s.review_guardian_id IS NULL)
+             ) AND (
+                 EXISTS (
+                     SELECT 1 FROM cells s
+                     WHERE s.review_branch = ?2
+                       AND (s.review_guardian_id = ?1 OR s.review_guardian_id IS NULL)
+                       AND s.state != 'done'
+                 )
+                 OR EXISTS (
+                     SELECT 1 FROM cells s
+                     JOIN tasks t ON t.squad_id = s.squad_id AND t.idx = s.task_idx
+                     WHERE s.review_branch = ?2
+                       AND (s.review_guardian_id = ?1 OR s.review_guardian_id IS NULL)
+                       AND t.state != 'done'
+                 )
+             )",
+            params![guardian_id, branch],
+            |r| r.get::<_, bool>(0),
+        )?;
+        Ok(unfinished)
+    }
+
     /// Link an existing cell/task to a guardian's branch after the fact
     /// (RAL-392): stamps `cells.review_branch`/`review_guardian_id` the same
     /// way [`crate::reviews::derive_reviews`] does at submit time, for a
@@ -2283,8 +2354,16 @@ impl Store {
     /// preliminary, git-log-only change summary from the task's own worktree
     /// before any review worktree has been built for that branch.
     pub fn cell_cwd_for_branch(&self, branch: &str) -> Result<Option<String>> {
-        let cwd: Option<Option<String>> = self
-            .conn
+        Self::cell_cwd_for_branch_conn(&self.conn, branch)
+    }
+
+    /// [`Self::cell_cwd_for_branch`] against any connection, so the read pool
+    /// can serve it without the writer lock.
+    pub(crate) fn cell_cwd_for_branch_conn(
+        conn: &Connection,
+        branch: &str,
+    ) -> Result<Option<String>> {
+        let cwd: Option<Option<String>> = conn
             .query_row(
                 "SELECT cwd FROM cells WHERE review_branch=? ORDER BY rowid DESC LIMIT 1",
                 params![branch],
@@ -3267,38 +3346,12 @@ impl Store {
         }
     }
 
-    /// Set whether the finalize-time build/check step (explicit checks, config
-    /// `auto_build`, and AI-inferred build) is skipped entirely (RAL-110).
-    pub fn set_guardian_skip_auto_build(&self, id: &str, skip: bool) -> Result<()> {
-        let n = self.conn.execute(
-            "UPDATE guardians SET skip_auto_build=?, updated_at_ms=? WHERE id=?",
-            params![i64::from(skip), crate::store::now_ms(), id],
-        )?;
-        if n == 0 {
-            Err(StoreError::NotFound)
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Whether the guardian's finalize-time build/check step is opted out.
-    pub fn guardian_skip_auto_build(&self, id: &str) -> Result<bool> {
-        self.conn
-            .query_row(
-                "SELECT skip_auto_build FROM guardians WHERE id=?",
-                params![id],
-                |r| r.get(0),
-            )
-            .optional()?
-            .ok_or(StoreError::NotFound)
-    }
-
     /// Set this review's declared build step (RAL-342), from
     /// `[[review.auto_build]]`. Set once at review-derivation time
     /// (`reviews::derive_reviews`); blind-overwrite, not a read-then-merge
     /// like [`Self::set_guardian_build_env_overrides`], since the whole
     /// declaration is authored together in one TOML block. `None` records
-    /// that the review declared `skip_auto_build = true` instead.
+    /// that the review declared no build step.
     pub fn set_guardian_auto_build(
         &self,
         id: &str,
@@ -3798,6 +3851,25 @@ impl Store {
         let n = self.conn.execute(
             "UPDATE guardians SET proof_scope=?, updated_at_ms=? WHERE id=?",
             params![scope, crate::store::now_ms(), id],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Set this review's own `ci_deferral` mode: one of
+    /// [`ralphus_core::schema::CI_DEFERRAL_VALUES`]. `None` clears it, which
+    /// behaves as `every`. Validation of the literal belongs to the caller
+    /// (the API layer and the offline validator).
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] when no such guardian exists.
+    pub fn set_guardian_ci_deferral(&self, id: &str, mode: Option<&str>) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE guardians SET ci_deferral=?, updated_at_ms=? WHERE id=?",
+            params![mode, crate::store::now_ms(), id],
         )?;
         if n == 0 {
             Err(StoreError::NotFound)
@@ -5638,16 +5710,16 @@ impl Store {
     pub(crate) fn get_guardian_conn(conn: &Connection, id: &str) -> Result<GuardianView> {
         let row = conn
             .query_row(
-                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus, summary_format, base_shift_rebuild_attempts_by_project, rebuild_on, skip_manual_checks, auto_run, followup_enabled, followup_auto_start, post_appraisals
-                  FROM guardians WHERE id=?", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
+                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus, summary_format, base_shift_rebuild_attempts_by_project, rebuild_on, skip_manual_checks, auto_run, followup_enabled, followup_auto_start, post_appraisals, ci_deferral
+                  FROM guardians WHERE id=?", // `skip_worktree_checks` (col 13) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
                 /*
-                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus
-                 , summary_format FROM guardians WHERE id=?", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
+                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus
+                 , summary_format FROM guardians WHERE id=?", // `skip_worktree_checks` (col 13) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
                 */
                 /*
-                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached
-                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus
-                 FROM guardians WHERE id=?", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
+                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached
+                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus
+                 FROM guardians WHERE id=?", // `skip_worktree_checks` (col 13) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
                 */
                 params![id],
                 Self::map_guardian_row,
@@ -5695,7 +5767,15 @@ impl Store {
     /// for 3+ seconds under load, stalling every other daemon operation
     /// behind it.
     pub(crate) fn list_guardian_status_pairs(&self) -> Result<Vec<(String, String)>> {
-        let mut stmt = self.conn.prepare("SELECT id, status FROM guardians")?;
+        Self::list_guardian_status_pairs_conn(&self.conn)
+    }
+
+    /// [`Self::list_guardian_status_pairs`] against any connection, so the
+    /// read pool can serve it without the writer lock.
+    pub(crate) fn list_guardian_status_pairs_conn(
+        conn: &Connection,
+    ) -> Result<Vec<(String, String)>> {
+        let mut stmt = conn.prepare("SELECT id, status FROM guardians")?;
         let rows = stmt
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -5791,8 +5871,8 @@ impl Store {
     /// (`crate::store_pool`) can serve it without the writer lock.
     pub(crate) fn list_guardians_conn(conn: &Connection) -> Result<Vec<GuardianView>> {
         let mut stmt = conn.prepare(
-            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus, summary_format, base_shift_rebuild_attempts_by_project, rebuild_on, skip_manual_checks, auto_run, followup_enabled, followup_auto_start, post_appraisals
-              FROM guardians ORDER BY created_at_ms DESC", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
+            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus, summary_format, base_shift_rebuild_attempts_by_project, rebuild_on, skip_manual_checks, auto_run, followup_enabled, followup_auto_start, post_appraisals, ci_deferral
+              FROM guardians ORDER BY created_at_ms DESC", // `skip_worktree_checks` (col 13) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
         )?;
         let rows = stmt
             .query_map([], Self::map_guardian_row)?
@@ -5871,75 +5951,75 @@ impl Store {
             conflicts_found: r.get(10)?,
             conflicts_fixed: r.get(11)?,
             conflicts_committed: r.get(12)?,
-            skip_auto_build: r.get(13)?,
-            legacy_skip_worktree_checks: r.get(14)?,
-            review_type: r.get(15)?,
-            skip_worktrees: r.get(16)?,
-            created_at_ms: r.get(17)?,
-            resolver_agent: r.get(18)?,
-            resolver_model: r.get(19)?,
-            base_commit: r.get(20)?,
-            change_summary: r.get(21)?,
-            base_commits: r.get(22)?,
-            manual_commands: r.get(23)?,
-            action_hints: r.get(24)?,
-            summary_agent: r.get(25)?,
-            summary_model: r.get(26)?,
-            manual_commands_agent: r.get(27)?,
-            manual_commands_model: r.get(28)?,
-            manual_commands_agent_session_id: r.get(29)?,
-            squash_projects: r.get(30)?,
-            auto_pr_feedback: r.get(31)?,
-            input_values: r.get(32)?,
-            proof_scope: r.get(33)?,
-            proof_skip_auto_clean: r.get::<_, Option<i64>>(34)?.map(|v| v != 0),
-            machine: r.get(35)?,
-            build_env_overrides: r.get(36)?,
-            manual_checks_env_overrides: r.get(37)?,
-            maximum_budget_usd: r.get(38)?,
-            merge_attempt: r.get(39)?,
-            skip_base_updates: r.get::<_, Option<i64>>(40)?.map(|v| v != 0),
-            manual_checks_started_at_ms: r.get(41)?,
-            notice_kind: r.get(42)?,
-            notice_message: r.get(43)?,
-            notice_at_ms: r.get(44)?,
-            match_pr_branch_name: r.get::<_, Option<i64>>(45)?.map(|v| v != 0),
-            auto_submit_pr_stack: r.get::<_, Option<i64>>(46)?.map(|v| v != 0),
-            origin: r.get(47)?,
-            auto_build_json: r.get(48)?,
-            separate_pr_branch: r.get::<_, Option<i64>>(49)?.map(|v| v != 0),
-            readable_review_branch: r.get::<_, i64>(50)? != 0,
-            review_branch_name: r.get(51)?,
-            project: r.get(52)?,
-            auto_fix_pr_errors: r.get::<_, Option<i64>>(53)?.map(|v| v != 0),
-            auto_fix_prompt_template: r.get(54)?,
-            manual_checks_finished_at_ms: r.get(55)?,
-            post_merge_status: r.get(56)?,
-            post_merge_detail: r.get(57)?,
-            post_merge_started_at_ms: r.get(58)?,
-            post_merge_finished_at_ms: r.get(59)?,
-            owner: r.get(60)?,
-            dual_root_pr: r.get::<_, Option<i64>>(61)?.map(|v| v != 0),
+            legacy_skip_worktree_checks: r.get(13)?,
+            review_type: r.get(14)?,
+            skip_worktrees: r.get(15)?,
+            created_at_ms: r.get(16)?,
+            resolver_agent: r.get(17)?,
+            resolver_model: r.get(18)?,
+            base_commit: r.get(19)?,
+            change_summary: r.get(20)?,
+            base_commits: r.get(21)?,
+            manual_commands: r.get(22)?,
+            action_hints: r.get(23)?,
+            summary_agent: r.get(24)?,
+            summary_model: r.get(25)?,
+            manual_commands_agent: r.get(26)?,
+            manual_commands_model: r.get(27)?,
+            manual_commands_agent_session_id: r.get(28)?,
+            squash_projects: r.get(29)?,
+            auto_pr_feedback: r.get(30)?,
+            input_values: r.get(31)?,
+            proof_scope: r.get(32)?,
+            proof_skip_auto_clean: r.get::<_, Option<i64>>(33)?.map(|v| v != 0),
+            machine: r.get(34)?,
+            build_env_overrides: r.get(35)?,
+            manual_checks_env_overrides: r.get(36)?,
+            maximum_budget_usd: r.get(37)?,
+            merge_attempt: r.get(38)?,
+            skip_base_updates: r.get::<_, Option<i64>>(39)?.map(|v| v != 0),
+            manual_checks_started_at_ms: r.get(40)?,
+            notice_kind: r.get(41)?,
+            notice_message: r.get(42)?,
+            notice_at_ms: r.get(43)?,
+            match_pr_branch_name: r.get::<_, Option<i64>>(44)?.map(|v| v != 0),
+            auto_submit_pr_stack: r.get::<_, Option<i64>>(45)?.map(|v| v != 0),
+            origin: r.get(46)?,
+            auto_build_json: r.get(47)?,
+            separate_pr_branch: r.get::<_, Option<i64>>(48)?.map(|v| v != 0),
+            readable_review_branch: r.get::<_, i64>(49)? != 0,
+            review_branch_name: r.get(50)?,
+            project: r.get(51)?,
+            auto_fix_pr_errors: r.get::<_, Option<i64>>(52)?.map(|v| v != 0),
+            auto_fix_prompt_template: r.get(53)?,
+            manual_checks_finished_at_ms: r.get(54)?,
+            post_merge_status: r.get(55)?,
+            post_merge_detail: r.get(56)?,
+            post_merge_started_at_ms: r.get(57)?,
+            post_merge_finished_at_ms: r.get(58)?,
+            owner: r.get(59)?,
+            dual_root_pr: r.get::<_, Option<i64>>(60)?.map(|v| v != 0),
             discourage_tests_during_auto_pull_request_fixes: r
-                .get::<_, Option<i64>>(62)?
+                .get::<_, Option<i64>>(61)?
                 .map(|v| v != 0),
-            base_shift_maximum_rebuilds: r.get::<_, Option<i64>>(63)?,
-            base_shift_rebuild_attempts: r.get::<_, i64>(64)?,
-            base_shift_rebuild_targets: r.get(65)?,
-            base_shift_exhausted_notified_at_ms: r.get(66)?,
-            auto_cancel_outdated_pr_pipelines: r.get::<_, Option<i64>>(67)?.map(|v| v != 0),
-            cache_manual_checks: r.get::<_, Option<i64>>(68)?.map(|v| v != 0),
-            manual_checks_cached: r.get::<_, i64>(69)?,
-            manual_checks_basis: r.get(70)?,
-            manual_checks_focus: r.get(71)?,
-            summary_format: r.get(72)?,
-            base_shift_rebuild_attempts_by_project: r.get(73)?,
-            rebuild_on: r.get(74)?,
-            skip_manual_checks: r.get::<_, Option<i64>>(75)?.map(|v| v != 0),
-            auto_run: r.get::<_, Option<i64>>(76)?.map(|v| v != 0),
-            followup_enabled: r.get::<_, Option<i64>>(77)?.map(|v| v != 0),
-            followup_auto_start: r.get::<_, Option<i64>>(78)?.map(|v| v != 0),
-            post_appraisals: r.get::<_, Option<i64>>(79)?.map(|v| v != 0),
+            base_shift_maximum_rebuilds: r.get::<_, Option<i64>>(62)?,
+            base_shift_rebuild_attempts: r.get::<_, i64>(63)?,
+            base_shift_rebuild_targets: r.get(64)?,
+            base_shift_exhausted_notified_at_ms: r.get(65)?,
+            auto_cancel_outdated_pr_pipelines: r.get::<_, Option<i64>>(66)?.map(|v| v != 0),
+            cache_manual_checks: r.get::<_, Option<i64>>(67)?.map(|v| v != 0),
+            manual_checks_cached: r.get::<_, i64>(68)?,
+            manual_checks_basis: r.get(69)?,
+            manual_checks_focus: r.get(70)?,
+            summary_format: r.get(71)?,
+            base_shift_rebuild_attempts_by_project: r.get(72)?,
+            rebuild_on: r.get(73)?,
+            skip_manual_checks: r.get::<_, Option<i64>>(74)?.map(|v| v != 0),
+            auto_run: r.get::<_, Option<i64>>(75)?.map(|v| v != 0),
+            followup_enabled: r.get::<_, Option<i64>>(76)?.map(|v| v != 0),
+            followup_auto_start: r.get::<_, Option<i64>>(77)?.map(|v| v != 0),
+            post_appraisals: r.get::<_, Option<i64>>(78)?.map(|v| v != 0),
+            ci_deferral: r.get(79)?,
         })
     }
 
@@ -6162,23 +6242,30 @@ impl Store {
             .iter()
             .filter(|b| b.merge_status == "failed")
             .count();
-        let checks_state: &'static str = if row.post_merge_status.as_deref() == Some("ok") {
-            "ready"
-        } else if row.post_merge_status.as_deref() == Some("failed") {
-            "failed"
-        } else if row.post_merge_status.as_deref() == Some("running") {
-            "generating"
-        } else if !manual_commands.is_empty() {
-            "ready"
-        } else if row.status == "merging"
-            && !enabled_branches.is_empty()
-            && enabled_done == enabled_branches.len()
-            && enabled_failed == 0
-        {
-            "generating"
-        } else {
-            "waiting"
-        };
+        let checks_state: &'static str =
+            if manual_commands.is_empty() && manual_checks_stalled(&row.id) {
+                "hung"
+            } else if row.post_merge_status.as_deref() == Some("ok") {
+                if manual_commands.is_empty() && row.manual_checks_finished_at_ms.is_some() {
+                    "no_actions"
+                } else {
+                    "ready"
+                }
+            } else if row.post_merge_status.as_deref() == Some("failed") {
+                "failed"
+            } else if row.post_merge_status.as_deref() == Some("running") {
+                "generating"
+            } else if !manual_commands.is_empty() {
+                "ready"
+            } else if row.status == "merging"
+                && !enabled_branches.is_empty()
+                && enabled_done == enabled_branches.len()
+                && enabled_failed == 0
+            {
+                "generating"
+            } else {
+                "waiting"
+            };
         let input_resolutions = Self::guardian_input_resolutions_conn(conn, &row.id)?;
 
         // RAL-203: the combined worktree has no upstream task cell of its
@@ -6195,7 +6282,7 @@ impl Store {
         let build_env = apply_branch_env(&combined_env, &build_env_overrides);
         let manual_checks_env = apply_branch_env(&combined_env, &manual_checks_env_overrides);
         // RAL-342: `None` here is a valid, distinct state (the review declared
-        // `skip_auto_build = true`, or predates this migration) -- unlike the
+        // no build step, or predates this migration) -- unlike the
         // `{}`-default env-override maps above, there is no fallback to apply.
         let auto_build = row
             .auto_build_json
@@ -6370,6 +6457,23 @@ impl Store {
             .or(live_global.post_appraisals)
             .unwrap_or(true);
 
+        // Which PRs/MRs run the full CI suite, layered per-review override >
+        // database-backed project default > the merged `.ralphus.toml
+        // [review]` / global value > `every`. An unrecognised literal at any
+        // layer is skipped rather than trusted, so a bad value costs CI
+        // minutes, never coverage.
+        let is_ci_deferral = |mode: &&str| ralphus_core::schema::CI_DEFERRAL_VALUES.contains(mode);
+        let effective_ci_deferral = row
+            .ci_deferral
+            .as_deref()
+            .filter(is_ci_deferral)
+            .or(db_settings
+                .default_ci_deferral
+                .as_deref()
+                .filter(is_ci_deferral))
+            .unwrap_or_else(|| project_review_config.default_ci_deferral())
+            .to_string();
+
         // Whether manual-check generation is skipped, layered the same way:
         // per-review override > database-backed project default > explicit
         // `.ralphus.toml [review]` value > the live global config > `false`.
@@ -6469,7 +6573,6 @@ impl Store {
             conflicts_found: row.conflicts_found,
             conflicts_fixed: row.conflicts_fixed,
             conflicts_committed: row.conflicts_committed,
-            skip_auto_build: row.skip_auto_build,
             review_type: row.review_type,
             skip_worktrees: row.skip_worktrees,
             resolver_agent: row.resolver_agent,
@@ -6531,6 +6634,8 @@ impl Store {
             effective_followup_auto_start,
             post_appraisals: row.post_appraisals,
             effective_post_appraisals,
+            effective_ci_deferral,
+            ci_deferral: row.ci_deferral,
             rebuild_on,
             effective_rebuild_on,
             manual_checks_cached: row.manual_checks_cached != 0,
@@ -6941,7 +7046,6 @@ struct GuardianRow {
     conflicts_found: Option<i64>,
     conflicts_fixed: Option<i64>,
     conflicts_committed: Option<i64>,
-    skip_auto_build: bool,
     /// RAL-110's retired `skip_worktree_checks` column (RAL-285 removed the
     /// setting itself). No runtime path writes it -- only `Store::migrate`'s
     /// pre-RAL-110 `skip_checks` backfill does. Kept solely so
@@ -7036,7 +7140,7 @@ struct GuardianRow {
     origin: String,
     /// RAL-342: JSON-serialized [`GuardianAutoBuild`], this review's own
     /// declared build step. `None` means the review declared
-    /// `skip_auto_build = true` instead, or predates the RAL-342 migration --
+    /// no build step, or predates the RAL-342 migration --
     /// unlike the `Option`-typed overrides above, `None` here never means
     /// "inherit the project config default".
     auto_build_json: Option<String>,
@@ -7097,6 +7201,8 @@ struct GuardianRow {
     /// RAL-575: per-review override for whether appraisals are written to the
     /// PR/MR body and tip commit. `None` inherits the project/global default.
     post_appraisals: Option<bool>,
+    /// This review's own `ci_deferral` literal as stored; `None` when unset.
+    ci_deferral: Option<String>,
 }
 
 #[cfg(test)]
@@ -7956,6 +8062,28 @@ mod tests {
             .unwrap();
         let g = store.get_guardian(&id).unwrap();
         assert_eq!(g.checks_state, "ready");
+    }
+
+    #[test]
+    fn checks_state_reports_no_actions_and_hung() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "feat").unwrap();
+
+        // Generation ran to completion and produced nothing.
+        let started = store.start_guardian_post_merge(&id).unwrap();
+        store.stamp_guardian_manual_checks_started_at(&id).unwrap();
+        store.stamp_guardian_manual_checks_finished_at(&id).unwrap();
+        store
+            .finish_guardian_post_merge(&id, started, true, None)
+            .unwrap();
+        assert_eq!(store.get_guardian(&id).unwrap().checks_state, "no_actions");
+
+        // A stalled generation is "hung" until a new one starts.
+        set_manual_checks_stalled(&id, true);
+        assert_eq!(store.get_guardian(&id).unwrap().checks_state, "hung");
+        set_manual_checks_stalled(&id, false);
+        assert_eq!(store.get_guardian(&id).unwrap().checks_state, "no_actions");
     }
 
     // ── RAL-164: structured GuardianCheck + input_values persistence ────────
@@ -8870,18 +8998,6 @@ mod tests {
     }
 
     #[test]
-    fn skip_auto_build_defaults_off_and_toggles() {
-        let store = Store::open_in_memory().unwrap();
-        let id = store.create_guardian("r", "main", "/repo").unwrap();
-        assert!(!store.get_guardian(&id).unwrap().skip_auto_build);
-        assert!(!store.guardian_skip_auto_build(&id).unwrap());
-        store.set_guardian_skip_auto_build(&id, true).unwrap();
-        assert!(store.get_guardian(&id).unwrap().skip_auto_build);
-        assert!(store.guardian_skip_auto_build(&id).unwrap());
-        assert!(store.set_guardian_skip_auto_build("nope", true).is_err());
-    }
-
-    #[test]
     fn preparation_defaults_empty_and_accepts_legacy_single_step_writes() {
         let store = Store::open_in_memory().unwrap();
         let id = store.create_guardian("r", "main", "/repo").unwrap();
@@ -8950,9 +9066,6 @@ mod tests {
         let g = store.get_guardian(&id).unwrap();
         assert_eq!(g.proof_scope, None);
         assert_eq!(g.effective_proof_scope, "nothing");
-        // Independent axis: the legacy flag must not affect skip_auto_build
-        // (RAL-110 split the old single skip_checks flag).
-        assert!(!g.skip_auto_build);
 
         // An explicit `proof_scope` override takes precedence over the legacy flag.
         store
@@ -9055,6 +9168,77 @@ mod tests {
             store
                 .set_guardian_skip_manual_checks("nope", Some(true))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn ci_deferral_resolves_review_over_project_over_default() {
+        let store = Store::open_in_memory().unwrap();
+        store.register_project("proj", "", "/repo", "git").unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.ci_deferral, None);
+        assert_eq!(g.effective_ci_deferral, "every", "defaults to every");
+
+        store
+            .set_project_review_settings(
+                "proj",
+                &crate::store::ProjectReviewSettings {
+                    default_ci_deferral: Some("top".to_string()),
+                    ..crate::store::ProjectReviewSettings::default()
+                },
+            )
+            .unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.ci_deferral, None);
+        assert_eq!(g.effective_ci_deferral, "top", "project default applies");
+
+        store
+            .set_guardian_ci_deferral(&id, Some("bottom+top"))
+            .unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.ci_deferral.as_deref(), Some("bottom+top"));
+        assert_eq!(
+            g.effective_ci_deferral, "bottom+top",
+            "review beats project"
+        );
+
+        store.set_guardian_ci_deferral(&id, Some("every")).unwrap();
+        assert_eq!(
+            store.get_guardian(&id).unwrap().effective_ci_deferral,
+            "every",
+            "an explicit review `every` beats a project `top`"
+        );
+
+        store.set_guardian_ci_deferral(&id, None).unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.ci_deferral, None);
+        assert_eq!(
+            g.effective_ci_deferral, "top",
+            "back to the project default"
+        );
+        assert!(store.set_guardian_ci_deferral("nope", Some("top")).is_err());
+    }
+
+    #[test]
+    fn ci_deferral_unrecognized_stored_values_never_win() {
+        let store = Store::open_in_memory().unwrap();
+        store.register_project("proj", "", "/repo", "git").unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store
+            .set_project_review_settings(
+                "proj",
+                &crate::store::ProjectReviewSettings {
+                    default_ci_deferral: Some("head+tip".to_string()),
+                    ..crate::store::ProjectReviewSettings::default()
+                },
+            )
+            .unwrap();
+        store.set_guardian_ci_deferral(&id, Some("bogus")).unwrap();
+        assert_eq!(
+            store.get_guardian(&id).unwrap().effective_ci_deferral,
+            "every",
+            "a bad value at every layer falls back to full CI"
         );
     }
 
@@ -10492,6 +10676,32 @@ mod tests {
             .unwrap();
         store.set_cell_state(&squad_id, 0, 0, cell_state).unwrap();
         squad_id
+    }
+
+    #[test]
+    fn branch_task_unfinished_mirrors_straggler_readiness() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        assert!(
+            !store.branch_task_unfinished(&id, "manual").unwrap(),
+            "a branch with no linked cell has nothing to wait for"
+        );
+
+        insert_cell_for_branch(&mut store, "running", NodeState::Running);
+        assert!(store.branch_task_unfinished(&id, "running").unwrap());
+
+        // RAL-442: a finished cell whose task then failed (e.g. the
+        // no-commits finalizer) has not delivered either.
+        insert_cell_for_branch_with_task_state(
+            &mut store,
+            "task-failed",
+            NodeState::Done,
+            NodeState::Failed,
+        );
+        assert!(store.branch_task_unfinished(&id, "task-failed").unwrap());
+
+        insert_cell_for_branch(&mut store, "done", NodeState::Done);
+        assert!(!store.branch_task_unfinished(&id, "done").unwrap());
     }
 
     #[test]

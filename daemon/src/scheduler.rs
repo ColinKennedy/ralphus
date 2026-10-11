@@ -9,7 +9,7 @@
 //! records each result, and finalizes task/squad states.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -493,6 +493,15 @@ impl Drop for SemaphorePermit<'_> {
     }
 }
 
+/// Name the scheduler thread is registered under in
+/// [`crate::thread_health`].
+pub const SCHEDULER_THREAD: &str = "scheduler";
+
+/// How long the scheduler loop may go without completing a pass before it is
+/// reported stalled. A pass is normally well under a second; the allowance
+/// covers one long maintenance sweep.
+pub const SCHEDULER_MAX_SILENCE: Duration = Duration::from_secs(300);
+
 /// Run the scheduler forever, ticking every [`POLL_INTERVAL`] and sweeping
 /// reviews for base-branch shifts every [`REVIEW_MAINT_INTERVAL`].
 ///
@@ -502,6 +511,12 @@ impl Drop for SemaphorePermit<'_> {
 /// [`crate::summary_worker::SummaryQueue`] — its background worker threads are
 /// spawned separately (`server::serve`), so this loop only ever enqueues into
 /// it, never processes it inline.
+///
+/// `first_run` is `true` for the process's first start of this loop and `false`
+/// when [`crate::thread_health::restart`] re-enters it: the startup recovery,
+/// reaping and first-pass sweeps assume nothing has been dispatched yet, which
+/// stops being true once the daemon has been serving.
+#[allow(clippy::too_many_arguments)]
 pub fn run_loop(
     store: crate::store_lock::StoreHandle,
     runner: Arc<dyn Runner>,
@@ -510,6 +525,7 @@ pub fn run_loop(
     sem: Arc<Semaphore>,
     summary_queue: Arc<crate::summary_worker::SummaryQueue>,
     procs: crate::procreg::ProcRegistry,
+    first_run: bool,
 ) {
     let mut last_maintenance = std::time::Instant::now();
     let mut last_summary_sweep = std::time::Instant::now();
@@ -525,7 +541,9 @@ pub fn run_loop(
     let cpu_stall_tracker = crate::cpu_stall::CpuStallTracker::new();
     // Ark persists its per-project due times, so calling once at startup is
     // cheap for projects whose configured interval has not elapsed.
-    crate::ark::periodic_sweep(&store, &cancellations, &sem);
+    if first_run {
+        crate::ark::periodic_sweep(&store, &cancellations, &sem);
+    }
     // RAL-385: same startup reasoning as the ark sweep -- only worktrees
     // already past the 30-day threshold are touched, so running the daily
     // retirement pass once at startup (then every
@@ -534,8 +552,10 @@ pub fn run_loop(
     // dual-root upstream-branch sweep rides along for the same reason -- a
     // branch left behind by a review that went terminal while the daemon was
     // down is retired promptly instead of waiting a full interval.
-    crate::guardian_merge::retire_stale_worktrees(&store);
-    crate::pr::sweep_terminal_dual_root_upstream_branches(&store);
+    if first_run {
+        crate::guardian_merge::retire_stale_worktrees(&store);
+        crate::pr::sweep_terminal_dual_root_upstream_branches(&store);
+    }
     let mut last_worktree_retirement = std::time::Instant::now();
     // Same daily cadence as the retirement sweep just above, but deliberately
     // NOT also run once here at startup the way that sweep is: startup is
@@ -553,17 +573,21 @@ pub fn run_loop(
     // Run once at startup too, so a freshly (re)started daemon doesn't wait a
     // full BASE_BRANCH_FRESHNESS_POLL_INTERVAL before its first base-branch
     // refresh -- same rationale as the ark call just above.
-    crate::guardian_merge::poll_base_branch_freshness_once(&store);
+    if first_run {
+        crate::guardian_merge::poll_base_branch_freshness_once(&store);
+    }
     let mut last_base_branch_freshness_poll = std::time::Instant::now();
     // RAL-389: self-heal a request lost to a crash between a branch's
     // terminal-status write and its durable queue write.
-    crate::pr::recover_pending_auto_submits_on_startup(&store);
-    recover_interrupted_reviews(&store, &sem, &cancellations);
+    if first_run {
+        crate::pr::recover_pending_auto_submits_on_startup(&store);
+        recover_interrupted_reviews(&store, &sem, &cancellations);
+    }
     // Recovery: start collecting guardians whose contributing cells are all
     // Done. This handles the case where the daemon was restarted after the squad
     // completed but before the guardian auto-started, and a full-merge crash (its
     // branches were reset to `pending` by `run_merge_cancellable`).
-    {
+    if first_run {
         let ids = {
             let guard = store.lock();
             let ids = match guard.collecting_guardians_ready() {
@@ -603,7 +627,7 @@ pub fn run_loop(
     // half-built) but not all branches done. A staged merge builds their
     // already-`Done` prefix plus the next buildable branch. Branches are left in
     // whatever state the crash left them; the pass re-evaluates.
-    {
+    if first_run {
         let ids = {
             let guard = store.lock();
             guard.collecting_guardians_resumable().unwrap_or_default()
@@ -611,6 +635,10 @@ pub fn run_loop(
         start_reviews(&store, ids, &sem, &cancellations);
     }
     loop {
+        crate::watchdog::loop_beat(
+            crate::watchdog::DaemonLoop::Scheduler,
+            crate::watchdog::SCHEDULER_STALE_AFTER,
+        );
         tick(&store, &runner, &sem, &cancellations, &summary_queue);
         if last_maintenance.elapsed() >= REVIEW_MAINT_INTERVAL {
             crate::guardian_merge::review_maintenance(&store, &sem, &cancellations);
@@ -1228,14 +1256,11 @@ fn execute_squad_inner(
         }
         resolved
     };
-    // RAL-<pending>: decide every LOCAL cell's worktree (branch claim +
-    // `w/<short>` directory) under a brief lock, then actually create/resync
-    // them -- the real `git worktree add`/`fetch`/rebase -- with NO lock
-    // held, concurrently. Without this, the locked pass just below would run
-    // that same real git work serially, one cell at a time, for the ENTIRE
-    // duration the store lock is held -- stalling every other request the
-    // daemon serves meanwhile, not just this squad's own dispatch. See
-    // `crate::worktrees::plan_local_worktree_jobs`'s doc comment.
+    // Decide and durably claim every LOCAL cell's worktree (branch claim +
+    // `w/<short>` directory + creation marker) under a brief lock. No git work
+    // happens here: the claimed worktrees are created in the background below
+    // (or by the cell that needs one first), so the squad starts without
+    // waiting for any checkout. See `crate::worktrees::plan_local_worktree_jobs`.
     let prefetched_worktrees = {
         let guard = store.lock();
         let jobs = crate::worktrees::plan_local_worktree_jobs(
@@ -1246,7 +1271,7 @@ fn execute_squad_inner(
             &prefetched_upstreams,
         );
         drop(guard);
-        crate::worktrees::execute_local_worktree_jobs(&jobs)
+        crate::worktrees::planned_worktree_paths(&jobs)
     };
     // Resolve every worktree-placeholder `cwd` (RAL-100) before planning: a
     // placeholder repeated across cells/tasks materializes exactly one
@@ -1276,6 +1301,11 @@ fn execute_squad_inner(
             return;
         }
     }
+    // Every cell whose cwd is a claimed-but-not-yet-created worktree (including
+    // claims left by a daemon that restarted mid-materialization, recovered from
+    // their markers). The background creator below and each such cell's worker
+    // both go through `ensure_claimed_worktree`, which is single-flight.
+    let worktree_claims = pending_worktree_claims(&cells, &tasks);
     crate::rlog!(
         INFO,
         "ralphus [scheduler] squad {squad_id} executing ({} cells, {} tasks)",
@@ -1397,6 +1427,7 @@ fn execute_squad_inner(
         let cells_ref = &cells;
         let progress_ref = &progress;
         let plan_ref = &plan;
+        let claims_ref = &worktree_claims;
 
         // Spawn proof-only workers immediately for cells that are Done but
         // have pending proofs (restart_cell_proof or crash recovery). They
@@ -1426,6 +1457,21 @@ fn execute_squad_inner(
                     progress_ref,
                     i,
                     trace_ref,
+                );
+            });
+        }
+
+        // Create the claimed worktrees in the background while cells whose
+        // worktree is already ready start.
+        if !worktree_claims.is_empty() {
+            scope.spawn(move || {
+                create_claimed_worktrees_in_background(
+                    store,
+                    squad_id,
+                    cancel,
+                    cells_ref,
+                    progress_ref,
+                    claims_ref,
                 );
             });
         }
@@ -1910,6 +1956,7 @@ fn execute_squad_inner(
                         i,
                         trace_ref,
                         dispatch_priority,
+                        claims_ref,
                     );
                 });
             }
@@ -2137,6 +2184,220 @@ fn try_upstream_rebase(
         row.cell_id
     );
     None
+}
+
+/// A cell's claimed-but-not-yet-created worktree.
+struct WorktreeClaim {
+    /// The planned `w/<short>` directory, which is also the cell's cwd.
+    wt: PathBuf,
+    /// The task's registered project, used to route the worktree to the
+    /// submitter's fork once it exists.
+    project: Option<String>,
+}
+
+/// The pending worktree claims of one squad run, by cell index.
+struct WorktreeClaims {
+    by_cell: HashMap<usize, WorktreeClaim>,
+}
+
+impl WorktreeClaims {
+    fn for_cell(&self, i: usize) -> Option<&WorktreeClaim> {
+        self.by_cell.get(&i)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.by_cell.is_empty()
+    }
+
+    /// Distinct worktrees with the cells that wait on each, in cell order.
+    fn groups(&self) -> Vec<(&WorktreeClaim, Vec<usize>)> {
+        let mut order: Vec<usize> = self.by_cell.keys().copied().collect();
+        order.sort_unstable();
+        let mut groups: Vec<(&WorktreeClaim, Vec<usize>)> = Vec::new();
+        for i in order {
+            let claim = &self.by_cell[&i];
+            match groups.iter_mut().find(|(g, _)| g.wt == claim.wt) {
+                Some((_, cells)) => cells.push(i),
+                None => groups.push((claim, vec![i])),
+            }
+        }
+        groups
+    }
+}
+
+/// The cells of `cells` whose cwd is a worktree still waiting to be created.
+fn pending_worktree_claims(
+    cells: &[crate::store::CellRow],
+    tasks: &[crate::store::TaskRow],
+) -> WorktreeClaims {
+    let projects: HashMap<i64, Option<&str>> = tasks
+        .iter()
+        .map(|t| (t.idx, t.project.as_deref()))
+        .collect();
+    let by_cell = cells
+        .iter()
+        .enumerate()
+        .filter_map(|(i, row)| {
+            let wt = PathBuf::from(row.cwd.as_deref()?);
+            crate::worktrees::pending_worktree_at(&wt)?;
+            let project = projects
+                .get(&row.task_idx)
+                .copied()
+                .flatten()
+                .map(str::to_string);
+            Some((i, WorktreeClaim { wt, project }))
+        })
+        .collect();
+    WorktreeClaims { by_cell }
+}
+
+/// Create (or wait for) `claim`'s worktree on behalf of `row`, with a
+/// Cartographer note saying what happened.
+fn ensure_cell_worktree(
+    store: &crate::store_lock::StoreHandle,
+    squad_id: &str,
+    row: &crate::store::CellRow,
+    claim: &WorktreeClaim,
+) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    let materialized = crate::worktrees::ensure_claimed_worktree(
+        store,
+        squad_id,
+        claim.project.as_deref(),
+        &claim.wt,
+    )?;
+    let Some(materialized) = materialized else {
+        return Ok(());
+    };
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let how = if materialized.waited {
+        "waited for the in-flight creation of"
+    } else {
+        "created"
+    };
+    crate::cartographer::Note::new("scheduler")
+        .level(crate::logging::LogLevel::INFO)
+        .scope("materialize")
+        .squad(squad_id)
+        .task(&row.task_name)
+        .cell(&row.cell_id)
+        .emit(
+            &store.lock(),
+            format!(
+                "cell {squad_id}/{} {how} its worktree {} ({elapsed_ms}ms)",
+                row.cell_id,
+                claim.wt.display()
+            ),
+            serde_json::json!({
+                "worktree": claim.wt.display().to_string(),
+                "waited": materialized.waited,
+                "repaired": materialized.repaired,
+                "elapsed_ms": elapsed_ms,
+            }),
+        );
+    Ok(())
+}
+
+/// Record `row` as failed because its worktree could not be created, and tell
+/// the squad's watchers (with remediation) through the mailbox.
+fn fail_cell_for_worktree(
+    store: &crate::store_lock::StoreHandle,
+    squad_id: &str,
+    row: &crate::store::CellRow,
+    message: &str,
+) {
+    let message = format!("could not create the cell's worktree: {message}");
+    crate::rlog!(
+        ERROR,
+        "ralphus [scheduler] cell {squad_id}/{} {message}",
+        row.cell_id,
+    );
+    let outcome = crate::store::CellOutcome {
+        state: crate::store::NodeState::Failed,
+        usage: crate::store::RecordedUsage::default(),
+        error: Some(message.clone()),
+        agent_session_id: None,
+    };
+    let guard = store.lock();
+    store_ok(
+        &guard,
+        squad_id,
+        "record_cell_result",
+        guard.record_cell_result(squad_id, row.task_idx, row.idx, &outcome),
+    );
+    let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+        level: crate::logging::LogLevel::ERROR,
+        source: "scheduler",
+        message: "cell failed: worktree could not be created",
+        scope: Some("cell"),
+        squad_id: Some(squad_id),
+        guardian_id: None,
+        cell_id: Some(&row.cell_id),
+        task: Some(&row.task_name),
+        log_path: None,
+        payload: serde_json::json!({"error": message}),
+        admin_only: false,
+    });
+    enqueue_cell_failure_mailbox(
+        &guard,
+        squad_id,
+        &row.cell_id,
+        &row.task_name,
+        Some(&message),
+    );
+}
+
+/// Create every claimed worktree, at most
+/// [`crate::worktrees::MAX_PARALLEL_WORKTREE_JOBS`] at a time and with no store
+/// lock held. A creation that fails for good fails the cells waiting on that
+/// worktree right away (those not yet dispatched; a dispatched one reports the
+/// same failure from its own worker) while every other cell carries on.
+fn create_claimed_worktrees_in_background(
+    store: &crate::store_lock::StoreHandle,
+    squad_id: &str,
+    cancel: &CancelToken,
+    cells: &[crate::store::CellRow],
+    progress: &Mutex<Progress>,
+    claims: &WorktreeClaims,
+) {
+    let groups = claims.groups();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let workers = groups
+        .len()
+        .min(crate::worktrees::MAX_PARALLEL_WORKTREE_JOBS);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let n = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let Some((claim, waiting)) = groups.get(n) else {
+                        return;
+                    };
+                    if cancel.is_cancelled() {
+                        return;
+                    }
+                    let first = &cells[waiting[0]];
+                    let Err(message) = ensure_cell_worktree(store, squad_id, first, claim) else {
+                        continue;
+                    };
+                    for &i in waiting {
+                        let still_pending = {
+                            let mut prog = progress.lock().expect("progress mutex poisoned");
+                            let pending = prog.status[i] == CellState::Pending;
+                            if pending {
+                                prog.status[i] = CellState::Failed;
+                                prog.failed.insert(cells[i].task_idx);
+                            }
+                            pending
+                        };
+                        if still_pending {
+                            fail_cell_for_worktree(store, squad_id, &cells[i], &message);
+                        }
+                    }
+                }
+            });
+        }
+    });
 }
 
 /// RAL-241: broadcast a mailbox message for a cell that just failed, so a
@@ -2996,6 +3257,7 @@ fn run_cell_worker(
     i: usize,
     trace_context: Option<&str>,
     dispatch_priority: f64,
+    worktree_claims: &WorktreeClaims,
 ) {
     let row = &cells[i];
     // Held for the worker's whole lifetime so every early return below still
@@ -3035,6 +3297,21 @@ fn run_cell_worker(
             }),
             admin_only: false,
         });
+    }
+    // The cell's worktree may still be a claim the background creator has not
+    // reached: create it now (or wait for the creation already in flight), before
+    // taking a scheduler slot so the wait does not hold one.
+    if let Some(claim) = worktree_claims.for_cell(i) {
+        if let Err(message) = ensure_cell_worktree(store, squad_id, row, claim) {
+            fail_cell_for_worktree(store, squad_id, row, &message);
+            let mut prog = progress.lock().expect("progress mutex poisoned");
+            prog.status[i] = CellState::Failed;
+            prog.failed.insert(row.task_idx);
+            return;
+        }
+        if cancel.is_cancelled() {
+            return;
+        }
     }
     // Acquire a global slot; released when `_permit` drops at function end.
     // RAL-280: ranked, not plain `acquire()` — cells that unblock a Review's
@@ -3132,15 +3409,19 @@ fn run_cell_worker(
         // A cell that really was halted is resuming into a world that moved
         // while it waited -- the waypoint's change has landed upstream since.
         // Rebase before clearing the flag, so it resumes against a tree that
-        // actually contains what its guidance is about. Done under the lock
-        // like the rest of this block; the rebase is a local, already-fetched
-        // worktree operation, not a network round trip.
+        // actually contains what its guidance is about. The rebase is a git
+        // subprocess, so it runs with the store guard released: held under the
+        // lock it blocks every other store user, and a debug daemon's guard
+        // watchdog panics the worker thread, stranding the cell as `running`
+        // with no runner.
         let was_waypoint_halted = matches!(
             guard.cell_waypoint_halted_at_ms(squad_id, row.task_idx, row.idx),
             Ok(Some(_))
         );
-        if was_waypoint_halted {
-            let rebased = rebase_resumed_cell_onto_upstream(row);
+        drop(guard);
+        let rebased = was_waypoint_halted.then(|| rebase_resumed_cell_onto_upstream(row));
+        let guard = store.lock();
+        if let Some(rebased) = rebased {
             // Which waypoint held it. Gone by now in the normal case -- the
             // hold lifted because its affected landed -- so fall back to the
             // most recent one that affects this squad rather than reporting
@@ -4035,52 +4316,34 @@ fn run_cell_worker(
         }
     }
 
-    // Prophecy transport phase 2 (docs/prophecy-design.md §6.1): the at-exit
-    // backstop -- every `RALPHUS_PROPHECY:` marker the runner found crosses
-    // the provider boundary inside this same `exec` reply, mirroring the
-    // ghost handling just above. `attempt` is `0` for every write here: there
-    // is no per-cell restart counter in the schema today (a real
-    // improvement, out of scope for this phase), so a restarted cell's
-    // prophecies are not yet distinguished by attempt number the way the
-    // design intends -- they still each get their own row (append-only),
-    // just without a meaningfully distinct `attempt` value yet.
+    // Prophecy transport (docs/prophecy-design.md §6.1): the at-exit
+    // backstop -- every `RALPHUS_PROPHECY:` marker the runner collected over
+    // the run crosses the provider boundary inside this same `exec` reply,
+    // mirroring the ghost handling just above. Markers already delivered
+    // live as `prophecy` events dedupe against these on the store's unique
+    // key, so this only fills in whatever the live path missed.
     if !result.prophecies.is_empty() {
-        let uri = crate::ghost::cell_uri(squad_id, row.task_idx, row.idx);
         let revision = crate::ghost::current_revision(row.cwd.as_deref().unwrap_or_default());
         let guard = store.lock();
+        let target = crate::prophecy::CellProphecyTarget {
+            task_idx: row.task_idx,
+            idx: row.idx,
+            cwd: row.cwd.clone(),
+            attempt: guard.cell_restart_count(squad_id, row.task_idx, row.idx),
+        };
         for marker in &result.prophecies {
-            let Ok(kind) = marker.kind.parse::<crate::prophecy::ProphecyKind>() else {
-                crate::cartographer::Note::new("prophecy")
-                    .level(crate::logging::LogLevel::WARNING)
-                    .scope("cell")
-                    .squad(squad_id)
-                    .cell(&row.cell_id)
-                    .task(&row.task_name)
-                    .emit(
-                        &guard,
-                        format!(
-                            "prophecy marker dropped: unknown kind {:?} cell={squad_id}/{}",
-                            marker.kind, row.cell_id
-                        ),
-                        serde_json::json!({ "kind": marker.kind, "body_len": marker.body.len() }),
-                    );
-                continue;
-            };
-            // `add_prophecy` already emits its own Cartographer row (and the
-            // log line that rides along with it) on success -- nothing
-            // further to log here.
             store_ok(
                 &guard,
                 squad_id,
                 "add_prophecy",
-                guard.add_prophecy(
-                    &uri,
-                    0,
-                    kind,
-                    &marker.body,
+                guard.record_cell_prophecy_marker(
+                    squad_id,
+                    &row.task_name,
+                    &row.cell_id,
+                    &target,
                     revision.as_deref(),
-                    Some(squad_id),
-                    None,
+                    &marker.kind,
+                    &marker.body,
                 ),
             );
         }
@@ -5271,7 +5534,7 @@ fn proof_execution_context(
         specs[..position]
             .iter()
             .enumerate()
-            .map(|(prior_position, (prior_idx, prior_id, ..))| {
+            .map(|(prior_position, (prior_idx, prior_id, kind, spec, ..))| {
                 let state = guard
                     .proof_state(squad_id, task_idx, scope, cell_idx, *prior_idx)
                     .ok()
@@ -5279,21 +5542,13 @@ fn proof_execution_context(
                 (
                     proof_context_name(prior_id.as_deref(), prior_position),
                     proof_context_status(state.as_deref()),
+                    (kind == "command").then(|| spec.clone()),
                 )
             })
             .collect::<Vec<_>>()
     };
     let current = proof_context_name(current_id, position);
-    let earlier_text = if earlier.is_empty() {
-        "There are no earlier proofs in this scope.".to_string()
-    } else {
-        let rows = earlier
-            .iter()
-            .map(|(name, status)| format!("- `{name}`: {status}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        format!("Earlier proof results:\n{rows}")
-    };
+    let earlier_text = earlier_proofs_text(&earlier);
 
     format!(
         "## Ralphus proof execution context\n\n\
@@ -5308,6 +5563,85 @@ fn proof_execution_context(
         position + 1,
         specs.len(),
     )
+}
+
+/// Longest prior `command` proof (in characters) quoted verbatim in a proof
+/// prompt; anything longer is cut and marked with [`COMMAND_CLIP_MARKER`].
+const PRIOR_PROOF_COMMAND_MAX_CHARS: usize = 150;
+const COMMAND_CLIP_MARKER: &str = "… [clipped]";
+
+/// Collapse a command to one line and clip it to
+/// [`PRIOR_PROOF_COMMAND_MAX_CHARS`] characters (never splitting a character).
+fn clip_prior_command(command: &str) -> String {
+    let one_line = command
+        .trim()
+        .replace("\r\n", " ")
+        .replace(['\n', '\r', '`'], " ");
+    if one_line.chars().count() <= PRIOR_PROOF_COMMAND_MAX_CHARS {
+        return one_line;
+    }
+    let cut: String = one_line
+        .chars()
+        .take(PRIOR_PROOF_COMMAND_MAX_CHARS)
+        .collect();
+    format!("{}{COMMAND_CLIP_MARKER}", cut.trim_end())
+}
+
+/// Render the earlier-proofs section: `(name, status, command)` per proof,
+/// where `command` is `Some` only for `command` proofs (prompt proofs are
+/// listed by name only).
+fn earlier_proofs_text(earlier: &[(String, &'static str, Option<String>)]) -> String {
+    if earlier.is_empty() {
+        return "There are no earlier proofs in this scope.".to_string();
+    }
+    let rows = earlier
+        .iter()
+        .map(|(name, status, command)| match command {
+            Some(command) => format!(
+                "- `{name}`: {status} — ran command: `{}`",
+                clip_prior_command(command)
+            ),
+            None => format!("- `{name}`: {status}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut text = format!("Earlier proof results:\n{rows}");
+    if earlier.iter().any(|(.., command)| command.is_some()) {
+        text.push_str(
+            "\n\nDo not re-run the commands above: they already ran for an earlier proof. \
+             Do not run any other tests of the same class either (for example, if an earlier \
+             proof was a Rust proof and this one is not, do not run Rust tests at all).",
+        );
+    }
+    text
+}
+
+/// The declined-work section for a cell-scope proof that extends a judge
+/// preset, built from its cell's `refused` prophecies; `None` for any other
+/// proof or when nothing was refused. Diagnostic context only -- it has no
+/// bearing on the cell's or proof's outcome.
+fn declined_work_for_proof(
+    store: &crate::store_lock::StoreHandle,
+    squad_id: &str,
+    task_idx: i64,
+    scope: &str,
+    cell_idx: i64,
+    idx: i64,
+    cell_sid: Option<&str>,
+) -> Option<String> {
+    if scope != "cell" || cell_sid.is_none() {
+        return None;
+    }
+    let guard = store.lock();
+    if !guard
+        .proof_receives_refusals(squad_id, task_idx, scope, cell_idx, idx)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let uri = crate::ghost::cell_uri(squad_id, task_idx, cell_idx);
+    let prophecies = guard.list_prophecies_for_entity(&uri).unwrap_or_default();
+    crate::prophecy::declined_work_section(&prophecies)
 }
 
 fn proof_context_name(id: Option<&str>, position: usize) -> String {
@@ -5888,6 +6222,12 @@ fn run_proofs(
                     proof_id.as_deref(),
                 );
                 let mut prompt = format!("{spec}\n\n{proof_context}");
+                if let Some(declined) = declined_work_for_proof(
+                    store, squad_id, task_idx, scope, cell_idx, idx, cell_sid,
+                ) {
+                    prompt.push_str("\n\n");
+                    prompt.push_str(&declined);
+                }
                 if let Some(guidance) = restart_guidance.as_deref() {
                     prompt.push_str("\n\nHuman guidance for this restarted proof:\n\n");
                     prompt.push_str(guidance);
@@ -6167,6 +6507,62 @@ mod tests {
     use crate::runner::{RunnerResult, RunnerSpec};
     use std::collections::BTreeMap;
 
+    #[test]
+    fn earlier_proofs_text_no_prior_proofs() {
+        assert_eq!(
+            earlier_proofs_text(&[]),
+            "There are no earlier proofs in this scope."
+        );
+    }
+
+    #[test]
+    fn earlier_proofs_text_short_command_is_quoted_with_no_rerun_guidance() {
+        let text = earlier_proofs_text(&[(
+            "fmt".to_string(),
+            "PASS",
+            Some("cargo fmt --all -- --check".to_string()),
+        )]);
+        assert!(text.contains("- `fmt`: PASS — ran command: `cargo fmt --all -- --check`"));
+        assert!(text.contains("Do not re-run the commands above"));
+        assert!(text.contains("same class"));
+        assert!(!text.contains("[clipped]"));
+    }
+
+    #[test]
+    fn earlier_proofs_text_clips_long_commands_on_a_char_boundary() {
+        let long = "é".repeat(PRIOR_PROOF_COMMAND_MAX_CHARS + 40);
+        let text = earlier_proofs_text(&[("t".to_string(), "PASS", Some(long))]);
+        let expected = format!(
+            "`{}{COMMAND_CLIP_MARKER}`",
+            "é".repeat(PRIOR_PROOF_COMMAND_MAX_CHARS)
+        );
+        assert!(text.contains(&expected));
+        let exact = "x".repeat(PRIOR_PROOF_COMMAND_MAX_CHARS);
+        assert_eq!(clip_prior_command(&exact), exact);
+    }
+
+    #[test]
+    fn earlier_proofs_text_mixed_command_and_prompt() {
+        let text = earlier_proofs_text(&[
+            (
+                "fmt".to_string(),
+                "PASS",
+                Some("cargo fmt\n--check".to_string()),
+            ),
+            ("review".to_string(), "PASS", None),
+        ]);
+        assert!(text.contains("- `fmt`: PASS — ran command: `cargo fmt --check`"));
+        assert!(text.contains("- `review`: PASS\n") || text.contains("- `review`: PASS"));
+        assert!(!text.contains("`review`: PASS — ran command"));
+        assert!(text.contains("Do not re-run"));
+    }
+
+    #[test]
+    fn earlier_proofs_text_prompt_only_has_no_rerun_guidance() {
+        let text = earlier_proofs_text(&[("review".to_string(), "PASS", None)]);
+        assert!(!text.contains("Do not re-run"));
+    }
+
     /// RAL-524: startup feedback recovery defers to an explicit user stop.
     /// A `merge_stopped` review's queued feedback stays queued (applied once
     /// the review is deliberately resumed and recovery runs again), and no
@@ -6363,6 +6759,63 @@ mod tests {
         assert_eq!(recorded[0].kind, "hazard");
         assert_eq!(recorded[0].body, "left a race condition unresolved");
         assert_eq!(recorded[0].squad_id.as_deref(), Some(id.as_str()));
+    }
+
+    /// A cell that declines part of its prompt (a `refused` prophecy) and
+    /// proofs that record the prompt they were dispatched with.
+    struct RefusingCellRunner {
+        proof_prompts: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Runner for RefusingCellRunner {
+        fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+            let mut result = ProphecyRunner { markers: vec![] }.run(spec);
+            if spec.proof {
+                self.proof_prompts
+                    .lock()
+                    .unwrap()
+                    .push(spec.prompt.clone().unwrap_or_default());
+                result.proofed = Some(true);
+            } else {
+                result.prophecies = vec![crate::runner::RunnerProphecyMarker {
+                    kind: "refused".to_string(),
+                    body: "drop the audit table; it would destroy data".to_string(),
+                }];
+            }
+            result
+        }
+    }
+
+    #[test]
+    fn refused_prophecy_reaches_judge_proof_only_and_does_not_change_outcome() {
+        let toml = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\".\"\nprompt=\"do the work\"\n\
+                    [[task.cell.proof]]\nid=\"judge\"\nprompt=\"assess it\"\n\
+                    extends=[\"<<ralphus:presets/roles/judge/security>>\"]\n\
+                    [[task.cell.proof]]\nid=\"plain\"\nprompt=\"check it\"\n\
+                    extends=[\"<<ralphus:presets/other>>\"]\n";
+        let (store, id) = store_with(toml);
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        execute_squad(
+            &store,
+            &RefusingCellRunner {
+                proof_prompts: Arc::clone(&prompts),
+            },
+            &id,
+        );
+        let prompts = prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 2);
+        assert!(prompts[0].starts_with("assess it"), "{}", prompts[0]);
+        assert!(prompts[0].contains("## Declined work"), "{}", prompts[0]);
+        assert!(
+            prompts[0].contains("drop the audit table; it would destroy data"),
+            "{}",
+            prompts[0]
+        );
+        assert!(!prompts[1].contains("Declined work"), "{}", prompts[1]);
+        let uri = crate::ghost::cell_uri(&id, 0, 0);
+        let recorded = store.lock().list_prophecies_for_entity(&uri).unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].kind, "refused");
     }
 
     /// RAL-288 Stage 6: records whatever `resume_agent_session_id` (and, for
@@ -10509,6 +10962,8 @@ mod tests {
             maximum_context: None,
             auto_compact_threshold: None,
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             upstream: None,
             machine: None,
             maximum_timeout_sec: None,
@@ -10548,6 +11003,23 @@ mod tests {
 
     // Sentinel-string parsing itself is covered by
     // `ralphus_core::schema::parse_upstream_task_ref`'s own unit tests.
+
+    /// The waypoint-resume rebase is a git subprocess; it must run with the
+    /// store guard released (a debug daemon's guard watchdog panics the worker
+    /// thread on a >2s hold, stranding the cell as `running` with no runner).
+    #[test]
+    fn waypoint_resume_rebase_runs_outside_the_store_guard() {
+        let src = include_str!("scheduler.rs");
+        let call =
+            "let rebased = was_waypoint_halted.then(|| rebase_resumed_cell_onto_upstream(row));";
+        let at = src.find(call).expect("rebase call site present");
+        let before = &src[..at];
+        let tail = &before[before.len().saturating_sub(200)..];
+        assert!(
+            tail.contains("drop(guard);"),
+            "the store guard must be dropped before the resume rebase"
+        );
+    }
 
     #[test]
     fn try_upstream_rebase_noop_when_upstream_is_none() {
@@ -10661,6 +11133,8 @@ mod tests {
             maximum_context: None,
             auto_compact_threshold: None,
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             upstream: None,
             machine: None,
             maximum_timeout_sec: None,

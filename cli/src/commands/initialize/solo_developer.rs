@@ -1,8 +1,8 @@
-//! `ralphus initialize server` (RAL-501): the interactive, hidden new-
+//! `ralphus initialize solo-developer` (RAL-501): the interactive, hidden new-
 //! installation walkthrough. Deliberately absent from `help_map.rs` (see the
 //! `resolved_path` carve-out there), so it never appears in `--help`,
 //! `show help-map`, or the help-map-derived MCP tool surface, yet is still
-//! directly invocable as `ralphus initialize server [--yes]`. Every answer
+//! directly invocable as `ralphus initialize solo-developer [--yes]`. Every answer
 //! also has a flag, allowing a complete setup to run without a terminal.
 //!
 //! `--yes` accepts every stage's default answer instead of prompting, for
@@ -10,9 +10,9 @@
 //! the same way `ralphus mcp initialize` rejects one (see `mcp.rs`).
 //! Boolean answer flags take `yes` or `no`: `--install-tmux`,
 //! `--setup-mcp`, `--register-project`, `--review-auto-submit-pr-stack`,
-//! `--require-forks`, `--create-admin`, `--setup-forge-token`, `--submit-sample`.
+//! `--require-forks`, `--force-skills`, `--create-admin`, `--setup-forge-token`, `--submit-sample`.
 //! The value flags are `--tmux-program`, repeatable
-//! `--mcp-host`, `--agent-logins` (`claude,codex`, `all`, or `none`), `--project-name`, `--project-description`, `--project-is-fork`,
+//! `--mcp-host`, `--agent-logins` (`claude,codex`, `all`, or `none`), `--install-skills` (`claude-code,codex,pi`, `all`, or `none`), `--project-name`, `--project-description`, `--project-is-fork`,
 //! `--project-fork-url`, `--project-url`,
 //! `--fork-user`, `--fork-url`, `--forge-provider`,
 //! `--forge-host`, `--forge-token`, `--admin-name`,
@@ -44,6 +44,7 @@ use std::io::{IsTerminal as _, Write as _};
 use std::path::PathBuf;
 
 mod answers;
+mod skills;
 
 use crate::args::GlobalOpts;
 use crate::client::ProjectReviewSettingsPatch;
@@ -51,10 +52,11 @@ use crate::health::CheckResult;
 use answers::Source;
 use ralphus_core::git_remote::{default_upstream_remote, find_remote_for_url};
 use ralphus_runner::login_probe::{LoginProbe, LoginState, LoginStatus, StatusRun, login_probes};
+use ralphus_runner::skills_install::skills_harnesses;
 
-const TOTAL_STEPS: u32 = 10;
+const TOTAL_STEPS: u32 = 11;
 const WINDOWS_MINIMUM_TMUX_VERSION: (u32, u32, u32) = (3, 3, 8);
-const SAMPLE_LABEL_PREFIX: &str = "ralphus initialize server: hello world";
+const SAMPLE_LABEL_PREFIX: &str = "ralphus initialize solo-developer: hello world";
 
 pub(crate) fn validate_forge_host(host: &str) -> Result<(), String> {
     let lower = host.to_ascii_lowercase();
@@ -119,6 +121,14 @@ const MCP_HOST: InitializeSetting = InitializeSetting {
 const AGENT_LOGINS: InitializeSetting = InitializeSetting {
     prompt: "agent logins",
     flag: "--agent-logins",
+};
+const INSTALL_SKILLS: InitializeSetting = InitializeSetting {
+    prompt: "install skills",
+    flag: "--install-skills",
+};
+const FORCE_SKILLS: InitializeSetting = InitializeSetting {
+    prompt: "overwrite modified skills",
+    flag: "--force-skills",
 };
 const REGISTER_PROJECT: InitializeSetting = InitializeSetting {
     prompt: "register project",
@@ -207,6 +217,8 @@ const INTERACTIVE_SETTINGS: &[&InitializeSetting] = &[
     &SETUP_MCP,
     &MCP_HOST,
     &AGENT_LOGINS,
+    &INSTALL_SKILLS,
+    &FORCE_SKILLS,
     &REGISTER_PROJECT,
     &PROJECT_NAME,
     &PROJECT_IS_FORK,
@@ -243,7 +255,7 @@ fn interactive_settings_are_valid() -> bool {
 }
 
 #[derive(Default)]
-pub struct InitializeServerOptions {
+pub struct InitializeSoloDeveloperOptions {
     pub yes: bool,
     /// Saved answers to replay (`--answers-file`); flags still win.
     pub answers_file: Option<PathBuf>,
@@ -254,6 +266,12 @@ pub struct InitializeServerOptions {
     /// Backends to log in to (`claude,codex`, `all`, `none`); pre-answers the
     /// agent-logins prompt.
     pub agent_logins: Option<String>,
+    /// Harnesses to install the ralphus skills for (`claude-code,codex,pi`,
+    /// `all`, `none`); pre-answers the install-skills prompt.
+    pub install_skills: Option<String>,
+    /// Whether a modified, already-installed skill may be replaced (its old
+    /// contents are kept as `SKILL.md.bak`); pre-answers the overwrite prompt.
+    pub force_skills: Option<bool>,
     pub register_project: Option<bool>,
     pub project_name: Option<String>,
     pub project_is_fork: Option<bool>,
@@ -276,10 +294,10 @@ pub struct InitializeServerOptions {
     pub sample_agent: Option<String>,
 }
 
-impl std::fmt::Debug for InitializeServerOptions {
+impl std::fmt::Debug for InitializeSoloDeveloperOptions {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("InitializeServerOptions")
+            .debug_struct("InitializeSoloDeveloperOptions")
             .field("yes", &self.yes)
             .field("answers_file", &self.answers_file)
             .field("install_tmux", &self.install_tmux)
@@ -287,6 +305,8 @@ impl std::fmt::Debug for InitializeServerOptions {
             .field("setup_mcp", &self.setup_mcp)
             .field("mcp_hosts", &self.mcp_hosts)
             .field("agent_logins", &self.agent_logins)
+            .field("install_skills", &self.install_skills)
+            .field("force_skills", &self.force_skills)
             .field("register_project", &self.register_project)
             .field("project_name", &self.project_name)
             .field("project_is_fork", &self.project_is_fork)
@@ -317,7 +337,7 @@ impl std::fmt::Debug for InitializeServerOptions {
     }
 }
 
-impl InitializeServerOptions {
+impl InitializeSoloDeveloperOptions {
     fn is_non_interactive(&self) -> bool {
         self.yes
             || self.answers_file.is_some()
@@ -326,6 +346,8 @@ impl InitializeServerOptions {
             || self.setup_mcp.is_some()
             || !self.mcp_hosts.is_empty()
             || self.agent_logins.is_some()
+            || self.install_skills.is_some()
+            || self.force_skills.is_some()
             || self.register_project.is_some()
             || self.project_name.is_some()
             || self.project_is_fork.is_some()
@@ -349,7 +371,7 @@ impl InitializeServerOptions {
     }
 }
 
-pub fn dispatch(opts: &GlobalOpts, mut setup: InitializeServerOptions) -> i32 {
+pub fn dispatch(opts: &GlobalOpts, mut setup: InitializeSoloDeveloperOptions) -> i32 {
     debug_assert!(interactive_settings_are_valid());
     answers::reset();
     if let Some(path) = setup.answers_file.clone() {
@@ -360,12 +382,12 @@ pub fn dispatch(opts: &GlobalOpts, mut setup: InitializeServerOptions) -> i32 {
     }
     if !setup.yes && !setup.is_non_interactive() && !std::io::stdin().is_terminal() {
         println!(
-            "error: ralphus initialize server needs a terminal to prompt interactively; pass --yes to accept every stage's default non-interactively"
+            "error: ralphus initialize solo-developer needs a terminal to prompt interactively; pass --yes to accept every stage's default non-interactively"
         );
         return 2;
     }
 
-    println!("ralphus interactive server setup");
+    println!("ralphus interactive solo-developer setup");
 
     let mut step = Step::new(TOTAL_STEPS);
 
@@ -377,6 +399,9 @@ pub fn dispatch(opts: &GlobalOpts, mut setup: InitializeServerOptions) -> i32 {
 
     step.begin("Check agent logins (Claude Code, Codex)");
     let logins = step_agent_logins(opts, &setup);
+
+    step.begin("Install the ralphus skills (optional)");
+    step_skills(&setup);
 
     step.begin("Register this repository as a project (optional)");
     let pending_project = step_project(opts, &setup);
@@ -430,7 +455,7 @@ pub fn dispatch(opts: &GlobalOpts, mut setup: InitializeServerOptions) -> i32 {
     );
     println!("{answers_text}");
     println!(
-        "  equivalent command: ralphus initialize server --answers-file {}",
+        "  equivalent command: ralphus initialize solo-developer --answers-file {}",
         answers_path.display()
     );
     println!(
@@ -555,7 +580,7 @@ fn default_user_name() -> String {
 
 // ---- tmux/psmux -----------------------------------------------------------
 
-fn step_tmux(setup: &InitializeServerOptions) -> bool {
+fn step_tmux(setup: &InitializeSoloDeveloperOptions) -> bool {
     match ralphus_daemon::tmux::resolve_tmux_program_with_source() {
         Ok((program, source)) => {
             println!("  found a tmux-compatible binary: {program} (source: {source})");
@@ -624,7 +649,7 @@ fn version_at_least(version_text: &str, minimum: (u32, u32, u32)) -> bool {
     (major, minor, patch) >= minimum
 }
 
-fn offer_tmux_alternative(setup: &InitializeServerOptions) -> bool {
+fn offer_tmux_alternative(setup: &InitializeSoloDeveloperOptions) -> bool {
     if setup.yes && setup.install_tmux.is_none() && setup.tmux_program.is_none() {
         println!(
             "  skipping tmux install/alternative prompts (--yes); `ralphus check health` will report this below"
@@ -684,7 +709,7 @@ fn offer_tmux_alternative(setup: &InitializeServerOptions) -> bool {
 
 // ---- MCP host setup ---------------------------------------------------------
 
-fn step_mcp(setup: &InitializeServerOptions) {
+fn step_mcp(setup: &InitializeSoloDeveloperOptions) {
     let hosts = ["claude", "codex", "pi"];
     let detected: Vec<&str> = hosts
         .into_iter()
@@ -739,6 +764,85 @@ fn command_available(program: &str) -> bool {
         .arg("--version")
         .output()
         .is_ok_and(|output| output.status.success())
+}
+
+// ---- skills ---------------------------------------------------------------
+
+fn step_skills(setup: &InitializeSoloDeveloperOptions) {
+    let harnesses = skills_harnesses();
+    let names: Vec<&str> = harnesses
+        .iter()
+        .map(|harness| harness.backend_name())
+        .collect();
+    let answer = prompt(
+        &INSTALL_SKILLS,
+        &format!(
+            "  install the /ralphus-submit and /ralphus-feedback skills for which harnesses? ({}, all, or none)",
+            names.join(", ")
+        ),
+        "none",
+        setup.install_skills.as_ref(),
+        setup.yes,
+    );
+    let (chosen, unknown) = skills::select_harnesses(&answer, &harnesses);
+    for name in unknown {
+        println!("  ignoring \"{name}\": not a known harness");
+    }
+    if chosen.is_empty() {
+        println!("  skipped: no skills installed");
+        return;
+    }
+    // Asked at most once, and only when a modified skill is actually found.
+    let mut overwrite: Option<bool> = None;
+    for index in chosen {
+        let harness = harnesses[index];
+        let name = harness.display_name();
+        let Some(dir) = harness.skills_dir() else {
+            println!("  {name}: could not determine its skills directory; skipping");
+            continue;
+        };
+        for skill in skills::SKILLS {
+            let mut decide = |path: &std::path::Path| {
+                *overwrite.get_or_insert_with(|| {
+                    let allowed = prompt_yes_no(
+                        &FORCE_SKILLS,
+                        &format!(
+                            "  {} differs from the shipped skill; overwrite modified skills (old copies are kept as SKILL.md.bak)?",
+                            path.display()
+                        ),
+                        false,
+                        setup.force_skills,
+                        setup.yes,
+                    );
+                    if !allowed && setup.yes && setup.force_skills.is_none() {
+                        println!("  pass --force-skills yes to replace modified skills");
+                    }
+                    allowed
+                })
+            };
+            match skills::install_into(&dir, skill, &mut decide) {
+                Ok(skills::Outcome::Installed(path)) => {
+                    println!("  {name}: installed {}", path.display());
+                }
+                Ok(skills::Outcome::Unchanged(path)) => {
+                    println!("  {name}: up to date {}", path.display());
+                }
+                Ok(skills::Outcome::Skipped(path)) => {
+                    println!("  {name}: kept your modified {}", path.display());
+                }
+                Ok(skills::Outcome::Replaced { path, backup }) => {
+                    println!(
+                        "  {name}: replaced {} (previous copy at {})",
+                        path.display(),
+                        backup.display()
+                    );
+                }
+                Err(error) => {
+                    println!("  {name}: could not install {}: {error}", skill.name);
+                }
+            }
+        }
+    }
 }
 
 // ---- agent logins ---------------------------------------------------------------
@@ -879,7 +983,10 @@ impl LoginHost for RealLoginHost {
     }
 }
 
-fn step_agent_logins(opts: &GlobalOpts, setup: &InitializeServerOptions) -> Vec<AgentLoginReport> {
+fn step_agent_logins(
+    opts: &GlobalOpts,
+    setup: &InitializeSoloDeveloperOptions,
+) -> Vec<AgentLoginReport> {
     run_agent_logins(
         &RealLoginHost::load(opts),
         &login_probes(),
@@ -1126,7 +1233,7 @@ struct PendingProject {
     already_registered: bool,
 }
 
-/// A project `initialize server` registered (or found already registered) and
+/// A project `initialize solo-developer` registered (or found already registered) and
 /// the git remote of this checkout that points at its non-fork upstream.
 struct ProjectSetup {
     name: String,
@@ -1135,7 +1242,10 @@ struct ProjectSetup {
     is_fork: bool,
 }
 
-fn step_project(opts: &GlobalOpts, setup: &InitializeServerOptions) -> Option<PendingProject> {
+fn step_project(
+    opts: &GlobalOpts,
+    setup: &InitializeSoloDeveloperOptions,
+) -> Option<PendingProject> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let probe = std::process::Command::new("git")
         .args([
@@ -1340,7 +1450,7 @@ fn git_remotes(cwd: &std::path::Path) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The URL `initialize server` offers as the project's upstream: the first
+/// The URL `initialize solo-developer` offers as the project's upstream: the first
 /// remote that is not `fork_url`, preferring `origin`. Empty when none.
 fn default_upstream_url(cwd: &std::path::Path, fork_url: Option<&str>) -> String {
     default_upstream_remote(&git_remotes(cwd), fork_url)
@@ -1394,7 +1504,7 @@ struct ReviewDefaults {
     resolver_agent: String,
 }
 
-fn step_review_settings(setup: &InitializeServerOptions) -> ReviewDefaults {
+fn step_review_settings(setup: &InitializeSoloDeveloperOptions) -> ReviewDefaults {
     println!(
         "  using the recommended auto-review thresholds (bug=3, feature=5, investigation=3, unclassified=5)"
     );
@@ -1427,7 +1537,7 @@ struct ForkSettings {
     contributor: Option<(String, String)>,
 }
 
-fn step_forks(setup: &InitializeServerOptions) -> ForkSettings {
+fn step_forks(setup: &InitializeSoloDeveloperOptions) -> ForkSettings {
     let require_forks = prompt_yes_no(
         &REQUIRE_FORKS,
         "  does this project require contributors to work from forks?",
@@ -1679,7 +1789,7 @@ fn finalize_project_registration(
 
 // ---- default admin user ------------------------------------------------------
 
-fn step_admin(opts: &GlobalOpts, setup: &InitializeServerOptions) -> Option<String> {
+fn step_admin(opts: &GlobalOpts, setup: &InitializeSoloDeveloperOptions) -> Option<String> {
     if !prompt_yes_no(
         &CREATE_ADMIN,
         "  create a default admin user?",
@@ -1743,7 +1853,7 @@ fn step_admin(opts: &GlobalOpts, setup: &InitializeServerOptions) -> Option<Stri
 
 // ---- forge token ------------------------------------------------------------
 
-fn step_forge_token(opts: &GlobalOpts, user: Option<&str>, setup: &InitializeServerOptions) {
+fn step_forge_token(opts: &GlobalOpts, user: Option<&str>, setup: &InitializeSoloDeveloperOptions) {
     let Some(user) = user else {
         println!("  skipped: no default admin user was created");
         return;
@@ -1976,7 +2086,7 @@ fn step_sample(
     project: Option<&ProjectSetup>,
     health_results: &[CheckResult],
     logins: &[AgentLoginReport],
-    setup: &InitializeServerOptions,
+    setup: &InitializeSoloDeveloperOptions,
 ) {
     let Some(ProjectSetup {
         name: project,
@@ -2087,7 +2197,7 @@ fn sample_label(mode: &str) -> String {
     format!("{SAMPLE_LABEL_PREFIX} ({mode})")
 }
 
-fn sample_mode(setup: &InitializeServerOptions) -> String {
+fn sample_mode(setup: &InitializeSoloDeveloperOptions) -> String {
     loop {
         let mode = prompt(
             &SAMPLE_MODE,
@@ -2110,7 +2220,7 @@ mod tests {
     #[test]
     fn interactive_settings_have_unique_prompt_and_flag_contracts() {
         assert!(interactive_settings_are_valid());
-        assert_eq!(INTERACTIVE_SETTINGS.len(), 25);
+        assert_eq!(INTERACTIVE_SETTINGS.len(), 27);
     }
 
     #[test]

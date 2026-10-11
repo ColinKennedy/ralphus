@@ -907,6 +907,97 @@
         notify("info", "Refreshed PR status.");
         tick();
       }
+      /** Minimum gap between silent refreshes of the same PR, to spare the forge's rate limit. */
+      const PR_SILENT_REFRESH_COOLDOWN_MS = 30000;
+      /** @type {Record<string, number>} */
+      const prSilentRefreshAt = {};
+      /**
+       * Shared silent `refresh-ci` call: skipped inside the per-PR cooldown,
+       * never toasts, and swallows failures so the last-known badge stays.
+       * @param {string} prId
+       * @returns {Promise<boolean>} true when the daemon refreshed the PR
+       */
+      async function refreshPrStatusQuietly(prId) {
+        if (!prId) return false;
+        const now = Date.now();
+        if (now - (prSilentRefreshAt[prId] || 0) < PR_SILENT_REFRESH_COOLDOWN_MS) return false;
+        prSilentRefreshAt[prId] = now;
+        try {
+          const resp = await post(`/api/pull-requests/${prId}/refresh-ci`);
+          return resp.ok;
+        } catch (e) {
+          return false;
+        }
+      }
+      /**
+       * Silent, fire-and-forget status refresh fired when a PR link is opened
+       * (left-click, middle-click, Ctrl/Cmd-click). Never awaited by the
+       * navigation.
+       * @param {string} prId
+       * @returns {void}
+       */
+      function refreshPrStatusOnOpen(prId) {
+        void refreshPrStatusQuietly(prId).then((ok) => { if (ok) tick(); });
+      }
+      /** Minimum time the tab must have been hidden before a return refreshes PR status. */
+      const PR_RETURN_MIN_HIDDEN_MS = 20000;
+      /** Maximum concurrent `refresh-ci` requests for one return. */
+      const PR_RETURN_CONCURRENCY = 3;
+      /** @type {number|null} when the tab last became hidden */
+      let tabHiddenAt = null;
+      /**
+       * Records the moment the tab is hidden so the return can tell a real
+       * away-trip from a flick.
+       * @returns {void}
+       */
+      function noteTabHidden() {
+        if (tabHiddenAt === null) tabHiddenAt = Date.now();
+      }
+      /**
+       * On tab return: if the tab was hidden long enough, silently live-poll
+       * the forge for the selected review's open PRs (those with a forge
+       * number), skipping any inside the per-PR cooldown, with bounded
+       * concurrency. Failures are ignored so the last-known badge stays.
+       * @returns {void}
+       */
+      function refreshSelectedReviewPrsOnReturn() {
+        const hiddenFor = tabHiddenAt === null ? 0 : Date.now() - tabHiddenAt;
+        tabHiddenAt = null;
+        if (hiddenFor < PR_RETURN_MIN_HIDDEN_MS) return;
+        if (tab !== "reviews" || !selectedGuardian) return;
+        const ids = (pullRequests[selectedGuardian] || [])
+          .filter((p) => p.state === "open" && p.pr_number != null)
+          .map((p) => p.id);
+        const queue = ids.slice();
+        let refreshed = false;
+        const worker = async () => {
+          for (let id = queue.shift(); id !== undefined; id = queue.shift()) {
+            if (await refreshPrStatusQuietly(id)) refreshed = true;
+          }
+        };
+        const workers = [];
+        for (let i = 0; i < Math.min(PR_RETURN_CONCURRENCY, ids.length); i++) workers.push(worker());
+        Promise.all(workers).then(() => { if (refreshed) tick(); });
+      }
+      /**
+       * Capture-phase listener for `click` / `auxclick`: any element carrying
+       * `data-pr-id` and `data-pr-open="1"` is an openable PR link. Only the
+       * primary and middle buttons count, so right-click (which opens the
+       * status menu) never double-triggers.
+       * @param {MouseEvent} e
+       * @returns {void}
+       */
+      function onPrLinkActivated(e) {
+        if (e.button !== 0 && e.button !== 1) return;
+        const target = /** @type {HTMLElement} */ (e.target);
+        const el = /** @type {HTMLElement|null} */ (target.closest("[data-pr-id][data-pr-open]"));
+        if (!el || el.dataset.prOpen !== "1") return;
+        refreshPrStatusOnOpen(el.dataset.prId || "");
+      }
+      if (typeof document !== "undefined") {
+        document.addEventListener("click", onPrLinkActivated, true);
+        document.addEventListener("auxclick", onPrLinkActivated, true);
+      }
       /**
        * "Action feedback" menu item (RAL-<new>): pulls this PR's un-actioned
        * forge comments into the owning review worktree right now, instead of

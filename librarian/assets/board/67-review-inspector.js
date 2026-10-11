@@ -1,4 +1,4 @@
-﻿      // ---- Reviews tab: branch inspector + log dock ----
+      // ---- Reviews tab: branch inspector + log dock ----
       //
       // Two surfaces that used to be buried inside the review's single
       // scrolling column:
@@ -25,17 +25,6 @@
       /** @type {{[branchId: string]: boolean}} Branch ids whose Live view has been opened, and so attached. */
       const inspectorLiveAttached = {};
       /**
-       * Which run the Live tab is walked back to, per branch. Absent (or past
-       * the end) means the newest run -- the live one.
-       * @type {{[branchId: string]: number}}
-       */
-      const liveRunIdx = {};
-      /**
-       * Which Live sub-view is showing, per branch: terminal | prompt | system.
-       * @type {{[branchId: string]: string}}
-       */
-      const liveSub = {};
-      /**
        * One agent run on a branch -- a rebase pass, a final proof, a feedback
        * revision -- as the daemon pairs and attributes it
        * (`GET /api/guardians/{id}/branches/{bid}/runs`).
@@ -52,6 +41,7 @@
        * @property {string} [cell_id] - The unique resolver cell that owns this pass.
        * @property {string} [prompt] - The dispatched instruction, when retained by the daemon.
        * @property {boolean} start_recorded - False when only the run's end row exists.
+       * @property {string} [meta] - Cached formatted metadata line (timestamp, duration, outcome).
        */
       /**
        * Each branch's runs, keyed `gid|bid`; undefined until first fetched.
@@ -95,7 +85,7 @@
        * @returns {void}
        */
       function selectInspectorBranch(branchId) {
-        inspectorBranchId = branchId;
+        inspectorBranchId = branchId || null;
         if (!reviewDockSticky) reviewDockScope = branchId;
         // Switching branches while watching is still watching: the newly
         // selected branch attaches too, rather than showing a collapsed pane
@@ -103,6 +93,54 @@
         if (inspectorTab === "live" && !attachInspectorLive(branchId)) renderReviewInspector();
         else if (inspectorTab !== "live") renderReviewInspector();
         renderReviewDock();
+      }
+      /**
+       * The inspector and log-drawer state as the URL should carry it.
+       * @returns {InspectorHashState}
+       */
+      function currentInspectorHashState() {
+        const bid = inspectorBranchId;
+        const run = bid ? liveRunIdx[bid] : undefined;
+        // A command-scoped drawer has no branch id to name, so it links as the whole review.
+        const scopedToBranch = reviewDockScope !== "review" && reviewDockScope !== selectedCommandKey;
+        return {
+          branchId: bid,
+          tab: inspectorTab,
+          runIdx: run === undefined ? null : run,
+          liveSub: bid ? liveSub[bid] || "terminal" : "terminal",
+          dockOpen: reviewDockOpen,
+          dockScope: scopedToBranch ? reviewDockScope : "review",
+        };
+      }
+      /**
+       * Applies inspector state parsed from the URL once the open review's
+       * branches are loaded. An unknown branch falls back to no selection;
+       * restoring a tab does what opening it by hand does and nothing more.
+       * @param {GuardianView} g - The open review, with its branches loaded.
+       * @returns {void}
+       */
+      function applyPendingInspectorHash(g) {
+        const want = pendingInspectorHash;
+        if (!want || !g.branches) return;
+        pendingInspectorHash = null;
+        const b = want.branchId ? g.branches.find((x) => x.id === want.branchId) : null;
+        inspectorBranchId = b ? b.id : null;
+        selectedBranch[g.id] = b ? b.branch : null;
+        inspectorTab = b ? want.tab : "overview";
+        if (b) {
+          if (inspectorTab === "live") inspectorLiveAttached[b.id] = true;
+          if (inspectorTab === "appraisals") delete branchAppraisals[`${g.id}:${b.id}`];
+          if (want.runIdx === null) delete liveRunIdx[b.id]; else liveRunIdx[b.id] = want.runIdx;
+          liveSub[b.id] = want.liveSub;
+          if (inspectorTab === "live" && want.liveSub === "system") {
+            ensurePeekSystemPrompt(`guardian|${g.id}|${b.id}`).then(() => renderReviewInspector());
+          }
+        }
+        const scopeOk = want.dockScope === "review" || g.branches.some((x) => x.id === want.dockScope);
+        reviewDockScope = want.dockOpen && scopeOk ? want.dockScope : (b ? b.id : "review");
+        reviewDockCommand = "";
+        if (want.dockOpen !== reviewDockOpen) toggleReviewDock();
+        syncHash();
       }
       /**
        * Attaches one branch's live pane and starts its first fetch. Returns
@@ -136,6 +174,7 @@
         // since nothing had loaded before the tab was opened either way.
         const bid = inspectorBranchId;
         if (tab === "appraisals" && bid) delete branchAppraisals[`${selectedGuardian}:${bid}`];
+        syncHash();
         if (tab === "live" && bid && attachInspectorLive(bid)) return;
         renderReviewInspector();
       }
@@ -146,6 +185,7 @@
        */
       function toggleReviewDock() {
         reviewDockOpen = !reviewDockOpen;
+        syncHash();
         renderReviewDock();
         if (reviewDockTimer) { clearInterval(reviewDockTimer); reviewDockTimer = null; }
         if (reviewDockOpen) {
@@ -177,6 +217,7 @@
           renderReviewDock();
           if (reviewDockEvents[gid] === undefined) loadReviewDockEvents(gid);
         }
+        syncHash();
       }
 
       /**
@@ -726,13 +767,13 @@
        * @param {BranchRun} run - The run.
        * @returns {string}
        */
-      function runMeta(run) {
+      function inspectorRunMeta(run) {
         const t = run.start_at_ms
           ? new Date(run.start_at_ms).toLocaleTimeString([], { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" })
           : "";
         // Duration only where the daemon measured one -- a gate's elapsed_ms.
         // Nothing here is derived from wall-clock guesses.
-        const dur = run.elapsed_ms ? ` · ${fmtDurationMs(run.elapsed_ms)}` : "";
+        const dur = run.elapsed_ms ? ` · ${inspectorFmtDurationMs(run.elapsed_ms)}` : "";
         const note = run.start_recorded === false ? " · start not recorded" : "";
         return (run.outcome ? `${t} · ${run.outcome}` : t) + dur + note;
       }
@@ -741,7 +782,7 @@
        * @param {number} ms - Milliseconds.
        * @returns {string}
        */
-      function fmtDurationMs(ms) {
+      function inspectorFmtDurationMs(ms) {
         const secs = Math.round(ms / 1000);
         if (secs < 60) return `${secs}s`;
         return `${Math.floor(secs / 60)}m ${secs % 60}s`;
@@ -753,7 +794,7 @@
        * @param {string} bid - The branch id.
        * @returns {number}
        */
-      function curRunIdx(runs, bid) {
+      function inspectorCurRunIdx(runs, bid) {
         if (!runs.length) return -1;
         const want = liveRunIdx[bid];
         if (want === undefined) return runs.length - 1;
@@ -771,7 +812,8 @@
         if (!g || !b) return;
         const runs = branchRunsOf(g.id, b.id);
         if (!runs.length) return;
-        liveRunIdx[bid] = Math.max(0, Math.min(runs.length - 1, curRunIdx(runs, bid) + dir));
+        liveRunIdx[bid] = Math.max(0, Math.min(runs.length - 1, inspectorCurRunIdx(runs, bid) + dir));
+        syncHash();
         renderReviewInspector();
       }
       /**
@@ -781,6 +823,7 @@
        */
       function jumpToLatestRun(bid) {
         delete liveRunIdx[bid];
+        syncHash();
         renderReviewInspector();
       }
       /**
@@ -789,8 +832,9 @@
        * @param {string} sub - terminal | prompt | system.
        * @returns {void}
        */
-      function setLiveSub(bid, sub) {
+      function inspectorSetLiveSub(bid, sub) {
         liveSub[bid] = sub;
+        syncHash();
         renderReviewInspector();
         if (sub === "system") {
           const g = guardians.find((x) => x.id === selectedGuardian);
@@ -818,7 +862,7 @@
         // first renders, then refetched only on the branch's SSE state change.
         if (branchRunsCache[`${g.id}|${b.id}`] === undefined) loadBranchRuns(g.id, b.id);
         const runs = branchRunsOf(g.id, b.id);
-        const ri = curRunIdx(runs, b.id);
+        const ri = inspectorCurRunIdx(runs, b.id);
         const run = ri >= 0 ? runs[ri] : null;
         const key = `guardian|${g.id}|${b.id}${run && run.task && run.cell_id ? `|${run.task}|${run.cell_id}` : ""}`;
         // The key names the shown run, so it changes as runs load or are
@@ -859,7 +903,7 @@
               data-tip="Every agent session this branch ran — rebases, final proofs, feedback revisions.\nOpens the log drawer, where each run's own rows are listed alongside non-agent operations such as PR submission.">
               <span class="hkind ${esc(run.kind)}">${esc(run.kind)}</span>
               <span class="hlabel mono">${esc(run.label)}</span>
-              <span class="hmeta">${esc(runMeta(run))}</span>
+              <span class="hmeta">${esc(inspectorRunMeta(run))}</span>
               <span class="hcount num">${ri + 1}/${runs.length}</span> &#9662;</button>
             <button class="hnav" data-click="stepBranchRun" data-branch-id="${esc(b.id)}" data-dir="1" ${ri >= runs.length - 1 ? "disabled" : ""}
               data-tip="Step forward to the next run on this branch.">&#9654;</button>
@@ -867,7 +911,7 @@
               data-tip="Jump back to the newest run — the one still streaming.">&#8677; Latest</button>`}
           </div>
           ${onNewestTape ? "" : `<div class="histnote">You are walked back to ${esc(run.label)}
-            from ${esc(runMeta(run))} — an earlier pass than the one the pane below holds.</div>`}`
+            from ${esc(inspectorRunMeta(run))} — an earlier pass than the one the pane below holds.</div>`}`
           : `<div class="histbar"><span class="hpick" data-tip="Sessions appear here as the daemon records them — a rebase pass, a final proof, a feedback revision.\nThis branch has not run one yet.">
               <span class="hkind">no runs</span><span class="hmeta">no agent session recorded for this branch yet</span></span></div>`;
 
@@ -898,21 +942,15 @@
         // 4 - which view, seated directly on what it switches
         const subs = [["terminal", "Terminal"], ["prompt", "Prompt"], ["system", "System Prompt"]];
         const tabs = `<div class="subtabs">${subs.map((s) => `<button class="subtab ${sub === s[0] ? "on" : ""}" `
-          + `data-click="setLiveSub" data-branch-id="${esc(b.id)}" data-sub="${s[0]}" `
+          + `data-click="inspectorSetLiveSub" data-branch-id="${esc(b.id)}" data-sub="${s[0]}" `
           + `data-tip="${esc(LIVE_SUB_TIP[s[0]])}">${s[1]}</button>`).join("")}</div>`;
 
         const top = identity + histBar + ctl + tabs;
         // The system prompt is per branch, not per run: `setLiveSub` fetches it under the branch-level key.
-        if (sub === "system") return top + liveSystemPromptView(g, `guardian|${g.id}|${b.id}`);
+        if (sub === "system") return top + inspectorLiveSystemPromptView(g, `guardian|${g.id}|${b.id}`);
         if (sub === "prompt") return top + livePromptView(g, b, run);
-        return top + liveTerminalView(g, b, key, run, onNewestTape);
+        return top + inspectorLiveTerminalView(g, b, key, run, onNewestTape);
       }
-      /** @type {{[sub: string]: string}} What each Live sub-view shows. */
-      const LIVE_SUB_TIP = {
-        terminal: "The run's captured terminal output.\nThe newest run streams; an earlier one is the daemon's persisted record of it.",
-        prompt: "The instruction this run's agent was given — the task it was asked to do, as opposed to the standing rules it works under.",
-        system: "The exact system prompt this run's agent received: ralphus's hidden instructions plus the resolver's authored prompt.\nRead-only reference — changing it means changing the resolver settings.\nAdmin-only view.",
-      };
       /**
        * The Live tab's Terminal view: the run's captured output, framed, with
        * the controls that act on it underneath.
@@ -924,7 +962,7 @@
        *   a tmux pane, and so the only one whose text the live view still holds.
        * @returns {string}
        */
-      function liveTerminalView(g, b, key, run, isLatest) {
+      function inspectorLiveTerminalView(g, b, key, run, isLatest) {
         const foot = `<div class="run-foot">
             ${isLatest ? `<button class="btn" style="padding:3px 8px;font-size:11.5px" data-click="openGuardianBranchTerminalMenuItem" data-key="${esc(key)}" data-gid="${esc(g.id)}" data-bid="${esc(b.id)}" data-mode="open"
               data-tip="Attach a real, interactive terminal to this session.\nShows the runner's own log/event stream, not the agent's conversation.">Open terminal</button>` : ""}
@@ -940,40 +978,6 @@
           <div class="hint">Read-only — nothing typed here reaches the agent. Every run's text is
           captured separately, so walking back survives a restart.</div>`;
       }
-      // RALPHUS-PROMPTBOX-SCROLL:BEGIN
-      /** @type {{[scrollKey: string]: number}} Scroll offset of each Live prompt box, surviving the inspector's repaints. */
-      const promptBoxScroll = {};
-      /**
-       * A scrollable Live-tab prompt box whose scroll offset is remembered, so
-       * the inspector's periodic repaint does not send the reader back to the top.
-       * @param {string} scrollKey - Identifies this box's content across repaints.
-       * @param {string} text - The plain text to show.
-       * @returns {string}
-       */
-      function reviewPromptBox(scrollKey, text) {
-        return `<div class="promptbox" data-scroll-key="${esc(scrollKey)}" onscroll="savePromptBoxScroll(this)">${esc(text)}</div>`;
-      }
-      /**
-       * Remembers a prompt box's scroll offset.
-       * @param {HTMLElement} el - The `.promptbox` that scrolled.
-       * @returns {void}
-       */
-      function savePromptBoxScroll(el) {
-        const k = el.dataset.scrollKey;
-        if (k) promptBoxScroll[k] = el.scrollTop;
-      }
-      /**
-       * Re-applies remembered offsets to freshly painted prompt boxes.
-       * @returns {void}
-       */
-      function restorePromptBoxScroll() {
-        document.querySelectorAll("#review-inspector .promptbox[data-scroll-key]").forEach((el0) => {
-          const el = /** @type {HTMLElement} */ (el0);
-          const top = promptBoxScroll[el.dataset.scrollKey || ""];
-          if (top) el.scrollTop = top;
-        });
-      }
-      // RALPHUS-PROMPTBOX-SCROLL:END
       /**
        * The Live tab's Prompt view: the instruction this run's agent was given.
        *
@@ -1016,7 +1020,7 @@
        * @param {string} key - The peek key.
        * @returns {string}
        */
-      function liveSystemPromptView(g, key) {
+      function inspectorLiveSystemPromptView(g, key) {
         if (!currentUserIsAdmin) {
           return `<div class="absent-run">
               <div class="abody"><div class="at">Admin-only view</div>
@@ -1452,6 +1456,7 @@
         closeSquadMenu();
         inspectorBranchId = bid;
         if (!reviewDockSticky) reviewDockScope = bid;
+        syncHash(true);
         setInspectorTab(tab);
         renderReviewDock();
       }
@@ -1468,6 +1473,7 @@
         if (!reviewDockOpen) toggleReviewDock();
         else renderReviewDock();
         if (reviewDockEvents[gid] === undefined) loadReviewDockEvents(gid);
+        syncHash();
       }
 
       // ---- Command rows as selections ----
@@ -1786,6 +1792,7 @@
         }
         renderReviewDetail();
         renderReviewDock();
+        syncHash();
       }
       /**
        * Scopes the log drawer to one command and opens it. An explicit ask
@@ -1804,6 +1811,7 @@
         else renderReviewDock();
         if (reviewDockEvents[gid] === undefined) loadReviewDockEvents(gid);
         renderReviewDetail();
+        syncHash();
       }
       /**
        * Expands or collapses one command's full text beneath its row. The row

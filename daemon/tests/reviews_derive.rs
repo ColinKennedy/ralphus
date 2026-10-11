@@ -223,7 +223,7 @@ fn single_project_makes_one_review() {
     let toml = session_toml(
         &cwd,
         "backend",
-        "agent=\"claude\"\nmodel=\"claude-opus-4-8\"\nproof_scope=\"each_branch\"\nskip_worktrees=true\nauto_pr_feedback=true\nskip_base_updates=true\nskip_auto_clean=true\nmatch_pr_branch_name=true\nseparate_pr_branch=true\nskip_auto_build=true",
+        "agent=\"claude\"\nmodel=\"claude-opus-4-8\"\nproof_scope=\"each_branch\"\nskip_worktrees=true\nauto_pr_feedback=true\nskip_base_updates=true\nskip_auto_clean=true\nmatch_pr_branch_name=true\nseparate_pr_branch=true",
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
 
@@ -261,7 +261,7 @@ fn registered_project_task_records_project_identity_on_its_review() {
     let toml = format!(
         "[[task]]\nname=\"t\"\nproject=\"ralphus\"\n\
          [[task.cell]]\ncwd=\"{cwd}\"\nprompt=\"p\"\nreview=\"{sentinel}\"\n\
-         [[review]]\nid=\"project-review\"\nskip_auto_build=true\n"
+         [[review]]\nid=\"project-review\"\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
     let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
@@ -346,7 +346,7 @@ fn declared_review_upstream_resolves_against_the_registered_projects_remote() {
     let toml = format!(
         "[[task]]\nname=\"t\"\nproject=\"proj\"\n\
          [[task.cell]]\ncwd=\"{cwd}\"\nprompt=\"p\"\nreview=\"{sentinel}\"\n\
-         [[review]]\nid=\"remote-upstream-review\"\nupstream=\"staging\"\nskip_auto_build=true\n"
+         [[review]]\nid=\"remote-upstream-review\"\nupstream=\"staging\"\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
     let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
@@ -396,7 +396,7 @@ fn declared_review_settings_override_project_defaults() {
     let toml = session_toml(
         &cwd,
         "settings",
-        "proof_scope=\"each_branch\"\nskip_worktrees=true\nskip_base_updates=true\nmatch_pr_branch_name=true\nseparate_pr_branch=true\nskip_auto_build=true",
+        "proof_scope=\"each_branch\"\nskip_worktrees=true\nskip_base_updates=true\nmatch_pr_branch_name=true\nseparate_pr_branch=true",
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
     let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
@@ -425,11 +425,7 @@ fn cache_manual_checks_precedence_review_over_project_over_default() {
         "[review]\ncache_manual_checks = true\n",
     )
     .unwrap();
-    let toml = session_toml(
-        &cwd,
-        "override",
-        "skip_auto_build=true\ncache_manual_checks=false",
-    );
+    let toml = session_toml(&cwd, "override", "cache_manual_checks=false");
     let file: TaskFile = toml::from_str(&toml).unwrap();
     let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let squad_id = store.lock().insert_squad(&file, None, false).unwrap();
@@ -449,7 +445,7 @@ fn cache_manual_checks_precedence_review_over_project_over_default() {
         "[review]\ncache_manual_checks = false\n",
     )
     .unwrap();
-    let toml = session_toml(&cwd, "project", "skip_auto_build=true");
+    let toml = session_toml(&cwd, "project", "");
     let file: TaskFile = toml::from_str(&toml).unwrap();
     let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let squad_id = store.lock().insert_squad(&file, None, false).unwrap();
@@ -465,7 +461,7 @@ fn cache_manual_checks_precedence_review_over_project_over_default() {
     // Everything unset resolves to the built-in default: caching on.
     let base = temp_base("cache-manual-precedence-default");
     let cwd = repo_with_worktree(&base, "feature/cache-default");
-    let toml = session_toml(&cwd, "default", "skip_auto_build=true");
+    let toml = session_toml(&cwd, "default", "");
     let file: TaskFile = toml::from_str(&toml).unwrap();
     let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let squad_id = store.lock().insert_squad(&file, None, false).unwrap();
@@ -490,11 +486,7 @@ fn skip_manual_checks_precedence_review_over_project_over_default() {
         "[review]\nskip_manual_checks = true\n",
     )
     .unwrap();
-    let toml = session_toml(
-        &cwd,
-        "override",
-        "skip_auto_build=true\nskip_manual_checks=false",
-    );
+    let toml = session_toml(&cwd, "override", "skip_manual_checks=false");
     let file: TaskFile = toml::from_str(&toml).unwrap();
     let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let squad_id = store.lock().insert_squad(&file, None, false).unwrap();
@@ -512,7 +504,7 @@ fn skip_manual_checks_precedence_review_over_project_over_default() {
         "[review]\nskip_manual_checks = true\n",
     )
     .unwrap();
-    let toml = session_toml(&cwd, "project", "skip_auto_build=true");
+    let toml = session_toml(&cwd, "project", "");
     let file: TaskFile = toml::from_str(&toml).unwrap();
     let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let squad_id = store.lock().insert_squad(&file, None, false).unwrap();
@@ -528,7 +520,7 @@ fn skip_manual_checks_precedence_review_over_project_over_default() {
     // Everything unset resolves to the built-in default: generation runs.
     let base = temp_base("skip-manual-precedence-default");
     let cwd = repo_with_worktree(&base, "feature/skip-default");
-    let toml = session_toml(&cwd, "default", "skip_auto_build=true");
+    let toml = session_toml(&cwd, "default", "");
     let file: TaskFile = toml::from_str(&toml).unwrap();
     let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let squad_id = store.lock().insert_squad(&file, None, false).unwrap();
@@ -555,11 +547,7 @@ fn rebuild_on_precedence_review_over_project_over_default() {
         "[review]\nrebuild_on = [\"rebase\"]\n",
     )
     .unwrap();
-    let toml = session_toml(
-        &cwd,
-        "override",
-        "skip_auto_build=true\nrebuild_on=[\"feedback\", \"auto_fix\"]",
-    );
+    let toml = session_toml(&cwd, "override", "rebuild_on=[\"feedback\", \"auto_fix\"]");
     let file: TaskFile = toml::from_str(&toml).unwrap();
     let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let squad_id = store.lock().insert_squad(&file, None, false).unwrap();
@@ -580,7 +568,7 @@ fn rebuild_on_precedence_review_over_project_over_default() {
         "[review]\nrebuild_on = [\"rebase\"]\n",
     )
     .unwrap();
-    let toml = session_toml(&cwd, "empty", "skip_auto_build=true\nrebuild_on=[]");
+    let toml = session_toml(&cwd, "empty", "rebuild_on=[]");
     let file: TaskFile = toml::from_str(&toml).unwrap();
     let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let squad_id = store.lock().insert_squad(&file, None, false).unwrap();
@@ -598,7 +586,7 @@ fn rebuild_on_precedence_review_over_project_over_default() {
         "[review]\nrebuild_on = [\"auto_fix\"]\n",
     )
     .unwrap();
-    let toml = session_toml(&cwd, "project", "skip_auto_build=true");
+    let toml = session_toml(&cwd, "project", "");
     let file: TaskFile = toml::from_str(&toml).unwrap();
     let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let squad_id = store.lock().insert_squad(&file, None, false).unwrap();
@@ -611,7 +599,7 @@ fn rebuild_on_precedence_review_over_project_over_default() {
     // Everything unset resolves to the built-in default: every event.
     let base = temp_base("rebuild-on-precedence-default");
     let cwd = repo_with_worktree(&base, "feature/rebuild-default");
-    let toml = session_toml(&cwd, "default", "skip_auto_build=true");
+    let toml = session_toml(&cwd, "default", "");
     let file: TaskFile = toml::from_str(&toml).unwrap();
     let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let squad_id = store.lock().insert_squad(&file, None, false).unwrap();
@@ -632,8 +620,8 @@ fn two_projects_make_two_disambiguated_reviews() {
         "[[task]]\nname=\"t\"\n\
          [[task.cell]]\ncwd=\"{cwd_a}\"\nprompt=\"p\"\nreview=\"<<review:one>>\"\n\
          [[task.cell]]\ncwd=\"{cwd_b}\"\nprompt=\"p\"\nreview=\"<<review:two>>\"\n\
-         [[review]]\nid=\"one\"\nskip_auto_build=true\n\
-         [[review]]\nid=\"two\"\nskip_auto_build=true\n"
+         [[review]]\nid=\"one\"\n\
+         [[review]]\nid=\"two\"\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
 
@@ -695,11 +683,7 @@ fn repeat_submission_against_the_same_worktree_does_not_conflate_reviews() {
     let cwd = repo_with_worktree(&base, "feature/shared");
     let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
 
-    let toml_a = session_toml(
-        &cwd,
-        "ralphus:new-review/batch",
-        "name=\"Batch\"\nskip_auto_build=true",
-    );
+    let toml_a = session_toml(&cwd, "ralphus:new-review/batch", "name=\"Batch\"");
     let file_a: TaskFile = toml::from_str(&toml_a).unwrap();
     let squad_a = store.lock().insert_squad(&file_a, None, false).unwrap();
     let ids_a = derive_reviews(&store, &squad_a, &file_a).expect("derive a");
@@ -709,11 +693,7 @@ fn repeat_submission_against_the_same_worktree_does_not_conflate_reviews() {
     // Second submission, same worktree/branch, no branch switch in between --
     // it mints its OWN guardian (per `separate_submissions_each_mint_a_fresh_review`)
     // that happens to record the exact same branch string as guardian A.
-    let toml_b = session_toml(
-        &cwd,
-        "ralphus:new-review/batch",
-        "name=\"Batch\"\nskip_auto_build=true",
-    );
+    let toml_b = session_toml(&cwd, "ralphus:new-review/batch", "name=\"Batch\"");
     let file_b: TaskFile = toml::from_str(&toml_b).unwrap();
     let squad_b = store.lock().insert_squad(&file_b, None, false).unwrap();
     let ids_b = derive_reviews(&store, &squad_b, &file_b).expect("derive b");
@@ -797,7 +777,7 @@ fn separate_submissions_each_mint_a_fresh_review() {
     let file1: TaskFile = toml::from_str(&session_toml(
         &cwd_a,
         "ralphus:new-review/batch",
-        "name=\"My Batch\"\nskip_auto_build=true",
+        "name=\"My Batch\"",
     ))
     .unwrap();
     let run1 = store.lock().insert_squad(&file1, None, false).unwrap();
@@ -811,7 +791,7 @@ fn separate_submissions_each_mint_a_fresh_review() {
     let file2: TaskFile = toml::from_str(&session_toml(
         &cwd_b,
         "ralphus:new-review/batch",
-        "name=\"My Batch\"\nskip_auto_build=true",
+        "name=\"My Batch\"",
     ))
     .unwrap();
     let run2 = store.lock().insert_squad(&file2, None, false).unwrap();
@@ -909,20 +889,20 @@ fn three_files_combined_into_one_submission_two_keys_make_two_reviews() {
     let file1_text = format!(
         "[[task]]\nname=\"t1\"\n\
          [[task.cell]]\ncwd=\"{cwd_a}\"\nprompt=\"p\"\nreview=\"<<ralphus:new-review/shared>>\"\n\
-         [[review]]\nid=\"ralphus:new-review/shared\"\nname=\"Shared Batch\"\nskip_auto_build=true\n"
+         [[review]]\nid=\"ralphus:new-review/shared\"\nname=\"Shared Batch\"\n"
     );
     // File 2: task "t2", opts into the SAME shared key (repeated [[review]]
     // block, matching the documented multi-file convention).
     let file2_text = format!(
         "[[task]]\nname=\"t2\"\n\
          [[task.cell]]\ncwd=\"{cwd_b}\"\nprompt=\"p\"\nreview=\"<<ralphus:new-review/shared>>\"\n\
-         [[review]]\nid=\"ralphus:new-review/shared\"\nname=\"Shared Batch\"\nskip_auto_build=true\n"
+         [[review]]\nid=\"ralphus:new-review/shared\"\nname=\"Shared Batch\"\n"
     );
     // File 3: task "t3", opts into a DIFFERENT key -- must end up in its own review.
     let file3_text = format!(
         "[[task]]\nname=\"t3\"\n\
          [[task.cell]]\ncwd=\"{cwd_c}\"\nprompt=\"p\"\nreview=\"<<ralphus:new-review/solo>>\"\n\
-         [[review]]\nid=\"ralphus:new-review/solo\"\nname=\"Solo\"\nskip_auto_build=true\n"
+         [[review]]\nid=\"ralphus:new-review/solo\"\nname=\"Solo\"\n"
     );
 
     // Exactly what `_cmd_submit` does for multiple file args: join with a blank
@@ -996,7 +976,7 @@ fn reviews_auto_start_when_the_run_succeeds() {
     let cwd = repo_with_worktree(&base, "feature/a");
     let toml = format!(
         "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"{cwd}\"\ncommand=\"noop\"\nreview=\"<<review:r>>\"\n\
-         [[review]]\nid=\"r\"\nskip_auto_build=true\n"
+         [[review]]\nid=\"r\"\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
 
@@ -1057,7 +1037,7 @@ fn start_merge_resolves_conflicts_with_agent() {
          [[task.cell]]\ncwd=\"{cwd_a}\"\ncommand=\"noop\"\nreview=\"<<review:rev>>\"\n\
          [[task]]\nname=\"b\"\ndepends_on=[\"a\"]\n\
          [[task.cell]]\ncwd=\"{cwd_b}\"\ncommand=\"noop\"\nreview=\"<<review:rev>>\"\n\
-         [[review]]\nid=\"rev\"\nskip_auto_build=true\n"
+         [[review]]\nid=\"rev\"\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
     let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
@@ -1162,7 +1142,7 @@ fn force_push_then_merge_resolves_cleanly() {
          [[task.cell]]\ncwd=\"{cwd_a}\"\ncommand=\"noop\"\nreview=\"<<review:rev>>\"\n\
          [[task]]\nname=\"b\"\ndepends_on=[\"a\"]\n\
          [[task.cell]]\ncwd=\"{cwd_b}\"\ncommand=\"noop\"\nreview=\"<<review:rev>>\"\n\
-         [[review]]\nid=\"rev\"\nskip_auto_build=true\n"
+         [[review]]\nid=\"rev\"\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
     let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
@@ -1266,7 +1246,7 @@ fn merge_button_forces_a_fresh_rebase_on_an_already_in_review_review() {
          [[task.cell]]\ncwd=\"{cwd_a}\"\ncommand=\"noop\"\nreview=\"<<review:rev>>\"\n\
          [[task]]\nname=\"b\"\ndepends_on=[\"a\"]\n\
          [[task.cell]]\ncwd=\"{cwd_b}\"\ncommand=\"noop\"\nreview=\"<<review:rev>>\"\n\
-         [[review]]\nid=\"rev\"\nskip_auto_build=true\n"
+         [[review]]\nid=\"rev\"\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
     let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
@@ -1550,7 +1530,7 @@ fn non_overlapping_task_does_not_block_readiness() {
     let toml = format!(
         "[[task]]\nname=\"a\"\n[[task.cell]]\ncwd=\"{cwd_a}\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n\
          [[task]]\nname=\"b\"\n[[task.cell]]\ncwd=\"{cwd_b}\"\nprompt=\"p\"\n\
-         [[review]]\nid=\"r\"\nskip_auto_build=true\n"
+         [[review]]\nid=\"r\"\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
 
@@ -1630,7 +1610,7 @@ fn undeclared_overlapping_task_blocks_readiness() {
     let toml = format!(
         "[[task]]\nname=\"a\"\n[[task.cell]]\ncwd=\"{cwd_a}\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n\
          [[task]]\nname=\"b\"\n[[task.cell]]\ncwd=\"{cwd_b}\"\nprompt=\"p\"\n\
-         [[review]]\nid=\"r\"\nskip_auto_build=true\n"
+         [[review]]\nid=\"r\"\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
 
@@ -1826,7 +1806,7 @@ fn full_flow_validate_submit_run_and_ollama_resolves_conflict() {
          [[task.cell]]\ncwd=\"{cwd_a}\"\ncommand=\"noop\"\nreview=\"<<review:rev>>\"\n\
          [[task]]\nname=\"b\"\ndepends_on=[\"a\"]\n\
          [[task.cell]]\ncwd=\"{cwd_b}\"\ncommand=\"noop\"\nreview=\"<<review:rev>>\"\n\
-         [[review]]\nid=\"rev\"\nskip_auto_build=true\n"
+         [[review]]\nid=\"rev\"\n"
     );
     assert!(
         ralphus_core::validate::validate_toml(&toml).is_ok(),
@@ -1917,7 +1897,7 @@ fn link_key_across_two_repos_creates_one_multi_project_guardian() {
         &cwd_a,
         &cwd_b,
         "ralphus:new-review/cross",
-        "name=\"Cross Review\"\nskip_auto_build=true",
+        "name=\"Cross Review\"",
     ))
     .unwrap();
     let run = store.lock().insert_squad(&file, None, false).unwrap();
@@ -1968,7 +1948,7 @@ fn link_key_same_repo_branches_have_no_project_tag() {
         &cwd_a,
         &cwd_b,
         "ralphus:new-review/same",
-        "name=\"Same Repo\"\nskip_auto_build=true",
+        "name=\"Same Repo\"",
     ))
     .unwrap();
     let run = store.lock().insert_squad(&file, None, false).unwrap();
@@ -2001,8 +1981,8 @@ fn proj_group_branches_carry_no_project_tag() {
         "[[task]]\nname=\"t\"\n\
          [[task.cell]]\ncwd=\"{cwd_a}\"\nprompt=\"p\"\nreview=\"<<review:rA>>\"\n\
          [[task.cell]]\ncwd=\"{cwd_b}\"\nprompt=\"p\"\nreview=\"<<review:rB>>\"\n\
-         [[review]]\nid=\"rA\"\nskip_auto_build=true\n\
-         [[review]]\nid=\"rB\"\nskip_auto_build=true\n"
+         [[review]]\nid=\"rA\"\n\
+         [[review]]\nid=\"rB\"\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
     let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
@@ -2056,7 +2036,7 @@ fn multi_project_merge_runs_per_project_and_aggregates() {
         &cwd_a,
         &cwd_b,
         "ralphus:new-review/mp",
-        "name=\"MP Review\"\nskip_auto_build=true",
+        "name=\"MP Review\"",
     ))
     .unwrap();
     let gid = {
@@ -2235,7 +2215,7 @@ fn nested_cwd_session_implicitly_joins_review_and_reviews_list() {
         "[[task]]\nname=\"a\"\n[[task.cell]]\ncwd=\"{cwd_share}\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n\
          [[task]]\nname=\"b\"\n[[task.cell]]\ncwd=\"{sub}\"\nprompt=\"p\"\n\
          [[task]]\nname=\"c\"\n[[task.cell]]\ncwd=\"{cwd_other}\"\nprompt=\"p\"\n\
-         [[review]]\nid=\"r\"\nskip_auto_build=true\n"
+         [[review]]\nid=\"r\"\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
 
@@ -2284,7 +2264,7 @@ fn worktree_sharing_gates_branch_ready_until_all_sessions_done() {
     let toml = format!(
         "[[task]]\nname=\"a\"\n[[task.cell]]\ncwd=\"{cwd}\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n\
          [[task]]\nname=\"b\"\n[[task.cell]]\ncwd=\"{sub}\"\nprompt=\"p\"\n\
-         [[review]]\nid=\"r\"\nskip_auto_build=true\n"
+         [[review]]\nid=\"r\"\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
 
@@ -2358,7 +2338,7 @@ fn worktree_sibling_failure_never_falsely_reports_ready() {
     let toml = format!(
         "[[task]]\nname=\"a\"\n[[task.cell]]\ncwd=\"{cwd}\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n\
          [[task]]\nname=\"b\"\n[[task.cell]]\ncwd=\"{sub}\"\nprompt=\"p\"\n\
-         [[review]]\nid=\"r\"\nskip_auto_build=true\n"
+         [[review]]\nid=\"r\"\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
 
@@ -2440,7 +2420,7 @@ fn simultaneous_worktree_sibling_completion_transitions_ready_exactly_once() {
     let toml = format!(
         "[[task]]\nname=\"a\"\n[[task.cell]]\ncwd=\"{cwd}\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n\
          [[task]]\nname=\"b\"\n[[task.cell]]\ncwd=\"{sub}\"\nprompt=\"p\"\n\
-         [[review]]\nid=\"r\"\nskip_auto_build=true\n"
+         [[review]]\nid=\"r\"\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
 

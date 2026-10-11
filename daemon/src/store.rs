@@ -461,6 +461,16 @@ pub struct CellView {
     /// which backends accept this.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub maximum_tool_output_tokens: Option<i64>,
+    /// Resolved reasoning-effort level (cell overrides task), or `None` for
+    /// the backend's own default (RAL-607). See
+    /// `ralphus_core::schema::agent_supports_effort`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Resolved sampling temperature (cell overrides task), Pi only, or
+    /// `None` for the model's own default (RAL-607). See
+    /// `ralphus_core::schema::agent_supports_temperature`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
     /// Failure detail, when the cell failed.
     pub error: Option<String>,
     /// Dependency references (within-task cell ids or `task/cell`).
@@ -822,6 +832,11 @@ pub struct ProjectReviewSettings {
     pub default_maximum_budget_usd: Option<f64>,
     #[serde(default)]
     pub default_proof_scope: Option<String>,
+    /// Project default for which PRs/MRs in a review's stack run the full CI
+    /// suite (`every`/`top`/`bottom+top`). `None` inherits the file and
+    /// global layers, then `every`.
+    #[serde(default)]
+    pub default_ci_deferral: Option<String>,
     #[serde(default)]
     pub verify_skip_auto_clean: Option<bool>,
     #[serde(default)]
@@ -914,6 +929,7 @@ impl ProjectReviewSettings {
             auto_build: self.auto_build,
             summary_format: None,
             default_proof_scope: self.default_proof_scope,
+            default_ci_deferral: self.default_ci_deferral,
             proof_skip_auto_clean: self.verify_skip_auto_clean,
             default_resolver_agent: self.default_resolver_agent,
             default_resolver_model: self.default_resolver_model,
@@ -1814,6 +1830,8 @@ impl Store {
                 maximum_context INTEGER,
                 auto_compact_threshold INTEGER,
                 maximum_tool_output_tokens INTEGER,
+                effort        TEXT,
+                temperature   REAL,
                 upstream      TEXT,
                 queue_rank    REAL,
                 machine       TEXT,
@@ -1876,7 +1894,6 @@ impl Store {
                 conflicts_found     INTEGER,
                 conflicts_fixed     INTEGER,
                 conflicts_committed INTEGER,
-                skip_auto_build   INTEGER NOT NULL DEFAULT 0,
                 -- Read-only legacy data (RAL-285): nothing writes this column
                 -- anymore. `hydrate_guardian` reads it only to resolve a row
                 -- carrying the bit with no explicit `proof_scope` to an
@@ -2844,6 +2861,27 @@ impl Store {
                 created_at_ms INTEGER NOT NULL,
                 PRIMARY KEY (guardian_id, prophecy_id)
             );
+            -- Deferred prophecies a user accepted before the review merged
+            -- (`crate::followup`). Once the merge makes the offer, each one is
+            -- submitted as its own follow-up squad without being asked again.
+            CREATE TABLE IF NOT EXISTS followup_preaccepted (
+                guardian_id   TEXT NOT NULL,
+                prophecy_id   INTEGER NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (guardian_id, prophecy_id)
+            );
+            -- The squad and waypoint each accepted item of an offer produced
+            -- (`crate::followup`). An item is accepted on its own, so the
+            -- offer row cannot hold one squad id for the lot. An empty
+            -- `squad_id` is a claim whose squad is still being created.
+            CREATE TABLE IF NOT EXISTS followup_item_results (
+                guardian_id   TEXT NOT NULL,
+                prophecy_id   INTEGER NOT NULL,
+                squad_id      TEXT NOT NULL,
+                waypoint_id   TEXT NOT NULL DEFAULT '',
+                created_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (guardian_id, prophecy_id)
+            );
             ",
         )?;
         // RAL-318: the built-in `unclassified` Triage type always exists and
@@ -3007,10 +3045,6 @@ impl Store {
             // asynchronous work (squad-claim, cell execution, proof execution)
             // continues the same OpenTelemetry trace instead of starting a new one.
             "ALTER TABLE squads ADD COLUMN trace_context TEXT",
-            // RAL-110: split the old single `skip_checks` flag into two independent
-            // opt-outs -- see the backfill-and-drop block below, which carries
-            // forward any existing `skip_checks` value into both.
-            "ALTER TABLE guardians ADD COLUMN skip_auto_build INTEGER NOT NULL DEFAULT 0",
             // Read-only legacy data (RAL-285) -- see the `CREATE TABLE guardians`
             // comment on this column.
             "ALTER TABLE guardians ADD COLUMN skip_worktree_checks INTEGER NOT NULL DEFAULT 0",
@@ -3158,6 +3192,11 @@ impl Store {
             // `ralphus_core::schema::agent_supports_maximum_tool_output_tokens`.
             "ALTER TABLE cells ADD COLUMN maximum_tool_output_tokens INTEGER",
             "ALTER TABLE proofs ADD COLUMN maximum_tool_output_tokens INTEGER",
+            // RAL-607: per-cell reasoning effort and (Pi-only) sampling
+            // temperature -- see `ralphus_core::schema::agent_supports_effort`
+            // and `agent_supports_temperature`.
+            "ALTER TABLE cells ADD COLUMN effort TEXT",
+            "ALTER TABLE cells ADD COLUMN temperature REAL",
             // RAL-332: UI-level convenience gate only -- there is no verified
             // login yet (RAL-252), so this does not stop anyone holding the
             // daemon's shared bearer token from calling the same endpoints
@@ -3232,6 +3271,38 @@ impl Store {
             "ALTER TABLE guardian_pull_requests ADD COLUMN pr_kind TEXT NOT NULL DEFAULT 'parent'",
         ] {
             self.run_idempotent_migration(stmt);
+        }
+        // The judge roles live under `roles/judge/`. A database seeded before
+        // that moves a row only while it still equals the stock seed, so a
+        // user-edited preset keeps its name and content.
+        for seed in crate::preset_roles::ROLE_PRESETS
+            .iter()
+            .filter(|s| s.name.starts_with(crate::preset_roles::JUDGE_PREFIX))
+        {
+            let Some(old_name) = seed
+                .name
+                .strip_prefix(crate::preset_roles::JUDGE_PREFIX)
+                .map(|role| format!("roles/{role}"))
+            else {
+                continue;
+            };
+            self.conn.execute(
+                "UPDATE presets SET name=?1
+                 WHERE name=?2
+                   AND prompt IS ?3 AND system_prompt IS ?4 AND system_prompt_position IS ?5
+                   AND pass_score IS ?6
+                   AND maximum_context IS NULL AND auto_compact_threshold IS NULL
+                   AND maximum_tool_output_tokens IS NULL
+                   AND NOT EXISTS (SELECT 1 FROM presets WHERE name=?1)",
+                params![
+                    seed.name,
+                    old_name,
+                    seed.prompt,
+                    seed.system_prompt,
+                    seed.system_prompt_position,
+                    seed.pass_score.map(i64::from)
+                ],
+            )?;
         }
         // Codex support: `*claude_session_id` columns were named after the only
         // CLI harness that existed at the time, but they hold the resumable
@@ -3732,6 +3803,9 @@ impl Store {
             // (NULL for every unscored step), read back by the scheduler to
             // tell the runner to teach and decide the appraisal contract.
             "ALTER TABLE proofs ADD COLUMN pass_score INTEGER",
+            // A proof extending a judge preset receives its cell's declined-work
+            // (`refused`) prophecies in its prompt.
+            "ALTER TABLE proofs ADD COLUMN receives_refusals INTEGER NOT NULL DEFAULT 0",
             // RAL-308: a proof step's own wall-clock span, needed so its
             // contribution to its owning cell's/task's cumulative
             // `maximum_timeout_seconds` budget can be summed the same way
@@ -3846,6 +3920,10 @@ impl Store {
             // `None` inherits the project/global default, which resolves to
             // `true` (on by default).
             "ALTER TABLE guardians ADD COLUMN post_appraisals INTEGER",
+            // Per-review `ci_deferral` mode (`every`/`top`/`bottom+top`).
+            // NULL behaves as `every`: no PR/MR in the stack carries the
+            // defer-full-CI label.
+            "ALTER TABLE guardians ADD COLUMN ci_deferral TEXT",
             // RAL-521: per-review override for whether this review's manual
             // checks are computed once, when its review branches are first
             // created, and then reused through later merges, rebases, and
@@ -3922,6 +4000,16 @@ impl Store {
             // waypoint -- see `CellView::waypoint_halted_at_ms`. NULL means
             // not halted.
             "ALTER TABLE cells ADD COLUMN waypoint_halted_at_ms INTEGER",
+            // RAL-595: how many times this cell has been re-queued to run
+            // again (restart, orphan recovery, retry-failed). Stamped onto a
+            // cell's prophecies as their `attempt`, so a re-run's insights
+            // supersede the earlier attempt's in reviews and PR bodies.
+            "ALTER TABLE cells ADD COLUMN restart_count INTEGER NOT NULL DEFAULT 0",
+            // RAL-595: whitespace-normalized body a prophecy is deduplicated
+            // on. NULL on rows written before this column existed, which a
+            // unique index treats as distinct, so old data never conflicts.
+            "ALTER TABLE prophecies ADD COLUMN body_key TEXT",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_prophecies_dedupe ON prophecies(entity_uri, attempt, kind, body_key)",
             // RAL-400: `1` when this affected entry was auto-enrolled by the
             // daemon (submit-time scope overlap, or the survey sweep's own
             // discovery) rather than declared explicitly by a human/agent.
@@ -4082,10 +4170,7 @@ impl Store {
             self.run_idempotent_migration(stmt);
         }
         // RAL-110: one-time backfill of the old `skip_checks` column (present on
-        // any database created before this change) into both new columns --
-        // preserving prior behavior exactly (skip_checks used to gate both the
-        // finalize-time build/check step AND the per-worktree quality prompt)
-        // until a user explicitly changes one of the split flags. Guarded on the
+        // any database created before this change) into `skip_worktree_checks`. Guarded on the
         // column still existing so this runs exactly once: the DROP COLUMN below
         // makes it a no-op (harmless error, ignored) on every later startup,
         // instead of re-clobbering a later explicit toggle back to the old value.
@@ -4097,8 +4182,7 @@ impl Store {
             .is_some();
         if has_old_skip_checks {
             let backfill = self.conn.execute(
-                "UPDATE guardians SET skip_auto_build = skip_checks, \
-                 skip_worktree_checks = skip_checks",
+                "UPDATE guardians SET skip_worktree_checks = skip_checks",
                 [],
             );
             self.note_migration("RAL-110 skip_checks backfill", backfill);
@@ -4106,6 +4190,21 @@ impl Store {
                 .conn
                 .execute("ALTER TABLE guardians DROP COLUMN skip_checks", []);
             self.note_migration("RAL-110 drop guardians.skip_checks", drop);
+        }
+        // RAL-609: `skip_auto_build` is retired -- nothing reads it anymore, so
+        // the column is dropped outright rather than mapped forward. Guarded on
+        // the column existing so the DROP runs exactly once.
+        let has_skip_auto_build = self
+            .conn
+            .prepare("SELECT 1 FROM pragma_table_info('guardians') WHERE name='skip_auto_build'")
+            .and_then(|mut s| s.query_row([], |_| Ok(())).optional())
+            .unwrap_or(None)
+            .is_some();
+        if has_skip_auto_build {
+            let drop = self
+                .conn
+                .execute("ALTER TABLE guardians DROP COLUMN skip_auto_build", []);
+            self.note_migration("RAL-609 drop guardians.skip_auto_build", drop);
         }
         // RAL-168: `verify_mid_resolution` is retired -- replaced outright by
         // `proof_scope`/`proof_skip_auto_clean` above, not mapped forward
@@ -4481,6 +4580,8 @@ impl Store {
                 let maximum_tool_output_tokens =
                     ralphus_core::schema::resolve_cell_maximum_tool_output_tokens(task, cell)
                         .map(|v| i64::try_from(v).unwrap_or(i64::MAX));
+                let effort = ralphus_core::schema::resolve_cell_effort(task, cell);
+                let temperature = ralphus_core::schema::resolve_cell_temperature(task, cell);
                 let share_session = ralphus_core::schema::resolve_cell_share_session(task, cell);
                 // RAL-308: the cell's own cumulative maximum-runtime cap
                 // (covering itself and its cell-scope proofs) -- not
@@ -4510,8 +4611,8 @@ impl Store {
                     (None, None)
                 };
                 tx.execute(
-                    "INSERT INTO cells(squad_id, task_idx, idx, sid, name, cwd, subprojects, prompt, command, agent, model, system_prompt, system_prompt_position, effective_system_prompt, state, depends_on, timeout_sec, budget_tokens, maximum_budget_usd, maximum_context, auto_compact_threshold, maximum_tool_output_tokens, turns, upstream, queue_rank, env_overrides, machine, share_session, maximum_timeout_sec, mode, remediation_attempts)
-                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO cells(squad_id, task_idx, idx, sid, name, cwd, subprojects, prompt, command, agent, model, system_prompt, system_prompt_position, effective_system_prompt, state, depends_on, timeout_sec, budget_tokens, maximum_budget_usd, maximum_context, auto_compact_threshold, maximum_tool_output_tokens, turns, upstream, queue_rank, env_overrides, machine, share_session, maximum_timeout_sec, mode, remediation_attempts, effort, temperature)
+                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     params![
                         squad_id,
                         t_idx_i,
@@ -4557,6 +4658,8 @@ impl Store {
                         cell_maximum_timeout_sec,
                         cell_mode,
                         cell_remediation_attempts,
+                        effort,
+                        temperature,
                     ],
                 )?;
 
@@ -5563,8 +5666,13 @@ impl Store {
 
     /// Fetch a single squad's full board view.
     pub fn get_squad(&self, id: &str) -> Result<SquadView> {
-        let row = self
-            .conn
+        Self::get_squad_conn(&self.conn, id)
+    }
+
+    /// [`Self::get_squad`] against any connection, so the read pool
+    /// (`crate::store_pool`) can serve it without the writer lock.
+    pub(crate) fn get_squad_conn(conn: &Connection, id: &str) -> Result<SquadView> {
+        let row = conn
             .query_row(
                 "SELECT id, label, state, created_at_ms, started_at_ms, finished_at_ms, env_overrides, error, submitter, materialization_step, materialization_total, materialization_phase FROM squads WHERE id=?",
                 params![id],
@@ -5588,7 +5696,7 @@ impl Store {
             .optional()?
             .ok_or(StoreError::NotFound)?;
         Self::build_squad_view(
-            &self.conn,
+            conn,
             row.0,
             row.1,
             row.2,
@@ -6005,7 +6113,7 @@ impl Store {
         db_profiles: &HashMap<String, crate::agent_profile_store::AgentProfileView>,
     ) -> Result<HashMap<i64, Vec<CellView>>> {
         let mut stmt = conn.prepare(
-            "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date, machine, detached_at_ms, maximum_context, auto_compact_threshold, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, delayed_until_ms, completed_active_duration_ms, CASE WHEN state='running' THEN active_started_at_ms END, turns, waypoint_halted_at_ms
+            "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date, machine, detached_at_ms, maximum_context, auto_compact_threshold, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, delayed_until_ms, completed_active_duration_ms, CASE WHEN state='running' THEN active_started_at_ms END, turns, waypoint_halted_at_ms, effort, temperature
              FROM cells WHERE squad_id=? ORDER BY task_idx, idx",
         )?;
         let rows = stmt
@@ -6077,6 +6185,8 @@ impl Store {
                         delayed_until_ms: r.get::<_, Option<i64>>(34)?,
                         turns: r.get::<_, Option<i64>>(37)?,
                         waypoint_halted_at_ms: r.get::<_, Option<i64>>(38)?,
+                        effort: r.get::<_, Option<String>>(39)?,
+                        temperature: r.get::<_, Option<f64>>(40)?,
                     },
                 ))
             })?
@@ -7573,9 +7683,14 @@ fn insert_proof(
     } else {
         (None, None)
     };
+    let receives_refusals = kind == "prompt"
+        && v.extends.iter().any(|raw| {
+            ralphus_core::schema::parse_preset_sentinel(raw)
+                .is_some_and(|name| name.starts_with(crate::preset_roles::JUDGE_PREFIX))
+        });
     tx.execute(
-        "INSERT INTO proofs(squad_id, task_idx, scope, cell_idx, idx, vid, kind, spec, effective_system_prompt, model, agent, state, timeout_sec, maximum_timeout_sec, budget_tokens, maximum_tool_output_tokens, turns, env_overrides, mode, remediation_attempts, pass_score)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO proofs(squad_id, task_idx, scope, cell_idx, idx, vid, kind, spec, effective_system_prompt, model, agent, state, timeout_sec, maximum_timeout_sec, budget_tokens, maximum_tool_output_tokens, turns, env_overrides, mode, remediation_attempts, pass_score, receives_refusals)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         params![
             squad_id,
             task_idx,
@@ -7603,6 +7718,7 @@ fn insert_proof(
             mode,
             remediation_attempts,
             pass_score,
+            receives_refusals,
         ],
     )?;
     Ok(())
@@ -7665,6 +7781,12 @@ pub struct CellRow {
     /// for no cap (RAL-333). Delivered to the backend via its own mechanism
     /// -- see `ralphus_core::schema::agent_supports_maximum_tool_output_tokens`.
     pub maximum_tool_output_tokens: Option<i64>,
+    /// Effective reasoning-effort level (resolved from cell/task), or `None`
+    /// for the backend's default (RAL-607).
+    pub effort: Option<String>,
+    /// Effective sampling temperature (resolved from cell/task), Pi only, or
+    /// `None` for the model's default (RAL-607).
+    pub temperature: Option<f64>,
     /// Upstream sentinel, e.g. `"<<task:task-name>>"`. When present the
     /// scheduler rebases this cell's branch onto the named dependency's
     /// current branch tip before starting the runner (RAL-50).
@@ -7737,6 +7859,13 @@ pub struct CellEdit<'a> {
     /// `ralphus_core::schema::agent_supports_maximum_tool_output_tokens` --
     /// before it ever reaches the store.
     pub maximum_tool_output_tokens: Option<Option<i64>>,
+    /// Per-cell reasoning effort (RAL-607). The caller rejects this up front
+    /// when the cell's effective agent has no delivery mechanism for it --
+    /// see `ralphus_core::schema::agent_supports_effort`.
+    pub effort: Option<Option<&'a str>>,
+    /// Per-cell sampling temperature (RAL-607), Pi only -- see
+    /// `ralphus_core::schema::agent_supports_temperature`.
+    pub temperature: Option<Option<f64>>,
     /// Appended system prompt (RAL-341). The caller (`edit_squad`'s `"cell"`
     /// arm) is responsible for rejecting this up front when the cell's
     /// effective agent doesn't support it -- see
@@ -7906,7 +8035,7 @@ impl Store {
     /// (`crate::store_pool`) can serve it without the writer lock.
     pub(crate) fn cells_of_conn(conn: &Connection, squad_id: &str) -> Result<Vec<CellRow>> {
         let mut stmt = conn.prepare(
-            "SELECT s.task_idx, s.idx, t.name, s.sid, s.cwd, s.subprojects, s.prompt, s.command, s.agent, s.model, s.system_prompt, s.system_prompt_position, s.depends_on, s.timeout_sec, s.budget_tokens, s.upstream, s.maximum_budget_usd, s.machine, s.maximum_context, s.auto_compact_threshold, s.maximum_tool_output_tokens, s.share_session, s.maximum_timeout_sec, t.maximum_timeout_sec, s.mode, s.remediation_attempts
+            "SELECT s.task_idx, s.idx, t.name, s.sid, s.cwd, s.subprojects, s.prompt, s.command, s.agent, s.model, s.system_prompt, s.system_prompt_position, s.depends_on, s.timeout_sec, s.budget_tokens, s.upstream, s.maximum_budget_usd, s.machine, s.maximum_context, s.auto_compact_threshold, s.maximum_tool_output_tokens, s.share_session, s.maximum_timeout_sec, t.maximum_timeout_sec, s.mode, s.remediation_attempts, s.effort, s.temperature
              FROM cells s JOIN tasks t ON t.squad_id = s.squad_id AND t.idx = s.task_idx
              WHERE s.squad_id = ? ORDER BY s.task_idx, s.idx",
         )?;
@@ -7942,6 +8071,8 @@ impl Store {
                     task_maximum_timeout_sec: r.get(23)?,
                     mode: r.get(24)?,
                     remediation_attempts: r.get(25)?,
+                    effort: r.get(26)?,
+                    temperature: r.get(27)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -8222,6 +8353,27 @@ impl Store {
             .optional()?
             .flatten();
         Ok(score.and_then(|s| u8::try_from(s).ok()))
+    }
+
+    /// Whether one proof step extends a judge preset and so is handed its
+    /// cell's declined-work prophecies; `false` for a step that does not exist.
+    pub fn proof_receives_refusals(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        scope: &str,
+        cell_idx: i64,
+        idx: i64,
+    ) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT receives_refusals FROM proofs WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=?",
+                params![squad_id, task_idx, scope, cell_idx, idx],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some_and(|v| v != 0))
     }
 
     /// Fresh current state of one proof step (not a snapshot from
@@ -8788,6 +8940,10 @@ impl Store {
         let maximum_context_value = edit.maximum_context.flatten();
         let maximum_tool_output_tokens_touched = edit.maximum_tool_output_tokens.is_some();
         let maximum_tool_output_tokens_value = edit.maximum_tool_output_tokens.flatten();
+        let effort_touched = edit.effort.is_some();
+        let effort_value = edit.effort.flatten();
+        let temperature_touched = edit.temperature.is_some();
+        let temperature_value = edit.temperature.flatten();
         let system_prompt_touched = edit.system_prompt.is_some();
         let system_prompt_value = edit.system_prompt.flatten();
         let effective_authored_system_prompt = if system_prompt_touched {
@@ -8811,7 +8967,9 @@ impl Store {
                 effective_system_prompt = CASE WHEN :effective_system_prompt_touched THEN :effective_system_prompt ELSE effective_system_prompt END,
                 auto_compact_threshold = CASE WHEN :auto_compact_threshold_touched THEN :auto_compact_threshold ELSE auto_compact_threshold END,
                 maximum_context = CASE WHEN :maximum_context_touched THEN :maximum_context ELSE maximum_context END,
-                maximum_tool_output_tokens = CASE WHEN :maximum_tool_output_tokens_touched THEN :maximum_tool_output_tokens ELSE maximum_tool_output_tokens END
+                maximum_tool_output_tokens = CASE WHEN :maximum_tool_output_tokens_touched THEN :maximum_tool_output_tokens ELSE maximum_tool_output_tokens END,
+                effort = CASE WHEN :effort_touched THEN :effort ELSE effort END,
+                temperature = CASE WHEN :temperature_touched THEN :temperature ELSE temperature END
              WHERE squad_id=:squad_id AND task_idx=:task_idx AND idx=:idx",
             named_params! {
                 ":cwd_touched": cwd_touched,
@@ -8834,6 +8992,10 @@ impl Store {
                 ":maximum_context": maximum_context_value,
                 ":maximum_tool_output_tokens_touched": maximum_tool_output_tokens_touched,
                 ":maximum_tool_output_tokens": maximum_tool_output_tokens_value,
+                ":effort_touched": effort_touched,
+                ":effort": effort_value,
+                ":temperature_touched": temperature_touched,
+                ":temperature": temperature_value,
                 ":squad_id": squad_id,
                 ":task_idx": task_idx,
                 ":idx": idx,
@@ -9438,7 +9600,7 @@ impl Store {
             params![squad_id],
         )?;
         let cells = self.conn.execute(
-            "UPDATE cells SET state='pending', error=NULL, started_at_ms=NULL, finished_at_ms=NULL, completed_active_duration_ms=0, active_started_at_ms=NULL, env_out_of_date=0 WHERE squad_id=?",
+            "UPDATE cells SET state='pending', restart_count=restart_count+1, error=NULL, started_at_ms=NULL, finished_at_ms=NULL, completed_active_duration_ms=0, active_started_at_ms=NULL, env_out_of_date=0 WHERE squad_id=?",
             params![squad_id],
         )?;
         let proofs = self.conn.execute(
@@ -9495,7 +9657,7 @@ impl Store {
                 admin_only: false,
             });
             self.conn.execute(
-                "UPDATE cells SET state='pending', error=NULL, active_started_at_ms=NULL
+                "UPDATE cells SET state='pending', restart_count=restart_count+1, error=NULL, active_started_at_ms=NULL
                  WHERE squad_id=? AND state='running'",
                 params![id],
             )?;
@@ -10067,6 +10229,18 @@ impl Store {
         })
     }
 
+    /// RAL-595: how many times a cell has been re-queued; `0` for a cell
+    /// that has only ever run once (or does not exist).
+    pub fn cell_restart_count(&self, squad_id: &str, task_idx: i64, idx: i64) -> i64 {
+        self.conn
+            .query_row(
+                "SELECT restart_count FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
+                params![squad_id, task_idx, idx],
+                |r| r.get(0),
+            )
+            .unwrap_or(0)
+    }
+
     /// Restart a single cell: reset it and every cell downstream of it
     /// within the squad to Pending, put the squad (and each affected task) back to
     /// Pending, and dirty every squad that depends on this one (RAL-19). Upstream
@@ -10084,7 +10258,7 @@ impl Store {
 
         for s in &impact.cells {
             self.conn.execute(
-                "UPDATE cells SET state='pending', error=NULL, started_at_ms=NULL, finished_at_ms=NULL, completed_active_duration_ms=0, active_started_at_ms=NULL, env_out_of_date=0 WHERE squad_id=? AND task_idx=? AND idx=?",
+                "UPDATE cells SET state='pending', restart_count=restart_count+1, error=NULL, started_at_ms=NULL, finished_at_ms=NULL, completed_active_duration_ms=0, active_started_at_ms=NULL, env_out_of_date=0 WHERE squad_id=? AND task_idx=? AND idx=?",
                 params![squad_id, s.task_idx, s.idx],
             )?;
             self.conn.execute(
@@ -10241,7 +10415,7 @@ impl Store {
 
         for s in &impact.cells {
             self.conn.execute(
-                "UPDATE cells SET state='pending', error=NULL, env_out_of_date=0 WHERE squad_id=? AND task_idx=? AND idx=?",
+                "UPDATE cells SET state='pending', restart_count=restart_count+1, error=NULL, env_out_of_date=0 WHERE squad_id=? AND task_idx=? AND idx=?",
                 params![squad_id, s.task_idx, s.idx],
             )?;
             self.conn.execute(
@@ -11727,7 +11901,7 @@ impl Store {
                 continue;
             }
             self.conn.execute(
-                "UPDATE cells SET state='pending', error=NULL WHERE squad_id=? AND task_idx=? AND idx=?",
+                "UPDATE cells SET state='pending', restart_count=restart_count+1, error=NULL WHERE squad_id=? AND task_idx=? AND idx=?",
                 params![squad_id, task_idx, idx],
             )?;
             self.conn.execute(
@@ -13452,6 +13626,39 @@ prompt = "legacy cell, no review_guardian_id"
     }
 
     #[test]
+    fn migration_renames_unmodified_legacy_judge_presets_only() {
+        let store = Store::open_in_memory().unwrap();
+        for old in ["roles/reviewer", "roles/security"] {
+            let new = format!("roles/judge/{}", old.trim_start_matches("roles/"));
+            store
+                .conn
+                .execute(
+                    "UPDATE presets SET name=?1 WHERE name=?2",
+                    params![old, new],
+                )
+                .unwrap();
+        }
+        store
+            .conn
+            .execute(
+                "UPDATE presets SET prompt='edited' WHERE name='roles/security'",
+                [],
+            )
+            .unwrap();
+        store.init_schema().unwrap();
+        let names: Vec<String> = store
+            .list_presets()
+            .unwrap()
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert!(names.contains(&"roles/judge/reviewer".to_string()));
+        assert!(!names.contains(&"roles/reviewer".to_string()));
+        assert!(names.contains(&"roles/security".to_string()));
+        assert!(!names.contains(&"roles/judge/security".to_string()));
+    }
+
+    #[test]
     fn migration_adds_nullable_pass_score_column_to_existing_presets() {
         let conn = Connection::open_in_memory().expect("open sqlite");
         conn.execute_batch(
@@ -13487,6 +13694,42 @@ prompt = "legacy cell, no review_guardian_id"
         assert_eq!(presets[0].name, "legacy");
         assert_eq!(presets[0].system_prompt.as_deref(), Some("sys"));
         assert_eq!(presets[0].pass_score, None);
+    }
+
+    #[test]
+    fn migration_drops_retired_skip_auto_build_column_from_existing_guardians() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("legacy", "main", "/repo").unwrap();
+        let has_column = |store: &Store| -> bool {
+            store
+                .conn
+                .prepare(
+                    "SELECT 1 FROM pragma_table_info('guardians') WHERE name='skip_auto_build'",
+                )
+                .and_then(|mut s| s.query_row([], |_| Ok(())).optional())
+                .unwrap()
+                .is_some()
+        };
+        assert!(!has_column(&store), "fresh databases never create it");
+        // An established database still carries the column, set on some rows.
+        store
+            .conn
+            .execute(
+                "ALTER TABLE guardians ADD COLUMN skip_auto_build INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute("UPDATE guardians SET skip_auto_build=1", [])
+            .unwrap();
+        store
+            .init_schema()
+            .expect("migration must drop the retired column");
+        assert!(!has_column(&store));
+        assert_eq!(store.get_guardian(&id).unwrap().name, "legacy");
+        // Idempotent on later startups.
+        store.init_schema().unwrap();
     }
 
     #[test]
@@ -18351,6 +18594,7 @@ command = "e"
             default_machine: Some("local".to_string()),
             default_maximum_budget_usd: Some(5.0),
             default_proof_scope: Some("final_branch".to_string()),
+            default_ci_deferral: Some("bottom+top".to_string()),
             verify_skip_auto_clean: Some(true),
             skip_worktrees: Some(true),
             skip_base_updates: Some(false),

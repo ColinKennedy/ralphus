@@ -22,6 +22,7 @@ MAPPING = {
     "resolver_agent": "agent",
     "resolver_model": "model",
     "proof_scope": "proof_scope",
+    "ci_deferral": "ci_deferral",
     "proof_skip_auto_clean": "skip_auto_clean",
     "skip_base_updates": "skip_base_updates",
     "match_pr_branch_name": "match_pr_branch_name",
@@ -88,8 +89,8 @@ def settings_fields(source: str) -> dict[str, str | None]:
             comment = lines[index - 1]
         ignored = IGNORE.search(comment)
         fields[match.group(1)] = ignored.group(1) if ignored else None
-    if "skip_auto_build" not in fields:
-        raise ValueError("anchor not found: GuardianSettingsBody.skip_auto_build")
+    if "skip_worktrees" not in fields:
+        raise ValueError("anchor not found: GuardianSettingsBody.skip_worktrees")
     return fields
 
 

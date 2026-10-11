@@ -134,7 +134,7 @@ This mode closes the *filesystem* half of the problem. It does **not**:
 ## tmux-wrapped live cells still work unchanged
 
 Agent-kind cell/proof runs execute inside a detached tmux session
-(`daemon/src/tmux.rs`), which is what makes "Show Live View" and "Open
+(`daemon/src/tmux.rs`), which is what makes the Live view and "Open
 Terminal Log" possible. Container mode installs real Linux tmux (not the
 Windows `psmux` alternative this project also supports) — `daemon/src/tmux.rs`
 resolves it the same way it always does (`RALPHUS_TMUX_CMD` override, else

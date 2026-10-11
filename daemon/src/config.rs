@@ -113,8 +113,7 @@ pub struct ReviewConfig {
     #[serde(default)]
     pub checks: Vec<String>,
     /// RAL-101: the project's default build/test command, run in place of
-    /// `checks` when a review declares none (and hasn't opted out via
-    /// `guardian_skip_auto_build`) — so "in review" still means "testable" even
+    /// `checks` when a review declares none — so "in review" still means "testable" even
     /// when the review author configured no explicit check gates. This is now
     /// the *explicit override* tier: when unset, `generate_manual_commands`
     /// (RAL-110) instead asks the same LLM call that infers manual review
@@ -142,6 +141,14 @@ pub struct ReviewConfig {
     /// files using the old key working.
     #[serde(alias = "verify_scope", default)]
     pub default_proof_scope: Option<String>,
+    /// Which PRs/MRs in a review's stack run the full CI suite: `"every"`
+    /// (default), `"top"` or `"bottom+top"` (see
+    /// [`ralphus_core::schema::CI_DEFERRAL_VALUES`]). `None` means unset,
+    /// which resolves to `"every"` (see [`Self::default_ci_deferral`]);
+    /// per-project scalars win over the global layer. A per-review override
+    /// (see `GuardianView::ci_deferral` in `guardian.rs`) wins over this.
+    #[serde(default)]
+    pub default_ci_deferral: Option<String>,
     /// RAL-168: within `"each_branch"` scope, additionally skip verification
     /// on branches whose rebase applied cleanly with no conflict (an
     /// "auto-clean" branch) -- the old, lighter-weight default behavior.
@@ -400,22 +407,55 @@ pub struct ReviewConfig {
     pub retry_after_unknown_default_seconds: Option<u64>,
 }
 
+/// The paragraph of [`DEFAULT_AUTO_FIX_PROMPT_TEMPLATE`] that lets the agent
+/// decide which slow tests to run. Kept as its own constant so it can be
+/// swapped for [`STRICT_AUTO_FIX_TESTING_PARAGRAPH`] when the review
+/// discourages tests.
+pub const PERMISSIVE_AUTO_FIX_TESTING_PARAGRAPH: &str = "Prefer fixing fast checks first: run and fix any linters/formatters on the current machine before reaching for heavier/slower test suites. Only run a heavy test suite once the fast checks are clean; you are trusted to use judgment about which slow tests, if any, are actually necessary to confirm the fix.";
+
+/// RAL-619: replaces [`PERMISSIVE_AUTO_FIX_TESTING_PARAGRAPH`] when
+/// [`ReviewConfig::discourage_tests_during_auto_pull_request_fixes`] is
+/// effective. Language-neutral on purpose.
+pub const STRICT_AUTO_FIX_TESTING_PARAGRAPH: &str = "Run only cheap checks on the current machine: automatic formatters, linters, and static-analysis or type-checking tools. Do not run test suites locally, however small they seem. As soon as those cheap checks are clean, commit and push immediately. The tests run on the pull request's own CI; if they fail, the failure log is sent back to you in a later round.";
+
 /// RAL-395: the built-in fallback prompt template for auto-fixing a failing
 /// PR/MR, used when neither a per-review override nor a project-level
 /// `.ralphus.toml [review] auto_fix_prompt_template` is set. The "current
 /// machine" phrasing (not "locally") is deliberate: the fix may run on a
 /// remote machine.
-pub const DEFAULT_AUTO_FIX_PROMPT_TEMPLATE: &str = "We found 1-or-more errors in this PR {insert URL here}, please fix. Keep in mind that we want this code to continue to work:\n\nPrefer fixing fast checks first: run and fix any linters/formatters on the current machine before reaching for heavier/slower test suites. Only run a heavy test suite once the fast checks are clean; you are trusted to use judgment about which slow tests, if any, are actually necessary to confirm the fix.\n\n<<prompt>>";
+pub const DEFAULT_AUTO_FIX_PROMPT_TEMPLATE: &str = "We found 1-or-more errors in this PR {insert URL here}, please fix. Keep in mind that we want this code to continue to work:
 
-/// RAL-505: appended to a PR-fix prompt when
-/// [`ReviewConfig::discourage_tests_during_auto_pull_request_fixes`] is
-/// effective, in place of the more permissive "use judgment about slow
-/// tests" language `DEFAULT_AUTO_FIX_PROMPT_TEMPLATE` (and any per-review
-/// `auto_fix_prompt_template` override) already carries. This is a pure
-/// addition to the PR-fix prompt only -- it never touches the PR workflow's
-/// own proof/CI validation, and it has no bearing on any other agent work
-/// (e.g. command-remediation prompts).
-pub const DISCOURAGE_TESTS_DURING_AUTO_PR_FIX_GUIDANCE: &str = "\n\nDo not run a broad or expensive test suite to verify this fix -- prefer automatic formatters, linters, and static-analysis tools only. Comprehensive validation happens separately, through the pull request's own checks.";
+Prefer fixing fast checks first: run and fix any linters/formatters on the current machine before reaching for heavier/slower test suites. Only run a heavy test suite once the fast checks are clean; you are trusted to use judgment about which slow tests, if any, are actually necessary to confirm the fix.
+
+<<prompt>>";
+
+/// RAL-505 / RAL-619: appended to a PR-fix template that carries its own
+/// testing wording (a per-review or project `auto_fix_prompt_template`) when
+/// the discourage-tests setting is effective. States that it overrides any
+/// earlier test guidance. Pure addition to the PR-fix prompt only.
+pub const DISCOURAGE_TESTS_DURING_AUTO_PR_FIX_GUIDANCE: &str = "
+
+Test guidance (overrides any earlier instruction about running tests): run only cheap checks -- automatic formatters, linters, and static-analysis or type-checking tools. Do not run test suites locally. Once those checks are clean, commit and push immediately. The tests run on the pull request's own CI, and any failure is sent back to you in a later round.";
+
+/// Builds the auto-fix prompt template for a PR/MR. With `discourage_tests`
+/// off the result is `custom` (or the default) unchanged. With it on, the
+/// default's permissive testing paragraph is replaced by the strict one, and
+/// a custom template without that paragraph gets the override guidance
+/// appended.
+pub fn auto_fix_prompt_template(custom: Option<&str>, discourage_tests: bool) -> String {
+    let template = custom.unwrap_or(DEFAULT_AUTO_FIX_PROMPT_TEMPLATE);
+    if !discourage_tests {
+        return template.to_string();
+    }
+    if template.contains(PERMISSIVE_AUTO_FIX_TESTING_PARAGRAPH) {
+        template.replace(
+            PERMISSIVE_AUTO_FIX_TESTING_PARAGRAPH,
+            STRICT_AUTO_FIX_TESTING_PARAGRAPH,
+        )
+    } else {
+        format!("{template}{DISCOURAGE_TESTS_DURING_AUTO_PR_FIX_GUIDANCE}")
+    }
+}
 
 /// Default ceiling for an unattended PR/MR CI-fix campaign.
 pub const DEFAULT_AUTO_FIX_MAX_ATTEMPTS: u32 = 3;
@@ -441,6 +481,7 @@ pub const REVIEW_CONFIG_KEYS: &[&str] = &[
     "default_machine",
     "default_maximum_budget_usd",
     "default_proof_scope",
+    "default_ci_deferral",
     "auto_submit_pr_stack",
     "match_pr_branch_name",
     "skip_worktrees",
@@ -484,6 +525,17 @@ impl ReviewConfig {
             Some("nothing") => "nothing",
             _ => "each_branch",
         }
+    }
+
+    /// The effective default `ci_deferral` mode: one of
+    /// [`ralphus_core::schema::CI_DEFERRAL_VALUES`], `"every"` when unset or
+    /// unrecognised, so a typo costs CI minutes rather than coverage.
+    #[must_use]
+    pub fn default_ci_deferral(&self) -> &str {
+        self.default_ci_deferral
+            .as_deref()
+            .filter(|mode| ralphus_core::schema::CI_DEFERRAL_VALUES.contains(mode))
+            .unwrap_or(ralphus_core::schema::CI_DEFERRAL_EVERY)
     }
 
     /// Whether `"each_branch"` scope additionally skips auto-clean branches
@@ -748,6 +800,7 @@ impl ReviewConfig {
             auto_build: over.auto_build.or(self.auto_build),
             summary_format: over.summary_format.or(self.summary_format),
             default_proof_scope: over.default_proof_scope.or(self.default_proof_scope),
+            default_ci_deferral: over.default_ci_deferral.or(self.default_ci_deferral),
             proof_skip_auto_clean: over.proof_skip_auto_clean.or(self.proof_skip_auto_clean),
             default_resolver_agent: over.default_resolver_agent.or(self.default_resolver_agent),
             default_resolver_model: over.default_resolver_model.or(self.default_resolver_model),
@@ -861,6 +914,10 @@ pub const REVIEW_FIELD_PARITY: &[(&str, ReviewFieldDefault)] = &[
         ReviewFieldDefault::ProjectDefault(|c| c.default_proof_scope.is_some()),
     ),
     (
+        "ci_deferral",
+        ReviewFieldDefault::ProjectDefault(|c| c.default_ci_deferral.is_some()),
+    ),
+    (
         "auto_submit_pr_stack",
         ReviewFieldDefault::ProjectDefault(|c| c.auto_submit_pr_stack.is_some()),
     ),
@@ -914,13 +971,6 @@ pub const REVIEW_FIELD_PARITY: &[(&str, ReviewFieldDefault)] = &[
     (
         "auto_build",
         ReviewFieldDefault::ProjectDefault(|c| c.auto_build.is_some()),
-    ),
-    (
-        "skip_auto_build",
-        ReviewFieldDefault::NotApplicable(
-            "skip_auto_build is retained only for stored compatibility settings; preparation \
-             is optional and new task files use `[[review.prepare]]` when work is needed.",
-        ),
     ),
     (
         "auto_fix_pr_errors",
@@ -3367,6 +3417,40 @@ mod tests {
     use crate::forge::ForgeKind;
 
     #[test]
+    fn auto_fix_template_unchanged_when_tests_not_discouraged() {
+        assert_eq!(
+            auto_fix_prompt_template(None, false),
+            DEFAULT_AUTO_FIX_PROMPT_TEMPLATE
+        );
+        assert_eq!(auto_fix_prompt_template(Some("custom"), false), "custom");
+    }
+
+    #[test]
+    fn auto_fix_default_template_swaps_permissive_paragraph_when_discouraged() {
+        let out = auto_fix_prompt_template(None, true);
+        assert!(!out.contains("use judgment"));
+        assert!(!out.contains(PERMISSIVE_AUTO_FIX_TESTING_PARAGRAPH));
+        assert!(out.contains(STRICT_AUTO_FIX_TESTING_PARAGRAPH));
+        assert!(out.contains("commit and push immediately"));
+        assert!(out.contains("<<prompt>>") && out.contains("{insert URL here}"));
+    }
+
+    #[test]
+    fn auto_fix_custom_template_gets_override_guidance_when_discouraged() {
+        let out = auto_fix_prompt_template(
+            Some(
+                "Fix {insert URL here}
+
+<<prompt>>",
+            ),
+            true,
+        );
+        assert!(out.starts_with("Fix {insert URL here}"));
+        assert!(out.ends_with(DISCOURAGE_TESTS_DURING_AUTO_PR_FIX_GUIDANCE));
+        assert!(out.contains("overrides any earlier"));
+    }
+
+    #[test]
     fn project_shared_store_root_uses_logical_name() {
         let project = std::env::temp_dir().join(format!(
             "ralphus-shared-store-config-{}",
@@ -3886,6 +3970,47 @@ mod tests {
     fn default_proof_scope_accepts_the_legacy_verify_scope_key() {
         let c = from_toml_str("[review]\nverify_scope = \"final_branch\"\n");
         assert_eq!(c.default_proof_scope(), "final_branch");
+    }
+
+    // ── default_ci_deferral ─────────────────────────────────────────────────
+
+    #[test]
+    fn default_ci_deferral_defaults_to_every_when_unset() {
+        assert_eq!(ReviewConfig::default().default_ci_deferral(), "every");
+    }
+
+    #[test]
+    fn default_ci_deferral_parses_every_accepted_mode() {
+        for mode in ["every", "top", "bottom+top"] {
+            let c = from_toml_str(&format!("[review]\ndefault_ci_deferral = \"{mode}\"\n"));
+            assert_eq!(c.default_ci_deferral(), mode);
+        }
+    }
+
+    #[test]
+    fn default_ci_deferral_unrecognized_value_falls_back_to_every() {
+        let c = from_toml_str("[review]\ndefault_ci_deferral = \"head+tip\"\n");
+        assert_eq!(c.default_ci_deferral(), "every");
+    }
+
+    #[test]
+    fn default_ci_deferral_project_wins_over_global() {
+        let global = ReviewConfig {
+            default_ci_deferral: Some("top".to_string()),
+            ..ReviewConfig::default()
+        };
+        let project = ReviewConfig {
+            default_ci_deferral: Some("bottom+top".to_string()),
+            ..ReviewConfig::default()
+        };
+        assert_eq!(
+            global.clone().merge(project).default_ci_deferral(),
+            "bottom+top"
+        );
+        assert_eq!(
+            global.merge(ReviewConfig::default()).default_ci_deferral(),
+            "top"
+        );
     }
 
     #[test]

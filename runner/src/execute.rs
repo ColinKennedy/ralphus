@@ -71,8 +71,12 @@ const PROPHECY_SYSTEM_PROMPT: &str = "Operational logging note, not a request to
      that already has a ticket, and never 'nothing more is needed'), or \
      unconfirmed (something you could not verify or do not know: a test or \
      check you could not run, behavior you did not exercise, an assumption \
-     you left untested). When a note is about what you could not check, use \
-     unconfirmed, not deferred. Write as many of these as are \
+     you left untested), or refused (prompt work you explicitly decline or \
+     say you cannot perform, written as '<the refused portion of the \
+     prompt>; <why you refused>'; use it only for an explicit decline, not \
+     for a failure, a deferral, or something you merely could not check). \
+     When a note is about what you could not check, use unconfirmed, not \
+     deferred. Writing a refused note does not make the work done. Write as many of these as are \
      genuinely useful, anywhere in your reply, not only at the end -- unlike \
      the handoff note above, this is not a single end-of-reply section. This \
      is not a changelog and not a summary of what you did: only write one \
@@ -430,6 +434,15 @@ fn check_context_limit_support(spec: &CellSpec, backend: &dyn ModelBackend) -> R
             spec.agent
         ));
     }
+    if spec.effort.is_some() && !backend.supports_effort() {
+        return Err(format!("agent {:?} does not support effort", spec.agent));
+    }
+    if spec.temperature.is_some() && !backend.supports_temperature() {
+        return Err(format!(
+            "agent {:?} does not support temperature",
+            spec.agent
+        ));
+    }
     Ok(())
 }
 
@@ -519,6 +532,10 @@ fn run_with_backend(
     let mut total_turns: Option<i64> = None;
     let mut agent_session_id: Option<String> = None;
     let mut appraisal_reprompted = false;
+    // RAL-595: every distinct prophecy marker across all STILL_WORKING rounds
+    // and nudges, so a round that is later restarted, abandoned or failed
+    // still contributes what it wrote.
+    let mut prophecies = crate::prophecy::ProphecyScanner::new();
 
     for attempt in 0..MAX_ASYNC_ATTEMPTS {
         let options = RunOptions {
@@ -533,6 +550,8 @@ fn run_with_backend(
             thrash_max_compactions: spec.thrash_max_compactions,
             thrash_min_turn_gap: spec.thrash_min_turn_gap,
             maximum_tool_output_tokens: spec.maximum_tool_output_tokens,
+            effort: spec.effort.as_deref(),
+            temperature: spec.temperature,
             allow_personal_settings: spec.allow_personal_settings,
             allow_personal_memory: spec.allow_personal_memory,
             retry_attempt: spec.retry_attempt,
@@ -540,8 +559,9 @@ fn run_with_backend(
         };
         let mut outcome: BackendOutcome = match backend.run(&prompt, workspace, &options) {
             Ok(o) => o,
-            Err(e) => return CellResult::failed(e.to_string(), ""),
+            Err(e) => return failed_with_prophecies(e.to_string(), &prophecies),
         };
+        fold_prophecies(&mut prophecies, &outcome);
 
         total_tokens_in += outcome.tokens_in;
         total_tokens_out += outcome.tokens_out;
@@ -560,7 +580,7 @@ fn run_with_backend(
         // so this never gets mistaken for a normal completion and no proof
         // step ever starts.
         if let Some(detail) = outcome.compaction_thrash {
-            return thrash_cell_result(
+            let mut result = thrash_cell_result(
                 spec,
                 &detail,
                 outcome.summary,
@@ -574,6 +594,8 @@ fn run_with_backend(
                 total_cost_usd,
                 agent_session_id,
             );
+            result.prophecies = prophecies.markers();
+            return result;
         }
 
         // RAL-435: a recognized, retryable Pi 429 with a suggested delay --
@@ -584,7 +606,7 @@ fn run_with_backend(
         // session, since that wait must release scheduler capacity the way
         // this subprocess-scoped loop cannot.
         if let Some(delay) = outcome.rate_limit_retry_after {
-            return CellResult::rate_limited(
+            let mut result = CellResult::rate_limited(
                 delay.as_secs(),
                 outcome.summary,
                 total_tokens_in,
@@ -597,6 +619,8 @@ fn run_with_backend(
                 total_cost_usd,
                 agent_session_id,
             );
+            result.prophecies = prophecies.markers();
+            return result;
         }
 
         // RAL-292: a turn that ended with an unresolved backgrounded job
@@ -638,7 +662,7 @@ fn run_with_backend(
                     ghost: None,
                     turns: total_turns,
                     retry_after_secs: None,
-                    prophecies: Vec::new(),
+                    prophecies: prophecies.markers(),
                     appraisal: None,
                 };
             }
@@ -667,6 +691,8 @@ fn run_with_backend(
                 thrash_max_compactions: spec.thrash_max_compactions,
                 thrash_min_turn_gap: spec.thrash_min_turn_gap,
                 maximum_tool_output_tokens: spec.maximum_tool_output_tokens,
+                effort: spec.effort.as_deref(),
+                temperature: spec.temperature,
                 allow_personal_settings: spec.allow_personal_settings,
                 allow_personal_memory: spec.allow_personal_memory,
                 retry_attempt: spec.retry_attempt,
@@ -703,12 +729,13 @@ fn run_with_backend(
                         ghost: None,
                         turns: total_turns,
                         retry_after_secs: None,
-                        prophecies: Vec::new(),
+                        prophecies: prophecies.markers(),
                         appraisal: None,
                     };
                 }
-                Err(e) => return CellResult::failed(e.to_string(), ""),
+                Err(e) => return failed_with_prophecies(e.to_string(), &prophecies),
             };
+            fold_prophecies(&mut prophecies, &outcome);
             total_tokens_in += outcome.tokens_in;
             total_tokens_out += outcome.tokens_out;
             total_cache_creation_tokens += outcome.cache_creation_tokens;
@@ -719,7 +746,7 @@ fn run_with_backend(
             total_turns = Some(total_turns.unwrap_or(0) + outcome.turns);
             agent_session_id = outcome.agent_session_id.clone().or(agent_session_id);
             if let Some(detail) = outcome.compaction_thrash {
-                return thrash_cell_result(
+                let mut result = thrash_cell_result(
                     spec,
                     &detail,
                     outcome.summary,
@@ -733,9 +760,11 @@ fn run_with_backend(
                     total_cost_usd,
                     agent_session_id,
                 );
+                result.prophecies = prophecies.markers();
+                return result;
             }
             if let Some(delay) = outcome.rate_limit_retry_after {
-                return CellResult::rate_limited(
+                let mut result = CellResult::rate_limited(
                     delay.as_secs(),
                     outcome.summary,
                     total_tokens_in,
@@ -748,6 +777,8 @@ fn run_with_backend(
                     total_cost_usd,
                     agent_session_id,
                 );
+                result.prophecies = prophecies.markers();
+                return result;
             }
             crate::cartographer::emit_scoped(
                 "runner",
@@ -790,7 +821,7 @@ fn run_with_backend(
                     ghost: None,
                     turns: total_turns,
                     retry_after_secs: None,
-                    prophecies: Vec::new(),
+                    prophecies: prophecies.markers(),
                     appraisal: None,
                 };
             }
@@ -814,7 +845,7 @@ fn run_with_backend(
                 ghost: None,
                 turns: total_turns,
                 retry_after_secs: None,
-                prophecies: Vec::new(),
+                prophecies: prophecies.markers(),
                 appraisal: None,
             };
         }
@@ -879,7 +910,7 @@ fn run_with_backend(
                 ghost: None,
                 turns: total_turns,
                 retry_after_secs: None,
-                prophecies: Vec::new(),
+                prophecies: prophecies.markers(),
                 appraisal,
             };
         }
@@ -907,7 +938,7 @@ fn run_with_backend(
                 ghost: None,
                 turns: total_turns,
                 retry_after_secs: None,
-                prophecies: Vec::new(),
+                prophecies: prophecies.markers(),
                 appraisal: None,
             };
         }
@@ -947,13 +978,29 @@ fn run_with_backend(
             ghost,
             turns: total_turns,
             retry_after_secs: None,
-            prophecies: crate::prophecy::parse_prophecies(&outcome.summary),
+            prophecies: prophecies.markers(),
             appraisal: None,
             bearing: bearing_from(&outcome.summary),
         };
     }
 
     CellResult::failed("unreachable: retry loop exited without returning", "")
+}
+
+/// Folds an invocation's markers into the run-wide scanner: the typed list the
+/// backend already emitted live, plus the closing summary as a backstop for a
+/// backend that reports none of its own.
+fn fold_prophecies(scanner: &mut crate::prophecy::ProphecyScanner, outcome: &BackendOutcome) {
+    scanner.absorb(&outcome.prophecies);
+    scanner.scan(&outcome.summary);
+}
+
+/// A failed `CellResult` that still carries the markers written before the
+/// failure.
+fn failed_with_prophecies(error: String, scanner: &crate::prophecy::ProphecyScanner) -> CellResult {
+    let mut result = CellResult::failed(error, "");
+    result.prophecies = scanner.markers();
+    result
 }
 
 /// RAL-339: builds the failed `CellResult` for a detected autocompaction
@@ -1577,6 +1624,60 @@ RALPHUS_BEARING: accepted: renamed every call site"
         }
     }
 
+    #[test]
+    fn markers_from_earlier_still_working_rounds_are_kept() {
+        let spec = test_spec(false);
+        let ws = Workspace::create(std::env::temp_dir()).unwrap();
+        let backend = ScriptedBackend::new(
+            vec![
+                Ok(BackendOutcome {
+                    summary:
+                        "RALPHUS_PROPHECY: hazard: first round\nRALPHUS_STILL_WORKING: waiting"
+                            .to_string(),
+                    ..Default::default()
+                }),
+                Ok(BackendOutcome {
+                    summary: "finished".to_string(),
+                    prophecies: vec![crate::prophecy::ProphecyMarker {
+                        kind: "decision".into(),
+                        body: "second round".into(),
+                    }],
+                    ..Default::default()
+                }),
+            ],
+            vec![],
+        );
+
+        let result = run_with_backend(&spec, "do the thing", &ws, &backend);
+
+        assert!(result.ok());
+        let bodies: Vec<_> = result.prophecies.iter().map(|m| m.body.as_str()).collect();
+        assert_eq!(bodies, ["first round", "second round"]);
+    }
+
+    #[test]
+    fn markers_written_before_a_backend_failure_are_kept() {
+        let spec = test_spec(false);
+        let ws = Workspace::create(std::env::temp_dir()).unwrap();
+        let backend = ScriptedBackend::new(
+            vec![
+                Ok(BackendOutcome {
+                    summary: "RALPHUS_PROPHECY: unconfirmed: could not run it\nRALPHUS_STILL_WORKING: waiting"
+                        .to_string(),
+                    ..Default::default()
+                }),
+                Err(BackendError("timed out".to_string())),
+            ],
+            vec![],
+        );
+
+        let result = run_with_backend(&spec, "do the thing", &ws, &backend);
+
+        assert!(!result.ok());
+        assert_eq!(result.prophecies.len(), 1);
+        assert_eq!(result.prophecies[0].kind, "unconfirmed");
+    }
+
     fn abandoned_outcome(job: &str) -> BackendOutcome {
         BackendOutcome {
             summary: "did some work".to_string(),
@@ -1630,6 +1731,8 @@ RALPHUS_BEARING: accepted: renamed every call site"
             thrash_max_compactions: None,
             thrash_min_turn_gap: None,
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             allow_personal_settings: false,
             allow_personal_memory: false,
             retry_attempt: 0,
@@ -1963,6 +2066,8 @@ RALPHUS_APPRAISAL: {{\"score\": {score}, \"summary\": \"s\"}}"
             thrash_max_compactions: None,
             thrash_min_turn_gap: None,
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             allow_personal_settings: false,
             allow_personal_memory: false,
             retry_attempt: 0,

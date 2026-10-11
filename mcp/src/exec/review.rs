@@ -97,7 +97,6 @@ pub fn execute(cmd: ReviewCommand, client: &DaemonClient) -> ExecResult {
             base_branch,
             git_root,
             checks,
-            skip_auto_build,
             skip_worktrees,
             review_type,
         } => {
@@ -114,7 +113,6 @@ pub fn execute(cmd: ReviewCommand, client: &DaemonClient) -> ExecResult {
                 &base_branch,
                 &git_root,
                 Some(&checks_vec),
-                skip_auto_build,
                 skip_worktrees,
                 review_type.as_deref(),
             )?)
@@ -143,13 +141,13 @@ pub fn execute(cmd: ReviewCommand, client: &DaemonClient) -> ExecResult {
         }
         ReviewCommand::Settings {
             selector,
-            skip_auto_build,
             skip_worktrees,
             resolver_agent,
             resolver_model,
             base_branch,
             auto_pr_feedback,
             proof_scope,
+            ci_deferral,
             skip_auto_clean,
             skip_base_updates,
             match_pr_branch_name,
@@ -170,13 +168,13 @@ pub fn execute(cmd: ReviewCommand, client: &DaemonClient) -> ExecResult {
         } => {
             let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
             let settings = GuardianSettings {
-                skip_auto_build,
                 skip_worktrees,
                 resolver_agent: resolver_agent.as_deref(),
                 resolver_model: resolver_model.as_deref(),
                 base_branch: base_branch.as_deref(),
                 auto_pr_feedback,
                 proof_scope: proof_scope.as_deref(),
+                ci_deferral: ci_deferral.as_deref(),
                 proof_skip_auto_clean: skip_auto_clean,
                 skip_base_updates,
                 match_pr_branch_name,

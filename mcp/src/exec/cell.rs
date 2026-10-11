@@ -99,6 +99,8 @@ pub fn execute(cmd: CellCommand, client: &DaemonClient) -> ExecResult {
             auto_compact_threshold,
             maximum_context,
             maximum_tool_output_tokens,
+            effort,
+            temperature,
             system_prompt,
         } => {
             let resolved = cell::resolve_scoped(client, &selector, "cell")?;
@@ -114,6 +116,8 @@ pub fn execute(cmd: CellCommand, client: &DaemonClient) -> ExecResult {
                 auto_compact_threshold.as_deref(),
                 maximum_context.as_deref(),
                 maximum_tool_output_tokens.as_deref(),
+                effort.as_deref(),
+                temperature.as_deref(),
                 system_prompt.as_deref(),
             )?)
         }

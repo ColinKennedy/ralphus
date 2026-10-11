@@ -330,6 +330,79 @@ fn check_daemon(daemon_url: &str) -> Vec<CheckResult> {
     }
 }
 
+/// The `daemon-threads` rows: one `pass` row when every supervised daemon
+/// thread is running, otherwise one row per thread that is not, each carrying
+/// the exact restart command. An unreachable daemon yields no rows -- the
+/// `daemon` row already says so, and a second failure for the same cause would
+/// only be noise.
+fn check_daemon_threads(daemon_url: &str) -> Vec<CheckResult> {
+    let client = DaemonClient::new(daemon_url);
+    let Ok(response) = client.health_threads() else {
+        return Vec::new();
+    };
+    daemon_thread_results(&response)
+}
+
+/// Pure core of [`check_daemon_threads`], over the `GET /api/health/threads`
+/// body, so the per-state mapping is testable without a daemon.
+fn daemon_thread_results(response: &serde_json::Value) -> Vec<CheckResult> {
+    let threads = response["threads"].as_array().cloned().unwrap_or_default();
+    let impact = ralphus_core::health_catalog::get(ralphus_core::health_catalog::ID_DAEMON_THREADS)
+        .map_or("", |e| e.impact);
+    let bad: Vec<&serde_json::Value> = threads
+        .iter()
+        .filter(|t| t["state"].as_str() != Some("running"))
+        .collect();
+    if bad.is_empty() {
+        let detail = response["detail"]
+            .as_str()
+            .unwrap_or("all supervised daemon threads are running");
+        return vec![CheckResult::new(
+            "daemon-threads",
+            PASS,
+            detail,
+            impact,
+            "No action needed.",
+        )];
+    }
+    bad.into_iter()
+        .map(|t| {
+            let name = t["name"].as_str().unwrap_or("?");
+            let description = t["description"].as_str().unwrap_or_default();
+            let state = t["state"].as_str().unwrap_or("?");
+            let (status, detail) = match state {
+                "stalled" => (
+                    WARN,
+                    format!(
+                        "thread '{name}' has not reported progress for {}s",
+                        t["silent_for_ms"].as_u64().unwrap_or(0) / 1000
+                    ),
+                ),
+                "panicked" => (
+                    FAIL,
+                    format!(
+                        "thread '{name}' panicked: {}",
+                        t["panic_message"].as_str().unwrap_or("no message")
+                    ),
+                ),
+                _ => (FAIL, format!("thread '{name}' exited unexpectedly")),
+            };
+            let remediation = if t["restartable"].as_bool() == Some(true) {
+                format!("Run `ralphus check restart-thread {name}`.")
+            } else {
+                "The thread is still alive, so it cannot be restarted in place; restart the daemon if it stays stalled.".to_string()
+            };
+            CheckResult::new(
+                "daemon-threads",
+                status,
+                detail,
+                format!("{description} {impact}"),
+                remediation,
+            )
+        })
+        .collect()
+}
+
 /// Pure core of [`check_daemon`]'s reachable-daemon path: takes the already-
 /// fetched `/api/daemon` JSON response rather than calling the daemon
 /// itself, so tests can exercise db/watchdog escalation (RAL-544) without a
@@ -1970,6 +2043,11 @@ pub fn run_checks(
         .into_iter()
         .map(|r| r.with_id(ID_DAEMON))
         .collect();
+    results.extend(
+        check_daemon_threads(daemon_url)
+            .into_iter()
+            .map(|r| r.with_id(ID_DAEMON_THREADS)),
+    );
     results.push(check_config_sources_cli(cwd).with_id(ID_CONFIG_SOURCES));
     results.push(check_config_sources_project(cwd).with_id(ID_CONFIG_SOURCES_PROJECT));
 
@@ -2507,6 +2585,61 @@ mod tests {
                 .contains("agent.health.thinking_stall_diversity_threshold=0.2")
         );
         assert!(result.detail.contains("/project/.ralphus.toml"));
+    }
+
+    // ── daemon_thread_results ─────────────────────────────────────────────
+
+    #[test]
+    fn daemon_threads_all_running_is_one_passing_row() {
+        let response = serde_json::json!({
+            "detail": "4 supervised threads running",
+            "threads": [{"name": "scheduler", "state": "running"}],
+        });
+        let results = daemon_thread_results(&response);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, PASS);
+        assert_eq!(results[0].name, "daemon-threads");
+    }
+
+    #[test]
+    fn a_panicked_thread_fails_with_the_restart_command_and_message() {
+        let response = serde_json::json!({
+            "threads": [
+                {"name": "health-sweep", "state": "running"},
+                {
+                    "name": "scheduler",
+                    "description": "Scheduling stops.",
+                    "state": "panicked",
+                    "panic_message": "store guard held for 2007ms",
+                    "restartable": true,
+                },
+            ],
+        });
+        let results = daemon_thread_results(&response);
+        assert_eq!(results.len(), 1, "only the unhealthy thread gets a row");
+        assert_eq!(results[0].status, FAIL);
+        assert!(results[0].detail.contains("store guard held for 2007ms"));
+        assert!(
+            results[0]
+                .remediation
+                .contains("ralphus check restart-thread scheduler")
+        );
+    }
+
+    #[test]
+    fn a_stalled_thread_warns_and_does_not_offer_a_restart() {
+        let response = serde_json::json!({
+            "threads": [{
+                "name": "scheduler",
+                "description": "Scheduling stops.",
+                "state": "stalled",
+                "silent_for_ms": 400_000,
+                "restartable": false,
+            }],
+        });
+        let results = daemon_thread_results(&response);
+        assert_eq!(results[0].status, WARN);
+        assert!(!results[0].remediation.contains("restart-thread"));
     }
 
     // ── check_daemon_health_for (RAL-544) ─────────────────────────────────

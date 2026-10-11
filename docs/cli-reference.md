@@ -163,12 +163,12 @@ list of candidates.
 | `task show-tutor` | Print the Task TOML schema reference |
 | `queue list [--all]` / `reorder <paths...>` / `set-position <paths...> --to N [--relative]` / `set-status <path> <state>` | Inspect/reorder the squad queue by priority |
 | `initialize git [--path]` | Enable git rerere in a repository |
-| `initialize server [--yes] [--agent-logins claude,codex\|all\|none] ...` | Guided first-run server setup. See [Initialize server](#initialize-server) below |
+| `initialize solo-developer [--yes] [--agent-logins claude,codex\|all\|none] [--install-skills claude-code,codex,pi\|all\|none] [--force-skills yes\|no] ...` | Guided first-run solo-developer setup. See [Initialize solo-developer](#initialize-solo-developer) below |
 
-### Initialize server
+### Initialize solo-developer
 
-`ralphus initialize server` walks a fresh machine through ten steps (each
-printed as `Step N of 10`), ending with a health run and a sample squad. Every
+`ralphus initialize solo-developer` walks a fresh machine through eleven steps (each
+printed as `Step N of 11`), ending with a health run and a sample squad. Every
 interactive answer has a matching flag, and `--yes` accepts defaults without
 prompting.
 
@@ -187,6 +187,18 @@ login probes as `ralphus check health`:
   command is printed and the step waits for Enter (or `s` to skip the re-check).
 - Non-interactive runs, and `--yes` without `--agent-logins`, never block and
   never spawn a login: the command is printed for you to run later.
+
+The **Skills** step installs the `/ralphus-submit` and `/ralphus-feedback`
+skills (shipped inside the CLI, so they match the installed version) for the
+harnesses you pick: `claude-code`, `codex`, `pi`, a comma list, `all` or `none`
+(`--install-skills` supplies the same answer without a prompt; the default is
+`none`). Each lands at `<harness skills dir>/<skill>/SKILL.md` (`~/.claude/skills`,
+`~/.codex/skills`, `~/.pi/agent/skills`, or under `CLAUDE_CONFIG_DIR` /
+`CODEX_HOME` / `PI_CODING_AGENT_DIR` when set). Re-running is safe: an identical
+file is left alone, and a modified one is kept unless you agree to overwrite it
+(prompt, or `--force-skills yes|no`); an overwrite saves the old file as
+`SKILL.md.bak`. With `--yes` and no `--force-skills`, modified skills are kept
+and a notice says so.
 
 The sample-squad step defaults to a logged-in backend and warns if you pick a
 logged-out one. The final health run includes both login checks.
@@ -256,6 +268,21 @@ is reachability/config-shape only and free to run.
 check's `section`/`status`/`detail`/`impact`/`remediation`/`provenance`
 fields intact, plus (RAL-416) an `id` naming the stable
 `ralphus_core::health_catalog` entry each result belongs to.
+
+#### Daemon threads
+
+`check health` includes a `daemon-threads` row: the daemon's background
+threads (`scheduler`, `health-sweep`, `pr-base-drift-poller`,
+`store-watchdog`) each reported as running, stalled, panicked or exited. A
+panicked thread does not stop the daemon, so without this row a dead
+scheduler looks like a healthy daemon that has stopped rebasing reviews. A
+thread that ends also sends an `urgent` mailbox message naming the command
+below.
+
+`check restart-thread <name>` re-spawns a thread that has panicked or exited,
+without restarting the daemon (the board's Health tab has the same Restart
+button). It is refused for a thread that is still alive. Restarting the
+scheduler re-enters its tick loop only; startup recovery is not re-run.
 
 #### Check catalog (RAL-416)
 
@@ -701,7 +728,7 @@ use; see `READ_ONLY_NOTE`.
     - cartographer --ascending --cell [str] --entity [uri] --for [uri] --guardian [id] --level [str] --limit [integer] --offset [integer] --q [str] --scope [str] --source [str] --squad [id] --task [str]  {Query the structured Cartographer event log (RAL-98/RAL-155).}
     - cell  {Inspect and act on cells.}
         - (read-only-safe) diff selector [uri] --summary  {Show a running cell's live worktree diff (full diff computed only when changes were pushed).}
-        - edit selector [uri] --agent [name] --auto-compact-threshold [tokens] --command [cmd] --cwd [path] --maximum-context [tokens] --maximum-tool-output-tokens [tokens] --model [name] --prompt [text] --system-prompt [text]  {Edit a cell's fields.}
+        - edit selector [uri] --agent [name] --auto-compact-threshold [tokens] --command [cmd] --cwd [path] --effort [level] --maximum-context [tokens] --maximum-tool-output-tokens [tokens] --model [name] --prompt [text] --system-prompt [text] --temperature [number]  {Edit a cell's fields.}
         - (read-only-safe) env selector [uri] --scope [cell|proof]  {List a cell's resolved environment variables, read-only (RAL-324); --scope proof shows what its own proof steps inherit.}
         - open-agent selector [uri]  {Open the real interactive agent in a new terminal -- while running, cleanly detaches the cell first (RAL-288); while finished, resumes it the old way.}
         - remote-terminal selector [uri]  {Attach an interactive terminal to a remote cell's resumed Claude Code session over the daemon's WebSocket relay (RAL-355).}
@@ -716,6 +743,7 @@ use; see `READ_ONLY_NOTE`.
     - check  {System and environment checks.}
         - (read-only-safe) catalog --json  {List every check ralphus_core::health_catalog knows about -- stable id, Core/Harness/Machine section, daemon/remote applicability, Free/OnDemand cost tier, Required/Optional/FallbackOnly requirement level, and impact -- without running any probes (RAL-416). Instant and side-effect-free, unlike `check health`.}
         - (read-only-safe) health --all-remotes --enable-developer-checks --enable-live-agent-check --json (subagent)  {Check the local ralphus setup, grouped into Core/Harness/Machine sections (daemon, layered config, git, tmux, runner, agent backends, gh/glab, resource checks). --all-remotes also checks every configured [machine.targets.*] entry (RAL-355 Phase 9); --enable-live-agent-check additionally performs a live, cost-incurring Arbiter completion round-trip (RAL-415, off by default).}
+        - restart-thread name [str] --json  {Restart a daemon background thread that has panicked or exited (scheduler, health-sweep, pr-base-drift-poller, store-watchdog) without restarting the daemon. `check health` reports each thread's state and names this command for any that is down. Refused for a thread that is still alive.}
     - clear --all --keep-temporary --status [states] --yes (subagent)  {Delete tasks and reviews from the daemon.}
     - (read-only-safe) completion  {Print a shell tab-completion script. (Rust port: not yet implemented -- prints a placeholder message; Python's `shell` argument is not read.)}
     - (read-only-safe) configuration  {Show sourced .ralphus.toml files and resolved values. (Python's separate `configuration show` subcommand is flattened into this bare command in the Rust port; --no-local is not yet ported.)}
@@ -759,7 +787,7 @@ use; see `READ_ONLY_NOTE`.
         - deregister name [str]  {Remove a preset. Any preset, including a starter default, may be freely removed.}
         - (read-only-safe) get name [str]  {Show one registered preset by exact name.}
         - (read-only-safe) list  {List every registered preset.}
-        - register name [str] --auto-compact-threshold [integer] --maximum-context [integer] --maximum-tool-output-tokens [integer] --pass-score [integer] --prompt [text] --system-prompt [text] --system-prompt-position [text]  {Register (or update) a preset -- a named bundle of field defaults an "extends" sentinel stamps into a task's, cell's, or proof step's own unset fields when the squad is submitted. A name may be hierarchical (roles/reviewer). prompt and system-prompt may embed <<ralphus:linked-field/./prompt>> to splice in the entity's own prompt. 
+        - register name [str] --auto-compact-threshold [integer] --maximum-context [integer] --maximum-tool-output-tokens [integer] --pass-score [integer] --prompt [text] --system-prompt [text] --system-prompt-position [text]  {Register (or update) a preset -- a named bundle of field defaults an "extends" sentinel stamps into a task's, cell's, or proof step's own unset fields when the squad is submitted. A name may be hierarchical (roles/judge/reviewer). prompt and system-prompt may embed <<ralphus:linked-field/./prompt>> to splice in the entity's own prompt. 
          pass-score (1-10) is the score a prompt proof step must reach to pass.}
     - project  {Register and inspect projects known to the daemon.}
         - (read-only-safe) check-destination name [str]  {Run a manual reachability check for a project's destination repository -- its registered clone URL, else the checkout's forge remote -- against the forge REST API. SSH-style clone URLs resolve through their host/path pair (no SSH connection is opened); a URL no REST identity can be resolved from is reported as a failed check with an actionable diagnostic.}
@@ -775,7 +803,7 @@ use; see `READ_ONLY_NOTE`.
         - remove name [str]  {Unregister a project by exact name. Existing squads/tasks/reviews that reference it are unaffected; project-scoped settings (forks, Triage thresholds, review-settings defaults) are left in place as orphaned rows.}
         - review-settings  {Manage a project's database-backed DEFAULT review settings (RAL-408) -- resolver agent/model, machine, budget, proof scope, and the project-level equivalents of every `ralphus review settings` opt-out flag.}
             - (read-only-safe) get name [str]  {Show a project's current review-setting overrides plus the fully resolved effective value for each (file config + database).}
-            - set name [str] --auto-build [command] --auto-cancel-outdated-pr-pipelines/--no-auto-cancel-outdated-pr-pipelines --auto-fix-pr-errors/--no-auto-fix-pr-errors --auto-fix-prompt-template [str] --auto-run/--no-auto-run --auto-submit-pr-stack/--no-auto-submit-pr-stack --base-shift-maximum-rebuilds [count] --cache-manual-checks/--no-cache-manual-checks --clear-base-shift-maximum-rebuilds --clear-maximum-budget-usd --discourage-tests-during-auto-pr-fixes/--no-discourage-tests-during-auto-pr-fixes --dual-root-pr/--no-dual-root-pr --machine [scheme:uri] --match-pr-branch-name/--no-match-pr-branch-name --maximum-budget-usd [usd] --post-appraisals/--no-post-appraisals --proof-scope [each_branch|final_branch|nothing] --rebuild-on [none|inherit|rebase|feedback|auto_fix...] --resolver-agent [name] --resolver-model [name] --separate-pr-branch/--no-separate-pr-branch --skip-auto-clean/--no-skip-auto-clean --skip-base-updates/--no-skip-base-updates --skip-manual-checks/--no-skip-manual-checks --skip-worktrees/--no-skip-worktrees  {Update a project's DEFAULT review settings, applied to future reviews only (an Arbiter-created review with no [[review]] block, or any review whose own block leaves a field unset) -- existing reviews are unaffected.}
+            - set name [str] --auto-build [command] --auto-cancel-outdated-pr-pipelines/--no-auto-cancel-outdated-pr-pipelines --auto-fix-pr-errors/--no-auto-fix-pr-errors --auto-fix-prompt-template [str] --auto-run/--no-auto-run --auto-submit-pr-stack/--no-auto-submit-pr-stack --base-shift-maximum-rebuilds [count] --cache-manual-checks/--no-cache-manual-checks --ci-deferral [every|top|bottom+top] --clear-base-shift-maximum-rebuilds --clear-maximum-budget-usd --discourage-tests-during-auto-pr-fixes/--no-discourage-tests-during-auto-pr-fixes --dual-root-pr/--no-dual-root-pr --machine [scheme:uri] --match-pr-branch-name/--no-match-pr-branch-name --maximum-budget-usd [usd] --post-appraisals/--no-post-appraisals --proof-scope [each_branch|final_branch|nothing] --rebuild-on [none|inherit|rebase|feedback|auto_fix...] --resolver-agent [name] --resolver-model [name] --separate-pr-branch/--no-separate-pr-branch --skip-auto-clean/--no-skip-auto-clean --skip-base-updates/--no-skip-base-updates --skip-manual-checks/--no-skip-manual-checks --skip-worktrees/--no-skip-worktrees  {Update a project's DEFAULT review settings, applied to future reviews only (an Arbiter-created review with no [[review]] block, or any review whose own block leaves a field unset) -- existing reviews are unaffected.}
     - proof  {Inspect and act on proof steps.}
         - edit selector [uri] --agent [name] --command [cmd] --maximum-tool-output-tokens [tokens] --model [name] --prompt [text]  {Edit a proof step's agent/model/command/prompt overrides.}
         - (read-only-safe) env selector [uri]  {List a proof step's resolved environment variables, read-only (RAL-324); values of names registered in the Secrets tab are masked.}
@@ -809,7 +837,7 @@ use; see `READ_ONLY_NOTE`.
             - (read-only-safe) list selector [uri]  {List the manual checks.}
             - (read-only-safe) run selector [uri] --all --index [integer...] --input [name=value...]  {Print the command(s) + cwd to run one/some/all manual checks yourself.}
             - terminal selector [uri] --mode [open|readonly]  {Print the command to resume the manual-checks-generation agent conversation locally.}
-        - create name [str] base_branch [str] git_root [str] --checks [list] --review-type [label] --skip-auto-build --skip-worktrees  {Create a new review.}
+        - create name [str] base_branch [str] git_root [str] --checks [list] --review-type [label] --skip-worktrees  {Create a new review.}
         - delete selector [uri] --yes  {Delete a review and its worktrees.}
         - dismiss-reenable selector [uri]  {Dismiss the 're-enable' notification for a branch.}
         - (read-only-safe) env selector [uri] --scope [build|tests|manual-checks|worktree]  {List a review surface's resolved environment variables, read-only (RAL-324): the auto-build step, the check gates, manual checks, or one branch's review worktree.}
@@ -845,7 +873,7 @@ use; see `READ_ONLY_NOTE`.
         - reopen selector [uri]  {Reopen a cancelled or merged review and immediately stage in whatever branches are already ready, without waiting for the rest.}
         - reorder selector [uri] order [str] --disable [names] --enable [names]  {Set the branch order and kick off the rebase.}
         - restart-merge selector [uri]  {Cancel an in-progress rebase and start a fresh one.}
-        - settings selector [uri] --auto-cancel-outdated-pr-pipelines/--no-auto-cancel-outdated-pr-pipelines --auto-fix-pr-errors/--no-auto-fix-pr-errors --auto-fix-prompt-template [str] --auto-pr-feedback/--no-auto-pr-feedback --auto-run/--no-auto-run --auto-submit-pr-stack/--no-auto-submit-pr-stack --base-branch [branch] --cache-manual-checks/--no-cache-manual-checks --discourage-tests-during-auto-pr-fixes/--no-discourage-tests-during-auto-pr-fixes --dual-root-pr/--no-dual-root-pr --followup [on|off|inherit] --followup-auto-start [on|off|inherit] --match-pr-branch-name/--no-match-pr-branch-name --post-appraisals/--no-post-appraisals --proof-scope [each_branch|final_branch|nothing] --rebuild-on [none|inherit|rebase|feedback|auto_fix...] --resolver-agent [name] --resolver-model [name] --separate-pr-branch/--no-separate-pr-branch --skip-auto-build/--no-skip-auto-build --skip-auto-clean/--no-skip-auto-clean --skip-base-updates/--no-skip-base-updates --skip-manual-checks/--no-skip-manual-checks --skip-worktrees/--no-skip-worktrees  {Update per-review opt-out settings.}
+        - settings selector [uri] --auto-cancel-outdated-pr-pipelines/--no-auto-cancel-outdated-pr-pipelines --auto-fix-pr-errors/--no-auto-fix-pr-errors --auto-fix-prompt-template [str] --auto-pr-feedback/--no-auto-pr-feedback --auto-run/--no-auto-run --auto-submit-pr-stack/--no-auto-submit-pr-stack --base-branch [branch] --cache-manual-checks/--no-cache-manual-checks --ci-deferral [every|top|bottom+top] --discourage-tests-during-auto-pr-fixes/--no-discourage-tests-during-auto-pr-fixes --dual-root-pr/--no-dual-root-pr --followup [on|off|inherit] --followup-auto-start [on|off|inherit] --match-pr-branch-name/--no-match-pr-branch-name --post-appraisals/--no-post-appraisals --proof-scope [each_branch|final_branch|nothing] --rebuild-on [none|inherit|rebase|feedback|auto_fix...] --resolver-agent [name] --resolver-model [name] --separate-pr-branch/--no-separate-pr-branch --skip-auto-clean/--no-skip-auto-clean --skip-base-updates/--no-skip-base-updates --skip-manual-checks/--no-skip-manual-checks --skip-worktrees/--no-skip-worktrees  {Update per-review opt-out settings.}
         - (read-only-safe) show selector [uri]  {Show a single review's detail.}
         - squash selector [uri] project [str] --off --on  {Enable/disable squashing one git project's task branches to a single commit each in the review worktree.}
         - (read-only-safe) status selector [uri]  {Per-branch readiness + a summary verdict ('is this review ready?').}

@@ -1530,6 +1530,12 @@ fn route_for_user(
         ("POST", ["api", "health", "report", "refresh"]) => {
             admin_gated(daemon, user_header, || health_report_refresh(daemon))
         }
+        // Mapped to `check health` (its `daemon-threads` row) in check_endpoint_cli_parity.py's manifest.
+        ("GET", ["api", "health", "threads"]) => admin_gated(daemon, user_header, health_threads),
+        // Mapped to `check restart-thread` in check_endpoint_cli_parity.py's manifest.
+        ("POST", ["api", "health", "threads", name, "restart"]) => {
+            admin_gated(daemon, user_header, || health_thread_restart(name))
+        }
         // ralphus[ignore-endpoint-cli]: board agent picker for unsubmitted forms; CLI `agent list` deliberately reads .ralphus.toml locally
         ("GET", ["api", "agents"]) => list_agents(daemon, query, user_header),
         // RAL-297: cwd-independent agent+model catalog for the Simple task
@@ -2209,7 +2215,7 @@ fn route_for_user(
             guardian_followup_set_ignored(daemon, id, body, false)
         }
         ("POST", ["api", "guardians", id, "followup", "accept"]) => {
-            guardian_followup_accept(daemon, id)
+            guardian_followup_accept(daemon, id, body)
         }
         ("POST", ["api", "guardians", id, "followup", "decline"]) => {
             guardian_followup_decline(daemon, id)
@@ -3022,6 +3028,9 @@ struct EffectiveReviewDefaults {
     #[serde(skip_serializing_if = "Option::is_none")]
     maximum_budget_usd: Option<f64>,
     proof_scope: String,
+    /// The resolved CI-deferral default (per-review override > database
+    /// default > `.ralphus.toml`/global > `every`).
+    ci_deferral: String,
     skip_auto_clean: bool,
     skip_worktrees: bool,
     skip_base_updates: bool,
@@ -3065,6 +3074,7 @@ impl EffectiveReviewDefaults {
             machine: cfg.default_machine().map(str::to_string),
             maximum_budget_usd: cfg.default_maximum_budget_usd(),
             proof_scope: cfg.default_proof_scope().to_string(),
+            ci_deferral: cfg.default_ci_deferral().to_string(),
             skip_auto_clean: cfg.proof_skip_auto_clean(),
             skip_worktrees: cfg.skip_worktrees(),
             skip_base_updates: cfg.skip_base_updates(),
@@ -3153,6 +3163,10 @@ struct ProjectReviewSettingsBody {
     clear_maximum_budget_usd: bool,
     #[serde(default)]
     default_proof_scope: Option<String>,
+    /// Project default CI-deferral mode (`every`/`top`/`bottom+top`); an
+    /// empty string clears it back to inheriting.
+    #[serde(default)]
+    default_ci_deferral: Option<String>,
     #[serde(default)]
     verify_skip_auto_clean: Option<bool>,
     #[serde(default)]
@@ -3289,6 +3303,19 @@ fn set_project_review_settings(daemon: &Daemon, name: &str, body: &str) -> Reply
             );
         }
     }
+    if let Some(mode) = req.default_ci_deferral.as_deref().filter(|s| !s.is_empty()) {
+        if !ralphus_core::schema::CI_DEFERRAL_VALUES.contains(&mode) {
+            return error(
+                400,
+                "invalid_value",
+                &format!(
+                    "'default_ci_deferral' must be one of {:?} -- got {mode:?}",
+                    ralphus_core::schema::CI_DEFERRAL_VALUES
+                ),
+                vec![],
+            );
+        }
+    }
     if let Some(template) = req
         .auto_fix_prompt_template
         .as_deref()
@@ -3364,6 +3391,10 @@ fn set_project_review_settings(daemon: &Daemon, name: &str, body: &str) -> Reply
     if let Some(v) = req.default_proof_scope {
         settings.default_proof_scope = clear_if_empty(v);
     }
+    let ci_deferral_changed = req.default_ci_deferral.is_some();
+    if let Some(v) = req.default_ci_deferral {
+        settings.default_ci_deferral = clear_if_empty(v);
+    }
     if let Some(v) = req.verify_skip_auto_clean {
         settings.verify_skip_auto_clean = Some(v);
     }
@@ -3427,16 +3458,48 @@ fn set_project_review_settings(daemon: &Daemon, name: &str, body: &str) -> Reply
         settings.forks_only = Some(v);
     }
     match store.set_project_review_settings(&project.name, &settings) {
-        Ok(()) => json(
-            200,
-            &ProjectReviewSettingsResponse {
-                project: project.name.clone(),
-                effective: EffectiveReviewDefaults::from_config(
-                    &store.resolve_review_config(Path::new(&project.path)),
-                ),
-                settings,
-            },
-        ),
+        Ok(()) => {
+            let reply = json(
+                200,
+                &ProjectReviewSettingsResponse {
+                    project: project.name.clone(),
+                    effective: EffectiveReviewDefaults::from_config(
+                        &store.resolve_review_config(Path::new(&project.path)),
+                    ),
+                    settings,
+                },
+            );
+            // Reviews that inherit this default now resolve to a new mode, so
+            // their open PRs/MRs are re-labelled. Forge calls run off the
+            // request thread and outside the store lock.
+            let inheriting: Vec<String> = if ci_deferral_changed {
+                store
+                    .list_guardians()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|g| g.project.as_deref() == Some(project.name.as_str()))
+                    .filter(|g| g.ci_deferral.is_none())
+                    .map(|g| g.id)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            drop(store);
+            if !inheriting.is_empty() {
+                let handle = daemon.store_handle();
+                std::thread::spawn(move || {
+                    for id in inheriting {
+                        if let Err(e) = crate::pr::reconcile_ci_deferral(&handle, &id) {
+                            crate::rlog!(
+                                WARNING,
+                                "ralphus [pr] review {id} ci deferral label sync failed: {e}"
+                            );
+                        }
+                    }
+                });
+            }
+            reply
+        }
         Err(e) => store_error(&e),
     }
 }
@@ -3741,9 +3804,57 @@ fn health_report(daemon: &Daemon) -> Reply {
         &serde_json::json!({
             "machine": "daemon (local)",
             "checked_at_ms": latest.as_ref().map(|r| r.checked_at_ms),
-            "checks": latest.map(|r| r.checks).unwrap_or_default(),
+            "checks": with_live_thread_check(latest.map(|r| r.checks).unwrap_or_default()),
         }),
     )
+}
+
+/// `checks` plus the `daemon-threads` row, evaluated now rather than taken
+/// from the hourly sweep: a thread that panicked a minute ago must show as
+/// failed on the next read, not at the next scheduled pass.
+fn with_live_thread_check(checks: Vec<crate::health_sweep::SweepCheck>) -> Vec<serde_json::Value> {
+    let (status, detail) = crate::thread_health::rollup(&crate::thread_health::snapshot());
+    let mut rows: Vec<serde_json::Value> = checks
+        .into_iter()
+        .filter_map(|c| serde_json::to_value(c).ok())
+        .collect();
+    rows.push(serde_json::json!({
+        "id": ralphus_core::health_catalog::ID_DAEMON_THREADS,
+        "status": status,
+        "detail": detail,
+    }));
+    rows
+}
+
+/// `GET /api/health/threads`: every supervised daemon thread's live state,
+/// for the board's Health tab.
+fn health_threads() -> Reply {
+    let threads = crate::thread_health::snapshot();
+    let (status, detail) = crate::thread_health::rollup(&threads);
+    json(
+        200,
+        &serde_json::json!({"status": status, "detail": detail, "threads": threads}),
+    )
+}
+
+/// `POST /api/health/threads/{name}/restart`: re-spawns a thread that has
+/// panicked or exited. Refused (409) for a thread that is still alive, since
+/// a second copy beside a stalled one would be worse than none.
+fn health_thread_restart(name: &str) -> Reply {
+    use crate::thread_health::RestartError;
+    match crate::thread_health::restart(name) {
+        Ok(thread) => json(
+            200,
+            &serde_json::json!({"restarted": true, "thread": thread}),
+        ),
+        Err(RestartError::Unknown) => error(
+            404,
+            "not_found",
+            &format!("no supervised daemon thread named '{name}'"),
+            vec![],
+        ),
+        Err(e @ RestartError::StillAlive(_)) => error(409, "conflict", &e.to_string(), vec![]),
+    }
 }
 
 /// `POST /api/health/report/refresh` (RAL-416): re-runs the Free-tier
@@ -3761,7 +3872,7 @@ fn health_report_refresh(daemon: &Daemon) -> Reply {
         &serde_json::json!({
             "machine": "daemon (local)",
             "checked_at_ms": report.checked_at_ms,
-            "checks": report.checks,
+            "checks": with_live_thread_check(report.checks),
         }),
     )
 }
@@ -3949,7 +4060,7 @@ fn register_preset(daemon: &Daemon, body: &str) -> Reply {
         return error(
             400,
             "invalid_value",
-            "'name' must be one or more '/'-separated segments of letters, digits, '_', '-' or '.' (e.g. \"roles/reviewer\")",
+            "'name' must be one or more '/'-separated segments of letters, digits, '_', '-' or '.' (e.g. \"roles/judge/reviewer\")",
             vec![],
         );
     }
@@ -6945,17 +7056,11 @@ fn run_submit_followup(
         resolved
     };
 
-    // RAL-<pending>: decide every LOCAL cell's worktree (branch claim +
-    // `w/<short>` directory) under a brief lock, then actually create/resync
-    // them -- the real `git worktree add`/`fetch`/rebase -- with NO lock
-    // held, concurrently. Without this, `derive_reviews_with_prefetch` below
-    // would run that same real git work serially, one cell at a time, for
-    // the ENTIRE duration the store lock is held -- which stalls not just
-    // this squad's own submission but every other request the daemon
-    // serves meanwhile (board reads, other squads' dispatch), since it's
-    // the same single global lock. See
-    // `crate::worktrees::plan_local_worktree_jobs`'s doc comment.
-    report_phase("Creating worktrees");
+    // Claim every LOCAL cell's worktree (branch + `w/<short>` directory) under a
+    // brief lock and leave creating it to the scheduler: the squad is built
+    // from the TOML alone and each cell starts as its own worktree becomes
+    // ready. See `crate::worktrees::plan_local_worktree_jobs`'s doc comment.
+    report_phase("Claiming worktrees");
     let prefetched_worktrees = {
         let guard = store_handle.lock();
         let (cells, tasks) = crate::reviews::cells_and_tasks_from_file(&file);
@@ -6966,8 +7071,7 @@ fn run_submit_followup(
             &tasks,
             &prefetched_upstreams,
         );
-        drop(guard);
-        crate::worktrees::execute_local_worktree_jobs(&jobs)
+        crate::worktrees::planned_worktree_paths(&jobs)
     };
 
     // WS-D.8: called with the handle, not a held guard. This was the single
@@ -8487,6 +8591,10 @@ struct EditBody {
     #[serde(default)]
     maximum_tool_output_tokens: Option<String>,
     #[serde(default)]
+    effort: Option<String>,
+    #[serde(default)]
+    temperature: Option<String>,
+    #[serde(default)]
     system_prompt: Option<String>,
 }
 
@@ -8597,6 +8705,85 @@ fn reject_unsupported_maximum_tool_output_tokens(agent: &str) -> Option<Reply> {
     None
 }
 
+/// Decodes a `temperature` edit from the request body: `None` -- untouched;
+/// `Some(None)` -- present but empty, clear it; `Some(Some(t))` -- a finite
+/// number within `core`'s `TEMPERATURE_RANGE`. `Err` carries the message for a
+/// non-numeric or out-of-range value, matching `core::validate`'s submit-time
+/// rule.
+fn nullable_temperature_edit(
+    v: Option<&String>,
+) -> std::result::Result<Option<Option<f64>>, String> {
+    match v.map(|s| non_empty(Some(s))) {
+        None => Ok(None),
+        Some(None) => Ok(Some(None)),
+        Some(Some(s)) => {
+            let (min, max) = ralphus_core::schema::TEMPERATURE_RANGE;
+            match s.parse::<f64>() {
+                Ok(t) if t.is_finite() && (min..=max).contains(&t) => Ok(Some(Some(t))),
+                Ok(t) => Err(format!(
+                    "temperature: must be a finite number between {min} and {max}, got {t}"
+                )),
+                Err(_) => Err(format!("temperature: invalid number '{s}'")),
+            }
+        }
+    }
+}
+
+/// Reject an `effort` edit up front when the agent that would run the edited
+/// cell has no delivery mechanism for it, or (for an agent with a closed
+/// vocabulary) the level isn't one of its accepted values (RAL-607),
+/// mirroring `core::validate`'s submit-time rule.
+///
+/// A custom agent profile name (not in `RESERVED_AGENT_NAMES`) is deferred the
+/// way `core` defers it: resolving a profile's backend needs the cwd/config
+/// this edit path doesn't have on hand.
+fn reject_invalid_effort(agent: &str, effort: &str) -> Option<Reply> {
+    if !ralphus_core::schema::RESERVED_AGENT_NAMES.contains(&agent) {
+        return None;
+    }
+    if !ralphus_core::schema::agent_supports_effort(agent) {
+        return Some(error(
+            400,
+            "bad_request",
+            &format!(
+                "'effort' is only supported for the 'claude-code'/'codex'/'pi' agents right now, not '{agent}'"
+            ),
+            vec![],
+        ));
+    }
+    if let Some(levels) = ralphus_core::schema::effort_levels_for_agent(agent) {
+        if !levels.contains(&effort) {
+            return Some(error(
+                400,
+                "bad_request",
+                &format!(
+                    "effort: '{effort}' is not a valid level for '{agent}' (expected one of: {})",
+                    levels.join(", ")
+                ),
+                vec![],
+            ));
+        }
+    }
+    None
+}
+
+/// Reject a `temperature` edit up front when the agent that would run the
+/// edited cell is not Pi (RAL-607). Custom agent profile names are deferred
+/// like [`reject_invalid_effort`].
+fn reject_unsupported_temperature(agent: &str) -> Option<Reply> {
+    if ralphus_core::schema::RESERVED_AGENT_NAMES.contains(&agent)
+        && !ralphus_core::schema::agent_supports_temperature(agent)
+    {
+        return Some(error(
+            400,
+            "bad_request",
+            &format!("'temperature' is only supported for the 'pi' agent right now, not '{agent}'"),
+            vec![],
+        ));
+    }
+    None
+}
+
 /// Edit a squad's label, a task's name/project/model, a cell's fields, or a
 /// proof step's agent/model/command/prompt (RAL-290).
 ///
@@ -8649,6 +8836,8 @@ fn cell_edit_is_noop(current: &crate::store::CellRow, edit: &crate::store::CellE
         && edit
             .maximum_tool_output_tokens
             .is_none_or(|v| v == current.maximum_tool_output_tokens)
+        && edit.effort.is_none_or(|v| v == current.effort.as_deref())
+        && edit.temperature.is_none_or(|v| v == current.temperature)
         && edit
             .system_prompt
             .is_none_or(|v| v == current.system_prompt.as_deref())
@@ -8714,6 +8903,11 @@ fn edit_squad(daemon: &Daemon, id: &str, body: &str) -> Reply {
                 Ok(v) => v,
                 Err(msg) => return error(400, "bad_request", &msg, vec![]),
             };
+            let temperature = match nullable_temperature_edit(req.temperature.as_ref()) {
+                Ok(v) => v,
+                Err(msg) => return error(400, "bad_request", &msg, vec![]),
+            };
+            let effort = nullable_field_edit(req.effort.as_ref());
             let system_prompt = nullable_field_edit(req.system_prompt.as_ref());
             let new_agent = non_empty(req.agent.as_ref());
             // Reject up front (mirroring `core::validate::check_system_prompt`'s
@@ -8775,6 +8969,32 @@ fn edit_squad(daemon: &Daemon, id: &str, body: &str) -> Reply {
                     return reply;
                 }
             }
+            // Same up-front rejection for `effort`/`temperature` (RAL-607);
+            // clearing either back out needs no check.
+            if let Some(Some(level)) = effort {
+                let effective_agent = match new_agent {
+                    Some(a) => a.to_string(),
+                    None => match daemon.lock().get_cell_agent(id, req.task_idx, req.cell_idx) {
+                        Ok(a) => a,
+                        Err(e) => return store_error(&e),
+                    },
+                };
+                if let Some(reply) = reject_invalid_effort(&effective_agent, level) {
+                    return reply;
+                }
+            }
+            if let Some(Some(_)) = temperature {
+                let effective_agent = match new_agent {
+                    Some(a) => a.to_string(),
+                    None => match daemon.lock().get_cell_agent(id, req.task_idx, req.cell_idx) {
+                        Ok(a) => a,
+                        Err(e) => return store_error(&e),
+                    },
+                };
+                if let Some(reply) = reject_unsupported_temperature(&effective_agent) {
+                    return reply;
+                }
+            }
             let edit = crate::store::CellEdit {
                 cwd: nullable_field_edit(req.cwd.as_ref()),
                 agent: new_agent,
@@ -8784,6 +9004,8 @@ fn edit_squad(daemon: &Daemon, id: &str, body: &str) -> Reply {
                 auto_compact_threshold,
                 maximum_context,
                 maximum_tool_output_tokens,
+                effort,
+                temperature,
                 system_prompt,
             };
             // Computed before the write below so it reflects the PRE-edit
@@ -14149,8 +14371,6 @@ struct CreateGuardianBody {
     #[serde(default)]
     checks: Vec<String>,
     #[serde(default)]
-    skip_auto_build: bool,
-    #[serde(default)]
     skip_worktrees: bool,
     #[serde(default)]
     review_type: Option<String>,
@@ -14158,9 +14378,6 @@ struct CreateGuardianBody {
 
 #[derive(Deserialize)]
 struct GuardianSettingsBody {
-    #[serde(default)]
-    // ralphus[ignore-review-parity]: retained only for stored guardian compatibility settings; preparation is optional and new task files use `[[review.prepare]]` instead of a `[[review]]` key
-    skip_auto_build: Option<bool>,
     #[serde(default)]
     skip_worktrees: Option<bool>,
     #[serde(default)]
@@ -14179,6 +14396,12 @@ struct GuardianSettingsBody {
     /// convention `resolver_agent`/`resolver_model` above use).
     #[serde(default)]
     proof_scope: Option<String>,
+    /// This review's own CI-deferral mode -- `"every"`, `"top"` or
+    /// `"bottom+top"`. An empty string clears it back to the default
+    /// (`"every"`). Applying it puts or removes the defer-full-CI label on the
+    /// review's open PRs/MRs before the request returns.
+    #[serde(default)]
+    ci_deferral: Option<String>,
     /// RAL-168: this review's own override for `"each_branch"` scope's
     /// auto-clean-skip sub-option. Always an explicit override when present
     /// -- a boolean has no natural "reset to inherit" sentinel the way an
@@ -14296,6 +14519,24 @@ where
     Option::<T>::deserialize(deserializer).map(Some)
 }
 
+/// The 400 for a `ci_deferral` outside the closed set, or `None` when the
+/// request carries none, the empty string (which clears it), or a valid mode.
+fn reject_invalid_ci_deferral(value: Option<&str>) -> Option<Reply> {
+    let mode = value.filter(|m| !m.is_empty())?;
+    if ralphus_core::schema::CI_DEFERRAL_VALUES.contains(&mode) {
+        return None;
+    }
+    Some(error(
+        400,
+        "invalid_ci_deferral",
+        &format!(
+            "ci_deferral must be one of {} -- got \"{mode}\"",
+            ralphus_core::schema::CI_DEFERRAL_VALUES.join(", ")
+        ),
+        vec![],
+    ))
+}
+
 /// The 400 for a `rebuild_on` list outside the closed set, or `None` when the
 /// request carries no list or a valid one.
 fn reject_invalid_rebuild_on(value: &Option<Option<Vec<String>>>) -> Option<Reply> {
@@ -14327,10 +14568,11 @@ struct GuardianDetailsBody {
     resolver_model: Option<String>,
     #[serde(default)]
     proof_scope: Option<String>,
+    /// See [`GuardianSettingsBody::ci_deferral`].
+    #[serde(default)]
+    ci_deferral: Option<String>,
     #[serde(default)]
     proof_skip_auto_clean: Option<bool>,
-    #[serde(default)]
-    skip_auto_build: Option<bool>,
     #[serde(default)]
     skip_worktrees: Option<bool>,
     /// RAL-514: see [`GuardianSettingsBody::skip_base_updates`].
@@ -14721,9 +14963,6 @@ fn guardian_create(daemon: &Daemon, user_header: Option<&str>, body: &str) -> Re
             if !req.checks.is_empty() {
                 let _ = store.set_guardian_checks(&id, &req.checks);
             }
-            if req.skip_auto_build {
-                let _ = store.set_guardian_skip_auto_build(&id, true);
-            }
             if req.skip_worktrees {
                 let _ = store.set_guardian_skip_worktrees(&id, true);
             }
@@ -14827,21 +15066,25 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
         return error(
             400,
             "bad_request",
-            "body must be {skip_auto_build?, proof_scope?}",
+            "body must be {skip_worktrees?, proof_scope?}",
             vec![],
         );
     };
     if let Some(reply) = reject_invalid_rebuild_on(&req.rebuild_on) {
         return reply;
     }
+    if let Some(reply) = reject_invalid_ci_deferral(req.ci_deferral.as_deref()) {
+        return reply;
+    }
     let store = daemon.lock();
-    if let Some(skip) = req.skip_auto_build {
-        if let Err(e) = store.set_guardian_skip_auto_build(id, skip) {
+    if let Some(skip) = req.skip_worktrees {
+        if let Err(e) = store.set_guardian_skip_worktrees(id, skip) {
             return store_error(&e);
         }
     }
-    if let Some(skip) = req.skip_worktrees {
-        if let Err(e) = store.set_guardian_skip_worktrees(id, skip) {
+    if let Some(mode) = req.ci_deferral.as_deref() {
+        let mode = if mode.is_empty() { None } else { Some(mode) };
+        if let Err(e) = store.set_guardian_ci_deferral(id, mode) {
             return store_error(&e);
         }
     }
@@ -14995,6 +15238,18 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
             );
         }
     }
+    // A CI-deferral change is not complete until the labels on the forge match
+    // it, so a flip is visible on the PRs/MRs the moment this request returns.
+    if req.ci_deferral.is_some() {
+        if let Err(e) = crate::pr::reconcile_ci_deferral(&daemon.store_handle(), id) {
+            return error(
+                502,
+                "forge_error",
+                &format!("ci_deferral saved locally but PR/MR label sync failed: {e}"),
+                vec![],
+            );
+        }
+    }
     if status.as_deref() == Some("merging") {
         let runner = guardian_agent_runner(daemon);
         let restarted = crate::guardian_merge::restart_guardian_merge(
@@ -15128,6 +15383,9 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
     if let Some(reply) = reject_invalid_rebuild_on(&req.rebuild_on) {
         return reply;
     }
+    if let Some(reply) = reject_invalid_ci_deferral(req.ci_deferral.as_deref()) {
+        return reply;
+    }
 
     let store = daemon.lock();
     let guardian = match store.get_guardian(id) {
@@ -15221,13 +15479,14 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
             return store_error(&e);
         }
     }
-    if let Some(skip) = req.proof_skip_auto_clean {
-        if let Err(e) = store.set_guardian_proof_skip_auto_clean(id, Some(skip)) {
+    if let Some(mode) = req.ci_deferral.as_deref() {
+        let mode = if mode.is_empty() { None } else { Some(mode) };
+        if let Err(e) = store.set_guardian_ci_deferral(id, mode) {
             return store_error(&e);
         }
     }
-    if let Some(skip) = req.skip_auto_build {
-        if let Err(e) = store.set_guardian_skip_auto_build(id, skip) {
+    if let Some(skip) = req.proof_skip_auto_clean {
+        if let Err(e) = store.set_guardian_proof_skip_auto_clean(id, Some(skip)) {
             return store_error(&e);
         }
     }
@@ -15381,7 +15640,6 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
     let rebase_relevant = base_changed
         || req.resolver_agent.is_some()
         || req.resolver_model.is_some()
-        || req.skip_auto_build.is_some()
         || req.skip_worktrees.is_some()
         || req.squash_projects.is_some()
         || req.build_env.is_some()
@@ -15397,6 +15655,16 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
                 502,
                 "forge_error",
                 &format!("details saved locally but PR/MR base sync failed: {e}"),
+                vec![],
+            );
+        }
+    }
+    if req.ci_deferral.is_some() {
+        if let Err(e) = crate::pr::reconcile_ci_deferral(&daemon.store_handle(), id) {
+            return error(
+                502,
+                "forge_error",
+                &format!("details saved locally but PR/MR label sync failed: {e}"),
                 vec![],
             );
         }
@@ -17309,6 +17577,10 @@ fn guardian_reorder(daemon: &Daemon, id: &str, body: &str) -> Reply {
         Err(e) => return store_error(&e),
     };
     drop(store);
+    // A reorder, or a branch enabled or disabled with it, can change which PR
+    // is the bottom and which is the top, so the CI-deferral labels follow --
+    // backgrounded since it makes forge calls.
+    crate::pr::start_reconcile_ci_deferral(daemon.store_handle(), id);
     // RAL-190: a reorder can change which branch precedes a stacked PR, so
     // its forge base needs to follow -- backgrounded since it makes network
     // calls (see pr::resync_pr_bases's doc comment).
@@ -17501,9 +17773,32 @@ fn guardian_followup_set_ignored(daemon: &Daemon, id: &str, body: &str, ignored:
 }
 
 /// `POST /api/guardians/{id}/followup/accept`: drafts the follow-up squad and
-/// its waypoint from the offer.
-fn guardian_followup_accept(daemon: &Daemon, id: &str) -> Reply {
-    match crate::followup::accept_offer(daemon, id) {
+/// its waypoint from the offer, or from the one item `{"prophecy_id": n}`
+/// names.
+fn guardian_followup_accept(daemon: &Daemon, id: &str, body: &str) -> Reply {
+    let req = if body.trim().is_empty() {
+        FollowupIgnoreBody::default()
+    } else {
+        match serde_json::from_str::<FollowupIgnoreBody>(body) {
+            Ok(r) => r,
+            Err(_) => return error(400, "bad_request", "invalid body", vec![]),
+        }
+    };
+    // Before the merge there is no offer to accept: accepting an item then
+    // records the intent, and the item is submitted when the offer is made.
+    if let Some(prophecy_id) = req.prophecy_id {
+        let store = daemon.lock();
+        if matches!(store.get_followup_offer(id), Ok(None)) {
+            if let Err(e) = store.preaccept_followup(id, prophecy_id) {
+                return store_error(&e);
+            }
+            return match store.pending_followups(id) {
+                Ok(items) => json(200, &items),
+                Err(e) => store_error(&e),
+            };
+        }
+    }
+    match crate::followup::accept_offer(daemon, id, req.prophecy_id) {
         Ok(result) => json(201, &result),
         Err(crate::followup::AcceptError::Store(e)) => store_error(&e),
         Err(crate::followup::AcceptError::Rejected { status, message }) => {
@@ -19295,6 +19590,7 @@ pub fn serve<A: ToSocketAddrs>(
     // keep synchronous merges so their assertions stay hermetic.
     crate::guardian_merge::enable_post_merge_spawning();
     let store = Store::open(db_path).map_err(|e| {
+        crate::daemon_health::startup_failed("store_open", &e.to_string());
         // ralphus[ignore-rlog-pair]: the store failed to open, so there is no database to record this in
         crate::rlog!(
             ERROR,
@@ -19329,6 +19625,7 @@ pub fn serve<A: ToSocketAddrs>(
     let server = match tiny_http::Server::http(addr) {
         Ok(server) => server,
         Err(e) => {
+            crate::daemon_health::startup_failed("port_bind", &e.to_string());
             crate::cartographer::Note::new("daemon")
                 .level(crate::logging::LogLevel::ERROR)
                 .emit(
@@ -19440,6 +19737,7 @@ pub fn serve<A: ToSocketAddrs>(
     // pool -- see `tmux::reap_orphaned_sessions_at_startup`'s doc comment.
     let reap_started = Instant::now();
     let reaped = crate::tmux::reap_orphaned_sessions_at_startup();
+    crate::daemon_health::report_startup_reap(reaped);
     let reap_ms = reap_started.elapsed().as_millis();
     // RAL-234: this whole block (recovery + reap) runs after the port is
     // bound but before `run_http_loop` starts accepting/processing requests
@@ -19504,8 +19802,10 @@ pub fn serve<A: ToSocketAddrs>(
     // against the same value. Loaded before the scheduler/HTTP loop start so
     // a failure to persist it fails the whole startup rather than silently
     // serving an unauthenticated API.
-    let token = crate::token::load_or_create(&crate::token_path())
-        .map_err(|e| std::io::Error::other(format!("failed to load/create daemon token: {e}")))?;
+    let token = crate::token::load_or_create(&crate::token_path()).map_err(|e| {
+        crate::daemon_health::startup_failed("token", &e.to_string());
+        std::io::Error::other(format!("failed to load/create daemon token: {e}"))
+    })?;
     crate::rlog!(
         INFO,
         "ralphus [token] auth token ready at {}",
@@ -19591,6 +19891,9 @@ pub fn serve<A: ToSocketAddrs>(
     // ralphus entirely -- still gets pulled back into this guardian's branch
     // order instead of silently drifting forever.
     crate::pr::spawn_pr_base_drift_poller(daemon.store_handle());
+    // Follow-ups a user accepted before their review merged become squads as
+    // soon as the merge makes the offer.
+    crate::followup::spawn_preaccepted_worker(Arc::clone(&daemon));
     // RAL-308: the same PID registry the local runner reports its spawned
     // subprocesses into (`with_registry` above), so the CPU-flat stall sweep
     // sees every live cell/proof subprocess without a separate tracking path.
@@ -19603,36 +19906,57 @@ pub fn serve<A: ToSocketAddrs>(
     // `crate::watchdog`'s module doc comment for what the unwatched failure
     // looked like.
     crate::watchdog::spawn(daemon.store_handle(), daemon.watchdog_handle());
+    crate::daemon_health::spawn_periodic_probes(daemon.store_handle());
+    // The body is re-invoked as-is by `thread_health::restart`, so each call
+    // clones what `run_loop` takes by value. Only the first call runs the
+    // startup recovery; a restart re-enters the tick loop alone.
+    let first_scheduler_run = std::sync::atomic::AtomicBool::new(true);
     let scheduler_store = daemon.store_handle();
-    std::thread::spawn(move || {
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::scheduler::run_loop(
-                handle,
-                runner,
-                cancellations,
-                waypoint_halts,
-                sem,
-                summary_queue,
-                procs,
+    crate::thread_health::spawn_supervised(
+        crate::thread_health::ThreadSpec {
+            name: crate::scheduler::SCHEDULER_THREAD,
+            description: "Squad scheduling, review rebase/base-shift rebuilds, PR auto-submit,                           base-branch fetch polling and waypoint sweeps all stop while it is down.",
+            max_silence: Some(crate::scheduler::SCHEDULER_MAX_SILENCE),
+        },
+        daemon.store_handle(),
+        Arc::new(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::scheduler::run_loop(
+                    Arc::clone(&handle),
+                    Arc::clone(&runner),
+                    cancellations.clone(),
+                    waypoint_halts.clone(),
+                    Arc::clone(&sem),
+                    Arc::clone(&summary_queue),
+                    procs.clone(),
+                    first_scheduler_run.swap(false, std::sync::atomic::Ordering::SeqCst),
+                );
+            }));
+            // `run_loop` never returns while the daemon is healthy, so either way
+            // out means no further squads will be scheduled by this process.
+            let reason = match &outcome {
+                Ok(()) => "returned".to_string(),
+                Err(payload) => format!("panicked: {}", panic_payload_message(payload.as_ref())),
+            };
+            crate::cartographer::Note::new("scheduler")
+                .level(crate::logging::LogLevel::ERROR)
+                .emit(
+                    &scheduler_store.lock(),
+                    format!("scheduler thread {reason}; no further squads will be scheduled until the daemon restarts"),
+                    serde_json::json!({ "reason": reason }),
+                );
+            crate::daemon_health::emit(
+                crate::daemon_health::HealthEvent::error(
+                    "daemon.loop.dead",
+                    format!("scheduler thread {reason}"),
+                )
+                .attr("loop", "scheduler"),
             );
-        }));
-        // `run_loop` never returns while the daemon is healthy, so either way
-        // out means no further squads will be scheduled by this process.
-        let reason = match &outcome {
-            Ok(()) => "returned".to_string(),
-            Err(payload) => format!("panicked: {}", panic_payload_message(payload.as_ref())),
-        };
-        crate::cartographer::Note::new("scheduler")
-            .level(crate::logging::LogLevel::ERROR)
-            .emit(
-                &scheduler_store.lock(),
-                format!("scheduler thread {reason}; no further squads will be scheduled until the daemon restarts"),
-                serde_json::json!({ "reason": reason }),
-            );
-        if let Err(payload) = outcome {
-            std::panic::resume_unwind(payload);
-        }
-    });
+            if let Err(payload) = outcome {
+                std::panic::resume_unwind(payload);
+            }
+        }),
+    );
     crate::cartographer::Note::new("daemon").emit(
         &daemon.lock(),
         format!(
@@ -19643,6 +19967,12 @@ pub fn serve<A: ToSocketAddrs>(
             "read_workers": READ_WORKERS,
             "write_workers": WRITE_WORKERS,
         }),
+    );
+
+    crate::daemon_health::emit(
+        crate::daemon_health::HealthEvent::ok("daemon.startup")
+            .attr("total_startup_ms", total_startup_ms as i64)
+            .attr("reaped", reaped as i64),
     );
 
     // tiny_http 0.12 treats any accept() error as fatal: its accept thread
@@ -19695,6 +20025,10 @@ pub fn serve<A: ToSocketAddrs>(
             startup_started.elapsed().as_secs()
         ),
         serde_json::json!({ "uptime_secs": startup_started.elapsed().as_secs() }),
+    );
+    crate::daemon_health::emit(
+        crate::daemon_health::HealthEvent::ok("daemon.shutdown")
+            .attr("uptime_secs", startup_started.elapsed().as_secs() as i64),
     );
     Ok(())
 }
@@ -22139,7 +22473,7 @@ mod tests {
 
     /// RAL-445: registering a git project installs the co-author hook
     /// immediately, without waiting for a cell to materialize a worktree
-    /// through `ensure_worktree_with_existing` -- this covers a cell whose
+    /// through `ensure_worktree_tracked` -- this covers a cell whose
     /// `cwd` is the project root itself.
     #[test]
     fn register_project_route_installs_coauthor_hook() {
@@ -23377,6 +23711,77 @@ mod tests {
     }
 
     #[test]
+    fn project_review_settings_route_sets_reads_clears_and_validates_ci_deferral() {
+        let d = daemon();
+        let repo = tmp_git_repo("rs-ci-deferral");
+        route(
+            &d,
+            "POST",
+            "/api/projects",
+            &register_body("proj", &repo.to_string_lossy(), ""),
+        );
+        let get = || -> serde_json::Value {
+            let r = route(&d, "GET", "/api/projects/proj/review-settings", "");
+            serde_json::from_str(&r.body).unwrap()
+        };
+        assert_eq!(get()["effective"]["ci_deferral"], "every", "default");
+
+        for mode in ["top", "bottom+top", "every"] {
+            let r = route(
+                &d,
+                "POST",
+                "/api/projects/proj/review-settings",
+                &format!(r#"{{"default_ci_deferral":"{mode}"}}"#),
+            );
+            assert_eq!(r.status, 200, "{mode}: {}", r.body);
+            let body = get();
+            assert_eq!(body["settings"]["default_ci_deferral"], mode);
+            assert_eq!(body["effective"]["ci_deferral"], mode);
+        }
+
+        let r = route(
+            &d,
+            "POST",
+            "/api/projects/proj/review-settings",
+            r#"{"default_ci_deferral":"head+tip"}"#,
+        );
+        assert_eq!(r.status, 400, "{}", r.body);
+        assert!(r.body.contains("invalid_value"), "{}", r.body);
+        assert_eq!(
+            get()["settings"]["default_ci_deferral"],
+            "every",
+            "a rejected value leaves the saved one alone"
+        );
+
+        let r = route(
+            &d,
+            "POST",
+            "/api/projects/proj/review-settings",
+            r#"{"default_ci_deferral":""}"#,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(get()["settings"]["default_ci_deferral"].is_null());
+        assert_eq!(get()["effective"]["ci_deferral"], "every");
+    }
+
+    #[test]
+    fn guardian_settings_and_details_reject_an_unknown_ci_deferral() {
+        let d = daemon();
+        let id = d.lock().create_guardian("g", "main", "/repo").unwrap();
+        for path in ["settings", "details"] {
+            let r = route(
+                &d,
+                "POST",
+                &format!("/api/guardians/{id}/{path}"),
+                r#"{"ci_deferral":"head+tip"}"#,
+            );
+            assert_eq!(r.status, 400, "{path}: {}", r.body);
+            assert!(r.body.contains("invalid_ci_deferral"), "{}", r.body);
+        }
+        assert_eq!(d.lock().get_guardian(&id).unwrap().ci_deferral, None);
+    }
+
+    #[test]
     fn project_review_settings_route_round_trips_skip_manual_checks() {
         let d = daemon();
         let repo = tmp_git_repo("rs-skip-manual");
@@ -23974,7 +24379,76 @@ ANTHROPIC_AUTH_TOKEN = { from_env = "RALPHUS_AGENT_PROFILES_HEALTH_ROUTE_TEST_VA
         let parsed: serde_json::Value = serde_json::from_str(&r.body).unwrap();
         assert_eq!(parsed["machine"], "daemon (local)");
         assert!(parsed["checked_at_ms"].is_null());
-        assert_eq!(parsed["checks"].as_array().unwrap().len(), 0);
+        // No sweep has run, so the only row is the live `daemon-threads` one:
+        // thread state is read at request time, not taken from the sweep.
+        let checks = parsed["checks"].as_array().unwrap();
+        assert_eq!(checks.len(), 1, "{checks:?}");
+        assert_eq!(checks[0]["id"], "daemon-threads");
+    }
+
+    #[test]
+    fn health_threads_route_lists_a_supervised_thread_and_its_state() {
+        crate::thread_health::spawn_supervised(
+            crate::thread_health::ThreadSpec {
+                name: "route-test-panics",
+                description: "route test thread",
+                max_silence: None,
+            },
+            daemon().store_handle(),
+            std::sync::Arc::new(|| panic!("route test panic")),
+        );
+        let d = daemon();
+        let mut found = None;
+        for _ in 0..200 {
+            let r = route(&d, "GET", "/api/health/threads", "");
+            assert_eq!(r.status, 200, "{}", r.body);
+            let parsed: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+            found = parsed["threads"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == "route-test-panics" && t["state"] == "panicked")
+                .cloned();
+            if found.is_some() {
+                assert_eq!(parsed["status"], "fail");
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let thread = found.expect("the panicked thread is listed");
+        assert_eq!(thread["panic_message"], "route test panic");
+        assert_eq!(thread["restartable"], true);
+    }
+
+    #[test]
+    fn health_thread_restart_route_rejects_unknown_and_live_threads() {
+        let d = daemon();
+        let r = route(&d, "POST", "/api/health/threads/no-such-thread/restart", "");
+        assert_eq!(r.status, 404, "{}", r.body);
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&stop);
+        crate::thread_health::spawn_supervised(
+            crate::thread_health::ThreadSpec {
+                name: "route-test-live",
+                description: "route test thread",
+                max_silence: None,
+            },
+            d.store_handle(),
+            std::sync::Arc::new(move || {
+                while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }),
+        );
+        let r = route(
+            &d,
+            "POST",
+            "/api/health/threads/route-test-live/restart",
+            "",
+        );
+        assert_eq!(r.status, 409, "{}", r.body);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[test]
@@ -24883,6 +25357,120 @@ agent=\"codex\"
         let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &clear);
         assert_eq!(r.status, 200, "{}", r.body);
         assert!(!r.body.contains("maximum_context"), "{}", r.body);
+    }
+
+    #[test]
+    fn edit_cell_effort_and_temperature_set_and_clear() {
+        let d = daemon();
+        let toml = "[[task]]
+name=\"t\"
+[[task.cell]]
+cwd=\"/r\"
+prompt=\"p\"
+agent=\"pi\"
+";
+        route(&d, "POST", "/api/squads", &submit_body(toml));
+        let set = serde_json::json!({
+            "kind": "cell", "task_idx": 0, "cell_idx": 0,
+            "effort": "high", "temperature": "0.7"
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &set);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("\"effort\":\"high\""), "{}", r.body);
+        assert!(r.body.contains("\"temperature\":0.7"), "{}", r.body);
+
+        let clear = serde_json::json!({
+            "kind": "cell", "task_idx": 0, "cell_idx": 0, "effort": "", "temperature": ""
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &clear);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(!r.body.contains("\"effort\""), "{}", r.body);
+        assert!(!r.body.contains("\"temperature\""), "{}", r.body);
+    }
+
+    #[test]
+    fn edit_cell_effort_and_temperature_rejected_for_unsupported_agent() {
+        // GOOD's cell resolves to the default "claude", which supports neither.
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        for (field, value) in [("effort", "high"), ("temperature", "0.5")] {
+            let body = serde_json::json!({
+                "kind": "cell", "task_idx": 0, "cell_idx": 0, field: value
+            })
+            .to_string();
+            let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &body);
+            assert_eq!(r.status, 400, "{field}: {}", r.body);
+            assert!(r.body.contains(field), "{}", r.body);
+        }
+    }
+
+    #[test]
+    fn edit_cell_effort_and_temperature_reject_invalid_values() {
+        let d = daemon();
+        let toml = "[[task]]
+name=\"t\"
+[[task.cell]]
+cwd=\"/r\"
+prompt=\"p\"
+agent=\"pi\"
+";
+        route(&d, "POST", "/api/squads", &submit_body(toml));
+        for (field, value) in [
+            ("effort", "turbo"),
+            ("temperature", "3"),
+            ("temperature", "-0.1"),
+            ("temperature", "hot"),
+            ("temperature", "NaN"),
+        ] {
+            let body = serde_json::json!({
+                "kind": "cell", "task_idx": 0, "cell_idx": 0, field: value
+            })
+            .to_string();
+            let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &body);
+            assert_eq!(r.status, 400, "{field}={value}: {}", r.body);
+        }
+    }
+
+    #[test]
+    fn cell_edit_is_noop_covers_effort_and_temperature() {
+        let d = daemon();
+        let toml = "[[task]]
+name=\"t\"
+agent=\"pi\"
+effort=\"low\"
+[[task.cell]]
+cwd=\"/r\"
+prompt=\"p\"
+temperature=0.5
+";
+        let r = route(&d, "POST", "/api/squads", &submit_body(toml));
+        assert_eq!(r.status, 201, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        let squad_id = v["squad_id"].as_str().unwrap().to_string();
+        let current = d.lock().cells_of(&squad_id).unwrap().remove(0);
+        assert_eq!(current.effort.as_deref(), Some("low"));
+        assert_eq!(current.temperature, Some(0.5));
+        let mut edit = crate::store::CellEdit {
+            cwd: None,
+            agent: None,
+            model: None,
+            prompt: None,
+            command: None,
+            auto_compact_threshold: None,
+            maximum_context: None,
+            maximum_tool_output_tokens: None,
+            effort: Some(Some("low")),
+            temperature: Some(Some(0.5)),
+            system_prompt: None,
+        };
+        assert!(cell_edit_is_noop(&current, &edit));
+        edit.effort = Some(Some("high"));
+        assert!(!cell_edit_is_noop(&current, &edit));
+        edit.effort = None;
+        edit.temperature = Some(None);
+        assert!(!cell_edit_is_noop(&current, &edit));
     }
 
     #[test]
@@ -29551,13 +30139,12 @@ remediation_attempts = 1
         assert!(index.body.contains("\"branch_count\":0"));
         // Detail-only fields the sidebar list never reads must not be
         // serialized here -- that's the entire point of this endpoint.
-        assert!(!index.body.contains("\"skip_auto_build\""));
         assert!(!index.body.contains("\"combined_env\""));
         assert!(!index.body.contains("\"attempt_tokens_in\""));
 
         // The full endpoint is unaffected by this one's existence.
         let full = route(&d, "GET", "/api/guardians", "");
-        assert!(full.body.contains("\"skip_auto_build\""));
+        assert!(full.body.contains("\"combined_env\""));
     }
 
     #[test]
@@ -29674,29 +30261,6 @@ remediation_attempts = 1
         assert_eq!(del.status, 200);
 
         assert!(crate::terminal_log::list_attempts(&name).is_empty());
-    }
-
-    #[test]
-    fn guardian_skip_auto_build_via_create_and_settings() {
-        let d = daemon();
-        let body = serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo","skip_auto_build":true})
-            .to_string();
-        route(&d, "POST", "/api/guardians", &body);
-        let gid = "guardian-000000000001";
-        assert!(
-            route(&d, "GET", &format!("/api/guardians/{gid}"), "")
-                .body
-                .contains("\"skip_auto_build\":true")
-        );
-        // toggle back off via settings
-        let r = route(
-            &d,
-            "POST",
-            &format!("/api/guardians/{gid}/settings"),
-            "{\"skip_auto_build\":false}",
-        );
-        assert_eq!(r.status, 200);
-        assert!(r.body.contains("\"skip_auto_build\":false"));
     }
 
     #[test]
@@ -32595,14 +33159,14 @@ remediation_attempts=1
         let d = daemon();
         let gid = make_guardian(&d);
         let body = serde_json::json!({
-            "skip_auto_build": true,
+            "skip_worktrees": true,
             "proof_scope": "final_branch",
             "match_pr_branch_name": true,
         })
         .to_string();
         let r = route(&d, "POST", &format!("/api/guardians/{gid}/details"), &body);
         assert_eq!(r.status, 200, "{}", r.body);
-        assert!(r.body.contains("\"skip_auto_build\":true"));
+        assert!(r.body.contains("\"skip_worktrees\":true"));
         assert!(r.body.contains("\"proof_scope\":\"final_branch\""));
         assert!(r.body.contains("\"match_pr_branch_name\":true"));
     }
@@ -32805,7 +33369,7 @@ remediation_attempts=1
         // re-attempting; with no branches the re-attempt fails fast
         // (`NoBranches`) and never re-claims `merging`, so landing on
         // `collecting` here is proof the restart ran exactly once.
-        let rebase_relevant = serde_json::json!({"skip_auto_build": true}).to_string();
+        let rebase_relevant = serde_json::json!({"skip_worktrees": true}).to_string();
         let r = route(
             &d,
             "POST",
@@ -32851,7 +33415,7 @@ remediation_attempts=1
             )
             .unwrap();
 
-        let rebase_relevant = serde_json::json!({"skip_auto_build": true}).to_string();
+        let rebase_relevant = serde_json::json!({"skip_worktrees": true}).to_string();
         let r = route(
             &d,
             "POST",

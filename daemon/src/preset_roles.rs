@@ -2,7 +2,7 @@
 //! the first time the `presets` table is created.
 //!
 //! Each is a hierarchical name (`roles/<role>`, referenced as
-//! `<<ralphus:presets/roles/<role>>>`) with a short persona `system_prompt`
+//! `<<ralphus:presets/roles/<role>>>`; judges are `roles/judge/<role>`) with a short persona `system_prompt`
 //! and a `prompt` template. The template embeds the work being done or judged
 //! with [`SUBJECT_PROMPT`] -- the entity's own prompt on a cell, the parent
 //! cell's prompt on a proof -- so one role works in both positions. A prompt
@@ -29,6 +29,10 @@
 use ralphus_core::schema::SYSTEM_PROMPT_POSITION_APPEND;
 
 use crate::presets::PresetSeed;
+
+/// Name prefix of the judge presets. A cell's declined-work (`refused`)
+/// prophecies are handed to a proof extending a preset with this prefix.
+pub const JUDGE_PREFIX: &str = "roles/judge/";
 
 /// Expands to the [`SUBJECT_PROMPT`] literal so `concat!` can embed it.
 macro_rules! subject_prompt {
@@ -79,7 +83,7 @@ const fn judge(
 // carry one. Restoring them is follow-up work.
 pub const ROLE_PRESETS: &[PresetSeed] = &[
     judge(
-        "roles/adversary",
+        "roles/judge/adversary",
         "You are the adversary. Your job is to break the work, not to praise or repair it. \
          Assume the change is wrong and look for the input, ordering, state, or environment \
          that proves it. Prefer a concrete failing reproduction (a test or a command) over a \
@@ -96,7 +100,7 @@ pub const ROLE_PRESETS: &[PresetSeed] = &[
         6,
     ),
     judge(
-        "roles/analyst",
+        "roles/judge/analyst",
         "You are an analyst. Investigate, measure, and explain; do not change the code. \
          Ground every claim in something you read or ran, and say how sure you are. Separate \
          observations from interpretations, and call out what you could not verify.",
@@ -219,7 +223,7 @@ pub const ROLE_PRESETS: &[PresetSeed] = &[
         ),
     ),
     judge(
-        "roles/reviewer",
+        "roles/judge/reviewer",
         "You are a code reviewer. Judge the change on correctness first, then on safety, \
          maintainability, and fit with the codebase's conventions. Report only findings you \
          can justify, rank them by severity, and say what would change your mind. Do not \
@@ -235,7 +239,7 @@ pub const ROLE_PRESETS: &[PresetSeed] = &[
         7,
     ),
     judge(
-        "roles/security",
+        "roles/judge/security",
         "You are a security engineer. Think like an attacker with the access a real adversary \
          would have: untrusted input, confused deputies, leaked secrets, missing authorization, \
          injection, unsafe deserialization, and supply-chain exposure. Prefer concrete exploit \

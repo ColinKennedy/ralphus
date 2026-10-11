@@ -713,9 +713,29 @@ instead of falling through to a global, non-project-aware default:
 | `default_machine` | `machine` | the local machine |
 | `default_maximum_budget_usd` | `maximum_budget_usd` | unbounded |
 | `default_proof_scope` | `proof_scope` | `"each_branch"` |
+| `default_ci_deferral` | `ci_deferral` | `"every"` |
 
 An explicitly declared `[[review]]` value always wins over its project
-default. `default_proof_scope` accepts the legacy `verify_scope` key name too
+default. `ci_deferral` (`every` | `top` | `bottom+top`) decides which PRs/MRs
+in a review's stack run the full CI suite; every other open member carries the
+`ralphus:defer-full-ci` label, which the repository's CI configuration reads to
+skip its slow jobs. Changing it on a review (`POST .../settings` or `.../details`)
+re-labels the review's open PRs/MRs before the request returns -- a forge failure
+is a `502` with the value already saved -- and a later submission is labelled
+against the then-current setting. Only a PR/MR whose label actually changes is
+touched: the CI runs in flight on its head commit are recorded first and, once
+the label change has succeeded, cancelled (they ran under the old scope), and
+GitLab, which never starts a pipeline for a label change, is asked for a new
+merge request pipeline. Those CI steps are best-effort and never fail the
+request. Changing the project default re-labels the project's reviews that have
+no override of their own, in the background. The labels also follow the stack:
+a reorder (with any branch enabled or disabled alongside it), an arrange, a
+force-start, a branch move and every submission re-label it, and the daemon's
+periodic review check re-labels a review whose stack of open PRs/MRs no longer
+matches the one it was last labelled for -- a PR/MR merged, closed or dropped
+included -- without any forge call when nothing changed. An unrecognised stored
+value behaves as `every`. How a repository's CI reads the label is in
+[`ci-deferral.md`](ci-deferral.md). `default_proof_scope` accepts the legacy `verify_scope` key name too
 (pre-dates the Verify→Proof rename, see the glossary). `id`/`name`/`upstream`/
 `action` have no project-default equivalent -- see
 `daemon/src/config.rs`'s `REVIEW_FIELD_PARITY` for why each is excluded.
@@ -1326,6 +1346,48 @@ Deliberately local-only: there is no remote-target counterpart to this route
 (the daemon's own Free-tier subset is the only thing "check now" re-runs
 here) -- see `daemon/src/health_sweep.rs`'s `refresh_now` doc comment.
 
+### `GET /api/health/threads`
+Live state of the daemon's supervised background threads
+(`daemon/src/thread_health.rs`): `scheduler`, `health-sweep`,
+`pr-base-drift-poller`, `store-watchdog`. A panic ends one of these threads
+without stopping the daemon, so the HTTP API keeps answering while that
+thread's work (for the scheduler: squad scheduling, review rebases, PR
+auto-submit) silently stops.
+
+```json
+{
+  "status": "fail",
+  "detail": "scheduler: panicked (store guard held for 2007ms ...)",
+  "threads": [
+    {
+      "name": "scheduler",
+      "description": "Squad scheduling, review rebase/base-shift rebuilds, ...",
+      "state": "panicked",
+      "silent_for_ms": 61000,
+      "max_silence_ms": 300000,
+      "panic_message": "store guard held for 2007ms ...",
+      "panicked_at_ms": 1791680000000,
+      "restarts": 0,
+      "restartable": true
+    }
+  ]
+}
+```
+
+`state` is `running`, `stalled` (alive but past its heartbeat limit),
+`panicked` or `exited`. The same rollup is the `daemon-threads` row of
+`GET /api/health/report`, evaluated live rather than from the hourly sweep.
+When a thread ends, the daemon also enqueues an `urgent` mailbox message
+(category `daemon-thread`) whose remediation is the restart command below.
+
+### `POST /api/health/threads/{name}/restart`
+Re-spawns a thread that has `panicked` or `exited` -- CLI:
+`ralphus check restart-thread <name>`; board: the Restart button on the
+Health tab. `404` for an unknown name; `409` while the thread is still alive
+(a `stalled` thread cannot be killed from inside the process, and a second
+copy beside it would be worse than none). The scheduler restart re-enters its
+tick loop only: startup recovery and the first-pass sweeps are not re-run.
+
 ### `POST /api/clear`
 Bulk-delete tasks and reviews (RAL-13).
 
@@ -1351,7 +1413,7 @@ other keys are read:
 |---|---|---|
 | `squad` | — | `label` |
 | `task` | `task_idx` | `name`, `project`, `model` |
-| `cell` | `task_idx`, `cell_idx` | `cwd`, `agent`, `model`, `prompt`, `command`, `auto_compact_threshold`, `maximum_tool_output_tokens`, `system_prompt` |
+| `cell` | `task_idx`, `cell_idx` | `cwd`, `agent`, `model`, `prompt`, `command`, `auto_compact_threshold`, `maximum_tool_output_tokens`, `effort`, `temperature`, `system_prompt` |
 | `proof` | `task_idx`, `proof_scope`, `cell_idx`, `proof_idx` | `agent`, `model`, `command`, `prompt`, `maximum_tool_output_tokens` |
 
 Every editable key is optional and uses the same three-state convention: the
@@ -1372,6 +1434,16 @@ be **positive** — `0` and negatives are rejected with `400`, mirroring
 `core::validate`'s `check_positive_number` at submit time so an edit cannot
 store a value a task file would have been rejected for. A non-numeric value is
 likewise a `400`.
+
+A `cell` edit also accepts `effort` (RAL-607; a string, `null` clears) and
+`temperature` (a finite number from 0.0 to 2.0, `null` clears). `effort` maps to
+Claude Code `--effort` (`low`, `medium`, `high`, `xhigh`, `max`), Codex
+`model_reasoning_effort` (any non-empty string) and Pi `--thinking` (`off`,
+`minimal`, `low`, `medium`, `high`, `xhigh`, `max`); `temperature` is Pi only
+(`models.json` `samplingParams`). Either is rejected with `400` when the cell's
+effective agent does not support it, or the level is outside that agent's
+closed set. A changed value restarts the cell with resume like a model/agent
+edit; resubmitting identical values is a no-op. Cell views report both fields.
 
 `maximum_tool_output_tokens` is additionally rejected with `400` when the agent
 that would run the node has no delivery mechanism for it (RAL-333) — accepted
@@ -2154,7 +2226,7 @@ Field-by-field, this replaces:
 |---|---|
 | `name` | `POST .../rename` |
 | `base_branch` | `POST .../base` |
-| `resolver_agent`, `resolver_model`, `proof_scope`, `proof_skip_auto_clean`, `skip_auto_build`, `skip_worktrees`, `skip_base_updates`, `separate_pr_branch`, `match_pr_branch_name`, `auto_submit_pr_stack` | `POST .../settings` |
+| `resolver_agent`, `resolver_model`, `proof_scope`, `ci_deferral`, `proof_skip_auto_clean`, `skip_worktrees`, `skip_base_updates`, `separate_pr_branch`, `match_pr_branch_name`, `auto_submit_pr_stack` | `POST .../settings` |
 | `squash_projects` (full desired membership — every project in the list gets squash turned on, every other project on the review gets it turned off) | `POST .../squash` (one call per project) |
 | `build_env`, `manual_checks_env`, `branch_env` (keyed by branch id) | `POST .../build-env`, `POST .../manual-checks-env`, `POST .../branches/{id}/env` respectively — each an `{set, unset, clear}` object with the same three-way inherited-override shape those endpoints already use |
 
@@ -2167,7 +2239,7 @@ Unlike `POST .../settings` — which restarts an in-flight (`merging`) review
 on *any* field write, even a purely cosmetic one like a rename — this
 endpoint computes a single `rebase_relevant` decision across the whole
 batch (true if `base_branch`, `resolver_agent`/`resolver_model`,
-`skip_auto_build`, `skip_worktrees`, `squash_projects`, or any env-override
+`skip_worktrees`, `squash_projects`, or any env-override
 field was present) and takes **at most one** action at the end: restart the
 merge once if the review is already `merging` and something rebase-relevant
 changed, or kick off one merge if it wasn't merging and something
@@ -3039,12 +3111,24 @@ The reverse of `ignore`, with the same body, response and errors.
 
 ### `POST /api/guardians/{id}/followup/accept`
 
+Body `{"prophecy_id": 12}` accepts that one item; `{}` accepts every item not
+yet accepted. Each accept makes its own squad, and the offer becomes `accepted`
+once all of its items have one. **Before the review has merged** there is no
+offer yet, so `{"prophecy_id": n}` only records the acceptance (`200`, the
+`GET .../followup/items` body, the item's `accepted` true) and the item is
+submitted as soon as the merge makes the offer; ignoring the item withdraws it.
+On acceptance the daemon also sends a mailbox message saying the earlier offer
+message needs no action for those items.
+
 Accepts an open offer. The daemon drafts one squad — a task per deferred item,
 its prompt the deferred note plus the original prompt as context, started on
 the same agent and model — and submits it through the ordinary submit path, so
 every submit preflight applies. The squad is based on the branch the review
 merged into, or on the remote's default branch when that branch no longer
-exists. It starts at once unless auto-start is off for the review (its own
+exists. The squad declares no review of its own: each cell opts into Triage
+(`triage = true`), so the Arbiter classifies it and the work lands in an
+automatic review when its `(project, type)` pool drains, like any other
+Triage cell. It starts at once unless auto-start is off for the review (its own
 `followup_auto_start`, else the global `auto_start`), in which case it is
 created **held**.
 
@@ -4394,7 +4478,7 @@ tables of its own:
 
 - **`ralphus history <ID>` (no `--live`)** — a one-shot, non-blocking
   snapshot. If the id's tmux session is currently live, this is the same
-  `.../pane` content the board's "Show Live View" reads (see `GET
+  `.../pane` content the board's Live view reads (see `GET
   .../cells/{ti}/{si}/pane` / `GET .../proofs/{task_idx}/{scope}/{cell_idx}/{proof_idx}/pane`
   above). Once the tmux session is gone, `.../pane` itself may still return a
   persisted last-pane-content snapshot (RAL-102 follow-up —
@@ -4444,7 +4528,7 @@ alongside `active`/`content`:
 `last_activity_ms` is the Unix-epoch-milliseconds time the daemon last
 observed *fresh* pane output (strictly more lines than the previous poll)
 for this session — `null` once the session has ended or before it has
-produced any output yet. The board's Live View ("peek box") uses it to show
+produced any output yet. The board's Live View (the live-view widget) uses it to show
 an absolute "last activity" timestamp and to distinguish a quiet-but-healthy
 long-running command (e.g. a `cargo test` pass inside a Guardian
 quality-check) from one that has silently stopped producing output.
@@ -4540,7 +4624,7 @@ it's not on disk).
   partially survive at the edge — an inherent limitation of range-based
   redaction on top of substring-based scrubbing).
 
-**Wired into the board UI** (Phase 2G-A): the Live View peek box is driven
+**Wired into the board UI** (Phase 2G-A): the Live View widget is driven
 from this endpoint as a byte-addressed "tape" rather than stitched onto the
 line-based `GET .../pane`, which sidesteps the coordinate-space problem
 instead of solving it — the two endpoints still share no common offset space,

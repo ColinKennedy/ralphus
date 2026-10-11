@@ -455,9 +455,20 @@ fn run_agent_with_stall_recovery(
         if !attempt.is_thinking_stalled() || cancel.is_cancelled() {
             return attempt;
         }
+        // A stalled manual-check generation is surfaced on the review as
+        // `checks_state == "hung"` until the retry produces output or ends.
+        let manual_review = (spec.task == MANUAL_COMMANDS_TASK)
+            .then(|| spec.squad_id.strip_prefix("guardian-").map(str::to_string))
+            .flatten();
+        if let Some(gid) = &manual_review {
+            crate::guardian::set_manual_checks_stalled(gid, true);
+        }
         match crate::scheduler::handle_thinking_stall_attempt(store, spec, &attempt) {
             crate::scheduler::ThinkingStallOutcome::Retry => continue,
             crate::scheduler::ThinkingStallOutcome::Terminate(message) => {
+                if let Some(gid) = &manual_review {
+                    crate::guardian::set_manual_checks_stalled(gid, false);
+                }
                 let mut terminal = attempt;
                 terminal.status = "failed".to_string();
                 terminal.error = Some(message);
@@ -1809,7 +1820,14 @@ fn rebase_head_commit_is_empty(wt: &Workspace) -> bool {
 /// skip, the same `--continue` would fail identically forever (no committer
 /// identity on the machine, a failing `prepare-commit-msg` hook), so the
 /// caller must fail the branch rather than retry.
+///
+/// A `--continue` that fails with nothing unmerged is also progress when
+/// `REBASE_HEAD` now names a different commit than before: the step was
+/// committed and the rebase paused on the next pick, whose conflict `rerere`
+/// (with `rerere.autoupdate`) resolved and staged on the spot, so no file is
+/// left unmerged. The resolver loop commits that staged step on its next pass.
 fn advance_rebase(wt: &Workspace) -> Result<(), String> {
+    let head_before = rebase_head_sha(wt);
     let Err(error) = wt.git(&["rebase", "--continue"]) else {
         return Ok(());
     };
@@ -1818,11 +1836,24 @@ fn advance_rebase(wt: &Workspace) -> Result<(), String> {
         // conflict; the resolver loop picks that one up.
         return Ok(());
     }
+    if rebase_head_sha(wt).is_some_and(|after| head_before.as_deref() != Some(after.as_str())) {
+        return Ok(());
+    }
     if rebase_head_commit_is_empty(wt) {
         let _ = wt.git(&["rebase", "--skip"]);
         return Ok(());
     }
     Err(error)
+}
+
+/// The commit a paused rebase is currently replaying, or `None` when git wrote
+/// no `REBASE_HEAD` (no rebase, or a pick that stopped before conflicting).
+fn rebase_head_sha(wt: &Workspace) -> Option<String> {
+    let sha = wt
+        .git(&["rev-parse", "--verify", "--quiet", "REBASE_HEAD"])
+        .ok()?;
+    let sha = sha.trim();
+    (!sha.is_empty()).then(|| sha.to_string())
 }
 
 /// The branch-failure detail for an [`advance_rebase`] error.
@@ -2368,6 +2399,8 @@ fn synthesize_proof_instructions(
         maximum_context: None,
         auto_compact_threshold: None,
         maximum_tool_output_tokens: None,
+        effort: None,
+        temperature: None,
         proof: false,
         trace_context: None,
         resume_agent_session_id: None,
@@ -2983,6 +3016,8 @@ fn resolve_conflicts_with_agent(
             maximum_context: None,
             auto_compact_threshold: None,
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             proof: false,
             trace_context: None,
             resume_agent_session_id: current_commit_session_id.clone(),
@@ -3422,6 +3457,8 @@ fn run_final_proof(
         maximum_context: None,
         auto_compact_threshold: None,
         maximum_tool_output_tokens: None,
+        effort: None,
+        temperature: None,
         proof: true,
         trace_context: None,
         resume_agent_session_id: None,
@@ -3518,7 +3555,7 @@ fn run_final_proof(
 /// restarted for this branch (e.g. after `rebuild_on_base_shift`) then has a
 /// reliable signal that the last full check pass actually succeeded, not
 /// just that the agent said so. No note when `checks` is empty (nothing was
-/// actually validated) or `skip_auto_build` is set.
+/// actually validated).
 ///
 /// A failure here **does** fail the merge, unlike the post-merge gates run by
 /// [`final_checks`], which are advisory. The two are not inconsistent: this
@@ -3535,16 +3572,7 @@ fn run_commit_checks(
     branch: &str,
     cancel: &CancelToken,
 ) -> std::result::Result<(), String> {
-    let (skip_auto_build, checks) = {
-        let guard = store.lock();
-        (
-            guard.guardian_skip_auto_build(id).unwrap_or(false),
-            guard.guardian_checks(id).unwrap_or_default(),
-        )
-    };
-    if skip_auto_build {
-        return Ok(());
-    }
+    let checks = store.lock().guardian_checks(id).unwrap_or_default();
     // RAL-191: check gates run under the branch's resolved environment, same as
     // the agent invocations against this worktree -- a gate like `cargo test`
     // is worthless if it runs without the variables the code expects.
@@ -7331,6 +7359,12 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
                 // before treating it as a real failure.
                 let post_rebase_is_empty = review_ref_has_no_changes(&wt, &combined_branch, "HEAD");
                 if post_rebase_is_empty
+                    && hold_branch_for_unfinished_task(store, id, &ob.id, &ob.branch, set_status)
+                {
+                    let _ = wt.git(&["checkout", "--force", &combined_branch]);
+                    return;
+                }
+                if post_rebase_is_empty
                     && note_if_branch_is_empty(store, id, &ob.id, &ob.branch, &wt, base_sha)
                 {
                     fail_branch(
@@ -7597,6 +7631,8 @@ fn run_commit_step(
         maximum_context: None,
         auto_compact_threshold: None,
         maximum_tool_output_tokens: None,
+        effort: None,
+        temperature: None,
         proof: true,
         trace_context: None,
         resume_agent_session_id: None,
@@ -8124,6 +8160,8 @@ fn run_feedback_pass(
         maximum_context: None,
         auto_compact_threshold: None,
         maximum_tool_output_tokens: None,
+        effort: None,
+        temperature: None,
         proof: require_proof,
         trace_context: None,
         resume_agent_session_id: None,
@@ -9200,6 +9238,146 @@ static REOPENING: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new
 /// `in_review` mid-poll fail to claim [`MAINTAINING`] on the very next tick.
 static CI_POLLING: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
+/// Guardian ids with a linked-PR merge check in flight. Its own claim, apart
+/// from [`MAINTAINING`], so detecting that a review's PRs merged never waits
+/// behind that review's rebase, fetch or conflict-resolution work: a
+/// maintenance pass wedged on any of those would otherwise stop a merged
+/// review from ever being marked merged.
+static MERGE_CHECKING: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Last time [`spawn_merge_checks`] started a merge check per guardian id.
+static MERGE_CHECK_LAST: LazyLock<Mutex<HashMap<String, std::time::Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// How often an independent merge check runs per review. Each check is one
+/// forge request per open PR, so this bounds a 12-PR review to ~12 requests a
+/// minute -- well inside a forge's hourly budget even with several reviews.
+const MERGE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// When the in-flight [`MAINTAINING`] pass started per guardian id, and
+/// whether its "stuck" notice has been sent. Entries are removed when the
+/// pass ends ([`MaintenanceClock`]).
+static MAINTAINING_SINCE: LazyLock<Mutex<HashMap<String, (std::time::Instant, bool)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// A maintenance pass normally takes seconds and a full rebuild a few
+/// minutes; one still running after this is wedged, and until it ends nothing
+/// else on that review (base-shift rebuilds, manual-push restacks, PR branch
+/// sync) runs.
+const STUCK_MAINTENANCE_AFTER: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+
+/// Records a maintenance pass's start for the lifetime of the guard.
+struct MaintenanceClock {
+    id: String,
+}
+
+impl MaintenanceClock {
+    fn start(id: &str) -> Self {
+        MAINTAINING_SINCE
+            .lock()
+            .expect("poisoned")
+            .insert(id.to_string(), (std::time::Instant::now(), false));
+        Self { id: id.to_string() }
+    }
+}
+
+impl Drop for MaintenanceClock {
+    fn drop(&mut self) {
+        MAINTAINING_SINCE.lock().expect("poisoned").remove(&self.id);
+    }
+}
+
+/// Whether the maintenance pass for `id` has run past `limit` and has not yet
+/// been reported; marks it reported when it returns `Some(age)`.
+fn take_stuck_maintenance(id: &str, limit: std::time::Duration) -> Option<std::time::Duration> {
+    let mut since = MAINTAINING_SINCE.lock().expect("poisoned");
+    let (started, reported) = since.get_mut(id)?;
+    let age = started.elapsed();
+    if *reported || age < limit {
+        return None;
+    }
+    *reported = true;
+    Some(age)
+}
+
+/// Runs the linked-PR merge check for `id` unless one is already in flight.
+fn check_merges_claimed(store: &crate::store_lock::StoreHandle, id: &str) -> bool {
+    let Some(_claim) = InFlightClaim::acquire(&MERGE_CHECKING, id) else {
+        return false;
+    };
+    crate::pr::check_pr_merges(store, id)
+}
+
+/// Starts an independent merge check, on its own thread, for every candidate
+/// review whose last one is at least [`MERGE_CHECK_INTERVAL`] old.
+fn spawn_merge_checks(store: &crate::store_lock::StoreHandle, candidates: &[(String, String)]) {
+    let now = std::time::Instant::now();
+    let due: Vec<String> = {
+        let mut last = MERGE_CHECK_LAST.lock().expect("poisoned");
+        let live: HashSet<&str> = candidates.iter().map(|(id, _)| id.as_str()).collect();
+        last.retain(|id, _| live.contains(id.as_str()));
+        candidates
+            .iter()
+            .filter(|(id, _)| {
+                let ready = last
+                    .get(id.as_str())
+                    .is_none_or(|prev| now.duration_since(*prev) >= MERGE_CHECK_INTERVAL);
+                if ready {
+                    last.insert(id.clone(), now);
+                }
+                ready
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
+    };
+    for id in due {
+        let store = Arc::clone(store);
+        std::thread::spawn(move || {
+            check_merges_claimed(&store, &id);
+        });
+    }
+}
+
+/// A maintenance pass for `id` is still in flight, so this tick skips it.
+/// Tells the user once if that pass has been running implausibly long.
+fn report_stuck_maintenance(store: &crate::store_lock::StoreHandle, id: &str) {
+    let Some(age) = take_stuck_maintenance(id, STUCK_MAINTENANCE_AFTER) else {
+        return;
+    };
+    let message = format!(
+        "The background maintenance pass for review {id} has been running for {} minutes \
+         without finishing, so base-branch rebuilds, manual-push restacks and PR branch \
+         syncing are paused for this review (linked-PR merge detection still runs on its own).",
+        age.as_secs() / 60
+    );
+    crate::rlog!(WARNING, "ralphus [guardian] review {id}: {message}");
+    crate::cartographer::Note::new("guardian")
+        .level(crate::logging::LogLevel::WARNING)
+        .scope("guardian")
+        .guardian(id)
+        .emit(
+            &store.lock(),
+            "maintenance pass running past the stuck threshold",
+            serde_json::json!({"running_minutes": age.as_secs() / 60}),
+        );
+    let remediation = crate::mailbox::Remediation::ManualInterventionRequired {
+        guidance: "look at this review's Cartographer rows to see what it last did; the pass \
+                   holds only in-memory state, so restarting the daemon releases it"
+            .to_string(),
+    };
+    let result = store
+        .lock()
+        .enqueue_guardian_notice(id, &message, Some(&remediation));
+    if let Err(error) = result {
+        // ralphus[ignore-rlog-pair]: the store write itself failed, so there is no row to pair; the stuck-pass row above is the Cartographer record
+        crate::rlog!(
+            WARNING,
+            "ralphus [guardian] review {id} stuck-maintenance notice not enqueued: {error}"
+        );
+    }
+}
+
 /// Last idle-tier maintenance pass per guardian id — see
 /// `scheduler::REVIEW_IDLE_MAINT_INTERVAL`. Pruned on every pass to the set of
 /// guardians still in a maintained status, so it cannot grow without bound
@@ -9492,11 +9670,14 @@ fn review_maintenance_staggered(
         std::thread::spawn(move || {
             let _claim = claim;
             let runner = runners(&store);
+            // PRs of a still-collecting review are already a stack to label.
+            crate::pr::reconcile_ci_deferral_if_stack_changed(&store, &id);
             crate::ci_watch::poll_open_pr_ci_status(&store, runner.as_ref(), &cancellations, &id);
         });
     }
 
     let candidates: Vec<(String, String)> = full_maintenance_candidates(all_status_pairs);
+    spawn_merge_checks(store, &candidates);
     // Store lock released. Now apply the per-status cadence: an idle-tier
     // guardian is visited at most once per `REVIEW_IDLE_MAINT_INTERVAL`.
     let ids = filter_by_idle_cadence(&candidates);
@@ -9506,6 +9687,7 @@ fn review_maintenance_staggered(
                 DEBUG,
                 "ralphus [guardian] review {id} maintenance skipped: already in flight"
             );
+            report_stuck_maintenance(store, &id);
             continue;
         };
         let store = Arc::clone(store);
@@ -9517,6 +9699,7 @@ fn review_maintenance_staggered(
             // Released when this worker exits, including via the early return
             // on the PR-commit-sync error path below.
             let _claim = claim;
+            let _clock = MaintenanceClock::start(&id);
             std::thread::sleep(offset);
             let runner = runners(&store);
             // RAL-213: one token covers both the base-shift rebuild and (if
@@ -9534,7 +9717,13 @@ fn review_maintenance_staggered(
             // the base-shift/manual-push calls below re-read guardian.status
             // themselves and naturally no-op once it's no longer
             // `in_review`/`merge_failed`, so no extra branching is needed here.
-            crate::pr::check_pr_merges(&store, &id);
+            check_merges_claimed(&store, &id);
+            // A PR/MR merged, closed or dropped -- or any other change to the
+            // stack that no request of ours made -- can move the bottom or the
+            // top, so the CI-deferral labels are checked here, before any pass
+            // below that returns early (a part-merged stack does). Local
+            // state only unless the stack really changed.
+            crate::pr::reconcile_ci_deferral_if_stack_changed(&store, &id);
             // RAL-395: standing CI-status poll (self-throttled per guardian,
             // see `ci_watch::STANDING_POLL_INTERVAL`) -- persists the result
             // for the board and dispatches auto-fix on a fresh failure when
@@ -9556,6 +9745,23 @@ fn review_maintenance_staggered(
                         "automatic PR commit sync failed",
                         serde_json::json!({"error": e}),
                     );
+                // This aborts the rest of the pass (base-shift rebuild,
+                // manual-push restack, PR branch sync) for the review, so it
+                // is more than a log line.
+                let remediation = crate::mailbox::Remediation::ManualInterventionRequired {
+                    guidance: "check that the daemon can still fetch this review's PR \
+                               branches (remote reachable, credentials valid); the pass \
+                               retries on its own"
+                        .to_string(),
+                };
+                let _ = store.lock().enqueue_guardian_notice(
+                    &id,
+                    &format!(
+                        "Syncing review {id}'s PR branches from the remote failed, so \
+                         background maintenance for it is stopping early: {e}"
+                    ),
+                    Some(&remediation),
+                );
                 return;
             }
             // Hold off while a stack is visibly mid-merge on the forge.
@@ -10632,6 +10838,17 @@ fn stack_pick(
             // before treating it as a real failure.
             let post_rebase_is_empty = review_ref_has_no_changes(wt, newbase, rev);
             if post_rebase_is_empty
+                && hold_branch_for_unfinished_task(
+                    store,
+                    id,
+                    branch_id,
+                    feature_branch,
+                    &set_status,
+                )
+            {
+                return Err(());
+            }
+            if post_rebase_is_empty
                 && note_if_branch_is_empty(store, id, branch_id, feature_branch, wt, base_sha)
             {
                 fail_branch(
@@ -11470,7 +11687,7 @@ fn post_merge_jobs_inner(
     // silent -- a missing generated command list is better than failing a
     // declared manual action over an unavailable agent.
     if generate_manual && !cancel.is_cancelled() {
-        if let Err(e) = generate_manual_commands(
+        let generated = generate_manual_commands(
             store,
             runner,
             id,
@@ -11479,11 +11696,33 @@ fn post_merge_jobs_inner(
             &tip,
             Some(&pm_ws),
             cancel,
-        ) {
+        );
+        crate::guardian::set_manual_checks_stalled(id, false);
+        if let Err(e) = generated {
             crate::rlog!(
                 WARNING,
                 "ralphus [guardian] review {id} manual-commands generation failed: {e}"
             );
+            if !cancel.is_cancelled() {
+                let guard = store.lock();
+                let entity_uri = format!("guardian:{id}");
+                let _ = guard.enqueue_error_mailbox_message(
+                    crate::mailbox::MailboxPriority::High,
+                    &format!("Auto action generation failed for review {id}: {e}"),
+                    &crate::mailbox::Remediation::ManualInterventionRequired {
+                        guidance: format!(
+                            "open the review's Auto Actions live view to see what the agent \
+                             did, then use the review's ⋯ menu → Regenerate on the Auto \
+                             Actions section to run the computation again (review {id})"
+                        ),
+                    },
+                    None,
+                    None,
+                    None,
+                    Some(&entity_uri),
+                    None,
+                );
+            }
         }
         if outcome.is_ok() {
             let env = store
@@ -11822,6 +12061,8 @@ fn run_review_auto_build(
         maximum_context: None,
         auto_compact_threshold: None,
         maximum_tool_output_tokens: None,
+        effort: None,
+        temperature: None,
         proof: false,
         trace_context: None,
         resume_agent_session_id: None,
@@ -12465,6 +12706,8 @@ fn expand_action_prompt(
         maximum_context: None,
         auto_compact_threshold: None,
         maximum_tool_output_tokens: None,
+        effort: None,
+        temperature: None,
         proof: false,
         trace_context: None,
         resume_agent_session_id: None,
@@ -12978,6 +13221,75 @@ fn fetch_branch_for_remote_cell(
 const EMPTY_BRANCH_DETAIL: &str = "branch is empty: it adds no changes over the branch beneath it in the stack. \
      Its task most likely never committed its work -- check that cell, then re-run it. \
      If this branch is meant to be empty, disable it to drop it from the stack.";
+
+/// Detail for a branch held back by [`hold_branch_for_unfinished_task`].
+const TASK_UNFINISHED_DETAIL: &str = "waiting for its task to finish: the branch has no commits of its own yet. \
+     Re-run its failed task (or let a running one finish) and the review rebuilds automatically; \
+     disable the branch to drop it from the stack instead.";
+
+/// A clean rebase that left nothing over the stack beneath it reads as
+/// "already merged upstream" ([`clean_rebase_status`]) -- but only when the
+/// branch's task actually finished. A task that failed or is still running
+/// has simply not committed yet: its branch is still at the fork point, or
+/// carries nothing but the commits of the tasks it depends on, which the
+/// stack beneath it already contains. Returns whether that is the case for
+/// `branch`, in which case it has been put back to `pending` and the review
+/// to `merge_failed` with a reason, and the caller must stop building.
+///
+/// `pending` is what lets the review recover on its own: the straggler sweep
+/// ([`crate::store::Store::guardians_with_ready_stragglers`]) reopens a
+/// `merge_failed` review as soon as a `pending` branch's task is `done`.
+fn hold_branch_for_unfinished_task<F: Fn(GuardianStatus, Option<&str>)>(
+    store: &crate::store_lock::StoreHandle,
+    id: &str,
+    branch_id: &str,
+    branch: &str,
+    set_status: &F,
+) -> bool {
+    let unfinished = {
+        let guard = store.lock();
+        match guard.branch_task_unfinished(id, branch) {
+            Ok(unfinished) => unfinished,
+            Err(e) => {
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [guardian] review {id} cannot check whether branch {branch}'s task finished: {e}"
+                );
+                false
+            }
+        }
+    };
+    if !unfinished {
+        return false;
+    }
+    crate::rlog!(
+        WARNING,
+        "ralphus [guardian] review {id} branch {branch} adds nothing and its task has not finished; holding it pending"
+    );
+    {
+        let guard = store.lock();
+        let _ = guard.set_branch_status(
+            id,
+            branch_id,
+            MergeStatus::Pending,
+            Some(TASK_UNFINISHED_DETAIL),
+        );
+        crate::cartographer::Note::new("guardian")
+            .guardian(id)
+            .scope("branch")
+            .level(crate::logging::LogLevel::WARNING)
+            .emit(
+                &guard,
+                format!("review branch {branch} held: its task has not finished"),
+                serde_json::json!({"branch": branch, "branch_id": branch_id}),
+            );
+    }
+    set_status(
+        GuardianStatus::MergeFailed,
+        Some(&format!("branch {branch}: {TASK_UNFINISHED_DETAIL}")),
+    );
+    true
+}
 
 /// Flag a branch whose *own, pre-rebase* commits added nothing over `upstream`
 /// (RAL-190). Returns whether it is empty.
@@ -14285,9 +14597,10 @@ enum RebaseOutcome {
 /// (no conflicts, no dedicated proof call). By the time this is called,
 /// `note_if_branch_is_empty` has already run against the *original*
 /// pre-rebase branch and returned `false` (the caller returns early via
-/// `fail_branch` otherwise) -- so `post_rebase_is_empty` here can only mean
-/// the branch's real commits are already present on `newbase`, not that the
-/// task never committed (RAL-193 covers that distinction). RAL-480 promotes
+/// `fail_branch` otherwise), and [`hold_branch_for_unfinished_task`] has
+/// confirmed the branch's task finished -- so `post_rebase_is_empty` here can
+/// only mean the branch's real commits are already present on `newbase`, not
+/// that the task never committed (RAL-193 covers that distinction). RAL-480 promotes
 /// that case from a `Done` branch carrying an "(already merged?)" guess in
 /// its free-text `detail` to an explicit, independently-visible `Merged`
 /// status.
@@ -15566,6 +15879,8 @@ fn generate_final_summary(
         maximum_context: None,
         auto_compact_threshold: None,
         maximum_tool_output_tokens: None,
+        effort: None,
+        temperature: None,
         proof: false,
         trace_context: None,
         resume_agent_session_id: None,
@@ -16085,6 +16400,8 @@ fn generate_manual_commands(
         maximum_context: None,
         auto_compact_threshold: None,
         maximum_tool_output_tokens: None,
+        effort: None,
+        temperature: None,
         proof: false,
         trace_context: None,
         resume_agent_session_id: None,
@@ -16135,6 +16452,7 @@ fn generate_manual_commands(
     // RAL-259: the manual-checks generation agent is beginning to run — stamp
     // the guardian-level Live-View start time (plain overwrite, so a
     // regeneration always shows the latest generation's start).
+    crate::guardian::set_manual_checks_stalled(id, false);
     let _ = store.lock().stamp_guardian_manual_checks_started_at(id);
     // This agent run is the single longest phase of a merge -- routinely ten
     // minutes on a real stack. Announce it before blocking on it, so a board
@@ -16383,6 +16701,8 @@ pub(crate) fn resolve_check_input(
         maximum_context: None,
         auto_compact_threshold: None,
         maximum_tool_output_tokens: None,
+        effort: None,
+        temperature: None,
         proof: false,
         trace_context: None,
         resume_agent_session_id: None,
@@ -17027,6 +17347,126 @@ mod tests {
     fn reset_idle_cadence_state() {
         IDLE_MAINT_LAST.lock().expect("poisoned").clear();
         STACK_MERGE_DEFERRED_LAST.lock().expect("poisoned").clear();
+    }
+
+    #[test]
+    fn a_maintenance_pass_is_stuck_only_after_the_limit_and_is_reported_once() {
+        let id = "guardian-stuck-pass-test";
+        let limit = std::time::Duration::from_millis(40);
+        assert!(
+            take_stuck_maintenance(id, limit).is_none(),
+            "no pass in flight"
+        );
+
+        let clock = MaintenanceClock::start(id);
+        assert!(
+            take_stuck_maintenance(id, limit).is_none(),
+            "a fresh pass is fine"
+        );
+        std::thread::sleep(limit * 2);
+        assert!(
+            take_stuck_maintenance(id, limit).is_some(),
+            "an overdue pass is stuck"
+        );
+        assert!(
+            take_stuck_maintenance(id, limit).is_none(),
+            "but is only reported once"
+        );
+
+        drop(clock);
+        assert!(
+            take_stuck_maintenance(id, limit).is_none(),
+            "ending the pass clears it"
+        );
+        let _fresh = MaintenanceClock::start(id);
+        std::thread::sleep(limit * 2);
+        assert!(
+            take_stuck_maintenance(id, limit).is_some(),
+            "a later wedged pass is reported afresh"
+        );
+    }
+
+    #[test]
+    fn a_wedged_maintenance_pass_puts_one_remediable_notice_in_the_mailbox() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            crate::store::Store::open_in_memory().unwrap(),
+        ));
+        let id = store
+            .lock()
+            .create_guardian("demo", "main", "/repo")
+            .unwrap();
+        // Back-date the pass rather than sleeping out the real limit.
+        let _clock = MaintenanceClock::start(&id);
+        MAINTAINING_SINCE.lock().expect("poisoned").insert(
+            id.clone(),
+            (
+                std::time::Instant::now()
+                    - STUCK_MAINTENANCE_AFTER
+                    - std::time::Duration::from_secs(1),
+                false,
+            ),
+        );
+
+        report_stuck_maintenance(&store, &id);
+        report_stuck_maintenance(&store, &id);
+
+        let guard = store.lock();
+        let reader = guard.register_mailbox_client().unwrap();
+        let sent = guard
+            .mailbox_messages_for_client_filtered(&reader, false, None, None)
+            .unwrap();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(
+            sent[0].message.contains("maintenance pass"),
+            "{}",
+            sent[0].message
+        );
+        assert!(
+            sent[0].message.contains("Manual intervention required"),
+            "{}",
+            sent[0].message
+        );
+    }
+
+    #[test]
+    fn merge_checks_are_spawned_at_most_once_per_interval_per_review() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            crate::store::Store::open_in_memory().unwrap(),
+        ));
+        let id = "guardian-merge-cadence-test".to_string();
+        let candidates = vec![(id.clone(), "in_review".to_string())];
+        MERGE_CHECK_LAST.lock().expect("poisoned").remove(&id);
+
+        spawn_merge_checks(&store, &candidates);
+        let first = *MERGE_CHECK_LAST
+            .lock()
+            .expect("poisoned")
+            .get(&id)
+            .expect("the first call records a check");
+        spawn_merge_checks(&store, &candidates);
+        let second = *MERGE_CHECK_LAST.lock().expect("poisoned").get(&id).unwrap();
+        assert_eq!(
+            first, second,
+            "a check inside the interval must not respawn"
+        );
+
+        // A review that left the maintained set is forgotten.
+        spawn_merge_checks(&store, &[]);
+        assert!(!MERGE_CHECK_LAST.lock().expect("poisoned").contains_key(&id));
+    }
+
+    #[test]
+    fn a_merge_check_in_flight_is_not_started_twice() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            crate::store::Store::open_in_memory().unwrap(),
+        ));
+        let id = "guardian-merge-claim-test";
+        let held = InFlightClaim::acquire(&MERGE_CHECKING, id).expect("free claim");
+        assert!(!check_merges_claimed(&store, id));
+        drop(held);
+        // Free again: reaches `check_pr_merges`, which finds no such review.
+        assert!(!check_merges_claimed(&store, id));
+        assert!(InFlightClaim::acquire(&MERGE_CHECKING, id).is_some());
     }
 
     #[test]
@@ -18459,6 +18899,87 @@ mod tests {
             "the pick must not be skipped: {error}"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn advance_rebase_accepts_a_next_pick_that_rerere_already_staged() {
+        // `--continue` commits step 1, then stops on step 2's conflict. With a
+        // recorded resolution and `rerere.autoupdate`, git stages that
+        // resolution immediately, so nothing is left unmerged -- yet the
+        // rebase is healthy and merely paused one pick later. That is
+        // progress, not a stuck rebase.
+        let (base, repo, _fwt) = make_repo("advance-rebase-rerere-staged");
+        g(&repo, &["config", "user.name", "t"]);
+        g(&repo, &["config", "user.email", "t@t"]);
+        g(&repo, &["config", "rerere.enabled", "true"]);
+        g(&repo, &["config", "rerere.autoupdate", "true"]);
+        std::fs::write(repo.join("base.txt"), "main\n").unwrap();
+        g(&repo, &["commit", "--all", "--message", "main edit"]);
+        g(&repo, &["checkout", "-b", "side", "HEAD~1"]);
+        for step in ["side1", "side2"] {
+            std::fs::write(repo.join("base.txt"), format!("{step}\n")).unwrap();
+            g(&repo, &["commit", "--all", "--message", step]);
+        }
+        let original = g_out(&repo, &["rev-parse", "side"]);
+        // `--continue` exits non-zero when it stops on the next conflict, so
+        // its status is deliberately not asserted.
+        let resolve_and_continue = |content: &str| {
+            std::fs::write(repo.join("base.txt"), content).unwrap();
+            g(&repo, &["add", "base.txt"]);
+            let _ = std::process::Command::new("git")
+                .args(["rebase", "--continue"])
+                .current_dir(&repo)
+                .env("GIT_EDITOR", "true")
+                .status()
+                .unwrap();
+        };
+
+        // First pass records both resolutions.
+        assert!(!rebase_onto_main_succeeds(&repo));
+        resolve_and_continue("resolved1\n");
+        resolve_and_continue("resolved2\n");
+        assert!(!rebase_in_progress(&Workspace::local(&repo)));
+
+        // Second pass replays the same conflicts: step 1 is staged by rerere.
+        g(&repo, &["reset", "--hard", &original]);
+        assert!(!rebase_onto_main_succeeds(&repo));
+        let wt = Workspace::local(&repo);
+        advance_rebase(&wt).expect("the staged next pick is progress");
+        assert!(rebase_in_progress(&wt), "step 2 is paused, not finished");
+        assert!(
+            conflicted_files(&wt).is_empty(),
+            "precondition: rerere left nothing unmerged"
+        );
+        advance_rebase(&wt).expect("committing the staged step finishes the rebase");
+        assert!(!rebase_in_progress(&wt));
+        assert_eq!(
+            std::fs::read_to_string(repo.join("base.txt")).unwrap(),
+            "resolved2\n"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Rebase the checked-out `side` onto `main`; true if it finished
+    /// without stopping.
+    fn rebase_onto_main_succeeds(repo: &Path) -> bool {
+        std::process::Command::new("git")
+            .args(["rebase", "main"])
+            .current_dir(repo)
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    fn g_out(root: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?} failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
     fn make_repo(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
@@ -20946,6 +21467,133 @@ mod tests {
             !due.contains(&id),
             "a merged branch must never queue an auto-submit sweep (RAL-480)"
         );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn stack_pick_holds_an_empty_branch_whose_task_has_not_finished() {
+        // Reproduces guardian-000000000206: a manual "Merge / rebase" ran
+        // while some tasks' cells had failed (an expired agent login). Those
+        // branches had no commits of their own -- only the commits of the
+        // tasks they depend on, which the stack beneath them already held --
+        // so each rebase came out empty and was reported "already merged
+        // upstream". A branch whose task has not finished has not merged
+        // anything; it has not committed yet.
+        let (base, repo, _fwt) = make_repo("stack-pick-unfinished-task");
+        let old_base = git(&repo, &["rev-parse", "main"])
+            .unwrap()
+            .trim()
+            .to_string();
+        // The stack beneath already contains feature/a's only commit, as the
+        // review's lower branch held the commit of the task feature/a forked
+        // from.
+        g(&repo, &["merge", "--no-edit", "feature/a"]);
+        let new_base = git(&repo, &["rev-parse", "main"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let rev = "guardian/test/wt-feature-a";
+        let wt = base.join("review-wt");
+        g(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                rev,
+                wt.to_str().unwrap(),
+                "feature/a",
+            ],
+        );
+
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let (id, squad_id) = {
+            let mut guard = store.lock();
+            let squad_id =
+                insert_cell_for_branch(&mut guard, "feature/a", crate::store::NodeState::Failed);
+            guard
+                .set_task_state(&squad_id, 0, crate::store::NodeState::Failed)
+                .unwrap();
+            let id = guard
+                .create_guardian("r", "main", repo.to_str().unwrap())
+                .unwrap();
+            guard.add_guardian_branch(&id, "feature/a").unwrap();
+            (id, squad_id)
+        };
+        let branch_id = store.lock().get_guardian(&id).unwrap().branches[0]
+            .id
+            .clone();
+
+        struct MustNotRunRunner;
+        impl Runner for MustNotRunRunner {
+            fn run(&self, _: &RunnerSpec) -> RunnerResult {
+                panic!("a clean rebase must never call the runner");
+            }
+        }
+        let gate = ProofGate {
+            scope: "nothing".to_string(),
+            skip_auto_clean: false,
+            is_final_branch: false,
+        };
+
+        let result = stack_pick(
+            &store,
+            &MustNotRunRunner,
+            &id,
+            &branch_id,
+            "feature/a",
+            &old_base,
+            None,
+            &new_base,
+            rev,
+            &Workspace::local(&wt),
+            false,
+            &gate,
+            &CancelToken::never(),
+        );
+
+        assert!(
+            result.is_err(),
+            "the build must stop at a branch whose task has not finished"
+        );
+        let guardian = store.lock().get_guardian(&id).unwrap();
+        let branch = guardian.branches[0].clone();
+        assert_eq!(
+            branch.merge_status,
+            crate::guardian::MergeStatus::Pending.as_str(),
+            "an unfinished task's empty branch must be held pending, never reported merged"
+        );
+        assert_eq!(branch.detail.as_deref(), Some(TASK_UNFINISHED_DETAIL));
+        assert_eq!(
+            guardian.status.as_str(),
+            GuardianStatus::MergeFailed.as_str()
+        );
+        let due = store.lock().take_due_auto_submits(i64::MAX / 2, 0).unwrap();
+        assert!(
+            !due.contains(&id),
+            "a held branch has no work to submit and must not queue an auto-submit"
+        );
+
+        // Once the task is re-run and finishes, the straggler sweep must find
+        // this review and promote the held branch, so it rebuilds on its own.
+        {
+            let guard = store.lock();
+            assert!(guard.guardians_with_ready_stragglers().unwrap().is_empty());
+            guard
+                .set_cell_state(&squad_id, 0, 0, crate::store::NodeState::Done)
+                .unwrap();
+            guard
+                .set_task_state(&squad_id, 0, crate::store::NodeState::Done)
+                .unwrap();
+            assert_eq!(
+                guard.guardians_with_ready_stragglers().unwrap(),
+                vec![id.clone()]
+            );
+            assert_eq!(guard.mark_ready_branches_with_done_cells(&id).unwrap(), 1);
+        }
 
         let _ = std::fs::remove_dir_all(&base);
     }

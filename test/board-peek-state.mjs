@@ -12,7 +12,7 @@
 // region is the real shipped source: these tests cannot drift from what the board
 // actually runs, because there is only one copy of it.
 //
-// Everything outside the markers (fetchPeek, peekBox, pollOpenPeeks, ...) needs
+// Everything outside the markers (fetchPeek, liveViewWidget, pollOpenPeeks, ...) needs
 // a live document and stays out of scope here by design.
 
 import { boardScript } from "./board-source.mjs";
@@ -36,7 +36,7 @@ if (from === -1 || to === -1 || to < from) {
 }
 const source = html.slice(from + BEGIN.length, to);
 
-const exported = ["PEEK_MISSING_STRIKE_LIMIT", "peekCssKey", "peekUrlFor", "peekTranscriptUrlFor", "systemPromptUrlFor", "peekPromptDisplay", "peekPromptText", "nextPeekPaneState", "peekScrollRestoreTarget"];
+const exported = ["PEEK_MISSING_STRIKE_LIMIT", "peekCssKey", "splitPeekAttempt", "peekUrlFor", "peekTranscriptUrlFor", "systemPromptUrlFor", "peekPromptDisplay", "peekPromptText", "nextPeekPaneState", "peekScrollRestoreTarget"];
 // eslint-disable-next-line no-new-func -- evaluating the real shipped source is the point; see the header.
 const factory = new Function(`${source}\nreturn { ${exported.join(", ")} };`);
 

@@ -1237,7 +1237,7 @@ prompt = "hi"
             .collect();
         assert_eq!(roles.len(), crate::preset_roles::ROLE_PRESETS.len());
         for expected in [
-            "roles/reviewer",
+            "roles/judge/reviewer",
             "roles/qa",
             "roles/ci-fixer",
             "roles/retrieval",
@@ -1266,7 +1266,7 @@ prompt = "hi"
             );
             let judge = ["adversary", "analyst", "reviewer", "security"]
                 .iter()
-                .any(|r| seed.name == format!("roles/{r}"));
+                .any(|r| seed.name == format!("roles/judge/{r}"));
             assert_eq!(seed.pass_score.is_some(), judge, "{}", seed.name);
         }
     }
@@ -1281,7 +1281,7 @@ name = "t"
 [[task.cell]]
 cwd = "/tmp"
 prompt = "hi"
-extends = ["<<ralphus:presets/roles/reviewer>>"]
+extends = ["<<ralphus:presets/roles/judge/reviewer>>"]
 "#;
         let file = file_from_toml(raw);
         assert!(validate_task_file_presets(&s, raw, &file).is_empty());

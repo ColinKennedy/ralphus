@@ -61,6 +61,12 @@ const LIVE_USAGE_MESSAGE: &str = "live usage";
 const WORKTREE_DIFF_SOURCE: &str = "worktree-diff";
 const WORKTREE_DIFF_MESSAGE: &str = "diff changed";
 
+/// RAL-595: the runner's per-marker `RALPHUS_PROPHECY:` push (payload
+/// `{kind, body}`), mirrored from `runner/src/prophecy.rs::PROPHECY_MESSAGE`.
+/// [`forward_runner_event`] files it as a prophecy against the emitting cell
+/// the moment it is found, so a run that later dies keeps its insights.
+const PROPHECY_MESSAGE: &str = "prophecy";
+
 /// One structured event forwarded from the runner subprocess over the
 /// `RALPHUS_EVENT:` stderr marker (RAL-98). `squad_id`/`cell_id`/`task` fall
 /// back to the owning [`RunnerSpec`] when the event itself omits them.
@@ -192,6 +198,16 @@ pub struct RunnerSpec {
     /// means no cap.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub maximum_tool_output_tokens: Option<u64>,
+    /// Reasoning effort (RAL-607), delivered through the harness's own
+    /// mechanism -- see `ralphus_core::schema::agent_supports_effort`. `None`
+    /// leaves the harness default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Sampling temperature (RAL-607), Pi only -- see
+    /// `ralphus_core::schema::agent_supports_temperature`. `None` leaves the
+    /// provider default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
     /// True when this spec is an `agent`-kind proof step rather than a
     /// normal cell: the runner wraps `prompt` with verdict-reporting
     /// instructions and returns a `proofed` result instead of just "ran".
@@ -483,8 +499,12 @@ const PROPHECY_SYSTEM_PROMPT: &str = "Operational logging note, not a request to
      that already has a ticket, and never 'nothing more is needed'), or \
      unconfirmed (something you could not verify or do not know: a test or \
      check you could not run, behavior you did not exercise, an assumption \
-     you left untested). When a note is about what you could not check, use \
-     unconfirmed, not deferred. Write as many of these as are \
+     you left untested), or refused (prompt work you explicitly decline or \
+     say you cannot perform, written as '<the refused portion of the \
+     prompt>; <why you refused>'; use it only for an explicit decline, not \
+     for a failure, a deferral, or something you merely could not check). \
+     When a note is about what you could not check, use unconfirmed, not \
+     deferred. Writing a refused note does not make the work done. Write as many of these as are \
      genuinely useful, anywhere in your reply, not only at the end -- unlike \
      the handoff note above, this is not a single end-of-reply section. This \
      is not a changelog and not a summary of what you did: only write one \
@@ -799,6 +819,8 @@ impl RunnerSpec {
             maximum_tool_output_tokens: row
                 .maximum_tool_output_tokens
                 .and_then(|v| u64::try_from(v).ok()),
+            effort: row.effort.clone(),
+            temperature: row.temperature,
             proof: false,
             trace_context: None,
             resume_agent_session_id: None,
@@ -930,6 +952,8 @@ impl RunnerSpec {
             maximum_context: None,
             auto_compact_threshold: None,
             maximum_tool_output_tokens,
+            effort: None,
+            temperature: None,
             proof: true,
             trace_context: None,
             resume_agent_session_id: None,
@@ -1012,6 +1036,8 @@ impl RunnerSpec {
             // Command-kind proof steps never reach a `ModelBackend`, so there
             // is no tool-output cap to configure here either.
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             proof: true,
             trace_context: None,
             resume_agent_session_id: None,
@@ -3665,6 +3691,13 @@ pub(crate) fn forward_runner_event(
         }
     };
     redact_event(&mut event);
+    if event.message == PROPHECY_MESSAGE {
+        record_prophecy_event(store, squad_id, cell_id, task, &event);
+        return ForwardedEvent {
+            is_activity_signal: true,
+            ..ForwardedEvent::default()
+        };
+    }
     let is_activity_signal = event.message != LIVE_USAGE_MESSAGE;
     let level = event
         .level
@@ -3812,6 +3845,54 @@ pub(crate) fn forward_runner_event(
     }
 }
 
+/// RAL-595: file one live `prophecy` event against the cell it came from.
+/// The revision stamp shells out to git, so the store lock is released
+/// around it. An event that does not resolve to a cell row (a proof step, a
+/// resolver invocation) or lacks a `kind`/`body` is ignored.
+fn record_prophecy_event(
+    store: &crate::store_lock::StoreHandle,
+    squad_id: &str,
+    cell_id: &str,
+    task: &str,
+    event: &RunnerEvent,
+) {
+    let squad_id = event.squad_id.as_deref().unwrap_or(squad_id);
+    let cell_id = event.cell_id.as_deref().unwrap_or(cell_id);
+    let task = event.task.as_deref().unwrap_or(task);
+    let (Some(kind), Some(body)) = (
+        event.payload.get("kind").and_then(|v| v.as_str()),
+        event.payload.get("body").and_then(|v| v.as_str()),
+    ) else {
+        return;
+    };
+    let Some(target) = store.lock().cell_prophecy_target(squad_id, task, cell_id) else {
+        return;
+    };
+    let revision = crate::ghost::current_revision(target.cwd.as_deref().unwrap_or_default());
+    let guard = store.lock();
+    if let Err(e) = guard.record_cell_prophecy_marker(
+        squad_id,
+        task,
+        cell_id,
+        &target,
+        revision.as_deref(),
+        kind,
+        body,
+    ) {
+        crate::cartographer::Note::new("prophecy")
+            .level(crate::logging::LogLevel::WARNING)
+            .scope("cell")
+            .squad(squad_id)
+            .cell(cell_id)
+            .task(task)
+            .emit(
+                &guard,
+                format!("could not record live prophecy: {e}"),
+                serde_json::json!({ "error": e.to_string() }),
+            );
+    }
+}
+
 fn redact_event(event: &mut RunnerEvent) {
     fn text(value: &mut String) {
         let registered = crate::redact::redact_all(value);
@@ -3954,6 +4035,27 @@ mod tests {
         let plain = effective_proof_system_prompt(None, true);
         assert!(plain.contains("RALPHUS_PROOF: PASS"));
         assert!(!plain.contains("RALPHUS_APPRAISAL:"));
+    }
+
+    #[test]
+    fn prophecy_prompt_matches_the_runner_byte_for_byte() {
+        fn prophecy_const(src: &str) -> String {
+            src.lines()
+                .skip_while(|l| !l.starts_with("const PROPHECY_SYSTEM_PROMPT"))
+                .scan(false, |done, l| {
+                    if *done {
+                        return None;
+                    }
+                    *done = l.ends_with("\";");
+                    Some(l)
+                })
+                .collect::<Vec<_>>()
+                .join(" | ")
+        }
+        let from_runner = prophecy_const(include_str!("../../runner/src/execute.rs"));
+        let from_daemon = prophecy_const(include_str!("runner.rs"));
+        assert!(!from_runner.is_empty());
+        assert_eq!(from_runner, from_daemon);
     }
 
     #[test]
@@ -4355,6 +4457,8 @@ mod tests {
             maximum_context: None,
             auto_compact_threshold: None,
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             upstream: None,
             machine: None,
             share_session: false,
@@ -4396,6 +4500,8 @@ mod tests {
             maximum_context: None,
             auto_compact_threshold: None,
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             upstream: None,
             machine: None,
             share_session: false,
@@ -4436,6 +4542,8 @@ mod tests {
             maximum_context: Some(100_000),
             auto_compact_threshold: Some(80_000),
             maximum_tool_output_tokens: Some(40_000),
+            effort: None,
+            temperature: None,
             upstream: None,
             machine: None,
             share_session: false,
@@ -4476,6 +4584,8 @@ mod tests {
             maximum_context: None,
             auto_compact_threshold: None,
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             upstream: None,
             machine: None,
             share_session: false,
@@ -4517,6 +4627,8 @@ mod tests {
             maximum_context: None,
             auto_compact_threshold: None,
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             proof: false,
             trace_context: None,
             resume_agent_session_id: None,
@@ -4767,6 +4879,8 @@ mod tests {
             maximum_context: None,
             auto_compact_threshold: None,
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             upstream: None,
             machine: None,
             share_session: false,
@@ -4837,6 +4951,8 @@ mod tests {
             maximum_context: None,
             auto_compact_threshold: None,
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             upstream: None,
             machine: None,
             share_session: false,
@@ -4874,6 +4990,8 @@ mod tests {
             maximum_context: None,
             auto_compact_threshold: None,
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             upstream: None,
             machine: None,
             share_session: false,
@@ -4971,6 +5089,8 @@ mod tests {
             maximum_context: None,
             auto_compact_threshold: None,
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             upstream: None,
             machine: None,
             share_session: false,
@@ -5017,6 +5137,8 @@ mod tests {
             maximum_context: None,
             auto_compact_threshold: None,
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             upstream: None,
             machine: None,
             share_session: false,
@@ -5057,6 +5179,8 @@ mod tests {
             maximum_context: None,
             auto_compact_threshold: None,
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             upstream: None,
             machine: None,
             share_session: false,
@@ -5103,6 +5227,8 @@ mod tests {
             maximum_context: None,
             auto_compact_threshold: None,
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             upstream: None,
             machine: None,
             share_session: false,
@@ -5739,6 +5865,8 @@ prompt = "make it build"
             maximum_context: None,
             auto_compact_threshold: None,
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             upstream: None,
             machine: None,
             share_session: false,
@@ -5827,6 +5955,8 @@ prompt = "make it build"
             maximum_context: None,
             auto_compact_threshold: None,
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             upstream: None,
             machine: None,
             share_session: false,
@@ -6547,6 +6677,8 @@ prompt = "make it build"
             maximum_context: None,
             auto_compact_threshold: None,
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             proof: false,
             trace_context: None,
             resume_agent_session_id: None,
@@ -6693,6 +6825,8 @@ prompt = "make it build"
             maximum_context: None,
             auto_compact_threshold: None,
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             proof: false,
             trace_context: None,
             resume_agent_session_id: None,

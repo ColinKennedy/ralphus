@@ -1,6 +1,6 @@
 //! Git remote URL normalization and remote selection by URL.
 //!
-//! Shared by the daemon (PR/MR routing) and `ralphus initialize server`, so both
+//! Shared by the daemon (PR/MR routing) and `ralphus initialize solo-developer`, so both
 //! agree on when two remote URLs name the same repository.
 
 /// Parse a git remote URL into `(host, path)`, where `path` has no leading

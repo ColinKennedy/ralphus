@@ -93,6 +93,11 @@ pub struct BackendOutcome {
     /// cell. `None` for every other outcome, including an unrecognized or
     /// delay-less rate limit (treated as a genuine failure, not guessed at).
     pub rate_limit_retry_after: Option<std::time::Duration>,
+    /// RAL-595: every distinct `RALPHUS_PROPHECY:` marker the backend saw in
+    /// assistant text over this invocation, not only the final message. Each
+    /// was already emitted live as a `prophecy` event; this is the typed
+    /// at-exit copy `execute.rs` accumulates across rounds.
+    pub prophecies: Vec<crate::prophecy::ProphecyMarker>,
 }
 
 /// Options common to every backend's `run` call, bundled to keep the trait's
@@ -149,6 +154,16 @@ pub struct RunOptions<'a> {
     /// which) and defers entirely to that backend's behavior once the cap is
     /// set.
     pub maximum_tool_output_tokens: Option<u64>,
+    /// RAL-607: resolved reasoning effort, or `None` to leave the harness
+    /// default. Only ever `Some` for a backend whose
+    /// [`ModelBackend::supports_effort`] returns `true`; each backend maps it
+    /// onto its own mechanism (Claude Code `--effort`, Codex
+    /// `-c model_reasoning_effort=...`, Pi `--thinking`).
+    pub effort: Option<&'a str>,
+    /// RAL-607: resolved sampling temperature, or `None` for the provider
+    /// default. Only ever `Some` for a backend whose
+    /// [`ModelBackend::supports_temperature`] returns `true` (Pi).
+    pub temperature: Option<f64>,
     /// RAL-336: whether this session may load the operator's personal
     /// settings/config. Defaults to `false` (isolated) via `RunOptions`'s
     /// `Default` derive. Only the claude-code/codex/pi backends read this;
@@ -273,6 +288,20 @@ pub trait ModelBackend {
     /// actual submit-time gate; this is the runner-side mirror, checked
     /// defensively in `execute.rs` before a cell is ever run.
     fn supports_maximum_tool_output_tokens(&self) -> bool {
+        false
+    }
+
+    /// RAL-607: whether this backend has a delivery mechanism for
+    /// `RunOptions::effort`. Defaults to `false`; `core::validate`'s
+    /// `agent_supports_effort` is the submit-time gate this mirrors.
+    fn supports_effort(&self) -> bool {
+        false
+    }
+
+    /// RAL-607: whether this backend has a delivery mechanism for
+    /// `RunOptions::temperature`. Defaults to `false`; `core::validate`'s
+    /// `agent_supports_temperature` is the submit-time gate this mirrors.
+    fn supports_temperature(&self) -> bool {
         false
     }
 

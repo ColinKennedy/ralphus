@@ -86,6 +86,15 @@ fn worktree_root(cwd: &Path) -> std::result::Result<PathBuf, String> {
     Ok(PathBuf::from(top))
 }
 
+/// [`worktree_root`], except that a claimed worktree that has not been created
+/// yet is its own root (there is no checkout for git to answer for).
+fn review_worktree_root(cwd: &Path) -> Option<PathBuf> {
+    match crate::worktrees::pending_worktree_at(cwd) {
+        Some(pending) => Some(pending.wt),
+        None => worktree_root(cwd).ok(),
+    }
+}
+
 /// The branch currently checked out in the worktree (error if detached).
 pub(crate) fn worktree_branch(cwd: &Path) -> std::result::Result<String, String> {
     let b = git(cwd, &["symbolic-ref", "--quiet", "--short", "HEAD"])
@@ -213,23 +222,11 @@ pub(crate) fn set_worktree_commit_baseline(
 /// Run a `git config` write against the shared `.git/config`, serialized with
 /// the daemon's other config writers and retried while another process (a
 /// sibling cell's `git push -u`, an agent's own `git config`) holds
-/// `config.lock` -- git fails immediately with "could not lock config file"
-/// instead of waiting, and the lock is only held for milliseconds.
+/// `config.lock` or the file itself -- see
+/// [`crate::worktrees::is_transient_config_write_error`].
 fn git_config_write(cwd: &Path, args: &[&str]) -> std::result::Result<(), String> {
-    const ATTEMPTS: u32 = 20;
     let _guard = crate::worktrees::WORKTREE_CONFIG_LOCK.lock();
-    let mut attempt = 1;
-    loop {
-        match git(cwd, args) {
-            Ok(_) => return Ok(()),
-            Err(e) if attempt < ATTEMPTS && e.contains("could not lock config file") => {
-                // allow-lock-io: `_guard` is the config-writer mutex, not the store lock; holding it across this bounded retry (<= ~5s total) is what serializes the writers
-                std::thread::sleep(std::time::Duration::from_millis(25 * u64::from(attempt)));
-                attempt += 1;
-            }
-            Err(e) => return Err(e),
-        }
-    }
+    crate::worktrees::git_config_write_retrying(cwd, args).map(|_| ())
 }
 
 /// The upstream (`branch@{upstream}`) of the worktree's branch, if any.
@@ -365,7 +362,10 @@ pub(crate) fn cell_upstream_display(
     idx: i64,
 ) -> Option<String> {
     let cwd = cwd?;
-    project_root_of(cwd)?;
+    let pending = crate::worktrees::pending_worktree_at(Path::new(cwd));
+    if pending.is_none() {
+        project_root_of(cwd)?;
+    }
     let row = rows.iter().find(|r| r.task_idx == task_idx && r.idx == idx);
     if let Some(sentinel) = row.and_then(|r| r.upstream.as_deref()) {
         let ref_str = ralphus_core::schema::parse_upstream_task_ref(sentinel)?;
@@ -375,9 +375,16 @@ pub(crate) fn cell_upstream_display(
         let dep = rows.iter().find(|r| {
             r.task_name == task_name && cell_id_filter.is_none_or(|cid| r.cell_id == cid)
         })?;
-        return worktree_branch(Path::new(dep.cwd.as_deref()?)).ok();
+        let dep_cwd = Path::new(dep.cwd.as_deref()?);
+        return match crate::worktrees::pending_worktree_at(dep_cwd) {
+            Some(dep_pending) => Some(dep_pending.branch),
+            None => worktree_branch(dep_cwd).ok(),
+        };
     }
-    worktree_upstream(Path::new(cwd)).ok()
+    match pending {
+        Some(p) => Some(p.upstream),
+        None => worktree_upstream(Path::new(cwd)).ok(),
+    }
 }
 
 /// One cell's contribution to a review.
@@ -410,6 +417,9 @@ struct Membership {
     /// Optional Proof-scope override declared on the review (`[[review]]
     /// proof_scope`), one of `each_branch`/`final_branch`/`nothing`.
     proof_scope: Option<String>,
+    /// Optional CI-deferral mode declared on the review (`[[review]]
+    /// ci_deferral`), one of `every`/`top`/`bottom+top`.
+    ci_deferral: Option<String>,
     /// Optional auto-submit-PR-stack override declared on the review
     /// (`[[review]] auto_submit_pr_stack`, RAL-317).
     auto_submit_pr_stack: Option<bool>,
@@ -504,6 +514,8 @@ fn rows_from_file(file: &TaskFile) -> (Vec<CellRow>, Vec<TaskRow>, CellReviewInf
                 maximum_context: None,
                 auto_compact_threshold: None,
                 maximum_tool_output_tokens: None,
+                effort: None,
+                temperature: None,
                 upstream: s.upstream.clone(),
                 machine: ralphus_core::schema::resolve_cell_machine(task, s),
                 share_session: false,
@@ -998,10 +1010,21 @@ pub fn derive_reviews_with_full_prefetch(
             })?;
             (PathBuf::from(&rd.project_root), rd.branch.clone(), upstream)
         } else {
-            let project =
-                worktree_project(cwd_path).map_err(|e| ReviewError::new(format!("{cwd}: {e}")))?;
-            let branch =
-                worktree_branch(cwd_path).map_err(|e| ReviewError::new(format!("{cwd}: {e}")))?;
+            // A claimed worktree that has not been created yet (the scheduler
+            // creates it in the background or when its cell comes due) cannot
+            // be read from disk: its project, branch and upstream are exactly
+            // what the claim recorded.
+            let pending = crate::worktrees::pending_worktree_at(cwd_path);
+            let project = match &pending {
+                Some(p) => p.root.clone(),
+                None => worktree_project(cwd_path)
+                    .map_err(|e| ReviewError::new(format!("{cwd}: {e}")))?,
+            };
+            let branch = match &pending {
+                Some(p) => p.branch.clone(),
+                None => worktree_branch(cwd_path)
+                    .map_err(|e| ReviewError::new(format!("{cwd}: {e}")))?,
+            };
             // A declared upstream wins; otherwise infer it from the worktree's
             // own git upstream, exactly as an all-local review always has.
             let upstream = match declared_upstream.clone() {
@@ -1037,14 +1060,17 @@ pub fn derive_reviews_with_full_prefetch(
                         None => b,
                     }
                 }
-                None => worktree_upstream(cwd_path).map_err(|_| {
-                    ReviewError::new(format!(
-                        "{cwd}: review upstream requires a git upstream tracking branch for \
-                         '{branch}', but none is configured (set one with \
-                         'git branch --set-upstream-to=<branch>', or declare it on the review \
-                         as [[review]] upstream = \"<branch>\")"
-                    ))
-                })?,
+                None => match &pending {
+                    Some(p) => p.upstream.clone(),
+                    None => worktree_upstream(cwd_path).map_err(|_| {
+                        ReviewError::new(format!(
+                            "{cwd}: review upstream requires a git upstream tracking branch for \
+                             '{branch}', but none is configured (set one with \
+                             'git branch --set-upstream-to=<branch>', or declare it on the review \
+                             as [[review]] upstream = \"<branch>\")"
+                        ))
+                    })?,
+                },
             };
             (project, branch, upstream)
         };
@@ -1066,7 +1092,7 @@ pub fn derive_reviews_with_full_prefetch(
         // directory this host cannot stat, and its project grouping already
         // came from the owning task above.
         if remote.is_none() {
-            if let Ok(root) = worktree_root(cwd_path) {
+            if let Some(root) = review_worktree_root(cwd_path) {
                 explicit_roots.push((root, branch.clone()));
             }
         }
@@ -1099,6 +1125,9 @@ pub fn derive_reviews_with_full_prefetch(
             maximum_budget_usd: rv.and_then(|r| r.maximum_budget_usd),
             proof_scope: rv
                 .and_then(|r| r.proof_scope.clone())
+                .filter(|s| !s.trim().is_empty()),
+            ci_deferral: rv
+                .and_then(|r| r.ci_deferral.clone())
                 .filter(|s| !s.trim().is_empty()),
             auto_submit_pr_stack: rv.and_then(|r| r.auto_submit_pr_stack),
             skip_worktrees: rv.and_then(|r| r.skip_worktrees),
@@ -1155,7 +1184,7 @@ pub fn derive_reviews_with_full_prefetch(
         let Some(cwd) = cells[pos].cwd.as_deref() else {
             continue;
         };
-        let Ok(root) = worktree_root(Path::new(cwd)) else {
+        let Some(root) = review_worktree_root(Path::new(cwd)) else {
             continue;
         };
         if let Some((_, branch)) = explicit_roots.iter().find(|(r, _)| *r == root) {
@@ -1504,6 +1533,14 @@ fn apply_resolver(
     if let Some(scope) = members.iter().find_map(|m| m.proof_scope.clone()) {
         store
             .set_guardian_proof_scope(gid, Some(&scope))
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+    }
+    // This review's own CI-deferral mode, authored via `[[review]]
+    // ci_deferral`. Validated offline (`core::validate`) against
+    // `CI_DEFERRAL_VALUES`.
+    if let Some(mode) = members.iter().find_map(|m| m.ci_deferral.clone()) {
+        store
+            .set_guardian_ci_deferral(gid, Some(&mode))
             .map_err(|e| ReviewError::new(e.to_string()))?;
     }
     // This review's own auto-submit-PR-stack override, authored via
@@ -1868,19 +1905,29 @@ pub fn derive_triage_pools(
                 )));
             };
             let cwd_path = Path::new(cwd);
-            let project =
-                worktree_project(cwd_path).map_err(|e| ReviewError::new(format!("{cwd}: {e}")))?;
-            let branch =
-                worktree_branch(cwd_path).map_err(|e| ReviewError::new(format!("{cwd}: {e}")))?;
-            if let Ok(root) = worktree_root(cwd_path) {
+            let pending = crate::worktrees::pending_worktree_at(cwd_path);
+            let project = match &pending {
+                Some(p) => p.root.clone(),
+                None => worktree_project(cwd_path)
+                    .map_err(|e| ReviewError::new(format!("{cwd}: {e}")))?,
+            };
+            let branch = match &pending {
+                Some(p) => p.branch.clone(),
+                None => worktree_branch(cwd_path)
+                    .map_err(|e| ReviewError::new(format!("{cwd}: {e}")))?,
+            };
+            if let Some(root) = review_worktree_root(cwd_path) {
                 explicit_roots.push((root, branch.clone()));
             }
-            let upstream = worktree_upstream(cwd_path).map_err(|_| {
-                ReviewError::new(format!(
-                    "{cwd}: Triage pooling requires a git upstream tracking branch for '{branch}', \
+            let upstream = match &pending {
+                Some(p) => p.upstream.clone(),
+                None => worktree_upstream(cwd_path).map_err(|_| {
+                    ReviewError::new(format!(
+                        "{cwd}: Triage pooling requires a git upstream tracking branch for '{branch}', \
                  but none is configured (set one with 'git branch --set-upstream-to=<branch>')"
-                ))
-            })?;
+                    ))
+                })?,
+            };
             store
                 .set_cell_review_branch(squad_id, row.task_idx, row.idx, &branch)
                 .map_err(|e| ReviewError::new(e.to_string()))?;
@@ -1962,7 +2009,7 @@ pub fn derive_triage_pools(
                 let Some(cwd) = row.cwd.as_deref() else {
                     continue;
                 };
-                let Ok(root) = worktree_root(Path::new(cwd)) else {
+                let Some(root) = review_worktree_root(Path::new(cwd)) else {
                     continue;
                 };
                 if let Some((_, branch)) = explicit_roots.iter().find(|(r, _)| *r == root) {
@@ -2871,6 +2918,8 @@ mod tests {
             maximum_context: None,
             auto_compact_threshold: None,
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             upstream: None,
             machine: None,
             share_session: false,
@@ -3122,6 +3171,8 @@ mod tests {
             maximum_context: None,
             auto_compact_threshold: None,
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             upstream: None,
             machine: None,
             share_session: false,
@@ -3247,6 +3298,7 @@ mod tests {
             machine: None,
             maximum_budget_usd,
             proof_scope: None,
+            ci_deferral: None,
             auto_submit_pr_stack: None,
             skip_worktrees: None,
             auto_pr_feedback: None,
@@ -3311,6 +3363,33 @@ mod tests {
         let m = membership(None);
         apply_resolver(&store, &gid, &[&m]).unwrap();
         assert_eq!(store.get_guardian(&gid).unwrap().proof_scope, None);
+    }
+
+    // ── [[review]] ci_deferral wiring ─────────────────────────────────────
+
+    #[test]
+    fn apply_resolver_sets_ci_deferral_from_declaring_member() {
+        let store = Store::open_in_memory().unwrap();
+        let gid = store.create_guardian("r", "main", "/repo").unwrap();
+        let m = Membership {
+            ci_deferral: Some("bottom+top".to_string()),
+            ..membership(None)
+        };
+        apply_resolver(&store, &gid, &[&m]).unwrap();
+        let guardian = store.get_guardian(&gid).unwrap();
+        assert_eq!(guardian.ci_deferral.as_deref(), Some("bottom+top"));
+        assert_eq!(guardian.effective_ci_deferral, "bottom+top");
+    }
+
+    #[test]
+    fn apply_resolver_leaves_ci_deferral_unset_and_effectively_every() {
+        let store = Store::open_in_memory().unwrap();
+        let gid = store.create_guardian("r", "main", "/repo").unwrap();
+        let m = membership(None);
+        apply_resolver(&store, &gid, &[&m]).unwrap();
+        let guardian = store.get_guardian(&gid).unwrap();
+        assert_eq!(guardian.ci_deferral, None);
+        assert_eq!(guardian.effective_ci_deferral, "every");
     }
 
     // ── [[review]] auto_submit_pr_stack wiring (RAL-317) ────────────────────
@@ -3443,6 +3522,61 @@ mod tests {
         assert_eq!(guardians.len(), 1);
         assert!(crate::worktrees::worktree_dir(&root, "feat-x").exists());
         assert!(!git(&root, &["branch", "--list", "feat-x"]).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// RAL-600: a submitted `[[review.action]]` `auto_run` reaches the stored
+    /// review, and once the action (and its `prepare` build) is ready only the
+    /// flagged action is planned to start by itself.
+    #[test]
+    fn submitted_action_auto_run_is_stored_and_only_flagged_actions_auto_run() {
+        let root = temp_repo();
+        git(&root, &["init", "--initial-branch", "main"]);
+        std::fs::write(root.join("base.txt"), "base\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "base"]);
+
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        store
+            .lock()
+            .register_project("proj", "", &root.to_string_lossy(), "git")
+            .unwrap();
+        let src = link_review_toml(
+            "[[review.action]]\nlabel=\"auto\"\ncommand=\"echo auto\"\nauto_run=true\n\
+             [[review.action.prepare]]\ncommand=\"echo build\"\n\
+             [[review.action]]\nlabel=\"manual\"\ncommand=\"echo manual\"\n",
+        );
+        let file: ralphus_core::schema::TaskFile = toml::from_str(&src).unwrap();
+        let guardians =
+            derive_reviews_with_prefetch(&store, "squad-1", &file, &HashMap::new()).unwrap();
+        assert_eq!(guardians.len(), 1);
+
+        let g = store.lock().get_guardian(&guardians[0]).unwrap();
+        assert_eq!(g.action_hints.len(), 2);
+        assert_eq!(g.action_hints[0].auto_run, Some(true));
+        assert_eq!(g.action_hints[0].prepare.len(), 1);
+        assert_eq!(g.action_hints[1].auto_run, None);
+
+        // Preparation finished: both actions are ready, but only the flagged
+        // one starts without a person.
+        let mut ready = g.action_hints.clone();
+        for hint in &mut ready {
+            hint.preparation_state = Some("ready".to_string());
+        }
+        store
+            .lock()
+            .set_guardian_action_hints(&guardians[0], &ready)
+            .unwrap();
+        let g = store.lock().get_guardian(&guardians[0]).unwrap();
+        assert_eq!(
+            crate::auto_run::plan(&g).runnable,
+            vec![crate::auto_run::CheckRef {
+                kind: "action",
+                index: 0
+            }]
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

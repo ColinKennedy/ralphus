@@ -63,7 +63,7 @@ alternatives to reach for are in
   logic for it — a closed enum, a numeric bound, or deliberately unvalidated
   are all plausible, and guessing wrong either rejects a wanted value or lets
   a typo through.
-- **Keep `ralphus initialize server` prompts and flags symmetric.** Every
+- **Keep `ralphus initialize solo-developer` prompts and flags symmetric.** Every
   interactive answer needs an explicit flag that supplies the same value, and
   every initialization flag needs an equivalent interactive answer. Both paths
   must drive the same setup behavior; `--yes` accepting a default is not a
@@ -98,6 +98,10 @@ alternatives to reach for are in
   resync, reordering, or promotion needs a regression test proving the
   stack stays intact. See
   [`.agent/forge-design-principles.md`](.agent/forge-design-principles.md).
+- **Tag process-spawning behaviour for process counts** (RAL-604) — when you
+  add or change behaviour that spawns processes, add a test for it and list it
+  in `proc_counts/tags.toml` with exactly one tag. See
+  [`docs/proc-counts.md`](docs/proc-counts.md).
 - **Any mailbox message reporting a failure/blocked state must carry
   remediation guidance** (RAL-502) — go through
   `Store::enqueue_error_mailbox_message`/`notify_watchers_with_remediation`
@@ -289,6 +293,7 @@ files (each paired with a `CLAUDE.md` containing `@AGENTS.md`):
 - [`bench-harness/AGENTS.md`](bench-harness/AGENTS.md) — RAL-94 harness design, patience-comment rule
 - [`bench-macros/AGENTS.md`](bench-macros/AGENTS.md) — pointer to `bench-harness/AGENTS.md`
 - [`bench-types/AGENTS.md`](bench-types/AGENTS.md) — pointer to `bench-harness/AGENTS.md`
+- [`docs/proc-counts.md`](docs/proc-counts.md) — per-test process-count tags, cron measurement, graph
 - [`scripts/AGENTS.md`](scripts/AGENTS.md) — build-debug/build-release/container-mode/docs-site usage
 
 `.agent/` files for content that doesn't belong to one component:

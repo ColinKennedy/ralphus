@@ -18,6 +18,7 @@ use crate::cli_agent_common::{live_session_path, write_live_session_id, write_pr
 use crate::mcp_init::{self, McpInitializationPlan, McpInitializer, McpSetupCommand};
 use crate::shell_label::{exec_command_label, format_tool_input};
 use crate::shellcmd::{self, Env};
+use crate::skills_install::SkillsHarness;
 use crate::tools::Workspace;
 
 /// How often [`spawn_stdin_closer`]'s thread polls for the visible turn's
@@ -47,6 +48,24 @@ impl ClaudeCodeBackend {
         self.program_override.clone().unwrap_or_else(|| {
             std::env::var("RALPHUS_CLAUDE_COMMAND").unwrap_or_else(|_| DEFAULT_PROGRAM.to_string())
         })
+    }
+}
+
+impl SkillsHarness for ClaudeCodeBackend {
+    fn backend_name(&self) -> &'static str {
+        "claude-code"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Claude Code"
+    }
+
+    fn skills_dir(&self) -> Option<PathBuf> {
+        let config_dir = std::env::var_os("CLAUDE_CONFIG_DIR")
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| crate::agent_isolation::home_dir().map(|home| home.join(".claude")))?;
+        Some(config_dir.join("skills"))
     }
 }
 
@@ -182,6 +201,7 @@ impl ModelBackend for ClaudeCodeBackend {
             base_args.push("--model".to_string());
             base_args.push(model.to_string());
         }
+        base_args.extend(effort_args(options));
         base_args.extend(setting_sources_args(options));
         let claude_config_dir = isolated_claude_config_dir(options, workspace);
 
@@ -208,6 +228,7 @@ impl ModelBackend for ClaudeCodeBackend {
             workspace,
             options.auto_compact_threshold,
             options.maximum_tool_output_tokens,
+            options.effort.is_some(),
             claude_config_dir.as_deref(),
         )
         .map_err(|e| {
@@ -342,6 +363,14 @@ impl ModelBackend for ClaudeCodeBackend {
     fn supports_maximum_tool_output_tokens(&self) -> bool {
         true
     }
+
+    fn supports_effort(&self) -> bool {
+        true
+    }
+
+    fn supports_thinking(&self) -> bool {
+        true
+    }
 }
 
 /// The `--resume <id>` / `--session-id <id>` argument pair for a claude-code
@@ -384,6 +413,7 @@ const AUTO_COMPACT_WINDOW_ENV: &str = "CLAUDE_CODE_AUTO_COMPACT_WINDOW";
 /// backend (RAL-333).
 const FILE_READ_MAX_OUTPUT_TOKENS_ENV: &str = "CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS";
 
+#[allow(clippy::too_many_arguments)]
 fn spawn(
     program: &str,
     compound: bool,
@@ -391,6 +421,7 @@ fn spawn(
     workspace: &Workspace,
     auto_compact_threshold: Option<u64>,
     maximum_tool_output_tokens: Option<u64>,
+    effort_pinned: bool,
     claude_config_dir: Option<&std::path::Path>,
 ) -> std::io::Result<Child> {
     if compound {
@@ -405,6 +436,7 @@ fn spawn(
             .stderr(Stdio::piped());
         apply_auto_compact_env(&mut cmd, auto_compact_threshold);
         apply_maximum_tool_output_tokens_env(&mut cmd, maximum_tool_output_tokens);
+        apply_effort_env(&mut cmd, effort_pinned);
         apply_claude_config_dir_env(&mut cmd, claude_config_dir);
         cmd.spawn()
     } else {
@@ -416,6 +448,7 @@ fn spawn(
             .stderr(Stdio::piped());
         apply_auto_compact_env(&mut cmd, auto_compact_threshold);
         apply_maximum_tool_output_tokens_env(&mut cmd, maximum_tool_output_tokens);
+        apply_effort_env(&mut cmd, effort_pinned);
         apply_claude_config_dir_env(&mut cmd, claude_config_dir);
         cmd.spawn()
     }
@@ -440,6 +473,27 @@ fn apply_maximum_tool_output_tokens_env(
 ) {
     if let Some(v) = maximum_tool_output_tokens {
         cmd.env(FILE_READ_MAX_OUTPUT_TOKENS_ENV, v.to_string());
+    }
+}
+
+/// The env var Claude Code reads for a session-wide effort level; it takes
+/// precedence over the launch flag, so it is cleared whenever the cell pins
+/// an `effort` (RAL-607).
+const EFFORT_LEVEL_ENV: &str = "CLAUDE_CODE_EFFORT_LEVEL";
+
+/// `--effort <level>` when the cell sets one (RAL-607).
+fn effort_args(options: &RunOptions<'_>) -> Vec<String> {
+    match options.effort {
+        Some(level) => vec!["--effort".to_string(), level.to_string()],
+        None => Vec::new(),
+    }
+}
+
+/// Removes an inherited [`EFFORT_LEVEL_ENV`] from `cmd` when the cell pins an
+/// effort, so the cell's value is authoritative (RAL-607).
+fn apply_effort_env(cmd: &mut Command, effort_pinned: bool) {
+    if effort_pinned {
+        cmd.env_remove(EFFORT_LEVEL_ENV);
     }
 }
 
@@ -640,6 +694,7 @@ fn drive_stream_json(
             rate_limit_retry_after: None,
             compaction_input_tokens: state.compaction_input_tokens,
             compaction_count: state.compaction_count,
+            prophecies: state.prophecies.markers(),
         });
     }
 
@@ -685,6 +740,7 @@ fn drive_stream_json(
         rate_limit_retry_after: None,
         compaction_input_tokens: state.compaction_input_tokens,
         compaction_count: state.compaction_count,
+        prophecies: state.prophecies.markers(),
     })
 }
 
@@ -739,6 +795,17 @@ struct ParseState {
     /// rendered that way, so the `assistant` handling doesn't print the same
     /// text twice.
     printed_text_delta: bool,
+    /// RAL-598: a streamed `thinking` content block is open; its partial
+    /// line is buffered in [`Self::thinking_line`] until a newline or the
+    /// block's end.
+    in_thinking_block: bool,
+    thinking_line: String,
+    /// RAL-598: the open thinking block has already emitted some text.
+    thinking_block_had_text: bool,
+    /// RAL-598: thinking was already streamed as `thinking_delta`s for the
+    /// turn the next `assistant` event completes, so its `thinking` block
+    /// must not be printed a second time.
+    streamed_thinking: bool,
     /// RAL-292: the most recent `Bash` tool call's rendered args, launched
     /// with `run_in_background: true`, that hasn't yet been followed by a
     /// `BashOutput`/`KillShell` call checking on it. Still `Some` once the
@@ -753,6 +820,9 @@ struct ParseState {
     /// this after every event and stops (kills the child) rather than
     /// waiting for stdout EOF.
     compaction_thrash: Option<crate::thrash::ThrashDetail>,
+    /// RAL-595: every `RALPHUS_PROPHECY:` marker found in assistant text, as
+    /// each turn arrives and in the untruncated terminal `result` text.
+    prophecies: crate::prophecy::ProphecyScanner,
 }
 
 /// Handles one parsed stream-json line, updating `state` and printing to the
@@ -771,6 +841,27 @@ fn process_event(
     match event["type"].as_str() {
         Some("stream_event") => {
             let inner = &event["event"];
+            match inner["type"].as_str() {
+                Some("content_block_start")
+                    if inner["content_block"]["type"].as_str() == Some("thinking") =>
+                {
+                    open_thinking_block(state);
+                }
+                Some("content_block_stop") => finish_thinking_block(state),
+                Some("content_block_delta")
+                    if inner["delta"]["type"].as_str() == Some("thinking_delta") =>
+                {
+                    open_thinking_block(state);
+                    if let Some(text) = inner["delta"]["thinking"].as_str() {
+                        for line in split_thinking_lines(&mut state.thinking_line, text) {
+                            crate::pi_backend::print_thinking_line(&line);
+                            state.thinking_block_had_text = true;
+                        }
+                        state.thinking_block_had_text |= !text.is_empty();
+                    }
+                }
+                _ => {}
+            }
             if inner["type"].as_str() == Some("content_block_delta") {
                 if let Some(text) = inner["delta"]["text"].as_str() {
                     if !text.is_empty() {
@@ -867,18 +958,33 @@ fn process_event(
             // (the response event represents both sides).
             state.turns += 1;
             let already_streamed = state.printed_text_delta;
+            let thinking_streamed = std::mem::take(&mut state.streamed_thinking);
             if state.printed_text_delta {
                 finish_delta_line();
                 state.printed_text_delta = false;
             }
             if let Some(blocks) = event["message"]["content"].as_array() {
                 for block in blocks {
+                    // RAL-595: scan every assistant turn's text whether or not
+                    // it was already streamed to the pane -- the marker must
+                    // be filed from the turn it was written in, not only from
+                    // the final message.
+                    if block["type"].as_str() == Some("text") {
+                        if let Some(text) = block["text"].as_str() {
+                            state.prophecies.scan_and_emit("claude-code", text);
+                        }
+                    }
                     match block["type"].as_str() {
                         Some("text") if !already_streamed => {
                             if let Some(text) = block["text"].as_str() {
                                 if !text.is_empty() {
                                     print_line(text);
                                 }
+                            }
+                        }
+                        Some("thinking") if !thinking_streamed => {
+                            if let Some(text) = block["thinking"].as_str() {
+                                crate::pi_backend::print_thinking_block(text);
                             }
                         }
                         Some("tool_use") => {
@@ -1002,6 +1108,9 @@ fn process_event(
                 .or_else(|| event["cost_usd"].as_f64())
                 .unwrap_or(0.0);
             let text = event["result"].as_str().unwrap_or_default();
+            // RAL-595: scan before the tail truncation below drops a marker
+            // that sits earlier than the last 2000 characters.
+            state.prophecies.scan_and_emit("claude-code", text);
             state.result_summary = tail(text, RESULT_SUMMARY_TAIL_CHARS);
             let normalized = text.to_ascii_lowercase();
             let no_usage = state.tokens_in == 0
@@ -1158,6 +1267,50 @@ fn print_header(model: Option<&str>, workspace: &Workspace) {
     );
 }
 
+/// RAL-598: opens a streamed thinking block, first closing any half-written
+/// plain-text delta line so the thinking marker stays a line prefix.
+fn open_thinking_block(state: &mut ParseState) {
+    if state.in_thinking_block {
+        return;
+    }
+    state.in_thinking_block = true;
+    state.streamed_thinking = true;
+    state.thinking_block_had_text = false;
+    if state.printed_text_delta {
+        finish_delta_line();
+        state.printed_text_delta = false;
+    }
+}
+
+/// RAL-598: closes an open streamed thinking block, flushing its buffered
+/// partial line. A block that streamed nothing at all (an empty string)
+/// prints the placeholder instead.
+fn finish_thinking_block(state: &mut ParseState) {
+    if !state.in_thinking_block {
+        return;
+    }
+    if !state.thinking_line.is_empty() {
+        crate::pi_backend::print_thinking_line(&std::mem::take(&mut state.thinking_line));
+    } else if !state.thinking_block_had_text {
+        crate::pi_backend::print_thinking_block("");
+    }
+    state.in_thinking_block = false;
+}
+
+/// RAL-598: splits `delta` into the thinking lines it completes, carrying
+/// the unterminated tail over in `buffer`.
+fn split_thinking_lines(buffer: &mut String, delta: &str) -> Vec<String> {
+    let mut complete = Vec::new();
+    for c in delta.chars() {
+        if c == '\n' {
+            complete.push(std::mem::take(buffer));
+        } else {
+            buffer.push(c);
+        }
+    }
+    complete
+}
+
 /// Prints one line of Claude's own streamed text output to the live tmux
 /// pane -- the whole point of RAL-102 is to let a human read this.
 #[allow(clippy::print_stdout)] // intentional: see `print_header`
@@ -1228,6 +1381,34 @@ fn estimate_cost_usd(model: &str, tokens_in: i64, tokens_out: i64) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn effort_args_emit_the_effort_flag() {
+        let options = RunOptions {
+            effort: Some("xhigh"),
+            ..Default::default()
+        };
+        assert_eq!(effort_args(&options), ["--effort", "xhigh"]);
+    }
+
+    #[test]
+    fn effort_args_are_empty_when_unset() {
+        assert!(effort_args(&RunOptions::default()).is_empty());
+    }
+
+    #[test]
+    fn apply_effort_env_clears_the_inherited_env_var_only_when_pinned() {
+        let mut cmd = Command::new("claude");
+        apply_effort_env(&mut cmd, true);
+        let cleared = cmd
+            .get_envs()
+            .any(|(k, v)| k == EFFORT_LEVEL_ENV && v.is_none());
+        assert!(cleared);
+
+        let mut cmd = Command::new("claude");
+        apply_effort_env(&mut cmd, false);
+        assert!(cmd.get_envs().next().is_none());
+    }
+
     use super::*;
 
     #[test]
@@ -1573,6 +1754,66 @@ mod tests {
         assert!((state.cost_usd - 0.56).abs() < f64::EPSILON);
         assert_eq!(state.result_summary, "all done");
         assert!(state.saw_result);
+    }
+
+    #[test]
+    fn process_event_scans_markers_in_every_assistant_turn_but_not_tool_output() {
+        let mut state = ParseState::default();
+        let ws = test_workspace();
+        let feed = |state: &mut ParseState, event: serde_json::Value| {
+            process_event(&event, state, &ws, None, DEFAULT_TOOL_ARG_TRUNCATE_CHARS);
+        };
+        feed(
+            &mut state,
+            serde_json::json!({
+                "type":"assistant",
+                "message":{"content":[
+                    {"type":"text","text":"noted\nRALPHUS_PROPHECY: hazard: leaves a race\n"},
+                    {"type":"tool_use","name":"Bash","input":{"command":"ls"}}
+                ]}
+            }),
+        );
+        feed(
+            &mut state,
+            serde_json::json!({
+                "type":"user",
+                "message":{"content":[
+                    {"type":"tool_result","content":"RALPHUS_PROPHECY: discovery: from tool output"}
+                ]}
+            }),
+        );
+        feed(
+            &mut state,
+            serde_json::json!({
+                "type":"assistant",
+                "message":{"content":[{"type":"text","text":"done"}]}
+            }),
+        );
+        let markers = state.prophecies.markers();
+        assert_eq!(markers.len(), 1, "{markers:?}");
+        assert_eq!(markers[0].kind, "hazard");
+    }
+
+    #[test]
+    fn process_event_scans_a_marker_outside_the_truncated_result_tail() {
+        let mut state = ParseState::default();
+        let ws = test_workspace();
+        let text = format!(
+            "RALPHUS_PROPHECY: decision: chose X\n{}",
+            "filler line\n".repeat(400)
+        );
+        assert!(text.len() > RESULT_SUMMARY_TAIL_CHARS);
+        process_event(
+            &serde_json::json!({"type":"result","usage":{"input_tokens":1,"output_tokens":1},"result":text}),
+            &mut state,
+            &ws,
+            None,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+        assert!(!state.result_summary.contains("RALPHUS_PROPHECY"));
+        let markers = state.prophecies.markers();
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].body, "chose X");
     }
 
     #[test]
@@ -2332,5 +2573,34 @@ mod tests {
         let ws = test_workspace();
         let dir = isolated_claude_config_dir(&options, &ws).expect("isolated dir");
         assert!(dir.to_string_lossy().contains("claude-code"));
+    }
+}
+
+#[cfg(test)]
+mod thinking_tests {
+    use super::*;
+
+    #[test]
+    fn split_thinking_lines_carries_the_unterminated_tail() {
+        let mut buffer = String::new();
+        assert_eq!(split_thinking_lines(&mut buffer, "one\ntw"), vec!["one"]);
+        assert_eq!(split_thinking_lines(&mut buffer, "o\n"), vec!["two"]);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn thinking_deltas_mark_the_turn_as_streamed() {
+        let mut state = ParseState::default();
+        let event = serde_json::json!({"type": "stream_event", "event": {
+            "type": "content_block_delta",
+            "delta": {"type": "thinking_delta", "thinking": "hmm"}}});
+        let workspace = Workspace::create(std::env::temp_dir()).unwrap();
+        process_event(&event, &mut state, &workspace, None, 100);
+        assert!(state.in_thinking_block && state.streamed_thinking);
+        assert_eq!(state.thinking_line, "hmm");
+        let stop =
+            serde_json::json!({"type": "stream_event", "event": {"type": "content_block_stop"}});
+        process_event(&stop, &mut state, &workspace, None, 100);
+        assert!(!state.in_thinking_block && state.thinking_line.is_empty());
     }
 }

@@ -1,4 +1,4 @@
-﻿      // ---------- theme ----------
+      // ---------- theme ----------
       // RAL-257: the toggle swaps inline SVG icons instead of a Unicode glyph.
       // Each icon uses `currentColor`, so it inherits the .icon-btn
       // `color: var(--text)` and stays legible in either theme: the flashbang
@@ -196,6 +196,72 @@
       }
       initSplitters();
 
+      const DOCK_H_KEY = "ralphus-review-dock-h";
+      const DOCK_H_DEF = 300;
+      const DOCK_H_MIN = 120;
+      const DOCK_H_STEP = 24;
+      /**
+       * The log drawer's ceiling: nearly the whole review column, leaving a
+       * strip of the stack visible above it.
+       * @returns {number}
+       */
+      function dockMaxH() {
+        const main = document.querySelector(".review-main");
+        return Math.max(DOCK_H_MIN, (main ? main.getBoundingClientRect().height : window.innerHeight) - 80);
+      }
+      /**
+       * Applies and (optionally) persists the log drawer height, clamped to its bounds.
+       * @param {number} h
+       * @param {boolean} save
+       * @returns {number} the clamped height
+       */
+      function setDockH(h, save) {
+        const v = Math.round(Math.max(DOCK_H_MIN, Math.min(dockMaxH(), h)));
+        document.documentElement.style.setProperty("--review-dock-h", v + "px");
+        if (save) {
+          try { localStorage.setItem(DOCK_H_KEY, String(v)); } catch (_e) { /* storage unavailable */ }
+        }
+        return v;
+      }
+      /**
+       * Wires mouse/touch (pointer) and keyboard resizing on the review log drawer's top-edge handle.
+       * @returns {void}
+       */
+      function initDockResize() {
+        const el = document.getElementById("review-dock-resize");
+        if (!el) return;
+        try {
+          const saved = parseFloat(localStorage.getItem(DOCK_H_KEY) ?? "");
+          if (!Number.isNaN(saved)) setDockH(saved, false);
+        } catch (_e) { /* storage unavailable */ }
+        const curH = () => parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--review-dock-h")) || DOCK_H_DEF;
+        el.addEventListener("click", (e) => e.stopPropagation());
+        el.addEventListener("pointerdown", (e) => {
+          e.preventDefault();
+          const startY = e.clientY;
+          const startH = curH();
+          el.classList.add("dragging");
+          el.setPointerCapture(e.pointerId);
+          const move = (/** @type {PointerEvent} */ m) => { setDockH(startH + (startY - m.clientY), false); };
+          const up = () => {
+            el.classList.remove("dragging");
+            el.removeEventListener("pointermove", move);
+            el.removeEventListener("pointerup", up);
+            el.removeEventListener("pointercancel", up);
+            setDockH(curH(), true);
+          };
+          el.addEventListener("pointermove", move);
+          el.addEventListener("pointerup", up);
+          el.addEventListener("pointercancel", up);
+        });
+        el.addEventListener("keydown", (e) => {
+          if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
+          e.preventDefault();
+          setDockH(curH() + (e.key === "ArrowUp" ? DOCK_H_STEP : -DOCK_H_STEP), true);
+        });
+      }
+      initDockResize();
+
       // ---------- tabs ----------
       const TABS = ["squads", "tasks", "queue", "reviews", "waypoints", "resources", "cartographer", "projects", "machines", "triage", "presets", "users", "secrets", "worktree-retirement", "health", "agents", "prefs"];
       /**
@@ -229,6 +295,19 @@
         syncHash(push);
         // RAL-414: dormant unless `?ralphusTiming=1` -- see `85-perf-timing.js`.
         (/** @type {any} */ (window).RalphusTiming || { timeNav: (/** @type {any} */ _, /** @type {any} */ fn) => fn() }).timeNav(name, tick);
+      }
+      /**
+       * Click handler for the tab anchors (and the header Preferences link):
+       * an unmodified primary click switches tabs in place; ctrl/cmd/shift/alt
+       * or non-primary clicks fall through so the browser opens the `href`.
+       * @param {MouseEvent} ev
+       * @param {string} name
+       * @returns {boolean} false when the click was handled in place
+       */
+      function tabLinkClick(ev, name) {
+        if (ev.button !== 0 || ev.ctrlKey || ev.metaKey || ev.shiftKey || ev.altKey) return true;
+        showTab(name, true);
+        return false;
       }
       /**
        * Shows or hides the admin-only tab buttons (RAL-332) to match
@@ -309,6 +388,7 @@
        * @property {{q: string|null, status: string[]|null, projects: string[]|null}} [waypointHashFilters] raw Waypoints sidebar filters from the hash, applied by the Waypoints chunk (`applyWaypointHashFilters`) rather than here — that chunk loads after the first `parseHash()` call. A `null` field means the parameter was absent.
        * @property {string|null} [sel] legacy `kind:ti:si[:vi]` selector
        * @property {ParsedUri|null} [uri] RAL-188 selection, when the hash carried one
+       * @property {InspectorHashState} [inspector] Reviews-tab branch/detail-tab/log-drawer state
        */
       /**
        * Splits a raw hash into `[everything-before-sel, sel-value-or-null]`.
@@ -331,6 +411,81 @@
         const parts = [qs, selUri ? `sel=${selUri}` : ""].filter(Boolean);
         return parts.length ? `${base}?${parts.join("&")}` : base;
       }
+      // RALPHUS-REVIEW-INSPECTOR-HASH:BEGIN
+      /** Detail-pane tabs a `itab=` value may name. */
+      const INSPECTOR_HASH_TABS = ["overview", "worktree", "feedback", "live", "appraisals"];
+      /** Live sub-views an `lsub=` value may name. */
+      const INSPECTOR_HASH_LIVE_SUBS = ["terminal", "prompt", "system"];
+      /**
+       * The Reviews tab's branch-inspector and log-drawer state as the URL carries it.
+       * @typedef {object} InspectorHashState
+       * @property {string|null} branchId - Selected branch id, or null for none.
+       * @property {string} tab - One of INSPECTOR_HASH_TABS.
+       * @property {number|null} runIdx - Live run walked back to, or null for the newest.
+       * @property {string} liveSub - One of INSPECTOR_HASH_LIVE_SUBS.
+       * @property {boolean} dockOpen - Whether the log drawer is expanded.
+       * @property {string} dockScope - "review", or a branch id.
+       */
+      /**
+       * The state a hash without inspector params means.
+       * @returns {InspectorHashState}
+       */
+      function defaultInspectorHashState() {
+        return { branchId: null, tab: "overview", runIdx: null, liveSub: "terminal", dockOpen: false, dockScope: "review" };
+      }
+      /**
+       * Writes the non-default inspector state into `p` as plain query params:
+       * `branch`, `itab`, `run`, `lsub`, `dock`, `dscope`. Tab-specific params
+       * are only written where the tab makes them meaningful.
+       * @param {URLSearchParams} p
+       * @param {InspectorHashState} s
+       * @returns {void}
+       */
+      function encodeInspectorHash(p, s) {
+        if (s.branchId) {
+          p.set("branch", s.branchId);
+          if (s.tab !== "overview") p.set("itab", s.tab);
+          if (s.tab === "live") {
+            if (s.runIdx !== null) p.set("run", String(s.runIdx));
+            if (s.liveSub !== "terminal") p.set("lsub", s.liveSub);
+          }
+        }
+        if (s.dockOpen) {
+          p.set("dock", "1");
+          if (s.dockScope !== "review") p.set("dscope", s.dockScope);
+        }
+      }
+      /**
+       * Reads inspector state back out of `p`, falling back to defaults for
+       * any missing, unknown, or inapplicable value (a tab with no branch, a
+       * run/sub-view on a non-Live tab).
+       * @param {URLSearchParams} p
+       * @returns {InspectorHashState}
+       */
+      function decodeInspectorHash(p) {
+        const s = defaultInspectorHashState();
+        const branch = p.get("branch");
+        if (branch) {
+          s.branchId = branch;
+          const t = p.get("itab");
+          if (t && INSPECTOR_HASH_TABS.includes(t)) s.tab = t;
+          if (s.tab === "live") {
+            const run = p.get("run");
+            if (run !== null && /^\d+$/.test(run)) s.runIdx = Number(run);
+            const sub = p.get("lsub");
+            if (sub && INSPECTOR_HASH_LIVE_SUBS.includes(sub)) s.liveSub = sub;
+          }
+        }
+        if (p.get("dock") === "1") {
+          s.dockOpen = true;
+          const scope = p.get("dscope");
+          if (scope) s.dockScope = scope;
+        }
+        return s;
+      }
+      // RALPHUS-REVIEW-INSPECTOR-HASH:END
+      /** @type {InspectorHashState|null} inspector state parsed from the hash, waiting for the open review's detail to load */
+      let pendingInspectorHash = null;
       /** @type {ParsedHash|null} the hash-derived route waiting to be applied once its data has loaded */
       let pendingHash = null;
       /**
@@ -403,6 +558,7 @@
           const selUri = guardian
             ? `ralphus:${URI_SEGMENT_SEPARATOR_TOKEN}${uriSegment("REVIEW", guardian.name || guardian.id, 0)}${URI_QUERY_OPEN_TOKEN}id${URI_QUERY_ASSIGN_TOKEN}${uriEncodeQueryValue(guardian.id)}`
             : "";
+          encodeInspectorHash(p, pendingInspectorHash || currentInspectorHashState());
           const base = selectedGuardian && !guardian ? `#/reviews/${selectedGuardian}` : "#/reviews";
           url = hashWithSel(base, p.toString(), selUri);
         } else if (tab === "tasks") {
@@ -479,7 +635,7 @@
           // half and is resolved against the loaded list in `pollReviews`.
           const uri = looksLikeUri(selValue) ? parseRalphusUri(/** @type {string} */ (selValue)) : null;
           const reviewName = uri && uri.segments[0] ? uri.segments[0].name : null;
-          return { tab: "reviews", guardianId: (uri && uri.query.id) || path.split("/")[1] || null, uri, sel: reviewName };
+          return { tab: "reviews", guardianId: (uri && uri.query.id) || path.split("/")[1] || null, uri, sel: reviewName, inspector: decodeInspectorHash(p) };
         }
         if (raw.startsWith("resources")) return { tab: "resources" };
         if (raw.startsWith("queue")) return { tab: "queue" };

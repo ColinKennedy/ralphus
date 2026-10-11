@@ -575,7 +575,7 @@ fn setup_review_with_pending_last_branch(store: &Arc<StoreMutex>) -> (PathBuf, S
          [[task.cell]]\ncwd=\"{cwd_a}\"\ncommand=\"noop\"\nreview=\"<<review:rev>>\"\n\
          [[task]]\nname=\"b\"\ndepends_on=[\"a\"]\n\
          [[task.cell]]\ncwd=\"{cwd_b}\"\ncommand=\"noop\"\nreview=\"<<review:rev>>\"\n\
-         [[review]]\nid=\"rev\"\nskip_auto_build=true\n"
+         [[review]]\nid=\"rev\"\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
     let run_id = store.lock().insert_squad(&file, None, false).unwrap();
@@ -1854,7 +1854,7 @@ fn auto_fix_dispatch_appends_discourage_tests_guidance_when_review_override_set(
     assert!(
         messages[0]
             .text
-            .contains(ralphus_daemon::config::DISCOURAGE_TESTS_DURING_AUTO_PR_FIX_GUIDANCE),
+            .contains(ralphus_daemon::config::STRICT_AUTO_FIX_TESTING_PARAGRAPH),
         "feedback prompt must carry the discourage-tests guidance when the \
          review's own override is set: {:?}",
         messages[0].text
@@ -1956,7 +1956,7 @@ fn auto_fix_dispatch_appends_discourage_tests_guidance_from_project_default_when
     assert!(
         messages[0]
             .text
-            .contains(ralphus_daemon::config::DISCOURAGE_TESTS_DURING_AUTO_PR_FIX_GUIDANCE),
+            .contains(ralphus_daemon::config::STRICT_AUTO_FIX_TESTING_PARAGRAPH),
         "feedback prompt must carry the discourage-tests guidance from the \
          project-level default when the review itself is unset: {:?}",
         messages[0].text
@@ -3858,27 +3858,6 @@ fn configured_checks_are_not_double_built_by_auto_build() {
             .contains("prepared via project default"),
         "the configured check gate should take priority over the auto-build default"
     );
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-// `guardian_skip_auto_build` opts out of config auto-build too, not just
-// explicit checks (again, the auto_build default here deliberately fails to
-// prove it never ran).
-#[test]
-fn skip_auto_build_also_opts_out_of_config_auto_build() {
-    let (root, store, id) = single_feature_repo();
-    write(
-        &root,
-        ".ralphus.toml",
-        "[review]\nauto_build = \"test -f does_not_exist.txt\"\n",
-    );
-    store
-        .lock()
-        .set_guardian_skip_auto_build(&id, true)
-        .unwrap();
-    run_merge(&store, &NoopRunner, &id);
-    let view = store.lock().get_guardian(&id).unwrap();
-    assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
     let _ = std::fs::remove_dir_all(&root);
 }
 

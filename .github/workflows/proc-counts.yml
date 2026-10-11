@@ -1,0 +1,63 @@
+name: process counts
+
+# RAL-604: measures how many processes each tagged test spawns (lowest of three
+# runs), appends the result to proc_counts/records.json, re-renders the graph,
+# and commits both. Graph only -- nothing here fails on an increase.
+# See docs/proc-counts.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      label:
+        description: "x-axis label (default: nearest v* git tag)"
+        required: false
+      ref:
+        description: "backfill: commit to measure in a throwaway worktree (default: this checkout)"
+        required: false
+  schedule:
+    - cron: "41 5 * * *"
+
+concurrency:
+  group: proc-counts
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  measure:
+    name: Count processes per tagged test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+      - name: Install strace
+        run: sudo apt-get update && sudo apt-get install -y strace
+      - uses: astral-sh/setup-uv@v6
+      - name: Measure
+        working-directory: cli-py
+        env:
+          LABEL: ${{ inputs.label }}
+          REF: ${{ inputs.ref }}
+        run: |
+          uv sync --dev
+          args=()
+          [ -n "$LABEL" ] && args+=(--label "$LABEL")
+          [ -n "$REF" ] && args+=(--ref "$REF")
+          uv run ralphus-proccount collect "${args[@]}"
+      - name: Commit results
+        run: |
+          git config user.name "ralphus proc-counts"
+          git config user.email "proc-counts@users.noreply.github.com"
+          git add proc_counts
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "chore(proc-counts): record per-test process counts"
+          git pull --rebase
+          git push

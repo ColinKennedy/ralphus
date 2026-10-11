@@ -101,6 +101,26 @@ impl StoreMutex {
         }
     }
 
+    /// [`Self::with_read_snapshot`] for a caller that also runs in tests that
+    /// race it against writers on the shared-cache in-memory database.
+    ///
+    /// Shared-cache mode locks tables rather than snapshotting them, so there a
+    /// pooled reader and a concurrent writer can block or fail each other (a
+    /// review's merge start hung for a minute that way). That database takes
+    /// the writer lock instead; a file-backed store is WAL, has no such hazard,
+    /// and reads from the pool exactly as `with_read_snapshot` does.
+    pub fn with_read_snapshot_or_lock_when_shared_cache<T>(
+        &self,
+        f: impl FnOnce(&rusqlite::Connection) -> crate::store::Result<T>,
+    ) -> crate::store::Result<T> {
+        if self.read_pool.is_shared_cache() {
+            let store = self.lock();
+            let tx = store.conn.unchecked_transaction()?;
+            return f(&tx);
+        }
+        self.with_read_snapshot(f)
+    }
+
     /// Acquire the store lock, recording how long this call waited into both
     /// the process-lifetime histogram ([`store_lock_wait_snapshot`]) and the
     /// current thread's per-request accumulator ([`take_request_lock_wait_ms`]).
@@ -121,6 +141,19 @@ impl StoreMutex {
         {
             let mut holder = HOLDER.lock();
             if waited >= SLOW_WAIT_LOG_THRESHOLD {
+                // RAL-596: non-blocking queue push (see `daemon_health`), so
+                // it is safe with the store lock held.
+                crate::daemon_health::emit(
+                    crate::daemon_health::HealthEvent::error(
+                        "daemon.store_lock.slow_wait",
+                        format!("waited {}ms for the store lock", waited.as_millis()),
+                    )
+                    .attr(
+                        "waited_ms",
+                        i64::try_from(waited.as_millis()).unwrap_or(i64::MAX),
+                    )
+                    .attr("site", format!("{}:{}", loc.file(), loc.line())),
+                );
                 if let Some(prev) = *holder {
                     let held_ms = now.saturating_sub(prev.acquired_at_ms);
                     crate::rlog!(
@@ -247,6 +280,10 @@ impl std::ops::DerefMut for StoreGuard<'_> {
 /// (log + Cartographer row, and a panic in dev/test builds).
 const GUARD_HOLD_WARN_MS: u128 = 100;
 
+/// A hold at least this long (ms) is also exported as a `daemon.store_lock.long_hold`
+/// OpenTelemetry span (RAL-596); shorter holds are log-only.
+const GUARD_HOLD_OTEL_MS: u128 = 1000;
+
 /// Panic threshold for the guard watchdog, in milliseconds; `0` disables
 /// panicking (release builds log instead). Overridable via
 /// `RALPHUS_GUARD_HOLD_PANIC_MS` (set it very large to disable panicking).
@@ -330,6 +367,18 @@ impl Drop for StoreGuard<'_> {
             return;
         }
         GUARD_HOLD_WARN_COUNT.fetch_add(1, Ordering::Relaxed);
+        // RAL-596: only holds of a second or more are daemon-health events;
+        // the 100 ms band stays log-only.
+        if held_ms >= GUARD_HOLD_OTEL_MS {
+            crate::daemon_health::emit(
+                crate::daemon_health::HealthEvent::error(
+                    "daemon.store_lock.long_hold",
+                    format!("store lock held for {held_ms}ms"),
+                )
+                .attr("held_ms", i64::try_from(held_ms).unwrap_or(i64::MAX))
+                .attr("site", format!("{}:{}", self.site.file(), self.site.line())),
+            );
+        }
         let detail = format!(
             "store guard held for {held_ms}ms (acquired at {}:{})",
             self.site.file(),

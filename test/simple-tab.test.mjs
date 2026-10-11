@@ -50,7 +50,6 @@ function freshState(overrides = {}) {
     proofs: false,
     reviewMode: "none",
     generateManualChecks: false,
-    skipAutoBuild: true,
     generateAutoBuild: false,
     proofItems: [],
     checkItems: [],
@@ -233,7 +232,7 @@ test("ntPlannedGenerationKinds includes every kind when everything is opted in",
   assert.deepEqual(
     ntPlannedGenerationKinds(freshState({
       proofs: true, reviewMode: "explicit", generateManualChecks: true,
-      skipAutoBuild: false, generateAutoBuild: true,
+      generateAutoBuild: true,
     })),
     ["proof_steps", "manual_checks", "auto_build_steps"],
   );
@@ -402,7 +401,7 @@ test("ntSimpleResetKeepingProjectFields carries forward exactly the five remembe
   }
   // Fields that must NOT be carried forward -- they should reset to
   // ntFreshSimpleState()'s defaults, never copied from `prev`.
-  for (const field of ["prompt", "reviewMode", "proofs", "generateManualChecks", "skipAutoBuild", "generateAutoBuild", "proofItems", "checkItems", "buildItems", "generating", "confirmStep"]) {
+  for (const field of ["prompt", "reviewMode", "proofs", "generateManualChecks", "generateAutoBuild", "proofItems", "checkItems", "buildItems", "generating", "confirmStep"]) {
     assert.doesNotMatch(fn, new RegExp(`ntSimple\\.${field}\\s*=\\s*prev\\.${field}`), `must NOT carry forward ${field}`);
   }
 });

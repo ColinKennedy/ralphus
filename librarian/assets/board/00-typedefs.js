@@ -1,4 +1,4 @@
-﻿      // ---- Shared type definitions (JSDoc-only; see docs/daemon-api.md for the
+      // ---- Shared type definitions (JSDoc-only; see docs/daemon-api.md for the
       // authoritative wire shapes). Checked via `npm run typecheck` (tsc --checkJs
       // over the extracted <script> body) — see tsconfig.board.json. ----
       /**
@@ -81,6 +81,8 @@
        * @property {number} [maximum_context] - RAL-304: resolved context-window token limit, or absent for no cap. Only ever set for a backend with a real delivery mechanism (codex, pi) -- see `agent_supports_maximum_context`.
        * @property {number} [auto_compact_threshold] - RAL-304: resolved auto-compact trigger threshold in tokens, or absent for no explicit threshold. Accepted by a wider set of backends than `maximum_context` (codex, pi, and claude-code) -- see `agent_supports_auto_compact_threshold`.
        * @property {number} [maximum_tool_output_tokens] - RAL-333: resolved tool-output token cap (cell overrides task), or absent for no cap -- see `agent_supports_maximum_tool_output_tokens`.
+       * @property {string} [effort] - RAL-607: reasoning-effort level for the cell's agent (cell overrides task), or absent.
+       * @property {number} [temperature] - RAL-607: sampling temperature (Pi only; cell overrides task), or absent.
        * @property {string|null} [error]
        * @property {ProofView[]} [proof]
        * @property {string[]} [depends_on]
@@ -411,6 +413,8 @@
        * @property {string|null} [branch] - the review branch of the originating cell.
        * @property {string|null} [task_name] - the task the originating cell belongs to.
        * @property {boolean} ignored
+       * @property {string|null} [squad_id] - the follow-up squad accepting it created.
+       * @property {boolean} [accepted] - accepted: its squad exists, or it is submitted when the review merges.
        */
       /**
        * `GET /api/guardians/{id}/followup/items`: the counts plus the items.
@@ -441,7 +445,7 @@
        * @property {string} [review_type]
        * @property {string} [review_branch]
        * @property {string} [combined_worktree]
-       * @property {string} [checks_state] - "ready" | "generating" | "waiting" | "failed"
+       * @property {string} [checks_state] - "ready" | "generating" | "waiting" | "failed" | "no_actions" | "hung"
        * @property {GuardianCheck[]} [manual_commands]
        * @property {string} [manual_commands_agent]
        * @property {string} [manual_commands_model]
@@ -459,7 +463,6 @@
        * @property {string} [summary_state]
        * @property {string} [change_summary]
        * @property {string} [detail]
-       * @property {boolean} [skip_auto_build]
        * @property {boolean} [skip_worktrees]
        * @property {boolean|null} [skip_base_updates] - RAL-250: this review's own override for whether the automatic base-branch auto-update rebuild is skipped, or null to inherit the project/global default.
        * @property {boolean} [effective_skip_base_updates] - RAL-250: skip_base_updates resolved against the project/global default -- what the automatic base-shift sweep actually gates on.
@@ -469,6 +472,8 @@
        * @property {string|null} [proof_scope] - RAL-168: this review's own Proof-scope override ("each_branch"|"final_branch"|"nothing"), or null to inherit the project default.
        * @property {boolean|null} [proof_skip_auto_clean] - RAL-168: this review's own override for "each_branch"'s auto-clean-skip sub-option, or null to inherit the project default.
        * @property {string} [effective_proof_scope] - RAL-168: proof_scope resolved against the project default -- always "each_branch"|"final_branch"|"nothing".
+       * @property {string|null} [ci_deferral] - This review's own CI-deferral override ("every"|"top"|"bottom+top"), or null to inherit the project default.
+       * @property {string} [effective_ci_deferral] - ci_deferral resolved against the project and global defaults -- always "every"|"top"|"bottom+top".
        * @property {boolean} [effective_proof_skip_auto_clean] - RAL-168: proof_skip_auto_clean resolved against the project default.
        * @property {{[key: string]: string}} [combined_env] - RAL-203: the environment the combined worktree inherits by default -- the last enabled branch's own `resolved_env`. Shared baseline `build_env`/`manual_checks_env` each layer their own overrides on top of.
        * @property {{[key: string]: (string|null)}} [build_env_overrides] - RAL-203: this review's own env-override layer for the finalize-time build/check-gate step. A string value overrides the inherited one; `null` is a tombstone; an absent key is simply inherited.
@@ -896,6 +901,7 @@
        * @property {string|null|undefined} default_machine
        * @property {number|null|undefined} default_maximum_budget_usd
        * @property {string|null|undefined} default_proof_scope
+       * @property {string|null|undefined} default_ci_deferral
        * @property {boolean|null|undefined} verify_skip_auto_clean
        * @property {boolean|null|undefined} skip_worktrees
        * @property {boolean|null|undefined} skip_base_updates
@@ -925,6 +931,7 @@
        * @property {string|undefined} machine
        * @property {number|undefined} maximum_budget_usd
        * @property {string} proof_scope
+       * @property {string} ci_deferral
        * @property {boolean} skip_auto_clean
        * @property {boolean} skip_worktrees
        * @property {boolean} skip_base_updates
@@ -1117,6 +1124,19 @@
        * `GET /api/daemon` response shape, as far as the Health tab's store-lock
        * panel reads it (WS-G.4). The endpoint also returns name/version/status/
        * db/warnings, which other call sites use.
+       * @typedef {object} DaemonThreadView
+       * @property {string} name - stable id; the argument of `ralphus check restart-thread`.
+       * @property {string} description - what stops working while this thread is down.
+       * @property {"running"|"stalled"|"panicked"|"exited"} state
+       * @property {number} silent_for_ms - time since the thread last reported progress.
+       * @property {number|null} max_silence_ms - heartbeat limit, or null when the thread is judged only by whether it has ended.
+       * @property {string|null} panic_message - the panic text, when `state` is "panicked".
+       * @property {number|null} panicked_at_ms - epoch ms the thread ended.
+       * @property {number} restarts - how many times it has been restarted in place.
+       * @property {boolean} restartable - whether a restart would be accepted now (only an ended thread can be restarted).
+       */
+
+      /**
        * @typedef {object} DaemonHealthView
        * @property {string} [db] - result of the daemon's own database probe ("ok" or an error string). RAL-544: a non-"ok" value means the daemon is reachable but cannot reliably read its own store.
        * @property {StoreLockWaitView} [lock_wait] - store-lock acquisition wait over the daemon's lifetime (RAL-393).

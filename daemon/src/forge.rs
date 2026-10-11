@@ -465,6 +465,15 @@ pub struct CancelSummary {
     pub cancelled: Vec<i64>,
 }
 
+/// What [`ForgeClient::get_pull_request_ci_state`] reads off a PR/MR: its
+/// current label names and the commit its source branch points at (`None`
+/// when the response carries none).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PullRequestCiState {
+    pub labels: Vec<String>,
+    pub head_sha: Option<String>,
+}
+
 /// A resolved connection to one forge repository: enough to create PRs, list
 /// comments, and fetch a PR template. Built by [`resolve_remote`].
 #[derive(Clone)]
@@ -2027,6 +2036,422 @@ impl ForgeClient {
         }
     }
 
+    /// Add (`present = true`) or remove (`present = false`) one label on an
+    /// open PR/MR. Idempotent in both directions: adding a label already on
+    /// the PR/MR and removing one that is not both succeed, so a reconcile pass
+    /// can set the desired end state without first reading the current labels.
+    /// Both forges create a missing label on first add. Logs the outbound call
+    /// (start/done/error) via `rlog!`.
+    pub fn set_pull_request_label(
+        &self,
+        number: i64,
+        label: &str,
+        present: bool,
+    ) -> Result<(), String> {
+        let verb = if present { "add" } else { "remove" };
+        // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+        crate::rlog!(
+            INFO,
+            "ralphus [forge] {verb} pr label start kind={} repo={} number={number} label={label}",
+            self.kind.as_str(),
+            self.repo_path
+        );
+        let result = self.set_pull_request_label_inner(number, label, present);
+        match &result {
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+            Ok(()) => crate::rlog!(
+                INFO,
+                "ralphus [forge] {verb} pr label done kind={} repo={} number={number} label={label}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+            Err(e) => crate::rlog!(
+                ERROR,
+                "ralphus [forge] {verb} pr label failed kind={} repo={} number={number} label={label}: {e}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+        }
+        result
+    }
+
+    fn set_pull_request_label_inner(
+        &self,
+        number: i64,
+        label: &str,
+        present: bool,
+    ) -> Result<(), String> {
+        let token = self.require_token()?;
+        match (self.kind, present) {
+            // A PR is an issue for labelling purposes on GitHub.
+            (ForgeKind::GitHub, true) => {
+                let url = format!(
+                    "{}/repos/{}/issues/{number}/labels",
+                    self.api_base, self.repo_path
+                );
+                let payload = serde_json::json!({ "labels": [label] });
+                self.send(
+                    http_agent()
+                        .post(&url)
+                        .set("Authorization", &format!("Bearer {token}"))
+                        .set("Accept", "application/vnd.github+json"),
+                    &payload,
+                )?;
+                Ok(())
+            }
+            (ForgeKind::GitHub, false) => {
+                let url = format!(
+                    "{}/repos/{}/issues/{number}/labels/{}",
+                    self.api_base,
+                    self.repo_path,
+                    encode_path_segment(label)
+                );
+                match http_agent()
+                    .delete(&url)
+                    .set("Authorization", &format!("Bearer {token}"))
+                    .set("Accept", "application/vnd.github+json")
+                    .call()
+                {
+                    // 404: the label is not on the PR, which is the state asked for.
+                    Ok(_) | Err(ureq::Error::Status(404, _)) => Ok(()),
+                    Err(e) => Err(self.describe_evicting(e).into()),
+                }
+            }
+            (ForgeKind::GitLab, present) => {
+                let url = format!(
+                    "{}/projects/{}/merge_requests/{number}",
+                    self.api_base, self.repo_path
+                );
+                let field = if present {
+                    "add_labels"
+                } else {
+                    "remove_labels"
+                };
+                let payload = serde_json::json!({ field: label });
+                self.send(http_agent().put(&url).set("PRIVATE-TOKEN", token), &payload)?;
+                Ok(())
+            }
+        }
+    }
+
+    /// A PR/MR's current labels and source-head commit, read from the single
+    /// response that carries both on either forge. Lets a caller change a
+    /// label only where it differs from what it wants, and tell which CI runs
+    /// belong to the commit under review. Logs the outbound call
+    /// (start/done/error) via `rlog!`.
+    pub fn get_pull_request_ci_state(&self, number: i64) -> Result<PullRequestCiState, String> {
+        // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+        crate::rlog!(
+            DEBUG,
+            "ralphus [forge] get pr ci state start kind={} repo={} number={number}",
+            self.kind.as_str(),
+            self.repo_path
+        );
+        let result = self.get_pull_request_ci_state_inner(number);
+        match &result {
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+            Ok(state) => crate::rlog!(
+                DEBUG,
+                "ralphus [forge] get pr ci state done kind={} repo={} number={number} labels={}",
+                self.kind.as_str(),
+                self.repo_path,
+                state.labels.len()
+            ),
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+            Err(e) => crate::rlog!(
+                ERROR,
+                "ralphus [forge] get pr ci state failed kind={} repo={} number={number}: {e}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+        }
+        result
+    }
+
+    fn get_pull_request_ci_state_inner(&self, number: i64) -> Result<PullRequestCiState, String> {
+        let token = self.require_token()?;
+        match self.kind {
+            ForgeKind::GitHub => {
+                let url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
+                let resp = self.get(
+                    http_agent()
+                        .get(&url)
+                        .set("Authorization", &format!("Bearer {token}"))
+                        .set("Accept", "application/vnd.github+json"),
+                )?;
+                Ok(PullRequestCiState {
+                    labels: resp["labels"]
+                        .as_array()
+                        .map(|labels| {
+                            labels
+                                .iter()
+                                .filter_map(|label| label["name"].as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    head_sha: resp["head"]["sha"].as_str().map(str::to_string),
+                })
+            }
+            ForgeKind::GitLab => {
+                let url = format!(
+                    "{}/projects/{}/merge_requests/{number}",
+                    self.api_base, self.repo_path
+                );
+                let resp = self.get(http_agent().get(&url).set("PRIVATE-TOKEN", token))?;
+                Ok(PullRequestCiState {
+                    labels: resp["labels"]
+                        .as_array()
+                        .map(|labels| {
+                            labels
+                                .iter()
+                                .filter_map(|label| label.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    head_sha: resp["sha"]
+                        .as_str()
+                        .or_else(|| resp["diff_refs"]["head_sha"].as_str())
+                        .map(str::to_string),
+                })
+            }
+        }
+    }
+
+    /// The ids of the CI runs still in flight for one commit: GitHub workflow
+    /// runs that are `queued`, `in_progress`, `requested` or `waiting`, and
+    /// GitLab pipelines that are `created`, `waiting_for_resource`,
+    /// `preparing`, `pending` or `running`. A caller records these *before*
+    /// changing a label and cancels exactly this set afterwards
+    /// ([`Self::cancel_ci_runs`]), so a run the label change itself starts is
+    /// never mistaken for a stale one. Logs the outbound call (start/done/
+    /// error) via `rlog!`.
+    pub fn list_active_ci_runs(&self, head_sha: &str) -> Result<Vec<i64>, String> {
+        // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+        crate::rlog!(
+            DEBUG,
+            "ralphus [forge] list active ci start kind={} repo={} head_sha={head_sha}",
+            self.kind.as_str(),
+            self.repo_path
+        );
+        let result = self.list_active_ci_runs_inner(head_sha);
+        match &result {
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+            Ok(ids) => crate::rlog!(
+                DEBUG,
+                "ralphus [forge] list active ci done kind={} repo={} head_sha={head_sha} active={}",
+                self.kind.as_str(),
+                self.repo_path,
+                ids.len()
+            ),
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+            Err(e) => crate::rlog!(
+                ERROR,
+                "ralphus [forge] list active ci failed kind={} repo={} head_sha={head_sha}: {e}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+        }
+        result
+    }
+
+    fn list_active_ci_runs_inner(&self, head_sha: &str) -> Result<Vec<i64>, String> {
+        let token = self.require_token()?;
+        match self.kind {
+            ForgeKind::GitHub => {
+                let url = format!("{}/repos/{}/actions/runs", self.api_base, self.repo_path);
+                let resp = self.get(
+                    http_agent()
+                        .get(&url)
+                        .query("head_sha", head_sha)
+                        .query("per_page", "100")
+                        .set("Authorization", &format!("Bearer {token}"))
+                        .set("Accept", "application/vnd.github+json"),
+                )?;
+                Ok(resp["workflow_runs"]
+                    .as_array()
+                    .map(|runs| {
+                        runs.iter()
+                            .filter(|run| {
+                                matches!(
+                                    run["status"].as_str().unwrap_or_default(),
+                                    "queued" | "in_progress" | "requested" | "waiting"
+                                )
+                            })
+                            .filter_map(|run| run["id"].as_i64())
+                            .collect()
+                    })
+                    .unwrap_or_default())
+            }
+            ForgeKind::GitLab => {
+                let url = format!("{}/projects/{}/pipelines", self.api_base, self.repo_path);
+                let resp = self.get(
+                    http_agent()
+                        .get(&url)
+                        .query("sha", head_sha)
+                        .query("per_page", "100")
+                        .set("PRIVATE-TOKEN", token),
+                )?;
+                Ok(resp
+                    .as_array()
+                    .map(|pipelines| {
+                        pipelines
+                            .iter()
+                            .filter(|pipeline| {
+                                matches!(
+                                    pipeline["status"].as_str().unwrap_or_default(),
+                                    "created"
+                                        | "waiting_for_resource"
+                                        | "preparing"
+                                        | "pending"
+                                        | "running"
+                                )
+                            })
+                            .filter_map(|pipeline| pipeline["id"].as_i64())
+                            .collect()
+                    })
+                    .unwrap_or_default())
+            }
+        }
+    }
+
+    /// Cancel the given CI runs (GitHub workflow-run ids, GitLab pipeline ids)
+    /// and return the ids that were cancelled. Every id is attempted even if
+    /// an earlier one fails; the first error is returned after the rest ran.
+    /// GitHub uses `force-cancel`, where a `409` means the run already ended
+    /// on its own, which is the state asked for; GitLab's cancel is idempotent.
+    /// Logs the outbound call (start/done/error) via `rlog!`.
+    pub fn cancel_ci_runs(&self, ids: &[i64]) -> Result<Vec<i64>, String> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+        crate::rlog!(
+            INFO,
+            "ralphus [forge] cancel ci runs start kind={} repo={} runs={ids:?}",
+            self.kind.as_str(),
+            self.repo_path
+        );
+        let result = self.cancel_ci_runs_inner(ids);
+        match &result {
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+            Ok(cancelled) => crate::rlog!(
+                INFO,
+                "ralphus [forge] cancel ci runs done kind={} repo={} cancelled={cancelled:?}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+            Err(e) => crate::rlog!(
+                ERROR,
+                "ralphus [forge] cancel ci runs failed kind={} repo={} runs={ids:?}: {e}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+        }
+        result
+    }
+
+    fn cancel_ci_runs_inner(&self, ids: &[i64]) -> Result<Vec<i64>, String> {
+        let token = self.require_token()?;
+        let mut cancelled = Vec::new();
+        let mut first_error = None;
+        for &id in ids {
+            let outcome: Result<bool, String> = match self.kind {
+                ForgeKind::GitHub => {
+                    let url = format!(
+                        "{}/repos/{}/actions/runs/{id}/force-cancel",
+                        self.api_base, self.repo_path
+                    );
+                    match http_agent()
+                        .post(&url)
+                        .set("Authorization", &format!("Bearer {token}"))
+                        .set("Accept", "application/vnd.github+json")
+                        .set("Content-Type", "application/json")
+                        .send_string("{}")
+                    {
+                        Ok(_) => Ok(true),
+                        Err(ureq::Error::Status(409, _)) => Ok(false),
+                        Err(e) => Err(self.describe_evicting(e).into()),
+                    }
+                }
+                ForgeKind::GitLab => {
+                    let url = format!(
+                        "{}/projects/{}/pipelines/{id}/cancel",
+                        self.api_base, self.repo_path
+                    );
+                    self.send(
+                        http_agent().post(&url).set("PRIVATE-TOKEN", token),
+                        &serde_json::json!({}),
+                    )
+                    .map(|_| true)
+                }
+            };
+            match outcome {
+                Ok(true) => cancelled.push(id),
+                Ok(false) => {}
+                Err(e) => {
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(cancelled),
+        }
+    }
+
+    /// Ask the forge to run CI again on a PR/MR after its labels changed, for
+    /// forges that do not do so themselves. GitHub re-runs a workflow that
+    /// listens for `labeled`/`unlabeled` on its own, so this is a documented
+    /// no-op there and returns `Ok(false)`. GitLab never starts a pipeline
+    /// for a label change, so this creates a merge request pipeline
+    /// (`POST .../merge_requests/{iid}/pipelines`) and returns `Ok(true)`.
+    /// Logs the outbound call (start/done/error) via `rlog!`.
+    pub fn rerun_pull_request_ci(&self, number: i64) -> Result<bool, String> {
+        if self.kind != ForgeKind::GitLab {
+            return Ok(false);
+        }
+        // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+        crate::rlog!(
+            INFO,
+            "ralphus [forge] rerun mr pipeline start kind={} repo={} number={number}",
+            self.kind.as_str(),
+            self.repo_path
+        );
+        let result = self.rerun_merge_request_pipeline_inner(number);
+        match &result {
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+            Ok(()) => crate::rlog!(
+                INFO,
+                "ralphus [forge] rerun mr pipeline done kind={} repo={} number={number}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+            Err(e) => crate::rlog!(
+                ERROR,
+                "ralphus [forge] rerun mr pipeline failed kind={} repo={} number={number}: {e}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+        }
+        result.map(|()| true)
+    }
+
+    fn rerun_merge_request_pipeline_inner(&self, number: i64) -> Result<(), String> {
+        let token = self.require_token()?;
+        let url = format!(
+            "{}/projects/{}/merge_requests/{number}/pipelines",
+            self.api_base, self.repo_path
+        );
+        self.send(
+            http_agent().post(&url).set("PRIVATE-TOKEN", token),
+            &serde_json::json!({}),
+        )?;
+        Ok(())
+    }
+
     /// Register an ordered (bottom-to-top) list of already-created PR numbers
     /// as a GitHub-native PR stack
     /// (`POST /repos/{owner}/{repo}/stacks`, see
@@ -2711,6 +3136,20 @@ impl ForgeClient {
     }
 }
 
+/// Percent-encode one URL path segment (everything but RFC 3986 unreserved
+/// characters), so a label such as `ralphus:defer-full-ci` is a single segment.
+fn encode_path_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 /// A forge API error (RAL-366): carries the HTTP status and `Retry-After`
 /// header when the forge sent one, alongside the same human-readable message
 /// every pre-existing caller already treats as an opaque `String` (via
@@ -3161,7 +3600,7 @@ pub fn check_repository_url(
 }
 
 /// Parse a git remote URL into `(host, path)` -- the logic lives in
-/// [`ralphus_core::git_remote`] so `ralphus initialize server` normalizes
+/// [`ralphus_core::git_remote`] so `ralphus initialize solo-developer` normalizes
 /// URLs identically.
 ///
 /// `pub(crate)` (RAL-338) so `project_forks`/`pr.rs` can reuse it to derive a
@@ -5133,6 +5572,337 @@ mod tests {
         );
         let err = client.update_pull_request_base(1, "main").unwrap_err();
         assert!(err.contains("RALPHUS_GITHUB_TOKEN"), "{err}");
+    }
+
+    /// A mock forge that serves one request, asserting its method and URL
+    /// (and, when given, that the body contains `body_has`), and answers
+    /// `status`.
+    fn label_mock(
+        method: tiny_http::Method,
+        url: &'static str,
+        body_has: Option<&'static str>,
+        status: u16,
+    ) -> MockForge {
+        MockForge::start(move |server| {
+            let mut req = server.recv();
+            assert_eq!(req.method(), &method);
+            assert_eq!(req.url(), url);
+            if let Some(needle) = body_has {
+                let mut body = String::new();
+                std::io::Read::read_to_string(req.as_reader(), &mut body).unwrap();
+                assert!(body.contains(needle), "body {body:?} lacks {needle:?}");
+            }
+            req.respond(tiny_http::Response::from_string("{}").with_status_code(status))
+                .unwrap();
+        })
+    }
+
+    #[test]
+    fn set_label_adds_on_github_via_the_issues_endpoint() {
+        let mock = label_mock(
+            tiny_http::Method::Post,
+            "/repos/acme/widget/issues/7/labels",
+            Some("ralphus:defer-full-ci"),
+            200,
+        );
+        mock.client(ForgeKind::GitHub, "acme/widget")
+            .set_pull_request_label(7, "ralphus:defer-full-ci", true)
+            .unwrap();
+        mock.finish();
+    }
+
+    #[test]
+    fn set_label_removes_on_github_with_an_encoded_segment() {
+        let mock = label_mock(
+            tiny_http::Method::Delete,
+            "/repos/acme/widget/issues/7/labels/ralphus%3Adefer-full-ci",
+            None,
+            200,
+        );
+        mock.client(ForgeKind::GitHub, "acme/widget")
+            .set_pull_request_label(7, "ralphus:defer-full-ci", false)
+            .unwrap();
+        mock.finish();
+    }
+
+    #[test]
+    fn set_label_remove_on_github_treats_404_as_already_absent() {
+        let mock = label_mock(
+            tiny_http::Method::Delete,
+            "/repos/acme/widget/issues/7/labels/x",
+            None,
+            404,
+        );
+        mock.client(ForgeKind::GitHub, "acme/widget")
+            .set_pull_request_label(7, "x", false)
+            .unwrap();
+        mock.finish();
+    }
+
+    #[test]
+    fn set_label_remove_on_github_surfaces_other_errors() {
+        let mock = label_mock(
+            tiny_http::Method::Delete,
+            "/repos/acme/widget/issues/7/labels/x",
+            None,
+            403,
+        );
+        let err = mock
+            .client(ForgeKind::GitHub, "acme/widget")
+            .set_pull_request_label(7, "x", false)
+            .unwrap_err();
+        assert!(err.contains("403"), "{err}");
+        mock.finish();
+    }
+
+    #[test]
+    fn set_label_adds_on_gitlab_via_add_labels() {
+        let mock = label_mock(
+            tiny_http::Method::Put,
+            "/projects/group%2Fproj/merge_requests/9",
+            Some(r#""add_labels":"ralphus:defer-full-ci""#),
+            200,
+        );
+        mock.client(ForgeKind::GitLab, "group%2Fproj")
+            .set_pull_request_label(9, "ralphus:defer-full-ci", true)
+            .unwrap();
+        mock.finish();
+    }
+
+    #[test]
+    fn set_label_removes_on_gitlab_via_remove_labels() {
+        let mock = label_mock(
+            tiny_http::Method::Put,
+            "/projects/group%2Fproj/merge_requests/9",
+            Some(r#""remove_labels":"ralphus:defer-full-ci""#),
+            200,
+        );
+        mock.client(ForgeKind::GitLab, "group%2Fproj")
+            .set_pull_request_label(9, "ralphus:defer-full-ci", false)
+            .unwrap();
+        mock.finish();
+    }
+
+    #[test]
+    fn set_label_requires_token() {
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            "https://gitlab.com/api/v4".to_string(),
+            "group%2Fproj".to_string(),
+            None,
+        );
+        let err = client.set_pull_request_label(1, "x", true).unwrap_err();
+        assert!(err.contains("RALPHUS_GITLAB_TOKEN"), "{err}");
+    }
+
+    #[test]
+    fn ci_state_reads_labels_and_head_commit_on_github() {
+        let mock = MockForge::start(|server| {
+            let req = server.recv();
+            assert_eq!(req.method(), &tiny_http::Method::Get);
+            assert_eq!(req.url(), "/repos/acme/widget/pulls/7");
+            req.respond(tiny_http::Response::from_string(
+                r#"{"labels":[{"name":"bug"},{"name":"ralphus:defer-full-ci"}],"head":{"sha":"abc"}}"#,
+            ))
+            .unwrap();
+        });
+        let state = mock
+            .client(ForgeKind::GitHub, "acme/widget")
+            .get_pull_request_ci_state(7)
+            .unwrap();
+        assert_eq!(state.labels, ["bug", "ralphus:defer-full-ci"]);
+        assert_eq!(state.head_sha.as_deref(), Some("abc"));
+        mock.finish();
+    }
+
+    #[test]
+    fn ci_state_reads_labels_and_head_commit_on_gitlab() {
+        let mock = MockForge::start(|server| {
+            let req = server.recv();
+            assert_eq!(req.url(), "/projects/group%2Fproj/merge_requests/9");
+            req.respond(tiny_http::Response::from_string(
+                r#"{"labels":["bug","ralphus:defer-full-ci"],"sha":"def"}"#,
+            ))
+            .unwrap();
+        });
+        let state = mock
+            .client(ForgeKind::GitLab, "group%2Fproj")
+            .get_pull_request_ci_state(9)
+            .unwrap();
+        assert_eq!(state.labels, ["bug", "ralphus:defer-full-ci"]);
+        assert_eq!(state.head_sha.as_deref(), Some("def"));
+        mock.finish();
+    }
+
+    #[test]
+    fn list_active_ci_runs_keeps_only_runs_in_flight_on_github() {
+        let mock = MockForge::start(|server| {
+            let req = server.recv();
+            assert!(
+                req.url()
+                    .starts_with("/repos/acme/widget/actions/runs?head_sha=abc"),
+                "{}",
+                req.url()
+            );
+            req.respond(tiny_http::Response::from_string(
+                r#"{"workflow_runs":[
+                    {"id":1,"status":"in_progress"},{"id":2,"status":"completed"},
+                    {"id":3,"status":"queued"},{"id":4,"status":"waiting"},
+                    {"id":5,"status":"requested"}]}"#,
+            ))
+            .unwrap();
+        });
+        let ids = mock
+            .client(ForgeKind::GitHub, "acme/widget")
+            .list_active_ci_runs("abc")
+            .unwrap();
+        assert_eq!(ids, [1, 3, 4, 5]);
+        mock.finish();
+    }
+
+    #[test]
+    fn list_active_ci_runs_keeps_only_pipelines_in_flight_on_gitlab() {
+        let mock = MockForge::start(|server| {
+            let req = server.recv();
+            assert!(
+                req.url()
+                    .starts_with("/projects/group%2Fproj/pipelines?sha=def"),
+                "{}",
+                req.url()
+            );
+            req.respond(tiny_http::Response::from_string(
+                r#"[{"id":1,"status":"running"},{"id":2,"status":"success"},
+                    {"id":3,"status":"pending"},{"id":4,"status":"canceled"},
+                    {"id":5,"status":"created"}]"#,
+            ))
+            .unwrap();
+        });
+        let ids = mock
+            .client(ForgeKind::GitLab, "group%2Fproj")
+            .list_active_ci_runs("def")
+            .unwrap();
+        assert_eq!(ids, [1, 3, 5]);
+        mock.finish();
+    }
+
+    #[test]
+    fn cancel_ci_runs_force_cancels_on_github_and_treats_409_as_already_finished() {
+        let mock = MockForge::start(|server| {
+            for (url, status) in [
+                ("/repos/acme/widget/actions/runs/1/force-cancel", 202),
+                ("/repos/acme/widget/actions/runs/2/force-cancel", 409),
+                ("/repos/acme/widget/actions/runs/3/force-cancel", 202),
+            ] {
+                let req = server.recv();
+                assert_eq!(req.method(), &tiny_http::Method::Post);
+                assert_eq!(req.url(), url);
+                req.respond(tiny_http::Response::from_string("{}").with_status_code(status))
+                    .unwrap();
+            }
+        });
+        let cancelled = mock
+            .client(ForgeKind::GitHub, "acme/widget")
+            .cancel_ci_runs(&[1, 2, 3])
+            .unwrap();
+        assert_eq!(cancelled, [1, 3], "a 409 run had already ended on its own");
+        mock.finish();
+    }
+
+    #[test]
+    fn cancel_ci_runs_keeps_going_after_a_failure_and_reports_it() {
+        let mock = MockForge::start(|server| {
+            for (url, status) in [
+                ("/repos/acme/widget/actions/runs/1/force-cancel", 403),
+                ("/repos/acme/widget/actions/runs/2/force-cancel", 202),
+            ] {
+                let req = server.recv();
+                assert_eq!(req.url(), url);
+                req.respond(tiny_http::Response::from_string("{}").with_status_code(status))
+                    .unwrap();
+            }
+        });
+        let err = mock
+            .client(ForgeKind::GitHub, "acme/widget")
+            .cancel_ci_runs(&[1, 2])
+            .unwrap_err();
+        assert!(err.contains("403"), "{err}");
+        mock.finish();
+    }
+
+    #[test]
+    fn cancel_ci_runs_cancels_pipelines_on_gitlab() {
+        let mock = MockForge::start(|server| {
+            for url in [
+                "/projects/group%2Fproj/pipelines/11/cancel",
+                "/projects/group%2Fproj/pipelines/12/cancel",
+            ] {
+                let req = server.recv();
+                assert_eq!(req.method(), &tiny_http::Method::Post);
+                assert_eq!(req.url(), url);
+                req.respond(tiny_http::Response::from_string("{}")).unwrap();
+            }
+        });
+        let cancelled = mock
+            .client(ForgeKind::GitLab, "group%2Fproj")
+            .cancel_ci_runs(&[11, 12])
+            .unwrap();
+        assert_eq!(cancelled, [11, 12]);
+        mock.finish();
+    }
+
+    #[test]
+    fn cancel_ci_runs_with_nothing_to_cancel_makes_no_request() {
+        // No mock server: any request would fail to connect.
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            "http://127.0.0.1:1".to_string(),
+            "group%2Fproj".to_string(),
+            Some("tok".to_string()),
+        );
+        assert_eq!(client.cancel_ci_runs(&[]).unwrap(), Vec::<i64>::new());
+    }
+
+    #[test]
+    fn rerun_pull_request_ci_creates_a_gitlab_pipeline() {
+        let mock = MockForge::start(|server| {
+            let req = server.recv();
+            assert_eq!(req.method(), &tiny_http::Method::Post);
+            assert_eq!(
+                req.url(),
+                "/projects/group%2Fproj/merge_requests/9/pipelines"
+            );
+            req.respond(tiny_http::Response::from_string("{}").with_status_code(201))
+                .unwrap();
+        });
+        assert!(
+            mock.client(ForgeKind::GitLab, "group%2Fproj")
+                .rerun_pull_request_ci(9)
+                .unwrap()
+        );
+        mock.finish();
+    }
+
+    #[test]
+    fn rerun_pull_request_ci_is_a_no_op_on_github() {
+        // No mock server: GitHub re-runs a label-listening workflow itself, so
+        // any request here would fail to connect.
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            "http://127.0.0.1:1".to_string(),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        assert!(!client.rerun_pull_request_ci(7).unwrap());
+    }
+
+    #[test]
+    fn encode_path_segment_escapes_everything_but_unreserved() {
+        assert_eq!(
+            encode_path_segment("ralphus:defer-full-ci"),
+            "ralphus%3Adefer-full-ci"
+        );
+        assert_eq!(encode_path_segment("a b/c"), "a%20b%2Fc");
+        assert_eq!(encode_path_segment("A-z_0.9~"), "A-z_0.9~");
     }
 
     #[test]

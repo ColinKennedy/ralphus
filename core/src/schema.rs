@@ -142,6 +142,19 @@ pub struct TaskDef {
     /// time.
     #[serde(default)]
     pub maximum_tool_output_tokens: Option<u64>,
+    /// Task-level reasoning effort (RAL-607), delivered through each agent
+    /// harness's own mechanism (Claude Code `--effort`, Codex
+    /// `-c model_reasoning_effort=...`, Pi `--thinking`). TOML-cascade only:
+    /// cells inherit this unless they set their own `effort`. The accepted
+    /// vocabulary is per agent -- see [`agent_supports_effort`] and
+    /// [`effort_levels_for_agent`].
+    #[serde(default)]
+    pub effort: Option<String>,
+    /// Task-level sampling temperature (RAL-607). Pi only -- see
+    /// [`agent_supports_temperature`]. Cells inherit this unless they set
+    /// their own `temperature`.
+    #[serde(default)]
+    pub temperature: Option<f64>,
     /// Retry count.
     #[serde(default)]
     pub max_retries: Option<u32>,
@@ -326,6 +339,14 @@ pub struct CellDef {
     /// backend-support restriction.
     #[serde(default)]
     pub maximum_tool_output_tokens: Option<u64>,
+    /// Per-cell reasoning effort (RAL-607). Falls back to the task-level
+    /// `effort` when unset. See [`TaskDef::effort`].
+    #[serde(default)]
+    pub effort: Option<String>,
+    /// Per-cell sampling temperature (RAL-607), Pi only. Falls back to the
+    /// task-level `temperature` when unset. See [`TaskDef::temperature`].
+    #[serde(default)]
+    pub temperature: Option<f64>,
     /// Per-cell wall-clock timeout in minutes. Falls back to the task-level
     /// `timeout_minutes` when unset.
     #[serde(default)]
@@ -1151,6 +1172,27 @@ pub const PROOF_SCOPE_VALUES: &[&str] = &[
     PROOF_SCOPE_NOTHING,
 ];
 
+/// Valid values for `[[review]] ci_deferral` and the CLI's `ralphus review
+/// settings --ci-deferral`: which PRs/MRs in a review's stack run the full CI
+/// suite. Every other PR/MR in the stack carries [`DEFER_FULL_CI_LABEL`], which
+/// the project's CI configuration reads to skip its expensive jobs. See
+/// [`ReviewDef::ci_deferral`].
+pub const CI_DEFERRAL_EVERY: &str = "every";
+pub const CI_DEFERRAL_TOP: &str = "top";
+pub const CI_DEFERRAL_BOTTOM_AND_TOP: &str = "bottom+top";
+
+/// Every accepted `ci_deferral` literal, in the order shown to a user.
+pub const CI_DEFERRAL_VALUES: &[&str] = &[
+    CI_DEFERRAL_EVERY,
+    CI_DEFERRAL_TOP,
+    CI_DEFERRAL_BOTTOM_AND_TOP,
+];
+
+/// The label a review puts on every PR/MR whose full CI run `ci_deferral`
+/// defers. A missing label means "run everything", so a project that never
+/// opts in, or a label someone removed, costs CI minutes rather than coverage.
+pub const DEFER_FULL_CI_LABEL: &str = "ralphus:defer-full-ci";
+
 /// Every accepted `summary_format` literal for a review change summary.
 pub const SUMMARY_FORMAT_VALUES: &[&str] = &["bullet", "prose"];
 
@@ -1318,7 +1360,7 @@ pub fn parse_affected_entry_sentinel(entry: &str) -> Option<AffectedEntryRef> {
 /// fields still unset at submit time -- `core` has no store access, so it
 /// can only check this sentinel's shape, never whether the name is actually
 /// registered. The name may be hierarchical, e.g.
-/// `<<ralphus:presets/roles/reviewer>>` (see [`is_valid_preset_name`]).
+/// `<<ralphus:presets/roles/judge/reviewer>>` (see [`is_valid_preset_name`]).
 pub const PRESET_LINK_PREFIX: &str = "ralphus:presets/";
 
 /// Parse one `extends` list entry as a `<<ralphus:presets/<name>>>` sentinel.
@@ -1335,7 +1377,7 @@ pub fn parse_preset_sentinel(value: &str) -> Option<&str> {
 }
 
 /// Whether `name` is a well-formed preset name. A name may be hierarchical
-/// (`roles/reviewer`): `/` separates namespace segments, but a namespace is
+/// (`roles/judge/reviewer`): `/` separates namespace segments, but a namespace is
 /// only ever part of the name string -- there is no separate namespace
 /// object anywhere. Every segment must be non-empty, must not be `.` or
 /// `..` (so a name can never be mistaken for a path-relative reference), and
@@ -1501,6 +1543,20 @@ pub fn resolve_cell_proof_machine(
 pub fn resolve_cell_maximum_tool_output_tokens(task: &TaskDef, cell: &CellDef) -> Option<u64> {
     cell.maximum_tool_output_tokens
         .or(task.maximum_tool_output_tokens)
+}
+
+/// The effective `effort` for a cell: its own value, else the owning task's
+/// (RAL-607).
+#[must_use]
+pub fn resolve_cell_effort(task: &TaskDef, cell: &CellDef) -> Option<String> {
+    cell.effort.clone().or_else(|| task.effort.clone())
+}
+
+/// The effective `temperature` for a cell: its own value, else the owning
+/// task's (RAL-607).
+#[must_use]
+pub fn resolve_cell_temperature(task: &TaskDef, cell: &CellDef) -> Option<f64> {
+    cell.temperature.or(task.temperature)
 }
 
 /// The effective `maximum_tool_output_tokens` for a task-scope proof step (one
@@ -1675,6 +1731,14 @@ pub struct ReviewDef {
     /// `[[review]]` block to read it from.
     #[serde(default)]
     pub auto_fix_pr_errors: Option<bool>,
+    /// Which PRs/MRs in this review's stack run the full CI suite:
+    /// [`CI_DEFERRAL_EVERY`] (all of them), [`CI_DEFERRAL_TOP`] (only the top
+    /// of the stack) or [`CI_DEFERRAL_BOTTOM_AND_TOP`] (the bottom, which
+    /// targets the base branch, and the top). Every other PR/MR gets
+    /// [`DEFER_FULL_CI_LABEL`]. Unset means [`CI_DEFERRAL_EVERY`]. See
+    /// [`CI_DEFERRAL_VALUES`].
+    #[serde(default)]
+    pub ci_deferral: Option<String>,
     /// RAL-510: whether this review cancels a PR/MR's still-running CI
     /// pipelines whenever a newer commit is force-pushed onto the same
     /// branch, instead of letting superseded runs burn CI capacity to
@@ -2258,16 +2322,59 @@ pub fn agent_supports_maximum_tool_output_tokens(agent: &str) -> bool {
     )
 }
 
+/// Claude Code's `--effort` vocabulary (RAL-607).
+pub const CLAUDE_EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
+/// Pi's `--thinking` vocabulary (RAL-607).
+pub const PI_EFFORT_LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// Whether `agent` is a backend with a real delivery mechanism for `effort`
+/// (RAL-607): Claude Code (`--effort`), Codex
+/// (`-c model_reasoning_effort=...`) and Pi (`--thinking`). Every other
+/// backend has none, so validation rejects `effort` for it.
+///
+/// On the runner side, each supported backend overrides
+/// `ModelBackend::supports_effort` to match this set -- the two checks are
+/// independent and must be kept in sync by hand.
+#[must_use]
+pub fn agent_supports_effort(agent: &str) -> bool {
+    matches!(
+        agent,
+        "codex" | "codex-cli" | "pi" | "claude-code" | "claude-cli"
+    )
+}
+
+/// The closed `effort` vocabulary for `agent`, or `None` when the agent
+/// accepts any non-empty string (Codex advertises levels per model).
+#[must_use]
+pub fn effort_levels_for_agent(agent: &str) -> Option<&'static [&'static str]> {
+    match agent {
+        "claude-code" | "claude-cli" => Some(CLAUDE_EFFORT_LEVELS),
+        "pi" => Some(PI_EFFORT_LEVELS),
+        _ => None,
+    }
+}
+
+/// Whether `agent` accepts `temperature` (RAL-607): Pi only, via
+/// `samplingParams` in its `models.json`.
+#[must_use]
+pub fn agent_supports_temperature(agent: &str) -> bool {
+    agent == "pi"
+}
+
+/// Inclusive bounds a cell `temperature` must fall within (RAL-607).
+pub const TEMPERATURE_RANGE: (f64, f64) = (0.0, 2.0);
+
 /// Whether `agent` is a backend that emits its model's thinking/reasoning as
 /// a distinct, taggable stream the Live View's "Show Thinking" control
 /// (RAL-434) can fold/unfold -- as opposed to one that mixes reasoning into
 /// its regular output (or emits none at all) with nothing for the board to
 /// tell apart (RAL-516).
 ///
-/// Only Pi tags a `RALPHUS_THINKING: ` marker line
-/// (`runner::pi_backend::THINKING_MARKER`) today. Claude Code, Codex, the
-/// native/`anthropic`/`ollama` backends, and `raw`/harness cells emit
-/// nothing the board can classify as thinking, so this declares them
+/// Pi, Claude Code, and Codex tag a `RALPHUS_THINKING: ` marker line
+/// (`runner::pi_backend::THINKING_MARKER`) from reasoning their CLIs
+/// report. The native/`anthropic`/`ollama` backends and `raw`/harness cells
+/// emit nothing the board can classify as thinking, so this declares them
 /// incapable by default -- an agent-profile's own `thinking_capable`
 /// override (`daemon::agent_profiles::AgentProfile`) can still mark a custom
 /// profile capable without changing this default, e.g. a profile pointed at
@@ -2279,7 +2386,10 @@ pub fn agent_supports_maximum_tool_output_tokens(agent: &str) -> bool {
 /// in sync by hand.
 #[must_use]
 pub fn agent_supports_thinking(agent: &str) -> bool {
-    matches!(agent, "pi")
+    matches!(
+        agent,
+        "pi" | "claude-code" | "claude-cli" | "codex" | "codex-cli"
+    )
 }
 
 /// Whether `[[waypoint]].model` is required, forbidden, or unconstrained
@@ -2409,6 +2519,8 @@ mod tests {
             maximum_context: None,
             auto_compact_threshold: None,
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             max_retries: None,
             priority: None,
             timeout_minutes: None,
@@ -2454,6 +2566,8 @@ mod tests {
             upstream: None,
             share_session: None,
             maximum_tool_output_tokens: None,
+            effort: None,
+            temperature: None,
             triage: false,
             triage_type: None,
             extends: vec![],
@@ -2930,18 +3044,11 @@ mod tests {
     }
 
     #[test]
-    fn thinking_supported_only_by_pi() {
-        assert!(agent_supports_thinking("pi"));
-        for agent in [
-            "claude",
-            "anthropic",
-            "ollama",
-            "claude-code",
-            "claude-cli",
-            "codex",
-            "codex-cli",
-            "raw",
-        ] {
+    fn thinking_supported_only_by_reasoning_cli_backends() {
+        for agent in ["pi", "claude-code", "claude-cli", "codex", "codex-cli"] {
+            assert!(agent_supports_thinking(agent), "{agent}");
+        }
+        for agent in ["claude", "anthropic", "ollama", "raw"] {
             assert!(!agent_supports_thinking(agent), "{agent}");
         }
     }
@@ -2997,8 +3104,8 @@ mod tests {
     #[test]
     fn preset_sentinel_accepts_hierarchical_names() {
         assert_eq!(
-            parse_preset_sentinel("<<ralphus:presets/roles/reviewer>>"),
-            Some("roles/reviewer")
+            parse_preset_sentinel("<<ralphus:presets/roles/judge/reviewer>>"),
+            Some("roles/judge/reviewer")
         );
         assert_eq!(
             parse_preset_sentinel("<<ralphus:presets/a/b/c.d-e_f>>"),
@@ -3781,5 +3888,69 @@ mod tests {
             &LinkTarget::Environment("X"),
             ScopeLevel::ProofStep
         ));
+    }
+
+    #[test]
+    fn resolve_cell_effort_uses_cell_value_when_set() {
+        let mut task = task_with(None, None, &[]);
+        task.effort = Some("high".into());
+        let mut cell = cell_with(None, None, &[]);
+        cell.effort = Some("low".into());
+
+        assert_eq!(resolve_cell_effort(&task, &cell), Some("low".into()));
+    }
+
+    #[test]
+    fn resolve_cell_effort_inherits_task_value_when_cell_unset() {
+        let mut task = task_with(None, None, &[]);
+        task.effort = Some("medium".into());
+        let cell = cell_with(None, None, &[]);
+
+        assert_eq!(resolve_cell_effort(&task, &cell), Some("medium".into()));
+    }
+
+    #[test]
+    fn resolve_cell_effort_returns_none_when_both_unset() {
+        let task = task_with(None, None, &[]);
+        let cell = cell_with(None, None, &[]);
+
+        assert_eq!(resolve_cell_effort(&task, &cell), None);
+    }
+
+    #[test]
+    fn resolve_cell_temperature_uses_cell_value_when_set() {
+        let mut task = task_with(None, None, &[]);
+        task.temperature = Some(0.5);
+        let mut cell = cell_with(None, None, &[]);
+        cell.temperature = Some(1.5);
+
+        assert_eq!(resolve_cell_temperature(&task, &cell), Some(1.5));
+    }
+
+    #[test]
+    fn resolve_cell_temperature_inherits_task_value_when_cell_unset() {
+        let mut task = task_with(None, None, &[]);
+        task.temperature = Some(0.7);
+        let cell = cell_with(None, None, &[]);
+
+        assert_eq!(resolve_cell_temperature(&task, &cell), Some(0.7));
+    }
+
+    #[test]
+    fn resolve_cell_temperature_returns_none_when_both_unset() {
+        let task = task_with(None, None, &[]);
+        let cell = cell_with(None, None, &[]);
+
+        assert_eq!(resolve_cell_temperature(&task, &cell), None);
+    }
+
+    #[test]
+    fn resolve_cell_temperature_handles_zero_value() {
+        let mut task = task_with(None, None, &[]);
+        task.temperature = Some(1.0);
+        let mut cell = cell_with(None, None, &[]);
+        cell.temperature = Some(0.0);
+
+        assert_eq!(resolve_cell_temperature(&task, &cell), Some(0.0));
     }
 }

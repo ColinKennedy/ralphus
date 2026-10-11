@@ -56,3 +56,27 @@ and the daemon-side tmux/psmux crash it works around).
 - **Some read-only git is answered in-process by libgit2, never by a subprocess (`runner/src/git_inproc.rs`).** The runner's diff watcher and `GitVcs::exec_raw`'s `log --format=%s A..B` / `rev-list --count A..B` skip `git` entirely; `vcs_refs.rs` does the same for refs, config, ancestry and `rev-parse --git-path <rebase-merge|rebase-apply|MERGE_HEAD|...>`. Rules: (1) every in-process answer must equal real git's byte for byte or return "run git" -- a new shape needs a parity test against the subprocess, and anything involving a merge in a `log` range, a multi-line subject, a shallow clone, `refs/replace`/grafts, or a root that is not the checkout top must fall back; (2) libgit2 1.8.1 has no reftable, no sparse-checkout, and runs no hooks/credential helpers/rerere/smudge filters, so mutations, `fetch`/`push`, and remote machines stay on subprocesses; (3) `RALPHUS_GIT_INPROC=0` (read once per process, inherited by the runner) restores pure-subprocess behaviour for A/B comparison or rollback; (4) libgit2-sys 0.17 does not link `advapi32` on Windows, which `runner/build.rs` supplies -- a standalone link fails with LNK2019 (`OpenProcessToken`, `EqualSid`) without it.
 
 - **A git trace of the daemon includes git calls the daemon does not make.** `forge.rs::resolve_cli_token` (the sanctioned token fallback, cached for 5 minutes) runs `glab auth status --show-token` / `gh auth token`, and those CLIs run their own `git rev-parse --git-dir`, `git remote -v` and `git config --get-regexp ^remote\..*\.glab-resolved(-base|-head)?$` (`gh-resolved` for gh) -- about 7 git processes per invocation, none of which `GitVcs::exec_raw` sees or can answer in-process. Likewise the agent CLI's own startup probes (`status --short`, `log --oneline -n 5`, `config user.name`, `remote get-url origin`, carrying `-c core.hooksPath=NUL -c core.fsmonitor=` flags). When counting the daemon's git processes (`GIT_TRACE2_EVENT`), tell these apart: they have no `/` in `sid` only if they are not git children, so classify by argv flags and by which CLI started them, not by `sid` alone.
+
+## Worktrees are claimed at submit and created lazily (RAL-612)
+
+A squad starts before its `ralphus:new-worktree/...` worktrees exist. Submit
+(`plan_local_worktree_jobs`) only *claims* each slot: the branch name, the
+`w/<short>` directory, and a durable creation marker at
+`<ralphus_root>/creating/<short>` (branch, `upstream=`, `pid=`). The cell's cwd
+is that planned path even though nothing is on disk yet, so code that reads a
+cwd for a not-yet-created worktree must go through
+`worktrees::pending_worktree_at` (marker-only, restart-safe) rather than
+`worktree_root`/git — `reviews.rs` derives pending cells declaratively from the
+marker for exactly this reason.
+
+- Creation is single-flight per `(root, branch)` (`ensure_worktree_tracked`);
+  the scheduler's background creator (cap `MAX_PARALLEL_WORKTREE_JOBS`, no
+  store lock) and a cell that comes due first both go through
+  `ensure_claimed_worktree`, so only one `git worktree add` ever runs.
+- The marker is the only proof ralphus began a directory. A half-created
+  directory with a matching marker is removed and recreated; without one it is
+  *never* deleted and the cell fails with an interference message. The marker is
+  removed only after a complete creation and kept on failure.
+- A permanent creation failure fails only the cells waiting on that worktree
+  (via `fail_cell_for_worktree` → `enqueue_cell_failure_mailbox`); other cells
+  keep running.

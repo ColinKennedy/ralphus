@@ -116,8 +116,8 @@ fn print_validation_errors(errors: Option<&Vec<Value>>) {
     }
 }
 
-/// Print non-fatal findings (e.g. "no `[[review.auto_build]]`/
-/// `skip_auto_build` declared, and this can't be confirmed as covered by a
+/// Print non-fatal findings (e.g. "no `[[review.auto_build]]`
+/// declared, and this can't be confirmed as covered by a
 /// project-level default without the daemon") -- unlike `errors`, these never
 /// affect the command's exit code, but a caller should still see them rather
 /// than discover the same gap only once the daemon rejects the submission at
@@ -1200,6 +1200,12 @@ pub fn parse_check(scanner: &mut Scanner) -> super::Command {
     if tail.first().map(String::as_str) == Some("catalog") {
         return super::Command::CheckCatalog;
     }
+    if tail.first().map(String::as_str) == Some("restart-thread") {
+        return match tail.get(1) {
+            Some(name) => super::Command::CheckRestartThread { name: name.clone() },
+            None => super::Command::UsageError("missing required <name> argument".to_string()),
+        };
+    }
     let mut inner = Scanner::new(if tail.first().map(String::as_str) == Some("health") {
         &tail[1..]
     } else {
@@ -1390,6 +1396,23 @@ pub fn cmd_check_catalog(opts: &GlobalOpts) -> i32 {
         }
     }
     0
+}
+
+/// `ralphus check restart-thread <name>`: re-spawn a daemon background thread
+/// that has panicked or exited, without restarting the daemon. `check health`
+/// names the thread and prints this command as its remediation.
+pub fn cmd_check_restart_thread(opts: &GlobalOpts, name: &str) -> i32 {
+    let client = opts.client();
+    run_and_report(opts, None, || {
+        let result = client.restart_thread(name)?;
+        emit(opts, &result, |r| {
+            println!(
+                "restarted daemon thread '{name}' (restart #{})",
+                r["thread"]["restarts"]
+            );
+        });
+        Ok(())
+    })
 }
 
 // ---- completion / configuration / initialize --------------------------------

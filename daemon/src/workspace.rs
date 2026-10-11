@@ -64,7 +64,7 @@ struct RemoteBranchSource {
 /// Every branch of `guardian` produced by a cell on some machine, with that
 /// cell's provisioned workspace path. Store reads only.
 fn remote_branch_sources(
-    store: &crate::store::Store,
+    conn: &rusqlite::Connection,
     guardian: &crate::guardian::GuardianView,
 ) -> Vec<RemoteBranchSource> {
     guardian
@@ -78,7 +78,9 @@ fn remote_branch_sources(
                 .filter(|m| {
                     !m.is_empty() && !m.eq_ignore_ascii_case(ralphus_core::schema::LOCAL_MACHINE)
                 })?;
-            let remote_cwd = store.cell_cwd_for_branch(&b.branch).ok().flatten()?;
+            let remote_cwd = crate::store::Store::cell_cwd_for_branch_conn(conn, &b.branch)
+                .ok()
+                .flatten()?;
             Some(RemoteBranchSource {
                 local_root: PathBuf::from(b.project.as_deref().unwrap_or(&guardian.git_root)),
                 machine: machine.to_string(),
@@ -195,14 +197,18 @@ impl Workspace {
         root: impl Into<PathBuf>,
     ) -> Self {
         let root = root.into();
+        // Read through the pool: hydrating the review reads its project config
+        // from disk, which held the store lock for seconds under the writer.
+        let loaded = store.with_read_snapshot_or_lock_when_shared_cache(|conn| {
+            let g = crate::store::Store::get_guardian_conn(conn, guardian_id)?;
+            let sources = remote_branch_sources(conn, &g);
+            Ok((g.machine, sources))
+        });
         let (machine, sources) = {
-            let guard = store.lock();
-            match guard.get_guardian(guardian_id) {
-                Ok(g) => {
-                    let sources = remote_branch_sources(&guard, &g);
-                    (g.machine, sources)
-                }
+            match loaded {
+                Ok(found) => found,
                 Err(e) => {
+                    let guard = store.lock();
                     // A deleted guardian (its retained worktrees still being
                     // retired) is expected; anything else is a store fault.
                     let level = if matches!(e, crate::store::StoreError::NotFound) {

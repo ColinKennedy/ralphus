@@ -68,7 +68,6 @@ pub enum ReviewCommand {
         base_branch: String,
         git_root: String,
         checks: Option<String>,
-        skip_auto_build: bool,
         skip_worktrees: bool,
         review_type: Option<String>,
     },
@@ -88,13 +87,15 @@ pub enum ReviewCommand {
     },
     Settings {
         selector: String,
-        skip_auto_build: Option<bool>,
         skip_worktrees: Option<bool>,
         resolver_agent: Option<String>,
         resolver_model: Option<String>,
         base_branch: Option<String>,
         auto_pr_feedback: Option<bool>,
         proof_scope: Option<String>,
+        /// Which PRs/MRs in the stack run the full CI suite (`every`, `top`,
+        /// `bottom+top`); an empty string resets it to `every`.
+        ci_deferral: Option<String>,
         skip_auto_clean: Option<bool>,
         skip_base_updates: Option<bool>,
         /// RAL-307: this review's own override for whether a newly
@@ -420,7 +421,6 @@ pub fn parse(args: &[String]) -> ReviewCommand {
         }
         Some("create") => {
             let checks = scanner.take_value("--checks").ok().flatten();
-            let skip_auto_build = scanner.take_bool("--skip-auto-build");
             let skip_worktrees = scanner.take_bool("--skip-worktrees");
             let review_type = scanner.take_value("--review-type").ok().flatten();
             let rest = scanner.remaining();
@@ -430,7 +430,6 @@ pub fn parse(args: &[String]) -> ReviewCommand {
                     base_branch: base_branch.clone(),
                     git_root: git_root.clone(),
                     checks,
-                    skip_auto_build,
                     skip_worktrees,
                     review_type,
                 },
@@ -456,13 +455,13 @@ pub fn parse(args: &[String]) -> ReviewCommand {
             with_selector(scanner, |selector| ReviewCommand::Delete { selector, yes })
         }
         Some("settings") => {
-            let skip_auto_build = take_tri_bool(&mut scanner, "--skip-auto-build");
             let skip_worktrees = take_tri_bool(&mut scanner, "--skip-worktrees");
             let resolver_agent = scanner.take_value("--resolver-agent").ok().flatten();
             let resolver_model = scanner.take_value("--resolver-model").ok().flatten();
             let base_branch = scanner.take_value("--base-branch").ok().flatten();
             let auto_pr_feedback = take_tri_bool(&mut scanner, "--auto-pr-feedback");
             let proof_scope = scanner.take_value("--proof-scope").ok().flatten();
+            let ci_deferral = scanner.take_value("--ci-deferral").ok().flatten();
             let skip_auto_clean = take_tri_bool(&mut scanner, "--skip-auto-clean");
             let skip_base_updates = take_tri_bool(&mut scanner, "--skip-base-updates");
             let match_pr_branch_name = take_tri_bool(&mut scanner, "--match-pr-branch-name");
@@ -497,13 +496,13 @@ pub fn parse(args: &[String]) -> ReviewCommand {
             };
             with_selector(scanner, |selector| ReviewCommand::Settings {
                 selector,
-                skip_auto_build,
                 skip_worktrees,
                 resolver_agent,
                 resolver_model,
                 base_branch,
                 auto_pr_feedback,
                 proof_scope,
+                ci_deferral,
                 skip_auto_clean,
                 skip_base_updates,
                 match_pr_branch_name,
@@ -710,7 +709,7 @@ pub(crate) fn take_rebuild_on(
 
 /// `--flag`/`--no-flag` tri-state, mirroring Python's
 /// `argparse.BooleanOptionalAction` (default `None`). `name` must be the
-/// positive spelling (e.g. `"--skip-auto-build"`); the negative form is
+/// positive spelling (e.g. `"--skip-worktrees"`); the negative form is
 /// derived by inserting `no-` after the leading `--`.
 /// Take an `<on|off|inherit>` override switch: `None` when the flag is
 /// absent, `Some(None)` for `inherit` (clear the override), `Some(Some(b))`
@@ -1467,7 +1466,6 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
             base_branch,
             git_root,
             checks,
-            skip_auto_build,
             skip_worktrees,
             review_type,
         } => run_and_report(opts, None, || {
@@ -1484,7 +1482,6 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
                 &base_branch,
                 &git_root,
                 Some(&checks_vec),
-                skip_auto_build,
                 skip_worktrees,
                 review_type.as_deref(),
             )?;
@@ -1530,13 +1527,13 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
         }
         ReviewCommand::Settings {
             selector,
-            skip_auto_build,
             skip_worktrees,
             resolver_agent,
             resolver_model,
             base_branch,
             auto_pr_feedback,
             proof_scope,
+            ci_deferral,
             skip_auto_clean,
             skip_base_updates,
             match_pr_branch_name,
@@ -1557,13 +1554,13 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
         } => run_and_report(opts, None, || {
             let resolved = resolve_guardian_selector(&client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
             let settings = GuardianSettings {
-                skip_auto_build,
                 skip_worktrees,
                 resolver_agent: resolver_agent.as_deref(),
                 resolver_model: resolver_model.as_deref(),
                 base_branch: base_branch.as_deref(),
                 auto_pr_feedback,
                 proof_scope: proof_scope.as_deref(),
+                ci_deferral: ci_deferral.as_deref(),
                 proof_skip_auto_clean: skip_auto_clean,
                 skip_base_updates,
                 match_pr_branch_name,
@@ -2842,6 +2839,20 @@ fn render_review_detail(g: &Value) {
             .to_string(),
     ));
     rows.push((
+        "ci_deferral",
+        match g["ci_deferral"].as_str() {
+            Some(v) if !v.is_empty() => format!("{v} (explicit)"),
+            _ => "(unset)".to_string(),
+        },
+    ));
+    rows.push((
+        "effective_ci_deferral",
+        g["effective_ci_deferral"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+    ));
+    rows.push((
         "proof_skip_auto_clean",
         match proof_skip_auto_clean {
             Some(v) => format!("{v} (explicit)"),
@@ -2851,10 +2862,6 @@ fn render_review_detail(g: &Value) {
     rows.push((
         "effective_proof_skip_auto_clean",
         g["effective_proof_skip_auto_clean"].to_string(),
-    ));
-    rows.push((
-        "skip_auto_build",
-        g["skip_auto_build"].as_bool().unwrap_or(false).to_string(),
     ));
     rows.push((
         "skip_worktrees",
@@ -3254,7 +3261,6 @@ mod tests {
             "/repo",
             "--checks",
             "fmt,test",
-            "--skip-auto-build",
             "--review-type",
             "hotfix",
         ])) {
@@ -3263,7 +3269,6 @@ mod tests {
                 base_branch,
                 git_root,
                 checks,
-                skip_auto_build,
                 review_type,
                 ..
             } => {
@@ -3271,7 +3276,6 @@ mod tests {
                 assert_eq!(base_branch, "main");
                 assert_eq!(git_root, "/repo");
                 assert_eq!(checks.as_deref(), Some("fmt,test"));
-                assert!(skip_auto_build);
                 assert_eq!(review_type.as_deref(), Some("hotfix"));
             }
             other => panic!("unexpected: {other:?}"),
@@ -3302,20 +3306,17 @@ mod tests {
         match parse(&v(&[
             "settings",
             "g1",
-            "--skip-auto-build",
             "--no-skip-worktrees",
             "--proof-scope",
             "each_branch",
         ])) {
             ReviewCommand::Settings {
                 selector,
-                skip_auto_build,
                 skip_worktrees,
                 proof_scope,
                 ..
             } => {
                 assert_eq!(selector, "g1");
-                assert_eq!(skip_auto_build, Some(true));
                 assert_eq!(skip_worktrees, Some(false));
                 assert_eq!(proof_scope.as_deref(), Some("each_branch"));
             }
@@ -3324,15 +3325,34 @@ mod tests {
     }
 
     #[test]
+    fn parses_settings_ci_deferral_values() {
+        for mode in ["every", "top", "bottom+top", ""] {
+            match parse(&v(&["settings", "g1", "--ci-deferral", mode])) {
+                ReviewCommand::Settings {
+                    selector,
+                    ci_deferral,
+                    ..
+                } => {
+                    assert_eq!(selector, "g1");
+                    assert_eq!(ci_deferral.as_deref(), Some(mode));
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+        match parse(&v(&["settings", "g1"])) {
+            ReviewCommand::Settings { ci_deferral, .. } => assert_eq!(ci_deferral, None),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
     fn settings_tri_state_defaults_to_none_when_absent() {
         match parse(&v(&["settings", "g1"])) {
             ReviewCommand::Settings {
-                skip_auto_build,
                 skip_worktrees,
                 skip_base_updates,
                 ..
             } => {
-                assert_eq!(skip_auto_build, None);
                 assert_eq!(skip_worktrees, None);
                 assert_eq!(skip_base_updates, None);
             }

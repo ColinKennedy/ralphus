@@ -17,7 +17,13 @@
         --detached: #d2a8ff;
         --delayed: #79c0ff;
         --arbiter: #7c3aed;
-        --terminal-bg: #000000;
+        --terminal-bg: #000000; --terminal-fg: #b9c4d0; --terminal-cursor: #ffffff;
+        --terminal-selection: rgba(255,255,255,.3);
+        --ansi-black: #2e3436; --ansi-red: #cc0000; --ansi-green: #4e9a06; --ansi-yellow: #c4a000;
+        --ansi-blue: #3465a4; --ansi-magenta: #75507b; --ansi-cyan: #06989a; --ansi-white: #d3d7cf;
+        --ansi-bright-black: #555753; --ansi-bright-red: #ef2929; --ansi-bright-green: #8ae234;
+        --ansi-bright-yellow: #fce94f; --ansi-bright-blue: #729fcf; --ansi-bright-magenta: #ad7fa8;
+        --ansi-bright-cyan: #34e2e2; --ansi-bright-white: #eeeeec;
         /* A third text weight below --muted, for metadata that must stay
            readable without competing with the value it annotates (a run's
            timestamp beside its command, a position counter beside its label). */
@@ -51,6 +57,14 @@
         --queued-a: rgba(130,80,223,.08); --queued-b: rgba(130,80,223,.28);
         --amber-a: rgba(154,103,0,.08); --amber-b: rgba(154,103,0,.28);
         --turn-error: #cf222e; --turn-warn: #9a6700;
+        /* Terminal palette on a light ground; every ANSI slot is >= 4.5:1 on --terminal-bg. */
+        --terminal-bg: #f6f8fa; --terminal-fg: #1f2328; --terminal-cursor: #1f2328;
+        --terminal-selection: rgba(9,105,218,.25);
+        --ansi-black: #24292f; --ansi-red: #cf222e; --ansi-green: #116329; --ansi-yellow: #7d4e00;
+        --ansi-blue: #0969da; --ansi-magenta: #8250df; --ansi-cyan: #1b7c83; --ansi-white: #57606a;
+        --ansi-bright-black: #46505a; --ansi-bright-red: #a40e26; --ansi-bright-green: #1a7f37;
+        --ansi-bright-yellow: #633c01; --ansi-bright-blue: #0550ae; --ansi-bright-magenta: #6639ba;
+        --ansi-bright-cyan: #136c75; --ansi-bright-white: #3d444d;
       }
       * { box-sizing: border-box; }
       body { margin: 0; background: var(--bg); color: var(--text);
@@ -82,7 +96,7 @@
       .brand { display: flex; align-items: center; gap: 14px; font-weight: 600; }
       .logo { color: var(--accent); letter-spacing: .5px; }
       .tabs { display: flex; gap: 4px; }
-      .tab { background: none; border: none; color: var(--muted); font-weight: 500; padding: 6px 12px; border-radius: 6px; }
+      .tab { background: none; border: none; color: var(--muted); font-weight: 500; padding: 6px 12px; border-radius: 6px; display: inline-block; line-height: normal; text-decoration: none; cursor: pointer; }
       .tab:hover, .tab.active { color: var(--text); background: var(--panel-2); }
       .status-right { display: flex; align-items: center; gap: 14px; color: var(--muted); font-size: 13px; }
       .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; flex: none; }
@@ -93,6 +107,7 @@
       .running-menu div { padding: 6px 8px; border-radius: 6px; cursor: pointer; }
       .running-menu div:hover { background: var(--panel-2); }
       .icon-btn { background: none; border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 3px 8px; }
+      a.icon-btn { display: inline-block; line-height: normal; text-decoration: none; cursor: pointer; }
       .copy-btn { background: none; border: 1px solid var(--border); color: var(--muted); border-radius: 5px; padding: 0 6px; font-size: 12px; line-height: 1.7; vertical-align: middle; }
       .copy-btn:hover { color: var(--text); }
       .copy-btn.copied { color: var(--done); border-color: var(--done); }
@@ -190,7 +205,7 @@
       main#cartographer-page, main#users-page, main#secrets-page, main#agents-page, main#prefs-page, main#machines-page, main#triage-page, main#worktree-retirement-page, main#health-page { height: calc(100vh - 51px); overflow-y: auto; padding: 18px 20px; }
       /* ---- Triage tab (RAL-318): Flow (rail | pools | details pane) and Configuration ----
          Color is spent only where it carries meaning: --arbiter on triage type
-         names (Triage provenance), one small state dot per pool (--done ready,
+         names outside the pool cards (Triage provenance), one small state dot per pool (--done ready,
          --queued filling, --ignored no trigger), and --accent for selection. */
       main#triage-page { padding: 0; }
       .tri-shell { display: flex; flex-direction: column; height: 100%; }
@@ -274,6 +289,7 @@
       .tri-rows.compact .tri-r-name { font-size: 12.5px; }
       .tri-r-sub { font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .tri-r-right { flex: none; display: flex; align-items: center; gap: 6px; }
+      .tri-pool-head .tri-type { color: var(--text); }
       .tri-r-right .tri-type { font-size: 11.5px; font-weight: 500; }
       .tri-r-status { font-size: 12px; color: var(--muted); }
       .tri-pane-title { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 3px; }
@@ -475,16 +491,6 @@
       .history-item { display: flex; align-items: center; justify-content: space-between; padding: 5px 8px; font-size: 11px; border-bottom: 1px solid var(--border); cursor: pointer; }
       .history-item:last-child { border-bottom: none; }
       .history-item:hover { background: var(--panel-2); }
-      /* The inspector's Live tab opens its pane with the tab, so the terminal
-         row is a collapse control and a menu -- not the pane's front door. It
-         reads at the secondary weight accordingly, and the peek head's own
-         "✕ Hide" stands down rather than offering the same action twice. */
-      #review-inspector .btn.primary[data-click="togglePeek"] {
-        background: var(--panel-2); border-color: var(--border); color: var(--muted);
-        font-size: 11.5px; padding: 2px 9px;
-      }
-      #review-inspector .btn.primary[data-click="togglePeek"]:hover { color: var(--text); border-color: var(--accent); }
-      #review-inspector .peek-head [data-click="togglePeekStopProp"] { display: none; }
       /* The head carries a banner, times, toggles and controls; in a narrow
          pane they wrap rather than pushing "Show Debug Messages" off the edge. */
       #review-inspector .peek-head { flex-wrap: wrap; row-gap: 4px; }
@@ -693,11 +699,25 @@
       }
       .subtab:hover { color: var(--text); }
       .subtab.on { color: var(--accent); background: var(--accent-a); font-weight: 650; }
+      /* Agent Log widgets (RAL-603, experimental) */
+      .alog { max-height: 460px; overflow: auto; border: 1px solid var(--border); border-radius: 7px; background: var(--bg); padding: 6px; }
+      .alog-w { border: 1px solid var(--border-soft); border-radius: 6px; background: var(--panel); margin-bottom: 5px; font-size: 11px; }
+      .alog-w.error { border-color: var(--failed-b); }
+      .alog-w > summary { display: flex; align-items: center; gap: 8px; padding: 4px 8px; cursor: pointer; list-style: none; }
+      .alog-w > summary::-webkit-details-marker { display: none; }
+      .alog-tool { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-weight: 650; }
+      .alog-sub { color: var(--accent); background: var(--accent-a); border-radius: 10px; padding: 0 7px; font-size: 10px; }
+      .alog-prev { flex: 1; min-width: 0; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, "Cascadia Code", Consolas, monospace; }
+      .alog-st { font-size: 10px; color: var(--faint); }
+      .alog-st.ok { color: var(--done); }
+      .alog-st.error { color: var(--turn-error); }
+      .alog-lbl { padding: 2px 8px 0; font-size: 10px; color: var(--faint); text-transform: uppercase; letter-spacing: .04em; }
+      .alog-pre { margin: 2px 8px 6px; padding: 6px 8px; background: var(--terminal-bg); color: var(--text); border-radius: 5px; max-height: 240px; overflow: auto; white-space: pre-wrap; word-break: break-word; font-size: 10.5px; font-family: ui-monospace, "Cascadia Code", Consolas, monospace; }
       .runterm {
         background: var(--terminal-bg); border: 1px solid var(--border); border-radius: 7px;
         font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
         font-size: 10.5px; line-height: 1.62; padding: 9px 10px;
-        overflow: auto; color: #b9c4d0; white-space: pre-wrap; word-break: break-word;
+        overflow: auto; color: var(--terminal-fg); white-space: pre-wrap; word-break: break-word;
       }
       .runterm.past { border-color: var(--amber-b); }
       .promptbox {
@@ -860,6 +880,7 @@
       .branch-detail { margin: 2px 0 6px 22px; }
       .badge { font-size: 11px; padding: 1px 6px; border-radius: 6px; border: 1px solid var(--border); }
       .badge.warn2 { color: var(--queued); border-color: var(--queued); }
+      .badge.hung { color: var(--ignored); border-color: var(--ignored); }
       .badge.bad { color: var(--failed); border-color: var(--failed); }
       .badge.empty { color: var(--empty); border-color: var(--empty); }
       .badge.live { color: var(--running); border-color: var(--running); }
@@ -1297,10 +1318,15 @@
          over it, so it can stay open while you work through the stack. */
       .log-dock {
         display: flex; flex-direction: column; flex: none;
-        background: var(--panel); border-top: 1px solid var(--border);
+        background: var(--panel); border-top: 1px solid var(--border); position: relative;
       }
       .log-dock.closed { height: 30px; }
-      .log-dock.open { height: 300px; }
+      .log-dock.open { height: var(--review-dock-h, 300px); }
+      /* Horizontal-edge drag handle; sits over the dock's top border so it is
+         outside the click-to-toggle header. Only shown while the drawer is open. */
+      .dock-resize { display: none; position: absolute; left: 0; right: 0; top: -3px; height: 6px; z-index: 2; cursor: ns-resize; background: transparent; transition: background .12s; touch-action: none; }
+      .log-dock.open .dock-resize { display: block; }
+      .dock-resize:hover, .dock-resize:focus-visible, .dock-resize.dragging { background: var(--accent); outline: none; }
       .log-dock .dock-head {
         display: flex; align-items: center; gap: 8px; padding: 0 14px; height: 30px;
         flex: none; border-bottom: 1px solid var(--border); cursor: pointer;
@@ -1493,6 +1519,8 @@
         .tab { padding: 4px 8px; }
         main#reviews-page { grid-template-columns: 1fr; height: auto; overflow-y: auto; }
         main#reviews-page .splitter { display: none; }
+        .log-dock.open { height: 300px; }
+        .dock-resize { display: none !important; }
         main#reviews-page .sidebar { max-height: 45vh; }
       }
 

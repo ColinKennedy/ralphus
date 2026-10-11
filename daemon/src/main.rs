@@ -127,12 +127,6 @@ fn main() -> ExitCode {
             }
         }
         Command::Serve { port, db, log_path } => {
-            if let Err(e) = ralphus_auth::check_license() {
-                // Logging is not initialized yet (the config that names the
-                // log file is loaded below), so this stays on stderr.
-                eprintln!("Authorization error: {e}");
-                return ExitCode::FAILURE;
-            }
             // Held for the rest of `main` (RAL-99): confines every subprocess
             // this daemon spawns, transitively, to one Job Object so ending
             // the daemon from Task Manager takes the whole tree with it.
@@ -158,6 +152,26 @@ fn main() -> ExitCode {
                     daemon_cfg.opentelemetry_enabled()
                 ),
             );
+            // RAL-596: OTel comes up before the license check so a license
+            // failure is itself reportable as a `daemon.startup_failed` span.
+            let otel_provider = daemon_cfg
+                .opentelemetry_enabled()
+                .then(|| ralphus_daemon::otel::init("ralphus-daemon"))
+                .flatten();
+            if otel_provider.is_some() && ralphus_daemon::daemon_health::start_emitter() {
+                ralphus_daemon::daemon_health::install_panic_hook();
+            }
+            if let Err(e) = ralphus_auth::check_license() {
+                ralphus_daemon::logging::write_line(
+                    ralphus_daemon::logging::LogLevel::ERROR,
+                    &format!("Authorization error: {e}"),
+                );
+                eprintln!("Authorization error: {e}");
+                ralphus_daemon::daemon_health::startup_failed("license", &e.to_string());
+                ralphus_daemon::daemon_health::flush(Duration::from_secs(2));
+                ralphus_daemon::otel::shutdown(otel_provider);
+                return ExitCode::FAILURE;
+            }
             // A misconfigured agent profile (e.g. a `from_env` var that isn't
             // set yet) is not fatal here -- the var may be provided later, or
             // the profile may never be used this session. `ralphus check
@@ -194,11 +208,8 @@ fn main() -> ExitCode {
                     db.display()
                 ),
             );
-            let otel_provider = daemon_cfg
-                .opentelemetry_enabled()
-                .then(|| ralphus_daemon::otel::init("ralphus-daemon"))
-                .flatten();
             let result = server::serve(addr, &db, daemon_cfg.max_concurrent());
+            ralphus_daemon::daemon_health::flush(Duration::from_secs(2));
             ralphus_daemon::otel::shutdown(otel_provider);
             match result {
                 Ok(()) => {

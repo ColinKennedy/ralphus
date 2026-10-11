@@ -40,7 +40,7 @@ validation time — a typo fails fast at submit, before the daemon sees it.
 | `<<squad:<id>>>` | `[[waypoint]].roster` | an existing squad's id already known to the daemon (RAL-400) |
 | `<<ralphus:new-squad>>` | `[[waypoint]].roster` | the squad this same submission itself creates — no `<key>`, since one submission file always produces exactly one squad (RAL-400) |
 | `<<ralphus:linked-field/<path>>>` | `environment` value (task, cell, proof step, or `[[default]]`) | the field `<path>` addresses relative to where this value is declared — `cwd`/`id`, or a same-table sibling `environment.<key>` (RAL-460) |
-| `<<ralphus:presets/<name>>>` | `extends` (an array, on `[[task]]`, `[[task.cell]]`, or any `[[*.proof]]` block) | stamps a registered **preset**'s field values into any of that entity's own fields still unset; the name may be hierarchical (`roles/reviewer`) |
+| `<<ralphus:presets/<name>>>` | `extends` (an array, on `[[task]]`, `[[task.cell]]`, or any `[[*.proof]]` block) | stamps a registered **preset**'s field values into any of that entity's own fields still unset; the name may be hierarchical (`roles/judge/reviewer`) |
 
 Rules and risks:
 
@@ -260,8 +260,8 @@ values into any of the *same entity's own* fields still unset:
   cell is never given a `prompt`.
   The one exception is a preset `pass_score` on a `command` proof
   step: it is skipped, but the submit response carries a warning.
-- **A name may be hierarchical.** `roles/reviewer` is referenced as
-  `<<ralphus:presets/roles/reviewer>>`. The `/` is only part of the name —
+- **A name may be hierarchical.** `roles/judge/reviewer` is referenced as
+  `<<ralphus:presets/roles/judge/reviewer>>`. The `/` is only part of the name —
   there is no separate namespace object. Each `/`-separated segment is
   letters, digits, `_`, `-` or `.`.
 - **A cell or proof step that `extends` a preset may omit its `prompt`.**
@@ -465,10 +465,17 @@ tool guidance, but without the waypoint section (`waypoint_context` false). The 
 - **`RALPHUS_PROPHECY: <kind>: <note>`** — an append-only design note from
   a prompt cell. Every standalone marker line is carried in the runner
   result, rather than only the last one; `<kind>` is one of `discovery`,
-  `decision`, `hazard`, `deferred`, or `unconfirmed`. `deferred` is
+  `decision`, `hazard`, `deferred`, `unconfirmed`, or `refused`. `deferred` is
   strictly *follow-up work someone should do later*; a note about what the
   agent could not run, check or verify is `unconfirmed`, and a known risk
-  left behind is `hazard`. It is durable context for the
+  left behind is `hazard`. `refused` is work the agent explicitly
+  *declined* to do, written `RALPHUS_PROPHECY: refused: <the refused portion
+  of the prompt>; <why>`. It is diagnostic only: it never changes the cell,
+  proof, task or squad outcome and never creates a follow-up (unlike
+  `deferred`). The cell's `refused` notes are shown, under a
+  "## Declined work" heading (capped in size, only when one exists), to the
+  cell's own proof steps that extend a `roles/judge/*` preset, so a judge can
+  tell "done" from "declined". It is durable context for the
   eventual PR reader, not prompt context for another cell. The parser matches
   only the beginning of a trimmed line, never a substring, so an agent
   reading this guide does not accidentally create a prophecy.
@@ -607,6 +614,11 @@ Rules and risks:
 Three sentinels exist for code that *hosts* a ralphus runner, not for task
 files or cell replies:
 
+- **`RALPHUS_EVENT` message `prophecy`** — emitted by a backend the moment a
+  new `RALPHUS_PROPHECY:` marker appears in an assistant turn. The daemon's
+  `forward_runner_event` files it against the cell
+  (`daemon/src/runner.rs::PROPHECY_MESSAGE` mirrors
+  `runner/src/prophecy.rs::PROPHECY_MESSAGE`); payload `{"kind","body"}`.
 - **`RALPHUS_EVENT: {"level":"info",…}`** — stderr marker lines the runner
   subprocess (and a machine provider reaching a remote host) emits so live
   usage events reach the daemon's Cartographer event log. If you build a
