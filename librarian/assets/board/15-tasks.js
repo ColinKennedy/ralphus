@@ -853,7 +853,7 @@
        */
       function renderTtAgentFilter() {
         syncTaskTabAgentDefault();
-        renderStatusDropdown("tt-agent-filter", ttAgentDropdownConfig());
+        renderStatusDropdown("task-agent-filter", ttAgentDropdownConfig());
       }
       /**
        * Toggles one agent in/out of the Tasks tab's filter.
