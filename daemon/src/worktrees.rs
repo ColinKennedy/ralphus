@@ -2990,13 +2990,19 @@ pub(crate) fn plan_local_worktree_jobs(
         ) else {
             continue;
         };
-        jobs.insert(
-            cache_key.clone(),
-            LocalWorktreeJob {
-                cache_key,
-                wt: plan.wt,
-            },
-        );
+        // Only cache newly-planned worktrees, not pre-existing ones. Pre-existing
+        // worktrees need to go through ensure_worktree_tracked to resync to the
+        // latest remote state (RAL-612). See resolve_placeholders_inner's use of
+        // prefetched_worktrees as a shortcut cache.
+        if !plan.already_exists {
+            jobs.insert(
+                cache_key.clone(),
+                LocalWorktreeJob {
+                    cache_key,
+                    wt: plan.wt,
+                },
+            );
+        }
     }
     jobs.into_values().collect()
 }
