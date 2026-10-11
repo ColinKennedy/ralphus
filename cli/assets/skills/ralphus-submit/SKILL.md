@@ -29,3 +29,14 @@ ralphus, and reading it is critical to a good submission.
 - Create a TOML file and show it to me
   - For every ticket, you MUST write then ENTIRE ticket body into its respective prompt section!
 - After I say it looks good to submit, go ahead and submit it with ralphus
+
+
+## Worktree initialization
+- If the project's worktrees need gitignored assets restored before a build
+  (generated content, copied config), set `initialization_commands` once on
+  `[[default]]` (or on the task) rather than telling every prompt to do it.
+  It runs once per freshly created worktree, before any cell starts; the
+  nearest level wins and `""` disables an inherited value. Cells that share a
+  worktree must resolve to the same value. Keep the commands idempotent.
+- The board shows the resolved commands read-only on the squad, task and cell
+  panes; edit them on a cell.
