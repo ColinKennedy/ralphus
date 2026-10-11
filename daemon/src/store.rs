@@ -833,7 +833,7 @@ pub struct ProjectReviewSettings {
     #[serde(default)]
     pub default_proof_scope: Option<String>,
     /// Project default for which PRs/MRs in a review's stack run the full CI
-    /// suite (`every`/`tip`/`bottom+tip`). `None` inherits the file and
+    /// suite (`every`/`top`/`bottom+top`). `None` inherits the file and
     /// global layers, then `every`.
     #[serde(default)]
     pub default_ci_deferral: Option<String>,
@@ -3920,7 +3920,7 @@ impl Store {
             // `None` inherits the project/global default, which resolves to
             // `true` (on by default).
             "ALTER TABLE guardians ADD COLUMN post_appraisals INTEGER",
-            // Per-review `ci_deferral` mode (`every`/`tip`/`bottom+tip`).
+            // Per-review `ci_deferral` mode (`every`/`top`/`bottom+top`).
             // NULL behaves as `every`: no PR/MR in the stack carries the
             // defer-full-CI label.
             "ALTER TABLE guardians ADD COLUMN ci_deferral TEXT",
@@ -18594,7 +18594,7 @@ command = "e"
             default_machine: Some("local".to_string()),
             default_maximum_budget_usd: Some(5.0),
             default_proof_scope: Some("final_branch".to_string()),
-            default_ci_deferral: Some("bottom+tip".to_string()),
+            default_ci_deferral: Some("bottom+top".to_string()),
             verify_skip_auto_clean: Some(true),
             skip_worktrees: Some(true),
             skip_base_updates: Some(false),

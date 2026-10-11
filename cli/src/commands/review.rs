@@ -93,8 +93,8 @@ pub enum ReviewCommand {
         base_branch: Option<String>,
         auto_pr_feedback: Option<bool>,
         proof_scope: Option<String>,
-        /// Which PRs/MRs in the stack run the full CI suite (`every`, `tip`,
-        /// `bottom+tip`); an empty string resets it to `every`.
+        /// Which PRs/MRs in the stack run the full CI suite (`every`, `top`,
+        /// `bottom+top`); an empty string resets it to `every`.
         ci_deferral: Option<String>,
         skip_auto_clean: Option<bool>,
         skip_base_updates: Option<bool>,
@@ -3326,7 +3326,7 @@ mod tests {
 
     #[test]
     fn parses_settings_ci_deferral_values() {
-        for mode in ["every", "tip", "bottom+tip", ""] {
+        for mode in ["every", "top", "bottom+top", ""] {
             match parse(&v(&["settings", "g1", "--ci-deferral", mode])) {
                 ReviewCommand::Settings {
                     selector,

@@ -3818,14 +3818,14 @@ pub fn resync_pr_bases_synchronously(
 ///
 /// `every` and any unrecognised mode defer nothing, so a bad stored value runs
 /// more CI rather than less. A single-member stack is both its bottom and its
-/// tip, so it is never deferred.
+/// top, so it is never deferred.
 fn defers_full_ci(mode: &str, index: usize, count: usize) -> bool {
-    use ralphus_core::schema::{CI_DEFERRAL_BOTTOM_AND_TIP, CI_DEFERRAL_TIP};
+    use ralphus_core::schema::{CI_DEFERRAL_BOTTOM_AND_TOP, CI_DEFERRAL_TOP};
     let is_bottom = index == 0;
-    let is_tip = index + 1 == count;
+    let is_top = index + 1 == count;
     match mode {
-        CI_DEFERRAL_TIP => !is_tip,
-        CI_DEFERRAL_BOTTOM_AND_TIP => !is_bottom && !is_tip,
+        CI_DEFERRAL_TOP => !is_top,
+        CI_DEFERRAL_BOTTOM_AND_TOP => !is_bottom && !is_top,
         _ => false,
     }
 }
@@ -3972,7 +3972,7 @@ pub fn start_resync_pr_bases(store: crate::store_lock::StoreHandle, id: &str) {
                 );
             }
         }
-        // A reorder changes which PR is the bottom and which is the tip,
+        // A reorder changes which PR is the bottom and which is the top,
         // whether or not any base moved.
         if let Err(e) = reconcile_ci_deferral(&store, &sid) {
             crate::rlog!(
@@ -8626,7 +8626,7 @@ fn reconcile_native_pr_stack(
     // relies on for this; running it here too closes that gap for both
     // submission paths that funnel through this function.
     sync_open_pr_branches(store, id);
-    // A submission can add a new tip or change which PR is the bottom, so the
+    // A submission can add a new top or change which PR is the bottom, so the
     // defer labels are re-asserted against the stack as it now stands.
     if let Err(e) = reconcile_ci_deferral(store, id) {
         crate::rlog!(
@@ -14333,14 +14333,14 @@ mod tests {
             (0..count).map(|i| defers_full_ci(mode, i, count)).collect()
         };
         assert_eq!(rows("every", 3), [false, false, false]);
-        assert_eq!(rows("tip", 3), [true, true, false]);
-        assert_eq!(rows("bottom+tip", 3), [false, true, false]);
-        assert_eq!(rows("bottom+tip", 4), [false, true, true, false]);
-        // A one-member stack is its own bottom and tip: always full CI.
-        assert_eq!(rows("tip", 1), [false]);
-        assert_eq!(rows("bottom+tip", 1), [false]);
+        assert_eq!(rows("top", 3), [true, true, false]);
+        assert_eq!(rows("bottom+top", 3), [false, true, false]);
+        assert_eq!(rows("bottom+top", 4), [false, true, true, false]);
+        // A one-member stack is its own bottom and top: always full CI.
+        assert_eq!(rows("top", 1), [false]);
+        assert_eq!(rows("bottom+top", 1), [false]);
         // Two members are both an end of the stack.
-        assert_eq!(rows("bottom+tip", 2), [false, false]);
+        assert_eq!(rows("bottom+top", 2), [false, false]);
         // An unrecognised mode fails open to full CI.
         assert_eq!(rows("head+tip", 3), [false, false, false]);
     }
@@ -14503,10 +14503,10 @@ mod tests {
         // (mode, PR numbers expected to carry the label afterwards)
         let flips: [(&str, Vec<i64>); 5] = [
             ("every", vec![]),
-            ("tip", vec![1, 2]),
-            ("bottom+tip", vec![2]),
+            ("top", vec![1, 2]),
+            ("bottom+top", vec![2]),
             ("every", vec![]),
-            ("tip", vec![1, 2]),
+            ("top", vec![1, 2]),
         ];
         for (mode, expected) in flips {
             store
@@ -14547,8 +14547,8 @@ mod tests {
             )
             .unwrap();
         let after_new_pr: [(&str, Vec<i64>); 3] = [
-            ("tip", vec![1, 2, 3]),
-            ("bottom+tip", vec![2, 3]),
+            ("top", vec![1, 2, 3]),
+            ("bottom+top", vec![2, 3]),
             ("every", vec![]),
         ];
         for (mode, expected) in after_new_pr {

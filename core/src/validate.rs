@@ -4267,7 +4267,7 @@ prompt = "gate on review"
 
     #[test]
     fn review_ci_deferral_accepted_for_every_valid_value() {
-        for mode in ["every", "tip", "bottom+tip"] {
+        for mode in ["every", "top", "bottom+top"] {
             let src = format!(
                 "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nci_deferral=\"{mode}\"\n"
             );

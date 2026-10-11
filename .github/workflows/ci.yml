@@ -1,7 +1,20 @@
 name: CI
 
+# Ralphus marks the PRs of a stacked review that need not run the slow jobs
+# with the `ralphus:defer-full-ci` label (see "CI deferral" in
+# docs/glossary.md); which PRs get it is the review's `ci_deferral` setting.
+# A labelled PR still runs every fast job -- fmt, clippy (so the workspace
+# compiles), the web lint/type/dead-code checks, the python lint, the
+# parity/rlog/bench lints and the docs checks. Only the jobs marked
+# "deferrable" below are skipped, and a PR without the label runs everything,
+# so a missing label or a typo costs minutes, never coverage.
+#
+# `labeled`/`unlabeled` re-run the workflow when ralphus flips the label, so a
+# change of setting takes effect without a new push. Any label change re-runs
+# CI; the concurrency group below cancels the run it supersedes.
 on:
   pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
 
 # Cancel superseded runs on the same ref to save CI minutes.
 concurrency:
@@ -16,6 +29,23 @@ concurrency:
 # below) so the packaging scripts get validated on every PR.
 
 jobs:
+  # Says, in the run's summary, which scope this run has. Always runs.
+  ci-scope:
+    name: CI scope
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report the CI scope
+        env:
+          DEFERRED: ${{ contains(github.event.pull_request.labels.*.name, 'ralphus:defer-full-ci') }}
+        run: |
+          if [ "$DEFERRED" = "true" ]; then
+            echo "### Slow jobs deferred" >> "$GITHUB_STEP_SUMMARY"
+            echo "This PR carries \`ralphus:defer-full-ci\`, so the full test suite, the release builds, the exercises, the psmux tests, the Python tests and the perf tests were skipped. Fast checks still ran. The full suite runs on the top PR of the stack." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### Full CI" >> "$GITHUB_STEP_SUMMARY"
+            echo "No \`ralphus:defer-full-ci\` label: every job runs." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   rust:
     name: Rust (fmt, clippy, test)
     strategy:
@@ -49,8 +79,11 @@ jobs:
       - name: Install Rust toolchain
         run: rustup toolchain install ${{ matrix.toolchain }} --profile minimal --component rustfmt,clippy
       - uses: Swatinem/rust-cache@v2
+      # Deferrable (skipped on a `ralphus:defer-full-ci` PR): the nextest
+      # install, the test run and doctests, and the build-only MSRV/macOS legs.
+      # fmt and clippy below always run.
       - name: Install cargo-nextest
-        if: matrix.suite == 'full'
+        if: matrix.suite == 'full' && !contains(github.event.pull_request.labels.*.name, 'ralphus:defer-full-ci')
         uses: taiki-e/install-action@nextest
       - name: Format check
         if: matrix.suite == 'full'
@@ -82,7 +115,7 @@ jobs:
       # as the perf job's store-contention step; genuine blocking I/O under
       # the lock (a subprocess, a sleep, a network call) still blows past it.
       - name: Test
-        if: matrix.suite == 'full'
+        if: matrix.suite == 'full' && !contains(github.event.pull_request.labels.*.name, 'ralphus:defer-full-ci')
         env:
           RALPHUS_GUARD_HOLD_PANIC_MS: "8000"
         # The review-input race suite (daemon/tests/review_input_races.rs) is
@@ -91,24 +124,26 @@ jobs:
         # `race-soak-nightly.yml`.
         run: cargo "+${{ matrix.toolchain }}" nextest run --workspace --all-targets
       - name: Doctests
-        if: matrix.suite == 'full'
+        if: matrix.suite == 'full' && !contains(github.event.pull_request.labels.*.name, 'ralphus:defer-full-ci')
         run: cargo "+${{ matrix.toolchain }}" test --doc --workspace
       # MSRV leg: just prove the workspace compiles at the oldest supported
       # toolchain. (Cargo's default resolver is not MSRV-aware, so this is the
       # only guard against a dependency silently bumping the floor.)
       - name: Build (MSRV verification)
-        if: matrix.suite == 'msrv'
+        if: matrix.suite == 'msrv' && !contains(github.event.pull_request.labels.*.name, 'ralphus:defer-full-ci')
         run: cargo "+${{ matrix.toolchain }}" build --workspace --all-targets
       # macOS leg (RAL-398): experimental support, so this only proves the
       # workspace builds -- no fmt/clippy/test/doctest suite, and no vendored
       # psmux (that feature is Windows-only and off by default). A deeper
       # macOS CI leg can follow once there's a real need to justify it.
       - name: Build (macOS smoke test)
-        if: matrix.suite == 'macos-min'
+        if: matrix.suite == 'macos-min' && !contains(github.event.pull_request.labels.*.name, 'ralphus:defer-full-ci')
         run: cargo "+${{ matrix.toolchain }}" build --workspace --all-targets
 
+  # Deferrable: skipped on a `ralphus:defer-full-ci` PR.
   release-builds:
     name: Release build (${{ matrix.os }})
+    if: ${{ !contains(github.event.pull_request.labels.*.name, 'ralphus:defer-full-ci') }}
     strategy:
       fail-fast: false
       matrix:
@@ -146,8 +181,10 @@ jobs:
   # rather than by a new user. Ubuntu runs both variants; Windows runs the
   # remote variant only, because local cells need psmux, which only the
   # psmux-integration job builds.
+  # Deferrable: skipped on a `ralphus:defer-full-ci` PR.
   initialize-exercises:
     name: Initialize exercises (${{ matrix.os }})
+    if: ${{ !contains(github.event.pull_request.labels.*.name, 'ralphus:defer-full-ci') }}
     strategy:
       fail-fast: false
       matrix:
@@ -181,8 +218,10 @@ jobs:
           path: ${{ runner.temp }}/exercises
           retention-days: 7
 
+  # Deferrable: skipped on a `ralphus:defer-full-ci` PR.
   psmux-integration:
     name: Windows psmux integration
+    if: ${{ !contains(github.event.pull_request.labels.*.name, 'ralphus:defer-full-ci') }}
     runs-on: windows-latest
     env:
       # Only used by the "external tmux override" smoke test at the bottom of
@@ -315,8 +354,10 @@ jobs:
       - name: deadcode
         run: uv run deadcode src tests
 
+  # Deferrable: skipped on a `ralphus:defer-full-ci` PR.
   python-test:
     name: Python 3.13 (pytest)
+    if: ${{ !contains(github.event.pull_request.labels.*.name, 'ralphus:defer-full-ci') }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -350,8 +391,10 @@ jobs:
       - name: pytest
         run: uv run pytest
 
+  # Deferrable: skipped on a `ralphus:defer-full-ci` PR.
   perf-tests:
     name: Board cold-load performance budget (RAL-414)
+    if: ${{ !contains(github.event.pull_request.labels.*.name, 'ralphus:defer-full-ci') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

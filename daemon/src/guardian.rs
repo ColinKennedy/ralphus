@@ -948,7 +948,7 @@ pub struct GuardianView {
     /// layer is unset. PR/commit rendering reads this; appraisals are stored
     /// and shown on the board regardless.
     pub effective_post_appraisals: bool,
-    /// This review's own `ci_deferral` mode (`every`/`tip`/`bottom+tip`, see
+    /// This review's own `ci_deferral` mode (`every`/`top`/`bottom+top`, see
     /// [`ralphus_core::schema::CI_DEFERRAL_VALUES`]). `None` means unset,
     /// which behaves as `every`.
     pub ci_deferral: Option<String>,
@@ -9184,22 +9184,22 @@ mod tests {
             .set_project_review_settings(
                 "proj",
                 &crate::store::ProjectReviewSettings {
-                    default_ci_deferral: Some("tip".to_string()),
+                    default_ci_deferral: Some("top".to_string()),
                     ..crate::store::ProjectReviewSettings::default()
                 },
             )
             .unwrap();
         let g = store.get_guardian(&id).unwrap();
         assert_eq!(g.ci_deferral, None);
-        assert_eq!(g.effective_ci_deferral, "tip", "project default applies");
+        assert_eq!(g.effective_ci_deferral, "top", "project default applies");
 
         store
-            .set_guardian_ci_deferral(&id, Some("bottom+tip"))
+            .set_guardian_ci_deferral(&id, Some("bottom+top"))
             .unwrap();
         let g = store.get_guardian(&id).unwrap();
-        assert_eq!(g.ci_deferral.as_deref(), Some("bottom+tip"));
+        assert_eq!(g.ci_deferral.as_deref(), Some("bottom+top"));
         assert_eq!(
-            g.effective_ci_deferral, "bottom+tip",
+            g.effective_ci_deferral, "bottom+top",
             "review beats project"
         );
 
@@ -9207,17 +9207,17 @@ mod tests {
         assert_eq!(
             store.get_guardian(&id).unwrap().effective_ci_deferral,
             "every",
-            "an explicit review `every` beats a project `tip`"
+            "an explicit review `every` beats a project `top`"
         );
 
         store.set_guardian_ci_deferral(&id, None).unwrap();
         let g = store.get_guardian(&id).unwrap();
         assert_eq!(g.ci_deferral, None);
         assert_eq!(
-            g.effective_ci_deferral, "tip",
+            g.effective_ci_deferral, "top",
             "back to the project default"
         );
-        assert!(store.set_guardian_ci_deferral("nope", Some("tip")).is_err());
+        assert!(store.set_guardian_ci_deferral("nope", Some("top")).is_err());
     }
 
     #[test]

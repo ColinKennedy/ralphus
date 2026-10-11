@@ -716,7 +716,7 @@ instead of falling through to a global, non-project-aware default:
 | `default_ci_deferral` | `ci_deferral` | `"every"` |
 
 An explicitly declared `[[review]]` value always wins over its project
-default. `ci_deferral` (`every` | `tip` | `bottom+tip`) decides which PRs/MRs
+default. `ci_deferral` (`every` | `top` | `bottom+top`) decides which PRs/MRs
 in a review's stack run the full CI suite; every other open member carries the
 `ralphus:defer-full-ci` label, which the repository's CI configuration reads to
 skip its slow jobs. Changing it on a review (`POST .../settings` or `.../details`)

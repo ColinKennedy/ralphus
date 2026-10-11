@@ -3160,7 +3160,7 @@ struct ProjectReviewSettingsBody {
     clear_maximum_budget_usd: bool,
     #[serde(default)]
     default_proof_scope: Option<String>,
-    /// Project default CI-deferral mode (`every`/`tip`/`bottom+tip`); an
+    /// Project default CI-deferral mode (`every`/`top`/`bottom+top`); an
     /// empty string clears it back to inheriting.
     #[serde(default)]
     default_ci_deferral: Option<String>,
@@ -14393,8 +14393,8 @@ struct GuardianSettingsBody {
     /// convention `resolver_agent`/`resolver_model` above use).
     #[serde(default)]
     proof_scope: Option<String>,
-    /// This review's own CI-deferral mode -- `"every"`, `"tip"` or
-    /// `"bottom+tip"`. An empty string clears it back to the default
+    /// This review's own CI-deferral mode -- `"every"`, `"top"` or
+    /// `"bottom+top"`. An empty string clears it back to the default
     /// (`"every"`). Applying it puts or removes the defer-full-CI label on the
     /// review's open PRs/MRs before the request returns.
     #[serde(default)]
@@ -23695,7 +23695,7 @@ mod tests {
         };
         assert_eq!(get()["effective"]["ci_deferral"], "every", "default");
 
-        for mode in ["tip", "bottom+tip", "every"] {
+        for mode in ["top", "bottom+top", "every"] {
             let r = route(
                 &d,
                 "POST",

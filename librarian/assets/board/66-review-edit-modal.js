@@ -47,7 +47,7 @@
        * @property {string} originalResolverModel
        * @property {string} proofScope - "each_branch" | "final_branch" | "nothing"
        * @property {string} originalProofScope
-       * @property {string} ciDeferral - "" (inherit the project default) | "every" | "tip" | "bottom+tip"
+       * @property {string} ciDeferral - "" (inherit the project default) | "every" | "top" | "bottom+top"
        * @property {string} originalCiDeferral
        * @property {boolean} proofSkipAutoClean
        * @property {boolean} originalProofSkipAutoClean
@@ -227,8 +227,8 @@
        * @returns {string}
        */
       function ciDeferralChipText(effective) {
-        if (effective === "tip") return "top only";
-        if (effective === "bottom+tip") return "bottom + top";
+        if (effective === "top") return "top only";
+        if (effective === "bottom+top") return "bottom + top";
         return "every PR";
       }
 
@@ -892,11 +892,11 @@
         const option = (/** @type {string} */ value, /** @type {string} */ label) =>
           `<option value="${value}" ${ciDeferral === value ? "selected" : ""}>${label}</option>`;
         return `<div class="kv-row"><span class="k">full CI runs on</span>
-            <select style="${REVIEW_EDIT_INPUT_STYLE}" onchange="${onChange}(this.value)" data-tip="Which PRs/MRs in this review's stack run the project's full CI suite. The others are labelled 'ralphus:defer-full-ci', which the project's CI configuration reads to skip its slow jobs while still running its fast ones.\nUse 'tip' or 'bottom+tip' to save CI time on a stack that lands as a whole. The change is applied to the open PRs/MRs as soon as you Save, and to any PR/MR opened later.\nThe label only takes effect where the repository's CI reads it; with no CI rule for it, nothing is skipped.">
+            <select style="${REVIEW_EDIT_INPUT_STYLE}" onchange="${onChange}(this.value)" data-tip="Which PRs/MRs in this review's stack run the project's full CI suite. The others are labelled 'ralphus:defer-full-ci', which the project's CI configuration reads to skip its slow jobs while still running its fast ones.\nUse 'top' or 'bottom+top' to save CI time on a stack that lands as a whole. The change is applied to the open PRs/MRs as soon as you Save, and to any PR/MR opened later.\nThe label only takes effect where the repository's CI reads it; with no CI rule for it, nothing is skipped.">
               <option value="" ${ciDeferral === "" ? "selected" : ""}>${inheritLabel}</option>
               ${option("every", "every PR/MR")}
-              ${option("tip", "the top PR/MR only")}
-              ${option("bottom+tip", "the bottom and top PR/MR")}
+              ${option("top", "the top PR/MR only")}
+              ${option("bottom+top", "the bottom and top PR/MR")}
             </select></div>`;
       }
       /**

@@ -142,7 +142,7 @@ pub struct ReviewConfig {
     #[serde(alias = "verify_scope", default)]
     pub default_proof_scope: Option<String>,
     /// Which PRs/MRs in a review's stack run the full CI suite: `"every"`
-    /// (default), `"tip"` or `"bottom+tip"` (see
+    /// (default), `"top"` or `"bottom+top"` (see
     /// [`ralphus_core::schema::CI_DEFERRAL_VALUES`]). `None` means unset,
     /// which resolves to `"every"` (see [`Self::default_ci_deferral`]);
     /// per-project scalars win over the global layer. A per-review override
@@ -3981,7 +3981,7 @@ mod tests {
 
     #[test]
     fn default_ci_deferral_parses_every_accepted_mode() {
-        for mode in ["every", "tip", "bottom+tip"] {
+        for mode in ["every", "top", "bottom+top"] {
             let c = from_toml_str(&format!("[review]\ndefault_ci_deferral = \"{mode}\"\n"));
             assert_eq!(c.default_ci_deferral(), mode);
         }
@@ -3996,20 +3996,20 @@ mod tests {
     #[test]
     fn default_ci_deferral_project_wins_over_global() {
         let global = ReviewConfig {
-            default_ci_deferral: Some("tip".to_string()),
+            default_ci_deferral: Some("top".to_string()),
             ..ReviewConfig::default()
         };
         let project = ReviewConfig {
-            default_ci_deferral: Some("bottom+tip".to_string()),
+            default_ci_deferral: Some("bottom+top".to_string()),
             ..ReviewConfig::default()
         };
         assert_eq!(
             global.clone().merge(project).default_ci_deferral(),
-            "bottom+tip"
+            "bottom+top"
         );
         assert_eq!(
             global.merge(ReviewConfig::default()).default_ci_deferral(),
-            "tip"
+            "top"
         );
     }
 

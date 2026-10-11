@@ -430,7 +430,7 @@ struct Membership {
     /// proof_scope`), one of `each_branch`/`final_branch`/`nothing`.
     proof_scope: Option<String>,
     /// Optional CI-deferral mode declared on the review (`[[review]]
-    /// ci_deferral`), one of `every`/`tip`/`bottom+tip`.
+    /// ci_deferral`), one of `every`/`top`/`bottom+top`.
     ci_deferral: Option<String>,
     /// Optional auto-submit-PR-stack override declared on the review
     /// (`[[review]] auto_submit_pr_stack`, RAL-317).
@@ -3384,13 +3384,13 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let gid = store.create_guardian("r", "main", "/repo").unwrap();
         let m = Membership {
-            ci_deferral: Some("bottom+tip".to_string()),
+            ci_deferral: Some("bottom+top".to_string()),
             ..membership(None)
         };
         apply_resolver(&store, &gid, &[&m]).unwrap();
         let guardian = store.get_guardian(&gid).unwrap();
-        assert_eq!(guardian.ci_deferral.as_deref(), Some("bottom+tip"));
-        assert_eq!(guardian.effective_ci_deferral, "bottom+tip");
+        assert_eq!(guardian.ci_deferral.as_deref(), Some("bottom+top"));
+        assert_eq!(guardian.effective_ci_deferral, "bottom+top");
     }
 
     #[test]

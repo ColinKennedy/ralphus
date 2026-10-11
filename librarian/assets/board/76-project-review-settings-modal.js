@@ -37,7 +37,7 @@
        * @property {number|null} originalMaximumBudgetUsd
        * @property {string} proofScope - "" (inherit) | "each_branch" | "final_branch" | "nothing"
        * @property {string} originalProofScope
-       * @property {string} ciDeferral - "" (inherit the file-config/global default) | "every" | "tip" | "bottom+tip"
+       * @property {string} ciDeferral - "" (inherit the file-config/global default) | "every" | "top" | "bottom+top"
        * @property {string} originalCiDeferral
        * @property {boolean} proofSkipAutoClean
        * @property {boolean} originalProofSkipAutoClean

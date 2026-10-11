@@ -1178,14 +1178,14 @@ pub const PROOF_SCOPE_VALUES: &[&str] = &[
 /// the project's CI configuration reads to skip its expensive jobs. See
 /// [`ReviewDef::ci_deferral`].
 pub const CI_DEFERRAL_EVERY: &str = "every";
-pub const CI_DEFERRAL_TIP: &str = "tip";
-pub const CI_DEFERRAL_BOTTOM_AND_TIP: &str = "bottom+tip";
+pub const CI_DEFERRAL_TOP: &str = "top";
+pub const CI_DEFERRAL_BOTTOM_AND_TOP: &str = "bottom+top";
 
 /// Every accepted `ci_deferral` literal, in the order shown to a user.
 pub const CI_DEFERRAL_VALUES: &[&str] = &[
     CI_DEFERRAL_EVERY,
-    CI_DEFERRAL_TIP,
-    CI_DEFERRAL_BOTTOM_AND_TIP,
+    CI_DEFERRAL_TOP,
+    CI_DEFERRAL_BOTTOM_AND_TOP,
 ];
 
 /// The label a review puts on every PR/MR whose full CI run `ci_deferral`
@@ -1732,8 +1732,8 @@ pub struct ReviewDef {
     #[serde(default)]
     pub auto_fix_pr_errors: Option<bool>,
     /// Which PRs/MRs in this review's stack run the full CI suite:
-    /// [`CI_DEFERRAL_EVERY`] (all of them), [`CI_DEFERRAL_TIP`] (only the top
-    /// of the stack) or [`CI_DEFERRAL_BOTTOM_AND_TIP`] (the bottom, which
+    /// [`CI_DEFERRAL_EVERY`] (all of them), [`CI_DEFERRAL_TOP`] (only the top
+    /// of the stack) or [`CI_DEFERRAL_BOTTOM_AND_TOP`] (the bottom, which
     /// targets the base branch, and the top). Every other PR/MR gets
     /// [`DEFER_FULL_CI_LABEL`]. Unset means [`CI_DEFERRAL_EVERY`]. See
     /// [`CI_DEFERRAL_VALUES`].
