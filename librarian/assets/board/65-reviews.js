@@ -1848,7 +1848,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           ? `<span class="fu-chip fu-ignored" data-tip="This note is left out of the follow-ups made when the review merges.">Ignored</span>`
           : "";
         const squad = frozen && !it.ignored ? followupSquadHtml(offerStatus, it.squad_id || squadId) : "";
-        const acceptBtn = offerStatus === "declined" || it.accepted
+        const acceptBtn = (frozen && offerStatus !== "offered") || it.accepted
           ? ""
           : `<button class="btn primary fu-btn" data-click="acceptFollowup" data-guardian-id="${esc(gid)}" data-prophecy-id="${it.prophecy_id}" data-tip="Pressing this will create a follow-up Task that completes this offer.${frozen ? "" : "\nThe review has not merged yet, so it is created the moment the review merges."}">Accept</button>`;
         const acceptedChip = it.accepted && !it.squad_id

@@ -280,6 +280,12 @@ impl Store {
         let ignored = self.ignored_followup_ids(guardian_id)?;
         let results = self.followup_item_squads(guardian_id)?;
         let preaccepted = self.preaccepted_followup_ids(guardian_id)?;
+        // An offer accepted whole, before items were accepted one by one, has
+        // no per-item rows: its single squad stands for every item it offered.
+        let whole_offer_squad = self
+            .get_followup_offer(guardian_id)?
+            .filter(|o| o.status == STATUS_ACCEPTED)
+            .map(|o| o.squad_id.filter(|s| !s.is_empty()));
         Ok(deferred
             .into_iter()
             .filter(|p| latest.get(&p.entity_uri) == Some(&p.attempt))
@@ -291,8 +297,18 @@ impl Store {
                     created_at_ms: p.created_at_ms,
                     branch: context.as_ref().and_then(|c| c.branch.clone()),
                     task_name: context.as_ref().map(|c| c.task_name.clone()),
-                    squad_id: results.get(&p.id).filter(|s| !s.is_empty()).cloned(),
-                    accepted: results.contains_key(&p.id) || preaccepted.contains(&p.id),
+                    squad_id: results
+                        .get(&p.id)
+                        .filter(|s| !s.is_empty())
+                        .cloned()
+                        .or_else(|| {
+                            whole_offer_squad.clone().flatten().filter(|_| {
+                                !results.contains_key(&p.id) && !ignored.contains(&p.id)
+                            })
+                        }),
+                    accepted: results.contains_key(&p.id)
+                        || preaccepted.contains(&p.id)
+                        || (whole_offer_squad.is_some() && !ignored.contains(&p.id)),
                     item: FollowupItem {
                         prophecy_id: p.id,
                         prompt: context
@@ -1777,6 +1793,27 @@ prompt = "add feature.txt"
 
         s.claim_followup_item("g1", a).unwrap();
         assert!(s.due_preaccepted_followups().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_offer_accepted_whole_reads_as_every_item_accepted() {
+        use crate::prophecy::ProphecyKind;
+        let s = store();
+        let root = temp_root("legacy");
+        seed_guardian(&s, "g1", &root);
+        defer(&s, "g1", ProphecyKind::Deferred, "first");
+        merge(&s, "g1");
+        // The state the whole-offer accept left behind: no per-item rows.
+        s.conn
+            .execute(
+                "UPDATE followup_offers SET status='accepted', squad_id='squad-old' WHERE guardian_id='g1'",
+                [],
+            )
+            .unwrap();
+        let items = s.pending_followup_items("g1").unwrap();
+        assert!(items[0].accepted);
+        assert_eq!(items[0].squad_id.as_deref(), Some("squad-old"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
