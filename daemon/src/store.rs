@@ -461,6 +461,16 @@ pub struct CellView {
     /// which backends accept this.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub maximum_tool_output_tokens: Option<i64>,
+    /// Resolved reasoning-effort level (cell overrides task), or `None` for
+    /// the backend's own default (RAL-607). See
+    /// `ralphus_core::schema::agent_supports_effort`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Resolved sampling temperature (cell overrides task), Pi only, or
+    /// `None` for the model's own default (RAL-607). See
+    /// `ralphus_core::schema::agent_supports_temperature`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
     /// Failure detail, when the cell failed.
     pub error: Option<String>,
     /// Dependency references (within-task cell ids or `task/cell`).
@@ -1814,6 +1824,8 @@ impl Store {
                 maximum_context INTEGER,
                 auto_compact_threshold INTEGER,
                 maximum_tool_output_tokens INTEGER,
+                effort        TEXT,
+                temperature   REAL,
                 upstream      TEXT,
                 queue_rank    REAL,
                 machine       TEXT,
@@ -3158,6 +3170,11 @@ impl Store {
             // `ralphus_core::schema::agent_supports_maximum_tool_output_tokens`.
             "ALTER TABLE cells ADD COLUMN maximum_tool_output_tokens INTEGER",
             "ALTER TABLE proofs ADD COLUMN maximum_tool_output_tokens INTEGER",
+            // RAL-607: per-cell reasoning effort and (Pi-only) sampling
+            // temperature -- see `ralphus_core::schema::agent_supports_effort`
+            // and `agent_supports_temperature`.
+            "ALTER TABLE cells ADD COLUMN effort TEXT",
+            "ALTER TABLE cells ADD COLUMN temperature REAL",
             // RAL-332: UI-level convenience gate only -- there is no verified
             // login yet (RAL-252), so this does not stop anyone holding the
             // daemon's shared bearer token from calling the same endpoints
@@ -4491,6 +4508,8 @@ impl Store {
                 let maximum_tool_output_tokens =
                     ralphus_core::schema::resolve_cell_maximum_tool_output_tokens(task, cell)
                         .map(|v| i64::try_from(v).unwrap_or(i64::MAX));
+                let effort = ralphus_core::schema::resolve_cell_effort(task, cell);
+                let temperature = ralphus_core::schema::resolve_cell_temperature(task, cell);
                 let share_session = ralphus_core::schema::resolve_cell_share_session(task, cell);
                 // RAL-308: the cell's own cumulative maximum-runtime cap
                 // (covering itself and its cell-scope proofs) -- not
@@ -4520,8 +4539,8 @@ impl Store {
                     (None, None)
                 };
                 tx.execute(
-                    "INSERT INTO cells(squad_id, task_idx, idx, sid, name, cwd, subprojects, prompt, command, agent, model, system_prompt, system_prompt_position, effective_system_prompt, state, depends_on, timeout_sec, budget_tokens, maximum_budget_usd, maximum_context, auto_compact_threshold, maximum_tool_output_tokens, turns, upstream, queue_rank, env_overrides, machine, share_session, maximum_timeout_sec, mode, remediation_attempts)
-                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO cells(squad_id, task_idx, idx, sid, name, cwd, subprojects, prompt, command, agent, model, system_prompt, system_prompt_position, effective_system_prompt, state, depends_on, timeout_sec, budget_tokens, maximum_budget_usd, maximum_context, auto_compact_threshold, maximum_tool_output_tokens, turns, upstream, queue_rank, env_overrides, machine, share_session, maximum_timeout_sec, mode, remediation_attempts, effort, temperature)
+                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     params![
                         squad_id,
                         t_idx_i,
@@ -4567,6 +4586,8 @@ impl Store {
                         cell_maximum_timeout_sec,
                         cell_mode,
                         cell_remediation_attempts,
+                        effort,
+                        temperature,
                     ],
                 )?;
 
@@ -6015,7 +6036,7 @@ impl Store {
         db_profiles: &HashMap<String, crate::agent_profile_store::AgentProfileView>,
     ) -> Result<HashMap<i64, Vec<CellView>>> {
         let mut stmt = conn.prepare(
-            "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date, machine, detached_at_ms, maximum_context, auto_compact_threshold, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, delayed_until_ms, completed_active_duration_ms, CASE WHEN state='running' THEN active_started_at_ms END, turns, waypoint_halted_at_ms
+            "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date, machine, detached_at_ms, maximum_context, auto_compact_threshold, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, delayed_until_ms, completed_active_duration_ms, CASE WHEN state='running' THEN active_started_at_ms END, turns, waypoint_halted_at_ms, effort, temperature
              FROM cells WHERE squad_id=? ORDER BY task_idx, idx",
         )?;
         let rows = stmt
@@ -6087,6 +6108,8 @@ impl Store {
                         delayed_until_ms: r.get::<_, Option<i64>>(34)?,
                         turns: r.get::<_, Option<i64>>(37)?,
                         waypoint_halted_at_ms: r.get::<_, Option<i64>>(38)?,
+                        effort: r.get::<_, Option<String>>(39)?,
+                        temperature: r.get::<_, Option<f64>>(40)?,
                     },
                 ))
             })?
@@ -7675,6 +7698,12 @@ pub struct CellRow {
     /// for no cap (RAL-333). Delivered to the backend via its own mechanism
     /// -- see `ralphus_core::schema::agent_supports_maximum_tool_output_tokens`.
     pub maximum_tool_output_tokens: Option<i64>,
+    /// Effective reasoning-effort level (resolved from cell/task), or `None`
+    /// for the backend's default (RAL-607).
+    pub effort: Option<String>,
+    /// Effective sampling temperature (resolved from cell/task), Pi only, or
+    /// `None` for the model's default (RAL-607).
+    pub temperature: Option<f64>,
     /// Upstream sentinel, e.g. `"<<task:task-name>>"`. When present the
     /// scheduler rebases this cell's branch onto the named dependency's
     /// current branch tip before starting the runner (RAL-50).
@@ -7747,6 +7776,13 @@ pub struct CellEdit<'a> {
     /// `ralphus_core::schema::agent_supports_maximum_tool_output_tokens` --
     /// before it ever reaches the store.
     pub maximum_tool_output_tokens: Option<Option<i64>>,
+    /// Per-cell reasoning effort (RAL-607). The caller rejects this up front
+    /// when the cell's effective agent has no delivery mechanism for it --
+    /// see `ralphus_core::schema::agent_supports_effort`.
+    pub effort: Option<Option<&'a str>>,
+    /// Per-cell sampling temperature (RAL-607), Pi only -- see
+    /// `ralphus_core::schema::agent_supports_temperature`.
+    pub temperature: Option<Option<f64>>,
     /// Appended system prompt (RAL-341). The caller (`edit_squad`'s `"cell"`
     /// arm) is responsible for rejecting this up front when the cell's
     /// effective agent doesn't support it -- see
@@ -7916,7 +7952,7 @@ impl Store {
     /// (`crate::store_pool`) can serve it without the writer lock.
     pub(crate) fn cells_of_conn(conn: &Connection, squad_id: &str) -> Result<Vec<CellRow>> {
         let mut stmt = conn.prepare(
-            "SELECT s.task_idx, s.idx, t.name, s.sid, s.cwd, s.subprojects, s.prompt, s.command, s.agent, s.model, s.system_prompt, s.system_prompt_position, s.depends_on, s.timeout_sec, s.budget_tokens, s.upstream, s.maximum_budget_usd, s.machine, s.maximum_context, s.auto_compact_threshold, s.maximum_tool_output_tokens, s.share_session, s.maximum_timeout_sec, t.maximum_timeout_sec, s.mode, s.remediation_attempts
+            "SELECT s.task_idx, s.idx, t.name, s.sid, s.cwd, s.subprojects, s.prompt, s.command, s.agent, s.model, s.system_prompt, s.system_prompt_position, s.depends_on, s.timeout_sec, s.budget_tokens, s.upstream, s.maximum_budget_usd, s.machine, s.maximum_context, s.auto_compact_threshold, s.maximum_tool_output_tokens, s.share_session, s.maximum_timeout_sec, t.maximum_timeout_sec, s.mode, s.remediation_attempts, s.effort, s.temperature
              FROM cells s JOIN tasks t ON t.squad_id = s.squad_id AND t.idx = s.task_idx
              WHERE s.squad_id = ? ORDER BY s.task_idx, s.idx",
         )?;
@@ -7952,6 +7988,8 @@ impl Store {
                     task_maximum_timeout_sec: r.get(23)?,
                     mode: r.get(24)?,
                     remediation_attempts: r.get(25)?,
+                    effort: r.get(26)?,
+                    temperature: r.get(27)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -8798,6 +8836,10 @@ impl Store {
         let maximum_context_value = edit.maximum_context.flatten();
         let maximum_tool_output_tokens_touched = edit.maximum_tool_output_tokens.is_some();
         let maximum_tool_output_tokens_value = edit.maximum_tool_output_tokens.flatten();
+        let effort_touched = edit.effort.is_some();
+        let effort_value = edit.effort.flatten();
+        let temperature_touched = edit.temperature.is_some();
+        let temperature_value = edit.temperature.flatten();
         let system_prompt_touched = edit.system_prompt.is_some();
         let system_prompt_value = edit.system_prompt.flatten();
         let effective_authored_system_prompt = if system_prompt_touched {
@@ -8821,7 +8863,9 @@ impl Store {
                 effective_system_prompt = CASE WHEN :effective_system_prompt_touched THEN :effective_system_prompt ELSE effective_system_prompt END,
                 auto_compact_threshold = CASE WHEN :auto_compact_threshold_touched THEN :auto_compact_threshold ELSE auto_compact_threshold END,
                 maximum_context = CASE WHEN :maximum_context_touched THEN :maximum_context ELSE maximum_context END,
-                maximum_tool_output_tokens = CASE WHEN :maximum_tool_output_tokens_touched THEN :maximum_tool_output_tokens ELSE maximum_tool_output_tokens END
+                maximum_tool_output_tokens = CASE WHEN :maximum_tool_output_tokens_touched THEN :maximum_tool_output_tokens ELSE maximum_tool_output_tokens END,
+                effort = CASE WHEN :effort_touched THEN :effort ELSE effort END,
+                temperature = CASE WHEN :temperature_touched THEN :temperature ELSE temperature END
              WHERE squad_id=:squad_id AND task_idx=:task_idx AND idx=:idx",
             named_params! {
                 ":cwd_touched": cwd_touched,
@@ -8844,6 +8888,10 @@ impl Store {
                 ":maximum_context": maximum_context_value,
                 ":maximum_tool_output_tokens_touched": maximum_tool_output_tokens_touched,
                 ":maximum_tool_output_tokens": maximum_tool_output_tokens_value,
+                ":effort_touched": effort_touched,
+                ":effort": effort_value,
+                ":temperature_touched": temperature_touched,
+                ":temperature": temperature_value,
                 ":squad_id": squad_id,
                 ":task_idx": task_idx,
                 ":idx": idx,

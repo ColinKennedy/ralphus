@@ -201,6 +201,7 @@ impl ModelBackend for ClaudeCodeBackend {
             base_args.push("--model".to_string());
             base_args.push(model.to_string());
         }
+        base_args.extend(effort_args(options));
         base_args.extend(setting_sources_args(options));
         let claude_config_dir = isolated_claude_config_dir(options, workspace);
 
@@ -227,6 +228,7 @@ impl ModelBackend for ClaudeCodeBackend {
             workspace,
             options.auto_compact_threshold,
             options.maximum_tool_output_tokens,
+            options.effort.is_some(),
             claude_config_dir.as_deref(),
         )
         .map_err(|e| {
@@ -362,6 +364,10 @@ impl ModelBackend for ClaudeCodeBackend {
         true
     }
 
+    fn supports_effort(&self) -> bool {
+        true
+    }
+
     fn supports_thinking(&self) -> bool {
         true
     }
@@ -407,6 +413,7 @@ const AUTO_COMPACT_WINDOW_ENV: &str = "CLAUDE_CODE_AUTO_COMPACT_WINDOW";
 /// backend (RAL-333).
 const FILE_READ_MAX_OUTPUT_TOKENS_ENV: &str = "CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS";
 
+#[allow(clippy::too_many_arguments)]
 fn spawn(
     program: &str,
     compound: bool,
@@ -414,6 +421,7 @@ fn spawn(
     workspace: &Workspace,
     auto_compact_threshold: Option<u64>,
     maximum_tool_output_tokens: Option<u64>,
+    effort_pinned: bool,
     claude_config_dir: Option<&std::path::Path>,
 ) -> std::io::Result<Child> {
     if compound {
@@ -428,6 +436,7 @@ fn spawn(
             .stderr(Stdio::piped());
         apply_auto_compact_env(&mut cmd, auto_compact_threshold);
         apply_maximum_tool_output_tokens_env(&mut cmd, maximum_tool_output_tokens);
+        apply_effort_env(&mut cmd, effort_pinned);
         apply_claude_config_dir_env(&mut cmd, claude_config_dir);
         cmd.spawn()
     } else {
@@ -439,6 +448,7 @@ fn spawn(
             .stderr(Stdio::piped());
         apply_auto_compact_env(&mut cmd, auto_compact_threshold);
         apply_maximum_tool_output_tokens_env(&mut cmd, maximum_tool_output_tokens);
+        apply_effort_env(&mut cmd, effort_pinned);
         apply_claude_config_dir_env(&mut cmd, claude_config_dir);
         cmd.spawn()
     }
@@ -463,6 +473,27 @@ fn apply_maximum_tool_output_tokens_env(
 ) {
     if let Some(v) = maximum_tool_output_tokens {
         cmd.env(FILE_READ_MAX_OUTPUT_TOKENS_ENV, v.to_string());
+    }
+}
+
+/// The env var Claude Code reads for a session-wide effort level; it takes
+/// precedence over the launch flag, so it is cleared whenever the cell pins
+/// an `effort` (RAL-607).
+const EFFORT_LEVEL_ENV: &str = "CLAUDE_CODE_EFFORT_LEVEL";
+
+/// `--effort <level>` when the cell sets one (RAL-607).
+fn effort_args(options: &RunOptions<'_>) -> Vec<String> {
+    match options.effort {
+        Some(level) => vec!["--effort".to_string(), level.to_string()],
+        None => Vec::new(),
+    }
+}
+
+/// Removes an inherited [`EFFORT_LEVEL_ENV`] from `cmd` when the cell pins an
+/// effort, so the cell's value is authoritative (RAL-607).
+fn apply_effort_env(cmd: &mut Command, effort_pinned: bool) {
+    if effort_pinned {
+        cmd.env_remove(EFFORT_LEVEL_ENV);
     }
 }
 
@@ -1350,6 +1381,34 @@ fn estimate_cost_usd(model: &str, tokens_in: i64, tokens_out: i64) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn effort_args_emit_the_effort_flag() {
+        let options = RunOptions {
+            effort: Some("xhigh"),
+            ..Default::default()
+        };
+        assert_eq!(effort_args(&options), ["--effort", "xhigh"]);
+    }
+
+    #[test]
+    fn effort_args_are_empty_when_unset() {
+        assert!(effort_args(&RunOptions::default()).is_empty());
+    }
+
+    #[test]
+    fn apply_effort_env_clears_the_inherited_env_var_only_when_pinned() {
+        let mut cmd = Command::new("claude");
+        apply_effort_env(&mut cmd, true);
+        let cleared = cmd
+            .get_envs()
+            .any(|(k, v)| k == EFFORT_LEVEL_ENV && v.is_none());
+        assert!(cleared);
+
+        let mut cmd = Command::new("claude");
+        apply_effort_env(&mut cmd, false);
+        assert!(cmd.get_envs().next().is_none());
+    }
+
     use super::*;
 
     #[test]

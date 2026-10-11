@@ -80,6 +80,12 @@ pub struct CellSpec {
     /// unsupported by `agent` (the daemon rejects this combination at submit
     /// time, per `core::validate`'s `agent_supports_maximum_tool_output_tokens`).
     pub maximum_tool_output_tokens: Option<u64>,
+    /// RAL-607: resolved reasoning effort for the cell. `None` leaves the
+    /// harness default.
+    pub effort: Option<String>,
+    /// RAL-607: resolved sampling temperature (Pi only). `None` leaves the
+    /// provider default.
+    pub temperature: Option<f64>,
     /// RAL-336: whether this cell's agent session may load the operator's
     /// personal settings/config (Claude Code's `~/.claude` settings, Codex's
     /// `~/.codex/config.toml`, Pi's on-disk config). Defaults to `false`
@@ -154,6 +160,14 @@ impl CellSpec {
         let thrash_max_compactions = opt_u32(obj, "thrash_max_compactions")?;
         let thrash_min_turn_gap = opt_u32(obj, "thrash_min_turn_gap")?;
         let maximum_tool_output_tokens = opt_uint(obj, "maximum_tool_output_tokens")?;
+        let effort = opt_str(obj, "effort")?;
+        let temperature = match obj.get("temperature") {
+            None | Some(Value::Null) => None,
+            Some(v) => Some(
+                v.as_f64()
+                    .ok_or_else(|| SpecError("temperature must be a number".to_string()))?,
+            ),
+        };
         let allow_personal_settings = opt_bool(obj, "allow_personal_settings")?.unwrap_or(false);
         let allow_personal_memory = opt_bool(obj, "allow_personal_memory")?.unwrap_or(false);
         let retry_attempt = opt_u32(obj, "retry_attempt")?.unwrap_or(0);
@@ -198,6 +212,8 @@ impl CellSpec {
             thrash_max_compactions,
             thrash_min_turn_gap,
             maximum_tool_output_tokens,
+            effort,
+            temperature,
             allow_personal_settings,
             allow_personal_memory,
             retry_attempt,

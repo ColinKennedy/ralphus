@@ -231,6 +231,10 @@ impl ModelBackend for CodexBackend {
         true
     }
 
+    fn supports_effort(&self) -> bool {
+        true
+    }
+
     fn supports_thinking(&self) -> bool {
         true
     }
@@ -280,8 +284,8 @@ fn toml_basic_string(value: &str) -> String {
 
 /// RAL-304/RAL-333: the `-c key=value` argument pairs that deliver
 /// `RunOptions::maximum_context`/`RunOptions::auto_compact_threshold`/
-/// `RunOptions::maximum_tool_output_tokens` to `codex` -- there is no dedicated
-/// flag for any of these, only config-override keys (mirrors
+/// `RunOptions::maximum_tool_output_tokens`/`RunOptions::effort` (RAL-607) to
+/// `codex` -- there is no dedicated flag for any of these, only config-override keys (mirrors
 /// `developer_instructions`'s precedent for `system_prompt`). Must be spliced
 /// into the arg list before `exec` -- see the caller's comment.
 fn context_limit_args(options: &RunOptions<'_>) -> Vec<String> {
@@ -297,6 +301,10 @@ fn context_limit_args(options: &RunOptions<'_>) -> Vec<String> {
     if let Some(v) = options.maximum_tool_output_tokens {
         args.push("-c".to_string());
         args.push(format!("tool_output_token_limit={v}"));
+    }
+    if let Some(v) = options.effort {
+        args.push("-c".to_string());
+        args.push(format!("model_reasoning_effort={}", toml_basic_string(v)));
     }
     args
 }
@@ -1087,6 +1095,21 @@ mod tests {
             args.windows(2)
                 .any(|w| w == ["-c", "tool_output_token_limit=20000"])
         );
+    }
+
+    #[test]
+    fn context_limit_args_maps_effort_as_a_quoted_config_override() {
+        let options = RunOptions {
+            effort: Some("high"),
+            ..Default::default()
+        };
+        let args = context_limit_args(&options);
+        assert_eq!(args, ["-c", "model_reasoning_effort=\"high\""]);
+    }
+
+    #[test]
+    fn context_limit_args_omits_effort_when_unset() {
+        assert!(context_limit_args(&RunOptions::default()).is_empty());
     }
 
     // ── RAL-336 agent isolation ────────────────────────────────────────────

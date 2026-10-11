@@ -11,6 +11,7 @@ use crate::flags::Scanner;
 use crate::selector::{ResolvedSelector, SelectorError, resolve_squad_selector, squad_view_uri};
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum CellCommand {
     Help,
     Show {
@@ -47,6 +48,8 @@ pub enum CellCommand {
         auto_compact_threshold: Option<String>,
         maximum_context: Option<String>,
         maximum_tool_output_tokens: Option<String>,
+        effort: Option<String>,
+        temperature: Option<String>,
         system_prompt: Option<String>,
     },
     Terminal {
@@ -128,6 +131,8 @@ pub fn parse(args: &[String]) -> CellCommand {
                 .take_value("--maximum-tool-output-tokens")
                 .ok()
                 .flatten();
+            let effort = scanner.take_value("--effort").ok().flatten();
+            let temperature = scanner.take_value("--temperature").ok().flatten();
             let system_prompt = scanner.take_value("--system-prompt").ok().flatten();
             with_selector(scanner, |selector| CellCommand::Edit {
                 selector,
@@ -139,6 +144,8 @@ pub fn parse(args: &[String]) -> CellCommand {
                 auto_compact_threshold,
                 maximum_context,
                 maximum_tool_output_tokens,
+                effort,
+                temperature,
                 system_prompt,
             })
         }
@@ -373,6 +380,8 @@ pub fn dispatch(cmd: CellCommand, opts: &GlobalOpts) -> i32 {
             auto_compact_threshold,
             maximum_context,
             maximum_tool_output_tokens,
+            effort,
+            temperature,
             system_prompt,
         } => run_and_report(opts, None, || {
             let resolved = resolve_scoped(&client, &selector, "cell")?;
@@ -388,6 +397,8 @@ pub fn dispatch(cmd: CellCommand, opts: &GlobalOpts) -> i32 {
                 auto_compact_threshold.as_deref(),
                 maximum_context.as_deref(),
                 maximum_tool_output_tokens.as_deref(),
+                effort.as_deref(),
+                temperature.as_deref(),
                 system_prompt.as_deref(),
             )?;
             emit(opts, &result, |_| println!("{selector} updated"));
@@ -737,6 +748,28 @@ mod tests {
                 maximum_tool_output_tokens,
                 ..
             } => assert_eq!(maximum_tool_output_tokens.as_deref(), Some("")),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_edit_with_effort_and_temperature() {
+        match parse(&v(&[
+            "edit",
+            "squad-1/build/0",
+            "--effort",
+            "high",
+            "--temperature",
+            "0.7",
+        ])) {
+            CellCommand::Edit {
+                effort,
+                temperature,
+                ..
+            } => {
+                assert_eq!(effort.as_deref(), Some("high"));
+                assert_eq!(temperature.as_deref(), Some("0.7"));
+            }
             other => panic!("unexpected: {other:?}"),
         }
     }
