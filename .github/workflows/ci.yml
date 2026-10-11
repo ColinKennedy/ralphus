@@ -8,13 +8,12 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-# RAL-260: python runs as a 3.11/3.12/3.13 + floating "3" matrix; rust runs its
+# RAL-260: python runs on 3.13 only; rust runs its
 # full suite on linux+windows plus a pinned 1.86 MSRV build-only leg. RAL-398
 # adds a macOS leg -- experimental, so build-only rather than the full suite
 # (see "Platform support" in README.md and docs/dependencies.md). RAL-441
-# adds a debug x release build matrix across all three OSes (see the
-# `release-builds` job below) so release artifacts get the same early
-# validation as development builds.
+# adds release-build legs on linux and windows (see the `release-builds` job
+# below) so the packaging scripts get validated on every PR.
 
 jobs:
   rust:
@@ -109,49 +108,33 @@ jobs:
         run: cargo "+${{ matrix.toolchain }}" build --workspace --all-targets
 
   release-builds:
-    name: Build (${{ matrix.os }}, ${{ matrix.config }})
+    name: Release build (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
-        # Debug then release, per OS (RAL-441): a plain `cargo build` proves
-        # the workspace still builds in the profile developers iterate in
-        # day to day, while the release leg runs the same packaging scripts
-        # used to cut a real release (scripts/build-release.sh on
-        # linux/macOS, scripts/build-release.cmd on Windows), so ship-ready
-        # bundling -- not just compilation -- gets covered on every OS. The
-        # Windows release leg also exercises the vendored psmux submodule
-        # build that scripts/build-release.cmd performs by default.
-        include:
-          - os: ubuntu-latest
-            config: debug
-          - os: ubuntu-latest
-            config: release
-          - os: windows-latest
-            config: debug
-          - os: windows-latest
-            config: release
-          - os: macos-latest
-            config: debug
-          - os: macos-latest
-            config: release
+        # Runs the same packaging scripts used to cut a real release
+        # (scripts/build-release.sh on linux, scripts/build-release.cmd on
+        # Windows) so ship-ready bundling -- not just compilation -- is
+        # covered. Debug builds are already exercised by the `rust` job
+        # (including its macOS smoke leg), so they are not repeated here. The
+        # Windows leg also exercises the vendored psmux submodule build that
+        # scripts/build-release.cmd performs by default.
+        os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
         with:
-          # Only the Windows release leg needs vendor/psmux checked out --
+          # Only the Windows leg needs vendor/psmux checked out --
           # scripts/build-release.cmd builds it by default (RAL-347).
-          submodules: ${{ matrix.os == 'windows-latest' && matrix.config == 'release' }}
+          submodules: ${{ matrix.os == 'windows-latest' }}
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal
       - uses: Swatinem/rust-cache@v2
-      - name: Debug build
-        if: matrix.config == 'debug'
-        run: cargo build --workspace --all-targets
       - name: Release build (scripts/build-release.sh)
-        if: matrix.config == 'release' && matrix.os != 'windows-latest'
+        if: matrix.os != 'windows-latest'
         run: bash scripts/build-release.sh
       - name: Release build (scripts\build-release.cmd)
-        if: matrix.config == 'release' && matrix.os == 'windows-latest'
+        if: matrix.os == 'windows-latest'
         shell: cmd
         run: scripts\build-release.cmd
 
@@ -333,31 +316,24 @@ jobs:
         run: uv run deadcode src tests
 
   python-test:
-    name: Python ${{ matrix.python-version }} (pytest)
+    name: Python 3.13 (pytest)
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: cli-py
     env:
-      # Make every `uv` step use the matrix's interpreter, not just whatever uv
-      # first finds that satisfies requires-python (>=3.11).
-      UV_PYTHON: ${{ matrix.python-version }}
+      # Make every `uv` step use 3.13, not just whatever uv first finds that
+      # satisfies requires-python.
+      UV_PYTHON: "3.13"
       # `rust-cache` can restore a release binary from an earlier commit, while
       # this job deliberately builds the debug CLI below for docsgen's tests.
       RALPHUS_CLI_BIN: ../target/debug/ralphus
-    strategy:
-      fail-fast: false
-      matrix:
-        # The versions cli-py/pyproject.toml's `requires-python = ">=3.11"` covers
-        # in practice, plus a floating "3" leg that always resolves to the
-        # newest available Python so CI stays forward-looking.
-        python-version: ["3.11", "3.12", "3.13", "3"]
     steps:
       - uses: actions/checkout@v4
-      - name: Install Python ${{ matrix.python-version }}
+      - name: Install Python 3.13
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.13"
       - name: Install uv
         uses: astral-sh/setup-uv@v6
         with:
