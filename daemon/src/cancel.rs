@@ -85,6 +85,30 @@ impl Cancellations {
         active.token.clone()
     }
 
+    /// Like [`register`](Self::register), but never hands back a token that has
+    /// already tripped: when the key's shared token is cancelled (an earlier
+    /// worker is still unwinding), the key switches to a fresh token. Earlier
+    /// workers keep their own, already-cancelled token; the registration count
+    /// stays shared so every worker's [`remove`](Self::remove) still balances.
+    /// For signals that are consumed per trip (waypoint halts), where inheriting
+    /// a stale trip would stop a brand-new run before it starts.
+    #[must_use]
+    pub fn register_fresh(&self, run_id: &str) -> CancelToken {
+        let mut registrations = self.lock();
+        let active =
+            registrations
+                .entry(run_id.to_string())
+                .or_insert_with(|| ActiveCancellation {
+                    token: CancelToken::new(),
+                    registrations: 0,
+                });
+        if active.token.is_cancelled() {
+            active.token = CancelToken::new();
+        }
+        active.registrations += 1;
+        active.token.clone()
+    }
+
     /// Signal cancellation for a run if it is currently executing. A no-op when
     /// the run is not running (nothing to stop).
     pub fn cancel(&self, run_id: &str) {
@@ -207,6 +231,24 @@ mod tests {
         assert!(reg.is_active("review-1"));
         reg.remove("review-1");
         assert!(!reg.is_active("review-1"));
+    }
+
+    #[test]
+    fn register_fresh_does_not_inherit_a_tripped_token() {
+        let reg = Cancellations::new();
+        let old = reg.register_fresh("squad-1");
+        reg.cancel("squad-1");
+        assert!(old.is_cancelled());
+        let fresh = reg.register_fresh("squad-1");
+        assert!(!fresh.is_cancelled());
+        // The new token is the one the registry now trips.
+        reg.cancel("squad-1");
+        assert!(fresh.is_cancelled());
+        // Both workers' removals balance the shared count.
+        reg.remove("squad-1");
+        assert!(reg.is_active("squad-1"));
+        reg.remove("squad-1");
+        assert!(!reg.is_active("squad-1"));
     }
 
     #[test]

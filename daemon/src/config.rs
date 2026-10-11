@@ -1600,6 +1600,40 @@ impl CartographerConfig {
     }
 }
 
+/// Runner watchdog configuration (`[runner_watchdog]` table, RAL-626). A
+/// `running` cell with no live in-process runner and no recent Cartographer
+/// activity is surfaced (mailbox notice + board badge) after
+/// [`surface_after_minutes`](Self::surface_after_minutes) and failed after
+/// [`fail_after_minutes`](Self::fail_after_minutes). `None` means unset (so a
+/// lower layer can supply it).
+#[derive(Debug, Default, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub struct RunnerWatchdogConfig {
+    #[serde(default)]
+    pub surface_after_minutes: Option<i64>,
+    #[serde(default)]
+    pub fail_after_minutes: Option<i64>,
+}
+
+impl RunnerWatchdogConfig {
+    /// Minutes of runner-less silence before the cell is surfaced. Defaults
+    /// to 10; values below 1 fall back to the default.
+    #[must_use]
+    pub fn surface_after_minutes(&self) -> i64 {
+        self.surface_after_minutes.filter(|m| *m >= 1).unwrap_or(10)
+    }
+
+    /// Minutes of runner-less silence before the cell is failed. Defaults to
+    /// 30; never below the surface threshold, so a notice always precedes the
+    /// failure.
+    #[must_use]
+    pub fn fail_after_minutes(&self) -> i64 {
+        self.fail_after_minutes
+            .filter(|m| *m >= 1)
+            .unwrap_or(30)
+            .max(self.surface_after_minutes())
+    }
+}
+
 /// Session cost-cap enforcement configuration (`[budget]` table, RAL-161).
 /// Controls how often each running session's own poll loop re-checks its
 /// live `cost_usd` against its resolved `maximum_budget_usd` cap. `None`
@@ -2683,6 +2717,8 @@ struct ConfigFile {
     #[serde(default)]
     cartographer: Option<CartographerConfig>,
     #[serde(default)]
+    runner_watchdog: Option<RunnerWatchdogConfig>,
+    #[serde(default)]
     terminal_logs: Option<TerminalLogConfig>,
     #[serde(default)]
     agent: Option<AgentTableConfig>,
@@ -3021,6 +3057,35 @@ pub fn load_cartographer_config() -> CartographerConfig {
     CartographerConfig {
         retention_days: local.retention_days.or(global.retention_days),
         max_rows: local.max_rows.or(global.max_rows),
+    }
+}
+
+/// Parse a `RunnerWatchdogConfig` from the given TOML text; the defaults
+/// (10 / 30 minutes) when the `[runner_watchdog]` table is absent.
+#[must_use]
+pub fn runner_watchdog_from_toml_str(s: &str) -> RunnerWatchdogConfig {
+    parse_config_file(s).runner_watchdog.unwrap_or_default()
+}
+
+/// Load the effective runner watchdog config by layering the global config
+/// file under the nearest per-project `.ralphus.toml` (per-project scalars
+/// win, following the `[cartographer]` pattern).
+#[must_use]
+pub fn load_runner_watchdog_config() -> RunnerWatchdogConfig {
+    let global = global_config_path()
+        .and_then(|p| read_config_text(&p))
+        .map(|s| runner_watchdog_from_toml_str(&s))
+        .unwrap_or_default();
+    let local = std::env::current_dir()
+        .ok()
+        .as_deref()
+        .and_then(find_project_config)
+        .and_then(|p| read_config_text(&p))
+        .map(|s| runner_watchdog_from_toml_str(&s))
+        .unwrap_or_default();
+    RunnerWatchdogConfig {
+        surface_after_minutes: local.surface_after_minutes.or(global.surface_after_minutes),
+        fail_after_minutes: local.fail_after_minutes.or(global.fail_after_minutes),
     }
 }
 
@@ -4324,6 +4389,34 @@ mod tests {
         let c = cartographer_from_toml_str("not = = valid");
         assert_eq!(c.retention_days(), 30);
         assert_eq!(c.max_rows(), 50_000);
+    }
+
+    // ── RunnerWatchdogConfig (RAL-626) ───────────────────────────────────
+
+    #[test]
+    fn runner_watchdog_defaults_and_overrides() {
+        let d = runner_watchdog_from_toml_str("");
+        assert_eq!(d.surface_after_minutes(), 10);
+        assert_eq!(d.fail_after_minutes(), 30);
+        let c = runner_watchdog_from_toml_str(
+            "[runner_watchdog]
+surface_after_minutes = 2
+fail_after_minutes = 5
+",
+        );
+        assert_eq!(c.surface_after_minutes(), 2);
+        assert_eq!(c.fail_after_minutes(), 5);
+    }
+
+    #[test]
+    fn runner_watchdog_fail_threshold_never_precedes_surface() {
+        let c = runner_watchdog_from_toml_str(
+            "[runner_watchdog]
+surface_after_minutes = 40
+fail_after_minutes = 5
+",
+        );
+        assert_eq!(c.fail_after_minutes(), 40);
     }
 
     // ── BudgetConfig (RAL-161) ────────────────────────────────────────────

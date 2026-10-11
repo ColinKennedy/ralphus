@@ -500,6 +500,19 @@
       const delayedGraphBadge = (delayedUntilMs, reason = "") => delayedUntilMs
         ? ` <span class="pill p-delayed" data-tip="This work hit a provider rate limit and is automatically waiting out its suggested retry delay — it is not stuck, no action is needed.\n${esc(reason || "The agent backend reported a recognized, retryable rate limit.")}">delayed</span>`
         : "";
+      /**
+       * Renders a "no runner" warning badge (RAL-626) for a cell that reads
+       * `running` but has no live runner behind it and no recent activity.
+       * `stalledAtMs` is the cell's own `runner_stalled_at_ms` field (present
+       * only once the daemon's runner watchdog has flagged it).
+       * @param {number|null|undefined} stalledAtMs
+       * @returns {string}
+       */
+      const runnerStalledBadge = (stalledAtMs) => stalledAtMs
+        ? ` <span class="pill p-warn" data-tip="This cell is marked running, but the daemon has no live runner for it and has seen no activity from it.
+It is probably stuck: the runner may never have started.
+The daemon will mark it failed automatically if nothing happens; restart the cell to retry sooner.">⚠ no runner</span>`
+        : "";
       /** @type {{[key: string]: ("task"|"cell"|"proof")[]}} */
       const GRAPH_NODE_ACTION_COMPAT = {
         restart: ["task", "cell", "proof"],

@@ -158,8 +158,6 @@ export default {
   // JavaScript source. Keep their package/binary checks from depending on
   // whether the package manager materializes local bin shims in this
   // worktree.
-  ignoreBinaries: ["eslint", "tsc"],
-  ignoreDependencies: ["eslint"],
   // The chunk and vendor files are inlined into the compiled shell above and
   // are never imported by anything — without this knip would report them as
   // unused files. The shell itself is the entry and must NOT be covered by
