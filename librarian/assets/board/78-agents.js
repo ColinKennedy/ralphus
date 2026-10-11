@@ -86,6 +86,35 @@
       }
       // RALPHUS-AGENT-FILTER:END
 
+      /**
+       * Builds the HTML for an agent-filter dropdown menu opener (RAL-486). The
+       * dropdown's state and rendering are managed by renderStatusDropdown
+       * (shared with status/PR-status filters); this just wraps it with a
+       * consistent interface.
+       * @param {string} label
+       * @param {StatusDropdownConfig} config
+       * @returns {string}
+       */
+      function agentFilterHtml(label, config) {
+        const { id, itemNoun, selected, options } = config;
+        const badge = agentFilterBadge(selected.size, options.length);
+        const badgeHtml = badge ? ` <span class="chip">${esc(badge)}</span>` : "";
+        return `<button type="button" class="btn" id="${id}-opener" data-click="toggleAgentFilterMenu" data-tip="Filter by agent. Click to open the dropdown.">${esc(label)} ${selected.size > 0 ? `(${selected.size}/${options.length})` : `(${options.length})`}${badgeHtml}</button>`;
+      }
+      /**
+       * Toggles the agent filter menu open/closed.
+       * @param {Event} event
+       * @returns {void}
+       */
+      function toggleAgentFilterMenu(event) {
+        event.stopPropagation();
+        const button = /** @type {HTMLElement} */ (event.target).closest("button");
+        if (!button) return;
+        const menu = document.getElementById(`${button.id.replace("-opener", "-menu")}`);
+        if (!menu) return;
+        menu.classList.toggle("hidden");
+      }
+
       // ---- Agents tab (RAL-473: DB-backed agent profiles + built-in backend command overrides) ----
 
       /** Every backend a profile's `backend` field may select — mirrors `agent_profiles::PROFILE_BACKENDS`. */
