@@ -942,8 +942,10 @@
         if (!el || el.dataset.prOpen !== "1") return;
         refreshPrStatusOnOpen(el.dataset.prId || "");
       }
-      document.addEventListener("click", onPrLinkActivated, true);
-      document.addEventListener("auxclick", onPrLinkActivated, true);
+      if (typeof document !== "undefined") {
+        document.addEventListener("click", onPrLinkActivated, true);
+        document.addEventListener("auxclick", onPrLinkActivated, true);
+      }
       /**
        * "Action feedback" menu item (RAL-<new>): pulls this PR's un-actioned
        * forge comments into the owning review worktree right now, instead of
