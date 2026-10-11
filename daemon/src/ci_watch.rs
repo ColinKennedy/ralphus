@@ -1724,20 +1724,12 @@ fn run_pr_fix(
         },
     );
 
-    let template = guardian
-        .auto_fix_prompt_template
-        .clone()
-        .unwrap_or_else(|| crate::config::DEFAULT_AUTO_FIX_PROMPT_TEMPLATE.to_string());
     let pr_url = pr
         .pr_url
         .clone()
         .unwrap_or_else(|| format!("{} PR/MR #{}", pr.forge, pr.pr_number.unwrap_or_default()));
-    let mut feedback = template.replace("{insert URL here}", &pr_url).replace(
-        ralphus_core::validate::AUTO_FIX_PROMPT_PLACEHOLDER,
-        &prompt_body,
-    );
 
-    // RAL-505: append the discourage-tests guidance when this review's own
+    // RAL-505: use the discourage-tests wording when this review's own
     // override says so, else fall back to the project/global default --
     // applies to every PR-fix path (automatic and manual), since both funnel
     // through this shared core.
@@ -1749,9 +1741,14 @@ fn run_pr_fix(
                 .resolve_review_config(Path::new(&guardian.git_root))
                 .discourage_tests_during_auto_pull_request_fixes()
         });
-    if discourage_tests {
-        feedback.push_str(crate::config::DISCOURAGE_TESTS_DURING_AUTO_PR_FIX_GUIDANCE);
-    }
+    let template = crate::config::auto_fix_prompt_template(
+        guardian.auto_fix_prompt_template.as_deref(),
+        discourage_tests,
+    );
+    let feedback = template.replace("{insert URL here}", &pr_url).replace(
+        ralphus_core::validate::AUTO_FIX_PROMPT_PLACEHOLDER,
+        &prompt_body,
+    );
 
     // RAL-395 addendum (RAL-<new>: `author`/`submitted_by` now parameterized
     // rather than always `AUTO_FIX_AUTHOR`, so a manual dispatch attributes

@@ -1854,7 +1854,7 @@ fn auto_fix_dispatch_appends_discourage_tests_guidance_when_review_override_set(
     assert!(
         messages[0]
             .text
-            .contains(ralphus_daemon::config::DISCOURAGE_TESTS_DURING_AUTO_PR_FIX_GUIDANCE),
+            .contains(ralphus_daemon::config::STRICT_AUTO_FIX_TESTING_PARAGRAPH),
         "feedback prompt must carry the discourage-tests guidance when the \
          review's own override is set: {:?}",
         messages[0].text
@@ -1956,7 +1956,7 @@ fn auto_fix_dispatch_appends_discourage_tests_guidance_from_project_default_when
     assert!(
         messages[0]
             .text
-            .contains(ralphus_daemon::config::DISCOURAGE_TESTS_DURING_AUTO_PR_FIX_GUIDANCE),
+            .contains(ralphus_daemon::config::STRICT_AUTO_FIX_TESTING_PARAGRAPH),
         "feedback prompt must carry the discourage-tests guidance from the \
          project-level default when the review itself is unset: {:?}",
         messages[0].text
