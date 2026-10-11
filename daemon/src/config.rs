@@ -1339,6 +1339,62 @@ pub fn load_commit_config(start: &Path) -> CommitConfig {
     }
 }
 
+/// Worktree initialization (`[worktree]` table, RAL-615): command(s) run once
+/// in every freshly created cell worktree before any cell uses it, and the
+/// timeout covering them. A project's `.ralphus.toml` value wins over the
+/// global config file's.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct WorktreeConfig {
+    #[serde(default)]
+    pub initialization_commands: Option<ralphus_core::schema::InitCommands>,
+    #[serde(default)]
+    pub initialization_timeout_sec: Option<u64>,
+}
+
+/// Effective `[worktree]` settings after layering global under project.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EffectiveWorktreeConfig {
+    /// Normalized command list; empty when none is configured.
+    pub initialization_commands: Vec<String>,
+    /// Configured timeout, if any (callers fall back to
+    /// [`DEFAULT_INITIALIZATION_TIMEOUT_SEC`]).
+    pub initialization_timeout_sec: Option<u64>,
+}
+
+/// Timeout applied to a worktree's init commands when no layer sets one.
+pub const DEFAULT_INITIALIZATION_TIMEOUT_SEC: u64 = 900;
+
+/// Parse a `WorktreeConfig` from TOML text (default when the table is absent).
+#[must_use]
+pub fn worktree_config_from_toml_str(s: &str) -> WorktreeConfig {
+    parse_config_file(s).worktree.unwrap_or_default()
+}
+
+/// Load the effective `[worktree]` config for the project rooted at (or
+/// above) `start`: nearest `.ralphus.toml` over the global config file.
+/// `start` must be the registered project root, not a cell cwd.
+#[must_use]
+pub fn load_worktree_config(start: &Path) -> EffectiveWorktreeConfig {
+    let global = global_config_path()
+        .and_then(|p| read_config_text(&p))
+        .map(|s| worktree_config_from_toml_str(&s))
+        .unwrap_or_default();
+    let local = find_project_config(start)
+        .and_then(|p| read_config_text(&p))
+        .map(|s| worktree_config_from_toml_str(&s))
+        .unwrap_or_default();
+    EffectiveWorktreeConfig {
+        initialization_commands: local
+            .initialization_commands
+            .or(global.initialization_commands)
+            .map(|c| c.to_list())
+            .unwrap_or_default(),
+        initialization_timeout_sec: local
+            .initialization_timeout_sec
+            .or(global.initialization_timeout_sec),
+    }
+}
+
 /// Post-merge follow-up offers (`[followup]` table of the global config or a
 /// project's `.ralphus.toml`): once a review merges, the daemon offers to
 /// turn the `deferred` prophecies its cells wrote into a follow-up squad (see
@@ -2723,6 +2779,8 @@ struct ConfigFile {
     #[serde(default)]
     commits: Option<CommitConfig>,
     #[serde(default)]
+    worktree: Option<WorktreeConfig>,
+    #[serde(default)]
     followup: Option<FollowupConfig>,
     #[serde(default)]
     review: Option<ReviewConfig>,
@@ -3805,6 +3863,22 @@ mod tests {
     fn monorepo_config_empty_subprojects_list_is_not_a_monorepo() {
         let c = monorepo_from_toml_str("[monorepo]\nsubprojects = []\n");
         assert!(!c.is_monorepo());
+    }
+
+    #[test]
+    fn worktree_config_layers_project_over_global_and_normalizes() {
+        let c = worktree_config_from_toml_str(
+            "[worktree]
+initialization_commands = [\"a\", \"b\"]
+initialization_timeout_sec = 30
+",
+        );
+        assert_eq!(
+            c.initialization_commands.unwrap().to_list(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert_eq!(c.initialization_timeout_sec, Some(30));
+        assert_eq!(worktree_config_from_toml_str(""), WorktreeConfig::default());
     }
 
     // ── commits (RAL-445) ──────────────────────────────────────────────────

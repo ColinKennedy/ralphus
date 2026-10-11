@@ -102,6 +102,8 @@ pub fn execute(cmd: CellCommand, client: &DaemonClient) -> ExecResult {
             effort,
             temperature,
             system_prompt,
+            initialization_commands,
+            initialization_timeout_sec,
         } => {
             let resolved = cell::resolve_scoped(client, &selector, "cell")?;
             Ok(client.edit_cell(
@@ -119,6 +121,8 @@ pub fn execute(cmd: CellCommand, client: &DaemonClient) -> ExecResult {
                 effort.as_deref(),
                 temperature.as_deref(),
                 system_prompt.as_deref(),
+                initialization_commands.as_deref(),
+                initialization_timeout_sec.as_deref(),
             )?)
         }
         CellCommand::Terminal { selector, mode } => {

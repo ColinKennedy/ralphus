@@ -15,3 +15,8 @@ tag = "proof-command"
 [[test]]
 id = "ralphus-runner execute::tests::run_command_reports_exit_code_and_output"
 tag = "cell-command"
+
+# Worktree initialization commands (RAL-615; daemon-side `worktree_init::run`).
+[[test]]
+id = "ralphus-daemon worktree_init::tests::runs_every_command_in_order_in_the_worktree"
+tag = "worktree-init"

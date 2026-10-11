@@ -195,7 +195,12 @@ fn validate_submitter(value: Option<&toml::Value>, ctx: &mut Ctx<'_>) {
 
 // ── Allowed key sets (mirror old:src/tasks/validate.rs) ──────────────────────
 
-const DEFAULT_KEYS: &[&str] = &["depends_on", "environment"];
+const DEFAULT_KEYS: &[&str] = &[
+    "depends_on",
+    "environment",
+    "initialization_commands",
+    "initialization_timeout_sec",
+];
 const TASK_KEYS: &[&str] = &[
     "name",
     "project",
@@ -218,6 +223,8 @@ const TASK_KEYS: &[&str] = &[
     "environment",
     "no_commit_required",
     "share_session",
+    "initialization_commands",
+    "initialization_timeout_sec",
     "extends",
     "cell",
     "proof",
@@ -256,6 +263,8 @@ const CELL_KEYS: &[&str] = &[
     "share_session",
     "triage",
     "triage_type",
+    "initialization_commands",
+    "initialization_timeout_sec",
     "extends",
 ];
 /// The full set of top-level `[[review]]` keys -- also the source of truth
@@ -734,6 +743,84 @@ fn validate_defaults(value: Option<&toml::Value>, ctx: &mut Ctx) {
         unknown_keys(ctx, table, DEFAULT_KEYS, &path, header);
         check_type(ctx, table, "depends_on", Ty::StrArray, &path, header);
         check_environment_lenient(ctx, table, &path, header);
+        check_initialization(ctx, table, &path, header);
+    }
+}
+
+/// Validate `initialization_commands` / `initialization_timeout_sec` on a
+/// `[[default]]`, `[[task]]` or `[[task.cell]]` table: the commands are a
+/// string or an array of strings, an array must be non-empty, no command may
+/// contain a newline, and the timeout must be a positive integer. An empty
+/// string is accepted here as the explicit "disable the inherited command"
+/// value; the daemon rejects it at submit time when nothing is inherited.
+fn check_initialization(ctx: &mut Ctx, table: &toml::Table, path: &str, header: Option<u32>) {
+    check_type(
+        ctx,
+        table,
+        "initialization_commands",
+        Ty::StrOrStrArray,
+        path,
+        header,
+    );
+    let key_path = format!("{path}.initialization_commands");
+    let line = ctx.key_line(header, "initialization_commands");
+    if let Some(list) = table
+        .get("initialization_commands")
+        .and_then(toml::Value::as_array)
+    {
+        if list.is_empty() {
+            ctx.error(
+                &key_path,
+                ErrorKind::InvalidValue,
+                "'initialization_commands' must not be an empty list (use \"\" to disable an inherited command)",
+                line,
+            );
+        } else if list
+            .iter()
+            .any(|v| v.as_str().is_some_and(|s| s.trim().is_empty()))
+        {
+            ctx.error(
+                &key_path,
+                ErrorKind::InvalidValue,
+                "'initialization_commands' list entries must not be empty",
+                line,
+            );
+        }
+    }
+    if initialization_value(table)
+        .is_some_and(|cmds| cmds.iter().any(|c| c.contains('\n') || c.contains('\r')))
+    {
+        ctx.error(
+            &key_path,
+            ErrorKind::InvalidValue,
+            "'initialization_commands' entries must be single-line commands (use a list for several)",
+            line,
+        );
+    }
+    check_type(
+        ctx,
+        table,
+        "initialization_timeout_sec",
+        Ty::Int,
+        path,
+        header,
+    );
+    check_positive_number(ctx, table, "initialization_timeout_sec", path, header);
+}
+
+/// The `initialization_commands` a table sets, normalized to a command list
+/// (`""` -> empty list, `"x"` -> `["x"]`); `None` when the key is absent or
+/// not a string / array of strings.
+fn initialization_value(table: &toml::Table) -> Option<Vec<String>> {
+    match table.get("initialization_commands")? {
+        toml::Value::String(s) if s.trim().is_empty() => Some(Vec::new()),
+        toml::Value::String(s) => Some(vec![s.clone()]),
+        toml::Value::Array(a) => Some(
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+        ),
+        _ => None,
     }
 }
 
@@ -976,6 +1063,7 @@ fn validate_tasks(value: Option<&toml::Value>, ctx: &mut Ctx) {
         check_environment_lenient(ctx, table, &path, header);
         check_type(ctx, table, "no_commit_required", Ty::Bool, &path, header);
         check_type(ctx, table, "share_session", Ty::Bool, &path, header);
+        check_initialization(ctx, table, &path, header);
         check_type(ctx, table, "extends", Ty::StrArray, &path, header);
         check_extends(ctx, table, &path, header);
 
@@ -1004,6 +1092,8 @@ fn validate_tasks(value: Option<&toml::Value>, ctx: &mut Ctx) {
 
 // ── [[task.cell]] ─────────────────────────────────────────────────────────
 
+type WorktreeGroupMap = HashMap<String, Vec<(usize, Option<Vec<String>>)>>;
+
 #[allow(clippy::too_many_arguments)]
 fn validate_cells(
     value: Option<&toml::Value>,
@@ -1031,6 +1121,7 @@ fn validate_cells(
     let mut dep_edges: Vec<(usize, String)> = Vec::new();
     let mut has_placeholder = false;
     let mut has_auto_review = false;
+    let mut worktree_groups: WorktreeGroupMap = HashMap::new();
 
     for (s, item) in arr.iter().enumerate() {
         let path = format!("{task_path}.cell[{s}]");
@@ -1249,6 +1340,19 @@ fn validate_cells(
         check_upstream_task_ref_exists(ctx, table, &path, header, task_cell_index);
 
         check_type(ctx, table, "share_session", Ty::Bool, &path, header);
+        check_initialization(ctx, table, &path, header);
+        if let Some(placeholder) = table
+            .get("cwd")
+            .and_then(toml::Value::as_str)
+            .and_then(crate::schema::first_worktree_placeholder_in_text)
+        {
+            let effective =
+                initialization_value(table).or_else(|| initialization_value(task_scope.table));
+            worktree_groups
+                .entry(placeholder.to_string())
+                .or_default()
+                .push((s, effective));
+        }
 
         check_type(ctx, table, "review", Ty::Str, &path, header);
         check_review(ctx, table, &path, header);
@@ -1288,6 +1392,30 @@ fn validate_cells(
              since a Triage pool is keyed by project",
             task_header,
         );
+    }
+
+    // Cells sharing one worktree placeholder share one worktree, which is
+    // initialized once -- so they must agree on the command that does it.
+    for (placeholder, members) in &worktree_groups {
+        let Some((first_idx, first)) = members.first() else {
+            continue;
+        };
+        for (idx, effective) in &members[1..] {
+            if effective != first {
+                let line = ctx.idx.cell_line(task_idx, *idx);
+                ctx.error(
+                    &format!("{task_path}.cell[{idx}]"),
+                    ErrorKind::InvalidValue,
+                    format!(
+                        "cell shares the worktree \"{placeholder}\" with cell {first_idx} but \
+                         resolves a different 'initialization_commands'; cells sharing one \
+                         worktree must use the same command"
+                    ),
+                    line,
+                );
+                break;
+            }
+        }
     }
 
     check_cell_deps(&ids, &dep_edges, arr.len(), task_path, task_idx, ctx);
@@ -7232,5 +7360,60 @@ placement = "copy"
             "expected a wrong-type error for non-string submitter: {:?}",
             r.errors
         );
+    }
+
+    // ── RAL-615: initialization_commands ────────────────────────────────────
+
+    fn init_file(task_extra: &str, cell_extra: &str, default: &str) -> String {
+        format!(
+            "{default}\n[[task]]\nname = \"build\"\n{task_extra}\n[[task.cell]]\ncwd = \"/repo\"\nprompt = \"go\"\n{cell_extra}\n"
+        )
+    }
+
+    #[test]
+    fn initialization_commands_accepts_string_list_and_timeout() {
+        for src in [
+            init_file("initialization_commands = \"npm ci\"", "", ""),
+            init_file(
+                "",
+                "initialization_commands = [\"npm ci\", \"npm run build\"]\ninitialization_timeout_sec = 120",
+                "",
+            ),
+            init_file(
+                "",
+                "",
+                "[[default]]\ninitialization_commands = \"npm ci\"\ninitialization_timeout_sec = 60",
+            ),
+        ] {
+            let r = validate_toml(&src);
+            assert!(r.is_ok(), "expected ok for {src}, got {:?}", r.errors);
+        }
+    }
+
+    #[test]
+    fn initialization_commands_rejects_empty_list_newline_and_bad_timeout() {
+        for src in [
+            init_file("", "initialization_commands = []", ""),
+            init_file("", "initialization_commands = \"a\\nb\"", ""),
+            init_file(
+                "",
+                "initialization_commands = \"npm ci\"\ninitialization_timeout_sec = 0",
+                "",
+            ),
+        ] {
+            let r = validate_toml(&src);
+            assert!(!r.is_ok(), "expected an error for {src}");
+        }
+    }
+
+    #[test]
+    fn empty_string_disables_only_an_inherited_command() {
+        let ok = init_file(
+            "",
+            "initialization_commands = \"\"",
+            "[[default]]\ninitialization_commands = \"npm ci\"",
+        );
+        let r = validate_toml(&ok);
+        assert!(r.is_ok(), "{:?}", r.errors);
     }
 }

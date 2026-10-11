@@ -361,9 +361,88 @@ pub struct ProofView {
     pub appraisal: Option<crate::appraisal::AppraisalView>,
 }
 
+/// How RAL-615's worktree-initialization lookups identify the cells that
+/// share a worktree.
+#[derive(Debug, Clone)]
+pub enum WorktreeSelector {
+    /// The cells' original `<<ralphus:new-worktree/..>>` cwd placeholder
+    /// (before the scheduler has resolved it).
+    Placeholder(String),
+    /// The cells' resolved worktree directory.
+    Cwd(String),
+}
+
+impl WorktreeSelector {
+    fn column_and_value(&self) -> (&'static str, &str) {
+        match self {
+            Self::Placeholder(p) => ("worktree_placeholder", p),
+            Self::Cwd(c) => ("cwd", c),
+        }
+    }
+}
+
+/// One cell sharing an initialized worktree.
+#[derive(Debug, Clone)]
+pub struct StoredInitCell {
+    /// Task index.
+    pub task_idx: i64,
+    /// Cell index within the task.
+    pub idx: i64,
+    /// Cell id.
+    pub cell_id: String,
+    /// Owning task's name.
+    pub task_name: String,
+}
+
+/// A worktree's stored initialization (RAL-615).
+#[derive(Debug, Clone)]
+pub struct StoredInit {
+    /// The commands, in order.
+    pub commands: Vec<String>,
+    /// Timeout for the whole list, seconds.
+    pub timeout_sec: i64,
+    /// `pending`, `ok`, `failed` or `None` (never needed to re-run).
+    pub state: Option<String>,
+    /// Hash of the commands that last succeeded.
+    pub hash: Option<String>,
+    /// `(task_idx, idx)` of the first sharing cell.
+    pub first_cell: (i64, i64),
+    /// Every cell bound to the worktree.
+    pub cells: Vec<StoredInitCell>,
+}
+
+fn default_init_timeout_sec() -> i64 {
+    i64::try_from(crate::config::DEFAULT_INITIALIZATION_TIMEOUT_SEC).unwrap_or(900)
+}
+
+/// A cell's worktree initialization (RAL-615) as shown in the details pane.
+#[derive(Debug, Clone, Serialize)]
+pub struct CellInitView {
+    /// The commands, in order.
+    pub commands: Vec<String>,
+    /// Level that supplied them: `project|squad|task|cell|edited`.
+    pub source: Option<String>,
+    /// Timeout (seconds) covering the whole list.
+    pub timeout_sec: i64,
+    /// `pending`, `ok` or `failed`; `None` before the first run.
+    pub status: Option<String>,
+    /// Wall time of the last run.
+    pub duration_ms: Option<i64>,
+    /// Exit status of the last run (`0`, a code, or `timeout`).
+    pub exit_status: Option<String>,
+    /// Trimmed output of the last run.
+    pub output: Option<String>,
+    /// When the last run finished.
+    pub finished_at_ms: Option<i64>,
+}
+
 /// A cell as shown in the board.
 #[derive(Debug, Clone, Serialize)]
 pub struct CellView {
+    /// RAL-615: worktree initialization commands and last outcome; `None`
+    /// when no command applies to this cell.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_init: Option<CellInitView>,
     /// Cell id (or a generated `cell-N`).
     pub id: String,
     /// Human-readable display name (from `name` in the TOML). `None` when not set;
@@ -4007,6 +4086,25 @@ impl Store {
             // cell's prophecies as their `attempt`, so a re-run's insights
             // supersede the earlier attempt's in reviews and PR bodies.
             "ALTER TABLE cells ADD COLUMN restart_count INTEGER NOT NULL DEFAULT 0",
+            // RAL-615: the worktree initialization commands resolved for this
+            // cell at insert time (JSON array; NULL = none), the level that
+            // supplied them, the timeout covering the whole list, and the
+            // original `<<ralphus:new-worktree/..>>` placeholder (the cwd
+            // column is overwritten by the resolved path, so Retry needs this
+            // to recreate a deleted worktree).
+            "ALTER TABLE cells ADD COLUMN init_commands TEXT",
+            "ALTER TABLE cells ADD COLUMN init_source TEXT",
+            "ALTER TABLE cells ADD COLUMN init_timeout_sec INTEGER",
+            "ALTER TABLE cells ADD COLUMN worktree_placeholder TEXT",
+            // RAL-615: last init outcome -- `pending` (needs a (re-)run),
+            // `ok`, or `failed`; NULL = no command applies. `init_hash` is
+            // the hash of the command list that last succeeded.
+            "ALTER TABLE cells ADD COLUMN init_state TEXT",
+            "ALTER TABLE cells ADD COLUMN init_hash TEXT",
+            "ALTER TABLE cells ADD COLUMN init_duration_ms INTEGER",
+            "ALTER TABLE cells ADD COLUMN init_exit_status TEXT",
+            "ALTER TABLE cells ADD COLUMN init_output TEXT",
+            "ALTER TABLE cells ADD COLUMN init_finished_at_ms INTEGER",
             // RAL-595: whitespace-normalized body a prophecy is deduplicated
             // on. NULL on rows written before this column existed, which a
             // unique index treats as distinct, so old data never conflicts.
@@ -4564,8 +4662,48 @@ impl Store {
                 ],
             )?;
 
+            let project_init = task
+                .project
+                .as_deref()
+                .and_then(|name| Self::get_project_conn(&tx, name).ok().flatten())
+                .map(|p| crate::config::load_worktree_config(std::path::Path::new(&p.path)));
             for (s_idx, cell) in task.cell.iter().enumerate() {
                 let resolved = ResolvedAgent::resolve(task, cell);
+                let init = {
+                    let project_cmds = project_init
+                        .as_ref()
+                        .map(|c| c.initialization_commands.clone());
+                    let mut r = ralphus_core::schema::resolve_initialization(
+                        default_block,
+                        task,
+                        cell,
+                        project_cmds.as_deref(),
+                    )
+                    .map_err(|e| {
+                        StoreError::InvalidTransition(format!(
+                            "task \"{}\" cell {s_idx}: {e}",
+                            task.name
+                        ))
+                    })?;
+                    if r.timeout_sec.is_none() {
+                        r.timeout_sec = project_init
+                            .as_ref()
+                            .and_then(|c| c.initialization_timeout_sec);
+                    }
+                    r
+                };
+                let init_commands_json =
+                    (!init.commands.is_empty()).then(|| to_json(&init.commands));
+                let init_timeout = init
+                    .timeout_sec
+                    .map(|t| i64::try_from(t).unwrap_or(i64::MAX));
+                let init_placeholder = cell
+                    .cwd
+                    .as_deref()
+                    .filter(|c| {
+                        ralphus_core::schema::first_worktree_placeholder_in_text(c).is_some()
+                    })
+                    .map(str::to_string);
                 let sid = cell.id.clone().unwrap_or_else(|| format!("cell-{s_idx}"));
                 // A cell inherits the task's timeout/budget unless it sets its
                 // own. Timeout is stored in seconds; budget in total tokens.
@@ -4613,8 +4751,8 @@ impl Store {
                     (None, None)
                 };
                 tx.execute(
-                    "INSERT INTO cells(squad_id, task_idx, idx, sid, name, cwd, subprojects, prompt, command, agent, model, system_prompt, system_prompt_position, effective_system_prompt, state, depends_on, timeout_sec, budget_tokens, maximum_budget_usd, maximum_context, auto_compact_threshold, maximum_tool_output_tokens, turns, upstream, queue_rank, env_overrides, machine, share_session, maximum_timeout_sec, mode, remediation_attempts, effort, temperature)
-                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO cells(squad_id, task_idx, idx, sid, name, cwd, subprojects, prompt, command, agent, model, system_prompt, system_prompt_position, effective_system_prompt, state, depends_on, timeout_sec, budget_tokens, maximum_budget_usd, maximum_context, auto_compact_threshold, maximum_tool_output_tokens, turns, upstream, queue_rank, env_overrides, machine, share_session, maximum_timeout_sec, mode, remediation_attempts, effort, temperature, init_commands, init_source, init_timeout_sec, worktree_placeholder, init_state)
+                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     params![
                         squad_id,
                         t_idx_i,
@@ -4662,6 +4800,14 @@ impl Store {
                         cell_remediation_attempts,
                         effort,
                         temperature,
+                        init_commands_json,
+                        init.source,
+                        init_timeout,
+                        init_placeholder,
+                        // No init state until the first run records one: a
+                        // reused (not newly created) worktree is not
+                        // re-initialized.
+                        None::<&str>,
                     ],
                 )?;
 
@@ -6115,7 +6261,7 @@ impl Store {
         db_profiles: &HashMap<String, crate::agent_profile_store::AgentProfileView>,
     ) -> Result<HashMap<i64, Vec<CellView>>> {
         let mut stmt = conn.prepare(
-            "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date, machine, detached_at_ms, maximum_context, auto_compact_threshold, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, delayed_until_ms, completed_active_duration_ms, CASE WHEN state='running' THEN active_started_at_ms END, turns, waypoint_halted_at_ms, effort, temperature
+            "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date, machine, detached_at_ms, maximum_context, auto_compact_threshold, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, delayed_until_ms, completed_active_duration_ms, CASE WHEN state='running' THEN active_started_at_ms END, turns, waypoint_halted_at_ms, effort, temperature, init_commands, init_source, init_timeout_sec, init_state, init_duration_ms, init_exit_status, init_output, init_finished_at_ms
              FROM cells WHERE squad_id=? ORDER BY task_idx, idx",
         )?;
         let rows = stmt
@@ -6141,6 +6287,28 @@ impl Store {
                     task_idx,
                     idx,
                     CellView {
+                        worktree_init: {
+                            let commands: Vec<String> = r
+                                .get::<_, Option<String>>(41)?
+                                .map(|j| from_json(&j))
+                                .unwrap_or_default();
+                            if commands.is_empty() {
+                                None
+                            } else {
+                                Some(CellInitView {
+                                    commands,
+                                    source: r.get::<_, Option<String>>(42)?,
+                                    timeout_sec: r
+                                        .get::<_, Option<i64>>(43)?
+                                        .unwrap_or_else(default_init_timeout_sec),
+                                    status: r.get::<_, Option<String>>(44)?,
+                                    duration_ms: r.get::<_, Option<i64>>(45)?,
+                                    exit_status: r.get::<_, Option<String>>(46)?,
+                                    output: r.get::<_, Option<String>>(47)?,
+                                    finished_at_ms: r.get::<_, Option<i64>>(48)?,
+                                })
+                            }
+                        },
                         id: r.get::<_, String>(2)?,
                         name: r.get::<_, Option<String>>(3)?,
                         cwd: r.get::<_, Option<String>>(4)?,
@@ -7119,6 +7287,193 @@ impl Store {
             params![cwd, squad_id, task_idx, idx],
         )?;
         Ok(())
+    }
+
+    /// RAL-615: the worktree initialization stored for the cells of `squad_id`
+    /// that share one worktree, found by `selector`. `None` when none of them
+    /// carries a command. Cells sharing a worktree resolve to the same command
+    /// (the validator rejects anything else), so the first one speaks for all.
+    pub fn worktree_init_for(
+        &self,
+        squad_id: &str,
+        selector: &WorktreeSelector,
+    ) -> Result<Option<StoredInit>> {
+        let (column, value) = selector.column_and_value();
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT c.task_idx, c.idx, c.sid, t.name, c.init_commands, c.init_timeout_sec, c.init_state, c.init_hash
+             FROM cells c JOIN tasks t ON t.squad_id=c.squad_id AND t.idx=c.task_idx
+             WHERE c.squad_id=? AND c.{column}=? AND c.init_commands IS NOT NULL
+             ORDER BY c.task_idx, c.idx"
+        ))?;
+        let rows = stmt
+            .query_map(params![squad_id, value], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, Option<i64>>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                    r.get::<_, Option<String>>(7)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let Some(first) = rows.first() else {
+            return Ok(None);
+        };
+        let commands: Vec<String> = from_json(&first.4);
+        if commands.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(StoredInit {
+            commands,
+            timeout_sec: first.5.unwrap_or_else(default_init_timeout_sec),
+            state: first.6.clone(),
+            hash: first.7.clone(),
+            first_cell: (first.0, first.1),
+            cells: rows
+                .iter()
+                .map(|r| StoredInitCell {
+                    task_idx: r.0,
+                    idx: r.1,
+                    cell_id: r.2.clone(),
+                    task_name: r.3.clone(),
+                })
+                .collect(),
+        }))
+    }
+
+    /// RAL-615: cells of `squad_id` whose worktree needs its initialization
+    /// (re-)run -- the last run failed or the command was edited since.
+    pub fn cells_needing_worktree_init(&self, squad_id: &str) -> Result<HashSet<(i64, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT task_idx, idx FROM cells
+             WHERE squad_id=? AND init_commands IS NOT NULL AND init_state IN ('pending','failed')",
+        )?;
+        let rows = stmt
+            .query_map(params![squad_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<HashSet<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// RAL-615: record the outcome of one initialization run on every cell
+    /// sharing the worktree `selector` names. A success also stores the
+    /// command hash it ran, so a later edit back to the same commands does
+    /// not re-initialize.
+    pub(crate) fn record_worktree_init(
+        &self,
+        squad_id: &str,
+        selector: &WorktreeSelector,
+        outcome: &crate::worktree_init::InitOutcome,
+    ) -> Result<()> {
+        let (column, value) = selector.column_and_value();
+        let state = if outcome.ok { "ok" } else { "failed" };
+        self.conn.execute(
+            &format!(
+                "UPDATE cells SET init_state=?, init_hash=CASE WHEN ? THEN ? ELSE init_hash END,
+                    init_duration_ms=?, init_exit_status=?, init_output=?, init_finished_at_ms=?
+                 WHERE squad_id=? AND {column}=? AND init_commands IS NOT NULL"
+            ),
+            params![
+                state,
+                outcome.ok,
+                outcome.hash,
+                i64::try_from(outcome.duration_ms).unwrap_or(i64::MAX),
+                outcome.exit_status,
+                outcome.output,
+                now_ms(),
+                squad_id,
+                value
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// RAL-615: replace the initialization commands (and optionally timeout)
+    /// of every cell sharing `task_idx`/`idx`'s worktree, marking the source
+    /// `edited`. The worktree is flagged for re-initialization only when the
+    /// new command hash differs from the one that last succeeded. Returns the
+    /// `(task_idx, idx)` of every cell updated.
+    pub fn edit_worktree_init(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        idx: i64,
+        commands: &[String],
+        timeout_sec: Option<i64>,
+    ) -> Result<Vec<(i64, i64)>> {
+        let (placeholder, cwd): (Option<String>, Option<String>) = self.conn.query_row(
+            "SELECT worktree_placeholder, cwd FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
+            params![squad_id, task_idx, idx],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let shared = match (&placeholder, &cwd) {
+            (Some(p), _) => Some(("worktree_placeholder", p.clone())),
+            (None, Some(c)) => Some(("cwd", c.clone())),
+            (None, None) => None,
+        };
+        let targets: Vec<(i64, i64, Option<String>)> = match shared {
+            Some((column, value)) => {
+                let mut stmt = self.conn.prepare(&format!(
+                    "SELECT task_idx, idx, init_hash FROM cells WHERE squad_id=? AND {column}=?"
+                ))?;
+                stmt.query_map(params![squad_id, value], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+            }
+            None => vec![(task_idx, idx, None)],
+        };
+        let new_hash = crate::worktree_init::hash_commands(commands);
+        let json = (!commands.is_empty()).then(|| to_json(commands));
+        let mut updated = Vec::new();
+        for (t, i, last_hash) in targets {
+            let state: Option<&str> = match (&json, last_hash.as_deref()) {
+                (None, _) => None,
+                (Some(_), Some(h)) if h == new_hash => Some("ok"),
+                (Some(_), _) => Some("pending"),
+            };
+            self.conn.execute(
+                "UPDATE cells SET init_commands=?, init_source=?, init_state=?,
+                    init_timeout_sec=COALESCE(?, init_timeout_sec)
+                 WHERE squad_id=? AND task_idx=? AND idx=?",
+                params![
+                    json,
+                    json.as_ref().map(|_| "edited"),
+                    state,
+                    timeout_sec,
+                    squad_id,
+                    t,
+                    i
+                ],
+            )?;
+            updated.push((t, i));
+        }
+        Ok(updated)
+    }
+
+    /// RAL-615: point every cell sharing `task_idx`/`idx`'s worktree back at
+    /// its original placeholder cwd, so the scheduler's next resolution pass
+    /// recreates a worktree whose directory is gone. Cells with no persisted
+    /// placeholder are left alone.
+    pub fn restore_worktree_placeholder(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        idx: i64,
+    ) -> Result<usize> {
+        let cwd: Option<String> = self.conn.query_row(
+            "SELECT cwd FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
+            params![squad_id, task_idx, idx],
+            |r| r.get(0),
+        )?;
+        let Some(cwd) = cwd else { return Ok(0) };
+        Ok(self.conn.execute(
+            "UPDATE cells SET cwd=worktree_placeholder
+             WHERE squad_id=? AND cwd=? AND worktree_placeholder IS NOT NULL",
+            params![squad_id, cwd],
+        )?)
     }
 
     /// Persisted review worktrees, including per-branch and combined paths.

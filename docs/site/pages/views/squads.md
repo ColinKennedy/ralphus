@@ -38,6 +38,12 @@ cell-level proof steps. This is where you'd go to read exactly what an
 agent was asked to do and what it reported back — the same pane a
 `command`-kind cell shows its captured output in.
 
+When a worktree initialization command applies (`initialization_commands`),
+a **Worktree init** row shows the command, where it was inherited from, and
+the last run's status, duration and output. Edit it with ✎ Edit; if it
+failed, fix it and Retry the squad. The commands run with the same trust as
+`[review] auto_build` and should be idempotent.
+
 ## Where task state comes from
 
 A task's state rolls up from its cells and proof steps — it only counts

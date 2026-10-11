@@ -335,7 +335,7 @@ the daemon's hourly Free-tier background sweep
 | `cell set-status <selector> <state>` | Override a cell's status |
 | `cell restart <selector>` | Restart a cell and its downstream |
 | `cell restart-proof <selector> --from <i>` | Restart every cell-level proof step, re-running from the start |
-| `cell edit <selector> [--cwd] [--agent] [--model] [--prompt] [--command] [--system-prompt]` | Edit a cell's fields |
+| `cell edit <selector> [--cwd] [--agent] [--model] [--prompt] [--command] [--system-prompt] [--initialization-commands] [--initialization-timeout-sec]` | Edit a cell's fields |
 | `cell terminal <selector> [--mode open\|readonly]` | Print the `claude --resume` command + cwd (does **not** ask the daemon to spawn a terminal — see below) |
 
 ## proof
