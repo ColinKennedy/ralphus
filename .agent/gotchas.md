@@ -80,3 +80,5 @@ marker for exactly this reason.
 - A permanent creation failure fails only the cells waiting on that worktree
   (via `fail_cell_for_worktree` → `enqueue_cell_failure_mailbox`); other cells
   keep running.
+
+- **`Cancellations::register` hands every concurrent registrant of a key the same token, so a tripped one is inherited (RAL-626).** The waypoint-halt registry is keyed per squad; while any earlier cell worker of that squad is still unwinding, a restarted cell registered into the *already cancelled* token and the runner returned `waypoint_halted` before spawning anything, leaving the cell `running` with no runner. Per-trip signals register with `register_fresh`, which swaps in a new token when the current one has tripped (a squad cancel still wants the shared `register`). Root cause is from code reading, not a live repro. The runner watchdog (`scheduler::runner_watchdog_sweep`, `[runner_watchdog]` config) is the backstop for any other way a `running` cell loses its runner.

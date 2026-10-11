@@ -648,6 +648,40 @@ pub struct CellView {
     /// dispatched.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub waypoint_halted_at_ms: Option<i64>,
+    /// RAL-626: when the runner watchdog first flagged this `running` cell as
+    /// having no live runner and no recent activity (Unix epoch
+    /// milliseconds). `None` while the cell is healthy or the flag was
+    /// cleared. `state` stays `"running"` until the watchdog's second
+    /// threshold fails the cell; the board shows a warning badge meanwhile.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runner_stalled_at_ms: Option<i64>,
+}
+
+/// One `running` cell as the runner watchdog (RAL-626) sees it.
+#[derive(Debug, Clone)]
+pub struct RunningCellProbe {
+    /// Owning squad id.
+    pub squad_id: String,
+    /// Index of the owning task within the squad.
+    pub task_idx: i64,
+    /// Index of the cell within the task.
+    pub idx: i64,
+    /// Owning task name.
+    pub task_name: String,
+    /// Cell id.
+    pub cell_id: String,
+    /// Start of the current running stretch, if recorded.
+    pub active_started_at_ms: Option<i64>,
+    /// First start time, if recorded.
+    pub started_at_ms: Option<i64>,
+    /// Rate-limit wait deadline; set while the cell is delayed.
+    pub delayed_until_ms: Option<i64>,
+    /// Set while the cell is detached for a manual takeover.
+    pub detached_at_ms: Option<i64>,
+    /// Set while a waypoint holds the cell.
+    pub waypoint_halted_at_ms: Option<i64>,
+    /// Set once the watchdog has flagged the cell.
+    pub runner_stalled_at_ms: Option<i64>,
 }
 
 /// A task as shown in the board.
@@ -4110,6 +4144,9 @@ impl Store {
             // unique index treats as distinct, so old data never conflicts.
             "ALTER TABLE prophecies ADD COLUMN body_key TEXT",
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_prophecies_dedupe ON prophecies(entity_uri, attempt, kind, body_key)",
+            // RAL-626: when the runner watchdog flagged this running cell as
+            // having no live runner -- see `CellView::runner_stalled_at_ms`.
+            "ALTER TABLE cells ADD COLUMN runner_stalled_at_ms INTEGER",
             // RAL-400: `1` when this affected entry was auto-enrolled by the
             // daemon (submit-time scope overlap, or the survey sweep's own
             // discovery) rather than declared explicitly by a human/agent.
@@ -6261,7 +6298,7 @@ impl Store {
         db_profiles: &HashMap<String, crate::agent_profile_store::AgentProfileView>,
     ) -> Result<HashMap<i64, Vec<CellView>>> {
         let mut stmt = conn.prepare(
-            "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date, machine, detached_at_ms, maximum_context, auto_compact_threshold, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, delayed_until_ms, completed_active_duration_ms, CASE WHEN state='running' THEN active_started_at_ms END, turns, waypoint_halted_at_ms, effort, temperature, init_commands, init_source, init_timeout_sec, init_state, init_duration_ms, init_exit_status, init_output, init_finished_at_ms
+            "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date, machine, detached_at_ms, maximum_context, auto_compact_threshold, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, delayed_until_ms, completed_active_duration_ms, CASE WHEN state='running' THEN active_started_at_ms END, turns, waypoint_halted_at_ms, runner_stalled_at_ms, effort, temperature, init_commands, init_source, init_timeout_sec, init_state, init_duration_ms, init_exit_status, init_output, init_finished_at_ms
              FROM cells WHERE squad_id=? ORDER BY task_idx, idx",
         )?;
         let rows = stmt
@@ -6355,8 +6392,9 @@ impl Store {
                         delayed_until_ms: r.get::<_, Option<i64>>(34)?,
                         turns: r.get::<_, Option<i64>>(37)?,
                         waypoint_halted_at_ms: r.get::<_, Option<i64>>(38)?,
-                        effort: r.get::<_, Option<String>>(39)?,
-                        temperature: r.get::<_, Option<f64>>(40)?,
+                        runner_stalled_at_ms: r.get::<_, Option<i64>>(39)?,
+                        effort: r.get::<_, Option<String>>(40)?,
+                        temperature: r.get::<_, Option<f64>>(41)?,
                     },
                 ))
             })?
@@ -11578,6 +11616,83 @@ impl Store {
         self.conn.execute(
             "UPDATE cells SET waypoint_halted_at_ms=? WHERE squad_id=? AND task_idx=? AND idx=?",
             params![now_ms(), squad_id, task_idx, idx],
+        )?;
+        Ok(())
+    }
+
+    /// Every `running` cell, with the fields the runner watchdog (RAL-626)
+    /// needs to decide whether it has a runner behind it.
+    ///
+    /// # Errors
+    /// Propagates any SQLite error.
+    pub fn running_cells_for_watchdog(&self) -> Result<Vec<RunningCellProbe>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.squad_id, c.task_idx, c.idx, t.name, c.sid,
+                    c.active_started_at_ms, c.started_at_ms, c.delayed_until_ms,
+                    c.detached_at_ms, c.waypoint_halted_at_ms, c.runner_stalled_at_ms
+             FROM cells c
+             JOIN tasks t ON t.squad_id = c.squad_id AND t.idx = c.task_idx
+             WHERE c.state='running'",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(RunningCellProbe {
+                    squad_id: r.get(0)?,
+                    task_idx: r.get(1)?,
+                    idx: r.get(2)?,
+                    task_name: r.get(3)?,
+                    cell_id: r.get(4)?,
+                    active_started_at_ms: r.get(5)?,
+                    started_at_ms: r.get(6)?,
+                    delayed_until_ms: r.get(7)?,
+                    detached_at_ms: r.get(8)?,
+                    waypoint_halted_at_ms: r.get(9)?,
+                    runner_stalled_at_ms: r.get(10)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// The latest Cartographer row timestamp (Unix ms) for one cell, or `None`
+    /// when nothing was ever logged against it (RAL-626 watchdog).
+    ///
+    /// # Errors
+    /// Propagates any SQLite error.
+    pub fn last_cell_cartographer_activity_ms(
+        &self,
+        squad_id: &str,
+        cell_id: &str,
+    ) -> Result<Option<i64>> {
+        Ok(self.conn.query_row(
+            "SELECT MAX(at_ms) FROM cartographer_events WHERE squad_id=? AND cell_id=?",
+            params![squad_id, cell_id],
+            |r| r.get::<_, Option<i64>>(0),
+        )?)
+    }
+
+    /// Flags a running cell as having no live runner (RAL-626). Keeps the
+    /// first flag time if one is already set.
+    ///
+    /// # Errors
+    /// Propagates any SQLite error.
+    pub fn mark_cell_runner_stalled(&self, squad_id: &str, task_idx: i64, idx: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE cells SET runner_stalled_at_ms=COALESCE(runner_stalled_at_ms, ?)
+             WHERE squad_id=? AND task_idx=? AND idx=?",
+            params![now_ms(), squad_id, task_idx, idx],
+        )?;
+        Ok(())
+    }
+
+    /// Clears the runner-stalled flag (RAL-626).
+    ///
+    /// # Errors
+    /// Propagates any SQLite error.
+    pub fn clear_cell_runner_stalled(&self, squad_id: &str, task_idx: i64, idx: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE cells SET runner_stalled_at_ms=NULL WHERE squad_id=? AND task_idx=? AND idx=?",
+            params![squad_id, task_idx, idx],
         )?;
         Ok(())
     }

@@ -172,6 +172,25 @@ impl Drop for SurveyClaim {
     }
 }
 
+/// Proof that a cell's runner is executing in this process (RAL-626). Dropping
+/// it -- on every return path, including a panic -- ends the registration.
+pub struct LiveRunnerGuard {
+    memory: std::sync::Arc<StoreMemory>,
+    key: String,
+}
+
+impl Drop for LiveRunnerGuard {
+    fn drop(&mut self) {
+        let mut live = self.memory.live_runners.lock();
+        if let Some(n) = live.get_mut(&self.key) {
+            *n -= 1;
+            if *n == 0 {
+                live.remove(&self.key);
+            }
+        }
+    }
+}
+
 /// One `Store`'s non-database state. Cloning the `Arc` is cheap and touches no
 /// lock, so a caller can hold a handle to this without holding the store.
 #[derive(Default)]
@@ -210,12 +229,45 @@ pub struct StoreMemory {
     /// RAL-400: waypoint survey in-flight set and edit generations, see
     /// [`SurveyState`]. Independent of every other group here.
     survey: Mutex<SurveyState>,
+    /// RAL-626: cells whose runner is executing in this process right now,
+    /// keyed by [`StoreMemory::cell_diff_key`], with a registration count.
+    /// Deliberately independent of tmux liveness: a cell with a `running` row
+    /// and no entry here has no runner behind it. Independent of every other
+    /// group.
+    live_runners: Mutex<HashMap<String, usize>>,
 }
 
 impl StoreMemory {
     #[must_use]
     pub fn new() -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self::default())
+    }
+
+    // ---- live runner registry (RAL-626) ----
+
+    /// Register a cell as having a live in-process runner until the returned
+    /// guard drops.
+    #[must_use]
+    pub fn register_live_runner(
+        self: &std::sync::Arc<Self>,
+        squad_id: &str,
+        task: &str,
+        cell_id: &str,
+    ) -> LiveRunnerGuard {
+        let key = Self::cell_diff_key(squad_id, task, cell_id);
+        *self.live_runners.lock().entry(key.clone()).or_insert(0) += 1;
+        LiveRunnerGuard {
+            memory: std::sync::Arc::clone(self),
+            key,
+        }
+    }
+
+    /// Whether a runner for this cell is executing in this process.
+    #[must_use]
+    pub fn has_live_runner(&self, squad_id: &str, task: &str, cell_id: &str) -> bool {
+        self.live_runners
+            .lock()
+            .contains_key(&Self::cell_diff_key(squad_id, task, cell_id))
     }
 
     // ---- waypoint survey guard ----
@@ -993,5 +1045,23 @@ mod tests {
             1,
             "resetting one review's strikes reset a different review's key too"
         );
+    }
+}
+
+#[cfg(test)]
+mod live_runner_tests {
+    use super::*;
+
+    #[test]
+    fn live_runner_registration_ends_when_the_guard_drops() {
+        let memory = std::sync::Arc::new(StoreMemory::default());
+        assert!(!memory.has_live_runner("s", "t", "c"));
+        let first = memory.register_live_runner("s", "t", "c");
+        let second = memory.register_live_runner("s", "t", "c");
+        assert!(memory.has_live_runner("s", "t", "c"));
+        drop(first);
+        assert!(memory.has_live_runner("s", "t", "c"));
+        drop(second);
+        assert!(!memory.has_live_runner("s", "t", "c"));
     }
 }
