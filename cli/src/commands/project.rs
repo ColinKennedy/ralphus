@@ -682,7 +682,14 @@ fn render_review_settings(payload: &Value) {
             .map_or("(unbounded)".to_string(), |v| v.to_string())
     );
     row_str("proof scope:", "default_proof_scope");
-    row_str("ci deferral:", "default_ci_deferral");
+    println!(
+        "  {:<26} {:<24} (effective: {})",
+        "ci deferral:",
+        opt_str(&settings["default_ci_deferral"])
+            .as_deref()
+            .unwrap_or("(inherited)"),
+        effective["ci_deferral"].as_str().unwrap_or_default()
+    );
     row_bool("skip auto-clean:", "verify_skip_auto_clean");
     row_bool("skip worktrees:", "skip_worktrees");
     row_bool("skip base updates:", "skip_base_updates");

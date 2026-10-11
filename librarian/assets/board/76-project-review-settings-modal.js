@@ -413,6 +413,7 @@
             ${proofScopeSection}
             <h3 class="section">CI</h3>
             ${renderCiDeferralFieldsHtml(draft.ciDeferral, "onProjectEditCiDeferral", `(inherit: ${esc(draft.effective.ci_deferral || "every")})`)}
+            <div class="k" style="margin-top:4px" data-tip="Unlike the other defaults in this modal, this one is not limited to future reviews: on Save, every existing review in this project that has no CI setting of its own is re-labelled on the forge straight away. A review that sets its own value is left alone.">Also re-labels the open PRs/MRs of existing reviews that have no CI setting of their own.</div>
             <h3 class="section">review workspace</h3>
             <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:6px" data-tip="Build the entire branch stack in one shared worktree instead of isolated per-branch worktrees, for a future review that declares no explicit skip_worktrees of its own.">
               <input type="checkbox" ${draft.skipWorktrees ? "checked" : ""} onchange="onProjectEditSkipWorktrees(this.checked)">skip per-branch worktrees</label>
