@@ -111,7 +111,7 @@ waypoint hold is a separate, automatic mechanism.
 project's `.ralphus.toml` `[worktree]` table name command(s) that run **once**
 in each freshly created cell worktree, after `git worktree add` and upstream
 setup and before any cell uses it. A list runs in order and stops at the first
-failure; the timeout covers the whole list (default 900s). An empty list or a
+failure; the timeout covers the whole list. When no cell/task/`[[default]]` value sets it, the timeout comes from the project's database field, then `.ralphus.toml`/global `[worktree]`, then `[daemon] initialization_timeout_sec`, then 900s. An empty list or a
 newline inside a command is invalid. `""` disables an inherited value and is an
 error when nothing is inherited.
 

@@ -1592,9 +1592,34 @@ pub struct DaemonConfig {
     /// from creating an exporter.
     #[serde(default)]
     pub opentelemetry: Option<bool>,
+    /// Daemon-wide timeout (seconds) for a worktree's initialization commands
+    /// (RAL-615), used when no cell/task/`[[default]]` value, project database
+    /// value or `[worktree]` value sets one. A non-positive value is treated as
+    /// unset.
+    #[serde(default)]
+    pub initialization_timeout_sec: Option<i64>,
 }
 
 impl DaemonConfig {
+    /// The daemon-option initialization timeout, `None` when unset or not
+    /// positive (callers then fall back to
+    /// [`DEFAULT_INITIALIZATION_TIMEOUT_SEC`]).
+    #[must_use]
+    pub fn initialization_timeout_sec(&self) -> Option<u64> {
+        match self.initialization_timeout_sec {
+            Some(n) if n > 0 => u64::try_from(n).ok(),
+            Some(n) => {
+                warn_config_fallback(
+                    "daemon.initialization_timeout_sec",
+                    &n.to_string(),
+                    &format!("default {DEFAULT_INITIALIZATION_TIMEOUT_SEC}"),
+                );
+                None
+            }
+            None => None,
+        }
+    }
+
     /// Parsed `(start, end)` down-time windows. An entry whose `start`/`end`
     /// doesn't parse as `"HH:MM"` is silently dropped — one bad window must
     /// not block scheduling entirely, matching the "malformed config never
@@ -3085,6 +3110,9 @@ fn merge_daemon_config(base: DaemonConfig, over: DaemonConfig) -> DaemonConfig {
         default_user_is_admin: over.default_user_is_admin.or(base.default_user_is_admin),
         max_concurrent: over.max_concurrent.or(base.max_concurrent),
         opentelemetry: over.opentelemetry.or(base.opentelemetry),
+        initialization_timeout_sec: over
+            .initialization_timeout_sec
+            .or(base.initialization_timeout_sec),
     }
 }
 
