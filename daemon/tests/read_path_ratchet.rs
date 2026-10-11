@@ -74,6 +74,8 @@ const MAINTENANCE_WORKERS_OFF_THE_LOCK: &[(&str, &str)] = &[
     // The survey sweep scores every live squad and review per open waypoint;
     // on the writer lock that held the store for 8.9s.
     ("src/waypoints.rs", "run_pending_surveys"),
+    // Resolved at the start of every review merge and git operation batch.
+    ("src/workspace.rs", "for_guardian"),
 ];
 
 fn source(relative: &str) -> String {
