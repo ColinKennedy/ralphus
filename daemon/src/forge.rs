@@ -2027,6 +2027,105 @@ impl ForgeClient {
         }
     }
 
+    /// Add (`present = true`) or remove (`present = false`) one label on an
+    /// open PR/MR. Idempotent in both directions: adding a label already on
+    /// the PR/MR and removing one that is not both succeed, so a reconcile pass
+    /// can set the desired end state without first reading the current labels.
+    /// Both forges create a missing label on first add. Logs the outbound call
+    /// (start/done/error) via `rlog!`.
+    pub fn set_pull_request_label(
+        &self,
+        number: i64,
+        label: &str,
+        present: bool,
+    ) -> Result<(), String> {
+        let verb = if present { "add" } else { "remove" };
+        // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+        crate::rlog!(
+            INFO,
+            "ralphus [forge] {verb} pr label start kind={} repo={} number={number} label={label}",
+            self.kind.as_str(),
+            self.repo_path
+        );
+        let result = self.set_pull_request_label_inner(number, label, present);
+        match &result {
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+            Ok(()) => crate::rlog!(
+                INFO,
+                "ralphus [forge] {verb} pr label done kind={} repo={} number={number} label={label}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+            Err(e) => crate::rlog!(
+                ERROR,
+                "ralphus [forge] {verb} pr label failed kind={} repo={} number={number} label={label}: {e}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+        }
+        result
+    }
+
+    fn set_pull_request_label_inner(
+        &self,
+        number: i64,
+        label: &str,
+        present: bool,
+    ) -> Result<(), String> {
+        let token = self.require_token()?;
+        match (self.kind, present) {
+            // A PR is an issue for labelling purposes on GitHub.
+            (ForgeKind::GitHub, true) => {
+                let url = format!(
+                    "{}/repos/{}/issues/{number}/labels",
+                    self.api_base, self.repo_path
+                );
+                let payload = serde_json::json!({ "labels": [label] });
+                self.send(
+                    http_agent()
+                        .post(&url)
+                        .set("Authorization", &format!("Bearer {token}"))
+                        .set("Accept", "application/vnd.github+json"),
+                    &payload,
+                )?;
+                Ok(())
+            }
+            (ForgeKind::GitHub, false) => {
+                let url = format!(
+                    "{}/repos/{}/issues/{number}/labels/{}",
+                    self.api_base,
+                    self.repo_path,
+                    encode_path_segment(label)
+                );
+                match http_agent()
+                    .delete(&url)
+                    .set("Authorization", &format!("Bearer {token}"))
+                    .set("Accept", "application/vnd.github+json")
+                    .call()
+                {
+                    // 404: the label is not on the PR, which is the state asked for.
+                    Ok(_) | Err(ureq::Error::Status(404, _)) => Ok(()),
+                    Err(e) => Err(self.describe_evicting(e).into()),
+                }
+            }
+            (ForgeKind::GitLab, present) => {
+                let url = format!(
+                    "{}/projects/{}/merge_requests/{number}",
+                    self.api_base, self.repo_path
+                );
+                let field = if present {
+                    "add_labels"
+                } else {
+                    "remove_labels"
+                };
+                let payload = serde_json::json!({ field: label });
+                self.send(http_agent().put(&url).set("PRIVATE-TOKEN", token), &payload)?;
+                Ok(())
+            }
+        }
+    }
+
     /// Register an ordered (bottom-to-top) list of already-created PR numbers
     /// as a GitHub-native PR stack
     /// (`POST /repos/{owner}/{repo}/stacks`, see
@@ -2709,6 +2808,20 @@ impl ForgeClient {
         }
         error
     }
+}
+
+/// Percent-encode one URL path segment (everything but RFC 3986 unreserved
+/// characters), so a label such as `ralphus:defer-full-ci` is a single segment.
+fn encode_path_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 /// A forge API error (RAL-366): carries the HTTP status and `Retry-After`
@@ -5133,6 +5246,137 @@ mod tests {
         );
         let err = client.update_pull_request_base(1, "main").unwrap_err();
         assert!(err.contains("RALPHUS_GITHUB_TOKEN"), "{err}");
+    }
+
+    /// A mock forge that serves one request, asserting its method and URL
+    /// (and, when given, that the body contains `body_has`), and answers
+    /// `status`.
+    fn label_mock(
+        method: tiny_http::Method,
+        url: &'static str,
+        body_has: Option<&'static str>,
+        status: u16,
+    ) -> MockForge {
+        MockForge::start(move |server| {
+            let mut req = server.recv();
+            assert_eq!(req.method(), &method);
+            assert_eq!(req.url(), url);
+            if let Some(needle) = body_has {
+                let mut body = String::new();
+                std::io::Read::read_to_string(req.as_reader(), &mut body).unwrap();
+                assert!(body.contains(needle), "body {body:?} lacks {needle:?}");
+            }
+            req.respond(tiny_http::Response::from_string("{}").with_status_code(status))
+                .unwrap();
+        })
+    }
+
+    #[test]
+    fn set_label_adds_on_github_via_the_issues_endpoint() {
+        let mock = label_mock(
+            tiny_http::Method::Post,
+            "/repos/acme/widget/issues/7/labels",
+            Some("ralphus:defer-full-ci"),
+            200,
+        );
+        mock.client(ForgeKind::GitHub, "acme/widget")
+            .set_pull_request_label(7, "ralphus:defer-full-ci", true)
+            .unwrap();
+        mock.finish();
+    }
+
+    #[test]
+    fn set_label_removes_on_github_with_an_encoded_segment() {
+        let mock = label_mock(
+            tiny_http::Method::Delete,
+            "/repos/acme/widget/issues/7/labels/ralphus%3Adefer-full-ci",
+            None,
+            200,
+        );
+        mock.client(ForgeKind::GitHub, "acme/widget")
+            .set_pull_request_label(7, "ralphus:defer-full-ci", false)
+            .unwrap();
+        mock.finish();
+    }
+
+    #[test]
+    fn set_label_remove_on_github_treats_404_as_already_absent() {
+        let mock = label_mock(
+            tiny_http::Method::Delete,
+            "/repos/acme/widget/issues/7/labels/x",
+            None,
+            404,
+        );
+        mock.client(ForgeKind::GitHub, "acme/widget")
+            .set_pull_request_label(7, "x", false)
+            .unwrap();
+        mock.finish();
+    }
+
+    #[test]
+    fn set_label_remove_on_github_surfaces_other_errors() {
+        let mock = label_mock(
+            tiny_http::Method::Delete,
+            "/repos/acme/widget/issues/7/labels/x",
+            None,
+            403,
+        );
+        let err = mock
+            .client(ForgeKind::GitHub, "acme/widget")
+            .set_pull_request_label(7, "x", false)
+            .unwrap_err();
+        assert!(err.contains("403"), "{err}");
+        mock.finish();
+    }
+
+    #[test]
+    fn set_label_adds_on_gitlab_via_add_labels() {
+        let mock = label_mock(
+            tiny_http::Method::Put,
+            "/projects/group%2Fproj/merge_requests/9",
+            Some(r#""add_labels":"ralphus:defer-full-ci""#),
+            200,
+        );
+        mock.client(ForgeKind::GitLab, "group%2Fproj")
+            .set_pull_request_label(9, "ralphus:defer-full-ci", true)
+            .unwrap();
+        mock.finish();
+    }
+
+    #[test]
+    fn set_label_removes_on_gitlab_via_remove_labels() {
+        let mock = label_mock(
+            tiny_http::Method::Put,
+            "/projects/group%2Fproj/merge_requests/9",
+            Some(r#""remove_labels":"ralphus:defer-full-ci""#),
+            200,
+        );
+        mock.client(ForgeKind::GitLab, "group%2Fproj")
+            .set_pull_request_label(9, "ralphus:defer-full-ci", false)
+            .unwrap();
+        mock.finish();
+    }
+
+    #[test]
+    fn set_label_requires_token() {
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            "https://gitlab.com/api/v4".to_string(),
+            "group%2Fproj".to_string(),
+            None,
+        );
+        let err = client.set_pull_request_label(1, "x", true).unwrap_err();
+        assert!(err.contains("RALPHUS_GITLAB_TOKEN"), "{err}");
+    }
+
+    #[test]
+    fn encode_path_segment_escapes_everything_but_unreserved() {
+        assert_eq!(
+            encode_path_segment("ralphus:defer-full-ci"),
+            "ralphus%3Adefer-full-ci"
+        );
+        assert_eq!(encode_path_segment("a b/c"), "a%20b%2Fc");
+        assert_eq!(encode_path_segment("A-z_0.9~"), "A-z_0.9~");
     }
 
     #[test]
