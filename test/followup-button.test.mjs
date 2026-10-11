@@ -136,7 +136,7 @@ test("an accepted card drops Accept and shows the squad link or an Accepted chip
   const base = { prophecy_id: 7, entity_uri: "cell:squad-1:0:0", body: "x", ignored: false };
   const waiting = list("g1", { ...summary({ count: 1, total: 1 }), items: [{ ...base, accepted: true }] });
   assert.doesNotMatch(waiting, /data-click="acceptFollowup"/);
-  assert.match(waiting, />Accepted</);
+  assert.match(waiting, /<button class="btn fu-btn" disabled [^>]*>Accepted<\/button>/);
 
   const made = list("g1", {
     ...summary({ offered: true, enabled: false, count: 1, total: 1 }),
@@ -145,4 +145,6 @@ test("an accepted card drops Accept and shows the squad link or an Accepted chip
   });
   assert.doesNotMatch(made, /data-click="acceptFollowup"/);
   assert.match(made, /data-squad-id="squad-9"/);
+  assert.match(made, /<button class="btn fu-btn" disabled [^>]*>Accepted<\/button>/);
+  assert.doesNotMatch(made, /Accepted<\/button>.*data-click="acceptFollowup"/);
 });

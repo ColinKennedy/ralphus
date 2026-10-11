@@ -1851,8 +1851,13 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         const acceptBtn = (frozen && offerStatus !== "offered") || it.accepted
           ? ""
           : `<button class="btn primary fu-btn" data-click="acceptFollowup" data-guardian-id="${esc(gid)}" data-prophecy-id="${it.prophecy_id}" data-tip="Pressing this will create a follow-up Task that completes this offer.${frozen ? "" : "\nThe review has not merged yet, so it is created the moment the review merges."}">Accept</button>`;
-        const acceptedChip = it.accepted && !it.squad_id
-          ? `<span class="fu-status" data-tip="${frozen ? "Accepted: the follow-up squad is being created." : "Accepted: the follow-up Task is created the moment this review merges.\nIgnoring the note withdraws the acceptance."}">Accepted</span>`
+        const acceptedTip = it.squad_id
+          ? "Already accepted: the follow-up squad linked on this card was created from this note."
+          : frozen
+            ? "Already accepted: the follow-up squad is being created."
+            : "Already accepted: the follow-up Task is created the moment this review merges.\nIgnoring the note withdraws the acceptance.";
+        const acceptedChip = it.accepted
+          ? `<button class="btn fu-btn" disabled data-tip="${esc(acceptedTip)}">Accepted</button>`
           : "";
         const action = frozen
           ? `${acceptedChip}${acceptBtn}${it.ignored && !it.accepted ? `<span class="fu-status off" data-tip="This note was left out of the offer made when the review merged.">Ignored</span>` : ""}`
