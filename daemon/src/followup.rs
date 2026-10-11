@@ -852,11 +852,12 @@ pub fn attach_inherited_proofs(draft: &str, inherited: &[InheritedProofs]) -> St
             let Some(task) = task.as_table_mut() else {
                 continue;
             };
-            if !proofs.cell.is_empty()
-                && let Some(toml::Value::Array(cells)) = task.get_mut("cell")
-                && let Some(cell) = cells.first_mut().and_then(toml::Value::as_table_mut)
-            {
-                cell.insert("proof".into(), table_array(&proofs.cell));
+            if !proofs.cell.is_empty() {
+                if let Some(toml::Value::Array(cells)) = task.get_mut("cell") {
+                    if let Some(cell) = cells.first_mut().and_then(toml::Value::as_table_mut) {
+                        cell.insert("proof".into(), table_array(&proofs.cell));
+                    }
+                }
             }
             if !proofs.task.is_empty() {
                 task.insert("proof".into(), table_array(&proofs.task));
@@ -932,10 +933,10 @@ impl Store {
             ("task", -1, &mut out.task),
         ] {
             for proof in self.stored_proofs(squad_id, task_idx, scope, idx)? {
-                if let Some(step) = inherited_proof_table(&proof, &cell_agent)
-                    && !target.contains(&step)
-                {
-                    target.push(step);
+                if let Some(step) = inherited_proof_table(&proof, &cell_agent) {
+                    if !target.contains(&step) {
+                        target.push(step);
+                    }
                 }
             }
         }
@@ -978,6 +979,17 @@ impl Store {
                 "ralphus [followup] could not read the proofs of {}: {e}",
                 out.source
             );
+            crate::cartographer::Note::new("followup")
+                .scope("followup")
+                .guardian(guardian_id)
+                .emit(
+                    self,
+                    format!(
+                        "review {guardian_id}: could not read the proofs of {} for a follow-up",
+                        out.source
+                    ),
+                    serde_json::json!({"source": out.source, "error": e.to_string()}),
+                );
             return InheritedProofs::default();
         }
         crate::rlog!(
@@ -988,6 +1000,26 @@ impl Store {
             out.task.len(),
             out.source
         );
+        crate::cartographer::Note::new("followup")
+            .scope("followup")
+            .guardian(guardian_id)
+            .emit(
+                self,
+                format!(
+                    "review {guardian_id}: follow-up for {} inherits {} cell proof(s) and {} task \
+                     proof(s) from {}",
+                    item.entity_uri,
+                    out.cell.len(),
+                    out.task.len(),
+                    out.source
+                ),
+                serde_json::json!({
+                    "entity_uri": item.entity_uri,
+                    "cell_proofs": out.cell.len(),
+                    "task_proofs": out.task.len(),
+                    "source": out.source,
+                }),
+            );
         out
     }
 
