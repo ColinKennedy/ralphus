@@ -259,7 +259,7 @@ pub fn run_cell(spec: &CellSpec, keep_temporary_files: bool) -> CellResult {
 }
 
 fn run_command(workspace: &Workspace, command: &str, timeout_sec: Option<u64>) -> CellResult {
-    match workspace.run_bash(command, timeout_sec) {
+    match workspace.run_bash_live(command, timeout_sec) {
         Ok(out) if out.ok() => {
             let mut result = CellResult::done(tail(&out.stdout, COMMAND_TAIL_CHARS));
             // A command-mode cell has no agent to reason about a waypoint, so
