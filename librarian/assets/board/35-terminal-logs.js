@@ -69,128 +69,6 @@
         if (info.text) el.setAttribute("data-tip", info.tip);
         else el.removeAttribute("data-tip");
       }
-      // Renders the expandable box itself (empty string when collapsed) —
-      // call right after the button row that includes a matching togglePeek().
-      /**
-       * Renders the expandable live-pane peek box for a given key, or an
-       * empty string when collapsed.
-       * @param {string} key
-       * @param {number|null} [startedAtMs] - RAL-210/RAL-259: the most recent
-       *   start time (epoch ms, local time) of the agent this peek shows —
-       *   a task cell's run, a review branch's conflict-resolver/final-proof
-       *   cell, or a review's manual-checks generation pass. Shown in the
-       *   header when given.
-       * @param {number|null} [detachedAtMs] - RAL-288: set only for a task
-       *   cell that is cleanly detached (see `detachedBadge`) rather than
-       *   genuinely done/failed/cancelled — swaps the "cell ended" wording
-       *   below for one that doesn't misread as stuck/stalled.
-       * @param {number|null} [endedAtMs] - the most recent finish time (epoch
-       *   ms, local time) of the same agent `startedAtMs` describes. Shown in
-       *   the header next to "started" once the box is a historical record
-       *   (`peekEnded[key]`) — without it, "cell ended" gave no indication of
-       *   when.
-       * @param {boolean} [thinkingCapable] - RAL-516: whether the agent this
-       *   pane shows can emit thinking output at all (backend capability
-       *   folded with any per-profile override, computed server-side —
-       *   see `agent_profiles::thinking_capable_for_agent`). Defaults to
-       *   `true` (fail open) when omitted; the "Show Thinking" checkbox is
-       *   hidden entirely when this is `false`, since there is nothing for
-       *   it to fold/unfold.
-       * @returns {string}
-       */
-      function peekBox(key, startedAtMs, detachedAtMs, endedAtMs, thinkingCapable) {
-        if (!peekOpen[key]) return "";
-        // Reuse the last-fetched content (if any) instead of always starting from
-        // "Loading…" — the details pane fully re-renders on every pushed event
-        // (unrelated state changes elsewhere on the squad), and resetting this
-        // box's height/text each time produced a visible flash/layout-jump even
-        // though nothing about the terminal itself had changed (RAL-102 follow-up).
-        const cached = peekContent[key];
-        const cssKey = peekCssKey(key);
-        // Confirmed-ended (not just a single missed poll — see
-        // PEEK_MISSING_STRIKE_LIMIT/fetchPeek) shows as a distinct read-only
-        // historical record rather than the live auto-refreshing view, per
-        // docs/colors.md's "read-only field indicator" convention: --muted,
-        // never the caution-reserved --ignored or --danger/--failed.
-        const ended = !!peekEnded[key];
-        const detached = ended && !!detachedAtMs;
-        const headLabel = detached
-          ? "Historical record (read-only) — cell detached"
-          : ended
-            ? "Historical record (read-only) — cell ended"
-            : "Live terminal (read-only)";
-        const headTip = detached
-          ? "This tmux cell was cleanly stopped so a real interactive agent session could take over — not a hang. What's shown is the daemon's persisted record of the stopped process's last captured output, not live output; the live conversation now continues in a separate terminal outside this board.\nRead-only — there was never anything to send to here.\nUse 'Open Agent' to reattach a terminal to that live session, or 'Resume Automation' once done with it — this box switches back to auto-refreshing live output within a poll tick or two once headless execution resumes."
-          : ended
-            ? "This tmux cell has ended. What's shown is the daemon's persisted record of the pane's last captured output, not live output.\nRead-only — there was never anything to send to here.\nIf a new terminal comes up for this same step — the agent reattaching, or you restarting the cell or proof step — this box switches back to auto-refreshing live output within a poll tick or two on its own. You never need to navigate away and back."
-            : "Live output from the agent's tmux pane.\nAuto-refreshes every 2 seconds. Read-only — nothing typed here reaches the agent.\nSwitches to a read-only historical record once the underlying tmux cell ends.";
-        // RAL-170: last-activity label, seeded from cached state (if any) so
-        // it doesn't blank out on every full re-render -- fetchPeek patches
-        // it in place afterward via updatePeekActivityLabel.
-        const activity = peekActivityInfo(peekLastActivity[key], ended);
-        const activityHtml = activity.text
-          ? `<span id="peek-activity-${cssKey}" class="peek-activity${activity.stale ? ' stale' : ''}" data-tip="${activity.tip}">${activity.text}</span>`
-          : `<span id="peek-activity-${cssKey}" class="peek-activity"></span>`;
-        // RAL-210: cell start time, when the caller has one to show.
-        // Re-derived from the (freshly re-rendered) cell data on every
-        // call, so a restart's new started_at_ms shows up immediately.
-        const startedHtml = startedAtMs
-          ? `<span class="peek-activity" data-tip="When this step (cell, conflict resolver, or manual-checks generation) most recently started running.\nUpdates to a new time if it is restarted.\nExact time: ${fmtActivityTime(startedAtMs)}.">started ${fmtActivityTime(startedAtMs)}</span>`
-          : "";
-        // The end-time counterpart to startedHtml — only meaningful once this
-        // box is a historical record (`ended`); a still-running step has no
-        // finish time yet even if a stale one is passed in from a prior run.
-        const endedHtml = ended && endedAtMs
-          ? `<span class="peek-activity" data-tip="When this step (cell, conflict resolver, or manual-checks generation) most recently finished running.\nExact time: ${fmtActivityTime(endedAtMs)}.">ended ${fmtActivityTime(endedAtMs)}</span>`
-          : "";
-        // RAL-397 Phase 2G-A: the Live View renders the transcript tape run
-        // through the ANSI-strip/classify pipeline; `peekContent[key]` already
-        // holds that rendered text, so it's shown verbatim here. "Show Debug
-        // Messages" flips whether the tape's own inline RALPHUS_EVENT telemetry
-        // lines are rendered in place or dropped -- no separate stream, no
-        // prepended block (that richer Cartographer stream returns in 2G-B).
-        const showDebug = peekShowsDebug(key);
-        // RAL-434: the thinking counterpart. The runner tags each reasoning
-        // line into the tape rather than dropping it, so this folds and
-        // unfolds the same loaded window -- nothing is refetched, and nothing
-        // was discarded at capture time to begin with.
-        const showThinking = peekShowsThinking(key);
-        const canThink = thinkingCapable !== false;
-        const shown = cached;
-        // RAL-428: admins get a two-tab live viewer — the transcript-tape
-        // terminal (default; the Show Debug Messages toggle, jump button and
-        // tape scroll/keydown handlers are all the *terminal* tab's) and the
-        // step's exact system prompt. Non-admins get byte-identical
-        // single-tab markup to what this box always produced. The prompt tab
-        // only ever renders for admins: `peekTab` is per-key session state,
-        // so a demoted admin's stale "prompt" choice ALSO falls back to the
-        // terminal tab.
-        const promptTab = currentUserIsAdmin && peekTab[key] === "prompt";
-        const debugToggleHtml = promptTab ? "" : `<label class="peek-debug-toggle" data-tip="Show ralphus's own diagnostic/telemetry events (session lifecycle, token/cost RALPHUS_EVENT markers) inline, right where they occurred in the terminal output.\nOff by default so routine monitoring only shows what the agent did; the default can be changed globally via the ralphus config file's [live_view] table.\nThis only changes what's rendered here -- the daemon's own logs always keep everything.\nA 'live usage' line's token/cost numbers are tagged (est.) -- estimated token and cost, a conservative mid-run guess (it can undercount tokens and overstate cost) used only to trigger the spend-cap kill switch early. The cell's own 'llm done' line right after it carries the real, final numbers and is never tagged."><input type="checkbox" ${showDebug ? "checked" : ""} onchange="toggleShowDebugMessages('${esc(key)}',this.checked)"> Show Debug Messages</label>`;
-        const typeFilterHtml = promptTab ? "" : `<input class="peek-type-filter" value="${esc(peekTypeFilterInput[key] || "")}" oninput="setPeekTypeFilter('${esc(key)}',this.value)" placeholder="Filter types (e.g. read glob or -usage)" data-tip="${LIVE_VIEW_TYPE_FILTER_TIP}" aria-label="Filter log types">`;
-        const thinkingToggleHtml = (!canThink || promptTab) ? "" : `<label class="peek-debug-toggle" data-tip="Show the model's own thinking/reasoning, expanded inline where it happened. Off folds each thinking block to a single &lt;thinking…&gt; line so routine monitoring shows what the agent did rather than how it talked itself there.\nFolding is purely a display choice and is freely reversible -- the reasoning is always captured in the transcript, so toggling this re-renders the text already loaded without refetching anything.\nThe starting state can be changed globally via the ralphus config file's [live_view] table (hide_thinking).\nOnly agent backends that report thinking as its own distinct stream have anything to fold here; a backend that does not (or a plain command cell) shows nothing either way."><input type="checkbox" ${showThinking ? "checked" : ""} onchange="toggleShowThinking('${esc(key)}',this.checked)"> Show Thinking</label>`;
-        const copyTip = promptTab
-          ? "Copy this step's system prompt to clipboard.\nCopies the exact text shown on this tab — the full effective prompt the agent received (ralphus's hidden instructions plus the step's authored system prompt).\nA command cell or an agent step never yet dispatched has no text to copy."
-          : "Copy this terminal's current output to clipboard.\nCopies whatever is visible right now — the live view keeps auto-refreshing after.";
-        const tabsHtml = currentUserIsAdmin
-          ? `<div class="peek-tabs" data-tip="Which content this live viewer shows:\nTerminal — the step's live tmux output, with the Show Debug Messages toggle.\nSystem Prompt — the exact system prompt this step's agent received: ralphus's hidden instructions plus the step's authored system prompt.\nRead-only reference — changing it means editing the task file.\nAdmin-only view — non-admins see only the Terminal tab.">
-              <button class="peek-tab${promptTab ? "" : " active"}" data-click="switchPeekTab" data-key="${esc(key)}" data-tab="terminal" data-tip="The step's live terminal output (default).">Terminal</button>
-              <button class="peek-tab${promptTab ? " active" : ""}" data-click="switchPeekTab" data-key="${esc(key)}" data-tab="prompt" data-tip="The step's exact system prompt — ralphus's hidden instructions plus the step's authored system prompt, exactly as the agent received it.\nRead-only reference — changing it means editing the task file.">System Prompt</button>
-            </div>`
-          : "";
-        return `<div class="peek-box" data-tip="${headTip}">
-            <div class="peek-head"><span><span class="peek-dot${ended ? ' ended' : ''}"></span>${headLabel}${startedHtml}${endedHtml}${activityHtml}</span><span style="display:flex;gap:8px;align-items:center">${debugToggleHtml}${typeFilterHtml}${thinkingToggleHtml}<button class="copy-btn" data-tip="${copyTip}" data-click="copyPeekText" data-key="${esc(key)}">⧉</button><button class="btn" style="padding:1px 7px;font-size:11px" data-click="togglePeekStopProp" data-key="${esc(key)}" data-tip="Collapse this live view.">✕ Hide</button></span></div>
-            ${tabsHtml}
-            ${promptTab ? `<div class="peek-pre-wrap">
-              <pre id="peek-prompt-${cssKey}" class="peek-pre" style="height:${peekPaneHeight}px" data-tip="The exact system prompt this step's agent received — ralphus's hidden instructions plus the step's authored system prompt.\nShown on the System Prompt tab; the ⧉ Copy control copies this text.">${esc(peekPromptDisplay(peekSystemPrompt[key]))}</pre>
-              <div class="peek-resize-handle" data-peek-key="${key}" data-tip="Drag to resize the live terminal view.\nYour chosen size is kept while you switch between tabs during this browser session."></div>
-            </div>` : `<div class="peek-pre-wrap">
-              <pre id="peek-pre-${cssKey}" class="peek-pre" style="height:${peekPaneHeight}px" tabindex="0" data-key="${esc(key)}" onscroll="onPeekScroll(this.dataset.key)" onkeydown="handlePeekKeydown(event,this.dataset.key)" data-tip="Scroll through the live terminal output.\nClick here then press Ctrl+End to jump to the latest output, or Ctrl+Home to jump to the start.">${shown !== undefined ? transcriptHtml(shown) : "Loading…"}</pre>
-              <button id="peek-jump-${cssKey}" class="peek-jump-btn" style="display:none" data-click="peekScrollToBottom" data-key="${esc(key)}" data-tip="Jump to the latest output.\nAppears once you've scrolled up from the bottom — also triggerable with Ctrl+End while the terminal is focused.">↓ Jump to latest</button>
-              <div class="peek-resize-handle" data-peek-key="${key}" data-tip="Drag to resize the live terminal view.\nYour chosen size is kept while you switch between tabs during this browser session."></div>
-            </div>`}
-          </div>`;
-      }
       /**
        * Writes a plain status message into a peek box's `<pre>`, re-resolving
        * the element by id first — see {@link fetchPeek} for why a reference
@@ -250,7 +128,7 @@
        *    from the document by the time the response lands — patching it
        *    updated nothing the user could see.
        * 2. A full re-render is forced on **both** directions of the ended flip,
-       *    not just live→ended. `peekBox()` is the only thing that produces the
+       *    not just live→ended. The live-view widget is the only thing that produces the
        *    head banner, dot and tooltip, and since RAL-167 nothing else
        *    re-renders the details pane on a predictable cadence (SSE push plus
        *    a 60s reconciliation fallback replaced the old unconditional 2s
@@ -266,17 +144,6 @@
         // leave peekOpen alone so the toggle is remembered per-cell
         // (RAL-162) and skip fetching until it's rendered again.
         if (!document.getElementById(preId)) return;
-        // RAL-428: while this box is showing the System Prompt tab (admins),
-        // the tmux tape isn't what's on screen — skip the tape/pane poll and
-        // just make sure the prompt text is present (idempotent; patched into
-        // the prompt `<pre>` when its fetch lands). Switching back to Terminal
-        // relies on the next poll tick to repopulate the tape content in
-        // place. A non-admin can never render the prompt tab, so their poll
-        // loop is untouched.
-        if (currentUserIsAdmin && peekTab[key] === "prompt") {
-          void ensurePeekSystemPrompt(key);
-          return;
-        }
         const tapeUrl = peekTranscriptUrlFor(key);
         if (!tapeUrl) { delete peekOpen[key]; delete peekContent[key]; delete peekTape[key]; return; }
         try {
@@ -674,7 +541,7 @@
        * @returns {string|null}
        */
       function terminalLogAttemptsUrlFor(key, attempt) {
-        const [kind, ...rest] = key.split("|");
+        const [kind, ...rest] = splitPeekAttempt(key).base.split("|");
         /** @type {string|null} */
         let base = null;
         if (kind === "cell") { const [squadId, ti, si] = rest; base = `/api/squads/${squadId}/cells/${ti}/${si}/terminal-log-attempts`; }
