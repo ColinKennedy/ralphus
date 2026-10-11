@@ -2265,7 +2265,9 @@ Press Accept on the note to create it.">Squad pending</span>`;
               return `<div data-click="runCheck" data-kind="manual" data-guardian-id="${esc(g.id)}" data-i="${i}" style="padding:6px 12px;cursor:pointer;font-size:12px;font-family:monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:360px" data-tip="Run: ${esc(cmdText)}\nLaunches in the built review worktree.${needsInput ? "\nUses this review's current values for its parameters — edit them from the row's + in the section below." : ""}" onmouseover="this.style.background='var(--panel-2)'" onmouseout="this.style.background=''">${esc(cmdText)}</div>`;
             }).join("");
             const gateTip = isReady
-              ? `Run all ${cmds.length} auto action(s), each in a new terminal window.\nEach launches in the built review worktree.`
+              ? (cmds.length
+                ? `Run all ${cmds.length} auto action(s), each in a new terminal window.\nEach launches in the built review worktree.`
+                : "Preparation finished but produced no auto actions, so there is nothing to run.\nRegenerate them from the ⋯ menu next to the section title.")
               : state === "generating"
                 ? "Preparing auto actions now — this button enables once their builds and files are in place."
                 : state === "failed"
