@@ -162,7 +162,7 @@ where one exists.
 | GET | `/api/guardians/{id}/followup/items` | The review's [pending deferred follow-ups](#get-apiguardiansidfollowupitems), ignored ones marked |
 | POST | `/api/guardians/{id}/followup/ignore` | Ignore one pending follow-up (or all) so the merge-time offer leaves it out |
 | POST | `/api/guardians/{id}/followup/unignore` | Reverse an ignore |
-| POST | `/api/guardians/{id}/followup/accept` | Accept the offer: draft the follow-up squad and its waypoint |
+| POST | `/api/guardians/{id}/followup/accept` | Accept the offer: draft the follow-up squad |
 | POST | `/api/guardians/{id}/followup/decline` | Decline the offer |
 | POST | `/api/guardians/{id}/run-manual-commands` | Launch a ready manual-check command at its prepared execution location; `409` until ready |
 | POST | `/api/guardians/{id}/run-action-hint` | Launch a ready authored action at its prepared execution location; prompt actions are expanded during preparation |
@@ -3132,12 +3132,10 @@ Triage cell. It starts at once unless auto-start is off for the review (its own
 `followup_auto_start`, else the global `auto_start`), in which case it is
 created **held**.
 
-It also creates a blocking **waypoint** explaining the follow-up: the merged
-review is on its roster and the squad is its affected entry, answered
-`accepted` up front. The waypoint stays open while the follow-up is
-outstanding and auto-closes when the squad finishes.
+No waypoint is created; the squad id is recorded against each accepted item
+and the offer.
 
-`201 {"squad_id","waypoint_id","base","started"}`. `409` if the offer was
+`201 {"squad_id","base","started"}`. `409` if the offer was
 already accepted or declined (a second accept creates nothing); `400` when the
 review has no registered project; other statuses mirror the submit rejection.
 A failure before the squad exists puts the offer back to `offered`.

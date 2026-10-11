@@ -1165,11 +1165,10 @@ impl Store {
         if squad_scopes.is_empty() {
             return Ok(Vec::new());
         }
-        // A squad already placed on a waypoint by hand (or by a follow-up
-        // offer) has had that entry handed to its review once the review
-        // formed, so the entry for its own review counts as the squad being
-        // enrolled already -- enrolling it again would add a second, unanswered
-        // entry for the same work.
+        // A squad already placed on a waypoint by hand has had that entry
+        // handed to its review once the review formed, so the entry for its
+        // own review counts as the squad being enrolled already -- enrolling
+        // it again would add a second, unanswered entry for the same work.
         let own_reviews = self.guardians_for_squad(squad_id)?;
         let mut enrolled = Vec::new();
         for waypoint_id in self.list_open_waypoint_ids()? {
@@ -2480,7 +2479,7 @@ impl Store {
         {
             // The bearing decision travels with the entry: it is the same
             // work answering the same waypoint, and an entry that was already
-            // answered (a follow-up squad's waypoint answers for it up front)
+            // answered (an entry added with its decision already recorded)
             // must not turn back into an unanswered block when its review
             // forms.
             self.conn.execute(
