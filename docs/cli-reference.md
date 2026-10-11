@@ -459,7 +459,7 @@ Three independent command families (RAL-166/RAL-241), each with a
 | `quick-start reviewer claude-code [TARGET] [--command] [--shell] [-- ARGS...]` | Launch Claude Code primed to act as a reviewer on an existing review. See [quick-start reviewer](#quick-start-reviewer) below |
 | `quick-start reviewer codex [TARGET] [--command] [--shell] [-- ARGS...]` | Launch Codex primed to act as a reviewer on an existing review. See [quick-start reviewer](#quick-start-reviewer) below |
 | `quick-start reviewer pi [TARGET] [--command] [--shell] [-- ARGS...]` | Launch Pi primed to act as a reviewer on an existing review. See [quick-start reviewer](#quick-start-reviewer) below |
-| `quick-start watcher claude-code [--command] [--shell] [-- ARGS...]` | Launch Claude Code primed to poll the escalation mailbox after every user turn. See [quick-start watcher](#quick-start-watcher) below |
+| `quick-start watcher claude-code [--command] [--shell] [-- ARGS...]` | Launch Claude Code primed to receive escalation mailbox messages as they arrive (`mailbox follow` under its `Monitor` tool). See [quick-start watcher](#quick-start-watcher) below |
 | `quick-start watcher codex [--command] [--shell] [-- ARGS...]` | Launch Codex primed to poll the escalation mailbox after every user turn. See [quick-start watcher](#quick-start-watcher) below |
 | `quick-start watcher pi [--command] [--shell] [-- ARGS...]` | Launch Pi primed to poll the escalation mailbox after every user turn. See [quick-start watcher](#quick-start-watcher) below |
 
@@ -638,12 +638,15 @@ reference. Delivery mechanism mirrors the matching `manager` entrypoint
 
 ### quick-start watcher
 
-RAL-241, poll-only scope: a mailbox-polling supervisor session. Both
-entrypoints register (or reuse a locally persisted) mailbox `client_id` with
-the daemon (`POST /api/mailbox/register`) before launch, then inject a system
-prompt instructing the agent to run `ralphus mailbox check` (no `--category`
-filter, unlike `quick-start reviewer`'s `--category review` — RAL-375) after
-every user turn and show its output verbatim — `urgent` messages must be read
+RAL-241: a mailbox supervisor session. Every entrypoint registers (or reuses
+a locally persisted) mailbox `client_id` with the daemon (`POST
+/api/mailbox/register`) before launch, then injects a system prompt
+instructing the agent to run `ralphus mailbox check` (no `--category`
+filter, unlike `quick-start reviewer`'s `--category review` — RAL-375) and
+show its output verbatim. When it runs differs per backend: `claude-code`
+arms `ralphus mailbox follow` once under Claude Code's `Monitor` tool and
+checks each time that prints a line (push, no cost while idle); `codex` and
+`pi` check after every user turn. `urgent` messages must be read
 and acted on before continuing, `high` before the agent would otherwise go
 idle, `normal` is informational. This includes `review`-category PR/CI-watch
 notices, so a watcher session surfaces them too even when the user isn't in
@@ -652,16 +655,24 @@ entrypoints (temp-file for `claude-code`, `-c developer_instructions=...` for
 `codex`); the full help-map is still appended for reference, since the
 watcher may need to inspect/act on whatever the escalation is about.
 
-Direct-push delivery into a live tmux-tracked session (rather than this
-turn-boundary poll) is out of scope here — see the ticket's Q&A.
+Why Codex and Pi poll, what push delivery does and does not cover, and the
+possible routes to push for those backends are in
+[`mailbox-delivery.md`](mailbox-delivery.md).
 
 ## mailbox
 
-RAL-241, poll-only scope: the escalation mailbox client.
+RAL-241: the escalation mailbox client.
 
 | Command | What |
 |---|---|
 | `mailbox check [--priority urgent\|high\|normal] [--category <name>]` | List this client's unread messages, print them, then drain (mark read) exactly the ones printed |
+| `mailbox follow` | Hold the daemon's `/api/events` stream open and print one `MAILBOX [URGENT\|HIGH\|info] <message>` line per message as it is enqueued; runs until killed, reconnects on its own, never marks anything read |
+
+`mailbox follow` is the zero-polling way to know *when* to run `check`. It
+does not replace it: only Monitor events reach the stream, and nothing sent
+while it is disconnected is replayed. See
+[`mailbox-delivery.md`](mailbox-delivery.md) for what it covers, what it costs,
+and why the MCP server has no equivalent tool.
 
 `mailbox check` mints (or reuses) a `client_id` the same way `quick-start
 watcher` does, so a stray manual run before ever launching a watcher session

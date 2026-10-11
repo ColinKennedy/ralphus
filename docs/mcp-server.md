@@ -183,6 +183,14 @@ Because the list is generated at build time, the running server reflects the
 binary you registered. **After adding CLI commands, rebuild and re-copy to
 `dist/`**, then restart the client.
 
+A few commands are deliberately not tools (`mcp/src/exclusions.rs`). The one
+most often missed is `mailbox follow`: it streams mail as it arrives and never
+returns, which a request/response tool call cannot do. To be woken by new mail
+without paying a turn per check, run the CLI's `ralphus mailbox follow` beside
+the session (in Claude Code, under the `Monitor` tool) and use the MCP
+`mailbox_check` tool to read what arrived. See
+[`mailbox-delivery.md`](mailbox-delivery.md).
+
 ## Verifying without a client
 
 The stdio protocol is plain text, so the server can be exercised directly —
@@ -221,3 +229,5 @@ Swap the second line for a `tools/call` to prove it reaches the daemon:
 - [`docs/daemon-api.md`](daemon-api.md) — the HTTP API underneath.
 - [`docs/cli-reference.md`](cli-reference.md) — the command surface these
   tools mirror.
+- [`docs/mailbox-delivery.md`](mailbox-delivery.md) — getting mailbox
+  messages as they arrive, and why that has no MCP tool.
