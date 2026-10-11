@@ -688,6 +688,10 @@ pub fn spawn_health_sweep(state: HealthSweepState, store: StoreHandle) {
         Arc::new(move || {
             loop {
                 let cfg = crate::config::load_health_sweep_config();
+                crate::watchdog::loop_beat(
+                    crate::watchdog::DaemonLoop::HealthSweep,
+                    cfg.poll_interval() + crate::watchdog::LOOP_STALE_GRACE,
+                );
                 std::thread::sleep(cfg.poll_interval());
                 if !cfg.enabled() {
                     continue;
