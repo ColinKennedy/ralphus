@@ -1670,6 +1670,8 @@ impl DaemonClient {
         effort: Option<&str>,
         temperature: Option<&str>,
         system_prompt: Option<&str>,
+        initialization_commands: Option<&str>,
+        initialization_timeout_sec: Option<&str>,
     ) -> Result<Value, DaemonError> {
         let mut body = json!({"kind": "cell", "task_idx": task_idx, "cell_idx": cell_idx});
         set_if_some(&mut body, "cwd", cwd.map(str::to_string));
@@ -1698,6 +1700,16 @@ impl DaemonClient {
             &mut body,
             "system_prompt",
             system_prompt.map(str::to_string),
+        );
+        set_if_some(
+            &mut body,
+            "initialization_commands",
+            initialization_commands.map(str::to_string),
+        );
+        set_if_some(
+            &mut body,
+            "initialization_timeout_sec",
+            initialization_timeout_sec.map(str::to_string),
         );
         self.post(&format!("/api/squads/{squad_id}/edit"), Some(body))
     }

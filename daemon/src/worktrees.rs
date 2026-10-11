@@ -1680,9 +1680,25 @@ fn materialize_exclusively(
             (plan, Some(short))
         }
     };
+    let init_spec = crate::worktree_init::take(root, branch);
     let path = execute_worktree_plan(root, branch, upstream, &plan)?;
+    // RAL-615: initialization runs after the worktree is fully set up and
+    // before the creation marker is cleared, so an init interrupted by a
+    // daemon restart leaves the marker behind and the next attempt recreates
+    // and re-initializes it. A command that *fails* leaves a complete
+    // worktree, so the marker is cleared and Retry re-runs the commands in
+    // place.
+    let init_result = match init_spec {
+        Some(spec) if marker_short.is_some() || spec.rerun_existing => {
+            Some(crate::worktree_init::run(&path, &spec))
+        }
+        _ => None,
+    };
     if let Some(short) = marker_short {
         let _ = std::fs::remove_file(creation_marker_path(root, &short));
+    }
+    if let Some(Err(message)) = init_result {
+        return Err(message);
     }
     Ok(Materialized {
         path,
@@ -2910,9 +2926,15 @@ pub(crate) fn ensure_claimed_worktree(
         .or_default()
         .clone();
     let mut routed = flag.lock();
+    let init_spec = init_spec_for_worktree(store, squad_id, wt);
     let materialized = match pending_worktree_at(wt) {
         Some(pending) => {
-            let materialized = materialize_pending(&pending)?;
+            if let Some(spec) = &init_spec {
+                crate::worktree_init::register(&pending.root, &pending.branch, spec.clone());
+            }
+            let created = materialize_pending(&pending);
+            crate::worktree_init::unregister(&pending.root, &pending.branch);
+            let materialized = created?;
             if materialized.repaired.is_some() {
                 *routed = false;
             }
@@ -2926,7 +2948,16 @@ pub(crate) fn ensure_claimed_worktree(
             }
             Some(materialized)
         }
-        None => None,
+        None => {
+            // RAL-615: an existing worktree whose initialization failed or
+            // whose command was edited re-runs in place.
+            if let Some(spec) = init_spec.filter(|s| s.rerun_existing) {
+                if wt.join(".git").exists() {
+                    crate::worktree_init::run(wt, &spec)?;
+                }
+            }
+            None
+        }
     };
     if !*routed {
         if let Some(project_name) = project_name {
@@ -2937,6 +2968,89 @@ pub(crate) fn ensure_claimed_worktree(
         *routed = true;
     }
     Ok(materialized)
+}
+
+/// RAL-615: the initialization the cells bound to `wt` carry, as a spec whose
+/// recorder persists each run's outcome on those cells and logs it to
+/// Cartographer. `None` when no cell sharing the worktree has a command.
+fn init_spec_for_worktree(
+    store: &StoreHandle,
+    squad_id: &str,
+    wt: &Path,
+) -> Option<crate::worktree_init::InitSpec> {
+    use crate::worktree_init::{InitEvent, InitSpec};
+    let wt_text = wt.to_string_lossy().into_owned();
+    let selector = crate::store::WorktreeSelector::Cwd(wt_text.clone());
+    let (stored, mut env) = {
+        let guard = store.lock();
+        let stored = guard
+            .worktree_init_for(squad_id, &selector)
+            .ok()
+            .flatten()?;
+        let env = guard
+            .resolve_cell_env_overrides(squad_id, stored.first_cell.0, stored.first_cell.1)
+            .unwrap_or_default();
+        (stored, env)
+    };
+    env.entry("RALPHUS_SQUAD_ID".to_string())
+        .or_insert_with(|| squad_id.to_string());
+    env.entry("RALPHUS_WORKTREE".to_string())
+        .or_insert_with(|| wt_text.clone());
+    let rerun_existing = matches!(stored.state.as_deref(), Some("pending" | "failed"));
+    let commands = stored.commands.clone();
+    let cells = stored.cells.clone();
+    let recorder_store = store.clone();
+    let recorder_squad = squad_id.to_string();
+    let recorder: crate::worktree_init::InitRecorder = std::sync::Arc::new(move |event| {
+        let level = match event {
+            InitEvent::Finished(o) if !o.ok => crate::logging::LogLevel::WARNING,
+            _ => crate::logging::LogLevel::INFO,
+        };
+        let (message, payload) = match event {
+            InitEvent::Started => (
+                "worktree initialization started".to_string(),
+                serde_json::json!({"commands": commands, "worktree": wt_text}),
+            ),
+            InitEvent::Finished(o) if o.ok => (
+                format!("worktree initialization finished ({}ms)", o.duration_ms),
+                serde_json::json!({"exit_status": o.exit_status, "duration_ms": o.duration_ms}),
+            ),
+            InitEvent::Finished(o) => (
+                format!(
+                    "worktree initialization failed: `{}` ({}, {}ms)",
+                    o.failed_command.as_deref().unwrap_or(""),
+                    o.exit_status,
+                    o.duration_ms
+                ),
+                serde_json::json!({
+                    "exit_status": o.exit_status,
+                    "duration_ms": o.duration_ms,
+                    "command": o.failed_command,
+                    "output": o.output,
+                }),
+            ),
+        };
+        let guard = recorder_store.lock();
+        if let InitEvent::Finished(outcome) = event {
+            let _ = guard.record_worktree_init(&recorder_squad, &selector, outcome);
+        }
+        for cell in &cells {
+            crate::cartographer::Note::new("scheduler")
+                .level(level)
+                .scope("materialize")
+                .squad(&recorder_squad)
+                .task(&cell.task_name)
+                .cell(&cell.cell_id)
+                .emit(&guard, message.clone(), payload.clone());
+        }
+    });
+    Some(InitSpec {
+        commands: stored.commands,
+        timeout: std::time::Duration::from_secs(u64::try_from(stored.timeout_sec).unwrap_or(900)),
+        env,
+        rerun_existing,
+        recorder,
+    })
 }
 
 /// A local git worktree one of this submission's cells needs, decided (RAL-337

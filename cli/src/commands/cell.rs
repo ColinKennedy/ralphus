@@ -51,6 +51,8 @@ pub enum CellCommand {
         effort: Option<String>,
         temperature: Option<String>,
         system_prompt: Option<String>,
+        initialization_commands: Option<String>,
+        initialization_timeout_sec: Option<String>,
     },
     Terminal {
         selector: String,
@@ -134,6 +136,14 @@ pub fn parse(args: &[String]) -> CellCommand {
             let effort = scanner.take_value("--effort").ok().flatten();
             let temperature = scanner.take_value("--temperature").ok().flatten();
             let system_prompt = scanner.take_value("--system-prompt").ok().flatten();
+            let initialization_commands = scanner
+                .take_value("--initialization-commands")
+                .ok()
+                .flatten();
+            let initialization_timeout_sec = scanner
+                .take_value("--initialization-timeout-sec")
+                .ok()
+                .flatten();
             with_selector(scanner, |selector| CellCommand::Edit {
                 selector,
                 cwd,
@@ -147,6 +157,8 @@ pub fn parse(args: &[String]) -> CellCommand {
                 effort,
                 temperature,
                 system_prompt,
+                initialization_commands,
+                initialization_timeout_sec,
             })
         }
         Some("terminal") => {
@@ -383,6 +395,8 @@ pub fn dispatch(cmd: CellCommand, opts: &GlobalOpts) -> i32 {
             effort,
             temperature,
             system_prompt,
+            initialization_commands,
+            initialization_timeout_sec,
         } => run_and_report(opts, None, || {
             let resolved = resolve_scoped(&client, &selector, "cell")?;
             let result = client.edit_cell(
@@ -400,6 +414,8 @@ pub fn dispatch(cmd: CellCommand, opts: &GlobalOpts) -> i32 {
                 effort.as_deref(),
                 temperature.as_deref(),
                 system_prompt.as_deref(),
+                initialization_commands.as_deref(),
+                initialization_timeout_sec.as_deref(),
             )?;
             emit(opts, &result, |_| println!("{selector} updated"));
             Ok(())
@@ -652,6 +668,28 @@ mod tests {
                 assert_eq!(selector, "squad-1/build/0");
                 assert_eq!(agent.as_deref(), Some("claude"));
                 assert_eq!(command.as_deref(), Some("echo hi"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_edit_with_initialization_flags() {
+        match parse(&v(&[
+            "edit",
+            "squad-1/build/0",
+            "--initialization-commands",
+            "npm ci",
+            "--initialization-timeout-sec",
+            "300",
+        ])) {
+            CellCommand::Edit {
+                initialization_commands,
+                initialization_timeout_sec,
+                ..
+            } => {
+                assert_eq!(initialization_commands.as_deref(), Some("npm ci"));
+                assert_eq!(initialization_timeout_sec.as_deref(), Some("300"));
             }
             other => panic!("unexpected: {other:?}"),
         }

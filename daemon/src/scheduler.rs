@@ -1304,8 +1304,15 @@ fn execute_squad_inner(
     // Every cell whose cwd is a claimed-but-not-yet-created worktree (including
     // claims left by a daemon that restarted mid-materialization, recovered from
     // their markers). The background creator below and each such cell's worker
-    // both go through `ensure_claimed_worktree`, which is single-flight.
-    let worktree_claims = pending_worktree_claims(&cells, &tasks);
+    // both go through `ensure_claimed_worktree`, which is single-flight. Cells
+    // whose worktree still needs its initialization commands (re-)run (RAL-615:
+    // the last run failed or the command was edited) join them, so the commands
+    // run in place before any of those cells starts.
+    let reinit = store
+        .lock()
+        .cells_needing_worktree_init(squad_id)
+        .unwrap_or_default();
+    let worktree_claims = pending_worktree_claims(&cells, &tasks, &reinit);
     crate::rlog!(
         INFO,
         "ralphus [scheduler] squad {squad_id} executing ({} cells, {} tasks)",
@@ -2225,10 +2232,13 @@ impl WorktreeClaims {
     }
 }
 
-/// The cells of `cells` whose cwd is a worktree still waiting to be created.
+/// The cells of `cells` whose cwd is a worktree still waiting to be created, or
+/// whose worktree needs its initialization commands re-run (`reinit`, by
+/// `(task_idx, cell idx)`).
 fn pending_worktree_claims(
     cells: &[crate::store::CellRow],
     tasks: &[crate::store::TaskRow],
+    reinit: &std::collections::HashSet<(i64, i64)>,
 ) -> WorktreeClaims {
     let projects: HashMap<i64, Option<&str>> = tasks
         .iter()
@@ -2239,7 +2249,9 @@ fn pending_worktree_claims(
         .enumerate()
         .filter_map(|(i, row)| {
             let wt = PathBuf::from(row.cwd.as_deref()?);
-            crate::worktrees::pending_worktree_at(&wt)?;
+            if !reinit.contains(&(row.task_idx, row.idx)) {
+                crate::worktrees::pending_worktree_at(&wt)?;
+            }
             let project = projects
                 .get(&row.task_idx)
                 .copied()
@@ -2441,9 +2453,15 @@ fn enqueue_cell_failure_mailbox(
     } else {
         crate::mailbox::MailboxPriority::Urgent
     };
-    let remediation = crate::mailbox::Remediation::SuggestedCommand {
-        command: format!("ralphus cell restart {squad_id}/{task_name}/{cell_id}"),
-        purpose: "retry the failed cell".to_string(),
+    let remediation = if error.is_some_and(|e| e.contains(crate::worktree_init::FAILURE_PREFIX)) {
+        crate::mailbox::Remediation::ManualInterventionRequired {
+            guidance: crate::worktree_init::REMEDIATION.to_string(),
+        }
+    } else {
+        crate::mailbox::Remediation::SuggestedCommand {
+            command: format!("ralphus cell restart {squad_id}/{task_name}/{cell_id}"),
+            purpose: "retry the failed cell".to_string(),
+        }
     };
     match guard.notify_watchers_with_remediation(
         crate::monitor::NotifiableEventKind::SquadFailed,

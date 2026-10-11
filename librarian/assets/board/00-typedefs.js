@@ -96,6 +96,7 @@
        * @property {number} [prepared_at_ms]
        * @property {string} [prepared_cwd]
        * @property {string|null} [system_prompt]
+       * @property {{commands: string[], source: string|null, timeout_sec: number, status: string|null, duration_ms: number|null, exit_status: string|null, output: string|null, finished_at_ms: number|null}} [worktree_init] - RAL-615: worktree initialization commands resolved for this cell and the last run's outcome; absent when no command applies.
        * @property {string} [agent_session_id]
        * @property {string} [machine] - RAL-185/RAL-288: where this cell is routed. Absent/undefined means the daemon's own host.
        * @property {{id: string, name: string, status: string, branch?: string, origin: string}[]} [reviews]

@@ -181,6 +181,15 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                                         already-built git WORKTREE, if you built it
                                         yourself. ALWAYS use forward slashes (e.g.
                                         "C:/Users/me/repo/.wt/feat")!
+ initialization_commands string|array<string>
+                                        OPTIONAL: command(s) run once in this cell's freshly
+                                        created worktree before any cell uses it (list runs in
+                                        order, first failure stops). Also allowed on [[task]]
+                                        and [[default]], and in .ralphus.toml [worktree].
+                                        Precedence: cell > task > [[default]] > project.
+                                        `""` disables an inherited value. Same trust as
+                                        `[review] auto_build`; keep it idempotent.
+ initialization_timeout_sec integer      OPTIONAL: seconds for the whole list (> 0, default 900).
  subprojects             array<string>  If your project lives inside a monorepo, declare
                                         which package subdirectories this cell
                                         focuses on, e.g.

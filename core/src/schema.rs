@@ -32,6 +32,14 @@ pub struct DefaultBlock {
     /// "default's own" table for `.`/`..` to resolve against.
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
+    /// Command(s) run once in every freshly created cell worktree, before
+    /// any cell uses it (RAL-615). A string or a list run in order; `""`
+    /// disables an inherited command. See [`resolve_initialization`].
+    #[serde(default)]
+    pub initialization_commands: Option<InitCommands>,
+    /// Timeout in seconds covering the whole `initialization_commands` list.
+    #[serde(default)]
+    pub initialization_timeout_sec: Option<u64>,
 }
 
 /// A whole submitted task file.
@@ -211,6 +219,14 @@ pub struct TaskDef {
     /// its own [`CellDef::share_session`], which wins.
     #[serde(default)]
     pub share_session: Option<bool>,
+    /// Command(s) run once in every freshly created cell worktree, before
+    /// any cell uses it (RAL-615). A string or a list run in order; `""`
+    /// disables an inherited command. See [`resolve_initialization`].
+    #[serde(default)]
+    pub initialization_commands: Option<InitCommands>,
+    /// Timeout in seconds covering the whole `initialization_commands` list.
+    #[serde(default)]
+    pub initialization_timeout_sec: Option<u64>,
     /// Named presets (`daemon::presets`) to stamp field defaults from, each
     /// written as a wrapped `<<ralphus:presets/<name>>>` sentinel (see
     /// [`parse_preset_sentinel`]). At submit time, for each preset field
@@ -430,6 +446,14 @@ pub struct CellDef {
     /// fills that field only if this cell left it unset; when more than one
     /// named preset defines the same field, the last one in this list wins.
     /// A field this cell set explicitly is never overridden.
+    /// Command(s) run once in every freshly created cell worktree, before
+    /// any cell uses it (RAL-615). A string or a list run in order; `""`
+    /// disables an inherited command. See [`resolve_initialization`].
+    #[serde(default)]
+    pub initialization_commands: Option<InitCommands>,
+    /// Timeout in seconds covering the whole `initialization_commands` list.
+    #[serde(default)]
+    pub initialization_timeout_sec: Option<u64>,
     #[serde(default)]
     pub extends: Vec<String>,
 }
@@ -1495,6 +1519,108 @@ pub fn resolve_cell_share_session(task: &TaskDef, cell: &CellDef) -> bool {
     cell.share_session.or(task.share_session).unwrap_or(false)
 }
 
+/// One or more init commands as written in TOML: a bare string or a list.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum InitCommands {
+    /// A single command; `""` disables an inherited command.
+    One(String),
+    /// Commands run in order, stopping at the first failure.
+    Many(Vec<String>),
+}
+
+impl InitCommands {
+    /// The normalized command list; empty for `""` (the explicit disable).
+    #[must_use]
+    pub fn to_list(&self) -> Vec<String> {
+        match self {
+            Self::One(s) if s.trim().is_empty() => Vec::new(),
+            Self::One(s) => vec![s.clone()],
+            Self::Many(v) => v.clone(),
+        }
+    }
+}
+
+/// Where a cell's resolved `initialization_commands` came from.
+pub const INIT_SOURCE_PROJECT: &str = "project";
+/// Set by `[[default]]`.
+pub const INIT_SOURCE_SQUAD: &str = "squad";
+/// Set by `[[task]]`.
+pub const INIT_SOURCE_TASK: &str = "task";
+/// Set by `[[task.cell]]`.
+pub const INIT_SOURCE_CELL: &str = "cell";
+/// Changed through the cell edit endpoint.
+pub const INIT_SOURCE_EDITED: &str = "edited";
+
+/// A cell's resolved init commands and the level they came from. `source`
+/// is `None` when nothing applies at any level; an explicit `""` yields an
+/// empty `commands` with the disabling level as `source`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolvedInitialization {
+    /// Commands to run, in order.
+    pub commands: Vec<String>,
+    /// `project|squad|task|cell` (or `edited` once changed by hand).
+    pub source: Option<&'static str>,
+    /// Submission-level timeout (cell > task > squad), if any.
+    pub timeout_sec: Option<u64>,
+}
+
+/// Resolve a cell's init commands once at insert time: cell > task > squad
+/// `[[default]]` > `.ralphus.toml` (`project`, already merged with global).
+/// Errors when an explicit `""` disables a command but no outer level
+/// supplies one.
+pub fn resolve_initialization(
+    default: Option<&DefaultBlock>,
+    task: &TaskDef,
+    cell: &CellDef,
+    project: Option<&[String]>,
+) -> Result<ResolvedInitialization, String> {
+    let project_cmds = project.filter(|p| !p.is_empty());
+    let levels: [(&'static str, Option<&InitCommands>); 3] = [
+        (INIT_SOURCE_CELL, cell.initialization_commands.as_ref()),
+        (INIT_SOURCE_TASK, task.initialization_commands.as_ref()),
+        (
+            INIT_SOURCE_SQUAD,
+            default.and_then(|d| d.initialization_commands.as_ref()),
+        ),
+    ];
+    let timeout_sec = cell
+        .initialization_timeout_sec
+        .or(task.initialization_timeout_sec)
+        .or(default.and_then(|d| d.initialization_timeout_sec));
+    for (i, (source, value)) in levels.iter().enumerate() {
+        let Some(value) = value else { continue };
+        let commands = value.to_list();
+        if commands.is_empty() {
+            let has_parent = levels[i + 1..]
+                .iter()
+                .any(|(_, v)| v.is_some_and(|v| !v.to_list().is_empty()))
+                || project_cmds.is_some();
+            if !has_parent {
+                return Err(format!(
+                    "'initialization_commands = \"\"' at {source} level disables an inherited command, but no outer level sets one"
+                ));
+            }
+        }
+        return Ok(ResolvedInitialization {
+            commands,
+            source: Some(source),
+            timeout_sec,
+        });
+    }
+    Ok(match project_cmds {
+        Some(p) => ResolvedInitialization {
+            commands: p.to_vec(),
+            source: Some(INIT_SOURCE_PROJECT),
+            timeout_sec,
+        },
+        None => ResolvedInitialization {
+            timeout_sec,
+            ..Default::default()
+        },
+    })
+}
+
 /// The effective `machine` for a cell: its own value, else the owning
 /// task's, else `None` (meaning [`LOCAL_MACHINE`]). Mirrors how `agent` and
 /// `model` inherit in [`ResolvedAgent::resolve`].
@@ -2529,6 +2655,8 @@ mod tests {
             environment: BTreeMap::new(),
             no_commit_required: false,
             share_session: None,
+            initialization_commands: None,
+            initialization_timeout_sec: None,
             extends: vec![],
             cell: vec![],
             proof: vec![],
@@ -2570,6 +2698,8 @@ mod tests {
             temperature: None,
             triage: false,
             triage_type: None,
+            initialization_commands: None,
+            initialization_timeout_sec: None,
             extends: vec![],
         }
     }

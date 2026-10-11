@@ -83,6 +83,29 @@ Rules and risks:
   above; `<<ralphus:new-review/<key>>>` is cell-`review`-only and is not a
   valid roster entry.
 
+### `initialization_commands` (worktree init, RAL-615)
+
+`initialization_commands` (a string or a list of strings) and
+`initialization_timeout_sec` (> 0) on a cell, a task, `[[default]]`, or the
+project's `.ralphus.toml` `[worktree]` table name command(s) that run **once**
+in each freshly created cell worktree, after `git worktree add` and upstream
+setup and before any cell uses it. A list runs in order and stops at the first
+failure; the timeout covers the whole list (default 900s). An empty list or a
+newline inside a command is invalid. `""` disables an inherited value and is an
+error when nothing is inherited.
+
+Precedence: cell > task > squad `[[default]]` > `.ralphus.toml` `[worktree]`,
+resolved once at submit time and stored (with its source) on each cell. Cells
+sharing one worktree placeholder must resolve to the same command.
+
+A non-zero exit or a timeout fails every cell bound to the worktree, no agent
+starts, and the worktree stays on disk. Fix the command with the cell edit
+form (`ralphus cell edit --initialization-commands`), then Retry: Retry re-runs
+the init in place when the last run failed or the command was edited, and
+recreates the worktree from its original placeholder first if the directory is
+gone. A resync of an existing, successfully initialized worktree does not
+re-run it. Trust level: the commands run through the platform shell with the daemon's privileges, the same level as `[review] auto_build`; they come from the task file or the git-tracked `.ralphus.toml`. Write them to be idempotent: a Retry after a failure re-runs the whole list in place.
+
 ### Linked field (`environment`, RAL-460)
 
 An `environment` value may link to another field instead of re-embedding

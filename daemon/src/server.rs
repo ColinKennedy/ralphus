@@ -30,6 +30,8 @@ use crate::store_pool::ReadConnPool;
 use crate::summary_worker::SummaryQueue;
 use crate::vcs;
 
+type InitEditResult = std::result::Result<Option<(Vec<String>, Option<i64>)>, String>;
+
 /// The running daemon: its store handle plus configuration.
 pub struct Daemon {
     store: StoreHandle,
@@ -8593,6 +8595,13 @@ struct EditBody {
     temperature: Option<String>,
     #[serde(default)]
     system_prompt: Option<String>,
+    /// RAL-615: worktree initialization commands, one per line. Blank clears
+    /// them (an explicit disable of whatever the cell inherited).
+    #[serde(default)]
+    initialization_commands: Option<String>,
+    /// RAL-615: timeout, in seconds, for the whole initialization list.
+    #[serde(default)]
+    initialization_timeout_sec: Option<String>,
 }
 
 fn non_empty(v: Option<&String>) -> Option<&str> {
@@ -8992,6 +9001,10 @@ fn edit_squad(daemon: &Daemon, id: &str, body: &str) -> Reply {
                     return reply;
                 }
             }
+            let init_edit = match worktree_init_edit(&req) {
+                Ok(v) => v,
+                Err(msg) => return error(400, "bad_request", &msg, vec![]),
+            };
             let edit = crate::store::CellEdit {
                 cwd: nullable_field_edit(req.cwd.as_ref()),
                 agent: new_agent,
@@ -9024,7 +9037,18 @@ fn edit_squad(daemon: &Daemon, id: &str, body: &str) -> Reply {
             {
                 return store_error(&e);
             }
-            if !is_noop {
+            if let Some((commands, timeout)) = &init_edit {
+                if let Err(e) = daemon.lock().edit_worktree_init(
+                    id,
+                    req.task_idx,
+                    req.cell_idx,
+                    commands,
+                    *timeout,
+                ) {
+                    return store_error(&e);
+                }
+            }
+            if !is_noop || init_edit.is_some() {
                 // Same double-dispatch guard the `restart_cell` HTTP handler
                 // uses: stop every worker this is about to reset *before*
                 // resetting it, and never hold the daemon lock across the (up
@@ -9143,12 +9167,62 @@ fn edit_squad(daemon: &Daemon, id: &str, body: &str) -> Reply {
     }
 }
 
+/// RAL-615: the worktree initialization part of a cell edit -- the new command
+/// list (empty clears it) and optional timeout -- or `None` when the request
+/// touches neither. `Err` is the 400 message.
+fn worktree_init_edit(req: &EditBody) -> InitEditResult {
+    if req.initialization_commands.is_none() && req.initialization_timeout_sec.is_none() {
+        return Ok(None);
+    }
+    let commands: Vec<String> = req
+        .initialization_commands
+        .as_deref()
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    let timeout = match req.initialization_timeout_sec.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(raw) => match raw.parse::<i64>() {
+            Ok(n) if n > 0 => Some(n),
+            _ => {
+                return Err(format!(
+                    "'initialization_timeout_sec' must be a whole number of seconds > 0, got '{raw}'"
+                ));
+            }
+        },
+    };
+    Ok(Some((commands, timeout)))
+}
+
 /// Re-squad a squad with its existing parameters by resetting it (and its tasks,
 /// cells, and proofs) back to Pending so the scheduler picks it up again.
 fn retry_squad(daemon: &Daemon, id: &str) -> Reply {
     let store = daemon.lock();
     if let Err(e) = store.squad_state(id) {
         return store_error(&e);
+    }
+    // RAL-615: a worktree whose directory is gone is recreated from the cell's
+    // original placeholder, then initialized again; one that still exists is
+    // only re-initialized when its last init failed or its command was edited
+    // (the scheduler decides that from the stored init state).
+    if let Ok(cells) = store.cells_of(id) {
+        for cell in cells {
+            let remote = cell
+                .machine
+                .as_deref()
+                .is_some_and(|m| !m.trim().is_empty());
+            let missing = !remote
+                && cell
+                    .cwd
+                    .as_deref()
+                    .is_some_and(|c| !c.contains("<<") && !std::path::Path::new(c).exists());
+            if missing {
+                let _ = store.restore_worktree_placeholder(id, cell.task_idx, cell.idx);
+            }
+        }
     }
     if let Err(e) = store.reset_squad_to_pending(id) {
         return store_error(&e);

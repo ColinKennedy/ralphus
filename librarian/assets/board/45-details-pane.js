@@ -1140,6 +1140,7 @@
         const systemPromptSection = (!s.command && s.system_prompt)
           ? `<h3 class="section">system prompt</h3>${promptBox(s.system_prompt, `system-prompt-box-${sel.taskIdx}-${sel.cellIdx}`, SYSTEM_PROMPT_TIP)}`
           : "";
+        const initRow = worktreeInitRow(s);
         return `<div class="dhead"><span class="k">◉ cell</span> <span>${esc(s.name ?? s.id)}</span></div>
           ${s.name ? `<div class="kv-row"><span class="k">name</span><span class="v">${esc(s.name)}</span></div>` : ""}
           <div class="kv-row"><span class="k">id</span><span class="v mono">${esc(s.id)}${copyBtn(s.id)}</span></div>
@@ -1162,6 +1163,7 @@
           <h3 class="section">${s.command ? "command" : "prompt"}</h3>
           ${s.command ? cmdBox(s.command) : promptBox(s.prompt || "—", `prompt-box-${sel.taskIdx}-${sel.cellIdx}`)}
           ${systemPromptSection}
+          ${initRow}
           ${inReviews}
           ${proofSteps}
           ${cellEnvOverridesSection(r, sel.taskIdx, sel.cellIdx, s)}
@@ -1220,6 +1222,36 @@
                   "List every durably-persisted terminal-log attempt for this cell, including past reattaches.\nWho/when: the pane died or reattached and you need to see what happened right before, after the live view is gone.\nEach attempt's log survives pane death and daemon restarts.");
             return `<div class="btn-row" style="position:relative;gap:0">${squadLiveOpenBtn(key, "this cell")}${terminalMenuHtml(key, items)}</div>${squadLiveSlot(live)}${historyBox(key)}`;
           })()}`;
+      }
+      /**
+       * RAL-615: the "Worktree init" row -- the command(s) run once in this
+       * cell's freshly created worktree, where they came from, and the last
+       * run's outcome. Empty when no command applies to the cell.
+       * @param {CellView} s
+       * @returns {string}
+       */
+      function worktreeInitRow(s) {
+        const w = s.worktree_init;
+        if (!w) return "";
+        const sources = {
+          project: "the project's .ralphus.toml [worktree] initialization_commands",
+          squad: "the squad's [[default]] initialization_commands",
+          task: "the task's initialization_commands",
+          cell: "this cell's own initialization_commands",
+          edited: "an edit made in the board or CLI",
+        };
+        const src = w.source || "";
+        const srcTip = src in sources ? sources[/** @type {keyof typeof sources} */ (src)] : "an unknown source";
+        const status = w.status
+          ? `<span class="pill ${w.status === "failed" ? "failed" : w.status === "ok" ? "done" : "pending"}" data-tip="Result of the last initialization run: ok, failed, or pending (waiting for its next run).">${esc(w.status)}</span>`
+          : `<span style="color:var(--muted)" data-tip="The commands have not run yet; they run once when this cell's worktree is created.">not run yet</span>`;
+        const took = w.duration_ms != null ? ` <span style="color:var(--muted)">${(w.duration_ms / 1000).toFixed(1)}s · exit ${esc(w.exit_status || "?")}</span>` : "";
+        const out = w.output ? promptBox(w.output, null, "Trimmed output of the last worktree initialization run.") : "";
+        return `<h3 class="section" data-tip="Runs once in this cell's freshly created worktree, before any cell uses it. Inherited from ${esc(srcTip)}.
+On failure no agent starts; fix it with Edit, then Retry the squad.">Worktree init</h3>`
+          + `<div class="kv-row" data-tip="Source: ${esc(srcTip)}. Timeout for the whole list: ${w.timeout_sec}s."><span class="k">source</span><span class="v">${esc(src || "—")}</span></div>`
+          + cmdBox(w.commands.join("\n"))
+          + `<div class="kv-row"><span class="k">last run</span><span class="v">${status}${took}</span></div>${out}`;
       }
       // CCTL-115: render each command line elided in a fixed-height box; a
       // double-click opens a floating popup with the full, scrollable text.
@@ -1478,7 +1510,9 @@ It is held back rather than shown blank, so saving cannot overwrite it with an e
             </div>
             <div id="command-fields"${isCmd ? "" : ' class="hidden"'}>
               <label>command<textarea id="e-command" rows="5">${esc(s.command || "")}</textarea></label>
-            </div>`;
+            </div>
+            <label data-tip="Commands run once, in order, in this cell's freshly created worktree (one per line; blank clears an inherited value). The first failure stops the list and fails the cell. Must be idempotent. Applies to every cell sharing this worktree.">worktree init<textarea id="e-init" rows="3">${esc(s.worktree_init ? s.worktree_init.commands.join("\n") : "")}</textarea></label>
+            <label data-tip="Seconds allowed for the whole worktree init list (must be > 0). Blank keeps the current value.">worktree init timeout (s)<input id="e-init-timeout" value=""></label>`;
           envSection = cellEnvOverridesSection(r, sel.taskIdx, sel.cellIdx, s) + cellProofEnvOverridesSection(r, sel.taskIdx, sel.cellIdx, s);
         }
         return `<div class="dhead"><span class="k">✎ editing ${sel.kind}</span></div>${warn}
@@ -1502,6 +1536,8 @@ It is held back rather than shown blank, so saving cannot overwrite it with an e
        * @property {string} [effort]
        * @property {string} [temperature]
        * @property {string} [prompt]
+       * @property {string} [initialization_commands]
+       * @property {string} [initialization_timeout_sec]
        */
       /**
        * Reads the edit form's fields and POSTs them to persist the change.
@@ -1523,6 +1559,13 @@ It is held back rather than shown blank, so saving cannot overwrite it with an e
         else if (sel.kind === "task") { body.name = val("e-name"); body.project = val("e-project"); }
         else {
           body.cwd = val("e-cwd");
+          // Only a changed init list is sent, so an untouched form never marks
+          // the cell's init as `edited`.
+          const initEl = /** @type {HTMLTextAreaElement|null} */ (document.getElementById("e-init"));
+          const s0 = r.tasks[sel.taskIdx].cells[sel.cellIdx];
+          const initBefore = s0.worktree_init ? s0.worktree_init.commands.join("\n") : "";
+          if (initEl && initEl.value !== initBefore) body.initialization_commands = initEl.value;
+          if (val("e-init-timeout")) body.initialization_timeout_sec = val("e-init-timeout");
           // Submit only the active mode's fields, driven by the dropdown — not by
           // the cell's pre-existing kind.
           if (val("e-mode") === "command") {
