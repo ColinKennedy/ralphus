@@ -471,6 +471,8 @@ fn parse_initialize_solo_developer(
         setup_mcp: parse_initialize_bool(scanner, "--setup-mcp")?,
         mcp_hosts: scanner.take_repeated("--mcp-host")?,
         agent_logins: scanner.take_value("--agent-logins")?,
+        install_skills: scanner.take_value("--install-skills")?,
+        force_skills: parse_initialize_bool(scanner, "--force-skills")?,
         register_project: parse_initialize_bool(scanner, "--register-project")?,
         project_name: scanner.take_value("--project-name")?,
         project_is_fork: parse_initialize_bool(scanner, "--project-is-fork")?,
@@ -721,9 +723,15 @@ mod tests {
             "claude-code",
             "--agent-logins",
             "claude,codex",
+            "--install-skills",
+            "claude-code,pi",
+            "--force-skills",
+            "yes",
         ])) {
             Command::InitializeSoloDeveloper { setup } => {
                 assert_eq!(setup.agent_logins.as_deref(), Some("claude,codex"));
+                assert_eq!(setup.install_skills.as_deref(), Some("claude-code,pi"));
+                assert_eq!(setup.force_skills, Some(true));
                 assert_eq!(setup.install_tmux, Some(false));
                 assert_eq!(setup.mcp_hosts, ["claude"]);
                 assert_eq!(setup.project_name.as_deref(), Some("ralphus"));

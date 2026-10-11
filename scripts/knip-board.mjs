@@ -37,8 +37,10 @@ const scriptStart = shell.slice(0, shell.search(/^.*<script src="\/board\//m)).s
 // `.bin` directory to PATH for scripts, while the package's internal bin
 // layout is not a stable interface (and may not be materialized in a linked
 // or shared dependency installation).
+// Exclude "binaries" warnings for eslint and tsc, which are CLI tools called
+// directly from npm scripts and not fully traceable through JavaScript imports.
 const knipCommand = process.platform === "win32" ? "knip.cmd" : "knip";
-const result = spawnSync(knipCommand, [], {
+const result = spawnSync(knipCommand, ["--exclude", "binaries"], {
   cwd: repoRoot,
   encoding: "utf8",
   maxBuffer: 64 * 1024 * 1024,
