@@ -1,6 +1,6 @@
 ﻿      // ---- Tooltip engine (RAL-40) ----
       // Attach data-tip="..." to any element for a styled dark-theme tooltip.
-      // Multi-line content: use \n in the attribute value.
+      // Multi-line content: use \n in the attribute value; the engine converts literal \n to real newlines.
       /** Wires up the global hover-tooltip engine driven by `data-tip="..."` attributes; self-invoking, no exports. */
       (function () {
         const tip = document.createElement("div");
@@ -25,7 +25,7 @@
           const el = /** @type {HTMLElement|null} */ (/** @type {HTMLElement} */ (e.target).closest("[data-tip]"));
           if (!el) { if (cur) { cur = null; tip.classList.remove("show"); } return; }
           if (el === cur) return;
-          cur = el; tip.textContent = el.dataset.tip ?? "";
+          cur = el; tip.textContent = (el.dataset.tip ?? "").replace(/\\n/g, "\n");
           tip.classList.add("show"); reposition();
         });
         document.addEventListener("mouseout", (/** @type {MouseEvent} */ e) => {
