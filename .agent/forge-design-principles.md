@@ -202,3 +202,29 @@ explicit user-supplied descriptions alike — since both flow through the same
 `create_pull_request_inner` call. GitHub PR templates are unaffected;
 GitHub has no equivalent `%{...}` template-variable syntax, and this is
 GitLab-only scope by design (RAL-499's out-of-scope note).
+
+## 5. A background forge failure must reach the mailbox
+
+The pollers (merge detection, CI status, reorder/base-drift checks, comment
+polling) treat a failed forge call as "assume nothing changed" so an
+unreachable forge is never read as a merged PR. That fail-safe is silent by
+itself: a revoked token or an exhausted rate limit leaves every review
+looking healthy while nothing is detected. So every background forge call
+that swallows its error must also hand it to `daemon/src/forge_health.rs`
+(`report_error` / `report_failure`, and `note_success` on a good answer).
+
+- It classifies 401 / rate limit (429, or a 403 whose body says so) / other
+  403 / unreachable (5xx, transport), and enqueues **one** remediable mailbox
+  notice per `forge:repo` outage, re-arming on the next success. Transport and
+  5xx failures notify only after `TRANSIENT_NOTIFY_AFTER`; a still-running
+  outage reminds after `REMIND_AFTER`.
+- Do not write per-call-site `contains("forge API 403")` checks; extend
+  `classify` instead, so GitHub and GitLab stay at parity.
+- A rate-limited forge must not be asked again while its backoff window runs:
+  use `pr::is_backed_off` / `pr::start_backoff` (as `check_pr_merges` does).
+- A background thread that already returned `202` to the user reports its
+  failure with `pr::notify_background_failure` (a deduped guardian notice with
+  the retry command), not a log line alone.
+- Merge detection (`check_pr_merges`) runs on its own claim
+  (`guardian_merge::MERGE_CHECKING`), never only inside the heavy maintenance
+  pass, so a wedged rebase or fetch cannot stop a merged review from settling.

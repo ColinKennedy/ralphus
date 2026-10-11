@@ -29,6 +29,7 @@ pub mod env_view;
 pub mod events;
 pub mod followup;
 pub mod forge;
+pub mod forge_health;
 pub mod generation;
 pub mod ghost;
 pub mod git_hooks;
