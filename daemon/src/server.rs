@@ -6942,17 +6942,11 @@ fn run_submit_followup(
         resolved
     };
 
-    // RAL-<pending>: decide every LOCAL cell's worktree (branch claim +
-    // `w/<short>` directory) under a brief lock, then actually create/resync
-    // them -- the real `git worktree add`/`fetch`/rebase -- with NO lock
-    // held, concurrently. Without this, `derive_reviews_with_prefetch` below
-    // would run that same real git work serially, one cell at a time, for
-    // the ENTIRE duration the store lock is held -- which stalls not just
-    // this squad's own submission but every other request the daemon
-    // serves meanwhile (board reads, other squads' dispatch), since it's
-    // the same single global lock. See
-    // `crate::worktrees::plan_local_worktree_jobs`'s doc comment.
-    report_phase("Creating worktrees");
+    // Claim every LOCAL cell's worktree (branch + `w/<short>` directory) under a
+    // brief lock and leave creating it to the scheduler: the squad is built
+    // from the TOML alone and each cell starts as its own worktree becomes
+    // ready. See `crate::worktrees::plan_local_worktree_jobs`'s doc comment.
+    report_phase("Claiming worktrees");
     let prefetched_worktrees = {
         let guard = store_handle.lock();
         let (cells, tasks) = crate::reviews::cells_and_tasks_from_file(&file);
@@ -6963,8 +6957,7 @@ fn run_submit_followup(
             &tasks,
             &prefetched_upstreams,
         );
-        drop(guard);
-        crate::worktrees::execute_local_worktree_jobs(&jobs)
+        crate::worktrees::planned_worktree_paths(&jobs)
     };
 
     // WS-D.8: called with the handle, not a held guard. This was the single
@@ -22091,7 +22084,7 @@ mod tests {
 
     /// RAL-445: registering a git project installs the co-author hook
     /// immediately, without waiting for a cell to materialize a worktree
-    /// through `ensure_worktree_with_existing` -- this covers a cell whose
+    /// through `ensure_worktree_tracked` -- this covers a cell whose
     /// `cwd` is the project root itself.
     #[test]
     fn register_project_route_installs_coauthor_hook() {

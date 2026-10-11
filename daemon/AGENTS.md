@@ -36,6 +36,17 @@ project to protect the path's meaning); once a project association exists,
 its name is the only thing the UI shows. `server.rs::squad_worktrees`
 (`CellPaths::project`) is the reference implementation.
 
+## Lazy worktree materialization (RAL-612)
+
+Submit claims worktree slots (branch + `w/<short>` + a `creating/<short>`
+marker) with no git work; `scheduler.rs` creates them in the background while
+ready cells start, and a cell whose worktree is still missing creates it itself
+via `worktrees::ensure_claimed_worktree` (single-flight with the background
+creator, restart-safe because the marker carries branch and upstream). See
+`.agent/gotchas.md` for the ownership rules. Race tests for this live in
+`worktrees.rs`'s test module (`concurrent_*`, `*_interrupted_by_restart`,
+`*_never_deleted`).
+
 ## Tmux cell process-tree confinement (RAL-321)
 
 On Windows, `tmux.rs`'s `confine` module assigns each cell's `new-session`
