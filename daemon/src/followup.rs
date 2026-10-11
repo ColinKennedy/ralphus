@@ -693,8 +693,9 @@ fn task_prompt(review_name: &str, item: &FollowupItem) -> String {
     out.push_str(
         "\nDo the deferred work described above and nothing else. The original work is already \
          merged; build on the current state of the branch.\n\nWhen the work is done, commit \
-         all of it on the current branch with a clear commit message. Do not push. Work that \
-         is left uncommitted is not seen, and the task fails for having no commits.",
+         all of it on the current branch with a clear commit message, then push that branch \
+         (`git push -u origin HEAD`). Work that is left uncommitted is not seen, and the task \
+         fails for having no commits.",
     );
     out
 }
@@ -2006,6 +2007,6 @@ mode = "raw"
     fn task_prompt_tells_the_agent_to_commit_its_work() {
         let prompt = task_prompt("rev", &item("do the thing", None));
         assert!(prompt.contains("commit"), "{prompt}");
-        assert!(prompt.contains("Do not push"), "{prompt}");
+        assert!(prompt.contains("git push -u origin HEAD"), "{prompt}");
     }
 }
