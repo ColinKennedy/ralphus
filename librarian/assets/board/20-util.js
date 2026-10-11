@@ -552,6 +552,10 @@
       // submitted TOML, not editable here. Always shown (RAL-356), as "—"
       // when unset since most cells/proof steps leave it unset.
       const MAXIMUM_TOOL_OUTPUT_TOKENS_TIP = "Caps how many tokens a single tool-call result (e.g. a large file read) can inject into the agent's context, delivered via each backend's own mechanism: claude-code's CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS env var, codex's tool_output_token_limit config, or pi's models.json maxTokens.\nWho/when: check this to see whether a cell/proof step is guarded against one huge tool output blowing out its context and forcing an auto-compact.\nRead-only here — edit the TOML and resubmit to change it.";
+      // RAL-607: editable from the cell edit form (agent mode), or via `effort`
+      // in the submitted TOML.
+      const EFFORT_TIP = "Reasoning-effort level delivered to the cell's agent at launch (claude-code --effort, codex model_reasoning_effort, pi --thinking).\nWho/when: raise it for hard cells, lower it for cheap ones.\nEditing it restarts the cell, resuming the existing agent session. Leave blank to use the harness default; a level the agent does not accept is rejected on save.";
+      const TEMPERATURE_TIP = "Sampling temperature for the cell's agent. Only the pi agent supports it, and only OpenAI-compatible APIs (Ollama included) honor it -- elsewhere it may look set but be inert.\nEditing it restarts the cell, resuming the existing agent session. Leave blank for the model default.";
       // Same idea as TOKENS_COST_TIP/LIFETIME_COST_TIP above, for proof steps
       // (RAL-172): a proof step's own token/cost usage is now tracked
       // per-attempt server-side, and its lifetime total is loaded the same
