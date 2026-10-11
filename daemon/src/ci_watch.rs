@@ -324,7 +324,9 @@ pub fn start_ci_watch(store: &crate::store_lock::StoreHandle, guardian_id: &str,
 }
 
 fn run_watch(store: &crate::store_lock::StoreHandle, guardian_id: &str, branch_id: &str) {
-    let Ok(guardian) = store.lock().get_guardian(guardian_id) else {
+    let Ok(guardian) =
+        store.with_read_snapshot(|conn| crate::store::Store::get_guardian_conn(conn, guardian_id))
+    else {
         return;
     };
     let Some(branch) = guardian.branches.iter().find(|b| b.id == branch_id) else {
@@ -794,7 +796,9 @@ pub fn poll_open_pr_ci_status(
         }
         last.insert(guardian_id.to_string(), now);
     }
-    let Ok(guardian) = store.lock().get_guardian(guardian_id) else {
+    let Ok(guardian) =
+        store.with_read_snapshot(|conn| crate::store::Store::get_guardian_conn(conn, guardian_id))
+    else {
         return;
     };
     if crate::guardian::GuardianStatus::is_terminal_status(&guardian.status) {
