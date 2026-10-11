@@ -979,6 +979,16 @@ const CHECK_CHILDREN: &[HelpNode] = &[
         true,  // ("check", "catalog")
         &[],
     ),
+    // Mapped to POST /api/health/threads/{name}/restart in check_endpoint_cli_parity.py's manifest.
+    node(
+        "restart-thread",
+        &["name [str]"],
+        &["--json"],
+        "Restart a daemon background thread that has panicked or exited (scheduler, health-sweep, pr-base-drift-poller, store-watchdog) without restarting the daemon. `check health` reports each thread's state and names this command for any that is down. Refused for a thread that is still alive.",
+        false,
+        false, // mutating: re-spawns a thread
+        &[],
+    ),
 ];
 
 const INITIALIZE_CHILDREN: &[HelpNode] = &[

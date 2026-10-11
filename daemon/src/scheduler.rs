@@ -493,6 +493,15 @@ impl Drop for SemaphorePermit<'_> {
     }
 }
 
+/// Name the scheduler thread is registered under in
+/// [`crate::thread_health`].
+pub const SCHEDULER_THREAD: &str = "scheduler";
+
+/// How long the scheduler loop may go without completing a pass before it is
+/// reported stalled. A pass is normally well under a second; the allowance
+/// covers one long maintenance sweep.
+pub const SCHEDULER_MAX_SILENCE: Duration = Duration::from_secs(300);
+
 /// Run the scheduler forever, ticking every [`POLL_INTERVAL`] and sweeping
 /// reviews for base-branch shifts every [`REVIEW_MAINT_INTERVAL`].
 ///
@@ -502,6 +511,12 @@ impl Drop for SemaphorePermit<'_> {
 /// [`crate::summary_worker::SummaryQueue`] — its background worker threads are
 /// spawned separately (`server::serve`), so this loop only ever enqueues into
 /// it, never processes it inline.
+///
+/// `first_run` is `true` for the process's first start of this loop and `false`
+/// when [`crate::thread_health::restart`] re-enters it: the startup recovery,
+/// reaping and first-pass sweeps assume nothing has been dispatched yet, which
+/// stops being true once the daemon has been serving.
+#[allow(clippy::too_many_arguments)]
 pub fn run_loop(
     store: crate::store_lock::StoreHandle,
     runner: Arc<dyn Runner>,
@@ -510,6 +525,7 @@ pub fn run_loop(
     sem: Arc<Semaphore>,
     summary_queue: Arc<crate::summary_worker::SummaryQueue>,
     procs: crate::procreg::ProcRegistry,
+    first_run: bool,
 ) {
     let mut last_maintenance = std::time::Instant::now();
     let mut last_summary_sweep = std::time::Instant::now();
@@ -525,7 +541,9 @@ pub fn run_loop(
     let cpu_stall_tracker = crate::cpu_stall::CpuStallTracker::new();
     // Ark persists its per-project due times, so calling once at startup is
     // cheap for projects whose configured interval has not elapsed.
-    crate::ark::periodic_sweep(&store, &cancellations, &sem);
+    if first_run {
+        crate::ark::periodic_sweep(&store, &cancellations, &sem);
+    }
     // RAL-385: same startup reasoning as the ark sweep -- only worktrees
     // already past the 30-day threshold are touched, so running the daily
     // retirement pass once at startup (then every
@@ -534,8 +552,10 @@ pub fn run_loop(
     // dual-root upstream-branch sweep rides along for the same reason -- a
     // branch left behind by a review that went terminal while the daemon was
     // down is retired promptly instead of waiting a full interval.
-    crate::guardian_merge::retire_stale_worktrees(&store);
-    crate::pr::sweep_terminal_dual_root_upstream_branches(&store);
+    if first_run {
+        crate::guardian_merge::retire_stale_worktrees(&store);
+        crate::pr::sweep_terminal_dual_root_upstream_branches(&store);
+    }
     let mut last_worktree_retirement = std::time::Instant::now();
     // Same daily cadence as the retirement sweep just above, but deliberately
     // NOT also run once here at startup the way that sweep is: startup is
@@ -553,17 +573,21 @@ pub fn run_loop(
     // Run once at startup too, so a freshly (re)started daemon doesn't wait a
     // full BASE_BRANCH_FRESHNESS_POLL_INTERVAL before its first base-branch
     // refresh -- same rationale as the ark call just above.
-    crate::guardian_merge::poll_base_branch_freshness_once(&store);
+    if first_run {
+        crate::guardian_merge::poll_base_branch_freshness_once(&store);
+    }
     let mut last_base_branch_freshness_poll = std::time::Instant::now();
     // RAL-389: self-heal a request lost to a crash between a branch's
     // terminal-status write and its durable queue write.
-    crate::pr::recover_pending_auto_submits_on_startup(&store);
-    recover_interrupted_reviews(&store, &sem, &cancellations);
+    if first_run {
+        crate::pr::recover_pending_auto_submits_on_startup(&store);
+        recover_interrupted_reviews(&store, &sem, &cancellations);
+    }
     // Recovery: start collecting guardians whose contributing cells are all
     // Done. This handles the case where the daemon was restarted after the squad
     // completed but before the guardian auto-started, and a full-merge crash (its
     // branches were reset to `pending` by `run_merge_cancellable`).
-    {
+    if first_run {
         let ids = {
             let guard = store.lock();
             let ids = match guard.collecting_guardians_ready() {
@@ -603,7 +627,7 @@ pub fn run_loop(
     // half-built) but not all branches done. A staged merge builds their
     // already-`Done` prefix plus the next buildable branch. Branches are left in
     // whatever state the crash left them; the pass re-evaluates.
-    {
+    if first_run {
         let ids = {
             let guard = store.lock();
             guard.collecting_guardians_resumable().unwrap_or_default()
@@ -611,6 +635,7 @@ pub fn run_loop(
         start_reviews(&store, ids, &sem, &cancellations);
     }
     loop {
+        crate::thread_health::beat(SCHEDULER_THREAD);
         tick(&store, &runner, &sem, &cancellations, &summary_queue);
         if last_maintenance.elapsed() >= REVIEW_MAINT_INTERVAL {
             crate::guardian_merge::review_maintenance(&store, &sem, &cancellations);

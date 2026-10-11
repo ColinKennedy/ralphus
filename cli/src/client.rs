@@ -782,6 +782,18 @@ impl DaemonClient {
         self.get("/api/health/report")
     }
 
+    /// `GET /api/health/threads`: live state of every supervised daemon
+    /// thread (scheduler, pollers, watchdog), for `ralphus check health`.
+    pub fn health_threads(&self) -> Result<Value, DaemonError> {
+        self.get("/api/health/threads")
+    }
+
+    /// `POST /api/health/threads/{name}/restart`: re-spawn a daemon thread
+    /// that has panicked or exited.
+    pub fn restart_thread(&self, name: &str) -> Result<Value, DaemonError> {
+        self.post(&format!("/api/health/threads/{name}/restart"), None)
+    }
+
     pub fn get_machine(&self, scheme: &str) -> Result<Value, DaemonError> {
         self.get(&format!("/api/machines/{scheme}"))
     }

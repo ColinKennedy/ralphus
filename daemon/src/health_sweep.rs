@@ -678,18 +678,29 @@ pub fn run_sweep(store: &StoreHandle) -> SweepReport {
 /// available immediately rather than waiting a full interval.
 pub fn spawn_health_sweep(state: HealthSweepState, store: StoreHandle) {
     state.record(&store, run_sweep(&store), "startup");
-    std::thread::spawn(move || {
-        loop {
-            let cfg = crate::config::load_health_sweep_config();
-            std::thread::sleep(cfg.poll_interval());
-            if !cfg.enabled() {
-                continue;
+    crate::thread_health::spawn_supervised(
+        crate::thread_health::ThreadSpec {
+            name: HEALTH_SWEEP_THREAD,
+            description: "The hourly daemon-local health sweep stops refreshing.",
+            max_silence: None,
+        },
+        Arc::clone(&store),
+        Arc::new(move || {
+            loop {
+                let cfg = crate::config::load_health_sweep_config();
+                std::thread::sleep(cfg.poll_interval());
+                if !cfg.enabled() {
+                    continue;
+                }
+                let report = run_sweep(&store);
+                state.record(&store, report, "scheduled");
             }
-            let report = run_sweep(&store);
-            state.record(&store, report, "scheduled");
-        }
-    });
+        }),
+    );
 }
+
+/// Name the sweep thread is registered under in [`crate::thread_health`].
+const HEALTH_SWEEP_THREAD: &str = "health-sweep";
 
 #[cfg(test)]
 mod tests {

@@ -269,6 +269,21 @@ check's `section`/`status`/`detail`/`impact`/`remediation`/`provenance`
 fields intact, plus (RAL-416) an `id` naming the stable
 `ralphus_core::health_catalog` entry each result belongs to.
 
+#### Daemon threads
+
+`check health` includes a `daemon-threads` row: the daemon's background
+threads (`scheduler`, `health-sweep`, `pr-base-drift-poller`,
+`store-watchdog`) each reported as running, stalled, panicked or exited. A
+panicked thread does not stop the daemon, so without this row a dead
+scheduler looks like a healthy daemon that has stopped rebasing reviews. A
+thread that ends also sends an `urgent` mailbox message naming the command
+below.
+
+`check restart-thread <name>` re-spawns a thread that has panicked or exited,
+without restarting the daemon (the board's Health tab has the same Restart
+button). It is refused for a thread that is still alive. Restarting the
+scheduler re-enters its tick loop only; startup recovery is not re-run.
+
 #### Check catalog (RAL-416)
 
 `check catalog` lists every check `ralphus_core::health_catalog` knows about

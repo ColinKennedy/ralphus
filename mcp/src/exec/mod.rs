@@ -81,6 +81,7 @@ pub fn execute(cmd: Command, client: &DaemonClient) -> ExecResult {
         Command::Clear(args) => exec_clear(client, args),
         Command::Check(args) => Ok(exec_check(client, args)),
         Command::CheckCatalog => Ok(exec_check_catalog()),
+        Command::CheckRestartThread { name } => Ok(client.restart_thread(&name)?),
         Command::Completion => Ok(json!({
             "message": format!(
                 "# {} shell completion is not yet ported in this Rust build.",
