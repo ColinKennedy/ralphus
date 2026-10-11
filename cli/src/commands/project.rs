@@ -80,6 +80,7 @@ pub enum ProjectReviewSettingsCommand {
         base_shift_maximum_rebuilds: Option<u32>,
         clear_base_shift_maximum_rebuilds: bool,
         proof_scope: Option<String>,
+        ci_deferral: Option<String>,
         skip_auto_clean: Option<bool>,
         skip_worktrees: Option<bool>,
         skip_base_updates: Option<bool>,
@@ -351,6 +352,7 @@ fn parse_review_settings_set(
     let clear_base_shift_maximum_rebuilds =
         scanner.take_bool("--clear-base-shift-maximum-rebuilds");
     let proof_scope = scanner.take_value("--proof-scope")?;
+    let ci_deferral = scanner.take_value("--ci-deferral")?;
     let skip_auto_clean = crate::commands::review::take_tri_bool(scanner, "--skip-auto-clean");
     let skip_worktrees = crate::commands::review::take_tri_bool(scanner, "--skip-worktrees");
     let skip_base_updates = crate::commands::review::take_tri_bool(scanner, "--skip-base-updates");
@@ -422,6 +424,7 @@ fn parse_review_settings_set(
         base_shift_maximum_rebuilds,
         clear_base_shift_maximum_rebuilds,
         proof_scope,
+        ci_deferral,
         skip_auto_clean,
         skip_worktrees,
         skip_base_updates,
@@ -577,6 +580,7 @@ fn dispatch_review_settings(cmd: ProjectReviewSettingsCommand, opts: &GlobalOpts
             base_shift_maximum_rebuilds,
             clear_base_shift_maximum_rebuilds,
             proof_scope,
+            ci_deferral,
             skip_auto_clean,
             skip_worktrees,
             skip_base_updates,
@@ -604,6 +608,7 @@ fn dispatch_review_settings(cmd: ProjectReviewSettingsCommand, opts: &GlobalOpts
                 base_shift_maximum_rebuilds,
                 clear_base_shift_maximum_rebuilds,
                 default_proof_scope: proof_scope.as_deref(),
+                default_ci_deferral: ci_deferral.as_deref(),
                 verify_skip_auto_clean: skip_auto_clean,
                 skip_worktrees,
                 skip_base_updates,
@@ -677,6 +682,7 @@ fn render_review_settings(payload: &Value) {
             .map_or("(unbounded)".to_string(), |v| v.to_string())
     );
     row_str("proof scope:", "default_proof_scope");
+    row_str("ci deferral:", "default_ci_deferral");
     row_bool("skip auto-clean:", "verify_skip_auto_clean");
     row_bool("skip worktrees:", "skip_worktrees");
     row_bool("skip base updates:", "skip_base_updates");

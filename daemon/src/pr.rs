@@ -14519,6 +14519,47 @@ mod tests {
             assert_eq!(stack_shape(&store), shape_before, "{forge} {mode}");
         }
 
+        // A PR opened after the flips is labelled against the setting as it
+        // stands now: the old top stops being exempt and the new top is.
+        store.lock().add_guardian_branch(&gid, "d").unwrap();
+        let d_branch_id = store
+            .lock()
+            .get_guardian(&gid)
+            .unwrap()
+            .branches
+            .last()
+            .unwrap()
+            .id
+            .clone();
+        store
+            .lock()
+            .create_pull_request(
+                &gid,
+                Some(&d_branch_id),
+                forge,
+                "acme/widget",
+                "d-alias",
+                "c-alias",
+                "d-alias",
+                "",
+                Some(4),
+                None,
+            )
+            .unwrap();
+        let after_new_pr: [(&str, Vec<i64>); 3] = [
+            ("tip", vec![1, 2, 3]),
+            ("bottom+tip", vec![2, 3]),
+            ("every", vec![]),
+        ];
+        for (mode, expected) in after_new_pr {
+            store
+                .lock()
+                .set_guardian_ci_deferral(&gid, Some(mode))
+                .unwrap();
+            reconcile_ci_deferral(&store, &gid).unwrap();
+            assert_eq!(deferred_numbers(), expected, "{forge} {mode} with 4 PRs");
+        }
+
         mock.finish();
         let calls = calls.lock().unwrap();
         assert!(!calls.is_empty());

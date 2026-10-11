@@ -47,6 +47,8 @@
        * @property {string} originalResolverModel
        * @property {string} proofScope - "each_branch" | "final_branch" | "nothing"
        * @property {string} originalProofScope
+       * @property {string} ciDeferral - "" (inherit the project default) | "every" | "tip" | "bottom+tip"
+       * @property {string} originalCiDeferral
        * @property {boolean} proofSkipAutoClean
        * @property {boolean} originalProofSkipAutoClean
        * @property {boolean} skipWorktrees
@@ -220,6 +222,17 @@
       }
 
       /**
+       * Short value for the setup-strip's CI chip.
+       * @param {string|null|undefined} effective - The review's resolved CI-deferral mode.
+       * @returns {string}
+       */
+      function ciDeferralChipText(effective) {
+        if (effective === "tip") return "top only";
+        if (effective === "bottom+tip") return "bottom + top";
+        return "every PR";
+      }
+
+      /**
        * Whether a draft differs from the state it was seeded with. Two
        * inheriting drafts are equal whatever their (ignored) triggers hold.
        * @param {RebuildOnDraft} draft
@@ -325,6 +338,7 @@
         for (const p of projects) squash[p] = squashOn.includes(p);
         const proofScope = g.effective_proof_scope || "each_branch";
         const proofSkipAutoClean = !!g.effective_proof_skip_auto_clean;
+        const ciDeferral = g.ci_deferral || "";
         const skipWorktrees = !!g.skip_worktrees;
         const skipBaseUpdates = !!g.effective_skip_base_updates;
         const separatePrBranch = !!g.effective_separate_pr_branch;
@@ -351,6 +365,7 @@
           resolverModel: g.resolver_model || "",
           originalResolverModel: g.resolver_model || "",
           proofScope, originalProofScope: proofScope,
+          ciDeferral, originalCiDeferral: ciDeferral,
           proofSkipAutoClean, originalProofSkipAutoClean: proofSkipAutoClean,
           skipWorktrees, originalSkipWorktrees: skipWorktrees,
           skipBaseUpdates, originalSkipBaseUpdates: skipBaseUpdates,
@@ -471,6 +486,13 @@
         reviewEditDraft.proofScope = value;
         renderReviewEditModal();
       }
+      /**
+       * Stages a new CI-deferral choice for this review ("" inherits the
+       * project default).
+       * @param {string} value
+       * @returns {void}
+       */
+      function onEditCiDeferral(value) { if (reviewEditDraft) reviewEditDraft.ciDeferral = value; }
       /**
        * Stages the "skip auto-clean branches" sub-option.
        * @param {boolean} checked
@@ -857,6 +879,27 @@
           </div></div>`;
       }
       /**
+       * CI-deferral selector: which PRs/MRs in the review's stack run the full
+       * CI suite. Shared by the review-edit modal and the project
+       * review-settings modal, which differ only in the handler they wire up
+       * and whether "(inherit)" is offered.
+       * @param {string} ciDeferral
+       * @param {string} onChange
+       * @param {string} inheritLabel
+       * @returns {string}
+       */
+      function renderCiDeferralFieldsHtml(ciDeferral, onChange, inheritLabel) {
+        const option = (/** @type {string} */ value, /** @type {string} */ label) =>
+          `<option value="${value}" ${ciDeferral === value ? "selected" : ""}>${label}</option>`;
+        return `<div class="kv-row"><span class="k">full CI runs on</span>
+            <select style="${REVIEW_EDIT_INPUT_STYLE}" onchange="${onChange}(this.value)" data-tip="Which PRs/MRs in this review's stack run the project's full CI suite. The others are labelled 'ralphus:defer-full-ci', which the project's CI configuration reads to skip its slow jobs while still running its fast ones.\nUse 'tip' or 'bottom+tip' to save CI time on a stack that lands as a whole. The change is applied to the open PRs/MRs as soon as you Save, and to any PR/MR opened later.\nThe label only takes effect where the repository's CI reads it; with no CI rule for it, nothing is skipped.">
+              <option value="" ${ciDeferral === "" ? "selected" : ""}>${inheritLabel}</option>
+              ${option("every", "every PR/MR")}
+              ${option("tip", "the top PR/MR only")}
+              ${option("bottom+tip", "the bottom and top PR/MR")}
+            </select></div>`;
+      }
+      /**
        * RAL-408: pull-request settings fields (separate PR branch / match
        * worktree branch name / auto-submit PR stack / dual root PR), shared
        * as above.
@@ -934,6 +977,7 @@
               </div></div>
             <div ${grp("resolver")}><h3 class="section">resolver</h3>${resolverSection}</div>
             <div ${grp("proof")}><h3 class="section">proof</h3>${proofScopeSection}</div>
+            <div ${grp("ci")}><h3 class="section">CI</h3>${renderCiDeferralFieldsHtml(draft.ciDeferral, "onEditCiDeferral", "(inherit project default)")}</div>
             <div><h3 class="section">rebase</h3>
               <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Overrides the project default for this review only: when its upstream branch moves, don't automatically rebuild/rebase this review's stack onto the new tip. Use for a review whose auto-rebase keeps getting in the way (e.g. one under heavy manual conflict resolution). You can still start a merge/rebase manually at any time, individually or via the review list's bulk Merge/Rebase action, regardless of this setting. Applies on Save.">
                 <input type="checkbox" ${draft.skipBaseUpdates ? "checked" : ""} onchange="onEditSkipBaseUpdates(this.checked)">skip automatic base-branch rebasing</label>
@@ -1023,6 +1067,7 @@
           body.proof_scope = draft.proofScope;
           body.proof_skip_auto_clean = draft.proofSkipAutoClean;
         }
+        if (draft.ciDeferral !== draft.originalCiDeferral) body.ci_deferral = draft.ciDeferral;
         if (draft.skipWorktrees !== draft.originalSkipWorktrees) body.skip_worktrees = draft.skipWorktrees;
         if (draft.skipBaseUpdates !== draft.originalSkipBaseUpdates) body.skip_base_updates = draft.skipBaseUpdates;
         if (draft.separatePrBranch !== draft.originalSeparatePrBranch) body.separate_pr_branch = draft.separatePrBranch;
@@ -1071,4 +1116,4 @@
         }
       }
 
-      void [onEditResolverAgent, onEditResolverModel, onEditProofScope, onEditProofSkipAutoClean, onEditSeparatePrBranch, onEditMatchPrBranchName, onEditAutoSubmitPrStack, onEditDualRootPr, onEditAutoFixPrErrors, onEditAutoFixPromptTemplate, onEditDiscourageTests, onEditRebuildOnInherit, onEditRebuildOnTrigger];
+      void [onEditResolverAgent, onEditResolverModel, onEditProofScope, onEditCiDeferral, onEditProofSkipAutoClean, onEditSeparatePrBranch, onEditMatchPrBranchName, onEditAutoSubmitPrStack, onEditDualRootPr, onEditAutoFixPrErrors, onEditAutoFixPromptTemplate, onEditDiscourageTests, onEditRebuildOnInherit, onEditRebuildOnTrigger];

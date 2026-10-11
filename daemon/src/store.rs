@@ -832,6 +832,11 @@ pub struct ProjectReviewSettings {
     pub default_maximum_budget_usd: Option<f64>,
     #[serde(default)]
     pub default_proof_scope: Option<String>,
+    /// Project default for which PRs/MRs in a review's stack run the full CI
+    /// suite (`every`/`tip`/`bottom+tip`). `None` inherits the file and
+    /// global layers, then `every`.
+    #[serde(default)]
+    pub default_ci_deferral: Option<String>,
     #[serde(default)]
     pub verify_skip_auto_clean: Option<bool>,
     #[serde(default)]
@@ -924,6 +929,7 @@ impl ProjectReviewSettings {
             auto_build: self.auto_build,
             summary_format: None,
             default_proof_scope: self.default_proof_scope,
+            default_ci_deferral: self.default_ci_deferral,
             proof_skip_auto_clean: self.verify_skip_auto_clean,
             default_resolver_agent: self.default_resolver_agent,
             default_resolver_model: self.default_resolver_model,
@@ -18588,6 +18594,7 @@ command = "e"
             default_machine: Some("local".to_string()),
             default_maximum_budget_usd: Some(5.0),
             default_proof_scope: Some("final_branch".to_string()),
+            default_ci_deferral: Some("bottom+tip".to_string()),
             verify_skip_auto_clean: Some(true),
             skip_worktrees: Some(true),
             skip_base_updates: Some(false),

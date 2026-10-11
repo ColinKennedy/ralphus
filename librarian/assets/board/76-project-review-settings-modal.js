@@ -37,6 +37,8 @@
        * @property {number|null} originalMaximumBudgetUsd
        * @property {string} proofScope - "" (inherit) | "each_branch" | "final_branch" | "nothing"
        * @property {string} originalProofScope
+       * @property {string} ciDeferral - "" (inherit the file-config/global default) | "every" | "tip" | "bottom+tip"
+       * @property {string} originalCiDeferral
        * @property {boolean} proofSkipAutoClean
        * @property {boolean} originalProofSkipAutoClean
        * @property {boolean} skipWorktrees
@@ -110,6 +112,7 @@
           ? null
           : s.default_maximum_budget_usd;
         const proofScope = str(s.default_proof_scope);
+        const ciDeferral = str(s.default_ci_deferral);
         const proofSkipAutoClean = boolOr(s.verify_skip_auto_clean, effective.skip_auto_clean);
         const skipWorktrees = boolOr(s.skip_worktrees, effective.skip_worktrees);
         const skipBaseUpdates = boolOr(s.skip_base_updates, effective.skip_base_updates);
@@ -138,6 +141,7 @@
           machine, originalMachine: machine,
           maximumBudgetUsd, originalMaximumBudgetUsd: maximumBudgetUsd,
           proofScope, originalProofScope: proofScope,
+          ciDeferral, originalCiDeferral: ciDeferral,
           proofSkipAutoClean, originalProofSkipAutoClean: proofSkipAutoClean,
           skipWorktrees, originalSkipWorktrees: skipWorktrees,
           skipBaseUpdates, originalSkipBaseUpdates: skipBaseUpdates,
@@ -239,6 +243,12 @@
         projectReviewSettingsDraft.proofScope = value;
         renderProjectReviewSettingsModal();
       }
+      /**
+       * Stages a new project default CI-deferral choice ("" inherits).
+       * @param {string} value
+       * @returns {void}
+       */
+      function onProjectEditCiDeferral(value) { if (projectReviewSettingsDraft) projectReviewSettingsDraft.ciDeferral = value; }
       /**
        * Stages the "skip auto-clean branches" sub-option.
        * @param {boolean} checked
@@ -401,6 +411,8 @@
             <div class="kv-row"><span class="k">machine</span><input type="text" class="mono" style="${REVIEW_EDIT_INPUT_STYLE};width:200px" value="${esc(draft.machine)}" placeholder="inherits: ${esc(draft.effective.machine || "local")}" oninput="onProjectEditMachine(this.value)" data-tip="${PROJECT_REVIEW_SETTINGS_MACHINE_TIP}"></div>
             <div class="kv-row"><span class="k">maximum budget usd</span><input type="number" step="0.01" min="0" class="mono" style="${REVIEW_EDIT_INPUT_STYLE};width:120px" value="${draft.maximumBudgetUsd === null ? "" : esc(String(draft.maximumBudgetUsd))}" placeholder="${draft.effective.maximum_budget_usd === undefined ? "unbounded" : esc(String(draft.effective.maximum_budget_usd))}" oninput="onProjectEditMaximumBudgetUsd(this.value)" data-tip="${PROJECT_REVIEW_SETTINGS_BUDGET_TIP}"></div>
             ${proofScopeSection}
+            <h3 class="section">CI</h3>
+            ${renderCiDeferralFieldsHtml(draft.ciDeferral, "onProjectEditCiDeferral", `(inherit: ${esc(draft.effective.ci_deferral || "every")})`)}
             <h3 class="section">review workspace</h3>
             <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:6px" data-tip="Build the entire branch stack in one shared worktree instead of isolated per-branch worktrees, for a future review that declares no explicit skip_worktrees of its own.">
               <input type="checkbox" ${draft.skipWorktrees ? "checked" : ""} onchange="onProjectEditSkipWorktrees(this.checked)">skip per-branch worktrees</label>
@@ -455,6 +467,7 @@
           }
         }
         if (draft.proofScope !== draft.originalProofScope) body.default_proof_scope = draft.proofScope;
+        if (draft.ciDeferral !== draft.originalCiDeferral) body.default_ci_deferral = draft.ciDeferral;
         if (draft.proofSkipAutoClean !== draft.originalProofSkipAutoClean) body.verify_skip_auto_clean = draft.proofSkipAutoClean;
         if (draft.skipWorktrees !== draft.originalSkipWorktrees) body.skip_worktrees = draft.skipWorktrees;
         if (draft.skipBaseUpdates !== draft.originalSkipBaseUpdates) body.skip_base_updates = draft.skipBaseUpdates;
@@ -499,4 +512,4 @@
         closeProjectReviewSettingsModal();
       }
 
-      void [onProjectEditResolverAgent, onProjectEditResolverModel, onProjectEditMachine, onProjectEditMaximumBudgetUsd, onProjectEditProofScope, onProjectEditProofSkipAutoClean, onProjectEditSkipWorktrees, onProjectEditSkipBaseUpdates, onProjectEditBaseShiftMaximumRebuilds, onProjectEditSeparatePrBranch, onProjectEditDualRootPr, onProjectEditMatchPrBranchName, onProjectEditAutoBuild, onProjectEditAutoSubmitPrStack, onProjectEditAutoFixPrErrors, onProjectEditAutoFixPromptTemplate, onProjectEditDiscourageTests, onProjectEditAutoCancelOutdatedPrPipelines, onProjectEditRebuildOnInherit, onProjectEditRebuildOnTrigger];
+      void [onProjectEditResolverAgent, onProjectEditResolverModel, onProjectEditMachine, onProjectEditMaximumBudgetUsd, onProjectEditProofScope, onProjectEditCiDeferral, onProjectEditProofSkipAutoClean, onProjectEditSkipWorktrees, onProjectEditSkipBaseUpdates, onProjectEditBaseShiftMaximumRebuilds, onProjectEditSeparatePrBranch, onProjectEditDualRootPr, onProjectEditMatchPrBranchName, onProjectEditAutoBuild, onProjectEditAutoSubmitPrStack, onProjectEditAutoFixPrErrors, onProjectEditAutoFixPromptTemplate, onProjectEditDiscourageTests, onProjectEditAutoCancelOutdatedPrPipelines, onProjectEditRebuildOnInherit, onProjectEditRebuildOnTrigger];

@@ -515,6 +515,7 @@ impl DaemonClient {
             body["clear_base_shift_maximum_rebuilds"] = json!(true);
         }
         set_if_some(&mut body, "default_proof_scope", patch.default_proof_scope);
+        set_if_some(&mut body, "default_ci_deferral", patch.default_ci_deferral);
         set_if_some(
             &mut body,
             "verify_skip_auto_clean",
@@ -2526,6 +2527,9 @@ pub struct ProjectReviewSettingsPatch<'a> {
     /// it cannot serve as the clear sentinel).
     pub clear_base_shift_maximum_rebuilds: bool,
     pub default_proof_scope: Option<&'a str>,
+    /// Project default CI-deferral mode (`every`/`tip`/`bottom+tip`); an
+    /// empty string clears it back to inheriting.
+    pub default_ci_deferral: Option<&'a str>,
     pub verify_skip_auto_clean: Option<bool>,
     pub skip_worktrees: Option<bool>,
     pub skip_base_updates: Option<bool>,

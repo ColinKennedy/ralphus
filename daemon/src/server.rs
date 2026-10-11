@@ -3025,6 +3025,9 @@ struct EffectiveReviewDefaults {
     #[serde(skip_serializing_if = "Option::is_none")]
     maximum_budget_usd: Option<f64>,
     proof_scope: String,
+    /// The resolved CI-deferral default (per-review override > database
+    /// default > `.ralphus.toml`/global > `every`).
+    ci_deferral: String,
     skip_auto_clean: bool,
     skip_worktrees: bool,
     skip_base_updates: bool,
@@ -3068,6 +3071,7 @@ impl EffectiveReviewDefaults {
             machine: cfg.default_machine().map(str::to_string),
             maximum_budget_usd: cfg.default_maximum_budget_usd(),
             proof_scope: cfg.default_proof_scope().to_string(),
+            ci_deferral: cfg.default_ci_deferral().to_string(),
             skip_auto_clean: cfg.proof_skip_auto_clean(),
             skip_worktrees: cfg.skip_worktrees(),
             skip_base_updates: cfg.skip_base_updates(),
@@ -3156,6 +3160,10 @@ struct ProjectReviewSettingsBody {
     clear_maximum_budget_usd: bool,
     #[serde(default)]
     default_proof_scope: Option<String>,
+    /// Project default CI-deferral mode (`every`/`tip`/`bottom+tip`); an
+    /// empty string clears it back to inheriting.
+    #[serde(default)]
+    default_ci_deferral: Option<String>,
     #[serde(default)]
     verify_skip_auto_clean: Option<bool>,
     #[serde(default)]
@@ -3292,6 +3300,19 @@ fn set_project_review_settings(daemon: &Daemon, name: &str, body: &str) -> Reply
             );
         }
     }
+    if let Some(mode) = req.default_ci_deferral.as_deref().filter(|s| !s.is_empty()) {
+        if !ralphus_core::schema::CI_DEFERRAL_VALUES.contains(&mode) {
+            return error(
+                400,
+                "invalid_value",
+                &format!(
+                    "'default_ci_deferral' must be one of {:?} -- got {mode:?}",
+                    ralphus_core::schema::CI_DEFERRAL_VALUES
+                ),
+                vec![],
+            );
+        }
+    }
     if let Some(template) = req
         .auto_fix_prompt_template
         .as_deref()
@@ -3367,6 +3388,10 @@ fn set_project_review_settings(daemon: &Daemon, name: &str, body: &str) -> Reply
     if let Some(v) = req.default_proof_scope {
         settings.default_proof_scope = clear_if_empty(v);
     }
+    let ci_deferral_changed = req.default_ci_deferral.is_some();
+    if let Some(v) = req.default_ci_deferral {
+        settings.default_ci_deferral = clear_if_empty(v);
+    }
     if let Some(v) = req.verify_skip_auto_clean {
         settings.verify_skip_auto_clean = Some(v);
     }
@@ -3430,16 +3455,48 @@ fn set_project_review_settings(daemon: &Daemon, name: &str, body: &str) -> Reply
         settings.forks_only = Some(v);
     }
     match store.set_project_review_settings(&project.name, &settings) {
-        Ok(()) => json(
-            200,
-            &ProjectReviewSettingsResponse {
-                project: project.name.clone(),
-                effective: EffectiveReviewDefaults::from_config(
-                    &store.resolve_review_config(Path::new(&project.path)),
-                ),
-                settings,
-            },
-        ),
+        Ok(()) => {
+            let reply = json(
+                200,
+                &ProjectReviewSettingsResponse {
+                    project: project.name.clone(),
+                    effective: EffectiveReviewDefaults::from_config(
+                        &store.resolve_review_config(Path::new(&project.path)),
+                    ),
+                    settings,
+                },
+            );
+            // Reviews that inherit this default now resolve to a new mode, so
+            // their open PRs/MRs are re-labelled. Forge calls run off the
+            // request thread and outside the store lock.
+            let inheriting: Vec<String> = if ci_deferral_changed {
+                store
+                    .list_guardians()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|g| g.project.as_deref() == Some(project.name.as_str()))
+                    .filter(|g| g.ci_deferral.is_none())
+                    .map(|g| g.id)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            drop(store);
+            if !inheriting.is_empty() {
+                let handle = daemon.store_handle();
+                std::thread::spawn(move || {
+                    for id in inheriting {
+                        if let Err(e) = crate::pr::reconcile_ci_deferral(&handle, &id) {
+                            crate::rlog!(
+                                WARNING,
+                                "ralphus [pr] review {id} ci deferral label sync failed: {e}"
+                            );
+                        }
+                    }
+                });
+            }
+            reply
+        }
         Err(e) => store_error(&e),
     }
 }
@@ -14459,6 +14516,24 @@ where
     Option::<T>::deserialize(deserializer).map(Some)
 }
 
+/// The 400 for a `ci_deferral` outside the closed set, or `None` when the
+/// request carries none, the empty string (which clears it), or a valid mode.
+fn reject_invalid_ci_deferral(value: Option<&str>) -> Option<Reply> {
+    let mode = value.filter(|m| !m.is_empty())?;
+    if ralphus_core::schema::CI_DEFERRAL_VALUES.contains(&mode) {
+        return None;
+    }
+    Some(error(
+        400,
+        "invalid_ci_deferral",
+        &format!(
+            "ci_deferral must be one of {} -- got \"{mode}\"",
+            ralphus_core::schema::CI_DEFERRAL_VALUES.join(", ")
+        ),
+        vec![],
+    ))
+}
+
 /// The 400 for a `rebuild_on` list outside the closed set, or `None` when the
 /// request carries no list or a valid one.
 fn reject_invalid_rebuild_on(value: &Option<Option<Vec<String>>>) -> Option<Reply> {
@@ -14490,6 +14565,9 @@ struct GuardianDetailsBody {
     resolver_model: Option<String>,
     #[serde(default)]
     proof_scope: Option<String>,
+    /// See [`GuardianSettingsBody::ci_deferral`].
+    #[serde(default)]
+    ci_deferral: Option<String>,
     #[serde(default)]
     proof_skip_auto_clean: Option<bool>,
     #[serde(default)]
@@ -14992,18 +15070,8 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
     if let Some(reply) = reject_invalid_rebuild_on(&req.rebuild_on) {
         return reply;
     }
-    if let Some(mode) = req.ci_deferral.as_deref().filter(|m| !m.is_empty()) {
-        if !ralphus_core::schema::CI_DEFERRAL_VALUES.contains(&mode) {
-            return error(
-                400,
-                "invalid_ci_deferral",
-                &format!(
-                    "ci_deferral must be one of {} -- got \"{mode}\"",
-                    ralphus_core::schema::CI_DEFERRAL_VALUES.join(", ")
-                ),
-                vec![],
-            );
-        }
+    if let Some(reply) = reject_invalid_ci_deferral(req.ci_deferral.as_deref()) {
+        return reply;
     }
     let store = daemon.lock();
     if let Some(skip) = req.skip_worktrees {
@@ -15312,6 +15380,9 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
     if let Some(reply) = reject_invalid_rebuild_on(&req.rebuild_on) {
         return reply;
     }
+    if let Some(reply) = reject_invalid_ci_deferral(req.ci_deferral.as_deref()) {
+        return reply;
+    }
 
     let store = daemon.lock();
     let guardian = match store.get_guardian(id) {
@@ -15402,6 +15473,12 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
     if let Some(scope) = req.proof_scope.as_deref() {
         let scope = if scope.is_empty() { None } else { Some(scope) };
         if let Err(e) = store.set_guardian_proof_scope(id, scope) {
+            return store_error(&e);
+        }
+    }
+    if let Some(mode) = req.ci_deferral.as_deref() {
+        let mode = if mode.is_empty() { None } else { Some(mode) };
+        if let Err(e) = store.set_guardian_ci_deferral(id, mode) {
             return store_error(&e);
         }
     }
@@ -15575,6 +15652,16 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
                 502,
                 "forge_error",
                 &format!("details saved locally but PR/MR base sync failed: {e}"),
+                vec![],
+            );
+        }
+    }
+    if req.ci_deferral.is_some() {
+        if let Err(e) = crate::pr::reconcile_ci_deferral(&daemon.store_handle(), id) {
+            return error(
+                502,
+                "forge_error",
+                &format!("details saved locally but PR/MR label sync failed: {e}"),
                 vec![],
             );
         }
@@ -23590,6 +23677,77 @@ mod tests {
         );
         assert_eq!(r.status, 400, "{}", r.body);
         assert!(r.body.contains("invalid_value"));
+    }
+
+    #[test]
+    fn project_review_settings_route_sets_reads_clears_and_validates_ci_deferral() {
+        let d = daemon();
+        let repo = tmp_git_repo("rs-ci-deferral");
+        route(
+            &d,
+            "POST",
+            "/api/projects",
+            &register_body("proj", &repo.to_string_lossy(), ""),
+        );
+        let get = || -> serde_json::Value {
+            let r = route(&d, "GET", "/api/projects/proj/review-settings", "");
+            serde_json::from_str(&r.body).unwrap()
+        };
+        assert_eq!(get()["effective"]["ci_deferral"], "every", "default");
+
+        for mode in ["tip", "bottom+tip", "every"] {
+            let r = route(
+                &d,
+                "POST",
+                "/api/projects/proj/review-settings",
+                &format!(r#"{{"default_ci_deferral":"{mode}"}}"#),
+            );
+            assert_eq!(r.status, 200, "{mode}: {}", r.body);
+            let body = get();
+            assert_eq!(body["settings"]["default_ci_deferral"], mode);
+            assert_eq!(body["effective"]["ci_deferral"], mode);
+        }
+
+        let r = route(
+            &d,
+            "POST",
+            "/api/projects/proj/review-settings",
+            r#"{"default_ci_deferral":"head+tip"}"#,
+        );
+        assert_eq!(r.status, 400, "{}", r.body);
+        assert!(r.body.contains("invalid_value"), "{}", r.body);
+        assert_eq!(
+            get()["settings"]["default_ci_deferral"],
+            "every",
+            "a rejected value leaves the saved one alone"
+        );
+
+        let r = route(
+            &d,
+            "POST",
+            "/api/projects/proj/review-settings",
+            r#"{"default_ci_deferral":""}"#,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(get()["settings"]["default_ci_deferral"].is_null());
+        assert_eq!(get()["effective"]["ci_deferral"], "every");
+    }
+
+    #[test]
+    fn guardian_settings_and_details_reject_an_unknown_ci_deferral() {
+        let d = daemon();
+        let id = d.lock().create_guardian("g", "main", "/repo").unwrap();
+        for path in ["settings", "details"] {
+            let r = route(
+                &d,
+                "POST",
+                &format!("/api/guardians/{id}/{path}"),
+                r#"{"ci_deferral":"head+tip"}"#,
+            );
+            assert_eq!(r.status, 400, "{path}: {}", r.body);
+            assert!(r.body.contains("invalid_ci_deferral"), "{}", r.body);
+        }
+        assert_eq!(d.lock().get_guardian(&id).unwrap().ci_deferral, None);
     }
 
     #[test]

@@ -141,6 +141,14 @@ pub struct ReviewConfig {
     /// files using the old key working.
     #[serde(alias = "verify_scope", default)]
     pub default_proof_scope: Option<String>,
+    /// Which PRs/MRs in a review's stack run the full CI suite: `"every"`
+    /// (default), `"tip"` or `"bottom+tip"` (see
+    /// [`ralphus_core::schema::CI_DEFERRAL_VALUES`]). `None` means unset,
+    /// which resolves to `"every"` (see [`Self::default_ci_deferral`]);
+    /// per-project scalars win over the global layer. A per-review override
+    /// (see `GuardianView::ci_deferral` in `guardian.rs`) wins over this.
+    #[serde(default)]
+    pub default_ci_deferral: Option<String>,
     /// RAL-168: within `"each_branch"` scope, additionally skip verification
     /// on branches whose rebase applied cleanly with no conflict (an
     /// "auto-clean" branch) -- the old, lighter-weight default behavior.
@@ -473,6 +481,7 @@ pub const REVIEW_CONFIG_KEYS: &[&str] = &[
     "default_machine",
     "default_maximum_budget_usd",
     "default_proof_scope",
+    "default_ci_deferral",
     "auto_submit_pr_stack",
     "match_pr_branch_name",
     "skip_worktrees",
@@ -516,6 +525,17 @@ impl ReviewConfig {
             Some("nothing") => "nothing",
             _ => "each_branch",
         }
+    }
+
+    /// The effective default `ci_deferral` mode: one of
+    /// [`ralphus_core::schema::CI_DEFERRAL_VALUES`], `"every"` when unset or
+    /// unrecognised, so a typo costs CI minutes rather than coverage.
+    #[must_use]
+    pub fn default_ci_deferral(&self) -> &str {
+        self.default_ci_deferral
+            .as_deref()
+            .filter(|mode| ralphus_core::schema::CI_DEFERRAL_VALUES.contains(mode))
+            .unwrap_or(ralphus_core::schema::CI_DEFERRAL_EVERY)
     }
 
     /// Whether `"each_branch"` scope additionally skips auto-clean branches
@@ -780,6 +800,7 @@ impl ReviewConfig {
             auto_build: over.auto_build.or(self.auto_build),
             summary_format: over.summary_format.or(self.summary_format),
             default_proof_scope: over.default_proof_scope.or(self.default_proof_scope),
+            default_ci_deferral: over.default_ci_deferral.or(self.default_ci_deferral),
             proof_skip_auto_clean: over.proof_skip_auto_clean.or(self.proof_skip_auto_clean),
             default_resolver_agent: over.default_resolver_agent.or(self.default_resolver_agent),
             default_resolver_model: over.default_resolver_model.or(self.default_resolver_model),
@@ -891,6 +912,10 @@ pub const REVIEW_FIELD_PARITY: &[(&str, ReviewFieldDefault)] = &[
     (
         "proof_scope",
         ReviewFieldDefault::ProjectDefault(|c| c.default_proof_scope.is_some()),
+    ),
+    (
+        "ci_deferral",
+        ReviewFieldDefault::ProjectDefault(|c| c.default_ci_deferral.is_some()),
     ),
     (
         "auto_submit_pr_stack",
@@ -3945,6 +3970,47 @@ mod tests {
     fn default_proof_scope_accepts_the_legacy_verify_scope_key() {
         let c = from_toml_str("[review]\nverify_scope = \"final_branch\"\n");
         assert_eq!(c.default_proof_scope(), "final_branch");
+    }
+
+    // ── default_ci_deferral ─────────────────────────────────────────────────
+
+    #[test]
+    fn default_ci_deferral_defaults_to_every_when_unset() {
+        assert_eq!(ReviewConfig::default().default_ci_deferral(), "every");
+    }
+
+    #[test]
+    fn default_ci_deferral_parses_every_accepted_mode() {
+        for mode in ["every", "tip", "bottom+tip"] {
+            let c = from_toml_str(&format!("[review]\ndefault_ci_deferral = \"{mode}\"\n"));
+            assert_eq!(c.default_ci_deferral(), mode);
+        }
+    }
+
+    #[test]
+    fn default_ci_deferral_unrecognized_value_falls_back_to_every() {
+        let c = from_toml_str("[review]\ndefault_ci_deferral = \"head+tip\"\n");
+        assert_eq!(c.default_ci_deferral(), "every");
+    }
+
+    #[test]
+    fn default_ci_deferral_project_wins_over_global() {
+        let global = ReviewConfig {
+            default_ci_deferral: Some("tip".to_string()),
+            ..ReviewConfig::default()
+        };
+        let project = ReviewConfig {
+            default_ci_deferral: Some("bottom+tip".to_string()),
+            ..ReviewConfig::default()
+        };
+        assert_eq!(
+            global.clone().merge(project).default_ci_deferral(),
+            "bottom+tip"
+        );
+        assert_eq!(
+            global.merge(ReviewConfig::default()).default_ci_deferral(),
+            "tip"
+        );
     }
 
     #[test]

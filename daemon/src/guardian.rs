@@ -6457,6 +6457,23 @@ impl Store {
             .or(live_global.post_appraisals)
             .unwrap_or(true);
 
+        // Which PRs/MRs run the full CI suite, layered per-review override >
+        // database-backed project default > the merged `.ralphus.toml
+        // [review]` / global value > `every`. An unrecognised literal at any
+        // layer is skipped rather than trusted, so a bad value costs CI
+        // minutes, never coverage.
+        let is_ci_deferral = |mode: &&str| ralphus_core::schema::CI_DEFERRAL_VALUES.contains(mode);
+        let effective_ci_deferral = row
+            .ci_deferral
+            .as_deref()
+            .filter(is_ci_deferral)
+            .or(db_settings
+                .default_ci_deferral
+                .as_deref()
+                .filter(is_ci_deferral))
+            .unwrap_or_else(|| project_review_config.default_ci_deferral())
+            .to_string();
+
         // Whether manual-check generation is skipped, layered the same way:
         // per-review override > database-backed project default > explicit
         // `.ralphus.toml [review]` value > the live global config > `false`.
@@ -6617,11 +6634,7 @@ impl Store {
             effective_followup_auto_start,
             post_appraisals: row.post_appraisals,
             effective_post_appraisals,
-            effective_ci_deferral: row
-                .ci_deferral
-                .clone()
-                .filter(|mode| ralphus_core::schema::CI_DEFERRAL_VALUES.contains(&mode.as_str()))
-                .unwrap_or_else(|| ralphus_core::schema::CI_DEFERRAL_EVERY.to_string()),
+            effective_ci_deferral,
             ci_deferral: row.ci_deferral,
             rebuild_on,
             effective_rebuild_on,
@@ -9155,6 +9168,77 @@ mod tests {
             store
                 .set_guardian_skip_manual_checks("nope", Some(true))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn ci_deferral_resolves_review_over_project_over_default() {
+        let store = Store::open_in_memory().unwrap();
+        store.register_project("proj", "", "/repo", "git").unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.ci_deferral, None);
+        assert_eq!(g.effective_ci_deferral, "every", "defaults to every");
+
+        store
+            .set_project_review_settings(
+                "proj",
+                &crate::store::ProjectReviewSettings {
+                    default_ci_deferral: Some("tip".to_string()),
+                    ..crate::store::ProjectReviewSettings::default()
+                },
+            )
+            .unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.ci_deferral, None);
+        assert_eq!(g.effective_ci_deferral, "tip", "project default applies");
+
+        store
+            .set_guardian_ci_deferral(&id, Some("bottom+tip"))
+            .unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.ci_deferral.as_deref(), Some("bottom+tip"));
+        assert_eq!(
+            g.effective_ci_deferral, "bottom+tip",
+            "review beats project"
+        );
+
+        store.set_guardian_ci_deferral(&id, Some("every")).unwrap();
+        assert_eq!(
+            store.get_guardian(&id).unwrap().effective_ci_deferral,
+            "every",
+            "an explicit review `every` beats a project `tip`"
+        );
+
+        store.set_guardian_ci_deferral(&id, None).unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.ci_deferral, None);
+        assert_eq!(
+            g.effective_ci_deferral, "tip",
+            "back to the project default"
+        );
+        assert!(store.set_guardian_ci_deferral("nope", Some("tip")).is_err());
+    }
+
+    #[test]
+    fn ci_deferral_unrecognized_stored_values_never_win() {
+        let store = Store::open_in_memory().unwrap();
+        store.register_project("proj", "", "/repo", "git").unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store
+            .set_project_review_settings(
+                "proj",
+                &crate::store::ProjectReviewSettings {
+                    default_ci_deferral: Some("head+tip".to_string()),
+                    ..crate::store::ProjectReviewSettings::default()
+                },
+            )
+            .unwrap();
+        store.set_guardian_ci_deferral(&id, Some("bogus")).unwrap();
+        assert_eq!(
+            store.get_guardian(&id).unwrap().effective_ci_deferral,
+            "every",
+            "a bad value at every layer falls back to full CI"
         );
     }
 

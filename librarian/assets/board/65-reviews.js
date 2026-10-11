@@ -2002,6 +2002,8 @@ Press Accept on the note to create it.">Squad pending</span>`;
             "The agent that resolves rebase conflicts, writes the change summary, and generates the auto actions.")
           + setupChip(g.id, "proof", esc(proof),
             `How often the dedicated LLM proof pass runs${g.proof_scope ? "" : " — currently the project default"}.`)
+          + setupChip(g.id, "ci", esc(ciDeferralChipText(g.effective_ci_deferral)),
+            `Which PRs/MRs in this review's stack run the full CI suite${g.ci_deferral ? "" : " — currently the project default"}.\nThe others carry the 'ralphus:defer-full-ci' label, which the repository's CI reads to skip its slow jobs.`)
           + setupChip(g.id, "squash", esc(squashText),
             "Whether each task branch collapses to a single commit in the review worktree.\nScope is per git project, so a multi-project review sets it independently.")
           + (g.effective_rebuild_on === undefined ? "" : setupChip(g.id, "rebuild", esc(rebuildOnChipText(g.effective_rebuild_on)),
