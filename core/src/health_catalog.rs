@@ -157,6 +157,7 @@ macro_rules! catalog_ids {
 
 catalog_ids! {
     ID_DAEMON => "daemon",
+    ID_DAEMON_THREADS => "daemon-threads",
     ID_CONFIG_SOURCES => "config-sources",
     ID_CONFIG_SOURCES_PROJECT => "config-sources-project",
     ID_GIT => "git",
@@ -217,6 +218,17 @@ pub const CATALOG: &[CatalogEntry] = &[
         probe: Probe::Local,
         impact: "No task can be submitted, monitored, or managed without a reachable daemon.",
         remediation: "Start the daemon (`ralphus-daemon`), or fix --daemon-url/$RALPHUS_DAEMON_URL to point at a running one.",
+    },
+    CatalogEntry {
+        id: ID_DAEMON_THREADS,
+        label: "daemon background threads",
+        section: section::CORE,
+        applicability: Applicability::DaemonLocal,
+        cost_tier: CostTier::Free,
+        requirement: RequirementLevel::Required,
+        probe: Probe::Local,
+        impact: "A panicked or stalled daemon thread stops its work silently while the HTTP API keeps answering: a dead scheduler means no squads are scheduled, no review is rebased and no queued PR is submitted.",
+        remediation: "Restart the thread with `ralphus check restart-thread <name>` (or the Restart button on the board's Health tab); if it panics again, check the daemon log for the panic message.",
     },
     CatalogEntry {
         id: ID_CONFIG_SOURCES,

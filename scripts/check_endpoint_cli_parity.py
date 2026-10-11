@@ -116,6 +116,8 @@ ENDPOINT_TO_CLI: dict[str, list[str]] = {
     "GET /api/health/project-forks": ["check health"],
     "POST /api/health/arbiter": ["check health"],
     "GET /api/health/catalog": ["check catalog"],
+    "GET /api/health/threads": ["check health"],
+    "POST /api/health/threads/{name}/restart": ["check restart-thread"],
     "GET /api/cartographer": ["cartographer"],
     "GET /api/prophecies": ["prophecy list"],
     "GET /api/prophecies/{entity_uri}": ["prophecy show"],

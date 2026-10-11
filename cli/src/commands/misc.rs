@@ -1200,6 +1200,12 @@ pub fn parse_check(scanner: &mut Scanner) -> super::Command {
     if tail.first().map(String::as_str) == Some("catalog") {
         return super::Command::CheckCatalog;
     }
+    if tail.first().map(String::as_str) == Some("restart-thread") {
+        return match tail.get(1) {
+            Some(name) => super::Command::CheckRestartThread { name: name.clone() },
+            None => super::Command::UsageError("missing required <name> argument".to_string()),
+        };
+    }
     let mut inner = Scanner::new(if tail.first().map(String::as_str) == Some("health") {
         &tail[1..]
     } else {
@@ -1390,6 +1396,23 @@ pub fn cmd_check_catalog(opts: &GlobalOpts) -> i32 {
         }
     }
     0
+}
+
+/// `ralphus check restart-thread <name>`: re-spawn a daemon background thread
+/// that has panicked or exited, without restarting the daemon. `check health`
+/// names the thread and prints this command as its remediation.
+pub fn cmd_check_restart_thread(opts: &GlobalOpts, name: &str) -> i32 {
+    let client = opts.client();
+    run_and_report(opts, None, || {
+        let result = client.restart_thread(name)?;
+        emit(opts, &result, |r| {
+            println!(
+                "restarted daemon thread '{name}' (restart #{})",
+                r["thread"]["restarts"]
+            );
+        });
+        Ok(())
+    })
 }
 
 // ---- completion / configuration / initialize --------------------------------

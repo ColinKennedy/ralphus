@@ -203,15 +203,23 @@ pub fn check_once(store: &StoreHandle, state: &WatchdogState, timeout: Duration)
 /// and the process exiting is the only thing that should stop liveness
 /// monitoring.
 pub fn spawn(store: StoreHandle, state: Arc<WatchdogState>) {
-    std::thread::spawn(move || {
-        // One immediate check, so a daemon that is already wedged at startup
-        // says so now rather than after the first interval.
-        check_once(&store, &state, STALL_TIMEOUT);
-        loop {
-            std::thread::sleep(CHECK_INTERVAL);
+    crate::thread_health::spawn_supervised(
+        crate::thread_health::ThreadSpec {
+            name: "store-watchdog",
+            description: "Store-lock stalls are no longer detected or reported.",
+            max_silence: None,
+        },
+        Arc::clone(&store),
+        Arc::new(move || {
+            // One immediate check, so a daemon that is already wedged at
+            // startup says so now rather than after the first interval.
             check_once(&store, &state, STALL_TIMEOUT);
-        }
-    });
+            loop {
+                std::thread::sleep(CHECK_INTERVAL);
+                check_once(&store, &state, STALL_TIMEOUT);
+            }
+        }),
+    );
 }
 
 #[cfg(test)]

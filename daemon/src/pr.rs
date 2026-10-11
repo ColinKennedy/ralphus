@@ -6482,35 +6482,43 @@ fn run_pr_forge_poll_cycle(store: &crate::store_lock::StoreHandle, cache_enabled
 /// background reconciliation, not user-facing work, so it yields the same
 /// way scheduled cell claims do.
 pub fn spawn_pr_base_drift_poller(store: crate::store_lock::StoreHandle) {
-    std::thread::spawn(move || {
-        loop {
-            let cache_cfg = crate::config::load_pr_cache_config();
-            std::thread::sleep(cache_cfg.poll_interval());
-            if crate::config::scheduler_in_downtime() {
-                continue;
+    crate::thread_health::spawn_supervised(
+        crate::thread_health::ThreadSpec {
+            name: "pr-base-drift-poller",
+            description: "PR base-drift reconciliation and the PR cache refresh stop.",
+            max_silence: None,
+        },
+        std::sync::Arc::clone(&store),
+        std::sync::Arc::new(move || {
+            loop {
+                let cache_cfg = crate::config::load_pr_cache_config();
+                std::thread::sleep(cache_cfg.poll_interval());
+                if crate::config::scheduler_in_downtime() {
+                    continue;
+                }
+                // `[pr_cache].enabled = false` turns off the RAL-366 cache
+                // refresh only. RAL-279's base-drift reconciliation shares this
+                // thread but is unrelated functionality with real consequences --
+                // it is what notices a forge-side base edit -- and a key named
+                // `pr_cache` must not silently disable it.
+                //
+                // Caught so one panicking cycle costs that cycle rather than the
+                // thread. Unguarded, a single unwrap anywhere in the pass would
+                // silently end base-drift reconciliation for the daemon's whole
+                // lifetime, with nothing in the UI to indicate it had stopped.
+                let cache_enabled = cache_cfg.enabled();
+                let pass = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_pr_forge_poll_cycle(&store, cache_enabled);
+                }));
+                if pass.is_err() {
+                    crate::rlog!(
+                        ERROR,
+                        "ralphus [pr] forge poll cycle panicked; the poller continues with the next cycle"
+                    );
+                }
             }
-            // `[pr_cache].enabled = false` turns off the RAL-366 cache
-            // refresh only. RAL-279's base-drift reconciliation shares this
-            // thread but is unrelated functionality with real consequences --
-            // it is what notices a forge-side base edit -- and a key named
-            // `pr_cache` must not silently disable it.
-            //
-            // Caught so one panicking cycle costs that cycle rather than the
-            // thread. Unguarded, a single unwrap anywhere in the pass would
-            // silently end base-drift reconciliation for the daemon's whole
-            // lifetime, with nothing in the UI to indicate it had stopped.
-            let cache_enabled = cache_cfg.enabled();
-            let pass = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_pr_forge_poll_cycle(&store, cache_enabled);
-            }));
-            if pass.is_err() {
-                crate::rlog!(
-                    ERROR,
-                    "ralphus [pr] forge poll cycle panicked; the poller continues with the next cycle"
-                );
-            }
-        }
-    });
+        }),
+    );
 }
 
 // ---------------------------------------------------------------------------

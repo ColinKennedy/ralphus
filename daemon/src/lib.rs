@@ -79,6 +79,7 @@ pub mod summary_worker;
 pub mod terminal_log;
 pub mod terminal_relay;
 pub mod thinking_stall;
+pub mod thread_health;
 pub mod timeline;
 pub mod tmux;
 pub mod token;

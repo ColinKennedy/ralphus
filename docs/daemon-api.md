@@ -1326,6 +1326,48 @@ Deliberately local-only: there is no remote-target counterpart to this route
 (the daemon's own Free-tier subset is the only thing "check now" re-runs
 here) -- see `daemon/src/health_sweep.rs`'s `refresh_now` doc comment.
 
+### `GET /api/health/threads`
+Live state of the daemon's supervised background threads
+(`daemon/src/thread_health.rs`): `scheduler`, `health-sweep`,
+`pr-base-drift-poller`, `store-watchdog`. A panic ends one of these threads
+without stopping the daemon, so the HTTP API keeps answering while that
+thread's work (for the scheduler: squad scheduling, review rebases, PR
+auto-submit) silently stops.
+
+```json
+{
+  "status": "fail",
+  "detail": "scheduler: panicked (store guard held for 2007ms ...)",
+  "threads": [
+    {
+      "name": "scheduler",
+      "description": "Squad scheduling, review rebase/base-shift rebuilds, ...",
+      "state": "panicked",
+      "silent_for_ms": 61000,
+      "max_silence_ms": 300000,
+      "panic_message": "store guard held for 2007ms ...",
+      "panicked_at_ms": 1791680000000,
+      "restarts": 0,
+      "restartable": true
+    }
+  ]
+}
+```
+
+`state` is `running`, `stalled` (alive but past its heartbeat limit),
+`panicked` or `exited`. The same rollup is the `daemon-threads` row of
+`GET /api/health/report`, evaluated live rather than from the hourly sweep.
+When a thread ends, the daemon also enqueues an `urgent` mailbox message
+(category `daemon-thread`) whose remediation is the restart command below.
+
+### `POST /api/health/threads/{name}/restart`
+Re-spawns a thread that has `panicked` or `exited` -- CLI:
+`ralphus check restart-thread <name>`; board: the Restart button on the
+Health tab. `404` for an unknown name; `409` while the thread is still alive
+(a `stalled` thread cannot be killed from inside the process, and a second
+copy beside it would be worse than none). The scheduler restart re-enters its
+tick loop only: startup recovery and the first-pass sweeps are not re-run.
+
 ### `POST /api/clear`
 Bulk-delete tasks and reviews (RAL-13).
 

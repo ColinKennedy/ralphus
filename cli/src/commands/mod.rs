@@ -201,6 +201,10 @@ pub enum Command {
     /// applicability, cost tier, requirement level, impact) without running
     /// any probes. Read-only and instant, unlike `check health`.
     CheckCatalog,
+    /// `check restart-thread <name>`: re-spawn a panicked or exited daemon thread.
+    CheckRestartThread {
+        name: String,
+    },
     Completion,
     Configuration,
     Task(task::TaskCommand),
@@ -551,6 +555,7 @@ pub fn dispatch(cmd: Command, opts: &GlobalOpts) -> i32 {
         Command::Completion => misc::cmd_completion(),
         Command::Configuration => misc::cmd_configuration(opts),
         Command::CheckCatalog => misc::cmd_check_catalog(opts),
+        Command::CheckRestartThread { name } => misc::cmd_check_restart_thread(opts, &name),
         Command::TutorShow => {
             let dir = std::env::current_dir().unwrap_or_default();
             println!("{}", crate::tutor::task_tutor_in(&dir));

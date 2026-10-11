@@ -1118,6 +1118,19 @@
        * `GET /api/daemon` response shape, as far as the Health tab's store-lock
        * panel reads it (WS-G.4). The endpoint also returns name/version/status/
        * db/warnings, which other call sites use.
+       * @typedef {object} DaemonThreadView
+       * @property {string} name - stable id; the argument of `ralphus check restart-thread`.
+       * @property {string} description - what stops working while this thread is down.
+       * @property {"running"|"stalled"|"panicked"|"exited"} state
+       * @property {number} silent_for_ms - time since the thread last reported progress.
+       * @property {number|null} max_silence_ms - heartbeat limit, or null when the thread is judged only by whether it has ended.
+       * @property {string|null} panic_message - the panic text, when `state` is "panicked".
+       * @property {number|null} panicked_at_ms - epoch ms the thread ended.
+       * @property {number} restarts - how many times it has been restarted in place.
+       * @property {boolean} restartable - whether a restart would be accepted now (only an ended thread can be restarted).
+       */
+
+      /**
        * @typedef {object} DaemonHealthView
        * @property {string} [db] - result of the daemon's own database probe ("ok" or an error string). RAL-544: a non-"ok" value means the daemon is reachable but cannot reliably read its own store.
        * @property {StoreLockWaitView} [lock_wait] - store-lock acquisition wait over the daemon's lifetime (RAL-393).

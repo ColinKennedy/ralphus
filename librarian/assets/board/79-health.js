@@ -36,6 +36,14 @@
        * @type {DaemonHealthView | null}
        */
       let healthDaemon = null;
+      /**
+       * Live state of the daemon's supervised background threads from
+       * `GET /api/health/threads` (scheduler, pollers, watchdog).
+       * @type {DaemonThreadView[]}
+       */
+      let healthThreads = [];
+      /** Name of the thread whose restart POST is in flight, or "" when none. */
+      let healthRestartingThread = "";
 
       /**
        * Fetches the catalog, this daemon's cached sweep report, and every
@@ -45,11 +53,12 @@
        */
       async function pollHealth() {
         try {
-          const [catalogRes, reportRes, targetsRes, daemonRes] = await Promise.all([
+          const [catalogRes, reportRes, targetsRes, daemonRes, threadsRes] = await Promise.all([
             fetch("/api/health/catalog"),
             fetch("/api/health/report"),
             fetch("/api/machines/targets/health"),
             fetch("/api/daemon"),
+            fetch("/api/health/threads"),
           ]);
           if (!catalogRes.ok || !reportRes.ok || !targetsRes.ok) {
             healthError = await responseError(
@@ -67,6 +76,7 @@
           healthLocalReport = reportBody;
           healthRemoteTargets = targetsBody.targets || [];
           healthDaemon = daemonRes.ok ? await daemonRes.json() : null;
+          healthThreads = threadsRes.ok ? (await threadsRes.json()).threads || [] : [];
           byId("conn").className = "dot on";
           markUpdated();
           renderHealthPage();
@@ -88,6 +98,61 @@
         } catch (e) { healthError = "daemon unreachable"; }
         healthRefreshing = false;
         await pollHealth();
+      }
+      /**
+       * Restarts one daemon thread that has panicked or exited
+       * (POST /api/health/threads/{name}/restart), then re-polls the tab.
+       * @param {string} name
+       * @returns {Promise<void>}
+       */
+      async function restartDaemonThread(name) {
+        if (healthRestartingThread) return;
+        healthRestartingThread = name;
+        renderHealthPage();
+        try {
+          const r = await fetch(`/api/health/threads/${encodeURIComponent(name)}/restart`, { method: "POST" });
+          healthError = r.ok ? "" : await responseError(r, "thread restart failed");
+        } catch (e) { healthError = "daemon unreachable"; }
+        healthRestartingThread = "";
+        await pollHealth();
+      }
+      /**
+       * The "Daemon threads" subsection: one row per supervised background
+       * thread with its live state and, for a thread that has ended, a
+       * Restart button. Renders nothing against a daemon that predates the
+       * endpoint.
+       * @param {DaemonThreadView[]} threads
+       * @returns {string}
+       */
+      function daemonThreadsHtml(threads) {
+        if (!threads.length) return "";
+        const rows = threads.map((t) => {
+          const status = t.state === "running" ? "pass" : t.state === "stalled" ? "warn" : "fail";
+          const detail = t.state === "panicked"
+            ? `panicked: ${t.panic_message || "no message"}`
+            : t.state === "exited"
+              ? "exited unexpectedly"
+              : t.state === "stalled"
+                ? `no progress for ${fmtAgo(t.silent_for_ms).replace(" ago", "")}`
+                : "running";
+          const busy = healthRestartingThread === t.name;
+          const restart = t.restartable
+            ? `<button class="btn" ${healthRestartingThread ? "disabled" : ""} onclick="restartDaemonThread('${esc(t.name)}')" data-tip="Re-spawn this thread without restarting the daemon.\nUse it after a panic once you have read the message. If it panics again the cause is still there.">${busy ? "Restarting…" : "↻ Restart"}</button>`
+            : "";
+          return `<tr>
+              <td>${healthStatusBadge(status)}</td>
+              <td><span class="mono" data-tip="${esc(t.description)}">${esc(t.name)}</span></td>
+              <td style="max-width:420px;overflow:hidden;text-overflow:ellipsis" data-tip="${esc(detail)}">${esc(detail)}</td>
+              <td style="color:var(--muted)" data-tip="How many times this thread has been restarted in place since the daemon started.">${t.restarts ? `${esc(String(t.restarts))} restart(s)` : ""}</td>
+              <td>${restart}</td>
+            </tr>`;
+        }).join("");
+        return `<div style="margin-bottom:16px">
+            <b data-tip="The daemon's long-lived background threads. A panic ends a thread without stopping the daemon, so the API keeps answering while that thread's work silently stops. The scheduler thread, for one, drives squad scheduling, review rebases and PR auto-submit.">Daemon threads</b>
+            <table class="proj-table"><thead><tr>
+              <th>Status</th><th>Thread</th><th>Detail</th><th></th><th></th>
+            </tr></thead><tbody>${rows}</tbody></table>
+          </div>`;
       }
       /**
        * Status dot + label for one check's `pass`/`warn`/`fail`/`skip`
@@ -256,6 +321,7 @@
             <button class="btn" ${healthRefreshing ? "disabled" : ""} onclick="refreshHealthNow()" data-tip="Re-run this daemon's own Free-tier checks immediately instead of waiting for the next hourly sweep.">${healthRefreshing ? "Checking…" : "⟳ Check now (local)"}</button>
           </div>`);
         parts.push(storeLockPanelHtml(healthDaemon));
+        parts.push(daemonThreadsHtml(healthThreads));
         const localMachine = healthLocalReport ? healthLocalReport.machine : "daemon (local)";
         parts.push(healthGroupHtml(
           localMachine,

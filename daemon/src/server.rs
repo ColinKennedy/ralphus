@@ -1530,6 +1530,12 @@ fn route_for_user(
         ("POST", ["api", "health", "report", "refresh"]) => {
             admin_gated(daemon, user_header, || health_report_refresh(daemon))
         }
+        // Mapped to `check health` (its `daemon-threads` row) in check_endpoint_cli_parity.py's manifest.
+        ("GET", ["api", "health", "threads"]) => admin_gated(daemon, user_header, health_threads),
+        // Mapped to `check restart-thread` in check_endpoint_cli_parity.py's manifest.
+        ("POST", ["api", "health", "threads", name, "restart"]) => {
+            admin_gated(daemon, user_header, || health_thread_restart(name))
+        }
         // ralphus[ignore-endpoint-cli]: board agent picker for unsubmitted forms; CLI `agent list` deliberately reads .ralphus.toml locally
         ("GET", ["api", "agents"]) => list_agents(daemon, query, user_header),
         // RAL-297: cwd-independent agent+model catalog for the Simple task
@@ -3738,9 +3744,57 @@ fn health_report(daemon: &Daemon) -> Reply {
         &serde_json::json!({
             "machine": "daemon (local)",
             "checked_at_ms": latest.as_ref().map(|r| r.checked_at_ms),
-            "checks": latest.map(|r| r.checks).unwrap_or_default(),
+            "checks": with_live_thread_check(latest.map(|r| r.checks).unwrap_or_default()),
         }),
     )
+}
+
+/// `checks` plus the `daemon-threads` row, evaluated now rather than taken
+/// from the hourly sweep: a thread that panicked a minute ago must show as
+/// failed on the next read, not at the next scheduled pass.
+fn with_live_thread_check(checks: Vec<crate::health_sweep::SweepCheck>) -> Vec<serde_json::Value> {
+    let (status, detail) = crate::thread_health::rollup(&crate::thread_health::snapshot());
+    let mut rows: Vec<serde_json::Value> = checks
+        .into_iter()
+        .filter_map(|c| serde_json::to_value(c).ok())
+        .collect();
+    rows.push(serde_json::json!({
+        "id": ralphus_core::health_catalog::ID_DAEMON_THREADS,
+        "status": status,
+        "detail": detail,
+    }));
+    rows
+}
+
+/// `GET /api/health/threads`: every supervised daemon thread's live state,
+/// for the board's Health tab.
+fn health_threads() -> Reply {
+    let threads = crate::thread_health::snapshot();
+    let (status, detail) = crate::thread_health::rollup(&threads);
+    json(
+        200,
+        &serde_json::json!({"status": status, "detail": detail, "threads": threads}),
+    )
+}
+
+/// `POST /api/health/threads/{name}/restart`: re-spawns a thread that has
+/// panicked or exited. Refused (409) for a thread that is still alive, since
+/// a second copy beside a stalled one would be worse than none.
+fn health_thread_restart(name: &str) -> Reply {
+    use crate::thread_health::RestartError;
+    match crate::thread_health::restart(name) {
+        Ok(thread) => json(
+            200,
+            &serde_json::json!({"restarted": true, "thread": thread}),
+        ),
+        Err(RestartError::Unknown) => error(
+            404,
+            "not_found",
+            &format!("no supervised daemon thread named '{name}'"),
+            vec![],
+        ),
+        Err(e @ RestartError::StillAlive(_)) => error(409, "conflict", &e.to_string(), vec![]),
+    }
 }
 
 /// `POST /api/health/report/refresh` (RAL-416): re-runs the Free-tier
@@ -3758,7 +3812,7 @@ fn health_report_refresh(daemon: &Daemon) -> Reply {
         &serde_json::json!({
             "machine": "daemon (local)",
             "checked_at_ms": report.checked_at_ms,
-            "checks": report.checks,
+            "checks": with_live_thread_check(report.checks),
         }),
     )
 }
@@ -19666,36 +19720,30 @@ pub fn serve<A: ToSocketAddrs>(
     // `crate::watchdog`'s module doc comment for what the unwatched failure
     // looked like.
     crate::watchdog::spawn(daemon.store_handle(), daemon.watchdog_handle());
-    let scheduler_store = daemon.store_handle();
-    std::thread::spawn(move || {
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    // The body is re-invoked as-is by `thread_health::restart`, so each call
+    // clones what `run_loop` takes by value. Only the first call runs the
+    // startup recovery; a restart re-enters the tick loop alone.
+    let first_scheduler_run = std::sync::atomic::AtomicBool::new(true);
+    crate::thread_health::spawn_supervised(
+        crate::thread_health::ThreadSpec {
+            name: crate::scheduler::SCHEDULER_THREAD,
+            description: "Squad scheduling, review rebase/base-shift rebuilds, PR auto-submit,                           base-branch fetch polling and waypoint sweeps all stop while it is down.",
+            max_silence: Some(crate::scheduler::SCHEDULER_MAX_SILENCE),
+        },
+        daemon.store_handle(),
+        Arc::new(move || {
             crate::scheduler::run_loop(
-                handle,
-                runner,
-                cancellations,
-                waypoint_halts,
-                sem,
-                summary_queue,
-                procs,
+                Arc::clone(&handle),
+                Arc::clone(&runner),
+                cancellations.clone(),
+                waypoint_halts.clone(),
+                Arc::clone(&sem),
+                Arc::clone(&summary_queue),
+                procs.clone(),
+                first_scheduler_run.swap(false, std::sync::atomic::Ordering::SeqCst),
             );
-        }));
-        // `run_loop` never returns while the daemon is healthy, so either way
-        // out means no further squads will be scheduled by this process.
-        let reason = match &outcome {
-            Ok(()) => "returned".to_string(),
-            Err(payload) => format!("panicked: {}", panic_payload_message(payload.as_ref())),
-        };
-        crate::cartographer::Note::new("scheduler")
-            .level(crate::logging::LogLevel::ERROR)
-            .emit(
-                &scheduler_store.lock(),
-                format!("scheduler thread {reason}; no further squads will be scheduled until the daemon restarts"),
-                serde_json::json!({ "reason": reason }),
-            );
-        if let Err(payload) = outcome {
-            std::panic::resume_unwind(payload);
-        }
-    });
+        }),
+    );
     crate::cartographer::Note::new("daemon").emit(
         &daemon.lock(),
         format!(
@@ -24037,7 +24085,76 @@ ANTHROPIC_AUTH_TOKEN = { from_env = "RALPHUS_AGENT_PROFILES_HEALTH_ROUTE_TEST_VA
         let parsed: serde_json::Value = serde_json::from_str(&r.body).unwrap();
         assert_eq!(parsed["machine"], "daemon (local)");
         assert!(parsed["checked_at_ms"].is_null());
-        assert_eq!(parsed["checks"].as_array().unwrap().len(), 0);
+        // No sweep has run, so the only row is the live `daemon-threads` one:
+        // thread state is read at request time, not taken from the sweep.
+        let checks = parsed["checks"].as_array().unwrap();
+        assert_eq!(checks.len(), 1, "{checks:?}");
+        assert_eq!(checks[0]["id"], "daemon-threads");
+    }
+
+    #[test]
+    fn health_threads_route_lists_a_supervised_thread_and_its_state() {
+        crate::thread_health::spawn_supervised(
+            crate::thread_health::ThreadSpec {
+                name: "route-test-panics",
+                description: "route test thread",
+                max_silence: None,
+            },
+            daemon().store_handle(),
+            std::sync::Arc::new(|| panic!("route test panic")),
+        );
+        let d = daemon();
+        let mut found = None;
+        for _ in 0..200 {
+            let r = route(&d, "GET", "/api/health/threads", "");
+            assert_eq!(r.status, 200, "{}", r.body);
+            let parsed: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+            found = parsed["threads"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == "route-test-panics" && t["state"] == "panicked")
+                .cloned();
+            if found.is_some() {
+                assert_eq!(parsed["status"], "fail");
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let thread = found.expect("the panicked thread is listed");
+        assert_eq!(thread["panic_message"], "route test panic");
+        assert_eq!(thread["restartable"], true);
+    }
+
+    #[test]
+    fn health_thread_restart_route_rejects_unknown_and_live_threads() {
+        let d = daemon();
+        let r = route(&d, "POST", "/api/health/threads/no-such-thread/restart", "");
+        assert_eq!(r.status, 404, "{}", r.body);
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&stop);
+        crate::thread_health::spawn_supervised(
+            crate::thread_health::ThreadSpec {
+                name: "route-test-live",
+                description: "route test thread",
+                max_silence: None,
+            },
+            d.store_handle(),
+            std::sync::Arc::new(move || {
+                while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }),
+        );
+        let r = route(
+            &d,
+            "POST",
+            "/api/health/threads/route-test-live/restart",
+            "",
+        );
+        assert_eq!(r.status, 409, "{}", r.body);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[test]
