@@ -5732,7 +5732,15 @@ impl Store {
     /// for 3+ seconds under load, stalling every other daemon operation
     /// behind it.
     pub(crate) fn list_guardian_status_pairs(&self) -> Result<Vec<(String, String)>> {
-        let mut stmt = self.conn.prepare("SELECT id, status FROM guardians")?;
+        Self::list_guardian_status_pairs_conn(&self.conn)
+    }
+
+    /// [`Self::list_guardian_status_pairs`] against any connection, so the
+    /// read pool can serve it without the writer lock.
+    pub(crate) fn list_guardian_status_pairs_conn(
+        conn: &Connection,
+    ) -> Result<Vec<(String, String)>> {
+        let mut stmt = conn.prepare("SELECT id, status FROM guardians")?;
         let rows = stmt
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<std::result::Result<Vec<_>, _>>()?;

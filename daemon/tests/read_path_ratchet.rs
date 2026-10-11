@@ -65,6 +65,15 @@ const MAINTENANCE_WORKERS_OFF_THE_LOCK: &[(&str, &str)] = &[
     ("src/pr.rs", "poll_pr_base_drift"),
     ("src/ci_watch.rs", "poll_open_pr_ci_status"),
     ("src/ci_watch.rs", "run_watch"),
+    ("src/pr.rs", "settle_pr_merge_states"),
+    ("src/pr.rs", "sync_open_pr_branches"),
+    ("src/pr.rs", "verify_and_repair_stack_ancestry"),
+    ("src/pr.rs", "detect_forge_reorder"),
+    ("src/pr.rs", "refresh_pr_forge_cache_for_guardian"),
+    ("src/pr.rs", "compute_sync_status_inner"),
+    // The survey sweep scores every live squad and review per open waypoint;
+    // on the writer lock that held the store for 8.9s.
+    ("src/waypoints.rs", "run_pending_surveys"),
 ];
 
 fn source(relative: &str) -> String {
@@ -203,7 +212,7 @@ fn the_pooled_get_handler_count_only_goes_up() {
 /// `Store::get_guardian` always reads through it; the pooled form is
 /// `Store::get_guardian_conn` under `with_read_snapshot`.
 fn hydrates_review_under_the_lock(body: &str) -> bool {
-    body.contains(".get_guardian(")
+    body.contains(".get_guardian(") || body.contains(".waypoint_survey_candidates(")
 }
 
 #[test]

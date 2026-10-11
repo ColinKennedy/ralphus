@@ -4790,10 +4790,11 @@ fn settle_pr_merge_states(
     id: &str,
     freshly_merged: &[PullRequestView],
 ) -> bool {
-    let current_guardian = match store.lock().get_guardian(id) {
-        Ok(guardian) => guardian,
-        Err(_) => return false,
-    };
+    let current_guardian =
+        match store.with_read_snapshot(|conn| crate::store::Store::get_guardian_conn(conn, id)) {
+            Ok(guardian) => guardian,
+            Err(_) => return false,
+        };
     let current_prs = store
         .lock()
         .list_pull_requests_for_guardian(id)
@@ -4871,7 +4872,9 @@ fn settle_pr_merge_states(
             // owned `Option` first is required -- otherwise
             // `retire_dual_root_branch_for_guardian`'s own `store.lock()`
             // deadlocks against this still-held guard.
-            let guardian = store.lock().get_guardian(id).ok();
+            let guardian = store
+                .with_read_snapshot(|conn| crate::store::Store::get_guardian_conn(conn, id))
+                .ok();
             if let Some(guardian) = guardian {
                 retire_dual_root_branch_for_guardian(
                     store,
@@ -5031,7 +5034,9 @@ fn settle_pr_merge_states(
 /// (most likely `guard_against_clobber` tripping because a reviewer pushed
 /// directly to the PR branch) is logged and does not stop the others.
 pub fn sync_open_pr_branches(store: &crate::store_lock::StoreHandle, id: &str) {
-    let Ok(guardian) = store.lock().get_guardian(id) else {
+    let Ok(guardian) =
+        store.with_read_snapshot(|conn| crate::store::Store::get_guardian_conn(conn, id))
+    else {
         return;
     };
     if crate::guardian::GuardianStatus::is_terminal_status(&guardian.status) {
@@ -5227,7 +5232,9 @@ pub fn verify_and_repair_stack_ancestry(
     runner: &dyn Runner,
     id: &str,
 ) -> bool {
-    let Ok(guardian) = store.lock().get_guardian(id) else {
+    let Ok(guardian) =
+        store.with_read_snapshot(|conn| crate::store::Store::get_guardian_conn(conn, id))
+    else {
         return false;
     };
     if crate::guardian::GuardianStatus::is_terminal_status(&guardian.status) {
@@ -5350,7 +5357,9 @@ pub fn detect_forge_reorder(
     store: &crate::store_lock::StoreHandle,
     id: &str,
 ) -> std::result::Result<Option<ForgeStackDrift>, String> {
-    let guardian = store.lock().get_guardian(id).map_err(|e| e.to_string())?;
+    let guardian = store
+        .with_read_snapshot(|conn| crate::store::Store::get_guardian_conn(conn, id))
+        .map_err(|e| e.to_string())?;
     let root = PathBuf::from(&guardian.git_root);
     let forge_cfg = crate::config::resolve_forge(&root);
     // RAL-338: a fork-mode review's PRs may be split across two repositories,
@@ -6146,7 +6155,9 @@ fn poll_pr_comments(
 /// to per-root across every guardian in the daemon, which isn't worth the
 /// risk for what is already an N-to-1 reduction per guardian's own stack.
 fn refresh_pr_forge_cache_for_guardian(store: &crate::store_lock::StoreHandle, id: &str) {
-    let Ok(guardian) = store.lock().get_guardian(id) else {
+    let Ok(guardian) =
+        store.with_read_snapshot(|conn| crate::store::Store::get_guardian_conn(conn, id))
+    else {
         return;
     };
     // Checked before any work: the backoff window is per forge client, and a
@@ -9978,8 +9989,7 @@ fn compute_sync_status_inner(
         .get_pull_request(pr_id)
         .map_err(|e| e.to_string())?;
     let guardian = store
-        .lock()
-        .get_guardian(&pr.guardian_id)
+        .with_read_snapshot(|conn| crate::store::Store::get_guardian_conn(conn, &pr.guardian_id))
         .map_err(|e| e.to_string())?;
     let root = PathBuf::from(&guardian.git_root);
 

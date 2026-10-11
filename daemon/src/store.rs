@@ -5635,8 +5635,13 @@ impl Store {
 
     /// Fetch a single squad's full board view.
     pub fn get_squad(&self, id: &str) -> Result<SquadView> {
-        let row = self
-            .conn
+        Self::get_squad_conn(&self.conn, id)
+    }
+
+    /// [`Self::get_squad`] against any connection, so the read pool
+    /// (`crate::store_pool`) can serve it without the writer lock.
+    pub(crate) fn get_squad_conn(conn: &Connection, id: &str) -> Result<SquadView> {
+        let row = conn
             .query_row(
                 "SELECT id, label, state, created_at_ms, started_at_ms, finished_at_ms, env_overrides, error, submitter, materialization_step, materialization_total, materialization_phase FROM squads WHERE id=?",
                 params![id],
@@ -5660,7 +5665,7 @@ impl Store {
             .optional()?
             .ok_or(StoreError::NotFound)?;
         Self::build_squad_view(
-            &self.conn,
+            conn,
             row.0,
             row.1,
             row.2,
