@@ -86,6 +86,15 @@ fn worktree_root(cwd: &Path) -> std::result::Result<PathBuf, String> {
     Ok(PathBuf::from(top))
 }
 
+/// [`worktree_root`], except that a claimed worktree that has not been created
+/// yet is its own root (there is no checkout for git to answer for).
+fn review_worktree_root(cwd: &Path) -> Option<PathBuf> {
+    match crate::worktrees::pending_worktree_at(cwd) {
+        Some(pending) => Some(pending.wt),
+        None => worktree_root(cwd).ok(),
+    }
+}
+
 /// The branch currently checked out in the worktree (error if detached).
 pub(crate) fn worktree_branch(cwd: &Path) -> std::result::Result<String, String> {
     let b = git(cwd, &["symbolic-ref", "--quiet", "--short", "HEAD"])
@@ -365,7 +374,10 @@ pub(crate) fn cell_upstream_display(
     idx: i64,
 ) -> Option<String> {
     let cwd = cwd?;
-    project_root_of(cwd)?;
+    let pending = crate::worktrees::pending_worktree_at(Path::new(cwd));
+    if pending.is_none() {
+        project_root_of(cwd)?;
+    }
     let row = rows.iter().find(|r| r.task_idx == task_idx && r.idx == idx);
     if let Some(sentinel) = row.and_then(|r| r.upstream.as_deref()) {
         let ref_str = ralphus_core::schema::parse_upstream_task_ref(sentinel)?;
@@ -375,9 +387,16 @@ pub(crate) fn cell_upstream_display(
         let dep = rows.iter().find(|r| {
             r.task_name == task_name && cell_id_filter.is_none_or(|cid| r.cell_id == cid)
         })?;
-        return worktree_branch(Path::new(dep.cwd.as_deref()?)).ok();
+        let dep_cwd = Path::new(dep.cwd.as_deref()?);
+        return match crate::worktrees::pending_worktree_at(dep_cwd) {
+            Some(dep_pending) => Some(dep_pending.branch),
+            None => worktree_branch(dep_cwd).ok(),
+        };
     }
-    worktree_upstream(Path::new(cwd)).ok()
+    match pending {
+        Some(p) => Some(p.upstream),
+        None => worktree_upstream(Path::new(cwd)).ok(),
+    }
 }
 
 /// One cell's contribution to a review.
@@ -1000,10 +1019,21 @@ pub fn derive_reviews_with_full_prefetch(
             })?;
             (PathBuf::from(&rd.project_root), rd.branch.clone(), upstream)
         } else {
-            let project =
-                worktree_project(cwd_path).map_err(|e| ReviewError::new(format!("{cwd}: {e}")))?;
-            let branch =
-                worktree_branch(cwd_path).map_err(|e| ReviewError::new(format!("{cwd}: {e}")))?;
+            // A claimed worktree that has not been created yet (the scheduler
+            // creates it in the background or when its cell comes due) cannot
+            // be read from disk: its project, branch and upstream are exactly
+            // what the claim recorded.
+            let pending = crate::worktrees::pending_worktree_at(cwd_path);
+            let project = match &pending {
+                Some(p) => p.root.clone(),
+                None => worktree_project(cwd_path)
+                    .map_err(|e| ReviewError::new(format!("{cwd}: {e}")))?,
+            };
+            let branch = match &pending {
+                Some(p) => p.branch.clone(),
+                None => worktree_branch(cwd_path)
+                    .map_err(|e| ReviewError::new(format!("{cwd}: {e}")))?,
+            };
             // A declared upstream wins; otherwise infer it from the worktree's
             // own git upstream, exactly as an all-local review always has.
             let upstream = match declared_upstream.clone() {
@@ -1039,14 +1069,17 @@ pub fn derive_reviews_with_full_prefetch(
                         None => b,
                     }
                 }
-                None => worktree_upstream(cwd_path).map_err(|_| {
-                    ReviewError::new(format!(
-                        "{cwd}: review upstream requires a git upstream tracking branch for \
-                         '{branch}', but none is configured (set one with \
-                         'git branch --set-upstream-to=<branch>', or declare it on the review \
-                         as [[review]] upstream = \"<branch>\")"
-                    ))
-                })?,
+                None => match &pending {
+                    Some(p) => p.upstream.clone(),
+                    None => worktree_upstream(cwd_path).map_err(|_| {
+                        ReviewError::new(format!(
+                            "{cwd}: review upstream requires a git upstream tracking branch for \
+                             '{branch}', but none is configured (set one with \
+                             'git branch --set-upstream-to=<branch>', or declare it on the review \
+                             as [[review]] upstream = \"<branch>\")"
+                        ))
+                    })?,
+                },
             };
             (project, branch, upstream)
         };
@@ -1068,7 +1101,7 @@ pub fn derive_reviews_with_full_prefetch(
         // directory this host cannot stat, and its project grouping already
         // came from the owning task above.
         if remote.is_none() {
-            if let Ok(root) = worktree_root(cwd_path) {
+            if let Some(root) = review_worktree_root(cwd_path) {
                 explicit_roots.push((root, branch.clone()));
             }
         }
@@ -1157,7 +1190,7 @@ pub fn derive_reviews_with_full_prefetch(
         let Some(cwd) = cells[pos].cwd.as_deref() else {
             continue;
         };
-        let Ok(root) = worktree_root(Path::new(cwd)) else {
+        let Some(root) = review_worktree_root(Path::new(cwd)) else {
             continue;
         };
         if let Some((_, branch)) = explicit_roots.iter().find(|(r, _)| *r == root) {
@@ -1870,19 +1903,29 @@ pub fn derive_triage_pools(
                 )));
             };
             let cwd_path = Path::new(cwd);
-            let project =
-                worktree_project(cwd_path).map_err(|e| ReviewError::new(format!("{cwd}: {e}")))?;
-            let branch =
-                worktree_branch(cwd_path).map_err(|e| ReviewError::new(format!("{cwd}: {e}")))?;
-            if let Ok(root) = worktree_root(cwd_path) {
+            let pending = crate::worktrees::pending_worktree_at(cwd_path);
+            let project = match &pending {
+                Some(p) => p.root.clone(),
+                None => worktree_project(cwd_path)
+                    .map_err(|e| ReviewError::new(format!("{cwd}: {e}")))?,
+            };
+            let branch = match &pending {
+                Some(p) => p.branch.clone(),
+                None => worktree_branch(cwd_path)
+                    .map_err(|e| ReviewError::new(format!("{cwd}: {e}")))?,
+            };
+            if let Some(root) = review_worktree_root(cwd_path) {
                 explicit_roots.push((root, branch.clone()));
             }
-            let upstream = worktree_upstream(cwd_path).map_err(|_| {
-                ReviewError::new(format!(
-                    "{cwd}: Triage pooling requires a git upstream tracking branch for '{branch}', \
+            let upstream = match &pending {
+                Some(p) => p.upstream.clone(),
+                None => worktree_upstream(cwd_path).map_err(|_| {
+                    ReviewError::new(format!(
+                        "{cwd}: Triage pooling requires a git upstream tracking branch for '{branch}', \
                  but none is configured (set one with 'git branch --set-upstream-to=<branch>')"
-                ))
-            })?;
+                    ))
+                })?,
+            };
             store
                 .set_cell_review_branch(squad_id, row.task_idx, row.idx, &branch)
                 .map_err(|e| ReviewError::new(e.to_string()))?;
@@ -1964,7 +2007,7 @@ pub fn derive_triage_pools(
                 let Some(cwd) = row.cwd.as_deref() else {
                     continue;
                 };
-                let Ok(root) = worktree_root(Path::new(cwd)) else {
+                let Some(root) = review_worktree_root(Path::new(cwd)) else {
                     continue;
                 };
                 if let Some((_, branch)) = explicit_roots.iter().find(|(r, _)| *r == root) {

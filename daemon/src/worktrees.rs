@@ -30,7 +30,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use opentelemetry::Context;
 use opentelemetry::trace::{SpanKind, Status};
@@ -106,7 +106,7 @@ pub(crate) struct PlaceholderContext<'a> {
     /// lazily populated by [`GitProjectStartupAdapter::resolve_placeholder`]
     /// and shared across every cell in one [`resolve_placeholders`] call --
     /// not just within one cell's own resolution the way
-    /// [`ensure_worktree_with_existing`]'s doc comment describes.
+    /// [`ensure_worktree_tracked`]'s doc comment describes.
     ///
     /// Querying this is O(worktree count) and, on a dev machine with
     /// hundreds accumulated, can take real wall-clock time -- paying for it
@@ -115,7 +115,7 @@ pub(crate) struct PlaceholderContext<'a> {
     /// project's total worktree count once, versus once per cell. Safe to
     /// share across cells because every new worktree this resolution pass
     /// itself creates is recorded back into the same map immediately after
-    /// creation (see the catch-all branch's post-`ensure_worktree_with_existing`
+    /// creation (see the catch-all branch's post-`ensure_worktree_tracked`
     /// insert) -- so a later cell in this same call always sees an earlier
     /// one's freshly materialized worktree, exactly as a fresh git query
     /// would show it. `RefCell` because [`PlaceholderContext`] is `Copy` and
@@ -258,7 +258,173 @@ fn existing_and_reserved_worktree_branches(root: &Path) -> HashMap<String, Strin
             out.entry(short.clone()).or_insert_with(|| branch.clone());
         }
     }
+    for (short, branch) in creation_markers(root) {
+        out.entry(short).or_insert(branch);
+    }
     out
+}
+
+/// Directory holding one durable "creating" marker per worktree slot whose
+/// creation has started but not finished (see [`write_creation_marker`]).
+fn creation_marker_dir(root: &Path) -> PathBuf {
+    crate::short_paths::ralphus_root(root).join("creating")
+}
+
+/// The marker file for the `w/<short>` slot named `short`.
+fn creation_marker_path(root: &Path, short: &str) -> PathBuf {
+    creation_marker_dir(root).join(short)
+}
+
+/// The `(branch, upstream)` a slot's creation marker names, `None` when there
+/// is no marker (or it is unreadable, which is treated the same: no proof of
+/// ownership).
+fn read_creation_marker(path: &Path) -> Option<(String, Option<String>)> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut lines = text.lines();
+    let branch = lines.next()?.trim();
+    if branch.is_empty() {
+        return None;
+    }
+    let upstream = lines
+        .find_map(|l| l.strip_prefix("upstream="))
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty());
+    Some((branch.to_string(), upstream))
+}
+
+/// Every in-progress (or interrupted) creation under `root`: slot short name
+/// to the branch that marker names. A slot listed here is occupied even
+/// though `git worktree list` may not show it yet, or ever, if its creation
+/// died halfway.
+fn creation_markers(root: &Path) -> HashMap<String, String> {
+    let Ok(entries) = std::fs::read_dir(creation_marker_dir(root)) else {
+        return HashMap::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let short = entry.file_name().to_str()?.to_string();
+            let (branch, _) = read_creation_marker(&entry.path())?;
+            Some((short, branch))
+        })
+        .collect()
+}
+
+/// Atomically claim the `w/<short>` slot for `branch` by creating its marker
+/// file (`create_new`, so it can never overwrite another creation's marker).
+/// The marker is the durable proof that the directory at that slot was begun by
+/// ralphus for `branch`: a later run that finds a half-created directory may
+/// repair it only if the marker names its own branch. It also records the
+/// upstream, so a restarted daemon can finish creating a worktree whose
+/// submission is long gone.
+///
+/// `Ok(true)` when the slot is now claimed for `branch` (freshly, or by an
+/// earlier marker that already names `branch`); `Ok(false)` when the marker
+/// belongs to a different branch and the caller must pick another slot.
+fn write_creation_marker(
+    root: &Path,
+    short: &str,
+    branch: &str,
+    upstream: &str,
+) -> Result<bool, String> {
+    use std::io::Write as _;
+    let dir = creation_marker_dir(root);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("could not create worktree marker directory: {e}"))?;
+    let path = creation_marker_path(root, short);
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut file) => writeln!(
+            file,
+            "{branch}
+upstream={upstream}
+pid={}",
+            std::process::id()
+        )
+        .map(|()| true)
+        .map_err(|e| format!("could not write worktree creation marker: {e}")),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            Ok(read_creation_marker(&path).is_some_and(|(b, _)| b.eq_ignore_ascii_case(branch)))
+        }
+        Err(e) => Err(format!("could not write worktree creation marker: {e}")),
+    }
+}
+
+/// Remove a worktree this process proved it owns (via its creation marker)
+/// but whose creation never finished: deregister it from git, prune, and delete
+/// whatever the interrupted `git worktree add` left in the directory. Refuses
+/// any path outside the project's own `w/` directory.
+fn clean_half_created_worktree(root: &Path, wt: &Path) -> Result<(), String> {
+    let w_dir = crate::short_paths::ralphus_root(root).join("w");
+    if wt.parent() != Some(w_dir.as_path()) {
+        return Err(format!(
+            "refusing to clean {}: it is not directly under {}",
+            wt.display(),
+            w_dir.display()
+        ));
+    }
+    let wt_str = wt.to_string_lossy().to_string();
+    // Best-effort: an interrupted add may have registered nothing at all.
+    let _ = git(root, &["worktree", "remove", "--force", "--force", &wt_str]);
+    let _ = git(root, &["worktree", "prune"]);
+    if wt.exists() {
+        std::fs::remove_dir_all(wt).map_err(|e| {
+            format!(
+                "could not remove the half-created worktree at {}: {e}",
+                wt.display()
+            )
+        })?;
+    }
+    let _ = git(root, &["worktree", "prune"]);
+    Ok(())
+}
+
+/// Where a `(root, branch)` creation currently stands; see [`WORKTREE_CREATIONS`].
+#[derive(Clone)]
+enum CreationState {
+    Creating,
+    Finished(Result<Materialized, String>),
+}
+
+/// The creations in flight or just finished, plus the condvar waiters sleep on.
+type CreationRegistry = (
+    parking_lot::Mutex<HashMap<(PathBuf, String), CreationState>>,
+    parking_lot::Condvar,
+);
+
+/// Single-flight registry of worktree creations, keyed by project root and
+/// lower-cased branch. A second caller for a key already `Creating` (another
+/// cell of this squad, another squad sharing a remote-tracking branch, or the
+/// background creator racing a cell that came due) waits for that creation
+/// instead of running a second concurrent `git worktree add`. A `Finished`
+/// entry is only ever read by callers that waited for it; the next caller to
+/// arrive afterwards starts a fresh creation (which resyncs an existing
+/// worktree).
+static WORKTREE_CREATIONS: LazyLock<CreationRegistry> = LazyLock::new(|| {
+    (
+        parking_lot::Mutex::new(HashMap::new()),
+        parking_lot::Condvar::new(),
+    )
+});
+
+/// Serializes the choose-a-slot-then-claim-it step of every creation: picking
+/// the `w/<short>` directory and writing its marker happen under this one lock,
+/// so two creations can never both decide the same free slot.
+static WORKTREE_PLAN_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// What [`ensure_worktree_tracked`] did, for the caller's Cartographer notes.
+#[derive(Debug, Clone)]
+pub(crate) struct Materialized {
+    pub(crate) path: PathBuf,
+    /// Set when an interrupted earlier creation of this very worktree was found
+    /// (proved ours by its marker) and repaired by recreating it.
+    pub(crate) repaired: Option<String>,
+    /// Whether this caller waited on another thread's in-flight creation
+    /// rather than creating the worktree itself.
+    pub(crate) waited: bool,
 }
 
 /// Record that `plan`'s directory is now claimed for `branch` under `root`,
@@ -306,7 +472,7 @@ fn reserve_worktree_slot(root: &Path, plan: &WorktreePlan, branch: &str) {
 ///
 /// `existing` is a caller-supplied `git worktree list --porcelain` snapshot
 /// rather than one freshly queried here -- see
-/// [`ensure_worktree_with_existing`]'s doc comment for why: on a dev machine
+/// [`ensure_worktree_tracked`]'s doc comment for why: on a dev machine
 /// with hundreds of worktrees this query alone can take real wall-clock
 /// time, and [`GitProjectStartupAdapter::resolve_placeholder`] otherwise
 /// pays for it twice per branch (once via [`resolve_squad_branch`], once via
@@ -753,7 +919,7 @@ fn branch_materialization(root: &Path, branch: &str) -> Result<BranchMaterializa
 /// straight onto what `git status` calls "your branch's upstream," which is
 /// actually the shared base branch here). Either way the guard would then
 /// read the branch's own real work as "already accounted for." The caller
-/// ([`ensure_worktree_with_existing`]) instead freezes the marker to a
+/// ([`ensure_worktree_tracked`]) instead freezes the marker to a
 /// resolved commit SHA, once, *after* this function returns and the branch
 /// has been resynced -- see [`crate::reviews::set_worktree_commit_baseline`].
 /// Guards every `git config` WRITE this module makes to the shared
@@ -977,12 +1143,7 @@ fn resync_remote_tracking_branch(wt: &Path) -> Result<(), String> {
 /// tracking a remote keeps up with pushes to that branch over the life of the
 /// project via the resync described above.
 pub fn ensure_worktree(root: &Path, branch: &str, upstream: &str) -> Result<PathBuf, String> {
-    ensure_worktree_with_existing(
-        root,
-        branch,
-        upstream,
-        &existing_task_worktree_branches(root),
-    )
+    ensure_worktree_tracked(root, branch, upstream).map(|m| m.path)
 }
 
 /// Install the RAL-445/RAL-531 `prepare-commit-msg` hook for a project
@@ -1221,7 +1382,7 @@ pub(crate) fn apply_worktree_credential_helper_best_effort(
 /// holds the daemon's single global `Mutex<Store>`. No worktree is created
 /// between those two reads, so one shared snapshot is exactly as fresh as
 /// querying twice.
-/// The decision [`ensure_worktree_with_existing`] makes about how to
+/// The decision [`ensure_worktree_tracked`] makes about how to
 /// materialize `branch`'s worktree, split out so it can be made (fast,
 /// local-only, safe under the store lock) separately from actually doing it
 /// (slow, safe to run without the lock and concurrently with another
@@ -1232,7 +1393,7 @@ struct WorktreePlan {
     already_exists: bool,
 }
 
-/// The fast half of [`ensure_worktree_with_existing`]: everything needed to
+/// The fast half of [`ensure_worktree_tracked`]: everything needed to
 /// know WHERE `branch`'s worktree will live and HOW it must be created,
 /// using only local git plumbing (`branch_materialization`) and the
 /// caller-supplied on-disk snapshot -- no network, no checkout. Safe to call
@@ -1252,7 +1413,7 @@ fn plan_worktree(
     })
 }
 
-/// The slow half of [`ensure_worktree_with_existing`]: perform `plan`'s git
+/// The slow half of [`ensure_worktree_tracked`]: perform `plan`'s git
 /// work. An already-existing worktree only needs resyncing
 /// (`set_explicit_upstream` + `resync_remote_tracking_branch`, a real `git
 /// fetch`+rebase when it tracks a remote); a new one is created with `git
@@ -1350,14 +1511,137 @@ fn execute_worktree_plan(
     Ok(plan.wt.clone())
 }
 
-pub fn ensure_worktree_with_existing(
+/// [`ensure_worktree`] that also reports what happened (repair, waiting).
+///
+/// Single-flight per `(root, branch)` via [`WORKTREE_CREATIONS`]: a concurrent
+/// call for the same branch waits for the in-flight creation and returns its
+/// result instead of racing it. The creating caller picks the directory and
+/// claims it with a durable marker in one step ([`materialize_exclusively`]),
+/// so the folder choice and the creation can never disagree, even across a
+/// daemon restart.
+pub(crate) fn ensure_worktree_tracked(
     root: &Path,
     branch: &str,
     upstream: &str,
-    existing: &HashMap<String, String>,
-) -> Result<PathBuf, String> {
-    let plan = plan_worktree(root, branch, existing)?;
-    execute_worktree_plan(root, branch, upstream, &plan)
+) -> Result<Materialized, String> {
+    let key = (root.to_path_buf(), branch.to_ascii_lowercase());
+    let (lock, cv) = &*WORKTREE_CREATIONS;
+    let mut waited = false;
+    {
+        let mut map = lock.lock();
+        loop {
+            match map.get(&key) {
+                Some(CreationState::Creating) => {
+                    waited = true;
+                    cv.wait(&mut map);
+                }
+                Some(CreationState::Finished(result)) if waited => {
+                    return result.clone().map(|m| Materialized {
+                        waited: true,
+                        repaired: None,
+                        ..m
+                    });
+                }
+                _ => break,
+            }
+        }
+        map.insert(key.clone(), CreationState::Creating);
+    }
+    let result = materialize_exclusively(root, branch, upstream);
+    lock.lock()
+        .insert(key, CreationState::Finished(result.clone()));
+    cv.notify_all();
+    result
+}
+
+/// Choose `branch`'s directory, claim it, and run the git work, as the one
+/// creator for this `(root, branch)`.
+///
+/// The slot is chosen from LIVE state (`git worktree list` plus in-process
+/// reservations plus durable creation markers) under [`WORKTREE_PLAN_LOCK`] and
+/// claimed -- marker written, slot reserved -- before the lock is released, so
+/// no other creation can pick it. Then, with a slot decided:
+///
+/// - a marker naming this branch means an earlier creation here was
+///   interrupted: the leftovers are provably ours, so they are removed and the
+///   worktree is created fresh;
+/// - no marker and a non-empty directory that is not a worktree is not ours:
+///   fail with an interference message and touch nothing;
+/// - no marker and a healthy worktree is an ordinary reuse (resync only).
+///
+/// The marker is deleted only after the worktree is fully set up; a failure
+/// leaves it in place so the next attempt can prove ownership and repair.
+fn materialize_exclusively(
+    root: &Path,
+    branch: &str,
+    upstream: &str,
+) -> Result<Materialized, String> {
+    let mut repaired = None;
+    let (plan, marker_short) = {
+        let _slot = WORKTREE_PLAN_LOCK.lock();
+        let existing = existing_and_reserved_worktree_branches(root);
+        let mut plan = plan_worktree(root, branch, &existing)?;
+        let short = plan
+            .wt
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| format!("worktree path {} has no directory name", plan.wt.display()))?
+            .to_string();
+        let marker = creation_marker_path(root, &short);
+        let owned =
+            read_creation_marker(&marker).is_some_and(|(b, _)| b.eq_ignore_ascii_case(branch));
+        if marker.exists() && !owned {
+            return Err(format!(
+                "worktree slot {} is claimed by another creation (marker {}); refusing to touch it",
+                plan.wt.display(),
+                marker.display()
+            ));
+        }
+        if owned {
+            if plan.wt.exists() {
+                clean_half_created_worktree(root, &plan.wt)?;
+                repaired = Some(format!(
+                    "an interrupted creation of {} was found (ownership proven by marker {}); removed it and creating it again",
+                    plan.wt.display(),
+                    marker.display()
+                ));
+            } else {
+                // Registered with git but its directory is gone, or never begun.
+                let _ = git(root, &["worktree", "prune"]);
+            }
+            plan.already_exists = false;
+        } else if !plan.already_exists && dir_is_non_empty(&plan.wt) {
+            return Err(format!(
+                "{} already exists and is not a worktree ralphus created for \"{branch}\" (no creation marker); refusing to overwrite or delete it -- move it aside and retry",
+                plan.wt.display()
+            ));
+        }
+        if plan.already_exists {
+            (plan, None)
+        } else {
+            if !write_creation_marker(root, &short, branch, upstream)? {
+                return Err(format!(
+                    "worktree slot {} was claimed by another creation while this one was starting; refusing to touch it",
+                    plan.wt.display()
+                ));
+            }
+            reserve_worktree_slot(root, &plan, branch);
+            (plan, Some(short))
+        }
+    };
+    let path = execute_worktree_plan(root, branch, upstream, &plan)?;
+    if let Some(short) = marker_short {
+        let _ = std::fs::remove_file(creation_marker_path(root, &short));
+    }
+    Ok(Materialized {
+        path,
+        repaired,
+        waited: false,
+    })
+}
+
+fn dir_is_non_empty(dir: &Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_some())
 }
 
 fn project_startup_adapter(vcs: &str) -> Option<&'static dyn ProjectStartupAdapter> {
@@ -1476,7 +1760,7 @@ impl ProjectStartupAdapter for GitProjectStartupAdapter {
         // it. Without this, a resubmission of the same task file resolves to
         // the first squad's branch and inherits its finished commits.
         //
-        // The on-disk snapshot this needs (and `ensure_worktree_with_existing`
+        // The on-disk snapshot this needs (and `ensure_worktree_tracked`
         // below needs again) is queried at most once per project root for
         // this whole submission, via `ctx.on_disk_worktrees` -- not once per
         // branch -- see `PlaceholderContext::on_disk_worktrees`'s doc comment.
@@ -1533,16 +1817,12 @@ impl ProjectStartupAdapter for GitProjectStartupAdapter {
                         &upstream,
                     )?,
                 };
-                let materialized = {
-                    let all = ctx.on_disk_worktrees.borrow();
-                    let on_disk = all.get(&root_key).expect("populated above");
-                    ensure_worktree_with_existing(
-                        Path::new(&project.path),
-                        branch,
-                        &upstream,
-                        on_disk,
-                    )
-                }
+                let materialized = ensure_worktree_tracked(
+                    Path::new(&project.path),
+                    branch,
+                    &upstream,
+                )
+                .map(|m| m.path)
                 .map_err(|e| {
                     format!(
                         "cell '{}': could not materialize worktree for \"{placeholder}\": {e}",
@@ -2217,7 +2497,7 @@ pub fn resolve_placeholders(
 /// follow-up) who they're authored as -- applying the fork's registered
 /// `git_user_name`/`git_user_email`, if either is set, via `git config
 /// --worktree`.
-fn route_worktree_to_submitter_fork(
+pub(crate) fn route_worktree_to_submitter_fork(
     store: &StoreHandle,
     squad_id: &str,
     project_name: &str,
@@ -2471,34 +2751,164 @@ pub fn collect_remote_upstream_prefetch_targets(
     out
 }
 
+/// Decide `branch`'s `w/<short>` directory and claim it durably (creation
+/// marker + in-process reservation) without running any git work. The marker
+/// is created atomically, so when another claimer takes the slot first the
+/// snapshot is refreshed from live state and the decision is retried; the
+/// slot a caller ends up with is therefore never shared with a different
+/// branch. `snapshot` is updated to include the claimed slot.
+fn claim_worktree_slot(
+    root: &Path,
+    branch: &str,
+    upstream: &str,
+    snapshot: &mut HashMap<String, String>,
+) -> Result<WorktreePlan, String> {
+    for _ in 0..16 {
+        let plan = plan_worktree(root, branch, snapshot)?;
+        if plan.already_exists {
+            return Ok(plan);
+        }
+        let short = plan
+            .wt
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| format!("worktree path {} has no directory name", plan.wt.display()))?
+            .to_string();
+        if write_creation_marker(root, &short, branch, upstream)? {
+            reserve_worktree_slot(root, &plan, branch);
+            snapshot.insert(short, branch.to_string());
+            return Ok(plan);
+        }
+        *snapshot = existing_and_reserved_worktree_branches(root);
+    }
+    Err(format!(
+        "could not claim a worktree directory for \"{branch}\": the slots kept being taken"
+    ))
+}
+
+/// A claimed worktree whose directory has not (fully) been created yet,
+/// recovered from its creation marker alone -- so it works for a squad that
+/// was submitted before a daemon restart as well as for one claimed moments
+/// ago.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingWorktree {
+    pub(crate) root: PathBuf,
+    pub(crate) branch: String,
+    pub(crate) upstream: String,
+    pub(crate) wt: PathBuf,
+}
+
+/// The pending claim behind `cwd`, when `cwd` is a `w/<short>` directory of
+/// some project that still carries a creation marker (the marker is removed
+/// only once the checkout is complete, so a half-created worktree is pending
+/// too).
+/// `None` for anything else (a literal path, a finished worktree, a cwd nested
+/// inside a worktree).
+pub(crate) fn pending_worktree_at(cwd: &Path) -> Option<PendingWorktree> {
+    let short = cwd.file_name()?.to_str()?;
+    let w_dir = cwd.parent()?;
+    let ralphus_dir = w_dir.parent()?;
+    let git_dir = ralphus_dir.parent()?;
+    if w_dir.file_name()? != "w"
+        || ralphus_dir.file_name()? != ".ralphus"
+        || git_dir.file_name()? != ".git"
+    {
+        return None;
+    }
+    let root = git_dir.parent()?.to_path_buf();
+    let (branch, upstream) = read_creation_marker(&creation_marker_path(&root, short))?;
+    Some(PendingWorktree {
+        root,
+        branch,
+        upstream: upstream?,
+        wt: cwd.to_path_buf(),
+    })
+}
+
+/// Create the worktree behind `pending` (single-flight, see
+/// [`ensure_worktree_tracked`]).
+pub(crate) fn materialize_pending(pending: &PendingWorktree) -> Result<Materialized, String> {
+    ensure_worktree_tracked(&pending.root, &pending.branch, &pending.upstream)
+}
+
+/// Per-worktree "already routed to the submitter's fork" flags, so the
+/// background creator and a cell that came due while it was still creating
+/// route a worktree once between them (the second caller waits on the first's
+/// lock and then sees the flag set).
+static FORK_ROUTED: LazyLock<parking_lot::Mutex<HashMap<PathBuf, Arc<parking_lot::Mutex<bool>>>>> =
+    LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+/// Make the claimed worktree at `wt` ready for a cell to run in: create it when
+/// its creation marker says it is still pending (single-flight with the
+/// background creator, see [`ensure_worktree_tracked`]), then route it to the
+/// submitter's fork (`project_name` is the task's registered project, `None`
+/// when the task has none) once per worktree. The per-worktree lock is held
+/// across both steps, so a caller arriving while another is creating or routing
+/// waits for it instead of racing it.
+///
+/// `Ok(None)` when `wt` carried no pending claim (nothing was created here).
+pub(crate) fn ensure_claimed_worktree(
+    store: &StoreHandle,
+    squad_id: &str,
+    project_name: Option<&str>,
+    wt: &Path,
+) -> Result<Option<Materialized>, String> {
+    let flag = FORK_ROUTED
+        .lock()
+        .entry(wt.to_path_buf())
+        .or_default()
+        .clone();
+    let mut routed = flag.lock();
+    let materialized = match pending_worktree_at(wt) {
+        Some(pending) => {
+            let materialized = materialize_pending(&pending)?;
+            if materialized.repaired.is_some() {
+                *routed = false;
+            }
+            if !wt.join(".git").exists() {
+                return Err(format!(
+                    "worktree for branch {:?} was created at {} instead of the planned {}",
+                    pending.branch,
+                    materialized.path.display(),
+                    wt.display()
+                ));
+            }
+            Some(materialized)
+        }
+        None => None,
+    };
+    if !*routed {
+        if let Some(project_name) = project_name {
+            if wt.join(".git").exists() {
+                route_worktree_to_submitter_fork(store, squad_id, project_name, wt)?;
+            }
+        }
+        *routed = true;
+    }
+    Ok(materialized)
+}
+
 /// A local git worktree one of this submission's cells needs, decided (RAL-337
-/// branch claim + `w/<short>` directory assignment) but not yet created --
-/// see [`plan_local_worktree_jobs`]'s doc comment for why the decision and
-/// the (possibly slow) git work that realizes it are split into separate
-/// steps.
+/// branch claim + `w/<short>` directory assignment) and durably claimed, but
+/// not yet created -- see [`plan_local_worktree_jobs`]'s doc comment.
 pub(crate) struct LocalWorktreeJob {
     cache_key: String,
-    root: PathBuf,
-    branch: String,
-    upstream: String,
-    plan: WorktreePlan,
+    wt: PathBuf,
 }
 
 /// Decide every LOCAL (no `machine` set) worktree placeholder among `cells`'
 /// materialization up front -- the branch this squad gets (RAL-337) and the
 /// `w/<short>` directory it lands in -- WITHOUT running the slow `git
-/// worktree add`/`fetch`/rebase that used to follow immediately. Everything
-/// here is fast (DB reads/writes plus local git plumbing, no network, no
-/// checkout), so it's safe to run under the store lock exactly like the rest
-/// of placeholder resolution always has -- only the returned jobs' actual
-/// execution ([`execute_local_worktree_jobs`]) is meant to run afterward,
-/// WITHOUT the lock, in parallel.
+/// worktree add`/`fetch`/rebase. Everything here is fast (DB reads/writes plus
+/// local git plumbing and one marker file per slot, no network, no checkout),
+/// so it's safe to run under the store lock. The worktrees themselves are
+/// created later, in the background or when their cell comes due, from the
+/// claims this leaves behind ([`pending_worktree_at`]).
 ///
-/// Each decided slot is immediately reserved ([`reserve_worktree_slot`]) so
-/// neither a later cell in this same call nor a concurrent submission's own
-/// planning pass (which may run before this call's worktrees are actually
-/// created -- that's the whole point) can pick the same directory for a
-/// different branch.
+/// Each decided slot is durably claimed ([`claim_worktree_slot`]) so neither a
+/// later cell in this same call nor a concurrent submission's own planning
+/// pass nor a restarted daemon can pick the same directory for a different
+/// branch.
 ///
 /// A cell this can't confidently handle (its project can't be resolved, its
 /// `vcs` isn't `git`, its cwd isn't a direct placeholder, or it carries a
@@ -2572,98 +2982,39 @@ pub(crate) fn plan_local_worktree_jobs(
         let Ok(branch) = branch_result else {
             continue;
         };
-        let Ok(plan) = plan_worktree(&root, &branch, on_disk.get(&root).expect("populated above"))
-        else {
+        let Ok(plan) = claim_worktree_slot(
+            &root,
+            &branch,
+            &upstream,
+            on_disk.get_mut(&root).expect("populated above"),
+        ) else {
             continue;
         };
-        if !plan.already_exists {
-            reserve_worktree_slot(&root, &plan, &branch);
-            if let Some(short) = plan.wt.file_name().and_then(|n| n.to_str()) {
-                on_disk
-                    .get_mut(&root)
-                    .expect("populated above")
-                    .insert(short.to_string(), branch.clone());
-            }
-        }
         jobs.insert(
             cache_key.clone(),
             LocalWorktreeJob {
                 cache_key,
-                root,
-                branch,
-                upstream,
-                plan,
+                wt: plan.wt,
             },
         );
     }
     jobs.into_values().collect()
 }
 
-/// How many [`LocalWorktreeJob`]s [`execute_local_worktree_jobs`] runs at
-/// once. A ceiling on concurrent `git`/subprocess load, not tuned to any
-/// particular machine -- a submission with more jobs than this just runs in
-/// several back-to-back batches instead of a single one.
-const MAX_PARALLEL_WORKTREE_JOBS: usize = 8;
+/// How many worktrees the background creator materializes at once. A ceiling
+/// on concurrent `git`/subprocess load, not tuned to any particular machine.
+pub(crate) const MAX_PARALLEL_WORKTREE_JOBS: usize = 8;
 
-/// Execute every planned job's (possibly slow) git work -- see
-/// [`plan_local_worktree_jobs`] -- concurrently, with no store lock held.
-/// Safe to run several jobs at once even against the same project root:
-/// each targets a distinct, already-reserved directory and a distinct
-/// branch, which is what git itself needs for concurrent `worktree add`
-/// calls to be safe.
-///
-/// Returns resolved paths keyed exactly like [`placeholder_cache_key`], for
-/// only the jobs that succeeded -- a failed job is logged and left out, so
-/// the caller's later live pass (through [`resolve_placeholders_with_prefetch`])
-/// retries it and surfaces the real error through the normal failure path,
-/// exactly as it would if this prefetch pass had never run at all.
+/// The planned directory of every job, keyed like [`placeholder_cache_key`], in
+/// the shape [`resolve_placeholders_with_full_prefetch`] takes as
+/// `prefetched_worktrees`. The directories do not exist yet; resolution
+/// rewrites each cell's cwd to the claimed path and leaves creating it to
+/// [`materialize_pending`].
 #[must_use]
-pub(crate) fn execute_local_worktree_jobs(jobs: &[LocalWorktreeJob]) -> HashMap<String, String> {
-    let mut resolved = HashMap::new();
-    for chunk in jobs.chunks(MAX_PARALLEL_WORKTREE_JOBS) {
-        let outcomes: Vec<(&str, Result<PathBuf, String>)> = std::thread::scope(|scope| {
-            let handles: Vec<_> = chunk
-                .iter()
-                .map(|job| {
-                    scope.spawn(move || {
-                        (
-                            job.cache_key.as_str(),
-                            execute_worktree_plan(&job.root, &job.branch, &job.upstream, &job.plan),
-                        )
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .filter_map(|h| {
-                    h.join()
-                        .map_err(|_| {
-                            // ralphus[ignore-rlog-pair]: this prefetch pass has no `Store` access by design; the live fallback pass records the structured outcome when it retries inline.
-                            crate::rlog!(
-                                WARNING,
-                                "ralphus [scheduler] prefetch worktree materialization thread \
-                                 panicked (will retry inline)"
-                            );
-                        })
-                        .ok()
-                })
-                .collect()
-        });
-        for (key, outcome) in outcomes {
-            match outcome {
-                Ok(path) => {
-                    resolved.insert(key.to_string(), path.to_string_lossy().into_owned());
-                }
-                // ralphus[ignore-rlog-pair]: this prefetch pass has no `Store` access by design (see the doc comment above); the live fallback pass records the structured failure once it retries the cell inline.
-                Err(e) => crate::rlog!(
-                    WARNING,
-                    "ralphus [scheduler] prefetch worktree materialization failed (will retry \
-                     inline): {e}"
-                ),
-            }
-        }
-    }
-    resolved
+pub(crate) fn planned_worktree_paths(jobs: &[LocalWorktreeJob]) -> HashMap<String, String> {
+    jobs.iter()
+        .map(|j| (j.cache_key.clone(), j.wt.to_string_lossy().into_owned()))
+        .collect()
 }
 
 /// Test-only entry point mirroring [`resolve_placeholders`] but taking the
@@ -2786,7 +3137,11 @@ fn resolve_placeholders_inner(
             .lock()
             .set_cell_cwd(squad_id, cell.task_idx, cell.idx, &resolved)
             .map_err(|e| e.to_string())?;
-        route_worktree_to_submitter_fork(store, squad_id, project_name, Path::new(&resolved))?;
+        // A claimed-but-not-yet-created worktree is routed to the fork once it
+        // exists (the scheduler does that right after creating it).
+        if pending_worktree_at(Path::new(&resolved)).is_none() {
+            route_worktree_to_submitter_fork(store, squad_id, project_name, Path::new(&resolved))?;
+        }
         let elapsed_ms = resolve_started.elapsed().as_millis();
         // `Note::emit` writes the `ralphus [scheduler] ...` stderr line itself
         // (same sink `rlog!` uses), so this single call replaces what used to
@@ -4826,7 +5181,7 @@ mod tests {
         // needed yet), so `GitProjectStartupAdapter::resolve_placeholder`
         // recording it back into `on_disk_worktrees` under the raw
         // `short_name(branch)` key -- instead of the actual directory
-        // `ensure_worktree_with_existing` returned -- happens to be correct
+        // `ensure_worktree_tracked` returned -- happens to be correct
         // by coincidence. The third colliding branch exposes it: the
         // second branch's real `-2` directory was never recorded under its
         // own key, so the third cell's lookup walks straight past it,
@@ -5382,14 +5737,11 @@ mod tests {
         );
     }
 
-    /// RAL-<pending>: the fast-path prefetch (`plan_local_worktree_jobs` +
-    /// `execute_local_worktree_jobs`) must produce results identical to the
-    /// live path it's meant to short-circuit -- one worktree per distinct
-    /// branch, correctly resolved and persisted -- for several cells across
-    /// several tasks in one project, the exact squad-168 shape this
-    /// optimization targets.
+    /// Submit-time claims decide every distinct branch's directory without
+    /// creating anything; resolution rewrites each cwd to its claimed path, and
+    /// each claim is later materialized into exactly that path.
     #[test]
-    fn plan_and_execute_local_worktree_jobs_materializes_every_distinct_branch() {
+    fn claiming_defers_creation_and_each_claim_materializes_into_its_planned_path() {
         let repo = init_repo("prefetch-multi-branch");
         let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
             Store::open_in_memory().unwrap(),
@@ -5426,9 +5778,11 @@ mod tests {
 
         let jobs =
             plan_local_worktree_jobs(&store.lock(), "squad-1", &cells, &tasks, &HashMap::new());
-        assert_eq!(jobs.len(), 3, "one job per distinct branch");
-        let prefetched = execute_local_worktree_jobs(&jobs);
-        assert_eq!(prefetched.len(), 3, "every job must succeed");
+        assert_eq!(jobs.len(), 3, "one claim per distinct branch");
+        let planned = planned_worktree_paths(&jobs);
+        for path in planned.values() {
+            assert!(!Path::new(path).exists(), "claiming must not create {path}");
+        }
 
         resolve_placeholders_with_full_prefetch(
             &store,
@@ -5436,20 +5790,30 @@ mod tests {
             &mut cells,
             &tasks,
             &HashMap::new(),
-            &prefetched,
+            &planned,
             &Context::new(),
         )
-        .expect("resolution seeded entirely from the prefetch cache");
+        .expect("resolution seeded entirely from the claims");
 
-        let mut branches: Vec<String> = cells
-            .iter()
-            .map(|c| head_branch(c.cwd.as_deref().expect("resolved")))
-            .collect();
+        let mut branches = Vec::new();
+        for cell in &cells {
+            let cwd = cell.cwd.as_deref().expect("resolved");
+            assert!(!Path::new(cwd).exists(), "{cwd} is created lazily");
+            let pending = pending_worktree_at(Path::new(cwd)).expect("claim survives as marker");
+            assert_eq!(pending.root, repo);
+            assert_eq!(pending.upstream, "main");
+            let materialized = materialize_pending(&pending).expect("materialize");
+            assert_eq!(materialized.path, Path::new(cwd));
+            branches.push(head_branch(cwd));
+            assert!(
+                pending_worktree_at(Path::new(cwd)).is_none(),
+                "the marker is gone once the worktree is complete"
+            );
+        }
         branches.sort();
         assert_eq!(branches, vec!["feat-a", "feat-b", "feat-c"]);
 
-        // Restart safety must still hold: re-resolving the now-plain paths
-        // (nothing left to prefetch) is a no-op that returns the same paths.
+        // Restart safety: re-resolving the now-plain paths is a no-op.
         let before: Vec<String> = cells.iter().map(|c| c.cwd.clone().unwrap()).collect();
         resolve_placeholders(&store, "squad-1", &mut cells, &tasks, &Context::new())
             .expect("restart no-op");
@@ -5457,17 +5821,11 @@ mod tests {
         assert_eq!(before, after);
     }
 
-    /// RAL-<pending>: the whole reason [`RESERVED_WORKTREE_SLOTS`] exists.
-    /// Two branches whose short names collide (`short_name` truncates them to
-    /// the same value -- see the existing `ensure_worktree_disambiguates_branches_sharing_a_short_name`
-    /// test), planned by two SEPARATE calls to `plan_local_worktree_jobs`
-    /// (simulating two submissions whose planning passes each take, use, and
-    /// release the store lock before either one's worktree is actually
-    /// created -- exactly what the deferred, parallel execution step makes
-    /// possible), must still land in two DIFFERENT `w/<short>` directories,
-    /// never the same one.
+    /// Two branches whose short names collide, claimed by two SEPARATE planning
+    /// passes before either worktree exists, still land in different `w/<short>`
+    /// directories.
     #[test]
-    fn plan_local_worktree_jobs_reserves_a_slot_before_it_is_ever_created() {
+    fn claiming_reserves_a_slot_before_it_is_ever_created() {
         let repo = init_repo("prefetch-collision");
         let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
             Store::open_in_memory().unwrap(),
@@ -5477,61 +5835,277 @@ mod tests {
             .register_project("proj", "", &repo.to_string_lossy(), "git")
             .unwrap();
 
-        let cells_a = vec![cell_row(
-            0,
-            0,
-            "s0",
-            Some("ralphus:new-worktree/test-pr-submission-a?upstream=main"),
-        )];
-        let tasks_a = vec![task_row(0, Some("proj"))];
-        let jobs_a = plan_local_worktree_jobs(
-            &store.lock(),
-            "squad-1",
-            &cells_a,
-            &tasks_a,
-            &HashMap::new(),
-        );
-        assert_eq!(jobs_a.len(), 1);
+        let claim = |squad: &str, branch: &str| {
+            let cells = vec![cell_row(
+                0,
+                0,
+                "s0",
+                Some(&format!("ralphus:new-worktree/{branch}?upstream=main")),
+            )];
+            let tasks = vec![task_row(0, Some("proj"))];
+            let jobs =
+                plan_local_worktree_jobs(&store.lock(), squad, &cells, &tasks, &HashMap::new());
+            assert_eq!(jobs.len(), 1);
+            jobs[0].wt.clone()
+        };
+        let a = claim("squad-1", "test-pr-submission-a");
+        let b = claim("squad-2", "test-pr-submission-b");
+        assert_eq!(a, worktree_dir(&repo, "test-pr-submission-a"));
+        assert_ne!(a, b, "colliding short names must not share a directory");
 
-        // Squad 2's planning pass runs (and completes) BEFORE squad 1's
-        // worktree has actually been created on disk -- the race this
-        // registry exists to close.
-        let cells_b = vec![cell_row(
-            0,
-            0,
-            "s0",
-            Some("ralphus:new-worktree/test-pr-submission-b?upstream=main"),
-        )];
-        let tasks_b = vec![task_row(0, Some("proj"))];
-        let jobs_b = plan_local_worktree_jobs(
-            &store.lock(),
-            "squad-2",
-            &cells_b,
-            &tasks_b,
-            &HashMap::new(),
-        );
-        assert_eq!(jobs_b.len(), 1);
+        let pa = pending_worktree_at(&a).expect("a is claimed");
+        let pb = pending_worktree_at(&b).expect("b is claimed");
+        assert_eq!(materialize_pending(&pa).unwrap().path, a);
+        assert_eq!(materialize_pending(&pb).unwrap().path, b);
+        assert_eq!(head_branch(&a.to_string_lossy()), "test-pr-submission-a");
+        assert_eq!(head_branch(&b.to_string_lossy()), "test-pr-submission-b");
+    }
 
+    fn marker_short(repo: &Path, branch: &str) -> String {
+        worktree_dir(repo, branch)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Re-claiming the same branch yields the same slot; a different branch is
+    /// refused that slot.
+    #[test]
+    fn marker_claim_is_exclusive_to_one_branch() {
+        let repo = init_repo("marker-exclusive");
+        assert!(write_creation_marker(&repo, "slot", "feat-x", "main").unwrap());
+        assert!(
+            write_creation_marker(&repo, "slot", "FEAT-X", "main").unwrap(),
+            "the owning branch (case-insensitive) re-claims its own slot"
+        );
+        assert!(
+            !write_creation_marker(&repo, "slot", "feat-y", "main").unwrap(),
+            "a different branch must not take an owned slot"
+        );
+        let (branch, upstream) =
+            read_creation_marker(&creation_marker_path(&repo, "slot")).unwrap();
         assert_eq!(
-            jobs_a[0].plan.wt,
-            worktree_dir(&repo, "test-pr-submission-a")
+            (branch.as_str(), upstream.as_deref()),
+            ("feat-x", Some("main"))
         );
-        assert_ne!(
-            jobs_a[0].plan.wt, jobs_b[0].plan.wt,
-            "two colliding-short-name branches planned by two separate calls must not \
-             be assigned the same directory"
-        );
+    }
 
-        // Both still execute cleanly into their distinct, reserved slots.
-        let resolved_a = execute_local_worktree_jobs(&jobs_a);
-        let resolved_b = execute_local_worktree_jobs(&jobs_b);
-        assert_eq!(resolved_a.len(), 1);
-        assert_eq!(resolved_b.len(), 1);
-        let path_a = resolved_a.values().next().unwrap();
-        let path_b = resolved_b.values().next().unwrap();
-        assert_ne!(path_a, path_b);
-        assert_eq!(head_branch(path_a), "test-pr-submission-a");
-        assert_eq!(head_branch(path_b), "test-pr-submission-b");
+    /// Concurrent claimers of one slot: only the branch that wrote the marker
+    /// ever sees success.
+    #[test]
+    fn concurrent_marker_claims_have_exactly_one_winning_branch() {
+        let repo = init_repo("marker-race");
+        let wins: Vec<(usize, bool)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..16)
+                .map(|n| {
+                    let repo = &repo;
+                    scope.spawn(move || {
+                        let ok = write_creation_marker(
+                            repo,
+                            "slot",
+                            &format!("branch-{}", n % 4),
+                            "main",
+                        )
+                        .unwrap();
+                        (n % 4, ok)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let (winner, _) = read_creation_marker(&creation_marker_path(&repo, "slot")).unwrap();
+        for (branch, ok) in wins {
+            assert_eq!(
+                ok,
+                winner == format!("branch-{branch}"),
+                "only the winning branch may report success"
+            );
+        }
+    }
+
+    /// A pending claim is recovered from its marker alone (no in-process state),
+    /// which is what a restarted daemon has.
+    #[test]
+    fn pending_worktree_at_recovers_a_claim_from_the_marker_alone() {
+        let repo = init_repo("pending-recover");
+        let wt = worktree_dir(&repo, "feat-restart");
+        let short = marker_short(&repo, "feat-restart");
+        assert!(pending_worktree_at(&wt).is_none(), "no marker, no claim");
+        assert!(write_creation_marker(&repo, &short, "feat-restart", "main").unwrap());
+        let pending = pending_worktree_at(&wt).expect("claim from marker");
+        assert_eq!(
+            (pending.branch.as_str(), pending.upstream.as_str()),
+            ("feat-restart", "main")
+        );
+        assert_eq!(pending.root, repo);
+        assert!(
+            pending_worktree_at(&wt.join("nested")).is_none(),
+            "a cwd nested inside a worktree is not a claim"
+        );
+        assert!(pending_worktree_at(&repo).is_none());
+        let created = materialize_pending(&pending).expect("finish creation after restart");
+        assert_eq!(created.path, wt);
+        assert!(pending_worktree_at(&wt).is_none());
+        assert_eq!(head_branch(&wt.to_string_lossy()), "feat-restart");
+    }
+
+    /// A half-created directory with our marker is proven ours and repaired.
+    #[test]
+    fn half_created_worktree_with_our_marker_is_repaired() {
+        let repo = init_repo("half-created-owned");
+        let wt = worktree_dir(&repo, "feat-half");
+        let short = marker_short(&repo, "feat-half");
+        assert!(write_creation_marker(&repo, &short, "feat-half", "main").unwrap());
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join("partial.bin"), "interrupted checkout").unwrap();
+
+        let pending = pending_worktree_at(&wt).expect("claim");
+        let created = materialize_pending(&pending).expect("repair");
+        assert!(created.repaired.is_some(), "the repair is reported");
+        assert!(!wt.join("partial.bin").exists());
+        assert!(wt.join(".git").exists());
+        assert_eq!(head_branch(&wt.to_string_lossy()), "feat-half");
+        assert!(!creation_marker_path(&repo, &short).exists());
+    }
+
+    /// A non-empty directory at the slot with NO marker is not ours: refuse, and
+    /// leave every file in place.
+    #[test]
+    fn unmarked_directory_at_the_slot_is_refused_and_never_deleted() {
+        let repo = init_repo("half-created-foreign");
+        let wt = worktree_dir(&repo, "feat-foreign");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join("precious.txt"), "not ours").unwrap();
+
+        let err = ensure_worktree_tracked(&repo, "feat-foreign", "main").unwrap_err();
+        assert!(err.contains("refusing"), "{err}");
+        assert!(err.contains("no creation marker"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(wt.join("precious.txt")).unwrap(),
+            "not ours"
+        );
+    }
+
+    /// A marker naming a DIFFERENT branch must not let this branch delete the
+    /// directory behind it.
+    #[test]
+    fn marker_owned_by_another_branch_is_never_cleaned() {
+        let repo = init_repo("half-created-other");
+        let wt = worktree_dir(&repo, "feat-mine");
+        let short = marker_short(&repo, "feat-mine");
+        assert!(write_creation_marker(&repo, &short, "someone-else", "main").unwrap());
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join("theirs.txt"), "theirs").unwrap();
+
+        // Whether this branch is planned into another slot or refused, the
+        // other branch's directory and marker are untouched.
+        if let Ok(created) = ensure_worktree_tracked(&repo, "feat-mine", "main") {
+            assert_ne!(created.path, wt);
+        }
+        assert_eq!(
+            std::fs::read_to_string(wt.join("theirs.txt")).unwrap(),
+            "theirs"
+        );
+        assert!(creation_marker_path(&repo, &short).exists());
+    }
+
+    /// Many callers racing to create one branch's worktree: exactly one creates
+    /// it, the rest wait and observe the same path, and nobody runs a second
+    /// `git worktree add`.
+    #[test]
+    fn concurrent_creations_of_one_branch_are_single_flight() {
+        let repo = init_repo("single-flight");
+        let results: Vec<Materialized> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let repo = &repo;
+                    scope.spawn(move || ensure_worktree_tracked(repo, "feat-sf", "main").unwrap())
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let first = &results[0].path;
+        assert!(results.iter().all(|m| &m.path == first));
+        assert_eq!(head_branch(&first.to_string_lossy()), "feat-sf");
+        assert!(
+            results.iter().all(|m| m.repaired.is_none()),
+            "no concurrent caller may mistake the in-flight creation for a half-created one"
+        );
+        let listed = git(&repo, &["worktree", "list", "--porcelain"]).unwrap();
+        assert_eq!(
+            listed.matches("branch refs/heads/feat-sf").count(),
+            1,
+            "exactly one worktree for the branch: {listed}"
+        );
+    }
+
+    /// Several callers (the background creator and cells that came due) racing
+    /// on one claim all end with a usable worktree, and afterwards the claim is
+    /// gone so a later caller is a no-op.
+    #[test]
+    fn ensure_claimed_worktree_serves_every_racing_caller() {
+        let repo = init_repo("claimed-race");
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        store
+            .lock()
+            .register_project("proj", "", &repo.to_string_lossy(), "git")
+            .unwrap();
+        let cells = vec![cell_row(
+            0,
+            0,
+            "s0",
+            Some("ralphus:new-worktree/feat-cr?upstream=main"),
+        )];
+        let tasks = vec![task_row(0, Some("proj"))];
+        let jobs =
+            plan_local_worktree_jobs(&store.lock(), "squad-1", &cells, &tasks, &HashMap::new());
+        let wt = jobs[0].wt.clone();
+        let outcomes: Vec<Option<Materialized>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..6)
+                .map(|_| {
+                    let (store, wt) = (&store, &wt);
+                    scope.spawn(move || {
+                        ensure_claimed_worktree(store, "squad-1", Some("proj"), wt).unwrap()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert!(wt.join(".git").exists());
+        assert_eq!(head_branch(&wt.to_string_lossy()), "feat-cr");
+        assert!(
+            outcomes.iter().any(Option::is_some),
+            "at least one caller did the creating"
+        );
+        assert!(
+            ensure_claimed_worktree(&store, "squad-1", Some("proj"), &wt)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// A daemon restarted mid-creation leaves the marker, a half-built directory,
+    /// and no in-process state: `ensure_claimed_worktree` finishes the job.
+    #[test]
+    fn ensure_claimed_worktree_finishes_a_creation_interrupted_by_restart() {
+        let repo = init_repo("claimed-restart");
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let wt = worktree_dir(&repo, "feat-rs");
+        let short = marker_short(&repo, "feat-rs");
+        assert!(write_creation_marker(&repo, &short, "feat-rs", "main").unwrap());
+        std::fs::create_dir_all(wt.join("half")).unwrap();
+
+        let created = ensure_claimed_worktree(&store, "squad-1", None, &wt)
+            .unwrap()
+            .expect("pending claim");
+        assert!(created.repaired.is_some());
+        assert_eq!(head_branch(&wt.to_string_lossy()), "feat-rs");
+        assert!(!wt.join("half").exists());
     }
 
     fn env_ctx<'a>(
