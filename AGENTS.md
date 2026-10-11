@@ -294,6 +294,7 @@ files (each paired with a `CLAUDE.md` containing `@AGENTS.md`):
 - [`bench-macros/AGENTS.md`](bench-macros/AGENTS.md) — pointer to `bench-harness/AGENTS.md`
 - [`bench-types/AGENTS.md`](bench-types/AGENTS.md) — pointer to `bench-harness/AGENTS.md`
 - [`docs/proc-counts.md`](docs/proc-counts.md) — per-test process-count tags, cron measurement, graph
+- [`docs/mailbox-delivery.md`](docs/mailbox-delivery.md) — `mailbox follow` vs `check`, per-backend watcher delivery, which mail is pushed, and why MCP has no `mailbox_follow`
 - [`scripts/AGENTS.md`](scripts/AGENTS.md) — build-debug/build-release/container-mode/docs-site usage
 
 `.agent/` files for content that doesn't belong to one component:
