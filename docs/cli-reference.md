@@ -364,7 +364,7 @@ the daemon's hourly Free-tier background sweep
 | `review followup ignore <selector> [prophecy_id]` | Leave one deferred follow-up (or all, with no id) out of the merge-time offer; refused once the offer exists |
 | `review followup unignore <selector> [prophecy_id]` | Reverse `ignore`; refused once the offer exists |
 | `review followup show <selector>` | Show the follow-up offer a merged review sent for its `deferred` prophecies |
-| `review followup accept <selector>` | Draft a follow-up squad from the offer and create the waypoint that explains it (held unless `[followup] auto_start`) |
+| `review followup accept <selector>` | Draft a follow-up squad from the offer (held unless `[followup] auto_start`) |
 | `review followup decline <selector>` | Decline the offer; nothing is created and the review never offers again |
 | `review delete <selector> [--yes]` | Delete + purge worktrees |
 | `review settings <selector> [--skip-checks] [--skip-worktrees] [--resolver-agent] [--resolver-model] [--base-branch]` | Update opt-out settings |
@@ -751,7 +751,7 @@ use; see `READ_ONLY_NOTE`.
     - (read-only-safe) graph squad_id [id, optional] --all --dot  {Render the task-order dependency graph. (Rust port simplifies Python's --global/--format ascii|dot choice to plain --dot/--all boolean flags.)}
     - (read-only-safe) history selector [uri] --type [str]  {Show a cell/proof step's tmux history (one-shot snapshot; Python's --live tailing and --wait-until-valid are not yet ported).}
     - initialize  {One-time local setup helpers for a repository.}
-        - followup --remote --state-dir [path] --stop  {Launch an isolated daemon and run the deferred-prophecy follow-up flow with a stub agent: a review merges, offers follow-up work, the offer is accepted, and the drafted squad runs under its waypoint. Local only (--remote is refused); --stop shuts the daemon down afterwards.}
+        - followup --remote --state-dir [path] --stop  {Launch an isolated daemon and run the deferred-prophecy follow-up flow with a stub agent: a review merges, offers follow-up work, the offer is accepted, and the drafted squad runs to completion. Local only (--remote is refused); --stop shuts the daemon down afterwards.}
         - git --path [path]  {Enable git rerere in a repo so review rebases replay conflict resolutions.}
         - machine --remote --state-dir [path] --stop  {Launch an isolated daemon, register the loopback machine provider, and run a remote cell + proof in a worktree it provisions (always remote; --remote is accepted for symmetry). --stop shuts the daemon down afterwards.}
         - mailbox --remote --state-dir [path] --stop  {Launch an isolated daemon and verify cell/proof failure mailbox remediation. --remote runs both failures on a strict loopback machine; --stop shuts the daemon down afterwards.}
@@ -843,7 +843,7 @@ use; see `READ_ONLY_NOTE`.
         - (read-only-safe) env selector [uri] --scope [build|tests|manual-checks|worktree]  {List a review surface's resolved environment variables, read-only (RAL-324): the auto-build step, the check gates, manual checks, or one branch's review worktree.}
         - feedback selector [uri] text [str] --author [name]  {Post feedback on one branch, triggering a resolver re-attempt. --author attributes the feedback to a different registered user than the one submitting it (RAL-379); defaults to the submitter when omitted.}
         - followup  {Follow-up work offered when a review merges with deferred prophecies.}
-            - accept selector [uri]  {Accept a follow-up offer: draft a follow-up squad from the deferred items and create the waypoint that explains it. The squad starts at once unless auto-start is off for the review (`review settings --followup-auto-start`, else `[followup] auto_start`).}
+            - accept selector [uri]  {Accept a follow-up offer: draft a follow-up squad from the deferred items. The squad starts at once unless auto-start is off for the review (`review settings --followup-auto-start`, else `[followup] auto_start`).}
             - decline selector [uri]  {Decline a follow-up offer; nothing is created and the review never offers again.}
             - ignore selector [uri] prophecy_id [integer, optional]  {Ignore a pending deferred follow-up (or every one when no prophecy id is given) so the review's merge-time offer leaves it out. Refused once the offer exists.}
             - (read-only-safe) list selector [uri]  {List the deferred follow-ups a review has pending (latest attempt of each cell), which of them are ignored, and whether follow-ups are on for the review.}

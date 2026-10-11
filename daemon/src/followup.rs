@@ -12,10 +12,8 @@
 //! 2. The user accepts or declines (`POST /api/guardians/{id}/followup/...`,
 //!    `ralphus review followup ...`).
 //! 3. [`accept_offer`] drafts one squad (one task per deferred item) and
-//!    submits it through the ordinary submit path, then records a blocking
-//!    **waypoint** that explains the follow-up: the merged review is on its
-//!    roster, the squad is its affected entry. The waypoint stays open until
-//!    the squad finishes, so it reads as "follow-up outstanding".
+//!    submits it through the ordinary submit path, and records the squad
+//!    against each item and the offer. No waypoint is created.
 //!
 //! Drafting is deterministic: each task's prompt is the deferred note plus
 //! the original prompt as context. There is no model call, so drafting has no
@@ -31,11 +29,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::guardian::GuardianView;
 use crate::store::{Result, Store, StoreError, now_ms};
-use crate::waypoints::{AffectedMode, BearingDecision, WaypointEntryKind};
 
 /// The offer has been sent and awaits an answer.
 pub const STATUS_OFFERED: &str = "offered";
-/// The user accepted; the squad and waypoint were created.
+/// The user accepted; the squad was created.
 pub const STATUS_ACCEPTED: &str = "accepted";
 /// The user declined; nothing was created.
 pub const STATUS_DECLINED: &str = "declined";
@@ -89,8 +86,6 @@ pub struct FollowupOfferView {
     /// Follow-up generation of the review that triggered the offer (`0` for
     /// ordinary work).
     pub depth: i64,
-    /// The waypoint an accepted offer created.
-    pub waypoint_id: Option<String>,
     /// The squad an accepted offer created.
     pub squad_id: Option<String>,
     pub created_at_ms: i64,
@@ -98,7 +93,7 @@ pub struct FollowupOfferView {
 }
 
 const OFFER_COLUMNS: &str =
-    "guardian_id, status, items, depth, waypoint_id, squad_id, created_at_ms, resolved_at_ms";
+    "guardian_id, status, items, depth, squad_id, created_at_ms, resolved_at_ms";
 
 fn map_offer_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<FollowupOfferView> {
     let items: String = r.get(2)?;
@@ -109,10 +104,9 @@ fn map_offer_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<FollowupOfferView> {
         // lookup: the offer row still has to be answerable (declinable).
         items: serde_json::from_str(&items).unwrap_or_default(),
         depth: r.get(3)?,
-        waypoint_id: r.get(4)?,
-        squad_id: r.get(5)?,
-        created_at_ms: r.get(6)?,
-        resolved_at_ms: r.get(7)?,
+        squad_id: r.get(4)?,
+        created_at_ms: r.get(5)?,
+        resolved_at_ms: r.get(6)?,
     })
 }
 
@@ -659,18 +653,17 @@ impl Store {
         Ok(())
     }
 
-    /// Records the squad and waypoint a claimed item produced, and marks the
+    /// Records the squad a claimed item produced, and marks the
     /// whole offer `accepted` once every item in its snapshot has a squad.
     pub fn record_followup_item_result(
         &self,
         guardian_id: &str,
         prophecy_id: i64,
         squad_id: &str,
-        waypoint_id: &str,
     ) -> Result<()> {
         self.conn.execute(
-            "UPDATE followup_item_results SET squad_id=?, waypoint_id=? WHERE guardian_id=? AND prophecy_id=?",
-            params![squad_id, waypoint_id, guardian_id, prophecy_id],
+            "UPDATE followup_item_results SET squad_id=? WHERE guardian_id=? AND prophecy_id=?",
+            params![squad_id, guardian_id, prophecy_id],
         )?;
         let Some(offer) = self.get_followup_offer(guardian_id)? else {
             return Ok(());
@@ -682,12 +675,11 @@ impl Store {
             .all(|i| done.get(&i.prophecy_id).is_some_and(|s| !s.is_empty()));
         if all {
             self.conn.execute(
-                "UPDATE followup_offers SET status=?, squad_id=?, waypoint_id=?, resolved_at_ms=?
+                "UPDATE followup_offers SET status=?, squad_id=?, resolved_at_ms=?
                  WHERE guardian_id=? AND status=?",
                 params![
                     STATUS_ACCEPTED,
                     squad_id,
-                    waypoint_id,
                     now_ms(),
                     guardian_id,
                     STATUS_OFFERED
@@ -713,62 +705,6 @@ impl Store {
             )));
         }
         Ok(offer)
-    }
-
-    /// Creates the blocking waypoint that explains a follow-up squad: the
-    /// merged review is on its roster (the work it consists of, already
-    /// landed), the squad is its blocking affected entry. The squad's bearing
-    /// decision is recorded as `accepted` up front -- the follow-up *is* the
-    /// work the waypoint describes, so there is nothing for it to answer, and
-    /// leaving it unanswered would hold the squad and its review forever.
-    /// Returns the waypoint id.
-    pub fn create_followup_waypoint(
-        &self,
-        guardian: &GuardianView,
-        squad_id: &str,
-        items: &[FollowupItem],
-    ) -> Result<String> {
-        let waypoint_id = self.next_id("waypoint_seq", "waypoint")?;
-        let label = format!("follow-up: {}", guardian.name);
-        self.create_waypoint(
-            &waypoint_id,
-            Some(&label),
-            &waypoint_prompt(&guardian.id, &guardian.name, items),
-            None,
-            None,
-            false,
-        )?;
-        self.add_roster_entry(
-            &waypoint_id,
-            WaypointEntryKind::Review,
-            &guardian.id,
-            Some("the review the deferred work came out of; it has merged"),
-        )?;
-        self.add_affected_entry(
-            &waypoint_id,
-            WaypointEntryKind::Squad,
-            squad_id,
-            AffectedMode::Block,
-        )?;
-        self.set_affected_bearing_decision(
-            &waypoint_id,
-            WaypointEntryKind::Squad,
-            squad_id,
-            BearingDecision::Accepted,
-        )?;
-        crate::cartographer::Note::new("followup")
-            .scope("followup")
-            .guardian(&guardian.id)
-            .squad(squad_id)
-            .emit(
-                self,
-                format!(
-                    "waypoint {waypoint_id} created for follow-up squad {squad_id} (review {})",
-                    guardian.id
-                ),
-                serde_json::json!({"waypoint_id": waypoint_id, "squad_id": squad_id}),
-            );
-        Ok(waypoint_id)
     }
 }
 
@@ -810,21 +746,6 @@ pub fn accepted_message(
         out.push('\n');
     }
     out.push_str("The earlier offer message needs no action for these items.");
-    out
-}
-
-/// The waypoint's prompt: what was deferred and where it came from, concise.
-#[must_use]
-pub fn waypoint_prompt(guardian_id: &str, review_name: &str, items: &[FollowupItem]) -> String {
-    let mut out = format!(
-        "Follow-up work deferred while building review {guardian_id} ({review_name}), which has \
-         since merged. The deferred items:\n"
-    );
-    for item in items {
-        out.push_str("- ");
-        out.push_str(&truncate_chars(&item.body, MAX_MESSAGE_NOTE_CHARS));
-        out.push_str(&format!(" (from {})\n", item.entity_uri));
-    }
     out
 }
 
@@ -1288,7 +1209,6 @@ pub fn resolve_followup_base(git_root: &Path, merged_into: &str) -> String {
 #[derive(Debug, Clone, Serialize)]
 pub struct AcceptResult {
     pub squad_id: String,
-    pub waypoint_id: String,
     /// The upstream the squad is based on (`<<default>>` when the branch the
     /// review merged into no longer exists).
     pub base: String,
@@ -1316,8 +1236,7 @@ impl From<StoreError> for AcceptError {
 }
 
 /// Accepts an open offer: drafts the follow-up squad, submits it through the
-/// ordinary submit path (so every preflight applies), and creates the
-/// waypoint that explains it.
+/// ordinary submit path (so every preflight applies).
 ///
 /// The offer is claimed first, atomically, so a second accept -- a retried
 /// request, a double click -- finds it already accepted and creates nothing.
@@ -1389,16 +1308,7 @@ pub(crate) fn accept_offer(
     };
     let store = daemon.lock();
     for item in &offer.items {
-        store.record_followup_item_result(guardian_id, item.prophecy_id, &squad_id, "")?;
-    }
-    let waypoint_id = store.create_followup_waypoint(&guardian, &squad_id, &offer.items)?;
-    for item in &offer.items {
-        store.record_followup_item_result(
-            guardian_id,
-            item.prophecy_id,
-            &squad_id,
-            &waypoint_id,
-        )?;
+        store.record_followup_item_result(guardian_id, item.prophecy_id, &squad_id)?;
     }
     // The offer message sent at merge is now out of date; say so where the
     // same watchers will read it.
@@ -1421,7 +1331,6 @@ pub(crate) fn accept_offer(
     }
     Ok(AcceptResult {
         squad_id,
-        waypoint_id,
         base,
         started,
     })
@@ -2144,8 +2053,7 @@ mode = "raw"
         assert!(s.claim_followup_item("g1", a).unwrap());
 
         // One item answered leaves the offer open; the last one closes it.
-        s.record_followup_item_result("g1", a, "squad-a", "waypoint-a")
-            .unwrap();
+        s.record_followup_item_result("g1", a, "squad-a").unwrap();
         assert_eq!(
             s.get_followup_offer("g1").unwrap().unwrap().status,
             STATUS_OFFERED
@@ -2163,8 +2071,7 @@ mode = "raw"
         assert_eq!(squad_of(b), None);
 
         assert!(s.claim_followup_item("g1", b).unwrap());
-        s.record_followup_item_result("g1", b, "squad-b", "waypoint-b")
-            .unwrap();
+        s.record_followup_item_result("g1", b, "squad-b").unwrap();
         assert_eq!(
             s.get_followup_offer("g1").unwrap().unwrap().status,
             STATUS_ACCEPTED
@@ -2173,6 +2080,8 @@ mode = "raw"
             s.decline_followup_offer("g1"),
             Err(StoreError::InvalidTransition(_))
         ));
+        assert!(s.list_open_waypoint_ids().unwrap().is_empty());
+        assert!(s.list_closed_waypoint_ids().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2414,40 +2323,6 @@ mode = "raw"
         );
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&origin);
-    }
-
-    #[test]
-    fn the_follow_up_waypoint_lists_the_review_as_roster_and_the_squad_as_blocking() {
-        use crate::prophecy::ProphecyKind;
-        let s = store();
-        let root = temp_root("waypoint");
-        seed_guardian(&s, "g1", &root);
-        defer(&s, "g1", ProphecyKind::Deferred, "later");
-        merge(&s, "g1");
-        let offer = s.get_followup_offer("g1").unwrap().unwrap();
-        let guardian = s.get_guardian("g1").unwrap();
-
-        let waypoint_id = s
-            .create_followup_waypoint(&guardian, "squad-f", &offer.items)
-            .unwrap();
-        assert!(s.waypoint_is_open(&waypoint_id).unwrap());
-        let roster = s.list_roster_entries(&waypoint_id).unwrap();
-        assert_eq!(roster.len(), 1);
-        assert_eq!(roster[0].entry_id, "g1");
-        assert!(roster[0].terminal, "the merged review has already landed");
-        let affected = s.list_affected_entries(&waypoint_id).unwrap();
-        assert_eq!(affected.len(), 1);
-        assert_eq!(affected[0].entry_id, "squad-f");
-        assert_eq!(affected[0].mode, AffectedMode::Block);
-        assert_eq!(
-            affected[0].bearing_decision,
-            Some(BearingDecision::Accepted)
-        );
-        assert!(
-            s.squad_block_gating_waypoint("squad-f").unwrap().is_none(),
-            "an answered entry on a landed roster must not hold the squad"
-        );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
