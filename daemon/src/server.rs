@@ -9170,9 +9170,7 @@ fn edit_squad(daemon: &Daemon, id: &str, body: &str) -> Reply {
 /// RAL-615: the worktree initialization part of a cell edit -- the new command
 /// list (empty clears it) and optional timeout -- or `None` when the request
 /// touches neither. `Err` is the 400 message.
-fn worktree_init_edit(
-    req: &EditBody,
-) -> InitEditResult {
+fn worktree_init_edit(req: &EditBody) -> InitEditResult {
     if req.initialization_commands.is_none() && req.initialization_timeout_sec.is_none() {
         return Ok(None);
     }
