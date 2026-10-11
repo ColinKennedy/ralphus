@@ -949,6 +949,55 @@ fn branch_materialization(root: &Path, branch: &str) -> Result<BranchMaterializa
 pub(crate) static WORKTREE_CONFIG_LOCK: LazyLock<parking_lot::Mutex<()>> =
     LazyLock::new(|| parking_lot::Mutex::new(()));
 
+/// Whether a failed `git config` write is the kind that clears on its own:
+/// git's atomic update writes `config.lock` and renames it over the target, so
+/// it fails immediately (rather than waiting) when another process holds the
+/// lock ("could not lock config file", "File exists") and, on Windows, when a
+/// concurrent reader, antivirus scanner or indexer momentarily holds the old
+/// file open without delete sharing, so the rename comes back "Permission
+/// denied". Other git processes touch `.git/config` without taking
+/// [`WORKTREE_CONFIG_LOCK`] (every worktree's `git worktree add`, `rev-parse`
+/// and `fetch`, and the user's own git), so the in-process mutex alone cannot
+/// rule these out.
+pub(crate) fn is_transient_config_write_error(error: &str) -> bool {
+    let e = error.to_ascii_lowercase();
+    e.contains("could not lock config file")
+        || (e.contains("unable to create") && e.contains("config.lock"))
+        || e.contains("could not write config file")
+        || e.contains("permission denied")
+        || e.contains("file exists")
+        || e.contains("device or resource busy")
+        || e.contains("being used by another process")
+}
+
+/// Run `attempt` until it succeeds, fails non-transiently, or `attempts` runs
+/// are used, sleeping `backoff_step * n` after the n-th transient failure.
+fn retry_transient_config_write<T>(
+    attempts: u32,
+    backoff_step: std::time::Duration,
+    mut attempt: impl FnMut() -> Result<T, String>,
+) -> Result<T, String> {
+    let mut n = 1;
+    loop {
+        match attempt() {
+            Ok(v) => return Ok(v),
+            Err(e) if n < attempts && is_transient_config_write_error(&e) => {
+                // allow-lock-io: callers hold `WORKTREE_CONFIG_LOCK` (the config-writer mutex, not the store lock) across this bounded retry; that is what serializes the writers
+                std::thread::sleep(backoff_step * n);
+                n += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// `git config` write to a config file shared with other processes, retried
+/// (about 5s in total) while [`is_transient_config_write_error`] holds. The
+/// caller holds [`WORKTREE_CONFIG_LOCK`] for shared `.git/config` writes.
+pub(crate) fn git_config_write_retrying(cwd: &Path, args: &[&str]) -> Result<String, String> {
+    retry_transient_config_write(20, std::time::Duration::from_millis(25), || git(cwd, args))
+}
+
 fn set_explicit_upstream(wt: &Path, branch: &str, upstream: &str) -> Result<(), String> {
     let _guard = WORKTREE_CONFIG_LOCK.lock();
     // RAL-258: the reserved `<<...>>` sentinels are never literal branch names.
@@ -975,8 +1024,9 @@ fn set_explicit_upstream(wt: &Path, branch: &str, upstream: &str) -> Result<(), 
         let (remote, remote_branch) = remote_ref
             .split_once('/')
             .ok_or_else(|| fail(format!("malformed remote-tracking ref \"{remote_ref}\"")))?;
-        git(wt, &["config", &format!("branch.{branch}.remote"), remote]).map_err(fail)?;
-        git(
+        git_config_write_retrying(wt, &["config", &format!("branch.{branch}.remote"), remote])
+            .map_err(fail)?;
+        git_config_write_retrying(
             wt,
             &[
                 "config",
@@ -988,8 +1038,9 @@ fn set_explicit_upstream(wt: &Path, branch: &str, upstream: &str) -> Result<(), 
         return Ok(());
     }
     if qualified.starts_with("refs/heads/") {
-        git(wt, &["config", &format!("branch.{branch}.remote"), "."]).map_err(fail)?;
-        git(
+        git_config_write_retrying(wt, &["config", &format!("branch.{branch}.remote"), "."])
+            .map_err(fail)?;
+        git_config_write_retrying(
             wt,
             &["config", &format!("branch.{branch}.merge"), &qualified],
         )
@@ -1223,7 +1274,7 @@ pub(crate) fn apply_worktree_git_identity_best_effort(
 /// both, or neither), so neither can assume the extension is already on.
 fn ensure_worktree_config_extension(worktree_dir: &Path) -> Result<(), String> {
     let _guard = WORKTREE_CONFIG_LOCK.lock();
-    git(
+    git_config_write_retrying(
         worktree_dir,
         &["config", "extensions.worktreeConfig", "true"],
     )
@@ -3183,6 +3234,57 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static TEST_N: AtomicU32 = AtomicU32::new(0);
+
+    #[test]
+    fn config_write_errors_classified_as_transient() {
+        for e in [
+            "error: could not write config file C:/r/.git/config: Permission denied",
+            "error: could not lock config file .git/config: File exists",
+            "fatal: Unable to create 'C:/r/.git/config.lock': File exists.",
+            "error: The process cannot access the file because it is being used by another process",
+        ] {
+            assert!(is_transient_config_write_error(e), "{e}");
+        }
+        for e in [
+            "error: key does not contain a section: foo",
+            "fatal: not a git repository",
+            "error: invalid key: a b",
+        ] {
+            assert!(!is_transient_config_write_error(e), "{e}");
+        }
+    }
+
+    #[test]
+    fn config_write_retry_recovers_from_transient_failures_only() {
+        let step = std::time::Duration::from_millis(1);
+        let mut calls = 0;
+        let ok = retry_transient_config_write(5, step, || {
+            calls += 1;
+            if calls < 3 {
+                Err("error: could not write config file x: Permission denied".to_string())
+            } else {
+                Ok("done")
+            }
+        });
+        assert_eq!(ok, Ok("done"));
+        assert_eq!(calls, 3);
+
+        let mut calls = 0;
+        let permanent: Result<(), String> = retry_transient_config_write(5, step, || {
+            calls += 1;
+            Err("error: invalid key: a b".to_string())
+        });
+        assert!(permanent.is_err());
+        assert_eq!(calls, 1);
+
+        let mut calls = 0;
+        let exhausted: Result<(), String> = retry_transient_config_write(4, step, || {
+            calls += 1;
+            Err("Permission denied".to_string())
+        });
+        assert!(exhausted.is_err());
+        assert_eq!(calls, 4);
+    }
 
     fn tmp_dir(tag: &str) -> PathBuf {
         let n = TEST_N.fetch_add(1, Ordering::Relaxed);
