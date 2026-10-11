@@ -1,4 +1,4 @@
-﻿      // ---- Presets tab (RAL-…) ----
+      // ---- Presets tab (RAL-…) ----
       /**
        * The preset name the editor panel was last loaded from via Edit, or ""
        * while it holds a new, unsaved preset.
@@ -60,7 +60,7 @@
               <div class="presets-empty-title">No presets registered yet</div>
               <div class="presets-empty-body">A preset is a named bundle of field defaults. Register one with the form, then reference it from a task file:</div>
               <pre class="presets-snippet">[[task.cell]]
-extends = [<span class="preset-sentinel">"&lt;&lt;ralphus:presets/roles/reviewer&gt;&gt;"</span>]</pre>
+extends = [<span class="preset-sentinel">"&lt;&lt;ralphus:presets/roles/judge/reviewer&gt;&gt;"</span>]</pre>
               <div class="presets-empty-body">Any field the cell leaves unset is stamped from the preset at submit time.</div>
             </div>`;
         }
@@ -143,7 +143,7 @@ extends = [<span class="preset-sentinel">"&lt;&lt;ralphus:presets/roles/reviewer
             <div class="presets-editor-title" id="preset-editor-title" data-tip="Register a preset so &quot;extends = [\\&quot;&lt;&lt;ralphus:presets/&lt;name&gt;&gt;&gt;\\&quot;]&quot; on a task, cell, or proof step can stamp these field values into any of that entity's own fields still unset at submit time.\nA field left blank here is simply not stamped by this preset. A field this preset sets that doesn't exist on the entity it's applied to (e.g. system_prompt on a task) is silently skipped.">New preset</div>
             <label class="preset-input">
               <span>Name</span>
-              <input id="preset-name" type="text" class="mono" placeholder="roles/reviewer" autocomplete="off" data-tip="Preset name -- what &lt;&lt;ralphus:presets/&lt;name&gt;&gt;&gt; names. Use / for a namespace, e.g. roles/reviewer." />
+              <input id="preset-name" type="text" class="mono" placeholder="roles/judge/reviewer" autocomplete="off" data-tip="Preset name -- what &lt;&lt;ralphus:presets/&lt;name&gt;&gt;&gt; names. Use / for a namespace, e.g. roles/judge/reviewer." />
             </label>
             <label class="preset-input">
               <span>system_prompt <em>cell only</em></span>
