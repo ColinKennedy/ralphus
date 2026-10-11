@@ -14336,6 +14336,12 @@ struct GuardianSettingsBody {
     /// convention `resolver_agent`/`resolver_model` above use).
     #[serde(default)]
     proof_scope: Option<String>,
+    /// This review's own CI-deferral mode -- `"every"`, `"tip"` or
+    /// `"bottom+tip"`. An empty string clears it back to the default
+    /// (`"every"`). Applying it puts or removes the defer-full-CI label on the
+    /// review's open PRs/MRs before the request returns.
+    #[serde(default)]
+    ci_deferral: Option<String>,
     /// RAL-168: this review's own override for `"each_branch"` scope's
     /// auto-clean-skip sub-option. Always an explicit override when present
     /// -- a boolean has no natural "reset to inherit" sentinel the way an
@@ -14986,9 +14992,28 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
     if let Some(reply) = reject_invalid_rebuild_on(&req.rebuild_on) {
         return reply;
     }
+    if let Some(mode) = req.ci_deferral.as_deref().filter(|m| !m.is_empty()) {
+        if !ralphus_core::schema::CI_DEFERRAL_VALUES.contains(&mode) {
+            return error(
+                400,
+                "invalid_ci_deferral",
+                &format!(
+                    "ci_deferral must be one of {} -- got \"{mode}\"",
+                    ralphus_core::schema::CI_DEFERRAL_VALUES.join(", ")
+                ),
+                vec![],
+            );
+        }
+    }
     let store = daemon.lock();
     if let Some(skip) = req.skip_worktrees {
         if let Err(e) = store.set_guardian_skip_worktrees(id, skip) {
+            return store_error(&e);
+        }
+    }
+    if let Some(mode) = req.ci_deferral.as_deref() {
+        let mode = if mode.is_empty() { None } else { Some(mode) };
+        if let Err(e) = store.set_guardian_ci_deferral(id, mode) {
             return store_error(&e);
         }
     }
@@ -15138,6 +15163,18 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
                 502,
                 "forge_error",
                 &format!("base saved locally but PR/MR base sync failed: {e}"),
+                vec![],
+            );
+        }
+    }
+    // A CI-deferral change is not complete until the labels on the forge match
+    // it, so a flip is visible on the PRs/MRs the moment this request returns.
+    if req.ci_deferral.is_some() {
+        if let Err(e) = crate::pr::reconcile_ci_deferral(&daemon.store_handle(), id) {
+            return error(
+                502,
+                "forge_error",
+                &format!("ci_deferral saved locally but PR/MR label sync failed: {e}"),
                 vec![],
             );
         }

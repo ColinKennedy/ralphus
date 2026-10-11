@@ -3914,6 +3914,10 @@ impl Store {
             // `None` inherits the project/global default, which resolves to
             // `true` (on by default).
             "ALTER TABLE guardians ADD COLUMN post_appraisals INTEGER",
+            // Per-review `ci_deferral` mode (`every`/`tip`/`bottom+tip`).
+            // NULL behaves as `every`: no PR/MR in the stack carries the
+            // defer-full-CI label.
+            "ALTER TABLE guardians ADD COLUMN ci_deferral TEXT",
             // RAL-521: per-review override for whether this review's manual
             // checks are computed once, when its review branches are first
             // created, and then reused through later merges, rebases, and

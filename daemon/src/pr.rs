@@ -3813,6 +3813,117 @@ pub fn resync_pr_bases_synchronously(
     Err("timed out waiting for an earlier PR/MR base sync".to_string())
 }
 
+/// Whether the PR/MR at `index` of `count` stack members (bottom to top)
+/// carries [`ralphus_core::schema::DEFER_FULL_CI_LABEL`] under `mode`.
+///
+/// `every` and any unrecognised mode defer nothing, so a bad stored value runs
+/// more CI rather than less. A single-member stack is both its bottom and its
+/// tip, so it is never deferred.
+fn defers_full_ci(mode: &str, index: usize, count: usize) -> bool {
+    use ralphus_core::schema::{CI_DEFERRAL_BOTTOM_AND_TIP, CI_DEFERRAL_TIP};
+    let is_bottom = index == 0;
+    let is_tip = index + 1 == count;
+    match mode {
+        CI_DEFERRAL_TIP => !is_tip,
+        CI_DEFERRAL_BOTTOM_AND_TIP => !is_bottom && !is_tip,
+        _ => false,
+    }
+}
+
+/// Put [`ralphus_core::schema::DEFER_FULL_CI_LABEL`] on exactly the open
+/// stack members the review's `ci_deferral` mode defers, and take it off every
+/// other one, on the forge. The stack is the review's open `parent`-kind PRs/
+/// MRs in branch order, bottom to top -- the same membership
+/// [`resync_pr_bases`] chains together. Each label call is idempotent, so this
+/// asserts the desired end state without reading the current labels.
+///
+/// Every member is attempted even if an earlier one failed; the errors come
+/// back together. Returns how many members now carry the label.
+pub fn reconcile_ci_deferral(
+    store: &crate::store_lock::StoreHandle,
+    id: &str,
+) -> std::result::Result<usize, String> {
+    use ralphus_core::schema::DEFER_FULL_CI_LABEL;
+    let guardian = store.lock().get_guardian(id).map_err(|e| e.to_string())?;
+    if crate::guardian::GuardianStatus::is_terminal_status(&guardian.status) {
+        return Ok(0);
+    }
+    let prs = store
+        .lock()
+        .list_pull_requests_for_guardian(id)
+        .map_err(|e| e.to_string())?;
+    let by_branch = open_prs_by_branch(&prs);
+    let mut ordered_branches: Vec<_> = guardian.branches.iter().filter(|b| b.enabled).collect();
+    ordered_branches.sort_by_key(|b| b.position);
+    let members: Vec<&PullRequestView> = ordered_branches
+        .iter()
+        .filter_map(|b| by_branch.get(b.id.as_str()).copied())
+        .collect();
+    if members.is_empty() {
+        return Ok(0);
+    }
+
+    let root = PathBuf::from(&guardian.git_root);
+    let forge_cfg = crate::config::resolve_forge(&root);
+    let routing = resolve_pr_repo_routing(
+        store,
+        &root,
+        &guardian.base_branch,
+        &forge_cfg,
+        guardian.owner.as_deref(),
+    );
+    let mode = guardian.effective_ci_deferral.as_str();
+    let mut deferred = 0usize;
+    let mut errors = Vec::new();
+    for (index, pr) in members.iter().enumerate() {
+        let Some(number) = pr.pr_number else {
+            continue;
+        };
+        let Some(client) = routing.client_for(&pr.repo) else {
+            errors.push(format!(
+                "pr {}: no forge client for repo {}",
+                pr.id, pr.repo
+            ));
+            continue;
+        };
+        let present = defers_full_ci(mode, index, members.len());
+        match client.set_pull_request_label(number, DEFER_FULL_CI_LABEL, present) {
+            Ok(()) => deferred += usize::from(present),
+            Err(e) => errors.push(format!("pr {}: {e}", pr.id)),
+        }
+    }
+    {
+        let guard = store.lock();
+        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+            level: if errors.is_empty() {
+                crate::logging::LogLevel::INFO
+            } else {
+                crate::logging::LogLevel::WARNING
+            },
+            source: "pr",
+            message: "ci deferral labels reconciled",
+            scope: Some("guardian"),
+            squad_id: None,
+            guardian_id: Some(id),
+            cell_id: None,
+            task: None,
+            log_path: None,
+            payload: serde_json::json!({
+                "mode": mode,
+                "members": members.len(),
+                "deferred": deferred,
+                "errors": errors,
+            }),
+            admin_only: false,
+        });
+    }
+    if errors.is_empty() {
+        Ok(deferred)
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
 /// Kick off [`resync_pr_bases`] in the background — called after a reorder,
 /// so the reorder's own HTTP response is not held up by the forge network
 /// calls this makes. A no-op (logged, not queued) if a resync for this
@@ -3860,6 +3971,14 @@ pub fn start_resync_pr_bases(store: crate::store_lock::StoreHandle, id: &str) {
                     format!("ralphus review sync-pr {sid}"),
                 );
             }
+        }
+        // A reorder changes which PR is the bottom and which is the tip,
+        // whether or not any base moved.
+        if let Err(e) = reconcile_ci_deferral(&store, &sid) {
+            crate::rlog!(
+                WARNING,
+                "ralphus [pr] review {sid} ci deferral label sync failed: {e}"
+            );
         }
     });
 }
@@ -8507,6 +8626,14 @@ fn reconcile_native_pr_stack(
     // relies on for this; running it here too closes that gap for both
     // submission paths that funnel through this function.
     sync_open_pr_branches(store, id);
+    // A submission can add a new tip or change which PR is the bottom, so the
+    // defer labels are re-asserted against the stack as it now stands.
+    if let Err(e) = reconcile_ci_deferral(store, id) {
+        crate::rlog!(
+            WARNING,
+            "ralphus [pr] review {id} ci deferral label sync failed: {e}"
+        );
+    }
     {
         let guard = store.lock();
         let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
@@ -14198,6 +14325,222 @@ mod tests {
     #[test]
     fn synchronous_multi_branch_base_sync_does_not_retarget_an_already_correct_gitlab_stack() {
         synchronous_multi_branch_base_sync("gitlab", true);
+    }
+
+    #[test]
+    fn defers_full_ci_follows_each_mode() {
+        let rows = |mode: &str, count: usize| -> Vec<bool> {
+            (0..count).map(|i| defers_full_ci(mode, i, count)).collect()
+        };
+        assert_eq!(rows("every", 3), [false, false, false]);
+        assert_eq!(rows("tip", 3), [true, true, false]);
+        assert_eq!(rows("bottom+tip", 3), [false, true, false]);
+        assert_eq!(rows("bottom+tip", 4), [false, true, true, false]);
+        // A one-member stack is its own bottom and tip: always full CI.
+        assert_eq!(rows("tip", 1), [false]);
+        assert_eq!(rows("bottom+tip", 1), [false]);
+        // Two members are both an end of the stack.
+        assert_eq!(rows("bottom+tip", 2), [false, false]);
+        // An unrecognised mode fails open to full CI.
+        assert_eq!(rows("head+tip", 3), [false, false, false]);
+    }
+
+    /// Flip a three-PR stack through every mode against a mock forge that
+    /// keeps real per-PR label state, asserting which PRs/MRs carry the defer
+    /// label after each flip, and that the flips touch nothing but labels: the
+    /// PRs' bases and the branch order are exactly what they were.
+    fn ci_deferral_flip_scenario(forge: &str) {
+        use std::collections::{BTreeMap, BTreeSet};
+        use std::sync::Mutex;
+
+        let label = ralphus_core::schema::DEFER_FULL_CI_LABEL;
+        let labels: Arc<Mutex<BTreeMap<i64, BTreeSet<String>>>> = Arc::default();
+        let calls: Arc<Mutex<Vec<String>>> = Arc::default();
+        let (handler_labels, handler_calls) = (Arc::clone(&labels), Arc::clone(&calls));
+        let is_github = forge == "github";
+        let mock = MockForge::start(move |server| {
+            for mut req in server.requests() {
+                let method = req.method().clone();
+                let url = req.url().to_string();
+                let mut body = String::new();
+                req.as_reader().read_to_string(&mut body).unwrap();
+                handler_calls
+                    .lock()
+                    .unwrap()
+                    .push(format!("{method} {url}"));
+                let mut state = handler_labels.lock().unwrap();
+                if is_github {
+                    let parts: Vec<&str> = url.split('/').collect();
+                    let at = parts.iter().position(|p| *p == "issues").unwrap();
+                    let number: i64 = parts[at + 1].parse().unwrap();
+                    match method {
+                        tiny_http::Method::Post => {
+                            let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+                            for added in payload["labels"].as_array().unwrap() {
+                                state
+                                    .entry(number)
+                                    .or_default()
+                                    .insert(added.as_str().unwrap().to_string());
+                            }
+                        }
+                        tiny_http::Method::Delete => {
+                            assert!(url.ends_with("/labels/ralphus%3Adefer-full-ci"), "{url}");
+                            state
+                                .entry(number)
+                                .or_default()
+                                .remove("ralphus:defer-full-ci");
+                        }
+                        other => panic!("unexpected {other} {url}"),
+                    }
+                } else {
+                    assert_eq!(method, tiny_http::Method::Put, "{url}");
+                    let number: i64 = url.rsplit('/').next().unwrap().parse().unwrap();
+                    let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+                    let set = state.entry(number).or_default();
+                    match (
+                        payload["add_labels"].as_str(),
+                        payload["remove_labels"].as_str(),
+                    ) {
+                        (Some(added), None) => {
+                            set.insert(added.to_string());
+                        }
+                        (None, Some(removed)) => {
+                            set.remove(removed);
+                        }
+                        _ => panic!("a label call must only add or remove labels: {body}"),
+                    }
+                }
+                drop(state);
+                req.respond(tiny_http::Response::from_string("{}").with_status_code(200))
+                    .unwrap();
+            }
+        });
+        let addr = mock.addr();
+
+        let root = tmp_dir(&format!("ci-deferral-{forge}"));
+        g(&root, &["init"]);
+        let remote = if is_github {
+            "https://github.com/acme/widget.git"
+        } else {
+            "https://gitlab.com/acme/widget.git"
+        };
+        g(&root, &["remote", "add", "origin", remote]);
+        std::fs::write(
+            root.join(".ralphus.toml"),
+            format!(
+                "[forge]\nkind = \"{forge}\"\napi_base = \"http://{addr}\"\ntoken_env = \"RALPHUS_TEST_FORGE_TOKEN\"\n"
+            ),
+        )
+        .unwrap();
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let gid = store
+            .lock()
+            .create_guardian("demo", "main", root.to_str().unwrap())
+            .unwrap();
+        for branch in ["a", "b", "c"] {
+            store.lock().add_guardian_branch(&gid, branch).unwrap();
+        }
+        let ids: Vec<_> = store
+            .lock()
+            .get_guardian(&gid)
+            .unwrap()
+            .branches
+            .into_iter()
+            .map(|branch| branch.id)
+            .collect();
+        for (idx, (alias, base)) in [
+            ("a-alias", "main"),
+            ("b-alias", "a-alias"),
+            ("c-alias", "b-alias"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            store
+                .lock()
+                .create_pull_request(
+                    &gid,
+                    Some(&ids[idx]),
+                    forge,
+                    "acme/widget",
+                    alias,
+                    base,
+                    alias,
+                    "",
+                    Some(i64::try_from(idx).unwrap() + 1),
+                    None,
+                )
+                .unwrap();
+        }
+        let stack_shape = |store: &Arc<crate::store_lock::StoreMutex>| {
+            let guard = store.lock();
+            let rows = guard.list_pull_requests_for_guardian(&gid).unwrap();
+            let order: Vec<_> = guard
+                .get_guardian(&gid)
+                .unwrap()
+                .branches
+                .iter()
+                .map(|b| (b.id.clone(), b.position))
+                .collect();
+            (
+                rows.iter()
+                    .map(|pr| (pr.id.clone(), pr.base_ref.clone(), pr.state.clone()))
+                    .collect::<Vec<_>>(),
+                order,
+            )
+        };
+        let shape_before = stack_shape(&store);
+
+        let deferred_numbers = || -> Vec<i64> {
+            labels
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, set)| set.contains(label))
+                .map(|(number, _)| *number)
+                .collect()
+        };
+        // (mode, PR numbers expected to carry the label afterwards)
+        let flips: [(&str, Vec<i64>); 5] = [
+            ("every", vec![]),
+            ("tip", vec![1, 2]),
+            ("bottom+tip", vec![2]),
+            ("every", vec![]),
+            ("tip", vec![1, 2]),
+        ];
+        for (mode, expected) in flips {
+            store
+                .lock()
+                .set_guardian_ci_deferral(&gid, Some(mode))
+                .unwrap();
+            let deferred = reconcile_ci_deferral(&store, &gid).unwrap();
+            assert_eq!(deferred, expected.len(), "{forge} {mode}");
+            assert_eq!(deferred_numbers(), expected, "{forge} {mode}");
+            assert_eq!(stack_shape(&store), shape_before, "{forge} {mode}");
+        }
+
+        mock.finish();
+        let calls = calls.lock().unwrap();
+        assert!(!calls.is_empty());
+        assert!(
+            calls.iter().all(|call| if is_github {
+                call.contains("/issues/") && call.contains("/labels")
+            } else {
+                call.starts_with("PUT /projects/acme%2Fwidget/merge_requests/")
+            }),
+            "label reconciles must call only label endpoints, got {calls:?}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ci_deferral_flips_labels_on_a_github_stack_without_touching_it() {
+        ci_deferral_flip_scenario("github");
+    }
+
+    #[test]
+    fn ci_deferral_flips_labels_on_a_gitlab_stack_without_touching_it() {
+        ci_deferral_flip_scenario("gitlab");
     }
 
     #[test]

@@ -284,6 +284,7 @@ pub const REVIEW_KEYS: &[&str] = &[
     "separate_pr_branch",
     "dual_root_pr",
     "auto_fix_pr_errors",
+    "ci_deferral",
     "auto_fix_prompt_template",
     "discourage_tests_during_auto_pull_request_fixes",
     "auto_cancel_outdated_pr_pipelines",
@@ -2121,6 +2122,25 @@ fn validate_review_blocks(value: Option<&toml::Value>, ctx: &mut Ctx) {
                     format!(
                         "'proof_scope' must be one of {} -- got \"{scope}\"",
                         crate::schema::PROOF_SCOPE_VALUES
+                            .iter()
+                            .map(|v| format!("\"{v}\""))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    line,
+                );
+            }
+        }
+        check_type(ctx, table, "ci_deferral", Ty::Str, &rpath, header);
+        if let Some(mode) = table.get("ci_deferral").and_then(toml::Value::as_str) {
+            if !crate::schema::CI_DEFERRAL_VALUES.contains(&mode) {
+                let line = ctx.key_line(header, "ci_deferral");
+                ctx.error(
+                    &format!("{rpath}.ci_deferral"),
+                    ErrorKind::InvalidValue,
+                    format!(
+                        "'ci_deferral' must be one of {} -- got \"{mode}\"",
+                        crate::schema::CI_DEFERRAL_VALUES
                             .iter()
                             .map(|v| format!("\"{v}\""))
                             .collect::<Vec<_>>()
@@ -4238,6 +4258,45 @@ prompt = "gate on review"
             r.errors
                 .iter()
                 .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("proof_scope")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    // ── [[review]] ci_deferral ─────────────────────────────────────────────
+
+    #[test]
+    fn review_ci_deferral_accepted_for_every_valid_value() {
+        for mode in ["every", "tip", "bottom+tip"] {
+            let src = format!(
+                "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nci_deferral=\"{mode}\"\n"
+            );
+            let r = validate_toml(&src);
+            assert!(r.is_ok(), "{mode}: {:?}", r.errors);
+        }
+    }
+
+    #[test]
+    fn review_ci_deferral_wrong_type_reported() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nci_deferral=true\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::WrongType && e.message.contains("ci_deferral")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn review_ci_deferral_unknown_value_rejected() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nci_deferral=\"head+tip\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("ci_deferral")),
             "{:?}",
             r.errors
         );

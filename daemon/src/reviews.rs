@@ -429,6 +429,9 @@ struct Membership {
     /// Optional Proof-scope override declared on the review (`[[review]]
     /// proof_scope`), one of `each_branch`/`final_branch`/`nothing`.
     proof_scope: Option<String>,
+    /// Optional CI-deferral mode declared on the review (`[[review]]
+    /// ci_deferral`), one of `every`/`tip`/`bottom+tip`.
+    ci_deferral: Option<String>,
     /// Optional auto-submit-PR-stack override declared on the review
     /// (`[[review]] auto_submit_pr_stack`, RAL-317).
     auto_submit_pr_stack: Option<bool>,
@@ -1135,6 +1138,9 @@ pub fn derive_reviews_with_full_prefetch(
             proof_scope: rv
                 .and_then(|r| r.proof_scope.clone())
                 .filter(|s| !s.trim().is_empty()),
+            ci_deferral: rv
+                .and_then(|r| r.ci_deferral.clone())
+                .filter(|s| !s.trim().is_empty()),
             auto_submit_pr_stack: rv.and_then(|r| r.auto_submit_pr_stack),
             skip_worktrees: rv.and_then(|r| r.skip_worktrees),
             auto_pr_feedback: rv.and_then(|r| r.auto_pr_feedback),
@@ -1539,6 +1545,14 @@ fn apply_resolver(
     if let Some(scope) = members.iter().find_map(|m| m.proof_scope.clone()) {
         store
             .set_guardian_proof_scope(gid, Some(&scope))
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+    }
+    // This review's own CI-deferral mode, authored via `[[review]]
+    // ci_deferral`. Validated offline (`core::validate`) against
+    // `CI_DEFERRAL_VALUES`.
+    if let Some(mode) = members.iter().find_map(|m| m.ci_deferral.clone()) {
+        store
+            .set_guardian_ci_deferral(gid, Some(&mode))
             .map_err(|e| ReviewError::new(e.to_string()))?;
     }
     // This review's own auto-submit-PR-stack override, authored via
@@ -3296,6 +3310,7 @@ mod tests {
             machine: None,
             maximum_budget_usd,
             proof_scope: None,
+            ci_deferral: None,
             auto_submit_pr_stack: None,
             skip_worktrees: None,
             auto_pr_feedback: None,
@@ -3360,6 +3375,33 @@ mod tests {
         let m = membership(None);
         apply_resolver(&store, &gid, &[&m]).unwrap();
         assert_eq!(store.get_guardian(&gid).unwrap().proof_scope, None);
+    }
+
+    // ── [[review]] ci_deferral wiring ─────────────────────────────────────
+
+    #[test]
+    fn apply_resolver_sets_ci_deferral_from_declaring_member() {
+        let store = Store::open_in_memory().unwrap();
+        let gid = store.create_guardian("r", "main", "/repo").unwrap();
+        let m = Membership {
+            ci_deferral: Some("bottom+tip".to_string()),
+            ..membership(None)
+        };
+        apply_resolver(&store, &gid, &[&m]).unwrap();
+        let guardian = store.get_guardian(&gid).unwrap();
+        assert_eq!(guardian.ci_deferral.as_deref(), Some("bottom+tip"));
+        assert_eq!(guardian.effective_ci_deferral, "bottom+tip");
+    }
+
+    #[test]
+    fn apply_resolver_leaves_ci_deferral_unset_and_effectively_every() {
+        let store = Store::open_in_memory().unwrap();
+        let gid = store.create_guardian("r", "main", "/repo").unwrap();
+        let m = membership(None);
+        apply_resolver(&store, &gid, &[&m]).unwrap();
+        let guardian = store.get_guardian(&gid).unwrap();
+        assert_eq!(guardian.ci_deferral, None);
+        assert_eq!(guardian.effective_ci_deferral, "every");
     }
 
     // ── [[review]] auto_submit_pr_stack wiring (RAL-317) ────────────────────
