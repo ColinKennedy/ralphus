@@ -988,6 +988,18 @@
         return `<div class="kv-row" data-tip="${CONTEXT_LIMITS_TIP}"><span class="k">context limits</span><span class="v">${parts.join(" · ")}</span></div>`;
       }
       /**
+       * Renders the RAL-607 `effort`/`temperature` rows for the cell details
+       * pane, omitting whichever is unset (most cells set neither).
+       * @param {CellView} s
+       * @returns {string}
+       */
+      function effortTemperatureRows(s) {
+        let html = "";
+        if (s.effort != null) html += `<div class="kv-row" data-tip="${EFFORT_TIP}"><span class="k">effort</span><span class="v">${esc(s.effort)}</span></div>`;
+        if (s.temperature != null) html += `<div class="kv-row" data-tip="${TEMPERATURE_TIP}"><span class="k">temperature</span><span class="v">${esc(String(s.temperature))}</span></div>`;
+        return html;
+      }
+      /**
        * Renders the RAL-333 tool-output token cap row (`maximum_tool_output_tokens`)
        * for the cell/proof-step details pane, always shown — "—" when unset
        * (RAL-356), matching the placeholder style used elsewhere in this pane.
@@ -1145,6 +1157,7 @@
           <div class="kv-row" data-tip="${COMPACTION_TIP}"><span class="k">compaction</span><span class="v">${compactionSummary(s, s.model)}</span></div>
           <div class="kv-row" data-tip="${LIFETIME_COST_TIP}"><span class="k">lifetime</span><span class="v"><span id="cum-cost-${esc(s.id)}">—</span> <button class="btn" data-click="loadCumulativeCost" data-carto-key="${esc(s.id)}" data-carto-kind="cell" data-el-id="cum-cost-${esc(s.id)}" data-squad-id="${esc(r.id)}" data-tip="${LIFETIME_COST_TIP}">Σ load total</button></span></div>
           ${contextLimitsRow(s)}
+          ${effortTemperatureRows(s)}
           ${maximumToolOutputTokensRow(s)}
           <h3 class="section">${s.command ? "command" : "prompt"}</h3>
           ${s.command ? cmdBox(s.command) : promptBox(s.prompt || "—", `prompt-box-${sel.taskIdx}-${sel.cellIdx}`)}
@@ -1458,6 +1471,8 @@
             <div id="agent-fields"${isCmd ? ' class="hidden"' : ""}>
               <label>agent${renderAgentSelectHtml("e-agent", s.cwd || "", s.agent || "", "onCellEditAgentChange")}</label>
               <label>model<input id="e-model" value="${esc(s.model || "")}"></label>
+              <label data-tip="${EFFORT_TIP}">effort<input id="e-effort" value="${esc(s.effort || "")}" placeholder="harness default"></label>
+              <label data-tip="${TEMPERATURE_TIP}">temperature<input id="e-temperature" value="${s.temperature == null ? "" : esc(String(s.temperature))}" placeholder="model default"></label>
               <label>prompt<textarea id="e-prompt" rows="5"${s.prompt == null ? " disabled" : ""}>${esc(s.prompt || "")}</textarea></label>${s.prompt == null ? `<div class="warn" style="margin:2px 0 6px" data-tip="The prompt text is fetched separately from the squad list and has not arrived yet.
 It is held back rather than shown blank, so saving cannot overwrite it with an empty value.">prompt still loading — it will not be modified by this save</div>` : ""}
             </div>
@@ -1484,6 +1499,8 @@ It is held back rather than shown blank, so saving cannot overwrite it with an e
        * @property {string} [command]
        * @property {string} [agent]
        * @property {string} [model]
+       * @property {string} [effort]
+       * @property {string} [temperature]
        * @property {string} [prompt]
        */
       /**
@@ -1512,6 +1529,8 @@ It is held back rather than shown blank, so saving cannot overwrite it with an e
             body.command = val("e-command");
           } else {
             body.agent = val("e-agent"); body.model = val("e-model");
+            // Blank clears the field; the daemon treats an unchanged value as a no-op.
+            body.effort = val("e-effort").trim(); body.temperature = val("e-temperature").trim();
             // Only send the prompt when it was actually loaded into the form.
             // The board list omits prompt text (it is fetched per-squad), so a
             // form opened before that fetch landed holds an empty textarea --
