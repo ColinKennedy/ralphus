@@ -697,8 +697,14 @@ fn task_prompt(review_name: &str, item: &FollowupItem) -> String {
     out
 }
 
-/// Drafts the follow-up squad's task file: one task per deferred item, all
-/// feeding one review that targets `base`.
+/// Drafts the follow-up squad's task file: one task per deferred item, each
+/// on its own worktree branched from `base`.
+///
+/// The file names no `[[review]]`. Every cell opts into Triage
+/// (`triage = true`, no `triage_type`) so the Arbiter classifies it into a
+/// registered type and pools it with other work of that `(project, type)`;
+/// the pool's drain slots the follow-up work into an automatic review, the
+/// same path ordinary Triage cells take.
 #[must_use]
 pub fn draft_followup_toml(
     project: &str,
@@ -706,8 +712,6 @@ pub fn draft_followup_toml(
     base: &str,
     items: &[FollowupItem],
 ) -> String {
-    let review_key = "followup";
-    let sentinel = format!("<<ralphus:new-review/{review_key}>>");
     let guardian_slug = slug(&guardian.id);
     // A follow-up runs where the work it follows up on ran.
     let machine = guardian.machine.as_deref().filter(|m| !m.is_empty());
@@ -723,7 +727,7 @@ pub fn draft_followup_toml(
                 format!("<<ralphus:new-worktree/{branch}?upstream={base}>>").into(),
             );
             cell.insert("prompt".into(), task_prompt(&guardian.name, item).into());
-            cell.insert("review".into(), sentinel.clone().into());
+            cell.insert("triage".into(), true.into());
             if let Some(agent) = item.agent.as_deref().filter(|a| !a.is_empty()) {
                 cell.insert("agent".into(), agent.into());
             }
@@ -740,18 +744,8 @@ pub fn draft_followup_toml(
             toml::Value::Table(task)
         })
         .collect();
-    let mut review = toml::Table::new();
-    review.insert(
-        "id".into(),
-        format!("ralphus:new-review/{review_key}").into(),
-    );
-    review.insert("upstream".into(), base.into());
-    if let Some(machine) = machine {
-        review.insert("machine".into(), machine.into());
-    }
     let mut root = toml::Table::new();
     root.insert("task".into(), toml::Value::Array(tasks));
-    root.insert("review".into(), toml::Value::Array(vec![review.into()]));
     toml::to_string(&root).unwrap_or_default()
 }
 
@@ -1424,9 +1418,12 @@ prompt = "add feature.txt"
         assert!(report.errors.is_empty(), "{:?}\n{toml}", report.errors);
         let file: ralphus_core::schema::TaskFile = toml::from_str(&toml).unwrap();
         assert_eq!(file.task.len(), 2, "one task per deferred item");
-        assert_eq!(file.review.len(), 1);
-        assert_eq!(file.review[0].upstream.as_deref(), Some("release/1.0"));
+        assert!(file.review.is_empty(), "a follow-up declares no review");
+        assert!(!toml.contains("new-review"), "{toml}");
         let cell = &file.task[0].cell[0];
+        assert_eq!(cell.review, None, "no explicit review on the cell");
+        assert!(cell.triage, "the cell is routed by the Arbiter's Triage");
+        assert_eq!(cell.triage_type, None, "the Arbiter picks the type");
         assert!(
             cell.cwd
                 .as_deref()
@@ -1459,7 +1456,6 @@ prompt = "add feature.txt"
         let toml = draft_followup_toml("proj", &guardian, "main", &[item("later", None)]);
         let file: ralphus_core::schema::TaskFile = toml::from_str(&toml).unwrap();
         assert_eq!(file.task[0].machine.as_deref(), Some("loopback:exercise"));
-        assert_eq!(file.review[0].machine.as_deref(), Some("loopback:exercise"));
 
         let local = draft_followup_toml(
             "proj",

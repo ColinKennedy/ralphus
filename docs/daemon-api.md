@@ -3096,7 +3096,10 @@ its prompt the deferred note plus the original prompt as context, started on
 the same agent and model — and submits it through the ordinary submit path, so
 every submit preflight applies. The squad is based on the branch the review
 merged into, or on the remote's default branch when that branch no longer
-exists. It starts at once unless auto-start is off for the review (its own
+exists. The squad declares no review of its own: each cell opts into Triage
+(`triage = true`), so the Arbiter classifies it and the work lands in an
+automatic review when its `(project, type)` pool drains, like any other
+Triage cell. It starts at once unless auto-start is off for the review (its own
 `followup_auto_start`, else the global `auto_start`), in which case it is
 created **held**.
 
