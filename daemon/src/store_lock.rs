@@ -101,6 +101,26 @@ impl StoreMutex {
         }
     }
 
+    /// [`Self::with_read_snapshot`] for a caller that also runs in tests that
+    /// race it against writers on the shared-cache in-memory database.
+    ///
+    /// Shared-cache mode locks tables rather than snapshotting them, so there a
+    /// pooled reader and a concurrent writer can block or fail each other (a
+    /// review's merge start hung for a minute that way). That database takes
+    /// the writer lock instead; a file-backed store is WAL, has no such hazard,
+    /// and reads from the pool exactly as `with_read_snapshot` does.
+    pub fn with_read_snapshot_or_lock_when_shared_cache<T>(
+        &self,
+        f: impl FnOnce(&rusqlite::Connection) -> crate::store::Result<T>,
+    ) -> crate::store::Result<T> {
+        if self.read_pool.is_shared_cache() {
+            let store = self.lock();
+            let tx = store.conn.unchecked_transaction()?;
+            return f(&tx);
+        }
+        self.with_read_snapshot(f)
+    }
+
     /// Acquire the store lock, recording how long this call waited into both
     /// the process-lifetime histogram ([`store_lock_wait_snapshot`]) and the
     /// current thread's per-request accumulator ([`take_request_lock_wait_ms`]).

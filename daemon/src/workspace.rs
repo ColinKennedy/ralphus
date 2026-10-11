@@ -199,7 +199,7 @@ impl Workspace {
         let root = root.into();
         // Read through the pool: hydrating the review reads its project config
         // from disk, which held the store lock for seconds under the writer.
-        let loaded = store.with_read_snapshot(|conn| {
+        let loaded = store.with_read_snapshot_or_lock_when_shared_cache(|conn| {
             let g = crate::store::Store::get_guardian_conn(conn, guardian_id)?;
             let sources = remote_branch_sources(conn, &g);
             Ok((g.machine, sources))
