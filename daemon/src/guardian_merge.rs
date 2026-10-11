@@ -9238,6 +9238,146 @@ static REOPENING: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new
 /// `in_review` mid-poll fail to claim [`MAINTAINING`] on the very next tick.
 static CI_POLLING: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
+/// Guardian ids with a linked-PR merge check in flight. Its own claim, apart
+/// from [`MAINTAINING`], so detecting that a review's PRs merged never waits
+/// behind that review's rebase, fetch or conflict-resolution work: a
+/// maintenance pass wedged on any of those would otherwise stop a merged
+/// review from ever being marked merged.
+static MERGE_CHECKING: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Last time [`spawn_merge_checks`] started a merge check per guardian id.
+static MERGE_CHECK_LAST: LazyLock<Mutex<HashMap<String, std::time::Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// How often an independent merge check runs per review. Each check is one
+/// forge request per open PR, so this bounds a 12-PR review to ~12 requests a
+/// minute -- well inside a forge's hourly budget even with several reviews.
+const MERGE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// When the in-flight [`MAINTAINING`] pass started per guardian id, and
+/// whether its "stuck" notice has been sent. Entries are removed when the
+/// pass ends ([`MaintenanceClock`]).
+static MAINTAINING_SINCE: LazyLock<Mutex<HashMap<String, (std::time::Instant, bool)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// A maintenance pass normally takes seconds and a full rebuild a few
+/// minutes; one still running after this is wedged, and until it ends nothing
+/// else on that review (base-shift rebuilds, manual-push restacks, PR branch
+/// sync) runs.
+const STUCK_MAINTENANCE_AFTER: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+
+/// Records a maintenance pass's start for the lifetime of the guard.
+struct MaintenanceClock {
+    id: String,
+}
+
+impl MaintenanceClock {
+    fn start(id: &str) -> Self {
+        MAINTAINING_SINCE
+            .lock()
+            .expect("poisoned")
+            .insert(id.to_string(), (std::time::Instant::now(), false));
+        Self { id: id.to_string() }
+    }
+}
+
+impl Drop for MaintenanceClock {
+    fn drop(&mut self) {
+        MAINTAINING_SINCE.lock().expect("poisoned").remove(&self.id);
+    }
+}
+
+/// Whether the maintenance pass for `id` has run past `limit` and has not yet
+/// been reported; marks it reported when it returns `Some(age)`.
+fn take_stuck_maintenance(id: &str, limit: std::time::Duration) -> Option<std::time::Duration> {
+    let mut since = MAINTAINING_SINCE.lock().expect("poisoned");
+    let (started, reported) = since.get_mut(id)?;
+    let age = started.elapsed();
+    if *reported || age < limit {
+        return None;
+    }
+    *reported = true;
+    Some(age)
+}
+
+/// Runs the linked-PR merge check for `id` unless one is already in flight.
+fn check_merges_claimed(store: &crate::store_lock::StoreHandle, id: &str) -> bool {
+    let Some(_claim) = InFlightClaim::acquire(&MERGE_CHECKING, id) else {
+        return false;
+    };
+    crate::pr::check_pr_merges(store, id)
+}
+
+/// Starts an independent merge check, on its own thread, for every candidate
+/// review whose last one is at least [`MERGE_CHECK_INTERVAL`] old.
+fn spawn_merge_checks(store: &crate::store_lock::StoreHandle, candidates: &[(String, String)]) {
+    let now = std::time::Instant::now();
+    let due: Vec<String> = {
+        let mut last = MERGE_CHECK_LAST.lock().expect("poisoned");
+        let live: HashSet<&str> = candidates.iter().map(|(id, _)| id.as_str()).collect();
+        last.retain(|id, _| live.contains(id.as_str()));
+        candidates
+            .iter()
+            .filter(|(id, _)| {
+                let ready = last
+                    .get(id.as_str())
+                    .is_none_or(|prev| now.duration_since(*prev) >= MERGE_CHECK_INTERVAL);
+                if ready {
+                    last.insert(id.clone(), now);
+                }
+                ready
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
+    };
+    for id in due {
+        let store = Arc::clone(store);
+        std::thread::spawn(move || {
+            check_merges_claimed(&store, &id);
+        });
+    }
+}
+
+/// A maintenance pass for `id` is still in flight, so this tick skips it.
+/// Tells the user once if that pass has been running implausibly long.
+fn report_stuck_maintenance(store: &crate::store_lock::StoreHandle, id: &str) {
+    let Some(age) = take_stuck_maintenance(id, STUCK_MAINTENANCE_AFTER) else {
+        return;
+    };
+    let message = format!(
+        "The background maintenance pass for review {id} has been running for {} minutes \
+         without finishing, so base-branch rebuilds, manual-push restacks and PR branch \
+         syncing are paused for this review (linked-PR merge detection still runs on its own).",
+        age.as_secs() / 60
+    );
+    crate::rlog!(WARNING, "ralphus [guardian] review {id}: {message}");
+    crate::cartographer::Note::new("guardian")
+        .level(crate::logging::LogLevel::WARNING)
+        .scope("guardian")
+        .guardian(id)
+        .emit(
+            &store.lock(),
+            "maintenance pass running past the stuck threshold",
+            serde_json::json!({"running_minutes": age.as_secs() / 60}),
+        );
+    let remediation = crate::mailbox::Remediation::ManualInterventionRequired {
+        guidance: "look at this review's Cartographer rows to see what it last did; the pass \
+                   holds only in-memory state, so restarting the daemon releases it"
+            .to_string(),
+    };
+    let result = store
+        .lock()
+        .enqueue_guardian_notice(id, &message, Some(&remediation));
+    if let Err(error) = result {
+        // ralphus[ignore-rlog-pair]: the store write itself failed, so there is no row to pair; the stuck-pass row above is the Cartographer record
+        crate::rlog!(
+            WARNING,
+            "ralphus [guardian] review {id} stuck-maintenance notice not enqueued: {error}"
+        );
+    }
+}
+
 /// Last idle-tier maintenance pass per guardian id — see
 /// `scheduler::REVIEW_IDLE_MAINT_INTERVAL`. Pruned on every pass to the set of
 /// guardians still in a maintained status, so it cannot grow without bound
@@ -9535,6 +9675,7 @@ fn review_maintenance_staggered(
     }
 
     let candidates: Vec<(String, String)> = full_maintenance_candidates(all_status_pairs);
+    spawn_merge_checks(store, &candidates);
     // Store lock released. Now apply the per-status cadence: an idle-tier
     // guardian is visited at most once per `REVIEW_IDLE_MAINT_INTERVAL`.
     let ids = filter_by_idle_cadence(&candidates);
@@ -9544,6 +9685,7 @@ fn review_maintenance_staggered(
                 DEBUG,
                 "ralphus [guardian] review {id} maintenance skipped: already in flight"
             );
+            report_stuck_maintenance(store, &id);
             continue;
         };
         let store = Arc::clone(store);
@@ -9555,6 +9697,7 @@ fn review_maintenance_staggered(
             // Released when this worker exits, including via the early return
             // on the PR-commit-sync error path below.
             let _claim = claim;
+            let _clock = MaintenanceClock::start(&id);
             std::thread::sleep(offset);
             let runner = runners(&store);
             // RAL-213: one token covers both the base-shift rebuild and (if
@@ -9572,7 +9715,7 @@ fn review_maintenance_staggered(
             // the base-shift/manual-push calls below re-read guardian.status
             // themselves and naturally no-op once it's no longer
             // `in_review`/`merge_failed`, so no extra branching is needed here.
-            crate::pr::check_pr_merges(&store, &id);
+            check_merges_claimed(&store, &id);
             // RAL-395: standing CI-status poll (self-throttled per guardian,
             // see `ci_watch::STANDING_POLL_INTERVAL`) -- persists the result
             // for the board and dispatches auto-fix on a fresh failure when
@@ -9594,6 +9737,23 @@ fn review_maintenance_staggered(
                         "automatic PR commit sync failed",
                         serde_json::json!({"error": e}),
                     );
+                // This aborts the rest of the pass (base-shift rebuild,
+                // manual-push restack, PR branch sync) for the review, so it
+                // is more than a log line.
+                let remediation = crate::mailbox::Remediation::ManualInterventionRequired {
+                    guidance: "check that the daemon can still fetch this review's PR \
+                               branches (remote reachable, credentials valid); the pass \
+                               retries on its own"
+                        .to_string(),
+                };
+                let _ = store.lock().enqueue_guardian_notice(
+                    &id,
+                    &format!(
+                        "Syncing review {id}'s PR branches from the remote failed, so \
+                         background maintenance for it is stopping early: {e}"
+                    ),
+                    Some(&remediation),
+                );
                 return;
             }
             // Hold off while a stack is visibly mid-merge on the forge.
@@ -17179,6 +17339,126 @@ mod tests {
     fn reset_idle_cadence_state() {
         IDLE_MAINT_LAST.lock().expect("poisoned").clear();
         STACK_MERGE_DEFERRED_LAST.lock().expect("poisoned").clear();
+    }
+
+    #[test]
+    fn a_maintenance_pass_is_stuck_only_after_the_limit_and_is_reported_once() {
+        let id = "guardian-stuck-pass-test";
+        let limit = std::time::Duration::from_millis(40);
+        assert!(
+            take_stuck_maintenance(id, limit).is_none(),
+            "no pass in flight"
+        );
+
+        let clock = MaintenanceClock::start(id);
+        assert!(
+            take_stuck_maintenance(id, limit).is_none(),
+            "a fresh pass is fine"
+        );
+        std::thread::sleep(limit * 2);
+        assert!(
+            take_stuck_maintenance(id, limit).is_some(),
+            "an overdue pass is stuck"
+        );
+        assert!(
+            take_stuck_maintenance(id, limit).is_none(),
+            "but is only reported once"
+        );
+
+        drop(clock);
+        assert!(
+            take_stuck_maintenance(id, limit).is_none(),
+            "ending the pass clears it"
+        );
+        let _fresh = MaintenanceClock::start(id);
+        std::thread::sleep(limit * 2);
+        assert!(
+            take_stuck_maintenance(id, limit).is_some(),
+            "a later wedged pass is reported afresh"
+        );
+    }
+
+    #[test]
+    fn a_wedged_maintenance_pass_puts_one_remediable_notice_in_the_mailbox() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            crate::store::Store::open_in_memory().unwrap(),
+        ));
+        let id = store
+            .lock()
+            .create_guardian("demo", "main", "/repo")
+            .unwrap();
+        // Back-date the pass rather than sleeping out the real limit.
+        let _clock = MaintenanceClock::start(&id);
+        MAINTAINING_SINCE.lock().expect("poisoned").insert(
+            id.clone(),
+            (
+                std::time::Instant::now()
+                    - STUCK_MAINTENANCE_AFTER
+                    - std::time::Duration::from_secs(1),
+                false,
+            ),
+        );
+
+        report_stuck_maintenance(&store, &id);
+        report_stuck_maintenance(&store, &id);
+
+        let guard = store.lock();
+        let reader = guard.register_mailbox_client().unwrap();
+        let sent = guard
+            .mailbox_messages_for_client_filtered(&reader, false, None, None)
+            .unwrap();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(
+            sent[0].message.contains("maintenance pass"),
+            "{}",
+            sent[0].message
+        );
+        assert!(
+            sent[0].message.contains("Manual intervention required"),
+            "{}",
+            sent[0].message
+        );
+    }
+
+    #[test]
+    fn merge_checks_are_spawned_at_most_once_per_interval_per_review() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            crate::store::Store::open_in_memory().unwrap(),
+        ));
+        let id = "guardian-merge-cadence-test".to_string();
+        let candidates = vec![(id.clone(), "in_review".to_string())];
+        MERGE_CHECK_LAST.lock().expect("poisoned").remove(&id);
+
+        spawn_merge_checks(&store, &candidates);
+        let first = *MERGE_CHECK_LAST
+            .lock()
+            .expect("poisoned")
+            .get(&id)
+            .expect("the first call records a check");
+        spawn_merge_checks(&store, &candidates);
+        let second = *MERGE_CHECK_LAST.lock().expect("poisoned").get(&id).unwrap();
+        assert_eq!(
+            first, second,
+            "a check inside the interval must not respawn"
+        );
+
+        // A review that left the maintained set is forgotten.
+        spawn_merge_checks(&store, &[]);
+        assert!(!MERGE_CHECK_LAST.lock().expect("poisoned").contains_key(&id));
+    }
+
+    #[test]
+    fn a_merge_check_in_flight_is_not_started_twice() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            crate::store::Store::open_in_memory().unwrap(),
+        ));
+        let id = "guardian-merge-claim-test";
+        let held = InFlightClaim::acquire(&MERGE_CHECKING, id).expect("free claim");
+        assert!(!check_merges_claimed(&store, id));
+        drop(held);
+        // Free again: reaches `check_pr_merges`, which finds no such review.
+        assert!(!check_merges_claimed(&store, id));
+        assert!(InFlightClaim::acquire(&MERGE_CHECKING, id).is_some());
     }
 
     #[test]

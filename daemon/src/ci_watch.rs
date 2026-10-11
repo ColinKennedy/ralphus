@@ -491,6 +491,14 @@ fn run_watch(store: &crate::store_lock::StoreHandle, guardian_id: &str, branch_i
                 warn_on_pr_store_error(store, guardian_id, pr, "set_pr_ci_status", result);
             }
             Err(e) => {
+                crate::forge_health::report_error(
+                    store,
+                    Some(guardian_id),
+                    client.kind().as_str(),
+                    client.repo_label(),
+                    "CI status watching",
+                    &e,
+                );
                 log_ci_watch(
                     store,
                     guardian_id,
@@ -866,8 +874,19 @@ pub fn poll_open_pr_ci_status(
             continue;
         };
         let probe = match client.check_pr_ci_status_probe(number) {
-            Ok(p) => p,
+            Ok(p) => {
+                crate::forge_health::note_success(client.kind().as_str(), client.repo_label());
+                p
+            }
             Err(e) => {
+                crate::forge_health::report_error(
+                    store,
+                    Some(guardian_id),
+                    client.kind().as_str(),
+                    client.repo_label(),
+                    "CI status polling",
+                    &e,
+                );
                 log_ci_watch(
                     store,
                     guardian_id,

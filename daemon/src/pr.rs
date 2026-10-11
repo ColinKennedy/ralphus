@@ -2104,13 +2104,21 @@ pub(crate) fn cancel_superseded_ci_after_push(
                 "ralphus [pr] review {guardian_id} cancel-superseded-ci failed \
                  branch={branch_alias} keep_sha={keep_sha}: {e}"
             );
+            crate::forge_health::report_error(
+                store,
+                Some(guardian_id),
+                client.kind().as_str(),
+                client.repo_label(),
+                "superseded CI run cancellation",
+                &e,
+            );
             // A 403 here is the expected shape for a fork-owned PR run living
             // in the base repo -- the fork owner's token can't manage a run
             // it doesn't own. That's a genuine, review-visible error (not a
             // transient/benign one like the 409-already-terminal case
             // filtered out above), so it is surfaced as a durable, dismissible
             // mailbox notice.
-            if e.contains("forge API 403") {
+            if e.contains("forge API 403") && !e.to_ascii_lowercase().contains("rate limit") {
                 let guard = store.lock();
                 let _ = guard.enqueue_guardian_notice(
                     guardian_id,
@@ -3821,6 +3829,13 @@ pub fn start_resync_pr_bases(store: crate::store_lock::StoreHandle, id: &str) {
             Ok(_) => {}
             Err(e) => {
                 crate::rlog!(ERROR, "ralphus [pr] review {sid} resync bases failed: {e}");
+                notify_background_failure(
+                    &store,
+                    &sid,
+                    "resyncing the PR bases",
+                    &e,
+                    format!("ralphus review sync-pr {sid}"),
+                );
             }
         }
     });
@@ -3916,6 +3931,11 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
             guardian.owner.as_deref(),
         );
         match routing.client_for(&pr.repo) {
+            // A forge already known to be rate limiting this process is not
+            // asked again until its backoff window ends: re-asking only
+            // extends the limit. The outage notice was raised when the limit
+            // was first seen ([`crate::forge_health::report_failure`]).
+            Some(client) if is_backed_off(client) => {}
             Some(client) if client.kind().as_str() == pr.forge => {
                 jobs.push(MergeCheckJob {
                     pr,
@@ -3967,6 +3987,14 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
 
     let mut freshly_merged = Vec::new();
     for (job, result) in jobs.iter().zip(fetched) {
+        if let Some(Err(error)) = &result {
+            let status = crate::forge_health::status_from_message(error);
+            if crate::forge_health::classify(status, error)
+                == Some(crate::forge_health::Problem::RateLimited)
+            {
+                start_backoff(&job.client, None);
+            }
+        }
         apply_pr_merge_state(store, id, job.pr, result, &mut freshly_merged);
     }
     // RAL-338: react to a freshly-observed cross-repository root merge
@@ -4202,6 +4230,16 @@ fn maybe_promote_fork_root(
                 "ralphus [pr] review {id} cannot promote pr={}: {e}",
                 successor_pr.id
             );
+            notify_background_failure(
+                store,
+                id,
+                &format!(
+                    "promoting PR {} to the stack's root after its base merged",
+                    successor_pr.id
+                ),
+                &e.to_string(),
+                format!("ralphus review pr submit {id}"),
+            );
             return;
         }
     };
@@ -4224,6 +4262,27 @@ fn maybe_promote_fork_root(
                 ERROR,
                 "ralphus [pr] review {id} promotion failed for pr={}: {e}",
                 successor_pr.id
+            );
+            // The root already merged, so nothing re-runs this promotion:
+            // without a notice the stack is left with no PR aimed at the
+            // parent and nothing says so.
+            crate::forge_health::report_error(
+                store,
+                Some(id),
+                &successor_pr.forge,
+                &successor_pr.repo,
+                "stack-root promotion",
+                &e.to_string(),
+            );
+            notify_background_failure(
+                store,
+                id,
+                &format!(
+                    "promoting PR {} to the stack's root after its base merged",
+                    successor_pr.id
+                ),
+                &e.to_string(),
+                format!("ralphus review pr submit {id}"),
             );
             return;
         }
@@ -4531,6 +4590,9 @@ fn apply_pr_merge_state(
     let Some(result) = fetched else {
         return;
     };
+    if result.is_ok() {
+        crate::forge_health::note_success(&pr.forge, &pr.repo);
+    }
     match result {
         Ok(state) if state != "open" => {
             let result = store.lock().update_pull_request_ex(
@@ -4669,6 +4731,17 @@ fn log_pr_merge_check_failure(
         WARNING,
         "ralphus [pr] review {id} pr {} merge check failed, assuming not merged: {error}",
         pr.id
+    );
+    crate::forge_health::report_failure(
+        store,
+        &crate::forge_health::FailureReport {
+            forge: &pr.forge,
+            repo: &pr.repo,
+            guardian_id: Some(id),
+            activity: "PR merge detection",
+            error,
+            retry_after: None,
+        },
     );
     let guard = store.lock();
     let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
@@ -5288,7 +5361,23 @@ pub fn detect_forge_reorder(
                 pr.forge, pr.repo
             ));
         };
-        let state = client.get_pull_request_base_state(num)?;
+        let state = match client.get_pull_request_base_state(num) {
+            Ok(state) => {
+                crate::forge_health::note_success(&pr.forge, &pr.repo);
+                state
+            }
+            Err(e) => {
+                crate::forge_health::report_error(
+                    store,
+                    Some(id),
+                    &pr.forge,
+                    &pr.repo,
+                    "stack reorder detection",
+                    &e,
+                );
+                return Err(e);
+            }
+        };
         live_state.insert((*branch_id).to_string(), state);
     }
     let Some((forge_base, base_changed_at_ms, order)) =
@@ -5798,8 +5887,22 @@ pub fn poll_pr_base_drift(
         let Some(client) = routing.client_for(&pr.repo) else {
             continue;
         };
-        let Ok(forge_base) = client.get_pull_request_base(number) else {
-            continue;
+        let forge_base = match client.get_pull_request_base(number) {
+            Ok(base) => {
+                crate::forge_health::note_success(&pr.forge, &pr.repo);
+                base
+            }
+            Err(e) => {
+                crate::forge_health::report_error(
+                    store,
+                    Some(id),
+                    &pr.forge,
+                    &pr.repo,
+                    "PR base drift detection",
+                    &e,
+                );
+                continue;
+            }
         };
         match classify_base_drift(
             &pr.base_ref,
@@ -6212,6 +6315,18 @@ fn refresh_pr_forge_cache_for_guardian(store: &crate::store_lock::StoreHandle, i
             }
             Err(e) => Err(e.clone()),
         });
+        // A failed batched `git fetch` leaves the drift half unknown; that is
+        // as much a reason to call the cycle unhealthy as a failed comment
+        // fetch, and the only thing that reaches the user when the remote
+        // rejects the daemon's credentials.
+        if let Some(Err(fetch_failure)) = &drift {
+            cycle_ok = false;
+            if cycle_error.is_none() {
+                cycle_error = Some(format!(
+                    "git fetch of the PR branches failed: {fetch_failure}"
+                ));
+            }
+        }
         let comments_half: HalfOutcome<CommentsObservation<'_>> = Some(match &comment_error {
             Some(e) => Err(e.clone()),
             None => Ok(CommentsObservation {
@@ -8075,13 +8190,24 @@ fn refresh_open_prs<'a>(
                     }
                     false
                 }
-                Ok(_) => true,
+                Ok(_) => {
+                    crate::forge_health::note_success(&pr.forge, &pr.repo);
+                    true
+                }
                 Err(e) => {
                     // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
                     crate::rlog!(
                         WARNING,
                         "ralphus [pr] pr {} state check failed, assuming still open: {e}",
                         pr.id
+                    );
+                    crate::forge_health::report_error(
+                        store,
+                        Some(id),
+                        &pr.forge,
+                        &pr.repo,
+                        "PR submission state check",
+                        &e,
                     );
                     true
                 }
@@ -8863,6 +8989,36 @@ fn record_auto_submit_success(store: &crate::store_lock::StoreHandle, id: &str, 
 /// pass's own per-branch `failed` list, and a whole-pass error fanned out to
 /// every branch the pass covered) so both stamp the *correct* branch
 /// identically.
+/// A background operation the user started (or the daemon started for them)
+/// failed after its request already returned `202`, so nobody is waiting on
+/// the result. Puts a deduped, dismissible notice in the mailbox naming what
+/// failed and the command that retries it.
+fn notify_background_failure(
+    store: &crate::store_lock::StoreHandle,
+    guardian_id: &str,
+    what: &str,
+    error: &str,
+    retry_command: String,
+) {
+    let remediation = crate::mailbox::Remediation::SuggestedCommand {
+        command: retry_command,
+        purpose: format!("retry {what} once the cause below is resolved"),
+    };
+    let result = store.lock().enqueue_guardian_notice(
+        guardian_id,
+        &format!("{what} failed in the background: {error}"),
+        Some(&remediation),
+    );
+    if let Err(notice_error) = result {
+        // ralphus[ignore-rlog-pair]: the store write itself failed, so there is no row to pair; the enqueue is itself the record of the failure it reports
+        crate::rlog!(
+            WARNING,
+            "ralphus [pr] review {guardian_id} could not enqueue the {what} failure notice: \
+             {notice_error}"
+        );
+    }
+}
+
 fn record_auto_submit_failure(
     store: &crate::store_lock::StoreHandle,
     id: &str,
@@ -8870,6 +9026,13 @@ fn record_auto_submit_failure(
     error: &str,
 ) {
     let branch_label = crate::guardian::branch_log_label_for(store, id, branch_id);
+    notify_background_failure(
+        store,
+        id,
+        &format!("auto-submitting the PR stack for branch {branch_label}"),
+        error,
+        format!("ralphus review pr submit {id}"),
+    );
     crate::rlog!(
         WARNING,
         "ralphus [pr] review {id} branch {branch_label} auto-submit-pr-stack failed: {error}"
@@ -10127,6 +10290,13 @@ pub fn start_pull_pr_commits(
             }
             Err(e) => {
                 crate::rlog!(ERROR, "ralphus [pr] pull-from-pr failed pr={pid}: {e}");
+                notify_background_failure(
+                    &store,
+                    &guardian_id,
+                    "pulling commits from the PR",
+                    &e,
+                    format!("ralphus review pr pull-from-pr {pid}"),
+                );
                 let guard = store.lock();
                 let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
                     level: crate::logging::LogLevel::ERROR,
@@ -10558,6 +10728,13 @@ pub fn start_submit_pull_requests(
             }
             Err(e) => {
                 crate::rlog!(ERROR, "ralphus [pr] review {sid} submit failed: {e}");
+                notify_background_failure(
+                    &store,
+                    &sid,
+                    "submitting the pull request(s)",
+                    &e,
+                    format!("ralphus review pr submit {sid}"),
+                );
                 let guard = store.lock();
                 let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
                     level: crate::logging::LogLevel::ERROR,
@@ -10623,6 +10800,13 @@ pub fn start_action_pr_feedback(
             }
             Err(e) => {
                 crate::rlog!(ERROR, "ralphus [pr] feedback action failed pr={pid}: {e}");
+                notify_background_failure(
+                    &store,
+                    &guardian_id,
+                    "actioning the PR feedback",
+                    &e,
+                    format!("ralphus review pr pull-feedback {pid}"),
+                );
                 let guard = store.lock();
                 let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
                     level: crate::logging::LogLevel::ERROR,
@@ -15763,6 +15947,142 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         assert!(messages[0].message.contains("dropped from the review"));
 
         mock.finish();
+    }
+
+    #[test]
+    fn a_rate_limited_merge_check_tells_the_user_once_and_leaves_the_pr_open() {
+        // The forge answers every merge check with a 403 rate limit. The PR
+        // must stay open (an error is never "merged"), the user must hear
+        // about it through the mailbox exactly once however many polls hit
+        // the limit, and a later successful answer must clear the outage so
+        // the next one notifies again.
+        let rate_limited = r#"{"message": "API rate limit exceeded for user ID 1."}"#;
+        let mock = MockForge::start(move |server| {
+            for _ in 0..2 {
+                let req = server.recv();
+                req.respond(tiny_http::Response::from_string(rate_limited).with_status_code(403))
+                    .unwrap();
+            }
+            let req = server.recv();
+            req.respond(
+                tiny_http::Response::from_string(r#"{"state": "open", "merged": false}"#)
+                    .with_status_code(200),
+            )
+            .unwrap();
+            let req = server.recv();
+            req.respond(tiny_http::Response::from_string(rate_limited).with_status_code(403))
+                .unwrap();
+        });
+        let repo = "acme/rate-limited-merge-check";
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let gid = store
+            .lock()
+            .create_guardian("demo", "main", "/repo")
+            .unwrap();
+        store
+            .lock()
+            .set_guardian_status(&gid, GuardianStatus::InReview, None)
+            .unwrap();
+        let pr_id = store
+            .lock()
+            .create_pull_request(
+                &gid,
+                Some("branch-000000000001"),
+                "github",
+                repo,
+                "feature/foo",
+                "main",
+                "Add foo",
+                "Adds the foo thing.",
+                Some(7),
+                None,
+            )
+            .unwrap();
+        let client = mock.client(crate::forge::ForgeKind::GitHub, repo);
+        let prs = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
+        let notices = || {
+            let guard = store.lock();
+            let reader = guard.register_mailbox_client().unwrap();
+            guard
+                .mailbox_messages_for_client_filtered(&reader, false, None, Some("review"))
+                .unwrap()
+        };
+
+        assert!(!apply_pr_merge_check(&store, &gid, &prs, &client));
+        assert!(!apply_pr_merge_check(&store, &gid, &prs, &client));
+        assert_eq!(store.lock().get_pull_request(&pr_id).unwrap().state, "open");
+        let sent = notices();
+        assert_eq!(sent.len(), 1, "one notice per outage, got {sent:?}");
+        assert!(
+            sent[0].message.contains("rate limiting"),
+            "{}",
+            sent[0].message
+        );
+        assert!(
+            sent[0].message.contains("Manual intervention required"),
+            "{}",
+            sent[0].message
+        );
+        assert_eq!(
+            sent[0].entity_uri.as_deref(),
+            Some(format!("guardian:{gid}").as_str())
+        );
+
+        // A good answer ends the outage; the next failure is a new one.
+        assert!(!apply_pr_merge_check(&store, &gid, &prs, &client));
+        assert!(!apply_pr_merge_check(&store, &gid, &prs, &client));
+        assert_eq!(notices().len(), 2);
+        mock.finish();
+    }
+
+    #[test]
+    fn a_failed_background_operation_leaves_one_notice_with_a_retry_command() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let gid = store
+            .lock()
+            .create_guardian("demo", "main", "/repo")
+            .unwrap();
+        for _ in 0..2 {
+            notify_background_failure(
+                &store,
+                &gid,
+                "submitting the pull request(s)",
+                "forge API 422: validation failed",
+                format!("ralphus review pr submit {gid}"),
+            );
+        }
+        let guard = store.lock();
+        let reader = guard.register_mailbox_client().unwrap();
+        let sent = guard
+            .mailbox_messages_for_client_filtered(&reader, false, None, Some("review"))
+            .unwrap();
+        assert_eq!(sent.len(), 1, "the same failure is one notice: {sent:?}");
+        assert!(
+            sent[0].message.contains("failed in the background"),
+            "{}",
+            sent[0].message
+        );
+        assert!(
+            sent[0]
+                .message
+                .contains(&format!("run `ralphus review pr submit {gid}`")),
+            "{}",
+            sent[0].message
+        );
+    }
+
+    #[test]
+    fn a_rate_limited_forge_is_not_asked_again_while_backing_off() {
+        let repo = "acme/backoff-skips-merge-check";
+        let client = crate::forge::ForgeClient::new(
+            crate::forge::ForgeKind::GitHub,
+            "http://127.0.0.1:1".to_string(),
+            repo.to_string(),
+            None,
+        );
+        assert!(!is_backed_off(&client));
+        start_backoff(&client, Some(std::time::Duration::from_secs(60)));
+        assert!(is_backed_off(&client));
     }
 
     #[test]
