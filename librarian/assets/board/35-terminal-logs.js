@@ -472,6 +472,7 @@
         }
         peekContent[key] = text;
         setPeekPreText(`peek-pre-${peekCssKey(key)}`, text);
+        refreshAgentLog(key);
       }
       /**
        * Renders peek key `key` from the `/pane` snapshot `paneContent` — the
@@ -499,6 +500,7 @@
         }
         peekContent[key] = text;
         setPeekPreText(`peek-pre-${peekCssKey(key)}`, text);
+        refreshAgentLog(key);
       }
       /**
        * Pages an older chunk of the transcript tape in when the user scrolls
