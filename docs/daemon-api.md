@@ -2164,7 +2164,7 @@ Field-by-field, this replaces:
 |---|---|
 | `name` | `POST .../rename` |
 | `base_branch` | `POST .../base` |
-| `resolver_agent`, `resolver_model`, `proof_scope`, `proof_skip_auto_clean`, `skip_auto_build`, `skip_worktrees`, `skip_base_updates`, `separate_pr_branch`, `match_pr_branch_name`, `auto_submit_pr_stack` | `POST .../settings` |
+| `resolver_agent`, `resolver_model`, `proof_scope`, `proof_skip_auto_clean`, `skip_worktrees`, `skip_base_updates`, `separate_pr_branch`, `match_pr_branch_name`, `auto_submit_pr_stack` | `POST .../settings` |
 | `squash_projects` (full desired membership — every project in the list gets squash turned on, every other project on the review gets it turned off) | `POST .../squash` (one call per project) |
 | `build_env`, `manual_checks_env`, `branch_env` (keyed by branch id) | `POST .../build-env`, `POST .../manual-checks-env`, `POST .../branches/{id}/env` respectively — each an `{set, unset, clear}` object with the same three-way inherited-override shape those endpoints already use |
 
@@ -2177,7 +2177,7 @@ Unlike `POST .../settings` — which restarts an in-flight (`merging`) review
 on *any* field write, even a purely cosmetic one like a rename — this
 endpoint computes a single `rebase_relevant` decision across the whole
 batch (true if `base_branch`, `resolver_agent`/`resolver_model`,
-`skip_auto_build`, `skip_worktrees`, `squash_projects`, or any env-override
+`skip_worktrees`, `squash_projects`, or any env-override
 field was present) and takes **at most one** action at the end: restart the
 merge once if the review is already `merging` and something rebase-relevant
 changed, or kick off one merge if it wasn't merging and something

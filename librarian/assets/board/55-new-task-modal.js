@@ -200,7 +200,6 @@
        * @property {boolean} proofs
        * @property {NtReviewMode} reviewMode
        * @property {boolean} generateManualChecks
-       * @property {boolean} skipAutoBuild
        * @property {boolean} generateAutoBuild
        * @property {NtListItem[]} proofItems
        * @property {NtListItem[]} checkItems
@@ -238,7 +237,7 @@
           label: "",
           prompt: "", fieldValues: {}, agent: "", model: "",
           project: "", upstreamBranch: "", proofs: true, reviewMode: "auto", generateManualChecks: true,
-          skipAutoBuild: false, generateAutoBuild: true,
+          generateAutoBuild: true,
           proofItems: [], checkItems: [], buildItems: [], generating: false, confirmStep: false,
           fieldErrors: [], activeGenerationIds: [], generationJobIds: [],
         };

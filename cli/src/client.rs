@@ -1787,13 +1787,11 @@ impl DaemonClient {
         base_branch: &str,
         git_root: &str,
         checks: Option<&[String]>,
-        skip_auto_build: bool,
         skip_worktrees: bool,
         review_type: Option<&str>,
     ) -> Result<Value, DaemonError> {
         let mut body = json!({
             "name": name, "base_branch": base_branch, "git_root": git_root,
-            "skip_auto_build": skip_auto_build,
             "skip_worktrees": skip_worktrees,
         });
         set_if_some(&mut body, "checks", checks.map(|c| json!(c)));
@@ -1816,7 +1814,6 @@ impl DaemonClient {
         settings: &GuardianSettings<'_>,
     ) -> Result<Value, DaemonError> {
         let mut body = json!({});
-        set_if_some(&mut body, "skip_auto_build", settings.skip_auto_build);
         set_if_some(&mut body, "skip_worktrees", settings.skip_worktrees);
         set_if_some(
             &mut body,
@@ -2417,7 +2414,6 @@ impl Default for ProphecyFilters<'_> {
 /// Bundled optional fields for [`DaemonClient::guardian_settings`].
 #[derive(Debug, Clone, Default)]
 pub struct GuardianSettings<'a> {
-    pub skip_auto_build: Option<bool>,
     pub skip_worktrees: Option<bool>,
     pub resolver_agent: Option<&'a str>,
     pub resolver_model: Option<&'a str>,

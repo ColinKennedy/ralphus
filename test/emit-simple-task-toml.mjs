@@ -48,7 +48,6 @@ const base = {
   proofs: false,
   reviewMode: "none",
   generateManualChecks: false,
-  skipAutoBuild: true,
   generateAutoBuild: false,
   proofItems: [],
   checkItems: [],

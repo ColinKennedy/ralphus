@@ -116,8 +116,8 @@ fn print_validation_errors(errors: Option<&Vec<Value>>) {
     }
 }
 
-/// Print non-fatal findings (e.g. "no `[[review.auto_build]]`/
-/// `skip_auto_build` declared, and this can't be confirmed as covered by a
+/// Print non-fatal findings (e.g. "no `[[review.auto_build]]`
+/// declared, and this can't be confirmed as covered by a
 /// project-level default without the daemon") -- unlike `errors`, these never
 /// affect the command's exit code, but a caller should still see them rather
 /// than discover the same gap only once the daemon rejects the submission at
