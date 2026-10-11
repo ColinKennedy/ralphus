@@ -9,7 +9,7 @@
 //! records each result, and finalizes task/squad states.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1228,14 +1228,11 @@ fn execute_squad_inner(
         }
         resolved
     };
-    // RAL-<pending>: decide every LOCAL cell's worktree (branch claim +
-    // `w/<short>` directory) under a brief lock, then actually create/resync
-    // them -- the real `git worktree add`/`fetch`/rebase -- with NO lock
-    // held, concurrently. Without this, the locked pass just below would run
-    // that same real git work serially, one cell at a time, for the ENTIRE
-    // duration the store lock is held -- stalling every other request the
-    // daemon serves meanwhile, not just this squad's own dispatch. See
-    // `crate::worktrees::plan_local_worktree_jobs`'s doc comment.
+    // Decide and durably claim every LOCAL cell's worktree (branch claim +
+    // `w/<short>` directory + creation marker) under a brief lock. No git work
+    // happens here: the claimed worktrees are created in the background below
+    // (or by the cell that needs one first), so the squad starts without
+    // waiting for any checkout. See `crate::worktrees::plan_local_worktree_jobs`.
     let prefetched_worktrees = {
         let guard = store.lock();
         let jobs = crate::worktrees::plan_local_worktree_jobs(
@@ -1246,7 +1243,7 @@ fn execute_squad_inner(
             &prefetched_upstreams,
         );
         drop(guard);
-        crate::worktrees::execute_local_worktree_jobs(&jobs)
+        crate::worktrees::planned_worktree_paths(&jobs)
     };
     // Resolve every worktree-placeholder `cwd` (RAL-100) before planning: a
     // placeholder repeated across cells/tasks materializes exactly one
@@ -1276,6 +1273,11 @@ fn execute_squad_inner(
             return;
         }
     }
+    // Every cell whose cwd is a claimed-but-not-yet-created worktree (including
+    // claims left by a daemon that restarted mid-materialization, recovered from
+    // their markers). The background creator below and each such cell's worker
+    // both go through `ensure_claimed_worktree`, which is single-flight.
+    let worktree_claims = pending_worktree_claims(&cells, &tasks);
     crate::rlog!(
         INFO,
         "ralphus [scheduler] squad {squad_id} executing ({} cells, {} tasks)",
@@ -1397,6 +1399,7 @@ fn execute_squad_inner(
         let cells_ref = &cells;
         let progress_ref = &progress;
         let plan_ref = &plan;
+        let claims_ref = &worktree_claims;
 
         // Spawn proof-only workers immediately for cells that are Done but
         // have pending proofs (restart_cell_proof or crash recovery). They
@@ -1426,6 +1429,21 @@ fn execute_squad_inner(
                     progress_ref,
                     i,
                     trace_ref,
+                );
+            });
+        }
+
+        // Create the claimed worktrees in the background while cells whose
+        // worktree is already ready start.
+        if !worktree_claims.is_empty() {
+            scope.spawn(move || {
+                create_claimed_worktrees_in_background(
+                    store,
+                    squad_id,
+                    cancel,
+                    cells_ref,
+                    progress_ref,
+                    claims_ref,
                 );
             });
         }
@@ -1910,6 +1928,7 @@ fn execute_squad_inner(
                         i,
                         trace_ref,
                         dispatch_priority,
+                        claims_ref,
                     );
                 });
             }
@@ -2137,6 +2156,220 @@ fn try_upstream_rebase(
         row.cell_id
     );
     None
+}
+
+/// A cell's claimed-but-not-yet-created worktree.
+struct WorktreeClaim {
+    /// The planned `w/<short>` directory, which is also the cell's cwd.
+    wt: PathBuf,
+    /// The task's registered project, used to route the worktree to the
+    /// submitter's fork once it exists.
+    project: Option<String>,
+}
+
+/// The pending worktree claims of one squad run, by cell index.
+struct WorktreeClaims {
+    by_cell: HashMap<usize, WorktreeClaim>,
+}
+
+impl WorktreeClaims {
+    fn for_cell(&self, i: usize) -> Option<&WorktreeClaim> {
+        self.by_cell.get(&i)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.by_cell.is_empty()
+    }
+
+    /// Distinct worktrees with the cells that wait on each, in cell order.
+    fn groups(&self) -> Vec<(&WorktreeClaim, Vec<usize>)> {
+        let mut order: Vec<usize> = self.by_cell.keys().copied().collect();
+        order.sort_unstable();
+        let mut groups: Vec<(&WorktreeClaim, Vec<usize>)> = Vec::new();
+        for i in order {
+            let claim = &self.by_cell[&i];
+            match groups.iter_mut().find(|(g, _)| g.wt == claim.wt) {
+                Some((_, cells)) => cells.push(i),
+                None => groups.push((claim, vec![i])),
+            }
+        }
+        groups
+    }
+}
+
+/// The cells of `cells` whose cwd is a worktree still waiting to be created.
+fn pending_worktree_claims(
+    cells: &[crate::store::CellRow],
+    tasks: &[crate::store::TaskRow],
+) -> WorktreeClaims {
+    let projects: HashMap<i64, Option<&str>> = tasks
+        .iter()
+        .map(|t| (t.idx, t.project.as_deref()))
+        .collect();
+    let by_cell = cells
+        .iter()
+        .enumerate()
+        .filter_map(|(i, row)| {
+            let wt = PathBuf::from(row.cwd.as_deref()?);
+            crate::worktrees::pending_worktree_at(&wt)?;
+            let project = projects
+                .get(&row.task_idx)
+                .copied()
+                .flatten()
+                .map(str::to_string);
+            Some((i, WorktreeClaim { wt, project }))
+        })
+        .collect();
+    WorktreeClaims { by_cell }
+}
+
+/// Create (or wait for) `claim`'s worktree on behalf of `row`, with a
+/// Cartographer note saying what happened.
+fn ensure_cell_worktree(
+    store: &crate::store_lock::StoreHandle,
+    squad_id: &str,
+    row: &crate::store::CellRow,
+    claim: &WorktreeClaim,
+) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    let materialized = crate::worktrees::ensure_claimed_worktree(
+        store,
+        squad_id,
+        claim.project.as_deref(),
+        &claim.wt,
+    )?;
+    let Some(materialized) = materialized else {
+        return Ok(());
+    };
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let how = if materialized.waited {
+        "waited for the in-flight creation of"
+    } else {
+        "created"
+    };
+    crate::cartographer::Note::new("scheduler")
+        .level(crate::logging::LogLevel::INFO)
+        .scope("materialize")
+        .squad(squad_id)
+        .task(&row.task_name)
+        .cell(&row.cell_id)
+        .emit(
+            &store.lock(),
+            format!(
+                "cell {squad_id}/{} {how} its worktree {} ({elapsed_ms}ms)",
+                row.cell_id,
+                claim.wt.display()
+            ),
+            serde_json::json!({
+                "worktree": claim.wt.display().to_string(),
+                "waited": materialized.waited,
+                "repaired": materialized.repaired,
+                "elapsed_ms": elapsed_ms,
+            }),
+        );
+    Ok(())
+}
+
+/// Record `row` as failed because its worktree could not be created, and tell
+/// the squad's watchers (with remediation) through the mailbox.
+fn fail_cell_for_worktree(
+    store: &crate::store_lock::StoreHandle,
+    squad_id: &str,
+    row: &crate::store::CellRow,
+    message: &str,
+) {
+    let message = format!("could not create the cell's worktree: {message}");
+    crate::rlog!(
+        ERROR,
+        "ralphus [scheduler] cell {squad_id}/{} {message}",
+        row.cell_id,
+    );
+    let outcome = crate::store::CellOutcome {
+        state: crate::store::NodeState::Failed,
+        usage: crate::store::RecordedUsage::default(),
+        error: Some(message.clone()),
+        agent_session_id: None,
+    };
+    let guard = store.lock();
+    store_ok(
+        &guard,
+        squad_id,
+        "record_cell_result",
+        guard.record_cell_result(squad_id, row.task_idx, row.idx, &outcome),
+    );
+    let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+        level: crate::logging::LogLevel::ERROR,
+        source: "scheduler",
+        message: "cell failed: worktree could not be created",
+        scope: Some("cell"),
+        squad_id: Some(squad_id),
+        guardian_id: None,
+        cell_id: Some(&row.cell_id),
+        task: Some(&row.task_name),
+        log_path: None,
+        payload: serde_json::json!({"error": message}),
+        admin_only: false,
+    });
+    enqueue_cell_failure_mailbox(
+        &guard,
+        squad_id,
+        &row.cell_id,
+        &row.task_name,
+        Some(&message),
+    );
+}
+
+/// Create every claimed worktree, at most
+/// [`crate::worktrees::MAX_PARALLEL_WORKTREE_JOBS`] at a time and with no store
+/// lock held. A creation that fails for good fails the cells waiting on that
+/// worktree right away (those not yet dispatched; a dispatched one reports the
+/// same failure from its own worker) while every other cell carries on.
+fn create_claimed_worktrees_in_background(
+    store: &crate::store_lock::StoreHandle,
+    squad_id: &str,
+    cancel: &CancelToken,
+    cells: &[crate::store::CellRow],
+    progress: &Mutex<Progress>,
+    claims: &WorktreeClaims,
+) {
+    let groups = claims.groups();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let workers = groups
+        .len()
+        .min(crate::worktrees::MAX_PARALLEL_WORKTREE_JOBS);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let n = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let Some((claim, waiting)) = groups.get(n) else {
+                        return;
+                    };
+                    if cancel.is_cancelled() {
+                        return;
+                    }
+                    let first = &cells[waiting[0]];
+                    let Err(message) = ensure_cell_worktree(store, squad_id, first, claim) else {
+                        continue;
+                    };
+                    for &i in waiting {
+                        let still_pending = {
+                            let mut prog = progress.lock().expect("progress mutex poisoned");
+                            let pending = prog.status[i] == CellState::Pending;
+                            if pending {
+                                prog.status[i] = CellState::Failed;
+                                prog.failed.insert(cells[i].task_idx);
+                            }
+                            pending
+                        };
+                        if still_pending {
+                            fail_cell_for_worktree(store, squad_id, &cells[i], &message);
+                        }
+                    }
+                }
+            });
+        }
+    });
 }
 
 /// RAL-241: broadcast a mailbox message for a cell that just failed, so a
@@ -2996,6 +3229,7 @@ fn run_cell_worker(
     i: usize,
     trace_context: Option<&str>,
     dispatch_priority: f64,
+    worktree_claims: &WorktreeClaims,
 ) {
     let row = &cells[i];
     // Held for the worker's whole lifetime so every early return below still
@@ -3035,6 +3269,21 @@ fn run_cell_worker(
             }),
             admin_only: false,
         });
+    }
+    // The cell's worktree may still be a claim the background creator has not
+    // reached: create it now (or wait for the creation already in flight), before
+    // taking a scheduler slot so the wait does not hold one.
+    if let Some(claim) = worktree_claims.for_cell(i) {
+        if let Err(message) = ensure_cell_worktree(store, squad_id, row, claim) {
+            fail_cell_for_worktree(store, squad_id, row, &message);
+            let mut prog = progress.lock().expect("progress mutex poisoned");
+            prog.status[i] = CellState::Failed;
+            prog.failed.insert(row.task_idx);
+            return;
+        }
+        if cancel.is_cancelled() {
+            return;
+        }
     }
     // Acquire a global slot; released when `_permit` drops at function end.
     // RAL-280: ranked, not plain `acquire()` — cells that unblock a Review's
