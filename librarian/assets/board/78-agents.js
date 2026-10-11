@@ -97,9 +97,10 @@
        */
       function agentFilterHtml(label, config) {
         const { id, itemNoun, selected, options } = config;
-        const badge = agentFilterBadge(selected.size, options.length);
+        const selectedSet = selected ?? new Set();
+        const badge = agentFilterBadge(selectedSet.size, options.length);
         const badgeHtml = badge ? ` <span class="chip">${esc(badge)}</span>` : "";
-        return `<button type="button" class="btn" id="${id}-opener" data-click="toggleAgentFilterMenu" data-tip="Filter by agent. Click to open the dropdown.">${esc(label)} ${selected.size > 0 ? `(${selected.size}/${options.length})` : `(${options.length})`}${badgeHtml}</button>`;
+        return `<button type="button" class="btn" id="${id}-opener" data-click="toggleAgentFilterMenu" data-tip="Filter by agent. Click to open the dropdown.">${esc(label)} ${selectedSet.size > 0 ? `(${selectedSet.size}/${options.length})` : `(${options.length})`}${badgeHtml}</button>`;
       }
       /**
        * Toggles the agent filter menu open/closed.
