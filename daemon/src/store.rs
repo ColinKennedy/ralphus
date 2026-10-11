@@ -3245,6 +3245,38 @@ impl Store {
         ] {
             self.run_idempotent_migration(stmt);
         }
+        // The judge roles live under `roles/judge/`. A database seeded before
+        // that moves a row only while it still equals the stock seed, so a
+        // user-edited preset keeps its name and content.
+        for seed in crate::preset_roles::ROLE_PRESETS
+            .iter()
+            .filter(|s| s.name.starts_with(crate::preset_roles::JUDGE_PREFIX))
+        {
+            let Some(old_name) = seed
+                .name
+                .strip_prefix(crate::preset_roles::JUDGE_PREFIX)
+                .map(|role| format!("roles/{role}"))
+            else {
+                continue;
+            };
+            self.conn.execute(
+                "UPDATE presets SET name=?1
+                 WHERE name=?2
+                   AND prompt IS ?3 AND system_prompt IS ?4 AND system_prompt_position IS ?5
+                   AND pass_score IS ?6
+                   AND maximum_context IS NULL AND auto_compact_threshold IS NULL
+                   AND maximum_tool_output_tokens IS NULL
+                   AND NOT EXISTS (SELECT 1 FROM presets WHERE name=?1)",
+                params![
+                    seed.name,
+                    old_name,
+                    seed.prompt,
+                    seed.system_prompt,
+                    seed.system_prompt_position,
+                    seed.pass_score.map(i64::from)
+                ],
+            )?;
+        }
         // Codex support: `*claude_session_id` columns were named after the only
         // CLI harness that existed at the time, but they hold the resumable
         // cell/thread id of *whichever* CLI agent produced it (claude-code or
@@ -3744,6 +3776,9 @@ impl Store {
             // (NULL for every unscored step), read back by the scheduler to
             // tell the runner to teach and decide the appraisal contract.
             "ALTER TABLE proofs ADD COLUMN pass_score INTEGER",
+            // A proof extending a judge preset receives its cell's declined-work
+            // (`refused`) prophecies in its prompt.
+            "ALTER TABLE proofs ADD COLUMN receives_refusals INTEGER NOT NULL DEFAULT 0",
             // RAL-308: a proof step's own wall-clock span, needed so its
             // contribution to its owning cell's/task's cumulative
             // `maximum_timeout_seconds` budget can be summed the same way
@@ -7612,9 +7647,14 @@ fn insert_proof(
     } else {
         (None, None)
     };
+    let receives_refusals = kind == "prompt"
+        && v.extends.iter().any(|raw| {
+            ralphus_core::schema::parse_preset_sentinel(raw)
+                .is_some_and(|name| name.starts_with(crate::preset_roles::JUDGE_PREFIX))
+        });
     tx.execute(
-        "INSERT INTO proofs(squad_id, task_idx, scope, cell_idx, idx, vid, kind, spec, effective_system_prompt, model, agent, state, timeout_sec, maximum_timeout_sec, budget_tokens, maximum_tool_output_tokens, turns, env_overrides, mode, remediation_attempts, pass_score)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO proofs(squad_id, task_idx, scope, cell_idx, idx, vid, kind, spec, effective_system_prompt, model, agent, state, timeout_sec, maximum_timeout_sec, budget_tokens, maximum_tool_output_tokens, turns, env_overrides, mode, remediation_attempts, pass_score, receives_refusals)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         params![
             squad_id,
             task_idx,
@@ -7642,6 +7682,7 @@ fn insert_proof(
             mode,
             remediation_attempts,
             pass_score,
+            receives_refusals,
         ],
     )?;
     Ok(())
@@ -8276,6 +8317,27 @@ impl Store {
             .optional()?
             .flatten();
         Ok(score.and_then(|s| u8::try_from(s).ok()))
+    }
+
+    /// Whether one proof step extends a judge preset and so is handed its
+    /// cell's declined-work prophecies; `false` for a step that does not exist.
+    pub fn proof_receives_refusals(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        scope: &str,
+        cell_idx: i64,
+        idx: i64,
+    ) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT receives_refusals FROM proofs WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=?",
+                params![squad_id, task_idx, scope, cell_idx, idx],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some_and(|v| v != 0))
     }
 
     /// Fresh current state of one proof step (not a snapshot from
@@ -13525,6 +13587,39 @@ prompt = "legacy cell, no review_guardian_id"
             .expect("legacy-proj must still be found");
         assert!(project.clone_url.is_none());
         assert_eq!(project.path, "/srv/legacy-proj");
+    }
+
+    #[test]
+    fn migration_renames_unmodified_legacy_judge_presets_only() {
+        let store = Store::open_in_memory().unwrap();
+        for old in ["roles/reviewer", "roles/security"] {
+            let new = format!("roles/judge/{}", old.trim_start_matches("roles/"));
+            store
+                .conn
+                .execute(
+                    "UPDATE presets SET name=?1 WHERE name=?2",
+                    params![old, new],
+                )
+                .unwrap();
+        }
+        store
+            .conn
+            .execute(
+                "UPDATE presets SET prompt='edited' WHERE name='roles/security'",
+                [],
+            )
+            .unwrap();
+        store.init_schema().unwrap();
+        let names: Vec<String> = store
+            .list_presets()
+            .unwrap()
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert!(names.contains(&"roles/judge/reviewer".to_string()));
+        assert!(!names.contains(&"roles/reviewer".to_string()));
+        assert!(names.contains(&"roles/security".to_string()));
+        assert!(!names.contains(&"roles/judge/security".to_string()));
     }
 
     #[test]

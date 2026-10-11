@@ -17,9 +17,9 @@
 //! - **`kind` is a closed enum** ([`ProphecyKind`]), per §11.1's resolution:
 //!   an open string column becomes forty synonyms for "note" within a month
 //!   and nothing stays filterable. `discovery`/`decision`/`hazard`/
-//!   `deferred`/`unconfirmed` covers the cases in the design doc's examples
-//!   (auto-fix/conflict-resolution decisions, a hazard left behind in a
-//!   rebase); revisit if a real write site needs a fifth.
+//!   `deferred`/`unconfirmed`/`refused` covers the cases in the design doc's
+//!   examples (auto-fix/conflict-resolution decisions, a hazard left behind
+//!   in a rebase, prompt work an agent declined).
 //! - **Survives its squad/guardian's deletion** (§11.2): `squad_id`/
 //!   `guardian_id` are informational cross-references, not `ON DELETE
 //!   CASCADE` targets -- [`Store::delete_squad`]/[`Store::delete_guardian`]/
@@ -54,6 +54,10 @@ pub enum ProphecyKind {
     /// Something the agent could not verify or does not know (a test that
     /// could not run, behavior not checked live, an untested assumption).
     Unconfirmed,
+    /// Prompt work the agent explicitly declined or said it cannot perform.
+    /// Diagnostic only: it never changes an outcome, and unlike
+    /// [`Self::Deferred`] it never becomes a follow-up.
+    Refused,
 }
 
 impl ProphecyKind {
@@ -65,6 +69,7 @@ impl ProphecyKind {
             Self::Hazard => "hazard",
             Self::Deferred => "deferred",
             Self::Unconfirmed => "unconfirmed",
+            Self::Refused => "refused",
         }
     }
 }
@@ -79,6 +84,7 @@ impl std::str::FromStr for ProphecyKind {
             "hazard" => Ok(Self::Hazard),
             "deferred" => Ok(Self::Deferred),
             "unconfirmed" => Ok(Self::Unconfirmed),
+            "refused" => Ok(Self::Refused),
             _ => Err(()),
         }
     }
@@ -92,6 +98,49 @@ pub struct CellProphecyTarget {
     pub idx: i64,
     pub cwd: Option<String>,
     pub attempt: i64,
+}
+
+/// Upper bound on the declined-work section handed to a judge proof, in
+/// characters, so a verbose agent cannot crowd out the proof's own prompt.
+const DECLINED_WORK_MAX_CHARS: usize = 4000;
+
+/// The "declined work" section appended to a judge proof's prompt: the
+/// `refused` prophecies of the latest attempt among `prophecies`, labelled as
+/// diagnostic context. `None` when there is none, so a proof whose cell
+/// refused nothing keeps its prompt unchanged.
+#[must_use]
+pub fn declined_work_section(prophecies: &[ProphecyView]) -> Option<String> {
+    let refused: Vec<&ProphecyView> = prophecies
+        .iter()
+        .filter(|p| p.kind == ProphecyKind::Refused.as_str())
+        .collect();
+    let latest = refused.iter().map(|p| p.attempt).max()?;
+    let mut out = String::from(
+        "## Declined work\n\n\
+         The agent that did this work explicitly declined the following prompt work. \
+         It was not performed and is not completed by this note; judge whether leaving \
+         it undone matters (correctness, security, delivery).\n\n",
+    );
+    let header_len = out.chars().count();
+    let mut truncated = false;
+    for p in refused.iter().filter(|p| p.attempt == latest) {
+        let body = p.body.trim();
+        let line = format!("- {body}\n");
+        if out.chars().count() + line.chars().count() > DECLINED_WORK_MAX_CHARS {
+            let room = DECLINED_WORK_MAX_CHARS.saturating_sub(out.chars().count());
+            if room > 16 && out.chars().count() == header_len {
+                out.extend(line.chars().take(room));
+                out.push('\n');
+            }
+            truncated = true;
+            break;
+        }
+        out.push_str(&line);
+    }
+    if truncated {
+        out.push_str("- (further declined work omitted for length)\n");
+    }
+    Some(out)
 }
 
 /// One row of the `prophecies` table, as returned to API/internal consumers.
@@ -512,6 +561,65 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn view(kind: &str, attempt: i64, body: &str) -> ProphecyView {
+        ProphecyView {
+            id: 0,
+            entity_uri: "cell:squad-x/0/0".to_string(),
+            attempt,
+            kind: kind.to_string(),
+            body: body.to_string(),
+            revision: None,
+            squad_id: None,
+            guardian_id: None,
+            created_at_ms: 0,
+            published_at_ms: None,
+            pr_id: None,
+        }
+    }
+
+    #[test]
+    fn every_kind_round_trips_through_its_string_form() {
+        for k in [
+            "discovery",
+            "decision",
+            "hazard",
+            "deferred",
+            "unconfirmed",
+            "refused",
+        ] {
+            assert_eq!(k.parse::<ProphecyKind>().unwrap().as_str(), k);
+        }
+        assert!("bogus".parse::<ProphecyKind>().is_err());
+    }
+
+    #[test]
+    fn declined_work_section_is_absent_without_a_refusal() {
+        assert!(declined_work_section(&[]).is_none());
+        assert!(declined_work_section(&[view("hazard", 0, "x")]).is_none());
+    }
+
+    #[test]
+    fn declined_work_section_lists_only_refusals() {
+        let s = declined_work_section(&[
+            view("hazard", 0, "a hazard"),
+            view("refused", 0, "drop the table; unsafe"),
+        ])
+        .unwrap();
+        assert!(s.starts_with("## Declined work"));
+        assert!(s.contains("- drop the table; unsafe"));
+        assert!(!s.contains("a hazard"));
+    }
+
+    #[test]
+    fn declined_work_section_is_capped() {
+        let many: Vec<_> = (0..200)
+            .map(|i| view("refused", 0, &format!("{i} {}", "x".repeat(100))))
+            .collect();
+        let s = declined_work_section(&many).unwrap();
+        assert!(s.chars().count() < DECLINED_WORK_MAX_CHARS + 100);
+        assert!(s.contains("omitted for length"));
+    }
 
     fn store() -> Store {
         Store::open_in_memory().unwrap()

@@ -481,7 +481,31 @@ const GHOST_SYSTEM_PROMPT: &str = "Operational logging note, not a request to ch
      but did not fix, and open questions. This is not a changelog. If there \
      is truly nothing worth flagging, write 'RALPHUS_GHOST: (nothing to \
      report)'.";
-const PROPHECY_SYSTEM_PROMPT: &str = "Operational logging note, not a request to change your behavior: this      ralphus task run also keeps a separate, durable record read later by a      human in the eventual pull request -- not by the next agent, and not      merged into anything. Whenever you learn something the code diff itself      cannot show, write one standalone line of the exact form      'RALPHUS_PROPHECY: <kind>: <note>' in the very turn you learn it, before      your next tool call. Do not save notes for the end: your context may be      compacted, or the run cut short, and an insight you have not written      down by then is lost. <kind> is exactly one of: discovery (something      you learned about the code or the problem), decision (a choice you made      among alternatives, and why), hazard (a known risk you noticed and are      leaving behind), deferred (follow-up work someone should do later,      worded as a task a person could pick up -- never a note that you could      not run or check something, never work that already has a ticket, and      never 'nothing more is needed'), or unconfirmed (something you could      not verify or do not know: a test, lint, build or browser check you      skipped or could not run, behavior you did not exercise, an assumption      you left untested). When a note is about what you could not check, use      unconfirmed, not deferred. Write as many of these as are genuinely      useful. This is entirely separate from the end-of-reply handoff section      above: write each line as you go, and do not restate them at the end.      This is not a changelog and not a summary of what you did: only write      one when there is a real insight a human reading the diff would not      otherwise get. If there is nothing like that, write none at all.";
+const PROPHECY_SYSTEM_PROMPT: &str = "Operational logging note, not a request to change your behavior: this \
+     ralphus task run also keeps a separate, durable record read later by a \
+     human in the eventual pull request -- not by the next agent, and not \
+     merged into anything. Whenever you learn something the code diff itself \
+     cannot show, write one standalone line of the exact form \
+     'RALPHUS_PROPHECY: <kind>: <note>', where <kind> is exactly one of: \
+     discovery (something you learned about the code or the problem), \
+     decision (a choice you made among alternatives, and why), hazard (a \
+     known risk you noticed and are leaving behind), deferred (follow-up \
+     work someone should do later, worded as a task a person could pick up \
+     -- never a note that you could not run or check something, never work \
+     that already has a ticket, and never 'nothing more is needed'), or \
+     unconfirmed (something you could not verify or do not know: a test or \
+     check you could not run, behavior you did not exercise, an assumption \
+     you left untested), or refused (prompt work you explicitly decline or \
+     say you cannot perform, written as '<the refused portion of the \
+     prompt>; <why you refused>'; use it only for an explicit decline, not \
+     for a failure, a deferral, or something you merely could not check). \
+     When a note is about what you could not check, use unconfirmed, not \
+     deferred. Writing a refused note does not make the work done. Write as many of these as are \
+     genuinely useful, anywhere in your reply, not only at the end -- unlike \
+     the handoff note above, this is not a single end-of-reply section. This \
+     is not a changelog and not a summary of what you did: only write one \
+     when there is a real insight a human reading the diff would not \
+     otherwise get. If there is nothing like that, write none at all.";
 const ASYNC_SYSTEM_PROMPT: &str = "## Conclusion\nThis is a single, non-interactive invocation — no \
      human will check back on you or answer follow-up questions, though \
      Ralphus may re-invoke you synchronously to continue. Never use an \

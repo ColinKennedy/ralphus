@@ -30,7 +30,14 @@ const PROPHECY_MARKER: &str = "RALPHUS_PROPHECY:";
 /// crate has no dependency on `ralphus-daemon`. A line naming any other
 /// kind is treated as malformed and dropped, the same way the daemon drops
 /// an unparseable `RALPHUS_EVENT:` payload rather than guessing.
-const KNOWN_KINDS: [&str; 5] = ["discovery", "decision", "hazard", "deferred", "unconfirmed"];
+const KNOWN_KINDS: [&str; 6] = [
+    "discovery",
+    "decision",
+    "hazard",
+    "deferred",
+    "unconfirmed",
+    "refused",
+];
 
 /// The `RALPHUS_EVENT` message a backend emits for each newly found marker, so
 /// the daemon files it the moment the agent writes it rather than only when
@@ -211,6 +218,19 @@ mod tests {
         assert!(
             parse_prophecies("grep result: 42:RALPHUS_PROPHECY: hazard: prefixed, not standalone")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn parses_the_refused_kind() {
+        let markers = parse_prophecies(
+            "RALPHUS_PROPHECY: refused: deleting the audit log; it would destroy evidence",
+        );
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].kind, "refused");
+        assert_eq!(
+            markers[0].body,
+            "deleting the audit log; it would destroy evidence"
         );
     }
 

@@ -6625,7 +6625,7 @@ placement = "copy"
 
     #[test]
     fn cell_extending_a_preset_may_omit_prompt_and_command() {
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nextends=[\"<<ralphus:presets/roles/reviewer>>\"]\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nextends=[\"<<ralphus:presets/roles/judge/reviewer>>\"]\n";
         assert!(
             validate_toml(src).is_ok(),
             "{:?}",

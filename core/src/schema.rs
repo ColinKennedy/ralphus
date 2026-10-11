@@ -1339,7 +1339,7 @@ pub fn parse_affected_entry_sentinel(entry: &str) -> Option<AffectedEntryRef> {
 /// fields still unset at submit time -- `core` has no store access, so it
 /// can only check this sentinel's shape, never whether the name is actually
 /// registered. The name may be hierarchical, e.g.
-/// `<<ralphus:presets/roles/reviewer>>` (see [`is_valid_preset_name`]).
+/// `<<ralphus:presets/roles/judge/reviewer>>` (see [`is_valid_preset_name`]).
 pub const PRESET_LINK_PREFIX: &str = "ralphus:presets/";
 
 /// Parse one `extends` list entry as a `<<ralphus:presets/<name>>>` sentinel.
@@ -1356,7 +1356,7 @@ pub fn parse_preset_sentinel(value: &str) -> Option<&str> {
 }
 
 /// Whether `name` is a well-formed preset name. A name may be hierarchical
-/// (`roles/reviewer`): `/` separates namespace segments, but a namespace is
+/// (`roles/judge/reviewer`): `/` separates namespace segments, but a namespace is
 /// only ever part of the name string -- there is no separate namespace
 /// object anywhere. Every segment must be non-empty, must not be `.` or
 /// `..` (so a name can never be mistaken for a path-relative reference), and
@@ -3075,8 +3075,8 @@ mod tests {
     #[test]
     fn preset_sentinel_accepts_hierarchical_names() {
         assert_eq!(
-            parse_preset_sentinel("<<ralphus:presets/roles/reviewer>>"),
-            Some("roles/reviewer")
+            parse_preset_sentinel("<<ralphus:presets/roles/judge/reviewer>>"),
+            Some("roles/judge/reviewer")
         );
         assert_eq!(
             parse_preset_sentinel("<<ralphus:presets/a/b/c.d-e_f>>"),
