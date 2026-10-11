@@ -4000,7 +4000,7 @@ fn register_preset(daemon: &Daemon, body: &str) -> Reply {
         return error(
             400,
             "invalid_value",
-            "'name' must be one or more '/'-separated segments of letters, digits, '_', '-' or '.' (e.g. \"roles/reviewer\")",
+            "'name' must be one or more '/'-separated segments of letters, digits, '_', '-' or '.' (e.g. \"roles/judge/reviewer\")",
             vec![],
         );
     }
