@@ -2202,6 +2202,117 @@ fn auto_fix_dispatch_gives_every_failing_check_its_own_log_file_and_prompt_parag
     let _ = std::fs::remove_dir_all(&remote_dir);
 }
 
+/// RAL-591/RAL-594: refund mechanism for exhausted auto-fix attempts.
+/// When a PR's auto-fix budget is exhausted, setting PR failing checks to a
+/// smaller set than the baseline refunds (restores) the attempt, allowing it
+/// to be claimed again. This tests the direct refund logic via
+/// `set_pr_failing_checks`, which is called by the ci_watch polling loop.
+#[test]
+fn auto_fix_refund_restores_exhausted_attempt() {
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    let gid = {
+        let g = store.lock();
+        let gid = g
+            .create_guardian("r", "main", &std::env::temp_dir().to_string_lossy())
+            .unwrap();
+        g.add_guardian_branch(&gid, "a").unwrap();
+        gid
+    };
+    let bid = store.lock().get_guardian(&gid).unwrap().branches[0]
+        .id
+        .clone();
+    let pr_id = store
+        .lock()
+        .create_pull_request(
+            &gid,
+            Some(&bid),
+            "github",
+            "acme/w",
+            "a",
+            "main",
+            "A",
+            "",
+            Some(1),
+            None,
+        )
+        .unwrap();
+
+    // Claim the initial attempt.
+    assert_eq!(
+        store
+            .lock()
+            .claim_pr_auto_fix_attempt(&pr_id, 1, 0)
+            .unwrap(),
+        ralphus_daemon::pr::AutoFixClaim::Claimed { attempt: 1 }
+    );
+
+    // Verify the attempt was claimed (count incremented to 1).
+    let pr_claimed = store.lock().get_pull_request(&pr_id).unwrap();
+    assert_eq!(pr_claimed.auto_fix_attempt_count, 1, "attempt count must be incremented");
+
+    // Establish the baseline: checks 'a' and 'b' are failing. Use
+    // set_pr_failing_checks_at with settle_ms=0 so the settle condition is
+    // immediately satisfied for refund evaluation.
+    let now = 0i64;
+    let baseline_result = store
+        .lock()
+        .set_pr_failing_checks_at(
+            &pr_id,
+            &["a".to_string(), "b".to_string()],
+            Some("gen0"),
+            true,
+            now,
+            0,
+        )
+        .unwrap();
+    assert!(!baseline_result, "first failing set should not refund");
+
+    // Verify that the budget is now exhausted (no more attempts available).
+    assert_eq!(
+        store
+            .lock()
+            .claim_pr_auto_fix_attempt(&pr_id, 1, 0)
+            .unwrap(),
+        ralphus_daemon::pr::AutoFixClaim::Exhausted { attempts: 1 },
+        "budget must be exhausted after one attempt"
+    );
+
+    // CI settles with fewer failing checks: only 'a', not 'b'. This triggers
+    // a refund because the set shrank relative to the baseline. Advance time
+    // past the baseline settlement time to satisfy the settle condition.
+    let refund_result = store
+        .lock()
+        .set_pr_failing_checks_at(
+            &pr_id,
+            &["a".to_string()],
+            Some("gen1"),
+            true,
+            now + 1,
+            0,
+        )
+        .unwrap();
+    assert!(refund_result, "refund should occur when failing checks shrink");
+
+    // After refund, the attempt count should be restored to 0 (undoing the
+    // claim), which allows it to be claimed again. This is the mechanism by
+    // which a refund "restores" an attempt -- it backs out the claim count.
+    let pr_refunded = store.lock().get_pull_request(&pr_id).unwrap();
+    assert_eq!(
+        pr_refunded.auto_fix_attempt_count, 0,
+        "refund must decrement the attempt count to restore claimability"
+    );
+
+    // A claim after refund should now succeed (budget no longer exhausted).
+    assert_eq!(
+        store
+            .lock()
+            .claim_pr_auto_fix_attempt(&pr_id, 1, 0)
+            .unwrap(),
+        ralphus_daemon::pr::AutoFixClaim::Claimed { attempt: 1 },
+        "refunded attempt must be claimable again"
+    );
+}
+
 /// RAL-380: once `run_feedback` finishes a successful pass, the reviewer
 /// message it was invoked for (identified by its `seq`) gets marked `done` --
 /// the source of the board's two-checkmark indicator on that message's bubble.
