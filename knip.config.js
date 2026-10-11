@@ -119,6 +119,28 @@ function compileHtml(text, _filePath) {
   // The pure task-tab test loader exports these helpers dynamically.
   referenced.add("ttFmtTurns");
   referenced.add("ttGroupAggregateWithGeneration");
+  // Task filter test helpers
+  referenced.add("ttExpandAll");
+  referenced.add("ttCollapseAll");
+  referenced.add("ttSetNameFilter");
+  referenced.add("ttToggleShowHidden");
+  referenced.add("ttToggleNeedsMe");
+  // Notification center test helper
+  referenced.add("toggleNotificationCenter");
+  // Chrome/tab test helpers (dispatched dynamically)
+  referenced.add("tabLinkClick");
+  // Turn colors test helper
+  referenced.add("setTurnColorsEnabled");
+  // Triage test helpers
+  referenced.add("setTriageView");
+  referenced.add("onTriageQuery");
+  referenced.add("onTriageShowExcluded");
+  // Projects/machines test helper
+  referenced.add("setAutoWatch");
+  // Mailbox test helper
+  referenced.add("toggleMailboxWidget");
+  // Waypoints test helper
+  referenced.add("onWaypointFilter");
   // Review inspector Live tab run navigation, dispatched by data-click attributes.
   referenced.add("stepBranchRun");
   referenced.add("jumpToLatestRun");
