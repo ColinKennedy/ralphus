@@ -1820,7 +1820,14 @@ fn rebase_head_commit_is_empty(wt: &Workspace) -> bool {
 /// skip, the same `--continue` would fail identically forever (no committer
 /// identity on the machine, a failing `prepare-commit-msg` hook), so the
 /// caller must fail the branch rather than retry.
+///
+/// A `--continue` that fails with nothing unmerged is also progress when
+/// `REBASE_HEAD` now names a different commit than before: the step was
+/// committed and the rebase paused on the next pick, whose conflict `rerere`
+/// (with `rerere.autoupdate`) resolved and staged on the spot, so no file is
+/// left unmerged. The resolver loop commits that staged step on its next pass.
 fn advance_rebase(wt: &Workspace) -> Result<(), String> {
+    let head_before = rebase_head_sha(wt);
     let Err(error) = wt.git(&["rebase", "--continue"]) else {
         return Ok(());
     };
@@ -1829,11 +1836,24 @@ fn advance_rebase(wt: &Workspace) -> Result<(), String> {
         // conflict; the resolver loop picks that one up.
         return Ok(());
     }
+    if rebase_head_sha(wt).is_some_and(|after| head_before.as_deref() != Some(after.as_str())) {
+        return Ok(());
+    }
     if rebase_head_commit_is_empty(wt) {
         let _ = wt.git(&["rebase", "--skip"]);
         return Ok(());
     }
     Err(error)
+}
+
+/// The commit a paused rebase is currently replaying, or `None` when git wrote
+/// no `REBASE_HEAD` (no rebase, or a pick that stopped before conflicting).
+fn rebase_head_sha(wt: &Workspace) -> Option<String> {
+    let sha = wt
+        .git(&["rev-parse", "--verify", "--quiet", "REBASE_HEAD"])
+        .ok()?;
+    let sha = sha.trim();
+    (!sha.is_empty()).then(|| sha.to_string())
 }
 
 /// The branch-failure detail for an [`advance_rebase`] error.
@@ -18600,6 +18620,87 @@ mod tests {
             "the pick must not be skipped: {error}"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn advance_rebase_accepts_a_next_pick_that_rerere_already_staged() {
+        // `--continue` commits step 1, then stops on step 2's conflict. With a
+        // recorded resolution and `rerere.autoupdate`, git stages that
+        // resolution immediately, so nothing is left unmerged -- yet the
+        // rebase is healthy and merely paused one pick later. That is
+        // progress, not a stuck rebase.
+        let (base, repo, _fwt) = make_repo("advance-rebase-rerere-staged");
+        g(&repo, &["config", "user.name", "t"]);
+        g(&repo, &["config", "user.email", "t@t"]);
+        g(&repo, &["config", "rerere.enabled", "true"]);
+        g(&repo, &["config", "rerere.autoupdate", "true"]);
+        std::fs::write(repo.join("base.txt"), "main\n").unwrap();
+        g(&repo, &["commit", "--all", "--message", "main edit"]);
+        g(&repo, &["checkout", "-b", "side", "HEAD~1"]);
+        for step in ["side1", "side2"] {
+            std::fs::write(repo.join("base.txt"), format!("{step}\n")).unwrap();
+            g(&repo, &["commit", "--all", "--message", step]);
+        }
+        let original = g_out(&repo, &["rev-parse", "side"]);
+        // `--continue` exits non-zero when it stops on the next conflict, so
+        // its status is deliberately not asserted.
+        let resolve_and_continue = |content: &str| {
+            std::fs::write(repo.join("base.txt"), content).unwrap();
+            g(&repo, &["add", "base.txt"]);
+            let _ = std::process::Command::new("git")
+                .args(["rebase", "--continue"])
+                .current_dir(&repo)
+                .env("GIT_EDITOR", "true")
+                .status()
+                .unwrap();
+        };
+
+        // First pass records both resolutions.
+        assert!(!rebase_onto_main_succeeds(&repo));
+        resolve_and_continue("resolved1\n");
+        resolve_and_continue("resolved2\n");
+        assert!(!rebase_in_progress(&Workspace::local(&repo)));
+
+        // Second pass replays the same conflicts: step 1 is staged by rerere.
+        g(&repo, &["reset", "--hard", &original]);
+        assert!(!rebase_onto_main_succeeds(&repo));
+        let wt = Workspace::local(&repo);
+        advance_rebase(&wt).expect("the staged next pick is progress");
+        assert!(rebase_in_progress(&wt), "step 2 is paused, not finished");
+        assert!(
+            conflicted_files(&wt).is_empty(),
+            "precondition: rerere left nothing unmerged"
+        );
+        advance_rebase(&wt).expect("committing the staged step finishes the rebase");
+        assert!(!rebase_in_progress(&wt));
+        assert_eq!(
+            std::fs::read_to_string(repo.join("base.txt")).unwrap(),
+            "resolved2\n"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Rebase the checked-out `side` onto `main`; true if it finished
+    /// without stopping.
+    fn rebase_onto_main_succeeds(repo: &Path) -> bool {
+        std::process::Command::new("git")
+            .args(["rebase", "main"])
+            .current_dir(repo)
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    fn g_out(root: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?} failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
     fn make_repo(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
