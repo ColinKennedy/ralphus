@@ -96,6 +96,10 @@ pub fn execute(cmd: WaypointCommand, client: &DaemonClient) -> ExecResult {
         WaypointCommand::ResurveyPreview { waypoint_id } => {
             Ok(client.waypoint_resurvey_preview(&waypoint_id)?)
         }
+        WaypointCommand::Override {
+            waypoint_id,
+            entry_id,
+        } => Ok(client.waypoint_override_affected_entry(&waypoint_id, &entry_id)?),
         WaypointCommand::Redo {
             waypoint_id,
             entry_id,

@@ -36,6 +36,10 @@ pub enum WaypointCommand {
     Reopen {
         waypoint_id: String,
     },
+    Override {
+        waypoint_id: String,
+        entry_id: String,
+    },
     Redo {
         waypoint_id: String,
         entry_id: String,
@@ -183,6 +187,18 @@ pub fn parse(args: &[String]) -> WaypointCommand {
                     resurvey,
                 },
                 None => WaypointCommand::UsageError("edit requires <waypoint_id>".to_string()),
+            }
+        }
+        Some("override") => {
+            let rest = scanner.remaining();
+            match (rest.first(), rest.get(1)) {
+                (Some(waypoint_id), Some(entry_id)) => WaypointCommand::Override {
+                    waypoint_id: waypoint_id.clone(),
+                    entry_id: entry_id.clone(),
+                },
+                _ => WaypointCommand::UsageError(
+                    "override requires <waypoint_id> <entry_id>".to_string(),
+                ),
             }
         }
         Some("redo") => {
@@ -533,6 +549,14 @@ pub fn dispatch(cmd: WaypointCommand, opts: &GlobalOpts) -> i32 {
                 merged_allow,
                 resurvey,
             )?;
+            emit(opts, &result, render_waypoint_detail);
+            Ok(())
+        }),
+        WaypointCommand::Override {
+            waypoint_id,
+            entry_id,
+        } => run_and_report(opts, None, || {
+            let result = client.waypoint_override_affected_entry(&waypoint_id, &entry_id)?;
             emit(opts, &result, render_waypoint_detail);
             Ok(())
         }),

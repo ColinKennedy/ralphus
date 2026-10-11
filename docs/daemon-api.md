@@ -4964,6 +4964,15 @@ the survey's own verdict) — never touches that entry's `survey_verdict`/
 `mode` must be `"block"` or `"advisory"`; `404 not_found` if `entry_id`
 isn't on this waypoint's affected list. Returns the updated `WaypointDetail`.
 
+#### `POST /api/waypoints/{id}/affected/{entry_id}/override`
+Release exactly one held affected entry (no request body). The entry is
+recorded as `not_impacted` with rationale `overridden by <person>` (the
+`X-Ralphus-User` identity), its halted work resumes through the normal waypoint
+resume sweep, and the override is written to the delivery feed and Cartographer.
+Other entries are untouched. This is the way out when a survey could not run
+and halted the entry after its attempt limit. `404 not_found` for an unknown
+waypoint or entry. Returns the updated `WaypointDetail`.
+
 #### `POST /api/waypoints/{id}/close` / `POST /api/waypoints/{id}/reopen`
 Manual lifecycle overrides — no request body. `close` works regardless of
 whether every affected entry has reached a terminal delivery state yet (a

@@ -2979,27 +2979,32 @@ fn parse_survey_reply(reply: &str, allow_advisory: bool) -> Option<SurveyVerdict
     })
 }
 
-/// Turn a completed survey call's outcome into a [`SurveyVerdict`], applying
-/// the fail-closed rule uniformly whether the call itself failed or it
-/// succeeded but returned an unparseable reply. Split out from
-/// [`survey_candidate`] so the fail-closed and advisory-de-escalation
-/// decision logic is unit-testable without an actual `chat_client` call.
+/// Turn a completed survey call's outcome into a [`SurveyVerdict`]. A call that
+/// failed, or succeeded with a reply carrying no verdict, is not a verdict at
+/// all: it is `Err` with the reason, and the caller leaves the entry unjudged to
+/// be retried instead of resolving it to `impacted`/`block`. Split out from
+/// [`survey_candidate`] so the decision logic is unit-testable without an
+/// actual `chat_client` call.
 fn resolve_survey_verdict(
     call_result: Result<String, String>,
     allow_advisory: bool,
-) -> SurveyVerdict {
-    match call_result {
-        Ok(reply) => parse_survey_reply(&reply, allow_advisory).unwrap_or_else(|| SurveyVerdict {
-            impacted: true,
-            mode: AffectedMode::Block,
-            rationale: format!("unparseable survey reply, failing closed: {reply:?}"),
-        }),
-        Err(e) => SurveyVerdict {
-            impacted: true,
-            mode: AffectedMode::Block,
-            rationale: format!("survey call failed, failing closed: {e}"),
-        },
-    }
+) -> Result<SurveyVerdict, String> {
+    let reply = call_result.map_err(|e| format!("survey call failed: {e}"))?;
+    parse_survey_reply(&reply, allow_advisory)
+        .ok_or_else(|| format!("unparseable survey reply: {reply:?}"))
+}
+
+/// How many failed survey calls (errored, empty, unparseable or cancelled) an
+/// entry may accumulate before it is halted anyway. Overridable per daemon with
+/// `RALPHUS_WAYPOINT_SURVEY_MAX_ATTEMPTS`.
+const DEFAULT_SURVEY_MAX_ATTEMPTS: u32 = 3;
+
+fn survey_max_attempts() -> u32 {
+    std::env::var("RALPHUS_WAYPOINT_SURVEY_MAX_ATTEMPTS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_SURVEY_MAX_ATTEMPTS)
 }
 
 /// Survey one candidate against a waypoint (RAL-400 Phase 2): resolve the
@@ -3025,21 +3030,47 @@ fn resolve_survey_verdict(
 /// to this module and defaults to per-candidate absent a concrete cost
 /// problem.
 ///
-/// Fail-closed: any agent-resolution/call/parse failure resolves to
-/// `impacted = true`, `mode = Block`, with the failure reason as the
-/// rationale -- never silently dropped.
+/// Nothing is halted before the verdict. The entry's NULL verdict gates the
+/// squad's *next* cell from starting, but a running cell or proof is never
+/// killed on suspicion: only an `impacted` + `block` verdict trips the squad's
+/// waypoint-halt token. A failed call (agent resolution, call, empty or
+/// unparseable reply, or a cancelled run) is not a verdict: the entry stays
+/// unjudged and is retried on later sweeps, and after `max_attempts` failures it
+/// is halted with a verdict saying the survey could not run, with its watchers
+/// told how to override. Returns `None` while the entry is unjudged.
 ///
 /// # Errors
 /// Propagates a SQLite failure from reading the waypoint or persisting the
-/// outcome. A survey-call failure itself is not a [`StoreError`] -- it
-/// resolves to the fail-closed verdict described above instead.
+/// outcome.
 pub fn survey_candidate(
     store: &crate::store_lock::StoreHandle,
     waypoint_id: &str,
     candidate: &SurveyCandidate,
     waypoint_halts: &crate::cancel::WaypointHalts,
     runner: &Arc<dyn Runner>,
-) -> StoreResult<SurveyVerdict> {
+) -> StoreResult<Option<SurveyVerdict>> {
+    survey_candidate_with_limit(
+        store,
+        waypoint_id,
+        candidate,
+        waypoint_halts,
+        runner,
+        survey_max_attempts(),
+    )
+}
+
+/// [`survey_candidate`] with the failed-attempt limit passed in.
+///
+/// # Errors
+/// See [`survey_candidate`].
+pub fn survey_candidate_with_limit(
+    store: &crate::store_lock::StoreHandle,
+    waypoint_id: &str,
+    candidate: &SurveyCandidate,
+    waypoint_halts: &crate::cancel::WaypointHalts,
+    runner: &Arc<dyn Runner>,
+    max_attempts: u32,
+) -> StoreResult<Option<SurveyVerdict>> {
     // Read before the work is described, so an edit landing any time after this
     // point is seen below and the verdict for the superseded text is dropped.
     let memory = store.lock_free_memory();
@@ -3056,16 +3087,6 @@ pub fn survey_candidate(
         AffectedMode::Block,
     )?;
     drop(guard);
-    // RAL-400 Phase 3: the affected entry above just went from "not affecteded"
-    // (unblocked) to `mode=block`. A squad-kind candidate may have a cell
-    // actively running right now -- `cancel` is a no-op when nothing is
-    // registered under this squad id, so this is safe to call unconditionally
-    // rather than first checking squad/cell state. Review-kind candidates
-    // never have a runner-registered token (a review has no cell of its own
-    // to halt), so this is scoped to `Squad` only.
-    if candidate.kind == WaypointEntryKind::Squad {
-        waypoint_halts.cancel(&candidate.entry_id);
-    }
 
     let fallback = crate::config::global_review_config();
     let agent = waypoint
@@ -3100,7 +3121,54 @@ pub fn survey_candidate(
         &system,
         &user,
     );
-    let verdict = resolve_survey_verdict(call_result, waypoint.allow_advisory);
+    let failure_kind = candidate.kind.as_str();
+    let mut unrunnable = false;
+    let verdict = match resolve_survey_verdict(call_result, waypoint.allow_advisory) {
+        Ok(verdict) => {
+            memory.clear_survey_failures(waypoint_id, failure_kind, &candidate.entry_id);
+            verdict
+        }
+        Err(error) => {
+            let attempts =
+                memory.record_survey_failure(waypoint_id, failure_kind, &candidate.entry_id);
+            if attempts < max_attempts {
+                let guard = store.lock();
+                let note = crate::cartographer::Note::new("waypoints")
+                    .level(crate::logging::LogLevel::WARNING)
+                    .scope("waypoint");
+                let note = match candidate.kind {
+                    WaypointEntryKind::Squad => note.squad(&candidate.entry_id),
+                    WaypointEntryKind::Review => note.guardian(&candidate.entry_id),
+                };
+                note.emit(
+                    &guard,
+                    format!(
+                        "waypoint {waypoint_id} survey of {failure_kind} {} could not run \
+                         (attempt {attempts} of {max_attempts}); left unjudged to retry: {error}",
+                        candidate.entry_id
+                    ),
+                    serde_json::json!({
+                        "waypoint_id": waypoint_id,
+                        "candidate_kind": failure_kind,
+                        "candidate_id": candidate.entry_id,
+                        "attempts": attempts,
+                        "max_attempts": max_attempts,
+                        "error": error,
+                    }),
+                );
+                return Ok(None);
+            }
+            memory.clear_survey_failures(waypoint_id, failure_kind, &candidate.entry_id);
+            unrunnable = true;
+            SurveyVerdict {
+                impacted: true,
+                mode: AffectedMode::Block,
+                rationale: format!(
+                    "halted: survey could not run after {attempts} attempts ({error})"
+                ),
+            }
+        }
+    };
 
     let guard = store.lock();
     // Checked under the store lock, the same one an edit holds while it bumps
@@ -3127,13 +3195,21 @@ pub fn survey_candidate(
                 "candidate_id": candidate.entry_id,
             }),
         );
-        return Ok(verdict);
+        return Ok(None);
     }
     guard.set_affected_survey_result(waypoint_id, candidate.kind, &candidate.entry_id, &verdict)?;
     // Tell the entity's watchers what the verdict means for them. Every branch
     // notifies, including the release: someone told their work was held needs
     // to hear when it isn't any more, or the first message reads as a dead end.
     match (verdict.impacted, verdict.mode) {
+        (true, AffectedMode::Block) if unrunnable => notify_entry_halted_unjudged(
+            &guard,
+            waypoint_id,
+            Some(&waypoint),
+            candidate.kind,
+            &candidate.entry_id,
+            &verdict.rationale,
+        ),
         (true, AffectedMode::Block) => notify_entry_blocked(
             &guard,
             waypoint_id,
@@ -3183,7 +3259,16 @@ pub fn survey_candidate(
             "rationale": verdict.rationale,
         }),
     );
-    Ok(verdict)
+    // Only now, with an `impacted` block verdict recorded, is running work
+    // halted. Review-kind candidates have no runner-registered token (a review
+    // has no cell of its own to halt).
+    if verdict.impacted
+        && verdict.mode == AffectedMode::Block
+        && candidate.kind == WaypointEntryKind::Squad
+    {
+        waypoint_halts.cancel(&candidate.entry_id);
+    }
+    Ok(Some(verdict))
 }
 
 /// Scheduler-owned periodic sweep (RAL-400 Phase 2): survey every waiting
@@ -4109,6 +4194,55 @@ pub fn notify_entry_blocked(
     );
 }
 
+/// Notify an entry's watchers that it was halted because the survey that should
+/// have judged it could not run (RAL-624). Carries RAL-502 remediation naming
+/// the override, the way out that does not wait for the waypoint to finish.
+pub fn notify_entry_halted_unjudged(
+    store: &Store,
+    waypoint_id: &str,
+    waypoint: Option<&WaypointView>,
+    kind: WaypointEntryKind,
+    entry_id: &str,
+    detail: &str,
+) {
+    let which = waypoint.and_then(|w| w.label.clone()).map_or_else(
+        || format!("waypoint {waypoint_id}"),
+        |l| format!("waypoint \"{l}\""),
+    );
+    let message = format!(
+        "This {} ({entry_id}) was halted by open {which} without being judged: {detail}. It stays \
+         held until the waypoint finishes or the hold is overridden.",
+        kind.as_str()
+    );
+    let remediation = crate::mailbox::Remediation::SuggestedCommand {
+        command: format!("ralphus waypoint override {waypoint_id} {entry_id}"),
+        purpose: "release only this entry and resume its halted work, if the waypoint's guidance \
+                  does not affect it"
+            .to_string(),
+    };
+    let squad_scope = match kind {
+        WaypointEntryKind::Squad => Some(entry_id),
+        WaypointEntryKind::Review => None,
+    };
+    log_swallowed(
+        store,
+        &format!(
+            "waypoint {waypoint_id} unjudged-halt notice to {} {entry_id}",
+            kind.as_str()
+        ),
+        store.notify_watchers_with_remediation(
+            crate::monitor::NotifiableEventKind::WaypointBlocked,
+            &affected_entry_uri(kind, entry_id),
+            crate::mailbox::MailboxPriority::Normal,
+            &message,
+            &remediation,
+            squad_scope,
+            None,
+            None,
+        ),
+    );
+}
+
 /// Notify a affected entry's watchers that a waypoint's guidance applies to it
 /// in `advisory` mode -- not held, but expected to account for the guidance.
 ///
@@ -4218,6 +4352,50 @@ pub fn notify_entry_released(
             "reason": reason,
         }),
     );
+}
+
+/// Human override of one waypoint hold (RAL-624): release exactly this entry
+/// and nothing else on the waypoint.
+///
+/// The entry is recorded as judged `not_impacted` with the rationale
+/// "overridden by <person>", which is what drops it out of the gate and the
+/// survey sweep; the scheduler's waypoint-resume sweep then picks up its halted
+/// work with no further signal. The release notice also writes the Cartographer
+/// row that is this waypoint's delivery-feed entry.
+///
+/// # Errors
+/// [`StoreError::NotFound`] if the waypoint or the affected entry does not
+/// exist; otherwise propagates any SQLite failure.
+pub fn override_affected_entry(
+    store: &Store,
+    waypoint_id: &str,
+    entry_id: &str,
+    person: &str,
+) -> StoreResult<()> {
+    let _ = store.get_waypoint(waypoint_id)?;
+    let entry = store
+        .list_affected_entries(waypoint_id)?
+        .into_iter()
+        .find(|e| e.entry_id == entry_id)
+        .ok_or(StoreError::NotFound)?;
+    store.set_affected_survey_result(
+        waypoint_id,
+        entry.kind,
+        entry_id,
+        &SurveyVerdict {
+            impacted: false,
+            mode: entry.mode,
+            rationale: format!("overridden by {person}"),
+        },
+    )?;
+    notify_entry_released(
+        store,
+        waypoint_id,
+        entry.kind,
+        entry_id,
+        &format!("the hold was overridden by {person}"),
+    );
+    Ok(())
 }
 
 /// Wall-clock cap on one survey classification run through the subprocess
@@ -4338,7 +4516,7 @@ fn call_survey_agent(
     runner.preflight_agent(&selection.backend, selection.executable.as_deref(), None)?;
     let mut spec = crate::runner::RunnerSpec::for_proof(
         &candidate.entry_id,
-        "waypoint-survey",
+        crate::runner::WAYPOINT_SURVEY_TASK,
         &format!("survey-{waypoint_id}"),
         &cwd,
         user,
@@ -5798,20 +5976,18 @@ mod tests {
     // ── resolve_survey_verdict (fail-closed + advisory de-escalation) ──────
 
     #[test]
-    fn resolve_survey_verdict_fails_closed_on_call_error() {
-        let verdict = resolve_survey_verdict(Err("connection refused".to_string()), false);
-        assert!(verdict.impacted);
-        assert_eq!(verdict.mode, AffectedMode::Block);
-        assert!(verdict.rationale.contains("connection refused"));
+    fn resolve_survey_verdict_is_an_error_not_a_block_on_call_error() {
+        let error = resolve_survey_verdict(Err("connection refused".to_string()), false)
+            .expect_err("a failed call is not a verdict");
+        assert!(error.contains("connection refused"));
     }
 
     #[test]
-    fn resolve_survey_verdict_fails_closed_on_unparseable_reply() {
-        let verdict =
-            resolve_survey_verdict(Ok("the model rambled without a verdict".to_string()), false);
-        assert!(verdict.impacted);
-        assert_eq!(verdict.mode, AffectedMode::Block);
-        assert!(verdict.rationale.contains("unparseable"));
+    fn resolve_survey_verdict_is_an_error_on_unparseable_reply() {
+        let error =
+            resolve_survey_verdict(Ok("the model rambled without a verdict".to_string()), false)
+                .expect_err("an unparseable reply is not a verdict");
+        assert!(error.contains("unparseable"));
     }
 
     #[test]
@@ -5822,7 +5998,8 @@ mod tests {
                     .to_string(),
             ),
             true,
-        );
+        )
+        .unwrap();
         assert!(verdict.impacted);
         assert_eq!(verdict.mode, AffectedMode::Advisory);
     }
@@ -5832,7 +6009,8 @@ mod tests {
         let verdict = resolve_survey_verdict(
             Ok("IMPACTED: yes\nMODE: advisory\nRATIONALE: r".to_string()),
             false,
-        );
+        )
+        .unwrap();
         assert!(verdict.impacted);
         assert_eq!(verdict.mode, AffectedMode::Block);
     }
@@ -5842,7 +6020,8 @@ mod tests {
         let verdict = resolve_survey_verdict(
             Ok("IMPACTED: no\nRATIONALE: different area entirely".to_string()),
             true,
-        );
+        )
+        .unwrap();
         assert!(!verdict.impacted);
         assert_eq!(verdict.mode, AffectedMode::Block);
     }
@@ -8098,7 +8277,8 @@ mod tests {
             &Cancellations::new(),
             &as_runner,
         )
-        .unwrap();
+        .unwrap()
+        .expect("the reply is a verdict");
 
         assert!(
             !verdict.impacted,
@@ -8132,40 +8312,209 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_terminal_agent_survey_that_returns_nothing_fails_closed() {
-        // The fail-closed contract still governs the runner transport: an
-        // agent that produces no classifiable reply must block, never silently
-        // release the gate.
+    fn squad_candidate(id: &str) -> SurveyCandidate {
+        SurveyCandidate {
+            kind: WaypointEntryKind::Squad,
+            entry_id: id.to_string(),
+        }
+    }
+
+    /// One survey of `squad-1` through a canned reply, with a halt token
+    /// registered the way a running cell registers it.
+    fn survey_with_token(
+        reply: &str,
+        max_attempts: u32,
+    ) -> (
+        Arc<StoreMutex>,
+        crate::cancel::WaypointHaltToken,
+        Option<SurveyVerdict>,
+    ) {
         let store = Store::open_in_memory().unwrap();
-        store
-            .create_waypoint(
-                "waypoint-1",
-                None,
-                "greet() is being renamed",
-                Some("codex"),
-                None,
-                false,
-            )
-            .unwrap();
+        runner_waypoint(&store, "waypoint-1");
         insert_squad_with_cwd(&store, "squad-1", "/repo");
         let handle = handle(store);
-        let as_runner: Arc<dyn Runner> = SurveyTestRunner::new("   ");
-
-        let verdict = survey_candidate(
+        let halts = Cancellations::new();
+        let token = halts.register("squad-1");
+        let as_runner: Arc<dyn Runner> = SurveyTestRunner::new(reply);
+        let verdict = survey_candidate_with_limit(
             &handle,
             "waypoint-1",
-            &SurveyCandidate {
-                kind: WaypointEntryKind::Squad,
-                entry_id: "squad-1".to_string(),
-            },
-            &Cancellations::new(),
+            &squad_candidate("squad-1"),
+            &halts,
+            &as_runner,
+            max_attempts,
+        )
+        .unwrap();
+        (handle, token, verdict)
+    }
+
+    #[test]
+    fn a_survey_that_returns_nothing_leaves_the_entry_unjudged_and_running_work_alive() {
+        let (handle, token, verdict) = survey_with_token("   ", 3);
+        assert!(verdict.is_none(), "a failed survey is not a verdict");
+        assert!(
+            !token.is_cancelled(),
+            "nothing is killed on a failed survey"
+        );
+        let guard = handle.lock();
+        let entries = guard.list_affected_entries("waypoint-1").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(
+            entries[0].survey_verdict.is_none(),
+            "still unjudged, so it is retried"
+        );
+    }
+
+    #[test]
+    fn a_survey_that_keeps_failing_halts_with_a_remediation_after_the_limit() {
+        let store = Store::open_in_memory().unwrap();
+        runner_waypoint(&store, "waypoint-1");
+        insert_squad_with_cwd(&store, "squad-1", "/repo");
+        let handle = handle(store);
+        let halts = Cancellations::new();
+        let token = halts.register("squad-1");
+        let as_runner: Arc<dyn Runner> = SurveyTestRunner::new("   ");
+        let run = || {
+            survey_candidate_with_limit(
+                &handle,
+                "waypoint-1",
+                &squad_candidate("squad-1"),
+                &halts,
+                &as_runner,
+                2,
+            )
+            .unwrap()
+        };
+        assert!(run().is_none());
+        assert!(!token.is_cancelled());
+        let verdict = run().expect("the second failure reaches the limit");
+        assert!(verdict.impacted);
+        assert!(verdict.rationale.contains("survey could not run"));
+        assert!(token.is_cancelled(), "the limit halts the running work");
+        let guard = handle.lock();
+        let messages = mail(&guard);
+        let blocked: Vec<_> = messages
+            .iter()
+            .filter(|m| m.event_kind.as_deref() == Some("waypoint_blocked"))
+            .collect();
+        assert_eq!(blocked.len(), 1, "{messages:?}");
+        assert!(
+            blocked[0]
+                .message
+                .contains("ralphus waypoint override waypoint-1 squad-1"),
+            "{}",
+            blocked[0].message
+        );
+    }
+
+    #[test]
+    fn a_not_impacted_survey_touches_nothing_that_is_running() {
+        let (handle, token, verdict) =
+            survey_with_token("IMPACTED: no\nRATIONALE: only documentation", 3);
+        assert!(!verdict.expect("a verdict").impacted);
+        assert!(!token.is_cancelled(), "no kill for a not-impacted entry");
+        let guard = handle.lock();
+        let messages = mail(&guard);
+        assert!(
+            messages
+                .iter()
+                .all(|m| m.event_kind.as_deref() != Some("waypoint_blocked")),
+            "no failure notice: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn an_impacted_block_survey_halts_the_running_work() {
+        let (_handle, token, verdict) =
+            survey_with_token("IMPACTED: yes\nMODE: block\nRATIONALE: touches greet", 3);
+        assert!(verdict.expect("a verdict").impacted);
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn a_declared_entry_halts_without_a_survey() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_squad_with_cwd(&store, "squad-1", "/repo");
+        store
+            .add_affected_entry(
+                "waypoint-1",
+                WaypointEntryKind::Squad,
+                "squad-1",
+                AffectedMode::Block,
+            )
+            .unwrap();
+        let halts = Cancellations::new();
+        let token = halts.register("squad-1");
+        signal_explicit_block_halt(
+            &store,
+            &halts,
+            "waypoint-1",
+            WaypointEntryKind::Squad,
+            "squad-1",
+            AffectedMode::Block,
+        );
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn override_releases_only_the_named_entry() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        for id in ["squad-1", "squad-2"] {
+            insert_squad_with_cwd(&store, id, "/repo");
+            store
+                .add_affected_entry(
+                    "waypoint-1",
+                    WaypointEntryKind::Squad,
+                    id,
+                    AffectedMode::Block,
+                )
+                .unwrap();
+        }
+        override_affected_entry(&store, "waypoint-1", "squad-1", "ada").unwrap();
+        let entries = store.list_affected_entries("waypoint-1").unwrap();
+        let by = |id: &str| entries.iter().find(|e| e.entry_id == id).unwrap();
+        assert_eq!(
+            by("squad-1").survey_verdict.as_deref(),
+            Some("not_impacted")
+        );
+        assert_eq!(
+            by("squad-1").survey_rationale.as_deref(),
+            Some("overridden by ada")
+        );
+        assert!(
+            by("squad-2").survey_verdict.is_none(),
+            "the other stays held"
+        );
+        assert!(matches!(
+            override_affected_entry(&store, "waypoint-1", "squad-9", "ada"),
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn survey_runs_carry_the_task_that_exempts_them_from_halt_tokens() {
+        // The runner skips halt-token registration for this task, so a squad
+        // token tripped before the survey ran cannot kill the survey itself.
+        let store = Store::open_in_memory().unwrap();
+        runner_waypoint(&store, "waypoint-1");
+        insert_squad_with_cwd(&store, "squad-1", "/repo");
+        let handle = handle(store);
+        let halts = Cancellations::new();
+        halts.register("squad-1").cancel();
+        let runner = SurveyTestRunner::new("IMPACTED: no\nRATIONALE: unrelated");
+        let as_runner: Arc<dyn Runner> = runner.clone();
+        survey_candidate(
+            &handle,
+            "waypoint-1",
+            &squad_candidate("squad-1"),
+            &halts,
             &as_runner,
         )
         .unwrap();
-
-        assert!(verdict.impacted, "an unclassifiable reply must fail closed");
-        assert_eq!(verdict.mode, AffectedMode::Block);
+        let seen = runner.seen.lock().unwrap();
+        assert_eq!(seen[0].task, crate::runner::WAYPOINT_SURVEY_TASK);
     }
 
     #[test]
