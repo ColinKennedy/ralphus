@@ -658,7 +658,7 @@ impl Store {
                 w.model.as_deref(),
                 w.allow_advisory,
             )?;
-            if let Err(e) = self.add_submission_affected(&id, squad_id, w) {
+            if let Err(e) = self.add_submission_entries(&id, squad_id, w) {
                 let _ = self.discard_waypoint(&id);
                 return Err(e);
             }
@@ -683,53 +683,63 @@ impl Store {
         Ok(())
     }
 
-    fn add_submission_affected(
+    /// Writes the whole roster before any affected entry, so a squad the
+    /// waypoint affects is never visible to the scheduler without the roster
+    /// that releases it.
+    fn add_submission_entries(
         &self,
         id: &str,
         squad_id: &str,
         w: &ralphus_core::schema::WaypointDef,
     ) -> StoreResult<()> {
-        {
-            for entry in &w.affected {
-                // `core::validate`'s `validate_waypoint_blocks` already
-                // rejects an unparseable affected entry offline -- a `None`
-                // here would mean the daemon is running against a task file
-                // that bypassed that check.
-                let Some(parsed) = ralphus_core::schema::parse_affected_entry_sentinel(entry)
-                else {
-                    return Err(StoreError::InvalidTransition(format!(
-                        "waypoint affected entry {entry:?} is not a valid sentinel"
-                    )));
-                };
-                let (kind, entry_id) = match parsed {
-                    ralphus_core::schema::AffectedEntryRef::NewSquad => {
-                        (WaypointEntryKind::Squad, squad_id.to_string())
-                    }
-                    ralphus_core::schema::AffectedEntryRef::ExistingSquad(existing) => {
-                        (WaypointEntryKind::Squad, existing)
-                    }
-                    ralphus_core::schema::AffectedEntryRef::ExistingReview(raw) => {
-                        match ralphus_core::schema::review_link_key(&raw) {
-                            Some(key) => match self.guardian_id_for_review_key(squad_id, key)? {
-                                Some(guardian_id) => (WaypointEntryKind::Review, guardian_id),
-                                None => {
-                                    return Err(StoreError::InvalidTransition(format!(
-                                        "waypoint affected entry references review key \
-                                         {key:?}, but no guardian was created for it in \
-                                         squad {squad_id}"
-                                    )));
-                                }
-                            },
-                            None => (WaypointEntryKind::Review, raw),
-                        }
-                    }
-                };
-                self.add_affected_entry(id, kind, &entry_id, AffectedMode::Block)?;
-            }
+        for entry in &w.roster {
+            let (kind, entry_id) = self.resolve_submission_entry(squad_id, "roster", entry)?;
+            self.add_roster_entry(id, kind, &entry_id, None)?;
+        }
+        for entry in &w.affected {
+            let (kind, entry_id) = self.resolve_submission_entry(squad_id, "affected", entry)?;
+            self.add_affected_entry(id, kind, &entry_id, AffectedMode::Block)?;
         }
         Ok(())
     }
 
+    /// Resolve one `roster`/`affected` sentinel to a `(kind, id)`.
+    fn resolve_submission_entry(
+        &self,
+        squad_id: &str,
+        side: &str,
+        entry: &str,
+    ) -> StoreResult<EntryRef> {
+        // `core::validate`'s `validate_waypoint_blocks` already rejects an
+        // unparseable entry offline -- a `None` here would mean the daemon is
+        // running against a task file that bypassed that check.
+        let Some(parsed) = ralphus_core::schema::parse_affected_entry_sentinel(entry) else {
+            return Err(StoreError::InvalidTransition(format!(
+                "waypoint {side} entry {entry:?} is not a valid sentinel"
+            )));
+        };
+        Ok(match parsed {
+            ralphus_core::schema::AffectedEntryRef::NewSquad => {
+                (WaypointEntryKind::Squad, squad_id.to_string())
+            }
+            ralphus_core::schema::AffectedEntryRef::ExistingSquad(existing) => {
+                (WaypointEntryKind::Squad, existing)
+            }
+            ralphus_core::schema::AffectedEntryRef::ExistingReview(raw) => {
+                match ralphus_core::schema::review_link_key(&raw) {
+                    Some(key) => match self.guardian_id_for_review_key(squad_id, key)? {
+                        Some(guardian_id) => (WaypointEntryKind::Review, guardian_id),
+                        None => {
+                            return Err(StoreError::InvalidTransition(format!(
+                                "waypoint {side} entry references review key                                  {key:?}, but no guardian was created for it in                                  squad {squad_id}"
+                            )));
+                        }
+                    },
+                    None => (WaypointEntryKind::Review, raw),
+                }
+            }
+        })
+    }
     /// Fetch one waypoint by id.
     ///
     /// # Errors
