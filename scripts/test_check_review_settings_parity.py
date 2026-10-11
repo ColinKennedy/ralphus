@@ -9,12 +9,12 @@ from scripts.check_review_settings_parity import source_violations
 VALIDATE = '''
 pub const REVIEW_KEYS: &[&str] = &[
     "id",
-    "skip_auto_build",
+    "skip_worktrees",
 ];
 '''
 SERVER = '''
 struct GuardianSettingsBody {
-    skip_auto_build: Option<bool>, // ralphus[ignore-review-parity]: retained endpoint compatibility control
+    skip_worktrees: Option<bool>,
 }
 '''
 
@@ -22,8 +22,8 @@ struct GuardianSettingsBody {
 class ReviewSettingsParityTests(unittest.TestCase):
     def test_missing_mapping_fails(self) -> None:
         source = SERVER.replace(
-            "skip_auto_build: Option<bool>,",
-            "skip_auto_build: Option<bool>,\n    new_setting: Option<bool>,",
+            "skip_worktrees: Option<bool>,",
+            "skip_worktrees: Option<bool>,\n    new_setting: Option<bool>,",
         )
         self.assertIn("no [[review]] mapping", source_violations(source, VALIDATE)[0])
 
@@ -32,7 +32,7 @@ class ReviewSettingsParityTests(unittest.TestCase):
 struct GuardianSettingsBody {
     // ralphus[ignore-review-parity]: endpoint-only migration control, not a review setting
     endpoint_only: Option<bool>,
-    skip_auto_build: Option<bool>, // ralphus[ignore-review-parity]: retained endpoint compatibility control
+    skip_worktrees: Option<bool>, // ralphus[ignore-review-parity]: retained endpoint compatibility control
 }
 '''
         self.assertEqual(source_violations(source, VALIDATE), [])
@@ -42,7 +42,7 @@ struct GuardianSettingsBody {
 struct GuardianSettingsBody {
     // ralphus[ignore-review-parity]: no
     endpoint_only: Option<bool>,
-    skip_auto_build: Option<bool>, // ralphus[ignore-review-parity]: retained endpoint compatibility control
+    skip_worktrees: Option<bool>, // ralphus[ignore-review-parity]: retained endpoint compatibility control
 }
 '''
         self.assertIn("substantive", source_violations(source, VALIDATE)[0])

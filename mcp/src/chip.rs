@@ -51,7 +51,7 @@ impl Chip {
 pub fn parse_chip(text: &str) -> Chip {
     let Some(bracket_start) = text.find('[') else {
         if let Some((positive, _negative)) = text.split_once('/') {
-            // A tri-state option chip, e.g. "--skip-auto-build/--no-skip-auto-build".
+            // A tri-state option chip, e.g. "--skip-worktrees/--no-skip-worktrees".
             return Chip {
                 name: positive.to_string(),
                 required: false,
@@ -153,10 +153,10 @@ mod tests {
 
     #[test]
     fn parses_tri_state_option() {
-        let c = parse_chip("--skip-auto-build/--no-skip-auto-build");
-        assert_eq!(c.name, "--skip-auto-build");
+        let c = parse_chip("--skip-worktrees/--no-skip-worktrees");
+        assert_eq!(c.name, "--skip-worktrees");
         assert!(c.tri_state);
         assert!(!c.takes_value);
-        assert_eq!(c.property_name(), "skip_auto_build");
+        assert_eq!(c.property_name(), "skip_worktrees");
     }
 }
