@@ -113,8 +113,7 @@ pub struct ReviewConfig {
     #[serde(default)]
     pub checks: Vec<String>,
     /// RAL-101: the project's default build/test command, run in place of
-    /// `checks` when a review declares none (and hasn't opted out via
-    /// `guardian_skip_auto_build`) — so "in review" still means "testable" even
+    /// `checks` when a review declares none — so "in review" still means "testable" even
     /// when the review author configured no explicit check gates. This is now
     /// the *explicit override* tier: when unset, `generate_manual_commands`
     /// (RAL-110) instead asks the same LLM call that infers manual review
@@ -914,13 +913,6 @@ pub const REVIEW_FIELD_PARITY: &[(&str, ReviewFieldDefault)] = &[
     (
         "auto_build",
         ReviewFieldDefault::ProjectDefault(|c| c.auto_build.is_some()),
-    ),
-    (
-        "skip_auto_build",
-        ReviewFieldDefault::NotApplicable(
-            "skip_auto_build is retained only for stored compatibility settings; preparation \
-             is optional and new task files use `[[review.prepare]]` when work is needed.",
-        ),
     ),
     (
         "auto_fix_pr_errors",

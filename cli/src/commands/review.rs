@@ -68,7 +68,6 @@ pub enum ReviewCommand {
         base_branch: String,
         git_root: String,
         checks: Option<String>,
-        skip_auto_build: bool,
         skip_worktrees: bool,
         review_type: Option<String>,
     },
@@ -88,7 +87,6 @@ pub enum ReviewCommand {
     },
     Settings {
         selector: String,
-        skip_auto_build: Option<bool>,
         skip_worktrees: Option<bool>,
         resolver_agent: Option<String>,
         resolver_model: Option<String>,
@@ -420,7 +418,6 @@ pub fn parse(args: &[String]) -> ReviewCommand {
         }
         Some("create") => {
             let checks = scanner.take_value("--checks").ok().flatten();
-            let skip_auto_build = scanner.take_bool("--skip-auto-build");
             let skip_worktrees = scanner.take_bool("--skip-worktrees");
             let review_type = scanner.take_value("--review-type").ok().flatten();
             let rest = scanner.remaining();
@@ -430,7 +427,6 @@ pub fn parse(args: &[String]) -> ReviewCommand {
                     base_branch: base_branch.clone(),
                     git_root: git_root.clone(),
                     checks,
-                    skip_auto_build,
                     skip_worktrees,
                     review_type,
                 },
@@ -456,7 +452,6 @@ pub fn parse(args: &[String]) -> ReviewCommand {
             with_selector(scanner, |selector| ReviewCommand::Delete { selector, yes })
         }
         Some("settings") => {
-            let skip_auto_build = take_tri_bool(&mut scanner, "--skip-auto-build");
             let skip_worktrees = take_tri_bool(&mut scanner, "--skip-worktrees");
             let resolver_agent = scanner.take_value("--resolver-agent").ok().flatten();
             let resolver_model = scanner.take_value("--resolver-model").ok().flatten();
@@ -497,7 +492,6 @@ pub fn parse(args: &[String]) -> ReviewCommand {
             };
             with_selector(scanner, |selector| ReviewCommand::Settings {
                 selector,
-                skip_auto_build,
                 skip_worktrees,
                 resolver_agent,
                 resolver_model,
@@ -710,7 +704,7 @@ pub(crate) fn take_rebuild_on(
 
 /// `--flag`/`--no-flag` tri-state, mirroring Python's
 /// `argparse.BooleanOptionalAction` (default `None`). `name` must be the
-/// positive spelling (e.g. `"--skip-auto-build"`); the negative form is
+/// positive spelling (e.g. `"--skip-worktrees"`); the negative form is
 /// derived by inserting `no-` after the leading `--`.
 /// Take an `<on|off|inherit>` override switch: `None` when the flag is
 /// absent, `Some(None)` for `inherit` (clear the override), `Some(Some(b))`
@@ -1467,7 +1461,6 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
             base_branch,
             git_root,
             checks,
-            skip_auto_build,
             skip_worktrees,
             review_type,
         } => run_and_report(opts, None, || {
@@ -1484,7 +1477,6 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
                 &base_branch,
                 &git_root,
                 Some(&checks_vec),
-                skip_auto_build,
                 skip_worktrees,
                 review_type.as_deref(),
             )?;
@@ -1530,7 +1522,6 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
         }
         ReviewCommand::Settings {
             selector,
-            skip_auto_build,
             skip_worktrees,
             resolver_agent,
             resolver_model,
@@ -1557,7 +1548,6 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
         } => run_and_report(opts, None, || {
             let resolved = resolve_guardian_selector(&client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
             let settings = GuardianSettings {
-                skip_auto_build,
                 skip_worktrees,
                 resolver_agent: resolver_agent.as_deref(),
                 resolver_model: resolver_model.as_deref(),
@@ -2853,10 +2843,6 @@ fn render_review_detail(g: &Value) {
         g["effective_proof_skip_auto_clean"].to_string(),
     ));
     rows.push((
-        "skip_auto_build",
-        g["skip_auto_build"].as_bool().unwrap_or(false).to_string(),
-    ));
-    rows.push((
         "skip_worktrees",
         g["skip_worktrees"].as_bool().unwrap_or(false).to_string(),
     ));
@@ -3254,7 +3240,6 @@ mod tests {
             "/repo",
             "--checks",
             "fmt,test",
-            "--skip-auto-build",
             "--review-type",
             "hotfix",
         ])) {
@@ -3263,7 +3248,6 @@ mod tests {
                 base_branch,
                 git_root,
                 checks,
-                skip_auto_build,
                 review_type,
                 ..
             } => {
@@ -3271,7 +3255,6 @@ mod tests {
                 assert_eq!(base_branch, "main");
                 assert_eq!(git_root, "/repo");
                 assert_eq!(checks.as_deref(), Some("fmt,test"));
-                assert!(skip_auto_build);
                 assert_eq!(review_type.as_deref(), Some("hotfix"));
             }
             other => panic!("unexpected: {other:?}"),
@@ -3302,20 +3285,17 @@ mod tests {
         match parse(&v(&[
             "settings",
             "g1",
-            "--skip-auto-build",
             "--no-skip-worktrees",
             "--proof-scope",
             "each_branch",
         ])) {
             ReviewCommand::Settings {
                 selector,
-                skip_auto_build,
                 skip_worktrees,
                 proof_scope,
                 ..
             } => {
                 assert_eq!(selector, "g1");
-                assert_eq!(skip_auto_build, Some(true));
                 assert_eq!(skip_worktrees, Some(false));
                 assert_eq!(proof_scope.as_deref(), Some("each_branch"));
             }
@@ -3327,12 +3307,10 @@ mod tests {
     fn settings_tri_state_defaults_to_none_when_absent() {
         match parse(&v(&["settings", "g1"])) {
             ReviewCommand::Settings {
-                skip_auto_build,
                 skip_worktrees,
                 skip_base_updates,
                 ..
             } => {
-                assert_eq!(skip_auto_build, None);
                 assert_eq!(skip_worktrees, None);
                 assert_eq!(skip_base_updates, None);
             }

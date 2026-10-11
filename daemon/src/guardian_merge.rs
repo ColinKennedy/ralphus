@@ -3518,7 +3518,7 @@ fn run_final_proof(
 /// restarted for this branch (e.g. after `rebuild_on_base_shift`) then has a
 /// reliable signal that the last full check pass actually succeeded, not
 /// just that the agent said so. No note when `checks` is empty (nothing was
-/// actually validated) or `skip_auto_build` is set.
+/// actually validated).
 ///
 /// A failure here **does** fail the merge, unlike the post-merge gates run by
 /// [`final_checks`], which are advisory. The two are not inconsistent: this
@@ -3535,16 +3535,7 @@ fn run_commit_checks(
     branch: &str,
     cancel: &CancelToken,
 ) -> std::result::Result<(), String> {
-    let (skip_auto_build, checks) = {
-        let guard = store.lock();
-        (
-            guard.guardian_skip_auto_build(id).unwrap_or(false),
-            guard.guardian_checks(id).unwrap_or_default(),
-        )
-    };
-    if skip_auto_build {
-        return Ok(());
-    }
+    let checks = store.lock().guardian_checks(id).unwrap_or_default();
     // RAL-191: check gates run under the branch's resolved environment, same as
     // the agent invocations against this worktree -- a gate like `cargo test`
     // is worthless if it runs without the variables the code expects.

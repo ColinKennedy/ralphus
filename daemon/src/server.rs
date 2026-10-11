@@ -14146,8 +14146,6 @@ struct CreateGuardianBody {
     #[serde(default)]
     checks: Vec<String>,
     #[serde(default)]
-    skip_auto_build: bool,
-    #[serde(default)]
     skip_worktrees: bool,
     #[serde(default)]
     review_type: Option<String>,
@@ -14155,9 +14153,6 @@ struct CreateGuardianBody {
 
 #[derive(Deserialize)]
 struct GuardianSettingsBody {
-    #[serde(default)]
-    // ralphus[ignore-review-parity]: retained only for stored guardian compatibility settings; preparation is optional and new task files use `[[review.prepare]]` instead of a `[[review]]` key
-    skip_auto_build: Option<bool>,
     #[serde(default)]
     skip_worktrees: Option<bool>,
     #[serde(default)]
@@ -14326,8 +14321,6 @@ struct GuardianDetailsBody {
     proof_scope: Option<String>,
     #[serde(default)]
     proof_skip_auto_clean: Option<bool>,
-    #[serde(default)]
-    skip_auto_build: Option<bool>,
     #[serde(default)]
     skip_worktrees: Option<bool>,
     /// RAL-514: see [`GuardianSettingsBody::skip_base_updates`].
@@ -14718,9 +14711,6 @@ fn guardian_create(daemon: &Daemon, user_header: Option<&str>, body: &str) -> Re
             if !req.checks.is_empty() {
                 let _ = store.set_guardian_checks(&id, &req.checks);
             }
-            if req.skip_auto_build {
-                let _ = store.set_guardian_skip_auto_build(&id, true);
-            }
             if req.skip_worktrees {
                 let _ = store.set_guardian_skip_worktrees(&id, true);
             }
@@ -14824,7 +14814,7 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
         return error(
             400,
             "bad_request",
-            "body must be {skip_auto_build?, proof_scope?}",
+            "body must be {skip_worktrees?, proof_scope?}",
             vec![],
         );
     };
@@ -14832,11 +14822,6 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
         return reply;
     }
     let store = daemon.lock();
-    if let Some(skip) = req.skip_auto_build {
-        if let Err(e) = store.set_guardian_skip_auto_build(id, skip) {
-            return store_error(&e);
-        }
-    }
     if let Some(skip) = req.skip_worktrees {
         if let Err(e) = store.set_guardian_skip_worktrees(id, skip) {
             return store_error(&e);
@@ -15223,11 +15208,6 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
             return store_error(&e);
         }
     }
-    if let Some(skip) = req.skip_auto_build {
-        if let Err(e) = store.set_guardian_skip_auto_build(id, skip) {
-            return store_error(&e);
-        }
-    }
     if let Some(skip) = req.skip_worktrees {
         if let Err(e) = store.set_guardian_skip_worktrees(id, skip) {
             return store_error(&e);
@@ -15378,7 +15358,6 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
     let rebase_relevant = base_changed
         || req.resolver_agent.is_some()
         || req.resolver_model.is_some()
-        || req.skip_auto_build.is_some()
         || req.skip_worktrees.is_some()
         || req.squash_projects.is_some()
         || req.build_env.is_some()
@@ -29524,13 +29503,12 @@ remediation_attempts = 1
         assert!(index.body.contains("\"branch_count\":0"));
         // Detail-only fields the sidebar list never reads must not be
         // serialized here -- that's the entire point of this endpoint.
-        assert!(!index.body.contains("\"skip_auto_build\""));
         assert!(!index.body.contains("\"combined_env\""));
         assert!(!index.body.contains("\"attempt_tokens_in\""));
 
         // The full endpoint is unaffected by this one's existence.
         let full = route(&d, "GET", "/api/guardians", "");
-        assert!(full.body.contains("\"skip_auto_build\""));
+        assert!(full.body.contains("\"combined_env\""));
     }
 
     #[test]
@@ -29647,29 +29625,6 @@ remediation_attempts = 1
         assert_eq!(del.status, 200);
 
         assert!(crate::terminal_log::list_attempts(&name).is_empty());
-    }
-
-    #[test]
-    fn guardian_skip_auto_build_via_create_and_settings() {
-        let d = daemon();
-        let body = serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo","skip_auto_build":true})
-            .to_string();
-        route(&d, "POST", "/api/guardians", &body);
-        let gid = "guardian-000000000001";
-        assert!(
-            route(&d, "GET", &format!("/api/guardians/{gid}"), "")
-                .body
-                .contains("\"skip_auto_build\":true")
-        );
-        // toggle back off via settings
-        let r = route(
-            &d,
-            "POST",
-            &format!("/api/guardians/{gid}/settings"),
-            "{\"skip_auto_build\":false}",
-        );
-        assert_eq!(r.status, 200);
-        assert!(r.body.contains("\"skip_auto_build\":false"));
     }
 
     #[test]
@@ -32568,14 +32523,14 @@ remediation_attempts=1
         let d = daemon();
         let gid = make_guardian(&d);
         let body = serde_json::json!({
-            "skip_auto_build": true,
+            "skip_worktrees": true,
             "proof_scope": "final_branch",
             "match_pr_branch_name": true,
         })
         .to_string();
         let r = route(&d, "POST", &format!("/api/guardians/{gid}/details"), &body);
         assert_eq!(r.status, 200, "{}", r.body);
-        assert!(r.body.contains("\"skip_auto_build\":true"));
+        assert!(r.body.contains("\"skip_worktrees\":true"));
         assert!(r.body.contains("\"proof_scope\":\"final_branch\""));
         assert!(r.body.contains("\"match_pr_branch_name\":true"));
     }
@@ -32778,7 +32733,7 @@ remediation_attempts=1
         // re-attempting; with no branches the re-attempt fails fast
         // (`NoBranches`) and never re-claims `merging`, so landing on
         // `collecting` here is proof the restart ran exactly once.
-        let rebase_relevant = serde_json::json!({"skip_auto_build": true}).to_string();
+        let rebase_relevant = serde_json::json!({"skip_worktrees": true}).to_string();
         let r = route(
             &d,
             "POST",
@@ -32824,7 +32779,7 @@ remediation_attempts=1
             )
             .unwrap();
 
-        let rebase_relevant = serde_json::json!({"skip_auto_build": true}).to_string();
+        let rebase_relevant = serde_json::json!({"skip_worktrees": true}).to_string();
         let r = route(
             &d,
             "POST",

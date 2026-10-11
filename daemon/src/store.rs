@@ -1876,7 +1876,6 @@ impl Store {
                 conflicts_found     INTEGER,
                 conflicts_fixed     INTEGER,
                 conflicts_committed INTEGER,
-                skip_auto_build   INTEGER NOT NULL DEFAULT 0,
                 -- Read-only legacy data (RAL-285): nothing writes this column
                 -- anymore. `hydrate_guardian` reads it only to resolve a row
                 -- carrying the bit with no explicit `proof_scope` to an
@@ -3007,10 +3006,6 @@ impl Store {
             // asynchronous work (squad-claim, cell execution, proof execution)
             // continues the same OpenTelemetry trace instead of starting a new one.
             "ALTER TABLE squads ADD COLUMN trace_context TEXT",
-            // RAL-110: split the old single `skip_checks` flag into two independent
-            // opt-outs -- see the backfill-and-drop block below, which carries
-            // forward any existing `skip_checks` value into both.
-            "ALTER TABLE guardians ADD COLUMN skip_auto_build INTEGER NOT NULL DEFAULT 0",
             // Read-only legacy data (RAL-285) -- see the `CREATE TABLE guardians`
             // comment on this column.
             "ALTER TABLE guardians ADD COLUMN skip_worktree_checks INTEGER NOT NULL DEFAULT 0",
@@ -4082,10 +4077,7 @@ impl Store {
             self.run_idempotent_migration(stmt);
         }
         // RAL-110: one-time backfill of the old `skip_checks` column (present on
-        // any database created before this change) into both new columns --
-        // preserving prior behavior exactly (skip_checks used to gate both the
-        // finalize-time build/check step AND the per-worktree quality prompt)
-        // until a user explicitly changes one of the split flags. Guarded on the
+        // any database created before this change) into `skip_worktree_checks`. Guarded on the
         // column still existing so this runs exactly once: the DROP COLUMN below
         // makes it a no-op (harmless error, ignored) on every later startup,
         // instead of re-clobbering a later explicit toggle back to the old value.
@@ -4097,8 +4089,7 @@ impl Store {
             .is_some();
         if has_old_skip_checks {
             let backfill = self.conn.execute(
-                "UPDATE guardians SET skip_auto_build = skip_checks, \
-                 skip_worktree_checks = skip_checks",
+                "UPDATE guardians SET skip_worktree_checks = skip_checks",
                 [],
             );
             self.note_migration("RAL-110 skip_checks backfill", backfill);
@@ -4106,6 +4097,21 @@ impl Store {
                 .conn
                 .execute("ALTER TABLE guardians DROP COLUMN skip_checks", []);
             self.note_migration("RAL-110 drop guardians.skip_checks", drop);
+        }
+        // RAL-609: `skip_auto_build` is retired -- nothing reads it anymore, so
+        // the column is dropped outright rather than mapped forward. Guarded on
+        // the column existing so the DROP runs exactly once.
+        let has_skip_auto_build = self
+            .conn
+            .prepare("SELECT 1 FROM pragma_table_info('guardians') WHERE name='skip_auto_build'")
+            .and_then(|mut s| s.query_row([], |_| Ok(())).optional())
+            .unwrap_or(None)
+            .is_some();
+        if has_skip_auto_build {
+            let drop = self
+                .conn
+                .execute("ALTER TABLE guardians DROP COLUMN skip_auto_build", []);
+            self.note_migration("RAL-609 drop guardians.skip_auto_build", drop);
         }
         // RAL-168: `verify_mid_resolution` is retired -- replaced outright by
         // `proof_scope`/`proof_skip_auto_clean` above, not mapped forward
@@ -13487,6 +13493,42 @@ prompt = "legacy cell, no review_guardian_id"
         assert_eq!(presets[0].name, "legacy");
         assert_eq!(presets[0].system_prompt.as_deref(), Some("sys"));
         assert_eq!(presets[0].pass_score, None);
+    }
+
+    #[test]
+    fn migration_drops_retired_skip_auto_build_column_from_existing_guardians() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("legacy", "main", "/repo").unwrap();
+        let has_column = |store: &Store| -> bool {
+            store
+                .conn
+                .prepare(
+                    "SELECT 1 FROM pragma_table_info('guardians') WHERE name='skip_auto_build'",
+                )
+                .and_then(|mut s| s.query_row([], |_| Ok(())).optional())
+                .unwrap()
+                .is_some()
+        };
+        assert!(!has_column(&store), "fresh databases never create it");
+        // An established database still carries the column, set on some rows.
+        store
+            .conn
+            .execute(
+                "ALTER TABLE guardians ADD COLUMN skip_auto_build INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute("UPDATE guardians SET skip_auto_build=1", [])
+            .unwrap();
+        store
+            .init_schema()
+            .expect("migration must drop the retired column");
+        assert!(!has_column(&store));
+        assert_eq!(store.get_guardian(&id).unwrap().name, "legacy");
+        // Idempotent on later startups.
+        store.init_schema().unwrap();
     }
 
     #[test]

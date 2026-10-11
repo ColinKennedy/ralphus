@@ -363,17 +363,15 @@ mod tests {
             .expect("review settings tool");
         let mut args = Map::new();
         args.insert("selector".to_string(), json!("squad-1/review"));
-        args.insert("skip_auto_build".to_string(), json!(false));
+        args.insert("skip_worktrees".to_string(), json!(false));
         let argv = tool.build_argv(&args).unwrap();
         assert!(
-            argv.contains(&"--no-skip-auto-build".to_string()),
+            argv.contains(&"--no-skip-worktrees".to_string()),
             "{argv:?}"
         );
         match commands::parse_args(&argv) {
-            Command::Review(ReviewCommand::Settings {
-                skip_auto_build, ..
-            }) => {
-                assert_eq!(skip_auto_build, Some(false));
+            Command::Review(ReviewCommand::Settings { skip_worktrees, .. }) => {
+                assert_eq!(skip_worktrees, Some(false));
             }
             other => panic!("unexpected command: {other:?}"),
         }

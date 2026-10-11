@@ -2291,10 +2291,9 @@ fn validate_waypoint_blocks(root: &toml::Table, value: Option<&toml::Value>, ctx
 /// Validate `[[review.auto_build]]` entries (RAL-342): declares this review's build
 /// steps, either verbatim `command` or agent-driven `prompt` (mutually
 /// exclusive with each other, mirroring [`validate_review_action_array`]'s
-/// `prompt`/`command` XOR). If any entries are present, they're mutually
-/// exclusive with `skip_auto_build`. An empty `[[review.auto_build]]` entry is
+/// `prompt`/`command` XOR). An empty `[[review.auto_build]]` entry is
 /// rejected -- it can't be distinguished from a typo'd/half-written declaration.
-/// Whether neither `auto_build` nor `skip_auto_build` is set at all is NOT an
+/// Whether `auto_build` is unset is NOT an
 /// error here: that's only knowable once project-level `.ralphus.toml` config
 /// is in the picture too, which is a daemon-level, submit-time check (mirrors
 /// [`check_machine`]'s core/daemon split) -- see
@@ -2337,11 +2336,6 @@ fn validate_rebuild_on(table: &toml::Table, rpath: &str, ctx: &mut Ctx, header: 
 }
 
 fn validate_auto_build_table(table: &toml::Table, rpath: &str, ctx: &mut Ctx, header: Option<u32>) {
-    let skip_auto_build = table
-        .get("skip_auto_build")
-        .and_then(toml::Value::as_bool)
-        .unwrap_or(false);
-
     let Some(value) = table.get("auto_build") else {
         return;
     };
@@ -2354,16 +2348,6 @@ fn validate_auto_build_table(table: &toml::Table, rpath: &str, ctx: &mut Ctx, he
         );
         return;
     };
-
-    if skip_auto_build && !arr.is_empty() {
-        ctx.error(
-            rpath,
-            ErrorKind::ConflictingKeys,
-            "cannot set both [[review.auto_build]] and skip_auto_build; use exactly one",
-            ctx.key_line(header, "auto_build"),
-        );
-        return;
-    }
 
     for (idx, item) in arr.iter().enumerate() {
         let Some(auto_build) = item.as_table() else {
@@ -6154,19 +6138,6 @@ placement = "copy"
     #[test]
     fn review_auto_build_command_and_prompt_conflict_rejected() {
         let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\n[[review.auto_build]]\ncommand=\"cargo build\"\nprompt=\"build it\"\n";
-        let r = validate_toml(src);
-        assert!(
-            r.errors
-                .iter()
-                .any(|e| e.kind == ErrorKind::ConflictingKeys),
-            "{:?}",
-            r.errors
-        );
-    }
-
-    #[test]
-    fn review_auto_build_and_skip_auto_build_conflict_rejected() {
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nskip_auto_build=true\n[[review.auto_build]]\ncommand=\"cargo build\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors

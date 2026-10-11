@@ -459,7 +459,6 @@
        * @property {string} [summary_state]
        * @property {string} [change_summary]
        * @property {string} [detail]
-       * @property {boolean} [skip_auto_build]
        * @property {boolean} [skip_worktrees]
        * @property {boolean|null} [skip_base_updates] - RAL-250: this review's own override for whether the automatic base-branch auto-update rebuild is skipped, or null to inherit the project/global default.
        * @property {boolean} [effective_skip_base_updates] - RAL-250: skip_base_updates resolved against the project/global default -- what the automatic base-shift sweep actually gates on.
