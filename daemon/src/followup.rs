@@ -857,13 +857,22 @@ fn task_prompt(review_name: &str, item: &FollowupItem) -> String {
     }
     out.push_str(
         "\nDo the deferred work described above and nothing else. The original work is already \
-         merged; build on the current state of the branch.",
+         merged; build on the current state of the branch.\n\nWhen the work is done, commit \
+         all of it on the current branch with a clear commit message, then push that branch \
+         (`git push -u origin HEAD`). Work that is left uncommitted is not seen, and the task \
+         fails for having no commits.",
     );
     out
 }
 
-/// Drafts the follow-up squad's task file: one task per deferred item, all
-/// feeding one review that targets `base`.
+/// Drafts the follow-up squad's task file: one task per deferred item, each
+/// on its own worktree branched from `base`.
+///
+/// The file names no `[[review]]`. Every cell opts into Triage
+/// (`triage = true`, no `triage_type`) so the Arbiter classifies it into a
+/// registered type and pools it with other work of that `(project, type)`;
+/// the pool's drain slots the follow-up work into an automatic review, the
+/// same path ordinary Triage cells take.
 #[must_use]
 pub fn draft_followup_toml(
     project: &str,
@@ -871,8 +880,6 @@ pub fn draft_followup_toml(
     base: &str,
     items: &[FollowupItem],
 ) -> String {
-    let review_key = "followup";
-    let sentinel = format!("<<ralphus:new-review/{review_key}>>");
     let guardian_slug = slug(&guardian.id);
     // A follow-up runs where the work it follows up on ran.
     let machine = guardian.machine.as_deref().filter(|m| !m.is_empty());
@@ -888,7 +895,7 @@ pub fn draft_followup_toml(
                 format!("<<ralphus:new-worktree/{branch}?upstream={base}>>").into(),
             );
             cell.insert("prompt".into(), task_prompt(&guardian.name, item).into());
-            cell.insert("review".into(), sentinel.clone().into());
+            cell.insert("triage".into(), true.into());
             if let Some(agent) = item.agent.as_deref().filter(|a| !a.is_empty()) {
                 cell.insert("agent".into(), agent.into());
             }
@@ -905,19 +912,312 @@ pub fn draft_followup_toml(
             toml::Value::Table(task)
         })
         .collect();
-    let mut review = toml::Table::new();
-    review.insert(
-        "id".into(),
-        format!("ralphus:new-review/{review_key}").into(),
-    );
-    review.insert("upstream".into(), base.into());
-    if let Some(machine) = machine {
-        review.insert("machine".into(), machine.into());
-    }
     let mut root = toml::Table::new();
     root.insert("task".into(), toml::Value::Array(tasks));
-    root.insert("review".into(), toml::Value::Array(vec![review.into()]));
     toml::to_string(&root).unwrap_or_default()
+}
+
+/// The proof steps one follow-up task inherits from the work it follows up
+/// on, as `[[task.cell.proof]]` / `[[task.proof]]` tables ready to splice in.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct InheritedProofs {
+    /// Cell-scope steps, attached to the follow-up task's one cell.
+    pub cell: Vec<toml::Table>,
+    /// Task-scope steps, attached to the follow-up task itself.
+    pub task: Vec<toml::Table>,
+    /// Where the steps came from, for the log line (`cell:...`, or the review
+    /// whose linked cells stood in for an origin that no longer resolves).
+    pub source: String,
+}
+
+/// One row of `proofs`, as far as a follow-up copies it.
+struct StoredProof {
+    id: Option<String>,
+    kind: String,
+    spec: String,
+    agent: String,
+    model: Option<String>,
+    timeout_sec: Option<i64>,
+    budget_tokens: Option<i64>,
+    maximum_tool_output_tokens: Option<i64>,
+    maximum_timeout_sec: Option<i64>,
+    mode: Option<String>,
+    remediation_attempts: Option<i64>,
+    pass_score: Option<i64>,
+}
+
+/// The task-file table for one stored proof step, or `None` for a row that is
+/// neither a `command` nor a `prompt` proof. Only the step's own definition is
+/// copied: `restart_on` names steps of the original squad, `environment`
+/// holds values resolved against the original worktree, and `extends`
+/// presets are already stamped into the stored fields, so none of them mean
+/// anything in the new squad. `agent` is written only when the step overrode
+/// the agent of the cell it belongs to (`cell_agent`).
+fn inherited_proof_table(proof: &StoredProof, cell_agent: &str) -> Option<toml::Table> {
+    let mut step = toml::Table::new();
+    match proof.kind.as_str() {
+        "command" => {
+            step.insert("command".into(), proof.spec.clone().into());
+            if let Some(mode) = proof.mode.as_deref().filter(|m| !m.is_empty()) {
+                step.insert("mode".into(), mode.into());
+            }
+            if let Some(attempts) = proof.remediation_attempts {
+                step.insert("remediation_attempts".into(), attempts.into());
+            }
+        }
+        "prompt" => {
+            step.insert("prompt".into(), proof.spec.clone().into());
+            if let Some(score) = proof.pass_score {
+                step.insert("pass_score".into(), score.into());
+            }
+        }
+        _ => return None,
+    }
+    if let Some(id) = proof.id.as_deref().filter(|i| !i.is_empty()) {
+        step.insert("id".into(), id.into());
+    }
+    if !proof.agent.is_empty() && proof.agent != cell_agent {
+        step.insert("agent".into(), proof.agent.clone().into());
+    }
+    if let Some(model) = proof.model.as_deref().filter(|m| !m.is_empty()) {
+        step.insert("model".into(), model.into());
+    }
+    if let Some(secs) = proof.timeout_sec.filter(|s| *s > 0) {
+        step.insert("timeout_minutes".into(), ((secs + 59) / 60).into());
+    }
+    if let Some(tokens) = proof.budget_tokens.filter(|t| *t > 0) {
+        step.insert("budget_tokens".into(), tokens.into());
+    }
+    if let Some(tokens) = proof.maximum_tool_output_tokens.filter(|t| *t > 0) {
+        step.insert("maximum_tool_output_tokens".into(), tokens.into());
+    }
+    if let Some(secs) = proof.maximum_timeout_sec.filter(|s| *s > 0) {
+        step.insert("maximum_timeout_seconds".into(), secs.into());
+    }
+    Some(step)
+}
+
+/// Adds each `inherited[i]` to the `i`-th task of a drafted follow-up task
+/// file: cell-scope steps under its first cell, task-scope steps on the task.
+/// A task with no entry (or an empty one) is left as drafted, and so is the
+/// whole file if it does not parse.
+#[must_use]
+pub fn attach_inherited_proofs(draft: &str, inherited: &[InheritedProofs]) -> String {
+    if inherited
+        .iter()
+        .all(|p| p.cell.is_empty() && p.task.is_empty())
+    {
+        return draft.to_string();
+    }
+    let Ok(mut root) = draft.parse::<toml::Table>() else {
+        return draft.to_string();
+    };
+    if let Some(toml::Value::Array(tasks)) = root.get_mut("task") {
+        for (task, proofs) in tasks.iter_mut().zip(inherited) {
+            let Some(task) = task.as_table_mut() else {
+                continue;
+            };
+            if !proofs.cell.is_empty() {
+                if let Some(toml::Value::Array(cells)) = task.get_mut("cell") {
+                    if let Some(cell) = cells.first_mut().and_then(toml::Value::as_table_mut) {
+                        cell.insert("proof".into(), table_array(&proofs.cell));
+                    }
+                }
+            }
+            if !proofs.task.is_empty() {
+                task.insert("proof".into(), table_array(&proofs.task));
+            }
+        }
+    }
+    toml::to_string(&root).unwrap_or_else(|_| draft.to_string())
+}
+
+fn table_array(steps: &[toml::Table]) -> toml::Value {
+    toml::Value::Array(steps.iter().cloned().map(toml::Value::Table).collect())
+}
+
+impl Store {
+    /// The proof steps of one stored scope (`"cell"` with the cell's index, or
+    /// `"task"` with `-1`), in order.
+    fn stored_proofs(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        scope: &str,
+        cell_idx: i64,
+    ) -> Result<Vec<StoredProof>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT vid, kind, spec, agent, model, timeout_sec, budget_tokens,
+                    maximum_tool_output_tokens, maximum_timeout_sec, mode,
+                    remediation_attempts, pass_score
+             FROM proofs WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=?
+             ORDER BY idx",
+        )?;
+        let rows = stmt
+            .query_map(params![squad_id, task_idx, scope, cell_idx], |r| {
+                Ok(StoredProof {
+                    id: r.get(0)?,
+                    kind: r.get(1)?,
+                    spec: r.get(2)?,
+                    agent: r.get(3)?,
+                    model: r.get(4)?,
+                    timeout_sec: r.get(5)?,
+                    budget_tokens: r.get(6)?,
+                    maximum_tool_output_tokens: r.get(7)?,
+                    maximum_timeout_sec: r.get(8)?,
+                    mode: r.get(9)?,
+                    remediation_attempts: r.get(10)?,
+                    pass_score: r.get(11)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// The proofs of one cell and of its task, appended to `out` (steps
+    /// already present by `(kind, spec)` are skipped, so several linked cells
+    /// that share a proof contribute it once).
+    fn collect_cell_proofs(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        cell_idx: i64,
+        out: &mut InheritedProofs,
+    ) -> Result<()> {
+        let cell_agent: String = self
+            .conn
+            .query_row(
+                "SELECT agent FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
+                params![squad_id, task_idx, cell_idx],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or_default();
+        for (scope, idx, target) in [
+            ("cell", cell_idx, &mut out.cell),
+            ("task", -1, &mut out.task),
+        ] {
+            for proof in self.stored_proofs(squad_id, task_idx, scope, idx)? {
+                if let Some(step) = inherited_proof_table(&proof, &cell_agent) {
+                    if !target.contains(&step) {
+                        target.push(step);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The proofs a follow-up for `item` inherits: those of the cell that
+    /// deferred it and of that cell's task. When that cell no longer exists
+    /// (its squad was deleted, or a review-level deferral never had one), the
+    /// proofs of the cells linked to `guardian_id`'s branches stand in, newest
+    /// cell per branch. A store error yields no proofs rather than blocking
+    /// the follow-up.
+    #[must_use]
+    pub fn followup_inherited_proofs(
+        &self,
+        guardian_id: &str,
+        item: &FollowupItem,
+    ) -> InheritedProofs {
+        let mut out = InheritedProofs::default();
+        let origin = match crate::entity_uri::parse(&item.entity_uri) {
+            Some(crate::entity_uri::EntityUri::Cell {
+                squad_id,
+                task_idx,
+                cell_idx,
+            }) if self.cell_context_for_uri(&item.entity_uri).is_some() => {
+                Some((squad_id, task_idx, cell_idx))
+            }
+            _ => None,
+        };
+        let result = if let Some((squad_id, task_idx, cell_idx)) = origin {
+            out.source = item.entity_uri.clone();
+            self.collect_cell_proofs(&squad_id, task_idx, cell_idx, &mut out)
+        } else {
+            out.source = format!("the cells linked to review {guardian_id}");
+            self.collect_linked_cell_proofs(guardian_id, &mut out)
+        };
+        if let Err(e) = result {
+            crate::rlog!(
+                WARNING,
+                "ralphus [followup] could not read the proofs of {}: {e}",
+                out.source
+            );
+            crate::cartographer::Note::new("followup")
+                .scope("followup")
+                .guardian(guardian_id)
+                .emit(
+                    self,
+                    format!(
+                        "review {guardian_id}: could not read the proofs of {} for a follow-up",
+                        out.source
+                    ),
+                    serde_json::json!({"source": out.source, "error": e.to_string()}),
+                );
+            return InheritedProofs::default();
+        }
+        crate::rlog!(
+            INFO,
+            "ralphus [followup] {} inherits {} cell proof(s) and {} task proof(s) from {}",
+            item.entity_uri,
+            out.cell.len(),
+            out.task.len(),
+            out.source
+        );
+        crate::cartographer::Note::new("followup")
+            .scope("followup")
+            .guardian(guardian_id)
+            .emit(
+                self,
+                format!(
+                    "review {guardian_id}: follow-up for {} inherits {} cell proof(s) and {} task \
+                     proof(s) from {}",
+                    item.entity_uri,
+                    out.cell.len(),
+                    out.task.len(),
+                    out.source
+                ),
+                serde_json::json!({
+                    "entity_uri": item.entity_uri,
+                    "cell_proofs": out.cell.len(),
+                    "task_proofs": out.task.len(),
+                    "source": out.source,
+                }),
+            );
+        out
+    }
+
+    /// Fallback for [`Self::followup_inherited_proofs`]: the proofs of the
+    /// newest cell on each of the review's branches.
+    fn collect_linked_cell_proofs(
+        &self,
+        guardian_id: &str,
+        out: &mut InheritedProofs,
+    ) -> Result<()> {
+        let mut stmt = self.conn.prepare(
+            "SELECT squad_id, task_idx, idx, review_branch FROM cells
+             WHERE review_guardian_id=? AND review_branch IS NOT NULL
+             ORDER BY rowid DESC",
+        )?;
+        let linked = stmt
+            .query_map(params![guardian_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut seen = std::collections::HashSet::new();
+        for (squad_id, task_idx, cell_idx, branch) in linked {
+            if seen.insert(branch) {
+                self.collect_cell_proofs(&squad_id, task_idx, cell_idx, out)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Splits a stored merge target into `(remote, branch)`. The daemon records a
@@ -1241,8 +1541,20 @@ fn submit_followup_squad(
     let root = Path::new(&guardian.git_root);
     let base = resolve_followup_base(root, &guardian.base_branch);
     let started = guardian.effective_followup_auto_start;
+    let inherited: Vec<InheritedProofs> = {
+        let store = daemon.lock();
+        offer
+            .items
+            .iter()
+            .map(|item| store.followup_inherited_proofs(&guardian.id, item))
+            .collect()
+    };
+    let draft = attach_inherited_proofs(
+        &draft_followup_toml(&project, guardian, &base, &offer.items),
+        &inherited,
+    );
     let body = serde_json::json!({
-        "toml": draft_followup_toml(&project, guardian, &base, &offer.items),
+        "toml": draft,
         "hold": !started,
         "label": format!("follow-up: {}", guardian.name),
     })
@@ -1619,6 +1931,123 @@ prompt = "add feature.txt"
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    const PROOF_SQUAD: &str = r#"
+[[task]]
+name = "Add feature"
+timeout_minutes = 10
+[[task.cell]]
+cwd = "/repo"
+prompt = "add feature.txt"
+agent = "claude-code"
+[[task.cell.proof]]
+id = "unit"
+command = "cargo test"
+mode = "remediating"
+remediation_attempts = 3
+[[task.cell.proof]]
+prompt = "check the feature reads well"
+pass_score = 7
+agent = "codex"
+[[task.proof]]
+command = "cargo clippy"
+mode = "raw"
+"#;
+
+    fn seed_proof_squad(s: &mut Store, guardian_id: &str) -> String {
+        let file: ralphus_core::schema::TaskFile = toml::from_str(PROOF_SQUAD).expect("valid toml");
+        let squad_id = s.insert_squad(&file, None, false).unwrap();
+        s.set_cell_review_branch(&squad_id, 0, 0, "feat/readme")
+            .unwrap();
+        s.conn
+            .execute(
+                "UPDATE cells SET review_guardian_id=? WHERE squad_id=?",
+                params![guardian_id, squad_id],
+            )
+            .unwrap();
+        squad_id
+    }
+
+    fn item_for(owner: &str) -> FollowupItem {
+        FollowupItem {
+            entity_uri: owner.to_string(),
+            ..item("document it", None)
+        }
+    }
+
+    #[test]
+    fn a_follow_up_inherits_the_proofs_of_the_cell_that_deferred_it() {
+        let mut s = store();
+        let root = temp_root("inherit");
+        seed_guardian(&s, "g1", &root);
+        let squad_id = seed_proof_squad(&mut s, "g1");
+        let got = s.followup_inherited_proofs("g1", &item_for(&format!("cell:{squad_id}:0:0")));
+        assert_eq!(got.source, format!("cell:{squad_id}:0:0"));
+        assert_eq!(got.cell.len(), 2);
+        assert_eq!(got.cell[0]["command"].as_str(), Some("cargo test"));
+        assert_eq!(got.cell[0]["id"].as_str(), Some("unit"));
+        assert_eq!(got.cell[0]["mode"].as_str(), Some("remediating"));
+        assert_eq!(got.cell[0]["remediation_attempts"].as_integer(), Some(3));
+        assert_eq!(got.cell[0]["timeout_minutes"].as_integer(), Some(10));
+        assert!(!got.cell[0].contains_key("agent"), "same agent as the cell");
+        assert_eq!(got.cell[1]["pass_score"].as_integer(), Some(7));
+        assert_eq!(got.cell[1]["agent"].as_str(), Some("codex"));
+        assert_eq!(got.task.len(), 1);
+        assert_eq!(got.task[0]["mode"].as_str(), Some("raw"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_follow_up_whose_origin_is_gone_uses_the_reviews_linked_cells() {
+        let mut s = store();
+        let root = temp_root("inherit-fallback");
+        seed_guardian(&s, "g1", &root);
+        seed_proof_squad(&mut s, "g1");
+        for owner in ["cell:squad-deleted:0:0", "guardian:g1"] {
+            let got = s.followup_inherited_proofs("g1", &item_for(owner));
+            assert_eq!((got.cell.len(), got.task.len()), (2, 1), "{owner}");
+            assert!(got.source.contains("g1"), "{}", got.source);
+        }
+        let none = s.followup_inherited_proofs("other", &item_for("guardian:other"));
+        assert_eq!((none.cell.len(), none.task.len()), (0, 0));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn attached_proofs_land_on_the_right_task_and_validate() {
+        let mut s = store();
+        let root = temp_root("inherit-attach");
+        seed_guardian(&s, "g1", &root);
+        let squad_id = seed_proof_squad(&mut s, "g1");
+        let guardian = s.get_guardian("g1").unwrap();
+        let items = [
+            item_for(&format!("cell:{squad_id}:0:0")),
+            item_for("guardian:g1"),
+        ];
+        let inherited = [
+            s.followup_inherited_proofs("g1", &items[0]),
+            InheritedProofs::default(),
+        ];
+        let draft = draft_followup_toml("proj", &guardian, "main", &items);
+        let toml = attach_inherited_proofs(&draft, &inherited);
+        let report = ralphus_core::validate::validate_toml(&toml);
+        assert!(
+            report.errors.is_empty(),
+            "{:?}
+{toml}",
+            report.errors
+        );
+        let file: ralphus_core::schema::TaskFile = toml::from_str(&toml).unwrap();
+        assert_eq!(file.task[0].cell[0].proof.len(), 2);
+        assert_eq!(file.task[0].proof.len(), 1);
+        assert!(file.task[1].cell[0].proof.is_empty() && file.task[1].proof.is_empty());
+        assert_eq!(
+            attach_inherited_proofs(&draft, &[InheritedProofs::default()]),
+            draft,
+            "nothing to attach leaves the draft untouched"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn ignores_persist_and_are_left_out_of_the_offer() {
         let s = store();
@@ -1848,9 +2277,12 @@ prompt = "add feature.txt"
         assert!(report.errors.is_empty(), "{:?}\n{toml}", report.errors);
         let file: ralphus_core::schema::TaskFile = toml::from_str(&toml).unwrap();
         assert_eq!(file.task.len(), 2, "one task per deferred item");
-        assert_eq!(file.review.len(), 1);
-        assert_eq!(file.review[0].upstream.as_deref(), Some("release/1.0"));
+        assert!(file.review.is_empty(), "a follow-up declares no review");
+        assert!(!toml.contains("new-review"), "{toml}");
         let cell = &file.task[0].cell[0];
+        assert_eq!(cell.review, None, "no explicit review on the cell");
+        assert!(cell.triage, "the cell is routed by the Arbiter's Triage");
+        assert_eq!(cell.triage_type, None, "the Arbiter picks the type");
         assert!(
             cell.cwd
                 .as_deref()
@@ -1883,7 +2315,6 @@ prompt = "add feature.txt"
         let toml = draft_followup_toml("proj", &guardian, "main", &[item("later", None)]);
         let file: ralphus_core::schema::TaskFile = toml::from_str(&toml).unwrap();
         assert_eq!(file.task[0].machine.as_deref(), Some("loopback:exercise"));
-        assert_eq!(file.review[0].machine.as_deref(), Some("loopback:exercise"));
 
         let local = draft_followup_toml(
             "proj",
@@ -2026,5 +2457,12 @@ prompt = "add feature.txt"
         assert!(prompt.contains("the original ask"));
         let without = task_prompt("rev", &item("do the thing", None));
         assert!(!without.contains("For context"));
+    }
+
+    #[test]
+    fn task_prompt_tells_the_agent_to_commit_its_work() {
+        let prompt = task_prompt("rev", &item("do the thing", None));
+        assert!(prompt.contains("commit"), "{prompt}");
+        assert!(prompt.contains("git push -u origin HEAD"), "{prompt}");
     }
 }

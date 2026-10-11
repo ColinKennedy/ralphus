@@ -3409,15 +3409,19 @@ fn run_cell_worker(
         // A cell that really was halted is resuming into a world that moved
         // while it waited -- the waypoint's change has landed upstream since.
         // Rebase before clearing the flag, so it resumes against a tree that
-        // actually contains what its guidance is about. Done under the lock
-        // like the rest of this block; the rebase is a local, already-fetched
-        // worktree operation, not a network round trip.
+        // actually contains what its guidance is about. The rebase is a git
+        // subprocess, so it runs with the store guard released: held under the
+        // lock it blocks every other store user, and a debug daemon's guard
+        // watchdog panics the worker thread, stranding the cell as `running`
+        // with no runner.
         let was_waypoint_halted = matches!(
             guard.cell_waypoint_halted_at_ms(squad_id, row.task_idx, row.idx),
             Ok(Some(_))
         );
-        if was_waypoint_halted {
-            let rebased = rebase_resumed_cell_onto_upstream(row);
+        drop(guard);
+        let rebased = was_waypoint_halted.then(|| rebase_resumed_cell_onto_upstream(row));
+        let guard = store.lock();
+        if let Some(rebased) = rebased {
             // Which waypoint held it. Gone by now in the normal case -- the
             // hold lifted because its affected landed -- so fall back to the
             // most recent one that affects this squad rather than reporting
@@ -10999,6 +11003,23 @@ mod tests {
 
     // Sentinel-string parsing itself is covered by
     // `ralphus_core::schema::parse_upstream_task_ref`'s own unit tests.
+
+    /// The waypoint-resume rebase is a git subprocess; it must run with the
+    /// store guard released (a debug daemon's guard watchdog panics the worker
+    /// thread on a >2s hold, stranding the cell as `running` with no runner).
+    #[test]
+    fn waypoint_resume_rebase_runs_outside_the_store_guard() {
+        let src = include_str!("scheduler.rs");
+        let call =
+            "let rebased = was_waypoint_halted.then(|| rebase_resumed_cell_onto_upstream(row));";
+        let at = src.find(call).expect("rebase call site present");
+        let before = &src[..at];
+        let tail = &before[before.len().saturating_sub(200)..];
+        assert!(
+            tail.contains("drop(guard);"),
+            "the store guard must be dropped before the resume rebase"
+        );
+    }
 
     #[test]
     fn try_upstream_rebase_noop_when_upstream_is_none() {

@@ -222,23 +222,11 @@ pub(crate) fn set_worktree_commit_baseline(
 /// Run a `git config` write against the shared `.git/config`, serialized with
 /// the daemon's other config writers and retried while another process (a
 /// sibling cell's `git push -u`, an agent's own `git config`) holds
-/// `config.lock` -- git fails immediately with "could not lock config file"
-/// instead of waiting, and the lock is only held for milliseconds.
+/// `config.lock` or the file itself -- see
+/// [`crate::worktrees::is_transient_config_write_error`].
 fn git_config_write(cwd: &Path, args: &[&str]) -> std::result::Result<(), String> {
-    const ATTEMPTS: u32 = 20;
     let _guard = crate::worktrees::WORKTREE_CONFIG_LOCK.lock();
-    let mut attempt = 1;
-    loop {
-        match git(cwd, args) {
-            Ok(_) => return Ok(()),
-            Err(e) if attempt < ATTEMPTS && e.contains("could not lock config file") => {
-                // allow-lock-io: `_guard` is the config-writer mutex, not the store lock; holding it across this bounded retry (<= ~5s total) is what serializes the writers
-                std::thread::sleep(std::time::Duration::from_millis(25 * u64::from(attempt)));
-                attempt += 1;
-            }
-            Err(e) => return Err(e),
-        }
-    }
+    crate::worktrees::git_config_write_retrying(cwd, args).map(|_| ())
 }
 
 /// The upstream (`branch@{upstream}`) of the worktree's branch, if any.
