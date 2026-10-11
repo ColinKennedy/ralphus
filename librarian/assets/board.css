@@ -4,6 +4,7 @@
         --running: #4aa3ff; --done: #3fb950; --failed: #f85149; --pending: #8b949e;
         --queued: #a371f7; --materializing: #58a6ff; --cancelled: #6e7681; --teal: #39c5cf;
         --ignored: #c9a227;
+        --halted: var(--ignored);
         --warn: #d29922;
         --unverified: #e3b341;
         --waiting: #f778ba;

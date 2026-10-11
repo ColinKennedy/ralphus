@@ -1127,6 +1127,10 @@ struct Progress {
     /// task-name dependent never starts before the upstream task's own
     /// fmt/clippy/test-style proof has actually finished.
     task_finalized: HashSet<i64>,
+    /// Task indices whose finalizer was parked by a waypoint halt of one of its
+    /// task-scope proof steps: neither finalized nor failed, and held back from
+    /// completing the squad exactly as a `CellState::Detached` cell is.
+    halted_tasks: HashSet<i64>,
 }
 
 /// Execute a squad's cells concurrently: a cell starts the moment all its
@@ -1372,6 +1376,7 @@ fn execute_squad_inner(
             .chain(already_failed_cells.iter().map(|&(task_idx, _)| task_idx))
             .collect(),
         task_finalized: HashSet::new(),
+        halted_tasks: HashSet::new(),
     });
 
     // Indices of cells that need proof-only dispatch (precomputed so the
@@ -1533,6 +1538,38 @@ fn execute_squad_inner(
                         prog.summaries[i] = None;
                     }
                 }
+                // A cell parked by a waypoint-halted cell-scope proof step has a
+                // `done` body and `pending` proofs once released: only its proof
+                // steps re-run, so seed it `Running` and spawn a proof-only worker.
+                let mut halted_proof_only: Vec<usize> = Vec::new();
+                {
+                    let guard = store.lock();
+                    let proof_only_now =
+                        guard.cells_needing_proof_only(squad_id).unwrap_or_default();
+                    let mut prog = progress.lock().expect("progress mutex poisoned");
+                    for (i, row) in cells.iter().enumerate().take(n) {
+                        if prog.status[i] == CellState::Detached
+                            && proof_only_now.contains(&(row.task_idx, row.idx))
+                        {
+                            prog.status[i] = CellState::Running;
+                            halted_proof_only.push(i);
+                        }
+                    }
+                    // A task whose finalizer was parked by a halted task-scope proof
+                    // is released by resetting the task to `pending`; the
+                    // `reclaimed_tasks` pass below then re-runs its finalizer.
+                    let released: Vec<i64> = prog
+                        .halted_tasks
+                        .iter()
+                        .copied()
+                        .filter(|&t| {
+                            matches!(guard.task_state(squad_id, t), Ok(Some(NodeState::Pending)))
+                        })
+                        .collect();
+                    for t in released {
+                        prog.halted_tasks.remove(&t);
+                    }
+                }
                 let (reclaimed_tasks, reclaimed_cells, reclaimed_proof_only): (
                     Vec<i64>,
                     Vec<usize>,
@@ -1628,6 +1665,7 @@ fn execute_squad_inner(
                 // earlier tick, or by the initial `proof_only_indices` pass), so
                 // a still-in-flight proof is never spawned twice concurrently.
                 let mut to_spawn_proof_only: Vec<usize> = Vec::new();
+                to_spawn_proof_only.extend(halted_proof_only);
                 if !reclaimed_tasks.is_empty() {
                     for &t in &reclaimed_tasks {
                         finalized.remove(&t);
@@ -1799,11 +1837,12 @@ fn execute_squad_inner(
                                     let cell_dep_detached =
                                         deps.iter().any(|&d| prog.status[d] == CellState::Detached);
                                     let task_dep_detached = task_deps.iter().any(|&t| {
-                                        task_cells
-                                            .get(&t)
-                                            .into_iter()
-                                            .flatten()
-                                            .any(|&d| prog.status[d] == CellState::Detached)
+                                        prog.halted_tasks.contains(&t)
+                                            || task_cells
+                                                .get(&t)
+                                                .into_iter()
+                                                .flatten()
+                                                .any(|&d| prog.status[d] == CellState::Detached)
                                     });
                                     if !cell_dep_detached && !task_dep_detached {
                                         active = true;
@@ -2003,7 +2042,8 @@ fn execute_squad_inner(
     // (see `CellState::Detached`) without resolving the cell's actual work —
     // the squad did not complete, it's paused for manual takeover, and must
     // not be reported Done just because nothing is left to poll.
-    let any_detached = progress.status.contains(&CellState::Detached);
+    let any_detached =
+        progress.status.contains(&CellState::Detached) || !progress.halted_tasks.is_empty();
 
     let guard = store.lock();
     // If an edit reset this squad to Pending mid-flight after we had already
@@ -2481,6 +2521,37 @@ fn enqueue_cell_failure_mailbox(
                     serde_json::json!({"error": e.to_string()}),
                 );
         }
+    }
+}
+
+/// Park a proof scope whose step a waypoint halt killed: a cell-scope halt
+/// marks the owning cell waypoint-halted (so the existing cell resume path
+/// carries it forward), and every scope sends the same remediation-bearing
+/// `squad_waypoint_halted` notice a halted cell gets -- never a failure
+/// message. `cell_id` is the label the notice names (the finalizer's own
+/// label for a task-scope halt).
+#[allow(clippy::too_many_arguments)]
+fn park_halted_proof_scope(
+    store: &crate::store_lock::StoreHandle,
+    squad_id: &str,
+    scope: &str,
+    task_idx: i64,
+    cell_idx: i64,
+    cell_id: &str,
+    task_name: &str,
+    waypoint_id: Option<&str>,
+) {
+    let guard = store.lock();
+    if scope == "cell" {
+        store_ok(
+            &guard,
+            squad_id,
+            "mark_cell_waypoint_halted",
+            guard.mark_cell_waypoint_halted(squad_id, task_idx, cell_idx),
+        );
+    }
+    if let Some(waypoint_id) = waypoint_id {
+        enqueue_waypoint_halt_mailbox(&guard, squad_id, cell_id, task_name, waypoint_id);
     }
 }
 
@@ -4380,6 +4451,20 @@ fn run_cell_worker(
         cancel,
         cell_trace_context.as_deref(),
     );
+    if let Some(waypoint_id) = proof_outcome.halted.as_ref() {
+        park_halted_proof_scope(
+            store,
+            squad_id,
+            "cell",
+            row.task_idx,
+            row.idx,
+            &row.cell_id,
+            &row.task_name,
+            waypoint_id.as_deref(),
+        );
+        progress.lock().expect("progress mutex poisoned").status[i] = CellState::Detached;
+        return;
+    }
     // RAL-152: fold the ground-truth proof outcome onto this cell's own
     // ghost, independent of whatever the agent self-reported above -- so a
     // restarted cell reading its own ghost gets a reliable "the prior
@@ -4503,6 +4588,20 @@ fn run_proof_only_worker(
         cancel,
         span_trace_context.as_deref(),
     );
+    if let Some(waypoint_id) = proof_outcome.halted.as_ref() {
+        park_halted_proof_scope(
+            store,
+            squad_id,
+            "cell",
+            row.task_idx,
+            row.idx,
+            &row.cell_id,
+            &row.task_name,
+            waypoint_id.as_deref(),
+        );
+        progress.lock().expect("progress mutex poisoned").status[i] = CellState::Detached;
+        return;
+    }
     // RAL-152: same ground-truth ghost note as `run_cell_worker` — applies
     // here too since a proof-only restart (`restart_cell_proof`) is one
     // of the paths this ticket calls out explicitly.
@@ -4798,6 +4897,24 @@ fn run_task_finalizer(
             cancel,
             span_trace_context.as_deref(),
         );
+        if let Some(waypoint_id) = proof_outcome.halted.as_ref() {
+            park_halted_proof_scope(
+                store,
+                squad_id,
+                "task",
+                task_idx,
+                -1,
+                task_cell.map_or("task proof", |ts| ts.cell_id.as_str()),
+                &task_name,
+                waypoint_id.as_deref(),
+            );
+            progress
+                .lock()
+                .expect("progress mutex poisoned")
+                .halted_tasks
+                .insert(task_idx);
+            return;
+        }
         // RAL-152: task-level proof has no ghost of its own (ghosts are keyed
         // per cell/review, see `ghost.rs`), so fold the ground-truth
         // outcome onto the task's representative cell's ghost instead —
@@ -5510,6 +5627,10 @@ struct ProofOutcome {
     /// failure, not every one — one exhaustion transition gets one
     /// notification, not one per failing step.
     first_failure: Option<(i64, String)>,
+    /// Set when a waypoint halt killed a step: the gating waypoint's id
+    /// (`Some(None)` when it could not be resolved). The step is recorded
+    /// `halted`, not failed, and the scope stopped there.
+    halted: Option<Option<String>>,
 }
 
 /// Build the immutable proof context immediately before a prompt proof starts.
@@ -5655,6 +5776,7 @@ fn proof_context_status(state: Option<&str>) -> &'static str {
         Some("failed") => "FAIL",
         Some("cancelled") => "CANCELLED",
         Some("ignored") => "IGNORED",
+        Some("halted") => "HALTED",
         Some("running") => "RUNNING",
         Some("pending") => "PENDING",
         Some(_) | None => "NOT RECORDED",
@@ -5928,6 +6050,7 @@ fn run_proofs(
                 steps_run: 0,
                 steps_passed: 0,
                 first_failure: None,
+                halted: None,
             };
         }
     };
@@ -5964,6 +6087,7 @@ fn run_proofs(
                 steps_run,
                 steps_passed,
                 first_failure,
+                halted: None,
             };
         }
         // A user may have manually set this step to `ignored` (RAL Queue /
@@ -6079,6 +6203,7 @@ fn run_proofs(
             .lock()
             .take_proof_restart_note(squad_id, task_idx, scope, cell_idx, idx)
             .unwrap_or_default();
+        let mut halted_now = false;
         let (passed, output, proof_claude_id, proof_usage) = match kind.as_str() {
             "command" => {
                 crate::rlog!(
@@ -6173,6 +6298,7 @@ fn run_proofs(
                     vcs.as_deref(),
                 );
                 let passed = result.is_done();
+                halted_now = result.is_waypoint_halted();
                 let output = crate::remediation::diagnostic_text(&result);
                 let usage = crate::store::RecordedUsage::from(&result);
                 (passed, output, None, usage)
@@ -6289,6 +6415,7 @@ fn run_proofs(
                     idx,
                 );
                 let passed = result.proof_passed();
+                halted_now = result.is_waypoint_halted();
                 if let (Some(appraisal), Some(pass_score)) =
                     (&result.appraisal, runner_spec.pass_score)
                 {
@@ -6346,6 +6473,77 @@ fn run_proofs(
                 (false, msg, None, crate::store::RecordedUsage::default())
             }
         };
+        if halted_now {
+            // A waypoint halt killed this step mid-run. It is neither passed
+            // nor failed: record it `halted` against the gating waypoint and
+            // stop the scope so the owning cell/task is parked rather than
+            // failed. Counts and `first_failure` are deliberately untouched.
+            let waypoint_id = {
+                let guard = store.lock();
+                let waypoint_id = guard.squad_block_gating_waypoint(squad_id).ok().flatten();
+                let note = match waypoint_id.as_deref() {
+                    Some(wp) => format!("halted by {wp}"),
+                    None => "halted by waypoint".to_string(),
+                };
+                store_ok(
+                    &guard,
+                    squad_id,
+                    "set_proof_result",
+                    guard.set_proof_result(
+                        squad_id,
+                        task_idx,
+                        scope,
+                        cell_idx,
+                        idx,
+                        NodeState::Halted,
+                        &note,
+                        proof_claude_id.as_deref(),
+                        proof_usage,
+                    ),
+                );
+                store_ok(
+                    &guard,
+                    squad_id,
+                    "set_proof_halted_waypoint",
+                    guard.set_proof_halted_waypoint(
+                        squad_id,
+                        task_idx,
+                        scope,
+                        cell_idx,
+                        idx,
+                        waypoint_id.as_deref(),
+                    ),
+                );
+                let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+                    level: crate::logging::LogLevel::INFO,
+                    source: "scheduler",
+                    message: "proof halted by waypoint block",
+                    scope: Some("waypoint"),
+                    squad_id: Some(squad_id),
+                    guardian_id: None,
+                    cell_id: None,
+                    task: Some(task_name),
+                    log_path: None,
+                    payload: serde_json::json!({
+                        "waypoint_id": waypoint_id,
+                        "proof_scope": scope,
+                        "task_idx": task_idx,
+                        "cell_idx": cell_idx,
+                        "idx": idx,
+                        "kind": kind,
+                    }),
+                    admin_only: false,
+                });
+                waypoint_id
+            };
+            return ProofOutcome {
+                all_ok,
+                steps_run,
+                steps_passed,
+                first_failure,
+                halted: Some(waypoint_id),
+            };
+        }
         steps_run += 1;
         if passed {
             steps_passed += 1;
@@ -6428,6 +6626,7 @@ fn run_proofs(
         steps_run,
         steps_passed,
         first_failure,
+        halted: None,
     }
 }
 
@@ -7132,6 +7331,97 @@ mod tests {
                 .any(|r| r.message == "cell halted by waypoint block"),
             "expected a Cartographer row recording the waypoint halt"
         );
+    }
+
+    /// RAL-625: the cell body succeeds, but its proof step is killed by a
+    /// waypoint halt.
+    struct ProofWaypointHaltRunner;
+
+    impl Runner for ProofWaypointHaltRunner {
+        fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+            if spec.proof {
+                return RunnerResult::waypoint_halted(
+                    crate::runner::LiveUsage {
+                        tokens_in: 1,
+                        tokens_out: 1,
+                        cache_creation_tokens: 0,
+                        cache_read_tokens: 0,
+                        cost_usd: 0.0,
+                        turns: 0,
+                    },
+                    None,
+                );
+            }
+            RunnerResult {
+                bearing: None,
+                thinking_stall_last_line: None,
+                retry_after_secs: None,
+                status: "done".to_string(),
+                tokens_in: 0,
+                tokens_out: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+                compaction_input_tokens: 0,
+                compaction_count: 0,
+                cost_usd: 0.0,
+                cost_is_estimated: false,
+                summary: "ok".to_string(),
+                error: None,
+                proofed: None,
+                agent_session_id: None,
+                ghost: None,
+                turns: None,
+                prophecies: Vec::new(),
+                appraisal: None,
+            }
+        }
+    }
+
+    /// RAL-625: a proof killed by a waypoint halt is recorded `halted`, not
+    /// `failed`, and nothing above it turns `failed` or sends a failure
+    /// message; a release re-queues the proof.
+    #[test]
+    fn a_waypoint_halted_proof_is_halted_not_failed_and_release_requeues_it() {
+        let toml = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\".\"\nprompt=\"do work\"\n\
+                     [[task.cell.proof]]\nkind=\"prompt\"\nprompt=\"check it\"\n";
+        let (store, id) = store_with(toml);
+        {
+            let guard = store.lock();
+            guard
+                .create_watch(
+                    "colin",
+                    &format!("squad:{id}"),
+                    &[
+                        crate::mailbox::MailboxPriority::Urgent,
+                        crate::mailbox::MailboxPriority::High,
+                    ],
+                )
+                .unwrap();
+        }
+
+        execute_squad(&store, &ProofWaypointHaltRunner, &id);
+
+        let guard = store.lock();
+        let squad = guard.get_squad(&id).unwrap();
+        assert_eq!(squad.tasks[0].cells[0].proof[0].state, "halted");
+        assert_ne!(squad.tasks[0].cells[0].state, "failed");
+        assert_ne!(squad.tasks[0].state, "failed");
+        assert_ne!(guard.squad_state(&id).unwrap(), SquadState::Failed);
+        assert_ne!(guard.squad_state(&id).unwrap(), SquadState::Done);
+        let personal = guard
+            .personal_mailbox_messages_for_user("colin", false, None)
+            .unwrap();
+        assert!(
+            personal
+                .iter()
+                .all(|m| m.event_kind.as_deref() != Some("squad_failed")),
+            "a halted proof must not send a squad_failed message"
+        );
+        assert_eq!(guard.halted_proof_sequences().unwrap().len(), 1);
+
+        guard.release_halted_proofs(&id, 0, "cell", 0).unwrap();
+        let squad = guard.get_squad(&id).unwrap();
+        assert_eq!(squad.tasks[0].cells[0].proof[0].state, "pending");
     }
 
     /// RAL-400 Phase 5: the "parking" half of the resumability question --
@@ -8305,6 +8595,7 @@ mod tests {
             summaries: vec![None],
             failed: HashSet::from([0i64]),
             task_finalized: HashSet::new(),
+            halted_tasks: HashSet::new(),
         });
         let sem = Arc::new(Semaphore::new(4));
         let summary_queue = crate::summary_worker::SummaryQueue::new();
@@ -8362,6 +8653,7 @@ mod tests {
             summaries: vec![None],
             failed: HashSet::from([0i64]),
             task_finalized: HashSet::new(),
+            halted_tasks: HashSet::new(),
         });
         let sem = Arc::new(Semaphore::new(4));
         let summary_queue = crate::summary_worker::SummaryQueue::new();

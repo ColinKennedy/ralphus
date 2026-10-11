@@ -417,6 +417,7 @@
         done: "Finished successfully — completed its work (and any proof/verification steps) with no error.",
         failed: "Finished unsuccessfully.\nCheck its error/log for why, then use Restart to try again from scratch.",
         cancelled: "Stopped deliberately before finishing — a human or automated action cancelled it, not a crash or provider error.",
+        halted: "Paused by a waypoint block while a proof was running.\nNot a failure — the proof re-runs automatically when the waypoint is released.",
         ignored: "Manually marked as skipped via Set Status — satisfies downstream dependencies without actually running.\nReversible back to pending.",
         queued: "Squad accepted but not yet materializing worktrees or dispatching cells — normal briefly after submission; a long queue usually means the daemon is busy with other squads.",
         materializing: "Squad is creating its worktrees and deriving its review plan — normal briefly after submission, before any cell can start.",

@@ -13882,6 +13882,17 @@ fn set_status(daemon: &Daemon, id: &str, body: &str) -> Reply {
             None
         };
 
+    // `halted` is recorded only by the scheduler when a waypoint kills a proof;
+    // it is never a status a caller can set.
+    if req.state == "halted" {
+        return error(
+            400,
+            "bad_request",
+            "state 'halted' is set by waypoint halts only and cannot be set manually",
+            vec![],
+        );
+    }
+
     // RAL-163: any status other than "pending" on a task/cell/proof step
     // means "stop the agent running there" (including `ignored`, which is
     // deliberately non-terminal in the state machine but still means "stop

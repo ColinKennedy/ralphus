@@ -183,6 +183,9 @@ pub enum NodeState {
     /// Manually skipped by a user (RAL Queue). Not executed, but satisfies
     /// downstream dependencies exactly like `done`. Reversible back to `pending`.
     Ignored,
+    /// A proof step killed by a waypoint halt. Not a failure and not terminal:
+    /// the waypoint release re-runs it. Never user-settable.
+    Halted,
 }
 
 impl NodeState {
@@ -194,6 +197,7 @@ impl NodeState {
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
             Self::Ignored => "ignored",
+            Self::Halted => "halted",
         }
     }
 
@@ -207,6 +211,7 @@ impl NodeState {
             "failed" => Self::Failed,
             "cancelled" => Self::Cancelled,
             "ignored" => Self::Ignored,
+            "halted" => Self::Halted,
             _ => return None,
         })
     }
@@ -250,6 +255,22 @@ pub type ProofSpecRow = (
     Option<String>,
     Option<i64>,
 );
+
+/// One proof sequence holding a step a waypoint halt killed, from
+/// [`Store::halted_proof_sequences`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HaltedProofSequence {
+    /// Owning squad.
+    pub squad_id: String,
+    /// Owning task index.
+    pub task_idx: i64,
+    /// `cell` or `task`.
+    pub scope: String,
+    /// Owning cell index (`-1` for a task-scope sequence).
+    pub cell_idx: i64,
+    /// The waypoint that halted it, when recorded.
+    pub waypoint_id: Option<String>,
+}
 
 /// A proof step as shown in the board.
 #[derive(Debug, Clone, Serialize)]
@@ -3783,6 +3804,9 @@ impl Store {
             "ALTER TABLE cells ADD COLUMN delayed_until_ms INTEGER",
             "ALTER TABLE proofs ADD COLUMN delayed_until_ms INTEGER",
             "ALTER TABLE proofs ADD COLUMN delayed_reason TEXT",
+            // RAL-625: the waypoint whose halt killed this proof while it was
+            // `halted`; cleared when the release re-runs it.
+            "ALTER TABLE proofs ADD COLUMN halted_waypoint_id TEXT",
             "ALTER TABLE guardian_branches ADD COLUMN delayed_until_ms INTEGER",
             "ALTER TABLE guardian_branches ADD COLUMN delayed_reason TEXT",
             // RAL-308: hard cumulative maximum-runtime cap in seconds, at
@@ -7497,6 +7521,9 @@ fn effective_cell_state<'a>(raw: &str, proof_states: impl IntoIterator<Item = &'
     if states.contains(&"failed") {
         return "failed".to_string();
     }
+    if states.contains(&"halted") {
+        return "halted".to_string();
+    }
     if states
         .iter()
         .any(|s| !matches!(*s, "done" | "failed" | "cancelled" | "ignored"))
@@ -8611,7 +8638,7 @@ impl Store {
             .ok()
             .flatten()
             .unwrap_or_else(|| ("unknown".to_string(), None));
-        let entering_terminal = i64::from(state.is_terminal());
+        let entering_terminal = i64::from(state.is_terminal() || state == NodeState::Halted);
         let now = now_ms();
         self.conn.execute(
             "UPDATE proofs SET state=?, output=?, agent_session_id=?, tokens_in=?, tokens_out=?, cache_creation_tokens=?, cache_read_tokens=?, compaction_input_tokens=?, compaction_count=?, turns=?, cost_usd=?, cost_is_estimated=?,
@@ -9821,7 +9848,7 @@ impl Store {
                  AND v.task_idx=s.task_idx
                  AND v.scope='cell'
                  AND v.cell_idx=s.idx
-                 AND v.state NOT IN ('done','failed','cancelled')
+                 AND v.state NOT IN ('done','failed','cancelled','halted')
              )",
         )?;
         let rows = stmt
@@ -11334,6 +11361,83 @@ impl Store {
             "UPDATE proofs SET delayed_until_ms=NULL, delayed_reason=NULL WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=?",
             params![squad_id, task_idx, scope, cell_idx, idx],
         )?;
+        Ok(())
+    }
+
+    /// Records which waypoint's halt killed one `halted` proof step, so the
+    /// release sweep can tell an impacted entry from a stray halt.
+    pub fn set_proof_halted_waypoint(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        scope: &str,
+        cell_idx: i64,
+        idx: i64,
+        waypoint_id: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE proofs SET halted_waypoint_id=? WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=?",
+            params![waypoint_id, squad_id, task_idx, scope, cell_idx, idx],
+        )?;
+        Ok(())
+    }
+
+    /// Every proof sequence holding at least one `halted` step: one row per
+    /// `(squad, task, scope, cell)` with the waypoint recorded on its halted
+    /// step, if any.
+    pub fn halted_proof_sequences(&self) -> Result<Vec<HaltedProofSequence>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT squad_id, task_idx, scope, cell_idx, MAX(halted_waypoint_id) FROM proofs
+             WHERE state='halted'
+             GROUP BY squad_id, task_idx, scope, cell_idx
+             ORDER BY squad_id, task_idx, scope, cell_idx",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(HaltedProofSequence {
+                    squad_id: r.get(0)?,
+                    task_idx: r.get(1)?,
+                    scope: r.get(2)?,
+                    cell_idx: r.get(3)?,
+                    waypoint_id: r.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Re-queues a waypoint-halted proof sequence: every step in its scope goes
+    /// back to `pending` so the sequence re-runs from the start, mirroring
+    /// [`Store::restart_cell_proof`]. The cell and squad rows are left alone --
+    /// the caller decides whether the work cell re-runs first. A task-scope
+    /// sequence has no cell to carry it, so its task goes back to `pending`
+    /// for the finalizer to pick up, as in [`Store::restart_task_proof`].
+    pub fn release_halted_proofs(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        scope: &str,
+        cell_idx: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE proofs SET state='pending', env_out_of_date=0, restart_note=NULL, halted_waypoint_id=NULL
+             WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=?
+               AND state IN ('halted','pending','running','done','failed')",
+            params![squad_id, task_idx, scope, cell_idx],
+        )?;
+        if scope == "task" {
+            self.conn.execute(
+                "UPDATE tasks SET state='pending', error=NULL WHERE squad_id=? AND idx=?",
+                params![squad_id, task_idx],
+            )?;
+        }
+        let _ = self.log_event(
+            Some(squad_id),
+            None,
+            "proof",
+            Some(&format!("{scope} t{task_idx}/s{cell_idx}")),
+            "resumed (waypoint unblocked)",
+        );
         Ok(())
     }
 
@@ -16415,6 +16519,57 @@ command = "cargo test"
         assert!(step.cost_is_estimated);
     }
 
+    #[test]
+    fn halted_proof_is_listed_and_released_back_to_pending() {
+        let toml = concat!(
+            "[[task]]\nname=\"t\"\n",
+            "[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n",
+            "[[task.cell.proof]]\nkind=\"prompt\"\nprompt=\"check\"\n"
+        );
+        let mut store = Store::open_in_memory().unwrap();
+        let squad = store.insert_squad(&parse(toml), Some("r"), false).unwrap();
+        store
+            .set_proof_result(
+                &squad,
+                0,
+                "cell",
+                0,
+                0,
+                NodeState::Halted,
+                "halted by waypoint-7",
+                None,
+                RecordedUsage::default(),
+            )
+            .unwrap();
+        store
+            .set_proof_halted_waypoint(&squad, 0, "cell", 0, 0, Some("waypoint-7"))
+            .unwrap();
+
+        let halted = store.halted_proof_sequences().unwrap();
+        assert_eq!(halted.len(), 1);
+        assert_eq!(halted[0].waypoint_id.as_deref(), Some("waypoint-7"));
+        assert_eq!(
+            store.proofs_for(&squad, 0, "cell", 0).unwrap()[0].state,
+            "halted"
+        );
+        assert!(
+            store.cells_needing_proof_only(&squad).unwrap().is_empty(),
+            "a halted proof waits for release, not for a fresh worker"
+        );
+
+        store.release_halted_proofs(&squad, 0, "cell", 0).unwrap();
+        assert!(store.halted_proof_sequences().unwrap().is_empty());
+        assert_eq!(
+            store.proofs_for(&squad, 0, "cell", 0).unwrap()[0].state,
+            "pending"
+        );
+    }
+
+    #[test]
+    fn effective_cell_state_reports_halted_but_failed_wins() {
+        assert_eq!(effective_cell_state("done", ["done", "halted"]), "halted");
+        assert_eq!(effective_cell_state("done", ["failed", "halted"]), "failed");
+    }
     #[test]
     fn record_cell_result_applies_to_a_never_started_pending_cell() {
         // Mirrors the "blocked by a failed dependency" scheduler path: the

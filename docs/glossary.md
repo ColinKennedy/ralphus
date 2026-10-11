@@ -20,6 +20,7 @@ right — most of the collisions worth avoiding are with these.
 | **task** | One unit of work inside a squad, named by the author (`[[task]] name = "ral-169"`). Owns a workspace, a project, and — since RAL-185 — a machine. A task contains cells. |
 | **cell** | One agent (or command) invocation inside a task (`[[task.cell]]`). The thing that actually runs a model or a shell command. Cells in a task share a workspace and hand off through files on disk. |
 | **proof** / **proof step** | A check that runs *after* its owning cell (cell-scope) or after all of a task's cells (task-scope). Kinds: `command` (exit code is the verdict), `prompt` (an agent returns `RALPHUS_PROOF: PASS/FAIL`). |
+| **halted** (proof state, RAL-625) | A proof step whose run was stopped by a **waypoint** halt (RAL-400 Phase 3). Not a failure and not terminal — a `halted` proof waits for a waypoint release to re-run, and is never picked up by a fresh worker. Release the waypoint (via `waypoint override` or survey verdict) to re-queue the proof back to `pending` and resume the whole sequence. Distinct from **waypoint_halted** (a cell or squad held before running its proof), which is a cell/squad state rather than a proof state. |
 
 Do **not** reuse *cell* for anything else — notably not for connection reuse
 or transport (see **channel**).

@@ -92,6 +92,7 @@ border. The stable state string maps 1:1 to a variable of the same name:
 | `materializing` | `--materializing` (blue) |
 | `cancelled` | `--cancelled` (grey) |
 | `ignored` | `--ignored` (amber) |
+| `halted` | `--halted` (alias of `--ignored`, amber; a proof held by a waypoint block, never offered by Set Status) |
 
 ### Selection — `--accent` (pale blue)
 Anything the **user explicitly selected** (a selected queue row, task, squad, or
