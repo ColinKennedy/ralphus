@@ -481,9 +481,10 @@ Its roster -- the work that must land for it to be carried out -- is counted sep
             ${wdot(entry.delivery_status)}
             ${link}
             ${waypointModeBadge(entry.mode)}
-            <span class="badge" style="color:var(--muted);border-color:var(--border)" data-tip="Whether this waypoint's guidance has reached this entry yet.">${esc(entry.delivery_status)}</span>${staleBadge}${renderBearingDecisionBadge(entry)}
+            <span class="badge" style="color:var(--muted);border-color:var(--border)" data-tip="Whether this waypoint's guidance has reached this entry yet.">${esc(entry.delivery_status)}</span>${staleBadge}${renderSurveyVerdictBadge(entry)}${renderBearingDecisionBadge(entry)}
             <span class="wp-entry-actions">${toggleModeBtn}${removeBtn}</span>
           </div>
+          ${renderSurveyErrorLine(entry)}
           ${verdict}
         </div>`;
       }
@@ -526,6 +527,7 @@ Its roster -- the work that must land for it to be carried out -- is counted sep
         return /** @type {WaypointDetail} */ (waypointDetail);
       }
 
+      // RALPHUS-WAYPOINT-ANSWER-BADGES:BEGIN
       /**
        * The answer this entry gave the waypoint, as a badge.
        *
@@ -537,9 +539,16 @@ Its roster -- the work that must land for it to be carried out -- is counted sep
        */
       function renderBearingDecisionBadge(entry) {
         const decision = entry.bearing_decision;
+        const state = entry.answer_state;
+        if (state === "unjudged") {
+          return ` <span class="badge" style="color:var(--queued);border-color:var(--queued)" data-tip="The survey has not produced a verdict for this entry: it has not run yet, or its call errored and is being retried.\nThe entry is held meanwhile.\nAfter the retry limit it is halted until it is overridden.">survey errored, retrying</span>`;
+        }
+        if (state === "halted_unjudged") {
+          return ` <span class="badge" style="color:var(--failed);border-color:var(--failed)" data-tip="The survey could not run for this entry after its retry limit, so the waypoint holds it by default.\nThis is not a judgement that the entry is impacted.\nRelease it with: ralphus waypoint override ${esc(entry.waypoint_id)} ${esc(entry.entry_id)}">halted: survey could not run</span>`;
+        }
         if (!decision) {
-          // Only worth flagging where the absence costs something.
-          if (entry.mode !== "block") return "";
+          // Only an entry the waypoint is still holding is waiting on an answer.
+          if (state !== "awaiting_answer") return "";
           return ` <span class="badge" style="color:var(--queued);border-color:var(--queued)" data-tip="This entry has not answered the waypoint yet, and is blocking because of it.\nIt answers by ending its run with a RALPHUS_BEARING: line.">awaiting answer</span>`;
         }
         const color = decision === "accepted" ? "--done" : decision === "rejected" ? "--failed" : "--queued";
@@ -550,6 +559,45 @@ Its roster -- the work that must land for it to be carried out -- is counted sep
             : "The guidance applies here, but this entry is not acting on it now.";
         return ` <span class="badge" style="color:var(${color});border-color:var(${color})" data-tip="${why}">${esc(decision)}</span>`;
       }
+
+      /**
+       * The survey's verdict on this entry as a badge, separate from the entry's own answer. A verdict recorded
+       * because the survey could not run reads as unjudged, never as a real "impacted".
+       * @param {AffectedEntryView} entry
+       * @returns {string}
+       */
+      function renderSurveyVerdictBadge(entry) {
+        const state = entry.survey_state;
+        if (state === "not_impacted") {
+          return ` <span class="badge" style="color:var(--done);border-color:var(--done)" data-tip="The survey judged this entry not affected by the waypoint, so the waypoint does not hold it.">not impacted</span>`;
+        }
+        if (state === "impacted") {
+          return ` <span class="badge" style="color:var(--queued);border-color:var(--queued)" data-tip="The survey judged this entry affected by the waypoint. Whether it is still held depends on its mode and its own answer.">impacted</span>`;
+        }
+        if (state === "halted_unjudged") {
+          return ` <span class="badge" style="color:var(--muted);border-color:var(--border)" data-tip="No real verdict: the survey could not run, so the waypoint holds this entry by default.">unjudged, held by default</span>`;
+        }
+        return ` <span class="badge" style="color:var(--muted);border-color:var(--border)" data-tip="The survey has not judged this entry yet.">unjudged</span>`;
+      }
+
+      /**
+       * The survey's error text for an entry it could not judge, elided to one line. Clicking opens the full text in
+       * a popup with a copy button; a holding entry also names the command that releases it.
+       * @param {AffectedEntryView} entry
+       * @returns {string}
+       */
+      function renderSurveyErrorLine(entry) {
+        const parts = [];
+        if (entry.survey_state === "halted_unjudged" && entry.survey_rationale) {
+          parts.push(`<span class="wp-entry-error" data-click="showWaypointSurveyError" data-full="${esc(entry.survey_rationale)}" data-tip="Why the survey could not run.\nClick to see the full text and copy it.">${esc(entry.survey_rationale)}</span>`);
+        }
+        if (entry.holding) {
+          const cmd = `ralphus waypoint override ${entry.waypoint_id} ${entry.entry_id}`;
+          parts.push(`<span class="wp-entry-hint" data-tip="Releases only this entry so its work can continue; the waypoint's guidance is still delivered.">release with: <code>${esc(cmd)}</code></span>`);
+        }
+        return parts.length ? `<div class="wp-entry-lines">${parts.join("")}</div>` : "";
+      }
+      // RALPHUS-WAYPOINT-ANSWER-BADGES:END
 
       /**
        * Renders the delivery feed: a Cartographer-backed, chronological event list for the selected waypoint.

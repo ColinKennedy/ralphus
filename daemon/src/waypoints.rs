@@ -327,6 +327,70 @@ pub struct AffectedEntryView {
     pub bearing_decided_at_ms: Option<i64>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    /// What the survey concluded, as a closed set: `"unjudged"` (no verdict
+    /// yet -- not surveyed, or its survey call failed and is being retried),
+    /// `"halted_unjudged"` (the survey could not run and the entry was held by
+    /// default, see [`SURVEY_UNRUNNABLE_PREFIX`]), `"impacted"` or
+    /// `"not_impacted"`. Distinct from `bearing_decision`, which is the
+    /// entry's own answer.
+    pub survey_state: &'static str,
+    /// Whether this entry is held by the waypoint right now: block mode, not
+    /// judged `not_impacted`, no real answer from the entry yet (a `deferred`
+    /// answer does not release a block-mode entry), and the waypoint open.
+    pub holding: bool,
+    /// What the entry owes the waypoint, as a closed set: `"awaiting_answer"`
+    /// (holding, impacted, no bearing decision), `"unjudged"`,
+    /// `"halted_unjudged"`, `"answered"` (a bearing decision exists) or
+    /// `"released"` (not holding and nothing was answered). Computed here so
+    /// the CLI, the board and MCP render one rule.
+    pub answer_state: &'static str,
+}
+
+/// How a verdict recorded for an entry whose survey could not run begins.
+/// [`survey_candidate_with_limit`] writes it; [`AffectedEntryView`] reads it
+/// back as `survey_state = "halted_unjudged"`.
+pub const SURVEY_UNRUNNABLE_PREFIX: &str = "halted: survey could not run";
+
+impl AffectedEntryView {
+    /// Fill `survey_state`, `holding` and `answer_state` from the raw columns.
+    /// `waypoint_open` is false once the waypoint has closed, which lifts every
+    /// block-mode hold.
+    pub fn derive_answer_state(&mut self, waypoint_open: bool) {
+        self.survey_state = match self.survey_verdict.as_deref() {
+            None => "unjudged",
+            Some("not_impacted") => "not_impacted",
+            Some(_)
+                if self
+                    .survey_rationale
+                    .as_deref()
+                    .is_some_and(|r| r.starts_with(SURVEY_UNRUNNABLE_PREFIX)) =>
+            {
+                "halted_unjudged"
+            }
+            Some(_) => "impacted",
+        };
+        let undecided_or_deferred = !matches!(
+            self.bearing_decision,
+            Some(BearingDecision::Accepted | BearingDecision::Rejected)
+        );
+        self.holding = waypoint_open
+            && self.mode == AffectedMode::Block
+            && self.survey_state != "not_impacted"
+            && undecided_or_deferred;
+        self.answer_state = if !self.holding {
+            if self.bearing_decision.is_some() {
+                "answered"
+            } else {
+                "released"
+            }
+        } else if self.survey_state == "unjudged" || self.survey_state == "halted_unjudged" {
+            self.survey_state
+        } else if self.bearing_decision.is_some() {
+            "answered"
+        } else {
+            "awaiting_answer"
+        };
+    }
 }
 
 /// One row of `waypoint_roster`: a review or squad whose landing *is* this
@@ -1731,7 +1795,7 @@ impl Store {
         let kind_s: String = r.get(1)?;
         let mode_s: String = r.get(3)?;
         let delivery_s: String = r.get(6)?;
-        Ok(AffectedEntryView {
+        let mut view = AffectedEntryView {
             waypoint_id: r.get(0)?,
             kind: WaypointEntryKind::parse(&kind_s).unwrap_or(WaypointEntryKind::Squad),
             entry_id: r.get(2)?,
@@ -1749,7 +1813,12 @@ impl Store {
                 .as_deref()
                 .and_then(BearingDecision::parse),
             bearing_decided_at_ms: r.get(12)?,
-        })
+            survey_state: "unjudged",
+            holding: false,
+            answer_state: "released",
+        };
+        view.derive_answer_state(true);
+        Ok(view)
     }
 
     /// Record a affected entry's delivery status transition.
@@ -3758,7 +3827,7 @@ pub fn survey_candidate_with_limit(
                 impacted: true,
                 mode: AffectedMode::Block,
                 rationale: format!(
-                    "halted: survey could not run after {attempts} attempts ({error})"
+                    "{SURVEY_UNRUNNABLE_PREFIX} after {attempts} attempts ({error})"
                 ),
             }
         }
@@ -5586,6 +5655,83 @@ mod tests {
                 params![id, "review", "main", "/tmp/repo", now, now],
             )
             .unwrap();
+    }
+
+    fn view_with(
+        verdict: Option<&str>,
+        rationale: Option<&str>,
+        mode: AffectedMode,
+        decision: Option<BearingDecision>,
+    ) -> AffectedEntryView {
+        AffectedEntryView {
+            waypoint_id: "waypoint-1".into(),
+            kind: WaypointEntryKind::Squad,
+            entry_id: "squad-1".into(),
+            mode,
+            survey_verdict: verdict.map(str::to_string),
+            survey_rationale: rationale.map(str::to_string),
+            delivery_status: DeliveryStatus::Undelivered,
+            stand_down_at_ms: None,
+            stale_at_ms: None,
+            bearing_decision: decision,
+            bearing_decided_at_ms: None,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            survey_state: "unjudged",
+            holding: false,
+            answer_state: "released",
+        }
+    }
+
+    #[test]
+    fn answer_state_separates_released_holding_answered_and_unjudged() {
+        let mut released = view_with(Some("not_impacted"), Some("no"), AffectedMode::Block, None);
+        released.derive_answer_state(true);
+        assert!(!released.holding);
+        assert_eq!(released.answer_state, "released");
+        assert_eq!(released.survey_state, "not_impacted");
+
+        let mut holding = view_with(Some("impacted"), Some("yes"), AffectedMode::Block, None);
+        holding.derive_answer_state(true);
+        assert!(holding.holding);
+        assert_eq!(holding.answer_state, "awaiting_answer");
+        holding.derive_answer_state(false);
+        assert!(!holding.holding, "a closed waypoint holds nothing");
+        assert_eq!(holding.answer_state, "released");
+
+        let mut answered = view_with(
+            Some("impacted"),
+            Some("yes"),
+            AffectedMode::Block,
+            Some(BearingDecision::Accepted),
+        );
+        answered.derive_answer_state(true);
+        assert!(!answered.holding);
+        assert_eq!(answered.answer_state, "answered");
+
+        let mut deferred = view_with(
+            Some("impacted"),
+            None,
+            AffectedMode::Block,
+            Some(BearingDecision::Deferred),
+        );
+        deferred.derive_answer_state(true);
+        assert!(deferred.holding, "deferred does not release a block entry");
+
+        let mut retrying = view_with(None, None, AffectedMode::Block, None);
+        retrying.derive_answer_state(true);
+        assert_eq!(retrying.answer_state, "unjudged");
+
+        let rationale = format!("{SURVEY_UNRUNNABLE_PREFIX} after 3 attempts (boom)");
+        let mut halted = view_with(
+            Some("impacted"),
+            Some(&rationale),
+            AffectedMode::Block,
+            None,
+        );
+        halted.derive_answer_state(true);
+        assert_eq!(halted.survey_state, "halted_unjudged");
+        assert_eq!(halted.answer_state, "halted_unjudged");
     }
 
     #[test]

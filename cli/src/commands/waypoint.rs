@@ -869,21 +869,20 @@ roster (must land):"
                         .as_str()
                         .unwrap_or_default()
                         .to_string(),
-                    // Silence is not an answer, and for a block-mode entry it
-                    // is what is still holding it -- so say so rather than
-                    // leaving the column blank.
-                    match r["bearing_decision"].as_str() {
-                        Some(d) => d.to_string(),
-                        None if r["mode"].as_str() == Some("block") => {
-                            "awaiting answer".to_string()
-                        }
-                        None => "-".to_string(),
-                    },
+                    survey_verdict_label(r),
+                    answer_label(r),
                 ]
             })
             .collect();
         crate::output::print_table(
-            &["KIND", "ENTRY_ID", "MODE", "DELIVERY_STATUS", "ANSWER"],
+            &[
+                "KIND",
+                "ENTRY_ID",
+                "MODE",
+                "DELIVERY_STATUS",
+                "VERDICT",
+                "ANSWER",
+            ],
             &affected_rows,
         );
     }
@@ -894,6 +893,39 @@ roster (must land):"
             "\ndeliveries: {} undelivered, {} delivered, {} via_restack, {} failed",
             summary["undelivered"], summary["delivered"], summary["via_restack"], summary["failed"]
         );
+    }
+}
+
+/// The survey's verdict on an affected entry, kept apart from the entry's own
+/// answer. A verdict recorded because the survey could not run reads as
+/// unjudged rather than as a real `impacted`.
+fn survey_verdict_label(entry: &Value) -> String {
+    match entry["survey_state"].as_str() {
+        Some("unjudged") => "unjudged".to_string(),
+        Some("halted_unjudged") => "unjudged (held by default)".to_string(),
+        Some(state) => state.to_string(),
+        None => "-".to_string(),
+    }
+}
+
+/// What an affected entry owes the waypoint, from the daemon's `answer_state`.
+/// Only an entry that is still holding reads "awaiting answer"; one the survey
+/// released shows `-`.
+fn answer_label(entry: &Value) -> String {
+    match entry["answer_state"].as_str() {
+        Some("awaiting_answer") => "awaiting answer".to_string(),
+        Some("unjudged") => "survey errored, retrying".to_string(),
+        // The recorded rationale already reads "halted: survey could not run
+        // after N attempts (<error>)".
+        Some("halted_unjudged") => entry["survey_rationale"]
+            .as_str()
+            .unwrap_or("halted: survey could not run")
+            .to_string(),
+        Some("answered") => entry["bearing_decision"]
+            .as_str()
+            .unwrap_or("answered")
+            .to_string(),
+        _ => "-".to_string(),
     }
 }
 
@@ -931,6 +963,45 @@ mod tests {
 
     fn v(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn answer_column_distinguishes_released_holding_and_answered() {
+        let released = serde_json::json!({
+            "survey_state": "not_impacted", "answer_state": "released", "bearing_decision": null
+        });
+        assert_eq!(survey_verdict_label(&released), "not_impacted");
+        assert_eq!(answer_label(&released), "-");
+
+        let holding = serde_json::json!({
+            "survey_state": "impacted", "answer_state": "awaiting_answer", "bearing_decision": null
+        });
+        assert_eq!(survey_verdict_label(&holding), "impacted");
+        assert_eq!(answer_label(&holding), "awaiting answer");
+
+        let answered = serde_json::json!({
+            "survey_state": "impacted", "answer_state": "answered", "bearing_decision": "accepted"
+        });
+        assert_eq!(answer_label(&answered), "accepted");
+    }
+
+    #[test]
+    fn answer_column_marks_unjudged_entries_instead_of_a_bare_impacted() {
+        let retrying = serde_json::json!({
+            "survey_state": "unjudged", "answer_state": "unjudged", "survey_rationale": null
+        });
+        assert_eq!(answer_label(&retrying), "survey errored, retrying");
+
+        let halted = serde_json::json!({
+            "survey_state": "halted_unjudged",
+            "answer_state": "halted_unjudged",
+            "survey_rationale": "halted: survey could not run after 3 attempts (boom)"
+        });
+        assert_eq!(survey_verdict_label(&halted), "unjudged (held by default)");
+        assert_eq!(
+            answer_label(&halted),
+            "halted: survey could not run after 3 attempts (boom)"
+        );
     }
 
     #[test]
