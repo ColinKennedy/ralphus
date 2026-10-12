@@ -1300,6 +1300,25 @@ fn route_for_user(
                 delete_user_forge_token(daemon, &target_user, &url_decode(host))
             })
         }
+        // RAL-635: the daemon-wide forge poll-token pool. Admin-only on every
+        // verb, reads included: the listing is masked, but which tokens exist
+        // is operator information.
+        ("GET", ["api", "forge", "pool"]) => {
+            admin_gated(daemon, user_header, || list_forge_pool(daemon))
+        }
+        ("POST", ["api", "forge", "pool"]) => {
+            admin_gated(daemon, user_header, || add_forge_pool_token(daemon, body))
+        }
+        ("DELETE", ["api", "forge", "pool", kind, host, label]) => {
+            admin_gated(daemon, user_header, || {
+                remove_forge_pool_token(
+                    daemon,
+                    &url_decode(kind),
+                    &url_decode(host),
+                    &url_decode(label),
+                )
+            })
+        }
         // RAL-490: live authenticated ping using a token the caller just
         // typed in (not necessarily the one already saved for this host),
         // so the UI can show success/failure right after "Apply" instead of
@@ -6163,6 +6182,113 @@ fn set_user_forge_token(daemon: &Daemon, user: &str, body: &str) -> Reply {
     }
     match daemon.lock().set_user_forge_token(user, host, token) {
         Ok(()) => json(201, &serde_json::json!({"user": user, "host": host})),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// Request body of `POST /api/forge/pool`.
+#[derive(Deserialize)]
+struct AddForgePoolTokenBody {
+    kind: String,
+    #[serde(default)]
+    host: Option<String>,
+    label: String,
+    token: String,
+}
+
+/// `GET /api/forge/pool` (RAL-635): every pool token, masked.
+fn list_forge_pool(daemon: &Daemon) -> Reply {
+    match daemon.lock().list_forge_poll_tokens() {
+        Ok(tokens) => json(200, &serde_json::json!({ "tokens": tokens })),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `POST /api/forge/pool` (RAL-635): register a polling token. Body:
+/// `{"kind": "github"|"gitlab", "host": "github.com"?, "label": "...", "token": "..."}`;
+/// `host` defaults to the public host for `kind`. The response is the masked
+/// summary -- the token is never echoed.
+fn add_forge_pool_token(daemon: &Daemon, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<AddForgePoolTokenBody>(body) else {
+        return error(
+            400,
+            "bad_request",
+            "body must include \"kind\", \"label\" and \"token\" strings",
+            vec![],
+        );
+    };
+    let kind = req.kind.trim().to_ascii_lowercase();
+    let default_host = match kind.as_str() {
+        "github" => "github.com",
+        "gitlab" => "gitlab.com",
+        _ => {
+            return error(
+                400,
+                "invalid_value",
+                "'kind' must be \"github\" or \"gitlab\"",
+                vec![],
+            );
+        }
+    };
+    let host = req
+        .host
+        .as_deref()
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .unwrap_or(default_host)
+        .to_ascii_lowercase();
+    if host.contains('/') || host.chars().any(char::is_whitespace) {
+        return error(
+            400,
+            "invalid_value",
+            "'host' must be a bare host name such as \"gitlab.example.com\"",
+            vec![],
+        );
+    }
+    let label = req.label.trim();
+    if label.is_empty() || label.len() > 64 || label.contains('/') {
+        return error(
+            400,
+            "invalid_value",
+            "'label' must be 1-64 characters and must not contain '/'",
+            vec![],
+        );
+    }
+    let token = req.token.trim();
+    if token.is_empty() {
+        return error(400, "invalid_value", "'token' must not be empty", vec![]);
+    }
+    let store = daemon.lock();
+    let duplicate = match store.list_forge_poll_tokens() {
+        Ok(all) => all
+            .iter()
+            .any(|t| t.kind == kind && t.host == host && t.label == label),
+        Err(e) => return store_error(&e),
+    };
+    if duplicate {
+        return error(
+            409,
+            "conflict",
+            &format!("a {kind} pool token labelled {label:?} already exists for {host}"),
+            vec![],
+        );
+    }
+    match store.add_forge_poll_token(&kind, &host, label, token) {
+        Ok(summary) => json(201, &summary),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `DELETE /api/forge/pool/{kind}/{host}/{label}` (RAL-635).
+fn remove_forge_pool_token(daemon: &Daemon, kind: &str, host: &str, label: &str) -> Reply {
+    match daemon.lock().remove_forge_poll_token(kind, host, label) {
+        Ok(true) => json(200, &serde_json::json!({"removed": true})),
+        Ok(false) => error(
+            404,
+            "not_found",
+            &format!("no {kind} pool token labelled {label:?} for {host}"),
+            vec![],
+        ),
         Err(e) => store_error(&e),
     }
 }
@@ -20064,6 +20190,8 @@ pub fn serve<A: ToSocketAddrs>(
             .with_token(token)
             .with_background_work(BackgroundWork::Threaded),
     );
+    // RAL-635: load the forge poll-token pool and let it report exhaustion.
+    crate::forge_pool::install(&daemon.store_handle());
     // RAL-318 bug 3: repair any Triage pool/threshold/schedule row still
     // keyed by its pre-fix raw worktree path instead of the resolved
     // project name, and fire any pool that's now correctly counted and
@@ -23085,6 +23213,69 @@ mod tests {
             Some("bob"),
         );
         assert_eq!(r.status, 403, "{}", r.body);
+    }
+
+    #[test]
+    fn forge_pool_routes_add_list_remove_without_echoing_the_token() {
+        let d = daemon();
+        let add = |body: serde_json::Value| route(&d, "POST", "/api/forge/pool", &body.to_string());
+
+        let r = add(
+            serde_json::json!({"kind": "github", "label": "bot-1", "token": "ghp_secretvalue1234"}),
+        );
+        assert_eq!(r.status, 201, "{}", r.body);
+        assert!(!r.body.contains("ghp_secretvalue1234"), "{}", r.body);
+        let r = add(
+            serde_json::json!({"kind": "gitlab", "host": "gl.corp", "label": "bot-1", "token": "glpat-secretvalue99"}),
+        );
+        assert_eq!(r.status, 201, "{}", r.body);
+
+        let dup = add(
+            serde_json::json!({"kind": "github", "label": "bot-1", "token": "other-token-value"}),
+        );
+        assert_eq!(dup.status, 409, "{}", dup.body);
+        let bad_kind = add(serde_json::json!({"kind": "bitbucket", "label": "x", "token": "t"}));
+        assert_eq!(bad_kind.status, 400, "{}", bad_kind.body);
+        let no_token = add(serde_json::json!({"kind": "github", "label": "x", "token": ""}));
+        assert_eq!(no_token.status, 400, "{}", no_token.body);
+
+        let list = route(&d, "GET", "/api/forge/pool", "");
+        assert_eq!(list.status, 200, "{}", list.body);
+        assert!(!list.body.contains("secretvalue"), "{}", list.body);
+        let body: serde_json::Value = serde_json::from_str(&list.body).unwrap();
+        let tokens = body["tokens"].as_array().unwrap();
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0]["host"], "github.com");
+        assert_eq!(tokens[1]["host"], "gl.corp");
+
+        let gone = route(&d, "DELETE", "/api/forge/pool/github/github.com/bot-1", "");
+        assert_eq!(gone.status, 200, "{}", gone.body);
+        let again = route(&d, "DELETE", "/api/forge/pool/github/github.com/bot-1", "");
+        assert_eq!(again.status, 404, "{}", again.body);
+    }
+
+    #[test]
+    fn forge_pool_routes_are_admin_only() {
+        let d = daemon();
+        d.lock().create_user("bob").unwrap();
+        d.lock().create_user("some-admin").unwrap();
+        d.lock().set_user_admin("some-admin", true).unwrap();
+        for (method, path, body) in [
+            ("GET", "/api/forge/pool", String::new()),
+            (
+                "POST",
+                "/api/forge/pool",
+                serde_json::json!({"kind": "github", "label": "x", "token": "t"}).to_string(),
+            ),
+            (
+                "DELETE",
+                "/api/forge/pool/github/github.com/x",
+                String::new(),
+            ),
+        ] {
+            let r = route_for_user(&d, method, path, &body, Some("bob"));
+            assert_eq!(r.status, 403, "{method} {path}: {}", r.body);
+        }
     }
 
     #[test]

@@ -884,6 +884,17 @@
        * @property {TriageScheduleDraft[]} scheds
        */
       /**
+       * RAL-635: one poll-token pool entry from `GET /api/forge/pool`. The
+       * daemon never returns the token itself -- only a masked tail.
+       * @typedef {object} ForgePoolToken
+       * @property {number} id
+       * @property {string} kind - "github" or "gitlab"
+       * @property {string} host
+       * @property {string} label
+       * @property {string} masked
+       * @property {number} created_at_ms
+       */
+      /**
        * @typedef {object} ProjectView
        * @property {string} name
        * @property {string} description

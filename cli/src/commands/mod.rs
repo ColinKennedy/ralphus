@@ -14,6 +14,7 @@
 pub mod agent;
 pub mod cell;
 pub mod env;
+pub mod forge;
 pub mod initialize;
 pub mod internal;
 pub mod machine;
@@ -211,6 +212,7 @@ pub enum Command {
     TutorShow,
     Cell(cell::CellCommand),
     Proof(proof::ProofCommand),
+    Forge(forge::ForgeCommand),
     Prophecy(prophecy::ProphecyCommand),
     Review(review::ReviewCommand),
     Queue(queue::QueueCommand),
@@ -362,6 +364,7 @@ pub fn parse_args(args: &[String]) -> Command {
         Some("task") => Command::Task(task::parse(&scanner.remaining())),
         Some("cell") => Command::Cell(cell::parse(&scanner.remaining())),
         Some("proof") => Command::Proof(proof::parse(&scanner.remaining())),
+        Some("forge") => Command::Forge(forge::parse(&scanner.remaining())),
         Some("prophecy") => Command::Prophecy(prophecy::parse(&scanner.remaining())),
         Some("review") => Command::Review(review::parse(&scanner.remaining())),
         Some("queue") => Command::Queue(queue::parse(&scanner.remaining())),
@@ -564,6 +567,7 @@ pub fn dispatch(cmd: Command, opts: &GlobalOpts) -> i32 {
         Command::Task(c) => task::dispatch(c, opts),
         Command::Cell(c) => cell::dispatch(c, opts),
         Command::Proof(c) => proof::dispatch(c, opts),
+        Command::Forge(c) => forge::dispatch(c, opts),
         Command::Prophecy(c) => prophecy::dispatch(c, opts),
         Command::Review(c) => review::dispatch(c, opts),
         Command::Queue(c) => queue::dispatch(c, opts),

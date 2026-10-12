@@ -331,6 +331,9 @@
       .proj-table th { text-align: left; padding: 6px 12px; color: var(--muted); font-weight: 500; white-space: nowrap; }
       .proj-table td { padding: 6px 12px; border-bottom: 1px solid var(--border); vertical-align: top; word-break: break-word; }
       .proj-table tbody tr:hover { background: var(--panel-2); }
+      .forge-pool-kind { margin-top: 12px; }
+      .forge-pool-title { color: var(--muted); font-weight: 500; margin-bottom: 4px; }
+      .forge-pool-mask { font-family: monospace; }
       /* ---- RAL-324 resolved-env viewer popup ---- */
       .env-table { width: 100%; border-collapse: collapse; font-size: 12px; }
       .env-table th { text-align: left; padding: 4px 10px; color: var(--muted); font-weight: 500; white-space: nowrap; }

@@ -357,6 +357,9 @@ the daemon's hourly Free-tier background sweep
 | `review status <selector>` | Per-branch `merge_status`/`ready`/detail + a summary verdict — "is this review ready?" |
 | `review worktrees <selector>` | Worktrees/branches this review consumes, with source cell |
 | `review create <name> <base_branch> <git_root> [--checks] [--skip-checks] [--skip-worktrees] [--review-type]` | Create a review |
+| `forge pool list` | List the daemon-wide forge poll tokens (label and masked tail only) |
+| `forge pool add <kind> <label> --token <t> [--host <h>]` | Add a poll token for `github`/`gitlab` (host defaults to `github.com`/`gitlab.com`); admin-only |
+| `forge pool remove <kind> <label> [--host <h>]` | Remove a poll token; admin-only |
 | `review rename <selector> <name>` | Rename |
 | `review cancel <selector>` | Cancel |
 | `review reopen <selector>` | Reopen a cancelled or merged review, immediately staging in whatever branches are already ready |
@@ -758,6 +761,11 @@ use; see `READ_ONLY_NOTE`.
     - clear --all --keep-temporary --status [states] --yes (subagent)  {Delete tasks and reviews from the daemon.}
     - (read-only-safe) completion  {Print a shell tab-completion script. (Rust port: not yet implemented -- prints a placeholder message; Python's `shell` argument is not read.)}
     - (read-only-safe) configuration  {Show sourced .ralphus.toml files and resolved values. (Python's separate `configuration show` subcommand is flattened into this bare command in the Rust port; --no-local is not yet ported.)}
+    - forge  {Forge-wide settings: the poll-token pool used for read-only CI/PR polling.}
+        - pool  {Manage the daemon-wide poll-token pool that read-only forge polling rotates through when a token is rate-limited.}
+            - add kind [github|gitlab] label [str] --host [host] --token [token]  {Add a labelled personal access token to the poll pool for one forge host (default github.com / gitlab.com). Read-only polling rotates through the pool; writes always use the acting user's own token.}
+            - (read-only-safe) list  {List the poll-token pool: kind, host, label and a masked tail for each token (never the token).}
+            - remove kind [github|gitlab] label [str] --host [host]  {Remove a labelled token from the poll pool.}
     - (read-only-safe) get selector [uri] field [str, optional]  {Query one field from any entity's JSON view (jq-lite).}
     - (read-only-safe) graph squad_id [id, optional] --all --dot  {Render the task-order dependency graph. (Rust port simplifies Python's --global/--format ascii|dot choice to plain --dot/--all boolean flags.)}
     - (read-only-safe) history selector [uri] --type [str]  {Show a cell/proof step's tmux history (one-shot snapshot; Python's --live tailing and --wait-until-valid are not yet ported).}

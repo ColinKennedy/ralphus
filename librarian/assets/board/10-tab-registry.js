@@ -132,6 +132,10 @@
       let addProjectWarnings = [];
       /** Message from the last failed project removal, shown inline above the Projects table. */
       let projectRemoveError = "";
+      /** @type {ForgePoolToken[]} the daemon-wide forge poll-token pool (RAL-635), shown under the Projects table */
+      let forgePoolTokens = [];
+      /** Message from the last failed poll-token add/remove, shown inline in the Forges section. */
+      let forgePoolError = "";
       // ---- Users tab (placeholder identity registry; TODO: replace with user auth once RAL-252 is done) ----
       /** @type {UserView[]} */
       let users = [];

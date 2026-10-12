@@ -37,6 +37,14 @@
 //! detection even when no token is configured yet. [`resolve_remote`] and
 //! [`resolve_remote_for`] take no store and so only see steps 2-3.
 //!
+//! ### Poll-token pool (RAL-635)
+//!
+//! Polling reads (CI status, the PR comment cache refresh, base-state checks)
+//! additionally rotate through the admin-registered pool in `crate::forge_pool`
+//! for the remote's host: the first token until the forge answers 401/403/429,
+//! then the next, with the resolved token above last. Writes never use pool
+//! tokens. With an empty pool nothing changes.
+//!
 //! TODO: Replace with real user-service authentication once RAL-245 is complete.
 
 use std::collections::HashMap;
@@ -45,6 +53,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::config::ForgeConfig;
+use crate::forge_pool;
 
 /// Build a ureq agent with bounded connect/read/write timeouts. ureq 2.x
 /// defaults the read timeout to *infinite*, so a stalled remote socket would
@@ -539,6 +548,95 @@ impl ForgeClient {
         self
     }
 
+    /// A copy of this client that authenticates with a poll-pool `token`
+    /// (RAL-635). It carries no `cli_token_host` or lookup identity: a pool
+    /// token's rejection must not evict the user's cached CLI token, and a
+    /// pool client never rotates again.
+    #[must_use]
+    fn with_pool_token(&self, token: String) -> Self {
+        Self {
+            token: Some(token),
+            cli_token_host: None,
+            lookup_identity: None,
+            ..self.clone()
+        }
+    }
+
+    /// Run a polling read, rotating through the daemon's poll-token pool for
+    /// this client's `(kind, host)` (RAL-635).
+    ///
+    /// With an empty pool (or a client with no resolved host) this is exactly
+    /// `op(self)`. Otherwise pool tokens are tried in order, starting from the
+    /// one that last worked, and the client's own token goes last. A token the
+    /// forge rejects (`is_rejection`) is put on cooldown until its reset and
+    /// the next is tried; any other error is returned as is. When every token
+    /// is rejected or cooling down, an "all configured tokens rejected" error
+    /// built by `all_rejected` is returned and the exhaustion is reported
+    /// once. Only reads go through here: writes keep the acting user's token.
+    fn poll_rotated<T, E: std::fmt::Display>(
+        &self,
+        is_rejection: impl Fn(&E) -> bool,
+        all_rejected: impl Fn(String, Option<Duration>) -> E,
+        op: impl Fn(&ForgeClient) -> Result<T, E>,
+    ) -> Result<T, E> {
+        let Some(host) = self.cli_token_host.as_deref() else {
+            return op(self);
+        };
+        let kind = self.kind.as_str();
+        let pool = forge_pool::tokens(kind, host);
+        if pool.is_empty() {
+            return op(self);
+        }
+        let start = forge_pool::sticky_index(kind, host, pool.len());
+        let mut soonest: Option<Duration> = None;
+        let mut last_error = String::new();
+        let candidates = (0..pool.len())
+            .map(|off| {
+                let i = (start + off) % pool.len();
+                (Some(i), self.with_pool_token(pool[i].token.clone()))
+            })
+            .chain(std::iter::once((None, self.clone())));
+        for (pool_index, client) in candidates {
+            if let Some(left) = client.own_backoff_remaining() {
+                soonest = Some(soonest.map_or(left, |s| s.min(left)));
+                continue;
+            }
+            match op(&client) {
+                Ok(value) => {
+                    if let Some(i) = pool_index {
+                        forge_pool::set_sticky_index(kind, host, i);
+                    }
+                    forge_pool::note_recovered(kind, host);
+                    return Ok(value);
+                }
+                Err(e) if is_rejection(&e) => {
+                    // A rejection that carried no reset window still takes the
+                    // token out of rotation for the default backoff.
+                    client.note_rate_limited(None);
+                    let left = client
+                        .own_backoff_remaining()
+                        .unwrap_or(DEFAULT_QUOTA_BACKOFF);
+                    soonest = Some(soonest.map_or(left, |s| s.min(left)));
+                    last_error = e.to_string();
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        let detail = if last_error.is_empty() {
+            "every token is cooling down after an earlier rejection".to_string()
+        } else {
+            format!("last response: {last_error}")
+        };
+        forge_pool::note_exhausted(kind, host, pool.len(), &detail);
+        Err(all_rejected(
+            format!(
+                "forge API 403: all configured {kind} tokens for {host} were rejected                  ({} pool token(s) and the user's own token); {detail}",
+                pool.len()
+            ),
+            soonest,
+        ))
+    }
+
     /// Which forge this client talks to.
     #[must_use]
     pub fn kind(&self) -> ForgeKind {
@@ -1018,7 +1116,11 @@ impl ForgeClient {
             self.kind.as_str(),
             self.repo_path
         );
-        let result = self.get_pull_request_base_state_inner(number);
+        let result = self.poll_rotated(
+            |e: &String| is_string_rejection(e),
+            string_all_rejected,
+            |c| c.get_pull_request_base_state_inner(number),
+        );
         match &result {
             // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
             Ok(state) => crate::rlog!(
@@ -1136,7 +1238,11 @@ impl ForgeClient {
             self.kind.as_str(),
             self.repo_path
         );
-        let result = self.check_pr_ci_status_inner(number);
+        let result = self.poll_rotated(
+            |e: &String| is_string_rejection(e),
+            string_all_rejected,
+            |c| c.check_pr_ci_status_inner(number),
+        );
         match &result {
             // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
             Ok((state, _)) => crate::rlog!(
@@ -2855,6 +2961,23 @@ impl ForgeClient {
         source: PrCommentEndpoint,
         etag: Option<&str>,
     ) -> Result<CommentsPoll, ForgeError> {
+        self.poll_rotated(
+            |e: &ForgeError| matches!(e.status, Some(401 | 403 | 429)),
+            |detail, retry_after| ForgeError {
+                status: Some(403),
+                retry_after,
+                message: detail,
+            },
+            |c| c.list_pr_comments_conditional_once(number, source, etag),
+        )
+    }
+
+    fn list_pr_comments_conditional_once(
+        &self,
+        number: i64,
+        source: PrCommentEndpoint,
+        etag: Option<&str>,
+    ) -> Result<CommentsPoll, ForgeError> {
         let token = self.require_token().map_err(ForgeError::other)?;
         let req = match (self.kind, source) {
             (ForgeKind::GitHub, PrCommentEndpoint::Conversation) => {
@@ -3164,10 +3287,27 @@ impl ForgeClient {
         }
     }
 
-    /// How much longer this client's token is known to be out of quota, or
-    /// `None` when it is free to call. Only GitHub registers a window.
+    /// How much longer polling through this client is known to be out of
+    /// quota, or `None` when it is free to call. With a poll-token pool for
+    /// this client's host (RAL-635) that is only the case once the pool tokens
+    /// and the client's own token are all cooling down; the wait is the
+    /// shortest of them.
     #[must_use]
     pub fn rate_limit_backoff_remaining(&self) -> Option<Duration> {
+        let own = self.own_backoff_remaining()?;
+        let Some(host) = self.cli_token_host.as_deref() else {
+            return Some(own);
+        };
+        let mut soonest = own;
+        for pooled in forge_pool::tokens(self.kind.as_str(), host) {
+            let left = self.with_pool_token(pooled.token).own_backoff_remaining()?;
+            soonest = soonest.min(left);
+        }
+        Some(soonest)
+    }
+
+    /// The cooldown on exactly this client's token, ignoring any pool.
+    fn own_backoff_remaining(&self) -> Option<Duration> {
         let key = self.rate_limit_key();
         let mut map = RATE_LIMIT_BACKOFF
             .lock()
@@ -3196,7 +3336,7 @@ impl ForgeClient {
             }
         }
         let error = describe_error(e);
-        if self.kind == ForgeKind::GitHub && error.is_quota_exhausted() {
+        if error.is_quota_exhausted() {
             self.note_rate_limited(error.retry_after);
         }
         // Auth rejections and rate limits are logged here, at the one point
@@ -3296,6 +3436,19 @@ impl From<ForgeError> for String {
     }
 }
 
+/// Whether a plain-string forge error (`"forge API {status}: ..."`) is an
+/// auth rejection or rate limit, i.e. one the poll-token pool rotates past.
+fn is_string_rejection(e: &str) -> bool {
+    ["forge API 401", "forge API 403", "forge API 429"]
+        .iter()
+        .any(|p| e.starts_with(p))
+}
+
+/// The error a string-typed poll returns when every token was rejected.
+fn string_all_rejected(detail: String, _retry_after: Option<Duration>) -> String {
+    detail
+}
+
 /// Parse a `Retry-After` header value (RAL-366): supports only the
 /// delay-seconds form (`Retry-After: 120`), which is what GitHub/GitLab both
 /// send on a rate limit -- the HTTP-date form is valid per spec but not
@@ -3357,9 +3510,14 @@ fn describe_error(e: ureq::Error) -> ForgeError {
                         .duration_since(std::time::UNIX_EPOCH)
                         .ok()?
                         .as_secs();
+                    // GitHub sends `X-RateLimit-*`; GitLab sends `RateLimit-*`
+                    // with the same meaning (remaining count, epoch reset).
+                    let header = |github: &str, gitlab: &str| {
+                        resp.header(github).or_else(|| resp.header(gitlab))
+                    };
                     github_quota_reset_wait(
-                        resp.header("X-RateLimit-Remaining")?,
-                        resp.header("X-RateLimit-Reset")?,
+                        header("X-RateLimit-Remaining", "RateLimit-Remaining")?,
+                        header("X-RateLimit-Reset", "RateLimit-Reset")?,
                         now,
                     )
                 });
@@ -7750,7 +7908,7 @@ mod tests {
     }
 
     #[test]
-    fn a_gitlab_429_does_not_register_a_backoff() {
+    fn a_gitlab_429_registers_a_backoff_like_github() {
         let mock = MockForge::start(move |server| {
             let req = server.recv();
             req.respond(
@@ -7765,7 +7923,7 @@ mod tests {
         let client = mock.client(ForgeKind::GitLab, "acme%2Fwidget");
         let err = client.check_pr_ci_status(9).unwrap_err();
         assert!(err.contains("429"), "{err}");
-        assert_eq!(client.rate_limit_backoff_remaining(), None);
+        assert!(client.rate_limit_backoff_remaining().is_some());
         mock.finish();
     }
 
@@ -8875,5 +9033,256 @@ mod tests {
         let err =
             check_repository_url("https://forge.internal/acme/widget", &cfg, None).unwrap_err();
         assert!(err.contains("forge.internal"));
+    }
+}
+
+/// RAL-635: poll-token pool rotation.
+#[cfg(test)]
+mod pool_rotation_tests {
+    use super::*;
+    use crate::mock_forge::MockForge;
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    type Seen = Arc<StdMutex<Vec<(String, String)>>>;
+
+    fn token_of(req: &tiny_http::Request) -> String {
+        req.headers()
+            .iter()
+            .find(|h| h.field.equiv("Authorization") || h.field.equiv("PRIVATE-TOKEN"))
+            .map(|h| h.value.as_str().trim_start_matches("Bearer ").to_string())
+            .unwrap_or_default()
+    }
+
+    fn header(name: &str, value: &str) -> tiny_http::Header {
+        tiny_http::Header::from_bytes(name.as_bytes(), value.as_bytes()).unwrap()
+    }
+
+    /// A forge that answers `403` + `Retry-After` for any token in `rejected`
+    /// and a PR body (GitHub and GitLab shapes) for the rest, recording
+    /// `(method, token)` per request.
+    fn forge_rejecting(rejected: Vec<String>, seen: &Seen) -> MockForge {
+        let seen = Arc::clone(seen);
+        MockForge::start(move |server| {
+            for req in server.requests() {
+                let token = token_of(&req);
+                seen.lock()
+                    .unwrap()
+                    .push((req.method().as_str().to_string(), token.clone()));
+                let response = if rejected.contains(&token) {
+                    tiny_http::Response::from_string("rate limited")
+                        .with_status_code(403)
+                        .with_header(header("Retry-After", "30"))
+                } else {
+                    tiny_http::Response::from_string(
+                        r#"{"base":{"ref":"main"},"target_branch":"main","updated_at":"2024-05-01T00:00:00Z"}"#,
+                    )
+                    .with_header(header("Content-Type", "application/json"))
+                };
+                let _ = req.respond(response);
+            }
+        })
+    }
+
+    fn own(host: &str) -> String {
+        format!("own-{host}")
+    }
+
+    fn client(mock: &MockForge, kind: ForgeKind, host: &str) -> ForgeClient {
+        ForgeClient::new(
+            kind,
+            mock.base_url(),
+            "acme/widget".to_string(),
+            Some(own(host)),
+        )
+        .with_cli_token_host(host)
+    }
+
+    fn tokens_seen(seen: &Seen) -> Vec<String> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .map(|(_, t)| t.clone())
+            .collect()
+    }
+
+    #[test]
+    fn rotates_past_a_rejected_token_and_stays_on_the_one_that_worked() {
+        let host = "rot-sticky.example";
+        forge_pool::set_tokens_for_test("github", host, &[("a", "pool-a"), ("b", "pool-b")]);
+        let seen = Seen::default();
+        let mock = forge_rejecting(vec!["pool-a".into()], &seen);
+        let c = client(&mock, ForgeKind::GitHub, host);
+        assert_eq!(c.get_pull_request_base_state(1).unwrap().base, "main");
+        assert_eq!(c.get_pull_request_base_state(1).unwrap().base, "main");
+        mock.finish();
+        // The first token is tried once; after it is rejected polling sticks
+        // to the second without retrying the first.
+        assert_eq!(tokens_seen(&seen), ["pool-a", "pool-b", "pool-b"]);
+    }
+
+    #[test]
+    fn falls_back_to_the_users_own_token_after_the_pool() {
+        let host = "rot-fallback.example";
+        forge_pool::set_tokens_for_test("github", host, &[("a", "pool-a")]);
+        let seen = Seen::default();
+        let mock = forge_rejecting(vec!["pool-a".into()], &seen);
+        let c = client(&mock, ForgeKind::GitHub, host);
+        c.get_pull_request_base_state(1).unwrap();
+        mock.finish();
+        assert_eq!(tokens_seen(&seen), ["pool-a".to_string(), own(host)]);
+    }
+
+    #[test]
+    fn every_token_rejected_is_a_clear_error_and_stops_calling_the_forge() {
+        let host = "rot-all.example";
+        forge_pool::set_tokens_for_test("github", host, &[("a", "pool-a"), ("b", "pool-b")]);
+        let seen = Seen::default();
+        let mock = forge_rejecting(vec!["pool-a".into(), "pool-b".into(), own(host)], &seen);
+        let c = client(&mock, ForgeKind::GitHub, host);
+        let err = c.get_pull_request_base_state(1).unwrap_err();
+        assert!(err.contains("all configured github tokens"), "{err}");
+        assert!(err.contains(host), "{err}");
+        assert_eq!(seen.lock().unwrap().len(), 3);
+        // Every token is cooling down, so the next poll is refused locally.
+        assert!(c.rate_limit_backoff_remaining().is_some());
+        let again = c.get_pull_request_base_state(1).unwrap_err();
+        assert!(again.contains("all configured github tokens"), "{again}");
+        assert_eq!(seen.lock().unwrap().len(), 3, "no further forge calls");
+        mock.finish();
+    }
+
+    #[test]
+    fn exhausted_comment_poll_surfaces_a_rate_limited_forge_error() {
+        let host = "rot-comments.example";
+        forge_pool::set_tokens_for_test("github", host, &[("a", "pool-a")]);
+        let seen = Seen::default();
+        let mock = forge_rejecting(vec!["pool-a".into(), own(host)], &seen);
+        let c = client(&mock, ForgeKind::GitHub, host);
+        let err = c
+            .list_pr_comments_conditional(1, PrCommentEndpoint::Conversation, None)
+            .unwrap_err();
+        assert!(err.is_rate_limited());
+        assert!(err.to_string().contains("all configured github tokens"));
+        mock.finish();
+    }
+
+    #[test]
+    fn an_empty_pool_polls_with_the_users_own_token_only() {
+        let host = "rot-empty.example";
+        let seen = Seen::default();
+        let mock = forge_rejecting(Vec::new(), &seen);
+        let c = client(&mock, ForgeKind::GitHub, host);
+        c.get_pull_request_base_state(1).unwrap();
+        mock.finish();
+        assert_eq!(tokens_seen(&seen), [own(host)]);
+    }
+
+    #[test]
+    fn a_non_auth_error_is_returned_without_rotating() {
+        let host = "rot-404.example";
+        forge_pool::set_tokens_for_test("github", host, &[("a", "pool-a"), ("b", "pool-b")]);
+        let seen = Seen::default();
+        let mock = MockForge::start({
+            let seen = Arc::clone(&seen);
+            move |server| {
+                for req in server.requests() {
+                    seen.lock().unwrap().push((String::new(), token_of(&req)));
+                    let _ = req.respond(
+                        tiny_http::Response::from_string("not found").with_status_code(404),
+                    );
+                }
+            }
+        });
+        let c = client(&mock, ForgeKind::GitHub, host);
+        let err = c.get_pull_request_base_state(1).unwrap_err();
+        assert!(err.starts_with("forge API 404"), "{err}");
+        mock.finish();
+        assert_eq!(tokens_seen(&seen), ["pool-a"]);
+    }
+
+    #[test]
+    fn writes_never_use_a_pool_token() {
+        let host = "rot-write.example";
+        forge_pool::set_tokens_for_test("github", host, &[("a", "pool-a")]);
+        let seen = Seen::default();
+        let mock = forge_rejecting(Vec::new(), &seen);
+        let c = client(&mock, ForgeKind::GitHub, host);
+        c.update_pull_request_base(7, "feature-1").unwrap();
+        mock.finish();
+        let seen = seen.lock().unwrap();
+        assert!(!seen.is_empty());
+        assert!(seen.iter().all(|(_, t)| t == &own(host)), "{seen:?}");
+    }
+
+    #[test]
+    fn gitlab_rotates_on_a_429_with_ratelimit_headers() {
+        let host = "rot-gitlab.example";
+        forge_pool::set_tokens_for_test("gitlab", host, &[("a", "pool-a"), ("b", "pool-b")]);
+        let seen = Seen::default();
+        let mock = MockForge::start({
+            let seen = Arc::clone(&seen);
+            move |server| {
+                for req in server.requests() {
+                    let token = token_of(&req);
+                    seen.lock().unwrap().push((String::new(), token.clone()));
+                    let response = if token == "pool-a" {
+                        let reset = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs()
+                            + 120;
+                        tiny_http::Response::from_string("slow down")
+                            .with_status_code(429)
+                            .with_header(header("RateLimit-Remaining", "0"))
+                            .with_header(header("RateLimit-Reset", &reset.to_string()))
+                    } else {
+                        tiny_http::Response::from_string(
+                            r#"{"target_branch":"main","updated_at":"2024-05-01T00:00:00Z"}"#,
+                        )
+                    };
+                    let _ = req.respond(response);
+                }
+            }
+        });
+        let c = client(&mock, ForgeKind::GitLab, host);
+        assert_eq!(c.get_pull_request_base_state(3).unwrap().base, "main");
+        assert_eq!(c.get_pull_request_base_state(3).unwrap().base, "main");
+        mock.finish();
+        assert_eq!(tokens_seen(&seen), ["pool-a", "pool-b", "pool-b"]);
+    }
+
+    /// The reorder poll reads each PR's base through the pool; the stack
+    /// retargets that follow use the user's own token.
+    #[test]
+    fn stack_reads_rotate_and_retargets_stay_on_the_users_token() {
+        let host = "rot-stack.example";
+        forge_pool::set_tokens_for_test("github", host, &[("a", "pool-a"), ("b", "pool-b")]);
+        let seen = Seen::default();
+        let mock = forge_rejecting(vec!["pool-a".into()], &seen);
+        let c = client(&mock, ForgeKind::GitHub, host);
+        for number in [11, 12, 13] {
+            assert_eq!(c.get_pull_request_base_state(number).unwrap().base, "main");
+        }
+        c.update_pull_request_base(12, "feature-11").unwrap();
+        c.update_pull_request_base(13, "feature-12").unwrap();
+        mock.finish();
+        let seen = seen.lock().unwrap();
+        let writes: Vec<_> = seen.iter().filter(|(m, _)| m != "GET").collect();
+        assert_eq!(writes.len(), 2, "{seen:?}");
+        assert!(writes.iter().all(|(_, t)| t == &own(host)), "{seen:?}");
+    }
+
+    /// An exhausted pool fails the base read before any retarget would be
+    /// sent, leaving every PR where it was.
+    #[test]
+    fn exhausted_pool_read_makes_no_retarget_call() {
+        let host = "rot-stack-down.example";
+        forge_pool::set_tokens_for_test("github", host, &[("a", "pool-a")]);
+        let seen = Seen::default();
+        let mock = forge_rejecting(vec!["pool-a".into(), own(host)], &seen);
+        let c = client(&mock, ForgeKind::GitHub, host);
+        assert!(c.get_pull_request_base_state(11).is_err());
+        mock.finish();
+        assert!(seen.lock().unwrap().iter().all(|(m, _)| m == "GET"));
     }
 }

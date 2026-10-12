@@ -16,6 +16,7 @@
 
 mod agent;
 mod cell;
+mod forge;
 mod machine;
 mod mailbox;
 mod preset;
@@ -96,6 +97,7 @@ pub fn execute(cmd: Command, client: &DaemonClient) -> ExecResult {
         }
         Command::Cell(c) => cell::execute(c, client),
         Command::Proof(c) => proof::execute(c, client),
+        Command::Forge(c) => forge::execute(c, client),
         Command::Prophecy(c) => prophecy::execute(c, client),
         Command::Review(c) => review::execute(c, client),
         Command::Queue(c) => queue::execute(c, client),

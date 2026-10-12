@@ -253,6 +253,10 @@
         <span style="color:var(--muted)" id="proj-summary">—</span>
       </div>
       <div id="projects"><div class="empty">Loading…</div></div>
+      <div style="margin-top:24px">
+        <b data-tip="Forges (RAL-635) — a daemon-wide pool of personal access tokens used only for read-only forge polling (CI watch, PR cache refresh, base-state reads).\nWhen a token is rate-limited, polling moves to the next one, then falls back to the user's own token. Writes (create/update/close PR, comments, labels) never use these tokens.">Forges</b>
+        <div id="forge-pool"></div>
+      </div>
     </main>
 
     <main id="users-page" style="display:none">
