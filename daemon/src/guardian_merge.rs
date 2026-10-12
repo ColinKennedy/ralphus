@@ -8673,6 +8673,20 @@ fn run_feedback_pass(
                 "cell_id": feedback_run_cell_id,
                 "attempt_commit": attempt_commit,
                 "committed": committed,
+                "require_proof": require_proof,
+                "leftover_dirty": leftover_dirty,
+                "resolver_self_committed": resolver_self_committed,
+                "fixer_status": result.status,
+                "fixer_proof_passed": fixer_proof_passed,
+                "fixer_error": result.error,
+                "fixer_summary": result.summary.chars().take(FEEDBACK_LOG_TEXT_CHARS).collect::<String>(),
+                "commit_step_detail": commit_step_detail
+                    .as_deref()
+                    .map(|d| d.chars().take(FEEDBACK_LOG_TEXT_CHARS).collect::<String>()),
+                "push_error": push_error,
+                "tokens_in": result.tokens_in,
+                "tokens_out": result.tokens_out,
+                "cost_usd": result.cost_usd,
             }),
             admin_only: false,
         });
@@ -12134,6 +12148,10 @@ fn run_review_auto_build(
 /// How many sibling directories [`claim_post_merge_checkout`] will try before
 /// giving up on finding one it can use.
 const POST_MERGE_CHECKOUT_ATTEMPTS: usize = 8;
+
+/// Cap on each agent-authored text field (the fixer's summary, the commit
+/// step's explanation) in the "feedback done" Cartographer row.
+const FEEDBACK_LOG_TEXT_CHARS: usize = 2000;
 
 /// Produce a detached checkout of `tip` for the post-merge worker to prepare in,
 /// and return its directory. It is retained after preparation so manual actions
