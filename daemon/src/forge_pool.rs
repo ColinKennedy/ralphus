@@ -200,8 +200,8 @@ pub(crate) fn set_tokens_for_test(kind: &str, host: &str, tokens: &[(&str, &str)
             tokens
                 .iter()
                 .map(|(label, token)| PoolToken {
-                    label: (*label).to_string(),
-                    token: (*token).to_string(),
+                    label: label.to_string(),
+                    token: token.to_string(),
                 })
                 .collect(),
         );

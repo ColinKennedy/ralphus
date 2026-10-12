@@ -167,7 +167,7 @@ mod tests {
     use super::*;
 
     fn v(items: &[&str]) -> Vec<String> {
-        items.iter().map(|s| (*s).to_string()).collect()
+        items.iter().map(|s| s.to_string()).collect()
     }
 
     #[test]
