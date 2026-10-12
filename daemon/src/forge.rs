@@ -3117,6 +3117,48 @@ impl ForgeClient {
         }
     }
 
+    /// Registry key for the quota this client draws on: GitHub's primary limit
+    /// is per token, not per repository, so every client built on the same
+    /// token and API base shares one entry. Only a hash of the token is kept.
+    fn rate_limit_key(&self) -> String {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.token.as_deref().unwrap_or_default().hash(&mut hasher);
+        format!("{}|{:x}", self.api_base, hasher.finish())
+    }
+
+    /// Record that this client's quota is exhausted for `retry_after` (a
+    /// default when the forge gave none), so the pollers stop spending calls
+    /// against it. Extends, never shortens, an existing window.
+    fn note_rate_limited(&self, retry_after: Option<Duration>) {
+        let resume_at = Instant::now() + retry_after.unwrap_or(DEFAULT_QUOTA_BACKOFF);
+        let mut map = RATE_LIMIT_BACKOFF
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = map.entry(self.rate_limit_key()).or_insert(resume_at);
+        if *entry < resume_at {
+            *entry = resume_at;
+        }
+    }
+
+    /// How much longer this client's token is known to be out of quota, or
+    /// `None` when it is free to call. Only GitHub registers a window.
+    #[must_use]
+    pub fn rate_limit_backoff_remaining(&self) -> Option<Duration> {
+        let key = self.rate_limit_key();
+        let mut map = RATE_LIMIT_BACKOFF
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let resume_at = *map.get(&key)?;
+        match resume_at.checked_duration_since(Instant::now()) {
+            Some(left) if !left.is_zero() => Some(left),
+            _ => {
+                map.remove(&key);
+                None
+            }
+        }
+    }
+
     /// [`describe_error`], plus (RAL-<new>) evicting this client's
     /// [`CLI_TOKEN_CACHE`] entry on a 401/403 -- the daemon's one signal that
     /// a token might genuinely be bad (revoked, expired), as opposed to the
@@ -3131,6 +3173,9 @@ impl ForgeClient {
             }
         }
         let error = describe_error(e);
+        if self.kind == ForgeKind::GitHub && error.is_quota_exhausted() {
+            self.note_rate_limited(error.retry_after);
+        }
         // Auth rejections and rate limits are logged here, at the one point
         // every forge call's error passes through, so they are visible even
         // where a caller downgrades the failure to a fallback. Only the
@@ -3205,6 +3250,15 @@ impl ForgeError {
     pub fn is_rate_limited(&self) -> bool {
         matches!(self.status, Some(403 | 429))
     }
+
+    /// Whether the forge positively said a quota ran out: a `429`, or a `403`
+    /// that came with a wait (`Retry-After`, or a zero-`Remaining` reset
+    /// header). Stricter than [`Self::is_rate_limited`], which also matches
+    /// a plain permissions `403`.
+    #[must_use]
+    fn is_quota_exhausted(&self) -> bool {
+        self.status == Some(429) || (self.status == Some(403) && self.retry_after.is_some())
+    }
 }
 
 impl std::fmt::Display for ForgeError {
@@ -3228,10 +3282,54 @@ fn parse_retry_after(value: &str) -> Option<Duration> {
     value.trim().parse::<u64>().ok().map(Duration::from_secs)
 }
 
+/// How long a `429` with no wait header holds a token off.
+const DEFAULT_QUOTA_BACKOFF: Duration = Duration::from_secs(60);
+
+/// Quota-exhausted windows by [`ForgeClient::rate_limit_key`] -> resume time.
+static RATE_LIMIT_BACKOFF: std::sync::LazyLock<Mutex<HashMap<String, Instant>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Longest wait a quota-reset header may impose. GitHub's primary window is one
+/// hour, so anything past this is a malformed or hostile header.
+const MAX_QUOTA_RESET_WAIT: Duration = Duration::from_secs(60 * 60);
+
+/// How long until a GitHub primary quota window reopens, from the
+/// `X-RateLimit-Remaining` / `X-RateLimit-Reset` response headers: `Some` only
+/// when `remaining` is exactly `0` and `reset` (epoch seconds) parses. Always
+/// at least one second and at most [`MAX_QUOTA_RESET_WAIT`]. `None` for any
+/// other 403, e.g. a permissions failure on a token that still has quota.
+fn github_quota_reset_wait(remaining: &str, reset: &str, now_epoch_secs: u64) -> Option<Duration> {
+    if remaining.trim().parse::<u64>().ok()? != 0 {
+        return None;
+    }
+    let reset = reset.trim().parse::<u64>().ok()?;
+    let wait = Duration::from_secs(reset.saturating_sub(now_epoch_secs).max(1));
+    Some(wait.min(MAX_QUOTA_RESET_WAIT))
+}
+
 fn describe_error(e: ureq::Error) -> ForgeError {
     match e {
         ureq::Error::Status(code, resp) => {
-            let retry_after = resp.header("Retry-After").and_then(parse_retry_after);
+            // `Retry-After` (secondary limits, GitLab) wins; otherwise a
+            // GitHub 403/429 with `X-RateLimit-Remaining: 0` says exactly when
+            // the window reopens.
+            let retry_after = resp
+                .header("Retry-After")
+                .and_then(parse_retry_after)
+                .or_else(|| {
+                    if !matches!(code, 403 | 429) {
+                        return None;
+                    }
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .ok()?
+                        .as_secs();
+                    github_quota_reset_wait(
+                        resp.header("X-RateLimit-Remaining")?,
+                        resp.header("X-RateLimit-Reset")?,
+                        now,
+                    )
+                });
             let body = resp.into_string().unwrap_or_default();
             ForgeError {
                 status: Some(code),
@@ -7515,6 +7613,126 @@ mod tests {
         });
         let client = mock.client(ForgeKind::GitHub, "acme/widget");
         assert_eq!(client.check_pr_ci_status(4).unwrap(), PrCiState::Passing);
+        mock.finish();
+    }
+
+    #[test]
+    fn github_quota_reset_wait_needs_zero_remaining_and_a_parsable_reset() {
+        assert_eq!(
+            github_quota_reset_wait("0", "1100", 1000),
+            Some(Duration::from_secs(100))
+        );
+        assert_eq!(github_quota_reset_wait("12", "1100", 1000), None);
+        assert_eq!(github_quota_reset_wait("0", "soon", 1000), None);
+        assert_eq!(github_quota_reset_wait("", "1100", 1000), None);
+    }
+
+    #[test]
+    fn github_quota_reset_wait_is_clamped_to_between_one_second_and_an_hour() {
+        assert_eq!(
+            github_quota_reset_wait("0", "900", 1000),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            github_quota_reset_wait("0", "999999999", 1000),
+            Some(MAX_QUOTA_RESET_WAIT)
+        );
+    }
+
+    fn respond_403_with_headers(
+        server: &crate::mock_forge::MockForgeServer,
+        headers: &[(&str, String)],
+    ) {
+        let req = server.recv();
+        let mut resp =
+            tiny_http::Response::from_string(r#"{"message":"nope"}"#).with_status_code(403);
+        for (name, value) in headers {
+            resp = resp.with_header(
+                tiny_http::Header::from_bytes(name.as_bytes(), value.as_bytes()).unwrap(),
+            );
+        }
+        req.respond(resp).unwrap();
+    }
+
+    fn epoch_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    #[test]
+    fn a_github_403_with_zero_remaining_backs_the_client_off_until_the_reset() {
+        let reset = epoch_now() + 120;
+        let mock = MockForge::start(move |server| {
+            respond_403_with_headers(
+                server,
+                &[
+                    ("X-RateLimit-Remaining", "0".to_string()),
+                    ("X-RateLimit-Reset", reset.to_string()),
+                ],
+            );
+        });
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
+        assert_eq!(client.rate_limit_backoff_remaining(), None);
+        assert!(client.check_pr_ci_status(4).is_err());
+        let left = client
+            .rate_limit_backoff_remaining()
+            .expect("the 403 should have registered a backoff");
+        assert!(
+            left > Duration::from_secs(60) && left <= Duration::from_secs(120),
+            "{left:?}"
+        );
+        mock.finish();
+    }
+
+    #[test]
+    fn a_github_403_with_retry_after_backs_off_for_that_long_not_the_reset() {
+        let mock = MockForge::start(move |server| {
+            respond_403_with_headers(server, &[("Retry-After", "30".to_string())]);
+        });
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
+        assert!(client.check_pr_ci_status(4).is_err());
+        let left = client.rate_limit_backoff_remaining().unwrap();
+        assert!(left <= Duration::from_secs(30), "{left:?}");
+        mock.finish();
+    }
+
+    #[test]
+    fn a_github_permissions_403_with_quota_left_does_not_back_off() {
+        let reset = epoch_now() + 120;
+        let mock = MockForge::start(move |server| {
+            respond_403_with_headers(
+                server,
+                &[
+                    ("X-RateLimit-Remaining", "4000".to_string()),
+                    ("X-RateLimit-Reset", reset.to_string()),
+                ],
+            );
+        });
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
+        assert!(client.check_pr_ci_status(4).is_err());
+        assert_eq!(client.rate_limit_backoff_remaining(), None);
+        mock.finish();
+    }
+
+    #[test]
+    fn a_gitlab_429_does_not_register_a_backoff() {
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
+            req.respond(
+                tiny_http::Response::from_string("{}")
+                    .with_status_code(429)
+                    .with_header(
+                        tiny_http::Header::from_bytes(&b"Retry-After"[..], &b"30"[..]).unwrap(),
+                    ),
+            )
+            .unwrap();
+        });
+        let client = mock.client(ForgeKind::GitLab, "acme%2Fwidget");
+        let err = client.check_pr_ci_status(9).unwrap_err();
+        assert!(err.contains("429"), "{err}");
+        assert_eq!(client.rate_limit_backoff_remaining(), None);
         mock.finish();
     }
 
