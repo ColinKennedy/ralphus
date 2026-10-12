@@ -87,6 +87,7 @@
         confirmBulkCancelSquads: (e, ds) => confirmBulkCancelSquads(ds.squadIds || ""),
         toggleTerminalMenu: (e, ds) => toggleTerminalMenu(ds.key || ""),
         togglePeek: (e, ds) => togglePeek(ds.key || ""),
+        openAutoActionsPane: (e, ds) => openAutoActionsPane(ds.guardianId || ""),
         openAgentProofTerminalMenuItem: (e, ds) => { closeTerminalMenu(ds.key || ""); openAgentProofTerminal(ds.squadId || "", Number(ds.ti), ds.scope || "", Number(ds.si), Number(ds.vi)); },
         openProofTerminalMenuItem: (e, ds) => { closeTerminalMenu(ds.key || ""); openProofTerminal(ds.squadId || "", Number(ds.ti), ds.scope || "", Number(ds.si), Number(ds.vi)); },
         toggleHistoryMenuItem: (e, ds) => { closeTerminalMenu(ds.key || ""); toggleHistory(ds.key || ""); },

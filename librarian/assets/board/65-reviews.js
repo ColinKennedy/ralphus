@@ -2279,10 +2279,9 @@ Press Accept on the note to create it.">Squad pending</span>`;
             // It used to be a lone disabled button labelled "Waiting on
             // branches…" with a stray Live View button beside it, which read
             // as a different, older widget than the populated case.
-            const peekKey = `guardian-manual|${g.id}`;
             const noActions = state === "no_actions" || (isReady && !cmds.length);
             const waitingNote = autoActionsStateBadge(g, state, noActions);
-            const headAttrs = `data-click="togglePeek" data-key="${esc(peekKey)}" style="cursor:pointer" data-tip="${esc(peekOpen[peekKey] ? "Hide the live view of the agent that computes auto actions." : "Open the live view of the agent that computes auto actions: what it did, when it ran, and how it ended.")}"`;
+            const headAttrs = `data-click="openAutoActionsPane" data-guardian-id="${esc(g.id)}" style="cursor:pointer" data-tip="${esc(inspectorAutoActionsGid === g.id ? "The details pane on the right is showing the agent that computes auto actions. Click a branch to go back to its details." : "Show the agent that computes auto actions in the details pane: what it did, when it ran, and how it ended.")}"`;
             return `<h3 class="section" data-tip="Auto actions: checks the AI writes from this review's changes.\nThey can change when the stack's changes change; regenerate them from the ⋯ menu.\nAdvisory — they never block Approve or Merge / rebase.">auto actions${sectionMenuBtn(g.id, "manual")}</h3>
               ${isReady && cmds.length
                 ? reviewRunGroup(
@@ -2302,7 +2301,6 @@ Press Accept on the note to create it.">Squad pending</span>`;
                         </div>${commandFullBlock(key, cmdText, { g, check: cmd, kind: "manual", i })}`;
                     }).join(""), false, headAttrs)
                 : reviewRunGroup(runControl, waitingNote, "", false, headAttrs)}
-              ${squadLiveSlot(squadLiveCtx({ baseKey: peekKey, title: "auto actions generation", canThink: true, promptText: "", promptHint: "", noPromptText: "The prompt that generated these actions is not stored with the review. The Agent Log tab shows what the agent did with it.", withAttempts: false, currentMeta: g.manual_checks_finished_at_ms ? "finished" : "running", closeKey: peekKey }))}
               `;
           })()}`;
         attachPeekResizeHandlers();
