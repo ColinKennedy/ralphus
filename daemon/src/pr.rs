@@ -6444,10 +6444,12 @@ pub fn poll_pr_base_drift(
                 skipped.id,
                 pr.id
             );
-            let result = store
-                .lock()
-                .set_branch_enabled_by_name(id, &skipped.branch, false);
-            warn_on_store_write(store, "set_branch_enabled_by_name", id, true, result);
+            let result = store.lock().disable_branch_with_reason(
+                id,
+                &skipped.branch,
+                crate::guardian::DISABLED_BASE_DRIFT,
+            );
+            warn_on_store_write(store, "disable_branch_with_reason", id, true, result);
         }
 
         // ralphus[ignore-rlog-pair]: per-PR drift-detection detail; the batch summary in poll_pr_base_drift_once records the structured workflow outcome
@@ -11916,6 +11918,7 @@ mod tests {
             started_at_ms: None,
             auto_submit_error: None,
             finished_at_ms: None,
+            disabled_reason: None,
         }
     }
 

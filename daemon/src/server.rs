@@ -14562,6 +14562,24 @@ fn set_status(daemon: &Daemon, id: &str, body: &str) -> Reply {
     if matches!(req.kind.as_str(), "task" | "cell" | "proof") && req.state == "cancelled" {
         let _ = store.reconcile_squad_cancellation(id);
     }
+    // RAL-641: an `ignored` cell/task skips its review branch, and going back
+    // to `pending` restores a branch this sync disabled.
+    let review_changes = if matches!(req.kind.as_str(), "task" | "cell")
+        && matches!(req.state.as_str(), "ignored" | "pending")
+    {
+        store
+            .sync_ignored_review_branches(Some(id))
+            .unwrap_or_else(|e| {
+                crate::rlog!(
+                    ERROR,
+                    "ralphus [guardian] ignored-branch sync failed in {id}: {}",
+                    e
+                );
+                Vec::new()
+            })
+    } else {
+        Vec::new()
+    };
     let reply = match store.get_squad(id) {
         Ok(squad) => json(200, &squad),
         Err(e) => store_error(&e),
@@ -14576,8 +14594,25 @@ fn set_status(daemon: &Daemon, id: &str, body: &str) -> Reply {
     // immediately, the way a natural completion does. `store` must be
     // dropped first: `try_start_ready_reviews_for_task` locks the same
     // mutex itself.
-    if matches!(req.kind.as_str(), "task" | "cell" | "proof") && req.state == "done" {
+    let manual_completion = matches!(req.kind.as_str(), "task" | "cell" | "proof")
+        && matches!(req.state.as_str(), "done")
+        || (matches!(req.kind.as_str(), "task" | "cell") && req.state == "ignored");
+    if !review_changes.is_empty() || manual_completion {
         drop(store);
+        for change in &review_changes {
+            // Same path as `review branch disable`: PR base resync, then merge start.
+            crate::pr::start_resync_pr_bases(daemon.store_handle(), &change.guardian_id);
+            let runner = guardian_agent_runner(daemon);
+            let _ = crate::guardian_merge::start_merge(
+                daemon.store_handle(),
+                runner,
+                &change.guardian_id,
+                daemon.semaphore_handle(),
+                daemon.cancellations_handle(),
+            );
+        }
+    }
+    if manual_completion {
         let store_handle = daemon.store_handle();
         {
             // No guard held across this: its pool-firing path invokes the

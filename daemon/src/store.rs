@@ -3160,6 +3160,10 @@ impl Store {
             // RAL-69: tracks whether the user dismissed the "can re-enable" icon
             // on a force-started disabled branch. Once dismissed it never reappears.
             "ALTER TABLE guardian_branches ADD COLUMN dismissed_reenable INTEGER NOT NULL DEFAULT 0",
+            // RAL-641: why a branch is disabled (`user`, `ignored`,
+            // `force-start`, `base drift`); NULL while enabled or for rows
+            // disabled before the column existed.
+            "ALTER TABLE guardian_branches ADD COLUMN disabled_reason TEXT",
             // RAL-77: user-declared action hints from [[review.action]] in TOML.
             // JSON array of {label, command?, prompt?} objects, set at submit time.
             "ALTER TABLE guardians ADD COLUMN action_hints TEXT NOT NULL DEFAULT '[]'",
@@ -10467,13 +10471,18 @@ impl Store {
         Ok(rows)
     }
 
-    /// The `(task_idx, idx)` of every cell manually set to `ignored`. The
-    /// scheduler seeds these as satisfied so their downstream cells run,
-    /// exactly as a `done` upstream would (they are themselves never executed).
+    /// The `(task_idx, idx)` of every cell manually set to `ignored`, plus
+    /// every cell of a task manually set to `ignored`. The scheduler seeds
+    /// these as satisfied so their downstream cells run, exactly as a `done`
+    /// upstream would (they are themselves never executed).
     pub fn ignored_cells(&self, squad_id: &str) -> Result<HashSet<(i64, i64)>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT task_idx, idx FROM cells WHERE squad_id=? AND state='ignored'")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT task_idx, idx FROM cells WHERE squad_id=?1 AND state='ignored'
+             UNION
+             SELECT c.task_idx, c.idx FROM cells c
+             JOIN tasks t ON t.squad_id = c.squad_id AND t.idx = c.task_idx
+             WHERE c.squad_id=?1 AND t.state='ignored'",
+        )?;
         let rows = stmt
             .query_map(params![squad_id], |r| {
                 Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))

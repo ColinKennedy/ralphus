@@ -18004,8 +18004,28 @@ mod tests {
     // -----------------------------------------------------------------------
 
     static TEST_N: AtomicU32 = AtomicU32::new(0);
+    static CLEANUP_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    fn cleanup_old_test_dirs() {
+        use std::sync::atomic::Ordering;
+        if CLEANUP_DONE.swap(true, Ordering::Relaxed) {
+            return; // Already done in this process
+        }
+        let temp_dir = std::env::temp_dir();
+        let pid = std::process::id();
+        if let Ok(entries) = std::fs::read_dir(&temp_dir) {
+            for entry in entries.flatten() {
+                if let Ok(name) = entry.file_name().into_string() {
+                    if name.starts_with("wt-rec-") && name.contains(&format!("-{pid}")) {
+                        let _ = std::fs::remove_dir_all(entry.path());
+                    }
+                }
+            }
+        }
+    }
 
     fn tmp_dir(tag: &str) -> PathBuf {
+        cleanup_old_test_dirs();
         let n = TEST_N.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("wt-rec-{tag}-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -20272,14 +20292,17 @@ mod tests {
         let old = crate::store::now_ms() - WORKTREE_RETIREMENT_AGE_MS - 1;
 
         let make_review = |name: &str, branch: &str, status: &str| {
-            let guard = store.lock();
-            let id = guard
-                .create_guardian(name, "main", &repo.to_string_lossy())
-                .unwrap();
-            guard.add_guardian_branch(&id, branch).unwrap();
-            let branch_id = guard.get_guardian(&id).unwrap().branches[0].id.clone();
-            let wt = worktree_dir(&repo.to_string_lossy(), &id).join("wt-test");
-            std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+            let (id, branch_id, wt) = {
+                let guard = store.lock();
+                let id = guard
+                    .create_guardian(name, "main", &repo.to_string_lossy())
+                    .unwrap();
+                guard.add_guardian_branch(&id, branch).unwrap();
+                let branch_id = guard.get_guardian(&id).unwrap().branches[0].id.clone();
+                let wt = worktree_dir(&repo.to_string_lossy(), &id).join("wt-test");
+                std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+                (id, branch_id, wt)
+            };
             g(
                 &repo,
                 &[
@@ -20291,21 +20314,24 @@ mod tests {
                     "main",
                 ],
             );
-            guard
-                .set_branch_review(
-                    &id,
-                    &branch_id,
-                    &format!("guardian/{id}/wt-{branch}"),
-                    &wt.to_string_lossy(),
-                )
-                .unwrap();
-            guard
-                .conn
-                .execute(
-                    "UPDATE guardians SET status=?1, updated_at_ms=?2 WHERE id=?3",
-                    rusqlite::params![status, old, id],
-                )
-                .unwrap();
+            {
+                let guard = store.lock();
+                guard
+                    .set_branch_review(
+                        &id,
+                        &branch_id,
+                        &format!("guardian/{id}/wt-{branch}"),
+                        &wt.to_string_lossy(),
+                    )
+                    .unwrap();
+                guard
+                    .conn
+                    .execute(
+                        "UPDATE guardians SET status=?1, updated_at_ms=?2 WHERE id=?3",
+                        rusqlite::params![status, old, id],
+                    )
+                    .unwrap();
+            }
             (id, wt)
         };
 
