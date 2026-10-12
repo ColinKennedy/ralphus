@@ -1372,6 +1372,48 @@ which one actually failed rather than guessing.\n";
     format!("Reason: {reason_line}\n{step_note}{job_note}{log_note}\n{command_note}")
 }
 
+/// The auto-fix prompt paragraph telling the agent that a failure on a stacked
+/// PR/MR can come from an earlier branch's code, or `None` when `branch` is
+/// the bottom of the stack (or not in it). `stack` is the review's enabled
+/// branch names, bottom to top.
+///
+/// A stacked PR/MR's CI builds every branch below it together with its own,
+/// so a fixer that only searches its own branch's commits never finds a bug an
+/// earlier branch introduced. Under a `ci_deferral` mode the earlier PRs/MRs
+/// skip the full test suite entirely, so this PR/MR is the first place such a
+/// failure shows up at all.
+fn earlier_stack_branches_note(branch: &str, stack: &[&str], ci_deferral: &str) -> Option<String> {
+    let index = stack.iter().position(|name| *name == branch)?;
+    if index == 0 {
+        return None;
+    }
+    let earlier = &stack[..index];
+    let names = earlier
+        .iter()
+        .map(|name| format!("'{name}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let deferred = (0..index).any(|i| crate::pr::defers_full_ci(ci_deferral, i, stack.len()));
+    let deferral_note = if deferred {
+        format!(
+            " Their own PRs skip the full test suite (this review's `ci_deferral` is \
+             '{ci_deferral}'), so this PR's CI is the first to run those tests against their \
+             code."
+        )
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "This branch is stacked on {count} earlier branch(es) of the same review: {names}. \
+         Its CI builds and tests their code together with this branch's own.{deferral_note} \
+         The failure may therefore come from code an earlier branch introduced, not from this \
+         branch's own commits. Start from the failing assertion or error in the log and trace \
+         it to the code that produces it, wherever in the worktree that code lives (the whole \
+         stack's history is in this worktree's `git log`), then fix it here.",
+        count = earlier.len(),
+    ))
+}
+
 /// Attributed `author` (RAL-379 semantics) for the feedback message
 /// [`dispatch_pr_auto_fix`] posts to a branch's feedback thread -- the same
 /// field a human reviewer's name renders from, so the board shows this round
@@ -1768,8 +1810,18 @@ fn run_pr_fix(
             .collect()
     };
 
+    let mut stack: Vec<&BranchView> = guardian.branches.iter().filter(|b| b.enabled).collect();
+    stack.sort_by_key(|b| b.position);
+    let stack_names: Vec<&str> = stack.iter().map(|b| b.branch.as_str()).collect();
+    let stack_note = earlier_stack_branches_note(
+        &branch.branch,
+        &stack_names,
+        &guardian.effective_ci_deferral,
+    )
+    .map_or_else(String::new, |note| format!("\n\n{note}"));
+
     let prompt_body = format!(
-        "{paragraphs}\n\n\
+        "{paragraphs}{stack_note}\n\n\
          The following are the prompts of the work already done on this branch -- keep this \
          behavior intact while fixing the CI failure:\n\n{cells}",
         paragraphs = paragraphs.join("\n\n"),
@@ -2073,6 +2125,38 @@ mod tests {
             ),
             "must warn against guessing an equivalent command: {text}"
         );
+    }
+
+    /// A top-of-stack PR's CI is where an earlier branch's bug surfaces, so
+    /// its fixer must be told the failure may not be in its own commits --
+    /// and, under `ci_deferral`, that the earlier PRs never ran the tests.
+    #[test]
+    fn earlier_stack_branches_note_names_every_lower_branch() {
+        let stack = ["RAL-1-first", "RAL-2-second", "RAL-3-third"];
+        let note =
+            earlier_stack_branches_note("RAL-3-third", &stack, "top").expect("top has a note");
+        assert!(note.contains("2 earlier branch(es)"), "{note}");
+        assert!(note.contains("'RAL-1-first', 'RAL-2-second'"), "{note}");
+        assert!(!note.contains("RAL-3-third"), "{note}");
+        assert!(note.contains("skip the full test suite"), "{note}");
+        assert!(
+            note.contains("not from this branch's own commits"),
+            "{note}"
+        );
+
+        let middle = earlier_stack_branches_note("RAL-2-second", &stack, "every").expect("note");
+        assert!(middle.contains("'RAL-1-first'"), "{middle}");
+        assert!(
+            !middle.contains("skip the full test suite"),
+            "nothing is deferred under 'every': {middle}"
+        );
+    }
+
+    #[test]
+    fn earlier_stack_branches_note_is_absent_at_the_bottom_or_off_the_stack() {
+        let stack = ["bottom", "top"];
+        assert_eq!(earlier_stack_branches_note("bottom", &stack, "top"), None);
+        assert_eq!(earlier_stack_branches_note("absent", &stack, "top"), None);
     }
 
     /// The instruction to reuse the step's own command must still render

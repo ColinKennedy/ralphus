@@ -173,3 +173,13 @@ Things to know:
   this suits stacks that land as a unit.
 - It does not make a skipped job report success on its own terms; see the
   required-check note above.
+
+## Auto-fix on a deferred stack
+
+A bug that an earlier branch introduces first fails the tests on a later PR/MR,
+usually the top one. When `auto_fix_pr_errors` dispatches a fix for any PR/MR
+above the bottom of the stack, the prompt names the branches below it, says
+that their code is built and tested here too (and, when they are deferred, that
+their own PRs/MRs skipped the full suite), and tells the agent to trace the
+failure to wherever the code lives instead of searching only this branch's own
+commits.

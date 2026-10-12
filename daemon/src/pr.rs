@@ -3955,7 +3955,7 @@ pub fn resync_pr_bases_synchronously(
 /// `every` and any unrecognised mode defer nothing, so a bad stored value runs
 /// more CI rather than less. A single-member stack is both its bottom and its
 /// top, so it is never deferred.
-fn defers_full_ci(mode: &str, index: usize, count: usize) -> bool {
+pub(crate) fn defers_full_ci(mode: &str, index: usize, count: usize) -> bool {
     use ralphus_core::schema::{CI_DEFERRAL_BOTTOM_AND_TOP, CI_DEFERRAL_TOP};
     let is_bottom = index == 0;
     let is_top = index + 1 == count;
