@@ -36,7 +36,7 @@ for stale in ralphus ralphus-runner ralphus-daemon ralphus-librarian ralphus-ssh
   done
 done
 
-daemon_feature=""
+daemon_features=""
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*)
     if [[ "$skip_tmux" == true ]]; then
@@ -44,14 +44,14 @@ case "$(uname -s)" in
     else
       echo "== building vendored psmux (vendor/psmux submodule) =="
       powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$root/scripts/build-vendored-tmux.ps1"
-      daemon_feature="--features ralphus-daemon/embedded-tmux"
+      daemon_features="ralphus-daemon/embedded-tmux"
     fi
     ;;
 esac
 
 echo "== building Rust executables (release) =="
-if [[ -n "$daemon_feature" ]]; then
-  cargo build --release --package ralphus-daemon --package ralphus-librarian --package ralphus-cli --package ralphus-runner --package ralphus-ssh-provider --manifest-path "$root/Cargo.toml" "$daemon_feature"
+if [[ -n "$daemon_features" ]]; then
+  cargo build --release --package ralphus-daemon --package ralphus-librarian --package ralphus-cli --package ralphus-runner --package ralphus-ssh-provider --manifest-path "$root/Cargo.toml" --features "$daemon_features"
 else
   cargo build --release --package ralphus-daemon --package ralphus-librarian --package ralphus-cli --package ralphus-runner --package ralphus-ssh-provider --manifest-path "$root/Cargo.toml"
 fi

@@ -45,11 +45,15 @@ if /I "%~1"=="--skip-tmux" (
   echo == building vendored psmux ^(vendor/psmux submodule^) ==
   powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0build-vendored-tmux.ps1"
   if errorlevel 1 exit /b 1
-  set "daemon_features=--features ralphus-daemon/embedded-tmux"
+  set "daemon_features=ralphus-daemon/embedded-tmux"
 )
 
 echo == building Rust executables (release) ==
-cargo build --release --package ralphus-daemon --package ralphus-librarian --package ralphus-cli --package ralphus-runner --package ralphus-ssh-provider --manifest-path "%root%\Cargo.toml" !daemon_features!
+if defined daemon_features (
+  cargo build --release --package ralphus-daemon --package ralphus-librarian --package ralphus-cli --package ralphus-runner --package ralphus-ssh-provider --manifest-path "%root%\Cargo.toml" --features !daemon_features!
+) else (
+  cargo build --release --package ralphus-daemon --package ralphus-librarian --package ralphus-cli --package ralphus-runner --package ralphus-ssh-provider --manifest-path "%root%\Cargo.toml"
+)
 if errorlevel 1 exit /b 1
 
 for %%B in (ralphus-daemon ralphus-librarian ralphus ralphus-runner ralphus-ssh-provider) do (
