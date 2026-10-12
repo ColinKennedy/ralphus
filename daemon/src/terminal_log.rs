@@ -717,6 +717,87 @@ fn read_attempt_in(root: &std::path::Path, session_name: &str, attempt: u32) -> 
         .map(|s| ralphus_core::redact::redact_secrets(&s).into_owned())
 }
 
+/// Moves every persisted attempt file of `session_name` into the session
+/// directory `archive_name`, leaving `session_name` with no attempts so its
+/// next execution starts again at attempt `0`. A command that a remediation
+/// loop re-runs under the same session name uses this to keep each failed
+/// execution's log as its own readable run instead of overwriting it.
+/// Best-effort: a session with no logs is a no-op, and a failed move is
+/// logged and leaves the original in place.
+pub fn archive_session(session_name: &str, archive_name: &str) -> bool {
+    archive_session_in(&terminal_log_root(), session_name, archive_name)
+}
+
+fn archive_session_in(root: &std::path::Path, session_name: &str, archive_name: &str) -> bool {
+    let from = session_dir_in(root, session_name);
+    let to = session_dir_in(root, archive_name);
+    let Ok(entries) = std::fs::read_dir(&from) else {
+        return false;
+    };
+    let files: Vec<PathBuf> = entries
+        .filter_map(std::result::Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .collect();
+    if files.is_empty() || std::fs::create_dir_all(&to).is_err() {
+        return false;
+    }
+    let mut moved = false;
+    for file in files {
+        let Some(name) = file.file_name() else {
+            continue;
+        };
+        match std::fs::rename(&file, to.join(name)) {
+            Ok(()) => moved = true,
+            Err(e) => {
+                // ralphus[ignore-rlog-pair]: filesystem helper has no Store; the remediation loop logs the retry itself
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [terminal_log] could not archive {} into {}: {e}",
+                    file.display(),
+                    to.display()
+                );
+            }
+        }
+    }
+    moved
+}
+
+/// The sibling sessions of `session_name` that hold one remediation run each
+/// -- `<session_name>-run-<n>` (an archived earlier command execution) and
+/// `<session_name>-remediate-<n>` (a repair agent's pass) -- as
+/// `(suffix, kind, n)`, ordered by `n`, the command run before its repair.
+#[must_use]
+pub fn list_run_variants(session_name: &str) -> Vec<(String, &'static str, u32)> {
+    list_run_variants_in(&terminal_log_root(), session_name)
+}
+
+fn list_run_variants_in(
+    root: &std::path::Path,
+    session_name: &str,
+) -> Vec<(String, &'static str, u32)> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let prefix = format!("{session_name}-");
+    let mut out: Vec<(String, &'static str, u32)> = entries
+        .filter_map(std::result::Result::ok)
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let suffix = name.strip_prefix(&prefix)?;
+            let (kind, n) = if let Some(n) = suffix.strip_prefix("run-") {
+                ("command", n)
+            } else {
+                ("remediation", suffix.strip_prefix("remediate-")?)
+            };
+            Some((suffix.to_string(), kind, n.parse::<u32>().ok()?))
+        })
+        .collect();
+    out.sort_by_key(|(_, kind, n)| (*n, *kind != "command"));
+    out
+}
+
 /// Delete every persisted attempt for one session outright. Returns whether
 /// a log directory existed and was removed; a missing directory is not an
 /// error, and any other I/O failure is logged as a warning.
@@ -1015,6 +1096,49 @@ mod tests {
             read_attempt_in(&root.0, "sess-a", 1)
                 .unwrap()
                 .contains("second attempt")
+        );
+    }
+
+    #[test]
+    fn archiving_a_session_frees_its_attempt_zero_and_keeps_the_old_log() {
+        let root = TempRoot::new("archive-session");
+        write_attempt_in(&root.0, "sess-a", 0, "failed run", 100);
+        std::fs::write(raw_transcript_path_in(&root.0, "sess-a", 0), "raw").unwrap();
+        assert!(archive_session_in(&root.0, "sess-a", "sess-a-run-1"));
+        assert_eq!(read_attempt_in(&root.0, "sess-a", 0), None);
+        assert!(latest_attempt_in(&root.0, "sess-a").is_none());
+        assert!(
+            read_attempt_in(&root.0, "sess-a-run-1", 0)
+                .unwrap()
+                .contains("failed run")
+        );
+        // Nothing to archive is not an error.
+        assert!(!archive_session_in(&root.0, "sess-a", "sess-a-run-2"));
+    }
+
+    #[test]
+    fn run_variants_list_in_order_and_ignore_unrelated_sessions() {
+        let root = TempRoot::new("run-variants");
+        for name in [
+            "sess-a-remediate-1",
+            "sess-a-run-2",
+            "sess-a-run-1",
+            "sess-a-remediate-2",
+            "sess-a-runner-3",
+            "sess-ab-run-1",
+            "sess-a",
+        ] {
+            write_attempt_in(&root.0, name, 0, "x", 100);
+        }
+        let got: Vec<(String, &str, u32)> = list_run_variants_in(&root.0, "sess-a");
+        assert_eq!(
+            got,
+            vec![
+                ("run-1".to_string(), "command", 1),
+                ("remediate-1".to_string(), "remediation", 1),
+                ("run-2".to_string(), "command", 2),
+                ("remediate-2".to_string(), "remediation", 2),
+            ]
         );
     }
 

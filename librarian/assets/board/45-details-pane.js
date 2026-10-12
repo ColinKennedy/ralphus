@@ -877,6 +877,7 @@
             promptHint: v.kind === "command" ? "The command this proof step runs." : "The instruction dispatched to this proof step's agent.",
             withAttempts: true,
             currentMeta: v.state || "",
+            currentKind: v.kind === "command" ? "command" : "current",
             closeKey: key,
           });
           const openAgentItem = v.kind === "prompt"
@@ -1190,6 +1191,7 @@
               promptHint: s.command ? "The command this cell runs." : "The instruction dispatched to this cell's agent.",
               withAttempts: true,
               currentMeta: s.state || "",
+              currentKind: s.command ? "command" : "current",
               closeKey: key,
             });
             // Open Agent spawns a window on the *daemon's own desktop* — it

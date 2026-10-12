@@ -260,10 +260,24 @@ test("peekScrollRestoreTarget: a mid-log save past a shorter reloaded log is lef
 });
 
 test("splitPeekAttempt separates an attempt pin from a cell/proof key", () => {
-  assert.deepEqual(peek.splitPeekAttempt("cell|sq|1|2|a3"), { base: "cell|sq|1|2", attempt: 3 });
-  assert.deepEqual(peek.splitPeekAttempt("proof|sq|1|cell|2|0|a12"), { base: "proof|sq|1|cell|2|0", attempt: 12 });
-  assert.deepEqual(peek.splitPeekAttempt("cell|sq|1|2"), { base: "cell|sq|1|2", attempt: null });
-  assert.deepEqual(peek.splitPeekAttempt("guardian|g|b|t|a1"), { base: "guardian|g|b|t|a1", attempt: null });
+  assert.deepEqual(peek.splitPeekAttempt("cell|sq|1|2|a3"), { base: "cell|sq|1|2", attempt: 3, variant: null });
+  assert.deepEqual(peek.splitPeekAttempt("proof|sq|1|cell|2|0|a12"), { base: "proof|sq|1|cell|2|0", attempt: 12, variant: null });
+  assert.deepEqual(peek.splitPeekAttempt("cell|sq|1|2"), { base: "cell|sq|1|2", attempt: null, variant: null });
+  assert.deepEqual(peek.splitPeekAttempt("guardian|g|b|t|a1"), { base: "guardian|g|b|t|a1", attempt: null, variant: null });
+});
+
+test("splitPeekAttempt reads a remediation run variant and rejects anything else", () => {
+  assert.deepEqual(peek.splitPeekAttempt("proof|sq|1|cell|2|0|v:remediate-2"), { base: "proof|sq|1|cell|2|0", attempt: null, variant: "remediate-2" });
+  assert.deepEqual(peek.splitPeekAttempt("proof|sq|1|cell|2|0|v:run-1"), { base: "proof|sq|1|cell|2|0", attempt: null, variant: "run-1" });
+  assert.equal(peek.splitPeekAttempt("proof|sq|1|cell|2|0|v:../x").variant, null);
+});
+
+test("a remediation variant addresses its own session on every proof URL", () => {
+  const k = "proof|sq|1|cell|2|0|v:remediate-1";
+  const base = "/api/squads/sq/proofs/1/cell/2/0";
+  assert.equal(peek.peekUrlFor(k), `${base}/pane?lines=500&variant=remediate-1`);
+  assert.equal(peek.peekTranscriptUrlFor(k), `${base}/pane-transcript?variant=remediate-1`);
+  assert.equal(peek.systemPromptUrlFor(k), peek.systemPromptUrlFor("proof|sq|1|cell|2|0"));
 });
 
 test("a pinned key reads the attempt's transcript and never probes a live pane", () => {

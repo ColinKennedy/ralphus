@@ -233,17 +233,32 @@
        * earlier run); a key without it follows the step's current session.
        * Review keys never carry the suffix -- their runs are named by task and
        * cell id instead.
+       * A trailing `|v:<variant>` part instead names one run of a remediated
+       * proof step -- an archived command execution (`run-<n>`) or a repair
+       * agent's pass (`remediate-<n>`) -- whose logs live in a sibling session.
        * @param {string} key
-       * @returns {{base: string, attempt: number|null}}
+       * @returns {{base: string, attempt: number|null, variant: string|null}}
        */
       function splitPeekAttempt(key) {
         const parts = key.split("|");
         const baseLen = parts[0] === "cell" ? 4 : parts[0] === "proof" ? 6 : 0;
         const last = parts[parts.length - 1];
         if (baseLen && parts.length === baseLen + 1 && /^a\d+$/.test(last)) {
-          return { base: parts.slice(0, baseLen).join("|"), attempt: Number(last.slice(1)) };
+          return { base: parts.slice(0, baseLen).join("|"), attempt: Number(last.slice(1)), variant: null };
         }
-        return { base: key, attempt: null };
+        if (baseLen && parts.length === baseLen + 1 && /^v:(run|remediate)-\d+$/.test(last)) {
+          return { base: parts.slice(0, baseLen).join("|"), attempt: null, variant: last.slice(2) };
+        }
+        return { base: key, attempt: null, variant: null };
+      }
+      /**
+       * The query-string fragment addressing a remediation run's sibling
+       * session, appended after `?` or `&`.
+       * @param {string|null} variant - A `splitPeekAttempt` variant.
+       * @returns {string}
+       */
+      function peekVariantParam(variant) {
+        return variant ? `variant=${variant}` : "";
       }
       /**
        * Resolves a peek key to the daemon API URL for its live tmux pane content.
@@ -253,10 +268,11 @@
        * @returns {string|null}
        */
       function peekUrlFor(key) {
-        if (splitPeekAttempt(key).attempt !== null) return null;
-        const [kind, ...rest] = key.split("|");
+        const split = splitPeekAttempt(key);
+        if (split.attempt !== null) return null;
+        const [kind, ...rest] = split.base.split("|");
         if (kind === "cell") { const [squadId, ti, si] = rest; return `/api/squads/${squadId}/cells/${ti}/${si}/pane?lines=500`; }
-        if (kind === "proof") { const [squadId, ti, scope, si, vi] = rest; return `/api/squads/${squadId}/proofs/${ti}/${scope}/${si}/${vi}/pane?lines=500`; }
+        if (kind === "proof") { const [squadId, ti, scope, si, vi] = rest; return `/api/squads/${squadId}/proofs/${ti}/${scope}/${si}/${vi}/pane?lines=500${split.variant ? `&${peekVariantParam(split.variant)}` : ""}`; }
         if (kind === "guardian") {
           // A run-scoped key probes that run's own session; the branch-level
           // default cannot name a feedback run (its cell id is per-run), so
@@ -278,11 +294,11 @@
        * @returns {string|null}
        */
       function peekTranscriptUrlFor(key) {
-        const { base, attempt } = splitPeekAttempt(key);
+        const { base, attempt, variant } = splitPeekAttempt(key);
         const pin = attempt === null ? "" : `?attempt=${attempt}`;
         const [kind, ...rest] = base.split("|");
         if (kind === "cell") { const [squadId, ti, si] = rest; return `/api/squads/${squadId}/cells/${ti}/${si}/pane-transcript${pin}`; }
-        if (kind === "proof") { const [squadId, ti, scope, si, vi] = rest; return `/api/squads/${squadId}/proofs/${ti}/${scope}/${si}/${vi}/pane-transcript${pin}`; }
+        if (kind === "proof") { const [squadId, ti, scope, si, vi] = rest; return `/api/squads/${squadId}/proofs/${ti}/${scope}/${si}/${vi}/pane-transcript${pin || (variant ? `?${peekVariantParam(variant)}` : "")}`; }
         if (kind === "guardian") {
           const [gid, branchId, task, cellId] = rest;
           const run = task && cellId ? `?task=${encodeURIComponent(task)}&cell_id=${encodeURIComponent(cellId)}` : "";
@@ -897,9 +913,11 @@
        * @returns {string|null}
        */
       function debugEventsUrlFor(key) {
-        const [kind, ...rest] = key.split("|");
+        // A remediation run's key carries a trailing `|v:<variant>` part (see `splitPeekAttempt`).
+        const run = key.match(/^(.*)\|v:((?:run|remediate)-\d+)$/);
+        const [kind, ...rest] = (run ? run[1] : key).split("|");
         if (kind === "cell") { const [squadId, ti, si] = rest; return `/api/squads/${squadId}/cells/${ti}/${si}/debug-events`; }
-        if (kind === "proof") { const [squadId, ti, scope, si, vi] = rest; return `/api/squads/${squadId}/proofs/${ti}/${scope}/${si}/${vi}/debug-events`; }
+        if (kind === "proof") { const [squadId, ti, scope, si, vi] = rest; return `/api/squads/${squadId}/proofs/${ti}/${scope}/${si}/${vi}/debug-events${run ? `?variant=${run[2]}` : ""}`; }
         if (kind === "guardian") { const [gid, branchId] = rest; return `/api/guardians/${gid}/branches/${branchId}/debug-events`; }
         if (kind === "guardian-manual") { const [gid] = rest; return `/api/guardians/${gid}/manual-checks/debug-events`; }
         return null;
