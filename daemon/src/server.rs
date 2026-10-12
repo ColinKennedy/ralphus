@@ -11829,8 +11829,8 @@ fn proof_debug_events(
     task_idx: &str,
     scope: &str,
     cell_idx: &str,
-    query: &str,
     proof_idx: &str,
+    query: &str,
 ) -> Reply {
     let (Ok(task_idx_n), Ok(cell_idx_n), Ok(_proof_idx_n)) = (
         task_idx.parse::<i64>(),
@@ -11866,8 +11866,8 @@ fn proof_terminal_log_attempt(
     scope: &str,
     cell_idx: &str,
     proof_idx: &str,
-    query: &str,
     attempt: &str,
+    query: &str,
 ) -> Reply {
     let (Ok(task_idx_n), Ok(cell_idx_n), Ok(_proof_idx_n)) = (
         task_idx.parse::<i64>(),
