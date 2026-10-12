@@ -116,9 +116,27 @@ pub struct SquadTimeline {
     pub file_path: String,
 }
 
+/// The store-derived half of a squad timeline: everything
+/// [`gather_squad_timeline`] reads from the `Store`, before any file I/O.
+pub struct GatheredSquadTimeline {
+    meta: SquadTimelineMeta,
+    rows: Vec<crate::cartographer::CartographerRow>,
+}
+
 /// Build the merged, chronological timeline for `squad_id`. `NotFound` if the
 /// squad doesn't exist (mirrors every other squad-scoped `Store` accessor).
+/// Callers holding the daemon's store lock should use
+/// [`gather_squad_timeline`] under the lock and [`finish_squad_timeline`]
+/// after dropping it, since finishing reads log files and writes a temp file.
 pub fn build_squad_timeline(store: &Store, squad_id: &str) -> Result<SquadTimeline> {
+    Ok(finish_squad_timeline(gather_squad_timeline(
+        store, squad_id,
+    )?))
+}
+
+/// Read `squad_id`'s Cartographer rows and counts from the store. Store
+/// reads only -- no file I/O -- so it is safe under the store lock.
+pub fn gather_squad_timeline(store: &Store, squad_id: &str) -> Result<GatheredSquadTimeline> {
     let squad = store.get_squad(squad_id)?;
     let cell_count: i64 = squad.tasks.iter().map(|t| t.cells.len() as i64).sum();
 
@@ -145,10 +163,25 @@ pub fn build_squad_timeline(store: &Store, squad_id: &str) -> Result<SquadTimeli
     let truncated = (rows.len() as i64) < total;
     rows.truncate(MAX_EVENTS as usize);
 
-    let terminal_log_count = rows.iter().filter(|r| r.log_path.is_some()).count() as i64;
-    let start_ms = rows.first().map(|r| r.at_ms);
-    let end_ms = rows.last().map(|r| r.at_ms);
+    let meta = SquadTimelineMeta {
+        squad_id: squad_id.to_string(),
+        generated_at_ms: crate::store::now_ms(),
+        start_ms: rows.first().map(|r| r.at_ms),
+        end_ms: rows.last().map(|r| r.at_ms),
+        event_count: rows.len() as i64,
+        terminal_log_count: rows.iter().filter(|r| r.log_path.is_some()).count() as i64,
+        task_count: squad.tasks.len() as i64,
+        cell_count,
+        truncated,
+        gaps_possible,
+    };
+    Ok(GatheredSquadTimeline { meta, rows })
+}
 
+/// Inline each row's terminal-log excerpt, render the text and write it to
+/// the temp file. File I/O only -- call it without the store lock held.
+pub fn finish_squad_timeline(gathered: GatheredSquadTimeline) -> SquadTimeline {
+    let GatheredSquadTimeline { meta, rows } = gathered;
     let entries: Vec<SquadTimelineEntry> = rows
         .into_iter()
         .map(|r| {
@@ -167,29 +200,15 @@ pub fn build_squad_timeline(store: &Store, squad_id: &str) -> Result<SquadTimeli
         })
         .collect();
 
-    let generated_at_ms = crate::store::now_ms();
-    let meta = SquadTimelineMeta {
-        squad_id: squad_id.to_string(),
-        generated_at_ms,
-        start_ms,
-        end_ms,
-        event_count: entries.len() as i64,
-        terminal_log_count,
-        task_count: squad.tasks.len() as i64,
-        cell_count,
-        truncated,
-        gaps_possible,
-    };
-
     let text = render_text(&meta, &entries);
-    let file_path = write_temp_file(squad_id, &text);
+    let file_path = write_temp_file(&meta.squad_id, &text);
 
-    Ok(SquadTimeline {
+    SquadTimeline {
         meta,
         entries,
         text,
         file_path,
-    })
+    }
 }
 
 /// The current-attempt-only, chronologically-merged debug stream backing
@@ -352,6 +371,19 @@ fn format_ts(at_ms: i64) -> String {
         .unwrap_or_else(|| at_ms.to_string())
 }
 
+/// The directory timeline files are written to: the OS temp directory, or
+/// under tests a per-process subdirectory of it, so a test never touches the
+/// path a real daemon (or another test binary) writes for the same squad id.
+fn timeline_dir() -> std::path::PathBuf {
+    let dir = std::env::temp_dir();
+    if cfg!(test) {
+        let dir = dir.join(format!("ralphus-timeline-out-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        return dir;
+    }
+    dir
+}
+
 /// Write the rendered timeline to a fixed, per-squad path in the OS temp
 /// directory (RAL-155 Q5: a temp artifact, rewritten on every generation, not
 /// required to persist long-term). Best-effort: a write failure is logged but
@@ -362,57 +394,51 @@ fn format_ts(at_ms: i64) -> String {
 /// two overlapping generations for the same squad (e.g. two quick "Timeline"
 /// clicks) could otherwise interleave and leave a reader observing a torn or
 /// empty file. Rename is atomic on both POSIX and Windows.
+///
+/// On Windows the rename fails for as long as another process holds the old
+/// file open (a viewer, an indexer, or a delete-pending handle). After a few
+/// short retries the complete sibling file is returned in its place, so the
+/// caller always gets a path holding this generation's text without waiting
+/// on another process's handle.
 fn write_temp_file(squad_id: &str, text: &str) -> String {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let path = std::env::temp_dir().join(format!("ralphus-timeline-{squad_id}.log"));
+    let dir = timeline_dir();
+    let path = dir.join(format!("ralphus-timeline-{squad_id}.log"));
     let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp_path = std::env::temp_dir().join(format!(
+    let tmp_path = dir.join(format!(
         "ralphus-timeline-{squad_id}.{}.{unique}.tmp",
         std::process::id()
     ));
 
-    // Try to write and rename with retries on Windows file lock issues.
-    // Windows file locking can be transient (file indexer, antivirus, etc.),
-    // so we retry multiple times with increasing delays.
-    let mut last_err = None;
-    for attempt in 0..20 {
-        // Clean up tmp file if it exists from a failed previous attempt.
+    if let Err(e) = std::fs::write(&tmp_path, text) {
         let _ = std::fs::remove_file(&tmp_path);
-
-        if let Err(e) = std::fs::write(&tmp_path, text) {
-            last_err = Some(e);
-            if attempt < 19 {
-                let delay_ms = 50 * (attempt + 1) as u64;
-                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-            }
-            continue;
-        }
-
-        // Try to remove the destination first, then rename.
-        // Both operations might fail if the file is locked by another process.
-        let _ = std::fs::remove_file(&path);
-        match std::fs::rename(&tmp_path, &path) {
-            Ok(()) => return path.to_string_lossy().into_owned(),
-            Err(e) => {
-                last_err = Some(e);
-                if attempt < 19 {
-                    let delay_ms = 50 * (attempt + 1) as u64;
-                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-                }
-            }
-        }
-    }
-
-    let _ = std::fs::remove_file(&tmp_path);
-    if let Some(e) = last_err {
         // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
         crate::rlog!(
             WARNING,
             "ralphus [timeline] could not write {}: {e}",
-            path.display()
+            tmp_path.display()
+        );
+        return path.to_string_lossy().into_owned();
+    }
+
+    let mut last_err = None;
+    for attempt in 0..3u64 {
+        match std::fs::rename(&tmp_path, &path) {
+            Ok(()) => return path.to_string_lossy().into_owned(),
+            Err(e) => last_err = Some(e),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25 * (attempt + 1)));
+    }
+    if let Some(e) = last_err {
+        // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
+        crate::rlog!(
+            WARNING,
+            "ralphus [timeline] could not replace {} ({e}); serving {} instead",
+            path.display(),
+            tmp_path.display()
         );
     }
-    path.to_string_lossy().into_owned()
+    tmp_path.to_string_lossy().into_owned()
 }
 
 /// Every `Store::open_in_memory()` used in tests starts its squad-id sequence
@@ -545,36 +571,27 @@ prompt = "make it build"
     #[test]
     fn writes_a_temp_file_containing_the_rendered_text() {
         let _guard = TIMELINE_FILE_TEST_LOCK.lock().unwrap();
-        // Clean up any stale file from a previous run (Windows file lock issue mitigation).
-        let path = std::env::temp_dir().join("ralphus-timeline-squad-000000000001.log");
-        let _ = std::fs::remove_file(&path);
-        std::thread::sleep(std::time::Duration::from_millis(100));
-
         let (store, squad_id) = seeded_squad();
         let timeline = build_squad_timeline(&store, &squad_id).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&timeline.file_path).unwrap(),
+            timeline.text
+        );
+    }
 
-        // Retry reading the file if it doesn't exist initially (Windows lock issue).
-        // Windows file locking (antivirus, indexer, etc.) can prevent writes; if the file
-        // can't be read after retries, the write likely failed but timeline generation
-        // succeeded, which is acceptable for this "best-effort" function.
-        for attempt in 0..10 {
-            match std::fs::read_to_string(&timeline.file_path) {
-                Ok(content) => {
-                    assert_eq!(content, timeline.text);
-                    return;
-                }
-                Err(_) if attempt < 9 => {
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                }
-                Err(_) => {
-                    // File write likely failed due to Windows file locking.
-                    // Verify at least that the timeline content was generated.
-                    assert!(!timeline.text.is_empty());
-                    assert!(timeline.text.contains(&squad_id));
-                    return;
-                }
-            }
-        }
+    #[test]
+    fn a_held_destination_falls_back_to_the_written_sibling_file() {
+        let _guard = TIMELINE_FILE_TEST_LOCK.lock().unwrap();
+        let blocked = timeline_dir().join("ralphus-timeline-squad-held.log");
+        // A non-empty directory at the destination makes every rename fail,
+        // the same way a destination held open by another process does on
+        // Windows.
+        std::fs::create_dir_all(blocked.join("child")).unwrap();
+        let served = write_temp_file("squad-held", "the text");
+        assert_ne!(std::path::Path::new(&served), blocked);
+        assert_eq!(std::fs::read_to_string(&served).unwrap(), "the text");
+        let _ = std::fs::remove_file(&served);
+        let _ = std::fs::remove_dir_all(&blocked);
     }
 
     #[test]

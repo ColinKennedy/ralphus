@@ -8172,10 +8172,11 @@ fn apply_entity_filter(
 /// — so the board's "generate to file, then display" button and this JSON
 /// response come from the exact same generation, not two separate code paths.
 fn squad_timeline(daemon: &Daemon, id: &str) -> Reply {
-    // allow-lock-io: merges already-fetched Cartographer/terminal-log rows
-    // in-process, no subprocess/network work.
-    match crate::timeline::build_squad_timeline(&daemon.lock(), id) {
-        Ok(timeline) => json(200, &timeline),
+    // Only the store reads run under the lock; the log-excerpt reads and the
+    // temp-file write happen after it is dropped.
+    let gathered = crate::timeline::gather_squad_timeline(&daemon.lock(), id);
+    match gathered {
+        Ok(g) => json(200, &crate::timeline::finish_squad_timeline(g)),
         Err(e) => store_error(&e),
     }
 }
