@@ -2322,19 +2322,25 @@ fn strip_bot_trailer(commits: &str) -> String {
 const DEFAULT_PR_TEMPLATE: &str = "\
 ## Summary
 
-<!-- What changed and why, in a few sentences a reviewer can read cold. -->
+<!-- What this changes and why, in a few sentences a reviewer can read cold. -->
 
-## Changes
+## Details
 
-<!-- The notable changes, grouped by area. -->
+### Changes
 
-## Verification gaps
+<!-- The notable changes, grouped by area. Describe behavior, not file-by-file edits. -->
 
-<!-- Anything that was not run or not confirmed. Omit this section if everything was verified. -->
+### Rationale
 
-## Deferred work
+<!-- Why this approach, and any alternatives or trade-offs worth knowing. Omit if the summary already covers it. -->
 
-<!-- Follow-ups intentionally left out of this branch. Omit this section if there are none. -->
+## Testing
+
+<!-- What was run and what it showed. Also say plainly what was not run or not confirmed. -->
+
+## Reviewer notes
+
+<!-- Risks, breaking changes, migration steps, and related issues or links. Omit if there is nothing to flag. -->
 ";
 
 /// One commit of the formatted log `branch_change_context` produces: its
@@ -2422,7 +2428,7 @@ fn fallback_pr_description(commits: &str, diff_stat: &str, template: Option<&str
     let stat = diff_stat.trim();
     let body = match (summary.is_empty(), stat.is_empty()) {
         (true, true) => String::new(),
-        (false, true) => summary,
+        (false, true) => summary.clone(),
         (true, false) => format!("```text\n{stat}\n```"),
         (false, false) => format!("{summary}\n\n**Changed files**\n\n```text\n{stat}\n```"),
     };
@@ -2430,7 +2436,21 @@ fn fallback_pr_description(commits: &str, diff_stat: &str, template: Option<&str
         (Some(template), false) => insert_after_first_heading(template, &body),
         (Some(template), true) => template.to_string(),
         (None, true) => String::new(),
-        (None, false) => format!("## Summary\n\n{body}"),
+        (None, false) => {
+            let mut description = String::new();
+            if !summary.is_empty() {
+                description.push_str(&format!("## Summary\n\n{summary}"));
+            }
+            if !stat.is_empty() {
+                if !description.is_empty() {
+                    description.push_str("\n\n");
+                }
+                description.push_str(&format!(
+                    "## Details\n\n### Changed files\n\n```text\n{stat}\n```"
+                ));
+            }
+            description
+        }
     }
 }
 
@@ -2625,11 +2645,11 @@ fn synthesize_pr_text(
         ),
         None => format!(
             "\n\nThe target repository has no pull-request template, so use \
-             this structure. Fill in every section, replace the HTML comment \
-             hints with real content, and drop the \"Verification gaps\" and \
-             \"Deferred work\" sections when there is nothing to report in \
-             them. Write prose a reviewer can read cold -- never paste commit \
-             hashes, trailers, or raw commit messages:\n\n{DEFAULT_PR_TEMPLATE}"
+             this structure. Replace each HTML comment hint with real \
+             content, and drop any section whose hint says it may be omitted \
+             when there is nothing to report in it. Write prose a reviewer \
+             can read cold -- never paste commit hashes, trailers, or raw \
+             commit messages:\n\n{DEFAULT_PR_TEMPLATE}"
         ),
     };
     // RAL-<new>: ask the same call that writes the description to also judge
@@ -21540,7 +21560,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
              - RAL-623: detect waypoint overlap and cycles\n  \
              Survey skips candidates that would close a cycle.\n  \
              Two-entry cycles are rejected.\n\n\
-             **Changed files**\n\n```text\na.rs | 2 +-\n 1 file changed\n```"
+             ## Details\n\n### Changed files\n\n```text\na.rs | 2 +-\n 1 file changed\n```"
         );
         for noise in [
             "git-commit",
@@ -21565,12 +21585,15 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
     fn default_template_is_what_the_writer_is_asked_to_follow_without_a_repo_template() {
         for heading in [
             "## Summary",
-            "## Changes",
-            "## Verification gaps",
-            "## Deferred work",
+            "## Details",
+            "### Changes",
+            "### Rationale",
+            "## Testing",
+            "## Reviewer notes",
         ] {
             assert!(DEFAULT_PR_TEMPLATE.contains(heading), "{heading}");
         }
+        assert!(!DEFAULT_PR_TEMPLATE.contains("Deferred"));
     }
 
     #[test]
