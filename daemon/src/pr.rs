@@ -44,9 +44,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use opentelemetry::trace::{SpanKind, Status};
+use ralphus_core::schema::UpstreamRef;
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use ralphus_core::schema::UpstreamRef;
 
 use crate::guardian::{BranchView, GuardianView, MergeStatus};
 use crate::guardian_merge::{self, git};
@@ -16403,15 +16403,25 @@ mod tests {
 
         let forge_cfg = crate::config::resolve_forge(&root_dir);
 
-        let routing_no_owner =
-            resolve_pr_repo_routing(&store, &root_dir, "origin/main", &forge_cfg, None);
+        let routing_no_owner = resolve_pr_repo_routing(
+            &store,
+            &root_dir,
+            &ralphus_core::schema::UpstreamRef::new("origin", "main"),
+            &forge_cfg,
+            None,
+        );
         assert!(
             routing_no_owner.fork_client.is_none(),
             "with no owner to try and no empty-string default row registered, no fork should resolve"
         );
 
-        let routing_with_owner =
-            resolve_pr_repo_routing(&store, &root_dir, "origin/main", &forge_cfg, Some("alice"));
+        let routing_with_owner = resolve_pr_repo_routing(
+            &store,
+            &root_dir,
+            &ralphus_core::schema::UpstreamRef::new("origin", "main"),
+            &forge_cfg,
+            Some("alice"),
+        );
         assert!(
             routing_with_owner.fork_client.is_some(),
             "the guardian's own owner must be tried against the fork table, not only \"\""
@@ -16427,8 +16437,13 @@ mod tests {
             .lock()
             .set_user_forge_token("alice", "github.com", "alices-own-token")
             .unwrap();
-        let routing_with_token =
-            resolve_pr_repo_routing(&store, &root_dir, "origin/main", &forge_cfg, Some("alice"));
+        let routing_with_token = resolve_pr_repo_routing(
+            &store,
+            &root_dir,
+            &ralphus_core::schema::UpstreamRef::new("origin", "main"),
+            &forge_cfg,
+            Some("alice"),
+        );
         assert_eq!(
             routing_with_token.fork_client.unwrap().token(),
             Some("alices-own-token")
@@ -22674,16 +22689,6 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
     }
 
     #[test]
-    fn strip_remote_prefix_only_strips_matching_remote() {
-        assert_eq!(strip_remote_prefix("origin/main", "origin"), "main");
-        assert_eq!(strip_remote_prefix("main", "origin"), "main");
-        assert_eq!(
-            strip_remote_prefix("upstream/main", "origin"),
-            "upstream/main"
-        );
-    }
-
-    #[test]
     fn parse_suggested_pr_handles_a_chatty_preamble_and_no_prophecy_ids() {
         let (t, d, ids) = parse_suggested_pr(
             "Sure, here you go!\n\nTITLE: Fix bug\n===DESCRIPTION===\nFixes it.",
@@ -23018,7 +23023,11 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
 
         let store = store();
         let gid = store
-            .create_guardian("demo", "alt/staging", root.to_str().unwrap())
+            .create_guardian(
+                "demo",
+                ralphus_core::schema::UpstreamRef::new("alt", "staging"),
+                root.to_str().unwrap(),
+            )
             .unwrap();
         store.add_guardian_branch(&gid, "x").unwrap();
         let branch_id = store.get_guardian(&gid).unwrap().branches[0].id.clone();

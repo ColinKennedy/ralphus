@@ -1883,11 +1883,10 @@ fn parse_symref_head(output: &str) -> Option<String> {
     })
 }
 
-/// The `<remote>/<branch>` upstream for a forked project, or `None` when the
-/// parent's default branch cannot be found (the daemon's `<<default>>`
-/// resolution applies then).
+/// The default branch of a forked project's parent `remote`, or `None` when it
+/// cannot be found (the daemon's `<<default>>` resolution applies then).
 fn fork_upstream(cwd: &std::path::Path, remote: &str) -> Option<String> {
-    remote_default_branch(cwd, remote).map(|branch| format!("{remote}/{branch}"))
+    remote_default_branch(cwd, remote)
 }
 
 fn sample_task_toml(
@@ -1895,15 +1894,17 @@ fn sample_task_toml(
     remote: &str,
     mode: &str,
     agent: Option<&str>,
-    explicit_upstream: Option<&str>,
+    explicit_branch: Option<&str>,
 ) -> String {
     let review_id = "ralphus:new-review/ralphus-hello-world";
-    let cell_upstream = explicit_upstream.unwrap_or("<<default>>");
+    let cell_branch = explicit_branch.unwrap_or("<<default>>");
     let mut toml = format!(
         "[[review]]\nid = \"{review_id}\"\nname = \"Hello world for {project}\"\nproof_scope = \"nothing\"\n"
     );
-    if let Some(upstream) = explicit_upstream {
-        toml.push_str(&format!("upstream = \"{upstream}\"\n"));
+    if let Some(branch) = explicit_branch {
+        toml.push_str(&format!(
+            "upstream_remote = \"{remote}\"\nupstream_branch = \"{branch}\"\n"
+        ));
     }
     toml.push('\n');
     if let Some(agent) = agent {
@@ -1914,7 +1915,7 @@ fn sample_task_toml(
         let branch = format!("ralphus-hello-world-{suffix}");
         let file = format!("hello-world-{suffix}.txt");
         toml.push_str(&format!(
-            "[[task]]\nname = \"hello-world-{suffix}\"\nproject = \"{project}\"\n\n  [[task.cell]]\n  id = \"write\"\n  cwd = \"<<ralphus:new-worktree/{branch}?upstream={cell_upstream}>>\"\n  review = \"<<{review_id}>>\"\n"
+            "[[task]]\nname = \"hello-world-{suffix}\"\nproject = \"{project}\"\n\n  [[task.cell]]\n  id = \"write\"\n  cwd = \"<<ralphus:new-worktree/{branch}?upstream_remote={remote}&upstream_branch={cell_branch}>>\"\n  review = \"<<{review_id}>>\"\n"
         ));
         match mode {
             "raw" => toml.push_str(&format!(
@@ -1987,7 +1988,9 @@ fn step_sample(
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let found = fork_upstream(&cwd, upstream_remote);
         match &found {
-            Some(upstream) => println!("  fork project: basing the sample on {upstream}"),
+            Some(branch) => {
+                println!("  fork project: basing the sample on {upstream_remote}/{branch}")
+            }
             None => println!(
                 "  fork project: could not read {upstream_remote}'s default branch; using the default upstream"
             ),
@@ -2075,8 +2078,12 @@ mod tests {
     #[test]
     fn sample_toml_uses_three_parallel_tasks_and_one_explicit_review() {
         let toml = sample_task_toml("example", "origin", "agent", Some("claude-code"), None);
-        assert_eq!(toml.matches("?upstream=<<default>>>>").count(), 3);
-        assert!(!toml.contains("\nupstream = "));
+        assert_eq!(
+            toml.matches("?upstream_remote=origin&upstream_branch=<<default>>>>")
+                .count(),
+            3
+        );
+        assert!(!toml.contains("\nupstream_branch = "));
         assert_eq!(toml.matches("[[task]]").count(), 3);
         assert_eq!(toml.matches("review = \"<<ralphus:new-review/").count(), 3);
         assert!(!toml.contains("depends_on"));
@@ -2124,9 +2131,13 @@ mod tests {
 
     #[test]
     fn fork_sample_toml_pins_cells_and_review_to_the_upstream_remote() {
-        let toml = sample_task_toml("example", "main-repo", "raw", None, Some("main-repo/trunk"));
-        assert_eq!(toml.matches("?upstream=main-repo/trunk>>").count(), 3);
-        assert!(toml.contains("\nupstream = \"main-repo/trunk\"\n"));
+        let toml = sample_task_toml("example", "main-repo", "raw", None, Some("trunk"));
+        assert_eq!(
+            toml.matches("?upstream_remote=main-repo&upstream_branch=trunk>>")
+                .count(),
+            3
+        );
+        assert!(toml.contains("\nupstream_remote = \"main-repo\"\nupstream_branch = \"trunk\"\n"));
         assert!(!toml.contains("<<default>>"));
         assert!(
             ralphus_core::validate::validate_toml(&toml).is_ok(),
@@ -2179,10 +2190,7 @@ mod tests {
             ],
         );
         git(&work, &["push", "-q", "main-repo", "HEAD:refs/heads/trunk"]);
-        assert_eq!(
-            fork_upstream(&work, "main-repo").as_deref(),
-            Some("main-repo/trunk")
-        );
+        assert_eq!(fork_upstream(&work, "main-repo").as_deref(), Some("trunk"));
         assert_eq!(fork_upstream(&work, "no-such-remote"), None);
         let _ = std::fs::remove_dir_all(&base);
     }

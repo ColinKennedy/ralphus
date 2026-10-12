@@ -9,7 +9,7 @@ project = "fx"
 machine = "loopback:lb"
 
 [[task.cell]]
-cwd = "<<ralphus:new-worktree/l1-remote?upstream=<<default>>>>"
+cwd = "<<ralphus:new-worktree/l1-remote?upstream_remote=origin&upstream_branch=<<default>>>>"
 mode = "raw"
 command = "python -c \"import os,pathlib;pathlib.Path('l1.txt').write_text('LIVE_ENV='+os.environ.get('LIVE_ENV','<unset>')+chr(10))\" && git add l1.txt && git -c user.email=l@x -c user.name=l commit -q -m l1 && git push -q -u origin HEAD"
 

@@ -95,7 +95,8 @@ pub fn execute(cmd: ReviewCommand, client: &DaemonClient) -> ExecResult {
         }
         ReviewCommand::Create {
             name,
-            base_branch,
+            upstream_remote,
+            upstream_branch,
             git_root,
             checks,
             skip_worktrees,
@@ -111,7 +112,8 @@ pub fn execute(cmd: ReviewCommand, client: &DaemonClient) -> ExecResult {
                 .collect();
             Ok(client.guardian_create(
                 &name,
-                &base_branch,
+                &upstream_remote,
+                &upstream_branch,
                 &git_root,
                 Some(&checks_vec),
                 skip_worktrees,
@@ -145,7 +147,8 @@ pub fn execute(cmd: ReviewCommand, client: &DaemonClient) -> ExecResult {
             skip_worktrees,
             resolver_agent,
             resolver_model,
-            base_branch,
+            upstream_remote,
+            upstream_branch,
             auto_pr_feedback,
             proof_scope,
             ci_deferral,
@@ -174,7 +177,8 @@ pub fn execute(cmd: ReviewCommand, client: &DaemonClient) -> ExecResult {
                 skip_worktrees,
                 resolver_agent: resolver_agent.as_deref(),
                 resolver_model: resolver_model.as_deref(),
-                base_branch: base_branch.as_deref(),
+                upstream_remote: upstream_remote.as_deref(),
+                upstream_branch: upstream_branch.as_deref(),
                 auto_pr_feedback,
                 proof_scope: proof_scope.as_deref(),
                 ci_deferral: ci_deferral.as_deref(),
@@ -419,9 +423,17 @@ fn exec_upstream(cmd: ReviewUpstreamCommand, client: &DaemonClient) -> ExecResul
             let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
             Ok(client.guardian_base_branches(&resolved.guardian_id)?)
         }
-        ReviewUpstreamCommand::Set { selector, branch } => {
+        ReviewUpstreamCommand::Set {
+            selector,
+            upstream_remote,
+            upstream_branch,
+        } => {
             let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
-            Ok(client.guardian_change_base(&resolved.guardian_id, &branch)?)
+            Ok(client.guardian_change_base(
+                &resolved.guardian_id,
+                &upstream_remote,
+                &upstream_branch,
+            )?)
         }
     }
 }

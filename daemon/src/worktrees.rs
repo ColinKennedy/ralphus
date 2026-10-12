@@ -1,19 +1,19 @@
 //! Placeholder `cwd` resolution + git worktree materialization (RAL-100).
 //!
-//! A cell `cwd` of the form `ralphus:new-worktree/<branch>?upstream=<upstream>`
+//! A cell `cwd` of the form `ralphus:new-worktree/<branch>?upstream_remote=<remote>&upstream_branch=<branch>`
 //! names a branch to check out in a dedicated worktree under
 //! `.git/.ralphus/w/<short>` (`<short>` is a truncated form of `branch`; see
 //! `crate::short_paths`. Git branch names are never shortened, only this
 //! directory name), rather than a real filesystem path. The project to
 //! materialize it under is NOT embedded in the `cwd` string -- it's the
 //! owning task's `project` field (required whenever any of its cells uses
-//! this placeholder). The `?upstream=<upstream>` suffix is REQUIRED too:
+//! this placeholder). The `upstream_remote`/`upstream_branch` pair is REQUIRED too:
 //! submit-time validation (`ralphus_core::validate`) rejects a placeholder
 //! cwd with none, and [`ensure_worktree`] always applies it via
 //! `git branch --set-upstream-to`, so a freshly materialized branch's
 //! tracking target is always the author's explicit choice, never a guess
 //! from whatever `HEAD` happened to be at materialization time. Two reserved
-//! `?upstream=<<...>>` sentinels (RAL-258) let the author defer that choice:
+//! `<<...>>` sentinels for the branch half (RAL-258) let the author defer that choice:
 //! `<<default>>` (the repository's default branch, recommended) and
 //! `<<current_branch>>` (whatever branch the project currently has checked
 //! out). [`resolve_placeholders`] expands these against the project root via
@@ -36,10 +36,10 @@ use opentelemetry::Context;
 use opentelemetry::trace::{SpanKind, Status};
 
 use crate::guardian_merge::{git, qualify_upstream_ref};
-use ralphus_core::schema::UpstreamRef;
 use crate::otel;
 use crate::store::{CellRow, ProjectView, Store, TaskRow};
 use crate::store_lock::StoreHandle;
+use ralphus_core::schema::UpstreamRef;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BranchMaterialization {
@@ -278,9 +278,8 @@ fn creation_marker_path(root: &Path, short: &str) -> PathBuf {
 /// The `(branch, upstream)` a slot's creation marker names, `None` when there
 /// is no marker (or it is unreadable, which is treated the same: no proof of
 /// ownership). The upstream comes from the marker's `upstream_remote=` and
-/// `upstream_branch=` lines; a marker with only the combined `upstream=` line
-/// is taken apart against the remotes configured in `root`.
-fn read_creation_marker(root: &Path, path: &Path) -> Option<(String, Option<UpstreamRef>)> {
+/// `upstream_branch=` lines.
+fn read_creation_marker(path: &Path) -> Option<(String, Option<UpstreamRef>)> {
     let text = std::fs::read_to_string(path).ok()?;
     let mut lines = text.lines();
     let branch = lines.next()?.trim();
@@ -295,7 +294,7 @@ fn read_creation_marker(root: &Path, path: &Path) -> Option<(String, Option<Upst
     };
     let upstream = match (value("upstream_remote="), value("upstream_branch=")) {
         (Some(remote), Some(branch)) => Some(UpstreamRef::new(remote, branch)),
-        _ => value("upstream=").map(|u| crate::legacy_upstream::split_legacy_base(&u, root)),
+        _ => None,
     };
     Some((branch.to_string(), upstream))
 }
@@ -312,7 +311,7 @@ fn creation_markers(root: &Path) -> HashMap<String, String> {
         .filter_map(Result::ok)
         .filter_map(|entry| {
             let short = entry.file_name().to_str()?.to_string();
-            let (branch, _) = read_creation_marker(root, &entry.path())?;
+            let (branch, _) = read_creation_marker(&entry.path())?;
             Some((short, branch))
         })
         .collect()
@@ -358,7 +357,7 @@ pid={}",
         .map(|()| true)
         .map_err(|e| format!("could not write worktree creation marker: {e}")),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            Ok(read_creation_marker(root, &path).is_some_and(|(b, _)| b.eq_ignore_ascii_case(branch)))
+            Ok(read_creation_marker(&path).is_some_and(|(b, _)| b.eq_ignore_ascii_case(branch)))
         }
         Err(e) => Err(format!("could not write worktree creation marker: {e}")),
     }
@@ -813,7 +812,7 @@ fn default_branch(root: &Path, remote: &str) -> Result<String, String> {
 fn current_checked_out_branch(root: &Path) -> Result<String, String> {
     let out = git(root, &["symbolic-ref", "--quiet", "--short", "HEAD"]).map_err(|_| {
         format!(
-            "could not resolve \"?upstream=<<current_branch>>\" in {}: no branch checked out \
+            "could not resolve \"upstream_branch=<<current_branch>>\" in {}: no branch checked out \
              (detached HEAD)",
             root.display()
         )
@@ -821,7 +820,7 @@ fn current_checked_out_branch(root: &Path) -> Result<String, String> {
     let branch = out.trim();
     if branch.is_empty() {
         return Err(format!(
-            "could not resolve \"?upstream=<<current_branch>>\" in {}: no branch checked out",
+            "could not resolve \"upstream_branch=<<current_branch>>\" in {}: no branch checked out",
             root.display()
         ));
     }
@@ -972,7 +971,11 @@ fn set_explicit_upstream(wt: &Path, branch: &str, upstream: &UpstreamRef) -> Res
     git(wt, &["rev-parse", "--verify", &upstream.tracking_ref()]).map_err(fail)?;
     git_config_write_retrying(
         wt,
-        &["config", &format!("branch.{branch}.remote"), &upstream.remote],
+        &[
+            "config",
+            &format!("branch.{branch}.remote"),
+            &upstream.remote,
+        ],
     )
     .map_err(fail)?;
     git_config_write_retrying(
@@ -1538,7 +1541,7 @@ fn materialize_exclusively(
             .to_string();
         let marker = creation_marker_path(root, &short);
         let owned =
-            read_creation_marker(root, &marker).is_some_and(|(b, _)| b.eq_ignore_ascii_case(branch));
+            read_creation_marker(&marker).is_some_and(|(b, _)| b.eq_ignore_ascii_case(branch));
         if marker.exists() && !owned {
             return Err(format!(
                 "worktree slot {} is claimed by another creation (marker {}); refusing to touch it",
@@ -1695,7 +1698,7 @@ impl ProjectStartupAdapter for GitProjectStartupAdapter {
             .ok_or_else(|| {
                 format!(
                     "cell '{}': placeholder \"{placeholder}\" is missing the required \
-                         \"?upstream=<upstream>\" suffix (e.g. \"{}{branch}?upstream=main\")",
+                         \"?upstream_remote=<remote>&upstream_branch=<branch>\" suffix (e.g. \"{}{branch}?upstream_remote=.&upstream_branch=main\")",
                     ctx.cell_id,
                     ralphus_core::schema::WORKTREE_PLACEHOLDER_PREFIX
                 )
@@ -1869,7 +1872,7 @@ fn validate_worktree_placeholders(raw: &str, cell_id: &str) -> Result<(), String
         if ralphus_core::schema::parse_worktree_placeholder_upstream(placeholder).is_none() {
             return Err(format!(
                 "cell '{cell_id}': placeholder \"{placeholder}\" is missing the required \
-                 \"?upstream=<upstream>\" suffix (e.g. \"{}{branch}?upstream=main\")",
+                 \"?upstream_remote=<remote>&upstream_branch=<branch>\" suffix (e.g. \"{}{branch}?upstream_remote=.&upstream_branch=main\")",
                 ralphus_core::schema::WORKTREE_PLACEHOLDER_PREFIX
             ));
         }
@@ -2793,7 +2796,7 @@ pub(crate) fn pending_worktree_at(cwd: &Path) -> Option<PendingWorktree> {
         return None;
     }
     let root = git_dir.parent()?.to_path_buf();
-    let (branch, upstream) = read_creation_marker(&root, &creation_marker_path(&root, short))?;
+    let (branch, upstream) = read_creation_marker(&creation_marker_path(&root, short))?;
     Some(PendingWorktree {
         root,
         branch,
@@ -3437,7 +3440,7 @@ mod tests {
         g(&clone, &["checkout", "-q", "-b", "work", "origin/main"]);
 
         let ws = crate::workspace::Workspace::local(&clone);
-        pin_remote_upstream_and_baseline(&ws, "work", "main").unwrap();
+        pin_remote_upstream_and_baseline(&ws, "work", &UpstreamRef::new("origin", "main")).unwrap();
         assert_eq!(
             ws.git(&["config", "branch.work.merge"]).unwrap().trim(),
             "refs/heads/main"
@@ -3461,7 +3464,10 @@ mod tests {
     fn pinning_an_unknown_upstream_is_an_error() {
         let repo = init_repo("pin-remote-unknown");
         let ws = crate::workspace::Workspace::local(&repo);
-        assert!(pin_remote_upstream_and_baseline(&ws, "main", "nope").is_err());
+        assert!(
+            pin_remote_upstream_and_baseline(&ws, "main", &UpstreamRef::new("origin", "nope"))
+                .is_err()
+        );
         let _ = std::fs::remove_dir_all(&repo);
     }
 
@@ -4216,35 +4222,48 @@ mod tests {
         assert!(err.contains("does-not-exist"), "{err}");
     }
 
+    fn wt_up<'a>(remote: &'a str, branch: &'a str) -> ralphus_core::schema::WorktreeUpstream<'a> {
+        ralphus_core::schema::WorktreeUpstream { remote, branch }
+    }
+
     #[test]
-    fn resolve_upstream_expands_the_default_sentinel_via_origin_head() {
+    fn resolve_upstream_expands_the_default_sentinel_via_the_named_remote_head() {
         // `init_repo_with_remote_branch` clones a remote seeded with a `main`
         // default branch, so the clone's `refs/remotes/origin/HEAD` resolves
         // to `main` — `<<default>>` must expand to it.
         let (repo, _) = init_repo_with_remote_branch("sentinel-default", "origin/foo");
         assert_eq!(
-            resolve_upstream(&repo, "<<default>>").expect("default sentinel"),
-            "main"
+            resolve_upstream(&repo, wt_up("origin", "<<default>>")).expect("default sentinel"),
+            UpstreamRef::new("origin", "main")
         );
-        // And a literal value is passed through untouched.
-        assert_eq!(resolve_upstream(&repo, "main").unwrap(), "main");
-        assert_eq!(resolve_upstream(&repo, "origin/foo").unwrap(), "origin/foo");
+        // And literal values are passed through untouched.
+        assert_eq!(
+            resolve_upstream(&repo, wt_up(".", "main")).unwrap(),
+            UpstreamRef::local("main")
+        );
+        assert_eq!(
+            resolve_upstream(&repo, wt_up("origin", "foo")).unwrap(),
+            UpstreamRef::new("origin", "foo")
+        );
     }
 
     #[test]
     fn resolve_upstream_expands_the_current_branch_sentinel_from_root() {
         let repo = init_repo("sentinel-current");
         assert_eq!(
-            resolve_upstream(&repo, "<<current_branch>>").expect("current branch sentinel"),
-            "main"
+            resolve_upstream(&repo, wt_up(".", "<<current_branch>>"))
+                .expect("current branch sentinel"),
+            UpstreamRef::local("main")
         );
         // Following the project's checked-out branch moves the sentinel with it
         // (the riskier, run-varying behavior the tutor flags).
         g(&repo, &["checkout", "-b", "some-feature"]);
         assert_eq!(
-            resolve_upstream(&repo, "<<current_branch>>").unwrap(),
-            "some-feature"
+            resolve_upstream(&repo, wt_up(".", "<<current_branch>>")).unwrap(),
+            UpstreamRef::local("some-feature")
         );
+        let err = resolve_upstream(&repo, wt_up("origin", "<<current_branch>>")).unwrap_err();
+        assert!(err.contains("upstream_remote=."), "{err}");
     }
 
     #[test]
@@ -4253,15 +4272,11 @@ mod tests {
         // cannot resolve. `<<default>>` must FAIL with a clear error rather
         // than guessing `main`/`master`.
         let repo = init_repo("sentinel-no-remote");
-        let err = resolve_upstream(&repo, "<<default>>")
+        let err = resolve_upstream(&repo, wt_up("origin", "<<default>>"))
             .expect_err("no remote HEAD must be a hard error, not a guess");
         assert!(
             err.contains("<<default>>"),
             "should name the sentinel: {err}"
-        );
-        assert!(
-            err.contains("symbolic HEAD"),
-            "should explain the remote default branch is unconfigured: {err}"
         );
         assert!(
             err.contains("git remote set-head origin --auto"),
@@ -4271,12 +4286,14 @@ mod tests {
             err.contains("literal branch name"),
             "should offer a literal upstream branch as the alternative: {err}"
         );
+        assert!(resolve_upstream(&repo, wt_up(".", "<<default>>")).is_err());
     }
 
     #[test]
     fn resolve_upstream_rejects_an_unknown_sentinel_defensively() {
         let repo = init_repo("sentinel-unknown");
-        let err = resolve_upstream(&repo, "<<wat>>").expect_err("unknown sentinel must fail");
+        let err =
+            resolve_upstream(&repo, wt_up(".", "<<wat>>")).expect_err("unknown sentinel must fail");
         assert!(
             err.contains("<<wat>>") && err.contains("<<current_branch>>"),
             "{err}"
@@ -4353,8 +4370,8 @@ mod tests {
     #[test]
     fn ensure_worktree_bootstraps_a_remote_tracking_branch_when_it_exists() {
         let (repo, remote_sha) = init_repo_with_remote_branch("remote-branch", "origin/foo");
-        let wt =
-            ensure_worktree(&repo, "origin/foo", "origin/foo").expect("materialize from remote");
+        let wt = ensure_worktree(&repo, "origin/foo", UpstreamRef::new("origin", "foo"))
+            .expect("materialize from remote");
         assert_eq!(wt, worktree_dir(&repo, "origin/foo"));
         assert!(
             wt.join("remote-only.txt").exists(),
@@ -4386,7 +4403,8 @@ mod tests {
     #[test]
     fn ensure_worktree_resyncs_a_remote_tracking_branch_to_new_pushes() {
         let (repo, first_sha) = init_repo_with_remote_branch("resync-new-push", "origin/foo");
-        let wt = ensure_worktree(&repo, "origin/foo", "origin/foo").expect("first materialize");
+        let wt = ensure_worktree(&repo, "origin/foo", UpstreamRef::new("origin", "foo"))
+            .expect("first materialize");
         assert_eq!(git(&wt, &["rev-parse", "HEAD"]).unwrap().trim(), first_sha);
 
         // Simulate a new push to the remote branch, from the seed clone that
@@ -4402,7 +4420,8 @@ mod tests {
 
         // Re-resolving the same (already materialized) worktree must pick up
         // the new remote commit, not stay frozen at the first-materialize SHA.
-        let wt2 = ensure_worktree(&repo, "origin/foo", "origin/foo").expect("resync on reuse");
+        let wt2 = ensure_worktree(&repo, "origin/foo", UpstreamRef::new("origin", "foo"))
+            .expect("resync on reuse");
         assert_eq!(wt2, wt);
         assert_eq!(git(&wt, &["rev-parse", "HEAD"]).unwrap().trim(), second_sha);
     }
@@ -4410,7 +4429,8 @@ mod tests {
     #[test]
     fn ensure_worktree_rebases_local_commits_onto_the_resynced_remote_instead_of_discarding_them() {
         let (repo, _first_sha) = init_repo_with_remote_branch("resync-rebase-local", "origin/bar");
-        let wt = ensure_worktree(&repo, "origin/bar", "origin/bar").expect("first materialize");
+        let wt = ensure_worktree(&repo, "origin/bar", UpstreamRef::new("origin", "bar"))
+            .expect("first materialize");
 
         // A prior agent session committed local work directly in the worktree.
         std::fs::write(wt.join("local-work.txt"), "agent work\n").unwrap();
@@ -4423,7 +4443,8 @@ mod tests {
         g(&seed, &["commit", "-am", "second remote commit"]);
         g(&seed, &["push", "origin", "bar"]);
 
-        ensure_worktree(&repo, "origin/bar", "origin/bar").expect("resync via rebase");
+        ensure_worktree(&repo, "origin/bar", UpstreamRef::new("origin", "bar"))
+            .expect("resync via rebase");
 
         assert!(
             wt.join("local-work.txt").exists(),
@@ -4440,7 +4461,8 @@ mod tests {
     #[test]
     fn ensure_worktree_aborts_and_errors_when_the_resync_rebase_conflicts() {
         let (repo, _first_sha) = init_repo_with_remote_branch("resync-conflict", "origin/baz");
-        let wt = ensure_worktree(&repo, "origin/baz", "origin/baz").expect("first materialize");
+        let wt = ensure_worktree(&repo, "origin/baz", UpstreamRef::new("origin", "baz"))
+            .expect("first materialize");
 
         // A local commit that edits the same file the remote is about to change.
         std::fs::write(wt.join("remote-only.txt"), "local edit\n").unwrap();
@@ -4451,7 +4473,7 @@ mod tests {
         g(&seed, &["commit", "-am", "conflicting remote edit"]);
         g(&seed, &["push", "origin", "baz"]);
 
-        let err = ensure_worktree(&repo, "origin/baz", "origin/baz")
+        let err = ensure_worktree(&repo, "origin/baz", UpstreamRef::new("origin", "baz"))
             .expect_err("conflicting rebase must fail");
         assert!(err.contains("rebase"), "{err}");
 
@@ -4466,20 +4488,10 @@ mod tests {
     }
 
     #[test]
-    fn ensure_worktree_warns_and_falls_back_to_a_literal_local_slash_branch() {
+    fn a_local_branch_with_a_slash_is_created_literally() {
         let repo = init_repo("literal-slash-branch");
         let plan = branch_materialization(&repo, "alternative/foo").expect("plan");
-        assert_eq!(
-            plan,
-            BranchMaterialization::NewFromHead {
-                warning: Some(format!(
-                    "placeholder branch \"alternative/foo\" looks like <remote>/<branch>, but \
-             refs/remotes/alternative/foo does not exist in {}. Reusing or creating a \
-             literal local branch named \"alternative/foo\" instead.",
-                    repo.display()
-                ),),
-            }
-        );
+        assert_eq!(plan, BranchMaterialization::NewFromHead);
 
         let wt = ensure_worktree(&repo, "alternative/foo", "main").expect("materialize");
         assert_eq!(wt, worktree_dir(&repo, "alternative/foo"));
@@ -4638,7 +4650,7 @@ mod tests {
             0,
             0,
             "s0",
-            Some("ralphus:new-worktree/feat-r?upstream=main"),
+            Some("ralphus:new-worktree/feat-r?upstream_remote=.&upstream_branch=main"),
             Some("ib:A"),
         )];
         let tasks = vec![task_row(0, Some("proj"))];
@@ -4685,7 +4697,7 @@ mod tests {
             0,
             0,
             "s0",
-            Some("ralphus:new-worktree/feat-r?upstream=main"),
+            Some("ralphus:new-worktree/feat-r?upstream_remote=.&upstream_branch=main"),
             Some("ib:A"),
         )];
         let tasks = vec![task_row(0, Some("proj"))];
@@ -4736,7 +4748,7 @@ mod tests {
             0,
             0,
             "s0",
-            Some("ralphus:new-worktree/feat-r?upstream=main"),
+            Some("ralphus:new-worktree/feat-r?upstream_remote=.&upstream_branch=main"),
             Some("ib:A"),
         )];
         let tasks = vec![task_row(0, Some("proj"))];
@@ -4793,14 +4805,14 @@ mod tests {
                 0,
                 0,
                 "s0",
-                Some("ralphus:new-worktree/shared?upstream=main"),
+                Some("ralphus:new-worktree/shared?upstream_remote=.&upstream_branch=main"),
                 Some("ma:1"),
             ),
             cell_row_on(
                 1,
                 0,
                 "s1",
-                Some("ralphus:new-worktree/shared?upstream=main"),
+                Some("ralphus:new-worktree/shared?upstream_remote=.&upstream_branch=main"),
                 Some("mb:1"),
             ),
         ];
@@ -4848,7 +4860,7 @@ mod tests {
             0,
             0,
             "s0",
-            Some("ralphus:new-worktree/x?upstream=main"),
+            Some("ralphus:new-worktree/x?upstream_remote=.&upstream_branch=main"),
             Some("ib:A"),
         )];
         let tasks = vec![task_row(0, Some("proj"))];
@@ -4881,7 +4893,7 @@ mod tests {
             0,
             0,
             "s0",
-            Some("ralphus:new-worktree/feat?upstream=main"),
+            Some("ralphus:new-worktree/feat?upstream_remote=.&upstream_branch=main"),
         )];
         let tasks = vec![task_row(0, Some("ghost-project"))];
         let err = resolve_placeholders(&store, "squad-1", &mut cells, &tasks, &Context::new())
@@ -4903,7 +4915,7 @@ mod tests {
             0,
             0,
             "s0",
-            Some("ralphus:new-worktree/feat?upstream=main"),
+            Some("ralphus:new-worktree/feat?upstream_remote=.&upstream_branch=main"),
         )];
         let tasks = vec![task_row(0, None)];
         let err = resolve_placeholders(&store, "squad-1", &mut cells, &tasks, &Context::new())
@@ -4949,7 +4961,7 @@ mod tests {
             0,
             0,
             "s0",
-            Some("ralphus:new-worktree/feat?upstream=<<default>>"),
+            Some("ralphus:new-worktree/feat?upstream_remote=origin&upstream_branch=<<default>>"),
         )];
         let tasks = vec![task_row(0, Some("proj"))];
         let err = resolve_placeholders(&store, "squad-1", &mut cells, &tasks, &Context::new())
@@ -4958,10 +4970,6 @@ mod tests {
         assert!(
             err.contains("<<default>>"),
             "error should identify the sentinel: {err}"
-        );
-        assert!(
-            err.contains("symbolic HEAD"),
-            "error should explain the remote default branch is unconfigured: {err}"
         );
         assert!(
             err.contains("git remote set-head origin --auto"),
@@ -4995,7 +5003,7 @@ mod tests {
             0,
             0,
             "s0",
-            Some("ralphus:new-worktree/feat-override?upstream=other"),
+            Some("ralphus:new-worktree/feat-override?upstream_remote=.&upstream_branch=other"),
         )];
         let tasks = vec![task_row(0, Some("proj"))];
         resolve_placeholders(&store, "squad-1", &mut cells, &tasks, &Context::new())
@@ -5021,9 +5029,9 @@ mod tests {
     #[test]
     fn resolve_placeholders_resolves_a_bare_upstream_against_the_remote_for_a_registered_project() {
         // RAL-<pending> / PR #70: for a project registered with a remote
-        // (`clone_url` set), a bare `?upstream=staging` must resolve against
+        // (`clone_url` set), a bare `?upstream_remote=origin&upstream_branch=staging` must resolve against
         // that remote's `staging` -- exactly as if the submitter had written
-        // `?upstream=origin/staging` -- never against whatever the shared,
+        // `?upstream_remote=origin&upstream_branch=staging` -- never against whatever the shared,
         // locally-registered checkout happens to have on disk. Without this,
         // the checkout being mid-flight on an unrelated local branch with
         // un-pushed work leaks that work into the new task branch.
@@ -5092,7 +5100,7 @@ mod tests {
             0,
             0,
             "s0",
-            Some("ralphus:new-worktree/feature-new?upstream=staging"),
+            Some("ralphus:new-worktree/feature-new?upstream_remote=origin&upstream_branch=staging"),
         )];
         let tasks = vec![task_row(0, Some("proj"))];
         resolve_placeholders(&store, "squad-1", &mut cells, &tasks, &Context::new())
@@ -5113,7 +5121,7 @@ mod tests {
     fn resolve_placeholders_disambiguates_a_registered_remote_upstream_from_a_same_named_local_branch()
      {
         // RAL-<pending>: `resolve_registered_remote_upstream` rewrites a bare
-        // `?upstream=staging` to `<remote>/staging` (here, `origin/staging`)
+        // `?upstream_remote=origin&upstream_branch=staging` to `<remote>/staging` (here, `origin/staging`)
         // for a registered project. If this repo ALSO happens to have a
         // local branch literally named `origin/staging`
         // (`refs/heads/origin/staging`), that short name is ambiguous to
@@ -5181,7 +5189,9 @@ mod tests {
             0,
             0,
             "s0",
-            Some("ralphus:new-worktree/feature-ambiguous?upstream=staging"),
+            Some(
+                "ralphus:new-worktree/feature-ambiguous?upstream_remote=origin&upstream_branch=staging",
+            ),
         )];
         let tasks = vec![task_row(0, Some("proj"))];
         resolve_placeholders(&store, "squad-1", &mut cells, &tasks, &Context::new())
@@ -5209,7 +5219,7 @@ mod tests {
             0,
             0,
             "s0",
-            Some("ralphus:new-worktree/feat-a?upstream=main"),
+            Some("ralphus:new-worktree/feat-a?upstream_remote=.&upstream_branch=main"),
         )];
         let tasks = vec![task_row(0, Some("myproj"))];
         resolve_placeholders(&store, "squad-1", &mut cells, &tasks, &Context::new())
@@ -5233,7 +5243,9 @@ mod tests {
             0,
             0,
             "s0",
-            Some("<<ralphus:new-worktree/feat-wrapped?upstream=main>>/more/text"),
+            Some(
+                "<<ralphus:new-worktree/feat-wrapped?upstream_remote=.&upstream_branch=main>>/more/text",
+            ),
         )];
         let tasks = vec![task_row(0, Some("myproj"))];
         resolve_placeholders(&store, "squad-1", &mut cells, &tasks, &Context::new())
@@ -5285,13 +5297,13 @@ mod tests {
                 0,
                 0,
                 "s0",
-                Some("ralphus:new-worktree/feat-b?upstream=main"),
+                Some("ralphus:new-worktree/feat-b?upstream_remote=.&upstream_branch=main"),
             ),
             cell_row(
                 1,
                 0,
                 "s1",
-                Some("ralphus:new-worktree/feat-b?upstream=main"),
+                Some("ralphus:new-worktree/feat-b?upstream_remote=.&upstream_branch=main"),
             ),
         ];
         let tasks = vec![task_row(0, Some("shared")), task_row(1, Some("shared"))];
@@ -5331,13 +5343,17 @@ mod tests {
                 0,
                 0,
                 "work",
-                Some("ralphus:new-worktree/test-pr-submission-a?upstream=main"),
+                Some(
+                    "ralphus:new-worktree/test-pr-submission-a?upstream_remote=.&upstream_branch=main",
+                ),
             ),
             cell_row(
                 1,
                 0,
                 "work",
-                Some("ralphus:new-worktree/test-pr-submission-b?upstream=main"),
+                Some(
+                    "ralphus:new-worktree/test-pr-submission-b?upstream_remote=.&upstream_branch=main",
+                ),
             ),
         ];
         let tasks = vec![task_row(0, Some("ralphus")), task_row(1, Some("ralphus"))];
@@ -5390,19 +5406,25 @@ mod tests {
                 0,
                 0,
                 "work",
-                Some("ralphus:new-worktree/test-pr-submission-a?upstream=main"),
+                Some(
+                    "ralphus:new-worktree/test-pr-submission-a?upstream_remote=.&upstream_branch=main",
+                ),
             ),
             cell_row(
                 1,
                 0,
                 "work",
-                Some("ralphus:new-worktree/test-pr-submission-b?upstream=main"),
+                Some(
+                    "ralphus:new-worktree/test-pr-submission-b?upstream_remote=.&upstream_branch=main",
+                ),
             ),
             cell_row(
                 2,
                 0,
                 "work",
-                Some("ralphus:new-worktree/test-pr-submission-c?upstream=main"),
+                Some(
+                    "ralphus:new-worktree/test-pr-submission-c?upstream_remote=.&upstream_branch=main",
+                ),
             ),
         ];
         let tasks = vec![
@@ -5457,7 +5479,7 @@ mod tests {
             0,
             0,
             "s0",
-            Some("ralphus:new-worktree/feat-c?upstream=main"),
+            Some("ralphus:new-worktree/feat-c?upstream_remote=.&upstream_branch=main"),
         )];
         let tasks = vec![task_row(0, Some("proj"))];
         resolve_placeholders(&store, "squad-1", &mut cells, &tasks, &Context::new())
@@ -5516,7 +5538,7 @@ mod tests {
             .lock()
             .register_project("proj", "", &repo.to_string_lossy(), "git")
             .unwrap();
-        let ph = "ralphus:new-worktree/feat-share?upstream=main";
+        let ph = "ralphus:new-worktree/feat-share?upstream_remote=.&upstream_branch=main";
 
         let first = resolve_for_squad(&store, &repo, "squad-1", ph);
         // Squad 1 does its work and commits it -- this is what squad 2 must
@@ -5559,7 +5581,7 @@ mod tests {
             .lock()
             .register_project("proj", "", &repo.to_string_lossy(), "git")
             .unwrap();
-        let ph = "ralphus:new-worktree/feat-seq?upstream=main";
+        let ph = "ralphus:new-worktree/feat-seq?upstream_remote=.&upstream_branch=main";
 
         let a = resolve_for_squad(&store, &repo, "squad-1", ph);
         let b = resolve_for_squad(&store, &repo, "squad-2", ph);
@@ -5588,7 +5610,7 @@ mod tests {
             .lock()
             .register_project("proj", "", &repo.to_string_lossy(), "git")
             .unwrap();
-        let ph = "ralphus:new-worktree/feat-restart?upstream=main";
+        let ph = "ralphus:new-worktree/feat-restart?upstream_remote=.&upstream_branch=main";
 
         let first = resolve_for_squad(&store, &repo, "squad-1", ph);
         std::fs::write(Path::new(&first).join("wip.txt"), "in progress\n").unwrap();
@@ -5627,13 +5649,13 @@ mod tests {
                 0,
                 0,
                 "work",
-                Some("ralphus:new-worktree/feat-split-a?upstream=main"),
+                Some("ralphus:new-worktree/feat-split-a?upstream_remote=.&upstream_branch=main"),
             ),
             cell_row(
                 0,
                 1,
                 "sidecar",
-                Some("ralphus:new-worktree/feat-split-b?upstream=main"),
+                Some("ralphus:new-worktree/feat-split-b?upstream_remote=.&upstream_branch=main"),
             ),
         ];
         let tasks = vec![task_row(0, Some("proj"))];
@@ -5664,7 +5686,7 @@ mod tests {
             .lock()
             .register_project("proj", "", &repo.to_string_lossy(), "git")
             .unwrap();
-        let ph = "ralphus:new-worktree/feat-multi?upstream=main";
+        let ph = "ralphus:new-worktree/feat-multi?upstream_remote=.&upstream_branch=main";
         let mut cells = vec![
             cell_row(0, 0, "work", Some(ph)),
             cell_row(0, 1, "finalize", Some(ph)),
@@ -5701,7 +5723,7 @@ mod tests {
             &store,
             &repo,
             "squad-1",
-            "ralphus:new-worktree/feat-legacy?upstream=main",
+            "ralphus:new-worktree/feat-legacy?upstream_remote=.&upstream_branch=main",
         );
 
         assert_ne!(PathBuf::from(&fresh), legacy);
@@ -5743,7 +5765,7 @@ mod tests {
             &store,
             &repo,
             "squad-1",
-            "ralphus:new-worktree/RAL-428-admin-system-prompt-tab?upstream=main",
+            "ralphus:new-worktree/RAL-428-admin-system-prompt-tab?upstream_remote=.&upstream_branch=main",
         );
 
         assert_ne!(
@@ -5798,7 +5820,7 @@ mod tests {
             &store,
             &repo,
             "squad-1",
-            "ralphus:new-worktree/foreign-branch?upstream=main",
+            "ralphus:new-worktree/foreign-branch?upstream_remote=.&upstream_branch=main",
         );
 
         assert_ne!(
@@ -5828,40 +5850,12 @@ mod tests {
             .lock()
             .register_project("proj", "", &repo.to_string_lossy(), "git")
             .unwrap();
-        let ph = "ralphus:new-worktree/feat-skip?upstream=main";
+        let ph = "ralphus:new-worktree/feat-skip?upstream_remote=.&upstream_branch=main";
         resolve_for_squad(&store, &repo, "squad-1", ph);
         resolve_for_squad(&store, &repo, "squad-2", ph);
         let third = resolve_for_squad(&store, &repo, "squad-3", ph);
         assert_eq!(head_branch(&third), "feat-skip-3");
         assert_eq!(w_dir(&third), "feat-skip-3");
-    }
-
-    #[test]
-    fn ral337_a_remote_tracking_placeholder_is_shared_across_squads_not_suffixed() {
-        // A `new-worktree/origin/foo` placeholder names one specific,
-        // externally owned branch. Separate squads deliberately share that
-        // worktree and resync it to new pushes, so per-squad allocation must
-        // NOT apply -- `origin/foo-2` would be a local branch tracking
-        // nothing. Guards the behavior asserted end-to-end by
-        // `worktree_projects::placeholder_cwd_origin_foo_resyncs_across_separate_run_submissions`.
-        let (repo, _sha) = init_repo_with_remote_branch("ral337-remote-shared", "origin/foo");
-        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
-            Store::open_in_memory().unwrap(),
-        ));
-        store
-            .lock()
-            .register_project("proj", "", &repo.to_string_lossy(), "git")
-            .unwrap();
-        let ph = "ralphus:new-worktree/origin/foo?upstream=origin/foo";
-
-        let first = resolve_for_squad(&store, &repo, "squad-1", ph);
-        let second = resolve_for_squad(&store, &repo, "squad-2", ph);
-
-        assert_eq!(
-            first, second,
-            "a remote-tracking placeholder must resolve to the same shared worktree"
-        );
-        assert_eq!(head_branch(&second), "origin/foo");
     }
 
     #[test]
@@ -5882,7 +5876,7 @@ mod tests {
 
     #[test]
     fn resolve_placeholders_expands_the_current_branch_sentinel_end_to_end() {
-        // `?upstream=<<current_branch>>` must resolve to the project's
+        // `?upstream_remote=.&upstream_branch=<<current_branch>>` must resolve to the project's
         // currently-checked-out branch and drive the new worktree's tracking —
         // the full path from placeholder cwd to materialized worktree.
         let repo = init_repo("resolve-sentinel-current");
@@ -5898,7 +5892,9 @@ mod tests {
             0,
             0,
             "s0",
-            Some("ralphus:new-worktree/feature?upstream=<<current_branch>>"),
+            Some(
+                "ralphus:new-worktree/feature?upstream_remote=.&upstream_branch=<<current_branch>>",
+            ),
         )];
         let tasks = vec![task_row(0, Some("proj"))];
         resolve_placeholders(&store, "squad-1", &mut cells, &tasks, &Context::new())
@@ -5945,19 +5941,19 @@ mod tests {
                 0,
                 0,
                 "s0",
-                Some("ralphus:new-worktree/feat-a?upstream=main"),
+                Some("ralphus:new-worktree/feat-a?upstream_remote=.&upstream_branch=main"),
             ),
             cell_row(
                 1,
                 0,
                 "s0",
-                Some("ralphus:new-worktree/feat-b?upstream=main"),
+                Some("ralphus:new-worktree/feat-b?upstream_remote=.&upstream_branch=main"),
             ),
             cell_row(
                 2,
                 0,
                 "s0",
-                Some("ralphus:new-worktree/feat-c?upstream=main"),
+                Some("ralphus:new-worktree/feat-c?upstream_remote=.&upstream_branch=main"),
             ),
         ];
         let tasks = vec![
@@ -5991,7 +5987,7 @@ mod tests {
             assert!(!Path::new(cwd).exists(), "{cwd} is created lazily");
             let pending = pending_worktree_at(Path::new(cwd)).expect("claim survives as marker");
             assert_eq!(pending.root, repo);
-            assert_eq!(pending.upstream, "main");
+            assert_eq!(pending.upstream, UpstreamRef::local("main"));
             let materialized = materialize_pending(&pending).expect("materialize");
             assert_eq!(materialized.path, Path::new(cwd));
             branches.push(head_branch(cwd));
@@ -6119,7 +6115,9 @@ mod tests {
                 0,
                 0,
                 "s0",
-                Some(&format!("ralphus:new-worktree/{branch}?upstream=main")),
+                Some(&format!(
+                    "ralphus:new-worktree/{branch}?upstream_remote=.&upstream_branch=main"
+                )),
             )];
             let tasks = vec![task_row(0, Some("proj"))];
             let jobs =
@@ -6153,20 +6151,22 @@ mod tests {
     #[test]
     fn marker_claim_is_exclusive_to_one_branch() {
         let repo = init_repo("marker-exclusive");
-        assert!(write_creation_marker(&repo, "slot", "feat-x", "main").unwrap());
         assert!(
-            write_creation_marker(&repo, "slot", "FEAT-X", "main").unwrap(),
+            write_creation_marker(&repo, "slot", "feat-x", &UpstreamRef::local("main")).unwrap()
+        );
+        assert!(
+            write_creation_marker(&repo, "slot", "FEAT-X", &UpstreamRef::local("main")).unwrap(),
             "the owning branch (case-insensitive) re-claims its own slot"
         );
         assert!(
-            !write_creation_marker(&repo, "slot", "feat-y", "main").unwrap(),
+            !write_creation_marker(&repo, "slot", "feat-y", &UpstreamRef::local("main")).unwrap(),
             "a different branch must not take an owned slot"
         );
         let (branch, upstream) =
-            read_creation_marker(&repo, &creation_marker_path(&repo, "slot")).unwrap();
+            read_creation_marker(&creation_marker_path(&repo, "slot")).unwrap();
         assert_eq!(
-            (branch.as_str(), upstream.as_deref()),
-            ("feat-x", Some("main"))
+            (branch.as_str(), upstream),
+            ("feat-x", Some(UpstreamRef::local("main")))
         );
     }
 
@@ -6184,7 +6184,7 @@ mod tests {
                             repo,
                             "slot",
                             &format!("branch-{}", n % 4),
-                            "main",
+                            &UpstreamRef::local("main"),
                         )
                         .unwrap();
                         (n % 4, ok)
@@ -6193,7 +6193,7 @@ mod tests {
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
-        let (winner, _) = read_creation_marker(&repo, &creation_marker_path(&repo, "slot")).unwrap();
+        let (winner, _) = read_creation_marker(&creation_marker_path(&repo, "slot")).unwrap();
         for (branch, ok) in wins {
             assert_eq!(
                 ok,
@@ -6211,11 +6211,14 @@ mod tests {
         let wt = worktree_dir(&repo, "feat-restart");
         let short = marker_short(&repo, "feat-restart");
         assert!(pending_worktree_at(&wt).is_none(), "no marker, no claim");
-        assert!(write_creation_marker(&repo, &short, "feat-restart", "main").unwrap());
+        assert!(
+            write_creation_marker(&repo, &short, "feat-restart", &UpstreamRef::local("main"))
+                .unwrap()
+        );
         let pending = pending_worktree_at(&wt).expect("claim from marker");
         assert_eq!(
-            (pending.branch.as_str(), pending.upstream.as_str()),
-            ("feat-restart", "main")
+            (pending.branch.as_str(), pending.upstream.clone()),
+            ("feat-restart", UpstreamRef::local("main"))
         );
         assert_eq!(pending.root, repo);
         assert!(
@@ -6235,7 +6238,9 @@ mod tests {
         let repo = init_repo("half-created-owned");
         let wt = worktree_dir(&repo, "feat-half");
         let short = marker_short(&repo, "feat-half");
-        assert!(write_creation_marker(&repo, &short, "feat-half", "main").unwrap());
+        assert!(
+            write_creation_marker(&repo, &short, "feat-half", &UpstreamRef::local("main")).unwrap()
+        );
         std::fs::create_dir_all(&wt).unwrap();
         std::fs::write(wt.join("partial.bin"), "interrupted checkout").unwrap();
 
@@ -6257,7 +6262,8 @@ mod tests {
         std::fs::create_dir_all(&wt).unwrap();
         std::fs::write(wt.join("precious.txt"), "not ours").unwrap();
 
-        let err = ensure_worktree_tracked(&repo, "feat-foreign", "main").unwrap_err();
+        let err = ensure_worktree_tracked(&repo, "feat-foreign", &UpstreamRef::local("main"))
+            .unwrap_err();
         assert!(err.contains("refusing"), "{err}");
         assert!(err.contains("no creation marker"), "{err}");
         assert_eq!(
@@ -6273,13 +6279,18 @@ mod tests {
         let repo = init_repo("half-created-other");
         let wt = worktree_dir(&repo, "feat-mine");
         let short = marker_short(&repo, "feat-mine");
-        assert!(write_creation_marker(&repo, &short, "someone-else", "main").unwrap());
+        assert!(
+            write_creation_marker(&repo, &short, "someone-else", &UpstreamRef::local("main"))
+                .unwrap()
+        );
         std::fs::create_dir_all(&wt).unwrap();
         std::fs::write(wt.join("theirs.txt"), "theirs").unwrap();
 
         // Whether this branch is planned into another slot or refused, the
         // other branch's directory and marker are untouched.
-        if let Ok(created) = ensure_worktree_tracked(&repo, "feat-mine", "main") {
+        if let Ok(created) =
+            ensure_worktree_tracked(&repo, "feat-mine", &UpstreamRef::local("main"))
+        {
             assert_ne!(created.path, wt);
         }
         assert_eq!(
@@ -6299,7 +6310,10 @@ mod tests {
             let handles: Vec<_> = (0..8)
                 .map(|_| {
                     let repo = &repo;
-                    scope.spawn(move || ensure_worktree_tracked(repo, "feat-sf", "main").unwrap())
+                    scope.spawn(move || {
+                        ensure_worktree_tracked(repo, "feat-sf", &UpstreamRef::local("main"))
+                            .unwrap()
+                    })
                 })
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -6336,7 +6350,7 @@ mod tests {
             0,
             0,
             "s0",
-            Some("ralphus:new-worktree/feat-cr?upstream=main"),
+            Some("ralphus:new-worktree/feat-cr?upstream_remote=.&upstream_branch=main"),
         )];
         let tasks = vec![task_row(0, Some("proj"))];
         let jobs =
@@ -6376,7 +6390,9 @@ mod tests {
         ));
         let wt = worktree_dir(&repo, "feat-rs");
         let short = marker_short(&repo, "feat-rs");
-        assert!(write_creation_marker(&repo, &short, "feat-rs", "main").unwrap());
+        assert!(
+            write_creation_marker(&repo, &short, "feat-rs", &UpstreamRef::local("main")).unwrap()
+        );
         std::fs::create_dir_all(wt.join("half")).unwrap();
 
         let created = ensure_claimed_worktree(&store, "squad-1", None, &wt)

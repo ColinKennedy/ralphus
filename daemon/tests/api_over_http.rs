@@ -189,7 +189,8 @@ fn hidden_squads_are_scoped_by_the_user_header() {
     assert_eq!(status, 201, "submit body: {response}");
     let review_body = serde_json::json!({
         "name": "wire review",
-        "base_branch": "main",
+        "upstream_remote": ".",
+        "upstream_branch": "main",
         "git_root": "/repo"
     })
     .to_string();

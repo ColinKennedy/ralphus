@@ -173,7 +173,7 @@
        * @property {number} cell_idx
        * @property {string|null} worktree
        * @property {string|null} project - RAL-396: the registered project's name when this cell's worktree maps to one, otherwise the derived (unregistered) repo path as a fallback. Resolved server-side — never a raw path to display when a project association exists, since a cell's on-disk path isn't stable for remote-machine cells (RAL-185).
-       * @property {string|null} upstream
+       * @property {string|null} upstream - Joined `<remote>/<branch>` display form (just the branch for a local base).
        */
       /**
        * RAL-550: the runner-pushed numstat summary of a cell's worktree
@@ -529,7 +529,9 @@
        * @property {string} id
        * @property {string} name
        * @property {string} status
-       * @property {string} [base_branch]
+       * @property {string} [base_branch] - Joined display form of the upstream; the pair below is the source of truth.
+       * @property {string} [upstream_remote] - Remote half of the review's upstream (`.` for a local branch).
+       * @property {string} [upstream_branch] - Branch half of the review's upstream.
        * @property {string[]} [projects]
        * @property {string[]} [squash_projects]
        * @property {GuardianBranch[]} branches

@@ -38,8 +38,10 @@
        * @property {string} gid
        * @property {string} name
        * @property {string} originalName
-       * @property {string} baseBranch
-       * @property {string} originalBaseBranch
+       * @property {string} upstreamRemote
+       * @property {string} originalUpstreamRemote
+       * @property {string} upstreamBranch
+       * @property {string} originalUpstreamBranch
        * @property {boolean} resolverFrozen - True once the review is merged/deployed -- base/resolver are rejected server-side past that point.
        * @property {string} resolverAgent
        * @property {string} originalResolverAgent
@@ -363,8 +365,10 @@
           gid: g.id,
           name: g.name,
           originalName: g.name,
-          baseBranch: g.base_branch || "",
-          originalBaseBranch: g.base_branch || "",
+          upstreamRemote: g.upstream_remote || "",
+          originalUpstreamRemote: g.upstream_remote || "",
+          upstreamBranch: g.upstream_branch || "",
+          originalUpstreamBranch: g.upstream_branch || "",
           resolverFrozen: ["merged", "approved", "deployed"].includes(g.status),
           resolverAgent: g.resolver_agent || "",
           originalResolverAgent: g.resolver_agent || "",
@@ -461,11 +465,22 @@
        */
       function onEditName(value) { if (reviewEditDraft) reviewEditDraft.name = value; }
       /**
-       * Stages a new upstream/base branch.
+       * Stages a new upstream branch.
        * @param {string} value
        * @returns {void}
        */
-      function onEditBaseBranch(value) { if (reviewEditDraft) reviewEditDraft.baseBranch = value; }
+      function onEditUpstreamBranch(value) { if (reviewEditDraft) reviewEditDraft.upstreamBranch = value; }
+      /**
+       * Stages a new upstream remote and re-renders so the branch
+       * suggestions follow it.
+       * @param {string} value
+       * @returns {void}
+       */
+      function onEditUpstreamRemote(value) {
+        if (!reviewEditDraft) return;
+        reviewEditDraft.upstreamRemote = value;
+        renderReviewEditModal();
+      }
       /**
        * Stages a new resolver-agent choice and re-renders (a `<select>`
        * change never loses in-progress typing the way a text input would).
@@ -1014,7 +1029,8 @@
             </div>
             <div ${grp("onto")}><h3 class="section">upstream</h3>
               <div class="edit-form">
-                <label data-tip="The branch every submitted branch is rebased onto. Type or focus to load remote branch suggestions. Triggers a rebase on Save.">upstream branch<input type="text" class="mono" list="base-datalist" value="${esc(draft.baseBranch)}" onfocus="loadBaseBranches(${JSON.stringify(draft.gid)})" oninput="onEditBaseBranch(this.value)"><datalist id="base-datalist">${(baseBranchCache[draft.gid] || []).map((b) => `<option value="${esc(b)}"></option>`).join("")}</datalist></label>
+                <label data-tip="The remote that holds the upstream branch. '(local)' rebases onto a local branch of the checkout, which is never fetched. Triggers a rebase on Save.">upstream remote<select class="mono" onfocus="loadBaseBranches(${JSON.stringify(draft.gid)})" onchange="onEditUpstreamRemote(this.value)">${upstreamRemoteOptionsHtml(baseBranchCache[draft.gid] || [], draft.upstreamRemote)}</select></label>
+                <label data-tip="The branch on the upstream remote that every submitted branch is rebased onto. Type or focus to load branch suggestions. Triggers a rebase on Save.">upstream branch<input type="text" class="mono" list="base-datalist" value="${esc(draft.upstreamBranch)}" onfocus="loadBaseBranches(${JSON.stringify(draft.gid)})" oninput="onEditUpstreamBranch(this.value)"><datalist id="base-datalist">${upstreamBranchOptionsHtml(baseBranchCache[draft.gid] || [], draft.upstreamRemote)}</datalist></label>
               </div></div>
             <div ${grp("resolver")}><h3 class="section">resolver</h3>${resolverSection}</div>
             <div ${grp("proof")}><h3 class="section">proof</h3>${proofScopeSection}</div>
@@ -1099,8 +1115,13 @@
         const body = {};
         const name = draft.name.trim();
         if (name && name !== draft.originalName) body.name = name;
-        const base = draft.baseBranch.trim();
-        if (base && base !== draft.originalBaseBranch) body.base_branch = base;
+        const upstreamRemote = draft.upstreamRemote.trim();
+        const upstreamBranch = draft.upstreamBranch.trim();
+        if (upstreamRemote && upstreamBranch
+          && (upstreamRemote !== draft.originalUpstreamRemote || upstreamBranch !== draft.originalUpstreamBranch)) {
+          body.upstream_remote = upstreamRemote;
+          body.upstream_branch = upstreamBranch;
+        }
         if (!draft.resolverFrozen) {
           const model = draft.resolverModel.trim();
           if (draft.resolverAgent !== draft.originalResolverAgent || model !== draft.originalResolverModel) {

@@ -177,7 +177,9 @@ impl Exercise {
     /// else the fixture checkout itself.
     pub fn cell_cwd(&self, fixture: &Fixture, branch: &str) -> String {
         if self.remote {
-            format!("<<ralphus:new-worktree/{branch}?upstream=<<default>>>>")
+            format!(
+                "<<ralphus:new-worktree/{branch}?upstream_remote=origin&upstream_branch=<<default>>>>"
+            )
         } else {
             fixture.path.to_string_lossy().into_owned()
         }

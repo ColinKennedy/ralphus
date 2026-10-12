@@ -46,6 +46,7 @@ function freshState(overrides = {}) {
     agent: "claude-code",
     model: "",
     project: "demo",
+    upstreamRemote: "",
     upstreamBranch: "",
     proofs: false,
     reviewMode: "none",
@@ -392,11 +393,11 @@ test("ntResolveNaming requests generation when neither a label nor a ticket id i
 // submission's leftover generated items nor a completed one's leak into the
 // next, unrelated task.
 
-test("ntSimpleResetKeepingProjectFields carries forward exactly the five remembered fields", () => {
+test("ntSimpleResetKeepingProjectFields carries forward exactly the six remembered fields", () => {
   const body = boardSource.slice(boardSource.indexOf("function ntSimpleResetKeepingProjectFields()"));
   const fn = body.slice(0, body.indexOf("\n      }\n") + 1);
   assert.match(fn, /ntSimpleReset\(\);/, "must fully reset before restoring the remembered fields");
-  for (const field of ["templateName", "agent", "model", "project", "upstreamBranch"]) {
+  for (const field of ["templateName", "agent", "model", "project", "upstreamRemote", "upstreamBranch"]) {
     assert.match(fn, new RegExp(`ntSimple\\.${field}\\s*=\\s*prev\\.${field}`), `must carry forward ${field}`);
   }
   // Fields that must NOT be carried forward -- they should reset to

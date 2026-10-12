@@ -578,7 +578,9 @@ pub fn join_upstream(remote: &str, branch: &str) -> String {
 /// An owned upstream: a remote (or [`LOCAL_UPSTREAM_REMOTE`] for a local
 /// branch) plus a literal branch on it. Never split from or joined into a
 /// single string except for display.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct UpstreamRef {
     /// Remote name, or `.` for a local branch.
     pub remote: String,

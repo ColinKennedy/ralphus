@@ -1498,7 +1498,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         return {
           place: i < 0 ? 0 : i + 1,
           total: ordered.length,
-          onto: i > 0 ? ordered[i - 1].branch : (g.base_branch || "—"),
+          onto: i > 0 ? ordered[i - 1].branch : upstreamLabel(g.upstream_remote, g.upstream_branch),
         };
       }
 
@@ -1545,7 +1545,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           body: `<div class="hc-path">${esc(g.combined_worktree)}</div>`
             + hcKv(
               hcRow("review branch", esc(g.review_branch || "—"), "mono")
-              + hcRow("upstream", esc(g.base_branch || "—"), "mono")
+              + hcRow("upstream", esc(upstreamLabel(g.upstream_remote, g.upstream_branch)), "mono")
               + hcRow("branches", `${(g.branches || []).filter((b) => b.enabled !== false).length} enabled of ${(g.branches || []).length}`),
             )
             + hcNote("The whole stack rebased into one tree — the checkout prepared for actions."),
@@ -1563,7 +1563,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
             + hcKv(
               hcRow("from squad", esc(g.squad_id || "—"), "mono")
               + hcRow("type", esc(g.review_type || "git"))
-              + hcRow("upstream", esc(g.base_branch || "—"), "mono"),
+              + hcRow("upstream", esc(upstreamLabel(g.upstream_remote, g.upstream_branch)), "mono"),
             )
             + hcNote("Use this id with <span class=\"mono\">ralphus review show</span>, in daemon logs, "
               + "or to find the review worktree on disk."),
@@ -2022,8 +2022,8 @@ Press Accept on the note to create it.">Squad pending</span>`;
           : !preparationRevoked && g.post_merge_status === "failed" ? "failed" : "pending";
         return `<div class="setup-strip">`
           + `<div class="setup-chips">`
-          + setupChip(g.id, "onto", esc(g.base_branch || "—"),
-            `Upstream branch. Every branch in this review rebases onto ${g.base_branch || "it"}, each on top of the one before it.\nChanging it rebuilds the whole stack.`)
+          + setupChip(g.id, "onto", esc(upstreamLabel(g.upstream_remote, g.upstream_branch)),
+            `Upstream remote: ${upstreamRemoteName(g.upstream_remote)}\nUpstream branch: ${g.upstream_branch || "—"}\nEvery branch in this review rebases onto that branch, each on top of the one before it.\nChanging it rebuilds the whole stack.`)
           + setupChip(g.id, "resolver", esc(resolverOf(g)) + model,
             "The agent that resolves rebase conflicts, writes the change summary, and generates the auto actions.")
           + setupChip(g.id, "proof", esc(proof),
@@ -2631,9 +2631,62 @@ Press Accept on the note to create it.">Squad pending</span>`;
       // RAL-24: candidate base-branch lists, keyed by guardian id. Fetched once on
       // focus and cleared when the user commits a base change so the next open
       // re-fetches with the new remote scope.
-      /** @type {{[key: string]: string[]}} */
+      /** @type {Record<string, {remote: string, branch: string}[]>} */
       let baseBranchCache = {};
+      /** @type {Record<string, {remote: string, branch: string}[]>} */
+      let projectBranchCache = {};
+      /**
+       * Display form of an upstream pair: `<remote> / <branch>`, with
+       * `(local)` standing in for the local-branch remote `.`.
+       * @param {string|undefined} remote
+       * @param {string|undefined} branch
+       * @returns {string}
+       */
+      function upstreamLabel(remote, branch) {
+        if (!remote || !branch) return "—";
+        return `${upstreamRemoteName(remote)} / ${branch}`;
+      }
+      /**
+       * Display name of an upstream remote (`.` is shown as `(local)`).
+       * @param {string|undefined} remote
+       * @returns {string}
+       */
+      function upstreamRemoteName(remote) { return remote === "." ? "(local)" : (remote || "—"); }
+      /**
+       * Lazily fetches and caches a project's `{remote, branch}` candidates.
+       * @param {string} project
+       * @returns {Promise<void>}
+       */
+      async function loadProjectBranches(project) {
+        if (!project || projectBranchCache[project]) return;
+        try {
+          const data = await (await fetch(`/api/projects/${encodeURIComponent(project)}/branches`)).json();
+          projectBranchCache[project] = Array.isArray(data.branches) ? data.branches : [];
+        } catch (_) { projectBranchCache[project] = []; }
+      }
       // RAL-139: persists the user-dragged height of live pane peek boxes
+      /**
+       * `<option>` list for an upstream-remote picker: the local remote
+       * `.`, every remote in `entries`, and the currently chosen one.
+       * @param {{remote: string}[]} entries
+       * @param {string} current
+       * @returns {string}
+       */
+      function upstreamRemoteOptionsHtml(entries, current) {
+        const remotes = [...new Set([".", ...entries.map((e) => e.remote), ...(current ? [current] : [])])];
+        return remotes.map((r) => `<option value="${esc(r)}"${r === current ? " selected" : ""}>${esc(upstreamRemoteName(r))}</option>`).join("");
+      }
+      /**
+       * `<option>` list for an upstream-branch datalist: the branches
+       * `entries` knows on `remote`.
+       * @param {{remote: string, branch: string}[]} entries
+       * @param {string} remote
+       * @returns {string}
+       */
+      function upstreamBranchOptionsHtml(entries, remote) {
+        return entries.filter((e) => e.remote === remote).map((e) => `<option value="${esc(e.branch)}"></option>`).join("");
+      }
+      // RAL-139: persists the user-dragged height of live tmux pane peek boxes
       // across re-renders and tab navigation within this browser session.
       let peekPaneHeight = 320;
       // RAL-272: per-branch read-only feedback thread, keyed by `${gid}:${branchId}`.
@@ -2771,7 +2824,7 @@ Press Accept on the note to create it.">Squad pending</span>`;
           baseBranchCache[gid] = Array.isArray(data) ? data : [];
         } catch (_) { baseBranchCache[gid] = []; }
         const dl = document.getElementById("base-datalist");
-        if (dl) dl.innerHTML = baseBranchCache[gid].map(b => `<option value="${esc(b)}"></option>`).join('');
+        if (dl) dl.innerHTML = upstreamBranchOptionsHtml(baseBranchCache[gid], reviewEditDraft ? reviewEditDraft.upstreamRemote : "");
       }
       // RALPHUS-AGENT-SELECT:BEGIN
       // RAL-466: this block backs every agent-picking `<select>` in the
@@ -2981,7 +3034,8 @@ Press Accept on the note to create it.">Squad pending</span>`;
               <label data-tip="Display name for this review — shown in the sidebar list.">name<input id="cr-name" value="my review"></label>
               <label data-tip="Review type. 'git' stacks branches via rebase with AI conflict resolution. Other types are placeholders.">type<select id="cr-type" onchange="onReviewTypeChange()"><option value="git">git</option><option value="document">document (placeholder)</option></select></label>
               <div id="cr-git-fields">
-                <label data-tip="The branch that every submitted branch is ultimately rebased onto. Usually 'main' or 'master'.">upstream branch<input id="cr-base" value="main"></label>
+                <label data-tip="The remote that holds the upstream branch. Pick '(local)' to rebase onto a local branch of the checkout, which is never fetched.">upstream remote<select id="cr-remote" onchange="onCreateReviewRemoteChange()" onfocus="loadCreateReviewBranches()">${upstreamRemoteOptionsHtml([{ remote: "origin" }], "origin")}</select></label>
+                <label data-tip="The branch on the upstream remote that every submitted branch is ultimately rebased onto. Usually 'main' or 'master'. Focus to load the project's branches as suggestions.">upstream branch<input id="cr-base" value="main" list="cr-base-datalist" onfocus="loadCreateReviewBranches()"><datalist id="cr-base-datalist"></datalist></label>
                 <label data-tip="Choose whether this review is identified by a registered project or directly by a raw repository path.">target<select id="cr-target-kind" onchange="onReviewTargetKindChange()"><option value="project">registered project</option><option value="path">directory path</option></select></label>
                 <div id="cr-project-field">
                   <label data-tip="The stable registered project identity for this review. Its concrete path may differ by machine.">project<select id="cr-project">${projectOptions}</select></label>
@@ -3007,6 +3061,35 @@ Press Accept on the note to create it.">Squad pending</span>`;
         const current = select.value;
         select.innerHTML = `<option value="">(select a project)</option>` + projects.map((project) => `<option value="${esc(project.name)}">${esc(project.name)}</option>`).join("");
         select.value = current;
+      }
+      /**
+       * Refreshes the Create Review branch suggestions after the remote changes.
+       * @returns {void}
+       */
+      function onCreateReviewRemoteChange() { refreshCreateReviewBranchList(); }
+      /**
+       * Rebuilds the Create Review branch suggestions for the chosen remote.
+       * @returns {void}
+       */
+      function refreshCreateReviewBranchList() {
+        const project = /** @type {HTMLSelectElement|null} */ (document.getElementById("cr-project"));
+        const remote = /** @type {HTMLSelectElement|null} */ (document.getElementById("cr-remote"));
+        const dl = document.getElementById("cr-base-datalist");
+        if (!project || !remote || !dl) return;
+        dl.innerHTML = upstreamBranchOptionsHtml(projectBranchCache[project.value] || [], remote.value);
+      }
+      /**
+       * Loads the chosen project's remotes and branches into the Create
+       * Review remote picker and branch suggestions.
+       * @returns {Promise<void>}
+       */
+      async function loadCreateReviewBranches() {
+        const project = /** @type {HTMLSelectElement|null} */ (document.getElementById("cr-project"));
+        const remote = /** @type {HTMLSelectElement|null} */ (document.getElementById("cr-remote"));
+        if (!project || !remote || !project.value) return;
+        await loadProjectBranches(project.value);
+        remote.innerHTML = upstreamRemoteOptionsHtml(projectBranchCache[project.value] || [], remote.value);
+        refreshCreateReviewBranchList();
       }
       /**
        * Toggles between registered-project and raw-directory review creation.
@@ -3045,7 +3128,7 @@ Press Accept on the note to create it.">Squad pending</span>`;
         }
         const skip_worktrees = /** @type {HTMLInputElement} */ (document.getElementById("cr-skip-worktrees")).checked;
         /** @type {Record<string, unknown>} */
-        const body = { name: v("cr-name"), review_type, base_branch: v("cr-base"), skip_worktrees };
+        const body = { name: v("cr-name"), review_type, upstream_remote: v("cr-remote"), upstream_branch: v("cr-base"), skip_worktrees };
         const targetKind = /** @type {HTMLSelectElement} */ (document.getElementById("cr-target-kind")).value;
         if (targetKind === "project") {
           const project = /** @type {HTMLSelectElement} */ (document.getElementById("cr-project")).value;

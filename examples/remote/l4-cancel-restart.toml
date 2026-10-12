@@ -11,6 +11,6 @@ machine = "loopback:lb"
 no_commit_required = true
 
 [[task.cell]]
-cwd = "<<ralphus:new-worktree/l4-slow?upstream=<<default>>>>"
+cwd = "<<ralphus:new-worktree/l4-slow?upstream_remote=origin&upstream_branch=<<default>>>>"
 mode = "raw"
 command = "python -c \"import time,os;open('started.txt','w').write(str(os.getpid()));time.sleep(120)\""

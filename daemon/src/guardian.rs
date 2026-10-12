@@ -1560,14 +1560,7 @@ impl Store {
         let project = self
             .get_project(project_name)?
             .ok_or(StoreError::NotFound)?;
-        self.create_guardian_keyed(
-            name,
-            base,
-            &project.path,
-            None,
-            None,
-            Some(&project.name),
-        )
+        self.create_guardian_keyed(name, base, &project.path, None, None, Some(&project.name))
     }
 
     /// Resolve a review/worktree's owning user (RAL-476): the squad's own
@@ -1690,7 +1683,7 @@ impl Store {
         }
         self.conn.execute(
             "INSERT INTO guardians(id, name, base_branch, upstream_remote, upstream_branch, git_root, project, review_branch, status, detail, squad_id, review_key, created_at_ms, updated_at_ms, base_changed_at_ms, match_pr_branch_name, auto_submit_pr_stack, separate_pr_branch, readable_review_branch, owner, dual_root_pr)
-             VALUES(?,?,?,?,?,?,NULL,?,NULL,?,?,?,?,?,?,?,?,1,?,?)",
+             VALUES(?,?,?,?,?,?,?,NULL,?,NULL,?,?,?,?,?,?,?,?,1,?,?)",
             params![id, name, base_branch, base.remote, base.branch, git_root, project, GuardianStatus::Collecting.as_str(), squad_id, review_key, now, now, now, i64::from(match_pr_branch_name), i64::from(auto_submit_pr_stack), i64::from(separate_pr_branch), owner, i64::from(dual_root_pr)],
         )?;
         let defaults = self.resolve_review_config(Path::new(git_root));

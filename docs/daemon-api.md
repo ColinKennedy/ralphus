@@ -546,22 +546,22 @@ line and the MCP `submit` tool returns the key in its result.
 ### `POST /api/projects`
 Register (or re-register, updating its fields) a project by name (RAL-100).
 Lets a task's cell `cwd` use the placeholder
-`"ralphus:new-worktree/<branch>?upstream=<upstream>"` instead of a real
+`"ralphus:new-worktree/<branch>?upstream_remote=<remote>&upstream_branch=<upstream>"` instead of a real
 filesystem path -- the owning task's `project` field names which registered
 project to materialize it under, and the scheduler materializes (or reuses) a
 git worktree for `<branch>` before the cell runs. The trailing
-`?upstream=<upstream>` is REQUIRED (submit-time validation rejects a
+`?upstream_remote=<remote>&upstream_branch=<upstream>` is REQUIRED (both keys, either order; the old combined `?upstream=` form is rejected) (submit-time validation rejects a
 placeholder cwd without one) and names the branch `<branch>`'s worktree
-should track (`git branch --set-upstream-to`) -- a local branch (`?upstream=main`)
-or a remote-qualified one (`?upstream=origin/main`); it decides what a
+should track (`git branch --set-upstream-to`) -- a branch on a remote (`?upstream_remote=origin&upstream_branch=main`)
+or a local branch (`?upstream_remote=.&upstream_branch=main`); it decides what a
 review's upstream branch resolves to (unless the review declares its own
-`upstream` field, see `[[review]]` below — a declared value always wins)
+`upstream_remote`/`upstream_branch` fields, see `[[review]]` below — a declared value always wins)
 and drives the resync-on-reuse behavior described below, rather than the
 daemon guessing from `HEAD` at materialization time.
 Two reserved sentinel values may be used instead of a literal branch name
-(RAL-258): `?upstream=<<default>>` (resolve to the repository's default
+(RAL-258): `?upstream_remote=origin&upstream_branch=<<default>>` (resolve to the repository's default
 branch, against the project root, at resolution time — recommended) and
-`?upstream=<<current_branch>>` (resolve to whatever branch the project
+`?upstream_remote=origin&upstream_branch=<<current_branch>>` (resolve to whatever branch the project
 currently has checked out). These sentinels are reserved and are never
 treated as literal branch names; any other `<<...>>` value is rejected at
 validation time. The placeholder parser treats everything between
@@ -576,9 +576,9 @@ branch -- a real, attached branch checkout, never a detached HEAD. When no
 such remote-tracking ref exists, the daemon falls back to creating a literal
 local branch named `origin/foo` from the project's current `HEAD` and logs a
 warning about that ambiguous fallback. Either way, the branch's tracking
-configuration comes from `?upstream=`, not from this fallback logic.
+configuration comes from `?upstream_remote=`/`?upstream_branch=`, not from this fallback logic.
 
-A worktree whose `?upstream=` names a remote-tracking branch is not frozen at
+A worktree whose `?upstream_remote=`/`?upstream_branch=` names a remote-tracking branch is not frozen at
 whatever the remote held on first materialization: every later time that
 placeholder is resolved (i.e. on each new squad submitted against it), the
 daemon fetches that remote branch and rebases the local branch onto it, so
@@ -678,7 +678,7 @@ repo, without re-registering it. Runs the exact same checks as `POST
 ### `GET /api/projects/{name}/branches`
 Local and `origin` remote-tracking branch names for a registered git
 project (RAL-297) -- lets a client validate a user-typed upstream branch
-before generating a `ralphus:new-worktree/<branch>?upstream=<name>`
+before generating a `ralphus:new-worktree/<branch>?upstream_remote=origin&upstream_branch=<name>`
 placeholder, rather than only discovering a typo much later, at worktree
 materialization time. Empty list for a non-git project or a path that no
 longer resolves; `404` if no project is registered under that exact name.
@@ -690,7 +690,7 @@ longer resolves; `404` if no project is registered under that exact name.
 ### `POST /api/projects/{name}/default-branch/autofix`
 Runs `git remote set-head origin --auto` in a registered git project's path
 and reports the branch it resolved to -- the one-click fix for the
-`?upstream=<<default>>` failure `daemon/src/worktrees.rs`'s `default_branch()`
+`?upstream_remote=origin&upstream_branch=<<default>>` failure `daemon/src/worktrees.rs`'s `default_branch()`
 raises when the project has no `refs/remotes/origin/HEAD` symref (a repo not
 created via a plain `git clone`, e.g. `git init` + `git remote add`). Always
 targets the remote literally named `origin`; admin-gated like the other
@@ -1978,7 +1978,7 @@ The settings `skip_worktrees`, `auto_pr_feedback`, `skip_base_updates`,
 also declarable at submit time in `[[review]]` as the same names, except
 `proof_skip_auto_clean`, which is `skip_auto_clean`. `skip_auto_clean` requires
 `proof_scope = "each_branch"`. `base_branch` is represented at submit time by
-`[[review]] upstream`: the guardian's base branch is minted from that declared
+`[[review]] upstream_remote`/`upstream_branch`: the guardian's base branch is minted from that declared
 or inferred upstream when the review is created.
 
 `post_appraisals` (RAL-575, boolean, default `true`) controls whether a

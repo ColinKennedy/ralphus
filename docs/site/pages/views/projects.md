@@ -2,7 +2,7 @@
 
 A **project** is a registered git repository a task's cell `cwd` can
 materialize a worktree under — registering one is what lets a task file use
-the `ralphus:new-worktree/<branch>?upstream=<upstream>` placeholder instead
+the `ralphus:new-worktree/<branch>?upstream_remote=origin&upstream_branch=<upstream>` placeholder instead
 of a hardcoded filesystem path. The Projects tab is where you manage that
 registry.
 

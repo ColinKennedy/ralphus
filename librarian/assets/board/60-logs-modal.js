@@ -14,7 +14,7 @@
       const DEFAULT_BRANCH_AUTOFIX_MARKER = "git remote set-head origin --auto";
       /**
        * Renders an inline "Autofix" button beside a task's failure reason
-       * when it's the specific `?upstream=<<default>>` failure a missing
+       * when it's the specific `?upstream_branch=<<default>>` failure a missing
        * `origin/HEAD` symref causes (see DEFAULT_BRANCH_AUTOFIX_MARKER) --
        * empty string for every other reason. The button calls
        * `POST /api/projects/{project}/default-branch/autofix`, which runs
@@ -28,7 +28,7 @@
        */
       function taskErrorAutofixBtn(error, project, squadId, taskIdx) {
         if (!error || !error.includes(DEFAULT_BRANCH_AUTOFIX_MARKER)) return "";
-        return `<button class="btn" style="padding:1px 6px;font-size:11px;margin-left:6px" data-click="autofixDefaultBranch" data-project="${esc(project)}" data-squad-id="${esc(squadId)}" data-task-idx="${taskIdx}" data-tip="Runs \`git remote set-head origin --auto\` for project \"${esc(project)}\" -- points its local default-branch pointer at whatever the \"origin\" remote reports as its own default branch, then offers to restart this task.\nWho/when: this task failed because its project has no refs/remotes/origin/HEAD symref set locally (common for a repo not created via a plain \`git clone\`), which \"?upstream=&lt;&lt;default&gt;&gt;\" needs to resolve.\nAlways targets the remote named \"origin\" specifically -- never a fallback remote.">⚡ Autofix</button>`;
+        return `<button class="btn" style="padding:1px 6px;font-size:11px;margin-left:6px" data-click="autofixDefaultBranch" data-project="${esc(project)}" data-squad-id="${esc(squadId)}" data-task-idx="${taskIdx}" data-tip="Runs \`git remote set-head origin --auto\` for project \"${esc(project)}\" -- points its local default-branch pointer at whatever the \"origin\" remote reports as its own default branch, then offers to restart this task.\nWho/when: this task failed because its project has no refs/remotes/origin/HEAD symref set locally (common for a repo not created via a plain \`git clone\`), which \"?upstream_branch=&lt;&lt;default&gt;&gt;\" needs to resolve.\nAlways targets the remote named \"origin\" specifically -- never a fallback remote.">⚡ Autofix</button>`;
       }
       /**
        * Runs the origin/HEAD autofix for `project` (see taskErrorAutofixBtn),

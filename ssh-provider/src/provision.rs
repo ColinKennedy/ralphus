@@ -85,13 +85,20 @@ pub fn run(uri: &str, request_json: &str, config: &EffectiveConfig) -> Result<St
         .branch
         .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| "provision request is missing the worktree branch to create".to_string())?;
+    // The remote clone's only remote is `origin`, so the daemon's remote name
+    // is required for the contract but does not pick a ref here.
+    req.source
+        .upstream_remote
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| {
+            "provision request is missing the upstream remote to create the branch from".to_string()
+        })?;
     let upstream = req
         .source
         .upstream_branch
         .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| {
-            "provision request is missing the upstream branch to create the branch from"
-                .to_string()
+            "provision request is missing the upstream branch to create the branch from".to_string()
         })?;
     let remote_root = req.remote_root.filter(|s| !s.trim().is_empty()).ok_or_else(|| {
         "provision request has no remote_root -- register a [machine.targets.*] entry for this machine with one set".to_string()
@@ -219,8 +226,7 @@ fn build_provision_script(args: BuildScriptArgs<'_>) -> String {
     let project_name_q = shell_quote_single(args.project_name);
     let url_q = shell_quote_single(args.url);
     let branch_q = shell_quote_single(args.branch);
-    let origin_ref_q =
-        shell_quote_single(&format!("origin/{}", args.upstream));
+    let origin_ref_q = shell_quote_single(&format!("origin/{}", args.upstream));
     let local_branch_ref_q = shell_quote_single(&format!("refs/heads/{}", args.branch));
     // Cloned into a staging directory and `mv`'d into place only once the
     // whole clone succeeds, so an interrupted connection (or a killed

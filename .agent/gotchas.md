@@ -50,7 +50,7 @@ these bugs only make sense read together.
 A squad starts before its `ralphus:new-worktree/...` worktrees exist. Submit
 (`plan_local_worktree_jobs`) only *claims* each slot: the branch name, the
 `w/<short>` directory, and a durable creation marker at
-`<ralphus_root>/creating/<short>` (branch, `upstream=`, `pid=`). The cell's cwd
+`<ralphus_root>/creating/<short>` (branch, `upstream_remote=`, `upstream_branch=`, `pid=`). The cell's cwd
 is that planned path even though nothing is on disk yet, so code that reads a
 cwd for a not-yet-created worktree must go through
 `worktrees::pending_worktree_at` (marker-only, restart-safe) rather than
