@@ -133,6 +133,7 @@
           } catch (_e) {
             continue;
           }
+          if (rec === null || typeof rec !== "object" || Array.isArray(rec)) continue;
           const id = typeof rec.id === "string" ? rec.id : "";
           let cur = id === "" ? undefined : byId.get(id);
           if (cur === undefined) {

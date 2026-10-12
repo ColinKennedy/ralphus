@@ -120,6 +120,81 @@ mod tests {
     }
 
     #[test]
+    fn split_tag_handles_degenerate_tags() {
+        assert_eq!(split_tag(""), ("", ""));
+        assert_eq!(split_tag("tool."), ("", ""));
+        assert_eq!(split_tag("tool..x"), ("", "x"));
+        assert_eq!(split_tag("Bash.git"), ("Bash", "git"));
+        assert_eq!(split_tag("Bash"), ("Bash", ""));
+        assert_eq!(split_tag("tool.Bash."), ("Bash", ""));
+    }
+
+    #[test]
+    fn call_record_with_an_empty_tag_still_has_every_field() {
+        let rec = call_record("b", "", "", "");
+        assert_eq!(rec["v"], 1);
+        assert_eq!(rec["id"], "");
+        assert_eq!(rec["tool"], "");
+        assert_eq!(rec["sub"], "");
+        assert_eq!(rec["input"], "");
+    }
+
+    #[test]
+    fn field_exactly_at_the_limit_is_not_clipped() {
+        let text = "a".repeat(MAX_FIELD_CHARS);
+        let rec = result_record("x", "1", &text, false);
+        assert_eq!(rec["output"].as_str().unwrap(), text);
+    }
+
+    #[test]
+    fn one_char_over_the_limit_is_clipped_with_an_ellipsis() {
+        let rec = call_record("x", "1", "tool.Bash", &"a".repeat(MAX_FIELD_CHARS + 1));
+        let input = rec["input"].as_str().unwrap();
+        assert_eq!(input.chars().count(), MAX_FIELD_CHARS + 1);
+        assert!(input.ends_with('…'));
+    }
+
+    #[test]
+    fn clipping_counts_characters_not_bytes_and_never_splits_one() {
+        let rec = result_record("x", "1", &"é".repeat(MAX_FIELD_CHARS + 10), false);
+        let output = rec["output"].as_str().unwrap();
+        assert_eq!(output.chars().count(), MAX_FIELD_CHARS + 1);
+        assert!(output.starts_with('é'));
+        let emoji = result_record("x", "1", &"😀".repeat(MAX_FIELD_CHARS), false);
+        assert_eq!(
+            emoji["output"].as_str().unwrap().chars().count(),
+            MAX_FIELD_CHARS
+        );
+    }
+
+    #[test]
+    fn complete_record_clips_both_halves() {
+        let big = "a".repeat(MAX_FIELD_CHARS + 5);
+        let rec = complete_record("codex", "i", "tool.exec", &big, &big, true);
+        assert_eq!(
+            rec["input"].as_str().unwrap().chars().count(),
+            MAX_FIELD_CHARS + 1
+        );
+        assert_eq!(
+            rec["output"].as_str().unwrap().chars().count(),
+            MAX_FIELD_CHARS + 1
+        );
+        assert_eq!(rec["is_error"], true);
+    }
+
+    #[test]
+    fn control_characters_and_quotes_stay_on_one_json_line() {
+        let nasty = "line1\nline2\r\n\t\"quoted\" \\ \u{0}\u{1b}[31m";
+        let rec = complete_record("b", "i\n\"d", "tool.Bash", nasty, nasty, false);
+        let line = rec.to_string();
+        assert!(!line.contains('\n') && !line.contains('\r'));
+        let back: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(back["input"], nasty);
+        assert_eq!(back["output"], nasty);
+        assert_eq!(back["id"], "i\n\"d");
+    }
+
+    #[test]
     fn oversized_fields_are_clipped() {
         let rec = result_record("x", "1", &"a".repeat(MAX_FIELD_CHARS + 5), true);
         assert_eq!(
