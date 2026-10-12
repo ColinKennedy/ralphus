@@ -50,7 +50,6 @@ const base = {
   reviewMode: "none",
   generateManualChecks: false,
   generateAutoBuild: false,
-  proofShell: "",
   proofItems: [],
   checkItems: [],
   buildItems: [],
