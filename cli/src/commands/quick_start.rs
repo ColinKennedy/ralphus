@@ -2063,6 +2063,11 @@ mod tests {
         std::fs::create_dir_all(&target).expect("mkdir target");
         let script = base.join("where.ps1");
         let out_file = base.join("where-out.txt");
+
+        // Use canonicalized path to avoid any short-name/long-name issues
+        let target_canonical = std::fs::canonicalize(&target).unwrap_or_else(|_| target.clone());
+        let script_canonical = std::fs::canonicalize(&script).unwrap_or_else(|_| script.clone());
+
         std::fs::write(
             &script,
             format!(
@@ -2075,7 +2080,11 @@ mod tests {
         // The `cd` has to actually take effect for the launched program,
         // which is the whole reason this shape needs a shell rather than a
         // direct exec.
-        let raw_command = format!("cd '{}' ; & '{}'", target.display(), script.display());
+        let raw_command = format!(
+            "cd '{}' ; & '{}'",
+            target_canonical.display(),
+            script_canonical.display()
+        );
         let extra_args = v(&["--flag"]);
         let code = run_quick_start_subprocess_with(
             "test-label",

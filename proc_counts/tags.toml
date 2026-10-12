@@ -25,3 +25,8 @@ tag = "worktree-init"
 [[test]]
 id = "ralphus-daemon proof::tests::explicit_sh_runs_a_semicolon_separated_command"
 tag = "command-shell"
+
+# Diff summary of a review branch worktree against its enabled upstream (RAL-634).
+[[test]]
+id = "ralphus-daemon guardian_merge::branch_diff_tests::diff_summary_counts_worktree_edits_against_the_base"
+tag = "branch-diff-summary"

@@ -623,6 +623,140 @@ new file mode 100644
     Ok(out)
 }
 
+/// What a review branch's diff summary is measured against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BranchDiffBase {
+    /// The branch is the first enabled one of its project: the PR target, i.e.
+    /// the review's base branch as the remote holds it.
+    Remote,
+    /// The nearest enabled review branch beneath it in the stack, as its
+    /// review ref.
+    Review { branch_id: String, git_ref: String },
+}
+
+/// Resolve what `branch_id`'s diff summary is taken against, from the stack as
+/// it is right now (never cached: branches are disabled and reordered
+/// mid-fix). Only enabled branches of the same project count, ordered by
+/// position, so a disabled branch in the middle is stepped over. `None` when
+/// `branch_id` is not an enabled branch of the review.
+pub(crate) fn branch_diff_base(
+    guardian: &crate::guardian::GuardianView,
+    branch_id: &str,
+) -> Option<BranchDiffBase> {
+    let project_of = |b: &crate::guardian::BranchView| {
+        b.project
+            .clone()
+            .unwrap_or_else(|| guardian.git_root.clone())
+    };
+    let target = guardian.branches.iter().find(|b| b.id == branch_id)?;
+    if !target.enabled {
+        return None;
+    }
+    let project = project_of(target);
+    let upstream = guardian
+        .branches
+        .iter()
+        .filter(|b| b.enabled && b.position < target.position && project_of(b) == project)
+        .max_by_key(|b| b.position);
+    Some(match upstream {
+        None => BranchDiffBase::Remote,
+        Some(b) => BranchDiffBase::Review {
+            branch_id: b.id.clone(),
+            git_ref: review_ref_of(&guardian.id, b),
+        },
+    })
+}
+
+/// The git revision in `worktree` that `base` names, if it resolves.
+fn resolve_branch_diff_rev(
+    worktree: &Path,
+    guardian: &crate::guardian::GuardianView,
+    base: &BranchDiffBase,
+) -> Option<String> {
+    let resolves = |rev: &str| {
+        git(
+            worktree,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{rev}^{{commit}}"),
+            ],
+        )
+        .is_ok_and(|s| !s.trim().is_empty())
+    };
+    match base {
+        BranchDiffBase::Review { git_ref, .. } => resolves(git_ref).then(|| git_ref.clone()),
+        BranchDiffBase::Remote => {
+            let base_branch = guardian.base_branch.trim();
+            let remote = crate::forge::default_remote_name(&crate::config::resolve_forge(
+                Path::new(&guardian.git_root),
+            ));
+            [
+                format!("refs/remotes/{base_branch}"),
+                format!("refs/remotes/{remote}/{base_branch}"),
+                base_branch.to_string(),
+            ]
+            .into_iter()
+            .filter(|_| !base_branch.is_empty())
+            .find(|rev| resolves(rev))
+        }
+    }
+}
+
+/// Numstat counts of a review branch's worktree (committed, uncommitted and
+/// untracked changes) against its nearest enabled upstream: the same
+/// `files · +added −removed` shape the Squads details pane shows for a cell.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct BranchDiffSummary {
+    /// `remote` or `review`.
+    pub base_kind: &'static str,
+    /// The review branch the summary is measured against (`None` for `remote`).
+    pub base_branch_id: Option<String>,
+    /// The revision actually measured against.
+    pub base_ref: String,
+    pub files_changed: u64,
+    pub files_added: u64,
+    pub files_removed: u64,
+    pub lines_added: u64,
+    pub lines_removed: u64,
+}
+
+/// Compute [`BranchDiffSummary`] for `branch_id`. `Err` is a user-facing message.
+pub(crate) fn branch_diff_summary(
+    guardian: &crate::guardian::GuardianView,
+    branch_id: &str,
+) -> std::result::Result<BranchDiffSummary, String> {
+    let base = branch_diff_base(guardian, branch_id)
+        .ok_or_else(|| "this branch is disabled, so it has no diff summary".to_string())?;
+    let worktree = guardian
+        .branches
+        .iter()
+        .find(|b| b.id == branch_id)
+        .and_then(|b| b.worktree.as_deref())
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .ok_or_else(|| "no review worktree on this host yet".to_string())?;
+    let base_rev = resolve_branch_diff_rev(&worktree, guardian, &base)
+        .ok_or_else(|| "the diff base does not resolve in this worktree".to_string())?;
+    let counts = ralphus_runner::worktree_diff::summarize(&worktree, &base_rev)
+        .ok_or_else(|| "git could not diff this worktree".to_string())?;
+    let (base_kind, base_branch_id) = match &base {
+        BranchDiffBase::Remote => ("remote", None),
+        BranchDiffBase::Review { branch_id, .. } => ("review", Some(branch_id.clone())),
+    };
+    Ok(BranchDiffSummary {
+        base_kind,
+        base_branch_id,
+        base_ref: base_rev,
+        files_changed: counts.files_changed,
+        files_added: counts.files_added,
+        files_removed: counts.files_removed,
+        lines_added: counts.lines_added,
+        lines_removed: counts.lines_removed,
+    })
+}
+
 /// Push `wt`'s current `local_branch` after a feedback commit (RAL-<new>).
 ///
 /// Deliberately not PR-system-aware: this doesn't know or care whether
@@ -23571,5 +23705,84 @@ mod tests {
         assert!(!outcome.pushed);
         assert!(outcome.pushed_sha.is_none());
         assert!(outcome.proof_passed.is_none());
+    }
+}
+
+#[cfg(test)]
+mod branch_diff_tests {
+    use super::*;
+    use crate::store::Store;
+
+    fn review_with_branches(enabled: &[bool]) -> (crate::guardian::GuardianView, Vec<String>) {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        for (i, on) in enabled.iter().enumerate() {
+            let name = format!("b{i}");
+            store.add_guardian_branch(&id, &name).unwrap();
+            store.set_branch_enabled_by_name(&id, &name, *on).unwrap();
+        }
+        let g = store.get_guardian(&id).unwrap();
+        let ids = g.branches.iter().map(|b| b.id.clone()).collect();
+        (g, ids)
+    }
+
+    #[test]
+    fn first_enabled_branch_diffs_against_the_remote() {
+        let (g, ids) = review_with_branches(&[false, true, true]);
+        assert_eq!(branch_diff_base(&g, &ids[1]), Some(BranchDiffBase::Remote));
+    }
+
+    #[test]
+    fn a_disabled_branch_in_the_middle_is_skipped() {
+        let (g, ids) = review_with_branches(&[true, false, true]);
+        let base = branch_diff_base(&g, &ids[2]).unwrap();
+        let BranchDiffBase::Review { branch_id, git_ref } = base else {
+            panic!("expected a review base");
+        };
+        assert_eq!(branch_id, ids[0]);
+        assert_eq!(git_ref, review_ref_of(&g.id, &g.branches[0]));
+    }
+
+    #[test]
+    fn a_disabled_branch_has_no_branch_diff_base() {
+        let (g, ids) = review_with_branches(&[true, false]);
+        assert_eq!(branch_diff_base(&g, &ids[1]), None);
+    }
+
+    #[test]
+    fn diff_summary_counts_worktree_edits_against_the_base() {
+        let dir = std::env::temp_dir().join(format!("ralphus-branch-diff-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let g = |args: &[&str]| {
+            git(&dir, args).unwrap();
+        };
+        g(&["init", "--initial-branch", "main"]);
+        g(&["config", "user.email", "t@example.com"]);
+        g(&["config", "user.name", "t"]);
+        g(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-m", "base"]);
+
+        let (mut guardian, ids) = review_with_branches(&[true]);
+        guardian.base_branch = "main".to_string();
+        guardian.branches[0].worktree = Some(dir.to_string_lossy().to_string());
+
+        let none = branch_diff_summary(&guardian, &ids[0]).unwrap();
+        assert_eq!(
+            (none.files_changed, none.lines_added, none.lines_removed),
+            (0, 0, 0)
+        );
+
+        std::fs::write(dir.join("a.txt"), "two\nthree\n").unwrap();
+        std::fs::write(dir.join("new.txt"), "x\n").unwrap();
+        let some = branch_diff_summary(&guardian, &ids[0]).unwrap();
+        assert_eq!(some.files_changed, 2);
+        assert_eq!(some.files_added, 1);
+        assert_eq!(some.lines_added, 3);
+        assert_eq!(some.lines_removed, 1);
+        assert_eq!(some.base_kind, "remote");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

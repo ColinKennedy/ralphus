@@ -50,6 +50,23 @@
       const branchRunsCache = {};
       /** @type {Set<string>} Run fetches in flight, so a repaint never starts a second. */
       const branchRunsLoading = new Set();
+      /**
+       * A review branch's change counts against its nearest enabled upstream,
+       * from `GET /api/guardians/{id}/branches/{bid}/diff-summary`.
+       * @typedef {object} BranchDiffSummary
+       * @property {string} base_kind - "remote" or "review".
+       * @property {string|null} base_branch_id - The review branch measured against, when not the remote.
+       * @property {string} base_ref - The revision actually measured against.
+       * @property {number} files_changed
+       * @property {number} lines_added
+       * @property {number} lines_removed
+       */
+      /**
+       * Each branch's diff summary, keyed `gid|bid`, with when it was fetched;
+       * `summary` is null when the daemon could not compute one.
+       * @type {Record<string, {at: number, summary: BranchDiffSummary|null}>}
+       */
+      const branchDiffSummaries = {};
       /** @type {boolean} True while the log dock is expanded. */
       let reviewDockOpen = false;
       /**
@@ -228,9 +245,6 @@
        */
       function setInspectorTab(tab) {
         inspectorTab = tab;
-        // Opening the Live tab IS the request to watch, so it attaches and
-        // shows the pane -- a second "Show Live View" click bought nothing,
-        // since nothing had loaded before the tab was opened either way.
         // Opening the Live tab IS the request to watch, so it attaches and
         // shows the pane -- a second "Show Live View" click bought nothing,
         // since nothing had loaded before the tab was opened either way.
@@ -558,12 +572,18 @@
           ? `${esc(b.source_squad_id)}${b.source_cell_idx === undefined ? "" : ` · cell ${b.source_cell_idx}`}`
           : "—";
         const prs = (pullRequests[g.id] || []).filter((p) => p.branch_id === b.id);
-        // RAL-550: the runner-pushed change summary of the cell behind this branch.
-        const diffRow = (b.source_squad_id && b.source_task_idx != null && b.source_cell_idx != null)
+        // RAL-634: the branch worktree's own counts against its nearest enabled
+        // upstream; RAL-550's runner-pushed source-cell counts when the branch
+        // has no worktree on this host yet.
+        const own = b.enabled === false ? null : branchDiffSummary(g.id, b.id);
+        const diffRow = own || ((b.source_squad_id && b.source_task_idx != null && b.source_cell_idx != null)
           ? cellDiffSummary(b.source_squad_id, b.source_task_idx, b.source_cell_idx, renderReviewInspector)
-          : null;
+          : null);
+        const changesTip = own
+          ? `Files and lines this branch's worktree changes (committed, uncommitted and untracked) against ${own.base_kind === "remote" ? "the remote base" : "the nearest enabled branch beneath it"}, ${own.base_ref}.\nAn auto-fix or feedback edit shows up here as it lands.`
+          : "Pushed live by the runner as the source cell's worktree changes; pull the full diff with 'ralphus cell diff'.";
         const changes = diffRow && diffRow.files_changed !== undefined
-          ? `<dt>changes</dt><dd class="mono" data-tip="Pushed live by the runner as the source cell's worktree changes; pull the full diff with 'ralphus cell diff'.">${diffRow.files_changed} files · <span style="color:var(--done)">+${diffRow.lines_added || 0}</span> <span style="color:var(--failed)">−${diffRow.lines_removed || 0}</span></dd>`
+          ? `<dt>changes</dt><dd class="mono" data-tip="${esc(changesTip)}">${diffRow.files_changed} files · <span style="color:var(--done)">+${diffRow.lines_added || 0}</span> <span style="color:var(--failed)">−${diffRow.lines_removed || 0}</span></dd>`
           : "";
         return `<dl class="insp-kv">
             <dt>state</dt><dd>${pill(b.merge_status || "pending")}</dd>
@@ -844,6 +864,32 @@
           branchRunsLoading.delete(key);
         }
         renderReviewInspector();
+      }
+      /**
+       * RAL-634: how many files and lines a review branch's worktree changes
+       * against its nearest enabled upstream, cached per branch. Only read
+       * while the Overview is showing that branch; each read refetches at
+       * most once per 2s and repaints when the counts change.
+       * @param {string} gid - The review id.
+       * @param {string} bid - The branch id.
+       * @returns {BranchDiffSummary|null}
+       */
+      function branchDiffSummary(gid, bid) {
+        const key = `${gid}|${bid}`;
+        const cur = branchDiffSummaries[key];
+        if (!cur || Date.now() - cur.at > 2000) {
+          branchDiffSummaries[key] = { at: Date.now(), summary: cur ? cur.summary : null };
+          fetch(`/api/guardians/${encodeURIComponent(gid)}/branches/${encodeURIComponent(bid)}/diff-summary`)
+            .then((res) => (res.ok ? res.json() : null))
+            .then((body) => {
+              const summary = body && typeof body.files_changed === "number" ? body : null;
+              const changed = JSON.stringify(summary) !== JSON.stringify((branchDiffSummaries[key] || {}).summary);
+              branchDiffSummaries[key] = { at: Date.now(), summary };
+              if (changed) renderReviewInspector();
+            })
+            .catch(() => {});
+        }
+        return branchDiffSummaries[key].summary;
       }
       /**
        * A branch's runs, oldest first; empty until the first fetch lands.

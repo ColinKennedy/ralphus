@@ -142,6 +142,7 @@ where one exists.
 | GET | `/api/guardians/{id}/tests-env` | Legacy alias for the stored automated-check environment while existing reviews drain (RAL-324) |
 | GET | `/api/guardians/{id}/manual-checks-env` | Resolved environment variables for the manual-checks step (RAL-324) |
 | GET | `/api/guardians/{id}/branches/{branch_id}/conflicts` | [Live conflicting-files list](#get-apiguardiansidbranchesbranch_idconflicts) for the board's Reviews UI (RAL-148) |
+| GET | `/api/guardians/{id}/branches/{branch_id}/diff-summary` | [Files/lines changed](#get-apiguardiansidbranchesbranch_iddiff-summary) in a branch worktree against its nearest enabled upstream (RAL-634) |
 | GET | `/api/guardians/{id}/branches/{branch_id}/appraisals` | [Stored appraisals of one review branch](#get-apiguardiansidbranchesbranch_idappraisals) for the board's inspector Appraisals tab (RAL-588) |
 | POST | `/api/guardians/{id}/branches/{branch_id}/open-terminal` | Spawn a resolver terminal **on the daemon host** |
 | GET | `/api/guardians/{id}/branches/{branch_id}/debug-events` | [The resolver's current-attempt debug stream](#get-apisquadsidcellstisidebug-events-and-its-proofguardian-siblings-ral-296) (RAL-296) |
@@ -2637,6 +2638,21 @@ holding one of its task's cells. Board-only (no CLI command).
   else `proof N`. Empty when none were recorded.
 
 `404` if `id` or `branch_id` doesn't address a real guardian/branch.
+
+### `GET /api/guardians/{id}/branches/{branch_id}/diff-summary`
+
+How many files and lines a branch's review worktree changes (committed,
+uncommitted and untracked), for the `changes` row of the board's review
+Overview (RAL-634) -- the same `files · +added −removed` counts the Squads
+details pane shows for a cell. The base is resolved from the stack at request
+time: the review's base branch as the remote holds it for the first enabled
+branch of the project, otherwise the review ref of the nearest enabled branch
+beneath it (disabled branches are skipped).
+
+Response: `{ base_kind: "remote"|"review", base_branch_id, base_ref,
+files_changed, files_added, files_removed, lines_added, lines_removed }`.
+`409 diff_summary_unavailable` when the branch is disabled, has no worktree on
+the daemon's host, or the base does not resolve.
 
 ### `GET /api/guardians/{id}/branches/{branch_id}/conflicts`
 The live list of files still carrying unresolved `<<<<<<<` merge-conflict

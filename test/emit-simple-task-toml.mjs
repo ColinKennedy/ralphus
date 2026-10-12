@@ -49,6 +49,7 @@ const base = {
   reviewMode: "none",
   generateManualChecks: false,
   generateAutoBuild: false,
+  proofShell: "",
   proofItems: [],
   checkItems: [],
   buildItems: [],
@@ -74,6 +75,7 @@ const cases = {
   },
   "ticket label": { label: "RAL-123", proofItems: proofs.slice(0, 1) },
   "typed upstream branch": { upstreamBranch: "staging", proofItems: proofs.slice(0, 1) },
+  "proofs with a chosen shell": { proofShell: "bash", proofItems: proofs },
 };
 
 const out = Object.entries(cases).map(([name, overrides]) => ({

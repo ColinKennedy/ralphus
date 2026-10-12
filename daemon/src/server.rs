@@ -2110,6 +2110,18 @@ fn route_for_user(
         ("GET", ["api", "guardians", id, "branches", branch_id, "conflicts"]) => {
             guardian_branch_conflicts(daemon, id, branch_id)
         }
+        // ralphus[ignore-endpoint-cli]: board Overview "changes" row: files/lines changed in a branch worktree against its nearest enabled upstream (RAL-634)
+        (
+            "GET",
+            [
+                "api",
+                "guardians",
+                id,
+                "branches",
+                branch_id,
+                "diff-summary",
+            ],
+        ) => guardian_branch_diff_summary(daemon, id, branch_id),
         // ralphus[ignore-endpoint-cli]: board debug-event timeline for the branch
         (
             "GET",
@@ -8160,10 +8172,14 @@ fn apply_entity_filter(
 /// — so the board's "generate to file, then display" button and this JSON
 /// response come from the exact same generation, not two separate code paths.
 fn squad_timeline(daemon: &Daemon, id: &str) -> Reply {
-    // allow-lock-io: merges already-fetched Cartographer/terminal-log rows
-    // in-process, no subprocess/network work.
-    match crate::timeline::build_squad_timeline(&daemon.lock(), id) {
-        Ok(timeline) => json(200, &timeline),
+    // Only the store reads run under the lock; the log-excerpt reads and the
+    // temp-file write happen after it is dropped.
+    let gathered = {
+        let store = daemon.lock();
+        crate::timeline::gather_squad_timeline(&store, id)
+    };
+    match gathered {
+        Ok(g) => json(200, &crate::timeline::finish_squad_timeline(g)),
         Err(e) => store_error(&e),
     }
 }
@@ -12684,6 +12700,23 @@ struct BranchConflictsView {
     /// this `false` between rebase steps, so the board should not assume
     /// "no active rebase" means the conflicts are stale.
     rebase_in_progress: bool,
+}
+
+/// RAL-634: how many files and lines a review branch's worktree changes
+/// against the nearest enabled upstream (the remote base branch for the first
+/// enabled branch). Resolved from the stack at request time.
+fn guardian_branch_diff_summary(daemon: &Daemon, id: &str, branch_id: &str) -> Reply {
+    let guardian = match daemon.lock().get_guardian(id) {
+        Ok(g) => g,
+        Err(_) => return error(404, "not_found", "no such guardian", vec![]),
+    };
+    if !guardian.branches.iter().any(|b| b.id == branch_id) {
+        return error(404, "not_found", "no such branch", vec![]);
+    }
+    match crate::guardian_merge::branch_diff_summary(&guardian, branch_id) {
+        Ok(d) => json(200, &d),
+        Err(e) => error(409, "diff_summary_unavailable", &e, vec![]),
+    }
 }
 
 /// The live conflicting-files list for one review branch (RAL-148). Computed
