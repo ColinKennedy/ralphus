@@ -117,7 +117,11 @@ pub fn run_command_with_remediation(
     let mut result = runner.run_cancellable(command_spec, cancel);
     let mut attempt = 1u32;
     let mut last_repair_result: Option<RunnerResult> = None;
-    while !result.is_done() && attempt < total_attempts && !cancel.is_cancelled() {
+    while !result.is_done()
+        && !result.is_waypoint_halted()
+        && attempt < total_attempts
+        && !cancel.is_cancelled()
+    {
         // ralphus[ignore-rlog-pair]: low-level retry-loop helper with no Store; scheduler records structured cell state
         crate::rlog!(
             WARNING,
@@ -148,6 +152,13 @@ pub fn run_command_with_remediation(
                 None
             },
         ));
+        if last_repair_result
+            .as_ref()
+            .is_some_and(RunnerResult::is_waypoint_halted)
+        {
+            result = last_repair_result.take().unwrap_or(result);
+            break;
+        }
         if cancel.is_cancelled() {
             break;
         }
