@@ -129,9 +129,9 @@ pub struct GatheredSquadTimeline {
 /// [`gather_squad_timeline`] under the lock, [`finish_squad_timeline`]
 /// after dropping it, and [`finalize_timeline_file`] to write the temp file.
 pub fn build_squad_timeline(store: &Store, squad_id: &str) -> Result<SquadTimeline> {
-    Ok(finish_squad_timeline(gather_squad_timeline(
-        store, squad_id,
-    )?))
+    let mut timeline = finish_squad_timeline(gather_squad_timeline(store, squad_id)?);
+    finalize_timeline_file(&mut timeline);
+    Ok(timeline)
 }
 
 /// Read `squad_id`'s Cartographer rows and counts from the store. Store
