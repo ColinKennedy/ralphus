@@ -16164,6 +16164,12 @@ pub fn manual_commands_prompt(tail: &str, steering: Option<&str>) -> String {
          array as {\"command\": \"...\"}; Ralphus runs it before enabling the command. \
          Do NOT suggest unit tests or automated checks \
          that could be scripted — the goal is human eyes and hands on the actual result. \
+         Every \"command\" is handed verbatim to a shell and run, so it must be a real, \
+         runnable command line -- never an instruction written for a person. To get a person \
+         to look at something, launch it with a command (e.g. `Start-Process \
+         http://localhost:{port}`) and write what to look at and what correct looks like in \
+         \"description\" and \"success\". A \"command\" such as `Open http://... in your browser. \
+         Verify: ...` is wrong and will fail. \
          If a command depends on a value that could vary or collide between runs -- a \
          port number, a file path, a branch name, anything where running the same \
          command twice concurrently would conflict -- do NOT hardcode it. Instead make \
@@ -18433,6 +18439,12 @@ mod tests {
     fn manual_commands_prompt_forbids_blanket_process_kills_in_cleanup() {
         let prompt = manual_commands_prompt("tail", None);
         assert!(prompt.contains("never a blanket kill by image name"));
+    }
+
+    #[test]
+    fn manual_commands_prompt_requires_runnable_commands() {
+        let prompt = manual_commands_prompt("tail", None);
+        assert!(prompt.contains("must be a real, runnable command line"));
     }
 
     #[test]

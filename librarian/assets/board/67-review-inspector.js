@@ -66,6 +66,67 @@
       /** @type {boolean} When true the whole-review drawer includes branch-worktree activity. */
       let reviewDockIncludeBranchWorktrees = true;
 
+      /** @type {string|null} Review whose auto-actions generation the inspector shows in place of a branch, or null. */
+      let inspectorAutoActionsGid = null;
+      /**
+       * The auto-actions generation's live-view peek key.
+       * @param {string} gid - The review id.
+       * @returns {string}
+       */
+      function autoActionsPeekKey(gid) {
+        return `guardian-manual|${gid}`;
+      }
+      /**
+       * Shows the agent that computes a review's auto actions in the
+       * inspector, replacing the branch details until a branch is selected.
+       * The branch selection is cleared so clicking a branch row selects it
+       * rather than toggling it off.
+       * @param {string} gid - The review id.
+       * @returns {void}
+       */
+      function openAutoActionsPane(gid) {
+        const key = autoActionsPeekKey(gid);
+        inspectorAutoActionsGid = gid;
+        inspectorBranchId = null;
+        selectedBranch[gid] = null;
+        if (!peekOpen[key]) {
+          peekOpen[key] = true;
+          fetchPeek(key, !peekScrollState[key]);
+        }
+        syncHash();
+        renderReviewDetail();
+      }
+      /**
+       * Hides the auto-actions pane and releases its live view, so the next
+       * open starts from the newest run. No-op when it is not showing.
+       * @returns {void}
+       */
+      function closeAutoActionsPane() {
+        const gid = inspectorAutoActionsGid;
+        if (!gid) return;
+        inspectorAutoActionsGid = null;
+        if (peekOpen[autoActionsPeekKey(gid)]) togglePeek(autoActionsPeekKey(gid));
+      }
+      /**
+       * The inspector's body while it shows a review's auto-actions generation.
+       * @param {GuardianView} g - The review.
+       * @returns {string}
+       */
+      function autoActionsInspectorHtml(g) {
+        const key = autoActionsPeekKey(g.id);
+        return `<div class="insp-head"><div class="insp-title"><span class="t" data-tip="The agent that writes this review's auto actions from its changes.">Auto actions generation</span></div></div>
+          <div class="insp-body">${squadLiveSlot(squadLiveCtx({
+            baseKey: key,
+            title: "auto actions generation",
+            canThink: true,
+            promptText: "",
+            promptHint: "",
+            noPromptText: "The prompt that generated these actions is not stored with the review. The Agent Log tab shows what the agent did with it.",
+            withAttempts: false,
+            currentMeta: g.manual_checks_finished_at_ms ? "finished" : "running",
+            closeKey: "",
+          }))}</div>`;
+      }
       /**
        * The branch the inspector is showing, or null when nothing is selected
        * or the selection does not belong to the open review.
@@ -85,6 +146,7 @@
        * @returns {void}
        */
       function selectInspectorBranch(branchId) {
+        closeAutoActionsPane();
         inspectorBranchId = branchId || null;
         if (!reviewDockSticky) reviewDockScope = branchId;
         // Switching branches while watching is still watching: the newly
@@ -231,6 +293,11 @@
         const g = guardians.find((x) => x.id === selectedGuardian);
         if (!g || !g.branches) {
           host.innerHTML = `<div class="empty">Select a review.</div>`;
+          return;
+        }
+        if (inspectorAutoActionsGid === g.id) {
+          host.innerHTML = autoActionsInspectorHtml(g);
+          restorePeekScrollPositions();
           return;
         }
         const b = inspectorBranch(g);
