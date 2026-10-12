@@ -3300,10 +3300,8 @@ impl ForgeClient {
         };
         let mut soonest = own;
         for pooled in forge_pool::tokens(self.kind.as_str(), host) {
-            match self.with_pool_token(pooled.token).own_backoff_remaining() {
-                Some(left) => soonest = soonest.min(left),
-                None => return None,
-            }
+            let left = self.with_pool_token(pooled.token).own_backoff_remaining()?;
+            soonest = soonest.min(left);
         }
         Some(soonest)
     }
