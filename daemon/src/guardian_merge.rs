@@ -666,24 +666,6 @@ pub(crate) fn branch_diff_base(
         },
     })
 }
-    let target = guardian.branches.iter().find(|b| b.id == branch_id)?;
-    if !target.enabled {
-        return None;
-    }
-    let project = project_of(target);
-    let upstream = guardian
-        .branches
-        .iter()
-        .filter(|b| b.enabled && b.position < target.position && project_of(b) == project)
-        .max_by_key(|b| b.position);
-    Some(match upstream {
-        None => BranchDiffBase::Remote,
-        Some(b) => BranchDiffBase::Review {
-            branch_id: b.id.clone(),
-            git_ref: review_ref_of(&guardian.id, b),
-        },
-    })
-}
 
 /// The git revision in `worktree` that `base` names, if it resolves.
 fn resolve_branch_diff_rev(
