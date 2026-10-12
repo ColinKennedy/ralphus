@@ -1565,6 +1565,111 @@ fn auto_fix_dispatch_folds_into_stack_and_restacks_downstream() {
     let _ = std::fs::remove_dir_all(&remote_dir);
 }
 
+/// RAL-591: through `dispatch_pr_auto_fix` itself, a spent attempt budget
+/// against a still-running CI generation is "exhausted_awaiting_ci" (no agent
+/// run, no exhausted notice); once that generation settles with fewer failing
+/// checks the attempt is refunded and the next dispatch claims it and runs.
+#[test]
+fn auto_fix_exhausted_awaiting_ci_then_refund_then_claimed() {
+    let (root, store, id, bids) = staged_feature_repo(&["feature/a"]);
+    run_merge(&store, &NoopRunner, &id);
+    write(
+        &root,
+        ".ralphus.toml",
+        "[review]
+auto_fix_max_attempts = 1
+",
+    );
+    let pr_id = store
+        .lock()
+        .create_pull_request(
+            &id,
+            Some(&bids[0]),
+            "github",
+            "acme/w",
+            "feature-a-alias",
+            "main",
+            "T",
+            "",
+            Some(7),
+            Some("https://github.com/acme/w/pull/7"),
+        )
+        .unwrap();
+    store
+        .lock()
+        .set_guardian_auto_fix_pr_errors(&id, Some(true))
+        .unwrap();
+    let failure = ralphus_daemon::forge::PrFailure {
+        reason: "check 'a' failed".to_string(),
+        job_url: None,
+        log_text: None,
+        checks: vec![],
+        ..Default::default()
+    };
+    let runner = AutoFixRunner::new();
+    let client = test_forge_client();
+    let set_checks = |set: &[&str], generation: &str, settled: bool| {
+        let names: Vec<String> = set.iter().map(|s| s.to_string()).collect();
+        store
+            .lock()
+            .set_pr_failing_checks_at(
+                &pr_id,
+                &names,
+                Some(generation),
+                settled,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as i64,
+                0,
+            )
+            .unwrap()
+    };
+    let dispatch = || {
+        let guardian = store.lock().get_guardian(&id).unwrap();
+        let pr = store.lock().get_pull_request(&pr_id).unwrap();
+        ralphus_daemon::ci_watch::dispatch_pr_auto_fix(
+            &store, &runner, &guardian, &pr, &failure, &client,
+        );
+        store.lock().get_pull_request(&pr_id).unwrap()
+    };
+
+    // Attempt 1 claims against a settled {a, b} generation.
+    set_checks(&["a", "b"], "g0", true);
+    let pr = dispatch();
+    assert_eq!(pr.auto_fix_attempt_count, 1);
+    let calls_after_first = runner.calls.load(Ordering::Relaxed);
+    assert!(
+        calls_after_first > 0,
+        "the first attempt must run the agent"
+    );
+
+    // The fix's CI run shows one failure with checks still running.
+    set_checks(&["a"], "g1", false);
+    let pr = dispatch();
+    assert_eq!(
+        pr.auto_fix_last_outcome.as_deref(),
+        Some("exhausted_awaiting_ci")
+    );
+    assert!(
+        pr.auto_fix_exhausted_notified_at_ms.is_none(),
+        "no exhausted notice while CI is still running"
+    );
+    assert_eq!(runner.calls.load(Ordering::Relaxed), calls_after_first);
+
+    // The generation settles with a strict subset: refunded, then claimed.
+    assert!(set_checks(&["a"], "g1", true), "settled shrink must refund");
+    let pr = dispatch();
+    assert_eq!(
+        runner.calls.load(Ordering::Relaxed),
+        calls_after_first + 1,
+        "the refunded attempt must run the agent again"
+    );
+    assert_ne!(pr.auto_fix_last_outcome.as_deref(), Some("exhausted"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// RAL-509: a `collecting` review can already have a straggler branch's PR
 /// open and failing CI while a later branch is still being collected --
 /// `dispatch_pr_auto_fix` must still fold its commit into the linear stack,
