@@ -40,6 +40,11 @@ pub enum WayOut {
         /// `review#branch` selector of the branch.
         branch_ref: String,
     },
+    /// Re-run the cell's definition as a new one-task squad.
+    CopyToSquad {
+        /// `squad/task/cell` selector of the failing cell.
+        cell_ref: String,
+    },
 }
 
 impl WayOut {
@@ -55,6 +60,9 @@ impl WayOut {
             }
             Self::ExtractBranch { branch_ref } => format!(
                 "extract its branch to a new review with `ralphus review extract-branch {branch_ref}`"
+            ),
+            Self::CopyToSquad { cell_ref } => format!(
+                "copy it to a new squad with `ralphus cell copy {cell_ref}` (add `--from-branch` to start from its branch)"
             ),
         }
     }
@@ -74,6 +82,9 @@ pub fn way_outs(cell_ref: &str, blocking: &CellBlocking) -> Vec<WayOut> {
             branch_ref: format!("{review_id}#{branch}"),
         });
     }
+    out.push(WayOut::CopyToSquad {
+        cell_ref: cell_ref.to_string(),
+    });
     out
 }
 
@@ -268,6 +279,7 @@ mod tests {
         assert!(rendered.contains("ralphus cell set-status squad-1/build/compile ignored"));
         assert!(rendered.contains("ralphus review branch disable guardian-1#t-review"));
         assert!(rendered.contains("ralphus review extract-branch guardian-1#t-review"));
+        assert!(rendered.contains("ralphus cell copy squad-1/build/compile"));
     }
 
     #[test]
@@ -285,10 +297,20 @@ mod tests {
     }
 
     #[test]
-    fn no_branch_way_out_without_a_review_branch() {
+    fn only_cell_ways_out_without_a_review_branch() {
         let mut b = blocking(1, 0);
         b.branch = None;
-        assert_eq!(way_outs("s/t/c", &b).len(), 1);
+        assert_eq!(
+            way_outs("s/t/c", &b),
+            vec![
+                WayOut::IgnoreAndContinue {
+                    cell_ref: "s/t/c".into()
+                },
+                WayOut::CopyToSquad {
+                    cell_ref: "s/t/c".into()
+                },
+            ]
+        );
     }
 
     #[test]

@@ -1421,6 +1421,21 @@ impl DaemonClient {
         self.get(&format!("/api/ghosts/{}", urlencode(owner_uri)))
     }
 
+    /// `POST .../cells/{ti}/{si}/copy` (RAL-641): submit a copy of the cell as
+    /// a new one-task squad, from a clean base unless `from_branch`.
+    pub fn copy_cell(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        cell_idx: i64,
+        from_branch: bool,
+    ) -> Result<Value, DaemonError> {
+        self.post(
+            &format!("/api/squads/{squad_id}/cells/{task_idx}/{cell_idx}/copy"),
+            Some(json!({"from_branch": from_branch})),
+        )
+    }
+
     pub fn restart_cell(
         &self,
         squad_id: &str,

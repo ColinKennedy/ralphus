@@ -395,6 +395,23 @@
         if (tab === "queue") pollQueue();
       }
       /**
+       * Copies one cell into a new one-task squad (RAL-641) and selects the
+       * new squad. Starts from a clean base unless `fromBranch` is set.
+       * @param {string} squadId
+       * @param {number} ti
+       * @param {number} si
+       * @param {boolean} fromBranch
+       * @returns {Promise<void>}
+       */
+      async function copyCell(squadId, ti, si, fromBranch) {
+        const resp = await post(`/api/squads/${squadId}/cells/${ti}/${si}/copy`, { from_branch: fromBranch }, { success: "Cell copied to a new squad.", errorLabel: "copy cell" });
+        if (!resp.ok) return;
+        /** @type {{squad_id?: string}} */
+        const body = await resp.clone().json().catch(() => ({}));
+        await tick();
+        if (body.squad_id) selectSquad(body.squad_id);
+      }
+      /**
        * Deletes a squad permanently after confirmation. Applies to every
        * selected squad when the clicked one is part of a multi-selection
        * (RAL-508) via bulkDelete instead.

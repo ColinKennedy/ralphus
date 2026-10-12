@@ -876,6 +876,29 @@ pub struct SquadView {
     /// see `Store::set_squad_materialization_phase`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub materialization_phase: Option<SquadMaterializationPhase>,
+    /// RAL-641: the cell this squad was copied from, when it was made by
+    /// "copy a cell into a new squad". `None` for every other squad.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copied_from: Option<CellCopyLink>,
+    /// RAL-641: the squads made by copying one of this squad's cells.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub copied_to: Vec<CellCopyLink>,
+}
+
+/// One "copy a cell into a new squad" relation (RAL-641), seen from either end.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CellCopyLink {
+    /// The squad the cell was copied from.
+    pub from_squad_id: String,
+    /// Task index of the copied cell within [`Self::from_squad_id`].
+    pub from_task_idx: i64,
+    /// Cell index of the copied cell within its task.
+    pub from_cell_idx: i64,
+    /// The squad the copy was submitted as.
+    pub to_squad_id: String,
+    /// Whether the copy started from the copied cell's branch rather than a
+    /// clean base.
+    pub from_branch: bool,
 }
 
 /// One reported step of a squad's in-progress materialization (RAL-<pending>).
@@ -2011,6 +2034,17 @@ impl Store {
                 active_started_at_ms INTEGER,
                 PRIMARY KEY (squad_id, task_idx, scope, cell_idx, idx)
             );
+            -- RAL-641: copy a cell into a new squad. The source side has no
+            -- foreign key: deleting the original squad must not delete the copy.
+            CREATE TABLE IF NOT EXISTS cell_copies (
+                to_squad_id    TEXT PRIMARY KEY REFERENCES squads(id) ON DELETE CASCADE,
+                from_squad_id  TEXT NOT NULL,
+                from_task_idx  INTEGER NOT NULL,
+                from_cell_idx  INTEGER NOT NULL,
+                from_branch    INTEGER NOT NULL DEFAULT 0,
+                created_at_ms  INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_cell_copies_from ON cell_copies(from_squad_id);
             CREATE TABLE IF NOT EXISTS guardians (
                 id                TEXT PRIMARY KEY,
                 name              TEXT NOT NULL,
@@ -6273,6 +6307,7 @@ impl Store {
         }
 
         let reviews = Self::reviews_for_squad(conn, &id)?;
+        let (copied_from, copied_to) = Self::cell_copy_links(conn, &id)?;
         let state = effective_squad_state(conn, state, &id)?;
         let mut projects: Vec<String> = Vec::new();
         for t in &tasks {
@@ -6301,7 +6336,64 @@ impl Store {
             error,
             submitter,
             materialization_phase,
+            copied_from,
+            copied_to,
         })
+    }
+
+    /// Record that squad `to_squad_id` was made by copying cell
+    /// `(from_squad_id, task_idx, cell_idx)` (RAL-641).
+    pub fn record_cell_copy(
+        &self,
+        from_squad_id: &str,
+        task_idx: i64,
+        cell_idx: i64,
+        to_squad_id: &str,
+        from_branch: bool,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO cell_copies(to_squad_id, from_squad_id, from_task_idx, from_cell_idx, from_branch, created_at_ms)
+             VALUES(?,?,?,?,?,?)",
+            params![
+                to_squad_id,
+                from_squad_id,
+                task_idx,
+                cell_idx,
+                from_branch,
+                now_ms()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The copy relations touching `squad_id`: the one that made it (if any)
+    /// and every one that copied out of it, oldest first.
+    fn cell_copy_links(
+        conn: &Connection,
+        squad_id: &str,
+    ) -> Result<(Option<CellCopyLink>, Vec<CellCopyLink>)> {
+        let mut stmt = conn.prepare(
+            "SELECT from_squad_id, from_task_idx, from_cell_idx, to_squad_id, from_branch
+             FROM cell_copies WHERE to_squad_id=?1 OR from_squad_id=?1
+             ORDER BY created_at_ms, to_squad_id",
+        )?;
+        let links = stmt
+            .query_map(params![squad_id], |r| {
+                Ok(CellCopyLink {
+                    from_squad_id: r.get(0)?,
+                    from_task_idx: r.get(1)?,
+                    from_cell_idx: r.get(2)?,
+                    to_squad_id: r.get(3)?,
+                    from_branch: r.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let copied_from = links.iter().find(|l| l.to_squad_id == squad_id).cloned();
+        let copied_to = links
+            .into_iter()
+            .filter(|l| l.from_squad_id == squad_id)
+            .collect();
+        Ok((copied_from, copied_to))
     }
 
     /// The reviews (guardians) derived from a squad, oldest first (RAL-392: made

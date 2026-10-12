@@ -379,6 +379,29 @@
           ${editBtn()}`;
       }
       /**
+       * Copied-from / copied-to links between squads (RAL-641).
+       * @param {SquadView} r
+       * @returns {string}
+       */
+      function copyLinksSection(r) {
+        /**
+         * @param {string} id
+         * @param {string} text
+         * @param {string} tip
+         * @returns {string}
+         */
+        const link = (id, text, tip) => `<a href="#" data-click="gotoSquad" data-squad-id="${esc(id)}" style="color:var(--accent)" data-tip="${esc(tip)}">${esc(text)}</a>`;
+        const rows = [];
+        if (r.copied_from) {
+          const c = r.copied_from;
+          rows.push(`<div class="kv-row"><span class="k">copied from</span><span class="v">${link(c.from_squad_id, `${c.from_squad_id} · task ${c.from_task_idx} cell ${c.from_cell_idx}`, "Open the squad this one was copied from.")}${c.from_branch ? " (from its branch)" : ""}</span></div>`);
+        }
+        for (const c of r.copied_to || []) {
+          rows.push(`<div class="kv-row"><span class="k">copied to</span><span class="v">${link(c.to_squad_id, `${c.to_squad_id} · task ${c.from_task_idx} cell ${c.from_cell_idx}`, "Open the squad this cell was copied into.")}</span></div>`);
+        }
+        return rows.length ? `<h3 class="section">copies</h3>${rows.join("")}` : "";
+      }
+      /**
        * Renders the squad's pre-work generation cost (RAL-420), when it has
        * any: the retained usage of the agent/model calls the Simple form made
        * before this squad was submitted (Generate proof steps / manual checks
@@ -1176,7 +1199,13 @@
             ${["failed", "pending", "queued"].includes(s.state) ? `<button class="btn" data-click="ignoreCell" data-squad-id="${esc(r.id)}" data-ti="${sel.taskIdx}" data-si="${sel.cellIdx}" data-tip="Skip this cell and keep going.
 Dependents that were blocked only by this cell run again, starting from this cell's own upstream.
 Reversible: Restart cell runs it again.">⤼ Ignore and continue</button>` : ""}
+            <button class="btn" data-click="copyCell" data-squad-id="${esc(r.id)}" data-ti="${sel.taskIdx}" data-si="${sel.cellIdx}" data-tip="Copy this cell (prompt or command, agent, proof steps) into a new one-task squad that starts from a clean base.
+The two squads link to each other.
+Who/when: a cell failed or was ignored and you want to retry it without touching this squad.">⎘ Copy to new squad</button>
+            ${r.tasks[sel.taskIdx]?.project ? `<button class="btn" data-click="copyCell" data-from-branch="1" data-squad-id="${esc(r.id)}" data-ti="${sel.taskIdx}" data-si="${sel.cellIdx}" data-tip="Same as Copy to new squad, but the new squad starts from this cell's own branch instead of a clean base.
+Who/when: the cell's earlier work is worth keeping.">⎘ Copy from branch</button>` : ""}
           </div>
+          ${copyLinksSection(r)}
           ${(() => {
             // RAL-102/RAL-151: every command/prompt cell runs inside
             // tmux, so both a cell's kind is always live-view capable

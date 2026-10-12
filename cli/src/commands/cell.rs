@@ -34,6 +34,11 @@ pub enum CellCommand {
     Restart {
         selector: String,
     },
+    /// RAL-641: submit a copy of the cell as a new one-task squad.
+    Copy {
+        selector: String,
+        from_branch: bool,
+    },
     RestartProof {
         selector: String,
         from: i64,
@@ -108,6 +113,13 @@ pub fn parse(args: &[String]) -> CellCommand {
             }
         }
         Some("restart") => with_selector(scanner, |selector| CellCommand::Restart { selector }),
+        Some("copy") => {
+            let from_branch = scanner.take_bool("--from-branch");
+            with_selector(scanner, |selector| CellCommand::Copy {
+                selector,
+                from_branch,
+            })
+        }
         Some("restart-proof") => match scanner.take_parsed::<i64>("--from") {
             Ok(Some(from)) => with_selector(scanner, |selector| CellCommand::RestartProof {
                 selector,
@@ -369,6 +381,25 @@ pub fn dispatch(cmd: CellCommand, opts: &GlobalOpts) -> i32 {
             let result =
                 client.restart_cell(&resolved.squad_id, resolved.task_idx, resolved.cell_idx)?;
             emit(opts, &result, render_dirtied);
+            Ok(())
+        }),
+        CellCommand::Copy {
+            selector,
+            from_branch,
+        } => run_and_report(opts, None, || {
+            let resolved = resolve_scoped(&client, &selector, "cell")?;
+            let result = client.copy_cell(
+                &resolved.squad_id,
+                resolved.task_idx,
+                resolved.cell_idx,
+                from_branch,
+            )?;
+            emit(opts, &result, |r| {
+                println!(
+                    "copied {selector} to {}",
+                    r["squad_id"].as_str().unwrap_or("?")
+                );
+            });
             Ok(())
         }),
         CellCommand::RestartProof { selector, from } => run_and_report(opts, None, || {

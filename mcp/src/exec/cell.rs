@@ -80,6 +80,18 @@ pub fn execute(cmd: CellCommand, client: &DaemonClient) -> ExecResult {
             let resolved = cell::resolve_scoped(client, &selector, "cell")?;
             Ok(client.restart_cell(&resolved.squad_id, resolved.task_idx, resolved.cell_idx)?)
         }
+        CellCommand::Copy {
+            selector,
+            from_branch,
+        } => {
+            let resolved = cell::resolve_scoped(client, &selector, "cell")?;
+            Ok(client.copy_cell(
+                &resolved.squad_id,
+                resolved.task_idx,
+                resolved.cell_idx,
+                from_branch,
+            )?)
+        }
         CellCommand::RestartProof { selector, from } => {
             let resolved = cell::resolve_scoped(client, &selector, "cell")?;
             Ok(client.restart_cell_proof(

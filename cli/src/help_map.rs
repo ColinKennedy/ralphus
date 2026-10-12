@@ -2046,6 +2046,15 @@ const SQUAD_CHILDREN: &[HelpNode] = &[
 
 const CELL_CHILDREN: &[HelpNode] = &[
     node(
+        "copy",
+        &["selector [str]"],
+        &["--from-branch"],
+        "Copy a cell (prompt or command, agent, proofs) into a new one-task squad submitted from a clean base, linked both ways (RAL-641). --from-branch starts from the cell's own branch instead.",
+        false,
+        false,
+        &[],
+    ),
+    node(
         "edit",
         &["selector [str]"],
         &[
