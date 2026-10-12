@@ -408,9 +408,18 @@ pub(crate) fn run_repair_pass(
         &command_spec.task,
         &command_spec.cell_id,
     );
-    let output_note = match crate::terminal_log::latest_attempt(&session_name) {
+    // The retry loop archives a failed execution's logs as `-run-<attempt>`
+    // before this pass starts; a caller that does not archive leaves them in
+    // the command's own session.
+    let archived_session = format!("{session_name}-run-{attempt}");
+    let output_session = if crate::terminal_log::latest_attempt(&archived_session).is_some() {
+        archived_session
+    } else {
+        session_name
+    };
+    let output_note = match crate::terminal_log::latest_attempt(&output_session) {
         Some(n) => {
-            let path = crate::terminal_log::attempt_path(&session_name, n);
+            let path = crate::terminal_log::attempt_path(&output_session, n);
             match std::fs::metadata(&path) {
                 Ok(meta) => format!(
                     "The failed command's full output (stdout+stderr) was captured to:\n{}\n\
@@ -781,7 +790,8 @@ mod tests {
         assert!(result.is_done());
         let seen = runner.seen.lock().unwrap();
         let repair_prompt = seen[1].prompt.as_deref().unwrap_or_default();
-        let expected_path = crate::terminal_log::attempt_path(&session_name, 0);
+        // The failed execution's logs were archived as run 1 before the repair pass.
+        let expected_path = crate::terminal_log::attempt_path(&format!("{session_name}-run-1"), 0);
         assert!(
             repair_prompt.contains(&expected_path.to_string_lossy().into_owned()),
             "repair prompt should point at the attempt file: {repair_prompt}"
