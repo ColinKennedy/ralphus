@@ -26,7 +26,11 @@ use crate::tools::Workspace;
 const RESULT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 const DEFAULT_PROGRAM: &str = "claude";
-const RESULT_SUMMARY_TAIL_CHARS: usize = 2000;
+/// The tail of the agent's final message kept as the result summary. Large enough
+/// for a complete multi-section reply (a generated PR description with its
+/// `TITLE:` header is several thousand characters); the tail, not the head, is
+/// kept so a marker on the final line survives.
+const RESULT_SUMMARY_TAIL_CHARS: usize = 16_000;
 /// Fallback for [`format_tool_input`]'s truncation length (RAL-303) when
 /// `RunOptions::tool_arg_truncate_chars` is unset -- mirrors
 /// `ralphus_daemon::config::DEFAULT_TOOL_ARG_TRUNCATE_CHARS`, but this crate
@@ -1757,6 +1761,29 @@ mod tests {
     }
 
     #[test]
+    fn a_multi_section_reply_keeps_its_leading_header_in_the_summary() {
+        let mut state = ParseState::default();
+        let ws = test_workspace();
+        let reply = format!(
+            "TITLE: add a thing\n===DESCRIPTION===\n## Summary\n{}",
+            "A sentence that makes the reply longer than a small cap.\n".repeat(80)
+        );
+        assert!(reply.chars().count() > 4_000);
+        process_event(
+            &serde_json::json!({"type":"result","usage":{},"result":reply}),
+            &mut state,
+            &ws,
+            None,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+        assert!(
+            state.result_summary.starts_with("TITLE: add a thing"),
+            "the header was truncated away: {}",
+            &state.result_summary[..60]
+        );
+    }
+
+    #[test]
     fn process_event_scans_markers_in_every_assistant_turn_but_not_tool_output() {
         let mut state = ParseState::default();
         let ws = test_workspace();
@@ -1800,7 +1827,7 @@ mod tests {
         let ws = test_workspace();
         let text = format!(
             "RALPHUS_PROPHECY: decision: chose X\n{}",
-            "filler line\n".repeat(400)
+            "filler line\n".repeat(RESULT_SUMMARY_TAIL_CHARS / 12 + 100)
         );
         assert!(text.len() > RESULT_SUMMARY_TAIL_CHARS);
         process_event(

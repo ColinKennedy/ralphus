@@ -17,10 +17,11 @@ use crate::tools::Workspace;
 /// default -- used when a session sets no `timeout_sec` of its own.
 const DEFAULT_TIMEOUT_SECS: u64 = 1800;
 
-/// The tail of captured output kept when reporting a result -- matches
-/// Python's `_tail(text, 2000)` truncation length (trailing, not leading, so
-/// a marker on the final line survives).
-const SUMMARY_TAIL_CHARS: usize = 2000;
+/// The tail of the captured output kept as the result summary. Large enough
+/// for a complete multi-section reply (a generated PR description with its
+/// `TITLE:` header is several thousand characters); the tail, not the head, is
+/// kept so a marker on the final line survives.
+const SUMMARY_TAIL_CHARS: usize = 16_000;
 const ERROR_TAIL_CHARS: usize = 500;
 
 pub struct HarnessBackend {

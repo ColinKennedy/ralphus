@@ -2257,6 +2257,11 @@ fn commit_range_for(
 
 const MAX_PR_PATCH_CHARS: usize = 120_000;
 
+/// Length the writer is asked to stay under. The runner keeps only the tail of
+/// the agent's reply, so a reply far beyond its cap loses the `TITLE:` header
+/// and is rejected by [`parse_suggested_pr`].
+const MAX_PR_DESCRIPTION_CHARS: usize = 6_000;
+
 fn truncate_pr_patch(patch: String) -> String {
     if patch.chars().count() <= MAX_PR_PATCH_CHARS {
         return patch;
@@ -2311,22 +2316,141 @@ fn strip_bot_trailer(commits: &str) -> String {
         .join("\n")
 }
 
-/// Description used when the writer agent yields nothing usable: the branch's
-/// complete commit text inside a `{git-commit}` fenced block, placed in the
-/// template (if any) the same way an agent-written description would be.
-fn fallback_pr_description(commits: &str, template: Option<&str>) -> String {
-    let commits = commits.trim();
-    let body = if commits.is_empty() {
-        String::new()
-    } else {
-        let longest_run = commits.split(|c| c != '`').map(str::len).max().unwrap_or(0);
-        let fence = "`".repeat((longest_run + 1).max(3));
-        format!("{fence}{{git-commit}}\n{commits}\n{fence}")
+/// Structure the PR writer is asked to follow when the target repository has
+/// no pull-request template of its own. The HTML comments are hints for the
+/// writer and render as nothing on the forge.
+const DEFAULT_PR_TEMPLATE: &str = "\
+## Summary
+
+<!-- What this changes and why, in a few sentences a reviewer can read cold. -->
+
+## Details
+
+### Changes
+
+<!-- The notable changes, grouped by area. Describe behavior, not file-by-file edits. -->
+
+### Rationale
+
+<!-- Why this approach, and any alternatives or trade-offs worth knowing. Omit if the summary already covers it. -->
+
+## Testing
+
+<!-- What was run and what it showed. Also say plainly what was not run or not confirmed. -->
+
+## Reviewer notes
+
+<!-- Risks, breaking changes, migration steps, and related issues or links. Omit if there is nothing to flag. -->
+";
+
+/// One commit of the formatted log `branch_change_context` produces: its
+/// subject and the first paragraph of its message body.
+struct CommitNote {
+    subject: String,
+    lead: String,
+}
+
+/// Trailers that identify tooling rather than describe the change.
+fn is_tooling_trailer(line: &str) -> bool {
+    let lower = line.trim().to_ascii_lowercase();
+    lower.starts_with("co-authored-by:")
+        || lower.starts_with("ralphus-cell:")
+        || lower.starts_with("claude-session:")
+}
+
+/// Parse the `commit <sha>` / `subject: ...` / body / `---` text that
+/// `branch_change_context` builds into one [`CommitNote`] per commit.
+fn commit_notes(commits: &str) -> Vec<CommitNote> {
+    fn finish(notes: &mut Vec<CommitNote>, subject: String, body: &[&str]) {
+        if subject.is_empty() {
+            return;
+        }
+        let lead = body
+            .split(|line| line.trim().is_empty())
+            .map(|paragraph| {
+                paragraph
+                    .iter()
+                    .filter(|line| !is_tooling_trailer(line))
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .find(|paragraph| !paragraph.trim().is_empty())
+            .unwrap_or_default();
+        notes.push(CommitNote { subject, lead });
+    }
+
+    let mut notes = Vec::new();
+    let mut subject = String::new();
+    let mut body: Vec<&str> = Vec::new();
+    for line in commits.lines() {
+        if line.starts_with("commit ") {
+            finish(&mut notes, std::mem::take(&mut subject), &body);
+            body.clear();
+        } else if subject.is_empty() && line.starts_with("subject: ") {
+            subject = line["subject: ".len()..].trim().to_string();
+        } else if line.trim() != "---" {
+            body.push(line);
+        }
+    }
+    finish(&mut notes, subject, &body);
+    notes
+}
+
+/// Longest lead paragraph copied into the fallback summary for one commit.
+const FALLBACK_LEAD_CHARS: usize = 400;
+
+/// Description used when the writer agent yields nothing usable. It follows
+/// the Summary / Changes shape of [`DEFAULT_PR_TEMPLATE`]: one bullet per
+/// commit (its subject, then its lead paragraph) and the branch's diff stat.
+/// A repository template, if any, receives it the same way an agent-written
+/// description would be placed.
+fn fallback_pr_description(commits: &str, diff_stat: &str, template: Option<&str>) -> String {
+    let summary = commit_notes(commits)
+        .iter()
+        .map(|note| {
+            let mut item = format!("- {}", note.subject);
+            let lead = note.lead.trim();
+            let lead = if lead.chars().count() > FALLBACK_LEAD_CHARS {
+                let cut: String = lead.chars().take(FALLBACK_LEAD_CHARS).collect();
+                format!("{}...", cut.trim_end())
+            } else {
+                lead.to_string()
+            };
+            for line in lead.lines() {
+                item.push_str("\n  ");
+                item.push_str(line.trim_end());
+            }
+            item
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let stat = diff_stat.trim();
+    let body = match (summary.is_empty(), stat.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => summary.clone(),
+        (true, false) => format!("```text\n{stat}\n```"),
+        (false, false) => format!("{summary}\n\n**Changed files**\n\n```text\n{stat}\n```"),
     };
     match (template, body.is_empty()) {
         (Some(template), false) => insert_after_first_heading(template, &body),
         (Some(template), true) => template.to_string(),
-        (None, _) => body,
+        (None, true) => String::new(),
+        (None, false) => {
+            let mut description = String::new();
+            if !summary.is_empty() {
+                description.push_str(&format!("## Summary\n\n{summary}"));
+            }
+            if !stat.is_empty() {
+                if !description.is_empty() {
+                    description.push_str("\n\n");
+                }
+                description.push_str(&format!(
+                    "## Details\n\n### Changed files\n\n```text\n{stat}\n```"
+                ));
+            }
+            description
+        }
     }
 }
 
@@ -2417,9 +2541,10 @@ fn parse_suggested_pr(text: &str) -> Option<(String, String, Vec<i64>)> {
 /// commit range, using the same `Runner`/`RunnerSpec` mechanism
 /// `guardian_merge::generate_final_summary` uses for the change summary.
 /// `template`, if given (see `ForgeClient::fetch_pr_template`), is folded into
-/// the prompt so the repo's PR template is honoured. Falls back to a plain
-/// branch-name title and a `{git-commit}` block of this branch's full commit text
-/// when the agent call fails. The review-wide change summary is never used for
+/// the prompt so the repo's PR template is honoured; without one the prompt
+/// uses [`DEFAULT_PR_TEMPLATE`]. Falls back to a plain branch-name title and
+/// the deterministic summary of [`fallback_pr_description`] when the agent
+/// call fails. The review-wide change summary is never used for
 /// an individual PR. `trace_context`
 /// (the owning `pr.submit_pull_requests`/`pr.action_feedback` span, if any) is
 /// forwarded onto the `RunnerSpec` so `runner.subprocess`'s span (RAL-96)
@@ -2483,7 +2608,7 @@ fn synthesize_pr_text(
             deterministic_relevant_prophecies(prophecies),
         );
     };
-    let fallback_description = fallback_pr_description(&commits, template);
+    let fallback_description = fallback_pr_description(&commits, &diff_stat, template);
 
     // The resolver agent may name a custom `[agent.profiles.*]` entry, which
     // the runner cannot interpret -- resolve it to a real backend (plus its
@@ -2507,8 +2632,8 @@ fn synthesize_pr_text(
             );
         }
     };
-    let template_note = template.map_or_else(String::new, |t| {
-        format!(
+    let template_note = match template {
+        Some(t) => format!(
             "\n\nThe target repository has a pull-request template you MUST \
              follow -- fill it in, keeping its section headers intact. Put \
              the change summary in the template's first section (commonly \
@@ -2517,8 +2642,16 @@ fn synthesize_pr_text(
              content (e.g. after a checklist) -- that reads as no \
              description at all to a reviewer who doesn't scroll past the \
              template's own boilerplate:\n\n{t}"
-        )
-    });
+        ),
+        None => format!(
+            "\n\nThe target repository has no pull-request template, so use \
+             this structure. Replace each HTML comment hint with real \
+             content, and drop any section whose hint says it may be omitted \
+             when there is nothing to report in it. Write prose a reviewer \
+             can read cold -- never paste commit hashes, trailers, or raw \
+             commit messages:\n\n{DEFAULT_PR_TEMPLATE}"
+        ),
+    };
     // RAL-<new>: ask the same call that writes the description to also judge
     // which of this branch's unpublished prophecies are worth a reviewer's
     // time -- see the function doc for why this rides the existing call
@@ -2566,7 +2699,8 @@ fn synthesize_pr_text(
          headings, code fences, checklists, and blank lines exactly as they should \
          appear in the PR, with no quoting or escaping of any of it>\n\n\
          The description should explain what changed and why, focused on developer \
-         intent rather than file-level detail.{template_note}{prophecy_note}"
+         intent rather than file-level detail. Keep it under {MAX_PR_DESCRIPTION_CHARS} \
+         characters.{template_note}{prophecy_note}"
     );
     let pr_cwd = guardian
         .branches
@@ -2650,8 +2784,10 @@ fn synthesize_pr_text(
     crate::rlog!(
         WARNING,
         "ralphus [pr] synthesize pr text position={position:?} falling back to plain title/summary \
-         (agent result status={:?})",
-        result.status
+         (agent result status={:?}, reply_chars={}, reply_has_description_marker={})",
+        result.status,
+        result.summary.chars().count(),
+        result.summary.contains("===DESCRIPTION===")
     );
     (
         fallback_title,
@@ -21373,10 +21509,10 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
              - [ ] I have tested the change myself\n";
         let commits = "commit abc\nsubject: add widget support\n\nbody\n---\n";
 
-        let description = fallback_pr_description(commits, Some(template));
+        let description = fallback_pr_description(commits, "", Some(template));
 
         let overview_pos = description.find("## Overview").unwrap();
-        let body_pos = description.find("```{git-commit}").unwrap();
+        let body_pos = description.find("- add widget support").unwrap();
         let how_to_run_pos = description.find("## How To Run").unwrap();
         let checklist_pos = description.find("## Checklist").unwrap();
         assert!(
@@ -21394,13 +21530,70 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
     fn fallback_pr_description_appends_a_section_when_template_has_no_heading() {
         let description = fallback_pr_description(
             "commit abc\nsubject: add widget support\n\nbody\n---\n",
+            "",
             Some("no headings here"),
         );
         assert_eq!(
             description,
-            "no headings here\n\n## Branch changes\n\n```{git-commit}\n\
-             commit abc\nsubject: add widget support\n\nbody\n---\n```"
+            "no headings here\n\n## Branch changes\n\n- add widget support\n  body"
         );
+    }
+
+    #[test]
+    fn fallback_pr_description_is_a_readable_summary_not_a_commit_dump() {
+        let commits = "commit aad6d135f00b54e7f3291d90128aaa64ed461ba7\n\
+             subject: fix(waypoints): stop a cell sticking in running\n\n\n---\n\
+             commit 285bc55eb98decca84fed01cfc5617f34783be3e\n\
+             subject: RAL-623: detect waypoint overlap and cycles\n\n\
+             Survey skips candidates that would close a cycle.\n\
+             Two-entry cycles are rejected.\n\n\
+             - check_waypoint_entry rejects duplicates\n\n\
+             Co-Authored-By: Claude <noreply@anthropic.com>\n\n\
+             Ralphus-Cell: cell:squad-000000000285:0:1\n\n---\n";
+
+        let description = fallback_pr_description(commits, " a.rs | 2 +-\n 1 file changed", None);
+
+        assert_eq!(
+            description,
+            "## Summary\n\n\
+             - fix(waypoints): stop a cell sticking in running\n\
+             - RAL-623: detect waypoint overlap and cycles\n  \
+             Survey skips candidates that would close a cycle.\n  \
+             Two-entry cycles are rejected.\n\n\
+             ## Details\n\n### Changed files\n\n```text\na.rs | 2 +-\n 1 file changed\n```"
+        );
+        for noise in [
+            "git-commit",
+            "commit aad6",
+            "Co-Authored-By",
+            "Ralphus-Cell",
+            "---",
+        ] {
+            assert!(
+                !description.contains(noise),
+                "{noise} leaked:\n{description}"
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_pr_description_is_empty_without_commits_or_diff() {
+        assert_eq!(fallback_pr_description("", "", None), "");
+    }
+
+    #[test]
+    fn default_template_is_what_the_writer_is_asked_to_follow_without_a_repo_template() {
+        for heading in [
+            "## Summary",
+            "## Details",
+            "### Changes",
+            "### Rationale",
+            "## Testing",
+            "## Reviewer notes",
+        ] {
+            assert!(DEFAULT_PR_TEMPLATE.contains(heading), "{heading}");
+        }
+        assert!(!DEFAULT_PR_TEMPLATE.contains("Deferred"));
     }
 
     #[test]
@@ -21524,9 +21717,10 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         assert_eq!(
             fallback_pr_description(
                 "commit abc\nsubject: add this branch behavior\n\nbody\n---\n",
+                "",
                 None,
             ),
-            "```{git-commit}\ncommit abc\nsubject: add this branch behavior\n\nbody\n---\n```"
+            "## Summary\n\n- add this branch behavior\n  body"
         );
 
         let spec = runner.0.lock().unwrap().clone().unwrap();
