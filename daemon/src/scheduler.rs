@@ -535,6 +535,7 @@ pub fn run_loop(
     let mut last_triage_schedule_check = std::time::Instant::now();
     let mut last_cpu_stall_sweep = std::time::Instant::now();
     let mut last_waypoint_survey = std::time::Instant::now();
+    let mut last_runner_watchdog = std::time::Instant::now();
     // RAL-308: one tracker for this thread's whole lifetime, so CPU-flat
     // streaks accumulate correctly across sweeps -- see
     // `crate::cpu_stall::CpuStallTracker`.
@@ -733,7 +734,256 @@ pub fn run_loop(
             crate::waypoints::run_pending_stale_notices(&store);
             last_waypoint_survey = std::time::Instant::now();
         }
+        if last_runner_watchdog.elapsed() >= RUNNER_WATCHDOG_INTERVAL {
+            runner_watchdog_sweep(
+                &store,
+                &crate::config::load_runner_watchdog_config(),
+                crate::store::now_ms(),
+            );
+            last_runner_watchdog = std::time::Instant::now();
+        }
         std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// How often the runner watchdog sweep runs.
+pub const RUNNER_WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Window after the surface threshold in which a skipped cell still gets its
+/// one "skipped" Cartographer note (the sweep runs far more often than this).
+const WATCHDOG_SKIP_NOTE_WINDOW_MS: i64 = 60_000;
+
+/// Fails a cell the store still reports as `running` after its worker gave up
+/// (RAL-626). A no-op when the cell already settled (the usual cancel path).
+fn fail_cell_left_running(
+    store: &crate::store_lock::StoreHandle,
+    squad_id: &str,
+    row: &crate::store::CellRow,
+    reason: &str,
+) {
+    let guard = store.lock();
+    if !matches!(
+        guard.cell_state(squad_id, row.task_idx, row.idx),
+        Ok(Some(NodeState::Running))
+    ) {
+        return;
+    }
+    let outcome = CellOutcome {
+        state: NodeState::Failed,
+        usage: crate::store::RecordedUsage::default(),
+        error: Some(reason.to_string()),
+        agent_session_id: None,
+    };
+    store_ok(
+        &guard,
+        squad_id,
+        "record_cell_result",
+        guard.record_cell_result(squad_id, row.task_idx, row.idx, &outcome),
+    );
+    crate::cartographer::Note::new("scheduler")
+        .level(crate::logging::LogLevel::WARNING)
+        .squad(squad_id)
+        .cell(&row.cell_id)
+        .task(&row.task_name)
+        .scope("cell")
+        .emit(
+            &guard,
+            "cell failed: worker stopped while the cell was still running",
+            serde_json::json!({"reason": reason}),
+        );
+    enqueue_cell_failure_mailbox(&guard, squad_id, &row.cell_id, &row.task_name, Some(reason));
+}
+
+/// What the runner watchdog (RAL-626) decides for one `running` cell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WatchdogVerdict {
+    /// Not the watchdog's business; the reason is logged as a skip.
+    Skip(&'static str),
+    /// Runner-less but not for long enough to act on.
+    Healthy,
+    /// Past the surface threshold: notify and badge.
+    Surface,
+    /// Past the fail threshold: mark the cell failed.
+    Fail,
+}
+
+/// Pure decision for one `running` cell. `idle_ms` is the time since the later
+/// of the cell's run start and its last Cartographer activity.
+pub(crate) fn watchdog_verdict(
+    probe: &crate::store::RunningCellProbe,
+    has_live_runner: bool,
+    idle_ms: i64,
+    config: &crate::config::RunnerWatchdogConfig,
+) -> WatchdogVerdict {
+    if has_live_runner {
+        return WatchdogVerdict::Skip("live runner registered");
+    }
+    if probe.delayed_until_ms.is_some() {
+        return WatchdogVerdict::Skip("waiting out a rate limit");
+    }
+    if probe.detached_at_ms.is_some() {
+        return WatchdogVerdict::Skip("detached for manual takeover");
+    }
+    if probe.waypoint_halted_at_ms.is_some() {
+        return WatchdogVerdict::Skip("held by a waypoint");
+    }
+    if idle_ms >= config.fail_after_minutes() * 60_000 {
+        WatchdogVerdict::Fail
+    } else if idle_ms >= config.surface_after_minutes() * 60_000 {
+        WatchdogVerdict::Surface
+    } else {
+        WatchdogVerdict::Healthy
+    }
+}
+
+/// RAL-626: one sweep over every `running` cell. A cell with no in-process
+/// runner registration (tmux is deliberately ignored), no exclusion, and no
+/// Cartographer activity for the configured thresholds is surfaced (urgent
+/// mailbox notice + board badge) and later failed. Never restarts anything.
+pub(crate) fn runner_watchdog_sweep(
+    store: &crate::store_lock::StoreHandle,
+    config: &crate::config::RunnerWatchdogConfig,
+    now_ms: i64,
+) {
+    let memory = store.lock_free_memory();
+    let guard = store.lock();
+    let Ok(probes) = guard.running_cells_for_watchdog() else {
+        return;
+    };
+    let surface_ms = config.surface_after_minutes() * 60_000;
+    for probe in probes {
+        let live = memory.has_live_runner(&probe.squad_id, &probe.task_name, &probe.cell_id);
+        let started = probe
+            .active_started_at_ms
+            .or(probe.started_at_ms)
+            .unwrap_or(now_ms);
+        let last_activity = guard
+            .last_cell_cartographer_activity_ms(&probe.squad_id, &probe.cell_id)
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+        let idle_ms = now_ms - started.max(last_activity);
+        let verdict = watchdog_verdict(&probe, live, idle_ms, config);
+        let note = |message: &str, level: crate::logging::LogLevel| {
+            crate::cartographer::Note::new("scheduler")
+                .level(level)
+                .squad(&probe.squad_id)
+                .cell(&probe.cell_id)
+                .task(&probe.task_name)
+                .scope("runner_watchdog")
+                .emit(
+                    &guard,
+                    message,
+                    serde_json::json!({"idle_ms": idle_ms, "live_runner": live}),
+                );
+        };
+        match verdict {
+            WatchdogVerdict::Skip(reason) => {
+                // One note per skipped cell: only while idle time sits in the
+                // window just past the surface threshold.
+                if idle_ms >= surface_ms && idle_ms < surface_ms + WATCHDOG_SKIP_NOTE_WINDOW_MS {
+                    note(
+                        &format!("runner watchdog skipped cell: {reason}"),
+                        crate::logging::LogLevel::INFO,
+                    );
+                }
+                if probe.runner_stalled_at_ms.is_some() {
+                    store_ok(
+                        &guard,
+                        &probe.squad_id,
+                        "clear_cell_runner_stalled",
+                        guard.clear_cell_runner_stalled(&probe.squad_id, probe.task_idx, probe.idx),
+                    );
+                }
+            }
+            WatchdogVerdict::Healthy => {}
+            WatchdogVerdict::Surface => {
+                if probe.runner_stalled_at_ms.is_some() {
+                    continue;
+                }
+                store_ok(
+                    &guard,
+                    &probe.squad_id,
+                    "mark_cell_runner_stalled",
+                    guard.mark_cell_runner_stalled(&probe.squad_id, probe.task_idx, probe.idx),
+                );
+                note(
+                    "runner watchdog surfaced cell: running with no live runner",
+                    crate::logging::LogLevel::WARNING,
+                );
+                enqueue_runner_stalled_mailbox(&guard, &probe, config.fail_after_minutes());
+            }
+            WatchdogVerdict::Fail => {
+                let outcome = CellOutcome {
+                    state: NodeState::Failed,
+                    usage: crate::store::RecordedUsage::default(),
+                    error: Some(
+                        "runner never started: the cell was running with no live runner and no \
+                         activity"
+                            .to_string(),
+                    ),
+                    agent_session_id: None,
+                };
+                store_ok(
+                    &guard,
+                    &probe.squad_id,
+                    "record_cell_result",
+                    guard.record_cell_result(&probe.squad_id, probe.task_idx, probe.idx, &outcome),
+                );
+                store_ok(
+                    &guard,
+                    &probe.squad_id,
+                    "clear_cell_runner_stalled",
+                    guard.clear_cell_runner_stalled(&probe.squad_id, probe.task_idx, probe.idx),
+                );
+                note(
+                    "runner watchdog failed cell: runner never started",
+                    crate::logging::LogLevel::ERROR,
+                );
+                enqueue_cell_failure_mailbox(
+                    &guard,
+                    &probe.squad_id,
+                    &probe.cell_id,
+                    &probe.task_name,
+                    outcome.error.as_deref(),
+                );
+            }
+        }
+    }
+}
+
+fn enqueue_runner_stalled_mailbox(
+    guard: &Store,
+    probe: &crate::store::RunningCellProbe,
+    fail_after_minutes: i64,
+) {
+    let (squad_id, task_name, cell_id) = (&probe.squad_id, &probe.task_name, &probe.cell_id);
+    let text = format!(
+        "cell '{cell_id}' in task '{task_name}' (squad {squad_id}) is marked running but has no \
+         live runner and no activity; it will be failed after {fail_after_minutes} minutes"
+    );
+    let event_uri = guard
+        .cell_entity_uri(squad_id, task_name, cell_id)
+        .unwrap_or_else(|| format!("squad:{squad_id}"));
+    let remediation = crate::mailbox::Remediation::SuggestedCommand {
+        command: format!("ralphus cell restart {squad_id}/{task_name}/{cell_id}"),
+        purpose: "restart the cell that has no runner".to_string(),
+    };
+    if let Err(e) = guard.notify_watchers_with_remediation(
+        crate::monitor::NotifiableEventKind::SquadFailed,
+        &event_uri,
+        crate::mailbox::MailboxPriority::Urgent,
+        &text,
+        &remediation,
+        Some(squad_id),
+        Some(task_name),
+        Some(cell_id),
+    ) {
+        // ralphus[ignore-rlog-pair]: error in delivering the remediation notice; the cell's failed state is the event that matters
+        crate::rlog!(
+            WARNING,
+            "ralphus [scheduler] runner-stalled mailbox failed for {squad_id}/{cell_id}: {e}"
+        );
     }
 }
 
@@ -3287,6 +3537,13 @@ fn run_cell_worker(
     _span.set_attribute("cell_id", row.cell_id.clone());
     _span.set_attribute("agent", row.agent.clone());
     let cell_trace_context = otel::traceparent_from_context(&_span.cx);
+    // RAL-626: this worker thread is the cell's runner for as long as it
+    // lives, so the runner watchdog sees a registration on every path out of
+    // this function.
+    let _live_runner =
+        store
+            .lock_free_memory()
+            .register_live_runner(squad_id, &row.task_name, &row.cell_id);
     if cancel.is_cancelled() {
         return;
     }
@@ -3947,6 +4204,15 @@ fn run_cell_worker(
             squad_id,
             row,
         ) else {
+            // A cancellation normally leaves the cell `cancelled` already; if
+            // the store still says `running`, nothing else will ever settle
+            // it, so fail it here rather than leave it idle.
+            fail_cell_left_running(
+                store,
+                squad_id,
+                row,
+                "cell worker stopped before the runner reported a result",
+            );
             return;
         };
         _permit = permit_back;
@@ -9442,6 +9708,203 @@ mod tests {
         let b = squad.tasks[0].cells.iter().find(|s| s.id == "b").unwrap();
         assert_eq!(b.state, "failed");
         assert_eq!(b.error.as_deref(), Some("blocked by a failed dependency"));
+    }
+
+    // ---- RAL-626 runner watchdog ----
+
+    const MIN_MS: i64 = 60_000;
+
+    fn watchdog_probe() -> crate::store::RunningCellProbe {
+        crate::store::RunningCellProbe {
+            squad_id: "s".into(),
+            task_idx: 0,
+            idx: 0,
+            task_name: "t".into(),
+            cell_id: "c".into(),
+            active_started_at_ms: Some(0),
+            started_at_ms: Some(0),
+            delayed_until_ms: None,
+            detached_at_ms: None,
+            waypoint_halted_at_ms: None,
+            runner_stalled_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn watchdog_verdict_thresholds() {
+        let cfg = crate::config::RunnerWatchdogConfig::default();
+        let p = watchdog_probe();
+        assert_eq!(
+            watchdog_verdict(&p, false, 9 * MIN_MS, &cfg),
+            WatchdogVerdict::Healthy
+        );
+        assert_eq!(
+            watchdog_verdict(&p, false, 10 * MIN_MS, &cfg),
+            WatchdogVerdict::Surface
+        );
+        assert_eq!(
+            watchdog_verdict(&p, false, 29 * MIN_MS, &cfg),
+            WatchdogVerdict::Surface
+        );
+        assert_eq!(
+            watchdog_verdict(&p, false, 30 * MIN_MS, &cfg),
+            WatchdogVerdict::Fail
+        );
+    }
+
+    #[test]
+    fn watchdog_verdict_honours_configured_thresholds() {
+        let cfg = crate::config::RunnerWatchdogConfig {
+            surface_after_minutes: Some(1),
+            fail_after_minutes: Some(2),
+        };
+        let p = watchdog_probe();
+        assert_eq!(
+            watchdog_verdict(&p, false, MIN_MS, &cfg),
+            WatchdogVerdict::Surface
+        );
+        assert_eq!(
+            watchdog_verdict(&p, false, 2 * MIN_MS, &cfg),
+            WatchdogVerdict::Fail
+        );
+    }
+
+    #[test]
+    fn watchdog_verdict_skips_excluded_cells_however_idle() {
+        let cfg = crate::config::RunnerWatchdogConfig::default();
+        let idle = 120 * MIN_MS;
+        assert!(matches!(
+            watchdog_verdict(&watchdog_probe(), true, idle, &cfg),
+            WatchdogVerdict::Skip(_)
+        ));
+        let mut delayed = watchdog_probe();
+        delayed.delayed_until_ms = Some(1);
+        let mut detached = watchdog_probe();
+        detached.detached_at_ms = Some(1);
+        let mut halted = watchdog_probe();
+        halted.waypoint_halted_at_ms = Some(1);
+        for p in [delayed, detached, halted] {
+            assert!(matches!(
+                watchdog_verdict(&p, false, idle, &cfg),
+                WatchdogVerdict::Skip(_)
+            ));
+        }
+    }
+
+    fn running_cell_store() -> (crate::store_lock::StoreHandle, String, String) {
+        let (store, id) = store_with(ONE_CELL);
+        let cell_id = store.lock().get_squad(&id).unwrap().tasks[0].cells[0]
+            .id
+            .clone();
+        store
+            .lock()
+            .set_cell_state(&id, 0, 0, NodeState::Running)
+            .unwrap();
+        (store, id, cell_id)
+    }
+
+    fn cell_view(store: &crate::store_lock::StoreHandle, id: &str) -> crate::store::CellView {
+        store.lock().get_squad(id).unwrap().tasks[0].cells[0].clone()
+    }
+
+    #[test]
+    fn watchdog_sweep_surfaces_then_fails_a_runnerless_running_cell() {
+        let (store, id, _cell) = running_cell_store();
+        let cfg = crate::config::RunnerWatchdogConfig::default();
+        let now = crate::store::now_ms();
+
+        runner_watchdog_sweep(&store, &cfg, now + 5 * MIN_MS);
+        assert_eq!(cell_view(&store, &id).state, "running");
+        assert!(cell_view(&store, &id).runner_stalled_at_ms.is_none());
+
+        runner_watchdog_sweep(&store, &cfg, now + 11 * MIN_MS);
+        let view = cell_view(&store, &id);
+        assert_eq!(view.state, "running");
+        assert!(view.runner_stalled_at_ms.is_some());
+        {
+            let guard = store.lock();
+            let client = guard.register_mailbox_client().unwrap();
+            let messages = guard
+                .mailbox_messages_for_client(&client, true, None)
+                .unwrap();
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].priority, "urgent");
+        }
+
+        // A second pass inside the window does not re-notify.
+        runner_watchdog_sweep(&store, &cfg, now + 12 * MIN_MS);
+        {
+            let guard = store.lock();
+            let client = guard.register_mailbox_client().unwrap();
+            assert_eq!(
+                guard
+                    .mailbox_messages_for_client(&client, true, None)
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+
+        runner_watchdog_sweep(&store, &cfg, now + 31 * MIN_MS);
+        let view = cell_view(&store, &id);
+        assert_eq!(view.state, "failed");
+        assert!(
+            view.error
+                .as_deref()
+                .unwrap()
+                .contains("runner never started")
+        );
+    }
+
+    #[test]
+    fn watchdog_sweep_leaves_a_cell_with_a_live_runner_alone() {
+        let (store, id, cell_id) = running_cell_store();
+        let _live = store
+            .lock_free_memory()
+            .register_live_runner(&id, "build", &cell_id);
+        let cfg = crate::config::RunnerWatchdogConfig::default();
+        runner_watchdog_sweep(&store, &cfg, crate::store::now_ms() + 60 * MIN_MS);
+        let view = cell_view(&store, &id);
+        assert_eq!(view.state, "running");
+        assert!(view.runner_stalled_at_ms.is_none());
+    }
+
+    #[test]
+    fn watchdog_sweep_ignores_a_waypoint_halted_cell() {
+        let (store, id, _cell) = running_cell_store();
+        store.lock().mark_cell_waypoint_halted(&id, 0, 0).unwrap();
+        let cfg = crate::config::RunnerWatchdogConfig::default();
+        runner_watchdog_sweep(&store, &cfg, crate::store::now_ms() + 60 * MIN_MS);
+        assert_eq!(cell_view(&store, &id).state, "running");
+    }
+
+    #[test]
+    fn watchdog_activity_resets_the_idle_clock() {
+        let (store, id, cell_id) = running_cell_store();
+        let cfg = crate::config::RunnerWatchdogConfig::default();
+        let now = crate::store::now_ms();
+        {
+            let guard = store.lock();
+            crate::cartographer::Note::new("test")
+                .squad(&id)
+                .cell(&cell_id)
+                .emit(&guard, "activity", serde_json::json!({}));
+        }
+        // 11 minutes after the cell started, but only seconds after activity.
+        runner_watchdog_sweep(&store, &cfg, now + 5 * MIN_MS);
+        assert!(cell_view(&store, &id).runner_stalled_at_ms.is_none());
+    }
+
+    #[test]
+    fn restarted_cell_after_a_waypoint_halt_gets_a_fresh_halt_token() {
+        // A halt that tripped the squad's shared token must not be inherited by
+        // the next run of a cell in the same squad.
+        let halts = crate::cancel::WaypointHalts::new();
+        let first = halts.register_fresh("squad-1");
+        halts.cancel("squad-1");
+        assert!(first.is_cancelled());
+        let restarted = halts.register_fresh("squad-1");
+        assert!(!restarted.is_cancelled());
     }
 
     #[test]
