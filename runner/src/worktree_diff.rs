@@ -10,13 +10,10 @@
 //!
 //! The summary is computed without touching the index (no `git add -N`), so it
 //! cannot contend with the agent's own git operations or alter what it later
-//! commits: tracked changes come from `git diff` against the worktree's base
-//! (so commits the agent makes still count), and untracked files are counted
-//! by reading them.
-//!
-//! The base is a property of the worktree, not of the cell: every cell sharing
-//! a worktree measures against the same commit ([`worktree_base`]), so they all
-//! report the same net change however many cells committed before them.
+//! commits: tracked changes come from `git diff` against the merge-base of `HEAD`
+//! and the branch's configured upstream (so commits the agent makes still
+//! count, but commits merged or rebased in from the upstream do not; see
+//! [`effective_baseline`]), and untracked files are counted by reading them.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
@@ -46,7 +43,7 @@ const MAX_INTERVAL: Duration = Duration::from_secs(8);
 /// Untracked files larger than this are counted as zero lines rather than read.
 const MAX_UNTRACKED_READ_BYTES: u64 = 1024 * 1024;
 
-/// Numstat-style counts of what a worktree has changed since its base.
+/// Numstat-style counts of what a worktree has changed relative to its upstream base.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DiffSummary {
     pub files_changed: u64,
@@ -188,6 +185,24 @@ fn count_lines(path: &Path) -> u64 {
     newlines + u64::from(bytes.last().is_some_and(|&b| b != b'\n'))
 }
 
+/// The commit changes are measured from: the merge-base of `HEAD` with its
+/// branch's configured upstream (the explicit remote and branch the worktree
+/// was created against), so commits that arrive through a merge or rebase of
+/// that upstream are not counted as the cell's own work. Falls back to
+/// `start`, the commit `HEAD` pointed at when the watcher began, when the
+/// upstream cannot be resolved (detached `HEAD`, no upstream, unrelated
+/// histories).
+fn effective_baseline(repo: Option<&crate::git_inproc::Repo>, root: &Path, start: &str) -> String {
+    let base = match repo {
+        Some(open) => open.upstream_merge_base(),
+        None => git_detailed(root, &["merge-base", "HEAD", "@{upstream}"])
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+    };
+    base.unwrap_or_else(|| start.to_string())
+}
+
 /// Summarise everything changed in `root` since `baseline`: committed,
 /// uncommitted and untracked. `None` if git could not be queried.
 #[must_use]
@@ -324,7 +339,7 @@ impl WorktreeWatcher {
         max: Duration,
         emit: impl Fn(&str, &DiffSummary) + Send + 'static,
     ) -> Option<Self> {
-        let baseline = match worktree_base(root) {
+        let start = match head_commit_detailed(root) {
             Ok(head) => head,
             Err(error) => {
                 cartographer::emit(
@@ -340,10 +355,8 @@ impl WorktreeWatcher {
         let root: PathBuf = root.to_path_buf();
         let (stop, rx) = mpsc::channel::<()>();
         let handle = std::thread::spawn(move || {
-            // `None` until the first measurement, which is always pushed: a
-            // cell that changed nothing then reports a real zero instead of
-            // silence.
-            let mut last: Option<DiffSummary> = None;
+            let mut last = DiffSummary::default();
+            let mut last_baseline = start.clone();
             let mut backoff = Backoff::new(min, max);
             // Polls repeat every few seconds, so a persistent failure is
             // reported once when it starts and once when it clears, not per
@@ -352,7 +365,8 @@ impl WorktreeWatcher {
             // One libgit2 handle for the watcher's whole life; `None` when
             // libgit2 cannot read this repository (polls then spawn git).
             let mut repo = crate::git_inproc::Repo::open(&root).ok();
-            let mut poll = |last: &mut Option<DiffSummary>| -> bool {
+            let mut poll = |last: &mut DiffSummary| -> bool {
+                let baseline = effective_baseline(repo.as_ref(), &root, &start);
                 match summarize_polled(&mut repo, &root, &baseline) {
                     Ok(now) => {
                         if failing {
@@ -365,10 +379,11 @@ impl WorktreeWatcher {
                                 json!({"root": root.display().to_string()}),
                             );
                         }
-                        if *last == Some(now) {
+                        if now == *last && baseline == last_baseline {
                             return false;
                         }
-                        *last = Some(now);
+                        *last = now;
+                        last_baseline.clone_from(&baseline);
                         emit(&baseline, &now);
                         true
                     }
@@ -567,6 +582,80 @@ mod tests {
         let subprocess = summarize_subprocess(&dir, &base).unwrap();
         assert_eq!(in_process, subprocess);
         assert!(in_process.files_changed >= 4, "{in_process:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merged_in_upstream_commits_are_not_counted_as_the_cells_work() {
+        let dir = temp_repo("merged-upstream");
+        run(&dir, &["branch", "-M", "main"]);
+        run(&dir, &["checkout", "-q", "-b", "work"]);
+        run(&dir, &["branch", "--set-upstream-to=main"]);
+        let start = head_commit(&dir).unwrap();
+
+        // Upstream moves on, touching files the cell never edits.
+        run(&dir, &["checkout", "-q", "main"]);
+        std::fs::write(
+            dir.join("up1.txt"),
+            "u
+u
+u
+",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("up2.txt"),
+            "v
+",
+        )
+        .unwrap();
+        run(&dir, &["add", "."]);
+        run(&dir, &["commit", "-q", "-m", "upstream"]);
+        let upstream_tip = head_commit(&dir).unwrap();
+        run(&dir, &["checkout", "-q", "work"]);
+
+        // A pure merge: nothing of the cell's own.
+        run(&dir, &["merge", "-q", "--no-ff", "--no-edit", "main"]);
+        let mut repo = crate::git_inproc::Repo::open(&dir).ok();
+        let base = effective_baseline(repo.as_ref(), &dir, &start);
+        assert_eq!(base, upstream_tip, "the merge moved the merge-base forward");
+        assert_eq!(
+            summarize_polled(&mut repo, &dir, &base).unwrap(),
+            DiffSummary::default()
+        );
+        assert_eq!(
+            summarize_subprocess(&dir, &base).unwrap(),
+            DiffSummary::default()
+        );
+        assert_eq!(
+            effective_baseline(None, &dir, &start),
+            base,
+            "subprocess path agrees"
+        );
+
+        // Own edits on top of the merge still count, nothing else does.
+        std::fs::write(
+            dir.join("a.txt"),
+            "one
+two
+three
+",
+        )
+        .unwrap();
+        let in_process = summarize_polled(&mut repo, &dir, &base).unwrap();
+        assert_eq!(in_process, summarize_subprocess(&dir, &base).unwrap());
+        assert_eq!(in_process.files_changed, 1);
+        assert_eq!(in_process.lines_added, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn without_an_upstream_the_baseline_is_the_start_commit() {
+        let dir = temp_repo("no-upstream");
+        let start = head_commit(&dir).unwrap();
+        let repo = crate::git_inproc::Repo::open(&dir).ok();
+        assert_eq!(effective_baseline(repo.as_ref(), &dir, &start), start);
+        assert_eq!(effective_baseline(None, &dir, &start), start);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

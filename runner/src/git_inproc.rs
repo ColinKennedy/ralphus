@@ -115,6 +115,27 @@ impl Repo {
         Ok(commit.id().to_string())
     }
 
+    /// The merge-base of `HEAD` and its branch's configured upstream (the
+    /// explicit remote and branch the worktree was created against), as a
+    /// lowercase hex id. `None` when `HEAD` is detached, the branch has no
+    /// upstream, the upstream ref is missing, or the two share no history.
+    #[must_use]
+    pub fn upstream_merge_base(&self) -> Option<String> {
+        let head = self.repo.head().ok()?;
+        if !head.is_branch() {
+            return None;
+        }
+        let head_oid = head.peel_to_commit().ok()?.id();
+        let branch = git2::Branch::wrap(head);
+        let upstream_oid = branch.upstream().ok()?.get().peel_to_commit().ok()?.id();
+        Some(
+            self.repo
+                .merge_base(head_oid, upstream_oid)
+                .ok()?
+                .to_string(),
+        )
+    }
+
     /// Everything changed since `baseline` (a commit id): tracked changes as
     /// `git diff --numstat --summary --no-renames --no-ext-diff
     /// --no-textconv <baseline>` reports them, and untracked files as

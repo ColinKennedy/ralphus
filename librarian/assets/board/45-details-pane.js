@@ -978,21 +978,14 @@ Saving restarts the proof step and the rest of its list; an unchanged value rest
       }
       /**
        * Renders the RAL-550 "changes" key/value row from a pushed summary. The
-       * numbers are the cell's worktree total against the worktree's fork
-       * point, so every cell sharing a worktree shows the same figures. A cell
-       * that has not started, and has no summary yet, shows "not started"; a
-       * running or finished cell with none yet renders nothing.
+       * numbers are the cell's worktree total against the worktree's upstream
+       * base, so every cell sharing a worktree shows the same figures.
        * @param {CellDiffSummary|null} d
-       * @param {string} state - the cell's state
        * @returns {string}
        */
-      function cellDiffRow(d, state) {
-        if (!d || d.files_changed === undefined) {
-          if (!["pending", "queued"].includes(state)) return "";
-          const tip = "This cell has not started, so its worktree has not been measured yet.\nWho/when: check back once the cell runs; the figure is the worktree's total change, shared by every cell using it.";
-          return `<div class="kv-row" data-tip="${tip}"><span class="k">changes</span><span class="v">not started</span></div>`;
-        }
-        const tip = "The worktree's net change since its fork point (committed, uncommitted and untracked files), pushed live by the runner.\nEvery cell sharing this worktree shows the same figures, and a change a later cell reverted nets out. 0 files means the worktree has no change from its base.\nThe full diff is pulled on demand with ralphus cell diff.";
+      function cellDiffRow(d) {
+        if (!d || d.files_changed === undefined) return "";
+        const tip = "Pushed live by the runner as the cell's worktree changes (committed, uncommitted and untracked files against the worktree's upstream base; commits merged or rebased in from the upstream are excluded).\nThe full diff is pulled on demand with `ralphus cell diff`.";
         return `<div class="kv-row" data-tip="${tip}"><span class="k">changes</span><span class="v mono">${d.files_changed} files · <span style="color:var(--done)">+${d.lines_added || 0}</span> <span style="color:var(--failed)">−${d.lines_removed || 0}</span></span></div>`;
       }
       /**
