@@ -469,6 +469,7 @@
        * @property {number} now_ms
        * @property {PrPollEntry[]} polls
        * @property {{outcome: string|null, applied_at_ms: number|null}} feedback
+       * @property {{attempts_used: number, max_attempts: number|null, enabled: boolean|null}} [auto_fix]
        */
       /**
        * Poll status per PR id, loaded on demand once a branch with that PR is
@@ -490,6 +491,29 @@
           prPollStatus[prId] = null;
         }
         renderReviewInspector();
+      }
+      /**
+       * The auto-fix budget line for one open PR, from its poll status. Empty
+       * until the status loads, or when the daemon could not resolve the max.
+       * @param {string} prId - The PR id.
+       * @returns {string}
+       */
+      function prAutoFixBudgetHtml(prId) {
+        const af = prPollStatus[prId]?.auto_fix;
+        if (!af || af.max_attempts == null) return "";
+        const used = af.attempts_used;
+        const max = af.max_attempts;
+        const disabled = af.enabled === false;
+        const exhausted = used >= max;
+        const label = `auto-fix budget: ${used} of ${max} used${exhausted ? " — auto-fix stopped" : ""}${disabled ? " (auto-fix disabled)" : ""}`;
+        const colour = disabled ? "var(--muted)" : exhausted ? "var(--warn)" : "var(--muted)";
+        const tip = [
+          "Why: shows how much of this PR's automatic CI-fix budget is in use, so you can see how close auto-fix is to giving up.",
+          "This is not the number of fixes tried: when a later CI run fails fewer checks than the one before, one attempt is refunded, so more fixes may have run than this shows.",
+          "Who/when: it resets when CI passes or when you press 'Merge / rebase'. At the maximum, auto-fix stops until then.",
+          `Caveats: the maximum is the project's auto_fix_max_attempts.${disabled ? " Auto-fix is currently disabled for this review, so no further attempts will run." : ""}`,
+        ].join("\n");
+        return `<div class="insp-pr-sub" style="color:${colour}" data-tip="${esc(tip)}">${esc(label)}</div>`;
       }
       /**
        * The poll-status block for one PR; requests it the first time it is
@@ -556,6 +580,7 @@
                 <div class="insp-pr-head">${branchPrBadge(p, prs.length > 1)}<span class="insp-pr-title">${esc(p.title || "")}</span></div>
                 <div class="insp-pr-sub">base <span class="mono">${esc(p.base_ref || "—")}</span> · ${esc(p.state)}</div>
                 ${prPollStatusHtml(p.id)}
+                ${p.state === "open" ? prAutoFixBudgetHtml(p.id) : ""}
               </div>`).join("")
             : `<div class="empty" style="padding:8px 0" data-tip="Submitting folds this branch into the review's existing PR stack — it is never submitted on its own, which is what keeps the stack's base chain intact.">Not submitted yet.</div>`}`;
       }
