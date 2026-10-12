@@ -2110,10 +2110,18 @@ fn route_for_user(
         ("GET", ["api", "guardians", id, "branches", branch_id, "conflicts"]) => {
             guardian_branch_conflicts(daemon, id, branch_id)
         }
-        // ralphus[ignore-endpoint-cli]: board Live view diff of an auto-fix/feedback edit against the nearest enabled upstream (RAL-634)
-        ("GET", ["api", "guardians", id, "branches", branch_id, "live-diff"]) => {
-            guardian_branch_live_diff(daemon, id, branch_id)
-        }
+        // ralphus[ignore-endpoint-cli]: board Overview "changes" row: files/lines changed in a branch worktree against its nearest enabled upstream (RAL-634)
+        (
+            "GET",
+            [
+                "api",
+                "guardians",
+                id,
+                "branches",
+                branch_id,
+                "diff-summary",
+            ],
+        ) => guardian_branch_diff_summary(daemon, id, branch_id),
         // ralphus[ignore-endpoint-cli]: board debug-event timeline for the branch
         (
             "GET",
@@ -12690,11 +12698,10 @@ struct BranchConflictsView {
     rebase_in_progress: bool,
 }
 
-/// RAL-634: the diff a resolver/auto-fix has produced so far in a review
-/// branch's worktree, against the nearest enabled upstream (the remote base
-/// branch for the first enabled branch). Resolved from the stack at request
-/// time; capped, with `truncated` set when cut.
-fn guardian_branch_live_diff(daemon: &Daemon, id: &str, branch_id: &str) -> Reply {
+/// RAL-634: how many files and lines a review branch's worktree changes
+/// against the nearest enabled upstream (the remote base branch for the first
+/// enabled branch). Resolved from the stack at request time.
+fn guardian_branch_diff_summary(daemon: &Daemon, id: &str, branch_id: &str) -> Reply {
     let guardian = match daemon.lock().get_guardian(id) {
         Ok(g) => g,
         Err(_) => return error(404, "not_found", "no such guardian", vec![]),
@@ -12702,9 +12709,9 @@ fn guardian_branch_live_diff(daemon: &Daemon, id: &str, branch_id: &str) -> Repl
     if !guardian.branches.iter().any(|b| b.id == branch_id) {
         return error(404, "not_found", "no such branch", vec![]);
     }
-    match crate::guardian_merge::branch_live_diff(&guardian, branch_id) {
+    match crate::guardian_merge::branch_diff_summary(&guardian, branch_id) {
         Ok(d) => json(200, &d),
-        Err(e) => error(409, "live_diff_unavailable", &e, vec![]),
+        Err(e) => error(409, "diff_summary_unavailable", &e, vec![]),
     }
 }
 

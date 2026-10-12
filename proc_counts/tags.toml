@@ -26,7 +26,7 @@ tag = "worktree-init"
 id = "ralphus-daemon proof::tests::explicit_sh_runs_a_semicolon_separated_command"
 tag = "command-shell"
 
-# Live diff of a review branch worktree against its enabled upstream (RAL-634).
+# Diff summary of a review branch worktree against its enabled upstream (RAL-634).
 [[test]]
-id = "ralphus-daemon guardian_merge::live_diff_tests::live_diff_shows_worktree_edits_against_the_base_and_empty_without_them"
-tag = "branch-live-diff"
+id = "ralphus-daemon guardian_merge::branch_diff_tests::diff_summary_counts_worktree_edits_against_the_base"
+tag = "branch-diff-summary"

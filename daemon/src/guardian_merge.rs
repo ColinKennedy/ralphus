@@ -623,12 +623,9 @@ new file mode 100644
     Ok(out)
 }
 
-/// Largest live-diff body returned to the board; the rest is cut and flagged.
-pub(crate) const LIVE_DIFF_MAX_BYTES: usize = 256 * 1024;
-
-/// What a review branch's live diff is measured against.
+/// What a review branch's diff summary is measured against.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum LiveDiffBase {
+pub(crate) enum BranchDiffBase {
     /// The branch is the first enabled one of its project: the PR target, i.e.
     /// the review's base branch as the remote holds it.
     Remote,
@@ -637,15 +634,15 @@ pub(crate) enum LiveDiffBase {
     Review { branch_id: String, git_ref: String },
 }
 
-/// Resolve what `branch_id`'s live diff is taken against, from the stack as it
-/// is right now (never cached: branches are disabled and reordered mid-fix).
-/// Only enabled branches of the same project count, ordered by position, so a
-/// disabled branch in the middle is stepped over. `None` when `branch_id` is
-/// not an enabled branch of the review.
-pub(crate) fn live_diff_base(
+/// Resolve what `branch_id`'s diff summary is taken against, from the stack as
+/// it is right now (never cached: branches are disabled and reordered
+/// mid-fix). Only enabled branches of the same project count, ordered by
+/// position, so a disabled branch in the middle is stepped over. `None` when
+/// `branch_id` is not an enabled branch of the review.
+pub(crate) fn branch_diff_base(
     guardian: &crate::guardian::GuardianView,
     branch_id: &str,
-) -> Option<LiveDiffBase> {
+) -> Option<BranchDiffBase> {
     let project_of = |b: &crate::guardian::BranchView| {
         b.project
             .clone()
@@ -662,36 +659,19 @@ pub(crate) fn live_diff_base(
         .filter(|b| b.enabled && b.position < target.position && project_of(b) == project)
         .max_by_key(|b| b.position);
     Some(match upstream {
-        None => LiveDiffBase::Remote,
-        Some(b) => LiveDiffBase::Review {
+        None => BranchDiffBase::Remote,
+        Some(b) => BranchDiffBase::Review {
             branch_id: b.id.clone(),
             git_ref: review_ref_of(&guardian.id, b),
         },
     })
 }
 
-/// Cut `diff` to at most `max` bytes on a line boundary; reports whether it
-/// was cut.
-pub(crate) fn truncate_diff(mut diff: String, max: usize) -> (String, bool) {
-    if diff.len() <= max {
-        return (diff, false);
-    }
-    let mut cut = max;
-    while !diff.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    if let Some(nl) = diff[..cut].rfind('\n') {
-        cut = nl + 1;
-    }
-    diff.truncate(cut);
-    (diff, true)
-}
-
 /// The git revision in `worktree` that `base` names, if it resolves.
-fn resolve_live_diff_rev(
+fn resolve_branch_diff_rev(
     worktree: &Path,
     guardian: &crate::guardian::GuardianView,
-    base: &LiveDiffBase,
+    base: &BranchDiffBase,
 ) -> Option<String> {
     let resolves = |rev: &str| {
         git(
@@ -706,8 +686,8 @@ fn resolve_live_diff_rev(
         .is_ok_and(|s| !s.trim().is_empty())
     };
     match base {
-        LiveDiffBase::Review { git_ref, .. } => resolves(git_ref).then(|| git_ref.clone()),
-        LiveDiffBase::Remote => {
+        BranchDiffBase::Review { git_ref, .. } => resolves(git_ref).then(|| git_ref.clone()),
+        BranchDiffBase::Remote => {
             let base_branch = guardian.base_branch.trim();
             let remote = crate::forge::default_remote_name(&crate::config::resolve_forge(
                 Path::new(&guardian.git_root),
@@ -724,28 +704,31 @@ fn resolve_live_diff_rev(
     }
 }
 
-/// A review branch's live diff against its nearest enabled upstream, for the
-/// board's Live view while a fixer edits the branch worktree.
+/// Numstat counts of a review branch's worktree (committed, uncommitted and
+/// untracked changes) against its nearest enabled upstream: the same
+/// `files · +added −removed` shape the Squads details pane shows for a cell.
 #[derive(Debug, serde::Serialize)]
-pub(crate) struct BranchLiveDiff {
+pub(crate) struct BranchDiffSummary {
     /// `remote` or `review`.
     pub base_kind: &'static str,
-    /// The review branch the diff is measured against (`None` for `remote`).
+    /// The review branch the summary is measured against (`None` for `remote`).
     pub base_branch_id: Option<String>,
-    /// The revision actually diffed against.
+    /// The revision actually measured against.
     pub base_ref: String,
-    pub diff: String,
-    pub empty: bool,
-    pub truncated: bool,
+    pub files_changed: u64,
+    pub files_added: u64,
+    pub files_removed: u64,
+    pub lines_added: u64,
+    pub lines_removed: u64,
 }
 
-/// Compute [`BranchLiveDiff`] for `branch_id`. `Err` is a user-facing message.
-pub(crate) fn branch_live_diff(
+/// Compute [`BranchDiffSummary`] for `branch_id`. `Err` is a user-facing message.
+pub(crate) fn branch_diff_summary(
     guardian: &crate::guardian::GuardianView,
     branch_id: &str,
-) -> std::result::Result<BranchLiveDiff, String> {
-    let base = live_diff_base(guardian, branch_id)
-        .ok_or_else(|| "this branch is disabled, so it has no live diff".to_string())?;
+) -> std::result::Result<BranchDiffSummary, String> {
+    let base = branch_diff_base(guardian, branch_id)
+        .ok_or_else(|| "this branch is disabled, so it has no diff summary".to_string())?;
     let worktree = guardian
         .branches
         .iter()
@@ -754,22 +737,23 @@ pub(crate) fn branch_live_diff(
         .map(PathBuf::from)
         .filter(|p| p.is_dir())
         .ok_or_else(|| "no review worktree on this host yet".to_string())?;
-    let base_rev = resolve_live_diff_rev(&worktree, guardian, &base)
+    let base_rev = resolve_branch_diff_rev(&worktree, guardian, &base)
         .ok_or_else(|| "the diff base does not resolve in this worktree".to_string())?;
-    let full = cell_diff(&worktree, Some(&base_rev))?;
-    let empty = full.trim().is_empty();
-    let (diff, truncated) = truncate_diff(full, LIVE_DIFF_MAX_BYTES);
+    let counts = ralphus_runner::worktree_diff::summarize(&worktree, &base_rev)
+        .ok_or_else(|| "git could not diff this worktree".to_string())?;
     let (base_kind, base_branch_id) = match &base {
-        LiveDiffBase::Remote => ("remote", None),
-        LiveDiffBase::Review { branch_id, .. } => ("review", Some(branch_id.clone())),
+        BranchDiffBase::Remote => ("remote", None),
+        BranchDiffBase::Review { branch_id, .. } => ("review", Some(branch_id.clone())),
     };
-    Ok(BranchLiveDiff {
+    Ok(BranchDiffSummary {
         base_kind,
         base_branch_id,
         base_ref: base_rev,
-        diff,
-        empty,
-        truncated,
+        files_changed: counts.files_changed,
+        files_added: counts.files_added,
+        files_removed: counts.files_removed,
+        lines_added: counts.lines_added,
+        lines_removed: counts.lines_removed,
     })
 }
 
@@ -23725,7 +23709,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod live_diff_tests {
+mod branch_diff_tests {
     use super::*;
     use crate::store::Store;
 
@@ -23745,14 +23729,14 @@ mod live_diff_tests {
     #[test]
     fn first_enabled_branch_diffs_against_the_remote() {
         let (g, ids) = review_with_branches(&[false, true, true]);
-        assert_eq!(live_diff_base(&g, &ids[1]), Some(LiveDiffBase::Remote));
+        assert_eq!(branch_diff_base(&g, &ids[1]), Some(BranchDiffBase::Remote));
     }
 
     #[test]
     fn a_disabled_branch_in_the_middle_is_skipped() {
         let (g, ids) = review_with_branches(&[true, false, true]);
-        let base = live_diff_base(&g, &ids[2]).unwrap();
-        let LiveDiffBase::Review { branch_id, git_ref } = base else {
+        let base = branch_diff_base(&g, &ids[2]).unwrap();
+        let BranchDiffBase::Review { branch_id, git_ref } = base else {
             panic!("expected a review base");
         };
         assert_eq!(branch_id, ids[0]);
@@ -23760,24 +23744,14 @@ mod live_diff_tests {
     }
 
     #[test]
-    fn a_disabled_branch_has_no_live_diff_base() {
+    fn a_disabled_branch_has_no_branch_diff_base() {
         let (g, ids) = review_with_branches(&[true, false]);
-        assert_eq!(live_diff_base(&g, &ids[1]), None);
+        assert_eq!(branch_diff_base(&g, &ids[1]), None);
     }
 
     #[test]
-    fn truncation_cuts_on_a_line_boundary_and_flags_it() {
-        let (d, cut) = truncate_diff("aaaa\nbbbb\ncccc\n".to_string(), 12);
-        assert!(cut);
-        assert_eq!(d, "aaaa\nbbbb\n");
-        let (d, cut) = truncate_diff("short\n".to_string(), 12);
-        assert!(!cut);
-        assert_eq!(d, "short\n");
-    }
-
-    #[test]
-    fn live_diff_shows_worktree_edits_against_the_base_and_empty_without_them() {
-        let dir = std::env::temp_dir().join(format!("ralphus-live-diff-{}", std::process::id()));
+    fn diff_summary_counts_worktree_edits_against_the_base() {
+        let dir = std::env::temp_dir().join(format!("ralphus-branch-diff-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let g = |args: &[&str]| {
@@ -23795,13 +23769,19 @@ mod live_diff_tests {
         guardian.base_branch = "main".to_string();
         guardian.branches[0].worktree = Some(dir.to_string_lossy().to_string());
 
-        let none = branch_live_diff(&guardian, &ids[0]).unwrap();
-        assert!(none.empty && !none.truncated);
+        let none = branch_diff_summary(&guardian, &ids[0]).unwrap();
+        assert_eq!(
+            (none.files_changed, none.lines_added, none.lines_removed),
+            (0, 0, 0)
+        );
 
-        std::fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
-        let some = branch_live_diff(&guardian, &ids[0]).unwrap();
-        assert!(!some.empty);
-        assert!(some.diff.contains("+two"));
+        std::fs::write(dir.join("a.txt"), "two\nthree\n").unwrap();
+        std::fs::write(dir.join("new.txt"), "x\n").unwrap();
+        let some = branch_diff_summary(&guardian, &ids[0]).unwrap();
+        assert_eq!(some.files_changed, 2);
+        assert_eq!(some.files_added, 1);
+        assert_eq!(some.lines_added, 3);
+        assert_eq!(some.lines_removed, 1);
         assert_eq!(some.base_kind, "remote");
         let _ = std::fs::remove_dir_all(&dir);
     }
