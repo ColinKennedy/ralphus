@@ -4453,6 +4453,84 @@ fn base_branch_shift_triggers_rebuild() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+// A PR that the forge squash-merges leaves its review ref off the base's
+// ancestry (the forge writes a new commit), and forge merge detection can lag
+// or be rate limited. The base shift is that review landing, so the sweep must
+// settle it as merged -- review and branches both -- instead of rebuilding a
+// stack whose work is already upstream.
+#[test]
+fn squash_merged_base_shift_marks_review_and_branches_merged_without_rebuilding() {
+    let (root, store, id) = single_feature_repo();
+    run_merge(&store, &NoopRunner, &id);
+    assert_eq!(store.lock().get_guardian(&id).unwrap().status, "in_review");
+
+    // Land the feature on main the way a forge squash does, plus an unrelated
+    // commit so the base's tree is not simply the review's tree.
+    git(&root, &["checkout", "main"]);
+    git(&root, &["merge", "--squash", "feature/a"]);
+    git(&root, &["commit", "-m", "feature a (#1)"]);
+    write(
+        &root,
+        "unrelated.txt",
+        "someone else
+",
+    );
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "unrelated upstream work"]);
+
+    let sem = Semaphore::new(4);
+    assert!(
+        rebuild_on_base_shift(&store, &NoopRunner, &id, &sem, &CancelToken::never()),
+        "a base shift that is the review landing must be acted on"
+    );
+
+    let after = store.lock().get_guardian(&id).unwrap();
+    assert_eq!(after.status, "merged", "detail: {:?}", after.detail);
+    assert!(
+        after.branches.iter().all(|b| b.merge_status == "merged"),
+        "every branch must follow the review to merged: {:?}",
+        after
+            .branches
+            .iter()
+            .map(|b| b.merge_status.clone())
+            .collect::<Vec<_>>()
+    );
+    let events = store.lock().events_for_guardian(&id, 500).unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.message.contains("base branch changed; rebuilding")),
+        "no rebuild may start for work that already landed: {events:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// The converse: a squash that carried only part of the stack's work must not
+// read as landed.
+#[test]
+fn partial_squash_does_not_mark_review_merged() {
+    let (root, store, id) = single_feature_repo();
+    run_merge(&store, &NoopRunner, &id);
+
+    git(&root, &["checkout", "main"]);
+    write(
+        &root,
+        "c.txt",
+        "unrelated only
+",
+    );
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "unrelated upstream work"]);
+
+    let sem = Semaphore::new(4);
+    let _ = rebuild_on_base_shift(&store, &NoopRunner, &id, &sem, &CancelToken::never());
+    let after = store.lock().get_guardian(&id).unwrap();
+    assert_ne!(after.status, "merged", "detail: {:?}", after.detail);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 // RAL-<pending>: proves the base-branch freshness poller's fetch actually
 // feeds the existing, unchanged `rebuild_on_base_shift` path. Unlike
 // `base_branch_shift_triggers_rebuild` above (which advances `main` directly
@@ -9738,6 +9816,34 @@ fn staged_merge_rebuilds_when_branch_set_changes() {
     assert_ne!(
         tip_a_old, tip_a_new,
         "a's tip must be rebuilt after the branch set changed"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Stop must settle the review even when the merge worker is slow to unwind:
+/// answering `409 still stopping` left the review `merging` with no worker.
+#[test]
+fn stop_settles_the_review_even_when_the_worker_never_unwinds() {
+    let (root, store, id) = single_feature_repo();
+    assert!(store.lock().claim_guardian_merge(&id).unwrap());
+    let cancellations = Cancellations::new();
+    // A registered token that nothing ever removes stands in for a worker
+    // stuck past the acknowledgement wait.
+    let token = cancellations.register(&format!("guardian:{id}"));
+
+    let started = std::time::Instant::now();
+    let reply = stop_guardian_merge(Arc::clone(&store), cancellations.clone(), &id);
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(reply.body.contains("\"merge_stopped\""), "{}", reply.body);
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "stop must not block on the lingering worker"
+    );
+    assert!(token.is_cancelled(), "the worker must have been signalled");
+    assert_eq!(
+        store.lock().get_guardian(&id).unwrap().status,
+        "merge_stopped"
     );
 
     let _ = std::fs::remove_dir_all(&root);

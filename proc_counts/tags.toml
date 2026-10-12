@@ -70,3 +70,9 @@ tag = "review-rebase-stash"
 [[test]]
 id = "ralphus-daemon reviews::tests::restores_stash_after_rebase_failure"
 tag = "review-rebase-stash"
+
+# Base-shift sweep settling a squash-merged review as merged (content-landed
+# check: `git merge-tree --write-tree` + `rev-parse`).
+[[test]]
+id = "ralphus-daemon::guardian_merge squash_merged_base_shift_marks_review_and_branches_merged_without_rebuilding"
+tag = "review-base-shift-landed"
