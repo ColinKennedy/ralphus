@@ -3196,6 +3196,11 @@ impl Store {
             // from already-expanded text.
             "ALTER TABLE cells ADD COLUMN effective_system_prompt TEXT",
             "ALTER TABLE proofs ADD COLUMN effective_system_prompt TEXT",
+            // RAL-639: the restart note the latest attempt was dispatched
+            // with. The live note is consumed once at dispatch, so the board's
+            // Prompt tab reads this per-attempt copy instead.
+            "ALTER TABLE cells ADD COLUMN dispatched_restart_note TEXT",
+            "ALTER TABLE proofs ADD COLUMN dispatched_restart_note TEXT",
             // RAL-185: the resolved machine a cell/proof runs on. NULL means
             // the daemon's own host, which is what every pre-RAL-185 row is.
             // RAL-190: a branch that contributes no diff over the stack tip
@@ -7691,6 +7696,78 @@ impl Store {
         self.conn.execute(
             "UPDATE cells SET effective_system_prompt=? WHERE squad_id=? AND task_idx=? AND idx=?",
             params![system_prompt, squad_id, task_idx, idx],
+        )?;
+        Ok(())
+    }
+
+    /// The restart note the cell's latest attempt was dispatched with
+    /// (RAL-639); `None` when that attempt had no note.
+    pub fn get_cell_dispatched_restart_note(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        idx: i64,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT dispatched_restart_note FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
+                params![squad_id, task_idx, idx],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Record (or clear, with `None`) the restart note the cell's current
+    /// attempt is dispatched with.
+    pub fn set_cell_dispatched_restart_note(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        idx: i64,
+        note: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE cells SET dispatched_restart_note=? WHERE squad_id=? AND task_idx=? AND idx=?",
+            params![note, squad_id, task_idx, idx],
+        )?;
+        Ok(())
+    }
+
+    /// Proof-step twin of [`Self::get_cell_dispatched_restart_note`].
+    pub fn get_proof_dispatched_restart_note(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        scope: &str,
+        cell_idx: i64,
+        idx: i64,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT dispatched_restart_note FROM proofs WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=?",
+                params![squad_id, task_idx, scope, cell_idx, idx],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Proof-step twin of [`Self::set_cell_dispatched_restart_note`].
+    pub fn set_proof_dispatched_restart_note(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        scope: &str,
+        cell_idx: i64,
+        idx: i64,
+        note: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE proofs SET dispatched_restart_note=? WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=?",
+            params![note, squad_id, task_idx, scope, cell_idx, idx],
         )?;
         Ok(())
     }

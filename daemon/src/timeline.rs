@@ -118,6 +118,8 @@ pub struct SquadTimeline {
 
 /// Build the merged, chronological timeline for `squad_id`. `NotFound` if the
 /// squad doesn't exist (mirrors every other squad-scoped `Store` accessor).
+/// Does NOT write the file — call `finalize_timeline_file` after releasing
+/// the store lock to complete the operation.
 pub fn build_squad_timeline(store: &Store, squad_id: &str) -> Result<SquadTimeline> {
     let squad = store.get_squad(squad_id)?;
     let cell_count: i64 = squad.tasks.iter().map(|t| t.cells.len() as i64).sum();
@@ -182,7 +184,7 @@ pub fn build_squad_timeline(store: &Store, squad_id: &str) -> Result<SquadTimeli
     };
 
     let text = render_text(&meta, &entries);
-    let file_path = write_temp_file(squad_id, &text);
+    let file_path = String::new();
 
     Ok(SquadTimeline {
         meta,
@@ -190,6 +192,12 @@ pub fn build_squad_timeline(store: &Store, squad_id: &str) -> Result<SquadTimeli
         text,
         file_path,
     })
+}
+
+/// Finalize the timeline file path by writing the text to disk. Call this
+/// after releasing the store lock (blocking I/O, best-effort).
+pub fn finalize_timeline_file(timeline: &mut SquadTimeline) {
+    timeline.file_path = write_temp_file(&timeline.meta.squad_id, &timeline.text);
 }
 
 /// The current-attempt-only, chronologically-merged debug stream backing

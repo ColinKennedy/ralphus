@@ -3848,6 +3848,12 @@ fn run_cell_worker(
             row.idx,
             spec.effective_system_prompt().as_deref(),
         );
+        let _ = guard.set_cell_dispatched_restart_note(
+            squad_id,
+            row.task_idx,
+            row.idx,
+            restart_guidance.as_deref(),
+        );
     }
 
     // If this cell declares an upstream task ref, rebase its branch onto
@@ -6293,6 +6299,14 @@ fn run_proofs(
                         cell_idx,
                         idx,
                         runner_spec.effective_system_prompt().as_deref(),
+                    );
+                    let _ = guard.set_proof_dispatched_restart_note(
+                        squad_id,
+                        task_idx,
+                        scope,
+                        cell_idx,
+                        idx,
+                        restart_guidance.as_deref(),
                     );
                 }
                 let result = run_proof_with_rate_limit_retries(

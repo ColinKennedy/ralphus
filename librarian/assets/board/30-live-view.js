@@ -332,6 +332,7 @@
        * flight. An entirely absent entry means the tab was never opened.
        * @typedef {object} PromptTabState
        * @property {string} [text] - The step's exact effective system prompt, once fetched.
+       * @property {string|null} [restartNote] - The restart note (RAL-639) the latest attempt was dispatched with, if any; shown as part of the prompt.
        * @property {string} [error] - Why there is no text (a command cell, a step never yet dispatched, or a failed fetch) — shown verbatim in place of the prompt.
        */
       /**
@@ -343,7 +344,11 @@
        * @returns {string|null}
        */
       function peekPromptText(state) {
-        return state !== undefined && typeof state !== "string" && typeof state.text === "string" ? state.text : null;
+        if (state === undefined || typeof state === "string" || typeof state.text !== "string") return null;
+        return state.restartNote ? `${state.text}
+
+--- Restart note ---
+${state.restartNote}` : state.text;
       }
       /**
        * The System Prompt tab's display string for a given state — the loaded
@@ -355,7 +360,7 @@
       function peekPromptDisplay(state) {
         if (state === undefined || state === "loading") return "Loading…";
         if (typeof state.error === "string") return state.error;
-        return state.text ?? "(no system prompt)";
+        return peekPromptText(state) ?? "(no system prompt)";
       }
       /**
        * Folds one poll's liveness observation into a peek box's next state
@@ -1193,7 +1198,7 @@
             ? /** @type {SystemPromptReply|null} */ (await resp.json())
             : null;
           if (data && data.available && typeof data.system_prompt === "string") {
-            peekSystemPrompt[key] = { text: data.system_prompt };
+            peekSystemPrompt[key] = { text: data.system_prompt, restartNote: data.restart_note ?? null };
           } else if (data && typeof data.reason === "string") {
             peekSystemPrompt[key] = { error: data.reason };
           } else {
